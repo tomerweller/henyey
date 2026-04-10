@@ -74,7 +74,7 @@ fn test_ballot_pristine_confirm_prepared_a2_quorum_a2() {
     );
     assert_eq!(scp.envs_len(), 1);
     verify_prepare(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash,
         0,
@@ -127,7 +127,7 @@ fn test_ballot_pristine_confirm_prepared_a2_quorum_b2() {
     );
     assert_eq!(scp.envs_len(), 1);
     verify_prepare(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash,
         0,
@@ -167,7 +167,7 @@ fn test_ballot_pristine_accept_commit_quorum_a2() {
         &make_prepare_gen(qs_hash, a2.clone(), Some(a2.clone()), 2, 2, None),
     );
     assert_eq!(scp.envs_len(), 1);
-    verify_confirm(&scp.get_env(0), &v0_id(), qs_hash, 0, 2, &a2, 2, 2);
+    verify_confirm(&scp.env(0), &v0_id(), qs_hash, 0, 2, &a2, 2, 2);
 }
 
 // -- "Accept commit" -> "Quorum B2"
@@ -202,7 +202,7 @@ fn test_ballot_pristine_accept_commit_quorum_b2() {
         &make_prepare_gen(qs_hash, b2.clone(), Some(b2.clone()), 2, 2, None),
     );
     assert_eq!(scp.envs_len(), 1);
-    verify_confirm(&scp.get_env(0), &v0_id(), qs_hash, 0, 2, &b2, 2, 2);
+    verify_confirm(&scp.env(0), &v0_id(), qs_hash, 0, 2, &b2, 2, 2);
 }
 
 // -- "Accept commit" -> "v-blocking" -> "CONFIRM A2"
@@ -230,7 +230,7 @@ fn test_ballot_pristine_accept_commit_vblocking_confirm_a2() {
     // v-blocking CONFIRM(2, A2, 2, 2) -> emit CONFIRM(2, A2, 2, 2)
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 2, a2.clone(), 2, 2));
     assert_eq!(scp.envs_len(), 1);
-    verify_confirm(&scp.get_env(0), &v0_id(), qs_hash, 0, 2, &a2, 2, 2);
+    verify_confirm(&scp.env(0), &v0_id(), qs_hash, 0, 2, &a2, 2, 2);
 }
 
 // -- "Accept commit" -> "v-blocking" -> "CONFIRM A3..4"
@@ -262,7 +262,7 @@ fn test_ballot_pristine_accept_commit_vblocking_confirm_a3_a4() {
     // v-blocking CONFIRM(4, A4, 3, 4) -> emit CONFIRM(4, A4, 3, 4)
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 4, a4.clone(), 3, 4));
     assert_eq!(scp.envs_len(), 1);
-    verify_confirm(&scp.get_env(0), &v0_id(), qs_hash, 0, 4, &a4, 3, 4);
+    verify_confirm(&scp.env(0), &v0_id(), qs_hash, 0, 4, &a4, 3, 4);
 }
 
 // -- "Accept commit" -> "v-blocking" -> "CONFIRM B2"
@@ -294,7 +294,7 @@ fn test_ballot_pristine_accept_commit_vblocking_confirm_b2() {
     // v-blocking CONFIRM(2, B2, 2, 2) -> emit CONFIRM(2, B2, 2, 2)
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 2, b2.clone(), 2, 2));
     assert_eq!(scp.envs_len(), 1);
-    verify_confirm(&scp.get_env(0), &v0_id(), qs_hash, 0, 2, &b2, 2, 2);
+    verify_confirm(&scp.env(0), &v0_id(), qs_hash, 0, 2, &b2, 2, 2);
 }
 
 // -- "Accept commit" -> "v-blocking" -> "EXTERNALIZE A2"
@@ -327,7 +327,7 @@ fn test_ballot_pristine_accept_commit_vblocking_externalize_a2() {
     recv_v_blocking(&scp, &make_externalize_gen(qs_hash, a2.clone(), 2));
     assert_eq!(scp.envs_len(), 1);
     verify_confirm(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash,
         0,
@@ -372,7 +372,7 @@ fn test_ballot_pristine_accept_commit_vblocking_externalize_b2() {
     recv_v_blocking(&scp, &make_externalize_gen(qs_hash, b2.clone(), 2));
     assert_eq!(scp.envs_len(), 1);
     verify_confirm(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash,
         0,
@@ -445,7 +445,7 @@ fn test_ballot_pristine_confirm_prepared_mixed_a2() {
     ));
     assert_eq!(scp.envs_len(), 1);
     verify_prepare(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash,
         0,
@@ -531,7 +531,7 @@ fn test_ballot_pristine_confirm_prepared_mixed_b2() {
     ));
     assert_eq!(scp.envs_len(), 1);
     verify_prepare(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash,
         0,
@@ -634,7 +634,7 @@ fn test_ballot_pristine_confirm_vblocking_via_confirm() {
     scp.receive_envelope(make_confirm(&v1_id(), qs_hash, 0, 3, &a3, 3, 3));
     scp.receive_envelope(make_confirm(&v2_id(), qs_hash, 0, 4, &a4, 2, 4));
     assert_eq!(scp.envs_len(), 1);
-    verify_confirm(&scp.get_env(0), &v0_id(), qs_hash, 0, 3, &a3, 3, 3);
+    verify_confirm(&scp.env(0), &v0_id(), qs_hash, 0, 3, &a3, 3, 3);
 }
 
 // -- "confirm (v-blocking)" -> "via EXTERNALIZE"
@@ -665,7 +665,7 @@ fn test_ballot_pristine_confirm_vblocking_via_externalize() {
     scp.receive_envelope(make_externalize(&v2_id(), qs_hash, 0, &a3, 5));
     assert_eq!(scp.envs_len(), 1);
     verify_confirm(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash,
         0,

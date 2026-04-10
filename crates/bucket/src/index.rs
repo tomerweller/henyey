@@ -230,7 +230,7 @@ impl AssetPoolIdMap {
     }
 
     /// Gets all pool IDs containing the given asset.
-    pub fn get_pools_for_asset(&self, asset: &Asset) -> Vec<PoolId> {
+    pub fn pools_for_asset(&self, asset: &Asset) -> Vec<PoolId> {
         let hash = Self::hash_asset(asset);
         self.asset_to_pools
             .get(&hash)
@@ -421,7 +421,7 @@ impl InMemoryIndex {
     }
 
     /// Looks up the offset for a key.
-    pub fn get_offset(&self, key: &LedgerKey) -> Option<u64> {
+    pub fn offset(&self, key: &LedgerKey) -> Option<u64> {
         // Check bloom filter first
         if let Some(ref filter) = self.bloom_filter {
             if !filter.may_contain(key, &self.bloom_seed) {
@@ -456,7 +456,7 @@ impl InMemoryIndex {
     /// Looks up the offset for a key using pre-serialized key bytes.
     ///
     /// Skips bloom filter check (caller should check separately if needed).
-    pub fn get_offset_by_key_bytes(&self, key_bytes: &[u8]) -> Option<u64> {
+    pub fn offset_by_key_bytes(&self, key_bytes: &[u8]) -> Option<u64> {
         self.key_to_offset.get(key_bytes).copied()
     }
 
@@ -941,8 +941,8 @@ impl LiveBucketIndex {
     }
 
     /// Gets pools containing a specific asset.
-    pub fn get_pools_for_asset(&self, asset: &Asset) -> Vec<PoolId> {
-        self.asset_to_pool_id().get_pools_for_asset(asset)
+    pub fn pools_for_asset(&self, asset: &Asset) -> Vec<PoolId> {
+        self.asset_to_pool_id().pools_for_asset(asset)
     }
 
     /// Generates trustline keys for pool share lookups.
@@ -950,12 +950,12 @@ impl LiveBucketIndex {
     /// Given an account and asset, returns the trustline keys for all pool
     /// share trustlines that the account might have for pools containing
     /// the asset.
-    pub fn get_pool_share_trustline_keys(
+    pub fn pool_share_trustline_keys(
         &self,
         account_id: &stellar_xdr::curr::AccountId,
         asset: &Asset,
     ) -> Vec<LedgerKey> {
-        let pools = self.get_pools_for_asset(asset);
+        let pools = self.pools_for_asset(asset);
 
         pools
             .into_iter()
@@ -1045,12 +1045,12 @@ mod tests {
 
         // Test lookup
         let key = make_account_key(5);
-        let offset = index.get_offset(&key);
+        let offset = index.offset(&key);
         assert_eq!(offset, Some(500));
 
         // Test missing key
         let missing_key = make_account_key(100);
-        assert!(index.get_offset(&missing_key).is_none());
+        assert!(index.offset(&missing_key).is_none());
     }
 
     #[test]
@@ -1170,11 +1170,11 @@ mod tests {
 
         map.add_pool(pool_id.clone(), &asset_a, &asset_b);
 
-        let pools_for_native = map.get_pools_for_asset(&asset_a);
+        let pools_for_native = map.pools_for_asset(&asset_a);
         assert_eq!(pools_for_native.len(), 1);
         assert_eq!(pools_for_native[0], pool_id);
 
-        let pools_for_usd = map.get_pools_for_asset(&asset_b);
+        let pools_for_usd = map.pools_for_asset(&asset_b);
         assert_eq!(pools_for_usd.len(), 1);
     }
 
@@ -1255,7 +1255,7 @@ mod tests {
             seller_id: make_account_id(2),
             offer_id: 3,
         });
-        assert!(index.get_offset(&offer_key).is_some());
+        assert!(index.offset(&offer_key).is_some());
     }
 
     #[test]
@@ -1284,13 +1284,13 @@ mod tests {
 
         // Both lookups should work
         let acct_key = make_account_key(3);
-        assert!(index.get_offset(&acct_key).is_some());
+        assert!(index.offset(&acct_key).is_some());
 
         let offer_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: make_account_id(3),
             offer_id: 4,
         });
-        assert!(index.get_offset(&offer_key).is_some());
+        assert!(index.offset(&offer_key).is_some());
     }
 
     // ============ P2-5: ContractData Key with Same ScVal ============
@@ -1358,9 +1358,9 @@ mod tests {
         // Both should be independently findable
         let key1 = make_contract_data_key(1, 42, ContractDataDurability::Persistent);
         let key2 = make_contract_data_key(2, 42, ContractDataDurability::Persistent);
-        assert!(index.get_offset(&key1).is_some());
-        assert!(index.get_offset(&key2).is_some());
-        assert_ne!(index.get_offset(&key1), index.get_offset(&key2));
+        assert!(index.offset(&key1).is_some());
+        assert!(index.offset(&key2).is_some());
+        assert_ne!(index.offset(&key1), index.offset(&key2));
     }
 
     #[test]
@@ -1390,12 +1390,9 @@ mod tests {
 
         let key_persistent = make_contract_data_key(1, 42, ContractDataDurability::Persistent);
         let key_temporary = make_contract_data_key(1, 42, ContractDataDurability::Temporary);
-        assert!(index.get_offset(&key_persistent).is_some());
-        assert!(index.get_offset(&key_temporary).is_some());
-        assert_ne!(
-            index.get_offset(&key_persistent),
-            index.get_offset(&key_temporary)
-        );
+        assert!(index.offset(&key_persistent).is_some());
+        assert!(index.offset(&key_temporary).is_some());
+        assert_ne!(index.offset(&key_persistent), index.offset(&key_temporary));
     }
 
     // ============ P2-6: Account Lookup by ID ============
@@ -1419,7 +1416,7 @@ mod tests {
         // Look up specific accounts
         for i in [0u8, 10, 25, 49] {
             let key = make_account_key(i);
-            let offset = index.get_offset(&key);
+            let offset = index.offset(&key);
             assert!(offset.is_some(), "Account {} should be in index", i);
             assert_eq!(offset.unwrap(), i as u64 * 100);
         }
@@ -1428,7 +1425,7 @@ mod tests {
         for i in [50u8, 100, 255] {
             let key = make_account_key(i);
             assert!(
-                index.get_offset(&key).is_none(),
+                index.offset(&key).is_none(),
                 "Account {} should not be in index",
                 i
             );
@@ -1462,8 +1459,8 @@ mod tests {
         // but the actual offset should be None
         let key = make_account_key(200);
         // We can't assert may_contain is false (bloom filters have false positives)
-        // but we can assert get_offset is None
-        assert!(index.get_offset(&key).is_none());
+        // but we can assert offset is None
+        assert!(index.offset(&key).is_none());
     }
 
     // ============ P2-7: Soroban Cache Population ============

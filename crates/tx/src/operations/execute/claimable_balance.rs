@@ -56,7 +56,7 @@ pub(crate) fn execute_create_claimable_balance(
 
     // Check source account exists (stellar-core calls loadSourceAccount which records access)
     state.record_account_access(source);
-    let account = match state.get_account(source) {
+    let account = match state.account(source) {
         Some(a) => a.clone(),
         None => {
             return Ok(make_create_result(
@@ -103,7 +103,7 @@ pub(crate) fn execute_create_claimable_balance(
         _ => {
             if issuer.as_ref() != Some(source) {
                 // For non-native assets, check trustline when not issuer
-                match state.get_trustline(source, &op.asset) {
+                match state.trustline(source, &op.asset) {
                     Some(tl) => {
                         source_trustline_flags = Some(tl.flags);
                         if !is_trustline_authorized(tl.flags) {
@@ -139,13 +139,13 @@ pub(crate) fn execute_create_claimable_balance(
     // Deduct balance from source (matches stellar-core addBalance call)
     match &op.asset {
         Asset::Native => {
-            if let Some(account) = state.get_account_mut(source) {
+            if let Some(account) = state.account_mut(source) {
                 sub_account_balance(account, op.amount)?;
             }
         }
         _ => {
             if issuer.as_ref() != Some(source) {
-                if let Some(tl) = state.get_trustline_mut(source, &op.asset) {
+                if let Some(tl) = state.trustline_mut(source, &op.asset) {
                     sub_trustline_balance(tl, op.amount)?;
                 }
             }
@@ -155,7 +155,7 @@ pub(crate) fn execute_create_claimable_balance(
     // NOW check sponsor's reserve (matches stellar-core createEntryWithPossibleSponsorship)
     // This happens AFTER balance deduction in stellar-core
     let sponsor_account = state
-        .get_account(&sponsor)
+        .account(&sponsor)
         .ok_or(TxError::SourceAccountNotFound)?;
     let sponsor_min_balance = state.minimum_balance_for_account_with_deltas(
         sponsor_account,
@@ -251,7 +251,7 @@ pub(crate) fn execute_claim_claimable_balance(
     context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Get the claimable balance entry
-    let entry = match state.get_claimable_balance(&op.balance_id) {
+    let entry = match state.claimable_balance(&op.balance_id) {
         Some(e) => e.clone(),
         None => {
             return Ok(make_claim_result(
@@ -274,7 +274,7 @@ pub(crate) fn execute_claim_claimable_balance(
     }
 
     // Check source account exists (use mutable access to mirror stellar-core loadSourceAccount)
-    if state.get_account_mut(source).is_none() {
+    if state.account_mut(source).is_none() {
         return Ok(make_claim_result(
             ClaimClaimableBalanceResultCode::CannotClaim,
         ));
@@ -302,7 +302,7 @@ pub(crate) fn execute_claim_claimable_balance(
     // maxBalance >= balance >= 0).
     match &entry.asset {
         Asset::Native => {
-            if let Some(account) = state.get_account_mut(source) {
+            if let Some(account) = state.account_mut(source) {
                 if add_account_balance(account, entry.amount).is_err() {
                     return Ok(make_claim_result(ClaimClaimableBalanceResultCode::LineFull));
                 }
@@ -323,7 +323,7 @@ pub(crate) fn execute_claim_claimable_balance(
                 // (the tokens are effectively burned/returned to issuer)
             } else {
                 // Non-issuer: check trustline exists
-                match state.get_trustline_mut(source, &entry.asset) {
+                match state.trustline_mut(source, &entry.asset) {
                     Some(tl) => {
                         if !is_trustline_authorized(tl.flags) {
                             return Ok(make_claim_result(
@@ -371,7 +371,7 @@ fn generate_claimable_balance_id(tx_id: &TxIdentity<'_>) -> Result<ClaimableBala
 }
 
 fn asset_issuer(asset: &Asset) -> Option<AccountId> {
-    henyey_common::asset::get_issuer(asset).ok().cloned()
+    henyey_common::asset::issuer(asset).ok().cloned()
 }
 
 /// Check if a claim predicate is satisfied.
@@ -672,7 +672,7 @@ mod tests {
         }
 
         // Check source balance was deducted
-        let source = state.get_account(&source_id).unwrap();
+        let source = state.account(&source_id).unwrap();
         assert_eq!(source.balance, 90_000_000);
     }
 
@@ -802,7 +802,7 @@ mod tests {
         };
 
         let entry = state
-            .get_claimable_balance(&balance_id)
+            .claimable_balance(&balance_id)
             .expect("claimable balance exists");
         let stored_predicate = match entry.claimants[0] {
             Claimant::ClaimantTypeV0(ref cv0) => &cv0.predicate,
@@ -963,7 +963,7 @@ mod tests {
                 CreateClaimableBalanceResult::Success(balance_id),
             )) => {
                 let entry = state
-                    .get_claimable_balance(&balance_id)
+                    .claimable_balance(&balance_id)
                     .expect("claimable balance exists");
                 match &entry.ext {
                     ClaimableBalanceEntryExt::V1(v1) => {
@@ -1028,7 +1028,7 @@ mod tests {
                 CreateClaimableBalanceResult::Success(balance_id),
             )) => {
                 let entry = state
-                    .get_claimable_balance(&balance_id)
+                    .claimable_balance(&balance_id)
                     .expect("claimable balance exists");
                 match &entry.ext {
                     ClaimableBalanceEntryExt::V1(v1) => {
@@ -1213,7 +1213,7 @@ mod tests {
             ext: TrustLineEntryExt::V0,
         };
         state.create_trustline(trustline);
-        state.get_account_mut(&claimant_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&claimant_id).unwrap().num_sub_entries += 1;
 
         let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
             destination: claimant_id.clone(),
@@ -1267,7 +1267,7 @@ mod tests {
             ext: TrustLineEntryExt::V0,
         };
         state.create_trustline(trustline);
-        state.get_account_mut(&claimant_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&claimant_id).unwrap().num_sub_entries += 1;
 
         let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
             destination: claimant_id.clone(),
@@ -1556,7 +1556,7 @@ mod tests {
         };
 
         // Get claimant balance before claim
-        let claimant_balance_before = state.get_account(&claimant_id).unwrap().balance;
+        let claimant_balance_before = state.account(&claimant_id).unwrap().balance;
 
         // Now claim it
         let claim_op = ClaimClaimableBalanceOp {
@@ -1578,7 +1578,7 @@ mod tests {
         }
 
         // Verify claimant balance increased
-        let claimant_balance_after = state.get_account(&claimant_id).unwrap().balance;
+        let claimant_balance_after = state.account(&claimant_id).unwrap().balance;
         assert_eq!(claimant_balance_after, claimant_balance_before + 10_000_000);
     }
 
@@ -1742,7 +1742,7 @@ mod tests {
             100_000,
         );
         state.create_trustline(creator_trustline);
-        state.get_account_mut(&creator_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&creator_id).unwrap().num_sub_entries += 1;
 
         // Create trustline for claimant to receive the asset
         let claimant_trustline = create_test_trustline(
@@ -1753,7 +1753,7 @@ mod tests {
             0,
         );
         state.create_trustline(claimant_trustline);
-        state.get_account_mut(&claimant_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&claimant_id).unwrap().num_sub_entries += 1;
 
         // Create claimable balance
         let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
@@ -1807,7 +1807,7 @@ mod tests {
         }
 
         // Verify claimant trustline balance increased
-        let claimant_trustline = state.get_trustline(&claimant_id, &asset).unwrap();
+        let claimant_trustline = state.trustline(&claimant_id, &asset).unwrap();
         assert_eq!(claimant_trustline.balance, 50_000);
     }
 
@@ -1854,7 +1854,7 @@ mod tests {
             }),
         };
         state.create_trustline(trustline);
-        state.get_account_mut(&claimant_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&claimant_id).unwrap().num_sub_entries += 1;
 
         let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
             destination: claimant_id.clone(),
@@ -1971,7 +1971,7 @@ mod tests {
             ext: TrustLineEntryExt::V0,
         };
         state.create_trustline(trustline);
-        state.get_account_mut(&claimant_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&claimant_id).unwrap().num_sub_entries += 1;
 
         let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
             destination: claimant_id.clone(),
@@ -2003,7 +2003,7 @@ mod tests {
 
         // Verify trustline balance was NOT corrupted
         let tl = state
-            .get_trustline(
+            .trustline(
                 &claimant_id,
                 &Asset::CreditAlphanum4(AlphaNum4 {
                     asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
@@ -2065,7 +2065,7 @@ mod tests {
 
         // After deletion, the balance should not be in state
         assert!(
-            state.get_claimable_balance(&balance_id).is_none(),
+            state.claimable_balance(&balance_id).is_none(),
             "Claimable balance should be deleted after claim"
         );
 
@@ -2187,7 +2187,7 @@ mod tests {
             }),
         };
         state.create_trustline(trustline);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
             destination: claimant_id.clone(),
@@ -2296,7 +2296,7 @@ mod tests {
             false,
             0,
         ));
-        state.get_account_mut(&claimant_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&claimant_id).unwrap().num_sub_entries += 1;
 
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4(*b"USD\0"),

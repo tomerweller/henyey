@@ -219,8 +219,8 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify balances changed
-        assert_eq!(state.get_account(&source_id).unwrap().balance, 90_000_000);
-        assert_eq!(state.get_account(&dest_id).unwrap().balance, 60_000_000);
+        assert_eq!(state.account(&source_id).unwrap().balance, 90_000_000);
+        assert_eq!(state.account(&dest_id).unwrap().balance, 60_000_000);
     }
 
     #[test]
@@ -404,7 +404,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
@@ -457,7 +457,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
@@ -741,7 +741,7 @@ mod tests {
 
         // Balance should still be zero after self-payment
         let trustline = state
-            .get_trustline(
+            .trustline(
                 &account_id,
                 &Asset::CreditAlphanum4(AlphaNum4 {
                     asset_code: AssetCode4([b'U', b'S', b'D', b'Z']),
@@ -843,7 +843,7 @@ mod tests {
 
         // Verify holder received the payment
         let trustline = state
-            .get_trustline(
+            .trustline(
                 &holder_id,
                 &Asset::CreditAlphanum4(AlphaNum4 {
                     asset_code: AssetCode4(*b"USD\0"),
@@ -854,7 +854,7 @@ mod tests {
         assert_eq!(trustline.balance, 1000);
 
         // Issuer's XLM balance unchanged (issuer doesn't need trustline for own asset)
-        let issuer_account = state.get_account(&issuer_id).unwrap();
+        let issuer_account = state.account(&issuer_id).unwrap();
         assert_eq!(issuer_account.balance, 100_000_000);
     }
 
@@ -906,7 +906,7 @@ mod tests {
 
         // Verify holder's trustline was debited
         let trustline = state
-            .get_trustline(
+            .trustline(
                 &holder_id,
                 &Asset::CreditAlphanum4(AlphaNum4 {
                     asset_code: AssetCode4(*b"EUR\0"),
@@ -1036,7 +1036,7 @@ mod tests {
         }
 
         // Balance should be unchanged (self-payment is a no-op)
-        assert_eq!(state.get_account(&source_id).unwrap().balance, 100_000_000);
+        assert_eq!(state.account(&source_id).unwrap().balance, 100_000_000);
     }
 
     /// Test native payment source only has minimum reserve fails with Underfunded.

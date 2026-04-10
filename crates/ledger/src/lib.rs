@@ -128,7 +128,7 @@ pub type Result<T> = std::result::Result<T, LedgerError>;
 /// view with delta overlay) implement this trait, allowing config-loading and
 /// other read-path code to be generic over the entry source.
 pub trait EntryReader {
-    fn get_entry(
+    fn entry(
         &self,
         key: &stellar_xdr::curr::LedgerKey,
     ) -> Result<Option<stellar_xdr::curr::LedgerEntry>>;

@@ -43,7 +43,7 @@
 //! slot_tracker.record_envelope(100, node_a);
 //! slot_tracker.record_envelope(100, node_b);
 //!
-//! if slot_tracker.has_quorum(100, |n| get_quorum_set(n)) {
+//! if slot_tracker.has_quorum(100, |n| quorum_set(n)) {
 //!     println!("Heard from quorum for slot 100");
 //! }
 //!
@@ -141,7 +141,7 @@ impl SlotQuorumTracker {
     /// Get all slots that have achieved v-blocking status, sorted descending by slot.
     ///
     /// This is used for out-of-sync recovery to find slots to purge.
-    pub fn get_v_blocking_slots(&self) -> Vec<SlotIndex> {
+    pub fn v_blocking_slots(&self) -> Vec<SlotIndex> {
         let local = match &self.local_quorum_set {
             Some(qs) => qs,
             None => return vec![],

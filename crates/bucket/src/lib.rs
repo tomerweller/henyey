@@ -148,9 +148,9 @@ pub use bloom_filter::{BucketBloomFilter, HashSeed, HASH_KEY_BYTES};
 // ============================================================================
 
 pub use entry::{
-    compare_entries, compare_keys, get_ttl_key, get_ttl_live_until, is_persistent_entry,
-    is_persistent_key, is_soroban_entry, is_soroban_key, is_temporary_entry, is_ttl_expired,
-    ledger_entry_data_type, ledger_key_type, BucketEntry, BucketEntryExt,
+    compare_entries, compare_keys, is_persistent_entry, is_persistent_key, is_soroban_entry,
+    is_soroban_key, is_temporary_entry, is_ttl_expired, ledger_entry_data_type, ledger_key_type,
+    ttl_key, ttl_live_until, BucketEntry, BucketEntryExt,
 };
 
 // ============================================================================

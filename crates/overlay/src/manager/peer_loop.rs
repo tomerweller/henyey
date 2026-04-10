@@ -990,7 +990,7 @@ impl OverlayManager {
     ) -> crate::Result<bool> {
         use crate::flow_control::MessagePriority;
 
-        let batch = flow_control.get_next_batch_to_send();
+        let batch = flow_control.next_batch_to_send();
         if batch.is_empty() {
             return Ok(false);
         }
@@ -1510,9 +1510,9 @@ mod tests {
         );
 
         // GetTxSet is ControlFetch
-        let get_tx_set = StellarMessage::GetTxSet(Uint256([0; 32]));
+        let tx_set = StellarMessage::GetTxSet(Uint256([0; 32]));
         assert_eq!(
-            TrafficClass::classify(&get_tx_set),
+            TrafficClass::classify(&tx_set),
             Some(TrafficClass::ControlFetch)
         );
 

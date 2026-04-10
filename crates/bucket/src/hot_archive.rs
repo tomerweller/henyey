@@ -258,7 +258,7 @@ impl HotArchiveBucket {
     ///
     /// This matches stellar-core's `getBucketVersion()` method.
     /// Returns the ledger_version from the bucket's metadata entry, or 0 if no metadata.
-    pub fn get_protocol_version(&self) -> u32 {
+    pub fn protocol_version(&self) -> u32 {
         match &self.storage {
             HotArchiveStorage::InMemory { entries, .. } => {
                 // Metadata entry is stored with empty key
@@ -287,14 +287,14 @@ impl HotArchiveBucket {
         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
             BucketError::Serialization(format!("failed to serialize ledger key: {}", e))
         })?;
-        self.get_by_bytes(&key_bytes)
+        self.by_bytes(&key_bytes)
     }
 
     /// Look up an entry by pre-serialized key bytes.
     ///
     /// This avoids redundant XDR serialization when the caller already has the
     /// serialized key (e.g., when searching across multiple buckets).
-    pub fn get_by_bytes(&self, key_bytes: &[u8]) -> Result<Option<HotArchiveBucketEntry>> {
+    pub fn by_bytes(&self, key_bytes: &[u8]) -> Result<Option<HotArchiveBucketEntry>> {
         match &self.storage {
             HotArchiveStorage::InMemory { entries, .. } => Ok(entries.get(key_bytes).cloned()),
             HotArchiveStorage::DiskBacked { path, .. } => {
@@ -1137,7 +1137,7 @@ impl HotArchiveBucketList {
         })?;
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
-                if let Some(entry) = bucket.get_by_bytes(&key_bytes)? {
+                if let Some(entry) = bucket.by_bytes(&key_bytes)? {
                     match entry {
                         HotArchiveBucketEntry::Archived(e) => return Ok(Some(e)),
                         HotArchiveBucketEntry::Live(_) => return Ok(None), // Restored, not in archive
@@ -1592,7 +1592,7 @@ impl HotArchiveBucketList {
             );
 
             // Determine merge parameters
-            let merge_protocol_version = match prev_snap.get_protocol_version() {
+            let merge_protocol_version = match prev_snap.protocol_version() {
                 0 => protocol_version,
                 version => version,
             };
@@ -1753,7 +1753,7 @@ pub fn merge_hot_archive_buckets(
     // Calculate output protocol version using max(curr, snap), matching stellar-core behavior
     // in calculateMergeProtocolVersion(). The passed protocol_version is only used as
     // a constraint (maxProtocolVersion), not as the output version.
-    let output_version = curr.get_protocol_version().max(snap.get_protocol_version());
+    let output_version = curr.protocol_version().max(snap.protocol_version());
 
     // Validate that calculated version doesn't exceed the max
     if protocol_version > 0 && output_version > protocol_version {
@@ -1907,7 +1907,7 @@ mod tests {
         // Should have non-zero hash
         assert!(!bucket.hash().is_zero());
         // Should have correct protocol version
-        assert_eq!(bucket.get_protocol_version(), 25);
+        assert_eq!(bucket.protocol_version(), 25);
     }
 
     #[test]
@@ -1926,7 +1926,7 @@ mod tests {
         // Should have non-zero hash
         assert!(!merged.hash().is_zero());
         // Should have correct protocol version
-        assert_eq!(merged.get_protocol_version(), 25);
+        assert_eq!(merged.protocol_version(), 25);
     }
 
     #[test]
@@ -2133,7 +2133,7 @@ mod tests {
 
         // Output should use max(23, 24) = 24, NOT 25
         assert_eq!(
-            merged.get_protocol_version(),
+            merged.protocol_version(),
             24,
             "Hot archive merge should use max(curr=23, snap=24)=24, NOT max_protocol_version=25"
         );
@@ -2191,7 +2191,7 @@ mod tests {
 
         // Output should be 24 (max of inputs), not 25
         assert_eq!(
-            merged.get_protocol_version(),
+            merged.protocol_version(),
             24,
             "Output should be max(24, 24)=24, not constraint=25"
         );

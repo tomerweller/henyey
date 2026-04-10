@@ -636,7 +636,7 @@ impl SurveyManager {
     }
 
     /// Get the finalized node data (reporting phase only).
-    pub fn get_node_data(&self) -> Option<TimeSlicedNodeData> {
+    pub fn node_data(&self) -> Option<TimeSlicedNodeData> {
         let state = self.state.read();
         state.as_ref().and_then(|s| {
             if s.phase == SurveyPhase::Reporting {
@@ -648,7 +648,7 @@ impl SurveyManager {
     }
 
     /// Get the finalized inbound peer data (reporting phase only).
-    pub fn get_inbound_peer_data(&self) -> Vec<TimeSlicedPeerData> {
+    pub fn inbound_peer_data(&self) -> Vec<TimeSlicedPeerData> {
         let state = self.state.read();
         state
             .as_ref()
@@ -658,7 +658,7 @@ impl SurveyManager {
     }
 
     /// Get the finalized outbound peer data (reporting phase only).
-    pub fn get_outbound_peer_data(&self) -> Vec<TimeSlicedPeerData> {
+    pub fn outbound_peer_data(&self) -> Vec<TimeSlicedPeerData> {
         let state = self.state.read();
         state
             .as_ref()
@@ -891,13 +891,13 @@ mod tests {
         assert_eq!(manager.phase(), SurveyPhase::Reporting);
 
         // Check finalized data
-        let node_data = manager.get_node_data();
+        let node_data = manager.node_data();
         assert!(node_data.is_some());
 
-        let inbound = manager.get_inbound_peer_data();
+        let inbound = manager.inbound_peer_data();
         assert_eq!(inbound.len(), 1);
 
-        let outbound = manager.get_outbound_peer_data();
+        let outbound = manager.outbound_peer_data();
         assert_eq!(outbound.len(), 1);
     }
 
@@ -928,7 +928,7 @@ mod tests {
         // Verify by stopping and checking final data
         manager.stop_collecting(12345, 10, &[], &[]);
 
-        let node_data = manager.get_node_data().unwrap();
+        let node_data = manager.node_data().unwrap();
         assert_eq!(node_data.added_peers, 2);
         assert_eq!(node_data.dropped_peers, 1);
     }

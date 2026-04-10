@@ -44,7 +44,7 @@
 //!     "2025-01-07",
 //! );
 //!
-//! let meta = cdp.get_ledger_close_meta(310079).await?;
+//! let meta = cdp.ledger_close_meta(310079).await?;
 //! let header = henyey_history::cdp::extract_ledger_header(&meta);
 //! println!("Ledger {} closed at {}", header.ledger_seq, header.scp_value.close_time.0);
 //! # Ok(())
@@ -130,7 +130,7 @@ impl CdpDataLake {
     }
 
     /// Fetch LedgerCloseMeta for a single ledger.
-    pub async fn get_ledger_close_meta(&self, ledger_seq: u32) -> Result<LedgerCloseMeta> {
+    pub async fn ledger_close_meta(&self, ledger_seq: u32) -> Result<LedgerCloseMeta> {
         let url = self.url_for_ledger(ledger_seq);
         tracing::debug!(ledger_seq = ledger_seq, url = %url, "Fetching LedgerCloseMeta from CDP");
 
@@ -162,7 +162,7 @@ impl CdpDataLake {
     }
 
     /// Fetch LedgerCloseMeta for a range of ledgers.
-    pub async fn get_ledger_close_metas(
+    pub async fn ledger_close_metas(
         &self,
         start_seq: u32,
         end_seq: u32,
@@ -170,7 +170,7 @@ impl CdpDataLake {
         let mut metas = Vec::with_capacity((end_seq - start_seq + 1) as usize);
 
         for seq in start_seq..=end_seq {
-            let meta = self.get_ledger_close_meta(seq).await?;
+            let meta = self.ledger_close_meta(seq).await?;
             metas.push(meta);
         }
 
@@ -384,7 +384,7 @@ impl CachedCdpDataLake {
     }
 
     /// Fetch a ledger, using cache if available.
-    pub async fn get_ledger_close_meta(&self, ledger_seq: u32) -> Result<LedgerCloseMeta> {
+    pub async fn ledger_close_meta(&self, ledger_seq: u32) -> Result<LedgerCloseMeta> {
         let cache_path = self.cache_path(ledger_seq);
 
         // Check cache first
@@ -464,7 +464,7 @@ impl CachedCdpDataLake {
     /// 1. Using cached data when available
     /// 2. Prefetching uncached ledgers in parallel
     /// 3. Returning results in order
-    pub async fn get_ledger_close_metas_prefetch(
+    pub async fn ledger_close_metas_prefetch(
         &self,
         start: u32,
         end: u32,
@@ -504,7 +504,7 @@ impl CachedCdpDataLake {
         // Now read all from cache (which should all be populated)
         let mut metas = Vec::with_capacity((end - start + 1) as usize);
         for seq in start..=end {
-            let meta = self.get_ledger_close_meta(seq).await?;
+            let meta = self.ledger_close_meta(seq).await?;
             metas.push(meta);
         }
 

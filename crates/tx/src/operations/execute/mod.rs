@@ -60,9 +60,7 @@ pub(super) fn require_source_account<'a>(
     state: &'a LedgerStateManager,
     source: &AccountId,
 ) -> Result<&'a AccountEntry> {
-    state
-        .get_account(source)
-        .ok_or(TxError::SourceAccountNotFound)
+    state.account(source).ok_or(TxError::SourceAccountNotFound)
 }
 
 /// Like [`require_source_account`] but returns a clone.
@@ -71,7 +69,7 @@ pub(super) fn require_source_account_cloned(
     source: &AccountId,
 ) -> Result<AccountEntry> {
     state
-        .get_account(source)
+        .account(source)
         .cloned()
         .ok_or(TxError::SourceAccountNotFound)
 }
@@ -166,7 +164,7 @@ fn apply_balance_delta(
     state: &mut LedgerStateManager,
 ) -> Result<()> {
     if matches!(asset, Asset::Native) {
-        let Some(account) = state.get_account_mut(account_id) else {
+        let Some(account) = state.account_mut(account_id) else {
             return Err(TxError::Internal(
                 "missing account for balance update".into(),
             ));
@@ -185,7 +183,7 @@ fn apply_balance_delta(
         return Ok(());
     }
 
-    let Some(tl) = state.get_trustline_mut(account_id, asset) else {
+    let Some(tl) = state.trustline_mut(account_id, asset) else {
         return Err(TxError::Internal(
             "missing trustline for balance update".into(),
         ));
@@ -270,7 +268,7 @@ fn is_asset_valid(asset: &Asset) -> bool {
 /// The issuer of a non-native asset can always buy i64::MAX.
 fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager) -> i64 {
     if matches!(asset, Asset::Native) {
-        let Some(account) = state.get_account(source) else {
+        let Some(account) = state.account(source) else {
             return 0;
         };
         let available = i64::MAX - account.balance - account_liabilities(account).buying;
@@ -281,7 +279,7 @@ fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager
         return i64::MAX;
     }
 
-    let Some(trustline) = state.get_trustline(source, asset) else {
+    let Some(trustline) = state.trustline(source, asset) else {
         return 0;
     };
     if !is_authorized_to_maintain_liabilities(trustline.flags) {
@@ -303,13 +301,13 @@ fn apply_liabilities_delta(
     state: &mut LedgerStateManager,
 ) -> Result<()> {
     if matches!(selling, Asset::Native) {
-        let Some(account) = state.get_account_mut(account_id) else {
+        let Some(account) = state.account_mut(account_id) else {
             return Err(TxError::Internal("missing account for liabilities".into()));
         };
         let liab = ensure_account_liabilities(account);
         update_liabilities(liab, 0, selling_delta)?;
     } else if issuer_for_asset(selling) != Some(account_id) {
-        let Some(trustline) = state.get_trustline_mut(account_id, selling) else {
+        let Some(trustline) = state.trustline_mut(account_id, selling) else {
             return Err(TxError::Internal(
                 "missing trustline for liabilities".into(),
             ));
@@ -319,13 +317,13 @@ fn apply_liabilities_delta(
     }
 
     if matches!(buying, Asset::Native) {
-        let Some(account) = state.get_account_mut(account_id) else {
+        let Some(account) = state.account_mut(account_id) else {
             return Err(TxError::Internal("missing account for liabilities".into()));
         };
         let liab = ensure_account_liabilities(account);
         update_liabilities(liab, buying_delta, 0)?;
     } else if issuer_for_asset(buying) != Some(account_id) {
-        let Some(trustline) = state.get_trustline_mut(account_id, buying) else {
+        let Some(trustline) = state.trustline_mut(account_id, buying) else {
             return Err(TxError::Internal(
                 "missing trustline for liabilities".into(),
             ));
@@ -601,7 +599,7 @@ fn rent_snapshot_for_keys(
 ) -> Vec<RentSnapshot> {
     let mut snapshots = Vec::new();
     for key in keys {
-        let Some(entry) = state.get_entry(key) else {
+        let Some(entry) = state.entry(key) else {
             continue;
         };
         let entry_xdr = entry
@@ -615,7 +613,7 @@ fn rent_snapshot_for_keys(
         );
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
         let old_live_until = state
-            .get_ttl(&key_hash)
+            .ttl(&key_hash)
             .map(|ttl| ttl.live_until_ledger_seq)
             .unwrap_or(0);
         let (is_persistent, is_code_entry) = rent_classification(key);
@@ -642,7 +640,7 @@ fn rent_changes_from_snapshots(
 ) -> Vec<RentChange> {
     let mut changes = Vec::new();
     for snapshot in snapshots {
-        let Some(entry) = state.get_entry(&snapshot.key) else {
+        let Some(entry) = state.entry(&snapshot.key) else {
             tracing::debug!(?snapshot.key, "rent_changes_from_snapshots: entry not found, skipping");
             continue;
         };
@@ -657,7 +655,7 @@ fn rent_changes_from_snapshots(
         );
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &snapshot.key);
         let new_live_until = state
-            .get_ttl(&key_hash)
+            .ttl(&key_hash)
             .map(|ttl| ttl.live_until_ledger_seq)
             .unwrap_or(snapshot.old_live_until);
 
@@ -831,7 +829,7 @@ pub fn execute_operation_with_soroban(
     // This matches stellar-core's OperationFrame::checkSourceAccount().
     // If the source account doesn't exist (e.g., it was merged by a prior operation),
     // return opNO_ACCOUNT.
-    if state.get_account(&op_source).is_none() {
+    if state.account(&op_source).is_none() {
         return Ok(OperationExecutionResult::new(OperationResult::OpNoAccount));
     }
 
@@ -951,7 +949,7 @@ pub fn execute_operation_with_soroban(
                         // Only compute rent for entries that need restoration
                         let key_hash =
                             crate::soroban::get_or_compute_key_hash(soroban.ttl_key_cache, key);
-                        let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
+                        let current_ttl = state.ttl(&key_hash).map(|t| t.live_until_ledger_seq);
 
                         // Case 1: TTL exists and entry is live -> skip
                         if let Some(ttl) = current_ttl {
@@ -959,7 +957,7 @@ pub fn execute_operation_with_soroban(
                                 continue;
                             }
                             // Case 3: TTL exists but expired -> restore from live bucket list
-                            if let Some(entry) = state.get_entry(key) {
+                            if let Some(entry) = state.entry(key) {
                                 let entry_xdr = entry
                                     .to_xdr(stellar_xdr::curr::Limits::none())
                                     .unwrap_or_default();
@@ -1745,7 +1743,7 @@ mod tests {
         )
         .unwrap();
 
-        let account = state.get_account(&source).unwrap();
+        let account = state.account(&source).unwrap();
         let liab = account_liabilities(account);
         // Both selling and buying deltas applied to native account
         assert_eq!(liab.selling, 1000);

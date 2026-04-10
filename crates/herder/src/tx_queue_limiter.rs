@@ -204,7 +204,7 @@ impl TxQueueLimiter {
     /// Reset eviction state tracking.
     pub fn reset_eviction_state(&mut self) {
         if let Some(ref txs) = self.txs {
-            self.lane_evicted_inclusion_fee = vec![(0, 0); txs.get_num_lanes()];
+            self.lane_evicted_inclusion_fee = vec![(0, 0); txs.num_lanes()];
         } else {
             self.lane_evicted_inclusion_fee.clear();
         }
@@ -240,7 +240,7 @@ impl TxQueueLimiter {
         let lane = self
             .lane_config
             .as_ref()
-            .map(|c| c.get_lane(&frame))
+            .map(|c| c.lane(&frame))
             .unwrap_or(GENERIC_LANE);
 
         if let Some(ref mut txs) = self.txs {
@@ -301,7 +301,7 @@ impl TxQueueLimiter {
         let lane = self
             .lane_config
             .as_ref()
-            .map(|c| c.get_lane(&frame))
+            .map(|c| c.lane(&frame))
             .unwrap_or(GENERIC_LANE);
 
         // Check if the new transaction beats any evicted fees
@@ -387,7 +387,7 @@ impl TxQueueLimiter {
         let tx_to_fit_lane = self
             .lane_config
             .as_ref()
-            .map(|c| c.get_lane(&frame))
+            .map(|c| c.lane(&frame))
             .unwrap_or(GENERIC_LANE);
 
         let resources_to_fit = self
@@ -401,7 +401,7 @@ impl TxQueueLimiter {
             let evict_lane = self
                 .lane_config
                 .as_ref()
-                .map(|c| c.get_lane(&evict_frame))
+                .map(|c| c.lane(&evict_frame))
                 .unwrap_or(GENERIC_LANE);
 
             if *evicted_due_to_lane_limit {
@@ -469,7 +469,7 @@ impl TxQueueLimiter {
         F: FnMut(&QueuedTransaction) -> VisitTxResult,
     {
         if let Some(ref mut flood) = self.txs_to_flood {
-            let mut had_not_fitting = vec![false; flood.get_num_lanes()];
+            let mut had_not_fitting = vec![false; flood.num_lanes()];
             flood.pop_top_txs(
                 false,
                 &self.network_id,

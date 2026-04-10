@@ -80,7 +80,7 @@ impl QuorumSetTracker {
     }
 
     /// Get the local quorum set.
-    pub fn get_local(&self) -> Option<ScpQuorumSet> {
+    pub fn local(&self) -> Option<ScpQuorumSet> {
         self.local.read().unwrap().clone()
     }
 
@@ -163,14 +163,14 @@ impl QuorumSetTracker {
     }
 
     /// Look up by node ID.
-    pub fn get_by_node(&self, node_id: &NodeId) -> Option<ScpQuorumSet> {
+    pub fn by_node(&self, node_id: &NodeId) -> Option<ScpQuorumSet> {
         let key: [u8; 32] = match &node_id.0 {
             PublicKey::PublicKeyTypeEd25519(key) => key.0,
         };
         // Check local first (matches ScpDriver behavior: local_quorum_set checked
-        // before quorum_sets map in get_quorum_set).
+        // before quorum_sets map in quorum_set).
         if key == self.local_node_key {
-            if let Some(qs) = self.get_local() {
+            if let Some(qs) = self.local() {
                 return Some(qs);
             }
         }
@@ -178,7 +178,7 @@ impl QuorumSetTracker {
     }
 
     /// Look up by hash.
-    pub fn get_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
+    pub fn by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
         self.by_hash.get(hash).map(|v| v.clone())
     }
 
@@ -192,7 +192,7 @@ impl QuorumSetTracker {
     /// Clear validated qset maps (by_node, by_hash), preserving only
     /// the local node's entry. Does NOT clear pending.
     pub fn clear_validated_preserving_local(&self) {
-        let local_qs = self.get_local();
+        let local_qs = self.local();
 
         let prev_by_node = self.by_node.len();
         let prev_by_hash = self.by_hash.len();
@@ -287,7 +287,7 @@ mod tests {
         assert!(!tracker.request(hash, node_b.clone()));
 
         // node_b should now have the qset
-        assert!(tracker.get_by_node(&node_b).is_some());
+        assert!(tracker.by_node(&node_b).is_some());
         // No pending entry created
         assert_eq!(tracker.pending_count(), 0);
     }
@@ -330,8 +330,8 @@ mod tests {
 
         tracker.store(&node, qs.clone());
 
-        assert!(tracker.get_by_node(&node).is_some());
-        assert!(tracker.get_by_hash(&hash).is_some());
+        assert!(tracker.by_node(&node).is_some());
+        assert!(tracker.by_hash(&hash).is_some());
         assert_eq!(tracker.pending_count(), 0);
     }
 
@@ -355,9 +355,9 @@ mod tests {
         tracker.store(&make_node_id(20), qs.clone());
         tracker.store(&make_node_id(30), qs.clone());
 
-        assert!(tracker.get_by_node(&make_node_id(10)).is_some());
-        assert!(tracker.get_by_node(&make_node_id(20)).is_some());
-        assert!(tracker.get_by_node(&make_node_id(30)).is_some());
+        assert!(tracker.by_node(&make_node_id(10)).is_some());
+        assert!(tracker.by_node(&make_node_id(20)).is_some());
+        assert!(tracker.by_node(&make_node_id(30)).is_some());
     }
 
     #[test]
@@ -390,7 +390,7 @@ mod tests {
 
         // Local preserved
         assert_eq!(tracker.by_node_count(), 1);
-        assert!(tracker.get_by_node(&make_node_id(0)).is_some());
+        assert!(tracker.by_node(&make_node_id(0)).is_some());
         // Pending NOT cleared
         assert_eq!(tracker.pending_count(), 1);
     }
@@ -418,8 +418,8 @@ mod tests {
 
         tracker.set_local(qs.clone());
         assert_eq!(tracker.pending_count(), 0);
-        assert!(tracker.get_local().is_some());
-        assert!(tracker.get_by_hash(&hash).is_some());
+        assert!(tracker.local().is_some());
+        assert!(tracker.by_hash(&hash).is_some());
     }
 
     #[test]
@@ -439,7 +439,7 @@ mod tests {
         let tracker = QuorumSetTracker::new(node_key(0), Some(local_qs.clone()));
 
         // Querying the local node should return the local qset
-        let result = tracker.get_by_node(&make_node_id(0));
+        let result = tracker.by_node(&make_node_id(0));
         assert!(result.is_some());
         assert_eq!(result.unwrap().threshold, 1);
     }

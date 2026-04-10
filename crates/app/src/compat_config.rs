@@ -92,29 +92,29 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     config.node.quorum_set.validators.clear();
 
     // --- Node ---
-    if let Some(seed) = get_str(table, "NODE_SEED") {
+    if let Some(seed) = str(table, "NODE_SEED") {
         // stellar-core allows "SEED name" format (e.g., "S... self") — strip the name suffix
         let seed = seed.split_whitespace().next().unwrap_or(&seed).to_string();
         config.node.node_seed = Some(seed);
     }
-    if let Some(v) = get_bool(table, "NODE_IS_VALIDATOR") {
+    if let Some(v) = bool(table, "NODE_IS_VALIDATOR") {
         config.node.is_validator = v;
     }
-    if let Some(v) = get_bool(table, "MANUAL_CLOSE") {
+    if let Some(v) = bool(table, "MANUAL_CLOSE") {
         config.node.manual_close = v;
     }
     // NODE_HOME_DOMAIN
-    if let Some(v) = get_str(table, "NODE_HOME_DOMAIN") {
+    if let Some(v) = str(table, "NODE_HOME_DOMAIN") {
         config.node.home_domain = Some(v);
     }
 
     // --- Network ---
-    if let Some(passphrase) = get_str(table, "NETWORK_PASSPHRASE") {
+    if let Some(passphrase) = str(table, "NETWORK_PASSPHRASE") {
         config.network.passphrase = passphrase;
     }
 
     // --- Database ---
-    if let Some(db_str) = get_str(table, "DATABASE") {
+    if let Some(db_str) = str(table, "DATABASE") {
         // stellar-core format: "sqlite3:///path/to/db"
         // Strip the sqlite3:// prefix to get the raw path.
         let path = if let Some(stripped) = db_str.strip_prefix("sqlite3://") {
@@ -129,7 +129,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
 
     // --- Buckets ---
-    if let Some(dir) = get_str(table, "BUCKET_DIR_PATH") {
+    if let Some(dir) = str(table, "BUCKET_DIR_PATH") {
         config.buckets.directory = PathBuf::from(dir);
     }
 
@@ -148,7 +148,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         // clients connecting via IPv4 or IPv6 localhost can reach the server.
         // This matches stellar-core's behavior where PUBLIC_HTTP_PORT controls
         // whether the HTTP port is accessible beyond localhost.
-        let address = if get_bool(table, "PUBLIC_HTTP_PORT").unwrap_or(false) {
+        let address = if bool(table, "PUBLIC_HTTP_PORT").unwrap_or(false) {
             "::".to_string()
         } else {
             "127.0.0.1".to_string()
@@ -167,7 +167,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     if let Some(v) = get_u32(table, "QUERY_SNAPSHOT_LEDGERS") {
         config.query.snapshot_ledgers = v;
     }
-    if let Some(v) = get_usize(table, "QUERY_THREAD_POOL_SIZE") {
+    if let Some(v) = usize(table, "QUERY_THREAD_POOL_SIZE") {
         config.query.thread_pool_size = v;
     }
 
@@ -175,34 +175,34 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     if let Some(port) = get_u16(table, "PEER_PORT") {
         config.overlay.peer_port = port;
     }
-    if let Some(peers) = get_string_array(table, "KNOWN_PEERS") {
+    if let Some(peers) = string_array(table, "KNOWN_PEERS") {
         config.overlay.known_peers = peers;
     }
-    if let Some(peers) = get_string_array(table, "PREFERRED_PEERS") {
+    if let Some(peers) = string_array(table, "PREFERRED_PEERS") {
         config.overlay.preferred_peers = peers;
     }
 
     // --- Metadata ---
-    if let Some(stream) = get_str(table, "METADATA_OUTPUT_STREAM") {
+    if let Some(stream) = str(table, "METADATA_OUTPUT_STREAM") {
         config.metadata.output_stream = Some(stream);
     }
-    if let Some(v) = get_bool(table, "EMIT_SOROBAN_TRANSACTION_META_EXT_V1") {
+    if let Some(v) = bool(table, "EMIT_SOROBAN_TRANSACTION_META_EXT_V1") {
         config.metadata.emit_soroban_tx_meta_ext_v1 = v;
     }
-    if let Some(v) = get_bool(table, "EMIT_LEDGER_CLOSE_META_EXT_V1") {
+    if let Some(v) = bool(table, "EMIT_LEDGER_CLOSE_META_EXT_V1") {
         config.metadata.emit_ledger_close_meta_ext_v1 = v;
     }
 
     // --- Events ---
-    if let Some(v) = get_bool(table, "EMIT_CLASSIC_EVENTS") {
+    if let Some(v) = bool(table, "EMIT_CLASSIC_EVENTS") {
         config.events.emit_classic_events = v;
     }
 
     // --- Diagnostics ---
-    if let Some(v) = get_bool(table, "ENABLE_SOROBAN_DIAGNOSTIC_EVENTS") {
+    if let Some(v) = bool(table, "ENABLE_SOROBAN_DIAGNOSTIC_EVENTS") {
         config.diagnostics.soroban_diagnostic_events = v;
     }
-    if let Some(v) = get_bool(table, "ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION") {
+    if let Some(v) = bool(table, "ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION") {
         config.diagnostics.tx_submission_diagnostics = v;
     }
 
@@ -212,12 +212,12 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
 
     // --- Testing ---
-    if let Some(v) = get_bool(table, "ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING") {
+    if let Some(v) = bool(table, "ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING") {
         config.testing.accelerate_time = v;
     }
 
     // --- Catchup ---
-    if let Some(v) = get_bool(table, "CATCHUP_COMPLETE") {
+    if let Some(v) = bool(table, "CATCHUP_COMPLETE") {
         config.catchup.complete = v;
     }
     if let Some(v) = get_u32(table, "CATCHUP_RECENT") {
@@ -428,14 +428,14 @@ fn extract_url_from_curl_cmd(cmd: &str) -> Option<String> {
 
 // --- Helper functions for typed value extraction ---
 
-fn get_str(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<String> {
+fn str(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<String> {
     table
         .get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
 
-fn get_bool(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<bool> {
+fn bool(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<bool> {
     table.get(key).and_then(|v| v.as_bool())
 }
 
@@ -453,14 +453,14 @@ fn get_u32(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u32
         .and_then(|i| u32::try_from(i).ok())
 }
 
-fn get_usize(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<usize> {
+fn usize(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<usize> {
     table
         .get(key)
         .and_then(|v| v.as_integer())
         .and_then(|i| usize::try_from(i).ok())
 }
 
-fn get_string_array(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<Vec<String>> {
+fn string_array(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<Vec<String>> {
     table.get(key).and_then(|v| v.as_array()).map(|arr| {
         arr.iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))

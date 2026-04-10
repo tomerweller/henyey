@@ -97,7 +97,7 @@ fn extract_modified_entries(
         };
 
         // Get state before: re-query the snapshot for the entry
-        let state_before = if let Some((entry, live_until)) = snapshot.get_unfiltered(&key) {
+        let state_before = if let Some((entry, live_until)) = snapshot.unfiltered(&key) {
             // Check if entry is expired
             if let Some(lu) = live_until {
                 if lu < ledger_info.sequence_number {
@@ -173,7 +173,7 @@ pub(super) fn simulate_extend_ttl_op(
             )
         })?;
 
-        let Some((entry, live_until)) = snapshot.get_unfiltered(key) else {
+        let Some((entry, live_until)) = snapshot.unfiltered(key) else {
             continue; // entry doesn't exist, skip
         };
 
@@ -301,7 +301,7 @@ pub(super) fn simulate_restore_op(
         }
 
         let (entry, live_until) = snapshot
-            .get_unfiltered(key)
+            .unfiltered(key)
             .ok_or_else(|| format!("missing entry to restore for key {:?}", key.discriminant()))?;
 
         let current_live_until = live_until.ok_or_else(|| {

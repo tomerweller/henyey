@@ -55,7 +55,7 @@ pub(super) fn can_sell_at_most(
     reserve_subentry: bool,
 ) -> Result<i64> {
     if matches!(asset, Asset::Native) {
-        let Some(account) = state.get_account(source) else {
+        let Some(account) = state.account(source) else {
             return Ok(0);
         };
         let additional_subentries = if reserve_subentry { 1 } else { 0 };
@@ -72,7 +72,7 @@ pub(super) fn can_sell_at_most(
         return Ok(i64::MAX);
     }
 
-    let Some(trustline) = state.get_trustline(source, asset) else {
+    let Some(trustline) = state.trustline(source, asset) else {
         return Ok(0);
     };
     if !is_authorized_to_maintain_liabilities(trustline.flags) {
@@ -103,7 +103,7 @@ pub(super) fn delete_offer_with_sponsorship(
         state.update_num_sponsoring(&sponsor, -1)?;
         state.update_num_sponsored(seller, -1)?;
     }
-    if let Some(account) = state.get_account_mut(seller) {
+    if let Some(account) = state.account_mut(seller) {
         dec_sub_entries(account, 1);
     }
     Ok(())

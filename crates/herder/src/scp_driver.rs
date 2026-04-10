@@ -377,7 +377,7 @@ impl ScpDriver {
     }
 
     /// Get a cached transaction set by hash.
-    pub fn get_tx_set(&self, hash: &Hash256) -> Option<TransactionSet> {
+    pub fn tx_set(&self, hash: &Hash256) -> Option<TransactionSet> {
         self.tx_tracker.get(hash)
     }
 
@@ -405,17 +405,17 @@ impl ScpDriver {
     }
 
     /// Get the node IDs that are waiting for a quorum set with the given hash.
-    pub fn get_pending_quorum_set_node_ids(&self, hash: &Hash256) -> Vec<NodeId> {
+    pub fn pending_quorum_set_node_ids(&self, hash: &Hash256) -> Vec<NodeId> {
         self.qset_tracker.pending_node_ids(hash)
     }
 
     /// Get all pending tx set hashes that need to be fetched.
-    pub fn get_pending_tx_set_hashes(&self) -> Vec<Hash256> {
+    pub fn pending_tx_set_hashes(&self) -> Vec<Hash256> {
         self.tx_tracker.pending_hashes()
     }
 
     /// Get all pending tx sets with their slots.
-    pub fn get_pending_tx_sets(&self) -> Vec<(Hash256, SlotIndex)> {
+    pub fn pending_tx_sets(&self) -> Vec<(Hash256, SlotIndex)> {
         self.tx_tracker.pending_entries()
     }
 
@@ -465,7 +465,7 @@ impl ScpDriver {
     }
 
     /// Get an externalized slot.
-    pub fn get_externalized(&self, slot: SlotIndex) -> Option<ExternalizedSlot> {
+    pub fn externalized(&self, slot: SlotIndex) -> Option<ExternalizedSlot> {
         self.externalized.read().get(&slot).cloned()
     }
 
@@ -481,11 +481,7 @@ impl ScpDriver {
 
     /// Get all externalized slot indices in a range (inclusive).
     /// Returns a sorted list of slots that have been externalized.
-    pub fn get_externalized_slots_in_range(
-        &self,
-        from: SlotIndex,
-        to: SlotIndex,
-    ) -> Vec<SlotIndex> {
+    pub fn externalized_slots_in_range(&self, from: SlotIndex, to: SlotIndex) -> Vec<SlotIndex> {
         let externalized = self.externalized.read();
         let mut slots: Vec<SlotIndex> = externalized
             .keys()
@@ -1059,7 +1055,7 @@ impl ScpDriver {
     /// For `LedgerUpgrade::Config`, stellar-core performs a full ledger lookup
     /// via `ConfigUpgradeSetFrame::makeFromKey` and validates the loaded frame
     /// via `isValidForApply()`. We mirror this by using
-    /// `LedgerManager::get_config_upgrade_set` when available.
+    /// `LedgerManager::config_upgrade_set` when available.
     fn is_valid_upgrade_for_apply(
         upgrade: &LedgerUpgrade,
         current_version: u32,
@@ -1092,7 +1088,7 @@ impl ScpDriver {
                     debug!("Config upgrade validation: no ledger manager available, rejecting");
                     return false;
                 };
-                let Some(frame) = lm.get_config_upgrade_set(key) else {
+                let Some(frame) = lm.config_upgrade_set(key) else {
                     debug!(
                         contract_id = ?key.contract_id,
                         "Config upgrade key not found in ledger"
@@ -1611,7 +1607,7 @@ impl ScpDriver {
     }
 
     /// Get the close time of an externalized slot.
-    pub fn get_externalized_close_time(&self, slot: SlotIndex) -> Option<u64> {
+    pub fn externalized_close_time(&self, slot: SlotIndex) -> Option<u64> {
         self.externalized.read().get(&slot).map(|e| e.close_time)
     }
 
@@ -1774,15 +1770,15 @@ impl ScpDriver {
     /// Returns envelopes this node has emitted for the given slot.
     /// Note: Currently returns empty since we don't store envelopes in ExternalizedSlot.
     /// This can be enhanced to store and return actual envelopes if needed for recovery.
-    pub fn get_local_envelopes(&self, _slot: SlotIndex) -> Vec<ScpEnvelope> {
+    pub fn local_envelopes(&self, _slot: SlotIndex) -> Vec<ScpEnvelope> {
         // ExternalizedSlot doesn't store the envelope, just the value.
         // In a full implementation, we'd store envelopes separately.
         Vec::new()
     }
 
     /// Get our local quorum set.
-    pub fn get_local_quorum_set(&self) -> Option<ScpQuorumSet> {
-        self.qset_tracker.get_local()
+    pub fn local_quorum_set(&self) -> Option<ScpQuorumSet> {
+        self.qset_tracker.local()
     }
 
     /// Set our local quorum set.
@@ -1796,13 +1792,13 @@ impl ScpDriver {
     }
 
     /// Get a quorum set for a node.
-    pub fn get_quorum_set(&self, node_id: &stellar_xdr::curr::NodeId) -> Option<ScpQuorumSet> {
-        self.qset_tracker.get_by_node(node_id)
+    pub fn quorum_set(&self, node_id: &stellar_xdr::curr::NodeId) -> Option<ScpQuorumSet> {
+        self.qset_tracker.by_node(node_id)
     }
 
     /// Get a quorum set by its hash.
-    pub fn get_quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
-        self.qset_tracker.get_by_hash(hash)
+    pub fn quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
+        self.qset_tracker.by_hash(hash)
     }
 
     /// Whether we already have a quorum set with the given hash.
@@ -1871,12 +1867,12 @@ mod cache_tests {
         assert!(driver.request_tx_set(tx_set.hash, slot));
         assert!(!driver.request_tx_set(tx_set.hash, slot));
         assert!(driver.needs_tx_set(&tx_set.hash));
-        assert_eq!(driver.get_pending_tx_set_hashes(), vec![tx_set.hash]);
+        assert_eq!(driver.pending_tx_set_hashes(), vec![tx_set.hash]);
 
         let received = driver.receive_tx_set(tx_set.clone());
         assert_eq!(received, Some(slot));
         assert!(!driver.needs_tx_set(&tx_set.hash));
-        assert!(driver.get_tx_set(&tx_set.hash).is_some());
+        assert!(driver.tx_set(&tx_set.hash).is_some());
     }
 
     #[test]
@@ -1911,7 +1907,7 @@ mod cache_tests {
         let removed = driver.cleanup_old_pending_slots(12);
         assert_eq!(removed, 1);
 
-        let pending = driver.get_pending_tx_sets();
+        let pending = driver.pending_tx_sets();
         assert_eq!(pending, vec![(tx_set_b.hash, 12)]);
     }
 
@@ -1926,7 +1922,7 @@ mod cache_tests {
         driver.request_tx_set(tx_set.hash, 20);
 
         driver.cleanup_pending_tx_sets(0);
-        assert!(driver.get_pending_tx_set_hashes().is_empty());
+        assert!(driver.pending_tx_set_hashes().is_empty());
     }
 
     #[test]
@@ -1964,7 +1960,7 @@ mod cache_tests {
         assert!(!driver.request_quorum_set(unknown_hash, sender_node_id.clone()));
 
         // Verify the node_id was tracked
-        let pending_ids = driver.get_pending_quorum_set_node_ids(&unknown_hash);
+        let pending_ids = driver.pending_quorum_set_node_ids(&unknown_hash);
         assert_eq!(pending_ids.len(), 1);
         assert_eq!(pending_ids[0], sender_node_id);
     }
@@ -1997,19 +1993,19 @@ mod cache_tests {
         }
 
         // Test exact range
-        let slots = driver.get_externalized_slots_in_range(100, 105);
+        let slots = driver.externalized_slots_in_range(100, 105);
         assert_eq!(slots, vec![100, 102, 105]);
 
         // Test partial range
-        let slots = driver.get_externalized_slots_in_range(101, 106);
+        let slots = driver.externalized_slots_in_range(101, 106);
         assert_eq!(slots, vec![102, 105]);
 
         // Test empty range (no slots in range)
-        let slots = driver.get_externalized_slots_in_range(106, 109);
+        let slots = driver.externalized_slots_in_range(106, 109);
         assert!(slots.is_empty());
 
         // Test single slot
-        let slots = driver.get_externalized_slots_in_range(102, 102);
+        let slots = driver.externalized_slots_in_range(102, 102);
         assert_eq!(slots, vec![102]);
     }
 
@@ -2079,7 +2075,7 @@ mod cache_tests {
         driver.trim_stale_caches(100);
 
         // Verify pending_tx_sets
-        let pending = driver.get_pending_tx_sets();
+        let pending = driver.pending_tx_sets();
         assert_eq!(pending.len(), 2);
         assert!(pending
             .iter()
@@ -2092,7 +2088,7 @@ mod cache_tests {
         assert!(!pending.iter().any(|(h, _)| *h == tx_set_boundary.hash));
 
         // Verify externalized slots
-        let ext_slots = driver.get_externalized_slots_in_range(0, 200);
+        let ext_slots = driver.externalized_slots_in_range(0, 200);
         assert_eq!(ext_slots, vec![101, 105]);
     }
 
@@ -2110,11 +2106,11 @@ mod cache_tests {
         driver.request_tx_set(tx_set_a.hash, 100);
         driver.request_tx_set(tx_set_b.hash, 101);
         driver.request_tx_set(tx_set_c.hash, 102);
-        assert_eq!(driver.get_pending_tx_sets().len(), 3);
+        assert_eq!(driver.pending_tx_sets().len(), 3);
 
         driver.clear_pending_tx_sets();
-        assert!(driver.get_pending_tx_sets().is_empty());
-        assert!(driver.get_pending_tx_set_hashes().is_empty());
+        assert!(driver.pending_tx_sets().is_empty());
+        assert!(driver.pending_tx_set_hashes().is_empty());
     }
 
     #[test]
@@ -2124,11 +2120,11 @@ mod cache_tests {
             Hash256::hash(b"network"),
             default_tracking(),
         );
-        assert!(driver.get_pending_tx_sets().is_empty());
+        assert!(driver.pending_tx_sets().is_empty());
 
         // Should not panic when called on empty map
         driver.clear_pending_tx_sets();
-        assert!(driver.get_pending_tx_sets().is_empty());
+        assert!(driver.pending_tx_sets().is_empty());
     }
 
     #[test]
@@ -2152,8 +2148,8 @@ mod cache_tests {
         // Clear pending — should not affect the cached tx_set
         driver.clear_pending_tx_sets();
         assert!(driver.has_tx_set(&tx_set.hash));
-        assert!(driver.get_tx_set(&tx_set.hash).is_some());
-        assert!(driver.get_pending_tx_sets().is_empty());
+        assert!(driver.tx_set(&tx_set.hash).is_some());
+        assert!(driver.pending_tx_sets().is_empty());
     }
 
     /// Create a signed StellarValue for testing validate_value_impl.
@@ -2338,12 +2334,12 @@ impl SCPDriver for HerderScpCallback {
         self.driver.emit(envelope.clone());
     }
 
-    fn get_quorum_set(&self, node_id: &stellar_xdr::curr::NodeId) -> Option<ScpQuorumSet> {
-        self.driver.get_quorum_set(node_id)
+    fn quorum_set(&self, node_id: &stellar_xdr::curr::NodeId) -> Option<ScpQuorumSet> {
+        self.driver.quorum_set(node_id)
     }
 
-    fn get_quorum_set_by_hash(&self, hash: &henyey_common::Hash256) -> Option<ScpQuorumSet> {
-        self.driver.get_quorum_set_by_hash(hash)
+    fn quorum_set_by_hash(&self, hash: &henyey_common::Hash256) -> Option<ScpQuorumSet> {
+        self.driver.quorum_set_by_hash(hash)
     }
 
     fn nominating_value(&self, _slot_index: u64, _value: &Value) {
@@ -2449,7 +2445,7 @@ impl SCPDriver for HerderScpCallback {
 
     /// Parity: get the nomination timeout limit for upgrade stripping.
     /// In stellar-core: mUpgrades.getParameters().mNominationTimeoutLimit
-    fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
+    fn upgrade_nomination_timeout_limit(&self) -> u32 {
         if let Some(ref upgrades_arc) = *self.driver.upgrades.read() {
             upgrades_arc
                 .read()
@@ -2542,7 +2538,7 @@ mod tests {
         driver.cache_tx_set(tx_set);
         assert!(driver.has_tx_set(&hash));
 
-        let cached = driver.get_tx_set(&hash);
+        let cached = driver.tx_set(&hash);
         assert!(cached.is_some());
     }
 
@@ -4151,7 +4147,7 @@ mod compare_tx_sets_tests {
 
         // Default: no upgrades set → u32::MAX
         assert_eq!(
-            callback.get_upgrade_nomination_timeout_limit(),
+            callback.upgrade_nomination_timeout_limit(),
             u32::MAX,
             "Default should be u32::MAX when no upgrades configured"
         );
@@ -4175,7 +4171,7 @@ mod compare_tx_sets_tests {
 
         let callback = super::HerderScpCallback::new(Arc::new(driver));
         assert_eq!(
-            callback.get_upgrade_nomination_timeout_limit(),
+            callback.upgrade_nomination_timeout_limit(),
             300,
             "Should read nomination_timeout_limit from Upgrades"
         );

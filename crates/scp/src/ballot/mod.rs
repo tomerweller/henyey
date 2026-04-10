@@ -65,7 +65,7 @@ mod envelope;
 mod state_machine;
 mod statements;
 
-pub use statements::get_working_ballot;
+pub use statements::working_ballot;
 pub(crate) use statements::{ballot_compare, ballot_compatible, cmp_opt_ballot};
 
 /// The ballot protocol progresses through these phases in order.
@@ -277,7 +277,7 @@ impl BallotProtocol {
     }
 
     /// Get the externalized value if we've reached consensus.
-    pub fn get_externalized_value(&self) -> Option<&Value> {
+    pub fn externalized_value(&self) -> Option<&Value> {
         if self.phase == BallotPhase::Externalize {
             self.value.as_ref()
         } else {
@@ -303,7 +303,7 @@ impl BallotProtocol {
     }
 
     /// Get the last envelope constructed by this node.
-    pub fn get_last_envelope(&self) -> Option<&ScpEnvelope> {
+    pub fn last_envelope(&self) -> Option<&ScpEnvelope> {
         self.last_envelope.as_ref()
     }
 
@@ -313,7 +313,7 @@ impl BallotProtocol {
     /// - Only returns envelopes when in EXTERNALIZE phase
     /// - For other nodes: only includes envelopes with ballots compatible with commit
     /// - For self: only includes if `fully_validated` is true
-    pub fn get_externalizing_state(
+    pub fn externalizing_state(
         &self,
         local_node_id: &NodeId,
         fully_validated: bool,
@@ -331,7 +331,7 @@ impl BallotProtocol {
         for (node_id, envelope) in &self.latest_envelopes {
             if node_id != local_node_id {
                 // For other nodes: check ballot compatibility with commit
-                if let Some(working) = get_working_ballot(&envelope.statement) {
+                if let Some(working) = working_ballot(&envelope.statement) {
                     if ballot_compatible(&working, commit) {
                         res.push(envelope.clone());
                     }
@@ -400,7 +400,7 @@ impl BallotProtocol {
     }
 
     /// Get a string representation of the local state for debugging.
-    pub fn get_local_state(&self) -> String {
+    pub fn local_state(&self) -> String {
         fn fmt_ballot(state: &mut String, label: &str, ballot: &Option<ScpBallot>) {
             if let Some(b) = ballot {
                 state.push_str(&format!(
@@ -436,7 +436,7 @@ impl BallotProtocol {
     ///
     /// Returns the QuorumInfoNodeState for a given node based on their
     /// latest ballot envelope, or Missing if we haven't heard from them.
-    pub fn get_node_state(&self, node_id: &NodeId) -> crate::QuorumInfoNodeState {
+    pub fn node_state(&self, node_id: &NodeId) -> crate::QuorumInfoNodeState {
         if let Some(envelope) = self.latest_envelopes.get(node_id) {
             crate::QuorumInfoNodeState::from_pledges(&envelope.statement.pledges)
         } else {
@@ -448,7 +448,7 @@ impl BallotProtocol {
     ///
     /// Returns a BallotInfo struct that can be serialized to JSON
     /// for debugging and monitoring purposes.
-    pub fn get_info(&self) -> crate::BallotInfo {
+    pub fn info(&self) -> crate::BallotInfo {
         let ballot_to_info = |b: &ScpBallot| crate::BallotValue {
             counter: b.counter,
             value: crate::value_to_str(&b.value),
@@ -1466,7 +1466,7 @@ mod tests {
         ballot.process_envelope(&env4, &ctx!(&node, &quorum_set, &driver, 15));
 
         assert!(ballot.is_externalized());
-        let externalized_value = ballot.get_externalized_value().expect("value").clone();
+        let externalized_value = ballot.externalized_value().expect("value").clone();
 
         let bump_ballot = ScpBallot {
             counter: 2,
@@ -1511,7 +1511,7 @@ mod tests {
         );
 
         assert_eq!(
-            ballot.get_externalized_value().cloned(),
+            ballot.externalized_value().cloned(),
             Some(externalized_value)
         );
     }
@@ -1652,7 +1652,7 @@ mod tests {
         ballot.process_envelope(&confirm4, &ctx!(&node, &quorum_set, &driver, 16));
 
         assert!(ballot.is_externalized());
-        assert_eq!(ballot.get_externalized_value(), Some(&value));
+        assert_eq!(ballot.externalized_value(), Some(&value));
         assert_eq!(ballot.commit().map(|b| b.counter), Some(3));
     }
 
@@ -1818,7 +1818,7 @@ mod tests {
 
         fn emit_envelope(&self, _envelope: &ScpEnvelope) {}
 
-        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
+        fn quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
             Some(self.quorum_set.clone())
         }
 
@@ -2028,7 +2028,7 @@ mod tests {
         assert!(ballot.is_externalized());
         assert_eq!(ballot.commit(), Some(&commit));
         assert_eq!(ballot.high_ballot().map(|b| b.counter), Some(5));
-        assert_eq!(ballot.get_externalized_value(), Some(&value));
+        assert_eq!(ballot.externalized_value(), Some(&value));
     }
 
     #[test]
@@ -2204,7 +2204,7 @@ mod tests {
         });
         ballot.phase = BallotPhase::Prepare;
 
-        let state = ballot.get_local_state();
+        let state = ballot.local_state();
         assert!(state.contains("phase=Prepare"));
         assert!(state.contains("b=(5,"));
         assert!(state.contains("p=(3,"));
@@ -2222,7 +2222,7 @@ mod tests {
         let quorum_set = make_quorum_set(vec![node_id.clone()], 1);
         let env = make_prepare_envelope(node_id, 1, &quorum_set, ballot.clone());
 
-        let working = get_working_ballot(&env.statement);
+        let working = working_ballot(&env.statement);
         assert!(working.is_some());
         let working = working.unwrap();
         assert_eq!(working.counter, 5);
@@ -2242,7 +2242,7 @@ mod tests {
             make_confirm_envelope_with_counters(node_id, 1, &quorum_set, ballot.clone(), 3, 2, 4);
 
         // For CONFIRM, working ballot uses n_commit as counter
-        let working = get_working_ballot(&env.statement);
+        let working = working_ballot(&env.statement);
         assert!(working.is_some());
         let working = working.unwrap();
         assert_eq!(working.counter, 2); // n_commit
@@ -2269,7 +2269,7 @@ mod tests {
         };
 
         // For EXTERNALIZE, working ballot uses u32::MAX as counter
-        let working = get_working_ballot(&statement);
+        let working = working_ballot(&statement);
         assert!(working.is_some());
         let working = working.unwrap();
         assert_eq!(working.counter, u32::MAX);
@@ -2291,7 +2291,7 @@ mod tests {
         };
 
         // Nomination statements don't have a working ballot
-        let working = get_working_ballot(&statement);
+        let working = working_ballot(&statement);
         assert!(working.is_none());
     }
 
@@ -2319,15 +2319,15 @@ mod tests {
             }
         }
 
-        fn get_timer_setups(&self) -> Vec<(u64, crate::driver::SCPTimerType)> {
+        fn timer_setups(&self) -> Vec<(u64, crate::driver::SCPTimerType)> {
             self.timer_setups.lock().unwrap().clone()
         }
 
-        fn get_timer_stops(&self) -> Vec<(u64, crate::driver::SCPTimerType)> {
+        fn timer_stops(&self) -> Vec<(u64, crate::driver::SCPTimerType)> {
             self.timer_stops.lock().unwrap().clone()
         }
 
-        fn get_externalized_values(&self) -> Vec<(u64, Value)> {
+        fn externalized_values(&self) -> Vec<(u64, Value)> {
             self.externalized_values.lock().unwrap().clone()
         }
     }
@@ -2354,7 +2354,7 @@ mod tests {
             self.emit_count.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
+        fn quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
             Some(self.quorum_set.clone())
         }
 
@@ -2767,7 +2767,7 @@ mod tests {
 
         bp.set_confirm_commit(c.clone(), h, &ctx!(&node, &quorum_set, &driver, 1));
 
-        let externalized = driver.get_externalized_values();
+        let externalized = driver.externalized_values();
         assert_eq!(externalized.len(), 1);
         assert_eq!(
             externalized[0].1, c.value,
@@ -2810,7 +2810,7 @@ mod tests {
         assert!(bp.heard_from_quorum);
 
         // Ballot timer should have been set up
-        let setups = driver.get_timer_setups();
+        let setups = driver.timer_setups();
         assert!(
             setups
                 .iter()
@@ -2849,7 +2849,7 @@ mod tests {
         assert!(!bp.heard_from_quorum);
 
         // Timer should have been stopped
-        let stops = driver.get_timer_stops();
+        let stops = driver.timer_stops();
         assert!(
             stops
                 .iter()
@@ -2891,7 +2891,7 @@ mod tests {
         assert!(bp.heard_from_quorum);
 
         // Timer should NOT have been started (phase is Externalize)
-        let setups = driver.get_timer_setups();
+        let setups = driver.timer_setups();
         assert!(
             !setups
                 .iter()
@@ -2900,7 +2900,7 @@ mod tests {
         );
 
         // Timer should have been stopped
-        let stops = driver.get_timer_stops();
+        let stops = driver.timer_stops();
         assert!(
             stops
                 .iter()

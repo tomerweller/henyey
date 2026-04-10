@@ -149,13 +149,13 @@ pub use tx_queue::{
 
 // Persistence
 pub use persistence::{
-    get_quorum_set_hash, get_tx_set_hashes, Database, InMemoryScpPersistence, PersistedSlotState,
+    quorum_set_hash, tx_set_hashes, Database, InMemoryScpPersistence, PersistedSlotState,
     RestoredScpState, ScpPersistenceManager, ScpStatePersistence, SqliteScpPersistence,
 };
 
 // HerderUtils
 pub use herder_utils::{
-    get_stellar_values, get_tx_set_hashes_from_envelope, to_short_string, to_short_strkey,
+    stellar_values, to_short_string, to_short_strkey, tx_set_hashes_from_envelope,
 };
 
 // LedgerCloseData
@@ -163,7 +163,7 @@ pub use ledger_close_data::{stellar_value_to_string, LedgerCloseData, LedgerClos
 
 // TxSetUtils
 pub use tx_set_utils::{
-    get_invalid_tx_list, get_invalid_tx_list_with_fee_map, trim_invalid, trim_invalid_two_phase,
+    invalid_tx_list, invalid_tx_list_with_fee_map, trim_invalid, trim_invalid_two_phase,
     CloseTimeBounds, TxSetValidationContext,
 };
 

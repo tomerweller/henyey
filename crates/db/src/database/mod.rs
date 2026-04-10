@@ -119,27 +119,27 @@ impl Database {
     /// Returns the highest ledger sequence number stored in the database.
     ///
     /// Returns `None` if no ledgers have been stored yet.
-    pub fn get_latest_ledger_seq(&self) -> Result<Option<u32>> {
+    pub fn latest_ledger_seq(&self) -> Result<Option<u32>> {
         self.with_connection(|conn| {
             use queries::LedgerQueries;
-            conn.get_latest_ledger_seq()
+            conn.latest_ledger_seq()
         })
     }
 
     /// Returns the lowest ledger sequence number stored in the database.
     ///
     /// Returns `None` if no ledgers have been stored yet.
-    pub fn get_oldest_ledger_seq(&self) -> Result<Option<u32>> {
+    pub fn oldest_ledger_seq(&self) -> Result<Option<u32>> {
         self.with_connection(|conn| {
             use queries::LedgerQueries;
-            conn.get_oldest_ledger_seq()
+            conn.oldest_ledger_seq()
         })
     }
 
     /// Returns the ledger header for a given sequence number.
     ///
     /// Returns `None` if the ledger is not found.
-    pub fn get_ledger_header(&self, seq: u32) -> Result<Option<stellar_xdr::curr::LedgerHeader>> {
+    pub fn ledger_header(&self, seq: u32) -> Result<Option<stellar_xdr::curr::LedgerHeader>> {
         self.with_connection(|conn| {
             use queries::LedgerQueries;
             conn.load_ledger_header(seq)
@@ -149,10 +149,10 @@ impl Database {
     /// Returns the hash of a ledger by its sequence number.
     ///
     /// Returns `None` if the ledger is not found.
-    pub fn get_ledger_hash(&self, seq: u32) -> Result<Option<henyey_common::Hash256>> {
+    pub fn ledger_hash(&self, seq: u32) -> Result<Option<henyey_common::Hash256>> {
         self.with_connection(|conn| {
             use queries::LedgerQueries;
-            conn.get_ledger_hash(seq)
+            conn.ledger_hash(seq)
         })
     }
 
@@ -171,10 +171,10 @@ impl Database {
     ///
     /// The network passphrase identifies the Stellar network (mainnet, testnet, etc.)
     /// and is used in transaction signing.
-    pub fn get_network_passphrase(&self) -> Result<Option<String>> {
+    pub fn network_passphrase(&self) -> Result<Option<String>> {
         self.with_connection(|conn| {
             use queries::StateQueries;
-            conn.get_state(schema::state_keys::NETWORK_PASSPHRASE)
+            conn.state(schema::state_keys::NETWORK_PASSPHRASE)
         })
     }
 

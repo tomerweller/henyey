@@ -59,8 +59,8 @@ pub(crate) fn execute_allow_trust(
     // Check source account exists (the issuer)
     // NOTE: stellar-core loads the source account in a nested LedgerTxn (ltxSource)
     // that gets rolled back, so the source account access is NOT recorded in the
-    // transaction changes. We use get_account() (read-only) to match this behavior.
-    let issuer = match state.get_account(source) {
+    // transaction changes. We use account() (read-only) to match this behavior.
+    let issuer = match state.account(source) {
         Some(a) => a.clone(),
         None => {
             return Ok(make_allow_trust_result(AllowTrustResultCode::Malformed));
@@ -85,7 +85,7 @@ pub(crate) fn execute_allow_trust(
     let asset = asset_from_code(&op.asset, source);
 
     // Get the trustline
-    let trustline = match state.get_trustline(&op.trustor, &asset) {
+    let trustline = match state.trustline(&op.trustor, &asset) {
         Some(tl) => tl.clone(),
         None => {
             return Ok(make_allow_trust_result(AllowTrustResultCode::NoTrustLine));
@@ -125,7 +125,7 @@ pub(crate) fn execute_allow_trust(
     }
 
     // Update the trustline
-    if let Some(tl) = state.get_trustline_mut(&op.trustor, &asset) {
+    if let Some(tl) = state.trustline_mut(&op.trustor, &asset) {
         tl.flags = new_flags;
     }
 
@@ -193,8 +193,8 @@ pub(crate) fn execute_set_trust_line_flags(
     // Check source account exists (the issuer)
     // NOTE: stellar-core loads the source account in a nested LedgerTxn (ltxSource)
     // that gets rolled back, so the source account access is NOT recorded in the
-    // transaction changes. We use get_account() (read-only) to match this behavior.
-    let source_account = match state.get_account(source) {
+    // transaction changes. We use account() (read-only) to match this behavior.
+    let source_account = match state.account(source) {
         Some(a) => a.clone(),
         None => {
             return Ok(make_set_flags_result(
@@ -256,7 +256,7 @@ pub(crate) fn execute_set_trust_line_flags(
     }
 
     // Get the trustline
-    let trustline = match state.get_trustline(&op.trustor, &op.asset) {
+    let trustline = match state.trustline(&op.trustor, &op.asset) {
         Some(tl) => tl.clone(),
         None => {
             return Ok(make_set_flags_result(
@@ -299,7 +299,7 @@ pub(crate) fn execute_set_trust_line_flags(
     }
 
     // Update the trustline
-    if let Some(tl) = state.get_trustline_mut(&op.trustor, &op.asset) {
+    if let Some(tl) = state.trustline_mut(&op.trustor, &op.asset) {
         tl.flags = new_flags;
     }
 
@@ -417,7 +417,7 @@ fn remove_offers_with_cleanup(
             let _ = state.update_num_sponsored(&offer.seller_id, -1);
         }
 
-        if let Some(account) = state.get_account_mut(&offer.seller_id) {
+        if let Some(account) = state.account_mut(&offer.seller_id) {
             dec_sub_entries(account, 1);
         }
     }
@@ -439,12 +439,12 @@ fn release_offer_liabilities(state: &mut LedgerStateManager, offer: &OfferEntry)
 
     // Release selling liability
     if matches!(offer.selling, Asset::Native) {
-        if let Some(account) = state.get_account_mut(&offer.seller_id) {
+        if let Some(account) = state.account_mut(&offer.seller_id) {
             let liab = ensure_account_liabilities(account);
             liab.selling = liab.selling.saturating_sub(selling_liab);
         }
     } else if issuer_for_asset(&offer.selling) != Some(&offer.seller_id) {
-        if let Some(trustline) = state.get_trustline_mut(&offer.seller_id, &offer.selling) {
+        if let Some(trustline) = state.trustline_mut(&offer.seller_id, &offer.selling) {
             let liab = ensure_trustline_liabilities(trustline);
             liab.selling = liab.selling.saturating_sub(selling_liab);
         }
@@ -452,12 +452,12 @@ fn release_offer_liabilities(state: &mut LedgerStateManager, offer: &OfferEntry)
 
     // Release buying liability
     if matches!(offer.buying, Asset::Native) {
-        if let Some(account) = state.get_account_mut(&offer.seller_id) {
+        if let Some(account) = state.account_mut(&offer.seller_id) {
             let liab = ensure_account_liabilities(account);
             liab.buying = liab.buying.saturating_sub(buying_liab);
         }
     } else if issuer_for_asset(&offer.buying) != Some(&offer.seller_id) {
-        if let Some(trustline) = state.get_trustline_mut(&offer.seller_id, &offer.buying) {
+        if let Some(trustline) = state.trustline_mut(&offer.seller_id, &offer.buying) {
             let liab = ensure_trustline_liabilities(trustline);
             liab.buying = liab.buying.saturating_sub(buying_liab);
         }
@@ -476,7 +476,7 @@ enum RemoveResult {
 ///
 /// Uses `ENVELOPE_TYPE_POOL_REVOKE_OP_ID` (different from regular claimable balance IDs
 /// which use `ENVELOPE_TYPE_OP_ID`).
-fn get_revoke_id(
+fn revoke_id(
     tx_id: &TxIdentity<'_>,
     pool_id: &PoolId,
     asset: &Asset,
@@ -503,7 +503,7 @@ fn is_issuer(account_id: &AccountId, asset: &Asset) -> bool {
 }
 
 /// Calculate pool withdrawal amount: floor(amount * reserve / total_shares).
-fn get_pool_withdrawal_amount(amount: i64, total_shares: i64, reserve: i64) -> i64 {
+fn pool_withdrawal_amount(amount: i64, total_shares: i64, reserve: i64) -> i64 {
     if total_shares == 0 {
         return 0;
     }
@@ -545,7 +545,7 @@ fn redeem_pool_share_trustlines(
 
     for (pool_id, tl_asset) in pool_share_tl_keys {
         // Load pool share trustline data
-        let Some(pool_tl) = state.get_trustline_by_trustline_asset(account_id, &tl_asset) else {
+        let Some(pool_tl) = state.trustline_by_trustline_asset(account_id, &tl_asset) else {
             continue;
         };
         let balance = pool_tl.balance;
@@ -571,14 +571,14 @@ fn redeem_pool_share_trustlines(
         }
 
         // Decrease sub-entries BEFORE deleting trustline
-        if let Some(account) = state.get_account_mut(account_id) {
+        if let Some(account) = state.account_mut(account_id) {
             dec_sub_entries(account, multiplier as u32);
         }
 
         state.delete_trustline_by_trustline_asset(account_id, &tl_asset);
 
         // Load pool data for withdrawal calculation
-        let Some(pool) = state.get_liquidity_pool(&pool_id) else {
+        let Some(pool) = state.liquidity_pool(&pool_id) else {
             continue;
         };
         let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool.body;
@@ -589,7 +589,7 @@ fn redeem_pool_share_trustlines(
         let asset_b = cp.params.asset_b.clone();
 
         if balance != 0 {
-            let amount_a = get_pool_withdrawal_amount(balance, total_pool_shares, reserve_a);
+            let amount_a = pool_withdrawal_amount(balance, total_pool_shares, reserve_a);
 
             let res = redeem_into_claimable_balance(
                 state,
@@ -604,7 +604,7 @@ fn redeem_pool_share_trustlines(
                 return Ok(res);
             }
 
-            let amount_b = get_pool_withdrawal_amount(balance, total_pool_shares, reserve_b);
+            let amount_b = pool_withdrawal_amount(balance, total_pool_shares, reserve_b);
 
             let res = redeem_into_claimable_balance(
                 state,
@@ -620,7 +620,7 @@ fn redeem_pool_share_trustlines(
             }
 
             // Update pool reserves and shares
-            if let Some(pool) = state.get_liquidity_pool_mut(&pool_id) {
+            if let Some(pool) = state.liquidity_pool_mut(&pool_id) {
                 let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
                 add_pool_shares(&mut cp.total_pool_shares, -balance)?;
                 add_pool_reserve(&mut cp.reserve_a, -amount_a)?;
@@ -660,7 +660,7 @@ fn redeem_into_claimable_balance(
     }
 
     // Create the claimable balance entry
-    let balance_id = get_revoke_id(tx_id, pool_id, asset)?;
+    let balance_id = revoke_id(tx_id, pool_id, asset)?;
 
     let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
         destination: account_id.clone(),
@@ -677,7 +677,7 @@ fn redeem_into_claimable_balance(
 
     // If asset is not native, check clawback flag
     if !matches!(asset, Asset::Native) {
-        if let Some(asset_tl) = state.get_trustline(account_id, asset) {
+        if let Some(asset_tl) = state.trustline(account_id, asset) {
             if asset_tl.flags & TRUSTLINE_CLAWBACK_ENABLED_FLAG != 0 {
                 cb_entry.ext = stellar_xdr::curr::ClaimableBalanceEntryExt::V1(
                     stellar_xdr::curr::ClaimableBalanceEntryExtensionV1 {
@@ -694,7 +694,7 @@ fn redeem_into_claimable_balance(
 
     // Check if the sponsoring account is itself in a sponsorship sandwich
     if let Some(sandwich_sponsor) = state.active_sponsor_for(cb_sponsoring_acc_id) {
-        let sponsor_account = state.get_account(&sandwich_sponsor);
+        let sponsor_account = state.account(&sandwich_sponsor);
         if sponsor_account.is_none() {
             return Ok(RemoveResult::LowReserve);
         }
@@ -765,7 +765,7 @@ fn find_pool_share_trustlines_for_asset(
             _ => continue,
         };
 
-        let Some(pool) = state.get_liquidity_pool(pool_id) else {
+        let Some(pool) = state.liquidity_pool(pool_id) else {
             continue;
         };
 
@@ -801,7 +801,7 @@ fn decrement_liquidity_pool_use_count(
     if is_issuer(account_id, asset) {
         return;
     }
-    if let Some(tl) = state.get_trustline_mut(account_id, asset) {
+    if let Some(tl) = state.trustline_mut(account_id, asset) {
         let v2 = ensure_trustline_ext_v2(tl);
         if v2.liquidity_pool_use_count > 0 {
             v2.liquidity_pool_use_count -= 1;
@@ -854,7 +854,7 @@ fn ensure_trustline_ext_v2(
 /// Decrement the pool shares trust line count and delete the pool if it reaches 0.
 fn decrement_pool_shares_trust_line_count(state: &mut LedgerStateManager, pool_id: &PoolId) {
     let should_delete = {
-        let Some(pool) = state.get_liquidity_pool_mut(pool_id) else {
+        let Some(pool) = state.liquidity_pool_mut(pool_id) else {
             return;
         };
         let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
@@ -1209,7 +1209,7 @@ mod tests {
         }
 
         // Verify the flag was set
-        let tl = state.get_trustline(&trustor_id, &asset).unwrap();
+        let tl = state.trustline(&trustor_id, &asset).unwrap();
         assert_eq!(tl.flags & AUTHORIZED_FLAG, AUTHORIZED_FLAG);
     }
 
@@ -1989,7 +1989,7 @@ mod tests {
         });
 
         // Adjust sub-entries: 2 asset TLs (1 each) + 1 pool share TL (counts as 2) = 4
-        if let Some(acct) = state.get_account_mut(&trustor_id) {
+        if let Some(acct) = state.account_mut(&trustor_id) {
             acct.num_sub_entries += 4;
         }
 
@@ -2030,16 +2030,13 @@ mod tests {
 
         // Pool share trustline should be deleted
         assert!(state
-            .get_trustline_by_trustline_asset(
-                &trustor_id,
-                &TrustLineAsset::PoolShare(pool_id.clone())
-            )
+            .trustline_by_trustline_asset(&trustor_id, &TrustLineAsset::PoolShare(pool_id.clone()))
             .is_none());
 
         // Claimable balances should exist:
         // amount_a = floor(100 * 1000 / 500) = 200
         // amount_b = floor(100 * 2000 / 500) = 400
-        let cb_id_a = get_revoke_id(
+        let cb_id_a = revoke_id(
             &TxIdentity {
                 source_id: &tx_source_id,
                 seq: tx_seq,
@@ -2049,7 +2046,7 @@ mod tests {
             &asset_a,
         )
         .unwrap();
-        let cb_id_b = get_revoke_id(
+        let cb_id_b = revoke_id(
             &TxIdentity {
                 source_id: &tx_source_id,
                 seq: tx_seq,
@@ -2061,23 +2058,23 @@ mod tests {
         .unwrap();
 
         let cb_a = state
-            .get_claimable_balance(&cb_id_a)
+            .claimable_balance(&cb_id_a)
             .expect("claimable balance for asset_a should exist");
         assert_eq!(cb_a.amount, 200);
         assert_eq!(cb_a.asset, asset_a);
 
         let cb_b = state
-            .get_claimable_balance(&cb_id_b)
+            .claimable_balance(&cb_id_b)
             .expect("claimable balance for asset_b should exist");
         assert_eq!(cb_b.amount, 400);
         assert_eq!(cb_b.asset, asset_b);
 
         // Pool should be deleted (only 1 trust line count, now 0)
-        assert!(state.get_liquidity_pool(&pool_id).is_none());
+        assert!(state.liquidity_pool(&pool_id).is_none());
 
         // Pool use counts should be decremented on asset trustlines
         let tl_a = state
-            .get_trustline(&trustor_id, &asset_a)
+            .trustline(&trustor_id, &asset_a)
             .expect("asset A trustline should still exist");
         match &tl_a.ext {
             TrustLineEntryExt::V1(v1) => match &v1.ext {
@@ -2162,7 +2159,7 @@ mod tests {
             ext: TrustLineEntryExt::V0,
         });
 
-        if let Some(acct) = state.get_account_mut(&trustor_id) {
+        if let Some(acct) = state.account_mut(&trustor_id) {
             acct.num_sub_entries += 4;
         }
 
@@ -2201,14 +2198,11 @@ mod tests {
 
         // Pool share trustline should be deleted
         assert!(state
-            .get_trustline_by_trustline_asset(
-                &trustor_id,
-                &TrustLineAsset::PoolShare(pool_id.clone())
-            )
+            .trustline_by_trustline_asset(&trustor_id, &TrustLineAsset::PoolShare(pool_id.clone()))
             .is_none());
 
         // Claimable balances: floor(50*800/200)=200, floor(50*400/200)=100
-        let cb_id_a = get_revoke_id(
+        let cb_id_a = revoke_id(
             &TxIdentity {
                 source_id: &tx_source_id,
                 seq: 1,
@@ -2218,7 +2212,7 @@ mod tests {
             &asset_a,
         )
         .unwrap();
-        let cb_id_b = get_revoke_id(
+        let cb_id_b = revoke_id(
             &TxIdentity {
                 source_id: &tx_source_id,
                 seq: 1,
@@ -2230,12 +2224,12 @@ mod tests {
         .unwrap();
 
         let cb_a = state
-            .get_claimable_balance(&cb_id_a)
+            .claimable_balance(&cb_id_a)
             .expect("claimable balance for asset_a");
         assert_eq!(cb_a.amount, 200);
 
         let cb_b = state
-            .get_claimable_balance(&cb_id_b)
+            .claimable_balance(&cb_id_b)
             .expect("claimable balance for asset_b");
         assert_eq!(cb_b.amount, 100);
     }
@@ -2313,7 +2307,7 @@ mod tests {
             ext: TrustLineEntryExt::V0,
         });
 
-        if let Some(acct) = state.get_account_mut(&trustor_id) {
+        if let Some(acct) = state.account_mut(&trustor_id) {
             acct.num_sub_entries += 4;
         }
 
@@ -2350,14 +2344,11 @@ mod tests {
 
         // Pool share trustline should be deleted even with 0 balance
         assert!(state
-            .get_trustline_by_trustline_asset(
-                &trustor_id,
-                &TrustLineAsset::PoolShare(pool_id.clone())
-            )
+            .trustline_by_trustline_asset(&trustor_id, &TrustLineAsset::PoolShare(pool_id.clone()))
             .is_none());
 
         // No claimable balances should be created for zero balance
-        let cb_id_a = get_revoke_id(
+        let cb_id_a = revoke_id(
             &TxIdentity {
                 source_id: &issuer_id,
                 seq: 1,
@@ -2367,7 +2358,7 @@ mod tests {
             &asset_a,
         )
         .unwrap();
-        let cb_id_b = get_revoke_id(
+        let cb_id_b = revoke_id(
             &TxIdentity {
                 source_id: &issuer_id,
                 seq: 1,
@@ -2377,11 +2368,11 @@ mod tests {
             &asset_b,
         )
         .unwrap();
-        assert!(state.get_claimable_balance(&cb_id_a).is_none());
-        assert!(state.get_claimable_balance(&cb_id_b).is_none());
+        assert!(state.claimable_balance(&cb_id_a).is_none());
+        assert!(state.claimable_balance(&cb_id_b).is_none());
 
         // Pool should still be deleted (trust line count was 1, now 0)
-        assert!(state.get_liquidity_pool(&pool_id).is_none());
+        assert!(state.liquidity_pool(&pool_id).is_none());
     }
 
     /// T-02: When the trustor is the issuer of one of the pool's assets,
@@ -2446,7 +2437,7 @@ mod tests {
             ext: TrustLineEntryExt::V0,
         });
 
-        if let Some(acct) = state.get_account_mut(&trustor_id) {
+        if let Some(acct) = state.account_mut(&trustor_id) {
             acct.num_sub_entries += 3; // 1 asset TL + 1 pool share TL (2 subentries)
         }
 
@@ -2482,7 +2473,7 @@ mod tests {
         }
 
         // Claimable balance for asset_a should exist (trustor is NOT issuer of A)
-        let cb_id_a = get_revoke_id(
+        let cb_id_a = revoke_id(
             &TxIdentity {
                 source_id: &issuer_id,
                 seq: 1,
@@ -2493,12 +2484,12 @@ mod tests {
         )
         .unwrap();
         let cb_a = state
-            .get_claimable_balance(&cb_id_a)
+            .claimable_balance(&cb_id_a)
             .expect("claimable balance for asset_a should exist");
         assert_eq!(cb_a.amount, 200); // floor(100 * 1000 / 500)
 
         // Claimable balance for asset_b should NOT exist (trustor IS issuer of B)
-        let cb_id_b = get_revoke_id(
+        let cb_id_b = revoke_id(
             &TxIdentity {
                 source_id: &issuer_id,
                 seq: 1,
@@ -2509,7 +2500,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            state.get_claimable_balance(&cb_id_b).is_none(),
+            state.claimable_balance(&cb_id_b).is_none(),
             "No claimable balance should be created when trustor is the asset issuer"
         );
     }
@@ -2617,7 +2608,7 @@ mod tests {
         ));
 
         // sub-entries: 3 asset TLs + 3 pool share TLs (2 each) = 3 + 6 = 9
-        if let Some(acct) = state.get_account_mut(&trustor_id) {
+        if let Some(acct) = state.account_mut(&trustor_id) {
             acct.num_sub_entries += 9;
         }
 
@@ -2656,7 +2647,7 @@ mod tests {
         for pool_id in [&pool_id_low, &pool_id_mid, &pool_id_high] {
             assert!(
                 state
-                    .get_trustline_by_trustline_asset(
+                    .trustline_by_trustline_asset(
                         &trustor_id,
                         &TrustLineAsset::PoolShare(pool_id.clone())
                     )
@@ -2671,7 +2662,7 @@ mod tests {
         // pool_id_mid (0x80), pool_id_high (0xFF).
         //
         // pool_id_low: amount_a = floor(50 * 300 / 100) = 150
-        let cb_low_a = get_revoke_id(
+        let cb_low_a = revoke_id(
             &TxIdentity {
                 source_id: &issuer_id,
                 seq: 1,
@@ -2682,12 +2673,12 @@ mod tests {
         )
         .unwrap();
         let cb = state
-            .get_claimable_balance(&cb_low_a)
+            .claimable_balance(&cb_low_a)
             .expect("claimable balance for pool_id_low asset_a should exist");
         assert_eq!(cb.amount, 150);
 
         // pool_id_mid: amount_a = floor(50 * 600 / 200) = 150
-        let cb_mid_a = get_revoke_id(
+        let cb_mid_a = revoke_id(
             &TxIdentity {
                 source_id: &issuer_id,
                 seq: 1,
@@ -2698,12 +2689,12 @@ mod tests {
         )
         .unwrap();
         let cb = state
-            .get_claimable_balance(&cb_mid_a)
+            .claimable_balance(&cb_mid_a)
             .expect("claimable balance for pool_id_mid asset_a should exist");
         assert_eq!(cb.amount, 150);
 
         // pool_id_high: amount_a = floor(50 * 900 / 300) = 150
-        let cb_high_a = get_revoke_id(
+        let cb_high_a = revoke_id(
             &TxIdentity {
                 source_id: &issuer_id,
                 seq: 1,
@@ -2714,7 +2705,7 @@ mod tests {
         )
         .unwrap();
         let cb = state
-            .get_claimable_balance(&cb_high_a)
+            .claimable_balance(&cb_high_a)
             .expect("claimable balance for pool_id_high asset_a should exist");
         assert_eq!(cb.amount, 150);
     }
@@ -2878,7 +2869,7 @@ mod tests {
             ext: TrustLineEntryExt::V0,
         });
 
-        if let Some(acct) = state.get_account_mut(&trustor_id) {
+        if let Some(acct) = state.account_mut(&trustor_id) {
             acct.num_sub_entries += 4;
         }
 
@@ -3173,7 +3164,7 @@ mod tests {
             ext: TrustLineEntryExt::V0,
         });
 
-        if let Some(acct) = state.get_account_mut(&trustor_id) {
+        if let Some(acct) = state.account_mut(&trustor_id) {
             acct.num_sub_entries += 4;
         }
 

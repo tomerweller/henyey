@@ -54,7 +54,7 @@ pub(crate) fn execute_manage_data(
     require_source_account(state, source)?;
 
     // Check if data entry exists
-    let existing_entry = state.get_data(source, &data_name);
+    let existing_entry = state.data(source, &data_name);
     let sponsor = state.active_sponsor_for(source);
 
     match &op.data_value {
@@ -70,7 +70,7 @@ pub(crate) fn execute_manage_data(
                 }
 
                 // Decrease sub-entry count before deleting.
-                if let Some(account) = state.get_account_mut(source) {
+                if let Some(account) = state.account_mut(source) {
                     dec_sub_entries(account, 1);
                 }
 
@@ -82,7 +82,7 @@ pub(crate) fn execute_manage_data(
         Some(value) => {
             if existing_entry.is_some() {
                 // Update existing entry
-                if let Some(entry) = state.get_data_mut(source, &data_name) {
+                if let Some(entry) = state.data_mut(source, &data_name) {
                     entry.data_value = value.clone();
                 }
             } else {
@@ -105,7 +105,7 @@ pub(crate) fn execute_manage_data(
                 // Check source can afford new sub-entry
                 if let Some(sponsor) = &sponsor {
                     let sponsor_account = state
-                        .get_account(sponsor)
+                        .account(sponsor)
                         .ok_or(TxError::SourceAccountNotFound)?;
                     let new_min_balance = state.minimum_balance_for_account_with_deltas(
                         sponsor_account,
@@ -158,7 +158,7 @@ pub(crate) fn execute_manage_data(
                 state.create_data(new_entry);
 
                 // Increase sub-entry count
-                if let Some(account) = state.get_account_mut(source) {
+                if let Some(account) = state.account_mut(source) {
                     inc_sub_entries(account, 1);
                 }
             }
@@ -241,12 +241,12 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify data entry was created
-        let entry = state.get_data(&source_id, "test_key");
+        let entry = state.data(&source_id, "test_key");
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().data_value.as_slice(), &[1, 2, 3, 4]);
 
         // Verify sub-entries increased
-        assert_eq!(state.get_account(&source_id).unwrap().num_sub_entries, 1);
+        assert_eq!(state.account(&source_id).unwrap().num_sub_entries, 1);
     }
 
     #[test]
@@ -358,10 +358,10 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify data entry was removed
-        assert!(state.get_data(&source_id, "test_key").is_none());
+        assert!(state.data(&source_id, "test_key").is_none());
 
         // Verify sub-entries decreased
-        assert_eq!(state.get_account(&source_id).unwrap().num_sub_entries, 0);
+        assert_eq!(state.account(&source_id).unwrap().num_sub_entries, 0);
     }
 
     #[test]
@@ -484,7 +484,7 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
 
-        let initial_sub_entries = state.get_account(&source_id).unwrap().num_sub_entries;
+        let initial_sub_entries = state.account(&source_id).unwrap().num_sub_entries;
 
         let update_op = ManageDataOp {
             data_name: make_string64("test_key"),
@@ -501,10 +501,10 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
 
-        let entry = state.get_data(&source_id, "test_key").unwrap();
+        let entry = state.data(&source_id, "test_key").unwrap();
         assert_eq!(entry.data_value.as_slice(), &[9, 9, 9]);
         assert_eq!(
-            state.get_account(&source_id).unwrap().num_sub_entries,
+            state.account(&source_id).unwrap().num_sub_entries,
             initial_sub_entries
         );
     }
@@ -607,7 +607,7 @@ mod tests {
 
         // Verify num_sub_entries was not changed
         assert_eq!(
-            state.get_account(&source_id).unwrap().num_sub_entries,
+            state.account(&source_id).unwrap().num_sub_entries,
             ACCOUNT_SUBENTRY_LIMIT,
             "num_sub_entries should remain unchanged"
         );
@@ -651,7 +651,7 @@ mod tests {
         }
 
         // Verify the value was updated
-        let entry = state.get_data(&source_id, "existing_key").unwrap();
+        let entry = state.data(&source_id, "existing_key").unwrap();
         assert_eq!(entry.data_value.as_slice(), &[4, 5, 6, 7, 8]);
     }
 

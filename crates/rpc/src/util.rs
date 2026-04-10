@@ -318,7 +318,7 @@ pub(crate) fn extract_result_xdr(result_pair_bytes: &[u8]) -> Option<Vec<u8>> {
 /// Get the oldest ledger sequence from the database, defaulting to 1 on error.
 pub(crate) fn oldest_ledger(app: &henyey_app::App) -> u32 {
     app.database()
-        .get_oldest_ledger_seq()
+        .oldest_ledger_seq()
         .unwrap_or(Some(1))
         .unwrap_or(1)
 }

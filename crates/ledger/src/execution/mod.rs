@@ -748,8 +748,8 @@ impl TransactionExecutor {
     /// that entries deleted by a prior TX in this ledger are never reloaded.
     ///
     /// All `load_*` methods should call this instead of
-    /// `snapshot.get_entry()` directly.
-    fn get_entry_from_snapshot(
+    /// `snapshot.entry()` directly.
+    fn entry_from_snapshot(
         &self,
         snapshot: &SnapshotHandle,
         key: &LedgerKey,
@@ -757,7 +757,7 @@ impl TransactionExecutor {
         if self.state.delta().deleted_keys().contains(key) {
             return Ok(None);
         }
-        snapshot.get_entry(key)
+        snapshot.entry(key)
     }
 
     /// Batch-load multiple entries from the bucket list in a single pass.
@@ -772,28 +772,27 @@ impl TransactionExecutor {
         for key in keys {
             // Skip if the entry was deleted in this ledger (don't reload from snapshot).
             // Note: batch path uses load_entries(), so we filter here rather than
-            // going through get_entry_from_snapshot().
+            // going through entry_from_snapshot().
             if self.state.delta().deleted_keys().contains(key) {
                 continue;
             }
 
             let already_loaded = match key {
                 LedgerKey::Account(k) => {
-                    self.state.get_account(&k.account_id).is_some()
+                    self.state.account(&k.account_id).is_some()
                         || self.loaded_accounts.contains_key(&k.account_id)
                 }
                 LedgerKey::Trustline(k) => self
                     .state
-                    .get_trustline_by_trustline_asset(&k.account_id, &k.asset)
+                    .trustline_by_trustline_asset(&k.account_id, &k.asset)
                     .is_some(),
                 LedgerKey::ClaimableBalance(k) => {
-                    self.state.get_claimable_balance(&k.balance_id).is_some()
+                    self.state.claimable_balance(&k.balance_id).is_some()
                 }
-                LedgerKey::LiquidityPool(k) => self
-                    .state
-                    .get_liquidity_pool(&k.liquidity_pool_id)
-                    .is_some(),
-                LedgerKey::Offer(k) => self.state.get_offer(&k.seller_id, k.offer_id).is_some(),
+                LedgerKey::LiquidityPool(k) => {
+                    self.state.liquidity_pool(&k.liquidity_pool_id).is_some()
+                }
+                LedgerKey::Offer(k) => self.state.offer(&k.seller_id, k.offer_id).is_some(),
                 _ => false,
             };
 
@@ -860,7 +859,7 @@ impl TransactionExecutor {
 
         // First check if the account was created/updated by a previous transaction in this ledger
         // This is important for intra-ledger dependencies (e.g., TX0 creates account, TX1 uses it)
-        if self.state.get_account(account_id).is_some() {
+        if self.state.account(account_id).is_some() {
             tracing::trace!(account = %account_id_to_strkey(account_id), "{}: found in state", label);
             return Ok(true);
         }
@@ -879,7 +878,7 @@ impl TransactionExecutor {
             account_id: account_id.clone(),
         });
 
-        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
+        if let Some(entry) = self.entry_from_snapshot(snapshot, &key)? {
             if record {
                 // Log signer info for debugging (only in record mode)
                 if let stellar_xdr::curr::LedgerEntryData::Account(ref acct) = entry.data {
@@ -930,7 +929,7 @@ impl TransactionExecutor {
     ) -> Result<bool> {
         if self
             .state
-            .get_trustline_by_trustline_asset(account_id, asset)
+            .trustline_by_trustline_asset(account_id, asset)
             .is_some()
         {
             return Ok(true);
@@ -946,7 +945,7 @@ impl TransactionExecutor {
             asset: asset.clone(),
         });
 
-        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
+        if let Some(entry) = self.entry_from_snapshot(snapshot, &key)? {
             if let stellar_xdr::curr::LedgerEntryData::Trustline(ref tl) = entry.data {
                 tracing::debug!(
                     account = %account_id_to_strkey(account_id),
@@ -974,7 +973,7 @@ impl TransactionExecutor {
         balance_id: &ClaimableBalanceId,
     ) -> Result<bool> {
         // Check if already in state from previous transaction in this ledger
-        if self.state.get_claimable_balance(balance_id).is_some() {
+        if self.state.claimable_balance(balance_id).is_some() {
             return Ok(true);
         }
 
@@ -989,7 +988,7 @@ impl TransactionExecutor {
             balance_id: balance_id.clone(),
         });
 
-        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
+        if let Some(entry) = self.entry_from_snapshot(snapshot, &key)? {
             self.state.load_entry(entry);
             return Ok(true);
         }
@@ -1008,7 +1007,7 @@ impl TransactionExecutor {
         let name_str = String::from_utf8_lossy(data_name.as_slice()).to_string();
 
         // Check if already in state from previous transaction in this ledger
-        if self.state.get_data(account_id, &name_str).is_some() {
+        if self.state.data(account_id, &name_str).is_some() {
             return Ok(true);
         }
 
@@ -1022,7 +1021,7 @@ impl TransactionExecutor {
             data_name: data_name.clone(),
         });
 
-        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
+        if let Some(entry) = self.entry_from_snapshot(snapshot, &key)? {
             self.state.load_entry(entry);
             return Ok(true);
         }
@@ -1072,7 +1071,7 @@ impl TransactionExecutor {
         pool_id: &PoolId,
     ) -> Result<Option<LiquidityPoolEntry>> {
         // Check if already loaded in state - don't overwrite with snapshot data
-        if let Some(pool) = self.state.get_liquidity_pool(pool_id) {
+        if let Some(pool) = self.state.liquidity_pool(pool_id) {
             return Ok(Some(pool.clone()));
         }
 
@@ -1085,7 +1084,7 @@ impl TransactionExecutor {
             liquidity_pool_id: pool_id.clone(),
         });
 
-        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
+        if let Some(entry) = self.entry_from_snapshot(snapshot, &key)? {
             let pool = match &entry.data {
                 LedgerEntryData::LiquidityPool(pool) => pool.clone(),
                 _ => return Ok(None),
@@ -1209,7 +1208,7 @@ impl TransactionExecutor {
         let mut keys: HashSet<LedgerKey> = HashSet::new();
         for (buying, selling) in pairs {
             for offer_key in self.state.top_n_offer_keys(buying, selling, n) {
-                if let Some(offer) = self.state.get_offer_by_key(&offer_key) {
+                if let Some(offer) = self.state.offer_by_key(&offer_key) {
                     keys.insert(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                         account_id: offer.seller_id.clone(),
                     }));
@@ -1267,9 +1266,7 @@ impl TransactionExecutor {
     ) -> Result<()> {
         // Get matching offers from the state's own index, which is always up-to-date.
         // All offers are loaded into state by load_orderbook_offers() before any TX executes.
-        let offers = self
-            .state
-            .get_offers_by_account_and_asset(account_id, asset);
+        let offers = self.state.offers_by_account_and_asset(account_id, asset);
         for offer in &offers {
             let offer_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
                 seller_id: offer.seller_id.clone(),
@@ -1330,7 +1327,7 @@ impl TransactionExecutor {
         // trustline for the account so `decrement_liquidity_pool_use_count` can find it.
         let mut other_assets: Vec<Asset> = Vec::new();
         for pool_id in &pool_ids {
-            let Some(pool) = self.state.get_liquidity_pool(pool_id) else {
+            let Some(pool) = self.state.liquidity_pool(pool_id) else {
                 continue;
             };
             let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref cp) = pool.body;
@@ -1361,11 +1358,11 @@ impl TransactionExecutor {
         // First check if entry already exists in state (e.g., created by a previous TX in this ledger).
         // This is important for entries like TTLs that are created during restoration but haven't
         // been written to the bucket list yet.
-        if self.state.get_entry(key).is_some() {
+        if self.state.entry(key).is_some() {
             return Ok(true);
         }
         // Try to load from snapshot (bucket list + hot archive)
-        if let Some(entry) = self.get_entry_from_snapshot(snapshot, key)? {
+        if let Some(entry) = self.entry_from_snapshot(snapshot, key)? {
             self.state.load_entry(entry);
             return Ok(true);
         }
@@ -1373,8 +1370,8 @@ impl TransactionExecutor {
     }
 
     /// Get a ledger entry from the current state (if loaded).
-    pub fn get_entry(&self, key: &LedgerKey) -> Option<LedgerEntry> {
-        self.state.get_entry(key)
+    pub fn entry(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        self.state.entry(key)
     }
 
     /// Load all entries from a Soroban footprint into the state manager.
@@ -1436,9 +1433,9 @@ impl TransactionExecutor {
                 ttl_key_cache.insert(key.clone(), key_hash.clone());
                 let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
 
-                let entry_in_state = self.state.get_entry(key).is_some();
-                let ttl_in_state = self.state.get_entry(&ttl_key).is_some()
-                    || self.state.is_entry_deleted(&ttl_key);
+                let entry_in_state = self.state.entry(key).is_some();
+                let ttl_in_state =
+                    self.state.entry(&ttl_key).is_some() || self.state.is_entry_deleted(&ttl_key);
 
                 if entry_in_state && ttl_in_state {
                     // Both entry and TTL already loaded — nothing to do.
@@ -1493,7 +1490,7 @@ impl TransactionExecutor {
             }
 
             // Non-Soroban key: only load if not already in state.
-            if self.state.get_entry(key).is_none() {
+            if self.state.entry(key).is_none() {
                 bucket_list_keys.push(key.clone());
             }
         }
@@ -1516,7 +1513,7 @@ impl TransactionExecutor {
         // - RO entries with expired TTL or in hot archive → TX fails with ENTRY_ARCHIVED
         //   (checked by footprint_has_unrestored_archived_entries before host execution)
         // - RW entries marked in archivedSorobanEntries → restored in encode_footprint_entries
-        //   (via get_archived_with_restore_info / get_entry_for_restoration)
+        //   (via archived_with_restore_info / get_entry_for_restoration)
         // Auto-restoring entries here would mask the ENTRY_ARCHIVED check.
 
         // Store the TTL key cache for use during Soroban execution.
@@ -1602,8 +1599,7 @@ impl TransactionExecutor {
                 LedgerEntryChange::Updated(entry) => {
                     // For Account entries, preserve our sequence number
                     if let LedgerEntryData::Account(new_acc) = &entry.data {
-                        if let Some(existing_acc) = self.state.get_account_mut(&new_acc.account_id)
-                        {
+                        if let Some(existing_acc) = self.state.account_mut(&new_acc.account_id) {
                             // Preserve our sequence number
                             let our_seq = existing_acc.seq_num.0;
                             // Apply all fields from CDP entry
@@ -1728,14 +1724,14 @@ impl TransactionExecutor {
         // Capture STATE entries BEFORE modifications for correct change generation
         // This is needed because flush_modified_entries updates snapshots to current values
         let mut state_overrides: HashMap<LedgerKey, LedgerEntry> = HashMap::new();
-        if let Some(acc) = self.state.get_account(&fee_source_id) {
+        if let Some(acc) = self.state.account(&fee_source_id) {
             let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                 account_id: fee_source_id.clone(),
             });
             state_overrides.insert(key, self.state.ledger_entry_for_account(acc));
         }
         if fee_source_id != inner_source_id {
-            if let Some(acc) = self.state.get_account(&inner_source_id) {
+            if let Some(acc) = self.state.account(&inner_source_id) {
                 let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                     account_id: inner_source_id.clone(),
                 });
@@ -1745,7 +1741,7 @@ impl TransactionExecutor {
 
         // Deduct fee — cap at available balance to prevent negative balances.
         // stellar-core: TransactionFrame.cpp:1797 — fee = std::min(acc.balance, fee)
-        if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
+        if let Some(acc) = self.state.account_mut(&fee_source_id) {
             fee = std::cmp::min(acc.balance, fee);
             henyey_common::checked_types::sub_account_balance(acc, fee)
                 .expect("fee underflow after capping to balance");
@@ -1753,7 +1749,7 @@ impl TransactionExecutor {
 
         // For protocol < 10, sequence bump happens during fee processing
         if protocol_version_is_before(self.protocol_version, ProtocolVersion::V10) {
-            if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+            if let Some(acc) = self.state.account_mut(&inner_source_id) {
                 // Set the account's seq_num to the transaction's seq_num
                 acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
                 henyey_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
@@ -1871,7 +1867,7 @@ impl TransactionExecutor {
                         TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
                     let inner_source_id =
                         henyey_tx::muxed_to_account_id(&fail_frame.inner_source_account());
-                    if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+                    if let Some(acc) = self.state.account_mut(&inner_source_id) {
                         acc.seq_num =
                             stellar_xdr::curr::SequenceNumber(fail_frame.sequence_number());
                         henyey_tx::state::update_account_seq_info(
@@ -1921,7 +1917,7 @@ impl TransactionExecutor {
         let fee_deduct_start = std::time::Instant::now();
         let mut preflight_failure = None;
         if deduct_fee {
-            if let Some(acc) = self.state.get_account(&fee_source_id) {
+            if let Some(acc) = self.state.account(&fee_source_id) {
                 if self.available_balance_for_fee(acc)? < fee {
                     preflight_failure = Some(TransactionResultCode::TxInsufficientBalance);
                 }
@@ -1961,7 +1957,7 @@ impl TransactionExecutor {
             let delta_before_fee = delta_snapshot(&self.state);
 
             // Deduct fee (sequence update is handled separately for protocol >= 10).
-            if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
+            if let Some(acc) = self.state.account_mut(&fee_source_id) {
                 let old_balance = acc.balance;
                 let charged_fee = std::cmp::min(acc.balance, fee);
                 henyey_common::checked_types::sub_account_balance(acc, charged_fee)
@@ -2012,7 +2008,7 @@ impl TransactionExecutor {
             let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                 account_id: fee_source_id.clone(),
             });
-            if let Some(fee_source_before) = self.state.get_entry(&fee_source_key) {
+            if let Some(fee_source_before) = self.state.entry(&fee_source_key) {
                 // Remove the PreAuthTx signer matching the fee bump outer hash from
                 // the fee source, matching stellar-core's removeOneTimeSignerKeyFromFeeSource().
                 let signer_key = stellar_xdr::curr::SignerKey::PreAuthTx(
@@ -2027,7 +2023,7 @@ impl TransactionExecutor {
                 // and pushes to txChangesBefore regardless of fee mode.
                 let fee_source_after = self
                     .state
-                    .get_entry(&fee_source_key)
+                    .entry(&fee_source_key)
                     .unwrap_or_else(|| fee_source_before.clone());
 
                 vec![
@@ -2470,7 +2466,7 @@ impl TransactionExecutor {
             let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                 account_id: account_id.clone(),
             });
-            if let Some(entry) = self.state.get_entry(&key) {
+            if let Some(entry) = self.state.entry(&key) {
                 signer_state_overrides.insert(key, entry);
             }
         }
@@ -2530,9 +2526,9 @@ impl TransactionExecutor {
         let inner_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
             account_id: inner_source_id.clone(),
         });
-        let seq_state_override = self.state.get_entry(&inner_source_key);
+        let seq_state_override = self.state.entry(&inner_source_key);
 
-        if let Some(acc) = self.state.get_account_mut(inner_source_id) {
+        if let Some(acc) = self.state.account_mut(inner_source_id) {
             // CAP-0021: Set the account's seq_num to the transaction's seq_num.
             // This handles the case where minSeqNum allows sequence gaps - the
             // account's final seq must be the tx's seq, not just account_seq + 1.
@@ -3550,7 +3546,7 @@ mod tests {
         // The entry must remain absent — load_soroban_footprint skipped it because
         // is_entry_deleted returned true.
         assert!(
-            stage1_executor.state.get_entry(&code_key).is_none(),
+            stage1_executor.state.entry(&code_key).is_none(),
             "Deleted entry must NOT be reloaded from bucket list in stage 1"
         );
     }
@@ -3621,14 +3617,14 @@ mod tests {
         // loaded_accounts is NOT populated for this key.
         executor.state.load_entry(account_entry.clone());
         assert!(
-            executor.state.get_account(&account_id).is_some(),
+            executor.state.account(&account_id).is_some(),
             "Account should be in state after direct load"
         );
 
         // Simulate a prior TX deleting the account (account_merge).
         executor.state.delete_account(&account_id);
         assert!(
-            executor.state.get_account(&account_id).is_none(),
+            executor.state.account(&account_id).is_none(),
             "Account should be gone from state after delete"
         );
 
@@ -3697,9 +3693,9 @@ mod tests {
         // Load the entry into state, then delete it (simulating account_merge
         // by a prior TX).
         executor.state.load_entry(account_entry.clone());
-        assert!(executor.state.get_account(&account_id).is_some());
+        assert!(executor.state.account(&account_id).is_some());
         executor.state.delete_account(&account_id);
-        assert!(executor.state.get_account(&account_id).is_none());
+        assert!(executor.state.account(&account_id).is_none());
 
         // Generic load_entry must not reload the stale entry from the snapshot.
         let reloaded = executor.load_entry(&snapshot, &account_key).unwrap();
@@ -3709,7 +3705,7 @@ mod tests {
         );
         // Verify the account is still absent from state.
         assert!(
-            executor.state.get_account(&account_id).is_none(),
+            executor.state.account(&account_id).is_none(),
             "Account must remain absent after load_entry returns false"
         );
     }
@@ -3865,11 +3861,11 @@ mod tests {
 
         // Entry and its TTL must now be in executor state
         assert!(
-            executor.state.get_entry(&data_key).is_some(),
+            executor.state.entry(&data_key).is_some(),
             "ContractData entry must be loaded from InMemorySorobanState"
         );
         assert!(
-            executor.state.get_entry(&ttl_key).is_some(),
+            executor.state.entry(&ttl_key).is_some(),
             "TTL entry must be co-loaded from InMemorySorobanState"
         );
     }
@@ -3951,7 +3947,7 @@ mod tests {
         );
         // Entry must be present in executor state (loaded from bucket list)
         assert!(
-            executor.state.get_entry(&data_key).is_some(),
+            executor.state.entry(&data_key).is_some(),
             "Entry from bucket list must be loaded when IMS misses"
         );
     }
@@ -4036,7 +4032,7 @@ mod tests {
             "Without IMS, bucket list must be used"
         );
         assert!(
-            executor.state.get_entry(&data_key).is_some(),
+            executor.state.entry(&data_key).is_some(),
             "ContractData entry must be loaded from bucket list when IMS is absent"
         );
     }
@@ -4046,7 +4042,7 @@ mod tests {
     /// absent (the prior stage TX only modified data, not the TTL), load_soroban_footprint
     /// must still load the missing TTL from IMS.
     ///
-    /// Before the fix, the early `continue` when `state.get_entry(key).is_some()` caused
+    /// Before the fix, the early `continue` when `state.entry(key).is_some()` caused
     /// the TTL loading code to be skipped entirely. This made is_archived_contract_entry
     /// return true (no TTL → archived) even for fully live entries.
     #[test]
@@ -4112,11 +4108,11 @@ mod tests {
         // Simulate prior_stage loading: ContractData is already in state, TTL is NOT.
         executor.state.load_entry(data_entry);
         assert!(
-            executor.state.get_entry(&data_key).is_some(),
+            executor.state.entry(&data_key).is_some(),
             "setup: entry must be in state"
         );
         assert!(
-            executor.state.get_entry(&ttl_key).is_none(),
+            executor.state.entry(&ttl_key).is_none(),
             "setup: TTL must NOT be in state"
         );
 
@@ -4131,7 +4127,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            executor.state.get_entry(&ttl_key).is_some(),
+            executor.state.entry(&ttl_key).is_some(),
             "TTL must be loaded from IMS even when ContractData was already in state"
         );
     }

@@ -983,7 +983,7 @@ pub use henyey_common::ThresholdLevel;
 ///
 /// - **High**: Operations that can affect account security:
 ///   `AccountMerge`, `SetOptions` (when modifying thresholds, weights, or signers)
-pub fn get_threshold_level(op: &Operation) -> ThresholdLevel {
+pub fn threshold_level(op: &Operation) -> ThresholdLevel {
     match &op.body {
         // LOW threshold operations
         OperationBody::AllowTrust(_) => ThresholdLevel::Low,
@@ -1029,10 +1029,7 @@ pub fn get_threshold_level(op: &Operation) -> ThresholdLevel {
 /// # Returns
 ///
 /// The threshold value (0-255) as an i32.
-pub fn get_needed_threshold(
-    account: &stellar_xdr::curr::AccountEntry,
-    level: ThresholdLevel,
-) -> i32 {
+pub fn needed_threshold(account: &stellar_xdr::curr::AccountEntry, level: ThresholdLevel) -> i32 {
     account.thresholds.0[level as usize] as i32
 }
 
@@ -1224,7 +1221,7 @@ mod tests {
                 authorize: 1,
             }),
         };
-        assert_eq!(get_threshold_level(&allow_trust_op), ThresholdLevel::Low);
+        assert_eq!(threshold_level(&allow_trust_op), ThresholdLevel::Low);
 
         // BumpSequence
         let bump_seq_op = Operation {
@@ -1233,7 +1230,7 @@ mod tests {
                 bump_to: stellar_xdr::curr::SequenceNumber(100),
             }),
         };
-        assert_eq!(get_threshold_level(&bump_seq_op), ThresholdLevel::Low);
+        assert_eq!(threshold_level(&bump_seq_op), ThresholdLevel::Low);
 
         // ClaimClaimableBalance
         let claim_op = Operation {
@@ -1244,14 +1241,14 @@ mod tests {
                 ),
             }),
         };
-        assert_eq!(get_threshold_level(&claim_op), ThresholdLevel::Low);
+        assert_eq!(threshold_level(&claim_op), ThresholdLevel::Low);
 
         // Inflation
         let inflation_op = Operation {
             source_account: None,
             body: OperationBody::Inflation,
         };
-        assert_eq!(get_threshold_level(&inflation_op), ThresholdLevel::Low);
+        assert_eq!(threshold_level(&inflation_op), ThresholdLevel::Low);
     }
 
     #[test]
@@ -1265,7 +1262,7 @@ mod tests {
                 amount: 1000,
             }),
         };
-        assert_eq!(get_threshold_level(&payment_op), ThresholdLevel::Med);
+        assert_eq!(threshold_level(&payment_op), ThresholdLevel::Med);
 
         // CreateAccount
         let create_account_op = Operation {
@@ -1275,7 +1272,7 @@ mod tests {
                 starting_balance: 10_000_000,
             }),
         };
-        assert_eq!(get_threshold_level(&create_account_op), ThresholdLevel::Med);
+        assert_eq!(threshold_level(&create_account_op), ThresholdLevel::Med);
 
         // ChangeTrust
         let change_trust_op = Operation {
@@ -1285,7 +1282,7 @@ mod tests {
                 limit: 1000,
             }),
         };
-        assert_eq!(get_threshold_level(&change_trust_op), ThresholdLevel::Med);
+        assert_eq!(threshold_level(&change_trust_op), ThresholdLevel::Med);
 
         // ManageData
         let manage_data_op = Operation {
@@ -1295,7 +1292,7 @@ mod tests {
                 data_value: Some(b"value".to_vec().try_into().unwrap()),
             }),
         };
-        assert_eq!(get_threshold_level(&manage_data_op), ThresholdLevel::Med);
+        assert_eq!(threshold_level(&manage_data_op), ThresholdLevel::Med);
     }
 
     #[test]
@@ -1305,7 +1302,7 @@ mod tests {
             source_account: None,
             body: OperationBody::AccountMerge(MuxedAccount::Ed25519(Uint256([0u8; 32]))),
         };
-        assert_eq!(get_threshold_level(&account_merge_op), ThresholdLevel::High);
+        assert_eq!(threshold_level(&account_merge_op), ThresholdLevel::High);
 
         // SetOptions with threshold change
         let set_options_threshold_op = Operation {
@@ -1323,7 +1320,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            get_threshold_level(&set_options_threshold_op),
+            threshold_level(&set_options_threshold_op),
             ThresholdLevel::High
         );
 
@@ -1346,7 +1343,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            get_threshold_level(&set_options_signer_op),
+            threshold_level(&set_options_signer_op),
             ThresholdLevel::High
         );
 
@@ -1366,7 +1363,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            get_threshold_level(&set_options_master_op),
+            threshold_level(&set_options_master_op),
             ThresholdLevel::High
         );
     }
@@ -1390,10 +1387,7 @@ mod tests {
                 signer: None,
             }),
         };
-        assert_eq!(
-            get_threshold_level(&set_options_basic_op),
-            ThresholdLevel::Med
-        );
+        assert_eq!(threshold_level(&set_options_basic_op), ThresholdLevel::Med);
 
         // SetOptions with only home domain change
         let set_options_domain_op = Operation {
@@ -1412,10 +1406,7 @@ mod tests {
                 signer: None,
             }),
         };
-        assert_eq!(
-            get_threshold_level(&set_options_domain_op),
-            ThresholdLevel::Med
-        );
+        assert_eq!(threshold_level(&set_options_domain_op), ThresholdLevel::Med);
     }
 
     #[test]
@@ -1437,9 +1428,9 @@ mod tests {
             ext: AccountEntryExt::V0,
         };
 
-        assert_eq!(get_needed_threshold(&account, ThresholdLevel::Low), 1);
-        assert_eq!(get_needed_threshold(&account, ThresholdLevel::Med), 5);
-        assert_eq!(get_needed_threshold(&account, ThresholdLevel::High), 10);
+        assert_eq!(needed_threshold(&account, ThresholdLevel::Low), 1);
+        assert_eq!(needed_threshold(&account, ThresholdLevel::Med), 5);
+        assert_eq!(needed_threshold(&account, ThresholdLevel::High), 10);
     }
 
     /// Test validate_path_payment_strict_receive.

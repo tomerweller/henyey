@@ -4,7 +4,7 @@ use super::*;
 
 impl LedgerStateManager {
     /// Get a TTL entry by key hash (read-only).
-    pub fn get_ttl(&self, key_hash: &Hash) -> Option<&TtlEntry> {
+    pub fn ttl(&self, key_hash: &Hash) -> Option<&TtlEntry> {
         self.ttl_entries.get(key_hash)
     }
 
@@ -14,7 +14,7 @@ impl LedgerStateManager {
     /// start of the ledger, before any transactions modified it. This is used
     /// by Soroban execution to match stellar-core behavior where transactions
     /// see the bucket list state at ledger start, not changes from previous txs.
-    pub fn get_ttl_at_ledger_start(&self, key_hash: &Hash) -> Option<u32> {
+    pub fn ttl_at_ledger_start(&self, key_hash: &Hash) -> Option<u32> {
         self.ttl_bucket_list_snapshot.get(key_hash).copied()
     }
 
@@ -33,7 +33,7 @@ impl LedgerStateManager {
     }
 
     /// Get a mutable reference to a TTL entry.
-    pub fn get_ttl_mut(&mut self, key_hash: &Hash) -> Option<&mut TtlEntry> {
+    pub fn ttl_mut(&mut self, key_hash: &Hash) -> Option<&mut TtlEntry> {
         if self.ttl_entries.contains_key(key_hash) {
             // Save snapshot if not already saved or if it's None (for newly created entries).
             // For newly created entries, we update the snapshot to the current value so
@@ -490,7 +490,7 @@ impl LedgerStateManager {
 
     /// Check if a TTL entry is live (not expired).
     pub fn is_entry_live(&self, key_hash: &Hash) -> bool {
-        if let Some(ttl) = self.get_ttl(key_hash) {
+        if let Some(ttl) = self.ttl(key_hash) {
             ttl.live_until_ledger_seq >= self.ledger_seq
         } else {
             false

@@ -233,7 +233,7 @@ impl BanManager {
     }
 
     /// Get a list of all banned nodes as strkey strings.
-    pub fn get_bans(&self) -> Vec<String> {
+    pub fn bans(&self) -> Vec<String> {
         let cache = self.cache.read();
         let now = Instant::now();
         cache
@@ -247,7 +247,7 @@ impl BanManager {
     }
 
     /// Get a list of all banned node IDs.
-    pub fn get_banned_ids(&self) -> Vec<PeerId> {
+    pub fn banned_ids(&self) -> Vec<PeerId> {
         let cache = self.cache.read();
         let now = Instant::now();
         cache
@@ -387,7 +387,7 @@ mod tests {
         assert!(manager.is_banned(&peer3));
         assert_eq!(manager.ban_count(), 3);
 
-        let bans = manager.get_bans();
+        let bans = manager.bans();
         assert_eq!(bans.len(), 3);
     }
 

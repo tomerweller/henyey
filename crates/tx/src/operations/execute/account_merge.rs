@@ -22,7 +22,7 @@ pub(crate) fn execute_account_merge(
     let dest_account_id = muxed_to_account_id(dest);
 
     // Check destination exists
-    if state.get_account(&dest_account_id).is_none() {
+    if state.account(&dest_account_id).is_none() {
         return Ok(make_result(AccountMergeResultCode::NoAccount));
     }
     if &dest_account_id == source {
@@ -43,7 +43,7 @@ pub(crate) fn execute_account_merge(
     }
 
     let starting_seq = state.starting_sequence_number()?;
-    if let Some(&max_seq) = state.get_max_seq_num_to_apply(source) {
+    if let Some(&max_seq) = state.max_seq_num_to_apply(source) {
         if max_seq >= starting_seq {
             return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
         }
@@ -68,7 +68,7 @@ pub(crate) fn execute_account_merge(
 
     // Transfer balance to destination
     let dest_acc = state
-        .get_account_mut(&dest_account_id)
+        .account_mut(&dest_account_id)
         .ok_or_else(|| TxError::Internal("destination account disappeared".into()))?;
     if add_account_balance(dest_acc, source_balance).is_err() {
         return Ok(make_result(AccountMergeResultCode::DestFull));
@@ -236,10 +236,10 @@ mod tests {
         }
 
         // Source should be gone
-        assert!(state.get_account(&source_id).is_none());
+        assert!(state.account(&source_id).is_none());
 
         // Dest should have combined balance
-        assert_eq!(state.get_account(&dest_id).unwrap().balance, 150_000_000);
+        assert_eq!(state.account(&dest_id).unwrap().balance, 150_000_000);
     }
 
     #[test]
@@ -512,7 +512,7 @@ mod tests {
         }
 
         // Source should be deleted
-        assert!(state.get_account(&source_id).is_none());
+        assert!(state.account(&source_id).is_none());
     }
 
     /// Test AccountMerge with destination buying liabilities near overflow.
@@ -593,9 +593,9 @@ mod tests {
         }
 
         // Source should be deleted even with zero balance
-        assert!(state.get_account(&source_id).is_none());
+        assert!(state.account(&source_id).is_none());
         // Dest balance unchanged
-        assert_eq!(state.get_account(&dest_id).unwrap().balance, 50_000_000);
+        assert_eq!(state.account(&dest_id).unwrap().balance, 50_000_000);
     }
 
     /// Test AccountMerge with source account sponsored.
@@ -663,7 +663,7 @@ mod tests {
         }
 
         // Source should be deleted
-        assert!(state.get_account(&source_id).is_none());
+        assert!(state.account(&source_id).is_none());
     }
 
     /// Test that ImmutableSet is checked before HasSubEntries.
@@ -916,6 +916,6 @@ mod tests {
         }
 
         // Sponsor account should still exist (merge was rejected)
-        assert!(state.get_account(&sponsor_id).is_some());
+        assert!(state.account(&sponsor_id).is_some());
     }
 }

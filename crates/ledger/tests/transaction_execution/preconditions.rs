@@ -736,9 +736,9 @@ fn test_operation_failure_rolls_back_changes() {
     );
 
     let state = executor.state();
-    assert!(state.get_account(&destination).is_none());
+    assert!(state.account(&destination).is_none());
 
-    let source = state.get_account(&account_id).expect("source account");
+    let source = state.account(&account_id).expect("source account");
     assert_eq!(source.seq_num.0, 2);
     assert_eq!(source.balance, 10_000_000 - 200);
 }

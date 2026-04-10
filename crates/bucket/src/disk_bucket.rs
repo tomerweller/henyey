@@ -537,7 +537,7 @@ impl DiskBucket {
         let result = match index {
             LiveBucketIndex::InMemory(idx) => {
                 // Exact offset lookup
-                if let Some(offset) = idx.get_offset(key) {
+                if let Some(offset) = idx.offset(key) {
                     let entry = self.read_entry_at(offset)?;
                     if let Some(entry_key) = entry.key() {
                         if &entry_key == key {
@@ -576,11 +576,7 @@ impl DiskBucket {
     ///
     /// The `key` is needed for final verification (hash collisions), while `key_bytes`
     /// is used for bloom filter checks and index lookups.
-    pub fn get_by_key_bytes(
-        &self,
-        key: &LedgerKey,
-        key_bytes: &[u8],
-    ) -> Result<Option<BucketEntry>> {
+    pub fn by_key_bytes(&self, key: &LedgerKey, key_bytes: &[u8]) -> Result<Option<BucketEntry>> {
         // Check per-bucket cache first
         if let Some(cache) = self.cache.get() {
             if let Some(cached) = cache.get(key) {
@@ -596,7 +592,7 @@ impl DiskBucket {
 
         let result = match index {
             LiveBucketIndex::InMemory(idx) => {
-                if let Some(offset) = idx.get_offset_by_key_bytes(key_bytes) {
+                if let Some(offset) = idx.offset_by_key_bytes(key_bytes) {
                     let entry = self.read_entry_at(offset)?;
                     if let Some(entry_key) = entry.key() {
                         if &entry_key == key {

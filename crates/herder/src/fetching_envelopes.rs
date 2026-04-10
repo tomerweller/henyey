@@ -547,7 +547,7 @@ impl FetchingEnvelopes {
     }
 
     /// Get a cached TxSet.
-    pub fn get_tx_set(&self, hash: &Hash256) -> Option<Vec<u8>> {
+    pub fn tx_set(&self, hash: &Hash256) -> Option<Vec<u8>> {
         self.tx_set_cache.get(hash).map(|e| e.value().1.clone())
     }
 
@@ -557,7 +557,7 @@ impl FetchingEnvelopes {
     }
 
     /// Get a cached QuorumSet.
-    pub fn get_quorum_set(&self, hash: &Hash256) -> Option<Arc<ScpQuorumSet>> {
+    pub fn quorum_set(&self, hash: &Hash256) -> Option<Arc<ScpQuorumSet>> {
         self.quorum_set_cache.get(hash).map(|e| e.value().clone())
     }
 
@@ -765,7 +765,7 @@ impl FetchingEnvelopes {
     fn extract_tx_set_hashes(envelope: &ScpEnvelope) -> Vec<Hash256> {
         use stellar_xdr::curr::StellarValue;
 
-        henyey_scp::Slot::get_statement_values(&envelope.statement)
+        henyey_scp::Slot::statement_values(&envelope.statement)
             .into_iter()
             .filter_map(|v| StellarValue::from_xdr(&v.0, Limits::none()).ok())
             .map(|sv| Hash256::from_bytes(sv.tx_set_hash.0))
@@ -869,7 +869,7 @@ mod tests {
         fetching.cache_quorum_set(qs_hash, quorum_set);
 
         assert!(fetching.has_quorum_set(&qs_hash));
-        let retrieved = fetching.get_quorum_set(&qs_hash);
+        let retrieved = fetching.quorum_set(&qs_hash);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().threshold, 1);
     }
@@ -939,9 +939,9 @@ mod tests {
         );
 
         // Verify all are cached before trim
-        assert!(fetching.get_tx_set(&hash_old).is_some());
-        assert!(fetching.get_tx_set(&hash_boundary).is_some());
-        assert!(fetching.get_tx_set(&hash_future).is_some());
+        assert!(fetching.tx_set(&hash_old).is_some());
+        assert!(fetching.tx_set(&hash_boundary).is_some());
+        assert!(fetching.tx_set(&hash_future).is_some());
         assert!(fetching.has_quorum_set(&qs_hash));
 
         // Trim with keep_after_slot = 100
@@ -950,15 +950,15 @@ mod tests {
 
         // Verify tx_sets: only future slot (101) should remain
         assert!(
-            fetching.get_tx_set(&hash_future).is_some(),
+            fetching.tx_set(&hash_future).is_some(),
             "tx_set for slot 101 should be preserved"
         );
         assert!(
-            fetching.get_tx_set(&hash_old).is_none(),
+            fetching.tx_set(&hash_old).is_none(),
             "tx_set for slot 98 should be removed"
         );
         assert!(
-            fetching.get_tx_set(&hash_boundary).is_none(),
+            fetching.tx_set(&hash_boundary).is_none(),
             "tx_set for slot 100 should be removed (boundary)"
         );
 

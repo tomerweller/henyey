@@ -54,7 +54,7 @@ pub(crate) fn execute_liquidity_pool_deposit(
     }
 
     // Get the liquidity pool
-    let pool = match state.get_liquidity_pool(&op.liquidity_pool_id) {
+    let pool = match state.liquidity_pool(&op.liquidity_pool_id) {
         Some(p) => p.clone(),
         None => {
             return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
@@ -78,13 +78,12 @@ pub(crate) fn execute_liquidity_pool_deposit(
 
     // Check source has pool share trustline
     let pool_share_asset = TrustLineAsset::PoolShare(op.liquidity_pool_id.clone());
-    let pool_share_trustline =
-        match state.get_trustline_by_trustline_asset(source, &pool_share_asset) {
-            Some(tl) => tl,
-            None => {
-                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
-            }
-        };
+    let pool_share_trustline = match state.trustline_by_trustline_asset(source, &pool_share_asset) {
+        Some(tl) => tl,
+        None => {
+            return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
+        }
+    };
 
     // Check source has trustlines, authorization, and available balance for both assets.
     let available_a = match resolve_deposit_asset(source, &asset_a, state, context) {
@@ -214,13 +213,13 @@ pub(crate) fn execute_liquidity_pool_deposit(
     }
 
     // Credit pool shares to source
-    if let Some(tl) = state.get_trustline_by_trustline_asset_mut(source, &pool_share_asset) {
+    if let Some(tl) = state.trustline_by_trustline_asset_mut(source, &pool_share_asset) {
         add_trustline_balance(tl, shares_received)
             .map_err(|_| TxError::Internal("pool share credit overflow".into()))?;
     }
 
     // Update pool reserves
-    if let Some(pool_mut) = state.get_liquidity_pool_mut(&op.liquidity_pool_id) {
+    if let Some(pool_mut) = state.liquidity_pool_mut(&op.liquidity_pool_id) {
         match &mut pool_mut.body {
             stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
                 add_pool_reserve(&mut cp.reserve_a, deposit_a)?;
@@ -257,7 +256,7 @@ pub(crate) fn execute_liquidity_pool_withdraw(
     }
 
     // Get the liquidity pool
-    let pool = match state.get_liquidity_pool(&op.liquidity_pool_id) {
+    let pool = match state.liquidity_pool(&op.liquidity_pool_id) {
         Some(p) => p.clone(),
         None => {
             return Ok(make_withdraw_result(
@@ -284,7 +283,7 @@ pub(crate) fn execute_liquidity_pool_withdraw(
     // C++ uses getAvailableBalance which subtracts selling liabilities.
     let pool_share_asset = TrustLineAsset::PoolShare(op.liquidity_pool_id.clone());
     let (_shares_balance, shares_available) =
-        match state.get_trustline_by_trustline_asset(source, &pool_share_asset) {
+        match state.trustline_by_trustline_asset(source, &pool_share_asset) {
             Some(tl) => {
                 let selling = trustline_liabilities(tl).selling;
                 (tl.balance, tl.balance - selling)
@@ -324,8 +323,8 @@ pub(crate) fn execute_liquidity_pool_withdraw(
         }
     }
 
-    let withdraw_a = get_pool_withdrawal_amount(op.amount, total_shares, reserve_a);
-    let withdraw_b = get_pool_withdrawal_amount(op.amount, total_shares, reserve_b);
+    let withdraw_a = pool_withdrawal_amount(op.amount, total_shares, reserve_a);
+    let withdraw_b = pool_withdrawal_amount(op.amount, total_shares, reserve_b);
 
     if withdraw_a < op.min_amount_a || withdraw_b < op.min_amount_b {
         return Ok(make_withdraw_result(
@@ -353,12 +352,12 @@ pub(crate) fn execute_liquidity_pool_withdraw(
     credit_asset(state, source, &asset_b, withdraw_b);
 
     // Deduct pool shares from source
-    if let Some(tl) = state.get_trustline_by_trustline_asset_mut(source, &pool_share_asset) {
+    if let Some(tl) = state.trustline_by_trustline_asset_mut(source, &pool_share_asset) {
         sub_trustline_balance(tl, op.amount)?;
     }
 
     // Update pool reserves
-    if let Some(pool_mut) = state.get_liquidity_pool_mut(&op.liquidity_pool_id) {
+    if let Some(pool_mut) = state.liquidity_pool_mut(&op.liquidity_pool_id) {
         match &mut pool_mut.body {
             stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
                 add_pool_reserve(&mut cp.reserve_a, -withdraw_a)?;
@@ -389,7 +388,7 @@ fn resolve_deposit_asset(
         if matches!(asset, Asset::Native) || is_issuer(source, asset) {
             None
         } else {
-            match state.get_trustline(source, asset) {
+            match state.trustline(source, asset) {
                 Some(tl) => Some(tl),
                 None => return Err(LiquidityPoolDepositResultCode::NoTrust),
             }
@@ -428,7 +427,7 @@ fn debit_asset(
     amount: i64,
 ) -> std::result::Result<(), LiquidityPoolDepositResultCode> {
     if matches!(asset, Asset::Native) {
-        if let Some(account) = state.get_account_mut(source) {
+        if let Some(account) = state.account_mut(source) {
             if account.balance < amount {
                 return Err(LiquidityPoolDepositResultCode::Underfunded);
             }
@@ -437,7 +436,7 @@ fn debit_asset(
         }
     } else if is_issuer(source, asset) {
         // Issuer "creates" assets out of nothing, no balance to deduct
-    } else if let Some(tl) = state.get_trustline_mut(source, asset) {
+    } else if let Some(tl) = state.trustline_mut(source, asset) {
         if tl.balance < amount {
             return Err(LiquidityPoolDepositResultCode::Underfunded);
         }
@@ -452,7 +451,7 @@ fn available_native_balance(
     state: &LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<i64> {
-    let Some(account) = state.get_account(source) else {
+    let Some(account) = state.account(source) else {
         return Ok(0);
     };
     let min_balance = state.minimum_balance_for_account(account, context.protocol_version, 0)?;
@@ -581,7 +580,7 @@ fn deposit_into_non_empty_pool(request: NonEmptyPoolDepositRequest<'_>) -> Resul
     })
 }
 
-fn get_pool_withdrawal_amount(amount: i64, total_shares: i64, reserve: i64) -> i64 {
+fn pool_withdrawal_amount(amount: i64, total_shares: i64, reserve: i64) -> i64 {
     big_divide(amount, reserve, total_shares, Round::Down).unwrap_or(0)
 }
 
@@ -598,7 +597,7 @@ fn can_credit_asset(
     amount: i64,
 ) -> WithdrawAssetCheck {
     if matches!(asset, Asset::Native) {
-        let Some(account) = state.get_account(source) else {
+        let Some(account) = state.account(source) else {
             return WithdrawAssetCheck::NoTrust;
         };
         // Overflow-safe: i64::MAX - balance < amount
@@ -619,7 +618,7 @@ fn can_credit_asset(
         return WithdrawAssetCheck::Ok;
     }
 
-    let Some(tl) = state.get_trustline(source, asset) else {
+    let Some(tl) = state.trustline(source, asset) else {
         return WithdrawAssetCheck::NoTrust;
     };
     if !is_authorized_to_maintain_liabilities(tl.flags) {
@@ -639,7 +638,7 @@ fn can_credit_asset(
 
 fn credit_asset(state: &mut LedgerStateManager, source: &AccountId, asset: &Asset, amount: i64) {
     if matches!(asset, Asset::Native) {
-        if let Some(account) = state.get_account_mut(source) {
+        if let Some(account) = state.account_mut(source) {
             // stellar-core: LiquidityPoolWithdrawOpFrame.cpp — ignores addBalance return
             let _ = add_account_balance(account, amount);
         }
@@ -651,7 +650,7 @@ fn credit_asset(state: &mut LedgerStateManager, source: &AccountId, asset: &Asse
         return;
     }
 
-    if let Some(tl) = state.get_trustline_mut(source, asset) {
+    if let Some(tl) = state.trustline_mut(source, asset) {
         // stellar-core: LiquidityPoolWithdrawOpFrame.cpp — ignores addBalance return
         let _ = add_trustline_balance(tl, amount);
     }
@@ -944,7 +943,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         let op = LiquidityPoolDepositOp {
             liquidity_pool_id: pool_id,
@@ -1026,7 +1025,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         let op = LiquidityPoolDepositOp {
             liquidity_pool_id: pool_id,
@@ -1108,7 +1107,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         let op = LiquidityPoolWithdrawOp {
             liquidity_pool_id: pool_id,
@@ -1182,7 +1181,7 @@ mod tests {
         };
         state.create_trustline(trustline_a);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&issuer_id).unwrap().num_sub_entries += 2;
+        state.account_mut(&issuer_id).unwrap().num_sub_entries += 2;
 
         let op = LiquidityPoolDepositOp {
             liquidity_pool_id: pool_id,
@@ -1261,7 +1260,7 @@ mod tests {
         };
         state.create_trustline(trustline_a);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&issuer_id).unwrap().num_sub_entries += 2;
+        state.account_mut(&issuer_id).unwrap().num_sub_entries += 2;
 
         let op = LiquidityPoolWithdrawOp {
             liquidity_pool_id: pool_id,
@@ -1352,7 +1351,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         let op = LiquidityPoolDepositOp {
             liquidity_pool_id: pool_id,
@@ -1442,7 +1441,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         let op = LiquidityPoolDepositOp {
             liquidity_pool_id: pool_id,
@@ -1534,7 +1533,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         let op = LiquidityPoolWithdrawOp {
             liquidity_pool_id: pool_id,
@@ -1623,7 +1622,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         let op = LiquidityPoolWithdrawOp {
             liquidity_pool_id: pool_id,
@@ -1723,7 +1722,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         // Try to withdraw 700 shares — more than available (600)
         let op = LiquidityPoolWithdrawOp {
@@ -1814,7 +1813,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         // Set min_price to 0.5 (1/2), but pool price is 0.1
         // Pool price is lower than min_price, so should fail
@@ -1908,7 +1907,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         // Withdraw with unreasonably high min_amount requirements
         let op = LiquidityPoolWithdrawOp {
@@ -2004,7 +2003,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         // Deposit 500 of each — raw balance (1000) >= 500,
         // but available (1000 - 900 = 100) < 500
@@ -2248,7 +2247,7 @@ mod tests {
         state.create_trustline(tl_a);
         state.create_trustline(tl_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         let op = LiquidityPoolDepositOp {
             liquidity_pool_id: pool_id,
@@ -2390,7 +2389,7 @@ mod tests {
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
         state.create_trustline(pool_share_tl);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         let op = LiquidityPoolDepositOp {
             liquidity_pool_id: pool_id,
@@ -2483,7 +2482,7 @@ mod tests {
             flags: TrustLineFlags::AuthorizedFlag as u32,
             ext: TrustLineEntryExt::V0,
         });
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         // Freeze source's trustline for asset_a via CAP-77
         let frozen_key = crate::frozen_keys::trustline_key(&source_id, &asset_a);
@@ -2583,7 +2582,7 @@ mod tests {
             flags: TrustLineFlags::AuthorizedFlag as u32,
             ext: TrustLineEntryExt::V0,
         });
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 3;
 
         // Freeze source's trustline for asset_b via CAP-77
         let frozen_key = crate::frozen_keys::trustline_key(&source_id, &asset_b);

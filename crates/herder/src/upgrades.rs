@@ -556,7 +556,7 @@ impl fmt::Display for Upgrades {
 /// against ledger state (existence, XDR validity, non-upgradeable entries).
 /// For full Config upgrade validation matching stellar-core's
 /// `isValidForApply`, use `ScpDriver::is_valid_upgrade_for_apply` which
-/// performs ledger state lookups via `LedgerManager::get_config_upgrade_set`.
+/// performs ledger state lookups via `LedgerManager::config_upgrade_set`.
 ///
 /// # Arguments
 ///

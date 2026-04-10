@@ -89,7 +89,7 @@ impl BucketMergeMap {
     }
 
     /// Gets the output hash for a merge if it was previously completed.
-    pub fn get_output(&self, merge_key: &MergeKey) -> Option<&Hash256> {
+    pub fn output(&self, merge_key: &MergeKey) -> Option<&Hash256> {
         self.merge_key_to_output.get(merge_key)
     }
 
@@ -99,7 +99,7 @@ impl BucketMergeMap {
     }
 
     /// Gets all outputs that used a given input bucket.
-    pub fn get_outputs_for_input(&self, input_hash: &Hash256) -> Option<&HashSet<Hash256>> {
+    pub fn outputs_for_input(&self, input_hash: &Hash256) -> Option<&HashSet<Hash256>> {
         self.input_to_output.get(input_hash)
     }
 
@@ -357,10 +357,10 @@ mod tests {
         map.record_merge(key.clone(), output);
         assert_eq!(map.len(), 1);
         assert!(map.has_output(&key));
-        assert_eq!(map.get_output(&key), Some(&output));
+        assert_eq!(map.output(&key), Some(&output));
 
         // Check input -> output mapping
-        let outputs = map.get_outputs_for_input(&make_hash(1)).unwrap();
+        let outputs = map.outputs_for_input(&make_hash(1)).unwrap();
         assert!(outputs.contains(&output));
     }
 

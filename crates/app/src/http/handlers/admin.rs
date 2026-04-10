@@ -66,7 +66,7 @@ pub(crate) async fn ll_handler(
                         level = %level_str,
                         "Log level updated for partition"
                     );
-                    let levels = log_handle.get_levels();
+                    let levels = log_handle.levels();
                     return (StatusCode::OK, Json(LlResponse { levels }));
                 }
                 Err(e) => {
@@ -79,7 +79,7 @@ pub(crate) async fn ll_handler(
             match log_handle.set_level(level_str) {
                 Ok(()) => {
                     tracing::info!(level = %level_str, "Global log level updated");
-                    let levels = log_handle.get_levels();
+                    let levels = log_handle.levels();
                     return (StatusCode::OK, Json(LlResponse { levels }));
                 }
                 Err(e) => {
@@ -92,7 +92,7 @@ pub(crate) async fn ll_handler(
     }
 
     // GET request: return current levels
-    let levels = log_handle.get_levels();
+    let levels = log_handle.levels();
     (StatusCode::OK, Json(LlResponse { levels }))
 }
 

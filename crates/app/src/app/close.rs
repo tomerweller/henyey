@@ -137,7 +137,7 @@ impl SyncRecoveryCallback for App {
         self.herder.is_tracking()
     }
 
-    fn get_v_blocking_slots(&self) -> Vec<henyey_scp::SlotIndex> {
+    fn v_blocking_slots(&self) -> Vec<henyey_scp::SlotIndex> {
         // Return slots where we've received v-blocking messages
         // For now, return the tracking slot range
         let tracking = self.herder.tracking_slot();
@@ -156,7 +156,7 @@ impl SyncRecoveryCallback for App {
     fn broadcast_latest_messages(&self, from_slot: henyey_scp::SlotIndex) {
         tracing::debug!(from_slot, "Broadcasting latest SCP messages");
         // Get and broadcast latest messages for the slot
-        if let Some(messages) = self.herder.get_latest_messages(from_slot) {
+        if let Some(messages) = self.herder.latest_messages(from_slot) {
             for envelope in messages {
                 let _ = self.scp_envelope_tx.try_send(envelope);
             }

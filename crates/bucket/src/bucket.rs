@@ -97,7 +97,7 @@ enum BucketStorage {
 /// # Entry Access
 ///
 /// - [`Bucket::get()`]: Look up a raw bucket entry by key
-/// - [`Bucket::get_entry()`]: Look up a ledger entry (returns None for dead entries)
+/// - [`Bucket::entry()`]: Look up a ledger entry (returns None for dead entries)
 /// - [`Bucket::iter()`]: Iterate over all entries
 /// - [`Bucket::entries()`]: Get entries as a slice (in-memory only, panics for disk-backed)
 #[derive(Clone)]
@@ -848,11 +848,7 @@ impl Bucket {
     ///
     /// This avoids redundant key serialization when the caller has already
     /// serialized the key (e.g., when searching multiple buckets in sequence).
-    pub fn get_by_key_bytes(
-        &self,
-        key: &LedgerKey,
-        key_bytes: &[u8],
-    ) -> Result<Option<BucketEntry>> {
+    pub fn by_key_bytes(&self, key: &LedgerKey, key_bytes: &[u8]) -> Result<Option<BucketEntry>> {
         match &self.storage {
             BucketStorage::InMemory { entries, key_index } => {
                 if let Some(&idx) = key_index.get(key) {
@@ -861,14 +857,12 @@ impl Bucket {
                     Ok(None)
                 }
             }
-            BucketStorage::DiskBacked { disk_bucket } => {
-                disk_bucket.get_by_key_bytes(key, key_bytes)
-            }
+            BucketStorage::DiskBacked { disk_bucket } => disk_bucket.by_key_bytes(key, key_bytes),
         }
     }
 
     /// Look up a ledger entry by key, returning None if dead or not found.
-    pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
+    pub fn entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         match self.get(key)? {
             Some(BucketEntry::Liveentry(entry)) | Some(BucketEntry::Initentry(entry)) => {
                 Ok(Some(entry))
@@ -920,7 +914,7 @@ impl Bucket {
     /// Get the in-memory entries for level 0 optimization.
     ///
     /// Returns None if entries are not cached in memory.
-    pub fn get_in_memory_entries(&self) -> Option<&[BucketEntry]> {
+    pub fn in_memory_entries(&self) -> Option<&[BucketEntry]> {
         match &self.level_zero_state {
             LevelZeroState::None => None,
             LevelZeroState::Separate(entries) => Some(entries.as_slice()),
@@ -1217,7 +1211,7 @@ mod tests {
             account_id: make_account_id([1u8; 32]),
         });
 
-        let entry = bucket.get_entry(&key).unwrap().unwrap();
+        let entry = bucket.entry(&key).unwrap().unwrap();
         if let LedgerEntryData::Account(account) = &entry.data {
             assert_eq!(account.balance, 100);
         } else {
@@ -1235,7 +1229,7 @@ mod tests {
         let bucket = Bucket::from_entries(entries).unwrap();
 
         // Looking up a dead entry should return None
-        let result = bucket.get_entry(&key).unwrap();
+        let result = bucket.entry(&key).unwrap();
         assert!(result.is_none());
 
         // But get() should return the dead entry

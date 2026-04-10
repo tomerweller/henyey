@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use henyey_tx::{
-    state::{get_account_seq_ledger, get_account_seq_time},
+    state::{account_seq_ledger, account_seq_time},
     validation::{self, LedgerContext as ValidationContext},
     TransactionFrame,
 };
@@ -97,7 +97,7 @@ impl TransactionExecutor {
             )));
         }
 
-        let fee_source_account = match self.state.get_account(&fee_source_id) {
+        let fee_source_account = match self.state.account(&fee_source_id) {
             Some(acc) => acc.clone(),
             None => {
                 return Ok(Err(if is_fee_bump {
@@ -113,7 +113,7 @@ impl TransactionExecutor {
                 }))
             }
         };
-        let source_account = match self.state.get_account(&inner_source_id) {
+        let source_account = match self.state.account(&inner_source_id) {
             Some(acc) => acc.clone(),
             None => {
                 return Ok(Err(pre_seq_fail(
@@ -292,7 +292,7 @@ impl TransactionExecutor {
         // Phase 5b: Min seq age/gap checks (stellar-core's isTooEarlyForAccount)
         if let Preconditions::V2(cond) = frame.preconditions() {
             if cond.min_seq_age.0 > 0 {
-                let acc_seq_time = get_account_seq_time(&source_account);
+                let acc_seq_time = account_seq_time(&source_account);
                 let min_seq_age = cond.min_seq_age.0;
                 if min_seq_age > self.close_time || self.close_time - min_seq_age < acc_seq_time {
                     return Ok(Err(post_seq_fail(
@@ -303,7 +303,7 @@ impl TransactionExecutor {
             }
 
             if cond.min_seq_ledger_gap > 0 {
-                let acc_seq_ledger = get_account_seq_ledger(&source_account);
+                let acc_seq_ledger = account_seq_ledger(&source_account);
                 let min_seq_ledger_gap = cond.min_seq_ledger_gap;
                 if min_seq_ledger_gap > self.ledger_seq
                     || self.ledger_seq - min_seq_ledger_gap < acc_seq_ledger

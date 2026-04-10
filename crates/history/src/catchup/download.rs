@@ -80,7 +80,7 @@ pub(super) async fn download_bucket_from_archives(
     hash: Hash256,
 ) -> std::result::Result<Vec<u8>, henyey_bucket::BucketError> {
     for archive in &archives {
-        match archive.get_bucket(&hash).await {
+        match archive.bucket(&hash).await {
             Ok(data) => return Ok(data),
             Err(e) => {
                 warn!("Failed to download bucket {} from archive: {}", hash, e);
@@ -111,7 +111,7 @@ impl CatchupManager {
         let num_archives = self.archives.len() as u32;
         for attempt in 0..num_archives {
             let archive = self.select_archive(attempt);
-            match archive.get_checkpoint_has(checkpoint_seq).await {
+            match archive.checkpoint_has(checkpoint_seq).await {
                 Ok(has) => return Ok(has),
                 Err(e) => {
                     warn!(
@@ -135,7 +135,7 @@ impl CatchupManager {
         checkpoint_seq: u32,
     ) -> Result<Vec<ScpHistoryEntry>> {
         for archive in &self.archives {
-            match archive.get_scp_history(checkpoint_seq).await {
+            match archive.scp_history(checkpoint_seq).await {
                 Ok(entries) => return Ok(entries),
                 Err(HistoryError::NotFound(_)) => {
                     debug!(
@@ -216,7 +216,7 @@ impl CatchupManager {
 
                     // Try each archive until one succeeds
                     for archive in &archives {
-                        match archive.get_bucket(&hash).await {
+                        match archive.bucket(&hash).await {
                             Ok(data) => {
                                 // Reject oversized buckets
                                 if data.len() as u64
@@ -423,9 +423,9 @@ impl CatchupManager {
         archive: &HistoryArchive,
         checkpoint: u32,
     ) -> Result<CheckpointLedgerData> {
-        let headers = archive.get_ledger_headers(checkpoint).await?;
-        let tx_entries = archive.get_transactions(checkpoint).await?;
-        let result_entries = archive.get_results(checkpoint).await?;
+        let headers = archive.ledger_headers(checkpoint).await?;
+        let tx_entries = archive.transactions(checkpoint).await?;
+        let result_entries = archive.results(checkpoint).await?;
         Ok(CheckpointLedgerData {
             headers,
             tx_entries,
@@ -442,7 +442,7 @@ impl CatchupManager {
         self.db
             .with_connection(|conn| {
                 use henyey_db::queries::StateQueries;
-                conn.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)
+                conn.state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)
             })
             .ok()
             .flatten()
@@ -489,7 +489,7 @@ impl CatchupManager {
         ledger_seq: u32,
     ) -> Result<(LedgerHeader, Hash256)> {
         for archive in &self.archives {
-            match archive.get_ledger_header_with_hash(ledger_seq).await {
+            match archive.ledger_header_with_hash(ledger_seq).await {
                 Ok((header, hash)) => {
                     debug!(
                         "Downloaded header for ledger {}: bucket_list_hash={}, ledger_seq={}, hash={}",

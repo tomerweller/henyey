@@ -209,7 +209,7 @@ impl PublishQueue {
     /// Get the HistoryArchiveState for a queued checkpoint.
     ///
     /// Returns `None` if the checkpoint is not in the queue.
-    pub fn get_state(&self, ledger_seq: u32) -> Result<Option<HistoryArchiveState>> {
+    pub fn state(&self, ledger_seq: u32) -> Result<Option<HistoryArchiveState>> {
         self.db
             .with_connection(|conn| {
                 let result: std::result::Result<String, _> = conn.query_row(
@@ -236,7 +236,7 @@ impl PublishQueue {
     /// Get all queued checkpoints in ascending ledger order.
     ///
     /// Returns a list of (ledger_seq, HistoryArchiveState) pairs.
-    pub fn get_all(&self) -> Result<Vec<(u32, HistoryArchiveState)>> {
+    pub fn all(&self) -> Result<Vec<(u32, HistoryArchiveState)>> {
         self.db
             .with_connection(|conn| {
                 let mut stmt = conn
@@ -266,8 +266,8 @@ impl PublishQueue {
     ///
     /// This is used to determine which buckets must be retained
     /// until all referencing checkpoints are published.
-    pub fn get_referenced_bucket_hashes(&self) -> Result<HashSet<String>> {
-        let checkpoints = self.get_all()?;
+    pub fn referenced_bucket_hashes(&self) -> Result<HashSet<String>> {
+        let checkpoints = self.all()?;
         let mut hashes = HashSet::new();
 
         for (_, has) in checkpoints {
@@ -330,7 +330,7 @@ impl PublishQueue {
     pub fn stats(&self) -> Result<PublishQueueStats> {
         let queue_length = self.len()?;
         let (min_ledger, max_ledger) = self.ledger_range()?;
-        let bucket_count = self.get_referenced_bucket_hashes()?.len();
+        let bucket_count = self.referenced_bucket_hashes()?.len();
 
         Ok(PublishQueueStats {
             queue_length,
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(queue.len().unwrap(), 3);
         assert_eq!(queue.ledger_range().unwrap(), (63, 191));
 
-        let all = queue.get_all().unwrap();
+        let all = queue.all().unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].0, 63);
         assert_eq!(all[1].0, 127);
@@ -425,11 +425,11 @@ mod tests {
         let has = create_test_has(63);
         queue.enqueue(63, &has).unwrap();
 
-        let loaded = queue.get_state(63).unwrap().unwrap();
+        let loaded = queue.state(63).unwrap().unwrap();
         assert_eq!(loaded.current_ledger, 63);
         assert_eq!(loaded.network_passphrase, Some("Test Network".to_string()));
 
-        assert!(queue.get_state(127).unwrap().is_none());
+        assert!(queue.state(127).unwrap().is_none());
     }
 
     #[test]
@@ -440,7 +440,7 @@ mod tests {
         queue.enqueue(63, &create_test_has(63)).unwrap();
         queue.enqueue(127, &create_test_has(127)).unwrap();
 
-        let buckets = queue.get_referenced_bucket_hashes().unwrap();
+        let buckets = queue.referenced_bucket_hashes().unwrap();
         assert_eq!(buckets.len(), 4); // 2 checkpoints × 2 buckets each
     }
 

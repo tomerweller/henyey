@@ -204,17 +204,17 @@ impl FlowControlCapacity {
         }
     }
 
-    fn get_msg_resource_count(&self, msg: &StellarMessage) -> u64 {
+    fn msg_resource_count(&self, msg: &StellarMessage) -> u64 {
         (self.resource_counter)(msg)
     }
 
     fn has_outbound_capacity(&self, msg: &StellarMessage) -> bool {
-        self.outbound_capacity >= self.get_msg_resource_count(msg)
+        self.outbound_capacity >= self.msg_resource_count(msg)
     }
 
     fn lock_outbound_capacity(&mut self, msg: &StellarMessage) {
         if is_flow_controlled_message(msg) {
-            let count = self.get_msg_resource_count(msg);
+            let count = self.msg_resource_count(msg);
             debug_assert!(self.outbound_capacity >= count);
             self.outbound_capacity = self.outbound_capacity.saturating_sub(count);
         }
@@ -224,7 +224,7 @@ impl FlowControlCapacity {
     ///
     /// Mirrors stellar-core's `FlowControlCapacity::canLockLocalCapacity`.
     fn can_lock_local_capacity(&self, msg: &StellarMessage) -> bool {
-        let msg_resources = self.get_msg_resource_count(msg);
+        let msg_resources = self.msg_resource_count(msg);
 
         if let Some(total) = self.capacity.total_capacity {
             if total < msg_resources {
@@ -251,7 +251,7 @@ impl FlowControlCapacity {
             "lock_local_capacity called without sufficient capacity"
         );
 
-        let msg_resources = self.get_msg_resource_count(msg);
+        let msg_resources = self.msg_resource_count(msg);
 
         if let Some(ref mut total) = self.capacity.total_capacity {
             *total -= msg_resources;
@@ -263,7 +263,7 @@ impl FlowControlCapacity {
     }
 
     fn release_local_capacity(&mut self, msg: &StellarMessage) -> u64 {
-        let resources_freed = self.get_msg_resource_count(msg);
+        let resources_freed = self.msg_resource_count(msg);
         let mut released_flood_capacity = 0;
 
         if let Some(ref mut total) = self.capacity.total_capacity {
@@ -286,7 +286,7 @@ impl FlowControlCapacity {
         self.capacity.total_capacity.map(|c| c > 0).unwrap_or(true)
     }
 
-    fn get_outbound_capacity(&self) -> u64 {
+    fn outbound_capacity(&self) -> u64 {
         self.outbound_capacity
     }
 
@@ -442,7 +442,7 @@ impl FlowControl {
     ) -> bool {
         match msg {
             StellarMessage::Transaction(_) => {
-                let bytes = state.byte_capacity.get_msg_resource_count(msg) as usize;
+                let bytes = state.byte_capacity.msg_resource_count(msg) as usize;
                 if bytes > tx_queue_byte_limit {
                     return false;
                 }
@@ -463,7 +463,7 @@ impl FlowControl {
     fn dequeue_message_resources(state: &mut FlowControlState, msg: &StellarMessage) {
         match msg {
             StellarMessage::Transaction(_) => {
-                let bytes = state.byte_capacity.get_msg_resource_count(msg) as usize;
+                let bytes = state.byte_capacity.msg_resource_count(msg) as usize;
                 state.tx_queue_byte_count = state.tx_queue_byte_count.saturating_sub(bytes);
             }
             StellarMessage::FloodDemand(demand) => {
@@ -713,7 +713,7 @@ impl FlowControl {
     ///
     /// Returns messages that we have capacity to send, marking them as being sent.
     /// The caller must call `process_sent_messages` after actually sending them.
-    pub fn get_next_batch_to_send(&self) -> Vec<QueuedOutboundMessage> {
+    pub fn next_batch_to_send(&self) -> Vec<QueuedOutboundMessage> {
         let mut state = self.state.lock().unwrap();
         let mut batch = Vec::new();
         let mut to_mark: Vec<(usize, usize, StellarMessage)> = Vec::new();
@@ -799,10 +799,10 @@ impl FlowControl {
         let state = self.state.lock().unwrap();
 
         // Check for overflow
-        let msg_overflow = (send_more.num_messages as u64)
-            > u64::MAX - state.message_capacity.get_outbound_capacity();
+        let msg_overflow =
+            (send_more.num_messages as u64) > u64::MAX - state.message_capacity.outbound_capacity();
         let byte_overflow =
-            (send_more.num_bytes as u64) > u64::MAX - state.byte_capacity.get_outbound_capacity();
+            (send_more.num_bytes as u64) > u64::MAX - state.byte_capacity.outbound_capacity();
 
         if msg_overflow || byte_overflow {
             return Err(OverlayError::InvalidMessage(
@@ -920,7 +920,7 @@ impl FlowControl {
     }
 
     /// Get statistics about this flow control instance.
-    pub fn get_stats(&self) -> FlowControlStats {
+    pub fn stats(&self) -> FlowControlStats {
         let state = self.state.lock().unwrap();
         FlowControlStats {
             local_flood_capacity: state.message_capacity.capacity.flood_capacity,
@@ -1128,7 +1128,7 @@ mod tests {
         // getFlowControlBytesTotal() = INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES (300,000),
         // matching the SEND_MORE_EXTENDED grant sent to peers.
         let fc = FlowControl::default();
-        let stats = fc.get_stats();
+        let stats = fc.stats();
         assert_eq!(
             stats.local_flood_bytes_capacity, 300_000,
             "initial byte capacity must match SEND_MORE_EXTENDED grant (300,000)"
@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn test_flow_control_creation() {
         let fc = FlowControl::default();
-        let stats = fc.get_stats();
+        let stats = fc.stats();
 
         assert_eq!(stats.local_flood_capacity, 200);
         assert_eq!(stats.local_total_capacity, Some(201));
@@ -1192,7 +1192,7 @@ mod tests {
         let fc = FlowControl::default();
 
         // Initially no outbound capacity
-        let stats = fc.get_stats();
+        let stats = fc.stats();
         assert_eq!(stats.peer_message_capacity, 0);
         assert_eq!(stats.peer_bytes_capacity, 0);
 
@@ -1203,7 +1203,7 @@ mod tests {
         });
         fc.maybe_release_capacity(&send_more);
 
-        let stats = fc.get_stats();
+        let stats = fc.stats();
         assert_eq!(stats.peer_message_capacity, 100);
         assert_eq!(stats.peer_bytes_capacity, 1_000_000);
     }
@@ -1277,11 +1277,11 @@ mod tests {
         fc.add_msg_and_maybe_trim_queue(tx.clone());
         fc.add_msg_and_maybe_trim_queue(tx.clone());
 
-        let stats = fc.get_stats();
+        let stats = fc.stats();
         assert_eq!(stats.tx_queue_size, 2);
 
         // Get batch
-        let batch = fc.get_next_batch_to_send();
+        let batch = fc.next_batch_to_send();
         assert_eq!(batch.len(), 2);
 
         // Process sent messages
@@ -1293,7 +1293,7 @@ mod tests {
         ];
         fc.process_sent_messages(&sent);
 
-        let stats = fc.get_stats();
+        let stats = fc.stats();
         assert_eq!(stats.tx_queue_size, 0);
     }
 
@@ -1340,7 +1340,7 @@ mod tests {
         }
 
         // Queue should have been trimmed
-        let stats = fc.get_stats();
+        let stats = fc.stats();
         assert!(stats.tx_queue_size <= 5 || stats.tx_queue_size == 0);
     }
 
@@ -1399,7 +1399,7 @@ mod tests {
         // This 4th message triggers trimming (queue > limit of 3)
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(100)); // current, should keep
 
-        let stats = fc.get_stats();
+        let stats = fc.stats();
         // Slot 10 and 80 should have been dropped (below min_slot=100, not checkpoint=50)
         // Slot 50 and 100 should remain
         // But slot 10 is below min AND not checkpoint — dropped
@@ -1425,7 +1425,7 @@ mod tests {
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(10)); // old
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(200)); // triggers trim
 
-        let stats = fc.get_stats();
+        let stats = fc.stats();
         // Slot 10 should be dropped, slot 50 (checkpoint) and 200 should remain
         assert_eq!(stats.scp_queue_size, 2);
     }
@@ -1443,7 +1443,7 @@ mod tests {
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(3));
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(4)); // triggers trim
 
-        let stats = fc.get_stats();
+        let stats = fc.stats();
         // FIFO trims to limit/2 = 1, then the new msg makes it 2
         // (the 4th message was already added before trimming happens)
         assert!(stats.scp_queue_size <= 3);
@@ -1536,14 +1536,14 @@ mod tests {
         let fc = Arc::new(FlowControl::default());
         let tx = make_tx_message();
 
-        let initial_stats = fc.get_stats();
+        let initial_stats = fc.stats();
 
         let guard = CapacityGuard::new(Arc::clone(&fc), tx.clone()).unwrap();
         let _cap = guard.finish(); // consumes guard, calls end once
 
         // After finish + implicit drop (no-op), capacity should match
         // one begin + one end cycle
-        let final_stats = fc.get_stats();
+        let final_stats = fc.stats();
         assert_eq!(
             initial_stats.local_flood_capacity, final_stats.local_flood_capacity,
             "capacity should be fully restored after finish"
@@ -1565,7 +1565,7 @@ mod tests {
         let fc = FlowControl::with_byte_capacity(config, 1);
         let tx = make_tx_message();
 
-        let before = fc.get_stats();
+        let before = fc.stats();
         assert!(
             before.local_flood_capacity > 0,
             "precondition: message flood capacity should be available"
@@ -1578,7 +1578,7 @@ mod tests {
             "should be rejected due to insufficient byte capacity"
         );
 
-        let after = fc.get_stats();
+        let after = fc.stats();
         assert_eq!(
             before.local_flood_capacity, after.local_flood_capacity,
             "AUDIT-H9: message flood capacity must not leak when byte capacity check fails"
@@ -1603,7 +1603,7 @@ mod tests {
         let fc = FlowControl::new(config);
         let tx = make_tx_message();
 
-        let before = fc.get_stats();
+        let before = fc.stats();
 
         // This should fail because flood_capacity (0) < 1 (message cost).
         let accepted = fc.begin_message_processing(&tx);
@@ -1612,7 +1612,7 @@ mod tests {
             "should be rejected due to insufficient message flood capacity"
         );
 
-        let after = fc.get_stats();
+        let after = fc.stats();
         assert_eq!(
             before.local_flood_bytes_capacity, after.local_flood_bytes_capacity,
             "AUDIT-H9: byte flood capacity must not leak when message capacity check fails"

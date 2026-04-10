@@ -76,7 +76,7 @@ fn add_liabilities(
 /// Compute the buying liabilities implied by an offer.
 ///
 /// Parity: TransactionUtils.cpp:908-923 `getOfferBuyingLiabilities`
-fn get_offer_buying_liabilities(offer: &OfferEntry) -> Result<i64> {
+fn offer_buying_liabilities(offer: &OfferEntry) -> Result<i64> {
     let res = exchange_v10_without_price_error_thresholds(
         offer.price.clone(),
         offer.amount,
@@ -97,7 +97,7 @@ fn get_offer_buying_liabilities(offer: &OfferEntry) -> Result<i64> {
 /// Compute the selling liabilities implied by an offer.
 ///
 /// Parity: TransactionUtils.cpp:932-947 `getOfferSellingLiabilities`
-fn get_offer_selling_liabilities(offer: &OfferEntry) -> Result<i64> {
+fn offer_selling_liabilities(offer: &OfferEntry) -> Result<i64> {
     let res = exchange_v10_without_price_error_thresholds(
         offer.price.clone(),
         offer.amount,
@@ -118,7 +118,7 @@ fn get_offer_selling_liabilities(offer: &OfferEntry) -> Result<i64> {
 /// Get the available balance for an asset excluding liabilities.
 ///
 /// Parity: Upgrades.cpp:732-758 `getAvailableBalanceExcludingLiabilities`
-fn get_available_balance_excluding_liabilities(
+fn available_balance_excluding_liabilities(
     account_id: &AccountId,
     asset: &Asset,
     balance_above_reserve: i64,
@@ -134,7 +134,7 @@ fn get_available_balance_excluding_liabilities(
 
     // Load the trustline to check authorization.
     let tl_key = make_trustline_key(account_id, asset);
-    if let Some(entry) = ltx.get_entry(&tl_key)? {
+    if let Some(entry) = ltx.entry(&tl_key)? {
         if let LedgerEntryData::Trustline(ref tl) = entry.data {
             if is_authorized_to_maintain_liabilities_tl(tl) {
                 return Ok(tl.balance);
@@ -147,7 +147,7 @@ fn get_available_balance_excluding_liabilities(
 /// Get the available limit for an asset excluding liabilities.
 ///
 /// Parity: Upgrades.cpp:761-791 `getAvailableLimitExcludingLiabilities`
-fn get_available_limit_excluding_liabilities(
+fn available_limit_excluding_liabilities(
     account_id: &AccountId,
     asset: &Asset,
     balance: i64,
@@ -162,7 +162,7 @@ fn get_available_limit_excluding_liabilities(
     }
 
     let tl_key = make_trustline_key(account_id, asset);
-    if let Some(entry) = ltx.get_entry(&tl_key)? {
+    if let Some(entry) = ltx.entry(&tl_key)? {
         if let LedgerEntryData::Trustline(ref tl) = entry.data {
             if is_authorized_to_maintain_liabilities_tl(tl) {
                 return Ok(tl.limit - tl.balance);
@@ -215,9 +215,7 @@ fn update_offer(
         &offer.selling,
         balance_above_reserve,
         initial_selling_liabilities,
-        |asset, eff_bal| {
-            get_available_balance_excluding_liabilities(&seller_id, asset, eff_bal, ltx)
-        },
+        |asset, eff_bal| available_balance_excluding_liabilities(&seller_id, asset, eff_bal, ltx),
     )?;
 
     // Check if buying side should cause deletion.
@@ -225,7 +223,7 @@ fn update_offer(
         &offer.buying,
         balance,
         initial_buying_liabilities,
-        |asset, eff_bal| get_available_limit_excluding_liabilities(&seller_id, asset, eff_bal, ltx),
+        |asset, eff_bal| available_limit_excluding_liabilities(&seller_id, asset, eff_bal, ltx),
     )?;
 
     let mut erase = erase_sell || erase_buy;
@@ -261,7 +259,7 @@ fn update_offer(
 
         // Accumulate new liabilities for surviving offers.
         if matches!(offer.buying, Asset::Native) || !is_issuer(&seller_id, &offer.buying) {
-            let buying_liab = get_offer_buying_liabilities(offer)?;
+            let buying_liab = offer_buying_liabilities(offer)?;
             let entry = liabilities
                 .entry(offer.buying.clone())
                 .or_insert(Liabilities {
@@ -274,7 +272,7 @@ fn update_offer(
         }
 
         if matches!(offer.selling, Asset::Native) || !is_issuer(&seller_id, &offer.selling) {
-            let selling_liab = get_offer_selling_liabilities(offer)?;
+            let selling_liab = offer_selling_liabilities(offer)?;
             let entry = liabilities
                 .entry(offer.selling.clone())
                 .or_insert(Liabilities {
@@ -366,7 +364,7 @@ fn update_sponsor_num_sponsoring(
 
     // Load the current version of the sponsor account through the CloseLedgerState
     // read path (current delta → base snapshot).
-    let entry = ltx.get_entry(&key)?.ok_or_else(|| {
+    let entry = ltx.entry(&key)?.ok_or_else(|| {
         LedgerError::Internal(format!("sponsor account not found: {:?}", sponsor_id))
     })?;
 
@@ -542,7 +540,7 @@ pub fn prepare_liabilities(
     let mut min_balance_map: HashMap<AccountId, i64> = HashMap::new();
     for account_id in offers_by_account.keys() {
         let account = ltx
-            .get_account(account_id)?
+            .account(account_id)?
             .ok_or_else(|| LedgerError::Internal("account does not exist".to_string()))?;
         let min_balance = reserves::minimum_balance(&account, base_reserve);
         min_balance_map.insert(account_id.clone(), min_balance);
@@ -559,13 +557,13 @@ pub fn prepare_liabilities(
                 &mut initial_buying_liabilities,
                 &offer.seller_id,
                 &offer.buying,
-                get_offer_buying_liabilities(offer)?,
+                offer_buying_liabilities(offer)?,
             );
             add_liabilities(
                 &mut initial_selling_liabilities,
                 &offer.seller_id,
                 &offer.selling,
-                get_offer_selling_liabilities(offer)?,
+                offer_selling_liabilities(offer)?,
             );
         }
 
@@ -576,7 +574,7 @@ pub fn prepare_liabilities(
             account_id: account_id.clone(),
         });
         let account_entry = ltx
-            .get_entry(&account_key)?
+            .entry(&account_key)?
             .ok_or_else(|| LedgerError::Internal("account does not exist".to_string()))?;
         let mut account_entry_current = account_entry.clone();
         let account_before = if let LedgerEntryData::Account(ref acc) = account_entry.data {
@@ -700,7 +698,7 @@ pub fn prepare_liabilities(
                 // Update trustline liabilities for non-native assets.
                 let tl_key = make_trustline_key(account_id, asset);
                 let tl_entry = ltx
-                    .get_entry(&tl_key)?
+                    .entry(&tl_key)?
                     .ok_or_else(|| LedgerError::Internal("trustline not found".to_string()))?;
 
                 let mut tl_entry_new = tl_entry.clone();

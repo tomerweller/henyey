@@ -1483,7 +1483,7 @@ mod tests {
         assert_eq!(merged.len(), 1);
 
         let key = make_account_key([1u8; 32]);
-        let entry = merged.get_entry(&key).unwrap().unwrap();
+        let entry = merged.entry(&key).unwrap().unwrap();
         if let LedgerEntryData::Account(account) = &entry.data {
             assert_eq!(account.balance, 200);
         }
@@ -1687,7 +1687,7 @@ mod tests {
 
         // Check that entry 1 has the updated value
         let key1 = make_account_key([1u8; 32]);
-        let entry1 = merged.get_entry(&key1).unwrap().unwrap();
+        let entry1 = merged.entry(&key1).unwrap().unwrap();
         if let LedgerEntryData::Account(account) = &entry1.data {
             assert_eq!(account.balance, 150);
         } else {
@@ -2161,7 +2161,7 @@ mod tests {
             .finished_merges()
             .read()
             .unwrap()
-            .get_output(&merge_key)
+            .output(&merge_key)
             .copied();
         assert_eq!(output, Some(result_hash));
     }
@@ -2197,7 +2197,7 @@ mod tests {
             .finished_merges()
             .read()
             .unwrap()
-            .get_output(&merge_key)
+            .output(&merge_key)
             .copied();
         assert_eq!(output, None);
     }

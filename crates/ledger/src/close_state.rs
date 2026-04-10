@@ -86,21 +86,21 @@ impl CloseLedgerState {
     /// The primary way to read ledger entries during close.
     ///
     /// Resolves: current delta → base snapshot.
-    pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
+    pub fn entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         // 1. Check current delta
-        if let Some(change) = self.current.get_change(key) {
+        if let Some(change) = self.current.change(key) {
             return Ok(change.current_entry().cloned());
         }
         // 2. Fall back to base snapshot
-        self.snapshot.get_entry(key)
+        self.snapshot.entry(key)
     }
 
     /// Load an account by ID.
-    pub fn get_account(&self, account_id: &AccountId) -> Result<Option<AccountEntry>> {
+    pub fn account(&self, account_id: &AccountId) -> Result<Option<AccountEntry>> {
         let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
-        match self.get_entry(&key)? {
+        match self.entry(&key)? {
             Some(entry) => {
                 if let LedgerEntryData::Account(acc) = entry.data {
                     Ok(Some(acc))
@@ -309,8 +309,8 @@ impl CloseLedgerState {
 }
 
 impl crate::EntryReader for CloseLedgerState {
-    fn get_entry(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
-        CloseLedgerState::get_entry(self, key)
+    fn entry(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
+        CloseLedgerState::entry(self, key)
     }
 }
 
@@ -400,14 +400,14 @@ mod tests {
 
         // Initially empty
         let key = make_account_key(1);
-        assert!(state.get_entry(&key).unwrap().is_none());
+        assert!(state.entry(&key).unwrap().is_none());
 
         // Create an entry
         let entry = make_test_account_entry(1, 1000, 101);
         state.record_create(entry.clone()).unwrap();
 
         // Now visible
-        let loaded = state.get_entry(&key).unwrap().unwrap();
+        let loaded = state.entry(&key).unwrap().unwrap();
         assert_eq!(loaded, entry);
     }
 
@@ -423,7 +423,7 @@ mod tests {
         let state = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
         let key = make_account_key(1);
-        let loaded = state.get_entry(&key).unwrap().unwrap();
+        let loaded = state.entry(&key).unwrap().unwrap();
         assert_eq!(loaded, entry);
     }
 
@@ -444,7 +444,7 @@ mod tests {
         state.record_update(old_entry, new_entry.clone()).unwrap();
 
         let key = make_account_key(1);
-        let loaded = state.get_entry(&key).unwrap().unwrap();
+        let loaded = state.entry(&key).unwrap().unwrap();
         assert_eq!(loaded, new_entry);
     }
 

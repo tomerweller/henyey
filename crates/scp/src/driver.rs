@@ -106,7 +106,7 @@ pub enum ValidationLevel {
 ///
 /// - **Validation**: [`validate_value`](Self::validate_value), [`extract_valid_value`](Self::extract_valid_value)
 /// - **Value Composition**: [`combine_candidates`](Self::combine_candidates)
-/// - **Quorum Set Lookup**: [`get_quorum_set`](Self::get_quorum_set), [`get_quorum_set_by_hash`](Self::get_quorum_set_by_hash)
+/// - **Quorum Set Lookup**: [`quorum_set`](Self::quorum_set), [`quorum_set_by_hash`](Self::quorum_set_by_hash)
 /// - **Cryptography**: [`sign_envelope`](Self::sign_envelope), [`verify_envelope`](Self::verify_envelope), [`hash_quorum_set`](Self::hash_quorum_set)
 /// - **Hash Computation**: [`compute_hash_node`](Self::compute_hash_node), [`compute_value_hash`](Self::compute_value_hash)
 /// - **Network**: [`emit_envelope`](Self::emit_envelope)
@@ -163,7 +163,7 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// # Returns
     /// The quorum set, or None if unknown.
-    fn get_quorum_set(&self, node_id: &NodeId) -> Option<ScpQuorumSet>;
+    fn quorum_set(&self, node_id: &NodeId) -> Option<ScpQuorumSet>;
 
     /// Get a quorum set by its hash.
     ///
@@ -172,7 +172,7 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// # Returns
     /// The quorum set, or None if unknown.
-    fn get_quorum_set_by_hash(&self, _hash: &Hash256) -> Option<ScpQuorumSet> {
+    fn quorum_set_by_hash(&self, _hash: &Hash256) -> Option<ScpQuorumSet> {
         None
     }
 
@@ -276,12 +276,7 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// # Returns
     /// Weight as a u64 between 0 and `u64::MAX`.
-    fn get_node_weight(
-        &self,
-        node_id: &NodeId,
-        quorum_set: &ScpQuorumSet,
-        is_local_node: bool,
-    ) -> u64 {
+    fn node_weight(&self, node_id: &NodeId, quorum_set: &ScpQuorumSet, is_local_node: bool) -> u64 {
         base_get_node_weight(node_id, quorum_set, is_local_node)
     }
 
@@ -289,7 +284,7 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// Used for logging and debugging. The default implementation
     /// returns a hex-encoded prefix of the value.
-    fn get_value_string(&self, value: &Value) -> String {
+    fn value_string(&self, value: &Value) -> String {
         let bytes = value.as_slice();
         hex::encode(&bytes[..8.min(bytes.len())])
     }
@@ -298,7 +293,7 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// This is used for various internal hashing needs.
     /// The default implementation uses SHA-256.
-    fn get_hash_of(&self, data: &[u8]) -> Hash256 {
+    fn hash_of(&self, data: &[u8]) -> Hash256 {
         Hash256::hash(data)
     }
 
@@ -395,7 +390,7 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// # Default Implementation
     /// Returns `u32::MAX` (effectively never strip).
-    fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
+    fn upgrade_nomination_timeout_limit(&self) -> u32 {
         u32::MAX
     }
 }
@@ -417,7 +412,7 @@ pub(crate) fn compute_weight(m: u64, total: u64, threshold: u64) -> u64 {
     numerator.div_ceil(denominator) as u64
 }
 
-/// Base implementation of `get_node_weight`, matching upstream `SCPDriver::getNodeWeight`.
+/// Base implementation of `node_weight`, matching upstream `SCPDriver::getNodeWeight`.
 ///
 /// - If `is_local_node` is true, returns `u64::MAX`.
 /// - Searches validators at each level; if found, applies `compute_weight`.

@@ -9,7 +9,7 @@ use super::*;
 pub(super) use henyey_common::asset::non_native_asset_to_trustline_asset as asset_to_trustline_asset;
 
 pub(super) fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
-    henyey_common::asset::get_issuer(asset).ok().cloned()
+    henyey_common::asset::issuer(asset).ok().cloned()
 }
 
 pub(super) fn make_account_key(account_id: &AccountId) -> LedgerKey {
@@ -262,13 +262,13 @@ pub(super) fn emit_classic_events_for_operation(
         OperationBody::AllowTrust(op_data) => {
             let issuer = henyey_tx::muxed_to_account_id(op_source);
             let asset = allow_trust_asset(op_data, &issuer);
-            if let Some(trustline) = state.get_trustline(&op_data.trustor, &asset) {
+            if let Some(trustline) = state.trustline(&op_data.trustor, &asset) {
                 let authorize = trustline.flags & AUTHORIZED_FLAG != 0;
                 op_event_manager.new_set_authorized_event(&asset, &op_data.trustor, authorize);
             }
         }
         OperationBody::SetTrustLineFlags(op_data) => {
-            if let Some(trustline) = state.get_trustline(&op_data.trustor, &op_data.asset) {
+            if let Some(trustline) = state.trustline(&op_data.trustor, &op_data.asset) {
                 let authorize = trustline.flags & AUTHORIZED_FLAG != 0;
                 op_event_manager.new_set_authorized_event(
                     &op_data.asset,
@@ -282,7 +282,7 @@ pub(super) fn emit_classic_events_for_operation(
                 Some(values) => values,
                 None => return,
             };
-            let Some(post_pool) = state.get_liquidity_pool(&op_data.liquidity_pool_id) else {
+            let Some(post_pool) = state.liquidity_pool(&op_data.liquidity_pool_id) else {
                 return;
             };
             let Some((_, _, post_a, post_b)) = pool_reserves(post_pool) else {
@@ -314,7 +314,7 @@ pub(super) fn emit_classic_events_for_operation(
                 Some(values) => values,
                 None => return,
             };
-            let Some(post_pool) = state.get_liquidity_pool(&op_data.liquidity_pool_id) else {
+            let Some(post_pool) = state.liquidity_pool(&op_data.liquidity_pool_id) else {
                 return;
             };
             let Some((_, _, post_a, post_b)) = pool_reserves(post_pool) else {
@@ -578,7 +578,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                     // Sort by (associated_key_hash, type_order) where TTL comes before its data.
                     use sha2::{Digest, Sha256};
 
-                    fn get_associated_hash_and_type(entry: &LedgerEntry) -> (Vec<u8>, u8) {
+                    fn associated_hash_and_type(entry: &LedgerEntry) -> (Vec<u8>, u8) {
                         match &entry.data {
                             stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
                                 // TTL: associated_hash is key_hash, type_order=0 (first)
@@ -600,7 +600,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
 
                     let mut entries_with_sort: Vec<(usize, (Vec<u8>, u8))> = indices
                         .into_iter()
-                        .map(|idx| (idx, get_associated_hash_and_type(&created[idx])))
+                        .map(|idx| (idx, associated_hash_and_type(&created[idx])))
                         .collect();
 
                     // Sort by associated_hash (groups TTL with its data), then type_order (TTL=0 first)

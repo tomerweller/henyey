@@ -378,24 +378,22 @@ impl TransactionExecutor {
                 let op_source = henyey_tx::muxed_to_account_id(&op_source_muxed);
 
                 let pre_claimable_balance = match &op.body {
-                    OperationBody::ClaimClaimableBalance(op_data) => self
-                        .state
-                        .get_claimable_balance(&op_data.balance_id)
-                        .cloned(),
-                    OperationBody::ClawbackClaimableBalance(op_data) => self
-                        .state
-                        .get_claimable_balance(&op_data.balance_id)
-                        .cloned(),
+                    OperationBody::ClaimClaimableBalance(op_data) => {
+                        self.state.claimable_balance(&op_data.balance_id).cloned()
+                    }
+                    OperationBody::ClawbackClaimableBalance(op_data) => {
+                        self.state.claimable_balance(&op_data.balance_id).cloned()
+                    }
                     _ => None,
                 };
                 let pre_pool = match &op.body {
                     OperationBody::LiquidityPoolDeposit(op_data) => self
                         .state
-                        .get_liquidity_pool(&op_data.liquidity_pool_id)
+                        .liquidity_pool(&op_data.liquidity_pool_id)
                         .cloned(),
                     OperationBody::LiquidityPoolWithdraw(op_data) => self
                         .state
-                        .get_liquidity_pool(&op_data.liquidity_pool_id)
+                        .liquidity_pool(&op_data.liquidity_pool_id)
                         .cloned(),
                     _ => None,
                 };
@@ -777,7 +775,7 @@ impl TransactionExecutor {
         let snapshot_for_loader = snapshot.clone();
         self.state.set_entry_loader(std::sync::Arc::new(move |key| {
             snapshot_for_loader
-                .get_entry(key)
+                .entry(key)
                 .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
         }));
 

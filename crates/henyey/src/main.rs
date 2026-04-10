@@ -2100,15 +2100,12 @@ fn cmd_offline_info(config: AppConfig) -> anyhow::Result<()> {
     let db = henyey_db::Database::open(db_path)?;
 
     // Get last closed ledger sequence
-    let lcl_seq = db.with_connection(|conn| conn.get_last_closed_ledger())?;
+    let lcl_seq = db.with_connection(|conn| conn.last_closed_ledger())?;
 
     let (num, hash, close_time, version, base_fee, base_reserve, max_tx_set_size, flags) =
         if let Some(seq) = lcl_seq {
-            if let Some(header) = db.get_ledger_header(seq)? {
-                let hash = db
-                    .get_ledger_hash(seq)?
-                    .map(|h| h.to_hex())
-                    .unwrap_or_default();
+            if let Some(header) = db.ledger_header(seq)? {
+                let hash = db.ledger_hash(seq)?.map(|h| h.to_hex()).unwrap_or_default();
                 let flags = match &header.ext {
                     LedgerHeaderExt::V1(ext) => ext.flags as i64,
                     LedgerHeaderExt::V0 => 0i64,
@@ -2248,7 +2245,7 @@ async fn cmd_verify_history(
 
     // Get the range to verify
     let archive = &archives[0];
-    let root_has = archive.get_root_has().await?;
+    let root_has = archive.root_has().await?;
     let current_ledger = root_has.current_ledger;
 
     let start = from.unwrap_or(1);
@@ -2268,7 +2265,7 @@ async fn cmd_verify_history(
     let mut checkpoint = start_checkpoint;
     while checkpoint <= end_checkpoint {
         // Get checkpoint HAS (History Archive State)
-        match archive.get_checkpoint_has(checkpoint).await {
+        match archive.checkpoint_has(checkpoint).await {
             Ok(has) => {
                 // Verify the HAS structure
                 match verify::verify_has_structure(&has) {
@@ -2295,7 +2292,7 @@ async fn cmd_verify_history(
                 }
 
                 // Get and verify ledger headers for this checkpoint range
-                match archive.get_ledger_headers(checkpoint).await {
+                match archive.ledger_headers(checkpoint).await {
                     Ok(history_entries) => {
                         // Extract LedgerHeader from LedgerHeaderHistoryEntry
                         let headers: Vec<stellar_xdr::curr::LedgerHeader> = history_entries
@@ -2307,8 +2304,8 @@ async fn cmd_verify_history(
                             error_count += 1;
                         }
 
-                        match archive.get_transactions(checkpoint).await {
-                            Ok(tx_entries) => match archive.get_results(checkpoint).await {
+                        match archive.transactions(checkpoint).await {
+                            Ok(tx_entries) => match archive.results(checkpoint).await {
                                 Ok(tx_results) => {
                                     let tx_map = tx_entries
                                         .iter()
@@ -2386,7 +2383,7 @@ async fn cmd_verify_history(
                     }
                 }
 
-                match archive.get_scp_history(checkpoint).await {
+                match archive.scp_history(checkpoint).await {
                     Ok(entries) => {
                         if let Err(e) = verify::verify_scp_history_entries(&entries) {
                             println!("    SCP history verification FAILED: {}", e);
@@ -2503,7 +2500,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
 
     // Get current ledger from database
     let current_ledger = db
-        .get_latest_ledger_seq()?
+        .latest_ledger_seq()?
         .ok_or_else(|| anyhow::anyhow!("No ledger data in database. Run the node first."))?;
 
     println!("Current ledger in database: {}", current_ledger);
@@ -2603,7 +2600,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
 
         for seq in start_ledger..=checkpoint {
             let header = db
-                .get_ledger_header(seq)?
+                .ledger_header(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header {}", seq))?;
             let hash = compute_header_hash(&header)?;
             headers.push(stellar_xdr::curr::LedgerHeaderHistoryEntry {
@@ -2613,12 +2610,12 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             });
 
             let tx_entry = db
-                .get_tx_history_entry(seq)?
+                .tx_history_entry(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx history entry {}", seq))?;
             tx_entries.push(tx_entry);
 
             let tx_result = db
-                .get_tx_result_entry(seq)?
+                .tx_result_entry(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx result entry {}", seq))?;
             tx_results.push(tx_result);
         }
@@ -3050,7 +3047,7 @@ async fn download_buckets_parallel(
                 let downloaded = &downloaded;
                 let bm = &bucket_manager;
                 async move {
-                    let bucket_data = archive.get_bucket(hash).await.map_err(|e| {
+                    let bucket_data = archive.bucket(hash).await.map_err(|e| {
                         anyhow::anyhow!("Failed to download bucket {}: {}", hash.to_hex(), e)
                     })?;
                     bm.import_bucket(&bucket_data).map_err(|e| {
@@ -3649,7 +3646,7 @@ async fn cmd_verify_execution(
     }
 
     // Get current ledger and calculate range
-    let root_has = archive.get_root_has().await?;
+    let root_has = archive.root_has().await?;
     let current_ledger = root_has.current_ledger;
 
     let end_ledger = to.unwrap_or_else(|| {
@@ -3706,7 +3703,7 @@ async fn cmd_verify_execution(
             init_checkpoint
         );
     }
-    let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
+    let init_has = archive.checkpoint_has(init_checkpoint).await?;
 
     // Extract bucket hashes
     let bucket_hashes = init_has.bucket_hash_pairs();
@@ -3775,7 +3772,7 @@ async fn cmd_verify_execution(
     };
 
     // Get init header and restart merges
-    let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
+    let init_headers = archive.ledger_headers(init_checkpoint).await?;
     let init_header_entry = init_headers
         .iter()
         .find(|h| h.header.ledger_seq == init_checkpoint);
@@ -3878,7 +3875,7 @@ async fn cmd_verify_execution(
 
     let mut current_cp = process_from_cp;
     while current_cp <= end_checkpoint {
-        let headers = archive.get_ledger_headers(current_cp).await?;
+        let headers = archive.ledger_headers(current_cp).await?;
 
         for header_entry in &headers {
             let header = &header_entry.header;
@@ -3895,7 +3892,7 @@ async fn cmd_verify_execution(
             let in_test_range = seq >= start_ledger && seq <= end_ledger;
 
             // Fetch CDP metadata
-            let lcm = match cdp.get_ledger_close_meta(seq).await {
+            let lcm = match cdp.ledger_close_meta(seq).await {
                 Ok(lcm) => lcm,
                 Err(e) => {
                     if in_test_range {
@@ -4380,7 +4377,7 @@ async fn cmd_verify_execution(
                                             {
                                                 let offer_store = ledger_manager.offer_store_lock();
                                                 if let Some(our_entry) = offer_store
-                                                    .get_ledger_entry_by_id(cdp_offer.offer_id)
+                                                    .ledger_entry_by_id(cdp_offer.offer_id)
                                                     .as_ref()
                                                 {
                                                     let our_xdr = our_entry
@@ -4676,7 +4673,7 @@ async fn cmd_debug_bucket_entry(
     println!("Archive: {}", config.history.archives[0].url);
 
     // Get bucket list hashes at this checkpoint
-    let has_entry = archive.get_checkpoint_has(checkpoint_seq).await?;
+    let has_entry = archive.checkpoint_has(checkpoint_seq).await?;
     let bucket_hashes: Vec<Hash256> = has_entry
         .bucket_hash_pairs()
         .into_iter()
@@ -4889,7 +4886,7 @@ async fn cmd_dump_ledger(
 
     // Get current ledger
     let current_ledger = db
-        .get_latest_ledger_seq()?
+        .latest_ledger_seq()?
         .ok_or_else(|| anyhow::anyhow!("No ledger data in database. Run catchup first."))?;
 
     println!("Current ledger: {}", current_ledger);
@@ -4998,7 +4995,7 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
     println!("Self-check phase 1: header chain verification");
     let db = henyey_db::Database::open(&config.database.path)?;
 
-    let Some(latest_seq) = db.get_latest_ledger_seq()? else {
+    let Some(latest_seq) = db.latest_ledger_seq()? else {
         println!("  No ledger data in database. Skipping header verification.");
         println!();
         return Ok(());
@@ -5014,11 +5011,11 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
 
         while current_seq > 0 && verified < depth {
             let current = db
-                .get_ledger_header(current_seq)?
+                .ledger_header(current_seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", current_seq))?;
             let prev_seq = current_seq - 1;
             let prev = db
-                .get_ledger_header(prev_seq)?
+                .ledger_header(prev_seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", prev_seq))?;
 
             let prev_hash = henyey_ledger::compute_header_hash(&prev)?;
@@ -5173,7 +5170,7 @@ async fn cmd_verify_checkpoints(
     println!("Using {} archive(s)", archives.len());
 
     let archive = &archives[0];
-    let root_has = archive.get_root_has().await?;
+    let root_has = archive.root_has().await?;
     let current_ledger = root_has.current_ledger;
 
     let start = from.unwrap_or(63); // First checkpoint
@@ -5198,7 +5195,7 @@ async fn cmd_verify_checkpoints(
         std::io::stdout().flush()?;
 
         // Download headers for this checkpoint
-        match archive.get_ledger_headers(current_checkpoint).await {
+        match archive.ledger_headers(current_checkpoint).await {
             Ok(history_entries) => {
                 if history_entries.is_empty() {
                     println!("FAIL (no headers)");
@@ -5423,15 +5420,15 @@ mod tests {
 
         // Verify LCL is set to 1
         db.with_connection(|conn| {
-            let lcl = conn.get_last_closed_ledger().unwrap();
+            let lcl = conn.last_closed_ledger().unwrap();
             assert_eq!(lcl, Some(1));
 
             // Verify network passphrase is stored
-            let stored_passphrase = conn.get_state(state_keys::NETWORK_PASSPHRASE).unwrap();
+            let stored_passphrase = conn.state(state_keys::NETWORK_PASSPHRASE).unwrap();
             assert_eq!(stored_passphrase.as_deref(), Some(passphrase));
 
             // Verify HAS is stored
-            let has_json = conn.get_state(state_keys::HISTORY_ARCHIVE_STATE).unwrap();
+            let has_json = conn.state(state_keys::HISTORY_ARCHIVE_STATE).unwrap();
             assert!(has_json.is_some());
             let has_str = has_json.unwrap();
             assert!(
@@ -5493,7 +5490,7 @@ mod tests {
 
         // Verify LCL is set and header is stored
         db.with_connection(|conn| {
-            let lcl = conn.get_last_closed_ledger().unwrap();
+            let lcl = conn.last_closed_ledger().unwrap();
             assert_eq!(lcl, Some(1));
 
             // Verify header still has full total_coins
@@ -5679,7 +5676,7 @@ mod tests {
         // Verify genesis ledger was still created correctly
         db.with_connection(|conn| {
             use henyey_db::queries::StateQueries;
-            let lcl = conn.get_last_closed_ledger().unwrap();
+            let lcl = conn.last_closed_ledger().unwrap();
             assert_eq!(lcl, Some(1));
             Ok(())
         })

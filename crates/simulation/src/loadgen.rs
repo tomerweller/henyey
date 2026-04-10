@@ -542,7 +542,7 @@ impl TxGenerator {
     }
 
     /// Access a cached account by ID.
-    pub fn get_account(&self, id: u64) -> Option<&TestAccount> {
+    pub fn account(&self, id: u64) -> Option<&TestAccount> {
         self.accounts.get(&id)
     }
 
@@ -977,7 +977,7 @@ impl LoadGenerator {
             }
 
             // Compute how many txs we should have submitted by now
-            let txs_this_step = self.get_tx_per_step(config);
+            let txs_this_step = self.tx_per_step(config);
 
             // Cleanup accounts once per second
             let elapsed_secs = self.start_time.map(|t| t.elapsed().as_secs()).unwrap_or(0);
@@ -994,7 +994,7 @@ impl LoadGenerator {
                     break;
                 }
 
-                let source_id = match self.get_next_available_account(ledger_num) {
+                let source_id = match self.next_available_account(ledger_num) {
                     Some(id) => id,
                     None => {
                         debug!("No available accounts, waiting for cleanup");
@@ -1022,7 +1022,7 @@ impl LoadGenerator {
     /// Matches stellar-core `LoadGenerator::getTxPerStep()`.
     /// Includes spike interval logic: every `spike_interval` seconds, an
     /// additional `spike_size` transactions are added to the target.
-    fn get_tx_per_step(&self, config: &GeneratedLoadConfig) -> i64 {
+    fn tx_per_step(&self, config: &GeneratedLoadConfig) -> i64 {
         let Some(start) = self.start_time else {
             return 0;
         };
@@ -1044,7 +1044,7 @@ impl LoadGenerator {
     /// has no pending transactions in the herder queue.
     ///
     /// Matches stellar-core `LoadGenerator::getNextAvailableAccount()`.
-    fn get_next_available_account(&mut self, ledger_num: u32) -> Option<u64> {
+    fn next_available_account(&mut self, ledger_num: u32) -> Option<u64> {
         // Try up to `available.len()` times to find a non-pending account
         let max_attempts = self.accounts_available.len();
         for _ in 0..max_attempts {
@@ -1086,7 +1086,7 @@ impl LoadGenerator {
     pub fn cleanup_accounts(&mut self) {
         let mut to_return = Vec::new();
         for &id in &self.accounts_in_use {
-            if let Some(account) = self.tx_generator.get_account(id) {
+            if let Some(account) = self.tx_generator.account(id) {
                 if !self
                     .tx_generator
                     .app
@@ -1232,7 +1232,7 @@ impl LoadGenerator {
                         // Compute the contract ID and store the instance key
                         let source_account = self
                             .tx_generator
-                            .get_account(source_account_id)
+                            .account(source_account_id)
                             .expect("source account must exist");
                         let source_pk = source_account.account_id.clone();
                         let preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {

@@ -173,7 +173,7 @@ fn validate_footprint_entry(
 
     // Check if entry is live (has non-expired TTL)
     let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
-    let is_live = match state.get_ttl(&key_hash) {
+    let is_live = match state.ttl(&key_hash) {
         Some(ttl) => ttl.live_until_ledger_seq >= current_ledger,
         None => false,
     };
@@ -186,14 +186,14 @@ fn validate_footprint_entry(
     // Get entry and compute XDR size
     let entry: Option<LedgerEntry> = match key {
         LedgerKey::ContractData(cd_key) => state
-            .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+            .contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
             .map(|cd| LedgerEntry {
                 last_modified_ledger_seq: 0, // doesn't affect size
                 data: stellar_xdr::curr::LedgerEntryData::ContractData(cd.clone()),
                 ext: stellar_xdr::curr::LedgerEntryExt::V0,
             }),
         LedgerKey::ContractCode(cc_key) => {
-            state.get_contract_code(&cc_key.hash).map(|cc| LedgerEntry {
+            state.contract_code(&cc_key.hash).map(|cc| LedgerEntry {
                 last_modified_ledger_seq: 0,
                 data: stellar_xdr::curr::LedgerEntryData::ContractCode(cc.clone()),
                 ext: stellar_xdr::curr::LedgerEntryExt::V0,
@@ -543,14 +543,14 @@ fn disk_read_bytes_exceeded(
         let entry: Option<LedgerEntry> = if is_soroban_key(key) {
             match key {
                 LedgerKey::ContractData(cd_key) => state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                    .contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                     .map(|cd| LedgerEntry {
                         last_modified_ledger_seq: current_ledger,
                         data: stellar_xdr::curr::LedgerEntryData::ContractData(cd.clone()),
                         ext: stellar_xdr::curr::LedgerEntryExt::V0,
                     }),
                 LedgerKey::ContractCode(cc_key) => {
-                    state.get_contract_code(&cc_key.hash).map(|cc| LedgerEntry {
+                    state.contract_code(&cc_key.hash).map(|cc| LedgerEntry {
                         last_modified_ledger_seq: current_ledger,
                         data: stellar_xdr::curr::LedgerEntryData::ContractCode(cc.clone()),
                         ext: stellar_xdr::curr::LedgerEntryExt::V0,
@@ -559,7 +559,7 @@ fn disk_read_bytes_exceeded(
                 _ => None,
             }
         } else {
-            state.get_entry(key)
+            state.entry(key)
         };
 
         if let Some(entry) = entry {
@@ -627,7 +627,7 @@ fn disk_read_bytes_exceeded(
                     // restored the entry, its TTL is now live, and stellar-core treats
                     // it as an in-memory soroban entry (no disk read metering).
                     let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
-                    let is_still_archived = match state.get_ttl(&key_hash) {
+                    let is_still_archived = match state.ttl(&key_hash) {
                         Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
                         None => true, // No TTL = not in live state = archived
                     };
@@ -857,7 +857,7 @@ fn apply_soroban_storage_changes(
         match key {
             LedgerKey::ContractData(cd_key) => {
                 if state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                    .contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                     .is_some()
                 {
                     state.delete_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability);
@@ -867,7 +867,7 @@ fn apply_soroban_storage_changes(
                 }
             }
             LedgerKey::ContractCode(cc_key) => {
-                if state.get_contract_code(&cc_key.hash).is_some() {
+                if state.contract_code(&cc_key.hash).is_some() {
                     state.delete_contract_code(&cc_key.hash);
                     // Also delete the associated TTL entry
                     let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
@@ -932,7 +932,7 @@ fn apply_soroban_storage_change(
         match &entry.data {
             stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
                 let exists = state
-                    .get_contract_data(&cd.contract, &cd.key, cd.durability)
+                    .contract_data(&cd.contract, &cd.key, cd.durability)
                     .is_some();
                 let already_in_delta = is_hot_archive_restore
                     && key_already_created_in_delta(state.delta(), &change.key);
@@ -944,7 +944,7 @@ fn apply_soroban_storage_change(
                 }
             }
             stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
-                let exists = state.get_contract_code(&cc.hash).is_some();
+                let exists = state.contract_code(&cc.hash).is_some();
                 let already_in_delta = is_hot_archive_restore
                     && key_already_created_in_delta(state.delta(), &change.key);
                 if should_create_contract_entry(exists, is_hot_archive_restore, already_in_delta) {
@@ -955,7 +955,7 @@ fn apply_soroban_storage_change(
                 }
             }
             stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
-                let exists = state.get_ttl(&ttl.key_hash).is_some();
+                let exists = state.ttl(&ttl.key_hash).is_some();
                 tracing::debug!(
                     key_hash = ?ttl.key_hash,
                     live_until = ttl.live_until_ledger_seq,
@@ -967,7 +967,7 @@ fn apply_soroban_storage_change(
             }
             // SAC (Stellar Asset Contract) can modify Account and Trustline entries
             stellar_xdr::curr::LedgerEntryData::Account(acc) => {
-                if state.get_account(&acc.account_id).is_some() {
+                if state.account(&acc.account_id).is_some() {
                     state.update_account(acc.clone());
                 } else {
                     state.create_account(acc.clone());
@@ -976,7 +976,7 @@ fn apply_soroban_storage_change(
             }
             stellar_xdr::curr::LedgerEntryData::Trustline(tl) => {
                 if state
-                    .get_trustline_by_trustline_asset(&tl.account_id, &tl.asset)
+                    .trustline_by_trustline_asset(&tl.account_id, &tl.asset)
                     .is_some()
                 {
                     state.update_trustline(tl.clone());
@@ -1014,7 +1014,7 @@ fn apply_soroban_storage_change(
                     return was_created;
                 }
                 let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
-                let existing_ttl = state.get_ttl(&key_hash);
+                let existing_ttl = state.ttl(&key_hash);
                 let ttl = TtlEntry {
                     key_hash: key_hash.clone(),
                     live_until_ledger_seq: live_until,
@@ -1092,7 +1092,7 @@ fn apply_soroban_storage_change(
         // Only emit when TTL was actually extended (new > old).
         if change.ttl_extended {
             let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
-            let existing_ttl = state.get_ttl(&key_hash);
+            let existing_ttl = state.ttl(&key_hash);
             let ttl = TtlEntry {
                 key_hash: key_hash.clone(),
                 live_until_ledger_seq: live_until,
@@ -1225,16 +1225,16 @@ fn is_archived_contract_entry(
     // Check if the entry exists in live state with an expired TTL.
     let entry_in_live = match key {
         LedgerKey::ContractData(cd) => state
-            .get_contract_data(&cd.contract, &cd.key, cd.durability)
+            .contract_data(&cd.contract, &cd.key, cd.durability)
             .is_some(),
-        LedgerKey::ContractCode(cc) => state.get_contract_code(&cc.hash).is_some(),
+        LedgerKey::ContractCode(cc) => state.contract_code(&cc.hash).is_some(),
         _ => false,
     };
 
     if entry_in_live {
         // Entry is in live state — check its TTL
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
-        return Ok(match state.get_ttl(&key_hash) {
+        return Ok(match state.ttl(&key_hash) {
             Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
             None => false, // No TTL → not archived (matches stellar-core fallthrough)
         });
@@ -1809,7 +1809,7 @@ mod tests {
                 key: contract_key,
                 durability: ContractDataDurability::Persistent,
             }));
-        state.get_ttl_mut(&key_hash2).unwrap().live_until_ledger_seq = context.sequence - 1; // Expired
+        state.ttl_mut(&key_hash2).unwrap().live_until_ledger_seq = context.sequence - 1; // Expired
 
         let exceeded = disk_read_bytes_exceeded(
             &state,
@@ -1991,11 +1991,11 @@ mod tests {
             &mut std::collections::HashSet::new(),
         );
         assert!(state
-            .get_contract_data(&contract_id, &contract_key, durability)
+            .contract_data(&contract_id, &contract_key, durability)
             .is_some());
 
         let ttl_key = crate::soroban::compute_key_hash(&key);
-        assert!(state.get_ttl(&ttl_key).is_some());
+        assert!(state.ttl(&ttl_key).is_some());
 
         let delete_change = StorageChange {
             key,
@@ -2014,9 +2014,9 @@ mod tests {
             &mut std::collections::HashSet::new(),
         );
         assert!(state
-            .get_contract_data(&contract_id, &contract_key, durability)
+            .contract_data(&contract_id, &contract_key, durability)
             .is_none());
-        assert!(state.get_ttl(&ttl_key).is_none());
+        assert!(state.ttl(&ttl_key).is_none());
     }
 
     /// Regression test for ledger 182022: TTL emission should be skipped when data is modified
@@ -2120,12 +2120,12 @@ mod tests {
 
         // Verify data was updated
         let cd = state2
-            .get_contract_data(&contract_id, &contract_key, durability)
+            .contract_data(&contract_id, &contract_key, durability)
             .unwrap();
         assert_eq!(cd.val, ScVal::I32(200));
 
         // Verify TTL value is still the same
-        let ttl = state2.get_ttl(&ttl_key_hash).unwrap();
+        let ttl = state2.ttl(&ttl_key_hash).unwrap();
         assert_eq!(ttl.live_until_ledger_seq, 226129);
 
         // The key assertion: the delta should have ContractData updated, but NOT TTL
@@ -2378,7 +2378,7 @@ mod tests {
             // We do this by directly using create which will track it as created initially
             state.create_contract_data(cd_entry.clone());
 
-            // Now state knows about the entry. When we check get_contract_data, it returns Some.
+            // Now state knows about the entry. When we check contract_data, it returns Some.
             // Without hot_archive_keys, this means we should call update_contract_data.
             // But the initial create is also in delta. For this test, we just verify the logic:
             // - When hot_archive_keys doesn't contain the key and entry exists -> update
@@ -2389,12 +2389,12 @@ mod tests {
             let _no_restored_keys: std::collections::HashSet<LedgerKey> =
                 std::collections::HashSet::new();
 
-            // Check the logic path: get_contract_data returns Some, so without hot_archive_keys
+            // Check the logic path: contract_data returns Some, so without hot_archive_keys
             // we'd call update_contract_data. We can verify this by checking that the function
             // uses create vs update based on the flag.
             assert!(
                 state
-                    .get_contract_data(&contract_id, &contract_key, durability)
+                    .contract_data(&contract_id, &contract_key, durability)
                     .is_some(),
                 "Entry should exist in state"
             );
@@ -2420,7 +2420,7 @@ mod tests {
             // Verify entry is in state but NOT in delta
             assert!(
                 state
-                    .get_contract_data(&contract_id, &contract_key, durability)
+                    .contract_data(&contract_id, &contract_key, durability)
                     .is_some(),
                 "Entry should exist in state"
             );
@@ -2599,7 +2599,7 @@ mod tests {
 
         // Entry is not in state (never was in live BL — it came from hot archive).
         assert!(
-            state.get_ttl(&key_hash).is_none(),
+            state.ttl(&key_hash).is_none(),
             "TTL should not be in state before the call"
         );
         assert_eq!(
@@ -2728,14 +2728,14 @@ mod tests {
     /// the erase-RW loop must NOT delete it.
     ///
     /// Without the skip at invoke_host_function.rs:667, the erase-RW loop finds the entry
-    /// via `get_contract_data().is_some()` and calls `delete_contract_data()`, producing a
+    /// via `contract_data().is_some()` and calls `delete_contract_data()`, producing a
     /// spurious DEAD entry in the live bucket list delta. This DEAD entry would diverge the
     /// bucket_list_hash from stellar-core, where `handleArchivedEntry` creates DATA+TTL INIT
     /// and immediately erases both for read-only access (net zero effect on live BL).
     ///
     /// This test differs from `test_apply_soroban_storage_changes_hot_archive_read_only_no_side_effects`
     /// (VE-05) which does NOT pre-load the entry into state, so the erase-RW loop's
-    /// `get_contract_data().is_some()` returns false regardless of the skip.
+    /// `contract_data().is_some()` returns false regardless of the skip.
     #[test]
     fn test_erase_rw_skips_preloaded_hot_archive_read_only_entry() {
         let contract_id = ScAddress::Contract(ContractId(Hash([0xDDu8; 32])));
@@ -2750,7 +2750,7 @@ mod tests {
 
         // Pre-load the archived entry into state via load_entry (simulates how
         // InMemorySorobanState entries are loaded before host execution). This does
-        // NOT record a delta — it just makes get_contract_data() return Some.
+        // NOT record a delta — it just makes contract_data() return Some.
         let entry = LedgerEntry {
             last_modified_ledger_seq: 50_000_000,
             data: LedgerEntryData::ContractData(ContractDataEntry {
@@ -2769,7 +2769,7 @@ mod tests {
         // Confirm the entry is visible in state.
         assert!(
             state
-                .get_contract_data(&contract_id, &contract_key, durability)
+                .contract_data(&contract_id, &contract_key, durability)
                 .is_some(),
             "Entry must be in state (pre-loaded from hot archive)"
         );
@@ -2803,7 +2803,7 @@ mod tests {
 
         // KEY ASSERTION: no DEAD entry should be created.
         // Before the VE-06 fix (hot archive skip at line 667), the erase-RW loop
-        // would find the pre-loaded entry via get_contract_data().is_some() and
+        // would find the pre-loaded entry via contract_data().is_some() and
         // call delete_contract_data(), creating a spurious DEAD delta entry.
         assert_eq!(
             state.delta().deleted_keys().len(),
@@ -2815,7 +2815,7 @@ mod tests {
         // The entry should still be accessible in state (not deleted).
         assert!(
             state
-                .get_contract_data(&contract_id, &contract_key, durability)
+                .contract_data(&contract_id, &contract_key, durability)
                 .is_some(),
             "Hot archive read-only entry must remain in state after apply_soroban_storage_changes"
         );

@@ -14,8 +14,8 @@ use crate::fee_window::FeeDistribution;
 pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
     let ledger = ctx.app.ledger_summary();
 
-    let classic = ctx.fee_windows.get_classic_distribution();
-    let soroban = ctx.fee_windows.get_soroban_distribution();
+    let classic = ctx.fee_windows.classic_distribution();
+    let soroban = ctx.fee_windows.soroban_distribution();
 
     Ok(json!({
         "sorobanInclusionFee": distribution_to_json(&soroban),

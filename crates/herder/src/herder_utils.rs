@@ -3,8 +3,8 @@
 //! This module provides helper functions that match the stellar-core
 //! `HerderUtils.h` functionality:
 //!
-//! - [`get_stellar_values`]: Extract StellarValue from SCP statements
-//! - [`get_tx_set_hashes`]: Get transaction set hashes from SCP envelopes
+//! - [`stellar_values`]: Extract StellarValue from SCP statements
+//! - [`tx_set_hashes`]: Get transaction set hashes from SCP envelopes
 //! - [`to_short_string`]: Render NodeID as a short human-readable string
 
 use henyey_common::Hash256;
@@ -29,15 +29,15 @@ use stellar_xdr::curr::{Limits, NodeId, ReadXdr, ScpEnvelope, ScpStatement, Stel
 ///
 /// ```ignore
 /// use stellar_xdr::curr::ScpStatement;
-/// use henyey_herder::get_stellar_values;
+/// use henyey_herder::stellar_values;
 ///
-/// let values = get_stellar_values(&statement);
+/// let values = stellar_values(&statement);
 /// for sv in values {
 ///     println!("TxSet hash: {:?}, close time: {}", sv.tx_set_hash, sv.close_time.0);
 /// }
 /// ```
-pub fn get_stellar_values(statement: &ScpStatement) -> Vec<StellarValue> {
-    let values = Slot::get_statement_values(statement);
+pub fn stellar_values(statement: &ScpStatement) -> Vec<StellarValue> {
+    let values = Slot::statement_values(statement);
     values
         .into_iter()
         .filter_map(|v| StellarValue::from_xdr(&v.0, Limits::none()).ok())
@@ -46,7 +46,7 @@ pub fn get_stellar_values(statement: &ScpStatement) -> Vec<StellarValue> {
 
 /// Extract all transaction set hashes from an SCP envelope.
 ///
-/// This is a convenience wrapper around [`get_stellar_values`] that extracts
+/// This is a convenience wrapper around [`stellar_values`] that extracts
 /// just the transaction set hashes.
 ///
 /// # Arguments
@@ -61,15 +61,15 @@ pub fn get_stellar_values(statement: &ScpStatement) -> Vec<StellarValue> {
 ///
 /// ```ignore
 /// use stellar_xdr::curr::ScpEnvelope;
-/// use henyey_herder::get_tx_set_hashes_from_envelope;
+/// use henyey_herder::tx_set_hashes_from_envelope;
 ///
-/// let hashes = get_tx_set_hashes_from_envelope(&envelope);
+/// let hashes = tx_set_hashes_from_envelope(&envelope);
 /// for hash in hashes {
 ///     println!("TxSet hash: {}", hash);
 /// }
 /// ```
-pub fn get_tx_set_hashes_from_envelope(envelope: &ScpEnvelope) -> Vec<Hash256> {
-    get_stellar_values(&envelope.statement)
+pub fn tx_set_hashes_from_envelope(envelope: &ScpEnvelope) -> Vec<Hash256> {
+    stellar_values(&envelope.statement)
         .into_iter()
         .map(|sv| Hash256::from_bytes(sv.tx_set_hash.0))
         .collect()
@@ -195,7 +195,7 @@ mod tests {
             }),
         };
 
-        let values = get_stellar_values(&statement);
+        let values = stellar_values(&statement);
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].tx_set_hash.0, [1u8; 32]);
         assert_eq!(values[0].close_time.0, 100);
@@ -220,7 +220,7 @@ mod tests {
             }),
         };
 
-        let values = get_stellar_values(&statement);
+        let values = stellar_values(&statement);
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].tx_set_hash.0, [3u8; 32]);
         assert_eq!(values[0].close_time.0, 300);
@@ -246,7 +246,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
         };
 
-        let hashes = get_tx_set_hashes_from_envelope(&envelope);
+        let hashes = tx_set_hashes_from_envelope(&envelope);
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0].0, [4u8; 32]);
     }
@@ -285,7 +285,7 @@ mod tests {
         };
 
         // Should return empty vec (invalid values are skipped)
-        let values = get_stellar_values(&statement);
+        let values = stellar_values(&statement);
         assert!(values.is_empty());
     }
 }

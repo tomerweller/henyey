@@ -61,7 +61,7 @@ impl Work for GetHistoryArchiveStateWork {
     // SECURITY: checkpoint data validated by hash chain; content integrity verified before acceptance
     async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(&self.state, HistoryWorkStage::FetchHas, "fetching HAS").await;
-        match self.archive.get_checkpoint_has(self.checkpoint).await {
+        match self.archive.checkpoint_has(self.checkpoint).await {
             Ok(has) => {
                 let mut guard = self.state.lock().await;
                 guard.has = Some(has);
@@ -105,7 +105,7 @@ async fn download_and_save_bucket(
     bucket_path: &std::path::Path,
 ) -> Result<(), String> {
     let data = archive
-        .get_bucket(hash)
+        .bucket(hash)
         .await
         .map_err(|err| format!("failed to download bucket {hash}: {err}"))?;
 
@@ -249,7 +249,7 @@ impl Work for DownloadLedgerHeadersWork {
             "downloading headers",
         )
         .await;
-        let headers = match self.archive.get_ledger_headers(self.checkpoint).await {
+        let headers = match self.archive.ledger_headers(self.checkpoint).await {
             Ok(headers) => headers,
             Err(err) => return WorkOutcome::Failed(format!("failed to download headers: {err}")),
         };
@@ -301,7 +301,7 @@ impl Work for DownloadTransactionsWork {
             "downloading transactions",
         )
         .await;
-        let entries = match self.archive.get_transactions(self.checkpoint).await {
+        let entries = match self.archive.transactions(self.checkpoint).await {
             Ok(entries) => entries,
             Err(err) => {
                 return WorkOutcome::Failed(format!("failed to download transactions: {err}"))
@@ -381,7 +381,7 @@ impl Work for DownloadTxResultsWork {
             "downloading transaction results",
         )
         .await;
-        let results = match self.archive.get_results(self.checkpoint).await {
+        let results = match self.archive.results(self.checkpoint).await {
             Ok(results) => results,
             Err(err) => {
                 return WorkOutcome::Failed(format!("failed to download tx results: {err}"))
@@ -452,7 +452,7 @@ impl Work for DownloadScpHistoryWork {
             "downloading SCP history",
         )
         .await;
-        match self.archive.get_scp_history(self.checkpoint).await {
+        match self.archive.scp_history(self.checkpoint).await {
             Ok(entries) => {
                 let mut guard = self.state.lock().await;
                 guard.scp_history = entries;

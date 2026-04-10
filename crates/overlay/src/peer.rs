@@ -446,8 +446,8 @@ impl Peer {
 
         // Ask for SCP data _after_ the flow control message (matches stellar-core recvAuth behavior)
         // Use ledger seq 0 to request the latest SCP state
-        let get_scp_state = StellarMessage::GetScpState(0);
-        self.send(get_scp_state).await?;
+        let scp_state = StellarMessage::GetScpState(0);
+        self.send(scp_state).await?;
         debug!("Sent GET_SCP_STATE to {}", self.info.peer_id);
 
         Ok(())

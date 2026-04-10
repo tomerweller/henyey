@@ -14,7 +14,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 
 use henyey_bucket::{
-    get_ttl_key, get_ttl_live_until, is_persistent_key, is_soroban_key, BucketSnapshotManager,
+    is_persistent_key, is_soroban_key, ttl_key, ttl_live_until, BucketSnapshotManager,
     SearchableBucketListSnapshot, SearchableHotArchiveBucketListSnapshot,
 };
 use stellar_xdr::curr::{HotArchiveBucketEntry, LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
@@ -368,7 +368,7 @@ pub(crate) async fn getledgerentry_handler(
         .filter(|e| henyey_bucket::is_soroban_entry(e))
         .filter_map(|e| {
             let key = henyey_common::entry_to_key(e);
-            get_ttl_key(&key)
+            ttl_key(&key)
         })
         .collect();
 
@@ -410,7 +410,7 @@ pub(crate) async fn getledgerentry_handler(
             // Entry found in live bucket list.
             if is_soroban_key(key) {
                 // Look up the TTL entry.
-                let ttl_key = get_ttl_key(key);
+                let ttl_key = ttl_key(key);
                 let ttl_entry = ttl_key.as_ref().and_then(|tk| {
                     tk.to_xdr(Limits::none())
                         .ok()
@@ -418,7 +418,7 @@ pub(crate) async fn getledgerentry_handler(
                 });
 
                 if let Some(ttl_e) = ttl_entry {
-                    let live_until = get_ttl_live_until(ttl_e).unwrap_or(0);
+                    let live_until = ttl_live_until(ttl_e).unwrap_or(0);
                     let is_live = live_until >= ledger_seq;
 
                     if is_live {

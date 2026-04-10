@@ -942,7 +942,7 @@ mod tests {
         let original = DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size);
 
         // Verify original has pool data
-        let pools_native = original.asset_to_pool_id().get_pools_for_asset(&asset_a);
+        let pools_native = original.asset_to_pool_id().pools_for_asset(&asset_a);
         assert_eq!(pools_native.len(), 1);
         assert_eq!(pools_native[0], pool_id);
 
@@ -955,11 +955,11 @@ mod tests {
             .expect("Should load successfully");
 
         // Verify pool map is restored
-        let loaded_pools_native = loaded.asset_to_pool_id().get_pools_for_asset(&asset_a);
+        let loaded_pools_native = loaded.asset_to_pool_id().pools_for_asset(&asset_a);
         assert_eq!(loaded_pools_native.len(), 1);
         assert_eq!(loaded_pools_native[0], pool_id);
 
-        let loaded_pools_usd = loaded.asset_to_pool_id().get_pools_for_asset(&asset_b);
+        let loaded_pools_usd = loaded.asset_to_pool_id().pools_for_asset(&asset_b);
         assert_eq!(loaded_pools_usd.len(), 1);
         assert_eq!(loaded_pools_usd[0], pool_id);
     }

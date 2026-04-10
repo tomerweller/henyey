@@ -67,7 +67,7 @@ use tracing::{debug, info};
 
 /// Read current RSS (Resident Set Size) in bytes from /proc/self/statm.
 /// Returns 0 on non-Linux or on error.
-fn get_rss_bytes() -> u64 {
+fn rss_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
         if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
@@ -876,7 +876,7 @@ fn scan_bucket_list_for_caches(
 ///
 /// Equivalent to `BucketList::get` but operates on pre-extracted pairs so it can
 /// be called without holding a `BucketList` reference.
-fn get_from_pairs(
+fn from_pairs(
     level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
     key: &LedgerKey,
 ) -> henyey_bucket::Result<Option<LedgerEntry>> {
@@ -958,7 +958,7 @@ fn build_soroban_rent_config(
 fn compute_soroban_rent_config_from_pairs(
     level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
 ) -> Option<crate::soroban_state::SorobanRentConfig> {
-    build_soroban_rent_config(|key| get_from_pairs(level_pairs, key).ok().flatten())
+    build_soroban_rent_config(|key| from_pairs(level_pairs, key).ok().flatten())
 }
 
 /// Scan a set of bucket level pairs and extract all cache data.
@@ -1688,7 +1688,7 @@ impl LedgerManager {
         close_data: LedgerCloseData,
         runtime_handle: Option<tokio::runtime::Handle>,
     ) -> Result<LedgerCloseResult> {
-        let rss_before = get_rss_bytes();
+        let rss_before = rss_bytes();
         let begin_start = std::time::Instant::now();
         let mut ctx = self.begin_close(close_data)?;
         ctx.runtime_handle = runtime_handle;
@@ -2450,7 +2450,7 @@ impl LedgerManager {
     /// - The entry's TTL has expired
     /// - The entry is not TEMPORARY durability
     /// - The XDR cannot be decoded
-    pub fn get_config_upgrade_set(
+    pub fn config_upgrade_set(
         &self,
         key: &stellar_xdr::curr::ConfigUpgradeSetKey,
     ) -> Option<std::sync::Arc<crate::config_upgrade::ConfigUpgradeSetFrame>> {
@@ -2519,7 +2519,7 @@ struct LedgerCloseContext<'a> {
 impl LedgerCloseContext<'_> {
     /// Load an entry through the CloseLedgerState read path (current delta → snapshot).
     fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
-        self.ltx.get_entry(key)
+        self.ltx.entry(key)
     }
 
     /// Load StateArchivalSettings through the CloseLedgerState read path.
@@ -2531,7 +2531,7 @@ impl LedgerCloseContext<'_> {
         let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::StateArchival,
         });
-        let entry = self.ltx.get_entry(&key).ok()??;
+        let entry = self.ltx.entry(&key).ok()??;
         if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) =
             entry.data
         {
@@ -4091,7 +4091,7 @@ impl LedgerCloseContext<'_> {
 
                 // Read the window through CloseLedgerState (may have been resized by config upgrade).
                 // Parity: stellar-core reads from LedgerTxn which includes prior modifications.
-                let (window_vec_base, previous_entry) = match self.ltx.get_entry(&window_key)? {
+                let (window_vec_base, previous_entry) = match self.ltx.entry(&window_key)? {
                     Some(entry) => {
                         if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
                             stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
@@ -5192,7 +5192,7 @@ impl LedgerCloseContext<'_> {
             report.log();
         }
 
-        let rss_after = get_rss_bytes();
+        let rss_after = rss_bytes();
 
         // Sort tx_perf by exec_us descending (worst offenders first)
         let mut tx_timings = self.tx_perf;
@@ -6956,14 +6956,14 @@ mod tests {
     }
 
     /// Helper to extract a ConfigSettingEntry from the delta by ConfigSettingId.
-    fn get_config_setting_from_delta(
+    fn config_setting_from_delta(
         delta: &LedgerDelta,
         id: ConfigSettingId,
     ) -> Option<ConfigSettingEntry> {
         let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
             config_setting_id: id,
         });
-        delta.get_change(&key).and_then(|change| {
+        delta.change(&key).and_then(|change| {
             change.current_entry().and_then(|entry| {
                 if let LedgerEntryData::ConfigSetting(ref cs) = entry.data {
                     Some(cs.clone())
@@ -6999,7 +6999,7 @@ mod tests {
 
         // Verify all 14 entries were created
         // 1. ContractMaxSizeBytes
-        let entry = get_config_setting_from_delta(
+        let entry = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractMaxSizeBytes,
         );
@@ -7011,24 +7011,22 @@ mod tests {
         }
 
         // 2. ContractDataKeySizeBytes
-        let entry = get_config_setting_from_delta(
+        let entry = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractDataKeySizeBytes,
         );
         assert!(entry.is_some(), "ContractDataKeySizeBytes should exist");
 
         // 3. ContractDataEntrySizeBytes
-        let entry = get_config_setting_from_delta(
+        let entry = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractDataEntrySizeBytes,
         );
         assert!(entry.is_some(), "ContractDataEntrySizeBytes should exist");
 
         // 4. ContractComputeV0
-        let entry = get_config_setting_from_delta(
-            ctx.ltx.current_delta(),
-            ConfigSettingId::ContractComputeV0,
-        );
+        let entry =
+            config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::ContractComputeV0);
         assert!(entry.is_some(), "ContractComputeV0 should exist");
         if let Some(ConfigSettingEntry::ContractComputeV0(ref compute)) = entry {
             assert_eq!(compute.tx_max_instructions, 2_500_000);
@@ -7036,7 +7034,7 @@ mod tests {
         }
 
         // 5. ContractLedgerCostV0
-        let entry = get_config_setting_from_delta(
+        let entry = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractLedgerCostV0,
         );
@@ -7051,7 +7049,7 @@ mod tests {
 
         // 6-9. Historical data, events, bandwidth, execution lanes
         assert!(
-            get_config_setting_from_delta(
+            config_setting_from_delta(
                 ctx.ltx.current_delta(),
                 ConfigSettingId::ContractHistoricalDataV0
             )
@@ -7059,15 +7057,12 @@ mod tests {
             "ContractHistoricalDataV0 should exist"
         );
         assert!(
-            get_config_setting_from_delta(
-                ctx.ltx.current_delta(),
-                ConfigSettingId::ContractEventsV0
-            )
-            .is_some(),
+            config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::ContractEventsV0)
+                .is_some(),
             "ContractEventsV0 should exist"
         );
         assert!(
-            get_config_setting_from_delta(
+            config_setting_from_delta(
                 ctx.ltx.current_delta(),
                 ConfigSettingId::ContractBandwidthV0
             )
@@ -7075,7 +7070,7 @@ mod tests {
             "ContractBandwidthV0 should exist"
         );
         assert!(
-            get_config_setting_from_delta(
+            config_setting_from_delta(
                 ctx.ltx.current_delta(),
                 ConfigSettingId::ContractExecutionLanes
             )
@@ -7084,7 +7079,7 @@ mod tests {
         );
 
         // 10-11. CPU and memory cost params (23 entries each)
-        let cpu = get_config_setting_from_delta(
+        let cpu = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsCpuInstructions,
         );
@@ -7097,7 +7092,7 @@ mod tests {
             );
         }
 
-        let mem = get_config_setting_from_delta(
+        let mem = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsMemoryBytes,
         );
@@ -7112,7 +7107,7 @@ mod tests {
 
         // 12. StateArchival
         let archival =
-            get_config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::StateArchival);
+            config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::StateArchival);
         assert!(archival.is_some(), "StateArchival should exist");
         if let Some(ConfigSettingEntry::StateArchival(ref sa)) = archival {
             assert_eq!(sa.max_entry_ttl, 1_054_080);
@@ -7122,7 +7117,7 @@ mod tests {
         }
 
         // 13. LiveSorobanStateSizeWindow (30-entry window)
-        let window = get_config_setting_from_delta(
+        let window = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::LiveSorobanStateSizeWindow,
         );
@@ -7132,10 +7127,8 @@ mod tests {
         }
 
         // 14. EvictionIterator
-        let eviction = get_config_setting_from_delta(
-            ctx.ltx.current_delta(),
-            ConfigSettingId::EvictionIterator,
-        );
+        let eviction =
+            config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::EvictionIterator);
         assert!(eviction.is_some(), "EvictionIterator should exist");
         if let Some(ConfigSettingEntry::EvictionIterator(ref ei)) = eviction {
             assert_eq!(ei.bucket_list_level, 6);
@@ -7172,7 +7165,7 @@ mod tests {
             .expect("V21 cost types should be created");
 
         // CPU params should now be 45 entries
-        let cpu = get_config_setting_from_delta(
+        let cpu = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsCpuInstructions,
         );
@@ -7194,7 +7187,7 @@ mod tests {
         }
 
         // Memory params should now be 45 entries
-        let mem = get_config_setting_from_delta(
+        let mem = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsMemoryBytes,
         );
@@ -7236,7 +7229,7 @@ mod tests {
         ctx.create_cost_types_for_v22().expect("V22");
 
         // CPU params should now be 70 entries
-        let cpu = get_config_setting_from_delta(
+        let cpu = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsCpuInstructions,
         );
@@ -7255,7 +7248,7 @@ mod tests {
         }
 
         // Memory params should now be 70 entries
-        let mem = get_config_setting_from_delta(
+        let mem = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsMemoryBytes,
         );
@@ -7299,7 +7292,7 @@ mod tests {
         ctx.create_and_update_ledger_entries_for_v23().expect("V23");
 
         // 1. ContractParallelComputeV0
-        let parallel = get_config_setting_from_delta(
+        let parallel = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractParallelComputeV0,
         );
@@ -7309,8 +7302,7 @@ mod tests {
         }
 
         // 2. ScpTiming
-        let timing =
-            get_config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::ScpTiming);
+        let timing = config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::ScpTiming);
         assert!(timing.is_some(), "ScpTiming should exist");
         if let Some(ConfigSettingEntry::ScpTiming(ref t)) = timing {
             assert_eq!(t.ledger_target_close_time_milliseconds, 5000);
@@ -7318,7 +7310,7 @@ mod tests {
         }
 
         // 3. ContractLedgerCostExtV0
-        let ext = get_config_setting_from_delta(
+        let ext = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractLedgerCostExtV0,
         );
@@ -7330,7 +7322,7 @@ mod tests {
         }
 
         // 4. Verify rent cost params were updated
-        let cost = get_config_setting_from_delta(
+        let cost = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractLedgerCostV0,
         );
@@ -7343,7 +7335,7 @@ mod tests {
         }
 
         let archival =
-            get_config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::StateArchival);
+            config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::StateArchival);
         if let Some(ConfigSettingEntry::StateArchival(ref sa)) = archival {
             assert_eq!(sa.persistent_rent_rate_denominator, 1_215);
             assert_eq!(sa.temp_rent_rate_denominator, 2_430);
@@ -7379,7 +7371,7 @@ mod tests {
         ctx.create_cost_types_for_v25().expect("V25");
 
         // CPU cost params should have 85 entries (BN254)
-        let cpu = get_config_setting_from_delta(
+        let cpu = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsCpuInstructions,
         );
@@ -7404,7 +7396,7 @@ mod tests {
         }
 
         // Memory cost params should also have 85 entries
-        let mem = get_config_setting_from_delta(
+        let mem = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsMemoryBytes,
         );
@@ -7448,7 +7440,7 @@ mod tests {
         ctx.update_cost_types_for_v26().expect("V26");
 
         // CPU cost params should have 86 entries (Bn254G1Msm at index 85)
-        let cpu = get_config_setting_from_delta(
+        let cpu = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsCpuInstructions,
         );
@@ -7482,7 +7474,7 @@ mod tests {
         }
 
         // Memory cost params should also have 86 entries
-        let mem = get_config_setting_from_delta(
+        let mem = config_setting_from_delta(
             ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsMemoryBytes,
         );

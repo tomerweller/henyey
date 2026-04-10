@@ -373,7 +373,7 @@ impl PeerManager {
         };
 
         // Determine type update
-        let type_update = get_type_update(&record, observed_type, preferred_type_known);
+        let type_update = type_update(&record, observed_type, preferred_type_known);
         apply_type_update(&mut record, type_update);
 
         self.store(&record)
@@ -416,7 +416,7 @@ impl PeerManager {
             }
         };
 
-        let type_update = get_type_update(&record, observed_type, preferred_type_known);
+        let type_update = type_update(&record, observed_type, preferred_type_known);
         apply_type_update(&mut record, type_update);
         apply_backoff_update(&mut record, backoff);
 
@@ -505,7 +505,7 @@ impl PeerManager {
     }
 
     /// Get peers to send to another peer.
-    pub fn get_peers_to_send(&self, size: usize, exclude: &PeerAddress) -> Vec<PeerAddress> {
+    pub fn peers_to_send(&self, size: usize, exclude: &PeerAddress) -> Vec<PeerAddress> {
         let cache = self.cache.read();
 
         let mut candidates: Vec<&PeerRecord> = cache
@@ -537,7 +537,7 @@ impl PeerManager {
     }
 
     /// Get all peer records.
-    pub fn get_all_peers(&self) -> Vec<PeerRecord> {
+    pub fn all_peers(&self) -> Vec<PeerRecord> {
         let cache = self.cache.read();
         cache.values().cloned().collect()
     }
@@ -573,7 +573,7 @@ impl Default for PeerManager {
 }
 
 /// Determine what type update to apply.
-fn get_type_update(
+fn type_update(
     record: &PeerRecord,
     observed_type: StoredPeerType,
     preferred_type_known: bool,
@@ -803,7 +803,7 @@ mod tests {
             manager.ensure_exists(&addr).unwrap();
         }
 
-        let peers = manager.get_peers_to_send(10, &exclude);
+        let peers = manager.peers_to_send(10, &exclude);
         // Should exclude the "exclude" address
         assert_eq!(peers.len(), 3);
         assert!(!peers.contains(&exclude));

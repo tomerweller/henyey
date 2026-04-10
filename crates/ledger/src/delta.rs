@@ -381,7 +381,7 @@ impl LedgerDelta {
                 return Ok((0, LedgerEntryChanges(VecM::default())));
             }
         } else if let Some(entry) = snapshot
-            .get_entry(&key)
+            .entry(&key)
             .map_err(|e| LedgerError::Internal(format!("snapshot lookup failed: {}", e)))?
         {
             (entry, true)
@@ -466,7 +466,7 @@ impl LedgerDelta {
     ///
     /// Returns `Some(entry)` if the key has a Created or Updated change.
     /// Returns `None` if the key is Deleted or not present in the delta.
-    pub fn get_current_entry(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+    pub fn current_entry(&self, key: &LedgerKey) -> Option<LedgerEntry> {
         if let Some(change) = self.changes.get(key) {
             change.current_entry().cloned()
         } else {
@@ -703,7 +703,7 @@ impl LedgerDelta {
     }
 
     /// Get a specific change by key.
-    pub fn get_change(&self, key: &LedgerKey) -> Option<&EntryChange> {
+    pub fn change(&self, key: &LedgerKey) -> Option<&EntryChange> {
         self.changes.get(key)
     }
 
@@ -1532,11 +1532,11 @@ mod tests {
     // P2-4: Load entry when erased
     // Parity: LedgerTxnTests.cpp:1509 "when key exists in grandparent, erased in parent"
     //
-    // Tests that after deleting an entry, get_change shows it as deleted,
+    // Tests that after deleting an entry, change shows it as deleted,
     // and that created-then-deleted entries vanish entirely.
     // =========================================================================
 
-    /// After deleting an entry, get_change returns Deleted with the original.
+    /// After deleting an entry, change returns Deleted with the original.
     #[test]
     fn test_deleted_entry_shows_as_deleted_in_delta() {
         let mut delta = LedgerDelta::new(1);
@@ -1545,8 +1545,8 @@ mod tests {
 
         delta.record_delete(entry.clone()).unwrap();
 
-        // get_change should return Deleted
-        let change = delta.get_change(&key);
+        // change should return Deleted
+        let change = delta.change(&key);
         assert!(change.is_some(), "deleted entry should be findable");
         assert!(change.unwrap().is_deleted());
 
@@ -1571,7 +1571,7 @@ mod tests {
         assert_eq!(delta.num_changes(), 0, "create+delete should cancel out");
 
         // Entry should not be findable
-        let change = delta.get_change(&key);
+        let change = delta.change(&key);
         assert!(
             change.is_none(),
             "entry should have been removed from delta"
@@ -1599,7 +1599,7 @@ mod tests {
 
         delta.record_delete(custom.clone()).unwrap();
 
-        let change = delta.get_change(&key).unwrap();
+        let change = delta.change(&key).unwrap();
         assert!(change.is_deleted());
 
         // Previous entry should be the exact entry we deleted

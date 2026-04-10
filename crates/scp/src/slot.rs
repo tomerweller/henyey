@@ -157,7 +157,7 @@ impl Slot {
     }
 
     /// Get the externalized value if consensus was reached.
-    pub fn get_externalized_value(&self) -> Option<&Value> {
+    pub fn externalized_value(&self) -> Option<&Value> {
         self.externalized_value.as_ref()
     }
 
@@ -181,7 +181,7 @@ impl Slot {
     /// Check whether we have any latest message recorded from `node_id`.
     fn has_latest_message_from(&self, node_id: &NodeId) -> bool {
         self.ballot.latest_envelopes().contains_key(node_id)
-            || self.nomination.get_latest_nomination(node_id).is_some()
+            || self.nomination.latest_nomination(node_id).is_some()
     }
 
     /// Mirror ballot externalization into slot-level state.
@@ -190,13 +190,13 @@ impl Slot {
             return;
         }
 
-        if let Some(value) = self.ballot.get_externalized_value() {
+        if let Some(value) = self.ballot.externalized_value() {
             self.externalized_value = Some(value.clone());
             // Do NOT restore fully_validated here.  Upstream stellar-core
             // never sets mFullyValidated back to true after clearing it on
             // MaybeValid.  The local EXTERNALIZE envelope was already
             // recorded by emit_current_state; it will be visible through
-            // get_externalizing_state only when fully_validated is true
+            // externalizing_state only when fully_validated is true
             // (i.e., when externalization was reached while fully validated).
         }
     }
@@ -229,7 +229,7 @@ impl Slot {
         if !self.ballot.is_externalized() || self.externalized_value.is_some() {
             return;
         }
-        if self.ballot.get_externalized_value().is_some() {
+        if self.ballot.externalized_value().is_some() {
             self.sync_externalized_value_from_ballot();
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Ballot);
@@ -251,7 +251,7 @@ impl Slot {
 
         // Collect nodes we've heard from (have latest message in ballot or nomination)
         let mut heard_nodes = std::collections::HashSet::new();
-        let all_nodes = crate::quorum::get_all_nodes(&self.local_quorum_set);
+        let all_nodes = crate::quorum::all_nodes(&self.local_quorum_set);
         for node_id in &all_nodes {
             // Check ballot protocol first, then nomination (matching stellar-core getLatestMessage)
             if self.has_latest_message_from(node_id) {
@@ -396,7 +396,7 @@ impl Slot {
     }
 
     /// Get all envelopes received for this slot.
-    pub fn get_envelopes(&self) -> &HashMap<NodeId, Vec<ScpEnvelope>> {
+    pub fn envelopes(&self) -> &HashMap<NodeId, Vec<ScpEnvelope>> {
         &self.envelopes
     }
 
@@ -536,7 +536,7 @@ impl Slot {
     /// Get the total count of statements recorded for this slot.
     ///
     /// This counts all envelopes received from all nodes.
-    pub fn get_statement_count(&self) -> usize {
+    pub fn statement_count(&self) -> usize {
         self.envelopes.values().map(|v| v.len()).sum()
     }
 
@@ -544,11 +544,11 @@ impl Slot {
     ///
     /// Checks ballot protocol first, then nomination protocol.
     /// Matches stellar-core `Slot::getLatestMessage(NodeID const& id)`.
-    pub fn get_latest_envelope(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
+    pub fn latest_envelope(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
         self.ballot
             .latest_envelopes()
             .get(node_id)
-            .or_else(|| self.nomination.get_latest_nomination(node_id))
+            .or_else(|| self.nomination.latest_nomination(node_id))
     }
 
     /// Get the latest messages that would be sent for this slot.
@@ -556,7 +556,7 @@ impl Slot {
     /// Returns the latest envelopes for both nomination and ballot protocols.
     /// Only returns messages if the slot is fully validated (matching stellar-core
     /// `Slot::getLatestMessagesSend` which gates on `mFullyValidated`).
-    pub fn get_latest_messages_send(&self) -> Vec<ScpEnvelope> {
+    pub fn latest_messages_send(&self) -> Vec<ScpEnvelope> {
         let mut messages = Vec::new();
 
         if !self.fully_validated {
@@ -564,12 +564,12 @@ impl Slot {
         }
 
         // Add latest nomination message if available
-        if let Some(env) = self.nomination.get_last_envelope() {
+        if let Some(env) = self.nomination.last_envelope() {
             messages.push(env.clone());
         }
 
         // Add latest ballot message if available
-        if let Some(env) = self.ballot.get_last_envelope() {
+        if let Some(env) = self.ballot.last_envelope() {
             messages.push(env.clone());
         }
 
@@ -579,32 +579,32 @@ impl Slot {
     /// Get nomination round leaders.
     ///
     /// Returns the set of nodes that are leaders for the current nomination round.
-    pub fn get_nomination_leaders(&self) -> std::collections::BTreeSet<NodeId> {
-        self.nomination.get_round_leaders().clone()
+    pub fn nomination_leaders(&self) -> std::collections::BTreeSet<NodeId> {
+        self.nomination.round_leaders().clone()
     }
 
     /// Get the latest composite candidate value for this slot.
     ///
     /// Returns the most recently computed composite value from the nomination protocol.
     /// Matches stellar-core `Slot::getLatestCompositeCandidate()`.
-    pub fn get_latest_composite_candidate(&self) -> Option<Value> {
+    pub fn latest_composite_candidate(&self) -> Option<Value> {
         self.nomination.latest_composite().cloned()
     }
 
     /// Get the externalizing state for this slot.
     ///
-    /// Delegates to BallotProtocol::get_externalizing_state, matching stellar-core
+    /// Delegates to BallotProtocol::externalizing_state, matching stellar-core
     /// where `Slot::getExternalizingState()` calls
     /// `mBallotProtocol.getExternalizingState()`.
-    pub fn get_externalizing_state(&self) -> Vec<ScpEnvelope> {
+    pub fn externalizing_state(&self) -> Vec<ScpEnvelope> {
         self.ballot
-            .get_externalizing_state(&self.local_node_id, self.fully_validated)
+            .externalizing_state(&self.local_node_id, self.fully_validated)
     }
 
     /// Get values from a statement.
     ///
     /// Extracts all values referenced by a statement.
-    pub fn get_statement_values(statement: &stellar_xdr::curr::ScpStatement) -> Vec<Value> {
+    pub fn statement_values(statement: &stellar_xdr::curr::ScpStatement) -> Vec<Value> {
         use ScpStatementPledges::*;
         let mut values = Vec::new();
 
@@ -751,29 +751,27 @@ impl Slot {
     ///
     /// Returns the QuorumInfoNodeState combining both nomination and ballot states.
     /// The ballot state takes precedence if the node has progressed to ballot protocol.
-    pub fn get_node_state(&self, node_id: &NodeId) -> crate::QuorumInfoNodeState {
+    pub fn node_state(&self, node_id: &NodeId) -> crate::QuorumInfoNodeState {
         // Check ballot state first (more advanced)
-        let ballot_state = self.ballot.get_node_state(node_id);
+        let ballot_state = self.ballot.node_state(node_id);
         if ballot_state != crate::QuorumInfoNodeState::Missing {
             return ballot_state;
         }
 
         // Fall back to nomination state
-        self.nomination.get_node_state(node_id)
+        self.nomination.node_state(node_id)
     }
 
     /// Get states of all nodes in quorum set for this slot.
     ///
     /// Returns a map from node ID to their state in this slot's consensus.
-    pub fn get_all_node_states(
-        &self,
-    ) -> std::collections::HashMap<NodeId, crate::QuorumInfoNodeState> {
+    pub fn all_node_states(&self) -> std::collections::HashMap<NodeId, crate::QuorumInfoNodeState> {
         let mut states = std::collections::HashMap::new();
 
         // Get all nodes from quorum set
-        let nodes = crate::quorum::get_all_nodes(&self.local_quorum_set);
+        let nodes = crate::quorum::all_nodes(&self.local_quorum_set);
         for node_id in nodes {
-            states.insert(node_id.clone(), self.get_node_state(&node_id));
+            states.insert(node_id.clone(), self.node_state(&node_id));
         }
 
         states
@@ -783,7 +781,7 @@ impl Slot {
     ///
     /// Returns a SlotInfo struct that can be serialized to JSON
     /// for debugging and monitoring purposes, matching stellar-core `getJsonInfo()`.
-    pub fn get_info(&self) -> crate::SlotInfo {
+    pub fn info(&self) -> crate::SlotInfo {
         let phase = if self.externalized_value.is_some() {
             "EXTERNALIZED"
         } else if self.ballot.phase() != BallotPhase::Prepare
@@ -801,12 +799,12 @@ impl Slot {
             phase: phase.to_string(),
             fully_validated: self.fully_validated,
             nomination: if self.nomination.is_started() {
-                Some(self.nomination.get_info())
+                Some(self.nomination.info())
             } else {
                 None
             },
             ballot: if self.ballot.current_ballot().is_some() || self.externalized_value.is_some() {
-                Some(self.ballot.get_info())
+                Some(self.ballot.info())
             } else {
                 None
             },
@@ -817,8 +815,8 @@ impl Slot {
     ///
     /// Returns a QuorumInfo struct that can be serialized to JSON
     /// for debugging and monitoring purposes, matching stellar-core `getJsonQuorumInfo()`.
-    pub fn get_quorum_info(&self) -> crate::QuorumInfo {
-        let node_states = self.get_all_node_states();
+    pub fn quorum_info(&self) -> crate::QuorumInfo {
+        let node_states = self.all_node_states();
         let mut nodes = std::collections::HashMap::new();
 
         for (node_id, state) in &node_states {
@@ -895,7 +893,7 @@ mod tests {
 
         assert_eq!(slot.slot_index(), 42);
         assert!(!slot.is_externalized());
-        assert!(slot.get_externalized_value().is_none());
+        assert!(slot.externalized_value().is_none());
     }
 
     #[test]
@@ -906,7 +904,7 @@ mod tests {
         slot.force_externalize(value.clone());
 
         assert!(slot.is_externalized());
-        assert_eq!(slot.get_externalized_value(), Some(&value));
+        assert_eq!(slot.externalized_value(), Some(&value));
     }
 
     // ==================== Tests for new parity features ====================
@@ -1001,7 +999,7 @@ mod tests {
 
         assert!(slot.set_state_from_envelope(&envelope));
         assert!(slot.is_externalized());
-        assert_eq!(slot.get_externalized_value(), Some(&value));
+        assert_eq!(slot.externalized_value(), Some(&value));
     }
 
     #[test]
@@ -1075,7 +1073,7 @@ mod tests {
         let quorum_set = make_quorum_set();
         let slot = Slot::new(42, node.clone(), quorum_set.clone(), true);
 
-        let info = slot.get_info();
+        let info = slot.info();
         assert_eq!(info.slot_index, 42);
         assert_eq!(info.phase, "IDLE");
         assert!(info.fully_validated);
@@ -1092,7 +1090,7 @@ mod tests {
         let value: Value = vec![1, 2, 3].try_into().unwrap();
         slot.force_externalize(value);
 
-        let info = slot.get_info();
+        let info = slot.info();
         assert_eq!(info.slot_index, 42);
         assert_eq!(info.phase, "EXTERNALIZED");
         assert!(info.ballot.is_some());
@@ -1112,7 +1110,7 @@ mod tests {
         };
         let slot = Slot::new(42, node1.clone(), quorum_set.clone(), true);
 
-        let info = slot.get_quorum_info();
+        let info = slot.quorum_info();
         assert_eq!(info.slot_index, 42);
         assert_eq!(info.nodes.len(), 3);
         assert!(!info.quorum_reached); // No messages received yet
@@ -1131,7 +1129,7 @@ mod tests {
         let quorum_set = make_quorum_set();
         let slot = Slot::new(42, node.clone(), quorum_set.clone(), true);
 
-        let info = slot.get_info();
+        let info = slot.info();
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"slot_index\":42"));
         assert!(json.contains("\"phase\":\"IDLE\""));
@@ -1143,7 +1141,7 @@ mod tests {
         let quorum_set = make_quorum_set();
         let slot = Slot::new(42, node.clone(), quorum_set.clone(), true);
 
-        let info = slot.get_quorum_info();
+        let info = slot.quorum_info();
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"slot_index\":42"));
         assert!(json.contains("\"quorum_reached\":"));
@@ -1175,7 +1173,7 @@ mod tests {
 
     // ==================== Phase 4 parity tests ====================
 
-    // S1: get_latest_messages_send returns empty when not fully validated
+    // S1: latest_messages_send returns empty when not fully validated
     #[test]
     fn test_get_latest_messages_send_not_fully_validated() {
         let node = make_node_id(1);
@@ -1203,19 +1201,19 @@ mod tests {
         slot.set_state_from_envelope(&envelope);
 
         // Even though we have state, should return empty since not fully validated
-        let messages = slot.get_latest_messages_send();
+        let messages = slot.latest_messages_send();
         assert!(
             messages.is_empty(),
-            "get_latest_messages_send should return empty when not fully validated"
+            "latest_messages_send should return empty when not fully validated"
         );
 
         // Now test with fully validated slot
         let mut slot2 = Slot::new(1, node.clone(), quorum_set.clone(), true);
         slot2.set_state_from_envelope(&envelope);
-        let messages2 = slot2.get_latest_messages_send();
+        let messages2 = slot2.latest_messages_send();
         assert!(
             !messages2.is_empty(),
-            "get_latest_messages_send should return messages when fully validated"
+            "latest_messages_send should return messages when fully validated"
         );
     }
 
@@ -1274,7 +1272,7 @@ mod tests {
         );
     }
 
-    // S4: get_externalizing_state filters properly
+    // S4: externalizing_state filters properly
     #[test]
     fn test_get_externalizing_state_not_externalized() {
         let node = make_node_id(1);
@@ -1282,10 +1280,10 @@ mod tests {
         let slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
 
         // Not externalized, should return empty
-        let state = slot.get_externalizing_state();
+        let state = slot.externalizing_state();
         assert!(
             state.is_empty(),
-            "get_externalizing_state should return empty when not externalized"
+            "externalizing_state should return empty when not externalized"
         );
     }
 
@@ -1317,10 +1315,10 @@ mod tests {
 
         assert!(slot.is_externalized());
         // Since slot is fully validated and we externalized, should include our envelope
-        let state = slot.get_externalizing_state();
+        let state = slot.externalizing_state();
         assert!(
             !state.is_empty(),
-            "get_externalizing_state should include our envelope when externalized"
+            "externalizing_state should include our envelope when externalized"
         );
     }
 
@@ -1357,10 +1355,10 @@ mod tests {
         slot.fully_validated = false;
 
         // Our own envelope should NOT be included since not fully validated
-        let state = slot.get_externalizing_state();
+        let state = slot.externalizing_state();
         assert!(
             state.is_empty(),
-            "get_externalizing_state should exclude self envelope when not fully validated"
+            "externalizing_state should exclude self envelope when not fully validated"
         );
     }
 
@@ -1578,7 +1576,7 @@ mod tests {
         ballot.advance_slot_for_test(&statement, &ctx);
     }
 
-    // S-get_latest_envelope: checks ballot then nomination
+    // S-latest_envelope: checks ballot then nomination
     #[test]
     fn test_get_latest_envelope_checks_ballot_then_nomination() {
         let node = make_node_id(1);
@@ -1586,7 +1584,7 @@ mod tests {
         let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
 
         // Initially no envelope
-        assert!(slot.get_latest_envelope(&node).is_none());
+        assert!(slot.latest_envelope(&node).is_none());
 
         // Add nomination envelope
         let value: Value = vec![1, 2, 3].try_into().unwrap();
@@ -1606,7 +1604,7 @@ mod tests {
         slot.set_state_from_envelope(&nom_envelope);
 
         // Now should find the nomination envelope
-        let env = slot.get_latest_envelope(&node);
+        let env = slot.latest_envelope(&node);
         assert!(env.is_some(), "should find nomination envelope");
         assert!(
             matches!(
@@ -1639,7 +1637,7 @@ mod tests {
         slot.set_state_from_envelope(&ballot_envelope);
 
         // Now should find the ballot envelope (ballot protocol checked first)
-        let env = slot.get_latest_envelope(&node);
+        let env = slot.latest_envelope(&node);
         assert!(env.is_some(), "should find ballot envelope");
         assert!(
             matches!(
@@ -1704,8 +1702,8 @@ mod tests {
             "externalized value should be captured"
         );
 
-        // get_externalizing_state should NOT include our own envelope
-        let state = slot.get_externalizing_state();
+        // externalizing_state should NOT include our own envelope
+        let state = slot.externalizing_state();
         assert!(
             state.is_empty(),
             "self EXTERNALIZE should not be returned when not fully validated"

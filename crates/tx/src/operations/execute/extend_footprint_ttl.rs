@@ -125,7 +125,7 @@ pub(crate) fn execute_extend_footprint_ttl(
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
 
         // Look up the TTL entry for this key
-        let ttl_entry = state.get_ttl(&key_hash).cloned();
+        let ttl_entry = state.ttl(&key_hash).cloned();
         match ttl_entry {
             None => {
                 // TTL entry not found - skip (stellar-core: !ttlLeOpt -> continue)
@@ -147,7 +147,7 @@ pub(crate) fn execute_extend_footprint_ttl(
 
         // The main entry must exist (TTL exists and is live => entry exists)
         // stellar-core: releaseAssertOrThrow(entryOpt)
-        let entry = match state.get_entry(key) {
+        let entry = match state.entry(key) {
             None => continue,
             Some(e) => e,
         };

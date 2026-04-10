@@ -74,7 +74,7 @@ pub(crate) const DEX_LANE: usize = 1;
 /// - How to measure a transaction's resource consumption
 pub(crate) trait SurgePricingLaneConfig {
     /// Determine which lane a transaction belongs to based on its contents.
-    fn get_lane(&self, frame: &TransactionFrame) -> usize;
+    fn lane(&self, frame: &TransactionFrame) -> usize;
 
     /// Get the resource limits for each lane.
     fn lane_limits(&self) -> &[Resource];
@@ -113,7 +113,7 @@ impl DexLimitingLaneConfig {
 }
 
 impl SurgePricingLaneConfig for DexLimitingLaneConfig {
-    fn get_lane(&self, frame: &TransactionFrame) -> usize {
+    fn lane(&self, frame: &TransactionFrame) -> usize {
         if self.lane_limits.len() > DEX_LANE && frame.has_dex_operations() {
             DEX_LANE
         } else {
@@ -152,7 +152,7 @@ impl SorobanGenericLaneConfig {
 }
 
 impl SurgePricingLaneConfig for SorobanGenericLaneConfig {
-    fn get_lane(&self, frame: &TransactionFrame) -> usize {
+    fn lane(&self, frame: &TransactionFrame) -> usize {
         if !frame.is_soroban() {
             panic!("non-soroban tx in soroban lane config");
         }
@@ -189,7 +189,7 @@ impl OpsOnlyLaneConfig {
 }
 
 impl SurgePricingLaneConfig for OpsOnlyLaneConfig {
-    fn get_lane(&self, _frame: &TransactionFrame) -> usize {
+    fn lane(&self, _frame: &TransactionFrame) -> usize {
         GENERIC_LANE
     }
 
@@ -334,7 +334,7 @@ impl SurgePricingPriorityQueue {
         }
     }
 
-    pub(crate) fn get_num_lanes(&self) -> usize {
+    pub(crate) fn num_lanes(&self) -> usize {
         self.lane_limits.len()
     }
 
@@ -369,7 +369,7 @@ impl SurgePricingPriorityQueue {
         ledger_version: u32,
     ) {
         let frame = TransactionFrame::from_owned_with_network(tx.envelope.clone(), *network_id);
-        let lane = self.lane_config.get_lane(&frame);
+        let lane = self.lane_config.lane(&frame);
         let inserted = self
             .lanes
             .get_mut(lane)
@@ -515,7 +515,7 @@ impl SurgePricingPriorityQueue {
         ledger_version: u32,
     ) -> Option<Vec<(QueuedTransaction, bool)>> {
         let frame = TransactionFrame::from_owned_with_network(tx.envelope.clone(), *network_id);
-        let lane = self.lane_config.get_lane(&frame);
+        let lane = self.lane_config.lane(&frame);
         let mut tx_resources = self.lane_config.tx_resources(&frame, ledger_version);
         if let Some(discount) = tx_discount {
             tx_resources = subtract_non_negative(&tx_resources, &discount);

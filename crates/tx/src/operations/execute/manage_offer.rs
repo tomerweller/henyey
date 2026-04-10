@@ -101,7 +101,7 @@ fn execute_manage_offer(
     }
 
     // Check source account exists
-    if state.get_account(source).is_none() {
+    if state.account(source).is_none() {
         return Ok(make_sell_offer_result(
             ManageSellOfferResultCode::Underfunded,
             None,
@@ -118,7 +118,7 @@ fn execute_manage_offer(
         if issuer_for_asset(selling) == Some(source) {
             // Issuer can always sell its own asset.
         } else {
-            let trustline = match state.get_trustline(source, selling) {
+            let trustline = match state.trustline(source, selling) {
                 Some(tl) => tl,
                 None => {
                     return Ok(make_sell_offer_result(
@@ -151,7 +151,7 @@ fn execute_manage_offer(
         if issuer_for_asset(buying) == Some(source) {
             // Issuer can always receive its own asset.
         } else {
-            let trustline = match state.get_trustline(source, buying) {
+            let trustline = match state.trustline(source, buying) {
                 Some(tl) => tl,
                 None => {
                     return Ok(make_sell_offer_result(
@@ -172,7 +172,7 @@ fn execute_manage_offer(
 
     // NOW check if the offer exists (after trustline checks)
     let old_offer = if offer_id != 0 {
-        state.get_offer(source, offer_id)
+        state.offer(source, offer_id)
     } else {
         None
     };
@@ -213,7 +213,7 @@ fn execute_manage_offer(
     // computeOfferExchangeParameters). The later has_selling_capacity check
     // handles the Underfunded case for new offers after the LowReserve check.
     if old_offer.is_some() && matches!(selling, Asset::Native) {
-        let account = state.get_account(source).unwrap();
+        let account = state.account(source).unwrap();
         let min_balance =
             state.minimum_balance_for_account(account, context.protocol_version, 0)?;
         if account.balance < min_balance {
@@ -227,7 +227,7 @@ fn execute_manage_offer(
     if old_offer.is_none() {
         if let Some(sponsor) = &sponsor {
             let sponsor_account = state
-                .get_account(sponsor)
+                .account(sponsor)
                 .ok_or(TxError::SourceAccountNotFound)?;
             let min_balance = state.minimum_balance_for_account_with_deltas(
                 sponsor_account,
@@ -243,7 +243,7 @@ fn execute_manage_offer(
                     None,
                 ));
             }
-        } else if let Some(account) = state.get_account(source) {
+        } else if let Some(account) = state.account(source) {
             let min_balance =
                 state.minimum_balance_for_account(account, context.protocol_version, 1)?;
             let available = account_balance_after_liabilities(account);
@@ -426,7 +426,7 @@ fn execute_manage_offer(
                 )?;
             }
             state.create_offer(offer);
-            if let Some(account) = state.get_account_mut(source) {
+            if let Some(account) = state.account_mut(source) {
                 inc_sub_entries(account, 1);
             }
             ManageOfferSuccessResultOffer::Created(create_offer_entry(
@@ -461,7 +461,7 @@ fn execute_manage_offer(
             }
             state.delete_offer(source, offer_id);
             // stellar-core: panics on underflow (invalid account state)
-            if let Some(account) = state.get_account_mut(source) {
+            if let Some(account) = state.account_mut(source) {
                 dec_sub_entries(account, 1);
             }
         } else {
@@ -637,7 +637,7 @@ fn delete_offer(
     state: &mut LedgerStateManager,
 ) -> Result<OperationResult> {
     // Check offer exists and belongs to source
-    let offer = match state.get_offer(source, offer_id) {
+    let offer = match state.offer(source, offer_id) {
         Some(offer) => offer,
         None => {
             return Ok(make_sell_offer_result(
@@ -715,7 +715,7 @@ fn has_selling_capacity(
     context: &LedgerContext,
 ) -> Result<bool> {
     if matches!(selling, Asset::Native) {
-        let Some(account) = state.get_account(source) else {
+        let Some(account) = state.account(source) else {
             return Ok(false);
         };
         let min_balance = state.minimum_balance_for_account(
@@ -733,7 +733,7 @@ fn has_selling_capacity(
         return Ok(true);
     }
 
-    let Some(trustline) = state.get_trustline(source, selling) else {
+    let Some(trustline) = state.trustline(source, selling) else {
         return Ok(false);
     };
     let current_liab = trustline_liabilities(trustline).selling;
@@ -750,7 +750,7 @@ fn has_buying_capacity(
     state: &LedgerStateManager,
 ) -> bool {
     if matches!(buying, Asset::Native) {
-        let Some(account) = state.get_account(source) else {
+        let Some(account) = state.account(source) else {
             return false;
         };
         let current_liab = account_liabilities(account).buying;
@@ -763,7 +763,7 @@ fn has_buying_capacity(
         return true;
     }
 
-    let Some(trustline) = state.get_trustline(source, buying) else {
+    let Some(trustline) = state.trustline(source, buying) else {
         return false;
     };
     let current_liab = trustline_liabilities(trustline).buying;
@@ -1185,7 +1185,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1226,7 +1226,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1266,7 +1266,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1307,7 +1307,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1348,7 +1348,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1381,7 +1381,7 @@ mod tests {
         };
 
         let tl = state
-            .get_trustline_by_trustline_asset_mut(
+            .trustline_by_trustline_asset_mut(
                 &source_id,
                 &TrustLineAsset::CreditAlphanum4(AlphaNum4 {
                     asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
@@ -1418,7 +1418,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1451,7 +1451,7 @@ mod tests {
         };
 
         let tl = state
-            .get_trustline_by_trustline_asset_mut(
+            .trustline_by_trustline_asset_mut(
                 &source_id,
                 &TrustLineAsset::CreditAlphanum4(AlphaNum4 {
                     asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
@@ -1488,7 +1488,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1521,7 +1521,7 @@ mod tests {
         };
 
         let tl = state
-            .get_trustline_by_trustline_asset_mut(
+            .trustline_by_trustline_asset_mut(
                 &source_id,
                 &TrustLineAsset::CreditAlphanum4(AlphaNum4 {
                     asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
@@ -1546,7 +1546,7 @@ mod tests {
             )) => assert!(matches!(offer, ManageOfferSuccessResultOffer::Deleted)),
             _ => panic!("Unexpected result type"),
         }
-        assert!(state.get_offer(&source_id, offer_id).is_none());
+        assert!(state.offer(&source_id, offer_id).is_none());
     }
 
     #[test]
@@ -2088,7 +2088,7 @@ mod tests {
 
         // Verify num_sub_entries was not changed
         assert_eq!(
-            state.get_account(&source_id).unwrap().num_sub_entries,
+            state.account(&source_id).unwrap().num_sub_entries,
             ACCOUNT_SUBENTRY_LIMIT,
             "num_sub_entries should remain unchanged"
         );
@@ -2488,7 +2488,7 @@ mod tests {
             10_000_000,
             AUTHORIZED_FLAG,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         // First create an offer
         let create_op = ManageSellOfferOp {
@@ -2515,7 +2515,7 @@ mod tests {
         };
 
         // Verify offer exists
-        assert!(state.get_offer(&source_id, offer_id).is_some());
+        assert!(state.offer(&source_id, offer_id).is_some());
 
         // Now delete the offer
         let delete_op = ManageSellOfferOp {
@@ -2541,7 +2541,7 @@ mod tests {
         }
 
         // Verify offer is gone
-        assert!(state.get_offer(&source_id, offer_id).is_none());
+        assert!(state.offer(&source_id, offer_id).is_none());
     }
 
     /// Test ManageSellOffer update - updating existing offer.
@@ -2570,7 +2570,7 @@ mod tests {
             10_000_000,
             AUTHORIZED_FLAG,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         // First create an offer
         let create_op = ManageSellOfferOp {
@@ -2647,7 +2647,7 @@ mod tests {
             10_000_000,
             AUTHORIZED_FLAG,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         let op = CreatePassiveSellOfferOp {
             selling: asset,
@@ -2698,7 +2698,7 @@ mod tests {
             10_000_000,
             AUTHORIZED_FLAG,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         let op = ManageBuyOfferOp {
             selling: Asset::Native,
@@ -2808,7 +2808,7 @@ mod tests {
         });
 
         // Bump counterparty's num_sub_entries to account for the offer + 2 trustlines
-        if let Some(acct) = state.get_account_mut(&counter_id) {
+        if let Some(acct) = state.account_mut(&counter_id) {
             acct.num_sub_entries = 3;
         }
 
@@ -2833,7 +2833,7 @@ mod tests {
         ));
 
         // Record source's initial num_sub_entries (2 trustlines)
-        if let Some(acct) = state.get_account_mut(&source_id) {
+        if let Some(acct) = state.account_mut(&source_id) {
             acct.num_sub_entries = 2;
         }
 
@@ -2871,7 +2871,7 @@ mod tests {
         }
 
         // Verify source account num_sub_entries is unchanged (no offer was created)
-        let source_acct = state.get_account(&source_id).unwrap();
+        let source_acct = state.account(&source_id).unwrap();
         assert_eq!(
             source_acct.num_sub_entries, 2,
             "num_sub_entries should be unchanged (offer was fully consumed)"
@@ -2977,7 +2977,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         });
 
-        if let Some(acct) = state.get_account_mut(&counter_id) {
+        if let Some(acct) = state.account_mut(&counter_id) {
             acct.num_sub_entries = 3;
         }
 
@@ -2999,7 +2999,7 @@ mod tests {
             AUTHORIZED_FLAG,
         ));
 
-        if let Some(acct) = state.get_account_mut(&source_id) {
+        if let Some(acct) = state.account_mut(&source_id) {
             acct.num_sub_entries = 2;
         }
 
@@ -3254,7 +3254,7 @@ mod tests {
         }
 
         // The seller's frozen offer must STILL exist (price filter stopped before frozen check)
-        let offer = state.get_offer(&seller_id, 1);
+        let offer = state.offer(&seller_id, 1);
         assert!(
             offer.is_some(),
             "AUDIT-011: Frozen offer must survive when price filter would stop first"
@@ -3397,7 +3397,7 @@ mod tests {
             10_000_000,
             AUTHORIZED_FLAG,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         // Try to update a non-existent offer
         let op = ManageBuyOfferOp {
@@ -3444,7 +3444,7 @@ mod tests {
             10_000_000,
             AUTHORIZED_FLAG,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         let op = ManageBuyOfferOp {
             selling: usd,
@@ -3557,7 +3557,7 @@ mod tests {
             10_000_000,
             AUTHORIZED_FLAG,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         let op = CreatePassiveSellOfferOp {
             selling: usd,
@@ -3625,7 +3625,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let usd = create_asset(&issuer_id);
         // Trustline with flags=0 (not authorized)
@@ -3670,7 +3670,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let usd = create_asset(&issuer_id);
         // Trustline for buying side with flags=0 (not authorized)
@@ -3841,7 +3841,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let usd = create_asset(&issuer_id);
         // Trustline with flags=0 (not authorized)
@@ -3886,7 +3886,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let usd = create_asset(&issuer_id);
         // Trustline for buying side with flags=0 (not authorized)

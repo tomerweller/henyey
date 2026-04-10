@@ -30,7 +30,7 @@
 //! resources.set_val(ResourceType::Instructions, 1_000_000);
 //!
 //! // Check resource values
-//! assert_eq!(resources.get_val(ResourceType::Operations), 1);
+//! assert_eq!(resources.val(ResourceType::Operations), 1);
 //! assert!(!resources.is_zero());
 //! ```
 
@@ -177,7 +177,7 @@ impl Resource {
     /// # Panics
     ///
     /// Panics if the resource type index is out of bounds for this resource vector.
-    pub fn get_val(&self, ty: ResourceType) -> i64 {
+    pub fn val(&self, ty: ResourceType) -> i64 {
         self.values[ty as usize]
     }
 
@@ -347,7 +347,7 @@ impl ResourceType {
 ///
 /// let r = Resource::new(vec![100, 200]);
 /// let scaled = multiply_by_double(&r, 1.5);
-/// assert_eq!(scaled.get_val(henyey_common::resource::ResourceType::Operations), 150);
+/// assert_eq!(scaled.val(henyey_common::resource::ResourceType::Operations), 150);
 /// ```
 pub fn multiply_by_double(res: &Resource, m: f64) -> Resource {
     scale_by_double(res, m, |result| {
@@ -479,8 +479,8 @@ mod tests {
     fn test_multiply_by_double() {
         let r = Resource::new(vec![100, 200]);
         let scaled = multiply_by_double(&r, 1.5);
-        assert_eq!(scaled.get_val(ResourceType::Operations), 150);
-        assert_eq!(scaled.get_val(ResourceType::Instructions), 300);
+        assert_eq!(scaled.val(ResourceType::Operations), 150);
+        assert_eq!(scaled.val(ResourceType::Instructions), 300);
     }
 
     #[test]
@@ -494,8 +494,8 @@ mod tests {
     fn test_multiply_by_double_fractional() {
         let r = Resource::new(vec![100, 200]);
         let scaled = multiply_by_double(&r, 0.1);
-        assert_eq!(scaled.get_val(ResourceType::Operations), 10);
-        assert_eq!(scaled.get_val(ResourceType::Instructions), 20);
+        assert_eq!(scaled.val(ResourceType::Operations), 10);
+        assert_eq!(scaled.val(ResourceType::Instructions), 20);
     }
 
     #[test]
@@ -509,16 +509,16 @@ mod tests {
     fn test_saturated_multiply_by_double() {
         let r = Resource::new(vec![100, 200]);
         let scaled = saturated_multiply_by_double(&r, 1.5);
-        assert_eq!(scaled.get_val(ResourceType::Operations), 150);
-        assert_eq!(scaled.get_val(ResourceType::Instructions), 300);
+        assert_eq!(scaled.val(ResourceType::Operations), 150);
+        assert_eq!(scaled.val(ResourceType::Instructions), 300);
     }
 
     #[test]
     fn test_saturated_multiply_by_double_saturates() {
         let r = Resource::new(vec![i64::MAX / 2, 100]);
         let scaled = saturated_multiply_by_double(&r, 3.0);
-        assert_eq!(scaled.get_val(ResourceType::Operations), i64::MAX);
-        assert_eq!(scaled.get_val(ResourceType::Instructions), 300);
+        assert_eq!(scaled.val(ResourceType::Operations), i64::MAX);
+        assert_eq!(scaled.val(ResourceType::Instructions), 300);
     }
 
     #[test]
@@ -527,8 +527,8 @@ mod tests {
 
         let r = Resource::new(vec![1000, 2000]);
         let divided = big_divide_resource(&r, 1, 10, Rounding::Down).unwrap();
-        assert_eq!(divided.get_val(ResourceType::Operations), 100);
-        assert_eq!(divided.get_val(ResourceType::Instructions), 200);
+        assert_eq!(divided.val(ResourceType::Operations), 100);
+        assert_eq!(divided.val(ResourceType::Instructions), 200);
     }
 
     #[test]
@@ -537,8 +537,8 @@ mod tests {
 
         let r = Resource::new(vec![1001, 2001]);
         let divided = big_divide_resource(&r, 1, 10, Rounding::Up).unwrap();
-        assert_eq!(divided.get_val(ResourceType::Operations), 101);
-        assert_eq!(divided.get_val(ResourceType::Instructions), 201);
+        assert_eq!(divided.val(ResourceType::Operations), 101);
+        assert_eq!(divided.val(ResourceType::Instructions), 201);
     }
 
     #[test]
@@ -548,7 +548,7 @@ mod tests {
         // (100 * 3) / 2 = 150
         let r = Resource::new(vec![100, 200]);
         let divided = big_divide_resource(&r, 3, 2, Rounding::Down).unwrap();
-        assert_eq!(divided.get_val(ResourceType::Operations), 150);
-        assert_eq!(divided.get_val(ResourceType::Instructions), 300);
+        assert_eq!(divided.val(ResourceType::Operations), 150);
+        assert_eq!(divided.val(ResourceType::Instructions), 300);
     }
 }

@@ -99,7 +99,7 @@ impl TransactionExecutor {
                 if let Some(sponsor) = self.state.entry_sponsor(&key) {
                     self.load_account(snapshot, &sponsor)?;
                 }
-                if let Some(entry) = self.state.get_claimable_balance(&op_data.balance_id) {
+                if let Some(entry) = self.state.claimable_balance(&op_data.balance_id) {
                     let asset = entry.asset.clone();
                     if let Some(tl_asset) = asset_to_trustline_asset(&asset) {
                         self.load_trustline(snapshot, &op_source, &tl_asset)?;
@@ -389,7 +389,7 @@ impl TransactionExecutor {
                     // Collect sponsor IDs from the source account's signer_sponsoring_i_ds
                     let sponsor_ids: Vec<AccountId> = self
                         .state
-                        .get_account(&op_source)
+                        .account(&op_source)
                         .and_then(|account| {
                             if let stellar_xdr::curr::AccountEntryExt::V1(v1) = &account.ext {
                                 if let stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) =

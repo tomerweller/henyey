@@ -235,7 +235,7 @@ impl LogLevelHandle {
     }
 
     /// Get the current log levels for all partitions.
-    pub fn get_levels(&self) -> HashMap<String, String> {
+    pub fn levels(&self) -> HashMap<String, String> {
         let levels = self.levels.read().unwrap();
         let mut result = levels.clone();
         result.insert(

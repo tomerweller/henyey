@@ -228,11 +228,11 @@ fn summary_for_set(
         if frame.is_soroban() {
             soroban_ops += frame.operation_count() as i64;
             let resources = frame.resources(false, 25);
-            insns += resources.get_val(henyey_common::ResourceType::Instructions);
-            disk_read_bytes += resources.get_val(henyey_common::ResourceType::DiskReadBytes);
-            write_bytes += resources.get_val(henyey_common::ResourceType::WriteBytes);
-            disk_read_entries += resources.get_val(henyey_common::ResourceType::ReadLedgerEntries);
-            write_entries += resources.get_val(henyey_common::ResourceType::WriteLedgerEntries);
+            insns += resources.val(henyey_common::ResourceType::Instructions);
+            disk_read_bytes += resources.val(henyey_common::ResourceType::DiskReadBytes);
+            write_bytes += resources.val(henyey_common::ResourceType::WriteBytes);
+            disk_read_entries += resources.val(henyey_common::ResourceType::ReadLedgerEntries);
+            write_entries += resources.val(henyey_common::ResourceType::WriteLedgerEntries);
             tx_size_bytes += tx
                 .to_xdr(stellar_xdr::curr::Limits::none())
                 .map(|b| b.len() as i64)

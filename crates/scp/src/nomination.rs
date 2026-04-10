@@ -179,26 +179,26 @@ impl NominationProtocol {
     }
 
     /// Get the last envelope constructed by this node.
-    pub fn get_last_envelope(&self) -> Option<&ScpEnvelope> {
+    pub fn last_envelope(&self) -> Option<&ScpEnvelope> {
         self.last_envelope.as_ref()
     }
 
     /// Get the last envelope actually sent (emitted) to the network.
     ///
     /// This returns the most recent nomination envelope that was actually
-    /// broadcast to the network, which may differ from `get_last_envelope()`
+    /// broadcast to the network, which may differ from `last_envelope()`
     /// when the slot is not fully validated.
-    pub fn get_last_message_send(&self) -> Option<&ScpEnvelope> {
+    pub fn last_message_send(&self) -> Option<&ScpEnvelope> {
         self.last_envelope_emit.as_ref()
     }
 
     /// Get the current round leaders.
-    pub fn get_round_leaders(&self) -> &BTreeSet<NodeId> {
+    pub fn round_leaders(&self) -> &BTreeSet<NodeId> {
         &self.round_leaders
     }
 
     /// Get the latest nomination envelope from a specific node.
-    pub fn get_latest_nomination(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
+    pub fn latest_nomination(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
         self.latest_nominations.get(node_id)
     }
 
@@ -211,7 +211,7 @@ impl NominationProtocol {
     ///
     /// Returns the QuorumInfoNodeState for a given node based on their
     /// latest nomination envelope, or Missing if we haven't heard from them.
-    pub fn get_node_state(&self, node_id: &NodeId) -> crate::QuorumInfoNodeState {
+    pub fn node_state(&self, node_id: &NodeId) -> crate::QuorumInfoNodeState {
         if self.latest_nominations.contains_key(node_id) {
             crate::QuorumInfoNodeState::Nominating
         } else {
@@ -223,7 +223,7 @@ impl NominationProtocol {
     ///
     /// Returns a NominationInfo struct that can be serialized to JSON
     /// for debugging and monitoring purposes.
-    pub fn get_info(&self) -> crate::NominationInfo {
+    pub fn info(&self) -> crate::NominationInfo {
         crate::NominationInfo {
             running: self.started && !self.stopped,
             round: self.round,
@@ -316,7 +316,7 @@ impl NominationProtocol {
             let ScpStatementPledges::Nominate(nom) = &env.statement.pledges else {
                 continue;
             };
-            let Some(new_vote) = self.get_new_value_from_nomination(nom, ctx) else {
+            let Some(new_vote) = self.new_value_from_nomination(nom, ctx) else {
                 continue;
             };
             if Self::insert_unique(&mut self.votes, new_vote.clone()) {
@@ -338,7 +338,7 @@ impl NominationProtocol {
         }
 
         let over_upgrade_timeout_limit =
-            self.timer_exp_count >= ctx.driver.get_upgrade_nomination_timeout_limit();
+            self.timer_exp_count >= ctx.driver.upgrade_nomination_timeout_limit();
 
         let mut should_vote_for_value = false;
         let mut vote_value = value.clone();
@@ -411,7 +411,7 @@ impl NominationProtocol {
             // N13: Only take round leader votes if we're still looking for
             // candidates (stellar-core processEnvelope lines 476-489).
             if self.candidates.is_empty() && self.round_leaders.contains(node_id) {
-                if let Some(new_vote) = self.get_new_value_from_nomination(nomination, ctx) {
+                if let Some(new_vote) = self.new_value_from_nomination(nomination, ctx) {
                     if Self::insert_unique(&mut self.votes, new_vote.clone()) {
                         modified = true;
                         ctx.driver.nominating_value(ctx.slot_index, &new_vote);
@@ -449,7 +449,7 @@ impl NominationProtocol {
     }
 
     /// Get the nodes whose nominations contain `value` in the given field.
-    fn get_nodes_with_value(
+    fn nodes_with_value(
         &self,
         value: &Value,
         field: fn(&ScpNomination) -> &[Value],
@@ -748,9 +748,9 @@ impl NominationProtocol {
         for (node_id, envelope) in &self.latest_nominations {
             if let ScpStatementPledges::Nominate(nom) = &envelope.statement.pledges {
                 let qset_hash = henyey_common::Hash256::from(nom.quorum_set_hash.clone());
-                if let Some(qs) = ctx.driver.get_quorum_set_by_hash(&qset_hash) {
+                if let Some(qs) = ctx.driver.quorum_set_by_hash(&qset_hash) {
                     map.insert(node_id.clone(), qs);
-                } else if let Some(qs) = ctx.driver.get_quorum_set(node_id) {
+                } else if let Some(qs) = ctx.driver.quorum_set(node_id) {
                     // Verify the hash matches before using the fallback, matching
                     // the ballot protocol's approach (ballot/statements.rs) and
                     // stellar-core's hash-only lookup (Slot.cpp:316-348).
@@ -768,8 +768,8 @@ impl NominationProtocol {
     }
 
     fn should_accept_value<D: SCPDriver>(&self, value: &Value, ctx: &SlotContext<'_, D>) -> bool {
-        let voters = self.get_nodes_with_value(value, |nom| &nom.votes);
-        let acceptors = self.get_nodes_with_value(value, |nom| &nom.accepted);
+        let voters = self.nodes_with_value(value, |nom| &nom.votes);
+        let acceptors = self.nodes_with_value(value, |nom| &nom.accepted);
         let supporters: HashSet<_> = voters.union(&acceptors).cloned().collect();
         let qsets = self.nomination_quorum_set_map(ctx);
         let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
@@ -779,13 +779,13 @@ impl NominationProtocol {
     }
 
     fn should_ratify_value<D: SCPDriver>(&self, value: &Value, ctx: &SlotContext<'_, D>) -> bool {
-        let acceptors = self.get_nodes_with_value(value, |nom| &nom.accepted);
+        let acceptors = self.nodes_with_value(value, |nom| &nom.accepted);
         let qsets = self.nomination_quorum_set_map(ctx);
         let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
         is_quorum(ctx.local_quorum_set, &acceptors, get_qs)
     }
 
-    fn get_new_value_from_nomination<D: SCPDriver>(
+    fn new_value_from_nomination<D: SCPDriver>(
         &self,
         nomination: &ScpNomination,
         ctx: &SlotContext<'_, D>,
@@ -853,7 +853,7 @@ impl NominationProtocol {
 
         while self.round_leaders.len() < max_leader_count {
             let mut new_leaders = HashSet::new();
-            let mut top_priority = self.get_node_priority(
+            let mut top_priority = self.node_priority(
                 &normalized_qs,
                 ctx.driver,
                 ctx.slot_index,
@@ -864,7 +864,7 @@ impl NominationProtocol {
             new_leaders.insert(ctx.local_node_id.clone());
 
             Self::for_all_nodes(&normalized_qs, &mut |node| {
-                let priority = self.get_node_priority(
+                let priority = self.node_priority(
                     &normalized_qs,
                     ctx.driver,
                     ctx.slot_index,
@@ -895,7 +895,7 @@ impl NominationProtocol {
         }
     }
 
-    fn get_node_priority<D: SCPDriver>(
+    fn node_priority<D: SCPDriver>(
         &self,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
@@ -1552,7 +1552,7 @@ mod tests {
             *self.extract_result.lock().unwrap() = value;
         }
 
-        fn get_timer_stops(&self) -> Vec<(u64, crate::driver::SCPTimerType)> {
+        fn timer_stops(&self) -> Vec<(u64, crate::driver::SCPTimerType)> {
             self.timer_stops.lock().unwrap().clone()
         }
 
@@ -1591,7 +1591,7 @@ mod tests {
             self.emit_count.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
+        fn quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
             Some(self.quorum_set.clone())
         }
 
@@ -1667,7 +1667,7 @@ mod tests {
             self.stripped_value.lock().unwrap().clone()
         }
 
-        fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
+        fn upgrade_nomination_timeout_limit(&self) -> u32 {
             self.upgrade_timeout_limit.load(Ordering::SeqCst)
         }
     }
@@ -1754,7 +1754,7 @@ mod tests {
 
         // After normalization: node0 removed, threshold becomes 2, validators = [1,2,3]
         // Verify leaders were selected (at least one leader exists)
-        let leaders = nom.get_round_leaders();
+        let leaders = nom.round_leaders();
         assert!(
             !leaders.is_empty(),
             "Should have at least one round leader after normalization"
@@ -1802,7 +1802,7 @@ mod tests {
         assert!(nom.is_started());
 
         // Verify the leader is indeed a round leader
-        let leaders = nom.get_round_leaders();
+        let leaders = nom.round_leaders();
 
         // If leader is not in the round leaders, this test isn't exercising N13.
         // The ParityMockDriver gives higher priority to higher node IDs, so
@@ -1876,10 +1876,10 @@ mod tests {
             vec![accepted_value.clone()],
         );
 
-        // If leader is a round leader, get_new_value_from_nomination will be called.
+        // If leader is a round leader, new_value_from_nomination will be called.
         // With N14 fix: if accepted_value extracts to a valid value, foundValidValue
         // becomes true and we skip scanning votes.
-        let leaders = nom.get_round_leaders();
+        let leaders = nom.round_leaders();
         if leaders.contains(&leader) {
             nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 1));
 
@@ -1956,7 +1956,7 @@ mod tests {
 
         // No timer stops yet
         assert!(
-            driver.get_timer_stops().is_empty(),
+            driver.timer_stops().is_empty(),
             "No timer stops before candidate confirmation"
         );
 
@@ -1987,7 +1987,7 @@ mod tests {
         );
 
         // N12: Timer should have been stopped
-        let stops = driver.get_timer_stops();
+        let stops = driver.timer_stops();
         assert!(
             !stops.is_empty(),
             "Nomination timer should be stopped when candidates are confirmed"
@@ -2192,7 +2192,7 @@ mod tests {
         // Nominate to populate round_leaders
         nom.nominate(&ctx!(&node1, &quorum_set, &driver, 1), value, &prev, false);
 
-        let leaders = nom.get_round_leaders();
+        let leaders = nom.round_leaders();
         if leaders.len() > 1 {
             // Verify iteration order is deterministic (sorted) by collecting
             // multiple times and comparing
@@ -2210,7 +2210,7 @@ mod tests {
     /// Regression test for AUDIT-005 (SCP): nomination quorum set hash verification bypass.
     ///
     /// The nomination protocol's `nomination_quorum_set_map` was falling back to
-    /// `get_quorum_set(node_id)` without verifying the hash, allowing stale quorum
+    /// `quorum_set(node_id)` without verifying the hash, allowing stale quorum
     /// sets to be used in quorum calculations. stellar-core uses hash-only lookup
     /// and excludes nodes whose quorum set hash is unknown.
     #[test]
@@ -2245,15 +2245,15 @@ mod tests {
         };
         nom.latest_nominations.insert(remote_node.clone(), envelope);
 
-        // A driver where get_quorum_set_by_hash returns None (default)
-        // and get_quorum_set returns the STALE quorum set.
+        // A driver where quorum_set_by_hash returns None (default)
+        // and quorum_set returns the STALE quorum set.
         let driver = Arc::new(MockDriver::with_quorum_set(qs_stale.clone()));
         let slot_ctx = ctx!(&local_node, &qs_current, &driver, 0);
 
         let map = nom.nomination_quorum_set_map(&slot_ctx);
 
         // The remote node's quorum set should NOT be in the map because
-        // its declared hash (current_hash) doesn't match what get_quorum_set
+        // its declared hash (current_hash) doesn't match what quorum_set
         // returned (stale_hash). Before the fix, the stale set was used.
         assert!(
             !map.contains_key(&remote_node),
@@ -2321,7 +2321,7 @@ mod tests {
         );
     }
 
-    /// Regression test for AUDIT-018 (#1090): get_new_value_from_nomination must
+    /// Regression test for AUDIT-018 (#1090): new_value_from_nomination must
     /// call extract_valid_value for Invalid values, not just MaybeValid.
     #[test]
     fn test_get_new_value_from_nomination_extracts_invalid() {
@@ -2347,9 +2347,9 @@ mod tests {
             false,
         );
 
-        // Check if leader is a round leader — if so, get_new_value_from_nomination
+        // Check if leader is a round leader — if so, new_value_from_nomination
         // will be called during process_envelope
-        let leaders = nom.get_round_leaders();
+        let leaders = nom.round_leaders();
         if leaders.contains(&leader) {
             let env = make_nomination_envelope(
                 leader.clone(),
@@ -2364,7 +2364,7 @@ mod tests {
             // The extracted value should be adopted as a vote
             assert!(
                 nom.votes().contains(&extracted),
-                "get_new_value_from_nomination should extract valid values from Invalid; \
+                "new_value_from_nomination should extract valid values from Invalid; \
                  extracted {:?} not found in votes {:?}",
                 extracted,
                 nom.votes()

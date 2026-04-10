@@ -543,10 +543,10 @@ pub trait MergeInput {
     fn equal_keys(&self) -> bool;
 
     /// Returns the current entry from the old input.
-    fn get_old_entry(&self) -> Option<&BucketEntry>;
+    fn old_entry(&self) -> Option<&BucketEntry>;
 
     /// Returns the current entry from the new input.
-    fn get_new_entry(&self) -> Option<&BucketEntry>;
+    fn new_entry(&self) -> Option<&BucketEntry>;
 
     /// Advances the old input to the next entry.
     fn advance_old(&mut self) -> Result<()>;
@@ -616,11 +616,11 @@ impl MergeInput for MemoryMergeInput<'_> {
         ) == std::cmp::Ordering::Equal
     }
 
-    fn get_old_entry(&self) -> Option<&BucketEntry> {
+    fn old_entry(&self) -> Option<&BucketEntry> {
         self.old_entries.get(self.old_index)
     }
 
-    fn get_new_entry(&self) -> Option<&BucketEntry> {
+    fn new_entry(&self) -> Option<&BucketEntry> {
         self.new_entries.get(self.new_index)
     }
 
@@ -683,11 +683,11 @@ impl MergeInput for FileMergeInput {
         }
     }
 
-    fn get_old_entry(&self) -> Option<&BucketEntry> {
+    fn old_entry(&self) -> Option<&BucketEntry> {
         self.old_iter.peek()
     }
 
-    fn get_new_entry(&self) -> Option<&BucketEntry> {
+    fn new_entry(&self) -> Option<&BucketEntry> {
         self.new_iter.peek()
     }
 

@@ -399,7 +399,7 @@ fn test_set_options_loads_signer_sponsor_accounts() {
 
     // Verify the sponsor's num_sponsoring was decremented
     let state = executor.state();
-    let sponsor_account = state.get_account(&sponsor_id).expect("sponsor account");
+    let sponsor_account = state.account(&sponsor_id).expect("sponsor account");
     if let AccountEntryExt::V1(v1) = &sponsor_account.ext {
         if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
             assert_eq!(
@@ -414,7 +414,7 @@ fn test_set_options_loads_signer_sponsor_accounts() {
     }
 
     // Verify the source account's signer was removed
-    let source_account = state.get_account(&source_id).expect("source account");
+    let source_account = state.account(&source_id).expect("source account");
     assert!(
         source_account.signers.is_empty(),
         "Signer should have been removed"
@@ -537,7 +537,7 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
 /// 2. TX2 (manage sell offer) from the offer owner tries to delete the same offer by ID
 ///
 /// Without the fix, TX2 would reload the offer from the snapshot because:
-/// - `state.get_offer()` returns `None` (offer was removed from memory)
+/// - `state.offer()` returns `None` (offer was removed from memory)
 /// - `batch_load_keys()` would reload it from snapshot (ignoring that it was deleted)
 /// - The offer would appear to exist with full amount but trustline liabilities = 0
 /// - This caused "liabilities underflow" errors
@@ -1508,7 +1508,7 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     assert!(
         executor
             .state()
-            .get_trustline_by_trustline_asset(&source_id, &tl_asset)
+            .trustline_by_trustline_asset(&source_id, &tl_asset)
             .is_none(),
         "Trustline should be gone after TX1"
     );
@@ -1516,7 +1516,7 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     // Verify num_sub_entries decremented to 0
     let account = executor
         .state()
-        .get_account(&source_id)
+        .account(&source_id)
         .expect("source account");
     assert_eq!(
         account.num_sub_entries, 0,
@@ -1594,7 +1594,7 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     // Verify num_sub_entries is still 0 (not decremented to -1/underflow)
     let account = executor
         .state()
-        .get_account(&source_id)
+        .account(&source_id)
         .expect("source account");
     assert_eq!(
         account.num_sub_entries, 0,
@@ -1824,19 +1824,13 @@ fn test_advance_to_ledger() {
 
     // Verify offer A is NOT in the executor's state (it was consumed in ledger 1)
     assert!(
-        executor
-            .state()
-            .get_offer(&owner_a_id, offer_a_id)
-            .is_none(),
+        executor.state().offer(&owner_a_id, offer_a_id).is_none(),
         "Offer A should be gone after being fully crossed in ledger 1"
     );
 
     // Verify offer B IS still in the executor's state (it was not touched in ledger 1)
     assert!(
-        executor
-            .state()
-            .get_offer(&owner_b_id, offer_b_id)
-            .is_some(),
+        executor.state().offer(&owner_b_id, offer_b_id).is_some(),
         "Offer B should be preserved across ledger advance"
     );
 
@@ -3624,7 +3618,7 @@ fn test_should_apply_false_skips_operation_body() {
     // 6. Verify the executor state: sequence number was bumped (pre-apply committed).
     let account = executor
         .state()
-        .get_account(&source_id)
+        .account(&source_id)
         .expect("source account must exist in executor state");
     assert_eq!(
         account.seq_num,
@@ -3841,7 +3835,7 @@ fn test_audit_577_pre_charged_should_apply_false_skips_body() {
     );
     // The destination account must not have been created.
     assert!(
-        executor.state().get_account(&dest).is_none(),
+        executor.state().account(&dest).is_none(),
         "destination account must not exist when should_apply=false"
     );
 }
@@ -3959,7 +3953,7 @@ fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
 
     // Source account must still exist (merge was blocked).
     assert!(
-        executor.state().get_account(&source_id).is_some(),
+        executor.state().account(&source_id).is_some(),
         "source account must still exist when merge is blocked by MAX_SEQ_NUM_TO_APPLY"
     );
 }
@@ -4039,7 +4033,7 @@ fn test_single_op_tx_failure_rolls_back_without_per_op_savepoint() {
     // The payment amount must NOT have been deducted (rolled back by TX-level rollback).
     let source = executor
         .state()
-        .get_account(&source_id)
+        .account(&source_id)
         .expect("source account must exist");
     assert_eq!(
         source.balance,
@@ -4053,7 +4047,7 @@ fn test_single_op_tx_failure_rolls_back_without_per_op_savepoint() {
     // The destination should not exist (payment was rolled back).
     let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([99u8; 32])));
     assert!(
-        executor.state().get_account(&dest_id).is_none(),
+        executor.state().account(&dest_id).is_none(),
         "destination account must not exist after rollback"
     );
 }
@@ -4198,7 +4192,7 @@ fn test_audit_005_fee_bump_pre_auth_signer_removed_from_fee_source() {
     // Bug 1: The fee source's PreAuthTx signer matching the outer hash must be removed.
     let fee_account = executor
         .state()
-        .get_account(&fee_account_id)
+        .account(&fee_account_id)
         .expect("fee source account");
     assert!(
         fee_account.signers.is_empty(),
@@ -4337,7 +4331,7 @@ fn test_audit_005_fee_bump_inner_hash_for_signer_removal() {
     // Bug 2a: The inner source's PreAuthTx signer matching the INNER hash must be removed.
     let inner_account = executor
         .state()
-        .get_account(&inner_account_id)
+        .account(&inner_account_id)
         .expect("inner source account");
     assert!(
         inner_account.signers.is_empty(),

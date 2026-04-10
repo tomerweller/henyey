@@ -148,12 +148,12 @@ pub trait TxBroadcastCallback: Send + Sync + 'static {
     fn broadcast_transaction(&self, envelope: &TransactionEnvelope) -> bool;
 
     /// Get the maximum number of transactions to broadcast per period.
-    fn get_flood_capacity(&self) -> usize;
+    fn flood_capacity(&self) -> usize;
 
     /// Get transactions sorted by priority (highest fee first).
     ///
     /// Returns (tx_hash, envelope, already_broadcast).
-    fn get_transactions_by_priority(&self) -> Vec<(Hash, TransactionEnvelope, bool)>;
+    fn transactions_by_priority(&self) -> Vec<(Hash, TransactionEnvelope, bool)>;
 }
 
 /// Pending transaction for broadcast.
@@ -297,11 +297,11 @@ impl<C: TxBroadcastCallback> TxBroadcastManager<C> {
             return;
         }
 
-        let capacity = self.callback.get_flood_capacity();
+        let capacity = self.callback.flood_capacity();
         let mut broadcast_count = 0;
 
         // Get transactions sorted by priority from the callback
-        let transactions = self.callback.get_transactions_by_priority();
+        let transactions = self.callback.transactions_by_priority();
 
         for (tx_hash, envelope, already_broadcast) in &transactions {
             if broadcast_count >= capacity {
@@ -409,11 +409,11 @@ mod tests {
             true
         }
 
-        fn get_flood_capacity(&self) -> usize {
+        fn flood_capacity(&self) -> usize {
             10
         }
 
-        fn get_transactions_by_priority(&self) -> Vec<(Hash, TransactionEnvelope, bool)> {
+        fn transactions_by_priority(&self) -> Vec<(Hash, TransactionEnvelope, bool)> {
             self.transactions.read().clone()
         }
     }

@@ -20,7 +20,7 @@ impl App {
         }
 
         // Get current ledger state (catchup was already done by run_cmd)
-        let current_ledger = self.get_current_ledger().await?;
+        let current_ledger = self.current_ledger().await?;
 
         if current_ledger == 0 {
             // This shouldn't happen if run_cmd did catchup, but handle it just in case
@@ -448,7 +448,7 @@ impl App {
                     if self.sync_recovery_pending.swap(false, Ordering::SeqCst) {
                         tracing::info!("Sync recovery requested, starting recovery");
                         // SyncRecoveryManager triggered recovery - perform it now
-                        if let Ok(current_ledger) = self.get_current_ledger().await {
+                        if let Ok(current_ledger) = self.current_ledger().await {
                             tracing::info!(current_ledger, "Calling out_of_sync_recovery");
                             self.out_of_sync_recovery(current_ledger).await;
                             tracing::info!("out_of_sync_recovery completed");
@@ -476,7 +476,7 @@ impl App {
                             let latest = self.herder.latest_externalized_slot().unwrap_or(0);
                             let next = cl as u64 + 1;
                             if latest > next
-                                && self.herder.get_externalized(next).is_none()
+                                && self.herder.externalized(next).is_none()
                             {
                                 let last_req = *self.last_scp_state_request_at.read().await;
                                 // Throttle to at most once every 5 seconds
@@ -656,7 +656,7 @@ impl App {
                             // still having it in cache decreases.
                             let next_slot = current_ledger as u64 + 1;
                             let next_slot_missing = latest_ext > next_slot
-                                && self.herder.get_externalized(next_slot).is_none();
+                                && self.herder.externalized(next_slot).is_none();
 
                             if gap <= TX_SET_REQUEST_WINDOW && !next_slot_missing {
                                 // Small gap and we have the next slot's EXTERNALIZE.
@@ -1119,7 +1119,7 @@ impl App {
 
                     // Check if all connected peers have reported DontHave for this tx_set
                     let dont_have_count = map.get(&hash).map(|s| s.len()).unwrap_or(0);
-                    let peer_count = self.get_peer_count().await;
+                    let peer_count = self.peer_count().await;
                     let all_peers_dont_have = dont_have_count >= peer_count && peer_count > 0;
 
                     if self.herder.needs_tx_set(&hash) {
@@ -1347,18 +1347,13 @@ impl App {
     }
 
     /// Get the current ledger sequence from the database.
-    pub(super) async fn get_current_ledger(&self) -> anyhow::Result<u32> {
+    pub(super) async fn current_ledger(&self) -> anyhow::Result<u32> {
         // Check if ledger manager is initialized
         if self.ledger_manager.is_initialized() {
             return Ok(self.ledger_manager.current_ledger_seq());
         }
         // No state yet
         Ok(0)
-    }
-
-    /// Get the number of connected peers.
-    async fn get_peer_count(&self) -> usize {
-        self.overlay().await.map(|o| o.peer_count()).unwrap_or(0)
     }
 
     /// Signal the application to shut down.

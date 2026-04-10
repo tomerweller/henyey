@@ -154,7 +154,7 @@ impl SorobanStorage {
     }
 
     /// Get contract code.
-    pub fn get_code(&self, hash: &Hash) -> Option<&Vec<u8>> {
+    pub fn code(&self, hash: &Hash) -> Option<&Vec<u8>> {
         self.code_entries.get(hash).and_then(|c| c.as_ref())
     }
 
@@ -443,12 +443,12 @@ mod tests {
         storage.record_code_read(Hash([1u8; 32]), Some(vec![1, 2, 3]));
 
         assert!(storage.has(&key));
-        assert!(storage.get_code(&Hash([1u8; 32])).is_some());
+        assert!(storage.code(&Hash([1u8; 32])).is_some());
 
         storage.clear();
 
         assert!(!storage.has(&key));
-        assert!(storage.get_code(&Hash([1u8; 32])).is_none());
+        assert!(storage.code(&Hash([1u8; 32])).is_none());
         assert_eq!(storage.read_count(), 0);
         assert_eq!(storage.write_count(), 0);
     }
@@ -462,13 +462,13 @@ mod tests {
 
         storage.record_code_read(code_hash.clone(), Some(code.clone()));
 
-        let retrieved = storage.get_code(&code_hash);
+        let retrieved = storage.code(&code_hash);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap(), &code);
 
         // Non-existent code
         let missing_hash = Hash([99u8; 32]);
-        assert!(storage.get_code(&missing_hash).is_none());
+        assert!(storage.code(&missing_hash).is_none());
     }
 
     /// Test footprint read_only to read_write promotion.

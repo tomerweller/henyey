@@ -157,7 +157,7 @@ impl Tracker {
     }
 
     /// Get duration since fetch started.
-    pub fn get_duration(&self) -> Duration {
+    pub fn duration(&self) -> Duration {
         self.fetch_start.elapsed()
     }
 
@@ -365,7 +365,7 @@ impl ItemFetcher {
     }
 
     /// Get the current list of available peers.
-    pub fn get_available_peers(&self) -> Vec<PeerId> {
+    pub fn available_peers(&self) -> Vec<PeerId> {
         self.available_peers.lock().unwrap().clone()
     }
 
@@ -439,7 +439,7 @@ impl ItemFetcher {
     }
 
     /// Get the last seen slot index for an item.
-    pub fn get_last_seen_slot_index(&self, item_hash: &Hash) -> u64 {
+    pub fn last_seen_slot_index(&self, item_hash: &Hash) -> u64 {
         let trackers = self.trackers.lock().unwrap();
         trackers
             .get(item_hash)
@@ -492,7 +492,7 @@ impl ItemFetcher {
                 tracker.len()
             );
 
-            let duration = tracker.get_duration();
+            let duration = tracker.duration();
             debug!(
                 "Fetched {:?} {} in {:?}",
                 self.item_type,
@@ -525,7 +525,7 @@ impl ItemFetcher {
     ///
     /// Returns (item_hash, peer_to_ask) pairs.
     // SECURITY: retry state bounded by peer count and flow control
-    pub fn get_pending_requests(&self, available_peers: &[PeerId]) -> Vec<PendingRequest> {
+    pub fn pending_requests(&self, available_peers: &[PeerId]) -> Vec<PendingRequest> {
         let mut trackers = self.trackers.lock().unwrap();
         let mut requests = Vec::new();
 
@@ -560,7 +560,7 @@ impl ItemFetcher {
     /// and retry fetching from different peers. Returns the number of requests sent.
     pub fn process_pending(&self) -> usize {
         let available_peers = self.available_peers.lock().unwrap().clone();
-        let requests = self.get_pending_requests(&available_peers);
+        let requests = self.pending_requests(&available_peers);
 
         if requests.is_empty() {
             return 0;
@@ -597,7 +597,7 @@ impl ItemFetcher {
     }
 
     /// Get statistics.
-    pub fn get_stats(&self) -> ItemFetcherStats {
+    pub fn stats(&self) -> ItemFetcherStats {
         let trackers = self.trackers.lock().unwrap();
 
         let mut total_waiting = 0;
@@ -605,7 +605,7 @@ impl ItemFetcher {
 
         for tracker in trackers.values() {
             total_waiting += tracker.len();
-            let dur = tracker.get_duration();
+            let dur = tracker.duration();
             if dur > oldest_duration {
                 oldest_duration = dur;
             }
@@ -862,7 +862,7 @@ mod tests {
 
         fetcher.fetch(hash.clone(), &env);
 
-        let requests = fetcher.get_pending_requests(&peers);
+        let requests = fetcher.pending_requests(&peers);
 
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].item_hash, hash);
@@ -879,7 +879,7 @@ mod tests {
         fetcher.fetch(hash1, &env1);
         fetcher.fetch(hash2, &env2);
 
-        let stats = fetcher.get_stats();
+        let stats = fetcher.stats();
 
         assert_eq!(stats.item_type, ItemType::QuorumSet);
         assert_eq!(stats.num_trackers, 2);

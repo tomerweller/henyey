@@ -133,7 +133,7 @@ impl App {
         // Read LCL header from DB
         let (lcl_seq, header) = self.db.with_connection(|conn| {
             let lcl_seq = conn
-                .get_last_closed_ledger()?
+                .last_closed_ledger()?
                 .ok_or_else(|| henyey_db::DbError::Integrity("No LCL in DB".to_string()))?;
             let header = conn.load_ledger_header(lcl_seq)?.ok_or_else(|| {
                 henyey_db::DbError::Integrity(format!("No header for LCL {}", lcl_seq))

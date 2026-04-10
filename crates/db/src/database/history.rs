@@ -9,7 +9,7 @@ impl Database {
     ///
     /// The transaction history entry contains all transactions that were
     /// included in the specified ledger.
-    pub fn get_tx_history_entry(&self, seq: u32) -> Result<Option<TransactionHistoryEntry>> {
+    pub fn tx_history_entry(&self, seq: u32) -> Result<Option<TransactionHistoryEntry>> {
         self.with_connection(|conn| {
             use queries::HistoryQueries;
             conn.load_tx_history_entry(seq)
@@ -19,7 +19,7 @@ impl Database {
     /// Returns the transaction results for a ledger.
     ///
     /// Contains the execution results of all transactions in the ledger.
-    pub fn get_tx_result_entry(&self, seq: u32) -> Result<Option<TransactionHistoryResultEntry>> {
+    pub fn tx_result_entry(&self, seq: u32) -> Result<Option<TransactionHistoryResultEntry>> {
         self.with_connection(|conn| {
             use queries::HistoryQueries;
             conn.load_tx_result_entry(seq)

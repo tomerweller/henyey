@@ -33,7 +33,7 @@ pub(crate) fn execute_begin_sponsoring_future_reserves(
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check source account exists (the sponsor must exist to pay reserves)
-    if state.get_account(source).is_none() {
+    if state.account(source).is_none() {
         return Ok(make_begin_result(
             BeginSponsoringFutureReservesResultCode::Malformed,
         ));
@@ -81,7 +81,7 @@ pub(crate) fn execute_end_sponsoring_future_reserves(
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check source account exists
-    if state.get_account(source).is_none() {
+    if state.account(source).is_none() {
         return Ok(make_end_result(
             EndSponsoringFutureReservesResultCode::NotSponsored,
         ));
@@ -111,14 +111,14 @@ pub(crate) fn execute_revoke_sponsorship(
     use stellar_xdr::curr::RevokeSponsorshipOp as RSO;
 
     // Check source account exists
-    if state.get_account(source).is_none() {
+    if state.account(source).is_none() {
         return Ok(make_revoke_result(RevokeSponsorshipResultCode::NotSponsor));
     }
 
     match op {
         RSO::LedgerEntry(ledger_key) => {
             // Check if the entry exists
-            let Some(entry) = state.get_entry(ledger_key) else {
+            let Some(entry) = state.entry(ledger_key) else {
                 tracing::debug!(
                     "RevokeSponsorship: entry does not exist, key={:?}",
                     ledger_key
@@ -176,7 +176,7 @@ pub(crate) fn execute_revoke_sponsorship(
             if was_sponsored && will_be_sponsored {
                 let new_sponsor = new_sponsor.expect("sponsor must exist");
                 let new_sponsor_account = state
-                    .get_account(&new_sponsor)
+                    .account(&new_sponsor)
                     .ok_or(TxError::SourceAccountNotFound)?;
                 let new_min_balance = state.minimum_balance_for_account_with_deltas(
                     new_sponsor_account,
@@ -204,7 +204,7 @@ pub(crate) fn execute_revoke_sponsorship(
                 state.set_entry_sponsor(ledger_key.clone(), new_sponsor);
                 sponsorship_changed = true;
             } else if was_sponsored && !will_be_sponsored {
-                if let Some(owner_account) = state.get_account(&owner_id) {
+                if let Some(owner_account) = state.account(&owner_id) {
                     let new_min_balance = state.minimum_balance_for_account_with_deltas(
                         owner_account,
                         context.protocol_version,
@@ -231,7 +231,7 @@ pub(crate) fn execute_revoke_sponsorship(
             } else if !was_sponsored && will_be_sponsored {
                 let new_sponsor = new_sponsor.expect("sponsor must exist");
                 let new_sponsor_account = state
-                    .get_account(&new_sponsor)
+                    .account(&new_sponsor)
                     .ok_or(TxError::SourceAccountNotFound)?;
                 let new_min_balance = state.minimum_balance_for_account_with_deltas(
                     new_sponsor_account,
@@ -270,7 +270,7 @@ pub(crate) fn execute_revoke_sponsorship(
         }
         RSO::Signer(signer_key) => {
             // Check if the account exists
-            let Some(account) = state.get_account(&signer_key.account_id) else {
+            let Some(account) = state.account(&signer_key.account_id) else {
                 return Ok(make_revoke_result(
                     RevokeSponsorshipResultCode::DoesNotExist,
                 ));
@@ -307,7 +307,7 @@ pub(crate) fn execute_revoke_sponsorship(
             if was_sponsored && will_be_sponsored {
                 let new_sponsor = new_sponsor.expect("sponsor must exist");
                 let new_sponsor_account = state
-                    .get_account(&new_sponsor)
+                    .account(&new_sponsor)
                     .ok_or(TxError::SourceAccountNotFound)?;
                 let new_min_balance = state.minimum_balance_for_account_with_deltas(
                     new_sponsor_account,
@@ -333,7 +333,7 @@ pub(crate) fn execute_revoke_sponsorship(
                 state.update_num_sponsoring(&new_sponsor, 1)?;
                 set_signer_sponsor(state, &owner_id, pos, Some(new_sponsor))?;
             } else if was_sponsored && !will_be_sponsored {
-                if let Some(owner_account) = state.get_account(&owner_id) {
+                if let Some(owner_account) = state.account(&owner_id) {
                     let new_min_balance = state.minimum_balance_for_account_with_deltas(
                         owner_account,
                         context.protocol_version,
@@ -354,7 +354,7 @@ pub(crate) fn execute_revoke_sponsorship(
             } else if !was_sponsored && will_be_sponsored {
                 let new_sponsor = new_sponsor.expect("sponsor must exist");
                 let new_sponsor_account = state
-                    .get_account(&new_sponsor)
+                    .account(&new_sponsor)
                     .ok_or(TxError::SourceAccountNotFound)?;
                 let new_min_balance = state.minimum_balance_for_account_with_deltas(
                     new_sponsor_account,
@@ -438,26 +438,26 @@ fn update_entry_after_sponsorship(
 ) -> Result<()> {
     match ledger_key {
         LedgerKey::Account(LedgerKeyAccount { account_id }) => {
-            let _ = state.get_account_mut(account_id);
+            let _ = state.account_mut(account_id);
         }
         LedgerKey::Trustline(LedgerKeyTrustLine { account_id, asset }) => {
-            let _ = state.get_trustline_by_trustline_asset_mut(account_id, asset);
+            let _ = state.trustline_by_trustline_asset_mut(account_id, asset);
         }
         LedgerKey::Offer(LedgerKeyOffer {
             seller_id,
             offer_id,
         }) => {
-            let _ = state.get_offer_mut(seller_id, *offer_id);
+            let _ = state.offer_mut(seller_id, *offer_id);
         }
         LedgerKey::Data(LedgerKeyData {
             account_id,
             data_name,
         }) => {
             let name = String::from_utf8_lossy(data_name.as_vec()).to_string();
-            let _ = state.get_data_mut(account_id, &name);
+            let _ = state.data_mut(account_id, &name);
         }
         LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance { balance_id }) => {
-            let _ = state.get_claimable_balance_mut(balance_id);
+            let _ = state.claimable_balance_mut(balance_id);
         }
         _ => {}
     }
@@ -489,7 +489,7 @@ fn set_signer_sponsor(
     sponsor: Option<AccountId>,
 ) -> Result<()> {
     let account = state
-        .get_account_mut(account_id)
+        .account_mut(account_id)
         .ok_or(TxError::SourceAccountNotFound)?;
     let ext = crate::state::ensure_account_ext_v2(account);
     let mut sponsoring_ids: Vec<SponsorshipDescriptor> =
@@ -871,7 +871,7 @@ mod tests {
             signer_key.clone(),
             Some(sponsor_id.clone()),
         ));
-        if let Some(account) = state.get_account_mut(&sponsor_id) {
+        if let Some(account) = state.account_mut(&sponsor_id) {
             let ext = crate::state::ensure_account_ext_v2(account);
             ext.num_sponsoring = 1;
         }
@@ -906,7 +906,7 @@ mod tests {
             signer_key.clone(),
             Some(old_sponsor.clone()),
         ));
-        if let Some(account) = state.get_account_mut(&old_sponsor) {
+        if let Some(account) = state.account_mut(&old_sponsor) {
             let ext = crate::state::ensure_account_ext_v2(account);
             ext.num_sponsoring = 1;
         }
@@ -964,7 +964,7 @@ mod tests {
             ext: TrustLineEntryExt::V0,
         };
         state.create_trustline(trustline);
-        state.get_account_mut(&holder_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&holder_id).unwrap().num_sub_entries += 1;
 
         // Set up sponsorship
         let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
@@ -977,13 +977,13 @@ mod tests {
         state.set_entry_sponsor(ledger_key, sponsor_id.clone());
 
         // Update sponsor's num_sponsoring
-        if let Some(account) = state.get_account_mut(&sponsor_id) {
+        if let Some(account) = state.account_mut(&sponsor_id) {
             let ext = crate::state::ensure_account_ext_v2(account);
             ext.num_sponsoring = 1;
         }
 
         // Update holder's num_sponsored (since the trustline is sponsored)
-        if let Some(account) = state.get_account_mut(&holder_id) {
+        if let Some(account) = state.account_mut(&holder_id) {
             let ext = crate::state::ensure_account_ext_v2(account);
             ext.num_sponsored = 1;
         }
@@ -1041,7 +1041,7 @@ mod tests {
             ext: OfferEntryExt::V0,
         };
         state.create_offer(offer);
-        state.get_account_mut(&seller_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&seller_id).unwrap().num_sub_entries += 1;
 
         // Set up sponsorship
         let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
@@ -1051,13 +1051,13 @@ mod tests {
         state.set_entry_sponsor(ledger_key, sponsor_id.clone());
 
         // Update sponsor's num_sponsoring
-        if let Some(account) = state.get_account_mut(&sponsor_id) {
+        if let Some(account) = state.account_mut(&sponsor_id) {
             let ext = crate::state::ensure_account_ext_v2(account);
             ext.num_sponsoring = 1;
         }
 
         // Update seller's num_sponsored (since the offer is sponsored)
-        if let Some(account) = state.get_account_mut(&seller_id) {
+        if let Some(account) = state.account_mut(&seller_id) {
             let ext = crate::state::ensure_account_ext_v2(account);
             ext.num_sponsored = 1;
         }
@@ -1324,7 +1324,7 @@ mod tests {
         // Create a sponsored data entry
         let data_entry = create_data_entry(&holder_id, "mydata");
         state.create_data(data_entry);
-        state.get_account_mut(&holder_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&holder_id).unwrap().num_sub_entries += 1;
 
         // Set up sponsorship
         let data_name = String64::try_from("mydata".as_bytes().to_vec()).unwrap();
@@ -1335,13 +1335,13 @@ mod tests {
         state.set_entry_sponsor(ledger_key, sponsor_id.clone());
 
         // Update sponsor's num_sponsoring
-        if let Some(account) = state.get_account_mut(&sponsor_id) {
+        if let Some(account) = state.account_mut(&sponsor_id) {
             let ext = crate::state::ensure_account_ext_v2(account);
             ext.num_sponsoring = 1;
         }
 
         // Update holder's num_sponsored
-        if let Some(account) = state.get_account_mut(&holder_id) {
+        if let Some(account) = state.account_mut(&holder_id) {
             let ext = crate::state::ensure_account_ext_v2(account);
             ext.num_sponsored = 1;
         }

@@ -31,13 +31,13 @@ pub trait LedgerQueries {
     /// Returns the highest ledger sequence number in the database.
     ///
     /// Returns `None` if no ledgers have been stored.
-    fn get_latest_ledger_seq(&self) -> Result<Option<u32>, DbError>;
+    fn latest_ledger_seq(&self) -> Result<Option<u32>, DbError>;
 
     /// Returns the hash of a ledger by its sequence number.
     ///
     /// The hash is computed from the XDR-encoded header data.
     /// Returns `None` if the ledger is not found.
-    fn get_ledger_hash(&self, seq: u32) -> Result<Option<Hash256>, DbError>;
+    fn ledger_hash(&self, seq: u32) -> Result<Option<Hash256>, DbError>;
 
     /// Loads a ledger header by its hash (hex-encoded).
     ///
@@ -68,7 +68,7 @@ pub trait LedgerQueries {
     /// Returns the lowest ledger sequence number in the database.
     ///
     /// Returns `None` if no ledgers have been stored.
-    fn get_oldest_ledger_seq(&self) -> Result<Option<u32>, DbError>;
+    fn oldest_ledger_seq(&self) -> Result<Option<u32>, DbError>;
 }
 
 impl LedgerQueries for Connection {
@@ -109,7 +109,7 @@ impl LedgerQueries for Connection {
         Ok(())
     }
 
-    fn get_latest_ledger_seq(&self) -> Result<Option<u32>, DbError> {
+    fn latest_ledger_seq(&self) -> Result<Option<u32>, DbError> {
         // MAX() returns NULL when the table is empty, so we get the value optionally
         let result: Option<Option<u32>> = self
             .query_row("SELECT MAX(ledgerseq) FROM ledgerheaders", [], |row| {
@@ -119,7 +119,7 @@ impl LedgerQueries for Connection {
         Ok(result.flatten())
     }
 
-    fn get_ledger_hash(&self, seq: u32) -> Result<Option<Hash256>, DbError> {
+    fn ledger_hash(&self, seq: u32) -> Result<Option<Hash256>, DbError> {
         let result: Option<String> = self
             .query_row(
                 "SELECT ledgerhash FROM ledgerheaders WHERE ledgerseq = ?1",
@@ -205,7 +205,7 @@ impl LedgerQueries for Connection {
         Ok(deleted as u32)
     }
 
-    fn get_oldest_ledger_seq(&self) -> Result<Option<u32>, DbError> {
+    fn oldest_ledger_seq(&self) -> Result<Option<u32>, DbError> {
         let result: Option<Option<u32>> = self
             .query_row("SELECT MIN(ledgerseq) FROM ledgerheaders", [], |row| {
                 row.get::<_, Option<u32>>(0)
@@ -285,7 +285,7 @@ mod tests {
         let conn = setup_db();
 
         // Initially no ledgers
-        assert!(conn.get_latest_ledger_seq().unwrap().is_none());
+        assert!(conn.latest_ledger_seq().unwrap().is_none());
 
         // Add some ledgers
         for seq in [10, 20, 15] {
@@ -294,7 +294,7 @@ mod tests {
             conn.store_ledger_header(&header, &data).unwrap();
         }
 
-        assert_eq!(conn.get_latest_ledger_seq().unwrap(), Some(20));
+        assert_eq!(conn.latest_ledger_seq().unwrap(), Some(20));
     }
 
     #[test]
@@ -305,11 +305,11 @@ mod tests {
 
         conn.store_ledger_header(&header, &data).unwrap();
 
-        let hash = conn.get_ledger_hash(100).unwrap().unwrap();
+        let hash = conn.ledger_hash(100).unwrap().unwrap();
         assert!(!hash.is_zero());
 
         // Non-existent ledger
-        assert!(conn.get_ledger_hash(999).unwrap().is_none());
+        assert!(conn.ledger_hash(999).unwrap().is_none());
     }
 
     #[test]

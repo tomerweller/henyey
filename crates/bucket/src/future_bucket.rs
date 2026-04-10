@@ -502,7 +502,7 @@ impl FutureBucket {
     }
 
     /// Get all hashes referenced by this FutureBucket.
-    pub fn get_hashes(&self) -> Vec<Hash256> {
+    pub fn hashes(&self) -> Vec<Hash256> {
         let mut hashes = Vec::new();
         if let Some(h) = &self.input_curr_hash {
             hashes.push(*h);
@@ -769,7 +769,7 @@ mod tests {
         let bucket = Arc::new(bucket);
 
         let fb = FutureBucket::from_output(bucket);
-        let hashes = fb.get_hashes();
+        let hashes = fb.hashes();
         assert_eq!(hashes.len(), 1);
     }
 
@@ -1062,7 +1062,7 @@ mod tests {
         assert!(!restored.is_merging());
 
         // Verify hashes are preserved
-        let hashes = restored.get_hashes();
+        let hashes = restored.hashes();
         assert_eq!(hashes.len(), 2);
         assert!(hashes.contains(&b1_hash));
         assert!(hashes.contains(&b2_hash));
@@ -1095,7 +1095,7 @@ mod tests {
             output: None,
         };
         let restored = FutureBucket::from_snapshot(snap).unwrap();
-        let hashes = restored.get_hashes();
+        let hashes = restored.hashes();
         assert_eq!(hashes.len(), 2);
         assert!(hashes.contains(&hash1));
         assert!(hashes.contains(&hash2));

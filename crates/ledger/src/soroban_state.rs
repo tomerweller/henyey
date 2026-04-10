@@ -360,13 +360,13 @@ impl InMemorySorobanState {
     }
 
     /// Get a contract data entry by key.
-    pub fn get_contract_data(&self, key: &LedgerKeyContractData) -> Option<&ContractDataMapEntry> {
+    pub fn contract_data(&self, key: &LedgerKeyContractData) -> Option<&ContractDataMapEntry> {
         let key_hash = Self::contract_data_key_hash(key);
         self.contract_data_entries.get(&key_hash)
     }
 
     /// Get a contract code entry by key.
-    pub fn get_contract_code(&self, key: &LedgerKeyContractCode) -> Option<&ContractCodeMapEntry> {
+    pub fn contract_code(&self, key: &LedgerKeyContractCode) -> Option<&ContractCodeMapEntry> {
         let key_hash = Self::contract_code_key_hash(key);
         self.contract_code_entries.get(&key_hash)
     }
@@ -376,28 +376,24 @@ impl InMemorySorobanState {
     /// Returns the entry if found, along with synthesized TTL data.
     pub fn get(&self, key: &LedgerKey) -> Option<Arc<LedgerEntry>> {
         match key {
-            LedgerKey::ContractData(cd) => {
-                self.get_contract_data(cd).map(|e| e.ledger_entry.clone())
-            }
-            LedgerKey::ContractCode(cc) => {
-                self.get_contract_code(cc).map(|e| e.ledger_entry.clone())
-            }
-            LedgerKey::Ttl(ttl) => self.get_ttl_entry(ttl),
-            LedgerKey::ConfigSetting(cs) => self.get_config_setting(cs),
+            LedgerKey::ContractData(cd) => self.contract_data(cd).map(|e| e.ledger_entry.clone()),
+            LedgerKey::ContractCode(cc) => self.contract_code(cc).map(|e| e.ledger_entry.clone()),
+            LedgerKey::Ttl(ttl) => self.ttl_entry(ttl),
+            LedgerKey::ConfigSetting(cs) => self.config_setting(cs),
             _ => None,
         }
     }
 
     /// Get a ConfigSetting entry by key.
-    pub fn get_config_setting(&self, key: &LedgerKeyConfigSetting) -> Option<Arc<LedgerEntry>> {
+    pub fn config_setting(&self, key: &LedgerKeyConfigSetting) -> Option<Arc<LedgerEntry>> {
         self.config_settings.get(&key.config_setting_id).cloned()
     }
 
     /// Get TTL data for a key.
-    pub fn get_ttl(&self, key: &LedgerKey) -> Option<TtlData> {
+    pub fn ttl(&self, key: &LedgerKey) -> Option<TtlData> {
         match key {
-            LedgerKey::ContractData(cd) => self.get_contract_data(cd).map(|e| e.ttl_data),
-            LedgerKey::ContractCode(cc) => self.get_contract_code(cc).map(|e| e.ttl_data),
+            LedgerKey::ContractData(cd) => self.contract_data(cd).map(|e| e.ttl_data),
+            LedgerKey::ContractCode(cc) => self.contract_code(cc).map(|e| e.ttl_data),
             LedgerKey::Ttl(ttl) => self
                 .contract_data_entries
                 .get(&ttl.key_hash)
@@ -412,7 +408,7 @@ impl InMemorySorobanState {
     }
 
     /// Synthesize a TTL entry from stored TTL data.
-    fn get_ttl_entry(&self, key: &LedgerKeyTtl) -> Option<Arc<LedgerEntry>> {
+    fn ttl_entry(&self, key: &LedgerKeyTtl) -> Option<Arc<LedgerEntry>> {
         // Look up in both maps
         let ttl_data = self
             .contract_data_entries
@@ -1263,7 +1259,7 @@ mod tests {
         state.update_ttl(&ttl_key, TtlData::new(1000, 100)).unwrap();
 
         // Verify TTL is co-located
-        let map_entry = state.get_contract_data(&key).unwrap();
+        let map_entry = state.contract_data(&key).unwrap();
         assert_eq!(map_entry.ttl_data.live_until_ledger_seq, 1000);
         assert_eq!(map_entry.ttl_data.last_modified_ledger_seq, 100);
     }
@@ -1294,7 +1290,7 @@ mod tests {
         assert!(state.pending_ttls.is_empty());
 
         // Verify TTL was adopted
-        let map_entry = state.get_contract_data(&key).unwrap();
+        let map_entry = state.contract_data(&key).unwrap();
         assert_eq!(map_entry.ttl_data.live_until_ledger_seq, 2000);
     }
 
@@ -1319,7 +1315,7 @@ mod tests {
         state.update_ttl(&ttl_key, TtlData::new(3000, 300)).unwrap();
 
         // Get synthesized TTL entry
-        let ttl_entry = state.get_ttl_entry(&ttl_key).unwrap();
+        let ttl_entry = state.ttl_entry(&ttl_key).unwrap();
         if let LedgerEntryData::Ttl(ttl) = &ttl_entry.data {
             assert_eq!(ttl.live_until_ledger_seq, 3000);
             assert_eq!(ttl_entry.last_modified_ledger_seq, 300);
@@ -1424,7 +1420,7 @@ mod tests {
             .expect("update_state should succeed - TTL should pair with data entry");
 
         // Verify the entry was created with correct TTL
-        let map_entry = state.get_contract_data(&restored_key).unwrap();
+        let map_entry = state.contract_data(&restored_key).unwrap();
         assert_eq!(map_entry.ttl_data.live_until_ledger_seq, 500000);
         assert_eq!(state.pending_ttls.len(), 0);
     }

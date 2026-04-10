@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     let db_path = args.db.unwrap_or_else(|| config.database.path.clone());
     let db = henyey_db::Database::open(&db_path)?;
     let local_header = db
-        .get_ledger_header(args.ledger)?
+        .ledger_header(args.ledger)?
         .ok_or_else(|| anyhow::anyhow!("missing ledger header {} in db", args.ledger))?;
     let local_hash = compute_header_hash(&local_header)?;
 
@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no enabled history archives in config"))?;
     let archive = HistoryArchive::new(&archive.url)?;
     let checkpoint = henyey_history::checkpoint::checkpoint_containing(args.ledger);
-    let headers = archive.get_ledger_headers(checkpoint).await?;
+    let headers = archive.ledger_headers(checkpoint).await?;
     let archive_header = headers
         .iter()
         .find(|entry| entry.header.ledger_seq == args.ledger)
@@ -153,10 +153,10 @@ async fn compare_tx_results(
     checkpoint: u32,
 ) -> anyhow::Result<()> {
     let local_entry = db
-        .get_tx_result_entry(ledger)?
+        .tx_result_entry(ledger)?
         .ok_or_else(|| anyhow::anyhow!("missing tx result entry {} in db", ledger))?;
 
-    let archive_entries = archive.get_results(checkpoint).await?;
+    let archive_entries = archive.results(checkpoint).await?;
     let archive_entry = archive_entries
         .into_iter()
         .find(|entry| entry.ledger_seq == ledger)

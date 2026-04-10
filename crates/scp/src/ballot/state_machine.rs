@@ -54,7 +54,7 @@ impl BallotProtocol {
             return false;
         }
 
-        let candidates = self.get_prepare_candidates(hint);
+        let candidates = self.prepare_candidates(hint);
 
         for ballot in candidates.iter().rev() {
             if self.phase == BallotPhase::Confirm {
@@ -142,7 +142,7 @@ impl BallotProtocol {
             return false;
         }
 
-        let candidates = self.get_prepare_candidates(hint);
+        let candidates = self.prepare_candidates(hint);
         let (new_h_ballot, new_h_index) =
             match self.find_highest_confirmed_prepared(&candidates, ctx) {
                 Some(result) => result,
@@ -282,7 +282,7 @@ impl BallotProtocol {
             }
         }
 
-        let boundaries = self.get_commit_boundaries_from_statements(&ballot);
+        let boundaries = self.commit_boundaries_from_statements(&ballot);
         if boundaries.is_empty() {
             return false;
         }
@@ -380,7 +380,7 @@ impl BallotProtocol {
             return false;
         }
 
-        let boundaries = self.get_commit_boundaries_from_statements(&ballot);
+        let boundaries = self.commit_boundaries_from_statements(&ballot);
         let mut candidate = (0u32, 0u32);
         self.find_extended_interval(&mut candidate, &boundaries, |interval| {
             self.federated_ratify(|st| self.commit_predicate(&ballot, interval, st), ctx)
@@ -561,7 +561,7 @@ impl BallotProtocol {
         true
     }
 
-    fn get_commit_boundaries_from_statements(
+    fn commit_boundaries_from_statements(
         &self,
         ballot: &ScpBallot,
     ) -> std::collections::BTreeSet<u32> {

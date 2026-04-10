@@ -35,7 +35,7 @@
 //! tracker.check_interval(&transitive_quorum_members);
 //!
 //! // Get potentially dead nodes for diagnostics
-//! let dead = tracker.get_maybe_dead_nodes();
+//! let dead = tracker.maybe_dead_nodes();
 //! ```
 
 use std::collections::HashSet;
@@ -144,12 +144,12 @@ impl DeadNodeTracker {
     }
 
     /// Get the set of nodes that may be dead (missing for two intervals).
-    pub fn get_maybe_dead_nodes(&self) -> &HashSet<NodeId> {
+    pub fn maybe_dead_nodes(&self) -> &HashSet<NodeId> {
         &self.dead_nodes
     }
 
     /// Get the set of nodes currently missing (not seen in current interval).
-    pub fn get_missing_nodes(&self) -> &HashSet<NodeId> {
+    pub fn missing_nodes(&self) -> &HashSet<NodeId> {
         &self.missing_nodes
     }
 

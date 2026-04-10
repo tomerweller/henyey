@@ -254,11 +254,11 @@ impl OpEventManager {
         if !self.enabled || self.finalized {
             return;
         }
-        let contract_id = get_asset_contract_id(&self.network_id, asset);
+        let contract_id = asset_contract_id(&self.network_id, asset);
         let topics = vec![
             make_symbol_scval("transfer"),
-            ScVal::Address(get_address_with_dropped_muxed_info(from)),
-            ScVal::Address(get_address_with_dropped_muxed_info(to)),
+            ScVal::Address(address_with_dropped_muxed_info(from)),
+            ScVal::Address(address_with_dropped_muxed_info(to)),
             make_sep0011_asset_string_scval(asset),
         ];
         let data = make_possible_muxed_data(to, amount, &self.memo, allow_muxed_id_or_memo);
@@ -310,10 +310,10 @@ impl OpEventManager {
         if !self.enabled || self.finalized {
             return;
         }
-        let contract_id = get_asset_contract_id(&self.network_id, asset);
+        let contract_id = asset_contract_id(&self.network_id, asset);
         let topics = vec![
             make_symbol_scval("mint"),
-            ScVal::Address(get_address_with_dropped_muxed_info(to)),
+            ScVal::Address(address_with_dropped_muxed_info(to)),
             make_sep0011_asset_string_scval(asset),
         ];
         let data = make_possible_muxed_data(to, amount, &self.memo, allow_muxed_id_or_memo);
@@ -337,10 +337,10 @@ impl OpEventManager {
         if !self.enabled || self.finalized {
             return;
         }
-        let contract_id = get_asset_contract_id(&self.network_id, asset);
+        let contract_id = asset_contract_id(&self.network_id, asset);
         let topics = vec![
             make_symbol_scval("burn"),
-            ScVal::Address(get_address_with_dropped_muxed_info(from)),
+            ScVal::Address(address_with_dropped_muxed_info(from)),
             make_sep0011_asset_string_scval(asset),
         ];
         let data = make_i128_scval(amount);
@@ -358,10 +358,10 @@ impl OpEventManager {
         if !self.enabled || self.finalized {
             return;
         }
-        let contract_id = get_asset_contract_id(&self.network_id, asset);
+        let contract_id = asset_contract_id(&self.network_id, asset);
         let topics = vec![
             make_symbol_scval("clawback"),
-            ScVal::Address(get_address_with_dropped_muxed_info(from)),
+            ScVal::Address(address_with_dropped_muxed_info(from)),
             make_sep0011_asset_string_scval(asset),
         ];
         let data = make_i128_scval(amount);
@@ -384,7 +384,7 @@ impl OpEventManager {
         if !self.enabled || self.finalized {
             return;
         }
-        let contract_id = get_asset_contract_id(&self.network_id, asset);
+        let contract_id = asset_contract_id(&self.network_id, asset);
         let topics = vec![
             make_symbol_scval("set_authorized"),
             ScVal::Address(ScAddress::Account(account.clone())),
@@ -409,7 +409,7 @@ impl OpEventManager {
         }
 
         for event in events.iter_mut() {
-            let Some(asset) = get_asset_from_event(event, &self.network_id) else {
+            let Some(asset) = asset_from_event(event, &self.network_id) else {
                 continue;
             };
 
@@ -573,7 +573,7 @@ impl TxEventManager {
         if !self.enabled || self.finalized || amount == 0 {
             return;
         }
-        let contract_id = get_asset_contract_id(&self.network_id, &Asset::Native);
+        let contract_id = asset_contract_id(&self.network_id, &Asset::Native);
         let topics = vec![
             make_symbol_scval("fee"),
             ScVal::Address(ScAddress::Account(fee_source.clone())),
@@ -797,7 +797,7 @@ fn make_event(contract_id: ContractId, topics: Vec<ScVal>, data: ScVal) -> Contr
     }
 }
 
-fn get_address_with_dropped_muxed_info(address: &ScAddress) -> ScAddress {
+fn address_with_dropped_muxed_info(address: &ScAddress) -> ScAddress {
     match address {
         ScAddress::MuxedAccount(muxed) => ScAddress::Account(AccountId::from(
             XdrPublicKey::PublicKeyTypeEd25519(muxed.ed25519.clone()),
@@ -908,7 +908,7 @@ fn is_issuer(address: &ScAddress, asset: &Asset) -> bool {
     }
 }
 
-fn get_asset_contract_id(network_id: &NetworkId, asset: &Asset) -> ContractId {
+fn asset_contract_id(network_id: &NetworkId, asset: &Asset) -> ContractId {
     let preimage = HashIdPreimage::ContractId(HashIdPreimageContractId {
         network_id: Hash::from(network_id.0),
         contract_id_preimage: ContractIdPreimage::Asset(asset.clone()),
@@ -927,7 +927,7 @@ fn scval_symbol_bytes(value: &ScVal) -> Option<Vec<u8>> {
     }
 }
 
-fn get_asset_from_event(event: &ContractEvent, network_id: &NetworkId) -> Option<Asset> {
+fn asset_from_event(event: &ContractEvent, network_id: &NetworkId) -> Option<Asset> {
     let contract_id = event.contract_id.as_ref()?;
     let ContractEventBody::V0(body) = &event.body;
     let asset_val = body.topics.last()?;
@@ -965,7 +965,7 @@ fn get_asset_from_event(event: &ContractEvent, network_id: &NetworkId) -> Option
         return None;
     };
 
-    let expected = get_asset_contract_id(network_id, &asset);
+    let expected = asset_contract_id(network_id, &asset);
     if &expected != contract_id {
         return None;
     }
@@ -1629,7 +1629,7 @@ mod tests {
     fn test_get_address_with_dropped_muxed_info() {
         // Test with regular account - should return unchanged
         let account_addr = ScAddress::Account(test_account_id(1));
-        let result = get_address_with_dropped_muxed_info(&account_addr);
+        let result = address_with_dropped_muxed_info(&account_addr);
         assert!(matches!(result, ScAddress::Account(_)));
 
         // Test with muxed account - should return regular account
@@ -1637,7 +1637,7 @@ mod tests {
             id: 12345,
             ed25519: Uint256([3; 32]),
         });
-        let result = get_address_with_dropped_muxed_info(&muxed_addr);
+        let result = address_with_dropped_muxed_info(&muxed_addr);
         match result {
             ScAddress::Account(_) => {}
             _ => panic!("Expected Account address after dropping muxed info"),
@@ -1796,7 +1796,7 @@ mod tests {
     #[test]
     fn test_get_asset_contract_id() {
         let network_id = NetworkId::testnet();
-        let contract_id = get_asset_contract_id(&network_id, &Asset::Native);
+        let contract_id = asset_contract_id(&network_id, &Asset::Native);
 
         // Just verify it returns a valid contract ID
         assert!(!contract_id.0 .0.is_empty());

@@ -72,7 +72,7 @@ pub(crate) fn execute_clawback(
     }
 
     // Get the trustline
-    let trustline = match state.get_trustline(&from_account_id, &op.asset) {
+    let trustline = match state.trustline(&from_account_id, &op.asset) {
         Some(tl) => tl.clone(),
         None => {
             return Ok(make_clawback_result(ClawbackResultCode::NoTrust));
@@ -94,7 +94,7 @@ pub(crate) fn execute_clawback(
     }
 
     // Perform the clawback - deduct from trustline
-    if let Some(tl) = state.get_trustline_mut(&from_account_id, &op.asset) {
+    if let Some(tl) = state.trustline_mut(&from_account_id, &op.asset) {
         sub_trustline_balance(tl, op.amount)?;
     }
 
@@ -113,7 +113,7 @@ pub(crate) fn execute_clawback_claimable_balance(
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Get the claimable balance entry
-    let entry = match state.get_claimable_balance(&op.balance_id) {
+    let entry = match state.claimable_balance(&op.balance_id) {
         Some(e) => e.clone(),
         None => {
             return Ok(make_clawback_cb_result(
@@ -157,7 +157,7 @@ pub(crate) fn execute_clawback_claimable_balance(
     }
 
     // Load source account after all validation (matches stellar-core ordering)
-    if state.get_account_mut(source).is_none() {
+    if state.account_mut(source).is_none() {
         return Ok(make_clawback_cb_result(
             ClawbackClaimableBalanceResultCode::NotIssuer,
         ));
@@ -360,7 +360,7 @@ mod tests {
         }
 
         // Verify balance was clawed back
-        let tl = state.get_trustline(&holder_id, &asset).unwrap();
+        let tl = state.trustline(&holder_id, &asset).unwrap();
         assert_eq!(tl.balance, 500);
     }
 
@@ -697,7 +697,7 @@ mod tests {
             10_000,
             TRUSTLINE_CLAWBACK_ENABLED_FLAG,
         ));
-        state.get_account_mut(&holder_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&holder_id).unwrap().num_sub_entries += 1;
 
         let holder_id_clone = holder_id.clone();
         let op = ClawbackOp {
@@ -721,7 +721,7 @@ mod tests {
         }
 
         // Verify trustline balance was reduced
-        let trustline = state.get_trustline(&holder_id, &asset).unwrap();
+        let trustline = state.trustline(&holder_id, &asset).unwrap();
         assert_eq!(
             trustline.balance, 700,
             "Expected balance to be reduced to 700"
@@ -893,7 +893,7 @@ mod tests {
             10_000,
             TRUSTLINE_CLAWBACK_ENABLED_FLAG,
         ));
-        state.get_account_mut(&holder_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&holder_id).unwrap().num_sub_entries += 1;
 
         let holder_id_clone = holder_id.clone();
         let op = ClawbackOp {
@@ -917,7 +917,7 @@ mod tests {
         }
 
         // Verify trustline balance is now zero
-        let trustline = state.get_trustline(&holder_id, &asset).unwrap();
+        let trustline = state.trustline(&holder_id, &asset).unwrap();
         assert_eq!(trustline.balance, 0, "Expected balance to be 0");
     }
 
@@ -991,7 +991,7 @@ mod tests {
         }
 
         // Verify balance unchanged
-        let tl = state.get_trustline(&holder_id, &asset).unwrap();
+        let tl = state.trustline(&holder_id, &asset).unwrap();
         assert_eq!(
             tl.balance, 1000,
             "Balance should be unchanged after failed clawback"
@@ -1063,7 +1063,7 @@ mod tests {
         }
 
         // Verify balance was reduced (remaining = selling liabilities)
-        let tl = state.get_trustline(&holder_id, &asset).unwrap();
+        let tl = state.trustline(&holder_id, &asset).unwrap();
         assert_eq!(
             tl.balance, 400,
             "Balance should equal selling liabilities after max clawback"
@@ -1126,7 +1126,7 @@ mod tests {
 
         // Verify the claimable balance was deleted
         assert!(
-            state.get_claimable_balance(&balance_id).is_none(),
+            state.claimable_balance(&balance_id).is_none(),
             "Claimable balance should be deleted after clawback"
         );
     }

@@ -43,11 +43,11 @@ impl App {
     ///
     /// * `Some(json)` - The ConfigUpgradeSet as a JSON-serializable value
     /// * `None` - The upgrade set was not found or is invalid
-    pub fn get_config_upgrade_set(
+    pub fn config_upgrade_set(
         &self,
         key: &stellar_xdr::curr::ConfigUpgradeSetKey,
     ) -> Option<serde_json::Value> {
-        let frame = self.ledger_manager.get_config_upgrade_set(key)?;
+        let frame = self.ledger_manager.config_upgrade_set(key)?;
         let upgrade_set = frame.to_xdr();
 
         // Convert to JSON-serializable format

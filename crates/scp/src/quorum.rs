@@ -39,7 +39,7 @@
 //!
 //! // Check if nodes form a quorum
 //! let nodes = HashSet::from([node_a, node_b]);
-//! if is_quorum(&qs, &nodes, get_quorum_set) {
+//! if is_quorum(&qs, &nodes, quorum_set) {
 //!     // Nodes form a quorum
 //! }
 //! ```
@@ -75,7 +75,7 @@ pub const MAXIMUM_QUORUM_NODES: usize = 1000;
 /// # Arguments
 /// * `quorum_set` - The quorum set defining the slice
 /// * `nodes` - The set of nodes to check
-/// * `get_quorum_set` - Function to get quorum set for a node
+/// * `quorum_set` - Function to get quorum set for a node
 ///
 /// # Returns
 /// True if the nodes satisfy this quorum slice.
@@ -135,12 +135,12 @@ where
 /// # Arguments
 /// * `quorum_set` - The local node's quorum set
 /// * `nodes` - The set of nodes to check
-/// * `get_quorum_set` - Function to get quorum set for a node
+/// * `quorum_set` - Function to get quorum set for a node
 ///
 /// # Returns
 /// True if a subset of the nodes forms a quorum that satisfies the local
 /// node's quorum slice.
-pub fn is_quorum<F>(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>, get_quorum_set: F) -> bool
+pub fn is_quorum<F>(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>, quorum_set_fn: F) -> bool
 where
     F: Fn(&NodeId) -> Option<ScpQuorumSet>,
 {
@@ -154,8 +154,8 @@ where
         // Keep only nodes whose quorum slices are satisfied by the current set
         let remaining_set: HashSet<NodeId> = remaining.iter().cloned().collect();
         remaining.retain(|node_id| {
-            if let Some(qs) = get_quorum_set(node_id) {
-                is_quorum_slice(&qs, &remaining_set, &get_quorum_set)
+            if let Some(qs) = quorum_set_fn(node_id) {
+                is_quorum_slice(&qs, &remaining_set, &quorum_set_fn)
             } else {
                 false
             }
@@ -168,7 +168,7 @@ where
 
     // Check if the local node's quorum slice is satisfied by the surviving set
     let remaining_set: HashSet<NodeId> = remaining.into_iter().collect();
-    is_quorum_slice(quorum_set, &remaining_set, &get_quorum_set)
+    is_quorum_slice(quorum_set, &remaining_set, &quorum_set_fn)
 }
 
 /// Check if a set of nodes is a blocking set.
@@ -514,7 +514,7 @@ pub fn is_valid_quorum_set(quorum_set: &ScpQuorumSet) -> bool {
 }
 
 /// Get all node IDs referenced in a quorum set.
-pub fn get_all_nodes(quorum_set: &ScpQuorumSet) -> HashSet<NodeId> {
+pub fn all_nodes(quorum_set: &ScpQuorumSet) -> HashSet<NodeId> {
     let mut nodes = HashSet::new();
     collect_nodes(quorum_set, &mut nodes);
     nodes
@@ -671,7 +671,7 @@ mod tests {
         let node2 = make_node_id(2);
 
         let qs = make_simple_quorum_set(1, &[node1.clone(), node2.clone()]);
-        let nodes = get_all_nodes(&qs);
+        let nodes = all_nodes(&qs);
 
         assert!(nodes.contains(&node1));
         assert!(nodes.contains(&node2));
@@ -1276,7 +1276,7 @@ mod tests {
             inner_sets: vec![inner].try_into().unwrap(),
         };
 
-        let all_nodes = get_all_nodes(&qs);
+        let all_nodes = all_nodes(&qs);
         assert_eq!(all_nodes.len(), 4);
         assert!(all_nodes.contains(&node0));
         assert!(all_nodes.contains(&node1));

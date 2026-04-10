@@ -150,7 +150,7 @@ where
     /// Returns `None` if the key is not present. The caller must call
     /// `ensure_snapshot` and handle shared-state bookkeeping (op_snapshot,
     /// last_modified) before calling this.
-    pub fn get_mut_tracked(&mut self, key: &K) -> Option<&mut V> {
+    pub fn mut_tracked(&mut self, key: &K) -> Option<&mut V> {
         if self.entries.contains_key(key) {
             self.track_modified(key);
             self.entries.get_mut(key)
@@ -423,7 +423,7 @@ mod tests {
         let mut store = new_store();
         store.entries_mut().insert(1, "hello".to_string());
         store.ensure_snapshot(&1);
-        let val = store.get_mut_tracked(&1).unwrap();
+        let val = store.mut_tracked(&1).unwrap();
         assert_eq!(val, "hello");
         *val = "world".to_string();
         assert_eq!(store.get(&1), Some(&"world".to_string()));
@@ -434,7 +434,7 @@ mod tests {
         let mut store = new_store();
         store.entries_mut().insert(1, "hello".to_string());
         store.ensure_snapshot(&1);
-        store.get_mut_tracked(&1);
+        store.mut_tracked(&1);
         let modified = store.take_modified();
         assert_eq!(modified, vec![1]);
     }
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn test_get_mut_missing_returns_none() {
         let mut store = new_store();
-        assert!(store.get_mut_tracked(&1).is_none());
+        assert!(store.mut_tracked(&1).is_none());
     }
 
     #[test]
@@ -519,7 +519,7 @@ mod tests {
         let mut store = new_store();
         store.entries_mut().insert(1, "original".to_string());
         store.ensure_snapshot(&1);
-        // Mutate via entries_mut (simulating what get_mut_tracked caller does)
+        // Mutate via entries_mut (simulating what mut_tracked caller does)
         *store.entries_mut().get_mut(&1).unwrap() = "mutated".to_string();
         // Snapshot still has original
         assert_eq!(
@@ -585,7 +585,7 @@ mod tests {
         // Savepoint after initial load
         let sp = store.create_savepoint();
         // Modify after savepoint
-        *store.get_mut_tracked(&1).unwrap() = "modified".to_string();
+        *store.mut_tracked(&1).unwrap() = "modified".to_string();
         assert_eq!(store.get(&1), Some(&"modified".to_string()));
         // Rollback
         store.rollback_to_savepoint(sp);
@@ -612,10 +612,10 @@ mod tests {
         store.entries_mut().insert(1, "original".to_string());
         store.ensure_snapshot(&1);
         // Modify before savepoint
-        *store.get_mut_tracked(&1).unwrap() = "pre_sp_modified".to_string();
+        *store.mut_tracked(&1).unwrap() = "pre_sp_modified".to_string();
         let sp = store.create_savepoint();
         // Modify after savepoint
-        *store.get_mut_tracked(&1).unwrap() = "post_sp_modified".to_string();
+        *store.mut_tracked(&1).unwrap() = "post_sp_modified".to_string();
         store.rollback_to_savepoint(sp);
         // Should restore to pre-savepoint value (the modification before SP)
         assert_eq!(store.get(&1), Some(&"pre_sp_modified".to_string()));
@@ -639,11 +639,11 @@ mod tests {
         let mut store = new_store();
         store.entries_mut().insert(1, "a".to_string());
         store.ensure_snapshot(&1);
-        store.get_mut_tracked(&1); // modified = [1]
+        store.mut_tracked(&1); // modified = [1]
         let sp = store.create_savepoint();
         store.entries_mut().insert(2, "b".to_string());
         store.ensure_snapshot(&2);
-        store.get_mut_tracked(&2); // modified = [1, 2]
+        store.mut_tracked(&2); // modified = [1, 2]
         store.rollback_to_savepoint(sp);
         // Modified should be truncated back to length 1
         let modified = store.take_modified();
@@ -664,7 +664,7 @@ mod tests {
         let mut store = new_store();
         store.entries_mut().insert(1, "original".to_string());
         store.ensure_snapshot(&1);
-        *store.get_mut_tracked(&1).unwrap() = "modified".to_string();
+        *store.mut_tracked(&1).unwrap() = "modified".to_string();
         store.rollback();
         assert_eq!(store.get(&1), Some(&"original".to_string()));
     }
@@ -674,7 +674,7 @@ mod tests {
         let mut store = new_store();
         store.entries_mut().insert(1, "a".to_string());
         store.ensure_snapshot(&1);
-        store.get_mut_tracked(&1);
+        store.mut_tracked(&1);
         store.rollback();
         assert!(store.take_modified().is_empty());
     }
@@ -685,7 +685,7 @@ mod tests {
         store.entries_mut().insert(1, "original".to_string());
         store.ensure_snapshot(&1);
         store.insert_created(2, "new".to_string());
-        store.get_mut_tracked(&1);
+        store.mut_tracked(&1);
         store.commit();
         // Snapshots, created, modified should all be cleared
         assert!(!store.is_tracked(&1));
@@ -704,15 +704,15 @@ mod tests {
         store.ensure_snapshot(&1);
 
         // Modify to v1
-        *store.get_mut_tracked(&1).unwrap() = "v1".to_string();
+        *store.mut_tracked(&1).unwrap() = "v1".to_string();
         let sp1 = store.create_savepoint();
 
         // Modify to v2
-        *store.get_mut_tracked(&1).unwrap() = "v2".to_string();
+        *store.mut_tracked(&1).unwrap() = "v2".to_string();
         let sp2 = store.create_savepoint();
 
         // Modify to v3
-        *store.get_mut_tracked(&1).unwrap() = "v3".to_string();
+        *store.mut_tracked(&1).unwrap() = "v3".to_string();
         assert_eq!(store.get(&1), Some(&"v3".to_string()));
 
         // Rollback to sp2 → should restore to v2
@@ -731,7 +731,7 @@ mod tests {
         let mut store = new_store();
         store.entries_mut().insert(1, "a".to_string());
         store.ensure_snapshot(&1);
-        store.get_mut_tracked(&1);
+        store.mut_tracked(&1);
         let modified = store.take_modified();
         assert_eq!(modified, vec![1]);
         assert!(store.take_modified().is_empty());
@@ -742,7 +742,7 @@ mod tests {
         let mut store = new_store();
         store.entries_mut().insert(1, "same".to_string());
         store.ensure_snapshot(&1);
-        store.get_mut_tracked(&1); // tracked but not actually changed
+        store.mut_tracked(&1); // tracked but not actually changed
         if let Some(Some(snapshot)) = store.snapshot_value(&1) {
             assert_eq!(snapshot, store.get(&1).unwrap());
         }
@@ -753,7 +753,7 @@ mod tests {
         let mut store = new_store();
         store.entries_mut().insert(1, "before".to_string());
         store.ensure_snapshot(&1);
-        *store.get_mut_tracked(&1).unwrap() = "after".to_string();
+        *store.mut_tracked(&1).unwrap() = "after".to_string();
         if let Some(Some(snapshot)) = store.snapshot_value(&1) {
             assert_ne!(snapshot, store.get(&1).unwrap());
         }
@@ -870,8 +870,8 @@ mod tests {
         let mut store = new_store();
         store.entries_mut().insert(1, "a".to_string());
         store.ensure_snapshot(&1);
-        store.get_mut_tracked(&1);
-        store.get_mut_tracked(&1); // second call to same key
+        store.mut_tracked(&1);
+        store.mut_tracked(&1); // second call to same key
         let modified = store.take_modified();
         // Should only appear once
         assert_eq!(modified, vec![1]);

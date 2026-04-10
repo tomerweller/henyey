@@ -242,13 +242,13 @@ impl std::error::Error for NoIssuerError {}
 /// # Examples
 ///
 /// ```rust
-/// use henyey_common::asset::get_issuer;
+/// use henyey_common::asset::issuer;
 /// use stellar_xdr::curr::Asset;
 ///
 /// // Native assets have no issuer
-/// assert!(get_issuer(&Asset::Native).is_err());
+/// assert!(issuer(&Asset::Native).is_err());
 /// ```
-pub fn get_issuer(asset: &Asset) -> Result<&AccountId, NoIssuerError> {
+pub fn issuer(asset: &Asset) -> Result<&AccountId, NoIssuerError> {
     match asset {
         Asset::CreditAlphanum4(alpha4) => Ok(&alpha4.issuer),
         Asset::CreditAlphanum12(alpha12) => Ok(&alpha12.issuer),
@@ -281,7 +281,7 @@ pub fn non_native_asset_to_trustline_asset(asset: &Asset) -> Option<TrustLineAss
 }
 
 /// Get the issuer of a TrustLineAsset.
-pub fn get_trustline_asset_issuer(asset: &TrustLineAsset) -> Result<&AccountId, NoIssuerError> {
+pub fn trustline_asset_issuer(asset: &TrustLineAsset) -> Result<&AccountId, NoIssuerError> {
     match asset {
         TrustLineAsset::CreditAlphanum4(alpha4) => Ok(&alpha4.issuer),
         TrustLineAsset::CreditAlphanum12(alpha12) => Ok(&alpha12.issuer),
@@ -293,12 +293,12 @@ pub fn get_trustline_asset_issuer(asset: &TrustLineAsset) -> Result<&AccountId, 
 ///
 /// Returns false for native assets.
 pub fn is_issuer(acc: &AccountId, asset: &Asset) -> bool {
-    get_issuer(asset).is_ok_and(|issuer| issuer == acc)
+    issuer(asset).is_ok_and(|issuer| issuer == acc)
 }
 
 /// Check if an account is the issuer of a TrustLineAsset.
 pub fn is_trustline_asset_issuer(acc: &AccountId, asset: &TrustLineAsset) -> bool {
-    get_trustline_asset_issuer(asset).is_ok_and(|issuer| issuer == acc)
+    trustline_asset_issuer(asset).is_ok_and(|issuer| issuer == acc)
 }
 
 // ============================================================================
@@ -405,7 +405,7 @@ pub fn try_add_account_balance(acc: &mut stellar_xdr::curr::AccountEntry, delta:
 ///
 /// Panics for METAENTRY entries.
 #[allow(dead_code)] // Parity with stellar-core; not yet called in production
-pub(crate) fn get_hot_archive_bucket_ledger_key(be: &HotArchiveBucketEntry) -> LedgerKey {
+pub(crate) fn hot_archive_bucket_ledger_key(be: &HotArchiveBucketEntry) -> LedgerKey {
     match be {
         HotArchiveBucketEntry::Archived(entry) => crate::entry_to_key(entry),
         HotArchiveBucketEntry::Live(key) => key.clone(),
@@ -421,7 +421,7 @@ pub(crate) fn get_hot_archive_bucket_ledger_key(be: &HotArchiveBucketEntry) -> L
 ///
 /// Panics for METAENTRY entries.
 #[allow(dead_code)] // Parity with stellar-core; not yet called in production
-pub(crate) fn get_bucket_ledger_key(be: &BucketEntry) -> LedgerKey {
+pub(crate) fn bucket_ledger_key(be: &BucketEntry) -> LedgerKey {
     match be {
         BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => crate::entry_to_key(entry),
         BucketEntry::Deadentry(key) => key.clone(),
@@ -567,10 +567,10 @@ mod tests {
 
     #[test]
     fn test_get_issuer() {
-        assert!(get_issuer(&Asset::Native).is_err());
+        assert!(issuer(&Asset::Native).is_err());
 
         let usd = make_asset4("USD", 42);
-        let issuer = get_issuer(&usd).unwrap();
+        let issuer = issuer(&usd).unwrap();
         assert_eq!(issuer, &make_account_id(42));
     }
 

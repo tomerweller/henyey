@@ -62,7 +62,7 @@ impl App {
         tracing::info!(target_ledger = target_ledger, "Target ledger determined");
 
         // Check if we're already at or past the target
-        let current = self.get_current_ledger().await.unwrap_or(0);
+        let current = self.current_ledger().await.unwrap_or(0);
 
         // Note: we previously aborted here when the target checkpoint appeared
         // unpublished (target_cp > latest_externalized). However, latest_externalized
@@ -327,7 +327,7 @@ impl App {
                     let mut extra_hashes = Vec::new();
 
                     if let Some(has_json) =
-                        conn.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)?
+                        conn.state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)?
                     {
                         if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
                             extra_hashes.extend(has.all_bucket_hashes());
@@ -424,7 +424,7 @@ impl App {
         // check_ledger_close and insert into syncing_ledgers so the main
         // loop's pending_close chaining can close them.
         {
-            let current_ledger = self.get_current_ledger().await.unwrap_or(new_lcl);
+            let current_ledger = self.current_ledger().await.unwrap_or(new_lcl);
             let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
             let mut buffer = self.syncing_ledgers.write().await;
             let mut populated = 0u32;
@@ -472,7 +472,7 @@ impl App {
         // call to try_apply_buffered_ledgers() in handle_catchup_result()
         // kicks off the first close, and chaining takes it from there.
         {
-            let current_ledger = self.get_current_ledger().await.unwrap_or(new_lcl);
+            let current_ledger = self.current_ledger().await.unwrap_or(new_lcl);
             let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
             let buffered = self.syncing_ledgers.read().await.len();
             tracing::info!(
@@ -488,7 +488,7 @@ impl App {
         // while the main loop is still closing buffered ledgers.
         *self.last_catchup_completed_at.write().await = Some(self.clock.now());
 
-        let final_ledger = self.get_current_ledger().await.unwrap_or(output.ledger_seq);
+        let final_ledger = self.current_ledger().await.unwrap_or(output.ledger_seq);
         Ok(CatchupResult {
             ledger_seq: final_ledger,
             ledger_hash: output.ledger_hash,
@@ -499,7 +499,7 @@ impl App {
 
     /// Get the latest checkpoint from history archives, using a cache to avoid repeated network calls.
     /// The cache is valid for ARCHIVE_CHECKPOINT_CACHE_SECS.
-    pub(super) async fn get_cached_archive_checkpoint(&self) -> anyhow::Result<u32> {
+    pub(super) async fn cached_archive_checkpoint(&self) -> anyhow::Result<u32> {
         // Check cache first
         {
             let cache = self.cached_archive_checkpoint.read().await;
@@ -516,7 +516,7 @@ impl App {
         }
 
         // Cache miss or expired, query archive
-        let checkpoint = self.get_latest_checkpoint().await?;
+        let checkpoint = self.latest_checkpoint().await?;
 
         // Update cache
         {
@@ -529,16 +529,16 @@ impl App {
 
     /// Query history archives for the latest checkpoint (single attempt).
     ///
-    /// This is called from `get_cached_archive_checkpoint()` on cache miss.
+    /// This is called from `cached_archive_checkpoint()` on cache miss.
     /// It does NOT retry — returning quickly is critical because callers
     /// run on the main event loop. For startup scenarios where the archive
     /// may not have published yet, use `wait_for_archive_checkpoint()`.
-    async fn get_latest_checkpoint(&self) -> anyhow::Result<u32> {
+    async fn latest_checkpoint(&self) -> anyhow::Result<u32> {
         tracing::info!("Querying history archives for latest checkpoint");
 
         for archive_config in &self.config.history.archives {
             match HistoryArchive::new(&archive_config.url) {
-                Ok(archive) => match archive.get_current_ledger().await {
+                Ok(archive) => match archive.current_ledger().await {
                     Ok(ledger) => {
                         tracing::info!(
                             ledger,
@@ -593,7 +593,7 @@ impl App {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
 
-            match self.get_latest_checkpoint().await {
+            match self.latest_checkpoint().await {
                 Ok(checkpoint) => {
                     // Update the cache so subsequent calls are fast
                     let mut cache = self.cached_archive_checkpoint.write().await;
@@ -765,7 +765,7 @@ impl App {
         let lcl = if let Some(lcl_override) = override_lcl {
             lcl_override
         } else {
-            match self.get_current_ledger().await {
+            match self.current_ledger().await {
                 Ok(seq) if seq >= GENESIS_LEDGER_SEQ => seq,
                 _ => GENESIS_LEDGER_SEQ,
             }
@@ -862,7 +862,7 @@ impl App {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let progress = get_progress(&state_monitor).await;
+                        let progress = progress(&state_monitor).await;
                         if progress.stage != last_stage || progress.message != last_message {
                             last_stage = progress.stage.clone();
                             last_message = progress.message.clone();
@@ -1162,7 +1162,7 @@ impl App {
             return;
         }
 
-        let current_ledger = match self.get_current_ledger().await {
+        let current_ledger = match self.current_ledger().await {
             Ok(seq) => seq,
             Err(_) => return,
         };
@@ -1572,7 +1572,7 @@ impl App {
         // When using CatchupTarget::Current, check if the archive has a newer checkpoint.
         // Use the cached checkpoint to avoid repeated network calls that block the main loop.
         if use_current_target && is_checkpoint_ledger(current_ledger) {
-            match self.get_cached_archive_checkpoint().await {
+            match self.cached_archive_checkpoint().await {
                 Ok(latest_checkpoint) => {
                     if latest_checkpoint <= current_ledger {
                         // This is expected behavior after catchup - archive hasn't published
@@ -1739,7 +1739,7 @@ impl App {
                     }
 
                     let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
-                    let pending_count = self.herder.get_pending_tx_sets().len();
+                    let pending_count = self.herder.pending_tx_sets().len();
                     let buffer_count = self.syncing_ledgers.read().await.len();
                     tracing::debug!(
                         latest_externalized = latest_ext,
@@ -1909,7 +1909,7 @@ impl App {
             return;
         }
 
-        let current_ledger = match self.get_current_ledger().await {
+        let current_ledger = match self.current_ledger().await {
             Ok(seq) => seq,
             Err(_) => return,
         };
@@ -1928,7 +1928,7 @@ impl App {
 
         let target_checkpoint = checkpoint_containing(target);
         let first_replay = current_ledger as u64 + 1;
-        let have_next_externalize = self.herder.get_externalized(first_replay).is_some();
+        let have_next_externalize = self.herder.externalized(first_replay).is_some();
 
         if Self::should_skip_externalized_catchup_cooldown(
             target_checkpoint,
@@ -1977,7 +1977,7 @@ impl App {
         // If the archive hasn't published a checkpoint ahead of us, skip this
         // attempt and let the cooldown timer retry after the archive catches up.
         if target_checkpoint > latest_externalized as u32 {
-            match self.get_cached_archive_checkpoint().await {
+            match self.cached_archive_checkpoint().await {
                 Ok(archive_latest) => {
                     if archive_latest <= current_ledger {
                         tracing::debug!(

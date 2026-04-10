@@ -83,7 +83,7 @@ pub fn reconcile_events(
     }
 
     // Determine the effective source account
-    let source_account = get_operation_source(tx_source_account, operation);
+    let source_account = operation_source(tx_source_account, operation);
     let source_address = ScAddress::Account(source_account);
 
     if balance_delta > 0 {
@@ -110,20 +110,20 @@ fn calculate_balance_delta(delta: &LedgerDelta) -> i64 {
     let updated = delta.updated_entries();
     let pre_states = delta.update_states();
     for (post, pre) in updated.iter().zip(pre_states.iter()) {
-        let post_balance = get_account_balance(Some(post));
-        let pre_balance = get_account_balance(Some(pre));
+        let post_balance = account_balance(Some(post));
+        let pre_balance = account_balance(Some(pre));
         total_delta = total_delta.saturating_add(post_balance - pre_balance);
     }
 
     // Process created entries (no previous state, so add full balance)
     for entry in delta.created_entries() {
-        let balance = get_account_balance(Some(entry));
+        let balance = account_balance(Some(entry));
         total_delta = total_delta.saturating_add(balance);
     }
 
     // Process deleted entries (no current state, so subtract full balance)
     for entry in delta.delete_states() {
-        let balance = get_account_balance(Some(entry));
+        let balance = account_balance(Some(entry));
         total_delta = total_delta.saturating_sub(balance);
     }
 
@@ -131,7 +131,7 @@ fn calculate_balance_delta(delta: &LedgerDelta) -> i64 {
 }
 
 /// Extracts the XLM balance from a ledger entry if it's an account.
-fn get_account_balance(entry: Option<&LedgerEntry>) -> i64 {
+fn account_balance(entry: Option<&LedgerEntry>) -> i64 {
     let Some(entry) = entry else {
         return 0;
     };
@@ -146,7 +146,7 @@ fn get_account_balance(entry: Option<&LedgerEntry>) -> i64 {
 ///
 /// Uses the operation's source account if specified, otherwise falls back
 /// to the transaction source account.
-fn get_operation_source(tx_source: &MuxedAccount, operation: &Operation) -> AccountId {
+fn operation_source(tx_source: &MuxedAccount, operation: &Operation) -> AccountId {
     operation
         .source_account
         .as_ref()
@@ -217,7 +217,7 @@ impl LumenEventReconciler {
     }
 
     /// Get the previously recorded balance for an account.
-    pub fn get_tracked_balance(&self, account_id: &AccountId) -> Option<i64> {
+    pub fn tracked_balance(&self, account_id: &AccountId) -> Option<i64> {
         self.balances.get(account_id).copied()
     }
 
@@ -349,7 +349,7 @@ mod tests {
 
         reconciler.track_balance(account_id.clone(), 1000);
 
-        assert_eq!(reconciler.get_tracked_balance(&account_id), Some(1000));
+        assert_eq!(reconciler.tracked_balance(&account_id), Some(1000));
     }
 
     #[test]
@@ -359,7 +359,7 @@ mod tests {
 
         reconciler.track_balance(account_id.clone(), 1000);
 
-        assert_eq!(reconciler.get_tracked_balance(&account_id), None);
+        assert_eq!(reconciler.tracked_balance(&account_id), None);
     }
 
     #[test]
@@ -413,10 +413,10 @@ mod tests {
         let account_id = create_test_account_id(1);
 
         reconciler.track_balance(account_id.clone(), 1000);
-        assert!(reconciler.get_tracked_balance(&account_id).is_some());
+        assert!(reconciler.tracked_balance(&account_id).is_some());
 
         reconciler.clear();
-        assert!(reconciler.get_tracked_balance(&account_id).is_none());
+        assert!(reconciler.tracked_balance(&account_id).is_none());
     }
 
     #[test]
@@ -436,15 +436,15 @@ mod tests {
         let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 5000);
 
-        assert_eq!(get_account_balance(Some(&entry)), 5000);
-        assert_eq!(get_account_balance(None), 0);
+        assert_eq!(account_balance(Some(&entry)), 5000);
+        assert_eq!(account_balance(None), 0);
     }
 
     #[test]
     fn test_get_account_balance_non_account() {
         // Create a non-account entry (using Trustline as example would require more setup)
         // For now, test that None returns 0
-        assert_eq!(get_account_balance(None), 0);
+        assert_eq!(account_balance(None), 0);
     }
 
     #[test]
@@ -535,7 +535,7 @@ mod tests {
             body: stellar_xdr::curr::OperationBody::Inflation,
         };
 
-        let result = get_operation_source(&tx_source, &operation);
+        let result = operation_source(&tx_source, &operation);
         assert_eq!(result, muxed_to_account_id(&op_source));
     }
 
@@ -548,7 +548,7 @@ mod tests {
             body: stellar_xdr::curr::OperationBody::Inflation,
         };
 
-        let result = get_operation_source(&tx_source, &operation);
+        let result = operation_source(&tx_source, &operation);
         assert_eq!(result, muxed_to_account_id(&tx_source));
     }
 }

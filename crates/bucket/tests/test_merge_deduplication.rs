@@ -80,23 +80,23 @@ fn test_bucket_merge_map_stellar_core_parity() {
     // m6 reuses an input from m1 (in1a)
     bmm.record_merge(m6.clone(), out6);
 
-    // Verify findMergeFor (get_output)
-    assert_eq!(bmm.get_output(&m1), Some(&out1));
-    assert_eq!(bmm.get_output(&m2), Some(&out2));
-    assert_eq!(bmm.get_output(&m3), Some(&out2));
-    assert_eq!(bmm.get_output(&m4), Some(&out4));
-    assert_eq!(bmm.get_output(&m5), None); // Not recorded
-    assert_eq!(bmm.get_output(&m6), Some(&out6));
+    // Verify findMergeFor (output)
+    assert_eq!(bmm.output(&m1), Some(&out1));
+    assert_eq!(bmm.output(&m2), Some(&out2));
+    assert_eq!(bmm.output(&m3), Some(&out2));
+    assert_eq!(bmm.output(&m4), Some(&out4));
+    assert_eq!(bmm.output(&m5), None); // Not recorded
+    assert_eq!(bmm.output(&m6), Some(&out6));
 
     // Verify getOutputsUsingInput
     // in1a is used by m1 (producing out1) and m6 (producing out6)
-    let outputs_for_in1a = bmm.get_outputs_for_input(&in1a).unwrap();
+    let outputs_for_in1a = bmm.outputs_for_input(&in1a).unwrap();
     assert!(outputs_for_in1a.contains(&out1));
     assert!(outputs_for_in1a.contains(&out6));
     assert_eq!(outputs_for_in1a.len(), 2);
 
     // in1b is only used by m1
-    let outputs_for_in1b = bmm.get_outputs_for_input(&in1b).unwrap();
+    let outputs_for_in1b = bmm.outputs_for_input(&in1b).unwrap();
     assert!(outputs_for_in1b.contains(&out1));
     assert_eq!(outputs_for_in1b.len(), 1);
 
@@ -105,10 +105,10 @@ fn test_bucket_merge_map_stellar_core_parity() {
     let removed = bmm.forget_all_merges_producing(&out1);
     assert_eq!(removed.len(), 1);
     assert!(removed.contains(&m1));
-    assert_eq!(bmm.get_output(&m1), None);
+    assert_eq!(bmm.output(&m1), None);
 
     // After forgetting out1, in1a should only map to out6
-    let outputs_for_in1a = bmm.get_outputs_for_input(&in1a).unwrap();
+    let outputs_for_in1a = bmm.outputs_for_input(&in1a).unwrap();
     assert!(!outputs_for_in1a.contains(&out1));
     assert!(outputs_for_in1a.contains(&out6));
     assert_eq!(outputs_for_in1a.len(), 1);
@@ -118,25 +118,25 @@ fn test_bucket_merge_map_stellar_core_parity() {
     assert_eq!(removed.len(), 2);
     assert!(removed.contains(&m2));
     assert!(removed.contains(&m3));
-    assert_eq!(bmm.get_output(&m2), None);
-    assert_eq!(bmm.get_output(&m3), None);
+    assert_eq!(bmm.output(&m2), None);
+    assert_eq!(bmm.output(&m3), None);
 
     // Forget out4, should remove m4
     let removed = bmm.forget_all_merges_producing(&out4);
     assert_eq!(removed.len(), 1);
     assert!(removed.contains(&m4));
-    assert_eq!(bmm.get_output(&m4), None);
+    assert_eq!(bmm.output(&m4), None);
 
     // Forget out6, should remove m6
     let removed = bmm.forget_all_merges_producing(&out6);
     assert_eq!(removed.len(), 1);
     assert!(removed.contains(&m6));
-    assert_eq!(bmm.get_output(&m6), None);
+    assert_eq!(bmm.output(&m6), None);
 
     // in6a should no longer map to any outputs
-    assert!(bmm.get_outputs_for_input(&in6a).is_none());
+    assert!(bmm.outputs_for_input(&in6a).is_none());
     // in1a should also have no outputs now
-    assert!(bmm.get_outputs_for_input(&in1a).is_none());
+    assert!(bmm.outputs_for_input(&in1a).is_none());
 
     // Second forget produces empty set
     let removed = bmm.forget_all_merges_producing(&out1);
@@ -160,8 +160,8 @@ fn test_multiple_merges_same_output() {
     bmm.record_merge(m2.clone(), output);
 
     // Both should find the same output
-    assert_eq!(bmm.get_output(&m1), Some(&output));
-    assert_eq!(bmm.get_output(&m2), Some(&output));
+    assert_eq!(bmm.output(&m1), Some(&output));
+    assert_eq!(bmm.output(&m2), Some(&output));
 
     // Forgetting should remove both
     let removed = bmm.forget_all_merges_producing(&output);
@@ -187,8 +187,8 @@ fn test_keep_tombstones_affects_identity() {
     bmm.record_merge(m2.clone(), out2);
 
     // They should be different merge keys
-    assert_eq!(bmm.get_output(&m1), Some(&out1));
-    assert_eq!(bmm.get_output(&m2), Some(&out2));
+    assert_eq!(bmm.output(&m1), Some(&out1));
+    assert_eq!(bmm.output(&m2), Some(&out2));
     assert_eq!(bmm.len(), 2);
 }
 
@@ -280,9 +280,9 @@ fn test_retain_outputs_gc() {
 
     // Only m2 should remain
     assert_eq!(bmm.len(), 1);
-    assert_eq!(bmm.get_output(&m1), None);
-    assert_eq!(bmm.get_output(&m2), Some(&out2));
-    assert_eq!(bmm.get_output(&m3), None);
+    assert_eq!(bmm.output(&m1), None);
+    assert_eq!(bmm.output(&m2), Some(&out2));
+    assert_eq!(bmm.output(&m3), None);
 }
 
 /// Test that input mappings are properly cleaned up.
@@ -301,14 +301,14 @@ fn test_input_mapping_cleanup() {
     bmm.record_merge(m2.clone(), out2);
 
     // Shared input should map to both outputs
-    let outputs = bmm.get_outputs_for_input(&shared_input).unwrap();
+    let outputs = bmm.outputs_for_input(&shared_input).unwrap();
     assert_eq!(outputs.len(), 2);
 
     // Remove m1
     bmm.remove_merge(&m1);
 
     // Shared input should now only map to out2
-    let outputs = bmm.get_outputs_for_input(&shared_input).unwrap();
+    let outputs = bmm.outputs_for_input(&shared_input).unwrap();
     assert_eq!(outputs.len(), 1);
     assert!(outputs.contains(&out2));
 
@@ -316,5 +316,5 @@ fn test_input_mapping_cleanup() {
     bmm.remove_merge(&m2);
 
     // Shared input should have no mappings
-    assert!(bmm.get_outputs_for_input(&shared_input).is_none());
+    assert!(bmm.outputs_for_input(&shared_input).is_none());
 }

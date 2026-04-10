@@ -173,7 +173,7 @@ pub trait SyncRecoveryCallback: Send + Sync + 'static {
     /// Get slots with v-blocking status for purging.
     ///
     /// Returns slots in descending order where we've received v-blocking messages.
-    fn get_v_blocking_slots(&self) -> Vec<SlotIndex>;
+    fn v_blocking_slots(&self) -> Vec<SlotIndex>;
 
     /// Purge SCP state for slots below the given slot.
     fn purge_slots_below(&self, slot: SlotIndex);
@@ -427,7 +427,7 @@ impl SyncRecoveryStatsTracker {
     }
 
     /// Get the current stats.
-    pub fn get_stats(&self) -> SyncRecoveryStats {
+    pub fn stats(&self) -> SyncRecoveryStats {
         self.stats.read().clone()
     }
 }
@@ -484,7 +484,7 @@ mod tests {
             self.is_tracking.load(Ordering::SeqCst)
         }
 
-        fn get_v_blocking_slots(&self) -> Vec<SlotIndex> {
+        fn v_blocking_slots(&self) -> Vec<SlotIndex> {
             vec![]
         }
 

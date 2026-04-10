@@ -257,7 +257,7 @@ pub fn process_fee_seq_num(
             .state()
             .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
         let source_account = state
-            .get_account(&source_account_id)
+            .account(&source_account_id)
             .ok_or_else(|| TxError::AccountNotFound(format!("{:?}", source_account_id)))?;
         source_account.balance
     };
@@ -347,7 +347,7 @@ fn charge_fee_to_account(
     fee: i64,
 ) -> Result<()> {
     let account = state
-        .get_account_mut(account_id)
+        .account_mut(account_id)
         .ok_or_else(|| TxError::AccountNotFound(format!("{:?}", account_id)))?;
 
     if account.balance < fee {
@@ -371,7 +371,7 @@ fn update_sequence_number(
     tx_seq_num: i64,
 ) -> Result<()> {
     let account = state
-        .get_account_mut(account_id)
+        .account_mut(account_id)
         .ok_or_else(|| TxError::AccountNotFound(format!("{:?}", account_id)))?;
 
     account.seq_num = stellar_xdr::curr::SequenceNumber(tx_seq_num);
@@ -512,7 +512,7 @@ pub fn refund_soroban_fee(
 ) -> Result<i64> {
     // Get the refund amount
     let refund = match tx_result.refundable_fee_tracker() {
-        Some(tracker) => tracker.get_fee_refund(),
+        Some(tracker) => tracker.fee_refund(),
         None => return Ok(0), // No tracker = no refund
     };
 
@@ -527,7 +527,7 @@ pub fn refund_soroban_fee(
     };
 
     // Check if account still exists (may have been merged)
-    let account = match state.get_account_mut(fee_source_id) {
+    let account = match state.account_mut(fee_source_id) {
         Some(a) => a,
         None => return Ok(0), // Account merged, no refund
     };
@@ -869,7 +869,7 @@ mod tests {
 
         // Check account balance was deducted
         if let Some(state) = ctx.state() {
-            let updated_account = state.get_account(&create_test_account_id(1)).unwrap();
+            let updated_account = state.account(&create_test_account_id(1)).unwrap();
             assert_eq!(updated_account.balance, 10_000_000 - 100);
         }
     }
@@ -969,7 +969,7 @@ mod tests {
 
         // Check account balance was credited
         if let Some(state) = ctx.state() {
-            let updated_account = state.get_account(&account_id).unwrap();
+            let updated_account = state.account(&account_id).unwrap();
             assert_eq!(updated_account.balance, 10_000_000 + 300);
         }
     }
@@ -1025,7 +1025,7 @@ mod tests {
 
         // Balance should be unchanged
         if let Some(state) = ctx.state() {
-            let updated_account = state.get_account(&account_id).unwrap();
+            let updated_account = state.account(&account_id).unwrap();
             assert_eq!(
                 updated_account.balance,
                 i64::MAX - 100,
@@ -1064,7 +1064,7 @@ mod tests {
 
         // Check sequence was incremented
         if let Some(state) = ctx.state() {
-            let updated_account = state.get_account(&account_id).unwrap();
+            let updated_account = state.account(&account_id).unwrap();
             assert_eq!(updated_account.seq_num.0, 6);
         }
     }
@@ -1086,7 +1086,7 @@ mod tests {
 
         // Sequence should NOT have been incremented by this function
         if let Some(state) = ctx.state() {
-            let account = state.get_account(&account_id).unwrap();
+            let account = state.account(&account_id).unwrap();
             assert_eq!(account.seq_num.0, 5);
         }
     }
@@ -1117,7 +1117,7 @@ mod tests {
 
         // CAP-0021: Account seq_num should be set to tx's seq_num (105), NOT account_seq + 1 (101)
         if let Some(state) = ctx.state() {
-            let updated_account = state.get_account(&account_id).unwrap();
+            let updated_account = state.account(&account_id).unwrap();
             assert_eq!(
                 updated_account.seq_num.0, 105,
                 "CAP-0021: Account seq should equal tx seq (105), not account_seq+1 (101)"
@@ -1329,7 +1329,7 @@ mod tests {
 
         // Account should be at 0
         if let Some(state) = ctx.state() {
-            let updated_account = state.get_account(&create_test_account_id(1)).unwrap();
+            let updated_account = state.account(&create_test_account_id(1)).unwrap();
             assert_eq!(updated_account.balance, 0);
         }
     }
@@ -1424,11 +1424,11 @@ mod tests {
 
         // Inner source A: seq must be 6 (advanced)
         let state = ctx.state().unwrap();
-        let a = state.get_account(&inner_source_id).unwrap();
+        let a = state.account(&inner_source_id).unwrap();
         assert_eq!(a.seq_num.0, 6, "inner source sequence must be advanced");
 
         // Fee source B: seq must remain 99 (untouched)
-        let b = state.get_account(&fee_source_id).unwrap();
+        let b = state.account(&fee_source_id).unwrap();
         assert_eq!(b.seq_num.0, 99, "fee source sequence must NOT be advanced");
     }
 }

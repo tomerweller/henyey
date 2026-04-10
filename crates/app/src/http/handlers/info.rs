@@ -257,7 +257,7 @@ pub(crate) async fn dumpproposedsettings_handler(
         }
     };
 
-    match state.app.get_config_upgrade_set(&key) {
+    match state.app.config_upgrade_set(&key) {
         Some(settings) => (StatusCode::OK, Json(serde_json::json!(settings))),
         None => (
             StatusCode::NOT_FOUND,

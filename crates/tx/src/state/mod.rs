@@ -200,7 +200,7 @@ pub struct Savepoint {
 /// Trait for reading ledger entries from storage.
 pub trait LedgerReader {
     /// Get a ledger entry by key.
-    fn get_entry(&self, key: &LedgerKey) -> Option<LedgerEntry>;
+    fn entry(&self, key: &LedgerKey) -> Option<LedgerEntry>;
 }
 
 /// Re-export `StorageKey` from the soroban module as the canonical key type
@@ -439,12 +439,12 @@ impl LedgerStateManager {
         self.offer_store.is_some()
     }
 
-    fn get_entry_sponsorship(&self, key: &LedgerKey) -> Option<AccountId> {
+    fn entry_sponsorship(&self, key: &LedgerKey) -> Option<AccountId> {
         if Self::is_offer_key(key) {
             if let LedgerKey::Offer(ok) = key {
                 let store = self.offer_store_lock();
                 let from_store = store
-                    .get_by_seller(&ok.seller_id, ok.offer_id)
+                    .by_seller(&ok.seller_id, ok.offer_id)
                     .and_then(|r| r.sponsor.clone());
                 // Also check fallback map (sponsorship set before offer exists).
                 from_store.or_else(|| self.entry_sponsorships.get(key).cloned())
@@ -501,7 +501,7 @@ impl LedgerStateManager {
             if let LedgerKey::Offer(ok) = key {
                 let store = self.offer_store_lock();
                 let in_store = store
-                    .get_by_seller(&ok.seller_id, ok.offer_id)
+                    .by_seller(&ok.seller_id, ok.offer_id)
                     .map(|r| r.has_ext)
                     .unwrap_or(false);
                 // Also check fallback set (ext set before offer exists).
@@ -554,12 +554,12 @@ impl LedgerStateManager {
         }
     }
 
-    fn get_last_modified(&self, key: &LedgerKey) -> Option<u32> {
+    fn last_modified(&self, key: &LedgerKey) -> Option<u32> {
         if Self::is_offer_key(key) {
             if let LedgerKey::Offer(ok) = key {
                 let store = self.offer_store_lock();
                 store
-                    .get_by_seller(&ok.seller_id, ok.offer_id)
+                    .by_seller(&ok.seller_id, ok.offer_id)
                     .map(|r| r.last_modified)
             } else {
                 None
@@ -627,7 +627,7 @@ impl LedgerStateManager {
 
     /// Look up the maximum sequence number that any transaction in the current
     /// tx set uses for the given source account.
-    pub fn get_max_seq_num_to_apply(&self, account_id: &AccountId) -> Option<&i64> {
+    pub fn max_seq_num_to_apply(&self, account_id: &AccountId) -> Option<&i64> {
         self.max_seq_num_to_apply.get(account_id)
     }
 
@@ -1389,14 +1389,14 @@ impl LedgerStateManager {
             entry_last_modified_pre_values: self
                 .entry_last_modified_snapshots
                 .keys()
-                .map(|k| (k.clone(), self.get_last_modified(k)))
+                .map(|k| (k.clone(), self.last_modified(k)))
                 .collect(),
             entry_sponsorship_snapshots: self.entry_sponsorship_snapshots.clone(),
             entry_sponsorship_ext_snapshots: self.entry_sponsorship_ext_snapshots.clone(),
             entry_sponsorship_pre_values: self
                 .entry_sponsorship_snapshots
                 .keys()
-                .map(|k| (k.clone(), self.get_entry_sponsorship(k)))
+                .map(|k| (k.clone(), self.entry_sponsorship(k)))
                 .collect(),
             entry_sponsorship_ext_pre_values: self
                 .entry_sponsorship_ext_snapshots
@@ -2157,7 +2157,7 @@ pub fn update_account_seq_info(account: &mut AccountEntry, ledger_seq: u32, clos
 
 /// Get the sequence time from an account's extension V3.
 /// Returns 0 if the account doesn't have extension V3.
-pub fn get_account_seq_time(account: &AccountEntry) -> u64 {
+pub fn account_seq_time(account: &AccountEntry) -> u64 {
     match &account.ext {
         AccountEntryExt::V0 => 0,
         AccountEntryExt::V1(ext_v1) => match &ext_v1.ext {
@@ -2172,7 +2172,7 @@ pub fn get_account_seq_time(account: &AccountEntry) -> u64 {
 
 /// Get the sequence ledger from an account's extension V3.
 /// Returns 0 if the account doesn't have extension V3.
-pub fn get_account_seq_ledger(account: &AccountEntry) -> u32 {
+pub fn account_seq_ledger(account: &AccountEntry) -> u32 {
     match &account.ext {
         AccountEntryExt::V0 => 0,
         AccountEntryExt::V1(ext_v1) => match &ext_v1.ext {
@@ -2268,19 +2268,19 @@ mod tests {
         // Create account
         manager.create_account(account.clone());
         assert!(manager.has_changes());
-        assert!(manager.get_account(&account_id).is_some());
+        assert!(manager.account(&account_id).is_some());
 
         // Update account
         let mut updated = account.clone();
         updated.balance = 2000000000;
         manager.update_account(updated);
 
-        let stored = manager.get_account(&account_id).unwrap();
+        let stored = manager.account(&account_id).unwrap();
         assert_eq!(stored.balance, 2000000000);
 
         // Delete account
         manager.delete_account(&account_id);
-        assert!(manager.get_account(&account_id).is_none());
+        assert!(manager.account(&account_id).is_none());
     }
 
     #[test]
@@ -2291,11 +2291,11 @@ mod tests {
 
         // Create account
         manager.create_account(account.clone());
-        assert!(manager.get_account(&account_id).is_some());
+        assert!(manager.account(&account_id).is_some());
 
         // Rollback
         manager.rollback();
-        assert!(manager.get_account(&account_id).is_none());
+        assert!(manager.account(&account_id).is_none());
         assert!(!manager.has_changes());
     }
 
@@ -2368,11 +2368,11 @@ mod tests {
         manager.commit();
 
         // Account should still exist
-        assert!(manager.get_account(&account_id).is_some());
+        assert!(manager.account(&account_id).is_some());
 
         // But snapshots should be cleared (can't rollback anymore)
         manager.rollback();
-        assert!(manager.get_account(&account_id).is_some()); // Still there because commit cleared snapshots
+        assert!(manager.account(&account_id).is_some()); // Still there because commit cleared snapshots
     }
 
     #[test]
@@ -2442,9 +2442,9 @@ mod tests {
         // 1. Start operation snapshot mode
         manager.begin_op_snapshot();
 
-        // 2. Access the claimable balance via get_claimable_balance_mut
+        // 2. Access the claimable balance via claimable_balance_mut
         //    This puts it into op_entry_snapshots
-        let _ = manager.get_claimable_balance_mut(&balance_id);
+        let _ = manager.claimable_balance_mut(&balance_id);
 
         // 3. Change the sponsor (but not the entry data itself)
         let new_sponsor = create_test_account_id(3);
@@ -2525,9 +2525,9 @@ mod tests {
         // 1. Start operation snapshot mode
         manager.begin_op_snapshot();
 
-        // 2. Access the liquidity pool via get_liquidity_pool_mut
+        // 2. Access the liquidity pool via liquidity_pool_mut
         //    This puts it into op_entry_snapshots
-        let _ = manager.get_liquidity_pool_mut(&pool_id);
+        let _ = manager.liquidity_pool_mut(&pool_id);
 
         // 3. Change the sponsor (but not the entry data itself)
         let new_sponsor = create_test_account_id(3);
@@ -2604,9 +2604,9 @@ mod tests {
         // 1. Start operation snapshot mode
         manager.begin_op_snapshot();
 
-        // 2. Access the offer via get_offer_mut
+        // 2. Access the offer via offer_mut
         //    This puts it into op_entry_snapshots
-        let _ = manager.get_offer_mut(&seller_id, 1254);
+        let _ = manager.offer_mut(&seller_id, 1254);
 
         // 3. Change the sponsor (but not the entry data itself)
         let new_sponsor = create_test_account_id(3);
@@ -2670,7 +2670,7 @@ mod tests {
 
         manager.begin_op_snapshot();
 
-        let _ = manager.get_data_mut(&owner_id, "test");
+        let _ = manager.data_mut(&owner_id, "test");
 
         let new_sponsor = create_test_account_id(3);
         manager.set_entry_sponsor(ledger_key.clone(), new_sponsor.clone());
@@ -3037,7 +3037,7 @@ mod tests {
     fn aa_index_get(manager: &LedgerStateManager, seller_seed: u8, asset: &Asset) -> HashSet<i64> {
         let seller = create_test_account_id(seller_seed);
         manager
-            .get_offers_by_account_and_asset(&seller, asset)
+            .offers_by_account_and_asset(&seller, asset)
             .into_iter()
             .map(|e| e.offer_id)
             .collect()
@@ -3316,7 +3316,7 @@ mod tests {
         manager.commit();
 
         // Modify account balance
-        if let Some(acc) = manager.get_account_mut(&account_id) {
+        if let Some(acc) = manager.account_mut(&account_id) {
             acc.balance = 500_000_000;
         }
 
@@ -3324,17 +3324,14 @@ mod tests {
         let sp = manager.create_savepoint();
 
         // Modify account again after savepoint
-        if let Some(acc) = manager.get_account_mut(&account_id) {
+        if let Some(acc) = manager.account_mut(&account_id) {
             acc.balance = 100_000;
         }
-        assert_eq!(manager.get_account(&account_id).unwrap().balance, 100_000);
+        assert_eq!(manager.account(&account_id).unwrap().balance, 100_000);
 
         // Rollback — should restore to pre-savepoint value
         manager.rollback_to_savepoint(sp);
-        assert_eq!(
-            manager.get_account(&account_id).unwrap().balance,
-            500_000_000
-        );
+        assert_eq!(manager.account(&account_id).unwrap().balance, 500_000_000);
     }
 
     #[test]
@@ -3354,13 +3351,13 @@ mod tests {
         manager.create_data(data_entry);
 
         assert!(manager
-            .get_data(&create_test_account_id(1), "test_key")
+            .data(&create_test_account_id(1), "test_key")
             .is_some());
 
         // Rollback — data entry should be gone
         manager.rollback_to_savepoint(sp);
         assert!(manager
-            .get_data(&create_test_account_id(1), "test_key")
+            .data(&create_test_account_id(1), "test_key")
             .is_none());
     }
 
@@ -3382,11 +3379,11 @@ mod tests {
         };
         manager.create_claimable_balance(cb_entry);
 
-        assert!(manager.get_claimable_balance(&cb_id).is_some());
+        assert!(manager.claimable_balance(&cb_id).is_some());
 
         // Rollback — claimable balance should be gone
         manager.rollback_to_savepoint(sp);
-        assert!(manager.get_claimable_balance(&cb_id).is_none());
+        assert!(manager.claimable_balance(&cb_id).is_none());
     }
 
     #[test]
@@ -3400,7 +3397,7 @@ mod tests {
         manager.commit();
 
         // Modify balance to 500M (pre-savepoint change)
-        if let Some(acc) = manager.get_account_mut(&account_id) {
+        if let Some(acc) = manager.account_mut(&account_id) {
             acc.balance = 500_000_000;
         }
 
@@ -3412,7 +3409,7 @@ mod tests {
         let account2_id = account2.account_id.clone();
         manager.create_account(account2);
 
-        if let Some(acc) = manager.get_account_mut(&account_id) {
+        if let Some(acc) = manager.account_mut(&account_id) {
             acc.balance = 100;
         }
 
@@ -3420,12 +3417,9 @@ mod tests {
         manager.rollback_to_savepoint(sp);
 
         // Original account should have pre-savepoint balance
-        assert_eq!(
-            manager.get_account(&account_id).unwrap().balance,
-            500_000_000
-        );
+        assert_eq!(manager.account(&account_id).unwrap().balance, 500_000_000);
         // New account created after savepoint should be gone
-        assert!(manager.get_account(&account2_id).is_none());
+        assert!(manager.account(&account2_id).is_none());
     }
 
     #[test]
@@ -3494,14 +3488,14 @@ mod tests {
         // Create and verify exists
         manager.create_contract_data(cd.clone());
         assert!(manager
-            .get_contract_data(&cd.contract, &cd.key, cd.durability)
+            .contract_data(&cd.contract, &cd.key, cd.durability)
             .is_some());
         assert!(!manager.is_entry_deleted(&key));
 
         // Delete and verify tracking
         manager.delete_contract_data(&cd.contract, &cd.key, cd.durability);
         assert!(manager
-            .get_contract_data(&cd.contract, &cd.key, cd.durability)
+            .contract_data(&cd.contract, &cd.key, cd.durability)
             .is_none());
         assert!(manager.is_entry_deleted(&key));
     }
@@ -3519,12 +3513,12 @@ mod tests {
 
         // Create and verify exists
         manager.create_contract_code(cc.clone());
-        assert!(manager.get_contract_code(&cc.hash).is_some());
+        assert!(manager.contract_code(&cc.hash).is_some());
         assert!(!manager.is_entry_deleted(&key));
 
         // Delete and verify tracking
         manager.delete_contract_code(&cc.hash);
-        assert!(manager.get_contract_code(&cc.hash).is_none());
+        assert!(manager.contract_code(&cc.hash).is_none());
         assert!(manager.is_entry_deleted(&key));
     }
 
@@ -3541,12 +3535,12 @@ mod tests {
 
         // Create and verify exists
         manager.create_ttl(ttl.clone());
-        assert!(manager.get_ttl(&ttl.key_hash).is_some());
+        assert!(manager.ttl(&ttl.key_hash).is_some());
         assert!(!manager.is_entry_deleted(&key));
 
         // Delete and verify tracking
         manager.delete_ttl(&ttl.key_hash);
-        assert!(manager.get_ttl(&ttl.key_hash).is_none());
+        assert!(manager.ttl(&ttl.key_hash).is_none());
         assert!(manager.is_entry_deleted(&key));
     }
 
@@ -3584,13 +3578,13 @@ mod tests {
 
         // TX 4: Create entry
         manager.create_contract_data(cd.clone());
-        assert!(manager.get_entry(&key).is_some());
+        assert!(manager.entry(&key).is_some());
 
         // TX 4: Delete entry
         manager.delete_contract_data(&cd.contract, &cd.key, cd.durability);
 
         // TX 5: Should see entry as deleted, not reload from bucket list
-        assert!(manager.get_entry(&key).is_none());
+        assert!(manager.entry(&key).is_none());
         assert!(manager.is_entry_deleted(&key));
 
         // This is the key check: is_entry_deleted prevents footprint loading
@@ -3624,7 +3618,7 @@ mod tests {
 
         // Before marking: entry is not in state and not deleted.
         // load_soroban_footprint would fall through to BL.
-        assert!(manager.get_entry(&cd_key).is_none());
+        assert!(manager.entry(&cd_key).is_none());
         assert!(!manager.is_entry_deleted(&cd_key));
         assert!(!manager.is_entry_deleted(&ttl_key));
 
@@ -3634,7 +3628,7 @@ mod tests {
 
         // After marking: entry is still not in state, but IS marked deleted.
         // load_soroban_footprint will skip BL load.
-        assert!(manager.get_entry(&cd_key).is_none());
+        assert!(manager.entry(&cd_key).is_none());
         assert!(manager.is_entry_deleted(&cd_key));
         assert!(manager.is_entry_deleted(&ttl_key));
 
@@ -3688,26 +3682,26 @@ mod tests {
         manager.commit();
 
         // Verify everything is present before clear
-        assert!(manager.get_account(&create_test_account_id(1)).is_some());
-        assert!(manager.get_offer(&create_test_account_id(1), 100).is_some());
-        assert!(manager.get_offer(&create_test_account_id(2), 200).is_some());
+        assert!(manager.account(&create_test_account_id(1)).is_some());
+        assert!(manager.offer(&create_test_account_id(1), 100).is_some());
+        assert!(manager.offer(&create_test_account_id(2), 200).is_some());
 
         // Clear preserving offers
         manager.clear_cached_entries_preserving_offers();
 
         // Accounts and trustlines should be cleared
         assert!(
-            manager.get_account(&create_test_account_id(1)).is_none(),
+            manager.account(&create_test_account_id(1)).is_none(),
             "Accounts should be cleared"
         );
 
         // Offers should be preserved
         assert!(
-            manager.get_offer(&create_test_account_id(1), 100).is_some(),
+            manager.offer(&create_test_account_id(1), 100).is_some(),
             "Offer 1 should be preserved"
         );
         assert!(
-            manager.get_offer(&create_test_account_id(2), 200).is_some(),
+            manager.offer(&create_test_account_id(2), 200).is_some(),
             "Offer 2 should be preserved"
         );
 
@@ -3728,13 +3722,13 @@ mod tests {
         manager.create_offer(offer1);
         manager.commit();
 
-        assert!(manager.get_offer(&create_test_account_id(1), 100).is_some());
+        assert!(manager.offer(&create_test_account_id(1), 100).is_some());
 
         manager.clear_cached_entries();
 
         // Offers are preserved in the shared OfferStore
         assert!(
-            manager.get_offer(&create_test_account_id(1), 100).is_some(),
+            manager.offer(&create_test_account_id(1), 100).is_some(),
             "Offers in the shared OfferStore should be preserved across clear_cached_entries"
         );
     }
@@ -3797,7 +3791,7 @@ mod tests {
         manager.create_account(account.clone());
         manager.commit(); // commit the creation so it's permanent
 
-        let original_balance = manager.get_account(&account_id).unwrap().balance;
+        let original_balance = manager.account(&account_id).unwrap().balance;
         assert_eq!(original_balance, 1_000_000_000);
 
         // Simulate start of a new transaction: snapshot delta
@@ -3805,33 +3799,33 @@ mod tests {
 
         // Operation 1: modify account and flush
         {
-            let acc = manager.get_account_mut(&account_id).unwrap();
+            let acc = manager.account_mut(&account_id).unwrap();
             acc.balance -= 100;
         }
         manager.flush_all_accounts();
 
         // Operation 2: modify account again and flush
         {
-            let acc = manager.get_account_mut(&account_id).unwrap();
+            let acc = manager.account_mut(&account_id).unwrap();
             acc.balance -= 200;
         }
         manager.flush_all_accounts();
 
         // Operation 3: modify account again and flush
         {
-            let acc = manager.get_account_mut(&account_id).unwrap();
+            let acc = manager.account_mut(&account_id).unwrap();
             acc.balance -= 300;
         }
         manager.flush_all_accounts();
 
         // Current state should reflect all modifications
-        let current_balance = manager.get_account(&account_id).unwrap().balance;
+        let current_balance = manager.account(&account_id).unwrap().balance;
         assert_eq!(current_balance, 1_000_000_000 - 100 - 200 - 300);
 
         // Transaction fails — rollback should restore to original pre-tx state
         manager.rollback();
 
-        let restored_balance = manager.get_account(&account_id).unwrap().balance;
+        let restored_balance = manager.account(&account_id).unwrap().balance;
         assert_eq!(
             restored_balance, original_balance,
             "rollback() must restore to original pre-tx balance, not mid-tx flushed value"
@@ -3872,7 +3866,7 @@ mod tests {
         manager.commit();
 
         // Verify offer1 is deleted from the shared OfferStore
-        assert!(manager.get_offer(&seller, 100).is_none());
+        assert!(manager.offer(&seller, 100).is_none());
         // Verify offer1 deletion is in the delta
         let offer1_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: seller.clone(),
@@ -3945,14 +3939,14 @@ mod tests {
         };
         manager.update_ttl(extended_ttl);
         assert_eq!(
-            manager.get_ttl(&key_hash).unwrap().live_until_ledger_seq,
+            manager.ttl(&key_hash).unwrap().live_until_ledger_seq,
             500_000
         );
 
         // TX fails — rollback must restore original TTL
         manager.rollback();
         assert_eq!(
-            manager.get_ttl(&key_hash).unwrap().live_until_ledger_seq,
+            manager.ttl(&key_hash).unwrap().live_until_ledger_seq,
             100_000,
             "TTL must be restored to original value after rollback"
         );
@@ -3983,14 +3977,14 @@ mod tests {
         // extend_ttl to 700_000
         manager.extend_ttl(&key_hash, 700_000);
         assert_eq!(
-            manager.get_ttl(&key_hash).unwrap().live_until_ledger_seq,
+            manager.ttl(&key_hash).unwrap().live_until_ledger_seq,
             700_000
         );
 
         // Rollback to savepoint (simulating failed operation)
         manager.rollback_to_savepoint(sp);
         assert_eq!(
-            manager.get_ttl(&key_hash).unwrap().live_until_ledger_seq,
+            manager.ttl(&key_hash).unwrap().live_until_ledger_seq,
             200_000,
             "TTL must be restored to original value after savepoint rollback"
         );
@@ -4030,7 +4024,7 @@ mod tests {
 
         // === TX 2 ===
         // TX 2 should see the ORIGINAL TTL, not the extended one from TX 1
-        let ttl = manager.get_ttl(&key_hash).unwrap();
+        let ttl = manager.ttl(&key_hash).unwrap();
         assert_eq!(
             ttl.live_until_ledger_seq, 100_000,
             "TX 2 must see original TTL (100_000), not leaked extended TTL (500_000) from failed TX 1"
@@ -4261,7 +4255,7 @@ mod tests {
     /// record_flush_update was building the post_state LedgerEntry *before*
     /// calling set_last_modified_key, so the delta entry carried the stale
     /// (original) LML.  This caused bucket-list-hash mismatches starting at
-    /// mainnet L59658048 where trustlines were touched via get_trustline_mut
+    /// mainnet L59658048 where trustlines were touched via trustline_mut
     /// during offer crossing but their data was unchanged.
     #[test]
     fn test_flush_modified_entries_stamps_current_ledger_on_post_state() {
@@ -4304,15 +4298,15 @@ mod tests {
         // Begin an operation snapshot
         manager.begin_op_snapshot();
 
-        // Touch the trustline via get_trustline_mut (no data change)
+        // Touch the trustline via trustline_mut (no data change)
         // This is what happens during offer crossing: the trustline is loaded
-        // with record (get_trustline_mut) but its balance doesn't change.
-        let tl = manager.get_trustline_mut(&account_id, &usd_asset).unwrap();
+        // with record (trustline_mut) but its balance doesn't change.
+        let tl = manager.trustline_mut(&account_id, &usd_asset).unwrap();
         let original_balance = tl.balance;
         // Don't change the balance — the entry is touched but not modified
 
-        // Also touch the account via get_account_mut (no data change)
-        let acc = manager.get_account_mut(&account_id).unwrap();
+        // Also touch the account via account_mut (no data change)
+        let acc = manager.account_mut(&account_id).unwrap();
         let _original_acc_balance = acc.balance;
         // Don't change the balance
 
@@ -4401,7 +4395,7 @@ mod tests {
         // Modification is visible before rollback.
         assert_eq!(
             manager
-                .get_contract_data(&contract, &key, ContractDataDurability::Temporary)
+                .contract_data(&contract, &key, ContractDataDurability::Temporary)
                 .map(|e| e.val.clone()),
             Some(ScVal::I32(7)),
             "Entry should be modified before rollback"
@@ -4413,7 +4407,7 @@ mod tests {
         // Entry must be restored to the original value.
         assert_eq!(
             manager
-                .get_contract_data(&contract, &key, ContractDataDurability::Temporary)
+                .contract_data(&contract, &key, ContractDataDurability::Temporary)
                 .map(|e| e.val.clone()),
             Some(ScVal::I32(6)),
             "Entry must be restored to original value after rollback_to_savepoint"
@@ -4440,12 +4434,12 @@ mod tests {
         let savepoint = manager.create_savepoint();
 
         // Update account (e.g., fee deduction or transfer).
-        let mut modified = manager.get_account(&account_id).unwrap().clone();
+        let mut modified = manager.account(&account_id).unwrap().clone();
         modified.balance = 900_000;
         manager.update_account(modified);
 
         assert_eq!(
-            manager.get_account(&account_id).unwrap().balance,
+            manager.account(&account_id).unwrap().balance,
             900_000,
             "Entry should be modified before rollback"
         );
@@ -4454,7 +4448,7 @@ mod tests {
         manager.rollback_to_savepoint(savepoint);
 
         assert_eq!(
-            manager.get_account(&account_id).unwrap().balance,
+            manager.account(&account_id).unwrap().balance,
             1_000_000,
             "Account balance must be restored to original after rollback_to_savepoint"
         );
@@ -4491,7 +4485,7 @@ mod tests {
         let modified_val: DataValue = vec![2u8].try_into().unwrap();
         assert_eq!(
             manager
-                .get_data(&account_id, name)
+                .data(&account_id, name)
                 .map(|e| e.data_value.clone()),
             Some(modified_val),
             "Entry should be modified before rollback"
@@ -4502,7 +4496,7 @@ mod tests {
         let original_val: DataValue = vec![1u8].try_into().unwrap();
         assert_eq!(
             manager
-                .get_data(&account_id, name)
+                .data(&account_id, name)
                 .map(|e| e.data_value.clone()),
             Some(original_val),
             "Data entry must be restored to original after rollback_to_savepoint"
@@ -4549,7 +4543,7 @@ mod tests {
         manager.update_claimable_balance(modified_entry);
 
         assert_eq!(
-            manager.get_claimable_balance(&balance_id).map(|e| e.amount),
+            manager.claimable_balance(&balance_id).map(|e| e.amount),
             Some(500_000),
             "Entry should be modified before rollback"
         );
@@ -4557,7 +4551,7 @@ mod tests {
         manager.rollback_to_savepoint(savepoint);
 
         assert_eq!(
-            manager.get_claimable_balance(&balance_id).map(|e| e.amount),
+            manager.claimable_balance(&balance_id).map(|e| e.amount),
             Some(1_000_000),
             "Claimable balance amount must be restored to original after rollback_to_savepoint"
         );

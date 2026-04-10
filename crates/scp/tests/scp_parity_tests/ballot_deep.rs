@@ -20,7 +20,7 @@ fn setup_accept_commit_quorum_a2() -> (TestSCP, Value, Value, Value, Value, Hash
         &make_prepare_gen(qs_hash, a2.clone(), Some(a2.clone()), 2, 2, None),
     );
     assert_eq!(scp.envs_len(), 6);
-    verify_confirm(&scp.get_env(5), &v0_id(), qs_hash, 0, 2, &a2, 2, 2);
+    verify_confirm(&scp.env(5), &v0_id(), qs_hash, 0, 2, &a2, 2, 2);
     assert!(!scp.has_ballot_timer_upcoming());
 
     (scp, x_value, y_value, z_value, zz_value, qs_hash)
@@ -49,7 +49,7 @@ fn test_ballot_core5_vblocking_prepared_a3() {
         &make_prepare_gen(qs_hash, a3.clone(), Some(a3.clone()), 2, 2, None),
     );
     assert_eq!(scp.envs_len(), 7);
-    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 3, &a3, 2, 2);
+    verify_confirm(&scp.env(6), &v0_id(), qs_hash0, 0, 3, &a3, 2, 2);
     assert!(!scp.has_ballot_timer());
 }
 
@@ -81,7 +81,7 @@ fn test_ballot_core5_vblocking_prepared_a3_b3() {
         counter: 3,
         value: a_value.clone(),
     };
-    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 3, &a3, 2, 2);
+    verify_confirm(&scp.env(6), &v0_id(), qs_hash0, 0, 3, &a3, 2, 2);
     assert!(!scp.has_ballot_timer());
 }
 
@@ -101,7 +101,7 @@ fn test_ballot_core5_vblocking_confirm_a3() {
 
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 3, a3.clone(), 2, 2));
     assert_eq!(scp.envs_len(), 7);
-    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 3, &a3, 2, 2);
+    verify_confirm(&scp.env(6), &v0_id(), qs_hash0, 0, 3, &a3, 2, 2);
     assert!(!scp.has_ballot_timer());
 }
 
@@ -127,7 +127,7 @@ fn test_ballot_core5_hang_no_switch_externalize() {
     // v-blocking EXTERNALIZE with B2 → bumps to AInf but stays on A
     recv_v_blocking(&scp, &make_externalize_gen(qs_hash, b2.clone(), 3));
     assert_eq!(scp.envs_len(), 7);
-    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 2, &a_inf, 2, 2);
+    verify_confirm(&scp.env(6), &v0_id(), qs_hash0, 0, 2, &a_inf, 2, 2);
     assert!(!scp.has_ballot_timer());
 
     // stuck: quorum EXTERNALIZE with B2 doesn't externalize
@@ -192,7 +192,7 @@ fn test_ballot_core5_hang_confirm_different_counter() {
     // v-blocking CONFIRM B3 → bumps to A3 but keeps nC=2 nH=2
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 3, b3.clone(), 3, 3));
     assert_eq!(scp.envs_len(), 7);
-    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 2, &a3, 2, 2);
+    verify_confirm(&scp.env(6), &v0_id(), qs_hash0, 0, 2, &a3, 2, 2);
     assert!(!scp.has_ballot_timer());
 
     // quorum CONFIRM B3 → stuck, no externalization
@@ -233,7 +233,7 @@ fn test_ballot_core5_vblocking_accept_more_a3_confirm() {
         &make_prepare_gen(qs_hash, a3.clone(), Some(a2.clone()), 2, 2, None),
     );
     assert_eq!(scp.envs_len(), 7);
-    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 2, &a3, 2, 2);
+    verify_confirm(&scp.env(6), &v0_id(), qs_hash0, 0, 2, &a3, 2, 2);
 
     recv_quorum_ex(
         &scp,
@@ -241,12 +241,12 @@ fn test_ballot_core5_vblocking_accept_more_a3_confirm() {
         true,
     );
     assert_eq!(scp.envs_len(), 8);
-    verify_confirm(&scp.get_env(7), &v0_id(), qs_hash0, 0, 3, &a3, 2, 2);
+    verify_confirm(&scp.env(7), &v0_id(), qs_hash0, 0, 3, &a3, 2, 2);
 
     // v-blocking CONFIRM A3 with nC=2 nH=3 → updates nH
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 3, a3.clone(), 2, 3));
     assert_eq!(scp.envs_len(), 9);
-    verify_confirm(&scp.get_env(8), &v0_id(), qs_hash0, 0, 3, &a3, 2, 3);
+    verify_confirm(&scp.env(8), &v0_id(), qs_hash0, 0, 3, &a3, 2, 3);
     assert!(!scp.has_ballot_timer_upcoming());
 }
 
@@ -288,7 +288,7 @@ fn test_ballot_core5_vblocking_accept_more_a3_externalize() {
     recv_v_blocking(&scp, &make_externalize_gen(qs_hash, a2, 3));
     assert_eq!(scp.envs_len(), 9);
     verify_confirm(
-        &scp.get_env(8),
+        &scp.env(8),
         &v0_id(),
         qs_hash0,
         0,
@@ -337,7 +337,7 @@ fn test_ballot_core5_vblocking_accept_more_a3_confirm_a4_a5() {
     // v-blocking CONFIRM A5 nC=4 nH=5
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 3, a5.clone(), 4, 5));
     assert_eq!(scp.envs_len(), 9);
-    verify_confirm(&scp.get_env(8), &v0_id(), qs_hash0, 0, 3, &a5, 4, 5);
+    verify_confirm(&scp.env(8), &v0_id(), qs_hash0, 0, 3, &a5, 4, 5);
     assert!(!scp.has_ballot_timer());
 }
 
@@ -383,7 +383,7 @@ fn test_ballot_core5_vblocking_accept_more_a3_externalize_a4_a5() {
     recv_v_blocking(&scp, &make_externalize_gen(qs_hash, a4, 5));
     assert_eq!(scp.envs_len(), 9);
     verify_confirm(
-        &scp.get_env(8),
+        &scp.env(8),
         &v0_id(),
         qs_hash0,
         0,
@@ -411,7 +411,7 @@ fn test_ballot_core5_accept_commit_vblocking_confirm_a3_a4() {
 
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 4, a4.clone(), 3, 4));
     assert_eq!(scp.envs_len(), 6);
-    verify_confirm(&scp.get_env(5), &v0_id(), qs_hash0, 0, 4, &a4, 3, 4);
+    verify_confirm(&scp.env(5), &v0_id(), qs_hash0, 0, 4, &a4, 3, 4);
     assert!(!scp.has_ballot_timer());
 }
 
@@ -431,7 +431,7 @@ fn test_ballot_core5_accept_commit_vblocking_confirm_b2() {
 
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 2, b2.clone(), 2, 2));
     assert_eq!(scp.envs_len(), 6);
-    verify_confirm(&scp.get_env(5), &v0_id(), qs_hash0, 0, 2, &b2, 2, 2);
+    verify_confirm(&scp.env(5), &v0_id(), qs_hash0, 0, 2, &b2, 2, 2);
     assert!(!scp.has_ballot_timer_upcoming());
 }
 
@@ -456,7 +456,7 @@ fn test_ballot_core5_accept_commit_vblocking_externalize_b2() {
     recv_v_blocking(&scp, &make_externalize_gen(qs_hash, b2, 2));
     assert_eq!(scp.envs_len(), 6);
     verify_confirm(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -494,7 +494,7 @@ fn test_ballot_core5_conflicting_prepared_b_same_counter() {
     );
     assert_eq!(scp.envs_len(), 6);
     verify_prepare(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -512,7 +512,7 @@ fn test_ballot_core5_conflicting_prepared_b_same_counter() {
         &make_prepare_gen(qs_hash, b2.clone(), Some(b2.clone()), 2, 2, None),
     );
     assert_eq!(scp.envs_len(), 7);
-    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 2, &b2, 2, 2);
+    verify_confirm(&scp.env(6), &v0_id(), qs_hash0, 0, 2, &b2, 2, 2);
     assert!(!scp.has_ballot_timer_upcoming());
 }
 
@@ -550,7 +550,7 @@ fn test_ballot_core5_conflicting_prepared_b_higher_counter() {
     );
     assert_eq!(scp.envs_len(), 6);
     verify_prepare(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -571,7 +571,7 @@ fn test_ballot_core5_conflicting_prepared_b_higher_counter() {
         true,
     );
     assert_eq!(scp.envs_len(), 7);
-    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 3, &b3, 2, 2);
+    verify_confirm(&scp.env(6), &v0_id(), qs_hash0, 0, 3, &b3, 2, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -612,7 +612,7 @@ fn test_ballot_core5_conflicting_prepared_b_higher_counter_mixed() {
     assert_eq!(scp.envs_len(), 6);
     // p=B3, p'=A2, counter=3, b=A3 (same value as h), c=0
     verify_prepare(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -631,7 +631,7 @@ fn test_ballot_core5_conflicting_prepared_b_higher_counter_mixed() {
     );
     assert_eq!(scp.envs_len(), 7);
     verify_prepare(
-        &scp.get_env(6),
+        &scp.env(6),
         &v0_id(),
         qs_hash0,
         0,
@@ -701,7 +701,7 @@ fn test_ballot_core5_confirm_prepared_mixed_a2() {
     );
     assert_eq!(scp.envs_len(), 5);
     verify_prepare(
-        &scp.get_env(4),
+        &scp.env(4),
         &v0_id(),
         qs_hash0,
         0,
@@ -726,7 +726,7 @@ fn test_ballot_core5_confirm_prepared_mixed_a2() {
     ));
     assert_eq!(scp.envs_len(), 6);
     verify_prepare(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -801,7 +801,7 @@ fn test_ballot_core5_switch_prepared_no_downgrade_p() {
     );
     assert_eq!(scp.envs_len(), 3);
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -823,7 +823,7 @@ fn test_ballot_core5_switch_prepared_no_downgrade_p() {
         value: a_value.clone(),
     };
     verify_prepare(
-        &scp.get_env(3),
+        &scp.env(3),
         &v0_id(),
         qs_hash0,
         0,
@@ -841,7 +841,7 @@ fn test_ballot_core5_switch_prepared_no_downgrade_p() {
     );
     assert_eq!(scp.envs_len(), 5);
     verify_prepare(
-        &scp.get_env(4),
+        &scp.env(4),
         &v0_id(),
         qs_hash0,
         0,
@@ -863,7 +863,7 @@ fn test_ballot_core5_switch_prepared_no_downgrade_p() {
         value: a_value.clone(),
     };
     verify_prepare(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -957,7 +957,7 @@ fn test_ballot_core5_switch_prepared_pprime_to_mid2() {
     );
     assert_eq!(scp.envs_len(), 6);
     verify_prepare(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -1042,7 +1042,7 @@ fn test_ballot_core5_switch_prepared_big2() {
     );
     assert_eq!(scp.envs_len(), 6);
     verify_prepare(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -1098,7 +1098,7 @@ fn test_ballot_core5_switch_prepare_b1_quorum() {
     );
     assert_eq!(scp.envs_len(), 3);
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -1160,7 +1160,7 @@ fn test_ballot_core5_prepare_higher_counter_vblocking() {
     recv_v_blocking(&scp, &make_prepare_gen(qs_hash, b2, None, 0, 0, None));
     assert_eq!(scp.envs_len(), 3);
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -1176,7 +1176,7 @@ fn test_ballot_core5_prepare_higher_counter_vblocking() {
     recv_v_blocking(&scp, &make_prepare_gen(qs_hash, b3, None, 0, 0, None));
     assert_eq!(scp.envs_len(), 4);
     verify_prepare(
-        &scp.get_env(3),
+        &scp.env(3),
         &v0_id(),
         qs_hash0,
         0,
@@ -1223,7 +1223,7 @@ fn test_ballot_core5_prepared_b_vblocking_from_start() {
     );
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -1273,7 +1273,7 @@ fn test_ballot_core5_prepare_b_quorum_from_start() {
     );
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -1316,7 +1316,7 @@ fn test_ballot_core5_confirm_vblocking_via_confirm_higher() {
     };
     scp.receive_envelope(make_confirm(&v2_id(), qs_hash, 0, 4, &a4, 2, 4));
     assert_eq!(scp.envs_len(), 2);
-    verify_confirm(&scp.get_env(1), &v0_id(), qs_hash0, 0, 3, &a3, 3, 3);
+    verify_confirm(&scp.env(1), &v0_id(), qs_hash0, 0, 3, &a3, 3, 3);
     assert!(!scp.has_ballot_timer());
 }
 
@@ -1355,7 +1355,7 @@ fn test_ballot_core5_confirm_vblocking_via_externalize_higher() {
     scp.receive_envelope(make_externalize(&v2_id(), qs_hash, 0, &a3, 5));
     assert_eq!(scp.envs_len(), 2);
     verify_confirm(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,

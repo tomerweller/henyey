@@ -217,7 +217,7 @@ impl CloseTimeDriftTracker {
     ///
     /// Returns (min_drift, max_drift, median_drift, p75_drift) in seconds,
     /// or None if there are no completed entries.
-    pub fn get_drift_stats(&self) -> Option<DriftStats> {
+    pub fn drift_stats(&self) -> Option<DriftStats> {
         let drifts = self.sorted_completed_drifts()?;
 
         let min = drifts[0];
@@ -295,7 +295,7 @@ mod tests {
         let tracker = CloseTimeDriftTracker::new();
         assert_eq!(tracker.window_len(), 0);
         assert_eq!(tracker.completed_entries(), 0);
-        assert!(tracker.get_drift_stats().is_none());
+        assert!(tracker.drift_stats().is_none());
     }
 
     #[test]
@@ -347,7 +347,7 @@ mod tests {
             let _ = tracker.record_externalized_close_time(100 + i, network_time);
         }
 
-        let stats = tracker.get_drift_stats().unwrap();
+        let stats = tracker.drift_stats().unwrap();
         assert_eq!(stats.min, 2);
         assert_eq!(stats.max, 2);
         assert_eq!(stats.median, 2);
@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(tracker.window_len(), 5);
         assert_eq!(tracker.completed_entries(), 3);
 
-        let stats = tracker.get_drift_stats().unwrap();
+        let stats = tracker.drift_stats().unwrap();
         assert_eq!(stats.sample_count, 3);
     }
 
@@ -461,7 +461,7 @@ mod tests {
         }
 
         // Before window check triggers
-        let _stats = tracker.get_drift_stats();
+        let _stats = tracker.drift_stats();
         // Window should have been cleared since size == 10
         // Let's verify by checking the tracker state
         assert_eq!(tracker.window_len(), 0);
@@ -480,7 +480,7 @@ mod tests {
             let _ = tracker.record_externalized_close_time(100 + i as u32, network_time);
         }
 
-        let stats = tracker.get_drift_stats().unwrap();
+        let stats = tracker.drift_stats().unwrap();
         assert_eq!(stats.min, -5);
         assert_eq!(stats.max, 12);
         assert_eq!(stats.sample_count, 8);

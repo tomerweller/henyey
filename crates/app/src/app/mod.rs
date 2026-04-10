@@ -67,7 +67,7 @@ use henyey_db::{
 use henyey_herder::{
     drift_tracker::CloseTimeDriftTracker,
     flow_control::compute_max_tx_size,
-    get_invalid_tx_list,
+    invalid_tx_list,
     sync_recovery::{SyncRecoveryCallback, SyncRecoveryHandle, SyncRecoveryManager},
     CloseTimeBounds, EnvelopeState, Herder, HerderConfig, HerderStats, TxQueueConfig,
     TxSetValidationContext,
@@ -78,9 +78,7 @@ use henyey_history::{
     CatchupResult as HistoryCatchupResult, CheckpointData, ExistingBucketState, HistoryArchive,
     HistoryArchiveState, GENESIS_LEDGER_SEQ,
 };
-use henyey_historywork::{
-    build_checkpoint_data, get_progress, HistoryWorkBuilder, HistoryWorkState,
-};
+use henyey_historywork::{build_checkpoint_data, progress, HistoryWorkBuilder, HistoryWorkState};
 use henyey_ledger::{
     LedgerCloseData, LedgerCloseResult, LedgerManager, LedgerManagerConfig, SorobanNetworkInfo,
     TransactionSetVariant,
@@ -692,7 +690,7 @@ impl App {
     fn verify_on_disk_integrity(db: &henyey_db::Database) -> anyhow::Result<()> {
         const VERIFY_DEPTH: u32 = 128;
 
-        let Some(latest) = db.get_latest_ledger_seq()? else {
+        let Some(latest) = db.latest_ledger_seq()? else {
             return Ok(());
         };
         if latest == 0 {
@@ -703,10 +701,10 @@ impl App {
         let mut checked = 0u32;
         while current_seq > 0 && checked < VERIFY_DEPTH {
             let current = db
-                .get_ledger_header(current_seq)?
+                .ledger_header(current_seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", current_seq))?;
             let prev_seq = current_seq - 1;
-            let Some(prev) = db.get_ledger_header(prev_seq)? else {
+            let Some(prev) = db.ledger_header(prev_seq)? else {
                 tracing::warn!(
                     missing_seq = prev_seq,
                     latest_seq = latest,
@@ -729,7 +727,7 @@ impl App {
     }
 
     fn ensure_network_passphrase(db: &henyey_db::Database, passphrase: &str) -> anyhow::Result<()> {
-        let stored = db.get_network_passphrase()?;
+        let stored = db.network_passphrase()?;
         if let Some(existing) = stored {
             if existing != passphrase {
                 anyhow::bail!(
@@ -993,7 +991,7 @@ impl App {
         use henyey_db::schema::state_keys;
         self.db
             .with_connection(|conn| {
-                Ok(conn.get_state(state_keys::FORCE_SCP)?.as_deref() == Some("true"))
+                Ok(conn.state(state_keys::FORCE_SCP)?.as_deref() == Some("true"))
             })
             .unwrap_or(false)
     }
@@ -1137,7 +1135,7 @@ impl App {
     /// Used by the simulation LoadGenerator to refresh cached sequence numbers.
     pub fn load_account_sequence(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
         let snapshot = self.ledger_manager.create_snapshot().ok()?;
-        let account = snapshot.get_account(account_id).ok()??;
+        let account = snapshot.account(account_id).ok()??;
         Some(account.seq_num.0)
     }
 
@@ -1150,7 +1148,7 @@ impl App {
         account_id: &stellar_xdr::curr::AccountId,
     ) -> Option<stellar_xdr::curr::AccountEntry> {
         let snapshot = self.ledger_manager.create_snapshot().ok()?;
-        snapshot.get_account(account_id).ok()?
+        snapshot.account(account_id).ok()?
     }
 
     /// Check whether a ledger entry exists in the current bucket list.
@@ -1160,7 +1158,7 @@ impl App {
         let Ok(snapshot) = self.ledger_manager.create_snapshot() else {
             return false;
         };
-        matches!(snapshot.get_entry(key), Ok(Some(_)))
+        matches!(snapshot.entry(key), Ok(Some(_)))
     }
 
     /// Check whether the given account has any pending transactions in the
@@ -1230,7 +1228,7 @@ impl App {
     }
 
     pub fn self_check(&self, depth: u32) -> anyhow::Result<SelfCheckResult> {
-        let Some(latest) = self.db.get_latest_ledger_seq()? else {
+        let Some(latest) = self.db.latest_ledger_seq()? else {
             return Ok(SelfCheckResult {
                 ok: true,
                 checked_ledgers: 0,
@@ -1252,12 +1250,12 @@ impl App {
         while current_seq > 0 && checked < depth {
             let current = self
                 .db
-                .get_ledger_header(current_seq)?
+                .ledger_header(current_seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", current_seq))?;
             let prev_seq = current_seq - 1;
             let prev = self
                 .db
-                .get_ledger_header(prev_seq)?
+                .ledger_header(prev_seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", prev_seq))?;
             let prev_hash = compute_header_hash(&prev)?;
             verify_header_chain(&prev, &prev_hash, &current)?;
@@ -1317,7 +1315,7 @@ impl App {
             .tracking_slot
             .max(current_ledger as u64 + 1)
             .max(1);
-        let slot_state = self.herder.get_slot_state(quorum_slot);
+        let slot_state = self.herder.slot_state(quorum_slot);
         SimulationDebugStats {
             app_state: self.state().await.to_string(),
             herder_state: herder_stats.state.to_string(),
@@ -1436,7 +1434,7 @@ impl App {
                 let mut extra_hashes = Vec::new();
 
                 // Stored authoritative HAS
-                if let Some(has_json) = conn.get_state(state_keys::HISTORY_ARCHIVE_STATE)? {
+                if let Some(has_json) = conn.state(state_keys::HISTORY_ARCHIVE_STATE)? {
                     if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
                         extra_hashes.extend(has.all_bucket_hashes());
                     }
@@ -1485,8 +1483,8 @@ impl App {
         let mut snapshots = Vec::new();
 
         while slot > 0 && snapshots.len() < limit {
-            if let Some(state) = scp.get_slot_state(slot) {
-                let envelopes = self.herder.get_scp_envelopes(slot);
+            if let Some(state) = scp.slot_state(slot) {
+                let envelopes = self.herder.scp_envelopes(slot);
                 snapshots.push(ScpSlotSnapshot {
                     slot_index: state.slot_index,
                     is_externalized: state.is_externalized,
@@ -1528,7 +1526,7 @@ impl App {
         }
 
         // Request SCP state from a low watermark similar to stellar-core behavior.
-        let ledger_seq = self.herder.get_min_ledger_seq_to_ask_peers();
+        let ledger_seq = self.herder.min_ledger_seq_to_ask_peers();
         match overlay.request_scp_state(ledger_seq).await {
             Ok(count) => {
                 tracing::info!(
@@ -2596,11 +2594,11 @@ mod tests {
         let hash2 = Hash256::from_bytes([2u8; 32]);
         app.herder.scp_driver().request_tx_set(hash1, 100);
         app.herder.scp_driver().request_tx_set(hash2, 101);
-        assert_eq!(app.herder.get_pending_tx_sets().len(), 2);
+        assert_eq!(app.herder.pending_tx_sets().len(), 2);
 
         // Clear via the herder passthrough
         app.herder.clear_pending_tx_sets();
-        assert!(app.herder.get_pending_tx_sets().is_empty());
+        assert!(app.herder.pending_tx_sets().is_empty());
     }
 
     #[tokio::test]

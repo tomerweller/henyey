@@ -236,7 +236,7 @@ fn test_stats() {
     fetcher.fetch(hash1, &make_test_envelope(100, 1));
     fetcher.fetch(hash2, &make_test_envelope(101, 2));
 
-    let stats = fetcher.get_stats();
+    let stats = fetcher.stats();
     assert_eq!(stats.num_trackers, 2);
     assert_eq!(stats.item_type, ItemType::TxSet);
 }

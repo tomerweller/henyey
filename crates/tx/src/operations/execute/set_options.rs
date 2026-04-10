@@ -113,7 +113,7 @@ pub(crate) fn execute_set_options(
     // returning SET_OPTIONS_INVALID_INFLATION before any auth flag checks.
     // Reference: SetOptionsOpFrame.cpp doApply()
     if let Some(ref inflation_dest) = op.inflation_dest {
-        if inflation_dest != source && state.get_account(inflation_dest).is_none() {
+        if inflation_dest != source && state.account(inflation_dest).is_none() {
             return Ok(make_result(SetOptionsResultCode::InvalidInflation));
         }
     }
@@ -153,7 +153,7 @@ pub(crate) fn execute_set_options(
     let base_reserve = state.base_reserve();
     let sponsor_info = if let Some(sponsor_id) = state.active_sponsor_for(source) {
         let sponsor_account = state
-            .get_account(&sponsor_id)
+            .account(&sponsor_id)
             .ok_or(TxError::SourceAccountNotFound)?;
         let min_balance = state.minimum_balance_for_account_with_deltas(
             sponsor_account,
@@ -172,7 +172,7 @@ pub(crate) fn execute_set_options(
 
     // Now apply changes to the account
     let source_account_mut = state
-        .get_account_mut(source)
+        .account_mut(source)
         .ok_or(TxError::SourceAccountNotFound)?;
 
     // Update inflation destination
@@ -557,7 +557,7 @@ mod tests {
         let result = execute_set_options(&op, &source_id, &mut state, &context);
         assert!(result.is_ok());
 
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.thresholds.0[0], 10); // master weight
         assert_eq!(account.thresholds.0[1], 1); // low
         assert_eq!(account.thresholds.0[2], 2); // med
@@ -587,7 +587,7 @@ mod tests {
         let result = execute_set_options(&op, &source_id, &mut state, &context);
         assert!(result.is_ok());
 
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.flags, 0x3);
     }
 
@@ -777,7 +777,7 @@ mod tests {
         let result = execute_set_options(&op, &source_id, &mut state, &context);
         assert!(result.is_ok());
 
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.signers.len(), 1);
         assert_eq!(account.num_sub_entries, 1);
     }
@@ -913,7 +913,7 @@ mod tests {
         let result = execute_set_options(&op, &source_id, &mut state, &context);
         assert!(result.is_ok());
 
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.home_domain.to_string(), "stellar.org");
     }
 
@@ -981,7 +981,7 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
 
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.inflation_dest, Some(source_id));
     }
 
@@ -1018,7 +1018,7 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
 
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.inflation_dest, Some(dest_id));
     }
 
@@ -1066,14 +1066,14 @@ mod tests {
 
         // Verify num_sub_entries was not changed
         assert_eq!(
-            state.get_account(&source_id).unwrap().num_sub_entries,
+            state.account(&source_id).unwrap().num_sub_entries,
             ACCOUNT_SUBENTRY_LIMIT,
             "num_sub_entries should remain unchanged"
         );
 
         // Verify no signer was added
         assert_eq!(
-            state.get_account(&source_id).unwrap().signers.len(),
+            state.account(&source_id).unwrap().signers.len(),
             0,
             "no signer should have been added"
         );
@@ -1127,7 +1127,7 @@ mod tests {
         }
 
         // Verify the signer weight was updated
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         let signer = account
             .signers
             .iter()
@@ -1185,7 +1185,7 @@ mod tests {
         }
 
         // Verify signer was removed
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.signers.len(), 0, "Signer should be removed");
         assert_eq!(
             account.num_sub_entries, 0,
@@ -1341,7 +1341,7 @@ mod tests {
         }
 
         // Verify home domain was set
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.home_domain.as_vec(), b"valid.stellar.org");
     }
 
@@ -1379,7 +1379,7 @@ mod tests {
         }
 
         // Verify flag was cleared
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(
             account.flags & (AccountFlags::RevocableFlag as u32),
             0,
@@ -1439,7 +1439,7 @@ mod tests {
             other => panic!("expected SetOptions result, got {:?}", other),
         }
 
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.flags & (AccountFlags::RevocableFlag as u32), 0);
         assert_eq!(
             account.flags & (AccountFlags::ClawbackEnabledFlag as u32),
@@ -1534,7 +1534,7 @@ mod tests {
         ));
 
         // Verify signers are sorted: key_a (smaller payload) should be first
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.signers.len(), 2);
         assert_eq!(
             account.signers[0].key, key_a,
@@ -1575,7 +1575,7 @@ mod tests {
         }
 
         // Verify master weight is 0
-        let account = state.get_account(&source_id).unwrap();
+        let account = state.account(&source_id).unwrap();
         assert_eq!(account.thresholds.0[0], 0, "Master weight should be 0");
     }
 

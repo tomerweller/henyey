@@ -154,17 +154,17 @@ impl LedgerSnapshot {
     }
 
     /// Look up an entry by key.
-    pub fn get_entry(&self, key: &LedgerKey) -> Option<&LedgerEntry> {
+    pub fn entry(&self, key: &LedgerKey) -> Option<&LedgerEntry> {
         self.entries.get(key)
     }
 
     /// Look up an account by ID.
-    pub fn get_account(&self, account_id: &AccountId) -> Option<&AccountEntry> {
+    pub fn account(&self, account_id: &AccountId) -> Option<&AccountEntry> {
         let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
 
-        if let Some(entry) = self.get_entry(&key) {
+        if let Some(entry) = self.entry(&key) {
             if let LedgerEntryData::Account(ref account) = entry.data {
                 return Some(account);
             }
@@ -248,7 +248,7 @@ pub type PoolShareTrustlinesByAccountFn =
 /// let handle = SnapshotHandle::with_lookup(snapshot, bucket_list_lookup);
 ///
 /// // Entry lookup falls through to bucket list if not cached
-/// let entry = handle.get_entry(&key)?;
+/// let entry = handle.entry(&key)?;
 /// ```
 #[derive(Clone)]
 pub struct SnapshotHandle {
@@ -376,7 +376,7 @@ impl SnapshotHandle {
         let mut remaining = Vec::new();
         let prefetch = self.prefetch_cache.read();
         for key in keys {
-            if let Some(entry) = self.inner.get_entry(key) {
+            if let Some(entry) = self.inner.entry(key) {
                 result.push(entry.clone());
             } else if let Some(entry) = prefetch.get(key) {
                 result.push(entry.clone());
@@ -445,9 +445,9 @@ impl SnapshotHandle {
     /// First checks the snapshot cache, then the prefetch cache, then falls
     /// back to the lookup function if one is configured (e.g., for bucket
     /// list lookups).
-    pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
+    pub fn entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         // 1. Check snapshot's built-in cache
-        if let Some(entry) = self.inner.get_entry(key) {
+        if let Some(entry) = self.inner.entry(key) {
             return Ok(Some(entry.clone()));
         }
 
@@ -473,12 +473,12 @@ impl SnapshotHandle {
     }
 
     /// Look up an account.
-    pub fn get_account(&self, account_id: &AccountId) -> Result<Option<AccountEntry>> {
+    pub fn account(&self, account_id: &AccountId) -> Result<Option<AccountEntry>> {
         let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
 
-        if let Some(entry) = self.get_entry(&key)? {
+        if let Some(entry) = self.entry(&key)? {
             if let LedgerEntryData::Account(account) = entry.data {
                 return Ok(Some(account));
             }
@@ -495,7 +495,7 @@ impl SnapshotHandle {
         let cache = self.prefetch_cache.read();
 
         for key in keys {
-            if self.inner.get_entry(key).is_some() || cache.contains_key(key) {
+            if self.inner.entry(key).is_some() || cache.contains_key(key) {
                 continue;
             }
             needed.push(key.clone());
@@ -646,8 +646,8 @@ impl SnapshotBuilder {
 }
 
 impl crate::EntryReader for SnapshotHandle {
-    fn get_entry(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
-        SnapshotHandle::get_entry(self, key)
+    fn entry(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
+        SnapshotHandle::entry(self, key)
     }
 }
 
@@ -698,7 +698,7 @@ mod tests {
             .build_with_default_header();
 
         assert_eq!(snapshot.ledger_seq(), 10);
-        assert!(snapshot.get_entry(&key).is_some());
+        assert!(snapshot.entry(&key).is_some());
     }
 
     #[test]
@@ -715,7 +715,7 @@ mod tests {
             .add_entry(key, entry)
             .build_with_default_header();
 
-        let account = snapshot.get_account(&account_id);
+        let account = snapshot.account(&account_id);
         assert!(account.is_some());
         assert_eq!(account.unwrap().balance, 1000000000);
     }
@@ -735,17 +735,17 @@ mod tests {
 
         // Read entries multiple times
         for _ in 0..3 {
-            assert!(snapshot.get_entry(&key1).is_some());
-            assert!(snapshot.get_entry(&key2).is_some());
+            assert!(snapshot.entry(&key1).is_some());
+            assert!(snapshot.entry(&key2).is_some());
         }
 
         // Reading a non-existent entry is fine
         let (missing_key, _) = create_test_account(99);
-        assert!(snapshot.get_entry(&missing_key).is_none());
+        assert!(snapshot.entry(&missing_key).is_none());
 
         // Snapshot state hasn't changed: sequence, header, entries all same
         assert_eq!(snapshot.ledger_seq(), 5);
-        let e1_again = snapshot.get_entry(&key1).unwrap();
+        let e1_again = snapshot.entry(&key1).unwrap();
         assert_eq!(e1_again.data, entry1.data);
     }
 
@@ -761,14 +761,14 @@ mod tests {
             .build_with_default_header();
 
         // Existing entry: found
-        assert!(snapshot.get_entry(&key1).is_some());
+        assert!(snapshot.entry(&key1).is_some());
 
         // Missing entry: returns None (not error)
-        assert!(snapshot.get_entry(&missing_key).is_none());
+        assert!(snapshot.entry(&missing_key).is_none());
 
         // Missing account: returns None
         if let LedgerKey::Account(ref ak) = missing_key {
-            assert!(snapshot.get_account(&ak.account_id).is_none());
+            assert!(snapshot.account(&ak.account_id).is_none());
         }
     }
 
@@ -788,11 +788,11 @@ mod tests {
             .build_with_default_header();
 
         // key1 and key2 are found
-        assert!(snapshot.get_entry(&key1).is_some());
-        assert!(snapshot.get_entry(&key2).is_some());
+        assert!(snapshot.entry(&key1).is_some());
+        assert!(snapshot.entry(&key2).is_some());
 
         // key3 was never added (simulating deletion) - not found
-        assert!(snapshot.get_entry(&key3).is_none());
+        assert!(snapshot.entry(&key3).is_none());
     }
 
     /// Snapshot provides an immutable header view.
@@ -808,7 +808,7 @@ mod tests {
         assert_eq!(h1.ledger_seq, 42);
     }
 
-    /// Verify that `load_entries()` caches loaded entries so a subsequent `get_entry()`
+    /// Verify that `load_entries()` caches loaded entries so a subsequent `entry()`
     /// for the same key does NOT invoke the `lookup_fn` again.
     #[test]
     fn test_load_entries_caches_results() {
@@ -830,8 +830,8 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // get_entry for the same key must be served from prefetch_cache, not lookup_fn
-        let result = handle.get_entry(&key).unwrap();
+        // entry for the same key must be served from prefetch_cache, not lookup_fn
+        let result = handle.entry(&key).unwrap();
         assert!(result.is_some());
         assert_eq!(
             call_count.load(std::sync::atomic::Ordering::SeqCst),
@@ -840,7 +840,7 @@ mod tests {
         );
     }
 
-    /// Verify that `get_entry()` caches bucket list results so subsequent lookups
+    /// Verify that `entry()` caches bucket list results so subsequent lookups
     /// do NOT re-invoke the `lookup_fn`.
     #[test]
     fn test_get_entry_caches_lookup_result() {
@@ -858,12 +858,12 @@ mod tests {
         }));
 
         // First call: hits lookup_fn
-        let result1 = handle.get_entry(&key).unwrap();
+        let result1 = handle.entry(&key).unwrap();
         assert!(result1.is_some());
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // Second call: served from prefetch_cache, lookup_fn not called again
-        let result2 = handle.get_entry(&key).unwrap();
+        let result2 = handle.entry(&key).unwrap();
         assert!(result2.is_some());
         assert_eq!(
             call_count.load(std::sync::atomic::Ordering::SeqCst),

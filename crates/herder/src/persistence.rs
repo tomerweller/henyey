@@ -90,7 +90,7 @@ impl PersistedSlotState {
     }
 
     /// Get the envelopes from the persisted state.
-    pub(crate) fn get_envelopes(&self) -> Vec<Result<ScpEnvelope>> {
+    pub(crate) fn envelopes(&self) -> Vec<Result<ScpEnvelope>> {
         self.envelopes
             .iter()
             .map(|bytes| {
@@ -102,7 +102,7 @@ impl PersistedSlotState {
     }
 
     /// Get the quorum sets from the persisted state.
-    pub(crate) fn get_quorum_sets(&self) -> Vec<Result<ScpQuorumSet>> {
+    pub(crate) fn quorum_sets(&self) -> Vec<Result<ScpQuorumSet>> {
         self.quorum_sets
             .iter()
             .map(|bytes| {
@@ -266,7 +266,7 @@ impl ScpStatePersistence for InMemoryScpPersistence {
 /// Extract transaction set hashes from an SCP envelope.
 ///
 /// Returns the hashes of transaction sets referenced by the envelope's statement.
-pub fn get_tx_set_hashes(envelope: &ScpEnvelope) -> Vec<Hash> {
+pub fn tx_set_hashes(envelope: &ScpEnvelope) -> Vec<Hash> {
     let mut hashes = Vec::new();
 
     match &envelope.statement.pledges {
@@ -321,7 +321,7 @@ fn extract_tx_set_hash_from_value(value: &Value) -> Option<Hash> {
 /// Get the quorum set hash from an SCP statement.
 ///
 /// This extracts the quorum set hash from the statement pledges.
-pub fn get_quorum_set_hash(envelope: &ScpEnvelope) -> Option<Hash> {
+pub fn quorum_set_hash(envelope: &ScpEnvelope) -> Option<Hash> {
     match &envelope.statement.pledges {
         ScpStatementPledges::Nominate(nom) => Some(nom.quorum_set_hash.clone()),
         ScpStatementPledges::Prepare(prep) => Some(prep.quorum_set_hash.clone()),
@@ -422,7 +422,7 @@ impl ScpPersistenceManager {
 
         for (slot, state) in states {
             // Process quorum sets
-            for qs_result in state.get_quorum_sets() {
+            for qs_result in state.quorum_sets() {
                 match qs_result {
                     Ok(qs) => {
                         let hash = henyey_common::Hash256::hash_xdr(&qs)
@@ -442,7 +442,7 @@ impl ScpPersistenceManager {
             }
 
             // Process envelopes
-            for env_result in state.get_envelopes() {
+            for env_result in state.envelopes() {
                 match env_result {
                     Ok(env) => {
                         let env_slot = env.statement.slot_index;
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(restored.envelopes.len(), 1);
         assert_eq!(restored.quorum_sets.len(), 1);
 
-        let envelopes: Vec<_> = restored.get_envelopes().into_iter().collect();
+        let envelopes: Vec<_> = restored.envelopes().into_iter().collect();
         assert!(envelopes[0].is_ok());
         assert_eq!(envelopes[0].as_ref().unwrap().statement.slot_index, 100);
     }
@@ -552,7 +552,7 @@ mod tests {
         let base64 = state.to_base64().unwrap();
         let restored = PersistedSlotState::from_base64(&base64).unwrap();
 
-        let envelopes: Vec<_> = restored.get_envelopes().into_iter().collect();
+        let envelopes: Vec<_> = restored.envelopes().into_iter().collect();
         assert_eq!(envelopes.len(), 1);
         assert!(envelopes[0].is_ok());
     }
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn test_get_quorum_set_hash() {
         let envelope = make_test_envelope(100);
-        let hash = get_quorum_set_hash(&envelope);
+        let hash = quorum_set_hash(&envelope);
         assert!(hash.is_some());
         assert_eq!(hash.unwrap(), Hash([0u8; 32]));
     }

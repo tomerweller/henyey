@@ -50,17 +50,13 @@ impl TransactionQueue {
     /// Get a transaction set for the next ledger.
     ///
     /// Returns the highest-fee transactions up to the specified limit.
-    pub fn get_transaction_set(
-        &self,
-        previous_ledger_hash: Hash256,
-        max_ops: usize,
-    ) -> TransactionSet {
+    pub fn transaction_set(&self, previous_ledger_hash: Hash256, max_ops: usize) -> TransactionSet {
         let SelectedTxs { transactions, .. } =
             self.select_transactions_with_starting_seq(max_ops, None);
         TransactionSet::new(previous_ledger_hash, transactions)
     }
 
-    pub fn get_transaction_set_with_starting_seq(
+    pub fn transaction_set_with_starting_seq(
         &self,
         previous_ledger_hash: Hash256,
         max_ops: usize,
@@ -124,7 +120,7 @@ impl TransactionQueue {
         // We only run this when a fee balance provider is available. Txs are already
         // individually validated at queue admission; the cross-phase trim catches the case
         // where cumulative fees across both phases exceed a source's balance.
-        let fee_provider = self.get_fee_balance_provider();
+        let fee_provider = self.fee_balance_provider();
         let (classic_txs, mut soroban_txs) = if fee_provider.is_some() {
             let ctx = {
                 let vc = self.validation_context.read();
@@ -381,7 +377,7 @@ impl TransactionQueue {
         );
 
         let mut classic_selected = Vec::new();
-        let lane_count = classic_queue.get_num_lanes();
+        let lane_count = classic_queue.num_lanes();
         let mut classic_lane_left: Vec<Resource> = (0..lane_count)
             .map(|lane| classic_queue.lane_limits(lane))
             .collect();
@@ -443,7 +439,7 @@ impl TransactionQueue {
         if let (Some(limit), Some(byte_limit)) =
             (soroban_limit.as_mut(), self.config.max_soroban_bytes)
         {
-            let current = limit.get_val(ResourceType::TxByteSize);
+            let current = limit.val(ResourceType::TxByteSize);
             let clamped = (byte_limit as i64).min(current);
             limit.set_val(ResourceType::TxByteSize, clamped);
         }

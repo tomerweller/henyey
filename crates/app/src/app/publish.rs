@@ -136,7 +136,7 @@ impl App {
         for seq in start_ledger..=checkpoint {
             let header = self
                 .db
-                .get_ledger_header(seq)?
+                .ledger_header(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header {}", seq))?;
             let hash = henyey_ledger::compute_header_hash(&header)?;
             headers.push(stellar_xdr::curr::LedgerHeaderHistoryEntry {
@@ -147,13 +147,13 @@ impl App {
 
             let tx_entry = self
                 .db
-                .get_tx_history_entry(seq)?
+                .tx_history_entry(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx history entry {}", seq))?;
             tx_entries.push(tx_entry);
 
             let tx_result = self
                 .db
-                .get_tx_result_entry(seq)?
+                .tx_result_entry(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx result entry {}", seq))?;
             tx_results.push(tx_result);
         }

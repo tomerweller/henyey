@@ -898,7 +898,7 @@ impl Simulation {
         let app = Self::wrap_app(app).await;
 
         // Restore the LedgerManager from persisted DB + on-disk buckets.
-        // App::run() will read the restored ledger via get_current_ledger()
+        // App::run() will read the restored ledger via current_ledger()
         // and set state via restore_operational_state().
         match app.load_last_known_ledger().await {
             Ok(true) => {

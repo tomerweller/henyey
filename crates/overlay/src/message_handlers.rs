@@ -349,13 +349,13 @@ impl MessageDispatcher {
     }
 
     /// Get pending TxSet requests.
-    pub fn get_pending_tx_set_requests(&self, peers: &[PeerId]) -> Vec<PendingRequest> {
-        self.tx_set_fetcher.get_pending_requests(peers)
+    pub fn pending_tx_set_requests(&self, peers: &[PeerId]) -> Vec<PendingRequest> {
+        self.tx_set_fetcher.pending_requests(peers)
     }
 
     /// Get pending QuorumSet requests.
-    pub fn get_pending_quorum_set_requests(&self, peers: &[PeerId]) -> Vec<PendingRequest> {
-        self.quorum_set_fetcher.get_pending_requests(peers)
+    pub fn pending_quorum_set_requests(&self, peers: &[PeerId]) -> Vec<PendingRequest> {
+        self.quorum_set_fetcher.pending_requests(peers)
     }
 
     /// Check if a TxSet is cached.
@@ -371,13 +371,13 @@ impl MessageDispatcher {
     }
 
     /// Get a cached TxSet.
-    pub fn get_tx_set(&self, hash: &Hash) -> Option<TxSetData> {
+    pub fn tx_set(&self, hash: &Hash) -> Option<TxSetData> {
         let cache = self.tx_set_cache.lock().unwrap();
         cache.get(hash).cloned()
     }
 
     /// Get a cached QuorumSet.
-    pub fn get_quorum_set(&self, hash: &Hash) -> Option<ScpQuorumSet> {
+    pub fn quorum_set(&self, hash: &Hash) -> Option<ScpQuorumSet> {
         let cache = self.quorum_set_cache.lock().unwrap();
         cache.get(hash).cloned()
     }
@@ -402,8 +402,8 @@ impl MessageDispatcher {
         let quorum_set_cache = self.quorum_set_cache.lock().unwrap();
 
         MessageDispatcherStats {
-            tx_set_fetcher_stats: self.tx_set_fetcher.get_stats(),
-            quorum_set_fetcher_stats: self.quorum_set_fetcher.get_stats(),
+            tx_set_fetcher_stats: self.tx_set_fetcher.stats(),
+            quorum_set_fetcher_stats: self.quorum_set_fetcher.stats(),
             cached_tx_sets: tx_set_cache.len(),
             cached_quorum_sets: quorum_set_cache.len(),
         }
@@ -520,7 +520,7 @@ mod tests {
         dispatcher.cache_tx_set(hash.clone(), TxSetData::Legacy(tx_set));
 
         assert!(dispatcher.has_tx_set(&hash));
-        assert!(dispatcher.get_tx_set(&hash).is_some());
+        assert!(dispatcher.tx_set(&hash).is_some());
     }
 
     #[test]
@@ -542,7 +542,7 @@ mod tests {
         dispatcher.cache_quorum_set(hash.clone(), quorum_set);
 
         assert!(dispatcher.has_quorum_set(&hash));
-        assert!(dispatcher.get_quorum_set(&hash).is_some());
+        assert!(dispatcher.quorum_set(&hash).is_some());
     }
 
     #[test]

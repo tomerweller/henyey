@@ -596,8 +596,8 @@ pub fn merge_in_memory(
     );
 
     // Get in-memory entries directly (no disk I/O)
-    let old_entries = old_bucket.get_in_memory_entries().unwrap();
-    let new_entries = new_bucket.get_in_memory_entries().unwrap();
+    let old_entries = old_bucket.in_memory_entries().unwrap();
+    let new_entries = new_bucket.in_memory_entries().unwrap();
 
     // DEBUG: Print merge inputs
     tracing::debug!(
@@ -1234,7 +1234,7 @@ mod tests {
 
         // Verify new entry won
         let key = make_account_key([1u8; 32]);
-        let entry = merged.get_entry(&key).unwrap().unwrap();
+        let entry = merged.entry(&key).unwrap().unwrap();
         if let LedgerEntryData::Account(account) = &entry.data {
             assert_eq!(account.balance, 200);
         } else {
@@ -1299,19 +1299,19 @@ mod tests {
         assert!(merged.get(&key1).unwrap().unwrap().is_dead());
 
         let key2 = make_account_key([2u8; 32]);
-        let entry2 = merged.get_entry(&key2).unwrap().unwrap();
+        let entry2 = merged.entry(&key2).unwrap().unwrap();
         if let LedgerEntryData::Account(account) = &entry2.data {
             assert_eq!(account.balance, 250);
         }
 
         let key3 = make_account_key([3u8; 32]);
-        let entry3 = merged.get_entry(&key3).unwrap().unwrap();
+        let entry3 = merged.entry(&key3).unwrap().unwrap();
         if let LedgerEntryData::Account(account) = &entry3.data {
             assert_eq!(account.balance, 300);
         }
 
         let key4 = make_account_key([4u8; 32]);
-        let entry4 = merged.get_entry(&key4).unwrap().unwrap();
+        let entry4 = merged.entry(&key4).unwrap().unwrap();
         if let LedgerEntryData::Account(account) = &entry4.data {
             assert_eq!(account.balance, 400);
         }
@@ -1358,7 +1358,7 @@ mod tests {
         assert_eq!(merged.len(), 1);
 
         let key = make_account_key([1u8; 32]);
-        let entry = merged.get_entry(&key).unwrap().unwrap();
+        let entry = merged.entry(&key).unwrap().unwrap();
         if let LedgerEntryData::Account(account) = &entry.data {
             assert_eq!(account.balance, 300); // Newest wins
         }
@@ -1397,7 +1397,7 @@ mod tests {
         );
 
         let key = make_account_key([1u8; 32]);
-        let entry = merged.get_entry(&key).unwrap().unwrap();
+        let entry = merged.entry(&key).unwrap().unwrap();
         if let LedgerEntryData::Account(account) = &entry.data {
             assert_eq!(account.balance, 200);
         }
@@ -1535,9 +1535,9 @@ mod tests {
         let key2 = make_account_key([2u8; 32]);
         let key3 = make_account_key([3u8; 32]);
 
-        let entry1 = merged.get_entry(&key1).unwrap().unwrap();
-        let entry2 = merged.get_entry(&key2).unwrap().unwrap();
-        let entry3 = merged.get_entry(&key3).unwrap().unwrap();
+        let entry1 = merged.entry(&key1).unwrap().unwrap();
+        let entry2 = merged.entry(&key2).unwrap().unwrap();
+        let entry3 = merged.entry(&key3).unwrap().unwrap();
 
         if let LedgerEntryData::Account(a) = &entry1.data {
             assert_eq!(a.balance, 100);
@@ -1626,7 +1626,7 @@ mod tests {
         assert!(bucket.hash().is_zero());
 
         // Should be able to get in-memory entries
-        let in_mem = bucket.get_in_memory_entries().unwrap();
+        let in_mem = bucket.in_memory_entries().unwrap();
         assert_eq!(in_mem.len(), 2);
     }
 

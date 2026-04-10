@@ -19,7 +19,7 @@ pub trait StateQueries {
     /// Retrieves a state value by key.
     ///
     /// Returns `None` if the key does not exist.
-    fn get_state(&self, key: &str) -> Result<Option<String>, DbError>;
+    fn state(&self, key: &str) -> Result<Option<String>, DbError>;
 
     /// Stores a state value.
     ///
@@ -34,14 +34,14 @@ pub trait StateQueries {
     /// Returns the last closed ledger sequence number.
     ///
     /// This is the primary indicator of the node's progress through the chain.
-    fn get_last_closed_ledger(&self) -> Result<Option<u32>, DbError>;
+    fn last_closed_ledger(&self) -> Result<Option<u32>, DbError>;
 
     /// Records the last closed ledger sequence number.
     fn set_last_closed_ledger(&self, seq: u32) -> Result<(), DbError>;
 }
 
 impl StateQueries for Connection {
-    fn get_state(&self, key: &str) -> Result<Option<String>, DbError> {
+    fn state(&self, key: &str) -> Result<Option<String>, DbError> {
         self.query_row(
             "SELECT state FROM storestate WHERE statename = ?1",
             params![key],
@@ -64,8 +64,8 @@ impl StateQueries for Connection {
         Ok(())
     }
 
-    fn get_last_closed_ledger(&self) -> Result<Option<u32>, DbError> {
-        self.get_state(state_keys::LAST_CLOSED_LEDGER)?
+    fn last_closed_ledger(&self) -> Result<Option<u32>, DbError> {
+        self.state(state_keys::LAST_CLOSED_LEDGER)?
             .map(|s| {
                 s.parse::<u32>().map_err(|e| {
                     DbError::Integrity(format!("Invalid last closed ledger value: {}", e))
@@ -98,19 +98,19 @@ mod tests {
         let conn = setup_db();
 
         // Initially no state
-        assert!(conn.get_state("test_key").unwrap().is_none());
+        assert!(conn.state("test_key").unwrap().is_none());
 
         // Set state
         conn.set_state("test_key", "test_value").unwrap();
         assert_eq!(
-            conn.get_state("test_key").unwrap(),
+            conn.state("test_key").unwrap(),
             Some("test_value".to_string())
         );
 
         // Update state
         conn.set_state("test_key", "new_value").unwrap();
         assert_eq!(
-            conn.get_state("test_key").unwrap(),
+            conn.state("test_key").unwrap(),
             Some("new_value".to_string())
         );
     }
@@ -120,10 +120,10 @@ mod tests {
         let conn = setup_db();
 
         conn.set_state("test_key", "test_value").unwrap();
-        assert!(conn.get_state("test_key").unwrap().is_some());
+        assert!(conn.state("test_key").unwrap().is_some());
 
         conn.delete_state("test_key").unwrap();
-        assert!(conn.get_state("test_key").unwrap().is_none());
+        assert!(conn.state("test_key").unwrap().is_none());
     }
 
     #[test]
@@ -131,14 +131,14 @@ mod tests {
         let conn = setup_db();
 
         // Initially no ledger
-        assert!(conn.get_last_closed_ledger().unwrap().is_none());
+        assert!(conn.last_closed_ledger().unwrap().is_none());
 
         // Set ledger
         conn.set_last_closed_ledger(100).unwrap();
-        assert_eq!(conn.get_last_closed_ledger().unwrap(), Some(100));
+        assert_eq!(conn.last_closed_ledger().unwrap(), Some(100));
 
         // Update ledger
         conn.set_last_closed_ledger(200).unwrap();
-        assert_eq!(conn.get_last_closed_ledger().unwrap(), Some(200));
+        assert_eq!(conn.last_closed_ledger().unwrap(), Some(200));
     }
 }

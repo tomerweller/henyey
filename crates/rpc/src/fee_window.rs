@@ -13,8 +13,8 @@
 //! On each new ledger, [`FeeWindows::ingest_ledger_close_meta`] parses the
 //! `LedgerCloseMeta` XDR, extracts fees from every transaction, and appends
 //! them to the appropriate window. The distribution is recomputed eagerly so
-//! that [`FeeWindows::get_classic_distribution`] and
-//! [`FeeWindows::get_soroban_distribution`] are O(1) reads.
+//! that [`FeeWindows::classic_distribution`] and
+//! [`FeeWindows::soroban_distribution`] are O(1) reads.
 //!
 //! # Fee extraction
 //!
@@ -277,12 +277,12 @@ impl FeeWindows {
     }
 
     /// Get the classic fee distribution.
-    pub(crate) fn get_classic_distribution(&self) -> FeeDistribution {
+    pub(crate) fn classic_distribution(&self) -> FeeDistribution {
         self.classic.distribution()
     }
 
     /// Get the Soroban inclusion fee distribution.
-    pub(crate) fn get_soroban_distribution(&self) -> FeeDistribution {
+    pub(crate) fn soroban_distribution(&self) -> FeeDistribution {
         self.soroban.distribution()
     }
 
@@ -554,8 +554,8 @@ mod tests {
     fn test_fee_windows_composite() {
         let fw = FeeWindows::new(10);
         assert_eq!(fw.latest_ledger(), 0);
-        assert_eq!(fw.get_classic_distribution().fee_count, 0);
-        assert_eq!(fw.get_soroban_distribution().fee_count, 0);
+        assert_eq!(fw.classic_distribution().fee_count, 0);
+        assert_eq!(fw.soroban_distribution().fee_count, 0);
     }
 
     #[test]

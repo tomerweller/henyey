@@ -355,7 +355,7 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn load_scp_slot_state(&self, slot: u64) -> Result<Option<String>, DbError> {
-        self.get_state(&scp_slot_state_key(slot))
+        self.state(&scp_slot_state_key(slot))
     }
 
     fn load_all_scp_slot_states(&self) -> Result<Vec<(u64, String)>, DbError> {
@@ -395,7 +395,7 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn load_tx_set_data(&self, hash: &Hash) -> Result<Option<Vec<u8>>, DbError> {
-        self.get_state(&tx_set_key(hash))?
+        self.state(&tx_set_key(hash))?
             .map(|encoded| decode_tx_set_data(&encoded))
             .transpose()
     }

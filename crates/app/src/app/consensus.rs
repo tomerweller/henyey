@@ -82,7 +82,7 @@ impl App {
     pub(super) async fn out_of_sync_recovery(&self, current_ledger: u32) {
         let latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0);
         let last_processed = *self.last_processed_slot.read().await;
-        let pending_tx_sets = self.herder.get_pending_tx_sets();
+        let pending_tx_sets = self.herder.pending_tx_sets();
         let buffer_count = self.syncing_ledgers.read().await.len();
         let gap = latest_externalized.saturating_sub(current_ledger as u64);
 
@@ -151,8 +151,8 @@ impl App {
         if gap <= TX_SET_REQUEST_WINDOW {
             // Check if the next slot's EXTERNALIZE is missing
             let next_slot = current_ledger as u64 + 1;
-            let next_slot_missing = latest_externalized > next_slot
-                && self.herder.get_externalized(next_slot).is_none();
+            let next_slot_missing =
+                latest_externalized > next_slot && self.herder.externalized(next_slot).is_none();
 
             // Clear syncing_ledgers entries for already-closed slots.
             // Do NOT clear entries without tx_sets — their tx_set fetches
@@ -401,7 +401,7 @@ impl App {
         // Get recent SCP envelopes to broadcast
         let from_slot = current_ledger.saturating_sub(5) as u64;
         tracing::debug!(from_slot, "Getting SCP state for recovery");
-        let (envelopes, _quorum_set) = self.herder.get_scp_state(from_slot);
+        let (envelopes, _quorum_set) = self.herder.scp_state(from_slot);
         tracing::debug!(
             envelope_count = envelopes.len(),
             "Got SCP state for recovery"
@@ -481,7 +481,7 @@ impl App {
     /// Send SCP state to a peer in response to GetScpState.
     pub(super) async fn send_scp_state(&self, peer_id: &henyey_overlay::PeerId, from_ledger: u32) {
         let from_slot = from_ledger as u64;
-        let (envelopes, quorum_set) = self.herder.get_scp_state(from_slot);
+        let (envelopes, quorum_set) = self.herder.scp_state(from_slot);
 
         let Some(overlay) = self.overlay().await else {
             return;
@@ -518,7 +518,7 @@ impl App {
         };
 
         let req = henyey_common::Hash256::from_bytes(requested_hash.0);
-        if let Some(qs) = self.herder.get_quorum_set_by_hash(&req) {
+        if let Some(qs) = self.herder.quorum_set_by_hash(&req) {
             if let Err(e) = overlay.try_send_to(peer_id, StellarMessage::ScpQuorumset(qs)) {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send quorum set");
             }
@@ -545,7 +545,7 @@ impl App {
         // Reject unsolicited quorum sets — matching stellar-core's
         // PendingEnvelopes::recvSCPQuorumSet which checks
         // getLastSeenSlotIndex(hash) != 0 before accepting.
-        let node_ids = self.herder.get_pending_quorum_set_node_ids(&hash);
+        let node_ids = self.herder.pending_quorum_set_node_ids(&hash);
         if node_ids.is_empty() {
             tracing::debug!(%hash, "Ignoring unsolicited quorum set (no pending requests)");
             return;
@@ -582,7 +582,7 @@ impl App {
     }
 
     pub(super) fn build_scp_history_entry(&self, ledger_seq: u32) -> Option<ScpHistoryEntry> {
-        let envelopes = self.herder.get_scp_envelopes(ledger_seq as u64);
+        let envelopes = self.herder.scp_envelopes(ledger_seq as u64);
         if envelopes.is_empty() {
             return None;
         }
@@ -598,7 +598,7 @@ impl App {
 
         let mut qsets = Vec::new();
         for hash in hashes {
-            match self.herder.get_quorum_set_by_hash(&hash) {
+            match self.herder.quorum_set_by_hash(&hash) {
                 Some(qset) => qsets.push(qset),
                 None => {
                     tracing::debug!(hash = %hash.to_hex(), "Missing quorum set for SCP history entry");
@@ -657,7 +657,7 @@ impl App {
             }
         }
         if timeouts.next_nomination.is_none() {
-            if let Some(timeout) = self.herder.get_nomination_timeout(slot) {
+            if let Some(timeout) = self.herder.nomination_timeout(slot) {
                 timeouts.next_nomination = Some(now + timeout);
             }
         }
@@ -670,7 +670,7 @@ impl App {
             }
         }
         if timeouts.next_ballot.is_none() {
-            if let Some(timeout) = self.herder.get_ballot_timeout(slot) {
+            if let Some(timeout) = self.herder.ballot_timeout(slot) {
                 timeouts.next_ballot = Some(now + timeout);
             }
         }
@@ -719,7 +719,7 @@ impl App {
         if !self.catchup_in_progress.swap(true, Ordering::SeqCst) {
             let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
 
-            let archive_has_checkpoint = match self.get_cached_archive_checkpoint().await {
+            let archive_has_checkpoint = match self.cached_archive_checkpoint().await {
                 Ok(archive_latest) => archive_latest >= next_cp,
                 Err(_) => false,
             };

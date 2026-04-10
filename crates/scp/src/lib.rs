@@ -58,7 +58,7 @@ mod slot;
 pub(crate) mod test_utils;
 
 // Re-export main types
-pub use ballot::{get_working_ballot, BallotPhase};
+pub use ballot::{working_ballot, BallotPhase};
 pub use compare::is_newer_nomination_or_ballot_st;
 pub use driver::{SCPDriver, SCPTimerType, ValidationLevel};
 pub use error::ScpError;
@@ -67,7 +67,7 @@ pub use info::{
     BallotInfo, BallotValue, CommitBounds, NodeInfo, NominationInfo, QuorumInfo, SlotInfo,
 };
 pub use quorum::{
-    find_closest_v_blocking, get_all_nodes, hash_quorum_set, is_quorum, is_quorum_set_sane,
+    all_nodes, find_closest_v_blocking, hash_quorum_set, is_quorum, is_quorum_set_sane,
     is_quorum_slice, is_v_blocking, is_valid_quorum_set, normalize_quorum_set,
     normalize_quorum_set_with_remove, simple_quorum_set, singleton_quorum_set,
     SingletonQuorumSetCache, MAXIMUM_QUORUM_NESTING_LEVEL, MAXIMUM_QUORUM_NODES,

@@ -91,7 +91,7 @@ fn test_core3_prepared_b1_quorum_votes_b1_local_a_value() {
     );
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -148,7 +148,7 @@ fn test_core3_quorum_prepared_b1_then_bumps_to_a1() {
     );
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -188,7 +188,7 @@ fn test_core3_quorum_prepared_b1_then_bumps_to_a1() {
     assert_eq!(scp.envs_len(), 3);
     // still does not set h as b > computed_h
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -211,7 +211,7 @@ fn test_core3_quorum_prepared_b1_then_bumps_to_a1() {
         true,
     );
     assert_eq!(scp.envs_len(), 4);
-    verify_confirm(&scp.get_env(3), &v0_id(), qs_hash0, 0, 2, &a1, 1, 1);
+    verify_confirm(&scp.env(3), &v0_id(), qs_hash0, 0, 2, &a1, 1, 1);
     assert!(!scp.has_ballot_timer_upcoming());
 }
 
@@ -258,7 +258,7 @@ fn test_core3_prepared_a1_with_timeout() {
     );
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -284,7 +284,7 @@ fn test_core3_prepared_a1_with_timeout() {
     // h = B2 (2) (now possible)
     // c = 0 (1)
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -352,7 +352,7 @@ fn test_core3_node_without_self_quorum_timeout() {
 
     assert_eq!(scp_nns.envs_len(), 1);
     verify_prepare(
-        &scp_nns.get_env(0),
+        &scp_nns.env(0),
         &ns_id,
         qs_hash_ns,
         0,
@@ -376,7 +376,7 @@ fn test_core3_node_without_self_quorum_timeout() {
 
     assert_eq!(scp_nns.envs_len(), 2);
     verify_prepare(
-        &scp_nns.get_env(1),
+        &scp_nns.env(1),
         &ns_id,
         qs_hash_ns,
         0,

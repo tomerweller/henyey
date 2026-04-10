@@ -446,7 +446,7 @@ pub type OpResultCode = stellar_xdr::curr::OperationResultCode;
 /// tracker.consume_events_size(50);
 ///
 /// // Calculate refund
-/// let refund = tracker.get_fee_refund(); // max - consumed
+/// let refund = tracker.fee_refund(); // max - consumed
 /// ```
 #[derive(Debug, Clone)]
 pub struct RefundableFeeTracker {
@@ -522,7 +522,7 @@ impl RefundableFeeTracker {
     /// Get the fee refund (max - consumed).
     ///
     /// This is the amount that should be credited back to the fee source account.
-    pub fn get_fee_refund(&self) -> i64 {
+    pub fn fee_refund(&self) -> i64 {
         self.max_refundable_fee - self.consumed_refundable_fee
     }
 
@@ -729,7 +729,7 @@ impl MutableTransactionResult {
     /// the refund (if any) to reduce the fee_charged.
     pub fn finalize_fee_refund(&mut self, _protocol_version: u32) {
         if let Some(ref tracker) = self.refundable_fee_tracker {
-            self.inner.fee_charged -= tracker.get_fee_refund();
+            self.inner.fee_charged -= tracker.fee_refund();
         }
     }
 
@@ -913,7 +913,7 @@ mod tests {
         assert_eq!(tracker.max_refundable_fee(), 1000);
         assert_eq!(tracker.consumed_rent_fee(), 0);
         assert_eq!(tracker.consumed_refundable_fee(), 0);
-        assert_eq!(tracker.get_fee_refund(), 1000);
+        assert_eq!(tracker.fee_refund(), 1000);
     }
 
     #[test]
@@ -922,11 +922,11 @@ mod tests {
 
         assert!(tracker.consume_rent_fee(100).is_ok());
         assert_eq!(tracker.consumed_rent_fee(), 100);
-        assert_eq!(tracker.get_fee_refund(), 900);
+        assert_eq!(tracker.fee_refund(), 900);
 
         assert!(tracker.consume_rent_fee(200).is_ok());
         assert_eq!(tracker.consumed_rent_fee(), 300);
-        assert_eq!(tracker.get_fee_refund(), 700);
+        assert_eq!(tracker.fee_refund(), 700);
     }
 
     #[test]
@@ -956,7 +956,7 @@ mod tests {
         tracker.reset_consumed_fee();
         assert_eq!(tracker.consumed_rent_fee(), 0);
         assert_eq!(tracker.consumed_events_size_bytes(), 0);
-        assert_eq!(tracker.get_fee_refund(), 1000);
+        assert_eq!(tracker.fee_refund(), 1000);
     }
 
     #[test]
@@ -966,7 +966,7 @@ mod tests {
         tracker.consume_rent_fee(200).unwrap();
         assert!(tracker.update_consumed_refundable_fee(300).is_ok());
         assert_eq!(tracker.consumed_refundable_fee(), 500); // rent + refundable
-        assert_eq!(tracker.get_fee_refund(), 500);
+        assert_eq!(tracker.fee_refund(), 500);
     }
 
     // MutableTransactionResult tests
@@ -1008,10 +1008,7 @@ mod tests {
             result.refundable_fee_tracker().unwrap().consumed_rent_fee(),
             0
         );
-        assert_eq!(
-            result.refundable_fee_tracker().unwrap().get_fee_refund(),
-            500
-        );
+        assert_eq!(result.refundable_fee_tracker().unwrap().fee_refund(), 500);
     }
 
     #[test]
@@ -1180,7 +1177,7 @@ mod tests {
         // Consuming exactly max should succeed
         assert!(tracker.consume_rent_fee(100).is_ok());
         assert_eq!(tracker.consumed_rent_fee(), 100);
-        assert_eq!(tracker.get_fee_refund(), 0);
+        assert_eq!(tracker.fee_refund(), 0);
     }
 
     /// Test MutableTransactionResult with soroban result.

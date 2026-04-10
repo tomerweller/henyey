@@ -196,10 +196,10 @@ impl BallotProtocol {
                 return Some(ctx.local_quorum_set.clone());
             }
         }
-        if let Some(qset) = ctx.driver.get_quorum_set_by_hash(provided) {
+        if let Some(qset) = ctx.driver.quorum_set_by_hash(provided) {
             return Some(qset);
         }
-        ctx.driver.get_quorum_set(node_id).and_then(|qset| {
+        ctx.driver.quorum_set(node_id).and_then(|qset| {
             let expected = hash_quorum_set(&qset);
             if expected == *provided {
                 Some(qset)
@@ -210,10 +210,10 @@ impl BallotProtocol {
     }
 
     fn statement_values(statement: &ScpStatement) -> Vec<Value> {
-        crate::slot::Slot::get_statement_values(statement)
+        crate::slot::Slot::statement_values(statement)
     }
 
-    pub(super) fn get_prepare_candidates(&self, hint: &ScpStatement) -> Vec<ScpBallot> {
+    pub(super) fn prepare_candidates(&self, hint: &ScpStatement) -> Vec<ScpBallot> {
         let mut hint_ballots = Self::collect_hint_ballots(hint);
         let mut candidates: Vec<ScpBallot> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -537,7 +537,7 @@ impl BallotProtocol {
 /// # Returns
 /// The working ballot if the statement is a ballot statement (PREPARE/CONFIRM/EXTERNALIZE),
 /// or None if it's a nomination statement.
-pub fn get_working_ballot(statement: &ScpStatement) -> Option<ScpBallot> {
+pub fn working_ballot(statement: &ScpStatement) -> Option<ScpBallot> {
     match &statement.pledges {
         ScpStatementPledges::Prepare(prep) => Some(prep.ballot.clone()),
         ScpStatementPledges::Confirm(conf) => Some(ScpBallot {

@@ -28,7 +28,7 @@ pub(crate) fn execute_inflation(
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check source account exists
-    if state.get_account(source).is_none() {
+    if state.account(source).is_none() {
         return Ok(make_inflation_result(InflationResultCode::NotTime, vec![]));
     }
 

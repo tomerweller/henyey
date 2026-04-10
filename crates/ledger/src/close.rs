@@ -1346,7 +1346,7 @@ impl UpgradeContext {
         });
 
         // Load existing entry through ltx (current delta → base snapshot)
-        let previous = ltx.get_entry(&key)?.ok_or_else(|| {
+        let previous = ltx.entry(&key)?.ok_or_else(|| {
             LedgerError::Internal(
                 "CONFIG_SETTING_CONTRACT_EXECUTION_LANES entry not found".to_string(),
             )

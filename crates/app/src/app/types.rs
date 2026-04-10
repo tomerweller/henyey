@@ -641,11 +641,11 @@ pub(super) struct HerderScpCallback {
 
 impl ScpQueueCallback for HerderScpCallback {
     fn min_slot_to_remember(&self) -> u64 {
-        self.herder.get_min_ledger_seq_to_remember()
+        self.herder.min_ledger_seq_to_remember()
     }
 
     fn most_recent_checkpoint_seq(&self) -> u64 {
-        self.herder.get_most_recent_checkpoint_seq()
+        self.herder.most_recent_checkpoint_seq()
     }
 }
 
@@ -660,12 +660,12 @@ pub(super) struct LedgerFeeBalanceProvider {
 }
 
 impl FeeBalanceProvider for LedgerFeeBalanceProvider {
-    fn get_available_balance(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
+    fn available_balance(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
         let snapshot = self.ledger_manager.create_snapshot().ok()?;
         let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
-        let entry = snapshot.get_entry(&key).ok()??;
+        let entry = snapshot.entry(&key).ok()??;
         if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
             let base_reserve = snapshot.header().base_reserve;
             Some(henyey_ledger::reserves::available_to_send(

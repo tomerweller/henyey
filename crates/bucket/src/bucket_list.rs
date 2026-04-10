@@ -57,7 +57,7 @@ use henyey_common::{BucketListDbConfig, Hash256};
 use crate::bucket::Bucket;
 use crate::cache::CacheStats;
 use crate::entry::{
-    get_ttl_key, is_persistent_entry, is_soroban_entry, is_temporary_entry, is_ttl_expired,
+    is_persistent_entry, is_soroban_entry, is_temporary_entry, is_ttl_expired, ttl_key,
     BucketEntry, BucketEntryExt,
 };
 use crate::eviction::{
@@ -778,7 +778,7 @@ impl BucketLevel {
             let curr_hash = curr_for_merge.hash();
             let snap_hash = incoming.hash();
             let key = MergeKey::new(ctx.keep_dead_entries, curr_hash, snap_hash);
-            if let Some(output_hash) = merge_map.read().unwrap().get_output(&key).copied() {
+            if let Some(output_hash) = merge_map.read().unwrap().output(&key).copied() {
                 if !output_hash.is_zero() {
                     if let Some(dir) = ctx.bucket_dir {
                         let path = dir.join(canonical_bucket_filename(&output_hash));
@@ -1389,14 +1389,14 @@ impl BucketList {
     /// Searches from the newest (level 0) to oldest levels.
     /// Returns the first matching entry found, or None if not found.
     pub fn get(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
-        self.get_with_debug(key, false)
+        self.with_debug(key, false)
     }
 
     /// Look up an entry by its key with optional debug tracing.
     ///
     /// Per-bucket caches (inside each DiskBucket) handle caching transparently;
     /// no global cache logic is needed here.
-    pub fn get_with_debug(&self, key: &LedgerKey, debug: bool) -> Result<Option<LedgerEntry>> {
+    pub fn with_debug(&self, key: &LedgerKey, debug: bool) -> Result<Option<LedgerEntry>> {
         // Search from newest to oldest (curr then snap). Pending merges (next)
         // are not part of the bucket list state yet.
         for (level_idx, level) in self.levels.iter().enumerate() {
@@ -2806,7 +2806,7 @@ impl BucketList {
                     }
 
                     // Get the TTL key for this Soroban entry
-                    let Some(ttl_key) = get_ttl_key(&key) else {
+                    let Some(ttl_key) = ttl_key(&key) else {
                         continue;
                     };
 
@@ -3024,7 +3024,7 @@ impl BucketList {
                 }
 
                 // Get the TTL key
-                let Some(ttl_key) = get_ttl_key(&key) else {
+                let Some(ttl_key) = ttl_key(&key) else {
                     break 'process;
                 };
 
@@ -4576,7 +4576,7 @@ mod tests {
     /// be evaluated for eviction.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_audit_013_dead_key_dedup_does_not_block_eviction() {
-        use crate::entry::get_ttl_key;
+        use crate::entry::ttl_key;
 
         let seed: u8 = 42;
         let contract_hash = Hash([seed; 32]);
@@ -4596,7 +4596,7 @@ mod tests {
         };
 
         // TTL entry for this contract code — expired at current_ledger=100
-        let ttl_key = get_ttl_key(&data_key).expect("contract code should have TTL key");
+        let ttl_key = ttl_key(&data_key).expect("contract code should have TTL key");
         let ttl_key_hash = match &ttl_key {
             LedgerKey::Ttl(t) => t.key_hash.clone(),
             _ => panic!("expected TTL key"),

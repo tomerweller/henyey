@@ -225,7 +225,7 @@ pub(super) fn threshold_high(account: &AccountEntry) -> u32 {
 
 /// Determine the threshold level required for an operation type.
 /// Matches stellar-core's per-OperationFrame getThresholdLevel() overrides.
-pub(super) fn get_threshold_for_op(op: &Operation) -> ThresholdLevel {
+pub(super) fn threshold_for_op(op: &Operation) -> ThresholdLevel {
     match &op.body {
         // LOW threshold operations
         OperationBody::BumpSequence(_) => ThresholdLevel::Low,
@@ -259,7 +259,7 @@ pub(super) fn get_threshold_for_op(op: &Operation) -> ThresholdLevel {
 }
 
 /// Get the needed threshold weight for an operation based on its threshold level.
-pub(super) fn get_needed_threshold(account: &AccountEntry, level: ThresholdLevel) -> u32 {
+pub(super) fn needed_threshold(account: &AccountEntry, level: ThresholdLevel) -> u32 {
     match level {
         ThresholdLevel::MasterWeight => account.thresholds.0[0] as u32,
         ThresholdLevel::Low => threshold_low(account),
@@ -372,7 +372,7 @@ pub(super) fn check_operation_signatures(
     // outer fee has been charged) rather than in validate_preconditions. A prior
     // tx in the same ledger may have modified the inner source's signer set so
     // that the inner sigs are no longer valid at apply-time.
-    if let Some(source_account) = state.get_account(inner_source_id) {
+    if let Some(source_account) = state.account(inner_source_id) {
         let tx_threshold = threshold_low(source_account);
         if !tracker.check_signature(source_account, tx_threshold) {
             // TX-level auth failed. Return InvalidSignature so the caller records
@@ -407,10 +407,10 @@ pub(super) fn check_operation_signatures(
         };
 
         // Load the op source account from current state
-        if let Some(op_account) = state.get_account(&op_source_id) {
+        if let Some(op_account) = state.account(&op_source_id) {
             // Account exists: check threshold
-            let threshold_level = get_threshold_for_op(op);
-            let needed = get_needed_threshold(op_account, threshold_level);
+            let threshold_level = threshold_for_op(op);
+            let needed = needed_threshold(op_account, threshold_level);
             if !tracker.check_signature(op_account, needed) {
                 op_results[i] = Some(OperationResult::OpBadAuth);
                 all_ops_valid = false;

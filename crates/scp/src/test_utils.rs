@@ -19,7 +19,7 @@ use stellar_xdr::curr::{NodeId, PublicKey, ScpBallot, ScpEnvelope, ScpQuorumSet,
 ///
 /// | Option | Default |
 /// |---|---|
-/// | `quorum_set` | `None` (returns `None` from `get_quorum_set`) |
+/// | `quorum_set` | `None` (returns `None` from `quorum_set`) |
 /// | `validation_level` | `FullyValidated` |
 /// | `value_hash_mode` | `SumBytes` — `compute_value_hash` returns sum of value bytes |
 /// | `timeout_mode` | `Fixed(1ms)` |
@@ -146,7 +146,7 @@ impl SCPDriver for MockDriver {
         self.emit_count.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
+    fn quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
         self.quorum_set.clone()
     }
 

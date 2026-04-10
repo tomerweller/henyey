@@ -59,7 +59,7 @@ pub(crate) fn execute_path_payment_strict_receive(
 
     let bypass_issuer_check =
         should_bypass_issuer_check(op.path.as_slice(), &op.send_asset, &op.dest_asset, &dest);
-    if !bypass_issuer_check && state.get_account(&dest).is_none() {
+    if !bypass_issuer_check && state.account(&dest).is_none() {
         return Ok(make_strict_receive_result(
             PathPaymentStrictReceiveResultCode::NoDestination,
             None,
@@ -218,7 +218,7 @@ pub(crate) fn execute_path_payment_strict_send(
 
     let bypass_issuer_check =
         should_bypass_issuer_check(op.path.as_slice(), &op.send_asset, &op.dest_asset, &dest);
-    if !bypass_issuer_check && state.get_account(&dest).is_none() {
+    if !bypass_issuer_check && state.account(&dest).is_none() {
         return Ok(make_strict_send_result(
             PathPaymentStrictSendResultCode::NoDestination,
             None,
@@ -377,7 +377,7 @@ fn update_source_balance(
     context: &LedgerContext,
 ) -> std::result::Result<(), TransferError> {
     if matches!(asset, Asset::Native) {
-        let source_account = state.get_account(source).ok_or(TransferError {
+        let source_account = state.account(source).ok_or(TransferError {
             code: PathPaymentStrictReceiveResultCode::Underfunded,
             no_issuer_asset: None,
         })?;
@@ -395,7 +395,7 @@ fn update_source_balance(
                 no_issuer_asset: None,
             });
         }
-        let source_account_mut = state.get_account_mut(source).ok_or(TransferError {
+        let source_account_mut = state.account_mut(source).ok_or(TransferError {
             code: PathPaymentStrictReceiveResultCode::Underfunded,
             no_issuer_asset: None,
         })?;
@@ -414,7 +414,7 @@ fn update_source_balance(
         return Ok(());
     }
 
-    let source_trustline = state.get_trustline(source, asset).ok_or(TransferError {
+    let source_trustline = state.trustline(source, asset).ok_or(TransferError {
         code: PathPaymentStrictReceiveResultCode::SrcNoTrust,
         no_issuer_asset: None,
     })?;
@@ -435,12 +435,10 @@ fn update_source_balance(
         });
     }
 
-    let source_trustline_mut = state
-        .get_trustline_mut(source, asset)
-        .ok_or(TransferError {
-            code: PathPaymentStrictReceiveResultCode::SrcNoTrust,
-            no_issuer_asset: None,
-        })?;
+    let source_trustline_mut = state.trustline_mut(source, asset).ok_or(TransferError {
+        code: PathPaymentStrictReceiveResultCode::SrcNoTrust,
+        no_issuer_asset: None,
+    })?;
     sub_trustline_balance(source_trustline_mut, amount).map_err(|_| TransferError {
         code: PathPaymentStrictReceiveResultCode::Underfunded,
         no_issuer_asset: None,
@@ -457,7 +455,7 @@ fn update_dest_balance(
     context: &LedgerContext,
 ) -> std::result::Result<(), TransferError> {
     if matches!(asset, Asset::Native) {
-        let dest_account_mut = state.get_account_mut(dest).ok_or(TransferError {
+        let dest_account_mut = state.account_mut(dest).ok_or(TransferError {
             code: PathPaymentStrictReceiveResultCode::NoDestination,
             no_issuer_asset: None,
         })?;
@@ -478,7 +476,7 @@ fn update_dest_balance(
         return Ok(());
     }
 
-    let dest_trustline = state.get_trustline(dest, asset).ok_or(TransferError {
+    let dest_trustline = state.trustline(dest, asset).ok_or(TransferError {
         code: PathPaymentStrictReceiveResultCode::NoTrust,
         no_issuer_asset: None,
     })?;
@@ -489,7 +487,7 @@ fn update_dest_balance(
             no_issuer_asset: None,
         });
     }
-    let dest_trustline_mut = state.get_trustline_mut(dest, asset).ok_or(TransferError {
+    let dest_trustline_mut = state.trustline_mut(dest, asset).ok_or(TransferError {
         code: PathPaymentStrictReceiveResultCode::NoTrust,
         no_issuer_asset: None,
     })?;
@@ -752,7 +750,7 @@ fn compute_pool_exchange(
     state: &LedgerStateManager,
 ) -> Result<Option<PoolExchange>> {
     let pool_id = pool_id_for_assets(send_asset, recv_asset)?;
-    let Some(pool) = state.get_liquidity_pool(&pool_id) else {
+    let Some(pool) = state.liquidity_pool(&pool_id) else {
         return Ok(None);
     };
     let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool.body;
@@ -802,7 +800,7 @@ fn apply_pool_exchange(
     state: &mut LedgerStateManager,
 ) -> Result<bool> {
     let pool_id = pool_id_for_assets(send_asset, recv_asset)?;
-    let Some(pool) = state.get_liquidity_pool_mut(&pool_id) else {
+    let Some(pool) = state.liquidity_pool_mut(&pool_id) else {
         return Ok(false);
     };
     let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
@@ -1222,8 +1220,8 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify balances
-        assert_eq!(state.get_account(&source_id).unwrap().balance, 90_000_000);
-        assert_eq!(state.get_account(&dest_id).unwrap().balance, 60_000_000);
+        assert_eq!(state.account(&source_id).unwrap().balance, 90_000_000);
+        assert_eq!(state.account(&dest_id).unwrap().balance, 60_000_000);
     }
 
     #[test]
@@ -1250,8 +1248,8 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify balances
-        assert_eq!(state.get_account(&source_id).unwrap().balance, 90_000_000);
-        assert_eq!(state.get_account(&dest_id).unwrap().balance, 60_000_000);
+        assert_eq!(state.account(&source_id).unwrap().balance, 90_000_000);
+        assert_eq!(state.account(&dest_id).unwrap().balance, 60_000_000);
     }
 
     #[test]
@@ -1293,7 +1291,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1350,7 +1348,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+        state.account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1876,7 +1874,7 @@ mod tests {
             100_000,
             TrustLineFlags::AuthorizedFlag as u32,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         // Destination trustline already at limit
         state.create_trustline(create_test_trustline(
@@ -1889,7 +1887,7 @@ mod tests {
             1000, // At limit!
             TrustLineFlags::AuthorizedFlag as u32,
         ));
-        state.get_account_mut(&dest_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&dest_id).unwrap().num_sub_entries += 1;
 
         let op = PathPaymentStrictReceiveOp {
             send_asset: asset.clone(),

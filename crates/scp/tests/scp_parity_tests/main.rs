@@ -116,7 +116,7 @@ impl TestSCPDriver {
         self.envs.read().unwrap().len()
     }
 
-    fn get_env(&self, index: usize) -> ScpEnvelope {
+    fn env(&self, index: usize) -> ScpEnvelope {
         self.envs.read().unwrap()[index].clone()
     }
 
@@ -204,13 +204,13 @@ impl SCPDriver for TestSCPDriver {
         self.envs.write().unwrap().push(envelope.clone());
     }
 
-    fn get_quorum_set(&self, node_id: &NodeId) -> Option<ScpQuorumSet> {
+    fn quorum_set(&self, node_id: &NodeId) -> Option<ScpQuorumSet> {
         // All nodes share the same quorum set in these tests
         let _ = node_id;
         Some(self.quorum_set.clone())
     }
 
-    fn get_quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
+    fn quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
         self.quorum_sets.read().unwrap().get(hash).cloned()
     }
 
@@ -357,8 +357,8 @@ impl TestSCP {
         self.driver().envs_len()
     }
 
-    fn get_env(&self, index: usize) -> ScpEnvelope {
-        self.driver().get_env(index)
+    fn env(&self, index: usize) -> ScpEnvelope {
+        self.driver().env(index)
     }
 
     fn has_ballot_timer(&self) -> bool {
@@ -412,8 +412,8 @@ impl TestSCP {
 
     /// Get the current envelope for a specific node in a slot, including self
     /// even when not fully validated. Matches stellar-core `getCurrentEnvelope(index, nodeID)`.
-    fn get_current_envelope(&self, slot_index: u64, node_id: &NodeId) -> ScpEnvelope {
-        let envs = self.scp.get_entire_current_state(slot_index);
+    fn current_envelope(&self, slot_index: u64, node_id: &NodeId) -> ScpEnvelope {
+        let envs = self.scp.entire_current_state(slot_index);
         envs.into_iter()
             .find(|e| &e.statement.node_id == node_id)
             .expect("getCurrentEnvelope: envelope not found for node")
@@ -428,15 +428,15 @@ impl TestSCP {
     /// Get the nomination leaders for slot 0.
     /// Matches stellar-core `scp.getNominationLeaders(0)`.
     #[allow(dead_code)]
-    fn get_nomination_leaders(&self) -> std::collections::BTreeSet<NodeId> {
-        self.scp.get_nomination_leaders(0)
+    fn nomination_leaders(&self) -> std::collections::BTreeSet<NodeId> {
+        self.scp.nomination_leaders(0)
     }
 
     /// Get the latest composite candidate value for a slot.
     /// Matches stellar-core `scp.getLatestCompositeCandidate(slotIndex)`.
     #[allow(dead_code)]
-    fn get_latest_composite_candidate(&self, slot_index: u64) -> Option<Value> {
-        self.scp.get_latest_composite_candidate(slot_index)
+    fn latest_composite_candidate(&self, slot_index: u64) -> Option<Value> {
+        self.scp.latest_composite_candidate(slot_index)
     }
 
     /// Check if a nomination timer is currently set for slot 0.
@@ -893,7 +893,7 @@ fn nodes_all_pledge_to_commit(scp: &TestSCP, x_value: &Value, qs_hash: Hash256) 
     assert!(scp.bump_state(0, x_value.clone()));
     assert_eq!(scp.envs_len(), 1);
 
-    verify_prepare(&scp.get_env(0), &v0_id(), qs_hash0, 0, &b, None, 0, 0, None);
+    verify_prepare(&scp.env(0), &v0_id(), qs_hash0, 0, &b, None, 0, 0, None);
 
     // Receive PREPARE from v1, v2, v3 (quorum)
     let prepare1 = make_prepare(&v1_id(), qs_hash, 0, &b, None, 0, 0, None);
@@ -915,17 +915,7 @@ fn nodes_all_pledge_to_commit(scp: &TestSCP, x_value: &Value, qs_hash: Hash256) 
     assert_eq!(scp.heard_from_quorum_ballot(0, 0), b);
 
     // Quorum including us → emits PREPARE with prepared set
-    verify_prepare(
-        &scp.get_env(1),
-        &v0_id(),
-        qs_hash0,
-        0,
-        &b,
-        Some(&b),
-        0,
-        0,
-        None,
-    );
+    verify_prepare(&scp.env(1), &v0_id(), qs_hash0, 0, &b, Some(&b), 0, 0, None);
 
     scp.receive_envelope(prepare4);
     assert_eq!(scp.envs_len(), 2);
@@ -944,7 +934,7 @@ fn nodes_all_pledge_to_commit(scp: &TestSCP, x_value: &Value, qs_hash: Hash256) 
 
     // Confirms prepared: nC=1, nH=1
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,

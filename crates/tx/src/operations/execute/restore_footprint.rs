@@ -229,7 +229,7 @@ fn restore_entry(
     let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
 
     // Check the current TTL status
-    let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
+    let current_ttl = state.ttl(&key_hash).map(|t| t.live_until_ledger_seq);
 
     match current_ttl {
         Some(ttl) if ttl >= current_ledger => {
@@ -239,7 +239,7 @@ fn restore_entry(
         Some(_) | None => {
             // Entry is archived or has no TTL entry
             // We need to check if the entry itself exists in state
-            let entry = state.get_entry(key);
+            let entry = state.entry(key);
             let entry = match entry {
                 None => {
                     // Neither live nor archived entry exists; skip per stellar-core behavior.
@@ -278,7 +278,7 @@ fn restore_entry(
                 live_until_ledger_seq: new_ttl,
             };
 
-            if state.get_ttl(&key_hash).is_some() {
+            if state.ttl(&key_hash).is_some() {
                 state.update_ttl(ttl_entry);
             } else {
                 state.create_ttl(ttl_entry);

@@ -170,7 +170,7 @@ const MIGRATIONS: &[Migration] = &[
 /// # Errors
 ///
 /// Returns an error if the stored version string cannot be parsed as an integer.
-pub(crate) fn get_schema_version(conn: &Connection) -> Result<i32> {
+pub(crate) fn schema_version(conn: &Connection) -> Result<i32> {
     let result: std::result::Result<String, _> = conn.query_row(
         "SELECT state FROM storestate WHERE statename = 'databaseschema'",
         [],
@@ -204,7 +204,7 @@ pub(crate) fn set_schema_version(conn: &Connection, version: i32) -> Result<()> 
 ///
 /// Returns `true` if the database schema version is older than [`CURRENT_VERSION`].
 pub(crate) fn needs_migration(conn: &Connection) -> Result<bool> {
-    let current = get_schema_version(conn)?;
+    let current = schema_version(conn)?;
     Ok(current < CURRENT_VERSION)
 }
 
@@ -220,7 +220,7 @@ pub(crate) fn needs_migration(conn: &Connection) -> Result<bool> {
 /// - A required migration is not found
 /// - Any migration SQL fails to execute
 pub(crate) fn run_migrations(conn: &Connection) -> Result<()> {
-    let mut current_version = get_schema_version(conn)?;
+    let mut current_version = schema_version(conn)?;
 
     if current_version == CURRENT_VERSION {
         info!("Database is up to date at version {}", current_version);
@@ -282,7 +282,7 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<()> {
 /// - Older than [`CURRENT_VERSION`] (migrations should be run first)
 /// - Newer than [`CURRENT_VERSION`] (software upgrade required)
 pub(crate) fn verify_schema(conn: &Connection) -> Result<()> {
-    let version = get_schema_version(conn)?;
+    let version = schema_version(conn)?;
 
     if version < CURRENT_VERSION {
         return Err(DbError::Migration(format!(
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn test_get_schema_version_default() {
         let conn = setup_test_db();
-        let version = get_schema_version(&conn).unwrap();
+        let version = schema_version(&conn).unwrap();
         assert_eq!(version, 1);
     }
 
@@ -344,7 +344,7 @@ mod tests {
     fn test_set_and_get_schema_version() {
         let conn = setup_test_db();
         set_schema_version(&conn, 5).unwrap();
-        let version = get_schema_version(&conn).unwrap();
+        let version = schema_version(&conn).unwrap();
         assert_eq!(version, 5);
     }
 

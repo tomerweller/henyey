@@ -49,8 +49,8 @@ impl BucketListSnapshotSource {
     /// Returns the entry and its TTL regardless of whether the entry is expired.
     /// Used for ExtendTTL and Restore simulation where we need access to
     /// archived/expired entries.
-    pub(crate) fn get_unfiltered(&self, key: &LedgerKey) -> Option<(LedgerEntry, Option<u32>)> {
-        let live_until = get_entry_ttl(&self.snapshot, key).ok()?;
+    pub(crate) fn unfiltered(&self, key: &LedgerKey) -> Option<(LedgerEntry, Option<u32>)> {
+        let live_until = entry_ttl(&self.snapshot, key).ok()?;
         let mut entry = self.snapshot.load_result(key).ok()??;
         normalize_entry(&mut entry);
         Some((entry, live_until))
@@ -76,7 +76,7 @@ impl SnapshotSource for BucketListSnapshotSource {
         };
 
         // For contract data/code entries, we need to check TTL
-        let live_until = get_entry_ttl(&self.snapshot, &ws_key).map_err(|_| make_err())?;
+        let live_until = entry_ttl(&self.snapshot, &ws_key).map_err(|_| make_err())?;
 
         // Check TTL expiration for contract entries
         if matches!(
@@ -113,7 +113,7 @@ impl SnapshotSource for BucketListSnapshotSource {
 ///
 /// Returns `Ok(None)` if the entry has no TTL key or the TTL entry is not found.
 /// Returns `Err` on I/O or deserialization errors from disk-backed buckets.
-fn get_entry_ttl(
+fn entry_ttl(
     snapshot: &SearchableBucketListSnapshot,
     key: &LedgerKey,
 ) -> henyey_bucket::Result<Option<u32>> {

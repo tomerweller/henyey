@@ -25,7 +25,7 @@ fn test_ballot_core5_bump_state_x() {
     };
 
     verify_prepare(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash0,
         0,
@@ -70,7 +70,7 @@ fn test_ballot_core5_start_1x_prepared_a1() {
 
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -119,7 +119,7 @@ fn test_ballot_core5_bump_prepared_a2() {
     assert!(scp.scp.force_bump_state(0, a_value.clone()));
     assert_eq!(scp.envs_len(), 3);
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -139,7 +139,7 @@ fn test_ballot_core5_bump_prepared_a2() {
     );
     assert_eq!(scp.envs_len(), 4);
     verify_prepare(
-        &scp.get_env(3),
+        &scp.env(3),
         &v0_id(),
         qs_hash0,
         0,
@@ -198,7 +198,7 @@ pub(crate) fn setup_confirm_prepared_a2() -> (TestSCP, Value, Value, Value, Valu
     assert_eq!(scp.envs_len(), 5);
     let qs_hash0 = qs_hash;
     verify_prepare(
-        &scp.get_env(4),
+        &scp.env(4),
         &v0_id(),
         qs_hash0,
         0,
@@ -240,7 +240,7 @@ fn test_ballot_core5_accept_commit_quorum_a2() {
         &make_prepare_gen(qs_hash, a2.clone(), Some(a2.clone()), 2, 2, None),
     );
     assert_eq!(scp.envs_len(), 6);
-    verify_confirm(&scp.get_env(5), &v0_id(), qs_hash0, 0, 2, &a2, 2, 2);
+    verify_confirm(&scp.env(5), &v0_id(), qs_hash0, 0, 2, &a2, 2, 2);
     assert!(!scp.has_ballot_timer_upcoming());
 }
 
@@ -271,7 +271,7 @@ fn test_ballot_core5_full_externalization_path() {
         &make_prepare_gen(qs_hash, a2.clone(), Some(a2.clone()), 2, 2, None),
     );
     assert_eq!(scp.envs_len(), 6);
-    verify_confirm(&scp.get_env(5), &v0_id(), qs_hash0, 0, 2, &a2, 2, 2);
+    verify_confirm(&scp.env(5), &v0_id(), qs_hash0, 0, 2, &a2, 2, 2);
 
     // Quorum prepared A3: v-blocking PREPARE with A3
     // First send manually to debug
@@ -303,7 +303,7 @@ fn test_ballot_core5_full_externalization_path() {
         before + 1,
         "v-blocking: second message should emit exactly 1"
     );
-    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 2, &a3, 2, 2);
+    verify_confirm(&scp.env(6), &v0_id(), qs_hash0, 0, 2, &a3, 2, 2);
 
     // Now quorum PREPARE A3 prepared=A2 nC=2 nH=2 to bump nPrepared to 3
     recv_quorum_ex(
@@ -312,7 +312,7 @@ fn test_ballot_core5_full_externalization_path() {
         true,
     );
     assert_eq!(scp.envs_len(), 8);
-    verify_confirm(&scp.get_env(7), &v0_id(), qs_hash0, 0, 3, &a3, 2, 2);
+    verify_confirm(&scp.env(7), &v0_id(), qs_hash0, 0, 3, &a3, 2, 2);
 
     // Accept more commit A3: quorum PREPARE with A3 nC=2 nH=3
     recv_quorum(
@@ -320,12 +320,12 @@ fn test_ballot_core5_full_externalization_path() {
         &make_prepare_gen(qs_hash, a3.clone(), Some(a3.clone()), 2, 3, None),
     );
     assert_eq!(scp.envs_len(), 9);
-    verify_confirm(&scp.get_env(8), &v0_id(), qs_hash0, 0, 3, &a3, 2, 3);
+    verify_confirm(&scp.env(8), &v0_id(), qs_hash0, 0, 3, &a3, 2, 3);
 
     // Quorum externalize A3
     recv_quorum(&scp, &make_confirm_gen(qs_hash, 3, a3.clone(), 2, 3));
     assert_eq!(scp.envs_len(), 10);
-    verify_externalize(&scp.get_env(9), &v0_id(), qs_hash0, 0, &a2, 3);
+    verify_externalize(&scp.env(9), &v0_id(), qs_hash0, 0, &a2, 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +346,7 @@ fn test_ballot_core5_accept_commit_vblocking_confirm_a2() {
     // v-blocking CONFIRM for A2 → should emit CONFIRM
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 2, a2.clone(), 2, 2));
     assert_eq!(scp.envs_len(), 6);
-    verify_confirm(&scp.get_env(5), &v0_id(), qs_hash0, 0, 2, &a2, 2, 2);
+    verify_confirm(&scp.env(5), &v0_id(), qs_hash0, 0, 2, &a2, 2, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +368,7 @@ fn test_ballot_core5_accept_commit_vblocking_externalize_a2() {
     recv_v_blocking(&scp, &make_externalize_gen(qs_hash, a2.clone(), 2));
     assert_eq!(scp.envs_len(), 6);
     verify_confirm(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -413,12 +413,12 @@ fn test_ballot_core5_normal_round() {
         &make_prepare_gen(qs_hash, b.clone(), Some(b.clone()), 1, 1, None),
     );
     assert_eq!(scp.envs_len(), 4);
-    verify_confirm(&scp.get_env(3), &v0_id(), qs_hash0, 0, 1, &b, 1, 1);
+    verify_confirm(&scp.env(3), &v0_id(), qs_hash0, 0, 1, &b, 1, 1);
 
     // Receive quorum CONFIRM → should emit EXTERNALIZE
     recv_quorum(&scp, &make_confirm_gen(qs_hash, 1, b.clone(), 1, 1));
     assert_eq!(scp.envs_len(), 5);
-    verify_externalize(&scp.get_env(4), &v0_id(), qs_hash0, 0, &b, 1);
+    verify_externalize(&scp.env(4), &v0_id(), qs_hash0, 0, &b, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -569,7 +569,7 @@ fn test_ballot_core5_prepared_b_vblocking() {
     assert_eq!(scp.envs_len(), 2);
     // Should emit PREPARE(1,a) with prepared'=B1
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -608,7 +608,7 @@ fn test_ballot_core5_confirm_vblocking_via_confirm() {
     // v-blocking CONFIRM for A1 → should emit CONFIRM
     recv_v_blocking(&scp, &make_confirm_gen(qs_hash, 1, a1.clone(), 1, 1));
     assert_eq!(scp.envs_len(), 2);
-    verify_confirm(&scp.get_env(1), &v0_id(), qs_hash0, 0, 1, &a1, 1, 1);
+    verify_confirm(&scp.env(1), &v0_id(), qs_hash0, 0, 1, &a1, 1, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -638,7 +638,7 @@ fn test_ballot_core5_confirm_vblocking_via_externalize() {
     recv_v_blocking(&scp, &make_externalize_gen(qs_hash, a1.clone(), 1));
     assert_eq!(scp.envs_len(), 2);
     verify_confirm(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -692,7 +692,7 @@ fn test_ballot_core5_prepare_b_quorum() {
     );
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -738,7 +738,7 @@ fn test_ballot_core5_switch_prepared_b1_from_a1() {
     );
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -757,7 +757,7 @@ fn test_ballot_core5_switch_prepared_b1_from_a1() {
     );
     assert_eq!(scp.envs_len(), 3);
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -801,17 +801,7 @@ fn test_ballot_core3_prepared_b1_quorum_votes_b1() {
     // Start with aValue
     assert!(scp.bump_state(0, a_value.clone()));
     assert_eq!(scp.envs_len(), 1);
-    verify_prepare(
-        &scp.get_env(0),
-        &v0_id(),
-        qs_hash0,
-        0,
-        &a1,
-        None,
-        0,
-        0,
-        None,
-    );
+    verify_prepare(&scp.env(0), &v0_id(), qs_hash0, 0, &a1, None, 0, 0, None);
 
     // In a 3-node quorum with threshold=2:
     // v0 voted A1, v1 votes B1, v2 votes B1.
@@ -827,7 +817,7 @@ fn test_ballot_core3_prepared_b1_quorum_votes_b1() {
     assert_eq!(scp.envs_len(), 2);
     // Should have B1 as prepared (since quorum voted for B1)
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -961,7 +951,7 @@ fn test_ballot_core5_timeout_stay_locked_on_h() {
     scp.scp.force_bump_state(0, y_value.clone());
 
     // The bumped ballot should use x (locked on h), not y
-    let last = scp.get_env(scp.envs_len() - 1);
+    let last = scp.env(scp.envs_len() - 1);
     if let ScpStatementPledges::Prepare(prep) = &last.statement.pledges {
         assert_eq!(
             prep.ballot.value, *a_value,

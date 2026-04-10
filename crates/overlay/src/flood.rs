@@ -102,7 +102,7 @@ impl SeenEntry {
 /// let hash = compute_message_hash(&message);
 /// if gate.record_seen(hash, Some(peer_id), current_ledger_seq) {
 ///     // First time seeing this - flood to other peers
-///     let forward_to = gate.get_forward_peers(&hash, &all_peers);
+///     let forward_to = gate.forward_peers(&hash, &all_peers);
 /// }
 /// ```
 pub struct FloodGate {
@@ -216,7 +216,7 @@ impl FloodGate {
     ///
     /// Excludes any peers that have already sent us this message (tracked
     /// via [`record_seen`](FloodGate::record_seen)).
-    pub fn get_forward_peers(&self, message_hash: &Hash256, all_peers: &[PeerId]) -> Vec<PeerId> {
+    pub fn forward_peers(&self, message_hash: &Hash256, all_peers: &[PeerId]) -> Vec<PeerId> {
         let exclude: HashSet<PeerId> = self
             .seen
             .get(message_hash)
@@ -422,7 +422,7 @@ mod tests {
 
         // Get forward peers - should exclude peer1 and peer2
         let all_peers = vec![peer1.clone(), peer2.clone(), peer3.clone()];
-        let forward = gate.get_forward_peers(&hash, &all_peers);
+        let forward = gate.forward_peers(&hash, &all_peers);
 
         assert_eq!(forward.len(), 1);
         assert_eq!(forward[0], peer3);

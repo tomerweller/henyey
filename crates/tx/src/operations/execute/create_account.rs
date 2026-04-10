@@ -38,7 +38,7 @@ pub(crate) fn execute_create_account(
     }
 
     // Check destination doesn't already exist (matches upstream doApply)
-    if state.get_account(&op.destination).is_some() {
+    if state.account(&op.destination).is_some() {
         return Ok(make_result(CreateAccountResultCode::AlreadyExist));
     }
 
@@ -48,7 +48,7 @@ pub(crate) fn execute_create_account(
     if let Some(sponsor) = &sponsor {
         // Sponsored path: verify sponsor can afford the new account's reserve.
         let sponsor_account = state
-            .get_account(sponsor)
+            .account(sponsor)
             .ok_or(TxError::SourceAccountNotFound)?;
         let (num_sponsoring, num_sponsored) = state
             .sponsorship_counts_for_account(sponsor)
@@ -96,12 +96,12 @@ pub(crate) fn execute_create_account(
         return Ok(make_result(CreateAccountResultCode::Underfunded));
     }
 
-    // Deduct starting_balance from source. Always call get_account_mut even
+    // Deduct starting_balance from source. Always call account_mut even
     // when starting_balance==0 so the source is tracked as modified, matching
     // stellar-core's unconditional loadAccount in doApplyFromV14
     // (CreateAccountOpFrame.cpp:120). See #1093 / AUDIT-020.
     let source_account = state
-        .get_account_mut(source)
+        .account_mut(source)
         .ok_or(TxError::SourceAccountNotFound)?;
     sub_account_balance(source_account, op.starting_balance)?;
 
@@ -190,14 +190,14 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify destination was created
-        let dest_acc = state.get_account(&dest_id);
+        let dest_acc = state.account(&dest_id);
         assert!(dest_acc.is_some());
         let dest_acc = dest_acc.unwrap();
         assert_eq!(dest_acc.balance, 20_000_000);
         assert_eq!(dest_acc.seq_num.0, (100_i64) << 32);
 
         // Verify source was deducted
-        assert_eq!(state.get_account(&source_id).unwrap().balance, 80_000_000);
+        assert_eq!(state.account(&source_id).unwrap().balance, 80_000_000);
     }
 
     #[test]
@@ -363,8 +363,8 @@ mod tests {
         }
 
         // Verify destination was created
-        assert!(state.get_account(&dest_id).is_some());
-        assert_eq!(state.get_account(&dest_id).unwrap().balance, 20_000_000);
+        assert!(state.account(&dest_id).is_some());
+        assert_eq!(state.account(&dest_id).unwrap().balance, 20_000_000);
     }
 
     /// Test CreateAccount with sponsorship - sponsor pays reserve.
@@ -404,7 +404,7 @@ mod tests {
         }
 
         // Verify destination was created with 0 balance
-        let dest_acc = state.get_account(&dest_id);
+        let dest_acc = state.account(&dest_id);
         assert!(dest_acc.is_some());
         assert_eq!(dest_acc.unwrap().balance, 0);
     }
@@ -674,7 +674,7 @@ mod tests {
     /// stellar-core unconditionally calls `loadAccount(ltx, getSourceID())` in
     /// doApplyFromV14, which marks the source as mutably loaded. On commit,
     /// maybeUpdateLastModified bumps lastModifiedLedgerSeq. Henyey was skipping
-    /// get_account_mut when starting_balance==0, so the source was never tracked
+    /// account_mut when starting_balance==0, so the source was never tracked
     /// as modified — causing a lastModifiedLedgerSeq divergence (consensus-critical
     /// when op source != tx source).
     #[test]

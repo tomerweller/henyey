@@ -35,7 +35,7 @@ use henyey_common::config::QuorumSetConfig;
 use stellar_xdr::curr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
 use tracing::warn;
 
-use crate::{get_all_nodes, is_quorum_set_sane, is_valid_quorum_set};
+use crate::{all_nodes, is_quorum_set_sane, is_valid_quorum_set};
 
 /// Errors that can occur when parsing or validating quorum set configuration.
 ///
@@ -214,7 +214,7 @@ pub fn validate_quorum_config(config: &QuorumSetConfig) -> Result<(), QuorumConf
     }
 
     // Check we have validators
-    let all_nodes = get_all_nodes(&qs);
+    let all_nodes = all_nodes(&qs);
     if all_nodes.is_empty() && config.validators.is_empty() && config.inner_sets.is_empty() {
         warn!("Quorum set has no validators - node will not be able to reach consensus");
     }

@@ -30,7 +30,7 @@ fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchiv
     let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: ConfigSettingId::StateArchival,
     });
-    match snapshot.get_entry(&key) {
+    match snapshot.entry(&key) {
         Ok(Some(entry)) => match entry.data {
             LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => {
                 Some(settings)

@@ -56,7 +56,7 @@ use super::HostFunctionInvocation;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 
-/// Return type for `get_archived_with_restore_info` (p25 version).
+/// Return type for `archived_with_restore_info` (p25 version).
 /// Contains: (entry, live_until, live_bl_restore_info)
 type ArchivedWithRestoreInfoP25 = Option<(
     Rc<LedgerEntry>,
@@ -317,14 +317,14 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     /// Get an entry using our workspace XDR types (for internal use).
     /// This is separate from the `SnapshotSource::get()` trait impl which uses
     /// soroban-env-host's XDR types.
-    pub fn get_local(&self, key: &LedgerKey) -> Result<Option<EntryWithTtl>, HostErrorP25> {
+    pub fn local(&self, key: &LedgerKey) -> Result<Option<EntryWithTtl>, HostErrorP25> {
         // For ContractData and ContractCode, check TTL from bucket list snapshot.
         // This matches stellar-core behavior for parallel Soroban execution:
         // - Entries with valid TTL (live_until >= current_ledger): pass to host
         // - Entries with expired TTL (live_until < current_ledger): archived, not accessible
         // - Entries without TTL in bucket list snapshot: created within ledger, not visible
         let live_until =
-            get_entry_ttl_with_cache(self.state, key, self.current_ledger, self.ttl_key_cache);
+            entry_ttl_with_cache(self.state, key, self.current_ledger, self.ttl_key_cache);
 
         // Check TTL expiration for contract entries before looking up the entry.
         if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
@@ -334,9 +334,9 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
             }
         }
 
-        // Use get_entry() to reconstruct the full LedgerEntry with correct
+        // Use entry() to reconstruct the full LedgerEntry with correct
         // last_modified_ledger_seq and ext (sponsorship) metadata.
-        let entry = self.state.get_entry(key);
+        let entry = self.state.entry(key);
 
         match entry {
             Some(e) => Ok(Some((Rc::new(e), live_until))),
@@ -351,18 +351,18 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     /// then falls back to the hot archive bucket list (for truly evicted entries).
     ///
     /// Returns entries in our workspace XDR types (not soroban-env-host's types).
-    pub fn get_archived(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithTtl>, HostErrorP25> {
+    pub fn archived(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithTtl>, HostErrorP25> {
         // Get TTL but don't check if it's expired - this is for archived entries
-        let live_until = get_entry_ttl_with_cache(
+        let live_until = entry_ttl_with_cache(
             self.state,
             key.as_ref(),
             self.current_ledger,
             self.ttl_key_cache,
         );
 
-        // Use get_entry() to reconstruct the full LedgerEntry with correct
+        // Use entry() to reconstruct the full LedgerEntry with correct
         // last_modified_ledger_seq and ext (sponsorship) metadata.
-        let entry = self.state.get_entry(key.as_ref());
+        let entry = self.state.entry(key.as_ref());
 
         // If entry found in live state, return it
         if let Some(e) = entry {
@@ -396,11 +396,11 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     /// Returns (entry, live_until, live_bl_restore_info).
     ///
     /// Returns entries in our workspace XDR types (not soroban-env-host's types).
-    pub fn get_archived_with_restore_info(
+    pub fn archived_with_restore_info(
         &self,
         key: &Rc<LedgerKey>,
     ) -> Result<ArchivedWithRestoreInfoP25, HostErrorP25> {
-        let result = self.get_archived(key)?;
+        let result = self.archived(key)?;
 
         match result {
             Some((entry, live_until)) => {
@@ -411,7 +411,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                         let key_hash =
                             super::get_or_compute_key_hash(self.ttl_key_cache, key.as_ref());
                         let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
-                        let ttl_entry = self.state.get_entry(&ttl_key);
+                        let ttl_entry = self.state.entry(&ttl_key);
 
                         ttl_entry.map(|te| super::protocol::LiveBucketListRestore {
                             key: key.as_ref().clone(),
@@ -457,7 +457,7 @@ impl soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'_
         })?;
 
         let live_until =
-            get_entry_ttl_with_cache(self.state, &ws_key, self.current_ledger, self.ttl_key_cache);
+            entry_ttl_with_cache(self.state, &ws_key, self.current_ledger, self.ttl_key_cache);
 
         // Check TTL expiration for contract entries before looking up the entry.
         if matches!(
@@ -470,9 +470,9 @@ impl soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'_
             }
         }
 
-        // Use get_entry() to reconstruct the full LedgerEntry with correct
+        // Use entry() to reconstruct the full LedgerEntry with correct
         // last_modified_ledger_seq and ext (sponsorship) metadata.
-        let entry = self.state.get_entry(&ws_key);
+        let entry = self.state.entry(&ws_key);
 
         match entry {
             Some(e) => {
@@ -516,7 +516,7 @@ impl soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'_
 /// Note: TTL emission determination (whether to emit TTL to bucket list) still
 /// needs to compare against ledger-start TTL, which is handled separately in
 /// the storage_changes filter.
-fn get_entry_ttl_with_cache(
+fn entry_ttl_with_cache(
     state: &LedgerStateManager,
     key: &LedgerKey,
     current_ledger: u32,
@@ -528,9 +528,7 @@ fn get_entry_ttl_with_cache(
             // Use current state TTL which includes updates from earlier TXs in this ledger.
             // This matches stellar-core sequential execution where LedgerTxn reflects all prior
             // changes, including TTL bumps from earlier transactions.
-            let ttl = state
-                .get_ttl(&key_hash)
-                .map(|ttl| ttl.live_until_ledger_seq);
+            let ttl = state.ttl(&key_hash).map(|ttl| ttl.live_until_ledger_seq);
             if let Some(live_until) = ttl {
                 if live_until < current_ledger {
                     tracing::debug!(
@@ -798,7 +796,7 @@ fn prepare_footprint_entries(
 
     // Read-only footprint entries
     for key in soroban_data.resources.footprint.read_only.iter() {
-        if let Some((entry, live_until)) = snapshot.get_local(key).map_err(&map_snapshot_err)? {
+        if let Some((entry, live_until)) = snapshot.local(key).map_err(&map_snapshot_err)? {
             encoded_ledger_entries.push(
                 entry
                     .to_xdr(Limits::none())
@@ -828,7 +826,7 @@ fn prepare_footprint_entries(
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
         if is_being_restored {
             let result = snapshot
-                .get_archived_with_restore_info(&Rc::new(key.clone()))
+                .archived_with_restore_info(&Rc::new(key.clone()))
                 .map_err(&map_snapshot_err)?;
             if let Some((entry, live_until, live_bl_restore)) = result {
                 let is_actually_archived = match live_until {
@@ -874,9 +872,7 @@ fn prepare_footprint_entries(
                     encoded_ttl_entries.push(encode_ttl(key, live_until));
                 }
             }
-        } else if let Some((entry, live_until)) =
-            snapshot.get_local(key).map_err(&map_snapshot_err)?
-        {
+        } else if let Some((entry, live_until)) = snapshot.local(key).map_err(&map_snapshot_err)? {
             encoded_ledger_entries.push(
                 entry
                     .to_xdr(Limits::none())
@@ -963,7 +959,7 @@ fn map_storage_changes(
                 .ttl_new_live_until_ledger
                 .map(|new_live_until| {
                     let key_hash = super::get_or_compute_key_hash(ttl_key_cache, &key);
-                    let ledger_start_ttl = state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
+                    let ledger_start_ttl = state.ttl_at_ledger_start(&key_hash).unwrap_or(0);
                     new_live_until > ledger_start_ttl
                 })
                 .unwrap_or(false);

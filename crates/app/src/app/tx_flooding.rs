@@ -676,7 +676,7 @@ impl App {
         let hash256 = henyey_common::Hash256::from_bytes(*hash);
 
         // Get the tx set from cache
-        let tx_set = match self.herder.get_tx_set(&hash256) {
+        let tx_set = match self.herder.tx_set(&hash256) {
             Some(ts) => ts,
             None => {
                 tracing::debug!(hash = hex::encode(hash), peer = %peer_id, "TxSet not found in cache");
@@ -752,13 +752,13 @@ impl App {
 
     /// Request pending transaction sets from peers.
     pub(super) async fn request_pending_tx_sets(&self) {
-        let current_ledger = match self.get_current_ledger().await {
+        let current_ledger = match self.current_ledger().await {
             Ok(seq) => seq,
             Err(_) => return,
         };
         let min_slot = current_ledger.saturating_add(1) as u64;
         let window_end = current_ledger as u64 + TX_SET_REQUEST_WINDOW;
-        let mut pending = self.herder.get_pending_tx_sets();
+        let mut pending = self.herder.pending_tx_sets();
         pending.sort_by_key(|(_, slot)| *slot);
 
         // Log all pending tx_sets for debugging

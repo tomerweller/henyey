@@ -74,7 +74,7 @@ fn test_ballot_normal_round_1x() {
     assert_eq!(scp.envs_len(), 4);
 
     verify_confirm(
-        &scp.get_env(3),
+        &scp.env(3),
         &v0_id(),
         qs_hash0,
         0,
@@ -103,7 +103,7 @@ fn test_ballot_normal_round_1x() {
     assert_eq!(scp.externalized_value_count(), 1);
     assert_eq!(scp.externalized_value(0), Some(x_value.clone()));
 
-    verify_externalize(&scp.get_env(4), &v0_id(), qs_hash0, 0, &b, b.counter);
+    verify_externalize(&scp.env(4), &v0_id(), qs_hash0, 0, &b, b.counter);
 
     // extra vote should not do anything
     scp.receive_envelope(confirm4);
@@ -171,7 +171,7 @@ fn setup_normal_round_externalized(
     scp.receive_envelope(prepared_c3);
     assert_eq!(scp.envs_len(), 4);
     verify_confirm(
-        &scp.get_env(3),
+        &scp.env(3),
         &v0_id(),
         qs_hash0,
         0,
@@ -192,7 +192,7 @@ fn setup_normal_round_externalized(
     assert_eq!(scp.envs_len(), 5);
     assert_eq!(scp.externalized_value_count(), 1);
     assert_eq!(scp.externalized_value(0), Some(x_value.clone()));
-    verify_externalize(&scp.get_env(4), &v0_id(), qs_hash0, 0, &b, b.counter);
+    verify_externalize(&scp.env(4), &v0_id(), qs_hash0, 0, &b, b.counter);
 
     scp
 }
@@ -328,7 +328,7 @@ fn test_ballot_range_check() {
     assert_eq!(scp.envs_len(), 4);
 
     verify_confirm(
-        &scp.get_env(3),
+        &scp.env(3),
         &v0_id(),
         qs_hash0,
         0,
@@ -398,7 +398,7 @@ fn test_ballot_range_check() {
     scp.receive_envelope(confirm2);
     assert_eq!(scp.envs_len(), 5);
     verify_confirm(
-        &scp.get_env(4),
+        &scp.env(4),
         &v0_id(),
         qs_hash0,
         0,
@@ -421,7 +421,7 @@ fn test_ballot_range_check() {
     assert_eq!(scp.externalized_value(0), Some(x_value.clone()));
 
     verify_externalize(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -462,7 +462,7 @@ fn test_ballot_timeout_h_set_stay_locked() {
     );
     assert_eq!(scp.envs_len(), 3);
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -481,7 +481,7 @@ fn test_ballot_timeout_h_set_stay_locked() {
         value: x_value.clone(),
     };
     verify_prepare(
-        &scp.get_env(3),
+        &scp.env(3),
         &v0_id(),
         qs_hash0,
         0,
@@ -527,7 +527,7 @@ fn test_ballot_timeout_h_cant_be_set_vote_for_h() {
     );
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -557,7 +557,7 @@ fn test_ballot_timeout_h_cant_be_set_vote_for_h() {
     // * we should move to the quorum's h value
     // * c can't be set yet as b > h
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -591,17 +591,7 @@ fn test_ballot_timeout_from_multiple_nodes() {
     };
 
     assert_eq!(scp.envs_len(), 1);
-    verify_prepare(
-        &scp.get_env(0),
-        &v0_id(),
-        qs_hash0,
-        0,
-        &x1,
-        None,
-        0,
-        0,
-        None,
-    );
+    verify_prepare(&scp.env(0), &v0_id(), qs_hash0, 0, &x1, None, 0, 0, None);
 
     recv_quorum(
         &scp,
@@ -610,7 +600,7 @@ fn test_ballot_timeout_from_multiple_nodes() {
     // quorum -> prepared (1,x)
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -630,7 +620,7 @@ fn test_ballot_timeout_from_multiple_nodes() {
     // prepares (2,x)
     assert_eq!(scp.envs_len(), 3);
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -648,7 +638,7 @@ fn test_ballot_timeout_from_multiple_nodes() {
     // quorum -> set nH=1
     assert_eq!(scp.envs_len(), 4);
     verify_prepare(
-        &scp.get_env(3),
+        &scp.env(3),
         &v0_id(),
         qs_hash0,
         0,
@@ -667,7 +657,7 @@ fn test_ballot_timeout_from_multiple_nodes() {
     // v-blocking prepared (2,x) -> prepared (2,x)
     assert_eq!(scp.envs_len(), 5);
     verify_prepare(
-        &scp.get_env(4),
+        &scp.env(4),
         &v0_id(),
         qs_hash0,
         0,
@@ -688,7 +678,7 @@ fn test_ballot_timeout_from_multiple_nodes() {
     //  -> we confirm c=h=x1
     assert_eq!(scp.envs_len(), 7);
     verify_prepare(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -698,7 +688,7 @@ fn test_ballot_timeout_from_multiple_nodes() {
         2,
         None,
     );
-    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 2, &x2, 1, 1);
+    verify_confirm(&scp.env(6), &v0_id(), qs_hash0, 0, 2, &x2, 1, 1);
 }
 
 // ===========================================================================
@@ -723,17 +713,7 @@ fn test_ballot_timeout_after_prepare_receive_old_messages() {
     };
 
     assert_eq!(scp.envs_len(), 1);
-    verify_prepare(
-        &scp.get_env(0),
-        &v0_id(),
-        qs_hash0,
-        0,
-        &x1,
-        None,
-        0,
-        0,
-        None,
-    );
+    verify_prepare(&scp.env(0), &v0_id(), qs_hash0, 0, &x1, None, 0, 0, None);
 
     scp.receive_envelope(make_prepare(&v1_id(), qs_hash, 0, &x1, None, 0, 0, None));
     scp.receive_envelope(make_prepare(&v2_id(), qs_hash, 0, &x1, None, 0, 0, None));
@@ -742,7 +722,7 @@ fn test_ballot_timeout_after_prepare_receive_old_messages() {
     // quorum -> prepared (1,x)
     assert_eq!(scp.envs_len(), 2);
     verify_prepare(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -762,7 +742,7 @@ fn test_ballot_timeout_after_prepare_receive_old_messages() {
     // prepares (2,x)
     assert_eq!(scp.envs_len(), 3);
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -782,7 +762,7 @@ fn test_ballot_timeout_after_prepare_receive_old_messages() {
     // prepares (3,x)
     assert_eq!(scp.envs_len(), 4);
     verify_prepare(
-        &scp.get_env(3),
+        &scp.env(3),
         &v0_id(),
         qs_hash0,
         0,
@@ -817,7 +797,7 @@ fn test_ballot_timeout_after_prepare_receive_old_messages() {
     // v-blocking -> prepared x2
     assert_eq!(scp.envs_len(), 5);
     verify_prepare(
-        &scp.get_env(4),
+        &scp.env(4),
         &v0_id(),
         qs_hash0,
         0,
@@ -841,7 +821,7 @@ fn test_ballot_timeout_after_prepare_receive_old_messages() {
     // quorum -> set nH=2
     assert_eq!(scp.envs_len(), 6);
     verify_prepare(
-        &scp.get_env(5),
+        &scp.env(5),
         &v0_id(),
         qs_hash0,
         0,
@@ -880,7 +860,7 @@ fn test_non_validator_watching_the_network() {
 
     // But internally it should have moved to PREPARE
     verify_prepare(
-        &scp.get_current_envelope(0, &nv_id),
+        &scp.current_envelope(0, &nv_id),
         &nv_id,
         qs_hash_nv,
         0,
@@ -910,7 +890,7 @@ fn test_non_validator_watching_the_network() {
         value: x_value.clone(),
     };
     verify_confirm(
-        &scp.get_current_envelope(0, &nv_id),
+        &scp.current_envelope(0, &nv_id),
         &nv_id,
         qs_hash_nv,
         0,
@@ -926,7 +906,7 @@ fn test_non_validator_watching_the_network() {
 
     // Internal state should be EXTERNALIZE
     verify_externalize(
-        &scp.get_current_envelope(0, &nv_id),
+        &scp.current_envelope(0, &nv_id),
         &nv_id,
         qs_hash_nv,
         0,

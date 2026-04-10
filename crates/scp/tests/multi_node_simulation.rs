@@ -48,7 +48,7 @@ impl SimulationDriver {
         self.quorum_sets.write().unwrap().insert(node_id, qset);
     }
 
-    fn get_emitted_envelopes(&self) -> Vec<ScpEnvelope> {
+    fn emitted_envelopes(&self) -> Vec<ScpEnvelope> {
         self.emitted_envelopes.read().unwrap().clone()
     }
 
@@ -84,7 +84,7 @@ impl SCPDriver for SimulationDriver {
         self.emit_count.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn get_quorum_set(&self, node_id: &NodeId) -> Option<ScpQuorumSet> {
+    fn quorum_set(&self, node_id: &NodeId) -> Option<ScpQuorumSet> {
         if node_id == &self.node_id {
             Some(self.quorum_set.clone())
         } else {
@@ -308,11 +308,11 @@ impl Simulation {
         }
     }
 
-    fn get_node(&self, node_id: &NodeId) -> &Arc<SCP<SimulationDriver>> {
+    fn node(&self, node_id: &NodeId) -> &Arc<SCP<SimulationDriver>> {
         self.nodes.get(node_id).unwrap()
     }
 
-    fn get_driver(&self, node_id: &NodeId) -> &Arc<SimulationDriver> {
+    fn driver(&self, node_id: &NodeId) -> &Arc<SimulationDriver> {
         self.drivers.get(node_id).unwrap()
     }
 
@@ -322,10 +322,10 @@ impl Simulation {
         loop {
             let mut any_emitted = false;
             for node_id in self.nodes.keys() {
-                let envelopes = self.get_driver(node_id).get_emitted_envelopes();
+                let envelopes = self.driver(node_id).emitted_envelopes();
                 if !envelopes.is_empty() {
                     any_emitted = true;
-                    self.get_driver(node_id).clear_emitted();
+                    self.driver(node_id).clear_emitted();
                     for envelope in envelopes {
                         for (other_id, scp) in &self.nodes {
                             if other_id != node_id {
@@ -350,7 +350,7 @@ impl Simulation {
     fn all_externalized(&self, slot_index: u64) -> Option<Value> {
         let mut externalized_value: Option<Value> = None;
         for scp in self.nodes.values() {
-            match scp.get_externalized_value(slot_index) {
+            match scp.externalized_value(slot_index) {
                 Some(value) => {
                     if let Some(ref expected) = externalized_value {
                         if &value != expected {
@@ -383,11 +383,11 @@ fn test_three_node_basic_consensus() {
 
     // Node 1 nominates - result depends on whether it's a leader for this round
     let _ = sim
-        .get_node(&node1)
+        .node(&node1)
         .nominate(slot_index, value.clone(), &prev_value);
 
     // Node 1 should have the slot created after nomination attempt
-    assert!(!sim.get_node(&node1).empty());
+    assert!(!sim.node(&node1).empty());
 }
 
 #[test]
@@ -402,20 +402,20 @@ fn test_all_nodes_nominate_same_value() {
     let prev_value = make_value(&[0]);
 
     // All nodes nominate the same value
-    sim.get_node(&node1)
+    sim.node(&node1)
         .nominate(slot_index, value.clone(), &prev_value);
-    sim.get_node(&node2)
+    sim.node(&node2)
         .nominate(slot_index, value.clone(), &prev_value);
-    sim.get_node(&node3)
+    sim.node(&node3)
         .nominate(slot_index, value.clone(), &prev_value);
 
     // Run until stable
     sim.run_until_stable();
 
     // Check that nomination was started on all nodes
-    assert!(!sim.get_node(&node1).empty());
-    assert!(!sim.get_node(&node2).empty());
-    assert!(!sim.get_node(&node3).empty());
+    assert!(!sim.node(&node1).empty());
+    assert!(!sim.node(&node2).empty());
+    assert!(!sim.node(&node3).empty());
 }
 
 #[test]
@@ -429,11 +429,11 @@ fn test_force_externalize_all_nodes() {
     let value = make_value(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
     // Force externalize on all nodes (simulates catchup)
-    sim.get_node(&node1)
+    sim.node(&node1)
         .force_externalize(slot_index, value.clone());
-    sim.get_node(&node2)
+    sim.node(&node2)
         .force_externalize(slot_index, value.clone());
-    sim.get_node(&node3)
+    sim.node(&node3)
         .force_externalize(slot_index, value.clone());
 
     // All should be externalized with the same value
@@ -471,8 +471,8 @@ fn test_receive_externalize_envelope() {
     );
 
     // Node 1 receives externalize messages
-    let state2 = sim.get_node(&node1).receive_envelope(ext2);
-    let state3 = sim.get_node(&node1).receive_envelope(ext3);
+    let state2 = sim.node(&node1).receive_envelope(ext2);
+    let state3 = sim.node(&node1).receive_envelope(ext3);
 
     // Both should be valid
     assert!(matches!(
@@ -485,11 +485,8 @@ fn test_receive_externalize_envelope() {
     ));
 
     // Node 1 should now be externalized
-    assert!(sim.get_node(&node1).is_slot_externalized(slot_index));
-    assert_eq!(
-        sim.get_node(&node1).get_externalized_value(slot_index),
-        Some(value)
-    );
+    assert!(sim.node(&node1).is_slot_externalized(slot_index));
+    assert_eq!(sim.node(&node1).externalized_value(slot_index), Some(value));
 }
 
 #[test]
@@ -500,17 +497,17 @@ fn test_purge_old_slots() {
     // Create multiple slots
     for i in 1..=10u64 {
         let value = make_value(&[i as u8]);
-        sim.get_node(&node1).force_externalize(i, value);
+        sim.node(&node1).force_externalize(i, value);
     }
 
-    assert_eq!(sim.get_node(&node1).slot_count(), 10);
+    assert_eq!(sim.node(&node1).slot_count(), 10);
 
     // Purge slots older than 6
-    sim.get_node(&node1).purge_slots(6, None);
+    sim.node(&node1).purge_slots(6, None);
 
-    assert_eq!(sim.get_node(&node1).slot_count(), 5);
-    assert!(sim.get_node(&node1).get_externalized_value(5).is_none());
-    assert!(sim.get_node(&node1).get_externalized_value(6).is_some());
+    assert_eq!(sim.node(&node1).slot_count(), 5);
+    assert!(sim.node(&node1).externalized_value(5).is_none());
+    assert!(sim.node(&node1).externalized_value(6).is_some());
 }
 
 #[test]
@@ -532,7 +529,7 @@ fn test_nomination_envelope_processing() {
     );
 
     // Node 1 receives it
-    let state = sim.get_node(&node1).receive_envelope(nom);
+    let state = sim.node(&node1).receive_envelope(nom);
     assert!(matches!(
         state,
         EnvelopeState::Valid | EnvelopeState::ValidNew
@@ -564,7 +561,7 @@ fn test_prepare_envelope_processing() {
     );
 
     // Node 1 receives it
-    let state = sim.get_node(&node1).receive_envelope(prep);
+    let state = sim.node(&node1).receive_envelope(prep);
     assert!(matches!(
         state,
         EnvelopeState::Valid | EnvelopeState::ValidNew
@@ -588,7 +585,7 @@ fn test_confirm_envelope_processing() {
     let conf = make_confirm_envelope(node2.clone(), slot_index, &sim.quorum_set, ballot, 1, 1, 1);
 
     // Node 1 receives it
-    let state = sim.get_node(&node1).receive_envelope(conf);
+    let state = sim.node(&node1).receive_envelope(conf);
     assert!(matches!(
         state,
         EnvelopeState::Valid | EnvelopeState::ValidNew
@@ -625,16 +622,16 @@ fn test_highest_known_slot() {
     let node1 = make_node_id(1);
 
     // Initially no slots
-    assert_eq!(sim.get_node(&node1).get_highest_known_slot(), None);
+    assert_eq!(sim.node(&node1).highest_known_slot(), None);
 
     // Add some slots
     for i in [5, 2, 8, 3] {
         let value = make_value(&[i as u8]);
-        sim.get_node(&node1).force_externalize(i, value);
+        sim.node(&node1).force_externalize(i, value);
     }
 
     // Should return highest
-    assert_eq!(sim.get_node(&node1).get_highest_known_slot(), Some(8));
+    assert_eq!(sim.node(&node1).highest_known_slot(), Some(8));
 }
 
 #[test]
@@ -648,7 +645,7 @@ fn test_get_missing_nodes() {
     let scp = SCP::new(node1.clone(), true, quorum_set.clone(), driver);
 
     // All nodes should be missing initially
-    let missing = scp.get_missing_nodes(1);
+    let missing = scp.missing_nodes(1);
     assert!(missing.contains(&node1));
     assert!(missing.contains(&node2));
     assert!(missing.contains(&node3));
@@ -661,10 +658,10 @@ fn test_slot_state() {
 
     // Create slot via force_externalize
     let value = make_value(&[1, 2, 3]);
-    sim.get_node(&node1).force_externalize(1, value);
+    sim.node(&node1).force_externalize(1, value);
 
     // Get slot state
-    let state = sim.get_node(&node1).get_slot_state(1);
+    let state = sim.node(&node1).slot_state(1);
     assert!(state.is_some());
     let state = state.unwrap();
     assert_eq!(state.slot_index, 1);
@@ -678,10 +675,10 @@ fn test_get_info_serialization() {
 
     // Create slot
     let value = make_value(&[1, 2, 3]);
-    sim.get_node(&node1).force_externalize(1, value);
+    sim.node(&node1).force_externalize(1, value);
 
     // Get info
-    let info = sim.get_node(&node1).get_info(1);
+    let info = sim.node(&node1).info(1);
     assert!(info.is_some());
     let info = info.unwrap();
     assert_eq!(info.slot_index, 1);
@@ -698,10 +695,10 @@ fn test_quorum_info() {
 
     // Create slot
     let value = make_value(&[1, 2, 3]);
-    sim.get_node(&node1).force_externalize(1, value);
+    sim.node(&node1).force_externalize(1, value);
 
     // Get quorum info
-    let qinfo = sim.get_node(&node1).get_quorum_info(1);
+    let qinfo = sim.node(&node1).quorum_info(1);
     assert!(qinfo.is_some());
     let qinfo = qinfo.unwrap();
     assert_eq!(qinfo.slot_index, 1);
@@ -716,11 +713,11 @@ fn test_all_slot_info() {
     // Create multiple slots
     for i in 1..=5u64 {
         let value = make_value(&[i as u8]);
-        sim.get_node(&node1).force_externalize(i, value);
+        sim.node(&node1).force_externalize(i, value);
     }
 
     // Get all slot info
-    let infos = sim.get_node(&node1).get_all_slot_info();
+    let infos = sim.node(&node1).all_slot_info();
     assert_eq!(infos.len(), 5);
 
     // Should be sorted by slot index
@@ -753,7 +750,7 @@ fn test_set_state_from_envelope() {
 
     // Should be externalized
     assert!(scp.is_slot_externalized(slot_index));
-    assert_eq!(scp.get_externalized_value(slot_index), Some(value));
+    assert_eq!(scp.externalized_value(slot_index), Some(value));
 }
 
 #[test]
@@ -778,7 +775,7 @@ fn test_abandon_ballot() {
     assert!(scp.abandon_ballot(slot_index, 5));
 
     // Get slot state to verify
-    let state = scp.get_slot_state(slot_index);
+    let state = scp.slot_state(slot_index);
     assert!(state.is_some());
     let state = state.unwrap();
     assert_eq!(state.ballot_round, Some(5));
@@ -792,12 +789,12 @@ fn test_process_slots_ascending() {
     // Create slots
     for i in [1, 3, 5, 7, 9] {
         let value = make_value(&[i as u8]);
-        sim.get_node(&node1).force_externalize(i, value);
+        sim.node(&node1).force_externalize(i, value);
     }
 
     // Process ascending from 5
     let mut visited = Vec::new();
-    sim.get_node(&node1)
+    sim.node(&node1)
         .process_slots_ascending_from(5, |slot_index| {
             visited.push(slot_index);
             true
@@ -814,12 +811,12 @@ fn test_process_slots_descending() {
     // Create slots
     for i in [1, 3, 5, 7, 9] {
         let value = make_value(&[i as u8]);
-        sim.get_node(&node1).force_externalize(i, value);
+        sim.node(&node1).force_externalize(i, value);
     }
 
     // Process descending from 7
     let mut visited = Vec::new();
-    sim.get_node(&node1)
+    sim.node(&node1)
         .process_slots_descending_from(7, |slot_index| {
             visited.push(slot_index);
             true
@@ -834,13 +831,13 @@ fn test_empty_check() {
     let node1 = make_node_id(1);
 
     // Initially empty
-    assert!(sim.get_node(&node1).empty());
+    assert!(sim.node(&node1).empty());
 
     // Create a slot
-    sim.get_node(&node1).force_externalize(1, make_value(&[1]));
+    sim.node(&node1).force_externalize(1, make_value(&[1]));
 
     // No longer empty
-    assert!(!sim.get_node(&node1).empty());
+    assert!(!sim.node(&node1).empty());
 }
 
 #[test]
@@ -849,16 +846,16 @@ fn test_cumulative_statement_count() {
     let node1 = make_node_id(1);
 
     // Initially zero
-    assert_eq!(sim.get_node(&node1).get_cumulative_statement_count(), 0);
+    assert_eq!(sim.node(&node1).cumulative_statement_count(), 0);
 
     // Create slots
     for i in 1..=3 {
-        sim.get_node(&node1)
+        sim.node(&node1)
             .force_externalize(i, make_value(&[i as u8]));
     }
 
     // Count should still be valid (might be 0 if no statements recorded)
-    let _count = sim.get_node(&node1).get_cumulative_statement_count(); // Just verify it doesn't panic
+    let _count = sim.node(&node1).cumulative_statement_count(); // Just verify it doesn't panic
 }
 
 #[test]
@@ -931,10 +928,10 @@ fn test_full_consensus_flow_via_externalize_messages() {
 
     // All nodes should externalize the same value
     assert!(scp1.is_slot_externalized(slot_index));
-    assert_eq!(scp1.get_externalized_value(slot_index), Some(value.clone()));
+    assert_eq!(scp1.externalized_value(slot_index), Some(value.clone()));
 
     // Verify all nodes agree
-    assert_eq!(scp1.get_externalized_value(slot_index), Some(value.clone()));
+    assert_eq!(scp1.externalized_value(slot_index), Some(value.clone()));
 }
 
 /// Test ballot protocol progression through PREPARE phase
@@ -991,7 +988,7 @@ fn test_ballot_prepare_phase_progression() {
     ));
 
     // Slot should exist and be in ballot phase
-    let slot_state = scp.get_slot_state(slot_index);
+    let slot_state = scp.slot_state(slot_index);
     assert!(slot_state.is_some());
 }
 
@@ -1061,7 +1058,7 @@ fn test_nodes_heard_from_tracking() {
     let value = make_value(&[7, 8, 9]);
 
     // Initially all nodes are missing
-    let missing_before = scp.get_missing_nodes(slot_index);
+    let missing_before = scp.missing_nodes(slot_index);
     assert_eq!(missing_before.len(), 3);
 
     // Receive nomination from node2
@@ -1075,7 +1072,7 @@ fn test_nodes_heard_from_tracking() {
     scp.receive_envelope(nom2);
 
     // Node2 should no longer be missing (it's tracked in nomination)
-    // Note: get_missing_nodes checks ballot protocol, so this tests slot creation
+    // Note: missing_nodes checks ballot protocol, so this tests slot creation
     assert!(!scp.empty());
 }
 
@@ -1110,12 +1107,12 @@ fn test_multiple_slots_consensus() {
 
         // Verify slot is externalized
         assert!(scp.is_slot_externalized(slot_index));
-        assert_eq!(scp.get_externalized_value(slot_index), Some(value));
+        assert_eq!(scp.externalized_value(slot_index), Some(value));
     }
 
     // All 5 slots should exist
     assert_eq!(scp.slot_count(), 5);
-    assert_eq!(scp.get_highest_known_slot(), Some(5));
+    assert_eq!(scp.highest_known_slot(), Some(5));
 }
 
 /// Test that later slots can externalize before earlier slots
@@ -1155,11 +1152,11 @@ fn test_out_of_order_externalization() {
     // Both should be externalized
     assert!(scp.is_slot_externalized(5));
     assert!(scp.is_slot_externalized(3));
-    assert_eq!(scp.get_externalized_value(5), Some(value5));
-    assert_eq!(scp.get_externalized_value(3), Some(value3));
+    assert_eq!(scp.externalized_value(5), Some(value5));
+    assert_eq!(scp.externalized_value(3), Some(value3));
 
     // Highest known slot should be 5
-    assert_eq!(scp.get_highest_known_slot(), Some(5));
+    assert_eq!(scp.highest_known_slot(), Some(5));
 }
 
 /// Test ballot bumping on timeout
@@ -1247,7 +1244,7 @@ fn test_crash_recovery_from_prepare() {
     assert!(recovered);
 
     // Verify state
-    let state = scp.get_slot_state(slot_index);
+    let state = scp.slot_state(slot_index);
     assert!(state.is_some());
     let state = state.unwrap();
     assert_eq!(state.ballot_round, Some(3));
@@ -1310,7 +1307,7 @@ fn test_watcher_node_no_emission() {
     assert!(!nominated);
 
     // No envelopes should be emitted
-    assert_eq!(driver.get_emitted_envelopes().len(), 0);
+    assert_eq!(driver.emitted_envelopes().len(), 0);
 }
 
 /// Test that watcher nodes can still receive and track externalized values
@@ -1344,10 +1341,10 @@ fn test_watcher_node_tracks_externalization() {
 
     // Watcher should track the externalized value
     assert!(scp.is_slot_externalized(slot_index));
-    assert_eq!(scp.get_externalized_value(slot_index), Some(value));
+    assert_eq!(scp.externalized_value(slot_index), Some(value));
 }
 
-/// Test get_externalizing_state returns correct envelopes
+/// Test externalizing_state returns correct envelopes
 #[test]
 fn test_get_externalizing_state() {
     let node1 = make_node_id(1);
@@ -1374,13 +1371,13 @@ fn test_get_externalizing_state() {
     scp.receive_envelope(ext2);
 
     // Get externalizing state
-    let state = scp.get_externalizing_state(slot_index);
+    let state = scp.externalizing_state(slot_index);
 
     // Should have envelopes from both nodes
     assert!(!state.is_empty());
 }
 
-/// Test get_latest_messages_send returns proper envelopes
+/// Test latest_messages_send returns proper envelopes
 #[test]
 fn test_get_latest_messages_send() {
     let node1 = make_node_id(1);
@@ -1400,14 +1397,14 @@ fn test_get_latest_messages_send() {
     scp.nominate(slot_index, value.clone(), &prev_value);
 
     // Get latest messages - returns node1's own messages for syncing
-    let messages = scp.get_latest_messages_send(slot_index);
+    let messages = scp.latest_messages_send(slot_index);
 
     // Messages may or may not be present depending on whether node1 is a leader
     // The key test is that the method works without panicking
     let _ = messages;
 }
 
-/// Test get_scp_state for syncing with peers
+/// Test scp_state for syncing with peers
 #[test]
 fn test_get_scp_state_for_sync() {
     let node1 = make_node_id(1);
@@ -1431,7 +1428,7 @@ fn test_get_scp_state_for_sync() {
     }
 
     // Get state from slot 3
-    let state = scp.get_scp_state(3);
+    let state = scp.scp_state(3);
 
     // Should have envelopes from slots 3, 4, 5
     assert!(!state.is_empty());
@@ -1472,7 +1469,7 @@ fn test_stress_many_slots() {
     }
 
     assert_eq!(scp.slot_count(), 100);
-    assert_eq!(scp.get_highest_known_slot(), Some(100));
+    assert_eq!(scp.highest_known_slot(), Some(100));
 }
 
 /// Stress test: Many envelopes for same slot
@@ -1529,7 +1526,7 @@ fn test_stress_many_envelopes_same_slot() {
     }
 
     assert!(scp.is_slot_externalized(slot_index));
-    assert_eq!(scp.get_externalized_value(slot_index), Some(value));
+    assert_eq!(scp.externalized_value(slot_index), Some(value));
 }
 
 /// Stress test: Rapid slot creation and purging
@@ -1854,7 +1851,7 @@ fn test_byzantine_minority_different_value() {
     // Should externalize with majority value
     assert!(scp.is_slot_externalized(slot_index));
     assert_eq!(
-        scp.get_externalized_value(slot_index),
+        scp.externalized_value(slot_index),
         Some(value_majority.clone())
     );
 
@@ -1869,7 +1866,7 @@ fn test_byzantine_minority_different_value() {
     scp.receive_envelope(ext1_minority);
 
     // Should still have majority value
-    assert_eq!(scp.get_externalized_value(slot_index), Some(value_majority));
+    assert_eq!(scp.externalized_value(slot_index), Some(value_majority));
 }
 
 /// Test: Old/stale ballot counters are handled
@@ -2053,5 +2050,5 @@ fn test_byzantine_node_restart_recovery() {
 
     // Should reach same externalized state
     assert!(scp2.is_slot_externalized(slot_index));
-    assert_eq!(scp2.get_externalized_value(slot_index), Some(value));
+    assert_eq!(scp2.externalized_value(slot_index), Some(value));
 }

@@ -155,14 +155,14 @@ impl ConfigUpgradeSetFrame {
         closing_ledger_seq: u32,
         protocol_version: u32,
     ) -> Option<Arc<Self>> {
-        let lk = Self::get_ledger_key(key);
+        let lk = Self::ledger_key(key);
 
         // Load the CONTRACT_DATA entry
-        let entry = ltx.get_entry(&lk).ok()??;
+        let entry = ltx.entry(&lk).ok()??;
 
         // Check TTL (entry must be live)
-        let ttl_key = Self::get_ttl_key(&lk);
-        let ttl_entry = ltx.get_entry(&ttl_key).ok()??;
+        let ttl_key = Self::ttl_key(&lk);
+        let ttl_entry = ltx.entry(&ttl_key).ok()??;
         if !Self::is_live(&ttl_entry, closing_ledger_seq) {
             debug!(
                 hash = format!("{:02x?}", &key.content_hash.0[..8]),
@@ -223,7 +223,7 @@ impl ConfigUpgradeSetFrame {
     /// - Contract address: the contract_id from the key
     /// - Key: SCV_BYTES containing the content_hash
     /// - Durability: TEMPORARY
-    pub fn get_ledger_key(upgrade_key: &ConfigUpgradeSetKey) -> LedgerKey {
+    pub fn ledger_key(upgrade_key: &ConfigUpgradeSetKey) -> LedgerKey {
         let key_val = ScVal::Bytes(
             upgrade_key
                 .content_hash
@@ -241,7 +241,7 @@ impl ConfigUpgradeSetFrame {
     }
 
     /// Get the TTL key for a CONTRACT_DATA entry.
-    fn get_ttl_key(data_key: &LedgerKey) -> LedgerKey {
+    fn ttl_key(data_key: &LedgerKey) -> LedgerKey {
         LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
             key_hash: Hash256::hash_xdr(data_key)
                 .map(|h| Hash(h.0))
@@ -347,7 +347,7 @@ impl ConfigUpgradeSetFrame {
 
             // Load the current entry from the ledger (reads through
             // CloseLedgerState: current delta → base snapshot)
-            let current_entry = ltx.get_entry(&key).map_err(|e| {
+            let current_entry = ltx.entry(&key).map_err(|e| {
                 LedgerError::Internal(format!(
                     "Failed to load config setting {:?}: {}",
                     setting_id, e
@@ -450,7 +450,7 @@ impl ConfigUpgradeSetFrame {
             config_setting_id: ConfigSettingId::FrozenLedgerKeys,
         });
         let previous = ltx
-            .get_entry(&key)
+            .entry(&key)
             .map_err(|e| {
                 LedgerError::Internal(format!(
                     "Failed to load FrozenLedgerKeys config setting: {}",
@@ -538,7 +538,7 @@ impl ConfigUpgradeSetFrame {
             config_setting_id: ConfigSettingId::FreezeBypassTxs,
         });
         let previous = ltx
-            .get_entry(&key)
+            .entry(&key)
             .map_err(|e| {
                 LedgerError::Internal(format!(
                     "Failed to load FreezeBypassTxs config setting: {}",
@@ -636,7 +636,7 @@ impl ConfigUpgradeSetFrame {
         let window_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
         });
-        let window_entry = ltx.get_entry(&window_key).map_err(|e| {
+        let window_entry = ltx.entry(&window_key).map_err(|e| {
             LedgerError::Internal(format!("Failed to load LiveSorobanStateSizeWindow: {}", e))
         })?;
 
@@ -993,7 +993,7 @@ mod tests {
     #[test]
     fn test_get_ledger_key() {
         let key = make_test_key();
-        let lk = ConfigUpgradeSetFrame::get_ledger_key(&key);
+        let lk = ConfigUpgradeSetFrame::ledger_key(&key);
 
         match lk {
             LedgerKey::ContractData(cd) => {

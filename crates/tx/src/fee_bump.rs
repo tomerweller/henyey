@@ -595,7 +595,7 @@ impl FeeBumpMutableTransactionResult {
     /// For protocol >= 25: Inner fee is 0, refund applied to outer
     pub fn finalize_fee_refund(&mut self, protocol_version: u32) {
         if let Some(ref tracker) = self.refundable_fee_tracker {
-            let refund = tracker.get_fee_refund();
+            let refund = tracker.fee_refund();
 
             if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
                 // In P25+, all fees come from outer, so refund from outer
@@ -1173,10 +1173,7 @@ mod tests {
             result.refundable_fee_tracker().unwrap().consumed_rent_fee(),
             0
         );
-        assert_eq!(
-            result.refundable_fee_tracker().unwrap().get_fee_refund(),
-            400
-        );
+        assert_eq!(result.refundable_fee_tracker().unwrap().fee_refund(), 400);
     }
 
     /// AUDIT-C7: Empty signature list must not pass verification.

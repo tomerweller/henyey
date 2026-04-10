@@ -91,7 +91,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify sequence was bumped
-        assert_eq!(state.get_account(&source_id).unwrap().seq_num.0, 200);
+        assert_eq!(state.account(&source_id).unwrap().seq_num.0, 200);
     }
 
     #[test]
@@ -110,7 +110,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify sequence was NOT changed
-        assert_eq!(state.get_account(&source_id).unwrap().seq_num.0, 100);
+        assert_eq!(state.account(&source_id).unwrap().seq_num.0, 100);
     }
 
     #[test]
@@ -162,7 +162,7 @@ mod tests {
         }
 
         // Verify sequence was bumped to max
-        assert_eq!(state.get_account(&source_id).unwrap().seq_num.0, i64::MAX);
+        assert_eq!(state.account(&source_id).unwrap().seq_num.0, i64::MAX);
     }
 
     /// Test bumping sequence to exactly current sequence (no-op but success).
@@ -194,7 +194,7 @@ mod tests {
         }
 
         // Sequence should remain 100
-        assert_eq!(state.get_account(&source_id).unwrap().seq_num.0, 100);
+        assert_eq!(state.account(&source_id).unwrap().seq_num.0, 100);
     }
 
     /// Test bumping sequence to zero (valid - noop if current > 0).
@@ -226,6 +226,6 @@ mod tests {
         }
 
         // Sequence should remain 100 (not bumped down)
-        assert_eq!(state.get_account(&source_id).unwrap().seq_num.0, 100);
+        assert_eq!(state.account(&source_id).unwrap().seq_num.0, 100);
     }
 }

@@ -126,7 +126,7 @@ pub trait FeeBalanceProvider: Send + Sync {
     ///
     /// Returns the native asset balance minus any reserves or holds,
     /// or None if the account doesn't exist.
-    fn get_available_balance(&self, account_id: &AccountId) -> Option<i64>;
+    fn available_balance(&self, account_id: &AccountId) -> Option<i64>;
 }
 
 /// Configuration for the transaction queue.
@@ -684,7 +684,7 @@ impl TransactionQueue {
     }
 
     /// Get the fee balance provider (for post-close invalidation).
-    pub fn get_fee_balance_provider(&self) -> Option<Arc<dyn FeeBalanceProvider>> {
+    pub fn fee_balance_provider(&self) -> Option<Arc<dyn FeeBalanceProvider>> {
         self.fee_balance_provider.read().clone()
     }
 
@@ -1078,7 +1078,7 @@ impl TransactionQueue {
                 evicted.envelope.clone(),
                 self.config.network_id,
             );
-            let lane = lane_config.get_lane(&frame);
+            let lane = lane_config.lane(&frame);
             let mut lane_fees = lane_fees_lock.write();
             if lane_fees.len() != lane_config.lane_limits().len() {
                 lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
@@ -1104,7 +1104,7 @@ impl TransactionQueue {
         queued_frame: &henyey_tx::TransactionFrame,
         queued: &QueuedTransaction,
     ) -> bool {
-        let lane = lane_config.get_lane(queued_frame);
+        let lane = lane_config.lane(queued_frame);
         if lane_fees.len() != lane_config.lane_limits().len() {
             lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
         }
@@ -1447,7 +1447,7 @@ impl TransactionQueue {
                 };
 
                 // Check if fee-source has sufficient balance
-                if let Some(available) = provider.get_available_balance(&fee_source_id) {
+                if let Some(available) = provider.available_balance(&fee_source_id) {
                     // available - net_new_fee < current_total_fees means insufficient
                     if available.saturating_sub(net_new_fee) < current_total_fees {
                         return TxQueueResult::Invalid(Some(
@@ -2546,7 +2546,7 @@ mod tests {
         assert_eq!(queue.len(), 2);
         queue.try_add(tx_mid);
 
-        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let set = queue.transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 3);
 
         let mut fees: Vec<u64> = set.transactions.iter().map(envelope_fee).collect();
@@ -2573,7 +2573,7 @@ mod tests {
         queue.try_add(tx_a);
         queue.try_add(tx_b);
 
-        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let set = queue.transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 2);
 
         let expected = if hash_a.0 >= hash_b.0 {
@@ -2609,7 +2609,7 @@ mod tests {
         queue.try_add(tx_a);
         queue.try_add(tx_b);
 
-        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let set = queue.transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 1);
         assert_eq!(envelope_seq(&set.transactions[0]), 1);
     }
@@ -2633,7 +2633,7 @@ mod tests {
         queue.try_add(tx_a);
         queue.try_add(tx_b);
 
-        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let set = queue.transaction_set(Hash256::ZERO, 10);
         let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
         seqs.sort();
         assert_eq!(seqs, vec![1, 2]);
@@ -2659,7 +2659,7 @@ mod tests {
         assert_eq!(queue.try_add(classic), TxQueueResult::Added);
         assert_eq!(queue.try_add(soroban), TxQueueResult::Added);
 
-        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let set = queue.transaction_set(Hash256::ZERO, 10);
         let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
         seqs.sort();
         assert_eq!(seqs, vec![1, 2]);
@@ -2690,7 +2690,7 @@ mod tests {
         assert_eq!(queue.try_add(soroban_a), TxQueueResult::Added);
         assert_eq!(queue.try_add(soroban_b), TxQueueResult::Added);
 
-        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let set = queue.transaction_set(Hash256::ZERO, 10);
         let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
         seqs.sort();
         assert_eq!(seqs, vec![1, 2, 3]);
@@ -2720,7 +2720,7 @@ mod tests {
         let mut starting = std::collections::HashMap::new();
         starting.insert(account_key_from_account_id(&account_id), 5);
 
-        let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
+        let set = queue.transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
         let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
         seqs.sort();
         // tx_a with seq 5 is filtered (starting_seq >= 5), only tx_b with seq 6 remains
@@ -2752,7 +2752,7 @@ mod tests {
         let mut starting = std::collections::HashMap::new();
         starting.insert(account_key_from_account_id(&account_id), starting_seq);
 
-        let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
+        let set = queue.transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
         let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
         seqs.sort();
         // tx_starting is filtered (starting_seq >= starting_seq), only tx_next remains
@@ -3088,7 +3088,7 @@ mod tests {
         queue.try_add(dex_b);
         queue.try_add(classic);
 
-        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let set = queue.transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 2);
 
         let mut dex_count = 0;
@@ -3123,7 +3123,7 @@ mod tests {
         queue.try_add(dex_b.clone());
         queue.try_add(classic.clone());
 
-        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let set = queue.transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 2);
 
         let hash_dex_a = full_hash(&dex_a);
@@ -3771,7 +3771,7 @@ mod tests {
         queue.try_add(tx_a);
         queue.try_add(tx_b);
 
-        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let set = queue.transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 1);
     }
 
@@ -4222,7 +4222,7 @@ mod tests {
     fn test_audit_089_eviction_rollback_on_fee_rejection() {
         struct ZeroBalanceProvider;
         impl FeeBalanceProvider for ZeroBalanceProvider {
-            fn get_available_balance(&self, _account_id: &AccountId) -> Option<i64> {
+            fn available_balance(&self, _account_id: &AccountId) -> Option<i64> {
                 Some(0) // zero balance → candidate will be rejected
             }
         }
@@ -4365,13 +4365,13 @@ mod tests {
         );
 
         // Verify each position matches the canonical ResourceType index.
-        assert_eq!(limit.get_val(ResourceType::Operations), 2);
-        assert_eq!(limit.get_val(ResourceType::Instructions), 5_000_000);
-        assert_eq!(limit.get_val(ResourceType::TxByteSize), 20_000);
-        assert_eq!(limit.get_val(ResourceType::DiskReadBytes), 6_400);
-        assert_eq!(limit.get_val(ResourceType::WriteBytes), 6_400);
-        assert_eq!(limit.get_val(ResourceType::ReadLedgerEntries), 6);
-        assert_eq!(limit.get_val(ResourceType::WriteLedgerEntries), 4);
+        assert_eq!(limit.val(ResourceType::Operations), 2);
+        assert_eq!(limit.val(ResourceType::Instructions), 5_000_000);
+        assert_eq!(limit.val(ResourceType::TxByteSize), 20_000);
+        assert_eq!(limit.val(ResourceType::DiskReadBytes), 6_400);
+        assert_eq!(limit.val(ResourceType::WriteBytes), 6_400);
+        assert_eq!(limit.val(ResourceType::ReadLedgerEntries), 6);
+        assert_eq!(limit.val(ResourceType::WriteLedgerEntries), 4);
     }
 
     /// Regression: a Soroban tx whose byte size exceeds the initial min

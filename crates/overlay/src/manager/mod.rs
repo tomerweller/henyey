@@ -606,7 +606,7 @@ impl OverlayManager {
             self.flood_gate.record_seen(hash, None, lcl);
             // Only forward to peers that haven't already sent us this message
             let all_peers: Vec<PeerId> = self.peers.iter().map(|e| e.key().clone()).collect();
-            Some(self.flood_gate.get_forward_peers(&hash, &all_peers))
+            Some(self.flood_gate.forward_peers(&hash, &all_peers))
         } else {
             None // non-flood: send to all
         };
@@ -1675,9 +1675,9 @@ mod tests {
         );
 
         // Non-flood messages (e.g. GetScpState) should still use Send
-        let get_state = StellarMessage::GetScpState(1);
+        let state = StellarMessage::GetScpState(1);
         manager
-            .try_send_to(&peer_id, get_state)
+            .try_send_to(&peer_id, state)
             .expect("send should succeed");
         let msg = rx.recv().await.expect("should receive message");
         assert!(

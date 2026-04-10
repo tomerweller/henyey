@@ -215,14 +215,14 @@ impl TxSetValidationContext {
 /// # Returns
 ///
 /// A vector of transaction envelopes that failed validation.
-pub fn get_invalid_tx_list(
+pub fn invalid_tx_list(
     txs: &[TransactionEnvelope],
     ctx: &TxSetValidationContext,
     close_time_bounds: &CloseTimeBounds,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
 ) -> Vec<TransactionEnvelope> {
     let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
-    get_invalid_tx_list_with_fee_map(
+    invalid_tx_list_with_fee_map(
         txs,
         ctx,
         close_time_bounds,
@@ -241,7 +241,7 @@ pub fn get_invalid_tx_list(
 ///
 /// Mirrors `TxSetUtils::getInvalidTxListWithErrors()` in stellar-core,
 /// which accepts `accountFeeMap` by reference.
-pub fn get_invalid_tx_list_with_fee_map(
+pub fn invalid_tx_list_with_fee_map(
     txs: &[TransactionEnvelope],
     ctx: &TxSetValidationContext,
     close_time_bounds: &CloseTimeBounds,
@@ -329,7 +329,7 @@ pub fn get_invalid_tx_list_with_fee_map(
             let frame = TransactionFrame::from_owned_with_network(tx.clone(), ctx.network_id);
             let fee_source = frame.fee_source_account_id();
 
-            let available = provider.get_available_balance(&fee_source).unwrap_or(0);
+            let available = provider.available_balance(&fee_source).unwrap_or(0);
             let total_fee = account_fee_map.get(&fee_source).copied().unwrap_or(0);
 
             if available < total_fee {
@@ -352,7 +352,7 @@ pub fn get_invalid_tx_list_with_fee_map(
 
 /// Filter invalid transactions from a candidate set.
 ///
-/// Finds all invalid transactions using [`get_invalid_tx_list`], then removes
+/// Finds all invalid transactions using [`invalid_tx_list`], then removes
 /// them from the input set using hash comparison.
 ///
 /// # Parity
@@ -378,7 +378,7 @@ pub fn trim_invalid(
     close_time_bounds: &CloseTimeBounds,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
 ) -> (Vec<TransactionEnvelope>, Vec<TransactionEnvelope>) {
-    let invalid_txs = get_invalid_tx_list(txs, ctx, close_time_bounds, fee_balance_provider);
+    let invalid_txs = invalid_tx_list(txs, ctx, close_time_bounds, fee_balance_provider);
 
     if invalid_txs.is_empty() {
         return (txs.to_vec(), Vec::new());
@@ -439,7 +439,7 @@ pub fn trim_invalid_two_phase(
     let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
 
     // Phase 0: Classic
-    let classic_invalid = get_invalid_tx_list_with_fee_map(
+    let classic_invalid = invalid_tx_list_with_fee_map(
         classic_txs,
         ctx,
         close_time_bounds,
@@ -458,7 +458,7 @@ pub fn trim_invalid_two_phase(
     }
 
     // Phase 1: Soroban
-    let soroban_invalid = get_invalid_tx_list_with_fee_map(
+    let soroban_invalid = invalid_tx_list_with_fee_map(
         soroban_txs,
         ctx,
         close_time_bounds,
@@ -573,7 +573,7 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
                 let component_base_fee = comp.base_fee;
                 for tx in comp.txs.iter() {
                     let tx_inclusion_fee = envelope_inclusion_fee(tx);
-                    let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, component_base_fee);
+                    let min_fee = min_inclusion_fee(tx, lcl_base_fee, component_base_fee);
                     if tx_inclusion_fee < min_fee {
                         debug!(
                             "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
@@ -600,7 +600,7 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
                 for cluster in stage.iter() {
                     for tx in cluster.iter() {
                         let tx_inclusion_fee = envelope_inclusion_fee(tx);
-                        let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, component_base_fee);
+                        let min_fee = min_inclusion_fee(tx, lcl_base_fee, component_base_fee);
                         if tx_inclusion_fee < min_fee {
                             debug!(
                                 "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
@@ -621,7 +621,7 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
 /// Mirrors stellar-core's `getMinInclusionFee()` (TransactionUtils.cpp:1961-1971).
 /// effectiveBaseFee = max(header.baseFee, componentBaseFee)
 /// minFee = effectiveBaseFee * max(1, numOps)
-fn get_min_inclusion_fee(
+fn min_inclusion_fee(
     env: &TransactionEnvelope,
     lcl_base_fee: u32,
     component_base_fee: Option<i64>,
@@ -909,7 +909,7 @@ fn collect_phase_txs(phase: &TransactionPhase) -> Vec<&TransactionEnvelope> {
 /// 1. Verify generalized vs legacy matches protocol version
 /// 2. For generalized sets: verify no duplicate source accounts across ALL phases
 /// 3. Per-phase: fee map validation, phase-type checks, phase-specific limits
-/// 4. Per-TX content validation (time bounds, fees) via `get_invalid_tx_list_with_fee_map`
+/// 4. Per-TX content validation (time bounds, fees) via `invalid_tx_list_with_fee_map`
 ///
 /// For Phase 1, `fee_balance_provider` may be `None` to skip per-account balance checks.
 pub(crate) fn check_tx_set_valid(
@@ -996,7 +996,7 @@ pub(crate) fn check_tx_set_valid(
         // 4. Per-TX content validation (time bounds, fees, etc.)
         let tx_envelopes: Vec<TransactionEnvelope> =
             phase_txs.iter().map(|tx| (*tx).clone()).collect();
-        let invalid = get_invalid_tx_list_with_fee_map(
+        let invalid = invalid_tx_list_with_fee_map(
             &tx_envelopes,
             &ctx,
             &close_time_bounds,
@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     impl FeeBalanceProvider for MockFeeBalanceProvider {
-        fn get_available_balance(&self, account_id: &AccountId) -> Option<i64> {
+        fn available_balance(&self, account_id: &AccountId) -> Option<i64> {
             self.balances.get(account_id).copied()
         }
     }
@@ -1221,7 +1221,7 @@ mod tests {
         )
     }
 
-    // --- get_invalid_tx_list tests ---
+    // --- invalid_tx_list tests ---
 
     #[test]
     fn test_get_invalid_tx_list_all_valid() {
@@ -1234,7 +1234,7 @@ mod tests {
             make_valid_envelope(300, 3),
         ];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
+        let invalid = invalid_tx_list(&txs, &ctx, &bounds, None);
         assert!(
             invalid.is_empty(),
             "all valid transactions should produce no invalid list"
@@ -1248,7 +1248,7 @@ mod tests {
 
         let txs = vec![make_low_fee_envelope(1), make_low_fee_envelope(2)];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
+        let invalid = invalid_tx_list(&txs, &ctx, &bounds, None);
         assert_eq!(
             invalid.len(),
             2,
@@ -1267,7 +1267,7 @@ mod tests {
 
         let txs = vec![valid, invalid_fee, expired];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
+        let invalid = invalid_tx_list(&txs, &ctx, &bounds, None);
         assert_eq!(
             invalid.len(),
             2,
@@ -1280,7 +1280,7 @@ mod tests {
         let ctx = test_context();
         let bounds = CloseTimeBounds::exact();
 
-        let invalid = get_invalid_tx_list(&[], &ctx, &bounds, None);
+        let invalid = invalid_tx_list(&[], &ctx, &bounds, None);
         assert!(
             invalid.is_empty(),
             "empty input should produce empty invalid list"
@@ -1296,7 +1296,7 @@ mod tests {
         let bad_bounds = make_bad_ledger_bounds_envelope(1);
         let txs = vec![bad_bounds];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
+        let invalid = invalid_tx_list(&txs, &ctx, &bounds, None);
         assert_eq!(
             invalid.len(),
             1,
@@ -1537,8 +1537,7 @@ mod tests {
 
         // With no offset, should be valid
         let bounds_exact = CloseTimeBounds::exact();
-        let invalid =
-            get_invalid_tx_list(std::slice::from_ref(&envelope), &ctx, &bounds_exact, None);
+        let invalid = invalid_tx_list(std::slice::from_ref(&envelope), &ctx, &bounds_exact, None);
         assert!(
             invalid.is_empty(),
             "tx should be valid with exact close time"
@@ -1546,8 +1545,7 @@ mod tests {
 
         // With upper offset of 10 (close_time + 10 = 1010 > max_time 1005), should be invalid
         let bounds_offset = CloseTimeBounds::with_offsets(0, 10);
-        let invalid =
-            get_invalid_tx_list(std::slice::from_ref(&envelope), &ctx, &bounds_offset, None);
+        let invalid = invalid_tx_list(std::slice::from_ref(&envelope), &ctx, &bounds_offset, None);
         assert_eq!(
             invalid.len(),
             1,
@@ -1603,7 +1601,7 @@ mod tests {
         let mut provider = MockFeeBalanceProvider::new();
         provider.set_balance([10u8; 32], 500);
 
-        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
+        let invalid = invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
         assert!(
             invalid.is_empty(),
             "tx should be valid when balance covers fee"
@@ -1621,7 +1619,7 @@ mod tests {
         let mut provider = MockFeeBalanceProvider::new();
         provider.set_balance([10u8; 32], 100);
 
-        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
+        let invalid = invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
         assert_eq!(
             invalid.len(),
             1,
@@ -1642,7 +1640,7 @@ mod tests {
         let mut provider = MockFeeBalanceProvider::new();
         provider.set_balance([10u8; 32], 300);
 
-        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
+        let invalid = invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
         assert_eq!(
             invalid.len(),
             2,
@@ -1662,7 +1660,7 @@ mod tests {
         let mut provider = MockFeeBalanceProvider::new();
         provider.set_balance([10u8; 32], 400); // exactly covers total
 
-        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
+        let invalid = invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
         assert!(
             invalid.is_empty(),
             "txs should be valid when balance exactly covers cumulative fees"
@@ -1684,7 +1682,7 @@ mod tests {
         provider.set_balance([10u8; 32], 500);
         provider.set_balance([20u8; 32], 100);
 
-        let invalid = get_invalid_tx_list(&[tx_a1, tx_a2, tx_b], &ctx, &bounds, Some(&provider));
+        let invalid = invalid_tx_list(&[tx_a1, tx_a2, tx_b], &ctx, &bounds, Some(&provider));
         assert_eq!(invalid.len(), 1, "only source B's tx should be invalid");
     }
 
@@ -1698,7 +1696,7 @@ mod tests {
 
         let provider = MockFeeBalanceProvider::new(); // empty
 
-        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
+        let invalid = invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
         assert_eq!(
             invalid.len(),
             1,
@@ -1721,7 +1719,7 @@ mod tests {
         // Balance of 200 would cover tx2 alone, but not tx1+tx2 if tx1 wasn't filtered out
         provider.set_balance([2u8; 32], 200);
 
-        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
+        let invalid = invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
         // tx1 is invalid due to low fee; tx2 alone has fee=200, balance=200, so it passes
         assert_eq!(
             invalid.len(),
@@ -1738,7 +1736,7 @@ mod tests {
         // Even with 0 balance, without a provider, fee check is skipped
         let tx = make_envelope_with_source([10u8; 32], 200, 1);
 
-        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None);
+        let invalid = invalid_tx_list(&[tx], &ctx, &bounds, None);
         assert!(
             invalid.is_empty(),
             "without provider, fee affordability check should be skipped"
@@ -2154,7 +2152,7 @@ mod tests {
         assert!(!check_valid_classic(&phase, 100));
     }
 
-    /// Regression: get_invalid_tx_list must reject txs that fail check_valid_pre_seq_num
+    /// Regression: invalid_tx_list must reject txs that fail check_valid_pre_seq_num
     /// even when they would pass validate_basic.
     #[test]
     fn test_get_invalid_tx_list_rejects_inflation_via_pre_seq_num() {
@@ -2188,7 +2186,7 @@ mod tests {
             .unwrap(),
         });
 
-        let invalid = get_invalid_tx_list(&[envelope], &ctx, &bounds, None);
+        let invalid = invalid_tx_list(&[envelope], &ctx, &bounds, None);
         assert_eq!(invalid.len(), 1, "Inflation tx should be rejected at p21");
     }
 }

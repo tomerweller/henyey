@@ -56,12 +56,12 @@ impl App {
             .collect();
         let tx_count = ordered_txs.len().min(tx_results.len());
         let meta_count = tx_metas.map(|metas| metas.len()).unwrap_or(0);
-        let scp_envelopes = self.herder.get_scp_envelopes(header.ledger_seq as u64);
+        let scp_envelopes = self.herder.scp_envelopes(header.ledger_seq as u64);
         let mut scp_quorum_sets = Vec::new();
         for envelope in &scp_envelopes {
             let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
             let hash256 = Hash256::from_bytes(hash.0);
-            if let Some(qset) = self.herder.get_quorum_set_by_hash(&hash256) {
+            if let Some(qset) = self.herder.quorum_set_by_hash(&hash256) {
                 scp_quorum_sets.push((hash256, qset));
             } else {
                 tracing::warn!(hash = %hash256.to_hex(), "Missing quorum set for SCP history — export will fail for this checkpoint");
@@ -407,9 +407,7 @@ impl App {
     /// state is available (fresh node or corrupt state).
     pub async fn load_last_known_ledger(&self) -> anyhow::Result<bool> {
         // Step 1: Read LCL sequence from DB
-        let lcl_seq = self
-            .db
-            .with_connection(|conn| conn.get_last_closed_ledger())?;
+        let lcl_seq = self.db.with_connection(|conn| conn.last_closed_ledger())?;
         let Some(lcl_seq) = lcl_seq else {
             tracing::debug!("No last closed ledger in DB, cannot restore from disk");
             return Ok(false);
@@ -429,7 +427,7 @@ impl App {
         // Step 2: Read HAS JSON from DB
         let has_json = self
             .db
-            .with_connection(|conn| conn.get_state(state_keys::HISTORY_ARCHIVE_STATE))?;
+            .with_connection(|conn| conn.state(state_keys::HISTORY_ARCHIVE_STATE))?;
         let Some(has_json) = has_json else {
             tracing::warn!(lcl_seq, "LCL found but no HAS in DB, cannot restore");
             return Ok(false);
@@ -456,7 +454,7 @@ impl App {
         // Step 4: Load ledger header from DB
         let header = self
             .db
-            .get_ledger_header(lcl_seq)?
+            .ledger_header(lcl_seq)?
             .ok_or_else(|| anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq))?;
 
         // Compute header hash (we don't store it separately)
@@ -1018,7 +1016,7 @@ impl App {
         // Read persisted HAS from DB
         let has_json = self
             .db
-            .with_connection(|conn| conn.get_state(state_keys::HISTORY_ARCHIVE_STATE))?;
+            .with_connection(|conn| conn.state(state_keys::HISTORY_ARCHIVE_STATE))?;
         let has_json = has_json.ok_or_else(|| anyhow::anyhow!("No persisted HAS in database"))?;
         let has = HistoryArchiveState::from_json(&has_json)
             .map_err(|e| anyhow::anyhow!("Failed to parse persisted HAS: {}", e))?;
@@ -1027,7 +1025,7 @@ impl App {
 
         let header = self
             .db
-            .get_ledger_header(lcl_seq)?
+            .ledger_header(lcl_seq)?
             .ok_or_else(|| anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq))?;
 
         let (bucket_list, hot_archive) = self
@@ -1429,7 +1427,7 @@ impl App {
             return None;
         }
 
-        let current_ledger = self.get_current_ledger().await.ok()?;
+        let current_ledger = self.current_ledger().await.ok()?;
         let next_seq = current_ledger.saturating_add(1);
 
         let close_info = {
@@ -1446,7 +1444,7 @@ impl App {
                     return None;
                 }
                 None => {
-                    let is_externalized = self.herder.get_externalized(next_seq as u64).is_some();
+                    let is_externalized = self.herder.externalized(next_seq as u64).is_some();
                     if is_externalized {
                         tracing::debug!(
                             next_seq,
@@ -1847,8 +1845,8 @@ impl App {
                         _ => 0,
                     },
                 };
-                let fee_provider = self.herder.tx_queue().get_fee_balance_provider();
-                let invalid = get_invalid_tx_list(
+                let fee_provider = self.herder.tx_queue().fee_balance_provider();
+                let invalid = invalid_tx_list(
                     &pending_envs,
                     &ctx,
                     &CloseTimeBounds::with_offsets(0, upper_bound_offset),

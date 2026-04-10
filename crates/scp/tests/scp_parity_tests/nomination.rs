@@ -20,7 +20,7 @@ fn test_nomination_core5_v0_is_top_nominates_x() {
     assert!(scp.nominate(0, x_value.clone(), &empty_value));
     assert_eq!(scp.envs_len(), 1);
     verify_nominate(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash0,
         0,
@@ -61,7 +61,7 @@ fn setup_nomination_others_nominate_x_prepare_x() -> (TestSCP, Value, Value, Val
     assert!(scp.nominate(0, x_value.clone(), &empty_value));
     assert_eq!(scp.envs_len(), 1);
     verify_nominate(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash0,
         0,
@@ -90,7 +90,7 @@ fn setup_nomination_others_nominate_x_prepare_x() -> (TestSCP, Value, Value, Val
     scp.driver().set_composite_value(x_value.clone());
 
     verify_nominate(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -143,7 +143,7 @@ fn setup_nomination_others_nominate_x_prepare_x() -> (TestSCP, Value, Value, Val
     assert_eq!(scp.envs_len(), 3);
 
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -194,7 +194,7 @@ fn test_nomination_core5_others_accepted_y_update_latest() {
     scp.receive_envelope(acc2_2);
     assert_eq!(scp.envs_len(), 4);
     verify_nominate(
-        &scp.get_env(3),
+        &scp.env(3),
         &v0_id(),
         qs_hash0,
         0,
@@ -213,7 +213,7 @@ fn test_nomination_core5_others_accepted_y_update_latest() {
     scp.receive_envelope(acc3_2);
     assert_eq!(scp.envs_len(), 4);
 
-    assert_eq!(scp.get_latest_composite_candidate(0), Some(k_value.clone()));
+    assert_eq!(scp.latest_composite_candidate(0), Some(k_value.clone()));
 
     scp.receive_envelope(acc4_2);
     assert_eq!(scp.envs_len(), 4);
@@ -305,7 +305,7 @@ fn test_nomination_core5_restored_state_ballot_not_started() {
     assert_eq!(scp2.envs_len(), 1);
 
     verify_prepare(
-        &scp2.get_env(0),
+        &scp2.env(0),
         &v0_id(),
         qs_hash0,
         0,
@@ -456,7 +456,7 @@ fn test_nomination_core5_switch_leader() {
     let mut votes_xk = vec![x_value.clone(), k_value.clone()];
     votes_xk.sort();
 
-    verify_nominate(&scp.get_env(1), &v0_id(), qs_hash0, 0, votes_xk, vec![]);
+    verify_nominate(&scp.env(1), &v0_id(), qs_hash0, 0, votes_xk, vec![]);
 }
 
 // ---------------------------------------------------------------------------
@@ -501,14 +501,7 @@ fn test_nomination_core5_select_accepted_before_timeout() {
 
     // Common tail: verify nominate envelope and test additional nom2
     let votes_xy = vec![x_value.clone(), y_value.clone()];
-    verify_nominate(
-        &scp.get_env(1),
-        &v0_id(),
-        qs_hash0,
-        0,
-        votes_xy.clone(),
-        vec![],
-    );
+    verify_nominate(&scp.env(1), &v0_id(), qs_hash0, 0, votes_xy.clone(), vec![]);
 
     let nom2 = make_nominate(
         &v1_id(),
@@ -520,7 +513,7 @@ fn test_nomination_core5_select_accepted_before_timeout() {
     scp.receive_envelope(nom2);
     // Nothing happens, as v0 already voted for the accepted value (y)
     assert_eq!(scp.envs_len(), 2);
-    verify_nominate(&scp.get_env(1), &v0_id(), qs_hash0, 0, votes_xy, vec![]);
+    verify_nominate(&scp.env(1), &v0_id(), qs_hash0, 0, votes_xy, vec![]);
 }
 
 // ---------------------------------------------------------------------------
@@ -564,14 +557,7 @@ fn test_nomination_core5_select_accepted_after_timeout() {
 
     // Common tail: verify nominate envelope and test additional nom2
     let votes_xy = vec![x_value.clone(), y_value.clone()];
-    verify_nominate(
-        &scp.get_env(1),
-        &v0_id(),
-        qs_hash0,
-        0,
-        votes_xy.clone(),
-        vec![],
-    );
+    verify_nominate(&scp.env(1), &v0_id(), qs_hash0, 0, votes_xy.clone(), vec![]);
 
     let nom2 = make_nominate(
         &v1_id(),
@@ -583,7 +569,7 @@ fn test_nomination_core5_select_accepted_after_timeout() {
     scp.receive_envelope(nom2);
     // Nothing happens, as v0 already voted for the accepted value (y)
     assert_eq!(scp.envs_len(), 2);
-    verify_nominate(&scp.get_env(1), &v0_id(), qs_hash0, 0, votes_xy, vec![]);
+    verify_nominate(&scp.env(1), &v0_id(), qs_hash0, 0, votes_xy, vec![]);
 }
 
 // ---------------------------------------------------------------------------
@@ -611,14 +597,7 @@ fn test_nomination_core5_others_vote_y() {
 
     assert!(scp.nominate(0, x_value.clone(), &empty_value));
     assert_eq!(scp.envs_len(), 1);
-    verify_nominate(
-        &scp.get_env(0),
-        &v0_id(),
-        qs_hash0,
-        0,
-        my_votes.clone(),
-        vec![],
-    );
+    verify_nominate(&scp.env(0), &v0_id(), qs_hash0, 0, my_votes.clone(), vec![]);
 
     let votes = vec![y_value.clone()];
 
@@ -639,7 +618,7 @@ fn test_nomination_core5_others_vote_y() {
     assert_eq!(scp.envs_len(), 2);
     my_votes.push(y_value.clone());
     verify_nominate(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -673,14 +652,7 @@ fn test_nomination_core5_others_accepted_y() {
 
     assert!(scp.nominate(0, x_value.clone(), &empty_value));
     assert_eq!(scp.envs_len(), 1);
-    verify_nominate(
-        &scp.get_env(0),
-        &v0_id(),
-        qs_hash0,
-        0,
-        my_votes.clone(),
-        vec![],
-    );
+    verify_nominate(&scp.env(0), &v0_id(), qs_hash0, 0, my_votes.clone(), vec![]);
 
     let votes = vec![y_value.clone()];
     let accepted_y = vec![y_value.clone()];
@@ -699,7 +671,7 @@ fn test_nomination_core5_others_accepted_y() {
     assert_eq!(scp.envs_len(), 2);
 
     my_votes.push(y_value.clone());
-    verify_nominate(&scp.get_env(1), &v0_id(), qs_hash0, 0, my_votes, accepted_y);
+    verify_nominate(&scp.env(1), &v0_id(), qs_hash0, 0, my_votes, accepted_y);
 
     let mut expected2 = BTreeSet::new();
     expected2.insert(y_value.clone());
@@ -711,7 +683,7 @@ fn test_nomination_core5_others_accepted_y() {
     assert_eq!(scp.envs_len(), 3);
 
     verify_prepare(
-        &scp.get_env(2),
+        &scp.env(2),
         &v0_id(),
         qs_hash0,
         0,
@@ -760,7 +732,7 @@ fn test_nomination_core5_v1_candidate_no_new_value_on_timeout() {
     scp.receive_envelope(nom1);
     assert_eq!(scp.envs_len(), 1);
     verify_nominate(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash0,
         0,
@@ -772,7 +744,7 @@ fn test_nomination_core5_v1_candidate_no_new_value_on_timeout() {
     scp.receive_envelope(nom3);
     assert_eq!(scp.envs_len(), 2);
     verify_nominate(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -865,7 +837,7 @@ fn test_nomination_core5_nomination_waits_for_v1() {
     scp.receive_envelope(nom1);
     assert_eq!(scp.envs_len(), 1);
     verify_nominate(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash0,
         0,
@@ -893,7 +865,7 @@ fn test_nomination_core5_nomination_waits_for_v1() {
     // which also happens to cause 'x' to be accepted
     assert_eq!(scp.envs_len(), 2);
     verify_nominate(
-        &scp.get_env(1),
+        &scp.env(1),
         &v0_id(),
         qs_hash0,
         0,
@@ -948,7 +920,7 @@ fn test_nomination_core5_v1_dead_timeout_v0_becomes_top() {
 
     // stellar-core line 3313: NOMINATE(votes=[x], accepted=[])
     verify_nominate(
-        &scp.get_env(0),
+        &scp.env(0),
         &v0_id(),
         qs_hash0,
         0,
@@ -998,7 +970,7 @@ fn test_nomination_core5_v1_dead_timeout_v2_becomes_top() {
     // stellar-core line 3327-3332: v2 votes for XK, but nomination only picks the highest value
     // std::max(xValue, kValue) — pick the larger of x and k
     let v2_top = std::cmp::max(x_value.clone(), k_value.clone());
-    verify_nominate(&scp.get_env(0), &v0_id(), qs_hash0, 0, vec![v2_top], vec![]);
+    verify_nominate(&scp.env(0), &v0_id(), qs_hash0, 0, vec![v2_top], vec![]);
 }
 
 // ---------------------------------------------------------------------------

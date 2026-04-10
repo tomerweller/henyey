@@ -137,17 +137,17 @@ impl OfferStore {
     }
 
     /// Get an offer entry by key (convenience).
-    pub fn get_offer(&self, key: &OfferKey) -> Option<&OfferEntry> {
+    pub fn offer(&self, key: &OfferKey) -> Option<&OfferEntry> {
         self.offers.get(key).map(|r| &r.entry)
     }
 
     /// Get an offer by seller and offer_id.
-    pub fn get_by_seller(&self, seller_id: &AccountId, offer_id: i64) -> Option<&OfferRecord> {
+    pub fn by_seller(&self, seller_id: &AccountId, offer_id: i64) -> Option<&OfferRecord> {
         self.offers.get(&OfferKey::new(seller_id.clone(), offer_id))
     }
 
     /// Get a mutable offer by seller and offer_id.
-    pub fn get_by_seller_mut(
+    pub fn by_seller_mut(
         &mut self,
         seller_id: &AccountId,
         offer_id: i64,
@@ -157,15 +157,15 @@ impl OfferStore {
     }
 
     /// Get an offer record by offer_id (for verify-execution).
-    pub fn get_by_id(&self, offer_id: i64) -> Option<&OfferRecord> {
+    pub fn by_id(&self, offer_id: i64) -> Option<&OfferRecord> {
         self.by_id
             .get(&offer_id)
             .and_then(|key| self.offers.get(key))
     }
 
     /// Get a LedgerEntry by offer_id (for verify-execution / snapshot closures).
-    pub fn get_ledger_entry_by_id(&self, offer_id: i64) -> Option<LedgerEntry> {
-        self.get_by_id(offer_id).map(|r| r.to_ledger_entry())
+    pub fn ledger_entry_by_id(&self, offer_id: i64) -> Option<LedgerEntry> {
+        self.by_id(offer_id).map(|r| r.to_ledger_entry())
     }
 
     /// Check if an offer exists.
@@ -293,7 +293,7 @@ impl OfferStore {
     pub fn best_offer(&self, buying: &Asset, selling: &Asset) -> Option<&OfferEntry> {
         self.order_book
             .best_offer_key(buying, selling)
-            .and_then(|key| self.get_offer(&key))
+            .and_then(|key| self.offer(&key))
     }
 
     /// Best offer with a filter predicate.
@@ -330,14 +330,14 @@ impl OfferStore {
     pub fn offers_for_asset_pair(&self, buying: &Asset, selling: &Asset) -> Vec<OfferEntry> {
         self.order_book
             .offers_for_pair(buying, selling)
-            .filter_map(|key| self.get_offer(key).cloned())
+            .filter_map(|key| self.offer(key).cloned())
             .collect()
     }
 
     // ==================== Account+Asset Queries ====================
 
     /// Get all offers by account and asset (from secondary index).
-    pub fn get_offers_by_account_and_asset(
+    pub fn offers_by_account_and_asset(
         &self,
         account_id: &AccountId,
         asset: &Asset,

@@ -51,7 +51,7 @@ pub(crate) fn execute_change_trust(
 
     // Check not trusting self
     if let Some(asset) = &maybe_asset {
-        let issuer = get_asset_issuer(asset);
+        let issuer = asset_issuer(asset);
         if let Some(issuer_id) = issuer {
             if source == &issuer_id {
                 return Ok(make_result(ChangeTrustResultCode::Malformed));
@@ -63,7 +63,7 @@ pub(crate) fn execute_change_trust(
     require_source_account(state, source)?;
 
     // Get existing trustline if any
-    let existing = state.get_trustline_by_trustline_asset(source, &tl_asset);
+    let existing = state.trustline_by_trustline_asset(source, &tl_asset);
 
     if op.limit == 0 {
         // Removing trustline
@@ -87,15 +87,15 @@ pub(crate) fn execute_change_trust(
 
         if !is_pool_share {
             let asset = maybe_asset.as_ref().expect("asset must exist");
-            let issuer = get_asset_issuer(asset);
+            let issuer = asset_issuer(asset);
             if let Some(issuer_id) = issuer {
-                if state.get_account(&issuer_id).is_none() {
+                if state.account(&issuer_id).is_none() {
                     return Ok(make_result(ChangeTrustResultCode::NoIssuer));
                 }
             }
         }
 
-        if let Some(tl) = state.get_trustline_by_trustline_asset_mut(source, &tl_asset) {
+        if let Some(tl) = state.trustline_by_trustline_asset_mut(source, &tl_asset) {
             tl.limit = op.limit;
         }
     } else {
@@ -127,7 +127,7 @@ fn remove_trustline(
     multiplier: i64,
     state: &mut LedgerStateManager,
 ) -> Result<Option<OperationResult>> {
-    let Some(tl) = state.get_trustline_by_trustline_asset(source, tl_asset) else {
+    let Some(tl) = state.trustline_by_trustline_asset(source, tl_asset) else {
         return Ok(Some(make_result(ChangeTrustResultCode::InvalidLimit)));
     };
     if tl.balance > 0 {
@@ -162,7 +162,7 @@ fn remove_trustline(
 
     // Decrease sub-entries BEFORE deleting trustline.
     // stellar-core records account STATE/UPDATED before trustline STATE/REMOVED.
-    if let Some(account) = state.get_account_mut(source) {
+    if let Some(account) = state.account_mut(source) {
         // stellar-core: panics on underflow (invalid account state)
         dec_sub_entries(account, multiplier as u32);
     }
@@ -194,9 +194,9 @@ fn create_trustline(
         increment_pool_use_counts(state, source, params)?;
     } else {
         let asset = maybe_asset.expect("asset must exist");
-        let issuer = get_asset_issuer(asset);
+        let issuer = asset_issuer(asset);
         if let Some(issuer_id) = issuer {
-            if state.get_account(&issuer_id).is_none() {
+            if state.account(&issuer_id).is_none() {
                 return Ok(Some(make_result(ChangeTrustResultCode::NoIssuer)));
             }
         }
@@ -221,7 +221,7 @@ fn create_trustline(
     let sponsor = state.active_sponsor_for(source);
     if let Some(sponsor) = &sponsor {
         let sponsor_account = state
-            .get_account(sponsor)
+            .account(sponsor)
             .ok_or(TxError::SourceAccountNotFound)?;
         let new_min_balance = state.minimum_balance_for_account_with_deltas(
             sponsor_account,
@@ -270,7 +270,7 @@ fn create_trustline(
         manage_pool_on_new_trustline(state, tl_asset, params);
     }
 
-    if let Some(account) = state.get_account_mut(source) {
+    if let Some(account) = state.account_mut(source) {
         inc_sub_entries(account, multiplier as u32);
     }
     Ok(None)
@@ -304,7 +304,7 @@ fn change_trust_asset_to_trust_line_asset(
     }
 }
 
-fn get_asset_issuer(asset: &Asset) -> Option<AccountId> {
+fn asset_issuer(asset: &Asset) -> Option<AccountId> {
     match asset {
         Asset::Native => None,
         Asset::CreditAlphanum4(a) => Some(a.issuer.clone()),
@@ -316,11 +316,11 @@ fn build_trustline_flags(asset: Option<&Asset>, state: &LedgerStateManager) -> u
     let Some(asset) = asset else {
         return 0;
     };
-    let issuer = match get_asset_issuer(asset) {
+    let issuer = match asset_issuer(asset) {
         Some(issuer_id) => issuer_id,
         None => return 0,
     };
-    let Some(issuer_account) = state.get_account(&issuer) else {
+    let Some(issuer_account) = state.account(&issuer) else {
         return 0;
     };
     let mut flags = 0;
@@ -353,13 +353,13 @@ fn validate_pool_asset_trustline(
     if matches!(asset, Asset::Native) {
         return Ok(());
     }
-    if let Some(issuer) = get_asset_issuer(asset) {
+    if let Some(issuer) = asset_issuer(asset) {
         if &issuer == source {
             return Ok(());
         }
     }
     let trustline = state
-        .get_trustline(source, asset)
+        .trustline(source, asset)
         .ok_or(ChangeTrustResultCode::TrustLineMissing)?;
     if !is_authorized_to_maintain_liabilities(trustline.flags) {
         return Err(ChangeTrustResultCode::NotAuthMaintainLiabilities);
@@ -399,13 +399,13 @@ fn adjust_pool_use_count(
     if matches!(asset, Asset::Native) {
         return Ok(());
     }
-    if let Some(issuer) = get_asset_issuer(asset) {
+    if let Some(issuer) = asset_issuer(asset) {
         if &issuer == source {
             return Ok(());
         }
     }
     let trustline = state
-        .get_trustline_mut(source, asset)
+        .trustline_mut(source, asset)
         .ok_or_else(|| TxError::Internal("missing trustline".into()))?;
     let v2 = ensure_trustline_ext_v2(trustline);
     let new_count = v2.liquidity_pool_use_count.checked_add(delta);
@@ -481,7 +481,7 @@ fn manage_pool_on_new_trustline(
         _ => return,
     };
 
-    if let Some(pool) = state.get_liquidity_pool_mut(&pool_id) {
+    if let Some(pool) = state.liquidity_pool_mut(&pool_id) {
         let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
         cp.pool_shares_trust_line_count += 1;
         return;
@@ -514,7 +514,7 @@ fn manage_pool_on_deleted_trustline(
 
     // First, check if pool exists and get/decrement the count
     let should_delete = {
-        let Some(pool) = state.get_liquidity_pool_mut(&pool_id) else {
+        let Some(pool) = state.liquidity_pool_mut(&pool_id) else {
             return false;
         };
         let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
@@ -666,7 +666,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify sub-entries increased
-        assert_eq!(state.get_account(&source_id).unwrap().num_sub_entries, 1);
+        assert_eq!(state.account(&source_id).unwrap().num_sub_entries, 1);
     }
 
     #[test]
@@ -782,7 +782,7 @@ mod tests {
             1_000,
             TrustLineFlags::AuthorizedFlag as u32,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         let offer = ManageSellOfferOp {
             selling: Asset::Native,
@@ -881,7 +881,7 @@ mod tests {
             1_000,
             TrustLineFlags::AuthorizedFlag as u32,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         let op = ChangeTrustOp {
             line: ChangeTrustAsset::CreditAlphanum4(asset),
@@ -921,7 +921,7 @@ mod tests {
             ext: TrustLineEntryExt::V0,
         };
         state.create_trustline(trustline);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         let op = ChangeTrustOp {
             line: ChangeTrustAsset::CreditAlphanum4(asset),
@@ -964,7 +964,7 @@ mod tests {
         let result = execute_change_trust(&op, &source_id, &mut state, &context);
         assert!(result.is_ok());
 
-        let trustline = state.get_trustline(&source_id, &Asset::CreditAlphanum4(asset));
+        let trustline = state.trustline(&source_id, &Asset::CreditAlphanum4(asset));
         assert!(trustline.is_some());
         let flags = trustline.unwrap().flags;
         assert!(flags & TrustLineFlags::AuthorizedFlag as u32 != 0);
@@ -1015,7 +1015,7 @@ mod tests {
         };
         state.create_trustline(trustline_a);
         state.create_trustline(trustline_b);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 2;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 2;
 
         let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
             LiquidityPoolConstantProductParameters {
@@ -1033,10 +1033,10 @@ mod tests {
         let result = execute_change_trust(&op, &source_id, &mut state, &context);
         assert!(result.is_ok());
 
-        let pool = state.get_liquidity_pool(&pool_id);
+        let pool = state.liquidity_pool(&pool_id);
         assert!(pool.is_some());
         let tl_asset = TrustLineAsset::PoolShare(pool_id.clone());
-        let trustline = state.get_trustline_by_trustline_asset(&source_id, &tl_asset);
+        let trustline = state.trustline_by_trustline_asset(&source_id, &tl_asset);
         assert!(trustline.is_some());
     }
 
@@ -1063,7 +1063,7 @@ mod tests {
             1,
         );
         state.create_trustline(trustline);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         let op = ChangeTrustOp {
             line: ChangeTrustAsset::CreditAlphanum4(asset),
@@ -1124,7 +1124,7 @@ mod tests {
         );
         state.create_trustline(tl_a);
         state.create_trustline(tl_b);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 2;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 2;
 
         let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
             LiquidityPoolConstantProductParameters {
@@ -1141,8 +1141,8 @@ mod tests {
         let result = execute_change_trust(&op, &source_id, &mut state, &context);
         assert!(result.is_ok());
 
-        let tl_a_after = state.get_trustline(&source_id, &asset_a).unwrap();
-        let tl_b_after = state.get_trustline(&source_id, &asset_b).unwrap();
+        let tl_a_after = state.trustline(&source_id, &asset_a).unwrap();
+        let tl_b_after = state.trustline(&source_id, &asset_b).unwrap();
         assert_eq!(liquidity_pool_use_count(tl_a_after), 1);
         assert_eq!(liquidity_pool_use_count(tl_b_after), 1);
     }
@@ -1198,7 +1198,7 @@ mod tests {
         );
         state.create_trustline(tl_a);
         state.create_trustline(tl_b);
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 2;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 2;
 
         // Create pool share trustline (this creates the pool with trust_line_count=1)
         let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
@@ -1218,7 +1218,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify pool exists with trust_line_count=1
-        let pool = state.get_liquidity_pool(&pool_id);
+        let pool = state.liquidity_pool(&pool_id);
         assert!(pool.is_some(), "Pool should exist after creating trustline");
         let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool.unwrap().body;
         assert_eq!(
@@ -1236,7 +1236,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify pool is deleted (trust_line_count reached 0)
-        let pool_after = state.get_liquidity_pool(&pool_id);
+        let pool_after = state.liquidity_pool(&pool_id);
         assert!(
             pool_after.is_none(),
             "Pool should be deleted when last trustline is removed"
@@ -1244,7 +1244,7 @@ mod tests {
 
         // Verify the pool share trustline is also gone
         let tl_asset = TrustLineAsset::PoolShare(pool_id);
-        let trustline_after = state.get_trustline_by_trustline_asset(&source_id, &tl_asset);
+        let trustline_after = state.trustline_by_trustline_asset(&source_id, &tl_asset);
         assert!(
             trustline_after.is_none(),
             "Pool share trustline should be deleted"
@@ -1306,7 +1306,7 @@ mod tests {
 
         // Set up source account with num_sub_entries and num_sponsored
         {
-            let source_account = state.get_account_mut(&source_id).unwrap();
+            let source_account = state.account_mut(&source_id).unwrap();
             source_account.num_sub_entries = 1;
             source_account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
                 liabilities: Liabilities {
@@ -1331,7 +1331,7 @@ mod tests {
 
         // Verify initial state
         assert_eq!(state.entry_sponsor(&ledger_key).as_ref(), Some(&sponsor_id));
-        let sponsor_before = state.get_account(&sponsor_id).unwrap();
+        let sponsor_before = state.account(&sponsor_id).unwrap();
         let sponsor_ext = match &sponsor_before.ext {
             AccountEntryExt::V1(v1) => match &v1.ext {
                 AccountEntryExtensionV1Ext::V2(v2) => v2,
@@ -1351,11 +1351,11 @@ mod tests {
         assert!(result.is_ok(), "ChangeTrust delete should succeed");
 
         // Verify trustline is deleted
-        let trustline_after = state.get_trustline_by_trustline_asset(&source_id, &tl_asset);
+        let trustline_after = state.trustline_by_trustline_asset(&source_id, &tl_asset);
         assert!(trustline_after.is_none(), "Trustline should be deleted");
 
         // Verify sponsor's num_sponsoring was decremented
-        let sponsor_after = state.get_account(&sponsor_id).unwrap();
+        let sponsor_after = state.account(&sponsor_id).unwrap();
         let sponsor_ext_after = match &sponsor_after.ext {
             AccountEntryExt::V1(v1) => match &v1.ext {
                 AccountEntryExtensionV1Ext::V2(v2) => v2,
@@ -1369,7 +1369,7 @@ mod tests {
         );
 
         // Verify source's num_sponsored was decremented
-        let source_after = state.get_account(&source_id).unwrap();
+        let source_after = state.account(&source_id).unwrap();
         let source_ext_after = match &source_after.ext {
             AccountEntryExt::V1(v1) => match &v1.ext {
                 AccountEntryExtensionV1Ext::V2(v2) => v2,
@@ -1428,7 +1428,7 @@ mod tests {
 
         // Verify num_sub_entries was not changed
         assert_eq!(
-            state.get_account(&source_id).unwrap().num_sub_entries,
+            state.account(&source_id).unwrap().num_sub_entries,
             1000,
             "num_sub_entries should remain unchanged"
         );
@@ -1496,7 +1496,7 @@ mod tests {
         }
 
         // Verify trustline was created
-        assert_eq!(state.get_account(&source_id).unwrap().num_sub_entries, 1);
+        assert_eq!(state.account(&source_id).unwrap().num_sub_entries, 1);
     }
 
     /// Test ChangeTrust update existing trustline with issuer that was deleted.
@@ -1530,7 +1530,7 @@ mod tests {
             1_000,
             TrustLineFlags::AuthorizedFlag as u32,
         ));
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         // Delete the issuer
         state.delete_account(&issuer_id);
@@ -1851,7 +1851,7 @@ mod tests {
             flags: TrustLineFlags::AuthorizedFlag as u32,
             ext: TrustLineEntryExt::V0,
         });
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 1;
 
         let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
             LiquidityPoolConstantProductParameters {
@@ -1927,7 +1927,7 @@ mod tests {
             flags: 0, // Not authorized
             ext: TrustLineEntryExt::V0,
         });
-        state.get_account_mut(&source_id).unwrap().num_sub_entries += 2;
+        state.account_mut(&source_id).unwrap().num_sub_entries += 2;
 
         let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
             LiquidityPoolConstantProductParameters {

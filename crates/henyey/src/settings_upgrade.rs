@@ -42,7 +42,7 @@ fn single_operation(body: OperationBody) -> VecM<Operation, 100> {
     .unwrap()
 }
 
-/// Outputs of `get_create_tx` needed by `get_invoke_tx`.
+/// Outputs of `create_tx` needed by `invoke_tx`.
 struct ContractDeployment {
     /// The contract code ledger key (for the WASM upload entry).
     code_key: LedgerKey,
@@ -81,7 +81,7 @@ fn build_soroban_envelope(
 /// Build the WASM restore transaction (tx 1 of 4).
 ///
 /// Restores the contract code ledger entry in case it has been archived.
-fn get_wasm_restore_tx(
+fn wasm_restore_tx(
     public_key: &Uint256,
     seq_num: i64,
     add_resource_fee: i64,
@@ -122,7 +122,7 @@ fn get_wasm_restore_tx(
 }
 
 /// Build the WASM upload transaction (tx 2 of 4).
-fn get_upload_tx(public_key: &Uint256, seq_num: i64) -> (TransactionEnvelope, LedgerKey) {
+fn upload_tx(public_key: &Uint256, seq_num: i64) -> (TransactionEnvelope, LedgerKey) {
     let wasm = WRITE_BYTES_WASM.to_vec();
     let wasm_hash = sha256(&wasm);
 
@@ -162,7 +162,7 @@ fn get_upload_tx(public_key: &Uint256, seq_num: i64) -> (TransactionEnvelope, Le
 }
 
 /// Build the contract creation transaction (tx 3 of 4).
-fn get_create_tx(
+fn create_tx(
     public_key: &Uint256,
     contract_code_key: &LedgerKey,
     network_passphrase: &str,
@@ -262,7 +262,7 @@ fn get_create_tx(
 }
 
 /// Build the invoke transaction (tx 4 of 4).
-fn get_invoke_tx(
+fn invoke_tx(
     public_key: &Uint256,
     deployment: &ContractDeployment,
     upgrade_set: &ConfigUpgradeSet,
@@ -423,12 +423,12 @@ pub fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
 
     // Build the 4 transactions
     let (mut restore_tx, _restore_key) =
-        get_wasm_restore_tx(&public_key, params.seq_num + 1, params.add_resource_fee);
+        wasm_restore_tx(&public_key, params.seq_num + 1, params.add_resource_fee);
 
     // Note: stellar-core passes 0 for addResourceFee to getUploadTx
-    let (mut upload_tx, contract_code_key) = get_upload_tx(&public_key, params.seq_num + 2);
+    let (mut upload_tx, contract_code_key) = upload_tx(&public_key, params.seq_num + 2);
 
-    let (mut create_tx, deployment) = get_create_tx(
+    let (mut create_tx, deployment) = create_tx(
         &public_key,
         &contract_code_key,
         params.network_passphrase,
@@ -436,7 +436,7 @@ pub fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
         params.add_resource_fee,
     );
 
-    let (mut invoke_tx, upgrade_set_key) = get_invoke_tx(
+    let (mut invoke_tx, upgrade_set_key) = invoke_tx(
         &public_key,
         &deployment,
         &upgrade_set,

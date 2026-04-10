@@ -204,13 +204,13 @@ pub enum HistoryWorkStage {
 /// Progress indicator for history work execution.
 ///
 /// This struct provides a snapshot of the current work stage and a
-/// human-readable status message. Use [`get_progress`] to retrieve
+/// human-readable status message. Use [`progress`] to retrieve
 /// the current progress from shared state.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// let progress = get_progress(&state).await;
+/// let progress = progress(&state).await;
 /// if let Some(stage) = progress.stage {
 ///     println!("Stage: {:?}, Status: {}", stage, progress.message);
 /// }
@@ -241,7 +241,7 @@ async fn set_progress(state: &SharedHistoryState, stage: HistoryWorkStage, messa
 ///
 /// This function never fails and returns default progress if no work
 /// has started yet.
-pub async fn get_progress(state: &SharedHistoryState) -> HistoryWorkProgress {
+pub async fn progress(state: &SharedHistoryState) -> HistoryWorkProgress {
     let guard = state.lock().await;
     guard.progress.clone()
 }

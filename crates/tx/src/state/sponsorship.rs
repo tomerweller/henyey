@@ -63,7 +63,7 @@ impl LedgerStateManager {
 
     /// Return the sponsor for a ledger entry, if any.
     pub fn entry_sponsor(&self, key: &LedgerKey) -> Option<AccountId> {
-        self.get_entry_sponsorship(key)
+        self.entry_sponsorship(key)
     }
 
     fn snapshot_entry_sponsorship_ext(&mut self, key: &LedgerKey) {
@@ -76,7 +76,7 @@ impl LedgerStateManager {
     fn snapshot_entry_sponsorship_metadata(&mut self, key: &LedgerKey) {
         if !self.entry_sponsorship_snapshots.contains_key(key) {
             self.entry_sponsorship_snapshots
-                .insert(key.clone(), self.get_entry_sponsorship(key));
+                .insert(key.clone(), self.entry_sponsorship(key));
         }
         self.snapshot_entry_sponsorship_ext(key);
     }
@@ -211,7 +211,7 @@ impl LedgerStateManager {
     pub fn update_num_sponsoring(&mut self, account_id: &AccountId, delta: i64) -> Result<()> {
         self.ensure_account_loaded(account_id)?;
         let account = self
-            .get_account_mut(account_id)
+            .account_mut(account_id)
             .ok_or(TxError::SourceAccountNotFound)?;
         let ext = ensure_account_ext_v2(account);
         let updated = ext.num_sponsoring as i64 + delta;
@@ -228,7 +228,7 @@ impl LedgerStateManager {
     pub fn update_num_sponsored(&mut self, account_id: &AccountId, delta: i64) -> Result<()> {
         self.ensure_account_loaded(account_id)?;
         let account = self
-            .get_account_mut(account_id)
+            .account_mut(account_id)
             .ok_or(TxError::SourceAccountNotFound)?;
         let ext = ensure_account_ext_v2(account);
         let updated = ext.num_sponsored as i64 + delta;
@@ -241,7 +241,7 @@ impl LedgerStateManager {
 
     /// Get sponsorship counts (num_sponsoring, num_sponsored) for an account.
     pub fn sponsorship_counts_for_account(&self, account_id: &AccountId) -> Option<(i64, i64)> {
-        self.get_account(account_id).map(sponsorship_counts)
+        self.account(account_id).map(sponsorship_counts)
     }
 
     /// Remove a one-time (pre-auth TX) signer from all source accounts in a transaction.
@@ -296,7 +296,7 @@ impl LedgerStateManager {
         signer_key: &stellar_xdr::curr::SignerKey,
     ) -> bool {
         // Get mutable access to the account
-        let Some(account) = self.get_account_mut(account_id) else {
+        let Some(account) = self.account_mut(account_id) else {
             return false; // Account may have been removed (e.g., by merge)
         };
 
@@ -330,7 +330,7 @@ impl LedgerStateManager {
     /// and updating the sponsor's `num_sponsoring` count.
     fn remove_signer_sponsorship(&mut self, account_id: &AccountId, signer_index: usize) {
         // Get the account to check for sponsorship
-        let Some(account) = self.get_account(account_id) else {
+        let Some(account) = self.account(account_id) else {
             return;
         };
 
@@ -370,7 +370,7 @@ impl LedgerStateManager {
             }
 
             // Remove the sponsorship entry from signer_sponsoring_i_ds
-            if let Some(account) = self.get_account_mut(account_id) {
+            if let Some(account) = self.account_mut(account_id) {
                 if let AccountEntryExt::V1(v1) = &mut account.ext {
                     if let AccountEntryExtensionV1Ext::V2(v2) = &mut v1.ext {
                         if signer_index < v2.signer_sponsoring_i_ds.len() {

@@ -474,7 +474,7 @@ impl Herder {
     /// - ledger 1..63  → checkpoint starts at 1 (first checkpoint is size 63)
     /// - ledger 64..127 → checkpoint starts at 64
     /// - ledger 128..191 → checkpoint starts at 128
-    pub fn get_most_recent_checkpoint_seq(&self) -> u64 {
+    pub fn most_recent_checkpoint_seq(&self) -> u64 {
         let tracking_consensus_index = self.tracking_slot().saturating_sub(1);
         let freq = self.config.checkpoint_frequency;
         // checkpointContainingLedger: ((ledger / freq + 1) * freq) - 1
@@ -493,7 +493,7 @@ impl Herder {
     ///
     /// Messages for slots below this value can be safely dropped from queues.
     /// Matches upstream `HerderImpl::getMinLedgerSeqToRemember()`.
-    pub fn get_min_ledger_seq_to_remember(&self) -> u64 {
+    pub fn min_ledger_seq_to_remember(&self) -> u64 {
         let current_slot = self.tracking_slot();
         if current_slot > MAX_SLOTS_TO_REMEMBER {
             current_slot - MAX_SLOTS_TO_REMEMBER + 1
@@ -503,7 +503,7 @@ impl Herder {
     }
 
     /// Compute the minimum ledger sequence to ask peers for SCP state.
-    pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
+    pub fn min_ledger_seq_to_ask_peers(&self) -> u32 {
         let lcl = self
             .ledger_manager
             .read()
@@ -577,7 +577,7 @@ impl Herder {
             .store_quorum_set(node_id, quorum_set.clone());
         let mut tracker = self.quorum_tracker.write();
         if !tracker.expand(node_id, quorum_set.clone()) {
-            if let Err(err) = tracker.rebuild(|id| self.scp_driver.get_quorum_set(id)) {
+            if let Err(err) = tracker.rebuild(|id| self.scp_driver.quorum_set(id)) {
                 warn!(error = %err, "Failed to rebuild quorum tracker");
             }
         }
@@ -590,8 +590,8 @@ impl Herder {
     }
 
     /// Get a quorum set by hash if available.
-    pub fn get_quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
-        self.scp_driver.get_quorum_set_by_hash(hash)
+    pub fn quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
+        self.scp_driver.quorum_set_by_hash(hash)
     }
 
     /// Whether we already have a quorum set with the given hash.
@@ -611,14 +611,14 @@ impl Herder {
     }
 
     /// Get the node IDs that are waiting for a quorum set with the given hash.
-    pub fn get_pending_quorum_set_node_ids(&self, hash: &Hash256) -> Vec<NodeId> {
-        self.scp_driver.get_pending_quorum_set_node_ids(hash)
+    pub fn pending_quorum_set_node_ids(&self, hash: &Hash256) -> Vec<NodeId> {
+        self.scp_driver.pending_quorum_set_node_ids(hash)
     }
 
     /// Check whether we've heard from quorum for a slot.
     pub fn heard_from_quorum(&self, slot: SlotIndex) -> bool {
         let tracker = self.slot_quorum_tracker.read();
-        tracker.has_quorum(slot, |node_id| self.scp_driver.get_quorum_set(node_id))
+        tracker.has_quorum(slot, |node_id| self.scp_driver.quorum_set(node_id))
     }
 
     /// Check whether we have a v-blocking set for a slot.
@@ -627,8 +627,8 @@ impl Herder {
     }
 
     /// Get all slots that have achieved v-blocking status, sorted descending.
-    pub fn get_v_blocking_slots(&self) -> Vec<SlotIndex> {
-        self.slot_quorum_tracker.read().get_v_blocking_slots()
+    pub fn v_blocking_slots(&self) -> Vec<SlotIndex> {
+        self.slot_quorum_tracker.read().v_blocking_slots()
     }
 
     /// Perform out-of-sync recovery by purging old slots.
@@ -886,7 +886,7 @@ impl Herder {
             return EnvelopeState::Invalid;
         }
 
-        let checkpoint = self.get_most_recent_checkpoint_seq();
+        let checkpoint = self.most_recent_checkpoint_seq();
         let mut max_ledger_seq: u64 = u64::MAX;
 
         if state.is_tracking() {
@@ -1060,7 +1060,7 @@ impl Herder {
         );
 
         // Check if we have the tx sets needed for this envelope.
-        let tx_set_hashes = crate::herder_utils::get_tx_set_hashes_from_envelope(&envelope);
+        let tx_set_hashes = crate::herder_utils::tx_set_hashes_from_envelope(&envelope);
         let mut missing_tx_sets = Vec::new();
         for hash in &tx_set_hashes {
             if !self.scp_driver.has_tx_set(hash) {
@@ -1170,7 +1170,7 @@ impl Herder {
                 }
                 // Check if this slot is now externalized
                 if self.scp.is_slot_externalized(slot) {
-                    if let Some(value) = self.scp.get_externalized_value(slot) {
+                    if let Some(value) = self.scp.externalized_value(slot) {
                         info!(slot, "Slot externalized via SCP consensus");
 
                         // Request the tx_set so we can close this ledger.
@@ -1203,7 +1203,7 @@ impl Herder {
         // Extract close time from the externalized value for tracking
         let close_time = self
             .scp_driver
-            .get_externalized_close_time(externalized_slot)
+            .externalized_close_time(externalized_slot)
             .unwrap_or(0);
 
         let mut ts = self.tracking_state.write();
@@ -1317,7 +1317,7 @@ impl Herder {
         // happens synchronously within self.scp.nominate(). Check if the slot was
         // externalized and advance tracking state accordingly.
         if self.scp_driver.latest_externalized_slot() == Some(slot) {
-            if let Some(ext) = self.scp_driver.get_externalized(slot) {
+            if let Some(ext) = self.scp_driver.externalized(slot) {
                 *self.prev_value.write() = ext.value;
             }
             self.advance_tracking_slot(slot);
@@ -1352,7 +1352,7 @@ impl Herder {
     /// reached and the ledger should be closed.
     pub fn check_ledger_close(&self, slot: SlotIndex) -> Option<LedgerCloseInfo> {
         // Check if we have externalized this slot
-        let externalized = self.scp_driver.get_externalized(slot)?;
+        let externalized = self.scp_driver.externalized(slot)?;
 
         // Parse the StellarValue
         let stellar_value = match StellarValue::from_xdr(&externalized.value, Limits::none()) {
@@ -1365,7 +1365,7 @@ impl Herder {
 
         // Get the transaction set
         let tx_set_hash = Hash256::from_bytes(stellar_value.tx_set_hash.0);
-        let tx_set = self.scp_driver.get_tx_set(&tx_set_hash);
+        let tx_set = self.scp_driver.tx_set(&tx_set_hash);
 
         if tx_set.is_none() {
             // Register this as a pending tx set request
@@ -1472,23 +1472,23 @@ impl Herder {
     }
 
     /// Get the current nomination timeout.
-    pub fn get_nomination_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
-        if let Some(state) = self.scp.get_slot_state(slot) {
+    pub fn nomination_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
+        if let Some(state) = self.scp.slot_state(slot) {
             if state.is_nominating {
-                return Some(self.scp.get_nomination_timeout(state.nomination_round));
+                return Some(self.scp.nomination_timeout(state.nomination_round));
             }
         }
         None
     }
 
     /// Get the current ballot timeout.
-    pub fn get_ballot_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
-        if let Some(state) = self.scp.get_slot_state(slot) {
+    pub fn ballot_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
+        if let Some(state) = self.scp.slot_state(slot) {
             if let Some(round) = state.ballot_round {
                 if state.heard_from_quorum
                     && !matches!(state.ballot_phase, BallotPhase::Externalize)
                 {
-                    return Some(self.scp.get_ballot_timeout(round));
+                    return Some(self.scp.ballot_timeout(round));
                 }
             }
         }
@@ -1683,7 +1683,7 @@ impl Herder {
         let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
         for account in self.tx_queue.pending_accounts() {
             let key = account_key_from_account_id(&account);
-            match snapshot.get_account(&account) {
+            match snapshot.account(&account) {
                 Ok(Some(entry)) => {
                     map.insert(key, entry.seq_num.0);
                 }
@@ -1724,8 +1724,8 @@ impl Herder {
     }
 
     /// Get an externalized value.
-    pub fn get_externalized(&self, slot: u64) -> Option<crate::scp_driver::ExternalizedSlot> {
-        self.scp_driver.get_externalized(slot)
+    pub fn externalized(&self, slot: u64) -> Option<crate::scp_driver::ExternalizedSlot> {
+        self.scp_driver.externalized(slot)
     }
 
     /// Find an externalized slot for a given tx set hash.
@@ -1735,8 +1735,8 @@ impl Herder {
 
     /// Get all externalized slot indices in a range (inclusive).
     /// Returns a sorted list of slots that have been externalized.
-    pub fn get_externalized_slots_in_range(&self, from: u64, to: u64) -> Vec<u64> {
-        self.scp_driver.get_externalized_slots_in_range(from, to)
+    pub fn externalized_slots_in_range(&self, from: u64, to: u64) -> Vec<u64> {
+        self.scp_driver.externalized_slots_in_range(from, to)
     }
 
     /// Find missing (gap) slots in a range that have not been externalized.
@@ -1758,26 +1758,26 @@ impl Herder {
     ///
     /// Returns SCP envelopes for slots starting from `from_slot`, along with
     /// our local quorum set if configured.
-    pub fn get_scp_state(&self, from_slot: u64) -> (Vec<ScpEnvelope>, Option<ScpQuorumSet>) {
-        let envelopes = self.scp.get_scp_state(from_slot);
+    pub fn scp_state(&self, from_slot: u64) -> (Vec<ScpEnvelope>, Option<ScpQuorumSet>) {
+        let envelopes = self.scp.scp_state(from_slot);
 
-        let quorum_set = self.scp_driver.get_local_quorum_set();
+        let quorum_set = self.scp_driver.local_quorum_set();
 
         (envelopes, quorum_set)
     }
 
     /// Get all SCP envelopes recorded for a slot.
-    pub fn get_scp_envelopes(&self, slot: u64) -> Vec<ScpEnvelope> {
-        self.scp.get_slot_envelopes(slot)
+    pub fn scp_envelopes(&self, slot: u64) -> Vec<ScpEnvelope> {
+        self.scp.slot_envelopes(slot)
     }
 
-    pub fn get_slot_state(&self, slot: u64) -> Option<henyey_scp::SlotState> {
-        self.scp.get_slot_state(slot)
+    pub fn slot_state(&self, slot: u64) -> Option<henyey_scp::SlotState> {
+        self.scp.slot_state(slot)
     }
 
     /// Get the local quorum set if configured.
     pub fn local_quorum_set(&self) -> Option<ScpQuorumSet> {
-        self.scp_driver.get_local_quorum_set()
+        self.scp_driver.local_quorum_set()
     }
 
     /// Purge SCP state for slots below the given slot.
@@ -1792,8 +1792,8 @@ impl Herder {
     /// Get the latest SCP messages for a slot.
     ///
     /// Returns envelopes that can be broadcast to peers during recovery.
-    pub fn get_latest_messages(&self, slot: SlotIndex) -> Option<Vec<ScpEnvelope>> {
-        let envelopes = self.scp_driver.get_local_envelopes(slot);
+    pub fn latest_messages(&self, slot: SlotIndex) -> Option<Vec<ScpEnvelope>> {
+        let envelopes = self.scp_driver.local_envelopes(slot);
         if envelopes.is_empty() {
             None
         } else {
@@ -1857,13 +1857,13 @@ impl Herder {
     }
 
     /// Get pending transaction set hashes that need to be fetched from peers.
-    pub fn get_pending_tx_set_hashes(&self) -> Vec<Hash256> {
-        self.scp_driver.get_pending_tx_set_hashes()
+    pub fn pending_tx_set_hashes(&self) -> Vec<Hash256> {
+        self.scp_driver.pending_tx_set_hashes()
     }
 
     /// Get pending transaction sets with their slots.
-    pub fn get_pending_tx_sets(&self) -> Vec<(Hash256, SlotIndex)> {
-        self.scp_driver.get_pending_tx_sets()
+    pub fn pending_tx_sets(&self) -> Vec<(Hash256, SlotIndex)> {
+        self.scp_driver.pending_tx_sets()
     }
 
     /// Clear all pending tx set requests.
@@ -1952,8 +1952,8 @@ impl Herder {
     }
 
     /// Get a cached transaction set by hash.
-    pub fn get_tx_set(&self, hash: &Hash256) -> Option<TransactionSet> {
-        self.scp_driver.get_tx_set(hash)
+    pub fn tx_set(&self, hash: &Hash256) -> Option<TransactionSet> {
+        self.scp_driver.tx_set(hash)
     }
 
     /// Get statistics about the Herder.
@@ -2579,13 +2579,13 @@ mod tests {
         let (herder, secret) = make_validator_herder();
         let slot = 1u64;
 
-        assert!(herder.get_nomination_timeout(slot).is_none());
+        assert!(herder.nomination_timeout(slot).is_none());
 
         let value = make_valid_value_with_cached_tx_set(&herder, &secret);
         let prev_value = value.clone();
         assert!(herder.scp().nominate(slot, value, &prev_value));
 
-        assert!(herder.get_nomination_timeout(slot).is_some());
+        assert!(herder.nomination_timeout(slot).is_some());
     }
 
     #[test]
@@ -2626,7 +2626,7 @@ mod tests {
         let secret = SecretKey::from_seed(&seed);
         let slot = 1u64;
 
-        assert!(herder.get_ballot_timeout(slot).is_none());
+        assert!(herder.ballot_timeout(slot).is_none());
 
         // Create a valid value and start ballot protocol via bump_state
         let value = make_valid_value_with_cached_tx_set(&herder, &secret);
@@ -2634,7 +2634,7 @@ mod tests {
 
         // Ballot started but no quorum heard yet (only local node's PREPARE)
         assert!(
-            herder.get_ballot_timeout(slot).is_none(),
+            herder.ballot_timeout(slot).is_none(),
             "should not have ballot timeout without quorum"
         );
 
@@ -2661,7 +2661,7 @@ mod tests {
         herder.scp().receive_envelope(env);
 
         // Now we should have heard from quorum (local + other = 2, threshold = 2)
-        assert!(herder.get_ballot_timeout(slot).is_some());
+        assert!(herder.ballot_timeout(slot).is_some());
     }
 
     #[test]
@@ -2669,8 +2669,8 @@ mod tests {
         let herder = make_test_herder();
         let slot = 1u64;
 
-        assert!(herder.get_nomination_timeout(slot).is_none());
-        assert!(herder.get_ballot_timeout(slot).is_none());
+        assert!(herder.nomination_timeout(slot).is_none());
+        assert!(herder.ballot_timeout(slot).is_none());
     }
 
     #[test]
@@ -2681,7 +2681,7 @@ mod tests {
         let value = make_valid_value_with_cached_tx_set(&herder, &secret);
         herder.scp().force_externalize(slot, value);
 
-        assert!(herder.get_ballot_timeout(slot).is_none());
+        assert!(herder.ballot_timeout(slot).is_none());
     }
 
     // =========================================================================
@@ -2727,23 +2727,23 @@ mod tests {
 
         // Default tracking_slot is 0, so tracking_consensus_index = 0
         // first checkpoint: ((0/64 + 1) * 64) - 1 = 63, size = 63, first = 1
-        assert_eq!(herder.get_most_recent_checkpoint_seq(), 1);
+        assert_eq!(herder.most_recent_checkpoint_seq(), 1);
 
         // Bootstrap to slot 100 (tracking_slot = 101)
         herder.bootstrap(100);
         // tracking_consensus_index = 100
         // checkpoint containing 100: ((100/64 + 1) * 64) - 1 = 127, size = 64, first = 64
-        assert_eq!(herder.get_most_recent_checkpoint_seq(), 64);
+        assert_eq!(herder.most_recent_checkpoint_seq(), 64);
 
         // Bootstrap to slot 127 (tracking_slot = 128)
         herder.bootstrap(127);
         // checkpoint containing 127: ((127/64 + 1) * 64) - 1 = 127, size = 64, first = 64
-        assert_eq!(herder.get_most_recent_checkpoint_seq(), 64);
+        assert_eq!(herder.most_recent_checkpoint_seq(), 64);
 
         // Bootstrap to slot 129 (tracking_slot = 129, LCL = 128)
         herder.bootstrap(129);
         // checkpoint containing 128: ((128/64 + 1) * 64) - 1 = 191, size = 64, first = 128
-        assert_eq!(herder.get_most_recent_checkpoint_seq(), 128);
+        assert_eq!(herder.most_recent_checkpoint_seq(), 128);
     }
 
     #[test]
@@ -2863,7 +2863,7 @@ mod tests {
 
         // For a solo validator (1-of-1 quorum), nomination→ballot→externalization
         // happens synchronously. The externalized value should contain the upgrades.
-        let externalized = herder.scp_driver.get_externalized(2);
+        let externalized = herder.scp_driver.externalized(2);
         assert!(
             externalized.is_some(),
             "Slot 2 should be externalized for solo validator"
@@ -2954,7 +2954,7 @@ mod tests {
             result.err()
         );
 
-        let externalized = herder.scp_driver.get_externalized(2);
+        let externalized = herder.scp_driver.externalized(2);
         assert!(externalized.is_some(), "slot 2 should be externalized");
 
         let ext = externalized.unwrap();

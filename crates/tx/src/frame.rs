@@ -1043,7 +1043,7 @@ mod tests {
         let resources = frame.resources(false, 25);
 
         assert_eq!(resources.size(), 1);
-        assert_eq!(resources.get_val(ResourceType::Operations), 1);
+        assert_eq!(resources.val(ResourceType::Operations), 1);
     }
 
     #[test]
@@ -1053,12 +1053,12 @@ mod tests {
         let resources = frame.resources(false, 25);
 
         assert_eq!(resources.size(), 7);
-        assert_eq!(resources.get_val(ResourceType::Operations), 1);
-        assert_eq!(resources.get_val(ResourceType::Instructions), 100);
-        assert_eq!(resources.get_val(ResourceType::DiskReadBytes), 55);
-        assert_eq!(resources.get_val(ResourceType::WriteBytes), 21);
-        assert_eq!(resources.get_val(ResourceType::ReadLedgerEntries), 3);
-        assert_eq!(resources.get_val(ResourceType::WriteLedgerEntries), 1);
+        assert_eq!(resources.val(ResourceType::Operations), 1);
+        assert_eq!(resources.val(ResourceType::Instructions), 100);
+        assert_eq!(resources.val(ResourceType::DiskReadBytes), 55);
+        assert_eq!(resources.val(ResourceType::WriteBytes), 21);
+        assert_eq!(resources.val(ResourceType::ReadLedgerEntries), 3);
+        assert_eq!(resources.val(ResourceType::WriteLedgerEntries), 1);
     }
 
     #[test]

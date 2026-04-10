@@ -43,8 +43,8 @@
 use crate::{
     bucket_list::BUCKET_LIST_LEVELS,
     entry::{
-        get_ttl_key, is_soroban_entry, is_temporary_entry, is_ttl_expired, ledger_entry_data_type,
-        ledger_key_type,
+        is_soroban_entry, is_temporary_entry, is_ttl_expired, ledger_entry_data_type,
+        ledger_key_type, ttl_key,
     },
     eviction::{
         update_starting_eviction_iterator, EvictionCandidate, EvictionIterator,
@@ -121,17 +121,17 @@ impl BucketSnapshot {
     ///
     /// Unlike [`get`](Self::get) which swallows errors, this method returns
     /// a `Result` so callers can handle I/O or deserialization failures.
-    pub fn get_result(&self, key: &LedgerKey) -> crate::Result<Option<BucketEntry>> {
+    pub fn result(&self, key: &LedgerKey) -> crate::Result<Option<BucketEntry>> {
         self.bucket.get(key)
     }
 
     /// Gets an entry using pre-serialized key bytes, propagating errors.
-    pub fn get_result_by_key_bytes(
+    pub fn result_by_key_bytes(
         &self,
         key: &LedgerKey,
         key_bytes: &[u8],
     ) -> crate::Result<Option<BucketEntry>> {
-        self.bucket.get_by_key_bytes(key, key_bytes)
+        self.bucket.by_key_bytes(key, key_bytes)
     }
 
     /// Returns a reference to the underlying bucket.
@@ -393,7 +393,7 @@ impl BucketListSnapshot {
     /// Returns `None` immediately for OFFER keys (matching stellar-core's
     /// `LiveBucketIndex::typeNotSupported`).
     pub fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
-        self.get_result(key).ok().flatten()
+        self.result(key).ok().flatten()
     }
 
     /// Looks up an entry by key in this snapshot, propagating errors.
@@ -403,7 +403,7 @@ impl BucketListSnapshot {
     /// Per-bucket caches inside each DiskBucket handle caching transparently.
     ///
     /// Returns `Ok(None)` immediately for OFFER keys.
-    pub fn get_result(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
+    pub fn result(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
         if LiveBucketIndex::type_not_supported(ledger_key_type(key)) {
             return Ok(None);
         }
@@ -414,7 +414,7 @@ impl BucketListSnapshot {
         })?;
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
-                if let Some(entry) = bucket.get_result_by_key_bytes(key, &key_bytes)? {
+                if let Some(entry) = bucket.result_by_key_bytes(key, &key_bytes)? {
                     match entry {
                         BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => {
                             return Ok(Some(e))
@@ -475,7 +475,7 @@ impl BucketListSnapshot {
                     if bucket_err.is_some() {
                         return true;
                     }
-                    match bucket.get_result_by_key_bytes(key, key_bytes) {
+                    match bucket.result_by_key_bytes(key, key_bytes) {
                         Ok(Some(entry)) => match entry {
                             BucketEntry::Liveentry(ref e) | BucketEntry::Initentry(ref e) => {
                                 result.push(e.clone());
@@ -615,7 +615,7 @@ impl BucketListSnapshot {
     /// Returns (entries_scanned, bytes_used, finished_bucket).
     ///
     /// This is the snapshot-based equivalent of [`BucketList::scan_bucket_region`].
-    /// Uses `self.get_result()` for TTL and entry lookups instead of `BucketList::get()`.
+    /// Uses `self.result()` for TTL and entry lookups instead of `BucketList::get()`.
     fn scan_bucket_region(
         &self,
         bucket: &Bucket,
@@ -663,12 +663,12 @@ impl BucketListSnapshot {
                     break 'process;
                 }
 
-                let Some(ttl_key) = get_ttl_key(&key) else {
+                let Some(ttl_key) = ttl_key(&key) else {
                     break 'process;
                 };
 
                 // Look up TTL entry from the snapshot (instead of BucketList::get)
-                let Some(ttl_entry) = self.get_result(&ttl_key)? else {
+                let Some(ttl_entry) = self.result(&ttl_key)? else {
                     break 'process;
                 };
 
@@ -684,7 +684,7 @@ impl BucketListSnapshot {
                 // For persistent entries, archive the NEWEST version from the snapshot.
                 let is_temp = is_temporary_entry(live_entry);
                 let entry_for_candidate = if !is_temp {
-                    if let Some(newest_entry) = self.get_result(&key)? {
+                    if let Some(newest_entry) = self.result(&key)? {
                         newest_entry
                     } else {
                         live_entry.clone()
@@ -852,7 +852,7 @@ impl SearchableBucketListSnapshot {
 
     /// Loads a single entry by key, propagating I/O errors.
     pub fn load_result(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
-        self.snapshot.get_result(key)
+        self.snapshot.result(key)
     }
 
     /// Loads multiple entries by their keys from the current snapshot.
@@ -1940,8 +1940,8 @@ mod tests {
         let snapshot = BucketListSnapshot::new(&bucket_list, make_test_header(1));
         assert!(snapshot.get(&key_a).is_some());
 
-        // Also verify get_result returns the same entry
-        let result = snapshot.get_result(&key_a).unwrap();
+        // Also verify result returns the same entry
+        let result = snapshot.result(&key_a).unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().last_modified_ledger_seq, 1);
 
@@ -1997,14 +1997,14 @@ mod tests {
             "snapshot should not see entry B"
         );
 
-        // Same via get_result
+        // Same via result
         assert!(
-            snapshot.get_result(&key_a).unwrap().is_some(),
-            "get_result should still return entry A"
+            snapshot.result(&key_a).unwrap().is_some(),
+            "result should still return entry A"
         );
         assert!(
-            snapshot.get_result(&key_b).unwrap().is_none(),
-            "get_result should not return entry B"
+            snapshot.result(&key_b).unwrap().is_none(),
+            "result should not return entry B"
         );
     }
 }

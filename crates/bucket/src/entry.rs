@@ -30,7 +30,7 @@
 //! - [`is_soroban_entry`]: Check if an entry is ContractData or ContractCode
 //! - [`is_temporary_entry`]: Check if a ContractData entry is temporary
 //! - [`is_persistent_entry`]: Check if an entry is persistent (archived on eviction)
-//! - [`get_ttl_key`]: Get the TTL key for a Soroban entry
+//! - [`ttl_key`]: Get the TTL key for a Soroban entry
 //! - [`is_ttl_expired`]: Check if a TTL entry has expired
 
 use std::cmp::Ordering;
@@ -278,7 +278,7 @@ pub fn is_persistent_key(key: &LedgerKey) -> bool {
 ///
 /// - `Some(LedgerKey::Ttl)` with the key hash for Soroban entries
 /// - `None` for non-Soroban entries (they don't have TTL)
-pub fn get_ttl_key(key: &LedgerKey) -> Option<LedgerKey> {
+pub fn ttl_key(key: &LedgerKey) -> Option<LedgerKey> {
     if !is_soroban_key(key) {
         return None;
     }
@@ -302,13 +302,13 @@ pub fn get_ttl_key(key: &LedgerKey) -> Option<LedgerKey> {
 /// An entry is expired when its `live_until_ledger_seq` is less than the current ledger.
 /// Returns None if the entry is not a TTL entry.
 pub fn is_ttl_expired(ttl_entry: &LedgerEntry, current_ledger: u32) -> Option<bool> {
-    get_ttl_live_until(ttl_entry).map(|live_until| live_until < current_ledger)
+    ttl_live_until(ttl_entry).map(|live_until| live_until < current_ledger)
 }
 
 /// Get the live_until_ledger_seq from a TTL entry.
 ///
 /// Returns None if the entry is not a TTL entry.
-pub fn get_ttl_live_until(ttl_entry: &LedgerEntry) -> Option<u32> {
+pub fn ttl_live_until(ttl_entry: &LedgerEntry) -> Option<u32> {
     if let LedgerEntryData::Ttl(ttl) = &ttl_entry.data {
         Some(ttl.live_until_ledger_seq)
     } else {

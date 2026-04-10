@@ -32,7 +32,7 @@
 //! let test_db = Database::open_in_memory()?;
 //!
 //! // Query the latest ledger
-//! if let Some(seq) = db.get_latest_ledger_seq()? {
+//! if let Some(seq) = db.latest_ledger_seq()? {
 //!     println!("Latest ledger: {}", seq);
 //! }
 //! # Ok::<(), henyey_db::DbError>(())
@@ -52,7 +52,7 @@
 //! let db = Database::open_in_memory()?;
 //! db.with_connection(|conn| {
 //!     // Use trait methods directly on the connection
-//!     let seq = conn.get_latest_ledger_seq()?;
+//!     let seq = conn.latest_ledger_seq()?;
 //!     Ok(seq)
 //! })?;
 //! # Ok::<(), henyey_db::DbError>(())

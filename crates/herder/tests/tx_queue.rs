@@ -209,7 +209,7 @@ fn test_dex_lane_limit_deterministic_selection() {
     queue.try_add(dex_b.clone());
     queue.try_add(classic.clone());
 
-    let set = queue.get_transaction_set(Hash256::ZERO, 10);
+    let set = queue.transaction_set(Hash256::ZERO, 10);
     assert_eq!(set.len(), 2);
 
     let hash_dex_a = full_hash(&dex_a);
@@ -306,7 +306,7 @@ fn test_sequence_gap_blocks_following() {
     queue.try_add(tx_a);
     queue.try_add(tx_b);
 
-    let set = queue.get_transaction_set(Hash256::ZERO, 10);
+    let set = queue.transaction_set(Hash256::ZERO, 10);
     let seqs: Vec<i64> = set
         .transactions
         .iter()
@@ -340,7 +340,7 @@ fn test_duplicate_sequence_prefers_higher_fee() {
     queue.try_add(high);
 
     // Both transactions should be in the set now (different accounts)
-    let set = queue.get_transaction_set(Hash256::ZERO, 10);
+    let set = queue.transaction_set(Hash256::ZERO, 10);
     let hashes: Vec<_> = set.transactions.iter().map(full_hash).collect();
     assert!(hashes.contains(&low_hash));
     assert!(hashes.contains(&high_hash));
@@ -365,7 +365,7 @@ fn test_starting_sequence_excludes_prior() {
     let mut starting = std::collections::HashMap::new();
     starting.insert(account_key_from_envelope(&tx_a), 5);
 
-    let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
+    let set = queue.transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
     let seqs: Vec<i64> = set
         .transactions
         .iter()

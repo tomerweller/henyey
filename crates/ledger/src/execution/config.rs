@@ -19,7 +19,7 @@ pub(crate) fn load_config_setting(
     let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: id,
     });
-    match reader.get_entry(&key)? {
+    match reader.entry(&key)? {
         Some(entry) => {
             if let LedgerEntryData::ConfigSetting(config) = entry.data {
                 Ok(Some(config))
