@@ -1494,6 +1494,9 @@ mod tests {
             crate::connection::ConnectionDirection::Inbound,
         );
 
+        // Simulate the incoming preferred peer's pending reservation.
+        pool.try_reserve();
+
         // Pool is full — normal promotion should fail.
         assert!(!pool.try_promote_to_authenticated());
 
@@ -1536,6 +1539,9 @@ mod tests {
             crate::connection::ConnectionDirection::Inbound,
         );
 
+        // Simulate the incoming preferred peer's pending reservation.
+        pool.try_reserve();
+
         // Eviction should fail — the only authenticated peer is preferred.
         let evicted = OverlayManager::try_evict_non_preferred_for_inbound(&shared, &pool);
         assert!(!evicted, "should not evict when all peers are preferred");
@@ -1568,5 +1574,39 @@ mod tests {
         assert!(!pool.try_promote_to_authenticated());
         // (The caller in handle_accepted_inbound_peer only calls eviction for
         // preferred peers — this test verifies the pool correctly rejects.)
+    }
+
+    /// Outbound non-preferred peers must not be evicted when making room for
+    /// a preferred inbound peer — eviction only considers inbound peers.
+    #[tokio::test]
+    async fn test_audit_055_outbound_peer_not_evicted_for_inbound() {
+        use crate::connection::ConnectionPool;
+
+        let preferred_addr = PeerAddress::new("10.0.0.1", 11625);
+        let shared = test_shared_state(vec![preferred_addr.clone()]);
+
+        let pool = Arc::new(ConnectionPool::new(1));
+        pool.try_reserve();
+        pool.mark_authenticated();
+
+        // Insert a non-preferred OUTBOUND peer — should not be evictable.
+        let outbound_id = PeerId::from_bytes([4u8; 32]);
+        let outbound_addr: std::net::SocketAddr = "10.0.0.99:11625".parse().unwrap();
+        let _rx = insert_fake_peer(
+            &shared,
+            outbound_id,
+            outbound_addr,
+            crate::connection::ConnectionDirection::Outbound,
+        );
+
+        // Simulate the incoming preferred peer's pending reservation.
+        pool.try_reserve();
+
+        // Eviction should fail — the only peer in the cache is outbound.
+        let evicted = OverlayManager::try_evict_non_preferred_for_inbound(&shared, &pool);
+        assert!(
+            !evicted,
+            "should not evict outbound peers for inbound admission"
+        );
     }
 }
