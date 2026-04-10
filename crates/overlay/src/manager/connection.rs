@@ -384,21 +384,27 @@ impl OverlayManager {
             }
         };
 
-        let peer =
-            match Peer::connect_with_connection(&addr, connection, local_node, connect_timeout)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    debug!("Failed to connect to discovered peer {}: {}", addr, e);
-                    shared
-                        .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
-                        .await;
-                    shared.pending_connections.release_address(&addr_key);
-                    pool.release_pending();
-                    return;
-                }
-            };
+        let pending_peer_ids = Some(Arc::clone(&shared.pending_connections.by_peer_id));
+        let peer = match Peer::connect_with_connection(
+            &addr,
+            connection,
+            local_node,
+            connect_timeout,
+            pending_peer_ids,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("Failed to connect to discovered peer {}: {}", addr, e);
+                shared
+                    .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
+                    .await;
+                shared.pending_connections.release_address(&addr_key);
+                pool.release_pending();
+                return;
+            }
+        };
 
         let peer_id = peer.id().clone();
         // Address reservation no longer needed — we have the peer_id now.
@@ -407,6 +413,7 @@ impl OverlayManager {
         // Reject banned peers (mirrors connect_outbound_inner).
         if shared.banned_peers.read().contains(&peer_id) {
             debug!("Rejected banned discovered peer {} at {}", peer_id, addr);
+            shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
             return;
         }
@@ -414,16 +421,7 @@ impl OverlayManager {
         // Reject peers we're already connected to (mirrors connect_outbound_inner).
         if shared.peers.contains_key(&peer_id) {
             debug!("Rejected duplicate discovered peer {} at {}", peer_id, addr);
-            pool.release_pending();
-            return;
-        }
-
-        // Prevent concurrent registration for the same peer ID.
-        if !shared.pending_connections.try_reserve_peer_id(&peer_id) {
-            debug!(
-                "Rejected discovered peer {} — registration already in flight",
-                peer_id
-            );
+            shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
             return;
         }
@@ -597,7 +595,15 @@ pub(super) async fn connect_to_explicit_peer(
         }
     };
 
-    let peer = match Peer::connect_with_connection(addr, connection, local_node, timeout_secs).await
+    let pending_peer_ids = Some(Arc::clone(&shared.pending_connections.by_peer_id));
+    let peer = match Peer::connect_with_connection(
+        addr,
+        connection,
+        local_node,
+        timeout_secs,
+        pending_peer_ids,
+    )
+    .await
     {
         Ok(peer) => peer,
         Err(e) => {
@@ -620,12 +626,7 @@ pub(super) async fn connect_to_explicit_peer(
     }
 
     if shared.peers.contains_key(&peer_id) {
-        pool.release_pending();
-        return Err(OverlayError::AlreadyConnected);
-    }
-
-    // Prevent concurrent registration for the same peer ID.
-    if !shared.pending_connections.try_reserve_peer_id(&peer_id) {
+        shared.pending_connections.release_peer_id(&peer_id);
         pool.release_pending();
         return Err(OverlayError::AlreadyConnected);
     }

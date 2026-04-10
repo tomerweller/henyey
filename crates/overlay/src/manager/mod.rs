@@ -190,6 +190,8 @@ impl PendingConnections {
 
     /// Try to reserve a pending connection for the given peer ID.
     /// Returns false if a handshake for this peer ID is already in flight.
+    /// Used in tests; production reservation now happens inside Peer::handshake().
+    #[cfg(test)]
     pub(super) fn try_reserve_peer_id(&self, peer_id: &PeerId) -> bool {
         use dashmap::mapref::entry::Entry;
         match self.by_peer_id.entry(peer_id.clone()) {

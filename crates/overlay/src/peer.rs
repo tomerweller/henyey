@@ -255,6 +255,7 @@ impl Peer {
         connection: Connection,
         local_node: LocalNode,
         timeout_secs: u64,
+        pending_peer_ids: Option<Arc<DashMap<PeerId, Instant>>>,
     ) -> Result<Self> {
         let auth = AuthContext::new(local_node, true);
 
@@ -275,7 +276,7 @@ impl Peer {
             stats: Arc::new(PeerStats::default()),
         };
 
-        peer.handshake(timeout_secs, None, None).await?;
+        peer.handshake(timeout_secs, None, pending_peer_ids).await?;
         Ok(peer)
     }
 
@@ -340,8 +341,37 @@ impl Peer {
             // --- Initiator (outbound): Send HELLO first, then receive ---
             self.send_hello().await?;
             self.recv_hello(timeout_secs).await?;
-            self.send_auth_msg().await?;
-            self.recv_auth(timeout_secs).await?;
+
+            // Reserve pending peer_id after learning remote identity.
+            // Matches stellar-core Peer::recvHello() duplicate check.
+            if let Some(ref pending) = pending_peer_ids {
+                use dashmap::mapref::entry::Entry;
+                match pending.entry(self.info.peer_id.clone()) {
+                    Entry::Occupied(_) => {
+                        warn!(
+                            "Rejected duplicate outbound peer {} — handshake already in flight",
+                            self.info.peer_id
+                        );
+                        return Err(OverlayError::PeerDuplicate(self.info.peer_id.to_string()));
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(Instant::now());
+                    }
+                }
+            }
+
+            let result: Result<()> = async {
+                self.send_auth_msg().await?;
+                self.recv_auth(timeout_secs).await?;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                if let Some(ref pending) = pending_peer_ids {
+                    pending.remove(&self.info.peer_id);
+                }
+                return Err(e);
+            }
         } else {
             // --- Responder (inbound): Receive HELLO first, then reply ---
             self.recv_hello(timeout_secs).await?;
