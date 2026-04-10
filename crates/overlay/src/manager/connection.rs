@@ -152,13 +152,35 @@ impl OverlayManager {
         // This ensures crawlers and other peers get topology data even when rejected.
         Self::send_peers_to_inbound_peer(&mut peer, &peer_id, &peer_info, &shared).await;
 
-        // Check if we have room for this authenticated peer.
-        // Matches stellar-core acceptAuthenticatedPeer (OverlayManagerImpl.cpp:206).
-        if !pool.try_promote_to_authenticated() {
+        // Determine if this peer is preferred (by address).
+        // Matches stellar-core isPreferred (OverlayManagerImpl.cpp:1071).
+        let is_preferred = shared
+            .preferred_peers
+            .iter()
+            .any(|pref| Self::peer_info_matches_address(&peer_info, pref));
+
+        // Try to promote to authenticated.
+        // Matches stellar-core acceptAuthenticatedPeer (OverlayManagerImpl.cpp:208).
+        let promoted = if pool.try_promote_to_authenticated() {
+            // Room available — promoted directly.
+            true
+        } else if is_preferred {
+            // Preferred peer but no room — try to evict a non-preferred peer.
+            // Matches stellar-core (OverlayManagerImpl.cpp:222-235).
+            Self::try_evict_non_preferred_for_inbound(&shared, &pool)
+        } else {
+            false
+        };
+
+        if !promoted {
+            let reason = if is_preferred {
+                "all inbound slots occupied by preferred peers"
+            } else {
+                "all available slots are taken"
+            };
             info!(
-                "Non-preferred inbound authenticated peer {} rejected because all \
-                 available slots are taken",
-                peer_id
+                "Inbound authenticated peer {} rejected because {}",
+                peer_id, reason
             );
             let err_msg = make_error_msg(ErrorCode::Load, "peer rejected");
             let _ = peer.send(err_msg).await;
@@ -203,6 +225,56 @@ impl OverlayManager {
 
         shared.cleanup_peer(&peer_id);
         pool.release_authenticated();
+    }
+
+    /// Try to evict a non-preferred authenticated inbound peer to make room for
+    /// a preferred peer. Returns true if eviction succeeded and the pool slot
+    /// was claimed.
+    ///
+    /// Matches stellar-core acceptAuthenticatedPeer (OverlayManagerImpl.cpp:222-235):
+    /// iterates authenticated peers, finds first non-preferred, sends ERR_LOAD.
+    pub(super) fn try_evict_non_preferred_for_inbound(
+        shared: &SharedPeerState,
+        pool: &Arc<ConnectionPool>,
+    ) -> bool {
+        // Find a non-preferred authenticated peer to evict.
+        let victim = shared.peer_info_cache.iter().find_map(|entry| {
+            let info = entry.value();
+            // Only consider inbound peers for inbound eviction.
+            if info.direction.we_called_remote() {
+                return None;
+            }
+            let is_preferred = shared
+                .preferred_peers
+                .iter()
+                .any(|pref| Self::peer_info_matches_address(info, pref));
+            if is_preferred {
+                return None;
+            }
+            Some(entry.key().clone())
+        });
+
+        if let Some(victim_id) = victim {
+            info!(
+                "Evicting non-preferred inbound peer {} for preferred peer",
+                victim_id
+            );
+            if let Some(entry) = shared.peers.get(&victim_id) {
+                super::peer_loop::send_error_and_drop(
+                    &victim_id,
+                    &entry.value().outbound_tx,
+                    ErrorCode::Load,
+                    "preferred peer selected instead",
+                );
+            }
+            // Force-promote the new peer. The evicted peer's slot will be
+            // released asynchronously when its task exits, temporarily
+            // exceeding max_connections by 1 — this is acceptable.
+            pool.mark_authenticated();
+            true
+        } else {
+            false
+        }
     }
 
     /// Start the connection listener.
