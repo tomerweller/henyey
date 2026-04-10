@@ -526,10 +526,19 @@ impl OverlayManager {
     /// Returns the number of connection attempts initiated.
     // SECURITY: dial dedup and queue bounded by max_peer_count config + peer universe
     pub async fn add_peers(&self, addrs: Vec<PeerAddress>) -> usize {
+        // Deduplicate addresses within the batch to prevent repeated dials
+        // to the same endpoint. Matches stellar-core's connectToImpl which
+        // checks pending connections by address before dialing.
+        let mut seen_addrs = std::collections::HashSet::new();
+        let unique_addrs: Vec<PeerAddress> = addrs
+            .into_iter()
+            .filter(|addr| seen_addrs.insert(format!("{}:{}", addr.host, addr.port)))
+            .collect();
+
         let mut added = 0;
         let target_outbound = self.config.target_outbound_peers;
         let mut remaining = target_outbound.saturating_sub(self.outbound_pool.count());
-        for addr in addrs {
+        for addr in unique_addrs {
             if remaining == 0 || !self.outbound_pool.can_accept() {
                 break;
             }
