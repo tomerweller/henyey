@@ -23,7 +23,6 @@
 
 use crate::{LedgerError, Result};
 use henyey_common::Hash256;
-use henyey_common::LedgerSeq;
 use std::collections::HashMap;
 use std::sync::Arc;
 use stellar_xdr::curr::{
@@ -58,7 +57,7 @@ pub struct PrefetchStats {
 #[derive(Debug)]
 pub struct LedgerSnapshot {
     /// The ledger sequence number this snapshot represents.
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
 
     /// The complete ledger header at this sequence.
     header: LedgerHeader,
@@ -81,7 +80,7 @@ impl LedgerSnapshot {
         entries: HashMap<LedgerKey, LedgerEntry>,
     ) -> Self {
         Self {
-            ledger_seq: header.ledger_seq.into(),
+            ledger_seq: header.ledger_seq,
             header,
             header_hash,
             entries,
@@ -89,7 +88,7 @@ impl LedgerSnapshot {
     }
 
     /// Create an empty snapshot (for genesis or testing).
-    pub fn empty(ledger_seq: LedgerSeq) -> Self {
+    pub fn empty(ledger_seq: u32) -> Self {
         Self {
             ledger_seq,
             header: LedgerHeader {
@@ -103,7 +102,7 @@ impl LedgerSnapshot {
                 },
                 tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
                 bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                ledger_seq: ledger_seq.get(),
+                ledger_seq,
                 total_coins: 0,
                 fee_pool: 0,
                 inflation_seq: 0,
@@ -120,7 +119,7 @@ impl LedgerSnapshot {
     }
 
     /// Get the ledger sequence of this snapshot.
-    pub fn ledger_seq(&self) -> LedgerSeq {
+    pub fn ledger_seq(&self) -> u32 {
         self.ledger_seq
     }
 
@@ -432,7 +431,7 @@ impl SnapshotHandle {
     }
 
     /// Get the ledger sequence.
-    pub fn ledger_seq(&self) -> LedgerSeq {
+    pub fn ledger_seq(&self) -> u32 {
         self.inner.ledger_seq
     }
 
@@ -554,7 +553,7 @@ impl SnapshotHandle {
 /// ```
 pub struct SnapshotBuilder {
     /// Target ledger sequence.
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
     /// Optional header (required for build, optional for build_with_default_header).
     header: Option<LedgerHeader>,
     /// Hash of the header.
@@ -565,7 +564,7 @@ pub struct SnapshotBuilder {
 
 impl SnapshotBuilder {
     /// Create a new builder for a given ledger sequence.
-    pub fn new(ledger_seq: LedgerSeq) -> Self {
+    pub fn new(ledger_seq: u32) -> Self {
         Self {
             ledger_seq,
             header: None,
@@ -625,7 +624,7 @@ impl SnapshotBuilder {
             },
             tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
             bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            ledger_seq: self.ledger_seq.get(),
+            ledger_seq: self.ledger_seq,
             total_coins: 100_000_000_000_000_000,
             fee_pool: 0,
             inflation_seq: 0,
@@ -694,7 +693,7 @@ mod tests {
     fn test_snapshot_builder() {
         let (key, entry) = create_test_account(1);
 
-        let snapshot = SnapshotBuilder::new(10.into())
+        let snapshot = SnapshotBuilder::new(10)
             .add_entry(key.clone(), entry.clone())
             .build_with_default_header();
 
@@ -712,7 +711,7 @@ mod tests {
             panic!("Expected account key");
         };
 
-        let snapshot = SnapshotBuilder::new(1.into())
+        let snapshot = SnapshotBuilder::new(1)
             .add_entry(key, entry)
             .build_with_default_header();
 
@@ -729,7 +728,7 @@ mod tests {
         let (key1, entry1) = create_test_account(1);
         let (key2, entry2) = create_test_account(2);
 
-        let snapshot = SnapshotBuilder::new(5.into())
+        let snapshot = SnapshotBuilder::new(5)
             .add_entry(key1.clone(), entry1.clone())
             .add_entry(key2.clone(), entry2.clone())
             .build_with_default_header();
@@ -757,7 +756,7 @@ mod tests {
         let (key1, entry1) = create_test_account(1);
         let (missing_key, _) = create_test_account(99);
 
-        let snapshot = SnapshotBuilder::new(5.into())
+        let snapshot = SnapshotBuilder::new(5)
             .add_entry(key1.clone(), entry1)
             .build_with_default_header();
 
@@ -783,7 +782,7 @@ mod tests {
         let (key3, _entry3) = create_test_account(3);
 
         // Build snapshot with only key1 and key2 (key3 was "erased")
-        let snapshot = SnapshotBuilder::new(5.into())
+        let snapshot = SnapshotBuilder::new(5)
             .add_entry(key1.clone(), entry1)
             .add_entry(key2.clone(), entry2)
             .build_with_default_header();
@@ -799,7 +798,7 @@ mod tests {
     /// Snapshot provides an immutable header view.
     #[test]
     fn test_snapshot_header_immutability() {
-        let snapshot = SnapshotBuilder::new(42.into()).build_with_default_header();
+        let snapshot = SnapshotBuilder::new(42).build_with_default_header();
 
         let h1 = snapshot.header().clone();
         let h2 = snapshot.header().clone();
@@ -816,7 +815,7 @@ mod tests {
         let (key, entry) = create_test_account(7);
         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let snapshot = LedgerSnapshot::empty(1.into());
+        let snapshot = LedgerSnapshot::empty(1);
         let mut handle = SnapshotHandle::new(snapshot);
 
         let entry_clone = entry.clone();
@@ -827,7 +826,7 @@ mod tests {
         }));
 
         // load_entries fetches from lookup_fn (count goes to 1)
-        let loaded = handle.load_entries(std::slice::from_ref(&key)).unwrap();
+        let loaded = handle.load_entries(&[key.clone()]).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
@@ -848,7 +847,7 @@ mod tests {
         let (key, entry) = create_test_account(42);
         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let snapshot = LedgerSnapshot::empty(1.into());
+        let snapshot = LedgerSnapshot::empty(1);
         let mut handle = SnapshotHandle::new(snapshot);
 
         let entry_clone = entry.clone();
@@ -883,7 +882,7 @@ mod tests {
     #[test]
     fn test_set_id_pool_for_replay() {
         // Create an empty snapshot (as used in replay)
-        let mut snapshot = LedgerSnapshot::empty(100.into());
+        let mut snapshot = LedgerSnapshot::empty(100);
 
         // Verify default id_pool is 0
         assert_eq!(snapshot.header().id_pool, 0);

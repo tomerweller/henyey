@@ -23,7 +23,6 @@ use henyey_common::protocol::{
     PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
 };
 use henyey_common::Hash256;
-use henyey_common::LedgerSeq;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use stellar_xdr::curr::{
@@ -153,7 +152,7 @@ impl ConfigUpgradeSetFrame {
     pub fn make_from_key(
         ltx: &CloseLedgerState,
         key: &ConfigUpgradeSetKey,
-        closing_ledger_seq: LedgerSeq,
+        closing_ledger_seq: u32,
         protocol_version: u32,
     ) -> Option<Arc<Self>> {
         let lk = Self::get_ledger_key(key);
@@ -251,10 +250,10 @@ impl ConfigUpgradeSetFrame {
     }
 
     /// Check if a TTL entry indicates the data is live.
-    fn is_live(ttl_entry: &LedgerEntry, current_ledger: LedgerSeq) -> bool {
+    fn is_live(ttl_entry: &LedgerEntry, current_ledger: u32) -> bool {
         match &ttl_entry.data {
             stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
-                ttl.live_until_ledger_seq >= current_ledger.get()
+                ttl.live_until_ledger_seq >= current_ledger
             }
             _ => false,
         }
@@ -392,7 +391,7 @@ impl ConfigUpgradeSetFrame {
 
             // Create the new entry
             let new_ledger_entry = LedgerEntry {
-                last_modified_ledger_seq: ltx.ledger_seq().get(),
+                last_modified_ledger_seq: ltx.ledger_seq(),
                 data: LedgerEntryData::ConfigSetting(new_entry.clone()),
                 ext: LedgerEntryExt::V0,
             };
@@ -504,7 +503,7 @@ impl ConfigUpgradeSetFrame {
         };
 
         let new_ledger_entry = LedgerEntry {
-            last_modified_ledger_seq: ltx.ledger_seq().get(),
+            last_modified_ledger_seq: ltx.ledger_seq(),
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::FrozenLedgerKeys(frozen_keys)),
             ext: LedgerEntryExt::V0,
         };
@@ -591,7 +590,7 @@ impl ConfigUpgradeSetFrame {
         };
 
         let new_ledger_entry = LedgerEntry {
-            last_modified_ledger_seq: ltx.ledger_seq().get(),
+            last_modified_ledger_seq: ltx.ledger_seq(),
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::FreezeBypassTxs(bypass_txs)),
             ext: LedgerEntryExt::V0,
         };
@@ -681,7 +680,7 @@ impl ConfigUpgradeSetFrame {
             .map_err(|_| LedgerError::Internal("Failed to convert window vec".to_string()))?;
 
         let new_window_entry = LedgerEntry {
-            last_modified_ledger_seq: ltx.ledger_seq().get(),
+            last_modified_ledger_seq: ltx.ledger_seq(),
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
                 new_window,
             )),

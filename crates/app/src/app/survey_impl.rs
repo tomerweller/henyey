@@ -1,7 +1,6 @@
 //! Network survey: collecting and relaying topology survey data from peers.
 
 use super::*;
-use henyey_common::LedgerSeq;
 
 /// Error returned when stopping a survey fails.
 #[derive(Debug, thiserror::Error)]
@@ -75,7 +74,7 @@ impl App {
 
     pub async fn start_survey_collecting(&self, nonce: u32) -> anyhow::Result<()> {
         let ledger_num = self.survey_local_ledger().await;
-        self.broadcast_survey_start(nonce, ledger_num.into()).await
+        self.broadcast_survey_start(nonce, ledger_num).await
     }
 
     pub async fn stop_survey_collecting(&self) -> Result<(), SurveyStopError> {
@@ -84,7 +83,7 @@ impl App {
         let Some(nonce) = nonce else {
             return Err(SurveyStopError::NoActiveSurvey);
         };
-        self.broadcast_survey_stop(nonce, ledger_num.into()).await;
+        self.broadcast_survey_stop(nonce, ledger_num).await;
         Ok(())
     }
 
@@ -242,7 +241,7 @@ impl App {
                 .send_survey_request(
                     peer_id.clone(),
                     nonce,
-                    ledger_num.into(),
+                    ledger_num,
                     inbound_index,
                     outbound_index,
                 )
@@ -257,7 +256,7 @@ impl App {
         &self,
         peer_id: henyey_overlay::PeerId,
         nonce: u32,
-        ledger_num: LedgerSeq,
+        ledger_num: u32,
         inbound_index: u32,
         outbound_index: u32,
     ) -> bool {
@@ -271,7 +270,7 @@ impl App {
         let request = SurveyRequestMessage {
             surveyor_peer_id: local_node_id.clone(),
             surveyed_peer_id: stellar_xdr::curr::NodeId(peer_id.0.clone()),
-            ledger_num: ledger_num.get(),
+            ledger_num,
             encryption_key,
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
         };
@@ -320,15 +319,11 @@ impl App {
             .is_ok()
     }
 
-    async fn broadcast_survey_start(
-        &self,
-        nonce: u32,
-        ledger_num: LedgerSeq,
-    ) -> anyhow::Result<()> {
+    async fn broadcast_survey_start(&self, nonce: u32, ledger_num: u32) -> anyhow::Result<()> {
         let start = TimeSlicedSurveyStartCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
-            ledger_num: ledger_num.get(),
+            ledger_num,
         };
         let start_bytes = start
             .to_xdr(stellar_xdr::curr::Limits::none())
@@ -350,11 +345,11 @@ impl App {
         Ok(())
     }
 
-    async fn broadcast_survey_stop(&self, nonce: u32, ledger_num: LedgerSeq) {
+    async fn broadcast_survey_stop(&self, nonce: u32, ledger_num: u32) {
         let stop = TimeSlicedSurveyStopCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
-            ledger_num: ledger_num.get(),
+            ledger_num,
         };
 
         let stop_bytes = match stop.to_xdr(stellar_xdr::curr::Limits::none()) {
@@ -949,10 +944,7 @@ impl App {
                     current
                 };
 
-                if !self
-                    .send_survey_start(&peers, nonce, ledger_num.into())
-                    .await
-                {
+                if !self.send_survey_start(&peers, nonce, ledger_num).await {
                     scheduler.next_action = now + SURVEY_INTERVAL;
                     return;
                 }
@@ -960,7 +952,7 @@ impl App {
                 scheduler.phase = SurveySchedulerPhase::StartSent;
                 scheduler.peers = peers;
                 scheduler.nonce = nonce;
-                scheduler.ledger_num = ledger_num.into();
+                scheduler.ledger_num = ledger_num;
                 scheduler.next_action = now + SURVEY_COLLECT_DELAY;
                 scheduler.last_started = Some(now);
             }
@@ -986,7 +978,7 @@ impl App {
                 scheduler.phase = SurveySchedulerPhase::Idle;
                 scheduler.peers.clear();
                 scheduler.nonce = 0;
-                scheduler.ledger_num = LedgerSeq::new(0);
+                scheduler.ledger_num = 0;
                 scheduler.next_action = now + SURVEY_INTERVAL;
             }
         }
@@ -1012,19 +1004,19 @@ impl App {
 
         let last_closed = *self.current_ledger.read().await;
         let mut limiter = self.survey_limiter.write().await;
-        limiter.clear_old_ledgers(last_closed.into());
+        limiter.clear_old_ledgers(last_closed);
     }
 
     async fn send_survey_start(
         &self,
         peers: &[henyey_overlay::PeerId],
         nonce: u32,
-        ledger_num: LedgerSeq,
+        ledger_num: u32,
     ) -> bool {
         let start = TimeSlicedSurveyStartCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
-            ledger_num: ledger_num.get(),
+            ledger_num,
         };
 
         let start_bytes = match start.to_xdr(stellar_xdr::curr::Limits::none()) {
@@ -1062,7 +1054,7 @@ impl App {
         &self,
         peers: &[henyey_overlay::PeerId],
         nonce: u32,
-        ledger_num: LedgerSeq,
+        ledger_num: u32,
     ) -> bool {
         let local_node_id = self.local_node_id();
         let secret = self.ensure_survey_secret(nonce).await;
@@ -1076,7 +1068,7 @@ impl App {
             let request = SurveyRequestMessage {
                 surveyor_peer_id: local_node_id.clone(),
                 surveyed_peer_id: stellar_xdr::curr::NodeId(peer.0.clone()),
-                ledger_num: ledger_num.get(),
+                ledger_num,
                 encryption_key: encryption_key.clone(),
                 command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
             };
@@ -1120,12 +1112,12 @@ impl App {
         &self,
         peers: &[henyey_overlay::PeerId],
         nonce: u32,
-        ledger_num: LedgerSeq,
+        ledger_num: u32,
     ) {
         let stop = TimeSlicedSurveyStopCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
-            ledger_num: ledger_num.get(),
+            ledger_num,
         };
 
         let stop_bytes = match stop.to_xdr(stellar_xdr::curr::Limits::none()) {

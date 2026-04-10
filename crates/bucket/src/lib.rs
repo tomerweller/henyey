@@ -356,7 +356,7 @@ mod tests {
             let entry = make_account_entry(id, i as i64 * 100);
             bucket_list
                 .add_batch(
-                    i.into(),
+                    i,
                     TEST_PROTOCOL,
                     BucketListType::Live,
                     vec![entry],
@@ -384,7 +384,7 @@ mod tests {
             let entry = make_account_entry(id, i as i64 * 1000);
             bucket_list
                 .add_batch(
-                    (10 + i).into(),
+                    10 + i,
                     TEST_PROTOCOL,
                     BucketListType::Live,
                     vec![],
@@ -412,7 +412,7 @@ mod tests {
             let key = make_account_key(id);
             bucket_list
                 .add_batch(
-                    (10 + i).into(),
+                    10 + i,
                     TEST_PROTOCOL,
                     BucketListType::Live,
                     vec![],

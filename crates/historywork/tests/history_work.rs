@@ -1,4 +1,3 @@
-use henyey_common::LedgerSeq;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -46,7 +45,7 @@ fn record_marked(entries: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn make_header(
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
     bucket_list_hash: Hash256,
     tx_set_hash: Hash256,
     tx_result_hash: Hash256,
@@ -62,7 +61,7 @@ fn make_header(
         },
         tx_set_result_hash: Hash(*tx_result_hash.as_bytes()),
         bucket_list_hash: Hash(*bucket_list_hash.as_bytes()),
-        ledger_seq: ledger_seq.into(),
+        ledger_seq,
         total_coins: 1_000_000,
         fee_pool: 0,
         inflation_seq: 0,
@@ -101,12 +100,7 @@ async fn test_history_work_chain() {
         .expect("tx result xdr");
     let tx_result_hash = Hash256::hash(&tx_result_xdr);
 
-    let header = make_header(
-        checkpoint.into(),
-        Hash256::ZERO,
-        tx_set_hash,
-        tx_result_hash,
-    );
+    let header = make_header(checkpoint, Hash256::ZERO, tx_set_hash, tx_result_hash);
     let header_entry = LedgerHeaderHistoryEntry {
         hash: Hash([0u8; 32]),
         header,
@@ -120,7 +114,7 @@ async fn test_history_work_chain() {
     let has = HistoryArchiveState {
         version: 2,
         server: Some("rs-stellar-core test".to_string()),
-        current_ledger: checkpoint.into(),
+        current_ledger: checkpoint,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
         current_buckets: vec![HASBucketLevel {
             curr: bucket_hash.to_hex(),

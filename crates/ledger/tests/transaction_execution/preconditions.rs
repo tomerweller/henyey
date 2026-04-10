@@ -17,7 +17,7 @@ fn test_execute_transaction_missing_operation() {
         signatures: VecM::default(),
     });
 
-    let snapshot = LedgerSnapshot::empty(1.into());
+    let snapshot = LedgerSnapshot::empty(1);
     let snapshot = SnapshotHandle::new(snapshot);
     let context = henyey_tx::LedgerContext::new(1, 1000, 100, 5_000_000, 25, NetworkId::testnet());
     let mut executor = TransactionExecutor::new(
@@ -39,7 +39,7 @@ fn test_execute_transaction_time_bounds_too_early() {
     let account_id: AccountId = (&secret.public_key()).into();
 
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -97,7 +97,7 @@ fn test_execute_transaction_min_seq_num_precondition() {
     let account_id: AccountId = (&secret.public_key()).into();
 
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -167,7 +167,7 @@ fn test_execute_transaction_min_seq_num_relaxed_sequence() {
 
     // Account has seq_num = 100
     let (key, entry) = create_account_entry(account_id.clone(), 100, 10_000_000);
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -243,7 +243,7 @@ fn test_execute_transaction_strict_sequence_without_min_seq_num() {
 
     // Account has seq_num = 100
     let (key, entry) = create_account_entry(account_id.clone(), 100, 10_000_000);
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -316,14 +316,9 @@ fn test_execute_transaction_min_seq_age_precondition() {
     let seq_time = 900;
 
     // Create account with seq_time set (for min_seq_age checking)
-    let (key, entry) = create_account_entry_with_seq_info(
-        account_id.clone(),
-        1,
-        10_000_000,
-        seq_ledger.into(),
-        seq_time,
-    );
-    let snapshot = SnapshotBuilder::new(10.into())
+    let (key, entry) =
+        create_account_entry_with_seq_info(account_id.clone(), 1, 10_000_000, seq_ledger, seq_time);
+    let snapshot = SnapshotBuilder::new(10)
         .add_entry(key, entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -394,14 +389,9 @@ fn test_execute_transaction_min_seq_ledger_gap_precondition() {
     let seq_time = 0;
 
     // Create account with seq_ledger set (for min_seq_ledger_gap checking)
-    let (key, entry) = create_account_entry_with_seq_info(
-        account_id.clone(),
-        1,
-        10_000_000,
-        seq_ledger.into(),
-        seq_time,
-    );
-    let snapshot = SnapshotBuilder::new(10.into())
+    let (key, entry) =
+        create_account_entry_with_seq_info(account_id.clone(), 1, 10_000_000, seq_ledger, seq_time);
+    let snapshot = SnapshotBuilder::new(10)
         .add_entry(key, entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -467,7 +457,7 @@ fn test_execute_transaction_extra_signers_missing() {
     let account_id: AccountId = (&secret.public_key()).into();
 
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -684,7 +674,7 @@ fn test_operation_failure_rolls_back_changes() {
     let account_id: AccountId = (&secret.public_key()).into();
 
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -789,7 +779,7 @@ fn test_fee_bump_inner_signature_uses_low_threshold() {
 
     let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 10_000_000);
 
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(inner_key, inner_entry)
         .add_entry(fee_key, fee_entry)
         .build_with_default_header();
@@ -884,7 +874,7 @@ fn test_fee_bump_outer_source_frozen_key_rejected() {
     // Set up both accounts in the snapshot
     let (inner_key, inner_entry) = create_account_entry(inner_account_id.clone(), 1, 10_000_000);
     let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 10_000_000);
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(inner_key, inner_entry)
         .add_entry(fee_key, fee_entry)
         .build_with_default_header();
@@ -1002,7 +992,7 @@ fn test_fee_bump_outer_source_frozen_bypass_allowed() {
     let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([98u8; 32])));
     let (dest_key, dest_entry) = create_account_entry(destination.clone(), 0, 0);
 
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(inner_key, inner_entry)
         .add_entry(fee_key, fee_entry)
         .add_entry(dest_key, dest_entry)
@@ -1113,7 +1103,7 @@ fn test_inner_source_frozen_key_rejected() {
     let account_id: AccountId = (&secret.public_key()).into();
 
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -1189,7 +1179,7 @@ fn test_inner_source_frozen_bypass_allowed() {
     let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([96u8; 32])));
     let (dest_key, dest_entry) = create_account_entry(destination.clone(), 0, 0);
 
-    let snapshot = SnapshotBuilder::new(1.into())
+    let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
         .add_entry(dest_key, dest_entry)
         .build_with_default_header();

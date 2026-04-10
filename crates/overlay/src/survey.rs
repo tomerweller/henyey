@@ -32,7 +32,6 @@
 //! - Rate limiting prevents survey flooding
 
 use crate::PeerId;
-use henyey_common::LedgerSeq;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -269,7 +268,7 @@ struct SurveyState {
 /// Rate limiter for survey messages.
 struct SurveyMessageLimiter {
     /// Records of (ledger, surveyor, surveyed) -> response seen.
-    records: HashMap<LedgerSeq, HashMap<PeerId, HashMap<PeerId, bool>>>,
+    records: HashMap<u32, HashMap<PeerId, HashMap<PeerId, bool>>>,
     /// Configuration.
     config: SurveyConfig,
 }
@@ -283,7 +282,7 @@ impl SurveyMessageLimiter {
     }
 
     /// Check if a ledger number is valid (within acceptable range).
-    fn ledger_num_valid(&self, ledger_num: LedgerSeq, current_ledger: LedgerSeq) -> bool {
+    fn ledger_num_valid(&self, ledger_num: u32, current_ledger: u32) -> bool {
         if ledger_num > current_ledger {
             return false;
         }
@@ -293,10 +292,10 @@ impl SurveyMessageLimiter {
     /// Add and validate a survey request.
     fn add_request(
         &mut self,
-        ledger_num: LedgerSeq,
+        ledger_num: u32,
         surveyor: &PeerId,
         surveyed: &PeerId,
-        current_ledger: LedgerSeq,
+        current_ledger: u32,
     ) -> bool {
         if !self.ledger_num_valid(ledger_num, current_ledger) {
             return false;
@@ -322,10 +321,10 @@ impl SurveyMessageLimiter {
     /// Record a survey response.
     fn record_response(
         &mut self,
-        ledger_num: LedgerSeq,
+        ledger_num: u32,
         surveyor: &PeerId,
         surveyed: &PeerId,
-        current_ledger: LedgerSeq,
+        current_ledger: u32,
     ) -> bool {
         if !self.ledger_num_valid(ledger_num, current_ledger) {
             return false;
@@ -347,7 +346,7 @@ impl SurveyMessageLimiter {
     }
 
     /// Clear old ledger records.
-    fn clear_old_ledgers(&mut self, last_closed_ledger: LedgerSeq) {
+    fn clear_old_ledgers(&mut self, last_closed_ledger: u32) {
         let min_valid = last_closed_ledger.saturating_sub(self.config.num_ledgers_before_ignore);
         self.records.retain(|&ledger, _| ledger >= min_valid);
     }
@@ -715,10 +714,10 @@ impl SurveyManager {
     /// Add and validate a survey request message.
     pub fn add_request(
         &self,
-        ledger_num: LedgerSeq,
+        ledger_num: u32,
         surveyor: &PeerId,
         surveyed: &PeerId,
-        current_ledger: LedgerSeq,
+        current_ledger: u32,
     ) -> bool {
         let mut limiter = self.limiter.write();
         limiter.add_request(ledger_num, surveyor, surveyed, current_ledger)
@@ -727,17 +726,17 @@ impl SurveyManager {
     /// Record and validate a survey response message.
     pub fn record_response(
         &self,
-        ledger_num: LedgerSeq,
+        ledger_num: u32,
         surveyor: &PeerId,
         surveyed: &PeerId,
-        current_ledger: LedgerSeq,
+        current_ledger: u32,
     ) -> bool {
         let mut limiter = self.limiter.write();
         limiter.record_response(ledger_num, surveyor, surveyed, current_ledger)
     }
 
     /// Clear old ledger records from the rate limiter.
-    pub fn clear_old_ledgers(&self, last_closed_ledger: LedgerSeq) {
+    pub fn clear_old_ledgers(&self, last_closed_ledger: u32) {
         let mut limiter = self.limiter.write();
         limiter.clear_old_ledgers(last_closed_ledger);
     }
@@ -980,14 +979,14 @@ mod tests {
         let surveyed = make_peer_id(2);
 
         // First request should succeed
-        assert!(manager.add_request(100.into(), &surveyor, &surveyed, 100.into()));
+        assert!(manager.add_request(100, &surveyor, &surveyed, 100));
 
         // Duplicate request should fail
-        assert!(!manager.add_request(100.into(), &surveyor, &surveyed, 100.into()));
+        assert!(!manager.add_request(100, &surveyor, &surveyed, 100));
 
         // Different surveyed should succeed
         let surveyed2 = make_peer_id(3);
-        assert!(manager.add_request(100.into(), &surveyor, &surveyed2, 100.into()));
+        assert!(manager.add_request(100, &surveyor, &surveyed2, 100));
     }
 
     #[test]
@@ -997,16 +996,16 @@ mod tests {
         let surveyed = make_peer_id(2);
 
         // Must have request first
-        assert!(!manager.record_response(100.into(), &surveyor, &surveyed, 100.into()));
+        assert!(!manager.record_response(100, &surveyor, &surveyed, 100));
 
         // Add request
-        manager.add_request(100.into(), &surveyor, &surveyed, 100.into());
+        manager.add_request(100, &surveyor, &surveyed, 100);
 
         // First response should succeed
-        assert!(manager.record_response(100.into(), &surveyor, &surveyed, 100.into()));
+        assert!(manager.record_response(100, &surveyor, &surveyed, 100));
 
         // Duplicate response should fail
-        assert!(!manager.record_response(100.into(), &surveyor, &surveyed, 100.into()));
+        assert!(!manager.record_response(100, &surveyor, &surveyed, 100));
     }
 
     #[test]
@@ -1016,7 +1015,7 @@ mod tests {
         let surveyed = make_peer_id(2);
 
         // Old ledger should be rejected
-        assert!(!manager.add_request(100.into(), &surveyor, &surveyed, 200.into()));
+        assert!(!manager.add_request(100, &surveyor, &surveyed, 200));
     }
 
     #[test]
@@ -1027,17 +1026,17 @@ mod tests {
         let surveyed2 = make_peer_id(3);
 
         // Add requests at different ledgers
-        manager.add_request(100.into(), &surveyor, &surveyed1, 100.into());
-        manager.add_request(110.into(), &surveyor, &surveyed2, 110.into());
+        manager.add_request(100, &surveyor, &surveyed1, 100);
+        manager.add_request(110, &surveyor, &surveyed2, 110);
 
         // Clear old ledgers
-        manager.clear_old_ledgers(120.into());
+        manager.clear_old_ledgers(120);
 
         // Old request should now be invalid, so adding again should work
         // (but the ledger is too old to be valid)
         // New request at recent ledger should work
         let surveyed3 = make_peer_id(4);
-        assert!(manager.add_request(115.into(), &surveyor, &surveyed3, 120.into()));
+        assert!(manager.add_request(115, &surveyor, &surveyed3, 120));
     }
 
     #[test]

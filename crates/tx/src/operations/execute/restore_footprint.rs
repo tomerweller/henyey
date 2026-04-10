@@ -12,7 +12,6 @@ use stellar_xdr::curr::{
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
-use henyey_common::LedgerSeq;
 
 /// Entry to restore from the hot archive.
 pub struct HotArchiveRestoreEntry {
@@ -176,7 +175,7 @@ pub(crate) fn execute_restore_footprint(
             key,
             new_ttl,
             state,
-            current_ledger.into(),
+            current_ledger,
             resources.ttl_key_cache,
             &mut accumulated_read_bytes,
             &mut accumulated_write_bytes,
@@ -212,7 +211,7 @@ fn restore_entry(
     key: &LedgerKey,
     new_ttl: u32,
     state: &mut LedgerStateManager,
-    current_ledger: LedgerSeq,
+    current_ledger: u32,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
     accumulated_read_bytes: &mut u32,
     accumulated_write_bytes: &mut u32,
@@ -233,7 +232,7 @@ fn restore_entry(
     let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
 
     match current_ttl {
-        Some(ttl) if ttl >= current_ledger.get() => {
+        Some(ttl) if ttl >= current_ledger => {
             // Entry is still live, no restoration needed.
             Ok(())
         }
@@ -321,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_restore_footprint_no_soroban_data() {
-        let mut state = LedgerStateManager::new(5_000_000, 100.into());
+        let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -354,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_restore_footprint_empty_footprint() {
-        let mut state = LedgerStateManager::new(5_000_000, 100.into());
+        let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -401,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_restore_footprint_rejects_read_only() {
-        let mut state = LedgerStateManager::new(5_000_000, 100.into());
+        let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -452,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_restore_footprint_rejects_non_persistent_entry() {
-        let mut state = LedgerStateManager::new(5_000_000, 100.into());
+        let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -508,7 +507,7 @@ mod tests {
     /// C++ Reference: SorobanTest.cpp - "restore rejects account key" test section
     #[test]
     fn test_restore_footprint_rejects_account_entry() {
-        let mut state = LedgerStateManager::new(5_000_000, 100.into());
+        let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -568,7 +567,7 @@ mod tests {
     /// C++ Reference: SorobanTest.cpp - "restore contract code" test section
     #[test]
     fn test_restore_footprint_contract_code_missing() {
-        let mut state = LedgerStateManager::new(5_000_000, 100.into());
+        let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -628,7 +627,7 @@ mod tests {
     /// C++ Reference: SorobanTest.cpp - "restore persistent data" test section
     #[test]
     fn test_restore_footprint_persistent_data_missing() {
-        let mut state = LedgerStateManager::new(5_000_000, 100.into());
+        let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -688,7 +687,7 @@ mod tests {
     /// C++ Reference: SorobanTest.cpp - "restore rejects trustline" test section
     #[test]
     fn test_restore_footprint_rejects_trustline() {
-        let mut state = LedgerStateManager::new(5_000_000, 100.into());
+        let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -750,7 +749,7 @@ mod tests {
     /// that needs restoring, ResourceLimitExceeded should be returned.
     #[test]
     fn test_restore_footprint_resource_limit_exceeded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100.into());
+        let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 

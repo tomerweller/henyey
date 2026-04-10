@@ -3,7 +3,6 @@
 //! Contains the `HerderCallback` and `SyncRecoveryCallback` trait
 //! implementations for `App`, which drive ledger closing and sync recovery.
 
-use henyey_common::LedgerSeq;
 use std::sync::atomic::Ordering;
 
 use henyey_herder::{sync_recovery::SyncRecoveryCallback, HerderCallback};
@@ -20,7 +19,7 @@ use super::App;
 impl HerderCallback for App {
     async fn close_ledger(
         &self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         tx_set: henyey_herder::TransactionSet,
         close_time: u64,
         upgrades: Vec<UpgradeType>,
@@ -28,7 +27,7 @@ impl HerderCallback for App {
     ) -> henyey_herder::Result<henyey_common::Hash256> {
         let tx_summary = tx_set.summary();
         tracing::info!(
-            ledger_seq = ledger_seq.get(),
+            ledger_seq,
             tx_count = tx_set.transactions.len(),
             close_time,
             summary = %tx_summary,

@@ -16,7 +16,6 @@
 //! 3. When we receive a FloodAdvert, we call `queue_incoming_advert` to process it
 //! 4. We pop adverts from the incoming queue to demand transactions
 
-use henyey_common::LedgerSeq;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -60,7 +59,7 @@ impl Default for TxAdvertsConfig {
 #[derive(Debug, Clone)]
 struct AdvertHistoryEntry {
     /// Ledger sequence when this advert was seen.
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
 }
 
 /// Callback for sending FloodAdvert messages.
@@ -161,7 +160,7 @@ impl TxAdverts {
 
     /// Queue up transaction hashes from a neighbour to try demanding.
     // SECURITY: advert queue bounded by per-peer flow control window (MAX_HASH_COUNT)
-    pub fn queue_incoming_advert(&self, tx_hashes: &[Hash], ledger_seq: LedgerSeq) {
+    pub fn queue_incoming_advert(&self, tx_hashes: &[Hash], ledger_seq: u32) {
         let mut state = self.state.write();
 
         // Remember all hashes in history
@@ -232,7 +231,7 @@ impl TxAdverts {
     }
 
     /// Clear advert history for ledgers below the given sequence.
-    pub fn clear_below(&self, ledger_seq: LedgerSeq) {
+    pub fn clear_below(&self, ledger_seq: u32) {
         let mut state = self.state.write();
         state
             .advert_history
@@ -349,7 +348,7 @@ mod tests {
         let adverts = TxAdverts::default();
         let hashes = vec![make_hash(1), make_hash(2), make_hash(3)];
 
-        adverts.queue_incoming_advert(&hashes, 100.into());
+        adverts.queue_incoming_advert(&hashes, 100);
 
         assert_eq!(adverts.size(), 3);
         assert!(adverts.has_adverts());
@@ -366,7 +365,7 @@ mod tests {
         let adverts = TxAdverts::default();
         let hashes = vec![make_hash(1), make_hash(2)];
 
-        adverts.queue_incoming_advert(&hashes, 100.into());
+        adverts.queue_incoming_advert(&hashes, 100);
 
         let h1 = adverts.pop_incoming_advert();
         assert_eq!(h1, Some(make_hash(1)));
@@ -385,7 +384,7 @@ mod tests {
         let adverts = TxAdverts::default();
 
         // Add incoming
-        adverts.queue_incoming_advert(&[make_hash(1), make_hash(2)], 100.into());
+        adverts.queue_incoming_advert(&[make_hash(1), make_hash(2)], 100);
 
         // Add retry
         adverts.retry_incoming_advert(vec![make_hash(10)]);
@@ -453,12 +452,12 @@ mod tests {
     fn test_clear_below() {
         let adverts = TxAdverts::default();
 
-        adverts.queue_incoming_advert(&[make_hash(1)], 100.into());
-        adverts.queue_incoming_advert(&[make_hash(2)], 200.into());
-        adverts.queue_incoming_advert(&[make_hash(3)], 300.into());
+        adverts.queue_incoming_advert(&[make_hash(1)], 100);
+        adverts.queue_incoming_advert(&[make_hash(2)], 200);
+        adverts.queue_incoming_advert(&[make_hash(3)], 300);
 
         // Clear entries below ledger 200
-        adverts.clear_below(200.into());
+        adverts.clear_below(200);
 
         // Only entries at ledger 200+ should remain in history
         assert!(!adverts.seen_advert(&make_hash(1)));
@@ -475,7 +474,7 @@ mod tests {
 
         // Queue more than limit
         let hashes: Vec<Hash> = (0..10).map(|i| make_hash(i)).collect();
-        adverts.queue_incoming_advert(&hashes, 100.into());
+        adverts.queue_incoming_advert(&hashes, 100);
 
         // Should be trimmed to max_ops
         assert_eq!(adverts.size(), 5);

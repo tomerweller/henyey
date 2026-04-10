@@ -4,7 +4,6 @@
 //! survey scheduling, SCP latency tracking, and other App internals.
 //! They are extracted here to reduce the size of `mod.rs`.
 
-use henyey_common::LedgerSeq;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -98,7 +97,7 @@ pub struct SurveyReport {
 pub struct SimulationDebugStats {
     pub app_state: String,
     pub herder_state: String,
-    pub current_ledger: LedgerSeq,
+    pub current_ledger: u32,
     pub tracking_slot: u64,
     pub latest_externalized_slot: Option<u64>,
     pub peer_count: usize,
@@ -134,7 +133,7 @@ pub enum CatchupTarget {
 #[derive(Debug, Clone)]
 pub struct CatchupResult {
     /// Final ledger sequence.
-    pub ledger_seq: LedgerSeq,
+    pub ledger_seq: u32,
     /// Hash of the final ledger.
     pub ledger_hash: henyey_common::Hash256,
     /// Number of buckets applied.
@@ -163,7 +162,7 @@ impl std::fmt::Display for CatchupResult {
 #[derive(Debug, Clone)]
 pub struct LedgerInfo {
     /// Current ledger sequence number.
-    pub ledger_seq: LedgerSeq,
+    pub ledger_seq: u32,
     /// Hash of the current ledger header.
     pub hash: henyey_common::Hash256,
     /// Ledger close time (UNIX timestamp).
@@ -284,7 +283,7 @@ pub(super) struct PendingLedgerClose {
     pub handle:
         tokio::task::JoinHandle<std::result::Result<henyey_ledger::LedgerCloseResult, String>>,
     /// Sequence number being closed.
-    pub ledger_seq: LedgerSeq,
+    pub ledger_seq: u32,
     /// The transaction set used for closing.
     pub tx_set: henyey_herder::TransactionSet,
     /// Variant of the tx set (classic or generalized).
@@ -316,9 +315,9 @@ impl TxAdvertHistory {
         self.entries.contains_key(hash)
     }
 
-    pub fn remember(&mut self, hash: Hash256, ledger_seq: LedgerSeq) {
-        self.entries.insert(hash, ledger_seq.get());
-        self.order.push_back((hash, ledger_seq.get()));
+    pub fn remember(&mut self, hash: Hash256, ledger_seq: u32) {
+        self.entries.insert(hash, ledger_seq);
+        self.order.push_back((hash, ledger_seq));
 
         while self.entries.len() > self.capacity {
             if let Some((old_hash, old_seq)) = self.order.pop_front() {
@@ -329,10 +328,10 @@ impl TxAdvertHistory {
         }
     }
 
-    pub fn clear_below(&mut self, ledger_seq: LedgerSeq) {
-        self.entries.retain(|_, seq| *seq >= ledger_seq.get());
+    pub fn clear_below(&mut self, ledger_seq: u32) {
+        self.entries.retain(|_, seq| *seq >= ledger_seq);
         self.order
-            .retain(|(hash, seq)| *seq >= ledger_seq.get() && self.entries.get(hash) == Some(seq));
+            .retain(|(hash, seq)| *seq >= ledger_seq && self.entries.get(hash) == Some(seq));
     }
 }
 
@@ -350,7 +349,7 @@ pub(super) struct TxSetRequestState {
 #[derive(Debug, Clone)]
 pub(super) struct ConsensusStuckState {
     /// Current ledger when stuck was detected.
-    pub current_ledger: LedgerSeq,
+    pub current_ledger: u32,
     /// First buffered ledger when stuck was detected.
     pub first_buffered: u32,
     /// When we first detected the stuck condition.
@@ -436,11 +435,11 @@ impl PeerTxAdverts {
         self.history.seen(hash)
     }
 
-    pub fn remember(&mut self, hash: Hash256, ledger_seq: LedgerSeq) {
+    pub fn remember(&mut self, hash: Hash256, ledger_seq: u32) {
         self.history.remember(hash, ledger_seq);
     }
 
-    pub fn queue_incoming(&mut self, hashes: &[Hash], ledger_seq: LedgerSeq, max_ops: usize) {
+    pub fn queue_incoming(&mut self, hashes: &[Hash], ledger_seq: u32, max_ops: usize) {
         for hash in hashes {
             let hash256 = Hash256::from(hash.clone());
             self.remember(hash256, ledger_seq);
@@ -478,7 +477,7 @@ impl PeerTxAdverts {
         self.retry.len() + self.incoming.len()
     }
 
-    pub fn clear_below(&mut self, ledger_seq: LedgerSeq) {
+    pub fn clear_below(&mut self, ledger_seq: u32) {
         self.history.clear_below(ledger_seq);
     }
 }
@@ -597,7 +596,7 @@ pub(super) struct SurveyScheduler {
     pub next_action: Instant,
     pub peers: Vec<PeerId>,
     pub nonce: u32,
-    pub ledger_num: LedgerSeq,
+    pub ledger_num: u32,
     pub last_started: Option<Instant>,
 }
 
@@ -608,7 +607,7 @@ impl SurveyScheduler {
             next_action: now + Duration::from_secs(60),
             peers: Vec::new(),
             nonce: 0,
-            ledger_num: LedgerSeq::new(0),
+            ledger_num: 0,
             last_started: None,
         }
     }

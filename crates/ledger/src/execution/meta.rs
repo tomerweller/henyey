@@ -7,7 +7,6 @@
 use super::*;
 
 pub(super) use henyey_common::asset::non_native_asset_to_trustline_asset as asset_to_trustline_asset;
-use henyey_common::LedgerSeq;
 
 pub(super) fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
     henyey_common::asset::get_issuer(asset).ok().cloned()
@@ -426,7 +425,7 @@ pub(super) fn build_entry_changes_with_state_overrides(
         state,
         &ledger_changes,
         None,
-        LedgerSeq::new(0), // ledger_seq not used for non-operation changes
+        0, // ledger_seq not used for non-operation changes
     )
 }
 
@@ -461,7 +460,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
     state: &LedgerStateManager,
     changes: &LedgerChanges<'_>,
     footprint: Option<&stellar_xdr::curr::LedgerFootprint>,
-    current_ledger_seq: LedgerSeq,
+    current_ledger_seq: u32,
 ) -> LedgerEntryChanges {
     let &LedgerChanges {
         created,
@@ -889,7 +888,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
         if !processed_keys.contains(key) {
             // Clone the entry and update last_modified_ledger_seq to current ledger
             let mut restored_entry = entry.clone();
-            restored_entry.last_modified_ledger_seq = current_ledger_seq.get();
+            restored_entry.last_modified_ledger_seq = current_ledger_seq;
             changes.push(LedgerEntryChange::Restored(restored_entry));
         }
     }

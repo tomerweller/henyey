@@ -7,7 +7,6 @@ use henyey_bucket::{
     BUCKET_LIST_LEVELS, HAS_NEXT_STATE_CLEAR, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT,
 };
 use henyey_common::Hash256;
-use henyey_common::LedgerSeq;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -225,7 +224,7 @@ pub struct HistoryArchiveState {
     pub server: Option<String>,
 
     /// Current ledger sequence.
-    pub current_ledger: LedgerSeq,
+    pub current_ledger: u32,
 
     /// Network passphrase.
     #[serde(default)]
@@ -336,7 +335,7 @@ impl HistoryArchiveState {
 
     /// Get the current ledger sequence.
     #[inline]
-    pub fn current_ledger(&self) -> LedgerSeq {
+    pub fn current_ledger(&self) -> u32 {
         self.current_ledger
     }
 
@@ -1040,7 +1039,7 @@ mod tests {
         HistoryArchiveState {
             version: 2,
             server: None,
-            current_ledger: 100u32.into(),
+            current_ledger: 100,
             network_passphrase: None,
             current_buckets: buckets,
             hot_archive_buckets: None,
@@ -1253,7 +1252,7 @@ mod tests {
         let has = HistoryArchiveState {
             version: 2,
             server: Some("test".to_string()),
-            current_ledger: 7u32.into(),
+            current_ledger: 7,
             network_passphrase: None,
             current_buckets: levels.clone(),
             hot_archive_buckets: Some(levels),
@@ -1321,7 +1320,7 @@ mod tests {
         let has = HistoryArchiveState {
             version: 2,
             server: Some("test".to_string()),
-            current_ledger: 7u32.into(),
+            current_ledger: 7,
             network_passphrase: None,
             current_buckets: levels.clone(),
             hot_archive_buckets: Some(levels.clone()),

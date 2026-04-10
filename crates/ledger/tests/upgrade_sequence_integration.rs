@@ -29,7 +29,6 @@
 
 use henyey_bucket::{BucketList, HotArchiveBucketList};
 use henyey_common::Hash256;
-use henyey_common::LedgerSeq;
 use henyey_ledger::{
     compute_header_hash, CloseLedgerState, ConfigUpgradeSetFrame, LedgerCloseData, LedgerManager,
     LedgerManagerConfig, SnapshotBuilder, SnapshotHandle, TransactionSetVariant, UpgradeContext,
@@ -96,7 +95,7 @@ fn init_ledger_manager(version: u32) -> LedgerManager {
 fn empty_close_data(ledger: &LedgerManager, seq: u32, close_time: u64) -> LedgerCloseData {
     let prev_hash = ledger.current_header_hash();
     LedgerCloseData::new(
-        seq.into(),
+        seq,
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash::from(prev_hash),
             txs: VecM::default(),
@@ -143,11 +142,11 @@ fn ttl_key_for(data_key: &LedgerKey) -> LedgerKey {
 fn make_config_upgrade_entry(
     upgrade_key: &ConfigUpgradeSetKey,
     upgrade_set: &ConfigUpgradeSet,
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
 ) -> LedgerEntry {
     let xdr_bytes = upgrade_set.to_xdr(Limits::none()).expect("encode");
     LedgerEntry {
-        last_modified_ledger_seq: ledger_seq.into(),
+        last_modified_ledger_seq: ledger_seq,
         data: LedgerEntryData::ContractData(stellar_xdr::curr::ContractDataEntry {
             ext: stellar_xdr::curr::ExtensionPoint::V0,
             contract: ScAddress::Contract(upgrade_key.contract_id.clone()),
@@ -167,7 +166,7 @@ fn make_config_upgrade_entry(
 }
 
 /// Create a TTL entry that is live until the given ledger.
-fn make_ttl_entry(data_key: &LedgerKey, live_until: LedgerSeq) -> LedgerEntry {
+fn make_ttl_entry(data_key: &LedgerKey, live_until: u32) -> LedgerEntry {
     let key_hash = Hash256::hash_xdr(data_key)
         .map(|h| Hash(h.0))
         .unwrap_or(Hash([0u8; 32]));
@@ -175,7 +174,7 @@ fn make_ttl_entry(data_key: &LedgerKey, live_until: LedgerSeq) -> LedgerEntry {
         last_modified_ledger_seq: 1,
         data: LedgerEntryData::Ttl(TtlEntry {
             key_hash,
-            live_until_ledger_seq: live_until.into(),
+            live_until_ledger_seq: live_until,
         }),
         ext: LedgerEntryExt::V0,
     }
@@ -185,13 +184,13 @@ fn make_ttl_entry(data_key: &LedgerKey, live_until: LedgerSeq) -> LedgerEntry {
 fn make_config_setting_entry(
     id: ConfigSettingId,
     setting: ConfigSettingEntry,
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
 ) -> (LedgerKey, LedgerEntry) {
     let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: id,
     });
     let entry = LedgerEntry {
-        last_modified_ledger_seq: ledger_seq.into(),
+        last_modified_ledger_seq: ledger_seq,
         data: LedgerEntryData::ConfigSetting(setting),
         ext: LedgerEntryExt::V0,
     };
@@ -318,11 +317,11 @@ fn test_config_upgrade_sees_stale_protocol_version() {
     };
 
     let data_key = config_upgrade_data_key(&upgrade_key);
-    let data_entry = make_config_upgrade_entry(&upgrade_key, &upgrade_set, 1.into());
+    let data_entry = make_config_upgrade_entry(&upgrade_key, &upgrade_set, 1);
     let ttl_key = ttl_key_for(&data_key);
-    let ttl_entry = make_ttl_entry(&data_key, 1000.into());
+    let ttl_entry = make_ttl_entry(&data_key, 1000);
 
-    let snapshot = SnapshotBuilder::new(snapshot_ledger.into())
+    let snapshot = SnapshotBuilder::new(snapshot_ledger)
         .with_header(header.clone(), header_hash)
         .add_entry(data_key.clone(), data_entry)
         .add_entry(ttl_key, ttl_entry)
@@ -349,12 +348,12 @@ fn test_config_upgrade_sees_stale_protocol_version() {
         handle.clone(),
         header.clone(),
         header_hash,
-        closing_ledger_seq.into(),
+        closing_ledger_seq,
     );
     let frame = ConfigUpgradeSetFrame::make_from_key(
         &ltx,
         &upgrade_key,
-        closing_ledger_seq.into(),
+        closing_ledger_seq,
         post_upgrade_version,
     )
     .expect("should find config upgrade entry");
@@ -399,14 +398,14 @@ fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
     };
 
     let data_key = config_upgrade_data_key(&upgrade_key);
-    let data_entry = make_config_upgrade_entry(&upgrade_key, &upgrade_set, 1.into());
+    let data_entry = make_config_upgrade_entry(&upgrade_key, &upgrade_set, 1);
     let ttl_key = ttl_key_for(&data_key);
 
     // Set live_until = 99 = N-1 = snapshot.ledger_seq()
     // Both stellar-core and henyey now consider this EXPIRED (99 < 100).
-    let ttl_entry = make_ttl_entry(&data_key, snapshot_ledger.into());
+    let ttl_entry = make_ttl_entry(&data_key, snapshot_ledger);
 
-    let snapshot = SnapshotBuilder::new(snapshot_ledger.into())
+    let snapshot = SnapshotBuilder::new(snapshot_ledger)
         .with_header(header.clone(), header_hash)
         .add_entry(data_key, data_entry)
         .add_entry(ttl_key, ttl_entry)
@@ -416,13 +415,8 @@ fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
 
     // make_from_key now uses closing_ledger (100) for TTL check.
     // Entry with live_until=99 is expired because 99 < 100.
-    let ltx = CloseLedgerState::begin(
-        handle.clone(),
-        header.clone(),
-        header_hash,
-        closing_ledger.into(),
-    );
-    let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &upgrade_key, closing_ledger.into(), 25);
+    let ltx = CloseLedgerState::begin(handle.clone(), header.clone(), header_hash, closing_ledger);
+    let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &upgrade_key, closing_ledger, 25);
 
     assert!(
         frame.is_none(),
@@ -477,7 +471,7 @@ fn test_state_size_window_resize_at_sample_ledger() {
     let (_window_key, window_entry) = make_config_setting_entry(
         ConfigSettingId::LiveSorobanStateSizeWindow,
         ConfigSettingEntry::LiveSorobanStateSizeWindow(old_window_xdr),
-        1.into(),
+        1,
     );
 
     // Simulate a config upgrade that resizes the window from 5 to 8 entries
@@ -629,7 +623,7 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     let header = make_genesis_header(25);
     let header_hash = compute_header_hash(&header).expect("hash");
 
-    let snapshot = SnapshotBuilder::new(0.into())
+    let snapshot = SnapshotBuilder::new(0)
         .with_header(header.clone(), header_hash)
         .build()
         .expect("build snapshot");
@@ -641,8 +635,8 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     };
 
     // make_from_key returns None — key doesn't exist in ledger
-    let ltx = CloseLedgerState::begin(handle.clone(), header.clone(), header_hash, 1.into());
-    let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &bogus_key, 1.into(), 25);
+    let ltx = CloseLedgerState::begin(handle.clone(), header.clone(), header_hash, 1);
+    let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &bogus_key, 1, 25);
     assert!(
         frame.is_none(),
         "Nonexistent config upgrade key should not be loadable"
@@ -654,8 +648,8 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     let mut ctx = UpgradeContext::new(25);
     ctx.add_upgrade(LedgerUpgrade::Config(bogus_key));
 
-    let mut ltx = CloseLedgerState::begin(handle, header, header_hash, 1.into());
-    let result = ctx.apply_config_upgrades(&mut ltx, 1.into(), 25);
+    let mut ltx = CloseLedgerState::begin(handle, header, header_hash, 1);
+    let result = ctx.apply_config_upgrades(&mut ltx, 1, 25);
 
     assert!(
         result.is_err(),

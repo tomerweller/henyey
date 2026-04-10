@@ -28,7 +28,6 @@
 //! - Update + Delete = Delete (original previous)
 
 use crate::{LedgerError, Result};
-use henyey_common::LedgerSeq;
 use std::collections::HashMap;
 use stellar_xdr::curr::{
     AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerKey,
@@ -156,7 +155,7 @@ impl EntryChange {
 #[derive(Debug, Clone)]
 pub struct LedgerDelta {
     /// The ledger sequence this delta applies to.
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
 
     /// All entry changes, keyed by LedgerKey directly.
     ///
@@ -179,7 +178,7 @@ pub struct LedgerDelta {
 
 impl LedgerDelta {
     /// Create a new empty LedgerDelta.
-    pub fn new(ledger_seq: LedgerSeq) -> Self {
+    pub fn new(ledger_seq: u32) -> Self {
         Self {
             ledger_seq,
             changes: HashMap::new(),
@@ -190,7 +189,7 @@ impl LedgerDelta {
     }
 
     /// Get the ledger sequence this delta is for.
-    pub fn ledger_seq(&self) -> LedgerSeq {
+    pub fn ledger_seq(&self) -> u32 {
         self.ledger_seq
     }
 
@@ -367,7 +366,7 @@ impl LedgerDelta {
         account_id: &AccountId,
         fee: i64,
         snapshot: &crate::snapshot::SnapshotHandle,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
     ) -> Result<(i64, LedgerEntryChanges)> {
         let key = LedgerKey::Account(LedgerKeyAccount {
             account_id: account_id.clone(),
@@ -407,7 +406,7 @@ impl LedgerDelta {
         }
         // Stamp last_modified_ledger_seq to match stellar-core LedgerTxn behavior.
         if charged_fee > 0 {
-            entry.last_modified_ledger_seq = ledger_seq.get();
+            entry.last_modified_ledger_seq = ledger_seq;
         }
 
         // Build fee_changes: [State(before), Updated(after)].
@@ -884,7 +883,7 @@ mod tests {
 
     #[test]
     fn test_record_create() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
 
         delta.record_create(entry.clone()).unwrap();
@@ -896,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_record_update() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry1 = create_test_account(1);
         let mut entry2 = entry1.clone();
         if let LedgerEntryData::Account(ref mut acc) = entry2.data {
@@ -912,7 +911,7 @@ mod tests {
 
     #[test]
     fn test_record_delete() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
 
         delta.record_delete(entry).unwrap();
@@ -924,7 +923,7 @@ mod tests {
 
     #[test]
     fn test_create_then_delete() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
 
         delta.record_create(entry.clone()).unwrap();
@@ -936,7 +935,7 @@ mod tests {
 
     #[test]
     fn test_create_then_update() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry1 = create_test_account(1);
         let mut entry2 = entry1.clone();
         if let LedgerEntryData::Account(ref mut acc) = entry2.data {
@@ -957,7 +956,7 @@ mod tests {
         // Scenario: TX1 deletes an entry that existed before the ledger,
         // TX2 recreates it. Net effect should be Updated (existed before,
         // still exists after with new value).
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let original = create_test_account(1);
         let mut recreated = original.clone();
         if let LedgerEntryData::Account(ref mut acc) = recreated.data {
@@ -1009,7 +1008,7 @@ mod tests {
     /// Stress test: multiple rounds of create/modify/erase operations.
     #[test]
     fn test_delta_round_trip_stress() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
 
         // Round 1: Create 10 entries
         for i in 0..10u8 {
@@ -1066,7 +1065,7 @@ mod tests {
     /// Stress test: interleaved operations on the same entries.
     #[test]
     fn test_delta_interleaved_operations() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
 
         // Create entry
         let e1 = create_test_account(1);
@@ -1102,7 +1101,7 @@ mod tests {
     /// Creating when key already exists as Created should overwrite.
     #[test]
     fn test_create_on_existing_created_overwrites() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry1 = create_test_account(1);
         delta.record_create(entry1).unwrap();
 
@@ -1121,7 +1120,7 @@ mod tests {
     /// Creating when key exists as Updated should update current value.
     #[test]
     fn test_create_on_existing_updated_keeps_original_previous() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let original = create_test_account(1);
         let updated = create_test_account_with_balance(1, 2_000);
         delta.record_update(original.clone(), updated).unwrap();
@@ -1150,8 +1149,8 @@ mod tests {
     /// Merge two independent deltas.
     #[test]
     fn test_merge_independent_deltas() {
-        let mut delta1 = LedgerDelta::new(1.into());
-        let mut delta2 = LedgerDelta::new(1.into());
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
 
         delta1.record_create(create_test_account(1)).unwrap();
         delta2.record_create(create_test_account(2)).unwrap();
@@ -1164,8 +1163,8 @@ mod tests {
     /// Merge delta with Deleted + Created = Updated.
     #[test]
     fn test_merge_deleted_then_created_becomes_updated() {
-        let mut delta1 = LedgerDelta::new(1.into());
-        let mut delta2 = LedgerDelta::new(1.into());
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
 
         let original = create_test_account(1);
         delta1.record_delete(original.clone()).unwrap();
@@ -1182,8 +1181,8 @@ mod tests {
     /// Merge delta with Created + Deleted = no-op.
     #[test]
     fn test_merge_created_then_deleted_becomes_noop() {
-        let mut delta1 = LedgerDelta::new(1.into());
-        let mut delta2 = LedgerDelta::new(1.into());
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
 
         let entry = create_test_account(1);
         delta1.record_create(entry.clone()).unwrap();
@@ -1196,8 +1195,8 @@ mod tests {
     /// Merge delta: Updated + Updated = Updated (original previous, final current).
     #[test]
     fn test_merge_updated_then_updated_keeps_original_previous() {
-        let mut delta1 = LedgerDelta::new(1.into());
-        let mut delta2 = LedgerDelta::new(1.into());
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
 
         let v0 = create_test_account(1);
         let v1 = create_test_account_with_balance(1, 2_000);
@@ -1223,8 +1222,8 @@ mod tests {
     /// Merge fee pool and total coins deltas.
     #[test]
     fn test_merge_fee_pool_and_total_coins() {
-        let mut delta1 = LedgerDelta::new(1.into());
-        let mut delta2 = LedgerDelta::new(1.into());
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
 
         delta1.record_fee_pool_delta(100);
         delta1.record_total_coins_delta(50);
@@ -1244,8 +1243,8 @@ mod tests {
     /// re-creates it.  The merge should succeed, keeping the later value.
     #[test]
     fn test_merge_created_then_created_keeps_later_value() {
-        let mut delta1 = LedgerDelta::new(1.into());
-        let mut delta2 = LedgerDelta::new(1.into());
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
 
         let entry_v1 = create_test_account_with_balance(1, 1_000);
         let entry_v2 = create_test_account_with_balance(1, 2_000);
@@ -1264,8 +1263,8 @@ mod tests {
     /// Merge error: create on existing updated entry.
     #[test]
     fn test_merge_create_on_existing_updated_fails() {
-        let mut delta1 = LedgerDelta::new(1.into());
-        let mut delta2 = LedgerDelta::new(1.into());
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
 
         let original = create_test_account(1);
         let updated = create_test_account_with_balance(1, 2_000);
@@ -1281,8 +1280,8 @@ mod tests {
     /// same entry (e.g. a TTL key present in multiple footprints).
     #[test]
     fn test_merge_delete_on_deleted_is_idempotent() {
-        let mut delta1 = LedgerDelta::new(1.into());
-        let mut delta2 = LedgerDelta::new(1.into());
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
 
         let entry = create_test_account(1);
         delta1.record_delete(entry.clone()).unwrap();
@@ -1306,8 +1305,8 @@ mod tests {
     /// did not exist before the first delta.
     #[test]
     fn test_merge_created_then_updated_becomes_created_with_final_value() {
-        let mut delta1 = LedgerDelta::new(1.into());
-        let mut delta2 = LedgerDelta::new(1.into());
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
 
         let v0 = create_test_account(1);
         let v1 = create_test_account_with_balance(1, 2_000);
@@ -1337,8 +1336,8 @@ mod tests {
     /// original previous value (from before the first update).
     #[test]
     fn test_merge_updated_then_deleted_becomes_deleted_with_original_previous() {
-        let mut delta1 = LedgerDelta::new(1.into());
-        let mut delta2 = LedgerDelta::new(1.into());
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
 
         let v0 = create_test_account(1);
         let v1 = create_test_account_with_balance(1, 2_000);
@@ -1366,7 +1365,7 @@ mod tests {
     /// Changes are returned in insertion order (deterministic).
     #[test]
     fn test_delta_deterministic_ordering() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
 
         // Insert in specific order
         for i in (0..10u8).rev() {
@@ -1392,7 +1391,7 @@ mod tests {
     /// Clear resets all state.
     #[test]
     fn test_delta_clear() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         delta.record_create(create_test_account(1)).unwrap();
         delta.record_fee_pool_delta(100);
         delta.record_total_coins_delta(50);
@@ -1410,7 +1409,7 @@ mod tests {
     /// Double delete on same entry is idempotent.
     #[test]
     fn test_double_delete_idempotent() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
 
         delta.record_delete(entry.clone()).unwrap();
@@ -1423,7 +1422,7 @@ mod tests {
     /// Update then delete preserves original previous.
     #[test]
     fn test_update_then_delete_preserves_original() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let original = create_test_account(1);
         let updated = create_test_account_with_balance(1, 5_000);
 
@@ -1445,7 +1444,7 @@ mod tests {
     fn test_delete_then_update() {
         // Scenario: TX1 deletes an entry, TX2 updates it (e.g., fee refund
         // restores the account). Net effect should be Updated.
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let original = create_test_account(1);
         let mut updated_entry = original.clone();
         if let LedgerEntryData::Account(ref mut acc) = updated_entry.data {
@@ -1493,7 +1492,7 @@ mod tests {
     /// ConfigSetting entries cannot be erased.
     #[test]
     fn test_cannot_delete_config_setting() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let config = create_config_setting_entry();
 
         let result = delta.record_delete(config);
@@ -1512,7 +1511,7 @@ mod tests {
     /// ConfigSetting entries can be created and updated (just not deleted).
     #[test]
     fn test_config_setting_create_and_update_allowed() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let config = create_config_setting_entry();
 
         // Create is allowed
@@ -1540,7 +1539,7 @@ mod tests {
     /// After deleting an entry, get_change returns Deleted with the original.
     #[test]
     fn test_deleted_entry_shows_as_deleted_in_delta() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
         let key = henyey_common::entry_to_key(&entry);
 
@@ -1562,7 +1561,7 @@ mod tests {
     /// In stellar-core, erasing an entry erased by a parent throws. In Rust, created+deleted = removed.
     #[test]
     fn test_created_then_deleted_vanishes() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
         let key = henyey_common::entry_to_key(&entry);
 
@@ -1589,7 +1588,7 @@ mod tests {
     /// The snapshot/state layer interprets Deleted as "entry does not exist".
     #[test]
     fn test_deleted_entry_previous_preserved() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
         let key = henyey_common::entry_to_key(&entry);
 
@@ -1619,7 +1618,7 @@ mod tests {
     /// Applying a fee refund to an updated account modifies its balance.
     #[test]
     fn test_apply_refund_to_updated_account() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let original = create_test_account(1); // balance = 1_000_000_000
         let updated = create_test_account_with_balance(1, 900_000_000); // fee deducted
 
@@ -1653,7 +1652,7 @@ mod tests {
     /// Applying a fee refund to a created account modifies its balance.
     #[test]
     fn test_apply_refund_to_created_account() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry = create_test_account_with_balance(1, 500_000_000);
 
         delta.record_create(entry.clone()).unwrap();
@@ -1678,7 +1677,7 @@ mod tests {
     /// Applying a refund to a nonexistent account is a no-op.
     #[test]
     fn test_apply_refund_to_missing_account() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
         let account_id = if let LedgerEntryData::Account(ref acc) = entry.data {
             acc.account_id.clone()
@@ -1694,7 +1693,7 @@ mod tests {
     /// Regression test for AUDIT-H18.
     #[test]
     fn test_apply_refund_overflow_updated() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let original = create_test_account_with_balance(1, i64::MAX - 10);
         let updated = create_test_account_with_balance(1, i64::MAX - 10);
 
@@ -1726,7 +1725,7 @@ mod tests {
     /// Regression test for AUDIT-H18.
     #[test]
     fn test_apply_refund_overflow_created() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let entry = create_test_account_with_balance(1, i64::MAX - 5);
 
         delta.record_create(entry.clone()).unwrap();
@@ -1757,7 +1756,7 @@ mod tests {
     fn test_apply_refund_buying_liabilities() {
         use stellar_xdr::curr::{AccountEntryExtensionV1, AccountEntryExtensionV1Ext, Liabilities};
 
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
 
         let mut key = [0u8; 32];
         key[0] = 1;
@@ -1816,7 +1815,7 @@ mod tests {
     /// current_entries returns created and updated entries but not deleted.
     #[test]
     fn test_current_entries_includes_created_and_updated() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
 
         let created = create_test_account(1);
         delta.record_create(created.clone()).unwrap();
@@ -1835,7 +1834,7 @@ mod tests {
     /// current_entries on empty delta returns empty.
     #[test]
     fn test_current_entries_empty_delta() {
-        let delta = LedgerDelta::new(1.into());
+        let delta = LedgerDelta::new(1);
         assert!(delta.current_entries().is_empty());
     }
 
@@ -1847,7 +1846,7 @@ mod tests {
     #[test]
     fn test_audit_c8_drain_categorization_deterministic_order() {
         // Insert entries in a specific order
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         for seed in [10u8, 5, 20, 1, 15, 8, 25, 3] {
             delta.record_create(create_test_account(seed)).unwrap();
         }
@@ -1878,7 +1877,7 @@ mod tests {
     /// the fee pool in that case.
     #[test]
     fn test_audit_067_refund_skipped_for_deleted_account() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let original = create_test_account(1);
 
         let account_id = if let LedgerEntryData::Account(ref acc) = original.data {
@@ -1901,7 +1900,7 @@ mod tests {
     /// when adding the refund would overflow the balance.
     #[test]
     fn test_audit_067_refund_skipped_on_balance_overflow() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let original = create_test_account(1);
         // Set balance near i64::MAX so refund overflows.
         let mut high_balance = create_test_account(1);
@@ -1937,7 +1936,7 @@ mod tests {
     /// when the account is not in the delta at all.
     #[test]
     fn test_audit_067_refund_skipped_for_missing_account() {
-        let mut delta = LedgerDelta::new(1.into());
+        let mut delta = LedgerDelta::new(1);
         let nonexistent_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([99u8; 32])));
         let applied = delta
             .apply_refund_to_account(&nonexistent_id, 1000)

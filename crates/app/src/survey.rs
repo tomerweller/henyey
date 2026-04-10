@@ -37,7 +37,6 @@
 //! - Nodes can configure allowed surveyor keys
 //! - Rate limiting prevents abuse
 
-use henyey_common::LedgerSeq;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -102,7 +101,7 @@ impl SurveyMessageLimiter {
             return false;
         }
 
-        if !self.survey_ledger_num_valid(request.ledger_num.into(), local_ledger) {
+        if !self.survey_ledger_num_valid(request.ledger_num, local_ledger) {
             return false;
         }
 
@@ -149,7 +148,7 @@ impl SurveyMessageLimiter {
         local_ledger: u32,
         on_success_validation: F,
     ) -> bool {
-        if !self.survey_ledger_num_valid(response.ledger_num.into(), local_ledger) {
+        if !self.survey_ledger_num_valid(response.ledger_num, local_ledger) {
             return false;
         }
 
@@ -182,7 +181,7 @@ impl SurveyMessageLimiter {
         survey_active: bool,
         on_success_validation: F,
     ) -> bool {
-        if !self.survey_ledger_num_valid(start.ledger_num.into(), local_ledger) {
+        if !self.survey_ledger_num_valid(start.ledger_num, local_ledger) {
             return false;
         }
         if survey_active {
@@ -197,16 +196,16 @@ impl SurveyMessageLimiter {
         local_ledger: u32,
         on_success_validation: F,
     ) -> bool {
-        if !self.survey_ledger_num_valid(stop.ledger_num.into(), local_ledger) {
+        if !self.survey_ledger_num_valid(stop.ledger_num, local_ledger) {
             return false;
         }
         on_success_validation()
     }
 
-    pub fn clear_old_ledgers(&mut self, last_closed_ledger: LedgerSeq) {
+    pub fn clear_old_ledgers(&mut self, last_closed_ledger: u32) {
         let threshold = last_closed_ledger.saturating_sub(self.num_ledgers_before_ignore);
         while let Some((&ledger, _)) = self.record_map.iter().next() {
-            if ledger < threshold.get() {
+            if ledger < threshold {
                 self.record_map.pop_first();
             } else {
                 break;
@@ -214,7 +213,7 @@ impl SurveyMessageLimiter {
         }
     }
 
-    fn survey_ledger_num_valid(&self, ledger_num: LedgerSeq, local_ledger: u32) -> bool {
+    fn survey_ledger_num_valid(&self, ledger_num: u32, local_ledger: u32) -> bool {
         let max_offset = self.num_ledgers_before_ignore.max(1);
         let upper = local_ledger.saturating_add(max_offset);
         let lower = local_ledger.saturating_sub(self.num_ledgers_before_ignore);

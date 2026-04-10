@@ -77,7 +77,6 @@
 //! - Eviction iterator: `src/ledger/NetworkConfig.h` (EvictionIterator struct)
 //! - State archival CAP: CAP-0046 (Soroban State Archival)
 
-use henyey_common::LedgerSeq;
 use stellar_xdr::curr::{LedgerEntry, LedgerKey, StateArchivalSettings};
 
 use crate::bucket_list::BUCKET_LIST_LEVELS;
@@ -421,7 +420,7 @@ pub fn bucket_update_period(level: u32, is_curr: bool) -> u32 {
 pub fn update_starting_eviction_iterator(
     iter: &mut EvictionIterator,
     first_scan_level: u32,
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
 ) -> bool {
     let mut was_reset = false;
 
@@ -452,7 +451,7 @@ pub fn update_starting_eviction_iterator(
         }
         if iter.bucket_list_level > 0 {
             let level_below = iter.bucket_list_level - 1;
-            if level_should_spill(prev_ledger.get(), level_below) {
+            if level_should_spill(prev_ledger, level_below) {
                 iter.bucket_file_offset = 0;
                 was_reset = true;
             }
@@ -463,7 +462,7 @@ pub fn update_starting_eviction_iterator(
         }
     } else {
         // Snap bucket receives data when its own level spills
-        if level_should_spill(prev_ledger.get(), iter.bucket_list_level) {
+        if level_should_spill(prev_ledger, iter.bucket_list_level) {
             iter.bucket_file_offset = 0;
             was_reset = true;
         }
@@ -667,7 +666,7 @@ mod tests {
             is_curr_bucket: false,
         };
 
-        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 100.into());
+        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 100);
         assert!(was_reset);
         assert_eq!(iter.bucket_file_offset, 0);
         assert_eq!(iter.bucket_list_level, 6);
@@ -685,12 +684,12 @@ mod tests {
         };
 
         // Ledger 2047 - level 5 doesn't spill, iterator should NOT reset
-        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 2047.into());
+        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 2047);
         assert!(!was_reset);
         assert_eq!(iter.bucket_file_offset, 5000);
 
         // Ledger 2049 - previous ledger spills, iterator SHOULD reset
-        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 2049.into());
+        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 2049);
         assert!(was_reset);
         assert_eq!(iter.bucket_file_offset, 0);
     }
@@ -706,12 +705,12 @@ mod tests {
         };
 
         // Ledger 8191 - level 6 doesn't spill, iterator should NOT reset
-        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 8191.into());
+        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 8191);
         assert!(!was_reset);
         assert_eq!(iter.bucket_file_offset, 5000);
 
         // Ledger 8193 - previous ledger spills, iterator SHOULD reset
-        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 8193.into());
+        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 8193);
         assert!(was_reset);
         assert_eq!(iter.bucket_file_offset, 0);
     }
@@ -728,9 +727,9 @@ mod tests {
         };
 
         // Any ledger should reset level 0 curr
-        for ledger in [1u32, 2, 3, 100, 1000] {
+        for ledger in [1, 2, 3, 100, 1000] {
             iter.bucket_file_offset = 5000;
-            let was_reset = update_starting_eviction_iterator(&mut iter, 0, ledger.into());
+            let was_reset = update_starting_eviction_iterator(&mut iter, 0, ledger);
             assert!(was_reset, "Level 0 curr should reset at ledger {}", ledger);
             assert_eq!(iter.bucket_file_offset, 0);
         }
@@ -748,7 +747,7 @@ mod tests {
         // Level 7 curr receives data when level 6 spills
         // Level 6 spills at multiples of levelHalf(6) = 2048
         // Ledger 100 is not a spill point for level 6
-        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 100.into());
+        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 100);
         assert!(!was_reset);
         assert_eq!(iter.bucket_file_offset, 12345);
         assert_eq!(iter.bucket_list_level, 7);

@@ -43,7 +43,6 @@
 //! Dead entries (tombstones) shadow live entries, returning None.
 
 use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
-use henyey_common::LedgerSeq;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -125,11 +124,7 @@ pub(crate) fn bl_level_size(level: usize) -> u32 {
 /// For level 0 (half=2): spills at ledgers 0, 2, 4, 6, ...
 /// For level 1 (half=8): spills at ledgers 0, 8, 16, 24, ...
 /// For level 2 (half=32): spills at ledgers 0, 32, 64, 96, ...
-pub(crate) fn bl_level_should_spill(
-    ledger_seq: LedgerSeq,
-    level: usize,
-    num_levels: usize,
-) -> bool {
+pub(crate) fn bl_level_should_spill(ledger_seq: u32, level: usize, num_levels: usize) -> bool {
     if level == num_levels - 1 {
         // There's no level above the highest level, so it can't spill.
         return false;
@@ -156,7 +151,7 @@ pub(crate) fn bl_keep_tombstone_entries(level: usize, num_levels: usize) -> bool
 ///
 /// Matches stellar-core's `shouldMergeWithEmptyCurr` in BucketListBase.cpp.
 pub(crate) fn bl_should_merge_with_empty_curr(
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
     level: usize,
     num_levels: usize,
 ) -> bool {
@@ -166,14 +161,14 @@ pub(crate) fn bl_should_merge_with_empty_curr(
     }
 
     // Round down to when the merge was started
-    let merge_start_ledger = bl_round_down(ledger_seq.get(), bl_level_half(level - 1));
+    let merge_start_ledger = bl_round_down(ledger_seq, bl_level_half(level - 1));
 
     // Calculate when the next spill would happen
     let next_change_ledger = merge_start_ledger + bl_level_half(level - 1);
 
     // If the next spill would affect this level, use empty curr
     // because curr is about to be snapped
-    bl_level_should_spill(next_change_ledger.into(), level, num_levels)
+    bl_level_should_spill(next_change_ledger, level, num_levels)
 }
 
 /// State of a pending bucket merge from History Archive State (HAS).
@@ -292,7 +287,7 @@ struct AsyncMergeRequest {
 }
 
 struct AddBatchArgs {
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
     protocol_version: u32,
     bucket_list_type: BucketListType,
     init_entries: Vec<LedgerEntry>,
@@ -1014,7 +1009,7 @@ pub struct BucketList {
     /// The 11 levels of the bucket list (indices 0-10).
     levels: Vec<BucketLevel>,
     /// The current ledger sequence number (last ledger added).
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
     /// Optional directory for writing merge output files.
     /// When set, merges at level 1+ write to disk instead of collecting in memory,
     /// reducing peak memory from O(data_size) to O(index_size).
@@ -1133,7 +1128,7 @@ impl BucketList {
 
         Self {
             levels,
-            ledger_seq: LedgerSeq::new(0),
+            ledger_seq: 0,
             bucket_dir: None,
             bucket_list_db_config: None,
             completed_merges: Vec::new(),
@@ -1222,7 +1217,7 @@ impl BucketList {
     }
 
     /// Get the current ledger sequence.
-    pub fn ledger_seq(&self) -> LedgerSeq {
+    pub fn ledger_seq(&self) -> u32 {
         self.ledger_seq
     }
 
@@ -1232,7 +1227,7 @@ impl BucketList {
     /// to set the correct ledger sequence. The `restore_from_hashes` method
     /// sets ledger_seq to 0, so callers must set it to the actual ledger
     /// sequence to ensure proper bucket list advancement behavior.
-    pub fn set_ledger_seq(&mut self, ledger_seq: LedgerSeq) {
+    pub fn set_ledger_seq(&mut self, ledger_seq: u32) {
         self.ledger_seq = ledger_seq;
     }
 
@@ -1650,7 +1645,7 @@ impl BucketList {
     /// merges on spill boundaries and committing prior merges as needed.
     pub fn add_batch(
         &mut self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         protocol_version: u32,
         bucket_list_type: BucketListType,
         init_entries: Vec<LedgerEntry>,
@@ -1674,7 +1669,7 @@ impl BucketList {
     /// unique (e.g. from a coalesced `LedgerDelta`). Saves ~200ms on 100K entries.
     pub fn add_batch_unique(
         &mut self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         protocol_version: u32,
         bucket_list_type: BucketListType,
         init_entries: Vec<LedgerEntry>,
@@ -1792,7 +1787,7 @@ impl BucketList {
 
         let total_us = add_batch_start.elapsed().as_micros() as u64;
         tracing::debug!(
-            ledger_seq = ledger_seq.get(),
+            ledger_seq,
             total_us,
             dedup_us,
             sort_us,
@@ -1805,7 +1800,7 @@ impl BucketList {
 
     fn add_batch_internal(
         &mut self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         protocol_version: u32,
         new_bucket: Bucket,
     ) -> Result<()> {
@@ -1872,7 +1867,7 @@ impl BucketList {
 
                 let post_commit_curr_hash = self.levels[i].curr.hash();
                 tracing::debug!(
-                    ledger = ledger_seq.get(),
+                    ledger = ledger_seq,
                     level = i,
                     pre_commit_curr = %pre_commit_curr_hash.to_hex(),
                     pre_commit_snap = %pre_commit_snap_hash.to_hex(),
@@ -1916,7 +1911,7 @@ impl BucketList {
                     .map(|b| b.hash().to_hex())
                     .unwrap_or_else(|| "None".to_string());
                 tracing::debug!(
-                    ledger = ledger_seq.get(),
+                    ledger = ledger_seq,
                     level = i,
                     use_empty_curr = use_empty_curr,
                     spilling_snap_hash = %spilling_snap.hash().to_hex(),
@@ -2011,7 +2006,7 @@ impl BucketList {
         bucket_list_type: BucketListType,
     ) -> Result<()> {
         let current = self.ledger_seq;
-        if target_ledger <= current.get() {
+        if target_ledger <= current {
             // Nothing to do - we're already at or past this ledger
             return Ok(());
         }
@@ -2019,20 +2014,20 @@ impl BucketList {
         // Apply empty batches for each intermediate ledger
         // This maintains the correct merge timing in the bucket list
         tracing::info!(
-            current = current.get(),
+            current = current,
             target_ledger = target_ledger,
-            count = target_ledger - current.get() - 1,
+            count = target_ledger - current - 1,
             "advance_to_ledger: applying empty batches"
         );
-        for seq in (current.get() + 1)..target_ledger {
+        for seq in (current + 1)..target_ledger {
             tracing::debug!(
-                from_ledger = current.get(),
+                from_ledger = current,
                 to_ledger = target_ledger,
                 current_seq = seq,
                 "Advancing bucket list through empty ledger"
             );
             self.add_batch(
-                LedgerSeq::new(seq),
+                seq,
                 protocol_version,
                 bucket_list_type,
                 Vec::new(), // empty init
@@ -2041,7 +2036,7 @@ impl BucketList {
             )?;
         }
         tracing::info!(
-            current = current.get(),
+            current = current,
             target_ledger = target_ledger,
             "advance_to_ledger: completed"
         );
@@ -2051,7 +2046,7 @@ impl BucketList {
 
     /// Returns true if a level should spill at a given ledger.
     /// Delegates to [`bl_level_should_spill`].
-    pub fn level_should_spill(ledger_seq: LedgerSeq, level: usize) -> bool {
+    pub fn level_should_spill(ledger_seq: u32, level: usize) -> bool {
         bl_level_should_spill(ledger_seq, level, BUCKET_LIST_LEVELS)
     }
 
@@ -2063,7 +2058,7 @@ impl BucketList {
         }
     }
 
-    fn should_merge_with_empty_curr(ledger_seq: LedgerSeq, level: usize) -> bool {
+    fn should_merge_with_empty_curr(ledger_seq: u32, level: usize) -> bool {
         bl_should_merge_with_empty_curr(ledger_seq, level, BUCKET_LIST_LEVELS)
     }
 
@@ -2330,7 +2325,7 @@ impl BucketList {
 
         Ok(Self {
             levels,
-            ledger_seq: LedgerSeq::new(0),
+            ledger_seq: 0,
             bucket_dir: None,
             bucket_list_db_config: None,
             completed_merges: Vec::new(),
@@ -2429,7 +2424,7 @@ impl BucketList {
 
         Ok(Self {
             levels,
-            ledger_seq: LedgerSeq::new(0),
+            ledger_seq: 0,
             bucket_dir: None,
             bucket_list_db_config: None,
             completed_merges: Vec::new(),
@@ -2599,7 +2594,7 @@ impl BucketList {
         if restart_structure_based {
             self.restart_merges(ledger, protocol_version)
         } else {
-            self.ledger_seq = ledger.into();
+            self.ledger_seq = ledger;
             Ok(())
         }
     }
@@ -2659,7 +2654,7 @@ impl BucketList {
             // flag only affects DEAD entry filtering, not INIT entry transformation.
             let keep_dead = Self::keep_tombstone_entries(i);
             let normalize_init = InitEntryPolicy::Preserve; // stellar-core never normalizes INIT to LIVE during merges
-            let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger.into(), i);
+            let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
             // Log detailed merge parameters for debugging
             tracing::info!(
@@ -2696,7 +2691,7 @@ impl BucketList {
         }
 
         // Update the ledger sequence to the restored ledger
-        self.ledger_seq = ledger.into();
+        self.ledger_seq = ledger;
 
         Ok(())
     }
@@ -2766,7 +2761,7 @@ impl BucketList {
     /// are archived to the hot archive bucket list.
     pub fn scan_for_eviction(
         &self,
-        current_ledger: LedgerSeq,
+        current_ledger: u32,
     ) -> Result<(Vec<LedgerEntry>, Vec<LedgerKey>)> {
         let mut archived_entries: Vec<LedgerEntry> = Vec::new();
         let mut deleted_keys: Vec<LedgerKey> = Vec::new();
@@ -2828,7 +2823,7 @@ impl BucketList {
                     };
 
                     // Check if the entry is expired
-                    let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger.into()) else {
+                    let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
                         // Not a TTL entry (shouldn't happen)
                         continue;
                     };
@@ -2851,7 +2846,7 @@ impl BucketList {
         }
 
         tracing::debug!(
-            current_ledger = current_ledger.get(),
+            current_ledger,
             archived_count = archived_entries.len(),
             deleted_count = deleted_keys.len(),
             "Eviction scan completed"
@@ -2872,7 +2867,7 @@ impl BucketList {
     pub fn scan_for_eviction_incremental(
         &self,
         mut iter: EvictionIterator,
-        current_ledger: LedgerSeq,
+        current_ledger: u32,
         settings: &StateArchivalSettings,
     ) -> Result<EvictionResult> {
         let mut result = EvictionResult {
@@ -2972,7 +2967,7 @@ impl BucketList {
         bucket: &Bucket,
         iter: &mut EvictionIterator,
         max_bytes: u64,
-        current_ledger: LedgerSeq,
+        current_ledger: u32,
         candidates: &mut Vec<EvictionCandidate>,
         seen_keys: &mut HashSet<Vec<u8>>,
     ) -> Result<(usize, u64, bool)> {
@@ -3043,7 +3038,7 @@ impl BucketList {
                 };
 
                 // Check if expired
-                let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger.into()) else {
+                let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
                     break 'process;
                 };
 
@@ -3206,7 +3201,7 @@ mod tests {
 
         let entry = make_account_entry([1u8; 32], 100);
         bl.add_batch(
-            1.into(),
+            1,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![entry],
@@ -3232,7 +3227,7 @@ mod tests {
         // Add initial entry
         let entry1 = make_account_entry([1u8; 32], 100);
         bl.add_batch(
-            1.into(),
+            1,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![entry1],
@@ -3244,7 +3239,7 @@ mod tests {
         // Update entry
         let entry2 = make_account_entry([1u8; 32], 200);
         bl.add_batch(
-            2.into(),
+            2,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -3269,7 +3264,7 @@ mod tests {
 
         let entry = make_account_entry([1u8; 32], 100);
         bl.add_batch(
-            1.into(),
+            1,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![entry],
@@ -3280,7 +3275,7 @@ mod tests {
 
         let dead = make_account_key([1u8; 32]);
         bl.add_batch(
-            2.into(),
+            2,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -3300,7 +3295,7 @@ mod tests {
         // Add entry
         let entry = make_account_entry([1u8; 32], 100);
         bl.add_batch(
-            1.into(),
+            1,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![entry],
@@ -3312,7 +3307,7 @@ mod tests {
         // Delete entry
         let key = make_account_key([1u8; 32]);
         bl.add_batch(
-            2.into(),
+            2,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -3341,34 +3336,28 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_level_should_spill_boundaries() {
         // Level 0 spills at even ledgers (multiples of 2)
-        assert!(BucketList::level_should_spill(0.into(), 0));
-        assert!(BucketList::level_should_spill(2.into(), 0));
-        assert!(BucketList::level_should_spill(4.into(), 0));
-        assert!(!BucketList::level_should_spill(1.into(), 0));
-        assert!(!BucketList::level_should_spill(3.into(), 0));
+        assert!(BucketList::level_should_spill(0, 0));
+        assert!(BucketList::level_should_spill(2, 0));
+        assert!(BucketList::level_should_spill(4, 0));
+        assert!(!BucketList::level_should_spill(1, 0));
+        assert!(!BucketList::level_should_spill(3, 0));
 
         // Level 1 spills at multiples of 8
-        assert!(BucketList::level_should_spill(0.into(), 1));
-        assert!(BucketList::level_should_spill(8.into(), 1));
-        assert!(BucketList::level_should_spill(16.into(), 1));
-        assert!(!BucketList::level_should_spill(4.into(), 1));
-        assert!(!BucketList::level_should_spill(12.into(), 1));
+        assert!(BucketList::level_should_spill(0, 1));
+        assert!(BucketList::level_should_spill(8, 1));
+        assert!(BucketList::level_should_spill(16, 1));
+        assert!(!BucketList::level_should_spill(4, 1));
+        assert!(!BucketList::level_should_spill(12, 1));
 
         // Level 2 spills at multiples of 32
-        assert!(BucketList::level_should_spill(0.into(), 2));
-        assert!(BucketList::level_should_spill(32.into(), 2));
-        assert!(BucketList::level_should_spill(64.into(), 2));
-        assert!(!BucketList::level_should_spill(16.into(), 2));
+        assert!(BucketList::level_should_spill(0, 2));
+        assert!(BucketList::level_should_spill(32, 2));
+        assert!(BucketList::level_should_spill(64, 2));
+        assert!(!BucketList::level_should_spill(16, 2));
 
         // Top level never spills
-        assert!(!BucketList::level_should_spill(
-            0.into(),
-            BUCKET_LIST_LEVELS - 1
-        ));
-        assert!(!BucketList::level_should_spill(
-            64.into(),
-            BUCKET_LIST_LEVELS - 1
-        ));
+        assert!(!BucketList::level_should_spill(0, BUCKET_LIST_LEVELS - 1));
+        assert!(!BucketList::level_should_spill(64, BUCKET_LIST_LEVELS - 1));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3447,7 +3436,7 @@ mod tests {
 
         let entry = make_account_entry([1u8; 32], 100);
         bl.add_batch(
-            1.into(),
+            1,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![entry],
@@ -3469,7 +3458,7 @@ mod tests {
 
         let entry = make_account_entry([1u8; 32], 100);
         bl.add_batch(
-            1.into(),
+            1,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![entry],
@@ -3491,7 +3480,7 @@ mod tests {
             id[0..4].copy_from_slice(&i.to_be_bytes());
             let entry = make_account_entry(id, i as i64 * 100);
             bl.add_batch(
-                i.into(),
+                i,
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![entry],
@@ -3514,30 +3503,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_should_merge_with_empty_curr() {
         // Level 0 always returns false
-        assert!(!BucketList::should_merge_with_empty_curr(1.into(), 0));
-        assert!(!BucketList::should_merge_with_empty_curr(2.into(), 0));
-        assert!(!BucketList::should_merge_with_empty_curr(100.into(), 0));
+        assert!(!BucketList::should_merge_with_empty_curr(1, 0));
+        assert!(!BucketList::should_merge_with_empty_curr(2, 0));
+        assert!(!BucketList::should_merge_with_empty_curr(100, 0));
 
         // Level 1: half=8, size=16
         // At ledger 2: mergeStartLedger=2, nextChangeLedger=4
         // levelShouldSpill(4, 1) = false (4 is not at 8 or 16 boundary)
-        assert!(!BucketList::should_merge_with_empty_curr(2.into(), 1));
+        assert!(!BucketList::should_merge_with_empty_curr(2, 1));
 
         // At ledger 4: mergeStartLedger=4, nextChangeLedger=6
         // levelShouldSpill(6, 1) = false
-        assert!(!BucketList::should_merge_with_empty_curr(4.into(), 1));
+        assert!(!BucketList::should_merge_with_empty_curr(4, 1));
 
         // At ledger 6: mergeStartLedger=6, nextChangeLedger=8
         // levelShouldSpill(8, 1) = true (8 is at half boundary for level 1)
-        assert!(BucketList::should_merge_with_empty_curr(6.into(), 1));
+        assert!(BucketList::should_merge_with_empty_curr(6, 1));
 
         // At ledger 8: mergeStartLedger=8, nextChangeLedger=10
         // levelShouldSpill(10, 1) = false
-        assert!(!BucketList::should_merge_with_empty_curr(8.into(), 1));
+        assert!(!BucketList::should_merge_with_empty_curr(8, 1));
 
         // At ledger 14: mergeStartLedger=14, nextChangeLedger=16
         // levelShouldSpill(16, 1) = true (16 is at size boundary for level 1)
-        assert!(BucketList::should_merge_with_empty_curr(14.into(), 1));
+        assert!(BucketList::should_merge_with_empty_curr(14, 1));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3561,7 +3550,7 @@ mod tests {
             id[0..4].copy_from_slice(&ledger.to_be_bytes());
             let entry = make_account_entry(id, ledger as i64 * 100);
             bl.add_batch(
-                ledger.into(),
+                ledger,
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![entry],
@@ -3605,7 +3594,7 @@ mod tests {
         // Add an entry at ledger 1 - this goes to level 0's curr
         let entry1 = make_account_entry(make_id(1), 100);
         bl.add_batch(
-            1.into(),
+            1,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![entry1],
@@ -3624,7 +3613,7 @@ mod tests {
         // The old curr moves to snap, and a new curr is created
         let entry2 = make_account_entry(make_id(2), 200);
         bl.add_batch(
-            2.into(),
+            2,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![entry2],
@@ -3650,7 +3639,7 @@ mod tests {
         for ledger in 3..=8u32 {
             let entry = make_account_entry(make_id(ledger), ledger as i64 * 100);
             bl.add_batch(
-                ledger.into(),
+                ledger,
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![entry],
@@ -3770,7 +3759,7 @@ mod tests {
         // Add a single batch at ledger 1
         let entry = make_account_entry([1u8; 32], 100);
         bl.add_batch(
-            1.into(),
+            1,
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![entry],
@@ -3822,8 +3811,7 @@ mod tests {
 
         // Add a single archived entry at ledger 1
         let entry = make_account_entry([1u8; 32], 100);
-        ha.add_batch(1.into(), TEST_PROTOCOL, vec![entry], vec![])
-            .unwrap();
+        ha.add_batch(1, TEST_PROTOCOL, vec![entry], vec![]).unwrap();
 
         // Level 0 curr should have entries (1 data + potentially metadata)
         assert!(
@@ -3870,7 +3858,7 @@ mod tests {
             entry.last_modified_ledger_seq = ledger_seq;
 
             bl.add_batch(
-                ledger_seq.into(),
+                ledger_seq,
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![entry],
@@ -3919,7 +3907,7 @@ mod tests {
             entry.last_modified_ledger_seq = ledger_seq;
 
             bl.add_batch(
-                ledger_seq.into(),
+                ledger_seq,
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![entry],
@@ -3988,7 +3976,7 @@ mod tests {
         for ledger_seq in 1..=200u32 {
             let entry = make_account_entry(id, ledger_seq as i64 * 100);
             bl.add_batch(
-                ledger_seq.into(),
+                ledger_seq,
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![],
@@ -4027,7 +4015,7 @@ mod tests {
             let bob = make_account_entry(bob_id, ledger_seq as i64 * 10);
 
             bl.add_batch(
-                ledger_seq.into(),
+                ledger_seq,
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![],
@@ -4059,7 +4047,7 @@ mod tests {
         for seq in 1..=4u32 {
             let entry = make_account_entry([seq as u8; 32], seq as i64 * 100);
             bl.add_batch(
-                seq.into(),
+                seq,
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![entry],
@@ -4088,7 +4076,7 @@ mod tests {
         for seq in 1..=8u32 {
             let entry = make_account_entry([seq as u8; 32], seq as i64 * 100);
             bl.add_batch(
-                seq.into(),
+                seq,
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![entry],
@@ -4639,7 +4627,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let current_ledger: LedgerSeq = 100.into();
+        let current_ledger: u32 = 100;
 
         let mut bl = BucketList::new();
 

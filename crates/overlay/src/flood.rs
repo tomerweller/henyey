@@ -21,7 +21,6 @@
 
 use dashmap::DashMap;
 use henyey_common::Hash256;
-use henyey_common::LedgerSeq;
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,14 +56,14 @@ struct SeenEntry {
     /// When the message was first seen.
     first_seen: Instant,
     /// Ledger sequence when the message was first seen.
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
     /// Set of peers that have sent us this message.
     peers: HashSet<PeerId>,
 }
 
 impl SeenEntry {
     /// Creates a new entry with the current timestamp and ledger sequence.
-    fn new(ledger_seq: LedgerSeq) -> Self {
+    fn new(ledger_seq: u32) -> Self {
         Self {
             first_seen: Instant::now(),
             ledger_seq,
@@ -167,7 +166,7 @@ impl FloodGate {
         &self,
         message_hash: Hash256,
         from_peer: Option<PeerId>,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
     ) -> bool {
         self.messages_seen.fetch_add(1, Ordering::Relaxed);
 
@@ -284,7 +283,7 @@ impl FloodGate {
     /// Matches upstream stellar-core's `clearBelow(maxLedger)` which removes
     /// records from ledgers before `maxLedger`. Also runs time-based TTL
     /// cleanup as a secondary mechanism.
-    pub fn clear_below(&self, ledger_seq: LedgerSeq) {
+    pub fn clear_below(&self, ledger_seq: u32) {
         let ttl = self.ttl;
         let before_count = self.seen.len();
         self.seen
@@ -397,13 +396,13 @@ mod tests {
         assert!(gate.should_flood(&hash));
 
         // Record as seen
-        assert!(gate.record_seen(hash, None, 1.into()));
+        assert!(gate.record_seen(hash, None, 1));
 
         // Should not flood again
         assert!(!gate.should_flood(&hash));
 
         // Record again should return false
-        assert!(!gate.record_seen(hash, None, 1.into()));
+        assert!(!gate.record_seen(hash, None, 1));
     }
 
     #[test]
@@ -416,10 +415,10 @@ mod tests {
         let peer3 = make_peer_id(3);
 
         // First seen from peer1
-        assert!(gate.record_seen(hash, Some(peer1.clone()), 1.into()));
+        assert!(gate.record_seen(hash, Some(peer1.clone()), 1));
 
         // Also seen from peer2
-        assert!(!gate.record_seen(hash, Some(peer2.clone()), 1.into()));
+        assert!(!gate.record_seen(hash, Some(peer2.clone()), 1));
 
         // Get forward peers - should exclude peer1 and peer2
         let all_peers = vec![peer1.clone(), peer2.clone(), peer3.clone()];
@@ -436,9 +435,9 @@ mod tests {
         let hash1 = make_hash(1);
         let hash2 = make_hash(2);
 
-        gate.record_seen(hash1, None, 1.into());
-        gate.record_seen(hash1, None, 1.into()); // duplicate
-        gate.record_seen(hash2, None, 1.into());
+        gate.record_seen(hash1, None, 1);
+        gate.record_seen(hash1, None, 1); // duplicate
+        gate.record_seen(hash2, None, 1);
 
         let stats = gate.stats();
         assert_eq!(stats.seen_count, 2);
@@ -451,7 +450,7 @@ mod tests {
         let gate = FloodGate::with_ttl(Duration::from_millis(10));
 
         let hash = make_hash(1);
-        gate.record_seen(hash, None, 1.into());
+        gate.record_seen(hash, None, 1);
 
         // Wait for expiry
         std::thread::sleep(Duration::from_millis(20));
@@ -480,14 +479,14 @@ mod tests {
         let hash2 = make_hash(2);
         let hash3 = make_hash(3);
         // Record at different ledger sequences
-        gate.record_seen(hash1, None, 50.into());
-        gate.record_seen(hash2, None, 100.into());
-        gate.record_seen(hash3, None, 150.into());
+        gate.record_seen(hash1, None, 50);
+        gate.record_seen(hash2, None, 100);
+        gate.record_seen(hash3, None, 150);
 
         assert_eq!(gate.stats().seen_count, 3);
 
         // clear_below(100) removes entries from ledgers < 100
-        gate.clear_below(100.into());
+        gate.clear_below(100);
         assert_eq!(gate.stats().seen_count, 2);
         assert!(!gate.has_seen(&hash1));
         assert!(gate.has_seen(&hash2));
@@ -501,8 +500,8 @@ mod tests {
 
         let hash1 = make_hash(1);
         let hash2 = make_hash(2);
-        gate.record_seen(hash1, None, 100.into());
-        gate.record_seen(hash2, None, 100.into());
+        gate.record_seen(hash1, None, 100);
+        gate.record_seen(hash2, None, 100);
 
         assert_eq!(gate.stats().seen_count, 2);
 
@@ -510,7 +509,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
 
         // clear_below triggers cleanup of expired entries (even at same ledger)
-        gate.clear_below(100.into());
+        gate.clear_below(100);
 
         assert_eq!(gate.stats().seen_count, 0);
     }
@@ -522,11 +521,11 @@ mod tests {
 
         let hash1 = make_hash(1);
         let hash2 = make_hash(2);
-        gate.record_seen(hash1, None, 100.into());
-        gate.record_seen(hash2, None, 100.into());
+        gate.record_seen(hash1, None, 100);
+        gate.record_seen(hash2, None, 100);
 
         // clear_below should not remove entries at or above the threshold
-        gate.clear_below(100.into());
+        gate.clear_below(100);
 
         assert_eq!(gate.stats().seen_count, 2);
         assert!(gate.has_seen(&hash1));

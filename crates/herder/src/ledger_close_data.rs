@@ -9,7 +9,6 @@
 //! validation for replay and verification.
 
 use henyey_common::Hash256;
-use henyey_common::LedgerSeq;
 use stellar_xdr::curr::{Limits, ReadXdr, StellarValue, StoredDebugTransactionSet};
 
 #[cfg(feature = "test-utils")]
@@ -53,7 +52,7 @@ use crate::tx_queue::TransactionSet;
 #[derive(Debug, Clone)]
 pub struct LedgerCloseData {
     /// The ledger sequence number this close is for.
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
     /// The transaction set agreed upon by consensus.
     tx_set: TransactionSet,
     /// The consensus value containing close time, tx set hash, and upgrades.
@@ -80,7 +79,7 @@ impl LedgerCloseData {
     /// Panics in debug mode if the transaction set hash doesn't match
     /// the tx_set_hash in the StellarValue.
     pub fn new(
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         tx_set: TransactionSet,
         value: StellarValue,
         expected_ledger_hash: Option<Hash256>,
@@ -104,7 +103,7 @@ impl LedgerCloseData {
     /// Create new ledger close data with expected results (for testing).
     #[cfg(feature = "test-utils")]
     pub fn with_expected_results(
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         tx_set: TransactionSet,
         value: StellarValue,
         expected_ledger_hash: Option<Hash256>,
@@ -125,7 +124,7 @@ impl LedgerCloseData {
     }
 
     /// Get the ledger sequence number.
-    pub fn ledger_seq(&self) -> LedgerSeq {
+    pub fn ledger_seq(&self) -> u32 {
         self.ledger_seq
     }
 
@@ -172,7 +171,7 @@ impl LedgerCloseData {
         StoredDebugTransactionSet {
             tx_set: self.tx_set.to_xdr_stored_set(),
             scp_value: self.value.clone(),
-            ledger_seq: self.ledger_seq.get(),
+            ledger_seq: self.ledger_seq,
         }
     }
 
@@ -195,7 +194,7 @@ impl LedgerCloseData {
         }
 
         Ok(Self {
-            ledger_seq: sts.ledger_seq.into(),
+            ledger_seq: sts.ledger_seq,
             tx_set,
             value: sts.scp_value,
             expected_ledger_hash: None,
@@ -340,7 +339,7 @@ mod tests {
         // Use the computed hash from the tx_set
         let value = make_test_value(tx_set.hash.0, 1000);
 
-        let lcd = LedgerCloseData::new(100.into(), tx_set, value, None);
+        let lcd = LedgerCloseData::new(100, tx_set, value, None);
 
         assert_eq!(lcd.ledger_seq(), 100);
         assert_eq!(lcd.close_time(), 1000);
@@ -355,7 +354,7 @@ mod tests {
         // Use the computed hash from the tx_set
         let value = make_test_value(tx_set.hash.0, 2000);
 
-        let lcd = LedgerCloseData::new(200.into(), tx_set, value, Some(expected));
+        let lcd = LedgerCloseData::new(200, tx_set, value, Some(expected));
 
         assert_eq!(lcd.expected_hash(), Some(&expected));
         assert!(lcd.validate_hash(&expected));

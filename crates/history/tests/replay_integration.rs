@@ -1,4 +1,3 @@
-use henyey_common::LedgerSeq;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -47,7 +46,7 @@ fn record_marked(entries: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn make_header(
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
     prev_hash: Hash256,
     bucket_list_hash: Hash256,
     tx_set_hash: Hash256,
@@ -64,7 +63,7 @@ fn make_header(
         },
         tx_set_result_hash: Hash(*tx_result_hash.as_bytes()),
         bucket_list_hash: Hash(*bucket_list_hash.as_bytes()),
-        ledger_seq: ledger_seq.get(),
+        ledger_seq,
         total_coins: 1_000_000,
         fee_pool: 0,
         inflation_seq: 0,
@@ -126,7 +125,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
         .expect("restart merges");
     bucket_list_after
         .add_batch(
-            target.into(),
+            target,
             25,
             stellar_xdr::curr::BucketListType::Live,
             Vec::new(),
@@ -137,7 +136,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
     let replay_bucket_hash = combined_bucket_list_hash(bucket_list_after.hash());
 
     let header63 = make_header(
-        checkpoint.into(),
+        checkpoint,
         Hash256::ZERO,
         checkpoint_bucket_hash,
         Hash256::ZERO,
@@ -161,7 +160,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
     let tx_result_hash = Hash256::hash(&result_xdr);
 
     let header64 = make_header(
-        target.into(),
+        target,
         header63_hash,
         replay_bucket_hash,
         tx_set_hash,
@@ -227,7 +226,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
     let has = HistoryArchiveState {
         version: 2,
         server: Some("rs-stellar-core test".to_string()),
-        current_ledger: checkpoint.into(),
+        current_ledger: checkpoint,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
         current_buckets: levels,
         hot_archive_buckets: None,
@@ -323,6 +322,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
             // end-to-end on testnet.
             verify_buckets: false,
             verify_headers: false,
+            ..CatchupOptions::default()
         })
         .build()
         .expect("catchup manager");

@@ -1,4 +1,3 @@
-use henyey_common::LedgerSeq;
 use henyey_common::{NetworkId, LIQUIDITY_POOL_FEE_V18};
 use henyey_crypto::{sign_hash, SecretKey};
 use henyey_ledger::execution::build_tx_result_pair;
@@ -46,14 +45,14 @@ fn create_account_entry_with_last_modified(
     account_id: AccountId,
     seq_num: i64,
     balance: i64,
-    last_modified_ledger_seq: LedgerSeq,
+    last_modified_ledger_seq: u32,
 ) -> (LedgerKey, LedgerEntry) {
     let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
         account_id: account_id.clone(),
     });
 
     let entry = LedgerEntry {
-        last_modified_ledger_seq: last_modified_ledger_seq.into(),
+        last_modified_ledger_seq,
         data: LedgerEntryData::Account(AccountEntry {
             account_id,
             balance,
@@ -77,7 +76,7 @@ fn create_account_entry_with_seq_info(
     account_id: AccountId,
     seq_num: i64,
     balance: i64,
-    seq_ledger: LedgerSeq,
+    seq_ledger: u32,
     seq_time: u64,
 ) -> (LedgerKey, LedgerEntry) {
     let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
@@ -85,7 +84,7 @@ fn create_account_entry_with_seq_info(
     });
 
     let entry = LedgerEntry {
-        last_modified_ledger_seq: seq_ledger.into(),
+        last_modified_ledger_seq: seq_ledger,
         data: LedgerEntryData::Account(AccountEntry {
             account_id,
             balance,
@@ -107,7 +106,7 @@ fn create_account_entry_with_seq_info(
                     signer_sponsoring_i_ds: vec![].try_into().unwrap(),
                     ext: AccountEntryExtensionV2Ext::V3(AccountEntryExtensionV3 {
                         ext: ExtensionPoint::V0,
-                        seq_ledger: seq_ledger.into(),
+                        seq_ledger,
                         seq_time: TimePoint(seq_time),
                     }),
                 }),
@@ -124,7 +123,7 @@ fn create_account_entry(
     seq_num: i64,
     balance: i64,
 ) -> (LedgerKey, LedgerEntry) {
-    create_account_entry_with_last_modified(account_id, seq_num, balance, 1.into())
+    create_account_entry_with_last_modified(account_id, seq_num, balance, 1)
 }
 
 fn create_account_entry_with_flags(

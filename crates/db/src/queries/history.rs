@@ -10,7 +10,6 @@
 //! and catchup operations.
 
 use henyey_common::xdr_stream::XdrOutputStream;
-use henyey_common::LedgerSeq;
 use rusqlite::{params, Connection, OptionalExtension};
 use stellar_xdr::curr::{
     Limits, ReadXdr, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
@@ -53,7 +52,7 @@ pub struct TxRecord {
     /// The transaction ID (hash), hex-encoded.
     pub tx_id: String,
     /// The ledger sequence number where this transaction was included.
-    pub ledger_seq: LedgerSeq,
+    pub ledger_seq: u32,
     /// The index of this transaction within the ledger's transaction set.
     pub tx_index: u32,
     /// The XDR-encoded transaction envelope.
@@ -73,7 +72,7 @@ pub struct TxRecord {
 /// Groups the fields needed by [`HistoryQueries::store_transaction`] to avoid
 /// a long parameter list.
 pub struct StoreTxParams<'a> {
-    pub ledger_seq: LedgerSeq,
+    pub ledger_seq: u32,
     pub tx_index: u32,
     pub tx_id: &'a str,
     pub body: &'a [u8],
@@ -103,7 +102,7 @@ pub trait HistoryQueries {
     /// that were applied in the ledger.
     fn store_tx_history_entry(
         &self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         entry: &TransactionHistoryEntry,
     ) -> Result<(), DbError>;
 
@@ -112,7 +111,7 @@ pub trait HistoryQueries {
     /// Returns `None` if no entry exists for the given ledger.
     fn load_tx_history_entry(
         &self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
     ) -> Result<Option<TransactionHistoryEntry>, DbError>;
 
     /// Stores transaction results for a ledger.
@@ -121,7 +120,7 @@ pub trait HistoryQueries {
     /// results for all transactions in the ledger.
     fn store_tx_result_entry(
         &self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         entry: &TransactionHistoryResultEntry,
     ) -> Result<(), DbError>;
 
@@ -130,7 +129,7 @@ pub trait HistoryQueries {
     /// Returns `None` if no entry exists for the given ledger.
     fn load_tx_result_entry(
         &self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
     ) -> Result<Option<TransactionHistoryResultEntry>, DbError>;
 
     /// Copy transaction history and results to XDR output streams.
@@ -170,7 +169,7 @@ pub trait HistoryQueries {
     /// Cleans `txhistory`, `txsets`, and `txresults` tables.
     /// Removes at most `count` entries from each table.
     /// Returns the total number of entries deleted across all tables.
-    fn delete_old_tx_history(&self, max_ledger: LedgerSeq, count: u32) -> Result<u32, DbError>;
+    fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
 }
 
 impl HistoryQueries for Connection {
@@ -226,7 +225,7 @@ impl HistoryQueries for Connection {
 
     fn store_tx_history_entry(
         &self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         entry: &TransactionHistoryEntry,
     ) -> Result<(), DbError> {
         let data = entry.to_xdr(Limits::none())?;
@@ -239,7 +238,7 @@ impl HistoryQueries for Connection {
 
     fn load_tx_history_entry(
         &self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
     ) -> Result<Option<TransactionHistoryEntry>, DbError> {
         let result: Option<Vec<u8>> = self
             .query_row(
@@ -258,7 +257,7 @@ impl HistoryQueries for Connection {
 
     fn store_tx_result_entry(
         &self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         entry: &TransactionHistoryResultEntry,
     ) -> Result<(), DbError> {
         let data = entry.to_xdr(Limits::none())?;
@@ -271,7 +270,7 @@ impl HistoryQueries for Connection {
 
     fn load_tx_result_entry(
         &self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
     ) -> Result<Option<TransactionHistoryResultEntry>, DbError> {
         let result: Option<Vec<u8>> = self
             .query_row(
@@ -408,7 +407,7 @@ impl HistoryQueries for Connection {
             .map_err(DbError::from)
     }
 
-    fn delete_old_tx_history(&self, max_ledger: LedgerSeq, count: u32) -> Result<u32, DbError> {
+    fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
         let mut total = 0u32;
 
         // Delete from txhistory
@@ -491,7 +490,7 @@ mod tests {
         let meta = b"transaction meta";
 
         conn.store_transaction(&StoreTxParams {
-            ledger_seq: 100.into(),
+            ledger_seq: 100,
             tx_index: 0,
             tx_id,
             body,
@@ -519,7 +518,7 @@ mod tests {
         let result = b"result";
 
         conn.store_transaction(&StoreTxParams {
-            ledger_seq: 200.into(),
+            ledger_seq: 200,
             tx_index: 5,
             tx_id,
             body,
@@ -549,7 +548,7 @@ mod tests {
 
         // Store initial version
         conn.store_transaction(&StoreTxParams {
-            ledger_seq: 100.into(),
+            ledger_seq: 100,
             tx_index: 0,
             tx_id,
             body: b"old_body",
@@ -561,7 +560,7 @@ mod tests {
 
         // Update with new data
         conn.store_transaction(&StoreTxParams {
-            ledger_seq: 100.into(),
+            ledger_seq: 100,
             tx_index: 0,
             tx_id,
             body: b"new_body",
@@ -592,7 +591,7 @@ mod tests {
                 },
                 ext: TransactionHistoryEntryExt::V0,
             };
-            conn.store_tx_history_entry(seq.into(), &tx_entry).unwrap();
+            conn.store_tx_history_entry(seq, &tx_entry).unwrap();
 
             let result_entry = TransactionHistoryResultEntry {
                 ledger_seq: seq,
@@ -601,8 +600,7 @@ mod tests {
                 },
                 ext: TransactionHistoryResultEntryExt::V0,
             };
-            conn.store_tx_result_entry(seq.into(), &result_entry)
-                .unwrap();
+            conn.store_tx_result_entry(seq, &result_entry).unwrap();
         }
 
         // Create two streams
@@ -650,7 +648,7 @@ mod tests {
                 },
                 ext: TransactionHistoryEntryExt::V0,
             };
-            conn.store_tx_history_entry(seq.into(), &tx_entry).unwrap();
+            conn.store_tx_history_entry(seq, &tx_entry).unwrap();
 
             let result_entry = TransactionHistoryResultEntry {
                 ledger_seq: seq,
@@ -659,8 +657,7 @@ mod tests {
                 },
                 ext: TransactionHistoryResultEntryExt::V0,
             };
-            conn.store_tx_result_entry(seq.into(), &result_entry)
-                .unwrap();
+            conn.store_tx_result_entry(seq, &result_entry).unwrap();
         }
 
         struct SharedBufRB(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -722,7 +719,7 @@ mod tests {
                 },
                 ext: TransactionHistoryEntryExt::V0,
             };
-            conn.store_tx_history_entry(seq.into(), &tx_entry).unwrap();
+            conn.store_tx_history_entry(seq, &tx_entry).unwrap();
 
             let result_entry = TransactionHistoryResultEntry {
                 ledger_seq: seq,
@@ -731,8 +728,7 @@ mod tests {
                 },
                 ext: TransactionHistoryResultEntryExt::V0,
             };
-            conn.store_tx_result_entry(seq.into(), &result_entry)
-                .unwrap();
+            conn.store_tx_result_entry(seq, &result_entry).unwrap();
         }
 
         struct SharedBufP(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -804,8 +800,8 @@ mod tests {
             ext: TransactionHistoryEntryExt::V0,
         };
 
-        conn.store_tx_history_entry(123.into(), &entry).unwrap();
-        let loaded = conn.load_tx_history_entry(123.into()).unwrap().unwrap();
+        conn.store_tx_history_entry(123, &entry).unwrap();
+        let loaded = conn.load_tx_history_entry(123).unwrap().unwrap();
         assert_eq!(loaded.ledger_seq, 123);
         assert_eq!(loaded.tx_set, entry.tx_set);
         assert_eq!(loaded.ext, entry.ext);
@@ -822,8 +818,8 @@ mod tests {
             ext: TransactionHistoryResultEntryExt::V0,
         };
 
-        conn.store_tx_result_entry(456.into(), &entry).unwrap();
-        let loaded = conn.load_tx_result_entry(456.into()).unwrap().unwrap();
+        conn.store_tx_result_entry(456, &entry).unwrap();
+        let loaded = conn.load_tx_result_entry(456).unwrap().unwrap();
         assert_eq!(loaded.ledger_seq, 456);
         assert_eq!(loaded.tx_result_set, entry.tx_result_set);
         assert_eq!(loaded.ext, entry.ext);

@@ -25,7 +25,6 @@
 //!
 //! Hot archive is only supported from Protocol 23+ (Soroban state archival).
 
-use henyey_common::LedgerSeq;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read as _, Seek, SeekFrom};
@@ -883,7 +882,7 @@ pub struct HotArchiveBucketList {
     /// The 11 levels.
     levels: Vec<HotArchiveBucketLevel>,
     /// Current ledger sequence.
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
 }
 
 impl HotArchiveBucketList {
@@ -898,7 +897,7 @@ impl HotArchiveBucketList {
 
         Self {
             levels,
-            ledger_seq: LedgerSeq::new(0),
+            ledger_seq: 0,
         }
     }
 
@@ -917,7 +916,7 @@ impl HotArchiveBucketList {
     }
 
     /// Get the current ledger sequence.
-    pub fn ledger_seq(&self) -> LedgerSeq {
+    pub fn ledger_seq(&self) -> u32 {
         self.ledger_seq
     }
 
@@ -927,7 +926,7 @@ impl HotArchiveBucketList {
     /// to set the correct ledger sequence. The `restore_from_hashes` method
     /// sets ledger_seq to 0, so callers must set it to the actual ledger
     /// sequence to ensure proper bucket list advancement behavior.
-    pub fn set_ledger_seq(&mut self, ledger_seq: LedgerSeq) {
+    pub fn set_ledger_seq(&mut self, ledger_seq: u32) {
         self.ledger_seq = ledger_seq;
     }
 
@@ -1023,7 +1022,7 @@ impl HotArchiveBucketList {
     /// - `restored_keys`: Keys of entries that were restored (previously archived)
     pub fn add_batch(
         &mut self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         protocol_version: u32,
         archived_entries: Vec<LedgerEntry>,
         restored_keys: Vec<LedgerKey>,
@@ -1068,21 +1067,21 @@ impl HotArchiveBucketList {
     /// Ok(()) if successful, or an error if the target is not greater than current.
     pub fn advance_to_ledger(&mut self, target_ledger: u32, protocol_version: u32) -> Result<()> {
         let current = self.ledger_seq;
-        if target_ledger <= current.get() {
+        if target_ledger <= current {
             // Nothing to do - we're already at or past this ledger
             return Ok(());
         }
 
         // Apply empty batches for each intermediate ledger
-        for seq in (current.get() + 1)..target_ledger {
+        for seq in (current + 1)..target_ledger {
             tracing::trace!(
-                from_ledger = current.get(),
+                from_ledger = current,
                 to_ledger = target_ledger,
                 current_seq = seq,
                 "Advancing hot archive bucket list through empty ledger"
             );
             self.add_batch(
-                LedgerSeq::new(seq),
+                seq,
                 protocol_version,
                 Vec::new(), // empty archived entries
                 Vec::new(), // empty restored keys
@@ -1094,7 +1093,7 @@ impl HotArchiveBucketList {
 
     fn add_batch_internal(
         &mut self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         protocol_version: u32,
         new_bucket: HotArchiveBucket,
     ) -> Result<()> {
@@ -1156,7 +1155,7 @@ impl HotArchiveBucketList {
     }
 
     /// Returns true if a level should spill at a given ledger.
-    fn level_should_spill(ledger_seq: LedgerSeq, level: usize) -> bool {
+    fn level_should_spill(ledger_seq: u32, level: usize) -> bool {
         bl_level_should_spill(ledger_seq, level, HOT_ARCHIVE_BUCKET_LIST_LEVELS)
     }
 
@@ -1166,7 +1165,7 @@ impl HotArchiveBucketList {
     }
 
     /// Determines whether to merge with an empty curr bucket instead of the actual curr.
-    fn should_merge_with_empty_curr(ledger_seq: LedgerSeq, level: usize) -> bool {
+    fn should_merge_with_empty_curr(ledger_seq: u32, level: usize) -> bool {
         bl_should_merge_with_empty_curr(ledger_seq, level, HOT_ARCHIVE_BUCKET_LIST_LEVELS)
     }
 
@@ -1348,7 +1347,7 @@ impl HotArchiveBucketList {
 
         Ok(Self {
             levels,
-            ledger_seq: LedgerSeq::new(0),
+            ledger_seq: 0,
         })
     }
 
@@ -1430,7 +1429,7 @@ impl HotArchiveBucketList {
 
         Ok(Self {
             levels,
-            ledger_seq: LedgerSeq::new(0),
+            ledger_seq: 0,
         })
     }
 
@@ -1541,7 +1540,7 @@ impl HotArchiveBucketList {
             self.restart_merges(ledger, protocol_version)
         } else {
             // Update ledger sequence even when not restarting merges
-            self.ledger_seq = ledger.into();
+            self.ledger_seq = ledger;
             Ok(())
         }
     }
@@ -1598,7 +1597,7 @@ impl HotArchiveBucketList {
                 version => version,
             };
             let keep_tombstones = Self::keep_tombstone_entries(i);
-            let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger.into(), i);
+            let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
             // Start the merge with the previous level's snap
             self.levels[i].prepare(
@@ -1615,7 +1614,7 @@ impl HotArchiveBucketList {
         }
 
         // Update the ledger sequence to the restored ledger
-        self.ledger_seq = ledger.into();
+        self.ledger_seq = ledger;
 
         Ok(())
     }
@@ -1981,8 +1980,7 @@ mod tests {
         let mut list = HotArchiveBucketList::new();
         let entry = make_contract_data_entry([1u8; 32], b"key1", 100);
 
-        list.add_batch(1.into(), 25, vec![entry.clone()], vec![])
-            .unwrap();
+        list.add_batch(1, 25, vec![entry.clone()], vec![]).unwrap();
 
         let key = make_contract_data_key([1u8; 32], b"key1");
         let found = list.get(&key).unwrap();
@@ -1996,13 +1994,11 @@ mod tests {
         let key = make_contract_data_key([1u8; 32], b"key1");
 
         // Archive the entry
-        list.add_batch(1.into(), 25, vec![entry.clone()], vec![])
-            .unwrap();
+        list.add_batch(1, 25, vec![entry.clone()], vec![]).unwrap();
         assert!(list.contains(&key).unwrap());
 
         // Mark as restored
-        list.add_batch(2.into(), 25, vec![], vec![key.clone()])
-            .unwrap();
+        list.add_batch(2, 25, vec![], vec![key.clone()]).unwrap();
 
         // Entry should not be found (restored = Live marker shadows Archived)
         assert!(!list.contains(&key).unwrap());

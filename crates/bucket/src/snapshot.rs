@@ -55,7 +55,6 @@ use crate::{
     HotArchiveBucketLevel, HotArchiveBucketList,
 };
 use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
-use henyey_common::LedgerSeq;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -349,8 +348,8 @@ impl BucketListSnapshot {
     }
 
     /// Returns the ledger sequence number for this snapshot.
-    pub fn ledger_seq(&self) -> LedgerSeq {
-        self.header.ledger_seq.into()
+    pub fn ledger_seq(&self) -> u32 {
+        self.header.ledger_seq
     }
 
     /// Returns the ledger header for this snapshot.
@@ -536,7 +535,7 @@ impl BucketListSnapshot {
     pub fn scan_for_eviction_incremental(
         &self,
         mut iter: EvictionIterator,
-        current_ledger: LedgerSeq,
+        current_ledger: u32,
         settings: &StateArchivalSettings,
     ) -> crate::Result<EvictionResult> {
         let mut result = EvictionResult {
@@ -622,7 +621,7 @@ impl BucketListSnapshot {
         bucket: &Bucket,
         iter: &mut EvictionIterator,
         max_bytes: u64,
-        current_ledger: LedgerSeq,
+        current_ledger: u32,
         candidates: &mut Vec<EvictionCandidate>,
         seen_keys: &mut HashSet<LedgerKey>,
     ) -> crate::Result<(usize, u64, bool)> {
@@ -673,7 +672,7 @@ impl BucketListSnapshot {
                     break 'process;
                 };
 
-                let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger.into()) else {
+                let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
                     break 'process;
                 };
 
@@ -737,8 +736,8 @@ impl HotArchiveBucketListSnapshot {
     }
 
     /// Returns the ledger sequence number for this snapshot.
-    pub fn ledger_seq(&self) -> LedgerSeq {
-        self.header.ledger_seq.into()
+    pub fn ledger_seq(&self) -> u32 {
+        self.header.ledger_seq
     }
 
     /// Returns the ledger header for this snapshot.
@@ -837,7 +836,7 @@ impl SearchableBucketListSnapshot {
     }
 
     /// Returns the current ledger sequence number.
-    pub fn ledger_seq(&self) -> LedgerSeq {
+    pub fn ledger_seq(&self) -> u32 {
         self.snapshot.ledger_seq()
     }
 
@@ -873,14 +872,14 @@ impl SearchableBucketListSnapshot {
     pub fn load_keys_from_ledger(
         &self,
         keys: &[LedgerKey],
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
     ) -> Option<Vec<LedgerEntry>> {
         if ledger_seq == self.snapshot.ledger_seq() {
             return Some(self.snapshot.load_keys(keys));
         }
 
         self.historical_snapshots
-            .get(&ledger_seq.get())
+            .get(&ledger_seq)
             .map(|snap| snap.load_keys(keys))
     }
 
@@ -894,8 +893,8 @@ impl SearchableBucketListSnapshot {
             .keys()
             .next()
             .copied()
-            .unwrap_or(self.snapshot.ledger_seq().get());
-        (oldest, self.snapshot.ledger_seq().get())
+            .unwrap_or(self.snapshot.ledger_seq());
+        (oldest, self.snapshot.ledger_seq())
     }
 
     /// Scans all entries of a specific type in the bucket list.
@@ -1226,7 +1225,7 @@ impl SearchableHotArchiveBucketListSnapshot {
     }
 
     /// Returns the current ledger sequence number.
-    pub fn ledger_seq(&self) -> LedgerSeq {
+    pub fn ledger_seq(&self) -> u32 {
         self.snapshot.ledger_seq()
     }
 
@@ -1255,14 +1254,14 @@ impl SearchableHotArchiveBucketListSnapshot {
     pub fn load_keys_from_ledger(
         &self,
         keys: &[LedgerKey],
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
     ) -> Option<Vec<HotArchiveBucketEntry>> {
         if ledger_seq == self.snapshot.ledger_seq() {
             return Some(self.snapshot.load_keys(keys));
         }
 
         self._historical_snapshots
-            .get(&ledger_seq.get())
+            .get(&ledger_seq)
             .map(|snap| snap.load_keys(keys))
     }
 }
@@ -1450,7 +1449,7 @@ impl BucketSnapshotManager {
                     }
                 }
 
-                state.live.historical.insert(ledger_seq.get(), prev);
+                state.live.historical.insert(ledger_seq, prev);
             }
         }
 
@@ -1467,7 +1466,7 @@ impl BucketSnapshotManager {
                     }
                 }
 
-                state.hot_archive.historical.insert(ledger_seq.get(), prev);
+                state.hot_archive.historical.insert(ledger_seq, prev);
             }
         }
 
@@ -1481,7 +1480,7 @@ impl BucketSnapshotManager {
             .live
             .current
             .as_ref()
-            .map(|s| s.ledger_seq().get())
+            .map(|s| s.ledger_seq())
     }
 
     /// Returns the number of historical snapshots currently stored.
@@ -1520,7 +1519,7 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::*;
 
-    fn make_test_header(ledger_seq: LedgerSeq) -> LedgerHeader {
+    fn make_test_header(ledger_seq: u32) -> LedgerHeader {
         LedgerHeader {
             ledger_version: 25,
             previous_ledger_hash: Hash([0; 32]),
@@ -1532,7 +1531,7 @@ mod tests {
             },
             tx_set_result_hash: Hash([0; 32]),
             bucket_list_hash: Hash([0; 32]),
-            ledger_seq: ledger_seq.get(),
+            ledger_seq,
             total_coins: 0,
             fee_pool: 0,
             inflation_seq: 0,
@@ -1549,7 +1548,7 @@ mod tests {
     async fn test_bucket_snapshot_manager_creation() {
         let bucket_list = BucketList::new();
         let hot_archive = HotArchiveBucketList::new();
-        let header = make_test_header(1.into());
+        let header = make_test_header(1);
 
         let live_snapshot = BucketListSnapshot::new(&bucket_list, header.clone());
         let hot_archive_snapshot = HotArchiveBucketListSnapshot::new(&hot_archive, header);
@@ -1566,39 +1565,39 @@ mod tests {
         let hot_archive = HotArchiveBucketList::new();
 
         let manager = BucketSnapshotManager::new(
-            BucketListSnapshot::new(&bucket_list, make_test_header(1.into())),
-            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(1.into())),
+            BucketListSnapshot::new(&bucket_list, make_test_header(1)),
+            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(1)),
             3,
         );
 
         // Update to ledger 2
         manager.update_current_snapshot(
-            BucketListSnapshot::new(&bucket_list, make_test_header(2.into())),
-            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(2.into())),
+            BucketListSnapshot::new(&bucket_list, make_test_header(2)),
+            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(2)),
         );
         assert_eq!(manager.current_ledger_seq(), Some(2));
         assert_eq!(manager.historical_snapshot_count(), 1);
 
         // Update to ledger 3
         manager.update_current_snapshot(
-            BucketListSnapshot::new(&bucket_list, make_test_header(3.into())),
-            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(3.into())),
+            BucketListSnapshot::new(&bucket_list, make_test_header(3)),
+            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(3)),
         );
         assert_eq!(manager.current_ledger_seq(), Some(3));
         assert_eq!(manager.historical_snapshot_count(), 2);
 
         // Update to ledger 4
         manager.update_current_snapshot(
-            BucketListSnapshot::new(&bucket_list, make_test_header(4.into())),
-            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(4.into())),
+            BucketListSnapshot::new(&bucket_list, make_test_header(4)),
+            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(4)),
         );
         assert_eq!(manager.current_ledger_seq(), Some(4));
         assert_eq!(manager.historical_snapshot_count(), 3);
 
         // Update to ledger 5 - should evict oldest (ledger 1)
         manager.update_current_snapshot(
-            BucketListSnapshot::new(&bucket_list, make_test_header(5.into())),
-            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(5.into())),
+            BucketListSnapshot::new(&bucket_list, make_test_header(5)),
+            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(5)),
         );
         assert_eq!(manager.current_ledger_seq(), Some(5));
         assert_eq!(manager.historical_snapshot_count(), 3);
@@ -1613,7 +1612,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_searchable_snapshot_load() {
         let mut bucket_list = BucketList::new();
-        let header = make_test_header(1.into());
+        let header = make_test_header(1);
 
         // Add some entries
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32])));
@@ -1635,14 +1634,7 @@ mod tests {
         };
 
         bucket_list
-            .add_batch(
-                1.into(),
-                25,
-                BucketListType::Live,
-                vec![entry],
-                vec![],
-                vec![],
-            )
+            .add_batch(1, 25, BucketListType::Live, vec![entry], vec![], vec![])
             .unwrap();
 
         let snapshot = BucketListSnapshot::new(&bucket_list, header);
@@ -1671,7 +1663,7 @@ mod tests {
 
         let bucket_list = BucketList::new();
         let hot_archive = HotArchiveBucketList::new();
-        let header = make_test_header(1.into());
+        let header = make_test_header(1);
 
         let manager = Arc::new(BucketSnapshotManager::new(
             BucketListSnapshot::new(&bucket_list, header.clone()),
@@ -1701,7 +1693,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_scan_for_entries_of_type() {
         let mut bucket_list = BucketList::new();
-        let header = make_test_header(1.into());
+        let header = make_test_header(1);
 
         // Add some account entries
         for i in 0..5u8 {
@@ -1724,7 +1716,7 @@ mod tests {
             };
             bucket_list
                 .add_batch(
-                    (1 + i as u32).into(),
+                    1 + i as u32,
                     25,
                     BucketListType::Live,
                     vec![entry],
@@ -1762,7 +1754,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_load_inflation_winners() {
         let mut bucket_list = BucketList::new();
-        let header = make_test_header(10.into());
+        let header = make_test_header(10);
 
         // Create inflation destination account
         let dest_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xFF; 32])));
@@ -1788,7 +1780,7 @@ mod tests {
             };
             bucket_list
                 .add_batch(
-                    (i as u32).into(),
+                    i as u32,
                     25,
                     BucketListType::Live,
                     vec![entry],
@@ -1817,14 +1809,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
         bucket_list
-            .add_batch(
-                4.into(),
-                25,
-                BucketListType::Live,
-                vec![entry],
-                vec![],
-                vec![],
-            )
+            .add_batch(4, 25, BucketListType::Live, vec![entry], vec![], vec![])
             .unwrap();
 
         let snapshot = BucketListSnapshot::new(&bucket_list, header);
@@ -1842,7 +1827,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_inflation_winners_min_balance_filter() {
         let mut bucket_list = BucketList::new();
-        let header = make_test_header(5.into());
+        let header = make_test_header(5);
 
         let dest1 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xAA; 32])));
         let dest2 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xBB; 32])));
@@ -1887,7 +1872,7 @@ mod tests {
 
         bucket_list
             .add_batch(
-                1.into(),
+                1,
                 25,
                 BucketListType::Live,
                 vec![entry1, entry2],
@@ -1938,7 +1923,7 @@ mod tests {
         };
         bucket_list
             .add_batch(
-                1.into(),
+                1,
                 25,
                 BucketListType::Live,
                 vec![entry_a.clone()],
@@ -1952,7 +1937,7 @@ mod tests {
         });
 
         // Take snapshot — should see entry A
-        let snapshot = BucketListSnapshot::new(&bucket_list, make_test_header(1.into()));
+        let snapshot = BucketListSnapshot::new(&bucket_list, make_test_header(1));
         assert!(snapshot.get(&key_a).is_some());
 
         // Also verify get_result returns the same entry
@@ -1983,7 +1968,7 @@ mod tests {
         });
         bucket_list
             .add_batch(
-                2.into(),
+                2,
                 25,
                 BucketListType::Live,
                 vec![entry_b],

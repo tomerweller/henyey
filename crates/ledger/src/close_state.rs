@@ -24,7 +24,6 @@
 use crate::delta::{DeltaCategorization, LedgerDelta};
 use crate::snapshot::SnapshotHandle;
 use crate::Result;
-use henyey_common::LedgerSeq;
 use stellar_xdr::curr::{
     AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData,
     LedgerHeader, LedgerKey, VecM,
@@ -56,7 +55,7 @@ pub struct CloseLedgerState {
     header_hash: henyey_common::Hash256,
 
     /// Ledger sequence for this close.
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
 }
 
 impl CloseLedgerState {
@@ -69,7 +68,7 @@ impl CloseLedgerState {
         snapshot: SnapshotHandle,
         header: LedgerHeader,
         header_hash: henyey_common::Hash256,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
     ) -> Self {
         Self {
             snapshot,
@@ -124,7 +123,7 @@ impl CloseLedgerState {
     }
 
     /// Ledger sequence number.
-    pub fn ledger_seq(&self) -> LedgerSeq {
+    pub fn ledger_seq(&self) -> u32 {
         self.ledger_seq
     }
 
@@ -397,7 +396,7 @@ mod tests {
             ..Default::default()
         };
         let mut state =
-            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101.into());
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
         // Initially empty
         let key = make_account_key(1);
@@ -421,8 +420,7 @@ mod tests {
             ledger_seq: 100,
             ..Default::default()
         };
-        let state =
-            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101.into());
+        let state = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
         let key = make_account_key(1);
         let loaded = state.get_entry(&key).unwrap().unwrap();
@@ -439,7 +437,7 @@ mod tests {
             ..Default::default()
         };
         let mut state =
-            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101.into());
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
         // Update overrides snapshot
         let new_entry = make_test_account_entry(1, 3000, 101);
@@ -459,7 +457,7 @@ mod tests {
             ..Default::default()
         };
         let mut state =
-            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101.into());
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
         // Create an entry before the checkpoint
         let entry1 = make_test_account_entry(1, 1000, 101);
@@ -486,8 +484,7 @@ mod tests {
             ledger_seq: 100,
             ..Default::default()
         };
-        let state =
-            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101.into());
+        let state = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
         let cp = state.change_checkpoint();
         let changes = state.entry_changes_since(cp);
@@ -503,7 +500,7 @@ mod tests {
             ..Default::default()
         };
         let mut state =
-            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101.into());
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
         state.record_fee_pool_delta(500);
         assert_eq!(state.fee_pool_delta(), 500);
@@ -522,7 +519,7 @@ mod tests {
             ..Default::default()
         };
         let mut state =
-            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101.into());
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
         // Accumulate some entry changes plus metadata deltas
         let entry = make_test_account_entry(1, 1000, 101);

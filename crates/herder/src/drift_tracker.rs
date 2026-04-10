@@ -34,7 +34,6 @@
 //! }
 //! ```
 
-use henyey_common::LedgerSeq;
 use std::collections::BTreeMap;
 
 /// Size of the sliding window for drift tracking.
@@ -123,18 +122,14 @@ impl CloseTimeDriftTracker {
     ///
     /// `true` if this is a new entry, `false` if the ledger was already recorded
     /// (which indicates `trigger_next_ledger` was called twice for the same ledger).
-    pub fn record_local_close_time(
-        &mut self,
-        ledger_seq: LedgerSeq,
-        local_close_time: u64,
-    ) -> bool {
-        if self.window.contains_key(&ledger_seq.get()) {
+    pub fn record_local_close_time(&mut self, ledger_seq: u32, local_close_time: u64) -> bool {
+        if self.window.contains_key(&ledger_seq) {
             // Already have an entry for this ledger
             return false;
         }
 
         self.window.insert(
-            ledger_seq.get(),
+            ledger_seq,
             DriftEntry {
                 local_close_time,
                 externalized_close_time: None,
@@ -167,11 +162,11 @@ impl CloseTimeDriftTracker {
     /// `None` otherwise.
     pub fn record_externalized_close_time(
         &mut self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         network_close_time: u64,
     ) -> Option<String> {
         // Update the entry if it exists
-        if let Some(entry) = self.window.get_mut(&ledger_seq.get()) {
+        if let Some(entry) = self.window.get_mut(&ledger_seq) {
             entry.externalized_close_time = Some(network_close_time);
         }
 
@@ -308,15 +303,15 @@ mod tests {
         let mut tracker = CloseTimeDriftTracker::with_config(10, 10);
 
         // First record should succeed
-        assert!(tracker.record_local_close_time(100.into(), 1000));
+        assert!(tracker.record_local_close_time(100, 1000));
         assert_eq!(tracker.window_len(), 1);
 
         // Duplicate should return false
-        assert!(!tracker.record_local_close_time(100.into(), 1001));
+        assert!(!tracker.record_local_close_time(100, 1001));
         assert_eq!(tracker.window_len(), 1);
 
         // New ledger should succeed
-        assert!(tracker.record_local_close_time(101.into(), 1005));
+        assert!(tracker.record_local_close_time(101, 1005));
         assert_eq!(tracker.window_len(), 2);
     }
 
@@ -326,7 +321,7 @@ mod tests {
 
         // Add 7 entries - should evict oldest 2
         for i in 0..7 {
-            tracker.record_local_close_time((100 + i).into(), 1000 + (i as u64) * 5);
+            tracker.record_local_close_time(100 + i, 1000 + (i as u64) * 5);
         }
 
         assert_eq!(tracker.window_len(), 5);
@@ -348,8 +343,8 @@ mod tests {
             // Network time is 2 seconds ahead of local
             let network_time = local_time + 2;
 
-            tracker.record_local_close_time((100 + i).into(), local_time);
-            let _ = tracker.record_externalized_close_time((100 + i).into(), network_time);
+            tracker.record_local_close_time(100 + i, local_time);
+            let _ = tracker.record_externalized_close_time(100 + i, network_time);
         }
 
         let stats = tracker.get_drift_stats().unwrap();
@@ -370,9 +365,9 @@ mod tests {
             // Network time is 15 seconds ahead (exceeds 10s threshold)
             let network_time = local_time + 15;
 
-            tracker.record_local_close_time((100 + i).into(), local_time);
+            tracker.record_local_close_time(100 + i, local_time);
             // Only the last one should trigger check (window full)
-            let result = tracker.record_externalized_close_time((100 + i).into(), network_time);
+            let result = tracker.record_externalized_close_time(100 + i, network_time);
 
             if i == 4 {
                 assert!(result.is_some(), "Should have warning on full window");
@@ -398,8 +393,8 @@ mod tests {
             // Network time is 5 seconds ahead (within 10s threshold)
             let network_time = local_time + 5;
 
-            tracker.record_local_close_time((100 + i).into(), local_time);
-            let result = tracker.record_externalized_close_time((100 + i).into(), network_time);
+            tracker.record_local_close_time(100 + i, local_time);
+            let result = tracker.record_externalized_close_time(100 + i, network_time);
 
             // Should not warn even when window is full
             assert!(result.is_none());
@@ -419,8 +414,8 @@ mod tests {
             // Network time is 15 seconds behind local (negative drift)
             let network_time = local_time.saturating_sub(15);
 
-            tracker.record_local_close_time((100 + i).into(), local_time);
-            let result = tracker.record_externalized_close_time((100 + i).into(), network_time);
+            tracker.record_local_close_time(100 + i, local_time);
+            let result = tracker.record_externalized_close_time(100 + i, network_time);
 
             if i == 4 {
                 assert!(result.is_some());
@@ -437,13 +432,13 @@ mod tests {
 
         // Record local times for 5 ledgers (window size is 10, won't trigger clear)
         for i in 0u32..5 {
-            tracker.record_local_close_time((100 + i).into(), 1000 + (i as u64) * 5);
+            tracker.record_local_close_time(100 + i, 1000 + (i as u64) * 5);
         }
 
         // Only externalize 3 of them
-        let _ = tracker.record_externalized_close_time(100.into(), 1002);
-        let _ = tracker.record_externalized_close_time(101.into(), 1007);
-        let _ = tracker.record_externalized_close_time(102.into(), 1012);
+        let _ = tracker.record_externalized_close_time(100, 1002);
+        let _ = tracker.record_externalized_close_time(101, 1007);
+        let _ = tracker.record_externalized_close_time(102, 1012);
 
         assert_eq!(tracker.window_len(), 5);
         assert_eq!(tracker.completed_entries(), 3);
@@ -461,8 +456,8 @@ mod tests {
             let local_time = 1000 + (i as u64) * 5;
             let network_time = local_time + (i as u64) + 1; // drift = i + 1
 
-            tracker.record_local_close_time((100 + i).into(), local_time);
-            let _ = tracker.record_externalized_close_time((100 + i).into(), network_time);
+            tracker.record_local_close_time(100 + i, local_time);
+            let _ = tracker.record_externalized_close_time(100 + i, network_time);
         }
 
         // Before window check triggers
@@ -481,8 +476,8 @@ mod tests {
         for (i, &drift) in drifts.iter().enumerate() {
             let local_time = 1000u64;
             let network_time = (local_time as i64 + drift) as u64;
-            tracker.record_local_close_time((100 + i as u32).into(), local_time);
-            let _ = tracker.record_externalized_close_time((100 + i as u32).into(), network_time);
+            tracker.record_local_close_time(100 + i as u32, local_time);
+            let _ = tracker.record_externalized_close_time(100 + i as u32, network_time);
         }
 
         let stats = tracker.get_drift_stats().unwrap();

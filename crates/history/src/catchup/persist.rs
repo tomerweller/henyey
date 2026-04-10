@@ -2,7 +2,6 @@
 
 use crate::{HistoryError, Result};
 use henyey_bucket::BucketList;
-use henyey_common::LedgerSeq;
 use henyey_common::{Hash256, NetworkId};
 
 use henyey_tx::TransactionFrame;
@@ -56,7 +55,7 @@ impl CatchupManager {
                                     }
                                 }
                             });
-                    conn.store_tx_history_entry(data.header.ledger_seq.into(), &tx_history_entry)?;
+                    conn.store_tx_history_entry(data.header.ledger_seq, &tx_history_entry)?;
 
                     let tx_result_entry = data.tx_result_entry.clone().unwrap_or_else(|| {
                         let results = data.tx_results.clone().try_into().unwrap_or_default();
@@ -66,7 +65,7 @@ impl CatchupManager {
                             ext: TransactionHistoryResultEntryExt::default(),
                         }
                     });
-                    conn.store_tx_result_entry(data.header.ledger_seq.into(), &tx_result_entry)?;
+                    conn.store_tx_result_entry(data.header.ledger_seq, &tx_result_entry)?;
 
                     let tx_results: Vec<TransactionResultPair> = tx_result_entry
                         .tx_result_set
@@ -108,7 +107,7 @@ impl CatchupManager {
                         };
 
                         conn.store_transaction(&henyey_db::StoreTxParams {
-                            ledger_seq: data.header.ledger_seq.into(),
+                            ledger_seq: data.header.ledger_seq,
                             tx_index: idx as u32,
                             tx_id: &tx_id,
                             body: &tx_body,
@@ -142,7 +141,7 @@ impl CatchupManager {
                     let ledger_seq = v0.ledger_messages.ledger_seq;
                     let envelopes: Vec<_> = v0.ledger_messages.messages.iter().cloned().collect();
 
-                    conn.store_scp_history(ledger_seq.into(), &envelopes)?;
+                    conn.store_scp_history(ledger_seq, &envelopes)?;
 
                     for qset in v0.quorum_sets.iter() {
                         let hash = Hash256::hash_xdr(qset)?;
@@ -161,7 +160,7 @@ impl CatchupManager {
 
     pub(super) fn persist_bucket_list_snapshot(
         &self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         bucket_list: &BucketList,
     ) -> Result<()> {
         let levels = bucket_list
@@ -205,18 +204,14 @@ impl CatchupManager {
     /// `getLedgers`) see entries for the replayed range. The streaming callback
     /// (if configured) writes the meta to the fd:3 pipe for captive core
     /// consumers like stellar-rpc and horizon.
-    pub(super) fn emit_meta(
-        &self,
-        ledger_seq: LedgerSeq,
-        meta: stellar_xdr::curr::LedgerCloseMeta,
-    ) {
+    pub(super) fn emit_meta(&self, ledger_seq: u32, meta: stellar_xdr::curr::LedgerCloseMeta) {
         // Persist to SQLite first (to_xdr borrows &self on meta, no clone needed).
         match meta.to_xdr(stellar_xdr::curr::Limits::none()) {
             Ok(meta_xdr) => {
-                if let Err(err) = self.db.store_ledger_close_meta(ledger_seq.get(), &meta_xdr) {
+                if let Err(err) = self.db.store_ledger_close_meta(ledger_seq, &meta_xdr) {
                     warn!(
                         error = %err,
-                        ledger_seq = ledger_seq.get(),
+                        ledger_seq,
                         "Failed to persist LedgerCloseMeta during catchup"
                     );
                 }
@@ -224,7 +219,7 @@ impl CatchupManager {
             Err(err) => {
                 warn!(
                     error = %err,
-                    ledger_seq = ledger_seq.get(),
+                    ledger_seq,
                     "Failed to serialize LedgerCloseMeta during catchup"
                 );
             }

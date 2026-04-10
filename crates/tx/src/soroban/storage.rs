@@ -3,7 +3,6 @@
 //! Provides a storage interface for contract state that integrates with
 //! our LedgerStateManager.
 
-use henyey_common::LedgerSeq;
 use stellar_xdr::curr::{
     ContractDataDurability, ContractDataEntry, Hash, LedgerKey, LedgerKeyContractData, ScAddress,
     ScVal, WriteXdr,
@@ -60,12 +59,12 @@ pub struct StorageEntry {
     /// The stored value.
     pub value: ScVal,
     /// Time-to-live (ledger sequence when entry expires).
-    pub live_until: LedgerSeq,
+    pub live_until: u32,
 }
 
 impl StorageEntry {
     /// Create a new storage entry.
-    pub fn new(key: StorageKey, value: ScVal, live_until: LedgerSeq) -> Self {
+    pub fn new(key: StorageKey, value: ScVal, live_until: u32) -> Self {
         Self {
             key,
             value,
@@ -74,7 +73,7 @@ impl StorageEntry {
     }
 
     /// Check if the entry has expired.
-    pub fn is_expired(&self, current_ledger: LedgerSeq) -> bool {
+    pub fn is_expired(&self, current_ledger: u32) -> bool {
         self.live_until < current_ledger
     }
 
@@ -139,7 +138,7 @@ impl SorobanStorage {
     }
 
     /// Put a storage entry.
-    pub fn put(&mut self, key: StorageKey, value: ScVal, live_until: LedgerSeq) {
+    pub fn put(&mut self, key: StorageKey, value: ScVal, live_until: u32) {
         let entry = StorageEntry::new(key.clone(), value, live_until);
         self.record_write(key, Some(entry));
     }
@@ -286,7 +285,7 @@ mod tests {
         assert!(!storage.has(&key));
 
         // Write a value
-        storage.put(key.clone(), ScVal::I64(42), 1000.into());
+        storage.put(key.clone(), ScVal::I64(42), 1000);
         assert!(storage.has(&key));
 
         // Read the value
@@ -302,7 +301,7 @@ mod tests {
         // Record initial read
         storage.record_read(
             key.clone(),
-            Some(StorageEntry::new(key.clone(), ScVal::I64(100), 1000.into())),
+            Some(StorageEntry::new(key.clone(), ScVal::I64(100), 1000)),
         );
 
         // Delete it
@@ -337,16 +336,16 @@ mod tests {
     #[test]
     fn test_storage_entry_expiration() {
         let key = make_storage_key(1);
-        let entry = StorageEntry::new(key, ScVal::I64(100), 1000.into());
+        let entry = StorageEntry::new(key, ScVal::I64(100), 1000);
 
         // Not expired at ledger 999
-        assert!(!entry.is_expired(999.into()));
+        assert!(!entry.is_expired(999));
 
         // Not expired at ledger 1000 (expires AFTER this)
-        assert!(!entry.is_expired(1000.into()));
+        assert!(!entry.is_expired(1000));
 
         // Expired at ledger 1001
-        assert!(entry.is_expired(1001.into()));
+        assert!(entry.is_expired(1001));
     }
 
     /// Test storage key hash computation.
@@ -397,16 +396,12 @@ mod tests {
         // key1 is read first then written (update, not create)
         storage.record_read(
             key1.clone(),
-            Some(StorageEntry::new(
-                key1.clone(),
-                ScVal::I64(100),
-                1000.into(),
-            )),
+            Some(StorageEntry::new(key1.clone(), ScVal::I64(100), 1000)),
         );
-        storage.put(key1, ScVal::I64(200), 2000.into());
+        storage.put(key1, ScVal::I64(200), 2000);
 
         // key2 is only written (create)
-        storage.put(key2, ScVal::I64(300), 3000.into());
+        storage.put(key2, ScVal::I64(300), 3000);
 
         // Should have 1 created entry (key2)
         let created: Vec<_> = storage.created_entries().collect();
@@ -425,16 +420,12 @@ mod tests {
         // key1 is read first then written (update)
         storage.record_read(
             key1.clone(),
-            Some(StorageEntry::new(
-                key1.clone(),
-                ScVal::I64(100),
-                1000.into(),
-            )),
+            Some(StorageEntry::new(key1.clone(), ScVal::I64(100), 1000)),
         );
-        storage.put(key1, ScVal::I64(200), 2000.into());
+        storage.put(key1, ScVal::I64(200), 2000);
 
         // key2 is only written (create, not update)
-        storage.put(key2, ScVal::I64(300), 3000.into());
+        storage.put(key2, ScVal::I64(300), 3000);
 
         // Should have 1 updated entry (key1)
         let updated: Vec<_> = storage.updated_entries().collect();
@@ -448,7 +439,7 @@ mod tests {
         let mut storage = SorobanStorage::new();
 
         let key = make_storage_key(1);
-        storage.put(key.clone(), ScVal::I64(100), 1000.into());
+        storage.put(key.clone(), ScVal::I64(100), 1000);
         storage.record_code_read(Hash([1u8; 32]), Some(vec![1, 2, 3]));
 
         assert!(storage.has(&key));
@@ -511,7 +502,7 @@ mod tests {
         );
         // Use a simple ScVal type
         let value = ScVal::I128(stellar_xdr::curr::Int128Parts { hi: 0, lo: 42 });
-        let entry = StorageEntry::new(key, value.clone(), 5000.into());
+        let entry = StorageEntry::new(key, value.clone(), 5000);
 
         let contract_data = entry.to_contract_data_entry();
         assert!(matches!(contract_data.val, ScVal::I128(_)));

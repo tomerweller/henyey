@@ -4,7 +4,6 @@
 //! Stellar history archives. Each work item implements the [`Work`] trait
 //! and is registered with a [`WorkScheduler`] via [`HistoryWorkBuilder`].
 
-use henyey_common::LedgerSeq;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -314,7 +313,7 @@ impl Work for DownloadTransactionsWork {
             guard.headers.clone()
         };
         for entry in &entries {
-            let header = match find_header(&headers, entry.ledger_seq.into(), "transaction set") {
+            let header = match find_header(&headers, entry.ledger_seq, "transaction set") {
                 Ok(header) => header,
                 Err(err) => return WorkOutcome::Failed(err),
             };
@@ -390,7 +389,7 @@ impl Work for DownloadTxResultsWork {
         };
 
         for entry in &results {
-            let header = match find_header(&headers, entry.ledger_seq.into(), "tx result set") {
+            let header = match find_header(&headers, entry.ledger_seq, "tx result set") {
                 Ok(header) => header,
                 Err(err) => return WorkOutcome::Failed(err),
             };
@@ -482,11 +481,11 @@ pub(crate) fn content_bucket_hashes(has: &HistoryArchiveState) -> Vec<Hash256> {
 
 pub(crate) fn find_header<'a>(
     headers: &'a [LedgerHeaderHistoryEntry],
-    ledger_seq: LedgerSeq,
+    ledger_seq: u32,
     missing_label: &str,
 ) -> Result<&'a LedgerHeaderHistoryEntry, String> {
     headers
         .iter()
-        .find(|header| ledger_seq == header.header.ledger_seq)
+        .find(|header| header.header.ledger_seq == ledger_seq)
         .ok_or_else(|| format!("no header found for {missing_label} at ledger {ledger_seq}"))
 }

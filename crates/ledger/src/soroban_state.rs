@@ -49,7 +49,6 @@ use henyey_common::protocol::{
     protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
 };
 use henyey_common::Hash256;
-use henyey_common::LedgerSeq;
 use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
 use soroban_env_host25::budget::Budget;
 use soroban_env_host25::e2e_invoke::entry_size_for_rent as entry_size_for_rent_p25;
@@ -75,14 +74,14 @@ use crate::{LedgerError, Result};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TtlData {
     /// The ledger sequence number when this entry expires.
-    pub live_until_ledger_seq: LedgerSeq,
+    pub live_until_ledger_seq: u32,
     /// The ledger sequence number when this entry was last modified.
-    pub last_modified_ledger_seq: LedgerSeq,
+    pub last_modified_ledger_seq: u32,
 }
 
 impl TtlData {
     /// Create new TTL data.
-    pub fn new(live_until: LedgerSeq, last_modified: LedgerSeq) -> Self {
+    pub fn new(live_until: u32, last_modified: u32) -> Self {
         Self {
             live_until_ledger_seq: live_until,
             last_modified_ledger_seq: last_modified,
@@ -90,7 +89,7 @@ impl TtlData {
     }
 
     /// Check if the entry has expired at the given ledger sequence.
-    pub fn is_expired(&self, current_ledger_seq: LedgerSeq) -> bool {
+    pub fn is_expired(&self, current_ledger_seq: u32) -> bool {
         self.live_until_ledger_seq < current_ledger_seq
     }
 
@@ -247,7 +246,7 @@ pub struct InMemorySorobanState {
     pending_ttls: HashMap<Hash, TtlData>,
 
     /// Last closed ledger sequence number.
-    last_closed_ledger_seq: LedgerSeq,
+    last_closed_ledger_seq: u32,
 
     /// Cumulative XDR size of all contract data entries.
     contract_data_state_size: i64,
@@ -270,7 +269,7 @@ impl InMemorySorobanState {
             contract_code_entries: HashMap::new(),
             config_settings: HashMap::new(),
             pending_ttls: HashMap::new(),
-            last_closed_ledger_seq: LedgerSeq::new(0),
+            last_closed_ledger_seq: 0,
             contract_data_state_size: 0,
             contract_code_state_size: 0,
         }
@@ -285,7 +284,7 @@ impl InMemorySorobanState {
     }
 
     /// Get the last closed ledger sequence number.
-    pub fn ledger_seq(&self) -> LedgerSeq {
+    pub fn ledger_seq(&self) -> u32 {
         self.last_closed_ledger_seq
     }
 
@@ -293,7 +292,7 @@ impl InMemorySorobanState {
     ///
     /// This is used during initialization when populating state from a bucket list
     /// checkpoint without going through `update_state()`.
-    pub fn set_last_closed_ledger_seq(&mut self, ledger_seq: LedgerSeq) {
+    pub fn set_last_closed_ledger_seq(&mut self, ledger_seq: u32) {
         self.last_closed_ledger_seq = ledger_seq;
     }
 
@@ -427,10 +426,10 @@ impl InMemorySorobanState {
 
         // Synthesize the TTL entry
         let entry = LedgerEntry {
-            last_modified_ledger_seq: ttl_data.last_modified_ledger_seq.get(),
+            last_modified_ledger_seq: ttl_data.last_modified_ledger_seq,
             data: LedgerEntryData::Ttl(TtlEntry {
                 key_hash: key.key_hash.clone(),
-                live_until_ledger_seq: ttl_data.live_until_ledger_seq.get(),
+                live_until_ledger_seq: ttl_data.live_until_ledger_seq,
             }),
             ext: stellar_xdr::curr::LedgerEntryExt::V0,
         };
@@ -736,10 +735,8 @@ impl InMemorySorobanState {
                 let key = LedgerKeyTtl {
                     key_hash: ttl.key_hash.clone(),
                 };
-                let ttl_data = TtlData::new(
-                    ttl.live_until_ledger_seq.into(),
-                    entry.last_modified_ledger_seq.into(),
-                );
+                let ttl_data =
+                    TtlData::new(ttl.live_until_ledger_seq, entry.last_modified_ledger_seq);
                 Ok((key, ttl_data))
             }
             _ => Err(LedgerError::InvalidEntry("not a TTL entry".into())),
@@ -802,7 +799,7 @@ impl InMemorySorobanState {
     /// - Entry operations fail
     pub fn update_state(
         &mut self,
-        ledger_seq: LedgerSeq,
+        ledger_seq: u32,
         init_entries: &[LedgerEntry],
         live_entries: &[LedgerEntry],
         dead_entries: &[LedgerKey],
@@ -812,8 +809,8 @@ impl InMemorySorobanState {
         // Validate sequence progression
         if self.last_closed_ledger_seq > 0 && ledger_seq != self.last_closed_ledger_seq + 1 {
             return Err(LedgerError::InvalidSequence {
-                expected: (self.last_closed_ledger_seq + 1).get(),
-                actual: ledger_seq.get(),
+                expected: self.last_closed_ledger_seq + 1,
+                actual: ledger_seq,
             });
         }
 
@@ -840,7 +837,7 @@ impl InMemorySorobanState {
             for (key_hash, ttl_data) in &self.pending_ttls {
                 tracing::error!(
                     key_hash = %format!("{:02x?}", &key_hash.0[..8]),
-                    live_until = ttl_data.live_until_ledger_seq.get(),
+                    live_until = ttl_data.live_until_ledger_seq,
                     "Remaining pending TTL"
                 );
             }
@@ -986,7 +983,7 @@ impl InMemorySorobanState {
         self.contract_data_entries.clear();
         self.contract_code_entries.clear();
         self.pending_ttls.clear();
-        self.last_closed_ledger_seq = LedgerSeq::new(0);
+        self.last_closed_ledger_seq = 0;
         self.contract_data_state_size = 0;
         self.contract_code_state_size = 0;
     }
@@ -1058,7 +1055,7 @@ impl InMemorySorobanState {
 #[derive(Debug, Clone, Default)]
 pub struct SorobanStateStats {
     /// Current ledger sequence.
-    pub ledger_seq: LedgerSeq,
+    pub ledger_seq: u32,
     /// Number of contract data entries.
     pub contract_data_count: usize,
     /// Number of contract code entries.
@@ -1229,7 +1226,7 @@ mod tests {
 
         state
             .update_state(
-                1.into(),
+                1,
                 &[data_entry.clone(), code_entry.clone()],
                 &[],
                 &[],
@@ -1263,9 +1260,7 @@ mod tests {
 
         // Update TTL
         let ttl_key = LedgerKeyTtl { key_hash };
-        state
-            .update_ttl(&ttl_key, TtlData::new(1000.into(), 100.into()))
-            .unwrap();
+        state.update_ttl(&ttl_key, TtlData::new(1000, 100)).unwrap();
 
         // Verify TTL is co-located
         let map_entry = state.get_contract_data(&key).unwrap();
@@ -1288,9 +1283,7 @@ mod tests {
         let key_hash = InMemorySorobanState::contract_data_key_hash(&key);
         let ttl_key = LedgerKeyTtl { key_hash };
 
-        state
-            .create_ttl(&ttl_key, TtlData::new(2000.into(), 200.into()))
-            .unwrap();
+        state.create_ttl(&ttl_key, TtlData::new(2000, 200)).unwrap();
         assert_eq!(state.pending_ttls.len(), 1);
 
         // Now create the entry
@@ -1323,9 +1316,7 @@ mod tests {
         let key_hash = InMemorySorobanState::contract_data_key_hash(&key);
         let ttl_key = LedgerKeyTtl { key_hash };
 
-        state
-            .update_ttl(&ttl_key, TtlData::new(3000.into(), 300.into()))
-            .unwrap();
+        state.update_ttl(&ttl_key, TtlData::new(3000, 300)).unwrap();
 
         // Get synthesized TTL entry
         let ttl_entry = state.get_ttl_entry(&ttl_key).unwrap();
@@ -1345,7 +1336,7 @@ mod tests {
         let code_entry = make_contract_code_entry([2u8; 32]);
 
         state
-            .update_state(10.into(), &[data_entry, code_entry], &[], &[], 25, None)
+            .update_state(10, &[data_entry, code_entry], &[], &[], 25, None)
             .unwrap();
 
         let stats = state.stats();
@@ -1429,7 +1420,7 @@ mod tests {
         let init_entries = vec![ttl_entry, data_entry];
 
         state
-            .update_state(100.into(), &init_entries, &[], &[], 25, None)
+            .update_state(100, &init_entries, &[], &[], 25, None)
             .expect("update_state should succeed - TTL should pair with data entry");
 
         // Verify the entry was created with correct TTL

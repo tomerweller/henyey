@@ -9,7 +9,6 @@
 //! Mirrors `TxSetUtils::getInvalidTxList()` and `TxSetUtils::trimInvalid()`
 //! from stellar-core `src/herder/TxSetUtils.cpp`.
 
-use henyey_common::LedgerSeq;
 use std::collections::{HashMap, HashSet};
 
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
@@ -124,7 +123,7 @@ impl Default for CloseTimeBounds {
 #[derive(Debug, Clone)]
 pub struct TxSetValidationContext {
     /// Next ledger sequence (LCL + 1).
-    pub next_ledger_seq: LedgerSeq,
+    pub next_ledger_seq: u32,
     /// Close time for the next ledger.
     pub close_time: u64,
     /// Base fee per operation in stroops.
@@ -153,7 +152,7 @@ impl TxSetValidationContext {
     /// * `network_id` - Network identifier.
     /// * `ledger_flags` - Ledger header flags (LP disable flags etc.).
     pub fn new(
-        last_closed_ledger_seq: LedgerSeq,
+        last_closed_ledger_seq: u32,
         close_time: u64,
         base_fee: u32,
         base_reserve: u32,
@@ -175,7 +174,7 @@ impl TxSetValidationContext {
     /// Build a `LedgerContext` from this validation context.
     fn to_ledger_context(&self, close_time: u64) -> LedgerContext {
         let mut ctx = LedgerContext::new(
-            self.next_ledger_seq.get(),
+            self.next_ledger_seq,
             close_time,
             self.base_fee,
             self.base_reserve,
@@ -947,7 +946,7 @@ pub(crate) fn check_tx_set_valid(
         _ => 0,
     };
     let ctx = TxSetValidationContext::new(
-        lcl_header.ledger_seq.into(),
+        lcl_header.ledger_seq,
         lcl_header.scp_value.close_time.0,
         lcl_header.base_fee,
         lcl_header.base_reserve,
@@ -1212,11 +1211,11 @@ mod tests {
 
     fn test_context() -> TxSetValidationContext {
         TxSetValidationContext::new(
-            100.into(), // LCL = 100, so next ledger = 101
-            1000,       // close time
-            100,        // base fee
-            5_000_000,  // base reserve
-            21,         // protocol version
+            100,       // LCL = 100, so next ledger = 101
+            1000,      // close time
+            100,       // base fee
+            5_000_000, // base reserve
+            21,        // protocol version
             NetworkId::testnet(),
             0, // ledger flags
         )
@@ -1441,15 +1440,8 @@ mod tests {
 
     #[test]
     fn test_validation_context_next_ledger_seq() {
-        let ctx = TxSetValidationContext::new(
-            100.into(),
-            1000,
-            100,
-            5_000_000,
-            21,
-            NetworkId::testnet(),
-            0,
-        );
+        let ctx =
+            TxSetValidationContext::new(100, 1000, 100, 5_000_000, 21, NetworkId::testnet(), 0);
         assert_eq!(ctx.next_ledger_seq, 101, "next ledger should be LCL + 1");
     }
 
@@ -1457,7 +1449,7 @@ mod tests {
     fn test_validation_context_saturating_add() {
         // Edge case: LCL at u32::MAX should not overflow
         let ctx = TxSetValidationContext::new(
-            u32::MAX.into(),
+            u32::MAX,
             1000,
             100,
             5_000_000,

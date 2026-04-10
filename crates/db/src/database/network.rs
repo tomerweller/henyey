@@ -1,7 +1,6 @@
 //! High-level database methods for peer, publish queue, and ban-list state.
 
 use crate::{pool::Database, queries, Result};
-use henyey_common::LedgerSeq;
 
 impl Database {
     /// Loads peer records from the database.
@@ -24,7 +23,7 @@ impl Database {
     /// archives. This queue tracks which checkpoints are pending publication.
     /// The HAS JSON is captured at checkpoint time to preserve the exact
     /// bucket list state (including hot archive hashes) for publishing.
-    pub fn enqueue_publish(&self, ledger_seq: LedgerSeq, has_json: &str) -> Result<()> {
+    pub fn enqueue_publish(&self, ledger_seq: u32, has_json: &str) -> Result<()> {
         self.with_connection(|conn| {
             use queries::PublishQueueQueries;
             conn.enqueue_publish(ledger_seq, has_json)
@@ -34,7 +33,7 @@ impl Database {
     /// Removes a checkpoint ledger from the publish queue.
     ///
     /// Called after successful publication to a history archive.
-    pub fn remove_publish(&self, ledger_seq: LedgerSeq) -> Result<()> {
+    pub fn remove_publish(&self, ledger_seq: u32) -> Result<()> {
         self.with_connection(|conn| {
             use queries::PublishQueueQueries;
             conn.remove_publish(ledger_seq)
@@ -67,7 +66,7 @@ impl Database {
     ///
     /// Returns the History Archive State JSON that was stored at enqueue
     /// time, or `None` if the checkpoint is not in the queue.
-    pub fn load_publish_has(&self, ledger_seq: LedgerSeq) -> Result<Option<String>> {
+    pub fn load_publish_has(&self, ledger_seq: u32) -> Result<Option<String>> {
         self.with_connection(|conn| {
             use queries::PublishQueueQueries;
             conn.load_publish_has(ledger_seq)

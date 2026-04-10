@@ -1,6 +1,5 @@
 //! High-level database methods for SCP and bucket-list persistence.
 
-use henyey_common::LedgerSeq;
 use stellar_xdr::curr::{ScpEnvelope, ScpQuorumSet};
 
 use crate::{pool::Database, queries, Result};
@@ -10,7 +9,7 @@ impl Database {
     ///
     /// SCP envelopes contain the consensus messages from validators that
     /// were used to agree on this ledger's contents.
-    pub fn store_scp_history(&self, seq: LedgerSeq, envelopes: &[ScpEnvelope]) -> Result<()> {
+    pub fn store_scp_history(&self, seq: u32, envelopes: &[ScpEnvelope]) -> Result<()> {
         self.with_connection(|conn| {
             use queries::ScpQueries;
             conn.store_scp_history(seq, envelopes)
@@ -21,7 +20,7 @@ impl Database {
     ///
     /// Removes at most `count` entries from both scphistory and scpquorums
     /// tables. Used by the Maintainer for garbage collection.
-    pub fn delete_old_scp_entries(&self, max_ledger: LedgerSeq, count: u32) -> Result<u32> {
+    pub fn delete_old_scp_entries(&self, max_ledger: u32, count: u32) -> Result<u32> {
         self.with_connection(|conn| {
             use queries::ScpQueries;
             conn.delete_old_scp_entries(max_ledger, count)
@@ -31,7 +30,7 @@ impl Database {
     /// Loads SCP envelopes for a ledger.
     ///
     /// Returns the consensus messages that were recorded for the specified ledger.
-    pub fn load_scp_history(&self, seq: LedgerSeq) -> Result<Vec<ScpEnvelope>> {
+    pub fn load_scp_history(&self, seq: u32) -> Result<Vec<ScpEnvelope>> {
         self.with_connection(|conn| {
             use queries::ScpQueries;
             conn.load_scp_history(seq)
@@ -77,7 +76,7 @@ impl Database {
     /// Each level contains a pair of hashes: (current bucket hash, snap bucket hash).
     pub fn store_bucket_list(
         &self,
-        seq: LedgerSeq,
+        seq: u32,
         levels: &[(henyey_common::Hash256, henyey_common::Hash256)],
     ) -> Result<()> {
         self.with_connection(|conn| {
@@ -91,7 +90,7 @@ impl Database {
     /// Returns `None` if no bucket list snapshot exists for the given ledger.
     pub fn load_bucket_list(
         &self,
-        seq: LedgerSeq,
+        seq: u32,
     ) -> Result<Option<Vec<(henyey_common::Hash256, henyey_common::Hash256)>>> {
         self.with_connection(|conn| {
             use queries::BucketListQueries;

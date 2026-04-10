@@ -148,7 +148,7 @@ async fn test_catchup_against_local_archive_checkpoint() {
     let has = HistoryArchiveState {
         version: 2,
         server: Some("rs-stellar-core test".to_string()),
-        current_ledger: checkpoint.into(),
+        current_ledger: checkpoint,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
         current_buckets,
         hot_archive_buckets: None,
@@ -219,6 +219,7 @@ async fn test_catchup_against_local_archive_checkpoint() {
         .options(CatchupOptions {
             verify_buckets: true,
             verify_headers: true,
+            ..CatchupOptions::default()
         })
         .build()
         .expect("catchup manager");

@@ -8,7 +8,6 @@
 //! tracing fields for machine parsing.
 
 use henyey_common::memory::ComponentMemory;
-use henyey_common::LedgerSeq;
 use tracing::info;
 
 /// Process-level memory breakdown parsed from `/proc/self/status`.
@@ -120,7 +119,7 @@ impl AllocatorStats {
 /// Complete memory snapshot for a single point in time.
 #[derive(Debug, Clone)]
 pub struct MemoryReport {
-    pub ledger_seq: LedgerSeq,
+    pub ledger_seq: u32,
     pub process: ProcessMemory,
     pub allocator: AllocatorStats,
     pub components: Vec<ComponentMemory>,
@@ -128,7 +127,7 @@ pub struct MemoryReport {
 
 impl MemoryReport {
     /// Create a new memory report.
-    pub fn new(ledger_seq: LedgerSeq, components: Vec<ComponentMemory>) -> Self {
+    pub fn new(ledger_seq: u32, components: Vec<ComponentMemory>) -> Self {
         Self {
             ledger_seq,
             process: ProcessMemory::capture(),
@@ -180,7 +179,7 @@ impl MemoryReport {
         let to_mb = |b: u64| b as f64 / (1024.0 * 1024.0);
 
         info!(
-            ledger_seq = self.ledger_seq.get(),
+            ledger_seq = self.ledger_seq,
             rss_mb = format!("{:.0}", to_mb(self.process.rss_bytes)),
             anon_rss_mb = format!("{:.0}", to_mb(self.process.anon_rss_bytes)),
             file_rss_mb = format!("{:.0}", to_mb(self.process.file_rss_bytes)),
@@ -196,7 +195,7 @@ impl MemoryReport {
 
         for c in &self.components {
             info!(
-                ledger_seq = self.ledger_seq.get(),
+                ledger_seq = self.ledger_seq,
                 component = c.name,
                 mb = format!("{:.1}", c.heap_mb()),
                 entry_count = c.entry_count,
@@ -261,7 +260,7 @@ mod tests {
     #[test]
     fn test_memory_report_arithmetic() {
         let report = MemoryReport {
-            ledger_seq: 100.into(),
+            ledger_seq: 100,
             process: ProcessMemory::default(),
             allocator: AllocatorStats {
                 allocated: 1000,
@@ -284,7 +283,7 @@ mod tests {
     #[test]
     fn test_fragmentation_zero_allocated() {
         let report = MemoryReport {
-            ledger_seq: 0.into(),
+            ledger_seq: 0,
             process: ProcessMemory::default(),
             allocator: AllocatorStats::default(),
             components: vec![],
