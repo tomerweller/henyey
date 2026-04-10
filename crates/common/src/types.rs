@@ -86,10 +86,7 @@ impl Hash256 {
     pub fn hash(data: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(data);
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Self(bytes)
+        Self(hasher.finalize().into())
     }
 
     /// Compute the SHA-256 hash of XDR-encoded data.
@@ -133,9 +130,7 @@ impl Hash256 {
         let mut limited = Limited::new(&mut writer, stellar_xdr::curr::Limits::none());
         value.write_xdr(&mut limited)?;
         let result = writer.0.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Ok(Self(bytes))
+        Ok(Self(result.into()))
     }
 
     /// Returns a reference to the underlying 32-byte array.
@@ -168,11 +163,9 @@ impl Hash256 {
     /// ```
     pub fn from_hex(s: &str) -> Result<Self, hex::FromHexError> {
         let bytes = hex::decode(s)?;
-        if bytes.len() != 32 {
-            return Err(hex::FromHexError::InvalidStringLength);
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| hex::FromHexError::InvalidStringLength)?;
         Ok(Self(arr))
     }
 
