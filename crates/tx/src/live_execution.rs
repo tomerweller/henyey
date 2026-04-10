@@ -291,9 +291,11 @@ pub fn process_fee_seq_num(
         // Charge the fee (or whatever is available)
         charge_fee_to_account(state, &source_account_id, fee_charged)?;
 
-        // Update sequence number for pre-protocol 10 (only if applying)
+        // Update sequence number for pre-protocol 10 (only if applying).
+        // Sequence belongs to the inner source (matters for fee bumps).
         if should_apply && protocol_version_is_before(protocol_version, ProtocolVersion::V10) {
-            update_sequence_number(state, &source_account_id, frame.sequence_number())?;
+            let inner_source_id = frame.inner_source_account_id();
+            update_sequence_number(state, &inner_source_id, frame.sequence_number())?;
         }
     }
 
@@ -579,7 +581,9 @@ pub fn process_seq_num(frame: &TransactionFrame, ctx: &mut LiveExecutionContext)
         return Ok(()); // Sequence was already updated in process_fee_seq_num
     }
 
-    let source_account_id = muxed_to_account_id(&frame.source_account());
+    // Sequence number belongs to the inner source (matters for fee bumps
+    // where fee source != inner source).
+    let source_account_id = frame.inner_source_account_id();
 
     let state = ctx
         .state_mut()
@@ -622,8 +626,10 @@ pub fn remove_one_time_signers(
         return Ok(());
     }
 
-    // Collect all source accounts
-    let mut source_accounts = vec![muxed_to_account_id(&frame.source_account())];
+    // Collect all source accounts — use inner source (matters for fee bumps).
+    // Matches stellar-core TransactionFrame::removeOneTimeSignerFromAllSourceAccounts
+    // which operates on the inner transaction's source accounts.
+    let mut source_accounts = vec![frame.inner_source_account_id()];
 
     for op in frame.operations() {
         if let Some(ref source) = op.source_account {
@@ -700,8 +706,29 @@ pub fn apply_transaction(
     // Phase 4: Post-apply (pre-P23 refunds)
     process_post_apply(frame, ctx, &mut tx_result, None)?;
 
-    // Phase 5: Remove one-time signers
-    if let Ok(hash) = frame.hash(ctx.network_id()) {
+    // Phase 5: Remove one-time signers.
+    // For fee bumps, stellar-core does two separate passes:
+    //   1. removeOneTimeSignerKeyFromFeeSource with the outer fee-bump hash
+    //   2. removeOneTimeSignerFromAllSourceAccounts (inner tx) with the inner hash
+    // For regular txs, a single pass with the tx hash covers everything.
+    if frame.is_fee_bump() {
+        // Fee-source signer removal with outer hash
+        if let Ok(outer_hash) = frame.hash(ctx.network_id()) {
+            let fee_source_id = frame.fee_source_account_id();
+            let protocol_version = ctx.protocol_version();
+            if let Some(state) = ctx.state_mut() {
+                state.remove_one_time_signers_from_all_sources(
+                    &outer_hash,
+                    &[fee_source_id],
+                    protocol_version,
+                );
+            }
+        }
+        // Inner source signer removal with inner hash
+        if let Ok(inner_hash) = frame.inner_hash(ctx.network_id()) {
+            let _ = remove_one_time_signers(frame, ctx, &inner_hash);
+        }
+    } else if let Ok(hash) = frame.hash(ctx.network_id()) {
         let _ = remove_one_time_signers(frame, ctx, &hash);
     }
 
@@ -1316,5 +1343,92 @@ mod tests {
         // Fee charged should be min(100, 0) = 0
         let fee = calculate_fee_to_charge(&frame, 21, Some(0));
         assert_eq!(fee, 0, "With base_fee=0, fee should be 0");
+    }
+
+    /// Regression test for AUDIT-051: fee-bump seq num must advance on the inner source,
+    /// not the outer fee source.
+    #[test]
+    fn test_audit_051_fee_bump_seq_num_on_inner_source() {
+        use stellar_xdr::curr::{
+            DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope,
+            FeeBumpTransactionExt, FeeBumpTransactionInnerTx,
+        };
+
+        let mut ctx = make_test_context_with_state(21);
+
+        // Inner source: account A (seq=5)
+        let inner_source_id = create_test_account_id(10);
+        let inner_account = make_account_entry(inner_source_id.clone(), 10_000_000, 5);
+
+        // Fee source: account B (seq=99)
+        let fee_source_id = create_test_account_id(20);
+        let fee_account = make_account_entry(fee_source_id.clone(), 10_000_000, 99);
+
+        if let Some(state) = ctx.state_mut() {
+            state.put_account(inner_account);
+            state.put_account(fee_account);
+        }
+
+        // Build a fee-bump wrapping a payment from inner_source
+        let inner_tx = Transaction {
+            source_account: match inner_source_id.0.clone() {
+                PublicKey::PublicKeyTypeEd25519(key) => MuxedAccount::Ed25519(key),
+            },
+            fee: 100,
+            seq_num: SequenceNumber(6),
+            cond: Preconditions::None,
+            memo: stellar_xdr::curr::Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: MuxedAccount::Ed25519(Uint256([99u8; 32])),
+                    asset: stellar_xdr::curr::Asset::Native,
+                    amount: 1000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let inner_envelope = TransactionV1Envelope {
+            tx: inner_tx,
+            signatures: vec![].try_into().unwrap(),
+        };
+
+        let fee_bump_tx = FeeBumpTransaction {
+            fee_source: match fee_source_id.0.clone() {
+                PublicKey::PublicKeyTypeEd25519(key) => MuxedAccount::Ed25519(key),
+            },
+            fee: 200,
+            inner_tx: FeeBumpTransactionInnerTx::Tx(inner_envelope),
+            ext: FeeBumpTransactionExt::V0,
+        };
+
+        let fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: fee_bump_tx,
+            signatures: stellar_xdr::curr::VecM::<DecoratedSignature, 20>::default(),
+        });
+
+        let frame = TransactionFrame::from_owned(fee_bump_envelope);
+
+        // Verify it's a fee bump
+        assert!(frame.is_fee_bump());
+
+        // Process fee (charges fee source B)
+        let fee_result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
+        assert!(fee_result.should_apply);
+
+        // Process seq num (should advance inner source A, not fee source B)
+        process_seq_num(&frame, &mut ctx).unwrap();
+
+        // Inner source A: seq must be 6 (advanced)
+        let state = ctx.state().unwrap();
+        let a = state.get_account(&inner_source_id).unwrap();
+        assert_eq!(a.seq_num.0, 6, "inner source sequence must be advanced");
+
+        // Fee source B: seq must remain 99 (untouched)
+        let b = state.get_account(&fee_source_id).unwrap();
+        assert_eq!(b.seq_num.0, 99, "fee source sequence must NOT be advanced");
     }
 }

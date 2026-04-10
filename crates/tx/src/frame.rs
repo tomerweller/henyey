@@ -488,6 +488,28 @@ impl TransactionFrame {
         matches!(&*self.envelope, TransactionEnvelope::TxFeeBump(_))
     }
 
+    /// Compute the hash of the inner transaction for a fee-bump envelope.
+    ///
+    /// For non-fee-bump envelopes this returns the same as [`hash()`].
+    /// For fee bumps it hashes the inner `TransactionV1Envelope` as if it
+    /// were a standalone `TransactionEnvelope::Tx`.
+    ///
+    /// This is needed because stellar-core's
+    /// `removeOneTimeSignerFromAllSourceAccounts` uses `preAuthTxKey(*this)`
+    /// on the *inner* `TransactionFrame`, whose hash is different from the
+    /// outer fee-bump hash.
+    pub fn inner_hash(&self, network_id: &NetworkId) -> Result<Hash256> {
+        match &*self.envelope {
+            TransactionEnvelope::TxFeeBump(env) => {
+                let inner_env = match &env.tx.inner_tx {
+                    FeeBumpTransactionInnerTx::Tx(inner) => TransactionEnvelope::Tx(inner.clone()),
+                };
+                Self::hash_envelope(&inner_env, network_id)
+            }
+            _ => self.hash(network_id),
+        }
+    }
+
     /// Check if this is a Soroban transaction.
     pub fn is_soroban(&self) -> bool {
         self.operations().iter().any(|op| {
