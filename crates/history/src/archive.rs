@@ -35,11 +35,11 @@ use crate::paths::{bucket_path, checkpoint_path, root_has_path};
 /// let archive = HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001")?;
 ///
 /// // Get the current archive state
-/// let has = archive.get_root_has().await?;
+/// let has = archive.fetch_root_has().await?;
 /// println!("Current ledger: {}", has.current_ledger());
 ///
 /// // Get ledger headers for a specific checkpoint
-/// let headers = archive.get_ledger_headers(63).await?;
+/// let headers = archive.fetch_ledger_headers(63).await?;
 /// println!("Got {} ledger headers", headers.len());
 /// # Ok(())
 /// # }
@@ -119,7 +119,7 @@ impl HistoryArchive {
     /// # Returns
     ///
     /// The parsed `HistoryArchiveState`, or an error if fetching or parsing fails.
-    pub async fn get_root_has(&self) -> Result<HistoryArchiveState, HistoryError> {
+    pub async fn fetch_root_has(&self) -> Result<HistoryArchiveState, HistoryError> {
         let url = self.make_url(root_has_path())?;
         debug!(url = %url, "Fetching root HAS");
 
@@ -142,7 +142,7 @@ impl HistoryArchive {
     /// # Returns
     ///
     /// The parsed `HistoryArchiveState` for the checkpoint.
-    pub async fn get_checkpoint_has(
+    pub async fn fetch_checkpoint_has(
         &self,
         ledger: u32,
     ) -> Result<HistoryArchiveState, HistoryError> {
@@ -169,7 +169,7 @@ impl HistoryArchive {
     /// # Returns
     ///
     /// A vector of ledger header history entries.
-    pub async fn get_ledger_headers(
+    pub async fn fetch_ledger_headers(
         &self,
         checkpoint: u32,
     ) -> Result<Vec<LedgerHeaderHistoryEntry>, HistoryError> {
@@ -200,7 +200,7 @@ impl HistoryArchive {
     /// # Returns
     ///
     /// A vector of transaction history entries.
-    pub async fn get_transactions(
+    pub async fn fetch_transactions(
         &self,
         checkpoint: u32,
     ) -> Result<Vec<TransactionHistoryEntry>, HistoryError> {
@@ -220,7 +220,7 @@ impl HistoryArchive {
     /// # Returns
     ///
     /// A vector of transaction result history entries.
-    pub async fn get_results(
+    pub async fn fetch_results(
         &self,
         checkpoint: u32,
     ) -> Result<Vec<TransactionHistoryResultEntry>, HistoryError> {
@@ -232,7 +232,7 @@ impl HistoryArchive {
     /// Download SCP history for a checkpoint.
     ///
     /// Returns SCP envelopes and quorum sets for the checkpoint.
-    pub async fn get_scp_history(
+    pub async fn fetch_scp_history(
         &self,
         checkpoint: u32,
     ) -> Result<Vec<ScpHistoryEntry>, HistoryError> {
@@ -253,7 +253,7 @@ impl HistoryArchive {
     /// # Returns
     ///
     /// The raw (decompressed) bucket data.
-    pub async fn get_bucket(&self, hash: &Hash256) -> Result<Vec<u8>, HistoryError> {
+    pub async fn fetch_bucket(&self, hash: &Hash256) -> Result<Vec<u8>, HistoryError> {
         // Skip zero hash (empty bucket)
         if hash.is_zero() {
             return Ok(Vec::new());
@@ -283,7 +283,7 @@ impl HistoryArchive {
     ///
     /// `Ok(())` if the archive is accessible, or an error otherwise.
     pub async fn check_accessible(&self) -> Result<(), HistoryError> {
-        self.get_root_has().await?;
+        self.fetch_root_has().await?;
         Ok(())
     }
 
@@ -291,15 +291,15 @@ impl HistoryArchive {
     ///
     /// This is a convenience method that fetches the root HAS and returns
     /// the current ledger sequence.
-    pub async fn get_current_ledger(&self) -> Result<u32, HistoryError> {
-        let has = self.get_root_has().await?;
+    pub async fn fetch_current_ledger(&self) -> Result<u32, HistoryError> {
+        let has = self.fetch_root_has().await?;
         Ok(has.current_ledger())
     }
 
     /// Download a single ledger header by sequence.
     ///
     /// This downloads the checkpoint containing the ledger and extracts
-    /// the specific header. For bulk downloads, use `get_ledger_headers`.
+    /// the specific header. For bulk downloads, use `fetch_ledger_headers`.
     ///
     /// # Arguments
     ///
@@ -308,11 +308,11 @@ impl HistoryArchive {
     /// # Returns
     ///
     /// The ledger header for the specified sequence.
-    pub async fn get_ledger_header(
+    pub async fn fetch_ledger_header(
         &self,
         seq: u32,
     ) -> Result<stellar_xdr::curr::LedgerHeader, HistoryError> {
-        let (header, _hash) = self.get_ledger_header_with_hash(seq).await?;
+        let (header, _hash) = self.fetch_ledger_header_with_hash(seq).await?;
         Ok(header)
     }
 
@@ -330,11 +330,11 @@ impl HistoryArchive {
     /// # Returns
     ///
     /// A tuple of (header, hash) for the specified sequence.
-    pub async fn get_ledger_header_with_hash(
+    pub async fn fetch_ledger_header_with_hash(
         &self,
         seq: u32,
     ) -> Result<(stellar_xdr::curr::LedgerHeader, Hash256), HistoryError> {
-        let headers = self.get_ledger_headers(seq).await?;
+        let headers = self.fetch_ledger_headers(seq).await?;
 
         // Find the header with the matching sequence
         for entry in headers {
@@ -361,11 +361,11 @@ impl HistoryArchive {
     /// # Returns
     ///
     /// The transaction set for the specified ledger.
-    pub async fn get_transaction_set(
+    pub async fn fetch_transaction_set(
         &self,
         seq: u32,
     ) -> Result<stellar_xdr::curr::TransactionSet, HistoryError> {
-        let transactions = self.get_transactions(seq).await?;
+        let transactions = self.fetch_transactions(seq).await?;
 
         // Find the transaction set with the matching ledger sequence
         for entry in transactions {

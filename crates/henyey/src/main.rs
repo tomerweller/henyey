@@ -2248,7 +2248,7 @@ async fn cmd_verify_history(
 
     // Get the range to verify
     let archive = &archives[0];
-    let root_has = archive.get_root_has().await?;
+    let root_has = archive.fetch_root_has().await?;
     let current_ledger = root_has.current_ledger;
 
     let start = from.unwrap_or(1);
@@ -2268,7 +2268,7 @@ async fn cmd_verify_history(
     let mut checkpoint = start_checkpoint;
     while checkpoint <= end_checkpoint {
         // Get checkpoint HAS (History Archive State)
-        match archive.get_checkpoint_has(checkpoint).await {
+        match archive.fetch_checkpoint_has(checkpoint).await {
             Ok(has) => {
                 // Verify the HAS structure
                 match verify::verify_has_structure(&has) {
@@ -2295,7 +2295,7 @@ async fn cmd_verify_history(
                 }
 
                 // Get and verify ledger headers for this checkpoint range
-                match archive.get_ledger_headers(checkpoint).await {
+                match archive.fetch_ledger_headers(checkpoint).await {
                     Ok(history_entries) => {
                         // Extract LedgerHeader from LedgerHeaderHistoryEntry
                         let headers: Vec<stellar_xdr::curr::LedgerHeader> = history_entries
@@ -2307,8 +2307,8 @@ async fn cmd_verify_history(
                             error_count += 1;
                         }
 
-                        match archive.get_transactions(checkpoint).await {
-                            Ok(tx_entries) => match archive.get_results(checkpoint).await {
+                        match archive.fetch_transactions(checkpoint).await {
+                            Ok(tx_entries) => match archive.fetch_results(checkpoint).await {
                                 Ok(tx_results) => {
                                     let tx_map = tx_entries
                                         .iter()
@@ -2386,7 +2386,7 @@ async fn cmd_verify_history(
                     }
                 }
 
-                match archive.get_scp_history(checkpoint).await {
+                match archive.fetch_scp_history(checkpoint).await {
                     Ok(entries) => {
                         if let Err(e) = verify::verify_scp_history_entries(&entries) {
                             println!("    SCP history verification FAILED: {}", e);
@@ -3049,7 +3049,7 @@ async fn download_buckets_parallel(
                 let downloaded = &downloaded;
                 let bm = &bucket_manager;
                 async move {
-                    let bucket_data = archive.get_bucket(hash).await.map_err(|e| {
+                    let bucket_data = archive.fetch_bucket(hash).await.map_err(|e| {
                         anyhow::anyhow!("Failed to download bucket {}: {}", hash.to_hex(), e)
                     })?;
                     bm.import_bucket(&bucket_data).map_err(|e| {
@@ -3648,7 +3648,7 @@ async fn cmd_verify_execution(
     }
 
     // Get current ledger and calculate range
-    let root_has = archive.get_root_has().await?;
+    let root_has = archive.fetch_root_has().await?;
     let current_ledger = root_has.current_ledger;
 
     let end_ledger = to.unwrap_or_else(|| {
@@ -3705,7 +3705,7 @@ async fn cmd_verify_execution(
             init_checkpoint
         );
     }
-    let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
+    let init_has = archive.fetch_checkpoint_has(init_checkpoint).await?;
 
     // Extract bucket hashes
     let bucket_hashes = init_has.bucket_hash_pairs();
@@ -3774,7 +3774,7 @@ async fn cmd_verify_execution(
     };
 
     // Get init header and restart merges
-    let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
+    let init_headers = archive.fetch_ledger_headers(init_checkpoint).await?;
     let init_header_entry = init_headers
         .iter()
         .find(|h| h.header.ledger_seq == init_checkpoint);
@@ -3877,7 +3877,7 @@ async fn cmd_verify_execution(
 
     let mut current_cp = process_from_cp;
     while current_cp <= end_checkpoint {
-        let headers = archive.get_ledger_headers(current_cp).await?;
+        let headers = archive.fetch_ledger_headers(current_cp).await?;
 
         for header_entry in &headers {
             let header = &header_entry.header;
@@ -3894,7 +3894,7 @@ async fn cmd_verify_execution(
             let in_test_range = seq >= start_ledger && seq <= end_ledger;
 
             // Fetch CDP metadata
-            let lcm = match cdp.get_ledger_close_meta(seq).await {
+            let lcm = match cdp.fetch_ledger_close_meta(seq).await {
                 Ok(lcm) => lcm,
                 Err(e) => {
                     if in_test_range {
@@ -4675,7 +4675,7 @@ async fn cmd_debug_bucket_entry(
     println!("Archive: {}", config.history.archives[0].url);
 
     // Get bucket list hashes at this checkpoint
-    let has_entry = archive.get_checkpoint_has(checkpoint_seq).await?;
+    let has_entry = archive.fetch_checkpoint_has(checkpoint_seq).await?;
     let bucket_hashes: Vec<Hash256> = has_entry
         .bucket_hash_pairs()
         .into_iter()
@@ -5172,7 +5172,7 @@ async fn cmd_verify_checkpoints(
     println!("Using {} archive(s)", archives.len());
 
     let archive = &archives[0];
-    let root_has = archive.get_root_has().await?;
+    let root_has = archive.fetch_root_has().await?;
     let current_ledger = root_has.current_ledger;
 
     let start = from.unwrap_or(63); // First checkpoint
@@ -5197,7 +5197,7 @@ async fn cmd_verify_checkpoints(
         std::io::stdout().flush()?;
 
         // Download headers for this checkpoint
-        match archive.get_ledger_headers(current_checkpoint).await {
+        match archive.fetch_ledger_headers(current_checkpoint).await {
             Ok(history_entries) => {
                 if history_entries.is_empty() {
                     println!("FAIL (no headers)");

@@ -550,7 +550,7 @@ impl App {
 
         for archive_config in &self.config.history.archives {
             match HistoryArchive::new(&archive_config.url) {
-                Ok(archive) => match archive.get_current_ledger().await {
+                Ok(archive) => match archive.fetch_current_ledger().await {
                     Ok(ledger) => {
                         tracing::info!(
                             ledger,

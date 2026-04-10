@@ -115,23 +115,23 @@ pub async fn compare_checkpoint(
     let mut mismatches = Vec::new();
 
     // --- HAS ---
-    let local_has = local.get_checkpoint_has(checkpoint).await?;
-    let ref_has = reference.get_checkpoint_has(checkpoint).await?;
+    let local_has = local.fetch_checkpoint_has(checkpoint).await?;
+    let ref_has = reference.fetch_checkpoint_has(checkpoint).await?;
     compare_has(&local_has, &ref_has, &mut mismatches);
 
     // --- Ledger headers ---
-    let local_headers = local.get_ledger_headers(checkpoint).await?;
-    let ref_headers = reference.get_ledger_headers(checkpoint).await?;
+    let local_headers = local.fetch_ledger_headers(checkpoint).await?;
+    let ref_headers = reference.fetch_ledger_headers(checkpoint).await?;
     compare_ledger_headers(&local_headers, &ref_headers, &mut mismatches);
 
     // --- Transactions ---
-    let local_txs = local.get_transactions(checkpoint).await?;
-    let ref_txs = reference.get_transactions(checkpoint).await?;
+    let local_txs = local.fetch_transactions(checkpoint).await?;
+    let ref_txs = reference.fetch_transactions(checkpoint).await?;
     compare_entries(&local_txs, &ref_txs, &mut mismatches);
 
     // --- Results ---
-    let local_results = local.get_results(checkpoint).await?;
-    let ref_results = reference.get_results(checkpoint).await?;
+    let local_results = local.fetch_results(checkpoint).await?;
+    let ref_results = reference.fetch_results(checkpoint).await?;
     compare_entries(&local_results, &ref_results, &mut mismatches);
 
     Ok(CheckpointComparison {

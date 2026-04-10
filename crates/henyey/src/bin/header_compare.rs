@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no enabled history archives in config"))?;
     let archive = HistoryArchive::new(&archive.url)?;
     let checkpoint = henyey_history::checkpoint::checkpoint_containing(args.ledger);
-    let headers = archive.get_ledger_headers(checkpoint).await?;
+    let headers = archive.fetch_ledger_headers(checkpoint).await?;
     let archive_header = headers
         .iter()
         .find(|entry| entry.header.ledger_seq == args.ledger)
@@ -156,7 +156,7 @@ async fn compare_tx_results(
         .get_tx_result_entry(ledger)?
         .ok_or_else(|| anyhow::anyhow!("missing tx result entry {} in db", ledger))?;
 
-    let archive_entries = archive.get_results(checkpoint).await?;
+    let archive_entries = archive.fetch_results(checkpoint).await?;
     let archive_entry = archive_entries
         .into_iter()
         .find(|entry| entry.ledger_seq == ledger)

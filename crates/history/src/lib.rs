@@ -45,7 +45,7 @@
 //! )?;
 //!
 //! // Get the current archive state (History Archive State / HAS)
-//! let has = archive.get_root_has().await?;
+//! let has = archive.fetch_root_has().await?;
 //! println!("Current ledger: {}", has.current_ledger());
 //!
 //! // Get all bucket hashes needed for catchup
@@ -53,7 +53,7 @@
 //! println!("Need {} buckets", buckets.len());
 //!
 //! // Download ledger headers for a checkpoint
-//! let headers = archive.get_ledger_headers(63).await?;
+//! let headers = archive.fetch_ledger_headers(63).await?;
 //! println!("Got {} ledger headers", headers.len());
 //! # Ok(())
 //! # }
@@ -201,7 +201,7 @@ pub struct ArchiveConfig {
 /// let manager = HistoryManager::from_urls(testnet::ARCHIVE_URLS)?;
 ///
 /// // Automatically tries each archive until one succeeds
-/// let has = manager.get_root_has().await?;
+/// let has = manager.fetch_root_has().await?;
 /// println!("Network at ledger {}", has.current_ledger());
 /// # Ok(())
 /// # }
@@ -267,9 +267,9 @@ impl HistoryManager {
     /// Get the root HAS from any available archive.
     ///
     /// Tries each archive in sequence until one succeeds.
-    pub async fn get_root_has(&self) -> Result<HistoryArchiveState> {
+    pub async fn fetch_root_has(&self) -> Result<HistoryArchiveState> {
         self.try_archives(
-            |a| Box::pin(a.get_root_has()),
+            |a| Box::pin(a.fetch_root_has()),
             "get HAS",
             HistoryError::NoArchiveAvailable,
         )
@@ -277,9 +277,9 @@ impl HistoryManager {
     }
 
     /// Get the checkpoint HAS from any available archive.
-    pub async fn get_checkpoint_has(&self, ledger: u32) -> Result<HistoryArchiveState> {
+    pub async fn fetch_checkpoint_has(&self, ledger: u32) -> Result<HistoryArchiveState> {
         self.try_archives(
-            |a| Box::pin(a.get_checkpoint_has(ledger)),
+            |a| Box::pin(a.fetch_checkpoint_has(ledger)),
             "get checkpoint HAS",
             HistoryError::CheckpointNotFound(ledger),
         )
@@ -287,10 +287,10 @@ impl HistoryManager {
     }
 
     /// Download a bucket from any available archive.
-    pub async fn get_bucket(&self, hash: &henyey_common::Hash256) -> Result<Vec<u8>> {
+    pub async fn fetch_bucket(&self, hash: &henyey_common::Hash256) -> Result<Vec<u8>> {
         let hash = *hash;
         self.try_archives(
-            |a| Box::pin(a.get_bucket(&hash)),
+            |a| Box::pin(a.fetch_bucket(&hash)),
             "get bucket",
             HistoryError::BucketNotFound(hash),
         )
@@ -298,12 +298,12 @@ impl HistoryManager {
     }
 
     /// Get ledger headers for a checkpoint from any available archive.
-    pub async fn get_ledger_headers(
+    pub async fn fetch_ledger_headers(
         &self,
         checkpoint: u32,
     ) -> Result<Vec<stellar_xdr::curr::LedgerHeaderHistoryEntry>> {
         self.try_archives(
-            |a| Box::pin(a.get_ledger_headers(checkpoint)),
+            |a| Box::pin(a.fetch_ledger_headers(checkpoint)),
             "get ledger headers",
             HistoryError::CheckpointNotFound(checkpoint),
         )
@@ -311,12 +311,12 @@ impl HistoryManager {
     }
 
     /// Get transactions for a checkpoint from any available archive.
-    pub async fn get_transactions(
+    pub async fn fetch_transactions(
         &self,
         checkpoint: u32,
     ) -> Result<Vec<stellar_xdr::curr::TransactionHistoryEntry>> {
         self.try_archives(
-            |a| Box::pin(a.get_transactions(checkpoint)),
+            |a| Box::pin(a.fetch_transactions(checkpoint)),
             "get transactions",
             HistoryError::CheckpointNotFound(checkpoint),
         )
@@ -324,12 +324,12 @@ impl HistoryManager {
     }
 
     /// Get transaction results for a checkpoint from any available archive.
-    pub async fn get_results(
+    pub async fn fetch_results(
         &self,
         checkpoint: u32,
     ) -> Result<Vec<stellar_xdr::curr::TransactionHistoryResultEntry>> {
         self.try_archives(
-            |a| Box::pin(a.get_results(checkpoint)),
+            |a| Box::pin(a.fetch_results(checkpoint)),
             "get transaction results",
             HistoryError::CheckpointNotFound(checkpoint),
         )
@@ -626,7 +626,7 @@ impl HistoryArchiveManager {
 
         // Check if already initialized by trying to fetch the root HAS
         if let Some(ref archive) = entry.archive {
-            if archive.get_root_has().await.is_ok() {
+            if archive.fetch_root_has().await.is_ok() {
                 return Err(HistoryError::ArchiveAlreadyInitialized(name.to_string()));
             }
         }
@@ -688,10 +688,10 @@ impl HistoryArchiveManager {
     /// Get the root HAS from any readable archive.
     ///
     /// Tries each readable archive in sequence until one succeeds.
-    pub async fn get_root_has(&self) -> Result<HistoryArchiveState> {
+    pub async fn fetch_root_has(&self) -> Result<HistoryArchiveState> {
         for entry in &self.archives {
             if let Some(ref archive) = entry.archive {
-                match archive.get_root_has().await {
+                match archive.fetch_root_has().await {
                     Ok(has) => return Ok(has),
                     Err(e) => {
                         tracing::warn!(

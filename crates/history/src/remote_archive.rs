@@ -217,7 +217,7 @@ impl RemoteArchive {
     /// Returns an error if:
     /// - No get command is configured
     /// - The command execution fails
-    pub async fn get_file(&self, remote_url: &str, local_path: &Path) -> Result<()> {
+    pub async fn download_file(&self, remote_url: &str, local_path: &Path) -> Result<()> {
         let get_cmd = self.config.get_cmd.as_ref().ok_or_else(|| {
             HistoryError::RemoteNotConfigured("get command not configured".to_string())
         })?;
