@@ -193,7 +193,7 @@ fn ed25519_key(ed25519_pubkey: &[u8; 32]) -> SignerKey {
 ///
 /// `Some([u8; 32])` containing the Ed25519 public key, or `None`.
 #[cfg(test)]
-fn get_ed25519_from_signer_key(signer_key: &SignerKey) -> Option<[u8; 32]> {
+fn ed25519_from_signer_key(signer_key: &SignerKey) -> Option<[u8; 32]> {
     match signer_key {
         SignerKey::Ed25519(key) => Some(key.0),
         SignerKey::Ed25519SignedPayload(payload) => Some(payload.ed25519.0),
@@ -266,23 +266,23 @@ mod tests {
     }
 
     #[test]
-    fn test_get_ed25519_from_signer_key() {
+    fn test_ed25519_from_signer_key() {
         // Ed25519 type
         let pubkey = [0x03; 32];
         let signer = ed25519_key(&pubkey);
-        assert_eq!(get_ed25519_from_signer_key(&signer), Some(pubkey));
+        assert_eq!(ed25519_from_signer_key(&signer), Some(pubkey));
 
         // Ed25519SignedPayload type
         let signer = ed25519_payload_key(&pubkey, b"payload");
-        assert_eq!(get_ed25519_from_signer_key(&signer), Some(pubkey));
+        assert_eq!(ed25519_from_signer_key(&signer), Some(pubkey));
 
         // PreAuthTx type - no Ed25519 key
         let signer = pre_auth_tx_key(&Hash256([0; 32]));
-        assert_eq!(get_ed25519_from_signer_key(&signer), None);
+        assert_eq!(ed25519_from_signer_key(&signer), None);
 
         // HashX type - no Ed25519 key
         let signer = hash_x_key(b"secret");
-        assert_eq!(get_ed25519_from_signer_key(&signer), None);
+        assert_eq!(ed25519_from_signer_key(&signer), None);
     }
 
     #[test]

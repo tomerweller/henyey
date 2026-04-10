@@ -134,7 +134,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
 
     // --- HTTP ---
-    if let Some(port) = get_u16(table, "HTTP_PORT") {
+    if let Some(port) = u16_val(table, "HTTP_PORT") {
         // When stellar-core format is used, enable the compat HTTP server
         // on this port, since stellar-rpc expects stellar-core's wire format.
         // Disable the native HTTP server to avoid port conflict (both default
@@ -161,10 +161,10 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
 
     // --- Query server ---
-    if let Some(port) = get_u16(table, "HTTP_QUERY_PORT") {
+    if let Some(port) = u16_val(table, "HTTP_QUERY_PORT") {
         config.query.port = Some(port);
     }
-    if let Some(v) = get_u32(table, "QUERY_SNAPSHOT_LEDGERS") {
+    if let Some(v) = u32_val(table, "QUERY_SNAPSHOT_LEDGERS") {
         config.query.snapshot_ledgers = v;
     }
     if let Some(v) = usize(table, "QUERY_THREAD_POOL_SIZE") {
@@ -172,7 +172,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
 
     // --- Overlay ---
-    if let Some(port) = get_u16(table, "PEER_PORT") {
+    if let Some(port) = u16_val(table, "PEER_PORT") {
         config.overlay.peer_port = port;
     }
     if let Some(peers) = string_array(table, "KNOWN_PEERS") {
@@ -207,7 +207,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
 
     // --- Upgrades ---
-    if let Some(v) = get_u32(table, "PREFERRED_UPGRADE_PROTOCOL_VERSION") {
+    if let Some(v) = u32_val(table, "PREFERRED_UPGRADE_PROTOCOL_VERSION") {
         config.upgrades.protocol_version = Some(v);
     }
 
@@ -220,18 +220,18 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     if let Some(v) = bool(table, "CATCHUP_COMPLETE") {
         config.catchup.complete = v;
     }
-    if let Some(v) = get_u32(table, "CATCHUP_RECENT") {
+    if let Some(v) = u32_val(table, "CATCHUP_RECENT") {
         config.catchup.recent = v;
     }
 
     // --- Maintenance ---
-    if let Some(v) = get_u32(table, "AUTOMATIC_MAINTENANCE_PERIOD") {
+    if let Some(v) = u32_val(table, "AUTOMATIC_MAINTENANCE_PERIOD") {
         config.maintenance.period_secs = v as u64;
         if v == 0 {
             config.maintenance.enabled = false;
         }
     }
-    if let Some(v) = get_u32(table, "AUTOMATIC_MAINTENANCE_COUNT") {
+    if let Some(v) = u32_val(table, "AUTOMATIC_MAINTENANCE_COUNT") {
         config.maintenance.count = v;
         if v == 0 {
             config.maintenance.enabled = false;
@@ -394,7 +394,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
             config.testing.generate_load_for_testing = s.eq_ignore_ascii_case("true");
         }
     }
-    if let Some(v) = get_u32(table, "GENESIS_TEST_ACCOUNT_COUNT") {
+    if let Some(v) = u32_val(table, "GENESIS_TEST_ACCOUNT_COUNT") {
         config.testing.genesis_test_account_count = v;
     }
 
@@ -439,14 +439,14 @@ fn bool(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<bool> 
     table.get(key).and_then(|v| v.as_bool())
 }
 
-fn get_u16(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u16> {
+fn u16_val(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u16> {
     table
         .get(key)
         .and_then(|v| v.as_integer())
         .and_then(|i| u16::try_from(i).ok())
 }
 
-fn get_u32(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u32> {
+fn u32_val(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u32> {
     table
         .get(key)
         .and_then(|v| v.as_integer())
