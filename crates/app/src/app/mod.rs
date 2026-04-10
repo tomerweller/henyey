@@ -820,6 +820,11 @@ impl App {
                 max_queue_classic_bytes: Some(
                     config.surge_pricing.classic_byte_allowance * POOL_LEDGER_MULTIPLIER,
                 ),
+                expected_ledger_close_secs: config
+                    .testing
+                    .ledger_close_time
+                    .unwrap_or(if config.testing.accelerate_time { 1 } else { 5 })
+                    as u64,
                 ..Default::default()
             },
             local_quorum_set,

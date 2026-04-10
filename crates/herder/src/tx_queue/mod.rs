@@ -112,6 +112,9 @@ const DEFAULT_MAX_QUEUE_SIZE: usize = 1000;
 const DEFAULT_MAX_AGE_SECS: u64 = 300;
 /// Default minimum fee per operation (100 stroops = 0.00001 XLM).
 const DEFAULT_MIN_FEE_PER_OP: u32 = 100;
+/// Multiplier for expected close time in upper bound offset calculation.
+/// Parity: stellar-core `EXPECTED_CLOSE_TIME_MULT` in TransactionUtils.h.
+const EXPECTED_CLOSE_TIME_MULT: u64 = 2;
 
 /// Trait for providing ledger account balance information.
 ///
@@ -175,6 +178,9 @@ pub struct TxQueueConfig {
     pub soroban_phase_min_stage_count: u32,
     /// Maximum number of stages to try when building the parallel Soroban phase.
     pub soroban_phase_max_stage_count: u32,
+    /// Expected ledger close time in seconds (used for upper bound close time offset).
+    /// Matches stellar-core's `EXPECTED_LEDGER_CLOSE_TIME` config.
+    pub expected_ledger_close_secs: u64,
 }
 
 impl Default for TxQueueConfig {
@@ -200,6 +206,7 @@ impl Default for TxQueueConfig {
             ledger_max_dependent_tx_clusters: 0,
             soroban_phase_min_stage_count: 1,
             soroban_phase_max_stage_count: 4,
+            expected_ledger_close_secs: 5,
         }
     }
 }
@@ -807,10 +814,37 @@ impl TransactionQueue {
             self.config.network_id,
         );
 
-        // Validate time bounds if enabled
+        // Validate time bounds if enabled.
+        // Parity: stellar-core TransactionQueue::tryAdd uses
+        // getUpperBoundCloseTimeOffset(app, closeTime) for the max_time check,
+        // which accounts for drift since LCL + expected close time * 2.
         if self.config.validate_time_bounds {
+            // For min_time (too early) check: use lcl close_time directly (offset 0).
             if validate_time_bounds(&frame, &ledger_ctx).is_err() {
                 return Err(TxResultCode::TxTooEarly);
+            }
+
+            // For max_time (too late) check: add upper bound offset.
+            // upperBound = expected_close_time * EXPECTED_CLOSE_TIME_MULT + drift
+            // where drift = max(0, now - lcl_close_time).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let drift = now.saturating_sub(ctx.close_time);
+            let upper_offset =
+                self.config.expected_ledger_close_secs * EXPECTED_CLOSE_TIME_MULT + drift;
+            let upper_close_time = ctx.close_time.saturating_add(upper_offset);
+            let upper_ctx = LedgerContext::new(
+                ctx.ledger_seq,
+                upper_close_time,
+                base_fee,
+                5_000_000,
+                ctx.protocol_version,
+                self.config.network_id,
+            );
+            if validate_time_bounds(&frame, &upper_ctx).is_err() {
+                return Err(TxResultCode::TxTooLate);
             }
 
             if validate_ledger_bounds(&frame, &ledger_ctx).is_err() {
@@ -4392,6 +4426,70 @@ mod tests {
         }
 
         assert_eq!(queue.try_add(signed), TxQueueResult::Added);
+    }
+
+    /// Regression test for AUDIT-093: queue admission must reject transactions
+    /// whose max_time will expire before the estimated next ledger close.
+    /// stellar-core uses getUpperBoundCloseTimeOffset (= expected_close_time * 2 + drift)
+    /// to catch these; Henyey was only checking against the stale lcl_close_time.
+    #[test]
+    fn test_audit_093_queue_rejects_expiring_tx() {
+        use stellar_xdr::curr::TimeBounds;
+
+        let lcl_close_time: u64 = 1_700_000_000;
+        let expected_close_secs: u64 = 5;
+        // Upper bound offset = expected_close_time * 2 + drift.
+        // With drift=0 (just closed), offset = 10.
+        // A tx with max_time = lcl_close_time + 3 would expire before
+        // lcl_close_time + 10, so it should be rejected.
+        let max_time = lcl_close_time + 3;
+
+        let config = TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: true,
+            expected_ledger_close_secs: expected_close_secs,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0);
+
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let operations: Vec<Operation> = vec![Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
+                starting_balance: 1000000000,
+            }),
+        }];
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::Time(TimeBounds {
+                min_time: stellar_xdr::curr::TimePoint(0),
+                max_time: stellar_xdr::curr::TimePoint(max_time),
+            }),
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        // This tx should be rejected because max_time < lcl_close_time + upper_bound_offset.
+        assert!(
+            matches!(queue.try_add(envelope), TxQueueResult::Invalid(_)),
+            "tx with max_time expiring before next close should be rejected"
+        );
     }
 
     #[test]

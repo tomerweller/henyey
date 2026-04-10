@@ -1515,20 +1515,9 @@ impl Herder {
             }
         };
 
-        // 2. Build & cache tx set
-        let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set_with_starting_seq(
-            previous_hash,
-            max_txs,
-            starting_seq.as_ref(),
-        );
-        debug!(
-            hash = %tx_set.hash,
-            tx_count = tx_set.len(),
-            "Proposing transaction set"
-        );
-        self.scp_driver.cache_tx_set(tx_set.clone());
-
-        // 3. Close time with monotonic clamp (parity: HerderImpl.cpp triggerNextLedger)
+        // 2. Close time with monotonic clamp (parity: HerderImpl.cpp triggerNextLedger).
+        // Computed BEFORE tx-set building so the offset can be used to trim
+        // transactions that would expire at the proposed close time (#1192).
         let mut close_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before UNIX epoch")
@@ -1536,6 +1525,21 @@ impl Herder {
         if close_time <= lcl_close_time {
             close_time = lcl_close_time + 1;
         }
+        let close_time_offset = close_time - lcl_close_time;
+
+        // 3. Build & cache tx set, trimming against proposed close time.
+        let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set_with_starting_seq(
+            previous_hash,
+            max_txs,
+            starting_seq.as_ref(),
+            close_time_offset,
+        );
+        debug!(
+            hash = %tx_set.hash,
+            tx_count = tx_set.len(),
+            "Proposing transaction set"
+        );
+        self.scp_driver.cache_tx_set(tx_set.clone());
 
         // 4. Upgrades: config + runtime, filtered against current state.
         // Use lcl_close_time (not candidate close_time) for upgrade parameter

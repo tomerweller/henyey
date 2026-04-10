@@ -79,7 +79,7 @@ impl TransactionQueue {
         previous_ledger_hash: Hash256,
         max_ops: usize,
     ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
-        self.build_generalized_tx_set_with_starting_seq(previous_ledger_hash, max_ops, None)
+        self.build_generalized_tx_set_with_starting_seq(previous_ledger_hash, max_ops, None, 0)
     }
 
     pub fn build_generalized_tx_set_with_starting_seq(
@@ -87,6 +87,7 @@ impl TransactionQueue {
         previous_ledger_hash: Hash256,
         max_ops: usize,
         starting_seq: Option<&HashMap<Vec<u8>, i64>>,
+        close_time_offset: u64,
     ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
         use stellar_xdr::curr::{
             DependentTxCluster, GeneralizedTransactionSet, ParallelTxExecutionStage,
@@ -137,7 +138,10 @@ impl TransactionQueue {
                     ledger_flags: vc.ledger_flags,
                 }
             };
-            let close_time_bounds = crate::tx_set_utils::CloseTimeBounds::exact();
+            let close_time_bounds = crate::tx_set_utils::CloseTimeBounds::with_offsets(
+                close_time_offset,
+                close_time_offset,
+            );
             crate::tx_set_utils::trim_invalid_two_phase(
                 &classic_txs,
                 &soroban_txs,
