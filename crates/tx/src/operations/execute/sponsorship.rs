@@ -1598,4 +1598,103 @@ mod tests {
             other => panic!("unexpected: {:?}", other),
         }
     }
+
+    /// RevokeSponsorship returns OpTooManySponsoring (not TxInternalError)
+    /// when transferring sponsorship to an account at num_sponsoring == u32::MAX.
+    #[test]
+    fn test_revoke_sponsorship_transfer_too_many_sponsoring() {
+        // Use base_reserve=1 so minimum balance at u32::MAX sponsoring is tractable.
+        let mut state = LedgerStateManager::new(1, 100);
+        let context = create_test_context();
+
+        let old_sponsor = create_test_account_id(180);
+        let new_sponsor = create_test_account_id(181);
+        let owner_id = create_test_account_id(182);
+
+        state.create_account(create_test_account(old_sponsor.clone(), 100_000_000));
+        // min_balance = (2 + 0 + u32::MAX + 1 - 0) * 1 = ~4.3 billion
+        state.create_account(create_test_account_with_sponsorship(
+            new_sponsor.clone(),
+            5_000_000_000, // 5 billion — enough to pass reserve check with base_reserve=1
+            0,
+            0,
+            u32::MAX,
+        ));
+        state.create_account(create_test_account(owner_id.clone(), 100_000_000));
+
+        let data_entry = create_data_entry(&owner_id, "test");
+        state.create_data(data_entry);
+
+        let ledger_key = LedgerKey::Data(LedgerKeyData {
+            account_id: owner_id.clone(),
+            data_name: String64::try_from("test".as_bytes().to_vec()).unwrap(),
+        });
+        state
+            .apply_entry_sponsorship_with_sponsor(
+                ledger_key.clone(),
+                &old_sponsor,
+                Some(&owner_id),
+                1,
+            )
+            .unwrap();
+
+        // Begin sponsoring so revoke transfers to new_sponsor
+        let begin = BeginSponsoringFutureReservesOp {
+            sponsored_id: old_sponsor.clone(),
+        };
+        execute_begin_sponsoring_future_reserves(&begin, &new_sponsor, &mut state, &context)
+            .unwrap();
+
+        let op = RevokeSponsorshipOp::LedgerEntry(ledger_key);
+        let result = execute_revoke_sponsorship(&op, &old_sponsor, &mut state, &context).unwrap();
+        assert!(
+            matches!(result, OperationResult::OpTooManySponsoring),
+            "Expected OpTooManySponsoring, got {:?}",
+            result
+        );
+    }
+
+    /// RevokeSponsorship returns OpTooManySponsoring when establishing new
+    /// sponsorship with an account at num_sponsoring == u32::MAX.
+    #[test]
+    fn test_revoke_sponsorship_establish_too_many_sponsoring() {
+        // Use base_reserve=1 so minimum balance at u32::MAX sponsoring is tractable.
+        let mut state = LedgerStateManager::new(1, 100);
+        let context = create_test_context();
+
+        let new_sponsor = create_test_account_id(185);
+        let owner_id = create_test_account_id(186);
+
+        state.create_account(create_test_account_with_sponsorship(
+            new_sponsor.clone(),
+            5_000_000_000,
+            0,
+            0,
+            u32::MAX,
+        ));
+        state.create_account(create_test_account(owner_id.clone(), 100_000_000));
+
+        let data_entry = create_data_entry(&owner_id, "test2");
+        state.create_data(data_entry);
+
+        let ledger_key = LedgerKey::Data(LedgerKeyData {
+            account_id: owner_id.clone(),
+            data_name: String64::try_from("test2".as_bytes().to_vec()).unwrap(),
+        });
+
+        // Begin sponsoring so revoke establishes from new_sponsor
+        let begin = BeginSponsoringFutureReservesOp {
+            sponsored_id: owner_id.clone(),
+        };
+        execute_begin_sponsoring_future_reserves(&begin, &new_sponsor, &mut state, &context)
+            .unwrap();
+
+        let op = RevokeSponsorshipOp::LedgerEntry(ledger_key);
+        let result = execute_revoke_sponsorship(&op, &owner_id, &mut state, &context).unwrap();
+        assert!(
+            matches!(result, OperationResult::OpTooManySponsoring),
+            "Expected OpTooManySponsoring, got {:?}",
+            result
+        );
+    }
 }
