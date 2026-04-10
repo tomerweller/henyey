@@ -120,7 +120,8 @@ impl MetaWriter {
     /// Clone the underlying mpsc::Sender for use in callbacks.
     ///
     /// Used by the catchup meta callback which needs a `Send + 'static`
-    /// sender for `blocking_send`.
+    /// sender. Note: the catchup callback uses `try_send` (not
+    /// `blocking_send`) because it runs inside the tokio runtime.
     pub fn clone_sender(&self) -> mpsc::Sender<MetaWriteCommand> {
         self.tx.clone()
     }

@@ -736,20 +736,31 @@ impl App {
         };
 
         if let Some(ref writer) = self.meta_writer {
-            // Use the MetaWriter's blocking channel for catchup replay.
-            // The writer thread handles rotation and error handling.
+            // Use the MetaWriter's channel for catchup replay.
+            // The callback runs inside the async tokio runtime, so we cannot
+            // use blocking_send (it panics with "Cannot block the current
+            // thread from within a runtime"). Instead, use try_send with a
+            // yield-retry loop for backpressure when the channel is full.
             let writer_tx = writer.clone_sender();
             catchup_manager.set_meta_callback(Box::new(move |meta| {
-                // Extract ledger_seq from the meta for rotation.
                 let ledger_seq = crate::meta_writer::extract_ledger_seq(&meta);
-                if let Err(e) =
-                    writer_tx.blocking_send(crate::meta_writer::MetaWriteCommand::Write {
-                        meta: Box::new(meta),
-                        ledger_seq,
-                    })
-                {
-                    tracing::error!(error = %e, "Fatal: meta writer channel failed during catchup");
-                    std::process::abort();
+                let mut cmd = crate::meta_writer::MetaWriteCommand::Write {
+                    meta: Box::new(meta),
+                    ledger_seq,
+                };
+                loop {
+                    match writer_tx.try_send(cmd) {
+                        Ok(()) => break,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                            // Channel full — yield to let the writer thread drain.
+                            std::thread::yield_now();
+                            cmd = returned;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::error!("Fatal: meta writer channel closed during catchup");
+                            std::process::abort();
+                        }
+                    }
                 }
             }));
         } else if let Some(ref stream_arc) = shared_meta_stream {
