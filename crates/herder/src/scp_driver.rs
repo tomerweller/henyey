@@ -1751,16 +1751,17 @@ impl ScpDriver {
     /// freeing memory during out-of-sync recovery.
     pub fn purge_slots_below(&self, slot: SlotIndex) {
         // Remove externalized slots below the threshold
-        let mut externalized = self.externalized.write();
-        let slots_to_remove: Vec<_> = externalized
-            .keys()
-            .filter(|&s| *s < slot)
-            .cloned()
-            .collect();
-        for s in slots_to_remove {
-            externalized.remove(&s);
+        {
+            let mut externalized = self.externalized.write();
+            let slots_to_remove: Vec<_> = externalized
+                .keys()
+                .filter(|&s| *s < slot)
+                .cloned()
+                .collect();
+            for s in slots_to_remove {
+                externalized.remove(&s);
+            }
         }
-        drop(externalized);
 
         // Clean up pending tx set requests for old slots
         self.cleanup_old_pending_slots(slot);

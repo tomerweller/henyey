@@ -206,12 +206,13 @@ where
     }
 
     // Finalize the gzip stream and sync
-    let buf_writer = writer.finish()?;
-    let file = buf_writer
-        .into_inner()
-        .map_err(|e| HistoryError::Io(e.into_error()))?;
-    file.sync_all()?;
-    drop(file);
+    {
+        let buf_writer = writer.finish()?;
+        let file = buf_writer
+            .into_inner()
+            .map_err(|e| HistoryError::Io(e.into_error()))?;
+        file.sync_all()?;
+    }
 
     // Durable rename temp → dirty
     durable_rename(&tmp_file, dirty_path)?;

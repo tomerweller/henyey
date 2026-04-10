@@ -929,18 +929,19 @@ impl App {
         &self,
     ) -> Option<tokio::task::JoinHandle<()>> {
         tracing::info!("Attempting to start catchup message caching from self_arc");
-        let weak = self.self_arc.read().await;
-        let app = match weak.upgrade() {
-            Some(arc) => {
-                tracing::info!("Successfully upgraded self_arc weak reference");
-                arc
-            }
-            None => {
-                tracing::warn!("Failed to upgrade self_arc weak reference for message caching");
-                return None;
+        let app = {
+            let weak = self.self_arc.read().await;
+            match weak.upgrade() {
+                Some(arc) => {
+                    tracing::info!("Successfully upgraded self_arc weak reference");
+                    arc
+                }
+                None => {
+                    tracing::warn!("Failed to upgrade self_arc weak reference for message caching");
+                    return None;
+                }
             }
         };
-        drop(weak); // Release the read lock before calling async method
         let handle = app.start_catchup_message_caching().await;
         if handle.is_some() {
             tracing::info!("Started catchup message caching task from self_arc");
@@ -2150,15 +2151,19 @@ impl App {
     /// be available from peers (since those slots are now current, not future).
     /// Clearing the tracking allows fresh requests to all peers.
     async fn reset_tx_set_tracking_after_catchup(&self) {
-        let mut dont_have = self.tx_set_dont_have.write().await;
-        let cleared_dont_have = dont_have.len();
-        dont_have.clear();
-        drop(dont_have);
+        let cleared_dont_have = {
+            let mut dont_have = self.tx_set_dont_have.write().await;
+            let len = dont_have.len();
+            dont_have.clear();
+            len
+        };
 
-        let mut last_request = self.tx_set_last_request.write().await;
-        let cleared_last_request = last_request.len();
-        last_request.clear();
-        drop(last_request);
+        let cleared_last_request = {
+            let mut last_request = self.tx_set_last_request.write().await;
+            let len = last_request.len();
+            last_request.clear();
+            len
+        };
 
         if cleared_dont_have > 0 || cleared_last_request > 0 {
             tracing::info!(

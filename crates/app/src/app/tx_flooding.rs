@@ -52,26 +52,28 @@ impl App {
             .collect::<Vec<_>>();
         let peer_set: HashSet<_> = peer_ids.iter().cloned().collect();
 
-        let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
-        adverts_by_peer.retain(|peer, _| peer_set.contains(peer));
+        let per_peer = {
+            let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
+            adverts_by_peer.retain(|peer, _| peer_set.contains(peer));
 
-        let mut per_peer = Vec::new();
-        for peer_id in peer_ids {
-            let adverts = adverts_by_peer
-                .entry(peer_id.clone())
-                .or_insert_with(PeerTxAdverts::new);
-            let mut outgoing = Vec::new();
-            for hash in &hashes {
-                if adverts.seen_advert(hash) {
-                    continue;
+            let mut per_peer = Vec::new();
+            for peer_id in peer_ids {
+                let adverts = adverts_by_peer
+                    .entry(peer_id.clone())
+                    .or_insert_with(PeerTxAdverts::new);
+                let mut outgoing = Vec::new();
+                for hash in &hashes {
+                    if adverts.seen_advert(hash) {
+                        continue;
+                    }
+                    outgoing.push(*hash);
                 }
-                outgoing.push(*hash);
+                if !outgoing.is_empty() {
+                    per_peer.push((peer_id, outgoing));
+                }
             }
-            if !outgoing.is_empty() {
-                per_peer.push((peer_id, outgoing));
-            }
-        }
-        drop(adverts_by_peer);
+            per_peer
+        };
 
         for (peer_id, hashes) in per_peer {
             for chunk in hashes.chunks(max_advert_size) {

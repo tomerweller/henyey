@@ -1644,19 +1644,21 @@ impl LedgerManager {
     fn initialize_all_caches(&self, protocol_version: u32, _ledger_seq: u32) -> Result<()> {
         crate::memory_report::log_startup_memory("before_cache_scan");
 
-        let bucket_list = self.bucket_list.read();
-        let cache_data = scan_bucket_list_for_caches(
-            &bucket_list,
-            protocol_version,
-            self.config.scan_thread_count,
-        )?;
-        crate::memory_report::log_startup_memory("after_cache_scan");
+        let cache_data = {
+            let bucket_list = self.bucket_list.read();
+            let cache_data = scan_bucket_list_for_caches(
+                &bucket_list,
+                protocol_version,
+                self.config.scan_thread_count,
+            )?;
+            crate::memory_report::log_startup_memory("after_cache_scan");
 
-        // Initialize per-bucket caches for all DiskIndex buckets.
-        // Uses proportional sizing based on the BucketListDB config.
-        bucket_list.maybe_initialize_caches();
-        crate::memory_report::log_startup_memory("after_bucket_cache_init");
-        drop(bucket_list);
+            // Initialize per-bucket caches for all DiskIndex buckets.
+            // Uses proportional sizing based on the BucketListDB config.
+            bucket_list.maybe_initialize_caches();
+            crate::memory_report::log_startup_memory("after_bucket_cache_init");
+            cache_data
+        };
 
         *self.offer_store.lock() = OfferStore::from_bucket_list_entries(cache_data.offers);
         *self.pool_share_tl_account_index.write() = cache_data.pool_share_tl_account_index;
@@ -2381,52 +2383,54 @@ impl LedgerManager {
             }
         };
 
-        let bucket_list = self.bucket_list.read();
         let mut compiled = 0u32;
         let mut seen_hashes = std::collections::HashSet::<stellar_xdr::curr::Hash>::new();
 
         // Scan levels from 0 (newest) to 10 (oldest). Within each level,
         // curr shadows snap. Dead entries shadow live entries at higher levels.
-        for level in bucket_list.levels() {
-            for bucket in [level.curr.as_ref(), level.snap.as_ref()] {
-                let iter = match bucket.iter() {
-                    Ok(it) => it,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to iterate bucket during module cache rebuild");
-                        continue;
-                    }
-                };
-                for entry_result in iter {
-                    let entry = match entry_result {
-                        Ok(e) => e,
+        {
+            let bucket_list = self.bucket_list.read();
+            for level in bucket_list.levels() {
+                for bucket in [level.curr.as_ref(), level.snap.as_ref()] {
+                    let iter = match bucket.iter() {
+                        Ok(it) => it,
                         Err(e) => {
-                            tracing::error!(error = %e, "Failed to read bucket entry during module cache rebuild");
+                            tracing::error!(error = %e, "Failed to iterate bucket during module cache rebuild");
                             continue;
                         }
                     };
-                    match &entry {
-                        henyey_bucket::BucketEntry::Liveentry(le)
-                        | henyey_bucket::BucketEntry::Initentry(le) => {
-                            if let LedgerEntryData::ContractCode(ref cc) = le.data {
-                                let hash = stellar_xdr::curr::Hash(
-                                    <sha2::Sha256 as sha2::Digest>::digest(cc.code.as_slice())
-                                        .into(),
-                                );
-                                if seen_hashes.insert(hash) {
-                                    if new_cache.add_contract(cc.code.as_slice(), protocol_version)
-                                    {
-                                        compiled += 1;
+                    for entry_result in iter {
+                        let entry = match entry_result {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to read bucket entry during module cache rebuild");
+                                continue;
+                            }
+                        };
+                        match &entry {
+                            henyey_bucket::BucketEntry::Liveentry(le)
+                            | henyey_bucket::BucketEntry::Initentry(le) => {
+                                if let LedgerEntryData::ContractCode(ref cc) = le.data {
+                                    let hash = stellar_xdr::curr::Hash(
+                                        <sha2::Sha256 as sha2::Digest>::digest(cc.code.as_slice())
+                                            .into(),
+                                    );
+                                    if seen_hashes.insert(hash) {
+                                        if new_cache
+                                            .add_contract(cc.code.as_slice(), protocol_version)
+                                        {
+                                            compiled += 1;
+                                        }
                                     }
                                 }
                             }
+                            henyey_bucket::BucketEntry::Deadentry(_)
+                            | henyey_bucket::BucketEntry::Metaentry(_) => {}
                         }
-                        henyey_bucket::BucketEntry::Deadentry(_)
-                        | henyey_bucket::BucketEntry::Metaentry(_) => {}
                     }
                 }
             }
         }
-        drop(bucket_list);
 
         *self.module_cache.write() = Some(new_cache);
 
@@ -4493,10 +4497,8 @@ impl LedgerCloseContext<'_> {
             let mut evicted_meta_keys: Vec<LedgerKey> = Vec::new();
 
             if protocol_version_starts_from(prev_version, ProtocolVersion::V23) {
-                let hot_archive_guard = self.manager.hot_archive_bucket_list.read();
-                if hot_archive_guard.is_some() {
-                    drop(hot_archive_guard); // Release read lock before write operations
-
+                let has_hot_archive = self.manager.hot_archive_bucket_list.read().is_some();
+                if has_hot_archive {
                     // Use pre-loaded eviction settings (loaded before bucket list lock)
                     let eviction_settings = eviction_settings.clone().unwrap_or_default();
 

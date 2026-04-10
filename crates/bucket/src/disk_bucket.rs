@@ -397,10 +397,11 @@ impl DiskBucket {
         let save_path = save_path.as_ref();
 
         // Save to disk first
-        let mut file = File::create(save_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
+        {
+            let mut file = File::create(save_path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
 
         // Build index by streaming the saved file
         Self::from_file_streaming_with_seed(save_path, bloom_seed)

@@ -1079,16 +1079,17 @@ impl TransactionQueue {
                 self.config.network_id,
             );
             let lane = lane_config.get_lane(&frame);
-            let mut lane_fees = lane_fees_lock.write();
-            if lane_fees.len() != lane_config.lane_limits().len() {
-                lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+            {
+                let mut lane_fees = lane_fees_lock.write();
+                if lane_fees.len() != lane_config.lane_limits().len() {
+                    lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+                }
+                if evicted_due_to_lane_limit {
+                    lane_fees[lane] = (evicted.inclusion_fee, evicted.op_count);
+                } else {
+                    lane_fees[GENERIC_LANE] = (evicted.inclusion_fee, evicted.op_count);
+                }
             }
-            if evicted_due_to_lane_limit {
-                lane_fees[lane] = (evicted.inclusion_fee, evicted.op_count);
-            } else {
-                lane_fees[GENERIC_LANE] = (evicted.inclusion_fee, evicted.op_count);
-            }
-            drop(lane_fees);
             pending_eviction_list.push(evicted);
         }
     }

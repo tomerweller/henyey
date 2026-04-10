@@ -1206,13 +1206,19 @@ impl Herder {
             .get_externalized_close_time(externalized_slot)
             .unwrap_or(0);
 
-        let mut ts = self.tracking_state.write();
-        if externalized_slot >= ts.consensus_index {
-            ts.is_tracking = true;
-            ts.consensus_index = externalized_slot + 1;
-            ts.consensus_close_time = close_time;
-            drop(ts);
+        let should_advance = {
+            let mut ts = self.tracking_state.write();
+            if externalized_slot >= ts.consensus_index {
+                ts.is_tracking = true;
+                ts.consensus_index = externalized_slot + 1;
+                ts.consensus_close_time = close_time;
+                true
+            } else {
+                false
+            }
+        };
 
+        if should_advance {
             self.pending_envelopes
                 .set_current_slot(externalized_slot + 1);
 

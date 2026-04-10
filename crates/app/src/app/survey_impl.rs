@@ -4,13 +4,16 @@ use super::*;
 
 impl App {
     pub async fn survey_report(&self) -> SurveyReport {
-        let survey_data = self.survey_data.read().await;
-        let phase = survey_data.phase();
-        let nonce = survey_data.nonce();
-        let local_node = survey_data.final_node_data();
-        let inbound_peers = survey_data.final_inbound_peers().to_vec();
-        let outbound_peers = survey_data.final_outbound_peers().to_vec();
-        drop(survey_data);
+        let (phase, nonce, local_node, inbound_peers, outbound_peers) = {
+            let survey_data = self.survey_data.read().await;
+            (
+                survey_data.phase(),
+                survey_data.nonce(),
+                survey_data.final_node_data(),
+                survey_data.final_inbound_peers().to_vec(),
+                survey_data.final_outbound_peers().to_vec(),
+            )
+        };
 
         let (survey_in_progress, backlog, bad_response_nodes) = {
             let reporting = self.survey_reporting.read().await;
@@ -78,9 +81,10 @@ impl App {
     }
 
     pub async fn stop_survey_reporting(&self) {
-        let mut reporting = self.survey_reporting.write().await;
-        reporting.running = false;
-        drop(reporting);
+        {
+            let mut reporting = self.survey_reporting.write().await;
+            reporting.running = false;
+        }
 
         if let Some(nonce) = self.survey_data.read().await.nonce() {
             self.survey_secrets.write().await.remove(&nonce);
@@ -425,13 +429,16 @@ impl App {
             return;
         }
 
-        let Some(overlay) = self.overlay().await else {
-            return;
+        let (snapshots, added, dropped) = {
+            let Some(overlay) = self.overlay().await else {
+                return;
+            };
+            (
+                overlay.peer_snapshots(),
+                overlay.added_authenticated_peers(),
+                overlay.dropped_authenticated_peers(),
+            )
         };
-        let snapshots = overlay.peer_snapshots();
-        let added = overlay.added_authenticated_peers();
-        let dropped = overlay.dropped_authenticated_peers();
-        drop(overlay);
 
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
@@ -478,13 +485,16 @@ impl App {
             return;
         }
 
-        let Some(overlay) = self.overlay().await else {
-            return;
+        let (snapshots, added, dropped) = {
+            let Some(overlay) = self.overlay().await else {
+                return;
+            };
+            (
+                overlay.peer_snapshots(),
+                overlay.added_authenticated_peers(),
+                overlay.dropped_authenticated_peers(),
+            )
         };
-        let snapshots = overlay.peer_snapshots();
-        let added = overlay.added_authenticated_peers();
-        let dropped = overlay.dropped_authenticated_peers();
-        drop(overlay);
 
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
@@ -913,13 +923,13 @@ impl App {
                     }
                 }
 
-                let Some(overlay) = self.overlay().await else {
-                    scheduler.next_action = now + SURVEY_INTERVAL;
-                    return;
+                let peers = {
+                    let Some(overlay) = self.overlay().await else {
+                        scheduler.next_action = now + SURVEY_INTERVAL;
+                        return;
+                    };
+                    Self::select_survey_peers(overlay.peer_snapshots(), SURVEY_MAX_PEERS)
                 };
-
-                let peers = Self::select_survey_peers(overlay.peer_snapshots(), SURVEY_MAX_PEERS);
-                drop(overlay);
 
                 if peers.is_empty() {
                     scheduler.next_action = now + SURVEY_INTERVAL;
@@ -975,13 +985,16 @@ impl App {
     }
 
     pub(super) async fn update_survey_phase(&self) {
-        let Some(overlay) = self.overlay().await else {
-            return;
+        let (snapshots, added, dropped) = {
+            let Some(overlay) = self.overlay().await else {
+                return;
+            };
+            (
+                overlay.peer_snapshots(),
+                overlay.added_authenticated_peers(),
+                overlay.dropped_authenticated_peers(),
+            )
         };
-        let snapshots = overlay.peer_snapshots();
-        let added = overlay.added_authenticated_peers();
-        let dropped = overlay.dropped_authenticated_peers();
-        drop(overlay);
 
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
@@ -1153,13 +1166,16 @@ impl App {
         &self,
         message: &TimeSlicedSurveyStartCollectingMessage,
     ) {
-        let Some(overlay) = self.overlay().await else {
-            return;
+        let (snapshots, added, dropped) = {
+            let Some(overlay) = self.overlay().await else {
+                return;
+            };
+            (
+                overlay.peer_snapshots(),
+                overlay.added_authenticated_peers(),
+                overlay.dropped_authenticated_peers(),
+            )
         };
-        let snapshots = overlay.peer_snapshots();
-        let added = overlay.added_authenticated_peers();
-        let dropped = overlay.dropped_authenticated_peers();
-        drop(overlay);
 
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
@@ -1177,13 +1193,16 @@ impl App {
     }
 
     async fn stop_local_survey_collecting(&self, message: &TimeSlicedSurveyStopCollectingMessage) {
-        let Some(overlay) = self.overlay().await else {
-            return;
+        let (snapshots, added, dropped) = {
+            let Some(overlay) = self.overlay().await else {
+                return;
+            };
+            (
+                overlay.peer_snapshots(),
+                overlay.added_authenticated_peers(),
+                overlay.dropped_authenticated_peers(),
+            )
         };
-        let snapshots = overlay.peer_snapshots();
-        let added = overlay.added_authenticated_peers();
-        let dropped = overlay.dropped_authenticated_peers();
-        drop(overlay);
 
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);

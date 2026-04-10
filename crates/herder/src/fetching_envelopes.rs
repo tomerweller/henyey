@@ -653,9 +653,8 @@ impl FetchingEnvelopes {
         }
 
         // Remove any entry
-        if let Some(entry) = self.quorum_set_cache.iter().next() {
-            let hash = *entry.key();
-            drop(entry); // Release the iterator before removing
+        let to_remove = self.quorum_set_cache.iter().next().map(|e| *e.key());
+        if let Some(hash) = to_remove {
             self.quorum_set_cache.remove(&hash);
             debug!(
                 cache_size = self.quorum_set_cache.len(),

@@ -1114,11 +1114,11 @@ impl App {
                         "Peer reported DontHave for TxSet"
                     );
                     let hash = Hash256::from_bytes(dont_have.req_hash.0);
-                    let mut map = self.tx_set_dont_have.write().await;
-                    map.entry(hash).or_default().insert(msg.from_peer.clone());
-
-                    // Check if all connected peers have reported DontHave for this tx_set
-                    let dont_have_count = map.get(&hash).map(|s| s.len()).unwrap_or(0);
+                    let dont_have_count = {
+                        let mut map = self.tx_set_dont_have.write().await;
+                        map.entry(hash).or_default().insert(msg.from_peer.clone());
+                        map.get(&hash).map(|s| s.len()).unwrap_or(0)
+                    };
                     let peer_count = self.get_peer_count().await;
                     let all_peers_dont_have = dont_have_count >= peer_count && peer_count > 0;
 
@@ -1142,15 +1142,14 @@ impl App {
                                     "All peers reported DontHave for needed TxSet; relying on slot eviction"
                                 );
                             }
-                            drop(map);
                             // Reset request tracking to allow retry later
                             let mut last_request = self.tx_set_last_request.write().await;
                             last_request.remove(&hash);
                         } else {
-                            let mut last_request = self.tx_set_last_request.write().await;
-                            last_request.remove(&hash);
-                            drop(last_request);
-                            drop(map);
+                            {
+                                let mut last_request = self.tx_set_last_request.write().await;
+                                last_request.remove(&hash);
+                            }
                             self.request_pending_tx_sets().await;
                         }
                     }

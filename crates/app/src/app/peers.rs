@@ -186,38 +186,39 @@ impl App {
 
         // Phase 2: Build the to_ping list (no overlay lock needed).
         let now = self.clock.now();
-        let mut inflight = self.ping_inflight.write().await;
-        let mut peer_inflight = self.peer_ping_inflight.write().await;
-        inflight.retain(|hash, info| {
-            if now.duration_since(info.sent_at) > PING_TIMEOUT {
-                if let Some(existing) = peer_inflight.get(&info.peer_id) {
-                    if existing == hash {
-                        peer_inflight.remove(&info.peer_id);
+        let to_ping = {
+            let mut inflight = self.ping_inflight.write().await;
+            let mut peer_inflight = self.peer_ping_inflight.write().await;
+            inflight.retain(|hash, info| {
+                if now.duration_since(info.sent_at) > PING_TIMEOUT {
+                    if let Some(existing) = peer_inflight.get(&info.peer_id) {
+                        if existing == hash {
+                            peer_inflight.remove(&info.peer_id);
+                        }
                     }
+                    return false;
                 }
-                return false;
-            }
-            true
-        });
+                true
+            });
 
-        let mut to_ping = Vec::new();
-        for snapshot in snapshots {
-            if peer_inflight.contains_key(&snapshot.info.peer_id) {
-                continue;
+            let mut to_ping = Vec::new();
+            for snapshot in snapshots {
+                if peer_inflight.contains_key(&snapshot.info.peer_id) {
+                    continue;
+                }
+                let hash = self.next_ping_hash();
+                peer_inflight.insert(snapshot.info.peer_id.clone(), hash);
+                inflight.insert(
+                    hash,
+                    PingInfo {
+                        peer_id: snapshot.info.peer_id.clone(),
+                        sent_at: self.clock.now(),
+                    },
+                );
+                to_ping.push((snapshot.info.peer_id, hash));
             }
-            let hash = self.next_ping_hash();
-            peer_inflight.insert(snapshot.info.peer_id.clone(), hash);
-            inflight.insert(
-                hash,
-                PingInfo {
-                    peer_id: snapshot.info.peer_id.clone(),
-                    sent_at: self.clock.now(),
-                },
-            );
-            to_ping.push((snapshot.info.peer_id, hash));
-        }
-        drop(inflight);
-        drop(peer_inflight);
+            to_ping
+        };
 
         // Phase 3: Send pings concurrently.
         let Some(overlay) = self.overlay().await else {

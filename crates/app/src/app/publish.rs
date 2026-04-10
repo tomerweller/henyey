@@ -73,16 +73,17 @@ impl App {
         // blocking the event loop. Publishing involves gzip compression
         // of XDR files and shell command execution (cp/mkdir), which can
         // take 30-50 seconds on large checkpoints.
-        let weak = self.self_arc.read().await;
-        let app = match weak.upgrade() {
-            Some(arc) => arc,
-            None => {
-                self.publish_in_progress.store(false, Ordering::SeqCst);
-                tracing::warn!("Cannot spawn publish task: self_arc unavailable");
-                return;
+        let app = {
+            let weak = self.self_arc.read().await;
+            match weak.upgrade() {
+                Some(arc) => arc,
+                None => {
+                    self.publish_in_progress.store(false, Ordering::SeqCst);
+                    tracing::warn!("Cannot spawn publish task: self_arc unavailable");
+                    return;
+                }
             }
         };
-        drop(weak);
 
         tokio::spawn(async move {
             let command_archives: Vec<_> = app

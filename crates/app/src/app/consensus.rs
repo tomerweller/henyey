@@ -364,13 +364,15 @@ impl App {
                 // Peers won't have tx_sets for old slots (they cache ~60-72s).
                 // Check if any syncing_ledgers entries actually have tx_sets;
                 // if none do, catchup is the only recovery path.
-                let buffer = self.syncing_ledgers.read().await;
-                let total = buffer.range((current_ledger + 1)..).count();
-                let with_tx_set = buffer
-                    .range((current_ledger + 1)..)
-                    .filter(|(_, info)| info.tx_set.is_some())
-                    .count();
-                drop(buffer);
+                let (total, with_tx_set) = {
+                    let buffer = self.syncing_ledgers.read().await;
+                    let total = buffer.range((current_ledger + 1)..).count();
+                    let with_tx_set = buffer
+                        .range((current_ledger + 1)..)
+                        .filter(|(_, info)| info.tx_set.is_some())
+                        .count();
+                    (total, with_tx_set)
+                };
 
                 tracing::warn!(
                     current_ledger,

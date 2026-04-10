@@ -492,45 +492,46 @@ impl ProgressTracker {
 
     /// Report progress if enough time has elapsed.
     fn maybe_report(&self, processed: u64) {
-        let mut last_report = self.last_report.lock().unwrap();
         let now = Instant::now();
-
-        if now.duration_since(*last_report) >= self.report_interval {
+        {
+            let mut last_report = self.last_report.lock().unwrap();
+            if now.duration_since(*last_report) < self.report_interval {
+                return;
+            }
             *last_report = now;
-            drop(last_report);
+        }
 
-            let elapsed = self.start_time.elapsed();
-            let rate = if elapsed.as_secs_f64() > 0.0 {
-                processed as f64 / elapsed.as_secs_f64()
+        let elapsed = self.start_time.elapsed();
+        let rate = if elapsed.as_secs_f64() > 0.0 {
+            processed as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        if let Some(total) = self.total {
+            let percent = (processed as f64 / total as f64) * 100.0;
+            let eta_secs = if rate > 0.0 {
+                (total - processed) as f64 / rate
             } else {
                 0.0
             };
 
-            if let Some(total) = self.total {
-                let percent = (processed as f64 / total as f64) * 100.0;
-                let eta_secs = if rate > 0.0 {
-                    (total - processed) as f64 / rate
-                } else {
-                    0.0
-                };
-
-                tracing::info!(
-                    name = %self.name,
-                    processed = processed,
-                    total = total,
-                    percent = format!("{:.1}%", percent),
-                    rate = format!("{:.1}/s", rate),
-                    eta_secs = format!("{:.0}s", eta_secs),
-                    "Progress"
-                );
-            } else {
-                tracing::info!(
-                    name = %self.name,
-                    processed = processed,
-                    rate = format!("{:.1}/s", rate),
-                    "Progress"
-                );
-            }
+            tracing::info!(
+                name = %self.name,
+                processed = processed,
+                total = total,
+                percent = format!("{:.1}%", percent),
+                rate = format!("{:.1}/s", rate),
+                eta_secs = format!("{:.0}s", eta_secs),
+                "Progress"
+            );
+        } else {
+            tracing::info!(
+                name = %self.name,
+                processed = processed,
+                rate = format!("{:.1}/s", rate),
+                "Progress"
+            );
         }
     }
 }

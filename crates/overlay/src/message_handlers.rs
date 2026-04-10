@@ -171,18 +171,19 @@ impl MessageDispatcher {
         );
 
         // Check if we have this TxSet cached
-        let cache = self.tx_set_cache.lock().unwrap();
-        if let Some(tx_set) = cache.get(hash) {
-            match tx_set {
-                TxSetData::Legacy(ts) => {
-                    return Some(StellarMessage::TxSet(ts.clone()));
-                }
-                TxSetData::Generalized(ts) => {
-                    return Some(StellarMessage::GeneralizedTxSet(ts.clone()));
+        {
+            let cache = self.tx_set_cache.lock().unwrap();
+            if let Some(tx_set) = cache.get(hash) {
+                match tx_set {
+                    TxSetData::Legacy(ts) => {
+                        return Some(StellarMessage::TxSet(ts.clone()));
+                    }
+                    TxSetData::Generalized(ts) => {
+                        return Some(StellarMessage::GeneralizedTxSet(ts.clone()));
+                    }
                 }
             }
         }
-        drop(cache);
 
         // We don't have it, send DONT_HAVE
         Some(StellarMessage::DontHave(DontHave {
@@ -238,11 +239,12 @@ impl MessageDispatcher {
         );
 
         // Check if we have this QuorumSet cached
-        let cache = self.quorum_set_cache.lock().unwrap();
-        if let Some(qs) = cache.get(hash) {
-            return Some(StellarMessage::ScpQuorumset(qs.clone()));
+        {
+            let cache = self.quorum_set_cache.lock().unwrap();
+            if let Some(qs) = cache.get(hash) {
+                return Some(StellarMessage::ScpQuorumset(qs.clone()));
+            }
         }
-        drop(cache);
 
         // We don't have it, send DONT_HAVE
         Some(StellarMessage::DontHave(DontHave {
