@@ -25,7 +25,7 @@
 //! - [`PendingTxSet`]: Tracks transaction sets we need but haven't received yet
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 use tracing::{debug, trace, warn};
@@ -225,14 +225,14 @@ pub struct ScpDriver {
     /// Latest externalized slot.
     latest_externalized: RwLock<Option<SlotIndex>>,
     /// Envelope broadcast callback.
-    envelope_sender: RwLock<Option<EnvelopeSender>>,
+    envelope_sender: OnceLock<EnvelopeSender>,
     /// Network ID for signing.
     network_id: Hash256,
     /// Ledger manager for network configuration lookups.
-    ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
+    ledger_manager: OnceLock<Arc<LedgerManager>>,
     /// Upgrade parameters for nomination validation.
     /// Set via `set_upgrades` when the Herder initializes.
-    upgrades: RwLock<Option<Arc<RwLock<Upgrades>>>>,
+    upgrades: OnceLock<Arc<RwLock<Upgrades>>>,
     /// Shared tracking consensus state (owned by Herder, read by ScpDriver).
     tracking_state: Arc<RwLock<SharedTrackingState>>,
 }
@@ -256,10 +256,10 @@ impl ScpDriver {
             tx_tracker,
             externalized: RwLock::new(HashMap::new()),
             latest_externalized: RwLock::new(None),
-            envelope_sender: RwLock::new(None),
+            envelope_sender: OnceLock::new(),
             network_id,
-            ledger_manager: RwLock::new(None),
-            upgrades: RwLock::new(None),
+            ledger_manager: OnceLock::new(),
+            upgrades: OnceLock::new(),
             tracking_state,
         }
     }
@@ -281,17 +281,17 @@ impl ScpDriver {
     where
         F: Fn(ScpEnvelope) + Send + Sync + 'static,
     {
-        *self.envelope_sender.write() = Some(Box::new(sender));
+        let _ = self.envelope_sender.set(Box::new(sender));
     }
 
     /// Provide ledger manager access for network configuration lookups.
     pub fn set_ledger_manager(&self, manager: Arc<LedgerManager>) {
-        *self.ledger_manager.write() = Some(manager);
+        let _ = self.ledger_manager.set(manager);
     }
 
     /// Provide upgrade parameters access for nomination validation.
     pub fn set_upgrades(&self, upgrades: Arc<RwLock<Upgrades>>) {
-        *self.upgrades.write() = Some(upgrades);
+        let _ = self.upgrades.set(upgrades);
     }
 
     /// Clear the tx set validity cache (call on ledger close).
@@ -338,7 +338,7 @@ impl ScpDriver {
 
         // For generalized tx sets, run full content validation
         let result = if let Some(ref gen) = prepared.generalized_tx_set {
-            if let Some(ref lm) = *self.ledger_manager.read() {
+            if let Some(lm) = self.ledger_manager.get() {
                 let lcl_header = lm.current_header();
 
                 // Skip content validation when protocol < 20: generalized tx sets
@@ -738,7 +738,7 @@ impl ScpDriver {
         let close_time = stellar_value.close_time.0;
 
         // Get LCL data from ledger manager
-        let (lcl_seq, lcl_close_time) = if let Some(ref lm) = *self.ledger_manager.read() {
+        let (lcl_seq, lcl_close_time) = if let Some(lm) = self.ledger_manager.get() {
             let header = lm.current_header();
             (header.ledger_seq as u64, header.scp_value.close_time.0)
         } else {
@@ -811,7 +811,7 @@ impl ScpDriver {
                 }
 
                 // Parity: check previousLedgerHash matches the LCL hash
-                let lcl_hash = if let Some(ref lm) = *self.ledger_manager.read() {
+                let lcl_hash = if let Some(lm) = self.ledger_manager.get() {
                     let hash = lm.current_header_hash();
                     if tx_set.previous_ledger_hash != hash {
                         debug!(
@@ -960,8 +960,7 @@ impl ScpDriver {
         // Parity: strip invalid upgrades, keeping valid ones in order
         // Also validates each upgrade via isValid (apply + nomination)
         // stellar-core: extractValidValue calls isValid with nomination=true
-        let lm_guard = self.ledger_manager.read();
-        let lm_ref = lm_guard.as_ref().map(|lm| lm.as_ref());
+        let lm_ref = self.ledger_manager.get().map(|lm| lm.as_ref());
         let current_version = lm_ref
             .map(|lm| lm.current_header().ledger_version)
             .unwrap_or(0);
@@ -985,7 +984,7 @@ impl ScpDriver {
                 let valid_for_apply =
                     Self::is_valid_upgrade_for_apply(&upgrade, current_version, lm_ref);
                 // Also check nomination validity (timing + parameter match)
-                let valid_for_nomination = if let Some(ref upgrades_arc) = *self.upgrades.read() {
+                let valid_for_nomination = if let Some(upgrades_arc) = self.upgrades.get() {
                     upgrades_arc
                         .read()
                         .is_valid_for_nomination(&upgrade, lcl_close_time)
@@ -1017,8 +1016,7 @@ impl ScpDriver {
     /// Parity: Upgrades.cpp `isValid` — calls `isValidForApply` always,
     /// and additionally `isValidForNomination` when `nomination=true`.
     fn check_upgrades_valid(&self, stellar_value: &StellarValue, nomination: bool) -> bool {
-        let lm_guard = self.ledger_manager.read();
-        let lm_ref = match lm_guard.as_ref() {
+        let lm_ref = match self.ledger_manager.get() {
             Some(lm) => lm,
             None => return true, // No ledger manager — can't validate
         };
@@ -1040,7 +1038,7 @@ impl ScpDriver {
                 return false;
             }
             if nomination {
-                if let Some(ref upgrades_arc) = *self.upgrades.read() {
+                if let Some(upgrades_arc) = self.upgrades.get() {
                     let upgrades = upgrades_arc.read();
                     if !upgrades.is_valid_for_nomination(&upgrade, lcl_close_time) {
                         debug!(?upgrade, "Invalid upgrade for nomination");
@@ -1182,7 +1180,7 @@ impl ScpDriver {
         }
 
         // Parity: filter out candidates whose tx set has a different previousLedgerHash
-        if let Some(ref lm) = *self.ledger_manager.read() {
+        if let Some(lm) = self.ledger_manager.get() {
             let lcl_hash = lm.current_header_hash();
             decoded.retain(|sv| {
                 let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
@@ -1613,7 +1611,7 @@ impl ScpDriver {
 
     /// Emit an envelope to the network.
     fn emit(&self, envelope: ScpEnvelope) {
-        if let Some(sender) = self.envelope_sender.read().as_ref() {
+        if let Some(sender) = self.envelope_sender.get() {
             sender(envelope);
         }
     }
@@ -2396,7 +2394,7 @@ impl SCPDriver for HerderScpCallback {
         const MAX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
         let mut initial_ms: u64 = 1000;
         let mut increment_ms: u64 = 1000;
-        if let Some(manager) = self.driver.ledger_manager.read().as_ref() {
+        if let Some(manager) = self.driver.ledger_manager.get() {
             let header = manager.current_header();
             if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V23) {
                 if let Some(info) = manager.soroban_network_info() {
@@ -2447,7 +2445,7 @@ impl SCPDriver for HerderScpCallback {
     /// Parity: get the nomination timeout limit for upgrade stripping.
     /// In stellar-core: mUpgrades.getParameters().mNominationTimeoutLimit
     fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
-        if let Some(ref upgrades_arc) = *self.driver.upgrades.read() {
+        if let Some(upgrades_arc) = self.driver.upgrades.get() {
             upgrades_arc
                 .read()
                 .parameters()
