@@ -880,22 +880,31 @@ impl App {
                 let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
                 let hash256 = henyey_common::Hash256::from_bytes(hash.0);
                 let sender_node_id = envelope.statement.node_id.clone();
-                // Always call request_quorum_set to associate the quorum set with the node_id.
-                // If we already have the quorum set by hash, it will be associated with this
-                // node_id. If not, we'll create a pending request.
-                if self.herder.request_quorum_set(hash256, sender_node_id) {
-                    // New pending request - need to fetch from network
-                    let peer = msg.from_peer.clone();
-                    if let Some(overlay) = self.overlay().await {
-                        let request =
-                            StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
-                        if let Err(e) = overlay.try_send_to(&peer, request) {
-                            tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
+
+                let envelope_result = self.herder.receive_scp_envelope(envelope);
+
+                // Request quorum set only after receive_scp_envelope validates
+                // the envelope (signature check, slot range, etc.). This prevents
+                // forged envelopes from creating immortal pending qset entries.
+                // Matches stellar-core which verifies before any fetch logic.
+                if matches!(
+                    envelope_result,
+                    EnvelopeState::Valid | EnvelopeState::Pending
+                ) {
+                    if self.herder.request_quorum_set(hash256, sender_node_id) {
+                        // New pending request - need to fetch from network
+                        let peer = msg.from_peer.clone();
+                        if let Some(overlay) = self.overlay().await {
+                            let request =
+                                StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
+                            if let Err(e) = overlay.try_send_to(&peer, request) {
+                                tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
+                            }
                         }
                     }
                 }
 
-                match self.herder.receive_scp_envelope(envelope) {
+                match envelope_result {
                     EnvelopeState::Valid => {
                         tracing::debug!(slot, tracking, "SCP envelope accepted (Valid)");
                         // NOTE: We intentionally do NOT send a sync recovery

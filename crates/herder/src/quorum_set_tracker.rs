@@ -15,6 +15,12 @@ use tracing::{debug, info, trace};
 
 use super::scp_driver::PendingQuorumSet;
 
+/// Maximum number of pending quorum-set requests before new ones are dropped.
+const MAX_PENDING_QSET_REQUESTS: usize = 512;
+
+/// Maximum node IDs tracked per pending quorum-set entry.
+const MAX_PENDING_NODE_IDS: usize = 64;
+
 /// Diagnostic sizes for the quorum-set tracker.
 #[derive(Debug, Clone, Default)]
 pub struct QuorumSetTrackerSizes {
@@ -98,7 +104,19 @@ impl QuorumSetTracker {
         // If already pending, add this node_id to the waiting set.
         if let Some(mut entry) = self.pending.get_mut(&hash) {
             entry.request_count += 1;
-            entry.node_ids.insert(node_id);
+            // Cap per-entry node_ids to prevent unbounded growth
+            if entry.node_ids.len() < MAX_PENDING_NODE_IDS {
+                entry.node_ids.insert(node_id);
+            }
+            return false;
+        }
+
+        // Defense-in-depth: cap the number of pending entries
+        if self.pending.len() >= MAX_PENDING_QSET_REQUESTS {
+            debug!(
+                pending_count = self.pending.len(),
+                "Dropping quorum set request: pending cap reached"
+            );
             return false;
         }
 
@@ -424,5 +442,51 @@ mod tests {
         let result = tracker.get_by_node(&make_node_id(0));
         assert!(result.is_some());
         assert_eq!(result.unwrap().threshold, 1);
+    }
+
+    /// Regression test for AUDIT-010: pending entries are capped to prevent
+    /// unbounded memory growth from forged quorum-set hashes.
+    #[test]
+    fn test_audit_010_pending_cap() {
+        let tracker = QuorumSetTracker::new(node_key(0), None);
+
+        // Fill to the cap
+        for i in 0..MAX_PENDING_QSET_REQUESTS {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i & 0xFF) as u8;
+            bytes[1] = ((i >> 8) & 0xFF) as u8;
+            let hash = Hash256::from_bytes(bytes);
+            assert!(tracker.request(hash, make_node_id(1)));
+        }
+        assert_eq!(tracker.pending_count(), MAX_PENDING_QSET_REQUESTS);
+
+        // Next request should be rejected
+        let overflow_hash = Hash256::from_bytes([0xFF; 32]);
+        assert!(!tracker.request(overflow_hash, make_node_id(2)));
+        assert_eq!(tracker.pending_count(), MAX_PENDING_QSET_REQUESTS);
+    }
+
+    /// Regression test for AUDIT-010: per-entry node_ids are capped.
+    #[test]
+    fn test_audit_010_node_ids_cap() {
+        let tracker = QuorumSetTracker::new(node_key(0), None);
+        let hash = Hash256::from_bytes([42; 32]);
+
+        // First request creates the entry
+        assert!(tracker.request(hash, make_node_id(1)));
+
+        // Add up to the cap
+        for i in 2..=(MAX_PENDING_NODE_IDS as u8) {
+            assert!(!tracker.request(hash, make_node_id(i)));
+        }
+
+        // Verify node_ids are capped
+        let node_ids = tracker.pending_node_ids(&hash);
+        assert_eq!(node_ids.len(), MAX_PENDING_NODE_IDS);
+
+        // Adding more doesn't grow beyond cap
+        assert!(!tracker.request(hash, make_node_id(200)));
+        let node_ids = tracker.pending_node_ids(&hash);
+        assert_eq!(node_ids.len(), MAX_PENDING_NODE_IDS);
     }
 }
