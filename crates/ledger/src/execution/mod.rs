@@ -516,6 +516,19 @@ pub(super) struct DeltaEntries {
     pub(super) deleted: Vec<LedgerKey>,
 }
 
+impl DeltaEntries {
+    /// Empty snapshot — used when rollback data should be suppressed (e.g.,
+    /// pre-parallel path where fee/seq/signer mutations are already on the
+    /// main delta and must not be re-recorded on the cluster delta).
+    pub(super) fn empty() -> Self {
+        Self {
+            created: Vec::new(),
+            updated: Vec::new(),
+            deleted: Vec::new(),
+        }
+    }
+}
+
 /// Snapshot of delta entries from the pre-apply phases (fee, sequence, signers).
 ///
 /// Bundled together because all three are captured before operation execution
@@ -2243,7 +2256,7 @@ impl TransactionExecutor {
     pub(super) fn execute_with_pre_apply_result(
         &mut self,
         snapshot: &SnapshotHandle,
-        pre: PreApplyResult,
+        mut pre: PreApplyResult,
         should_apply: bool,
     ) -> Result<TransactionExecutionResult> {
         if !should_apply {
@@ -2253,6 +2266,23 @@ impl TransactionExecutor {
                 self.enable_soroban_diagnostic_events,
             ));
         }
+
+        // Clear rollback delta entries. The global pre_parallel_apply already
+        // committed fee/seq/signer mutations to the main delta. If apply_body
+        // fails, rollback_failed_tx must NOT re-record these on the cluster
+        // executor's delta — that would cause double-apply when the cluster
+        // delta is merged back into the main delta.
+        //
+        // This matches stellar-core's parallelApply which, on operation failure,
+        // simply sets txFAILED without touching fee/seq/signer state (those are
+        // already committed by preParallelApply on the shared ledger txn).
+        //
+        // Note: tx_changes_before and fee_changes (used for meta generation)
+        // are separate fields in PreApplyResult and remain unaffected.
+        pre.fee_entries = DeltaEntries::empty();
+        pre.seq_entries = DeltaEntries::empty();
+        pre.signer_entries = DeltaEntries::empty();
+
         self.apply_body(snapshot, pre)
     }
 
