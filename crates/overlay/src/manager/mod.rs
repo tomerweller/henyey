@@ -41,7 +41,7 @@ use crate::{
     connection::ConnectionPool,
     connection_factory::{ConnectionFactory, TcpConnectionFactory},
     flood::{compute_message_hash, FloodGate, FloodGateStats},
-    flow_control::{FlowControl, FlowControlConfig, ScpQueueCallback},
+    flow_control::{FlowControl, ScpQueueCallback},
     peer::{PeerInfo, PeerStats, PeerStatsSnapshot},
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, Result,
 };
@@ -425,7 +425,10 @@ pub struct OverlayManager {
 }
 
 impl OverlayManager {
-    pub(super) fn initial_send_more_grant(config: &FlowControlConfig) -> (u32, u32) {
+    #[cfg(test)]
+    pub(super) fn initial_send_more_grant(
+        config: &crate::flow_control::FlowControlConfig,
+    ) -> (u32, u32) {
         // Flow control bytes credit is granted in byte-batch units.
         // This must match the local byte capacity tracked in FlowControl.
         (

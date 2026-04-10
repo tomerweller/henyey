@@ -8,7 +8,7 @@ use crate::connection::ConnectionDirection;
 use crate::{
     codec::helpers,
     flood::compute_message_hash,
-    flow_control::{msg_body_size, FlowControl, FlowControlConfig},
+    flow_control::{msg_body_size, FlowControl},
     peer::Peer,
     PeerId,
 };
@@ -756,21 +756,9 @@ impl OverlayManager {
         let running = &state.running;
         let is_validator = state.is_validator;
 
-        // Send initial SendMoreExtended to grant the peer our full reading capacity.
-        // Matches stellar-core's Peer::recvAuth() → sendSendMore().
-        {
-            let config = FlowControlConfig::default();
-            let (initial_flood_msgs, initial_flood_bytes) = Self::initial_send_more_grant(&config);
-            if let Err(e) = peer
-                .send_more_extended(initial_flood_msgs, initial_flood_bytes)
-                .await
-            {
-                warn!(
-                    "Failed to send initial SendMoreExtended to {}: {}",
-                    peer_id, e
-                );
-            }
-        }
+        // NOTE: The initial SEND_MORE_EXTENDED grant is sent in Peer::handshake()
+        // after authentication, matching stellar-core's Peer::recvAuth() → sendSendMore().
+        // Do NOT send a second grant here.
 
         // Idle/straggler timeout tracking (matches stellar-core Peer::recurrentTimerExpired).
         let mut last_read = Instant::now();
