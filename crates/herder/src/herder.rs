@@ -570,14 +570,23 @@ impl Herder {
 
     /// Store a quorum set for a peer node.
     pub fn store_quorum_set(&self, node_id: &NodeId, quorum_set: ScpQuorumSet) {
+        // Compute hash before storing so we can notify fetching_envelopes.
+        let qs_hash = henyey_scp::hash_quorum_set(&quorum_set);
+
         self.scp_driver
             .store_quorum_set(node_id, quorum_set.clone());
         let mut tracker = self.quorum_tracker.write();
-        if !tracker.expand(node_id, quorum_set) {
+        if !tracker.expand(node_id, quorum_set.clone()) {
             if let Err(err) = tracker.rebuild(|id| self.scp_driver.get_quorum_set(id)) {
                 warn!(error = %err, "Failed to rebuild quorum tracker");
             }
         }
+
+        // Mirror quorum-set receipt into FetchingEnvelopes so blocked envelopes
+        // that are waiting for this quorum set get unblocked. Without this,
+        // store_quorum_set only updates ScpDriver and the quorum tracker,
+        // leaving FetchingEnvelopes unaware (AUDIT-004).
+        self.fetching_envelopes.recv_quorum_set(qs_hash, quorum_set);
     }
 
     /// Get a quorum set by hash if available.
@@ -3158,6 +3167,70 @@ mod tests {
         assert!(
             has_externalize,
             "SCP should emit its own EXTERNALIZE message"
+        );
+    }
+
+    /// Regression test for AUDIT-004: `store_quorum_set` must mirror the
+    /// quorum set into `FetchingEnvelopes` so that blocked envelopes waiting
+    /// for that quorum set get unblocked.
+    #[test]
+    fn test_audit_004_store_quorum_set_unblocks_fetching_envelopes() {
+        use stellar_xdr::curr::Hash as XdrHash;
+
+        let herder = make_test_herder();
+
+        // Build a sane quorum set with one validator.
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([1u8; 32]),
+        ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let qs_hash_bytes = hash_quorum_set(&quorum_set);
+
+        // Submit a nomination envelope whose quorum_set_hash references the
+        // quorum set we haven't stored yet. This should put the envelope
+        // into Fetching state.
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: node_id.clone(),
+                slot_index: 100,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: XdrHash(qs_hash_bytes.0),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        use crate::fetching_envelopes::RecvResult;
+        let result = herder.fetching_envelopes.recv_envelope(envelope);
+        assert_eq!(
+            result,
+            RecvResult::Fetching,
+            "Envelope should be fetching (quorum set not yet known)"
+        );
+
+        // Before the fix, store_quorum_set only updated ScpDriver and the
+        // quorum tracker, leaving FetchingEnvelopes unaware. The envelope
+        // would remain stuck in Fetching forever.
+        herder.store_quorum_set(&node_id, quorum_set.clone());
+
+        // After the fix, store_quorum_set mirrors into FetchingEnvelopes,
+        // which should now have the quorum set cached and the envelope
+        // moved to the ready queue.
+        assert!(
+            herder.fetching_envelopes.has_quorum_set(&qs_hash_bytes),
+            "FetchingEnvelopes must learn about the quorum set via store_quorum_set"
+        );
+
+        let popped = herder.fetching_envelopes.pop(100);
+        assert!(
+            popped.is_some(),
+            "Blocked envelope must be unblocked and poppable after store_quorum_set"
         );
     }
 }
