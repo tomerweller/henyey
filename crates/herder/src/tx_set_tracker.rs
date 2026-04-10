@@ -131,13 +131,14 @@ impl TxSetTracker {
         let hash = tx_set.hash;
 
         if self.cache.len() >= self.max_cache_size {
-            if let Some(oldest) = self
-                .cache
-                .iter()
-                .min_by_key(|e| e.cached_at)
-                .map(|e| *e.key())
-            {
-                self.cache.remove(&oldest);
+            // Collect the key to evict before calling remove, to avoid holding
+            // a DashMap shard read-lock while remove acquires a write-lock.
+            let to_evict: Option<Hash256> = {
+                let oldest = self.cache.iter().min_by_key(|e| e.cached_at);
+                oldest.map(|e| *e.key())
+            };
+            if let Some(k) = to_evict {
+                self.cache.remove(&k);
             }
         }
 
@@ -199,8 +200,14 @@ impl TxSetTracker {
     /// Store a validity result. Evicts an arbitrary entry if at capacity (64).
     pub fn store_valid(&self, key: (Hash256, Hash256, u64), valid: bool) {
         if self.valid_cache.len() >= 64 {
-            if let Some(entry) = self.valid_cache.iter().next().map(|e| *e.key()) {
-                self.valid_cache.remove(&entry);
+            // Collect the key to evict before calling remove, to avoid holding
+            // a DashMap shard read-lock while remove acquires a write-lock.
+            let to_evict: Option<(Hash256, Hash256, u64)> = {
+                let guard = self.valid_cache.iter().next();
+                guard.map(|e| *e.key())
+            };
+            if let Some(k) = to_evict {
+                self.valid_cache.remove(&k);
             }
         }
         self.valid_cache.insert(key, valid);
