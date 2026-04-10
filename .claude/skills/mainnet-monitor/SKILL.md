@@ -10,9 +10,10 @@ Parse `$ARGUMENTS`:
 # Mainnet Monitor
 
 Run a henyey mainnet node and monitor it for errors, automatically fixing
-bugs when they are discovered. This is a lightweight monitoring skill — no
-sweepers, no code maintenance, just a running node with automated log
-checking and bug fixing.
+bugs when they are discovered. This is the **God monitoring task** — all
+henyey issues are in scope. Node bugs, CI failures, testnet parity bugs,
+performance regressions, infrastructure issues — if it's broken, fix it.
+No issue is "out of scope" or "for another task".
 
 **Mainnet operation is explicitly authorized** — this overrides the
 testnet-only guideline in CLAUDE.md.
@@ -499,5 +500,6 @@ When stopping (user interrupts):
 - **Push after every fix commit** — do not accumulate unpushed commits.
 - All commits must include the appropriate `Co-authored-by` trailer per
   CLAUDE.md.
-- This skill does NOT manage sweepers or code maintenance. Use
-  `/production-ops` for the full workload.
+- All henyey issues are in scope: mainnet bugs, testnet parity bugs, CI
+  failures, performance regressions, infrastructure problems. If you find
+  it, fix it — do not defer to another task or skill.
