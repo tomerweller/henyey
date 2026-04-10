@@ -10,6 +10,7 @@
 //! behavior in ledger_close.rs and catchup_impl.rs).
 
 use crate::meta_stream::{MetaStreamError, MetaStreamManager};
+use henyey_common::LedgerSeq;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use stellar_xdr::curr::LedgerCloseMeta;
@@ -27,7 +28,7 @@ pub enum MetaWriteCommand {
     /// Write a LedgerCloseMeta frame.
     Write {
         meta: Box<LedgerCloseMeta>,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
     },
     /// Shut down the writer thread.
     Shutdown,
@@ -73,7 +74,7 @@ impl MetaWriter {
     pub async fn write_meta(
         &self,
         meta: LedgerCloseMeta,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
     ) -> Result<(), MetaWriterError> {
         if self.fatal.load(Ordering::Relaxed) {
             return Err(MetaWriterError::Fatal);
@@ -94,7 +95,7 @@ impl MetaWriter {
     pub fn write_meta_blocking(
         &self,
         meta: LedgerCloseMeta,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
     ) -> Result<(), MetaWriterError> {
         if self.fatal.load(Ordering::Relaxed) {
             return Err(MetaWriterError::Fatal);
@@ -146,7 +147,7 @@ impl MetaWriter {
                         if let Err(e) = stream.maybe_rotate_debug_stream(ledger_seq) {
                             tracing::warn!(
                                 error = %e,
-                                ledger_seq,
+                                ledger_seq = ledger_seq.get(),
                                 "Failed to rotate debug meta stream"
                             );
                         }
@@ -156,7 +157,7 @@ impl MetaWriter {
                             Err(MetaStreamError::MainStreamWrite(e)) => {
                                 tracing::error!(
                                     error = %e,
-                                    ledger_seq,
+                                    ledger_seq = ledger_seq.get(),
                                     "Fatal: metadata output stream write failed"
                                 );
                                 fatal.store(true, Ordering::Relaxed);
@@ -165,7 +166,7 @@ impl MetaWriter {
                             Err(MetaStreamError::DebugStreamWrite(e)) => {
                                 tracing::warn!(
                                     error = %e,
-                                    ledger_seq,
+                                    ledger_seq = ledger_seq.get(),
                                     "Debug metadata stream write failed"
                                 );
                             }
@@ -202,11 +203,11 @@ impl std::fmt::Display for MetaWriterError {
 impl std::error::Error for MetaWriterError {}
 
 /// Extract the ledger sequence number from a LedgerCloseMeta.
-pub fn extract_ledger_seq(meta: &LedgerCloseMeta) -> u32 {
+pub fn extract_ledger_seq(meta: &LedgerCloseMeta) -> LedgerSeq {
     match meta {
-        LedgerCloseMeta::V0(v0) => v0.ledger_header.header.ledger_seq,
-        LedgerCloseMeta::V1(v1) => v1.ledger_header.header.ledger_seq,
-        LedgerCloseMeta::V2(v2) => v2.ledger_header.header.ledger_seq,
+        LedgerCloseMeta::V0(v0) => v0.ledger_header.header.ledger_seq.into(),
+        LedgerCloseMeta::V1(v1) => v1.ledger_header.header.ledger_seq.into(),
+        LedgerCloseMeta::V2(v2) => v2.ledger_header.header.ledger_seq.into(),
     }
 }
 
@@ -287,7 +288,7 @@ mod tests {
             scp_info: vec![].try_into().unwrap(),
         });
 
-        let result = writer.write_meta(meta, 1).await;
+        let result = writer.write_meta(meta, 1.into()).await;
         assert!(result.is_err(), "should fail after shutdown");
     }
 }
