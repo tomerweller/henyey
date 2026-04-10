@@ -5624,6 +5624,91 @@ mod tests {
         );
     }
 
+    /// Regression test for AUDIT-006: lane eviction cleans up account state.
+    /// Before fix, lane-evicted txs left ghost account_states entries.
+    #[test]
+    fn test_audit_006_lane_eviction_cleans_account_state() {
+        // Queue with ops limit of 1 to force lane eviction when adding a 1-op tx
+        // after a 1-op tx is already present.
+        let config = TxQueueConfig {
+            max_queue_ops: Some(1),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // tx1: low-fee from source 1
+        let mut tx1 = make_test_envelope(100, 1);
+        set_source(&mut tx1, 1);
+
+        // tx2: high-fee from source 2 — will lane-evict tx1
+        let mut tx2 = make_test_envelope(500, 1);
+        set_source(&mut tx2, 2);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert_eq!(queue.account_states.read().len(), 1);
+
+        // tx2 evicts tx1 via lane eviction (ops limit exceeded)
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1);
+
+        // After fix: only source 2 remains, no ghost state for source 1.
+        assert_eq!(
+            queue.account_states.read().len(),
+            1,
+            "lane-evicted tx's account state should be cleaned up"
+        );
+    }
+
+    /// Regression test for AUDIT-006: expired-tx eviction in try_add cleans up
+    /// account state. Before fix, expired txs removed during try_add's size
+    /// check left ghost account_states entries.
+    #[test]
+    fn test_audit_006_expired_eviction_cleans_account_state() {
+        // Queue with max_size=1 and max_age_secs=0 so existing txs are expired
+        let config = TxQueueConfig {
+            max_size: 1,
+            max_age_secs: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // tx1: from source 1 — will become expired
+        let mut tx1 = make_test_envelope(100, 1);
+        set_source(&mut tx1, 1);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert_eq!(queue.account_states.read().len(), 1);
+
+        // Make tx1 expired by backdating received_at
+        {
+            let mut by_hash = queue.by_hash.write();
+            for tx in by_hash.values_mut() {
+                tx.received_at = tx
+                    .received_at
+                    .checked_sub(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(|| {
+                        std::time::Instant::now() - std::time::Duration::from_secs(10)
+                    });
+            }
+        }
+
+        // tx2: from source 2 — try_add will first evict expired tx1, then add tx2
+        let mut tx2 = make_test_envelope(200, 1);
+        set_source(&mut tx2, 2);
+
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1);
+
+        // After fix: only source 2 remains, expired tx1's state is cleaned up.
+        assert_eq!(
+            queue.account_states.read().len(),
+            1,
+            "expired tx's account state should be cleaned up during try_add"
+        );
+    }
+
     /// Regression test for AUDIT-006: fee-rate eviction cleans up account state.
     /// Before fix, evicted txs left ghost account_states entries, blocking
     /// future submissions from the same account with TryAgainLater.
