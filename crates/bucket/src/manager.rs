@@ -52,6 +52,7 @@ use henyey_common::Hash256;
 use crate::bucket::Bucket;
 use crate::entry::BucketEntry;
 use crate::merge::merge_buckets_to_file;
+use crate::merge::{DeadEntryPolicy, InitEntryPolicy};
 use crate::merge_map::BucketMergeMap;
 use crate::{BucketError, Result};
 
@@ -492,9 +493,9 @@ impl BucketManager {
             old,
             new,
             &temp_path,
-            true, // keep_dead_entries
+            DeadEntryPolicy::Keep, // keep_dead_entries
             max_protocol_version,
-            true, // normalize_init_entries
+            InitEntryPolicy::NormalizeToLive, // normalize_init_entries
         )?;
 
         if hash.is_zero() || entry_count == 0 {
@@ -1369,6 +1370,7 @@ pub struct BucketManagerStats {
 mod tests {
     use super::*;
     use crate::future_bucket::MergeKey;
+    use crate::merge::DeadEntryPolicy;
     use crate::BucketEntry; // Re-import to shadow XDR's BucketEntry
     use stellar_xdr::curr::*;
     use tempfile::TempDir;
@@ -2149,7 +2151,7 @@ mod tests {
         let result_hash = result.hash();
 
         // Record the merge in the merge map
-        let merge_key = MergeKey::new(true, old_hash, new_hash);
+        let merge_key = MergeKey::new(DeadEntryPolicy::Keep, old_hash, new_hash);
         manager
             .finished_merges()
             .write()
@@ -2182,7 +2184,7 @@ mod tests {
             .unwrap();
         let result = manager.merge(&old, &new, 25).unwrap();
 
-        let merge_key = MergeKey::new(true, old.hash(), new.hash());
+        let merge_key = MergeKey::new(DeadEntryPolicy::Keep, old.hash(), new.hash());
         manager
             .finished_merges()
             .write()

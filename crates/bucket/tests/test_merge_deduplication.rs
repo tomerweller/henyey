@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use henyey_bucket::{BucketMergeMap, FutureBucket, LiveMergeFutures, MergeKey};
+use henyey_bucket::{BucketMergeMap, DeadEntryPolicy, FutureBucket, LiveMergeFutures, MergeKey};
 use henyey_common::Hash256;
 
 /// Creates a unique hash from a byte value.
@@ -14,7 +14,7 @@ fn make_hash(byte: u8) -> Hash256 {
 }
 
 /// Creates a merge key from curr, snap, and keep_tombstones.
-fn make_merge_key(curr: u8, snap: u8, keep_tombstones: bool) -> MergeKey {
+fn make_merge_key(curr: u8, snap: u8, keep_tombstones: DeadEntryPolicy) -> MergeKey {
     MergeKey::new(keep_tombstones, make_hash(curr), make_hash(snap))
 }
 
@@ -63,12 +63,12 @@ fn test_bucket_merge_map_stellar_core_parity() {
 
     // Create merge keys
     // Note: Our MergeKey only takes curr and snap hashes, no shadows
-    let m1 = MergeKey::new(true, in1a, in1b);
-    let m2 = MergeKey::new(true, in2a, in2b);
-    let m3 = MergeKey::new(true, in3a, in3b);
-    let m4 = MergeKey::new(true, in4a, in4b);
-    let m5 = MergeKey::new(true, in5a, in5b);
-    let m6 = MergeKey::new(true, in6a, in1a); // Reuses in1a as snap
+    let m1 = MergeKey::new(DeadEntryPolicy::Keep, in1a, in1b);
+    let m2 = MergeKey::new(DeadEntryPolicy::Keep, in2a, in2b);
+    let m3 = MergeKey::new(DeadEntryPolicy::Keep, in3a, in3b);
+    let m4 = MergeKey::new(DeadEntryPolicy::Keep, in4a, in4b);
+    let m5 = MergeKey::new(DeadEntryPolicy::Keep, in5a, in5b);
+    let m6 = MergeKey::new(DeadEntryPolicy::Keep, in6a, in1a); // Reuses in1a as snap
 
     // Record merges
     bmm.record_merge(m1.clone(), out1);
@@ -152,8 +152,8 @@ fn test_multiple_merges_same_output() {
     let mut bmm = BucketMergeMap::new();
 
     // Two different merge keys produce the same output
-    let m1 = make_merge_key(1, 2, true);
-    let m2 = make_merge_key(3, 4, true);
+    let m1 = make_merge_key(1, 2, DeadEntryPolicy::Keep);
+    let m2 = make_merge_key(3, 4, DeadEntryPolicy::Keep);
     let output = make_hash(100);
 
     bmm.record_merge(m1.clone(), output);
@@ -178,8 +178,8 @@ fn test_keep_tombstones_affects_identity() {
     let mut bmm = BucketMergeMap::new();
 
     // Same curr/snap but different keep_tombstones
-    let m1 = make_merge_key(1, 2, true);
-    let m2 = make_merge_key(1, 2, false);
+    let m1 = make_merge_key(1, 2, DeadEntryPolicy::Keep);
+    let m2 = make_merge_key(1, 2, DeadEntryPolicy::Remove);
     let out1 = make_hash(100);
     let out2 = make_hash(101);
 
@@ -197,7 +197,7 @@ fn test_keep_tombstones_affects_identity() {
 fn test_live_merge_futures_deduplication() {
     let tracker = LiveMergeFutures::new();
 
-    let key = make_merge_key(1, 2, true);
+    let key = make_merge_key(1, 2, DeadEntryPolicy::Keep);
     let future = FutureBucket::clear();
 
     // First insertion creates new
@@ -237,7 +237,7 @@ fn test_live_merge_futures_concurrent() {
         .map(|_| {
             let tracker = Arc::clone(&tracker);
             thread::spawn(move || {
-                let key = make_merge_key(1, 2, true);
+                let key = make_merge_key(1, 2, DeadEntryPolicy::Keep);
                 tracker.get_or_insert(key, FutureBucket::clear())
             })
         })
@@ -263,9 +263,9 @@ fn test_live_merge_futures_concurrent() {
 fn test_retain_outputs_gc() {
     let mut bmm = BucketMergeMap::new();
 
-    let m1 = make_merge_key(1, 2, true);
-    let m2 = make_merge_key(3, 4, true);
-    let m3 = make_merge_key(5, 6, true);
+    let m1 = make_merge_key(1, 2, DeadEntryPolicy::Keep);
+    let m2 = make_merge_key(3, 4, DeadEntryPolicy::Keep);
+    let m3 = make_merge_key(5, 6, DeadEntryPolicy::Keep);
     let out1 = make_hash(100);
     let out2 = make_hash(101);
     let out3 = make_hash(102);
@@ -292,8 +292,8 @@ fn test_input_mapping_cleanup() {
 
     // Create two merges that share an input
     let shared_input = make_hash(1);
-    let m1 = MergeKey::new(true, shared_input, make_hash(2));
-    let m2 = MergeKey::new(true, make_hash(3), shared_input);
+    let m1 = MergeKey::new(DeadEntryPolicy::Keep, shared_input, make_hash(2));
+    let m2 = MergeKey::new(DeadEntryPolicy::Keep, make_hash(3), shared_input);
     let out1 = make_hash(100);
     let out2 = make_hash(101);
 

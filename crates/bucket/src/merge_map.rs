@@ -337,12 +337,13 @@ impl std::fmt::Debug for LiveMergeFutures {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::merge::DeadEntryPolicy;
 
     fn make_hash(byte: u8) -> Hash256 {
         Hash256::from_bytes([byte; 32])
     }
 
-    fn make_merge_key(curr: u8, snap: u8, keep_tombstones: bool) -> MergeKey {
+    fn make_merge_key(curr: u8, snap: u8, keep_tombstones: DeadEntryPolicy) -> MergeKey {
         MergeKey::new(keep_tombstones, make_hash(curr), make_hash(snap))
     }
 
@@ -351,7 +352,7 @@ mod tests {
         let mut map = BucketMergeMap::new();
         assert!(map.is_empty());
 
-        let key = make_merge_key(1, 2, true);
+        let key = make_merge_key(1, 2, DeadEntryPolicy::Keep);
         let output = make_hash(3);
 
         map.record_merge(key.clone(), output);
@@ -368,8 +369,8 @@ mod tests {
     fn test_bucket_merge_map_remove() {
         let mut map = BucketMergeMap::new();
 
-        let key1 = make_merge_key(1, 2, true);
-        let key2 = make_merge_key(3, 4, true);
+        let key1 = make_merge_key(1, 2, DeadEntryPolicy::Keep);
+        let key2 = make_merge_key(3, 4, DeadEntryPolicy::Keep);
         let output1 = make_hash(10);
         let output2 = make_hash(11);
 
@@ -387,8 +388,8 @@ mod tests {
     fn test_bucket_merge_map_retain() {
         let mut map = BucketMergeMap::new();
 
-        let key1 = make_merge_key(1, 2, true);
-        let key2 = make_merge_key(3, 4, true);
+        let key1 = make_merge_key(1, 2, DeadEntryPolicy::Keep);
+        let key2 = make_merge_key(3, 4, DeadEntryPolicy::Keep);
         let output1 = make_hash(10);
         let output2 = make_hash(11);
 
@@ -409,7 +410,7 @@ mod tests {
         let tracker = LiveMergeFutures::new();
         assert!(tracker.is_empty());
 
-        let key = make_merge_key(1, 2, true);
+        let key = make_merge_key(1, 2, DeadEntryPolicy::Keep);
         let future = FutureBucket::clear();
 
         let f1 = tracker.get_or_insert(key.clone(), future);
@@ -428,7 +429,7 @@ mod tests {
     fn test_live_merge_futures_remove() {
         let tracker = LiveMergeFutures::new();
 
-        let key = make_merge_key(1, 2, true);
+        let key = make_merge_key(1, 2, DeadEntryPolicy::Keep);
         let future = FutureBucket::clear();
 
         tracker.get_or_insert(key.clone(), future);
@@ -443,10 +444,10 @@ mod tests {
 
     #[test]
     fn test_merge_key_equality() {
-        let key1 = make_merge_key(1, 2, true);
-        let key2 = make_merge_key(1, 2, true);
-        let key3 = make_merge_key(1, 2, false);
-        let key4 = make_merge_key(1, 3, true);
+        let key1 = make_merge_key(1, 2, DeadEntryPolicy::Keep);
+        let key2 = make_merge_key(1, 2, DeadEntryPolicy::Keep);
+        let key3 = make_merge_key(1, 2, DeadEntryPolicy::Remove);
+        let key4 = make_merge_key(1, 3, DeadEntryPolicy::Keep);
 
         assert_eq!(key1, key2);
         assert_ne!(key1, key3); // Different keep_tombstones

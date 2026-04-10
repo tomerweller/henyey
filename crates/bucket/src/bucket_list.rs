@@ -71,7 +71,7 @@ use crate::manager::{canonical_bucket_filename, promote_temp_to_canonical, temp_
 use crate::merge::{
     merge_buckets_to_file, merge_buckets_to_file_with_counters,
     merge_buckets_with_options_and_shadows, merge_buckets_with_options_and_shadows_and_counters,
-    merge_in_memory, MergeOptions,
+    merge_in_memory, DeadEntryPolicy, InitEntryPolicy, MergeOptions,
 };
 use crate::merge_map::BucketMergeMap;
 use crate::metrics::MergeCounters;
@@ -263,10 +263,10 @@ impl PendingMerge {
 /// and `AsyncMergeHandle::start_merge`.
 pub(crate) struct MergeContext<'a> {
     /// Whether to keep dead (tombstone) entries in the merge output.
-    pub keep_dead_entries: bool,
+    pub keep_dead_entries: DeadEntryPolicy,
     /// If true, convert INIT entries to LIVE entries during the merge.
     /// Should ALWAYS be false in production; exists for test compatibility.
-    pub normalize_init: bool,
+    pub normalize_init: InitEntryPolicy,
     /// If true, use an empty bucket instead of the level's actual curr.
     pub use_empty_curr: bool,
     pub bucket_dir: Option<&'a std::path::Path>,
@@ -277,9 +277,9 @@ pub(crate) struct MergeContext<'a> {
 struct AsyncMergeRequest {
     curr: Arc<Bucket>,
     snap: Arc<Bucket>,
-    keep_dead_entries: bool,
+    keep_dead_entries: DeadEntryPolicy,
     protocol_version: u32,
-    normalize_init: bool,
+    normalize_init: InitEntryPolicy,
     shadow_buckets: Vec<Bucket>,
     level: usize,
     bucket_dir: Option<std::path::PathBuf>,
@@ -766,8 +766,8 @@ impl BucketLevel {
             curr_for_merge_entries = curr_for_merge.len(),
             incoming_hash = %incoming.hash(),
             incoming_entries = incoming.len(),
-            keep_dead_entries = ctx.keep_dead_entries,
-            normalize_init = ctx.normalize_init,
+            keep_dead_entries = ?ctx.keep_dead_entries,
+            normalize_init = ?ctx.normalize_init,
             "prepare_with_normalization: about to merge"
         );
 
@@ -900,10 +900,10 @@ impl BucketLevel {
             merge_buckets_with_options_and_shadows(
                 &self.curr,
                 &incoming,
-                true, // keep_dead_entries
+                DeadEntryPolicy::Keep, // keep_dead_entries
                 protocol_version,
-                false, // normalize_init_entries
-                &[],   // no shadow buckets at level 0
+                InitEntryPolicy::Preserve, // normalize_init_entries
+                &[],                       // no shadow buckets at level 0
             )?
         };
 
@@ -1087,7 +1087,7 @@ fn perform_merge(
     input_curr: &Bucket,
     input_snap: &Bucket,
     bucket_dir: Option<&std::path::PathBuf>,
-    keep_dead: bool,
+    keep_dead: DeadEntryPolicy,
     protocol_version: u32,
 ) -> Result<Bucket> {
     if let Some(dir) = bucket_dir {
@@ -1098,7 +1098,7 @@ fn perform_merge(
             &temp_path,
             keep_dead,
             protocol_version,
-            false, // normalize_init = false
+            InitEntryPolicy::Preserve, // normalize_init = false
         )?;
         if entry_count == 0 {
             let _ = std::fs::remove_file(&temp_path);
@@ -1112,8 +1112,8 @@ fn perform_merge(
             input_snap,
             keep_dead,
             protocol_version,
-            false, // normalize_init = false
-            &[],   // no shadows for post-protocol-12
+            InitEntryPolicy::Preserve, // normalize_init = false
+            &[],                       // no shadows for post-protocol-12
         )
     }
 }
@@ -1878,7 +1878,7 @@ impl BucketList {
 
                 // Prepare level i: merge curr with the spilling_snap from level i-1
                 let keep_dead = Self::keep_tombstone_entries(i);
-                let normalize_init = false; // Never normalize INIT to LIVE during merges
+                let normalize_init = InitEntryPolicy::Preserve; // Never normalize INIT to LIVE during merges
                 let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
                 let shadow_buckets =
                     if protocol_version_is_before(protocol_version, ProtocolVersion::V12) {
@@ -2050,8 +2050,12 @@ impl BucketList {
         bl_level_should_spill(ledger_seq, level, BUCKET_LIST_LEVELS)
     }
 
-    fn keep_tombstone_entries(level: usize) -> bool {
-        bl_keep_tombstone_entries(level, BUCKET_LIST_LEVELS)
+    fn keep_tombstone_entries(level: usize) -> DeadEntryPolicy {
+        if bl_keep_tombstone_entries(level, BUCKET_LIST_LEVELS) {
+            DeadEntryPolicy::Keep
+        } else {
+            DeadEntryPolicy::Remove
+        }
     }
 
     fn should_merge_with_empty_curr(ledger_seq: u32, level: usize) -> bool {
@@ -2473,7 +2477,7 @@ impl BucketList {
             level: usize,
             input_curr: Bucket,
             input_snap: Bucket,
-            keep_dead: bool,
+            keep_dead: DeadEntryPolicy,
         }
 
         let mut work_items = Vec::new();
@@ -2649,7 +2653,7 @@ impl BucketList {
             // Note: stellar-core never normalizes INIT to LIVE during merges - the keepTombstoneEntries
             // flag only affects DEAD entry filtering, not INIT entry transformation.
             let keep_dead = Self::keep_tombstone_entries(i);
-            let normalize_init = false; // stellar-core never normalizes INIT to LIVE during merges
+            let normalize_init = InitEntryPolicy::Preserve; // stellar-core never normalizes INIT to LIVE during merges
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
             // Log detailed merge parameters for debugging
@@ -3376,8 +3380,8 @@ mod tests {
                 Arc::new(incoming),
                 &[],
                 MergeContext {
-                    keep_dead_entries: false,
-                    normalize_init: true,
+                    keep_dead_entries: DeadEntryPolicy::Remove,
+                    normalize_init: InitEntryPolicy::NormalizeToLive,
                     use_empty_curr: false,
                     bucket_dir: None,
                     merge_map: None,
@@ -3406,9 +3410,14 @@ mod tests {
     async fn test_merge_drops_dead_when_keep_dead_false() {
         let key = make_account_key([1u8; 32]);
         let bucket = Bucket::from_entries(vec![BucketListEntry::Deadentry(key)]).unwrap();
-        let merged =
-            merge_buckets_with_options(&Bucket::empty(), &bucket, false, TEST_PROTOCOL, true)
-                .unwrap();
+        let merged = merge_buckets_with_options(
+            &Bucket::empty(),
+            &bucket,
+            DeadEntryPolicy::Remove,
+            TEST_PROTOCOL,
+            InitEntryPolicy::NormalizeToLive,
+        )
+        .unwrap();
         let mut has_non_meta = false;
         for entry_result in merged.iter().unwrap() {
             let entry = entry_result.unwrap();
@@ -3709,9 +3718,9 @@ mod tests {
         let handle = AsyncMergeHandle::start_merge(AsyncMergeRequest {
             curr: bucket1.clone(),
             snap: bucket2.clone(),
-            keep_dead_entries: false,
+            keep_dead_entries: DeadEntryPolicy::Remove,
             protocol_version: TEST_PROTOCOL,
-            normalize_init: true,
+            normalize_init: InitEntryPolicy::NormalizeToLive,
             shadow_buckets: vec![],
             level: 1,
             bucket_dir: Some(temp_dir.path().to_path_buf()),
@@ -4146,8 +4155,8 @@ mod tests {
                 snap_bucket.clone(),
                 &[],
                 MergeContext {
-                    keep_dead_entries: true,
-                    normalize_init: false,
+                    keep_dead_entries: DeadEntryPolicy::Keep,
+                    normalize_init: InitEntryPolicy::Preserve,
                     use_empty_curr: true, // merge(empty, snap_bucket)
                     bucket_dir: Some(&bucket_dir),
                     merge_map: None,
@@ -4199,8 +4208,8 @@ mod tests {
                 snap_bucket.clone(),
                 &[],
                 MergeContext {
-                    keep_dead_entries: true,
-                    normalize_init: false,
+                    keep_dead_entries: DeadEntryPolicy::Keep,
+                    normalize_init: InitEntryPolicy::Preserve,
                     use_empty_curr: true,
                     bucket_dir: Some(&bucket_dir),
                     merge_map: None,
@@ -4454,7 +4463,7 @@ mod tests {
             &empty_curr,
             &snap_bucket,
             Some(&bucket_dir),
-            true,
+            DeadEntryPolicy::Keep,
             TEST_PROTOCOL,
         )
         .unwrap();
@@ -4473,7 +4482,7 @@ mod tests {
             &empty_curr,
             &snap_bucket,
             Some(&bucket_dir),
-            true,
+            DeadEntryPolicy::Keep,
             TEST_PROTOCOL,
         )
         .unwrap();
@@ -4504,7 +4513,11 @@ mod tests {
 
         // Set up a PendingMerge::Async with a channel that sends an error
         let (sender, receiver) = oneshot::channel();
-        let merge_key = MergeKey::new(true, Hash256::default(), Hash256::default());
+        let merge_key = MergeKey::new(
+            DeadEntryPolicy::Keep,
+            Hash256::default(),
+            Hash256::default(),
+        );
 
         let handle = AsyncMergeHandle {
             receiver: Some(receiver),
@@ -4541,7 +4554,11 @@ mod tests {
         let mut level = BucketLevel::new(1);
 
         let (sender, receiver) = oneshot::channel();
-        let merge_key = MergeKey::new(true, Hash256::default(), Hash256::default());
+        let merge_key = MergeKey::new(
+            DeadEntryPolicy::Keep,
+            Hash256::default(),
+            Hash256::default(),
+        );
 
         let handle = AsyncMergeHandle {
             receiver: Some(receiver),

@@ -28,7 +28,8 @@
 use crate::offer_store::OfferStore;
 use crate::{
     close::{
-        LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext,
+        LedgerCloseData, LedgerCloseResult, LedgerCloseStats, SortState, TransactionSetVariant,
+        UpgradeContext,
     },
     close_state::CloseLedgerState,
     delta::EntryChange,
@@ -3448,7 +3449,7 @@ impl LedgerCloseContext<'_> {
 
         let prepare_start = std::time::Instant::now();
         let tx_set_hash = self.close_data.tx_set_hash();
-        let prepared = if self.close_data.presorted {
+        let prepared = if self.close_data.presorted == SortState::Presorted {
             // Take ownership of tx_set to avoid cloning 50K envelopes.
             // Replace with empty classic set; the original is only needed for meta later
             // (which is skipped in simulation mode).

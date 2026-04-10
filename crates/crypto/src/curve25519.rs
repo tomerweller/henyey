@@ -19,7 +19,7 @@
 //! # Example
 //!
 //! ```
-//! use henyey_crypto::{Curve25519Secret, Curve25519Public};
+//! use henyey_crypto::{Curve25519Secret, Curve25519Public, KeyOrdering};
 //!
 //! // Generate random session keys for two peers
 //! let alice_secret = Curve25519Secret::random();
@@ -30,14 +30,23 @@
 //!
 //! // Derive shared key from each side - both should match
 //! let alice_shared = Curve25519Secret::derive_shared_key(
-//!     &alice_secret, &alice_public, &bob_public, true).unwrap();
+//!     &alice_secret, &alice_public, &bob_public, KeyOrdering::LocalFirst).unwrap();
 //! let bob_shared = Curve25519Secret::derive_shared_key(
-//!     &bob_secret, &bob_public, &alice_public, false).unwrap();
+//!     &bob_secret, &bob_public, &alice_public, KeyOrdering::RemoteFirst).unwrap();
 //!
 //! assert_eq!(alice_shared, bob_shared);
 //! ```
 
 use crate::{hkdf_extract, random_bytes, CryptoError};
+
+/// Ordering of public keys when deriving a shared key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOrdering {
+    /// Local public key comes first in concatenation.
+    LocalFirst,
+    /// Remote public key comes first in concatenation.
+    RemoteFirst,
+}
 use std::hash::{Hash, Hasher};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::ZeroizeOnDrop;
@@ -129,7 +138,7 @@ impl Curve25519Secret {
     /// * `local_secret` - The local Curve25519 secret key
     /// * `local_public` - The local Curve25519 public key
     /// * `remote_public` - The remote peer's public key
-    /// * `local_first` - Whether the local key comes first in concatenation
+    /// * `key_ordering` - Whether the local key comes first in concatenation
     ///
     /// # Returns
     ///
@@ -138,13 +147,13 @@ impl Curve25519Secret {
         local_secret: &Curve25519Secret,
         local_public: &Curve25519Public,
         remote_public: &Curve25519Public,
-        local_first: bool,
+        key_ordering: KeyOrdering,
     ) -> Result<[u8; 32], CryptoError> {
         // Perform ECDH (returns Err for small-order public keys)
         let shared_secret = local_secret.diffie_hellman(remote_public)?;
 
-        // Determine key ordering based on local_first
-        let (public_a, public_b) = if local_first {
+        // Determine key ordering based on key_ordering
+        let (public_a, public_b) = if matches!(key_ordering, KeyOrdering::LocalFirst) {
             (local_public, remote_public)
         } else {
             (remote_public, local_public)
@@ -276,7 +285,7 @@ mod tests {
             &alice_secret,
             &alice_public,
             &bob_public,
-            true, // Alice first
+            KeyOrdering::LocalFirst, // Alice first
         )
         .unwrap();
 
@@ -284,7 +293,7 @@ mod tests {
             &bob_secret,
             &bob_public,
             &alice_public,
-            false, // Alice first (so Bob is not first)
+            KeyOrdering::RemoteFirst, // Alice first (so Bob is not first)
         )
         .unwrap();
 
@@ -301,13 +310,21 @@ mod tests {
         let bob_public = bob_secret.derive_public();
 
         // Same local_first value should produce different keys for different parties
-        let alice_key_first =
-            Curve25519Secret::derive_shared_key(&alice_secret, &alice_public, &bob_public, true)
-                .unwrap();
+        let alice_key_first = Curve25519Secret::derive_shared_key(
+            &alice_secret,
+            &alice_public,
+            &bob_public,
+            KeyOrdering::LocalFirst,
+        )
+        .unwrap();
 
-        let alice_key_second =
-            Curve25519Secret::derive_shared_key(&alice_secret, &alice_public, &bob_public, false)
-                .unwrap();
+        let alice_key_second = Curve25519Secret::derive_shared_key(
+            &alice_secret,
+            &alice_public,
+            &bob_public,
+            KeyOrdering::RemoteFirst,
+        )
+        .unwrap();
 
         // Different ordering should produce different keys
         assert_ne!(alice_key_first, alice_key_second);

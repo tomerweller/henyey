@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bucket::Bucket;
 use crate::merge::merge_buckets_with_options;
+use crate::merge::{DeadEntryPolicy, InitEntryPolicy};
 use crate::{BucketError, Result};
 
 /// State of a FutureBucket.
@@ -56,7 +57,7 @@ pub enum FutureBucketState {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MergeKey {
     /// Whether tombstone entries are kept (level < 10).
-    pub keep_tombstones: bool,
+    pub keep_tombstones: DeadEntryPolicy,
     /// Hash of the curr bucket.
     pub curr_hash: Hash256,
     /// Hash of the snap bucket.
@@ -65,7 +66,7 @@ pub struct MergeKey {
 
 impl MergeKey {
     /// Create a new merge key.
-    pub fn new(keep_tombstones: bool, curr_hash: Hash256, snap_hash: Hash256) -> Self {
+    pub fn new(keep_tombstones: DeadEntryPolicy, curr_hash: Hash256, snap_hash: Hash256) -> Self {
         Self {
             keep_tombstones,
             curr_hash,
@@ -201,9 +202,9 @@ pub struct FutureBucket {
     /// Protocol version for the merge.
     protocol_version: u32,
     /// Whether to keep tombstone entries.
-    keep_tombstones: bool,
+    keep_tombstones: DeadEntryPolicy,
     /// Whether to normalize INIT entries to LIVE.
-    normalize_init: bool,
+    normalize_init: InitEntryPolicy,
 }
 
 impl FutureBucket {
@@ -219,8 +220,8 @@ impl FutureBucket {
             input_snap_hash: None,
             output_hash: None,
             protocol_version: 0,
-            keep_tombstones: true,
-            normalize_init: false,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
         }
     }
 
@@ -231,8 +232,8 @@ impl FutureBucket {
         curr: Arc<Bucket>,
         snap: Arc<Bucket>,
         protocol_version: u32,
-        keep_tombstones: bool,
-        normalize_init: bool,
+        keep_tombstones: DeadEntryPolicy,
+        normalize_init: InitEntryPolicy,
     ) -> Self {
         let curr_hash = curr.hash();
         let snap_hash = snap.hash();
@@ -285,8 +286,8 @@ impl FutureBucket {
             input_snap_hash: None,
             output_hash: Some(hash),
             protocol_version: 0,
-            keep_tombstones: true,
-            normalize_init: false,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
         }
     }
 
@@ -311,8 +312,8 @@ impl FutureBucket {
                     input_snap_hash: None,
                     output_hash: Some(hash),
                     protocol_version: 0,
-                    keep_tombstones: true,
-                    normalize_init: false,
+                    keep_tombstones: DeadEntryPolicy::Keep,
+                    normalize_init: InitEntryPolicy::Preserve,
                 })
             }
             FutureBucketState::HashInputs => {
@@ -336,8 +337,8 @@ impl FutureBucket {
                     input_snap_hash: Some(snap),
                     output_hash: None,
                     protocol_version: 0,
-                    keep_tombstones: true,
-                    normalize_init: false,
+                    keep_tombstones: DeadEntryPolicy::Keep,
+                    normalize_init: InitEntryPolicy::Preserve,
                 })
             }
             _ => Err(BucketError::Serialization(format!(
@@ -542,8 +543,8 @@ impl FutureBucket {
         &mut self,
         load_bucket: F,
         protocol_version: u32,
-        keep_tombstones: bool,
-        normalize_init: bool,
+        keep_tombstones: DeadEntryPolicy,
+        normalize_init: InitEntryPolicy,
     ) -> Result<()>
     where
         F: Fn(&Hash256) -> Result<Bucket>,
@@ -738,8 +739,8 @@ mod tests {
             input_snap_hash: Some(bucket2.hash()),
             output_hash: None,
             protocol_version: 25,
-            keep_tombstones: true,
-            normalize_init: false,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
         };
 
         let result = fb.resolve_blocking().unwrap();
@@ -756,8 +757,8 @@ mod tests {
         let hash1 = Hash256::from_bytes([1u8; 32]);
         let hash2 = Hash256::from_bytes([2u8; 32]);
 
-        let key = MergeKey::new(true, hash1, hash2);
-        assert!(key.keep_tombstones);
+        let key = MergeKey::new(DeadEntryPolicy::Keep, hash1, hash2);
+        assert_eq!(key.keep_tombstones, DeadEntryPolicy::Keep);
         assert_eq!(key.curr_hash, hash1);
         assert_eq!(key.snap_hash, hash2);
     }
@@ -799,7 +800,13 @@ mod tests {
         let b2_hash = bucket2.hash();
 
         // Start a merge (enters LiveInputs state)
-        let mut fb = FutureBucket::start_merge(bucket1.clone(), bucket2.clone(), 25, true, false);
+        let mut fb = FutureBucket::start_merge(
+            bucket1.clone(),
+            bucket2.clone(),
+            25,
+            DeadEntryPolicy::Keep,
+            InitEntryPolicy::Preserve,
+        );
         assert_eq!(fb.state(), FutureBucketState::LiveInputs);
 
         // Resolve the original merge to get the expected result
@@ -835,8 +842,8 @@ mod tests {
                 }
             },
             25,
-            true,
-            false,
+            DeadEntryPolicy::Keep,
+            InitEntryPolicy::Preserve,
         )
         .unwrap();
 
@@ -862,7 +869,13 @@ mod tests {
         let bucket1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
         let bucket2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap());
 
-        let mut fb = FutureBucket::start_merge(bucket1.clone(), bucket2.clone(), 25, true, false);
+        let mut fb = FutureBucket::start_merge(
+            bucket1.clone(),
+            bucket2.clone(),
+            25,
+            DeadEntryPolicy::Keep,
+            InitEntryPolicy::Preserve,
+        );
         let result = fb.resolve().await.unwrap();
         let result_hash = result.hash();
 
@@ -886,8 +899,8 @@ mod tests {
                 }
             },
             25,
-            true,
-            false,
+            DeadEntryPolicy::Keep,
+            InitEntryPolicy::Preserve,
         )
         .unwrap();
 
@@ -929,8 +942,8 @@ mod tests {
             input_snap_hash: Some(b2.hash()),
             output_hash: None,
             protocol_version: 25,
-            keep_tombstones: true,
-            normalize_init: false,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
         };
         let snap = fb.to_snapshot();
         assert_eq!(snap.state, FutureBucketState::HashInputs);
@@ -975,8 +988,8 @@ mod tests {
             input_snap_hash: Some(b2_hash),
             output_hash: None,
             protocol_version: 25,
-            keep_tombstones: true,
-            normalize_init: false,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
         };
 
         let merged = fb.resolve_blocking().unwrap();
@@ -1007,8 +1020,14 @@ mod tests {
         .unwrap();
 
         // Re-merge to get the output bucket
-        let re_merged =
-            crate::merge::merge_buckets_with_options(&b1_new, &b2_new, true, 25, false).unwrap();
+        let re_merged = crate::merge::merge_buckets_with_options(
+            &b1_new,
+            &b2_new,
+            DeadEntryPolicy::Keep,
+            25,
+            InitEntryPolicy::Preserve,
+        )
+        .unwrap();
 
         // Verify re-merged has same hash as original
         assert_eq!(re_merged.hash(), merged_hash);
@@ -1025,8 +1044,8 @@ mod tests {
                     }
                 },
                 25,
-                true,
-                false,
+                DeadEntryPolicy::Keep,
+                InitEntryPolicy::Preserve,
             )
             .unwrap();
 
@@ -1115,7 +1134,13 @@ mod tests {
         let bucket1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
         let bucket2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap());
 
-        let mut fb = FutureBucket::start_merge(bucket1, bucket2, 25, true, false);
+        let mut fb = FutureBucket::start_merge(
+            bucket1,
+            bucket2,
+            25,
+            DeadEntryPolicy::Keep,
+            InitEntryPolicy::Preserve,
+        );
 
         // Wait for the merge to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1175,8 +1200,8 @@ mod tests {
             input_snap_hash: Some(Hash256::ZERO),
             output_hash: None,
             protocol_version: 25,
-            keep_tombstones: true,
-            normalize_init: false,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
         };
 
         // Before fix: resolve_blocking ignores merge_handle and tries to

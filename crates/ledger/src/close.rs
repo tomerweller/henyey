@@ -35,6 +35,16 @@ use crate::close_state::CloseLedgerState;
 use crate::config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
 use crate::error::LedgerError;
 
+/// Whether a transaction set needs sorting before ledger close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortState {
+    /// Transaction set needs hashing and sorting (normal consensus path).
+    #[default]
+    NeedsSorting,
+    /// Transaction set is already in final execution order (benchmark path).
+    Presorted,
+}
+
 /// A transaction paired with an optional per-component base fee override.
 pub type TxWithFee = (Arc<TransactionEnvelope>, Option<u32>);
 
@@ -142,7 +152,7 @@ pub struct LedgerCloseData {
 
     /// When true, skip per-TX hashing and sorting in prepare_with_hash.
     /// Only safe when the TX set stages are already in final execution order.
-    pub presorted: bool,
+    pub presorted: SortState,
 }
 
 impl LedgerCloseData {
@@ -162,7 +172,7 @@ impl LedgerCloseData {
             prev_ledger_hash,
             stellar_value_ext: StellarValueExt::Basic,
             cached_tx_set_hash: std::cell::OnceCell::new(),
-            presorted: false,
+            presorted: SortState::NeedsSorting,
         }
     }
 
@@ -196,7 +206,7 @@ impl LedgerCloseData {
     /// Mark the TX set as already sorted in final execution order.
     /// Skips per-TX hashing and sorting in prepare (~140ms for 50K TXs).
     pub fn with_presorted(mut self) -> Self {
-        self.presorted = true;
+        self.presorted = SortState::Presorted;
         self
     }
 
