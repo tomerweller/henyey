@@ -1376,6 +1376,10 @@ impl App {
         // uses per-write flush, so this is mostly defensive — but it also
         // ensures the underlying fd is closed promptly (important for pipe
         // consumers like stellar-rpc that detect EOF to know core has stopped).
+        if let Some(ref writer) = self.meta_writer {
+            tracing::info!("Shutting down MetaWriter");
+            writer.shutdown().await;
+        }
         {
             let mut guard = self.meta_stream.lock().unwrap();
             if let Some(stream) = guard.take() {

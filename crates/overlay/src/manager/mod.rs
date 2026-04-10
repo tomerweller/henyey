@@ -145,8 +145,9 @@ pub(super) struct TickConnectCtx {
 /// could start handshakes to the same destination. This struct provides
 /// dedup at two levels:
 ///
-/// - **by_address**: keyed by IP address, prevents outbound dial races
-///   to the same target. Inserted before dial, removed on completion.
+/// - **by_address**: keyed by socket address (host:port), prevents outbound
+///   dial races to the same target. Inserted before dial, removed on
+///   completion.
 /// - **by_peer_id**: keyed by peer ID (known after HELLO), prevents
 ///   concurrent registration attempts for the same node. Inserted after
 ///   handshake, removed after register_peer or on failure.
@@ -157,8 +158,8 @@ pub(super) struct TickConnectCtx {
 /// Matches stellar-core's `mPendingPeers` dedup (Peer.cpp:1881-1909).
 #[derive(Clone)]
 pub(super) struct PendingConnections {
-    /// In-flight connections by target IP.
-    pub(super) by_address: Arc<DashMap<IpAddr, std::time::Instant>>,
+    /// In-flight connections by target address (host:port string).
+    pub(super) by_address: Arc<DashMap<String, std::time::Instant>>,
     /// In-flight connections by peer ID (known after handshake).
     pub(super) by_peer_id: Arc<DashMap<PeerId, std::time::Instant>>,
 }
@@ -174,11 +175,11 @@ impl PendingConnections {
         }
     }
 
-    /// Try to reserve a pending outbound connection to the given IP.
-    /// Returns false if a connection to this IP is already in flight.
-    pub(super) fn try_reserve_address(&self, ip: IpAddr) -> bool {
+    /// Try to reserve a pending outbound connection to the given address.
+    /// Returns false if a connection to this address is already in flight.
+    pub(super) fn try_reserve_address(&self, addr_key: String) -> bool {
         use dashmap::mapref::entry::Entry;
-        match self.by_address.entry(ip) {
+        match self.by_address.entry(addr_key) {
             Entry::Occupied(_) => false,
             Entry::Vacant(e) => {
                 e.insert(std::time::Instant::now());
@@ -201,8 +202,8 @@ impl PendingConnections {
     }
 
     /// Release a pending address reservation.
-    pub(super) fn release_address(&self, ip: &IpAddr) {
-        self.by_address.remove(ip);
+    pub(super) fn release_address(&self, addr_key: &str) {
+        self.by_address.remove(addr_key);
     }
 
     /// Release a pending peer ID reservation.
@@ -1321,21 +1322,28 @@ mod tests {
     #[test]
     fn test_pending_connections_address_dedup() {
         let pending = PendingConnections::new();
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let addr = "10.0.0.1:11625".to_string();
 
         assert!(
-            pending.try_reserve_address(ip),
+            pending.try_reserve_address(addr.clone()),
             "first reservation should succeed"
         );
         assert!(
-            !pending.try_reserve_address(ip),
+            !pending.try_reserve_address(addr.clone()),
             "duplicate reservation should fail"
         );
 
-        pending.release_address(&ip);
+        pending.release_address(&addr);
         assert!(
-            pending.try_reserve_address(ip),
+            pending.try_reserve_address(addr.clone()),
             "should succeed after release"
+        );
+
+        // Same IP, different port should succeed independently
+        let addr2 = "10.0.0.1:11626".to_string();
+        assert!(
+            pending.try_reserve_address(addr2),
+            "same IP but different port should succeed"
         );
     }
 
@@ -1363,38 +1371,38 @@ mod tests {
     #[test]
     fn test_pending_connections_independent_tracking() {
         let pending = PendingConnections::new();
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let addr = "10.0.0.1:11625".to_string();
         let peer_id = PeerId::from_bytes([1u8; 32]);
 
         // Address and peer_id are independent
-        assert!(pending.try_reserve_address(ip));
+        assert!(pending.try_reserve_address(addr));
         assert!(pending.try_reserve_peer_id(&peer_id));
 
-        // Different IP should work
-        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
-        assert!(pending.try_reserve_address(ip2));
+        // Different address should work
+        let addr2 = "10.0.0.2:11625".to_string();
+        assert!(pending.try_reserve_address(addr2));
     }
 
     #[test]
     fn test_pending_connections_sweep_stale() {
         let pending = PendingConnections::new();
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let addr = "10.0.0.1:11625".to_string();
 
         // Insert with a backdated timestamp
         pending.by_address.insert(
-            ip,
+            addr.clone(),
             std::time::Instant::now() - std::time::Duration::from_secs(60),
         );
 
         assert!(
-            !pending.try_reserve_address(ip),
+            !pending.try_reserve_address(addr.clone()),
             "stale entry still blocks before sweep"
         );
 
         pending.sweep_stale();
 
         assert!(
-            pending.try_reserve_address(ip),
+            pending.try_reserve_address(addr),
             "should succeed after sweep removes stale entry"
         );
     }

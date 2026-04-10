@@ -1475,6 +1475,10 @@ impl AppConfig {
             }
         }
 
+        if self.query.thread_pool_size == 0 {
+            anyhow::bail!("query.thread_pool_size must be > 0");
+        }
+
         // Bucket page size exponent must be in valid range (4-24)
         let exp = self.buckets.bucket_list_db.index_page_size_exponent;
         if !(4..=24).contains(&exp) {

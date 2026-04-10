@@ -13,7 +13,6 @@ use crate::{
     peer::{Peer, PeerInfo},
     LocalNode, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
 };
-use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -295,15 +294,11 @@ impl OverlayManager {
         connection_factory: Arc<dyn ConnectionFactory>,
     ) {
         // Reserve address slot to prevent duplicate outbound dials.
-        let target_ip: IpAddr = match addr.host.parse() {
-            Ok(ip) => ip,
-            Err(_) => {
-                debug!("Cannot parse IP for discovered peer {}", addr);
-                pool.release_pending();
-                return;
-            }
-        };
-        if !shared.pending_connections.try_reserve_address(target_ip) {
+        let addr_key = format!("{}:{}", addr.host, addr.port);
+        if !shared
+            .pending_connections
+            .try_reserve_address(addr_key.clone())
+        {
             debug!(
                 "Rejected discovered peer {} — connection already in flight",
                 addr
@@ -319,7 +314,7 @@ impl OverlayManager {
                 shared
                     .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
                     .await;
-                shared.pending_connections.release_address(&target_ip);
+                shared.pending_connections.release_address(&addr_key);
                 pool.release_pending();
                 return;
             }
@@ -335,7 +330,7 @@ impl OverlayManager {
                     shared
                         .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
                         .await;
-                    shared.pending_connections.release_address(&target_ip);
+                    shared.pending_connections.release_address(&addr_key);
                     pool.release_pending();
                     return;
                 }
@@ -343,7 +338,7 @@ impl OverlayManager {
 
         let peer_id = peer.id().clone();
         // Address reservation no longer needed — we have the peer_id now.
-        shared.pending_connections.release_address(&target_ip);
+        shared.pending_connections.release_address(&addr_key);
 
         // Reject banned peers (mirrors connect_outbound_inner).
         if shared.banned_peers.read().contains(&peer_id) {
@@ -505,11 +500,11 @@ pub(super) async fn connect_to_explicit_peer(
     connection_factory: Arc<dyn ConnectionFactory>,
 ) -> Result<PeerId> {
     // Reserve address slot to prevent duplicate outbound dials.
-    let target_ip: IpAddr = addr
-        .host
-        .parse()
-        .map_err(|_| OverlayError::Internal(format!("cannot parse IP: {}", addr.host)))?;
-    if !shared.pending_connections.try_reserve_address(target_ip) {
+    let addr_key = format!("{}:{}", addr.host, addr.port);
+    if !shared
+        .pending_connections
+        .try_reserve_address(addr_key.clone())
+    {
         pool.release_pending();
         return Err(OverlayError::Internal(format!(
             "connection to {} already in flight",
@@ -520,7 +515,7 @@ pub(super) async fn connect_to_explicit_peer(
     let connection = match connection_factory.connect(addr, timeout_secs).await {
         Ok(connection) => connection,
         Err(e) => {
-            shared.pending_connections.release_address(&target_ip);
+            shared.pending_connections.release_address(&addr_key);
             pool.release_pending();
             shared
                 .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
@@ -533,7 +528,7 @@ pub(super) async fn connect_to_explicit_peer(
     {
         Ok(peer) => peer,
         Err(e) => {
-            shared.pending_connections.release_address(&target_ip);
+            shared.pending_connections.release_address(&addr_key);
             pool.release_pending();
             shared
                 .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
@@ -544,7 +539,7 @@ pub(super) async fn connect_to_explicit_peer(
 
     let peer_id = peer.id().clone();
     // Address reservation no longer needed — we have the peer_id now.
-    shared.pending_connections.release_address(&target_ip);
+    shared.pending_connections.release_address(&addr_key);
 
     if shared.banned_peers.read().contains(&peer_id) {
         pool.release_pending();
