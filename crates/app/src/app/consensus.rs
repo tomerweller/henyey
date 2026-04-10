@@ -556,6 +556,11 @@ impl App {
         // isQuorumSetSane(q, false, errString) before accepting.
         if let Err(reason) = henyey_scp::is_quorum_set_sane(&quorum_set, false) {
             tracing::warn!(%hash, %reason, "Rejecting insane quorum set");
+            // Notify fetching_envelopes so blocked envelopes are untracked —
+            // matching stellar-core's discardSCPEnvelopesWithQSet behavior.
+            // recv_quorum_set handles the insane case internally (rejects but
+            // cleans up the fetcher tracking for this hash).
+            self.herder.recv_quorum_set(hash, quorum_set);
             self.herder.clear_quorum_set_request(&hash);
             return;
         }
