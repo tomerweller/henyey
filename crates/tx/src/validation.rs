@@ -536,6 +536,25 @@ fn validate_soroban_resources(
     }
 
     let _ = context;
+
+    // Check for duplicate keys across read_only and read_write footprints.
+    // stellar-core rejects duplicates at commonValidPreSeqNum (TransactionFrame.cpp:1416-1444)
+    // with txSOROBAN_INVALID. We also check here so validate_basic catches it early.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for key in footprint
+            .read_only
+            .iter()
+            .chain(footprint.read_write.iter())
+        {
+            if !seen.insert(key) {
+                return Err(ValidationError::InvalidStructure(
+                    "duplicate key in Soroban footprint".to_string(),
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1276,6 +1295,71 @@ mod tests {
             validate_basic(&frame, &context),
             Err(errors) if matches!(errors.first(), Some(ValidationError::InvalidStructure(_)))
         ));
+    }
+
+    /// [AUDIT-096] validate_basic must reject Soroban TXs with duplicate footprint keys.
+    #[test]
+    fn test_audit_096_validate_basic_rejects_duplicate_footprint_keys() {
+        let dup_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([99u8; 32]))),
+            key: ScVal::Symbol(ScSymbol("test".try_into().unwrap())),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        // Duplicate within read_only
+        let envelope = create_soroban_envelope(vec![dup_key.clone(), dup_key.clone()], None, false);
+        let frame = TransactionFrame::from_owned(envelope);
+        let context = LedgerContext::testnet(1, 1000);
+        assert!(
+            validate_basic(&frame, &context).is_err(),
+            "duplicate key in read_only should be rejected"
+        );
+
+        // Duplicate across read_only and read_write
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![dup_key.clone()].try_into().unwrap(),
+                    read_write: vec![dup_key].try_into().unwrap(),
+                },
+                instructions: 100,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 50,
+        };
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                        contract_address: ScAddress::Contract(ContractId(Hash([1u8; 32]))),
+                        function_name: ScSymbol("test".try_into().unwrap()),
+                        args: vec![].try_into().unwrap(),
+                    }),
+                    auth: vec![].try_into().unwrap(),
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V1(soroban_data),
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::from_owned(envelope);
+        assert!(
+            validate_basic(&frame, &context).is_err(),
+            "duplicate key across read_only and read_write should be rejected"
+        );
     }
 
     #[test]
