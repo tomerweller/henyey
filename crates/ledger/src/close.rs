@@ -492,14 +492,19 @@ fn tx_hash(tx: &TransactionEnvelope) -> Hash256 {
 }
 
 fn less_than_xored(left: &Hash256, right: &Hash256, x: &Hash256) -> bool {
-    for i in 0..left.0.len() {
-        let v1 = x.0[i] ^ left.0[i];
-        let v2 = x.0[i] ^ right.0[i];
-        if v1 != v2 {
-            return v1 < v2;
-        }
-    }
-    false
+    x.0.iter()
+        .zip(left.0.iter())
+        .zip(right.0.iter())
+        .find_map(|((&xv, &lv), &rv)| {
+            let v1 = xv ^ lv;
+            let v2 = xv ^ rv;
+            if v1 != v2 {
+                Some(v1 < v2)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false)
 }
 
 fn cmp_hashes(left: &Hash256, right: &Hash256, set_hash: &Hash256) -> Ordering {

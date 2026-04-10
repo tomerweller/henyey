@@ -1162,9 +1162,9 @@ impl Topologies {
             ids.push(id);
         }
 
-        for i in 0..n {
-            for j in (i + 1)..n {
-                sim.add_pending_connection(ids[i].clone(), ids[j].clone());
+        for (i, id_i) in ids.iter().enumerate() {
+            for id_j in &ids[i + 1..] {
+                sim.add_pending_connection(id_i.clone(), id_j.clone());
             }
         }
 
@@ -1189,9 +1189,8 @@ impl Topologies {
         }
 
         if n >= 2 {
-            for i in 0..n {
-                let j = (i + 1) % n;
-                sim.add_pending_connection(ids[i].clone(), ids[j].clone());
+            for (id_i, id_j) in ids.iter().zip(ids.iter().cycle().skip(1)) {
+                sim.add_pending_connection(id_i.clone(), id_j.clone());
             }
         }
 
@@ -1202,10 +1201,10 @@ impl Topologies {
         let mut sim = Self::cycle(n, mode);
         let ids = sim.node_ids();
         if n >= 4 {
-            for i in 0..n {
+            for (i, id_i) in ids.iter().enumerate() {
                 let other = (i + (n / 2)) % n;
                 if i != other {
-                    sim.add_pending_connection(ids[i].clone(), ids[other].clone());
+                    sim.add_pending_connection(id_i.clone(), ids[other].clone());
                 }
             }
         }

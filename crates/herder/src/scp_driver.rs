@@ -1489,11 +1489,7 @@ impl ScpDriver {
 
     /// XOR a 32-byte hash with another 32-byte value for tiebreaking.
     fn xor_hash(hash: &[u8; 32], mask: &[u8; 32]) -> [u8; 32] {
-        let mut result = [0u8; 32];
-        for i in 0..32 {
-            result[i] = hash[i] ^ mask[i];
-        }
-        result
+        std::array::from_fn(|i| hash[i] ^ mask[i])
     }
 
     /// Sign an SCP envelope.

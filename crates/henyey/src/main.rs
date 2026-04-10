@@ -2625,10 +2625,9 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
 
         let scp_entries = build_scp_history_entries(&db, start_ledger, checkpoint)?;
 
-        for idx in 0..headers.len() {
-            let header_entry = &headers[idx];
-            let tx_entry = &tx_entries[idx];
-            let tx_result_entry = &tx_results[idx];
+        for ((header_entry, tx_entry), tx_result_entry) in
+            headers.iter().zip(tx_entries.iter()).zip(tx_results.iter())
+        {
             let header = &header_entry.header;
             let tx_set = TransactionSetVariant::from(tx_entry);
             let tx_set_hash = verify::compute_tx_set_hash(&tx_set).unwrap_or(Hash256::ZERO);

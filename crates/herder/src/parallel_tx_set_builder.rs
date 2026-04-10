@@ -60,27 +60,25 @@ impl BitSet {
 
     fn intersects(&self, other: &BitSet) -> bool {
         let len = self.words.len().min(other.words.len());
-        for i in 0..len {
-            if self.words[i] & other.words[i] != 0 {
-                return true;
-            }
-        }
-        false
+        self.words[..len]
+            .iter()
+            .zip(&other.words[..len])
+            .any(|(&a, &b)| a & b != 0)
     }
 
     fn union_with(&mut self, other: &BitSet) {
         if other.words.len() > self.words.len() {
             self.words.resize(other.words.len(), 0);
         }
-        for (i, &w) in other.words.iter().enumerate() {
-            self.words[i] |= w;
+        for (w, &o) in self.words.iter_mut().zip(other.words.iter()) {
+            *w |= o;
         }
     }
 
     fn difference_with(&mut self, other: &BitSet) {
         let len = self.words.len().min(other.words.len());
-        for i in 0..len {
-            self.words[i] &= !other.words[i];
+        for (w, &o) in self.words[..len].iter_mut().zip(&other.words[..len]) {
+            *w &= !o;
         }
     }
 

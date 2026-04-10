@@ -891,15 +891,12 @@ impl App {
                     Self::tx_set_start_index(hash, peers.len(), request_state.next_peer_offset);
                 let eligible_peer = match dont_have.get_mut(hash) {
                     Some(set) => {
-                        let mut found = None;
-                        for offset in 0..peers.len() {
-                            let idx = (start_idx + offset) % peers.len();
-                            let peer = &peers[idx];
-                            if !set.contains(peer) {
-                                found = Some(peer);
-                                break;
-                            }
-                        }
+                        let found = peers
+                            .iter()
+                            .cycle()
+                            .skip(start_idx)
+                            .take(peers.len())
+                            .find(|peer| !set.contains(peer));
                         if found.is_none() {
                             // All peers have said DontHave for this tx set.
                             // Track for warning (only if not already warned).

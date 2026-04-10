@@ -653,9 +653,12 @@ impl ApplyLoad {
 
         let total_weight: f64 = config.num_disk_read_entries_distribution.iter().sum();
         let mut mean_disk_reads_per_tx: f64 = 0.0;
-        for i in 0..config.num_disk_read_entries.len() {
-            mean_disk_reads_per_tx += config.num_disk_read_entries[i] as f64
-                * (config.num_disk_read_entries_distribution[i] / total_weight);
+        for (&entries, &dist) in config
+            .num_disk_read_entries
+            .iter()
+            .zip(config.num_disk_read_entries_distribution.iter())
+        {
+            mean_disk_reads_per_tx += entries as f64 * (dist / total_weight);
         }
 
         let total_expected_restores = mean_disk_reads_per_tx
