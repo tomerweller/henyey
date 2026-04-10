@@ -189,6 +189,15 @@ fn execute_manage_offer(
         if source_account.num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT {
             return Ok(OperationResult::OpTooManySubentries);
         }
+        // Protocol 18+ combined-cap: num_sub_entries + num_sponsoring + 1 must fit u32.
+        // Mirrors stellar-core isSponsoringSubentrySumIncreaseValid().
+        let (num_sponsoring, _) = state
+            .sponsorship_counts_for_account(source)
+            .unwrap_or((0, 0));
+        let total = source_account.num_sub_entries as u64 + num_sponsoring as u64 + 1;
+        if total > u32::MAX as u64 {
+            return Ok(OperationResult::OpTooManySubentries);
+        }
     }
 
     let sponsor = if old_offer.is_none() {

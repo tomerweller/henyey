@@ -207,6 +207,15 @@ fn create_trustline(
     if source_account.num_sub_entries + multiplier as u32 > ACCOUNT_SUBENTRY_LIMIT {
         return Ok(Some(OperationResult::OpTooManySubentries));
     }
+    // Protocol 18+ combined-cap: num_sub_entries + num_sponsoring + mult must fit u32.
+    // Mirrors stellar-core isSponsoringSubentrySumIncreaseValid().
+    let (num_sponsoring, _) = state
+        .sponsorship_counts_for_account(source)
+        .unwrap_or((0, 0));
+    let total = source_account.num_sub_entries as u64 + num_sponsoring as u64 + multiplier as u64;
+    if total > u32::MAX as u64 {
+        return Ok(Some(OperationResult::OpTooManySubentries));
+    }
 
     // Check source can afford new sub-entry
     let sponsor = state.active_sponsor_for(source);
@@ -2140,6 +2149,78 @@ mod tests {
                 );
             }
             other => panic!("Expected ChangeTrust result, got {:?}", other),
+        }
+    }
+
+    /// Regression test for AUDIT-059: unsponsored ChangeTrust when
+    /// num_sub_entries + num_sponsoring would overflow u32 must return
+    /// OpTooManySubentries.
+    #[test]
+    fn test_audit_059_combined_subentry_sponsoring_cap() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let issuer = create_test_account_id(1);
+
+        // Source with num_sub_entries=50 and num_sponsoring = u32::MAX - 50.
+        // Adding 1 more subentry would push total to u32::MAX + 1.
+        state.create_account(AccountEntry {
+            account_id: source.clone(),
+            balance: i64::MAX,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 50,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                    num_sponsoring: u32::MAX - 50,
+                    num_sponsored: 0,
+                    signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                    ext: AccountEntryExtensionV2Ext::V0,
+                }),
+            }),
+        });
+
+        // Issuer account
+        state.create_account(AccountEntry {
+            account_id: issuer.clone(),
+            balance: 1_000_000_000,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        });
+
+        let asset = ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer.clone(),
+        });
+        let op = ChangeTrustOp {
+            line: asset,
+            limit: 1_000_000,
+        };
+
+        let result = execute_change_trust(&op, &source, &mut state, &context);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            OperationResult::OpTooManySubentries => {
+                // Correct: combined cap enforced
+            }
+            other => panic!(
+                "Expected OpTooManySubentries for combined cap overflow, got {:?}",
+                other
+            ),
         }
     }
 }

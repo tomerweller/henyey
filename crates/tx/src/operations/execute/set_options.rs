@@ -402,6 +402,14 @@ fn apply_signer_update(
                 OperationResult::OpTooManySubentries,
             )));
         }
+        // Protocol 18+ combined-cap: num_sub_entries + num_sponsoring + 1 must fit u32.
+        // Mirrors stellar-core isSponsoringSubentrySumIncreaseValid().
+        let total = current_num_sub_entries as u64 + current_num_sponsoring as u64 + 1;
+        if total > u32::MAX as u64 {
+            return Err(SignerUpdateError::OpResult(Box::new(
+                OperationResult::OpTooManySubentries,
+            )));
+        }
 
         if let Some((_, sponsor_balance, sponsor_min_balance)) = sponsor_info {
             if *sponsor_balance < *sponsor_min_balance {
