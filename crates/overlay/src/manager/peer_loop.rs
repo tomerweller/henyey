@@ -723,7 +723,14 @@ impl OverlayManager {
                 .record_seen(hash, Some(peer_id.clone()), lcl);
             peer.record_flood_stats(unique, message_size);
             let is_scp = matches!(message, StellarMessage::ScpMessage(_));
-            if !unique && !is_scp {
+            // FloodAdvert/FloodDemand are peer-specific control messages and
+            // must not be globally deduplicated. Stellar-core delivers them
+            // directly to per-peer handlers, not through Floodgate.
+            let is_pull_control = matches!(
+                message,
+                StellarMessage::FloodAdvert(_) | StellarMessage::FloodDemand(_)
+            );
+            if !unique && !is_scp && !is_pull_control {
                 return Some(false);
             }
         } else if is_fetch_message(message) {
