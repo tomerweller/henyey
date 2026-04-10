@@ -75,6 +75,173 @@ impl QueryRateLimiter {
     }
 }
 
+/// Traffic class for per-peer inbound rate limiting.
+///
+/// Each class has its own sub-budget within the peer's overall allocation.
+/// SCP is exempt from all rate limiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficClass {
+    /// Transactions and FloodDemand — high priority flood traffic.
+    TxAndDemand,
+    /// FloodAdvert — lower priority flood traffic.
+    Advert,
+    /// Control/fetch messages (GetTxSet, TxSet, GetScpState, etc.) — reserved capacity.
+    ControlFetch,
+    /// Survey messages — counted against aggregate but exempt from flow control.
+    Survey,
+}
+
+impl TrafficClass {
+    fn classify(msg: &StellarMessage) -> Option<Self> {
+        match msg {
+            // SCP is exempt — returns None
+            StellarMessage::ScpMessage(_) => None,
+            // Tx + demand
+            StellarMessage::Transaction(_) | StellarMessage::FloodDemand(_) => {
+                Some(TrafficClass::TxAndDemand)
+            }
+            // Advert
+            StellarMessage::FloodAdvert(_) => Some(TrafficClass::Advert),
+            // Survey
+            StellarMessage::TimeSlicedSurveyRequest(_)
+            | StellarMessage::TimeSlicedSurveyResponse(_)
+            | StellarMessage::TimeSlicedSurveyStartCollecting(_)
+            | StellarMessage::TimeSlicedSurveyStopCollecting(_) => Some(TrafficClass::Survey),
+            // All other messages are control/fetch
+            _ => Some(TrafficClass::ControlFetch),
+        }
+    }
+}
+
+/// Per-peer inbound rate limiter with per-class sub-budgets.
+///
+/// Henyey-specific hardening (not present in stellar-core). Ensures no single
+/// peer can exhaust the node's message processing capacity, and that control/fetch
+/// messages always have reserved capacity even when flood traffic is high.
+///
+/// Sub-budgets:
+/// - Tx + FloodDemand: up to `tx_demand_limit` per second
+/// - FloodAdvert: up to `advert_limit` per second
+/// - Control/fetch: reserved minimum `control_fetch_limit` per second
+/// - Survey: counted against aggregate only
+/// - SCP: exempt (not rate limited)
+struct PeerRateLimiter {
+    window_start: Instant,
+    /// Per-class counts in the current 1-second window.
+    tx_demand_count: u32,
+    advert_count: u32,
+    control_fetch_count: u32,
+    aggregate_count: u32,
+    /// Configurable limits (per second).
+    tx_demand_limit: u32,
+    advert_limit: u32,
+    control_fetch_limit: u32,
+    aggregate_limit: u32,
+    /// Telemetry counters (cumulative, not reset per window).
+    pub dropped_tx_demand: u64,
+    pub dropped_advert: u64,
+    pub dropped_control_fetch: u64,
+    pub dropped_aggregate: u64,
+}
+
+/// Default per-peer aggregate message budget per second.
+pub(crate) const DEFAULT_PEER_RATE_LIMIT: u32 = 200;
+/// Default per-peer tx + demand sub-budget per second.
+const DEFAULT_TX_DEMAND_LIMIT: u32 = 150;
+/// Default per-peer advert sub-budget per second.
+const DEFAULT_ADVERT_LIMIT: u32 = 50;
+/// Default per-peer control/fetch reserved minimum per second.
+const DEFAULT_CONTROL_FETCH_LIMIT: u32 = 20;
+
+impl PeerRateLimiter {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            tx_demand_count: 0,
+            advert_count: 0,
+            control_fetch_count: 0,
+            aggregate_count: 0,
+            tx_demand_limit: DEFAULT_TX_DEMAND_LIMIT,
+            advert_limit: DEFAULT_ADVERT_LIMIT,
+            control_fetch_limit: DEFAULT_CONTROL_FETCH_LIMIT,
+            aggregate_limit: DEFAULT_PEER_RATE_LIMIT,
+            dropped_tx_demand: 0,
+            dropped_advert: 0,
+            dropped_control_fetch: 0,
+            dropped_aggregate: 0,
+        }
+    }
+
+    /// Check if a message of the given traffic class is allowed.
+    /// Returns true if allowed, false if rate limited.
+    fn allow(&mut self, class: TrafficClass) -> bool {
+        // Reset window if needed
+        if self.window_start.elapsed() >= Duration::from_secs(1) {
+            self.window_start = Instant::now();
+            self.tx_demand_count = 0;
+            self.advert_count = 0;
+            self.control_fetch_count = 0;
+            self.aggregate_count = 0;
+        }
+
+        // Check aggregate limit first (survey and all other classes)
+        if self.aggregate_count >= self.aggregate_limit {
+            // Control/fetch gets reserved capacity even when aggregate is exhausted
+            if class == TrafficClass::ControlFetch
+                && self.control_fetch_count < self.control_fetch_limit
+            {
+                self.control_fetch_count += 1;
+                // Don't increment aggregate — this is reserved capacity
+                return true;
+            }
+            match class {
+                TrafficClass::TxAndDemand => self.dropped_tx_demand += 1,
+                TrafficClass::Advert => self.dropped_advert += 1,
+                TrafficClass::ControlFetch => self.dropped_control_fetch += 1,
+                TrafficClass::Survey => self.dropped_aggregate += 1,
+            }
+            self.dropped_aggregate += 1;
+            return false;
+        }
+
+        // Check per-class sub-budget
+        let allowed = match class {
+            TrafficClass::TxAndDemand => {
+                if self.tx_demand_count >= self.tx_demand_limit {
+                    self.dropped_tx_demand += 1;
+                    false
+                } else {
+                    self.tx_demand_count += 1;
+                    true
+                }
+            }
+            TrafficClass::Advert => {
+                if self.advert_count >= self.advert_limit {
+                    self.dropped_advert += 1;
+                    false
+                } else {
+                    self.advert_count += 1;
+                    true
+                }
+            }
+            TrafficClass::ControlFetch => {
+                // Control/fetch always allowed within aggregate
+                self.control_fetch_count += 1;
+                true
+            }
+            TrafficClass::Survey => {
+                // Survey counted against aggregate only, no sub-budget
+                true
+            }
+        };
+
+        if allowed {
+            self.aggregate_count += 1;
+        }
+        allowed
+    }
+}
+
 /// Number of 1-second ticks between ping attempts.
 ///
 /// Matches stellar-core `RECURRENT_TIMER_PERIOD` (5 seconds).
@@ -447,6 +614,7 @@ impl OverlayManager {
         received_peers: &mut bool,
         ping: &mut PingTracker,
         query_limiter: &mut QueryRateLimiter,
+        peer_rate_limiter: &mut PeerRateLimiter,
     ) -> Option<bool> {
         // Parity: shouldAbort (Peer.cpp:1157-1160) — skip message processing
         // if the overlay is shutting down.
@@ -519,9 +687,24 @@ impl OverlayManager {
             }
         }
 
-        // Global rate limiter (henyey-specific, SCP bypasses).
+        // Per-peer rate limiter (henyey-specific hardening).
+        // SCP messages are exempt (TrafficClass::classify returns None for SCP).
+        if let Some(traffic_class) = TrafficClass::classify(message) {
+            if !peer_rate_limiter.allow(traffic_class) {
+                debug!(
+                    "Dropping {} from {}: per-peer rate limit exceeded ({:?})",
+                    msg_type, peer_id, traffic_class
+                );
+                return Some(false);
+            }
+        }
+
+        // Global rate limiter backstop (Sybil protection, SCP bypasses).
         if !matches!(message, StellarMessage::ScpMessage(_)) && !state.flood_gate.allow_message() {
-            debug!("Dropping message due to global rate limit");
+            debug!(
+                "Dropping {} from {}: global rate limit exceeded",
+                msg_type, peer_id
+            );
             return Some(false);
         }
 
@@ -601,6 +784,7 @@ impl OverlayManager {
         // from this peer. At most one is allowed; duplicates cause a drop.
         let mut received_peers = false;
         let mut query_limiter = QueryRateLimiter::new();
+        let mut peer_rate_limiter = PeerRateLimiter::new();
 
         // Ping/RTT tracking (G4/G17): store the hash and send time of the
         // outstanding ping so we can compute round-trip time when the peer
@@ -739,6 +923,7 @@ impl OverlayManager {
                                 &mut received_peers,
                                 &mut ping,
                                 &mut query_limiter,
+                                &mut peer_rate_limiter,
                             ) {
                                 None => break,
                                 Some(is_scp) => { if is_scp { scp_messages += 1; } }
@@ -1261,6 +1446,172 @@ mod tests {
         assert!(
             !info.check_and_increment(window),
             "query exceeding limit should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_traffic_class_classification() {
+        use stellar_xdr::curr::*;
+
+        // SCP is exempt (None)
+        let scp_msg = StellarMessage::ScpMessage(ScpEnvelope {
+            statement: ScpStatement {
+                node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot {
+                        counter: 1,
+                        value: vec![].try_into().unwrap(),
+                    },
+                    n_h: 1,
+                    commit_quorum_set_hash: Hash([0; 32]),
+                }),
+            },
+            signature: vec![].try_into().unwrap(),
+        });
+        assert_eq!(TrafficClass::classify(&scp_msg), None);
+
+        // Transaction is TxAndDemand
+        let tx_msg =
+            StellarMessage::Transaction(TransactionEnvelope::TxV0(TransactionV0Envelope {
+                tx: TransactionV0 {
+                    source_account_ed25519: Uint256([0; 32]),
+                    fee: 100,
+                    seq_num: SequenceNumber(1),
+                    time_bounds: None,
+                    memo: Memo::None,
+                    operations: vec![].try_into().unwrap(),
+                    ext: TransactionV0Ext::V0,
+                },
+                signatures: vec![].try_into().unwrap(),
+            }));
+        assert_eq!(
+            TrafficClass::classify(&tx_msg),
+            Some(TrafficClass::TxAndDemand)
+        );
+
+        // FloodDemand is TxAndDemand
+        let demand_msg = StellarMessage::FloodDemand(FloodDemand {
+            tx_hashes: vec![].try_into().unwrap(),
+        });
+        assert_eq!(
+            TrafficClass::classify(&demand_msg),
+            Some(TrafficClass::TxAndDemand)
+        );
+
+        // FloodAdvert is Advert
+        let advert_msg = StellarMessage::FloodAdvert(FloodAdvert {
+            tx_hashes: vec![].try_into().unwrap(),
+        });
+        assert_eq!(
+            TrafficClass::classify(&advert_msg),
+            Some(TrafficClass::Advert)
+        );
+
+        // GetTxSet is ControlFetch
+        let get_tx_set = StellarMessage::GetTxSet(Uint256([0; 32]));
+        assert_eq!(
+            TrafficClass::classify(&get_tx_set),
+            Some(TrafficClass::ControlFetch)
+        );
+
+        // DontHave is ControlFetch
+        let dont_have = StellarMessage::DontHave(DontHave {
+            type_: MessageType::Transaction,
+            req_hash: Uint256([0; 32]),
+        });
+        assert_eq!(
+            TrafficClass::classify(&dont_have),
+            Some(TrafficClass::ControlFetch)
+        );
+    }
+
+    #[test]
+    fn test_peer_rate_limiter_per_peer_isolation() {
+        let mut limiter_a = PeerRateLimiter::new();
+        let mut limiter_b = PeerRateLimiter::new();
+
+        // Exhaust peer A's tx budget
+        for _ in 0..DEFAULT_TX_DEMAND_LIMIT {
+            assert!(limiter_a.allow(TrafficClass::TxAndDemand));
+        }
+        // Peer A's next tx should be rejected
+        assert!(!limiter_a.allow(TrafficClass::TxAndDemand));
+
+        // Peer B should be unaffected
+        assert!(limiter_b.allow(TrafficClass::TxAndDemand));
+    }
+
+    #[test]
+    fn test_peer_rate_limiter_class_sub_budgets() {
+        let mut limiter = PeerRateLimiter::new();
+
+        // Exhaust tx+demand sub-budget
+        for _ in 0..DEFAULT_TX_DEMAND_LIMIT {
+            assert!(limiter.allow(TrafficClass::TxAndDemand));
+        }
+        assert!(
+            !limiter.allow(TrafficClass::TxAndDemand),
+            "tx+demand should be exhausted"
+        );
+
+        // Advert should still work (separate sub-budget)
+        assert!(
+            limiter.allow(TrafficClass::Advert),
+            "advert should have own budget"
+        );
+    }
+
+    #[test]
+    fn test_peer_rate_limiter_control_fetch_reserved() {
+        let mut limiter = PeerRateLimiter::new();
+
+        // Exhaust the full aggregate budget with tx+demand + advert
+        for _ in 0..DEFAULT_TX_DEMAND_LIMIT {
+            limiter.allow(TrafficClass::TxAndDemand);
+        }
+        for _ in 0..DEFAULT_ADVERT_LIMIT {
+            limiter.allow(TrafficClass::Advert);
+        }
+
+        // Aggregate is now at 200 (150 tx + 50 advert) = limit
+        // Control/fetch should still work due to reserved capacity
+        assert!(
+            limiter.allow(TrafficClass::ControlFetch),
+            "control/fetch should have reserved capacity even when aggregate exhausted"
+        );
+    }
+
+    #[test]
+    fn test_peer_rate_limiter_aggregate_caps_survey() {
+        let mut limiter = PeerRateLimiter::new();
+
+        // Exhaust aggregate with survey messages
+        for _ in 0..DEFAULT_PEER_RATE_LIMIT {
+            assert!(limiter.allow(TrafficClass::Survey));
+        }
+
+        // Next survey should be rejected (aggregate exhausted)
+        assert!(!limiter.allow(TrafficClass::Survey));
+
+        // But control/fetch should still work (reserved)
+        assert!(limiter.allow(TrafficClass::ControlFetch));
+    }
+
+    #[test]
+    fn test_peer_rate_limiter_telemetry_counters() {
+        let mut limiter = PeerRateLimiter::new();
+
+        // Exhaust tx budget
+        for _ in 0..DEFAULT_TX_DEMAND_LIMIT {
+            limiter.allow(TrafficClass::TxAndDemand);
+        }
+        // This should be rejected and counted
+        limiter.allow(TrafficClass::TxAndDemand);
+
+        assert!(
+            limiter.dropped_tx_demand > 0,
+            "should track dropped tx+demand"
         );
     }
 }

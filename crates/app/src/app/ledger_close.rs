@@ -669,7 +669,76 @@ impl App {
             "Successfully restored node state from disk"
         );
 
+        // Seed the validation context from the restored header so tx queue
+        // admission rejects invalid Soroban txs from the very first moment.
+        self.seed_validation_context();
+
         Ok(true)
+    }
+
+    /// Seed the herder's ValidationContext from the current ledger state.
+    ///
+    /// Must be called after any code path that initializes the ledger manager
+    /// (load_last_known_ledger, bootstrap_from_db) so the tx queue has up-to-date
+    /// ledger info and Soroban resource limits before the overlay accepts txs.
+    ///
+    /// Without this, `soroban_limits` defaults to `None` and
+    /// `check_soroban_resources` silently accepts any Soroban tx until the
+    /// first ledger close seeds the limits.
+    pub fn seed_validation_context(&self) {
+        use henyey_herder::SorobanTxLimits;
+
+        let header = self.ledger_manager.current_header();
+        if header.ledger_seq == 0 {
+            return;
+        }
+
+        let ledger_flags = match &header.ext {
+            stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+            stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+        };
+
+        self.herder.tx_queue().update_validation_context(
+            header.ledger_seq,
+            header.scp_value.close_time.0,
+            header.ledger_version,
+            header.base_fee,
+            header.base_reserve,
+            ledger_flags,
+        );
+
+        // Seed Soroban per-tx limits from network config.
+        if let Some(soroban_info) = self.soroban_network_info() {
+            self.herder.tx_queue().set_soroban_limits(SorobanTxLimits {
+                tx_max_instructions: soroban_info.tx_max_instructions as u64,
+                tx_max_read_bytes: soroban_info.tx_max_read_bytes as u64,
+                tx_max_write_bytes: soroban_info.tx_max_write_bytes as u64,
+                tx_max_read_ledger_entries: soroban_info.tx_max_read_ledger_entries as u64,
+                tx_max_write_ledger_entries: soroban_info.tx_max_write_ledger_entries as u64,
+                tx_max_size_bytes: soroban_info.tx_max_size_bytes as u64,
+            });
+            tracing::info!(
+                ledger_seq = header.ledger_seq,
+                "Seeded validation context with Soroban limits"
+            );
+        }
+
+        // Also seed the dynamic Soroban resource limits for queue admission.
+        if let Some(soroban_info) = self.soroban_network_info() {
+            let m = POOL_LEDGER_MULTIPLIER as i64;
+            let soroban_limit = henyey_common::Resource::soroban_ledger_limits(
+                soroban_info.ledger_max_tx_count as i64 * m,
+                soroban_info.ledger_max_instructions * m,
+                soroban_info.ledger_max_tx_size_bytes as i64 * m,
+                soroban_info.ledger_max_read_bytes as i64 * m,
+                soroban_info.ledger_max_write_bytes as i64 * m,
+                soroban_info.ledger_max_read_ledger_entries as i64 * m,
+                soroban_info.ledger_max_write_ledger_entries as i64 * m,
+            );
+            self.herder
+                .tx_queue()
+                .update_soroban_resource_limits(soroban_limit);
+        }
     }
 
     /// Restore checkpoint state on startup (crash recovery).
@@ -1497,32 +1566,46 @@ impl App {
         };
 
         // Emit LedgerCloseMeta to stream.
+        // If a MetaWriter is active (async channel + dedicated thread), use it
+        // for non-blocking I/O. Otherwise fall back to the synchronous Mutex path
+        // (for debug-only streams that don't need I/O isolation).
         if let Some(ref meta) = result.meta {
-            let mut guard = self.meta_stream.lock().unwrap();
-            if let Some(ref mut stream) = *guard {
-                if let Err(e) = stream.maybe_rotate_debug_stream(pending.ledger_seq) {
-                    tracing::warn!(
+            if let Some(ref writer) = self.meta_writer {
+                if let Err(e) = writer.write_meta(meta.clone(), pending.ledger_seq).await {
+                    tracing::error!(
                         error = %e,
                         ledger_seq = pending.ledger_seq,
-                        "Failed to rotate debug meta stream"
+                        "Fatal: metadata writer channel failed"
                     );
+                    std::process::abort();
                 }
-                match stream.emit_meta(meta) {
-                    Ok(()) => {}
-                    Err(MetaStreamError::MainStreamWrite(e)) => {
-                        tracing::error!(
-                            error = %e,
-                            ledger_seq = pending.ledger_seq,
-                            "Fatal: metadata output stream write failed"
-                        );
-                        std::process::abort();
-                    }
-                    Err(MetaStreamError::DebugStreamWrite(e)) => {
+            } else {
+                let mut guard = self.meta_stream.lock().unwrap();
+                if let Some(ref mut stream) = *guard {
+                    if let Err(e) = stream.maybe_rotate_debug_stream(pending.ledger_seq) {
                         tracing::warn!(
                             error = %e,
                             ledger_seq = pending.ledger_seq,
-                            "Debug metadata stream write failed"
+                            "Failed to rotate debug meta stream"
                         );
+                    }
+                    match stream.emit_meta(meta) {
+                        Ok(()) => {}
+                        Err(MetaStreamError::MainStreamWrite(e)) => {
+                            tracing::error!(
+                                error = %e,
+                                ledger_seq = pending.ledger_seq,
+                                "Fatal: metadata output stream write failed"
+                            );
+                            std::process::abort();
+                        }
+                        Err(MetaStreamError::DebugStreamWrite(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                ledger_seq = pending.ledger_seq,
+                                "Debug metadata stream write failed"
+                            );
+                        }
                     }
                 }
             }

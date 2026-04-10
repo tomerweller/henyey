@@ -13,6 +13,7 @@ use crate::{
     peer::{Peer, PeerInfo},
     LocalNode, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
 };
+use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,6 +135,16 @@ impl OverlayManager {
             pool.release_pending();
             return;
         }
+        // Prevent concurrent handshakes for the same peer ID.
+        if !shared.pending_connections.try_reserve_peer_id(&peer_id) {
+            debug!(
+                "Rejected inbound peer {} — handshake already in flight",
+                peer_id
+            );
+            peer.close().await;
+            pool.release_pending();
+            return;
+        }
 
         let peer_info = peer.info().clone();
 
@@ -153,6 +164,7 @@ impl OverlayManager {
             let err_msg = make_error_msg(ErrorCode::Load, "peer rejected");
             let _ = peer.send(err_msg).await;
             peer.close().await;
+            shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
             return;
         }
@@ -172,10 +184,14 @@ impl OverlayManager {
                 Err(_) => {
                     debug!("Rejected duplicate inbound peer {} (race)", peer_id);
                     peer.close().await;
+                    shared.pending_connections.release_peer_id(&peer_id);
                     pool.release_authenticated();
                     return;
                 }
             };
+
+        // Successfully registered — release the pending reservation.
+        shared.pending_connections.release_peer_id(&peer_id);
 
         Self::run_peer_loop(
             peer_id.clone(),
@@ -278,6 +294,24 @@ impl OverlayManager {
         shared: SharedPeerState,
         connection_factory: Arc<dyn ConnectionFactory>,
     ) {
+        // Reserve address slot to prevent duplicate outbound dials.
+        let target_ip: IpAddr = match addr.host.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                debug!("Cannot parse IP for discovered peer {}", addr);
+                pool.release_pending();
+                return;
+            }
+        };
+        if !shared.pending_connections.try_reserve_address(target_ip) {
+            debug!(
+                "Rejected discovered peer {} — connection already in flight",
+                addr
+            );
+            pool.release_pending();
+            return;
+        }
+
         let connection = match connection_factory.connect(&addr, connect_timeout).await {
             Ok(c) => c,
             Err(e) => {
@@ -285,6 +319,7 @@ impl OverlayManager {
                 shared
                     .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
                     .await;
+                shared.pending_connections.release_address(&target_ip);
                 pool.release_pending();
                 return;
             }
@@ -300,12 +335,15 @@ impl OverlayManager {
                     shared
                         .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
                         .await;
+                    shared.pending_connections.release_address(&target_ip);
                     pool.release_pending();
                     return;
                 }
             };
 
         let peer_id = peer.id().clone();
+        // Address reservation no longer needed — we have the peer_id now.
+        shared.pending_connections.release_address(&target_ip);
 
         // Reject banned peers (mirrors connect_outbound_inner).
         if shared.banned_peers.read().contains(&peer_id) {
@@ -317,6 +355,16 @@ impl OverlayManager {
         // Reject peers we're already connected to (mirrors connect_outbound_inner).
         if shared.peers.contains_key(&peer_id) {
             debug!("Rejected duplicate discovered peer {} at {}", peer_id, addr);
+            pool.release_pending();
+            return;
+        }
+
+        // Prevent concurrent registration for the same peer ID.
+        if !shared.pending_connections.try_reserve_peer_id(&peer_id) {
+            debug!(
+                "Rejected discovered peer {} — registration already in flight",
+                peer_id
+            );
             pool.release_pending();
             return;
         }
@@ -333,10 +381,13 @@ impl OverlayManager {
                 Ok(result) => result,
                 Err(_) => {
                     debug!("Rejected duplicate discovered peer {} (race)", peer_id);
+                    shared.pending_connections.release_peer_id(&peer_id);
                     pool.release_authenticated();
                     return;
                 }
             };
+
+        shared.pending_connections.release_peer_id(&peer_id);
 
         // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
@@ -453,9 +504,23 @@ pub(super) async fn connect_to_explicit_peer(
     shared: SharedPeerState,
     connection_factory: Arc<dyn ConnectionFactory>,
 ) -> Result<PeerId> {
+    // Reserve address slot to prevent duplicate outbound dials.
+    let target_ip: IpAddr = addr
+        .host
+        .parse()
+        .map_err(|_| OverlayError::Internal(format!("cannot parse IP: {}", addr.host)))?;
+    if !shared.pending_connections.try_reserve_address(target_ip) {
+        pool.release_pending();
+        return Err(OverlayError::Internal(format!(
+            "connection to {} already in flight",
+            addr
+        )));
+    }
+
     let connection = match connection_factory.connect(addr, timeout_secs).await {
         Ok(connection) => connection,
         Err(e) => {
+            shared.pending_connections.release_address(&target_ip);
             pool.release_pending();
             shared
                 .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
@@ -468,6 +533,7 @@ pub(super) async fn connect_to_explicit_peer(
     {
         Ok(peer) => peer,
         Err(e) => {
+            shared.pending_connections.release_address(&target_ip);
             pool.release_pending();
             shared
                 .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
@@ -477,12 +543,21 @@ pub(super) async fn connect_to_explicit_peer(
     };
 
     let peer_id = peer.id().clone();
+    // Address reservation no longer needed — we have the peer_id now.
+    shared.pending_connections.release_address(&target_ip);
+
     if shared.banned_peers.read().contains(&peer_id) {
         pool.release_pending();
         return Err(OverlayError::PeerBanned(peer_id.to_string()));
     }
 
     if shared.peers.contains_key(&peer_id) {
+        pool.release_pending();
+        return Err(OverlayError::AlreadyConnected);
+    }
+
+    // Prevent concurrent registration for the same peer ID.
+    if !shared.pending_connections.try_reserve_peer_id(&peer_id) {
         pool.release_pending();
         return Err(OverlayError::AlreadyConnected);
     }
@@ -497,10 +572,13 @@ pub(super) async fn connect_to_explicit_peer(
             Ok(result) => result,
             Err(e) => {
                 debug!("Rejected duplicate peer {} (race)", peer_id);
+                shared.pending_connections.release_peer_id(&peer_id);
                 pool.release_authenticated();
                 return Err(e);
             }
         };
+
+    shared.pending_connections.release_peer_id(&peer_id);
     shared
         .send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
         .await;

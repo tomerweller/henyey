@@ -747,6 +747,14 @@ impl TransactionQueue {
         ctx.ledger_flags = ledger_flags;
     }
 
+    /// Set the Soroban per-transaction resource limits in the validation context.
+    ///
+    /// Called during startup seeding (before the first ledger close) to ensure
+    /// Soroban txs are validated against network config limits from the start.
+    pub fn set_soroban_limits(&self, limits: SorobanTxLimits) {
+        self.validation_context.write().soroban_limits = Some(limits);
+    }
+
     /// Validate a transaction before queueing.
     fn validate_transaction(
         &self,

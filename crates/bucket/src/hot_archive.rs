@@ -26,7 +26,7 @@
 //! Hot archive is only supported from Protocol 23+ (Soroban state archival).
 
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::{BufReader, Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -1722,44 +1722,6 @@ pub fn merge_hot_archive_buckets(
         return Ok(HotArchiveBucket::empty());
     }
 
-    let mut merged_entries: HashMap<Vec<u8>, HotArchiveBucketEntry> = HashMap::new();
-
-    // Process curr entries first (older entries)
-    for entry in curr.iter() {
-        if matches!(entry, HotArchiveBucketEntry::Metaentry(_)) {
-            continue;
-        }
-
-        let key = hot_archive_entry_to_key(&entry)?;
-        merged_entries.insert(key, entry);
-    }
-
-    // Process snap entries (newer entries)
-    // stellar-core HotArchiveBucket::mergeCasesWithEqualKeys always takes the newer entry,
-    // so snap entries always win when there's a key match.
-    for entry in snap.iter() {
-        if matches!(entry, HotArchiveBucketEntry::Metaentry(_)) {
-            continue;
-        }
-
-        let key = hot_archive_entry_to_key(&entry)?;
-        // Always insert snap entry - it will either add a new entry
-        // or replace an existing curr entry (newer always wins)
-        merged_entries.insert(key, entry);
-    }
-
-    // Drop tombstones at bottom level
-    if !keep_tombstones {
-        merged_entries.retain(|_, v| !is_hot_archive_tombstone(v));
-    }
-
-    // Build result
-    // NOTE: Even if merged_entries is empty, we still create a bucket with metaentry.
-    // In stellar-core, BucketOutputIterator constructor ALWAYS writes a metaentry first,
-    // so merge output always has at least a metaentry (mObjectsPut >= 1).
-    // This is critical for hash consistency.
-    let mut result_entries = Vec::with_capacity(merged_entries.len() + 1);
-
     // Calculate output protocol version using max(curr, snap), matching stellar-core behavior
     // in calculateMergeProtocolVersion(). The passed protocol_version is only used as
     // a constraint (maxProtocolVersion), not as the output version.
@@ -1773,6 +1735,14 @@ pub fn merge_hot_archive_buckets(
         )));
     }
 
+    // Build result using sorted merge-join.
+    //
+    // Both curr and snap are already sorted by compare_hot_archive_entries.
+    // We merge them in O(n + m) time with O(1) extra space per entry,
+    // avoiding the HashMap + sort approach that required O(n + m) extra
+    // memory for the HashMap AND a subsequent O((n+m) log(n+m)) sort.
+    let mut result_entries = Vec::with_capacity(1 + curr.len() + snap.len());
+
     // Add metadata - hot archive buckets always use V1 with BucketListType::HotArchive
     // for Protocol 23+.
     let mut meta = BucketMetadata {
@@ -1784,12 +1754,59 @@ pub fn merge_hot_archive_buckets(
     }
     result_entries.push(HotArchiveBucketEntry::Metaentry(meta));
 
-    // Add merged entries
-    result_entries.extend(merged_entries.into_values());
+    // Sorted merge-join: iterate both iterators in lock-step.
+    // Snap (newer) wins on equal keys.
+    let mut curr_iter = curr
+        .iter()
+        .filter(|e| !matches!(e, HotArchiveBucketEntry::Metaentry(_)))
+        .peekable();
+    let mut snap_iter = snap
+        .iter()
+        .filter(|e| !matches!(e, HotArchiveBucketEntry::Metaentry(_)))
+        .peekable();
 
-    // Sort entries using stellar-core's comparison order
-    // This is critical for hash consistency with stellar-core
-    result_entries.sort_by(compare_hot_archive_entries);
+    loop {
+        match (curr_iter.peek(), snap_iter.peek()) {
+            (None, None) => break,
+            (Some(_), None) => {
+                let entry = curr_iter.next().unwrap();
+                if keep_tombstones || !is_hot_archive_tombstone(&entry) {
+                    result_entries.push(entry);
+                }
+            }
+            (None, Some(_)) => {
+                let entry = snap_iter.next().unwrap();
+                if keep_tombstones || !is_hot_archive_tombstone(&entry) {
+                    result_entries.push(entry);
+                }
+            }
+            (Some(c), Some(s)) => {
+                let ord = compare_hot_archive_entries(c, s);
+                match ord {
+                    std::cmp::Ordering::Less => {
+                        let entry = curr_iter.next().unwrap();
+                        if keep_tombstones || !is_hot_archive_tombstone(&entry) {
+                            result_entries.push(entry);
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let entry = snap_iter.next().unwrap();
+                        if keep_tombstones || !is_hot_archive_tombstone(&entry) {
+                            result_entries.push(entry);
+                        }
+                    }
+                    std::cmp::Ordering::Equal => {
+                        // Snap (newer) wins — skip curr entry.
+                        let _ = curr_iter.next();
+                        let entry = snap_iter.next().unwrap();
+                        if keep_tombstones || !is_hot_archive_tombstone(&entry) {
+                            result_entries.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let result = HotArchiveBucket::from_entries(result_entries)?;
     tracing::trace!(

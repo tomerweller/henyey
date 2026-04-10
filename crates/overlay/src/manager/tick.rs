@@ -228,6 +228,9 @@ impl OverlayManager {
                     &mut last_out_of_sync_reconnect,
                 );
 
+                // Sweep stale pending connection reservations.
+                shared.pending_connections.sweep_stale();
+
                 // G7: Collect completed DNS resolution and schedule next.
                 Self::maybe_collect_dns_result(
                     &mut dns_resolve_handle,

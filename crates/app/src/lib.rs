@@ -62,6 +62,7 @@ pub mod http;
 pub mod logging;
 pub mod maintainer;
 pub mod meta_stream;
+pub mod meta_writer;
 pub mod run_cmd;
 pub mod survey;
 

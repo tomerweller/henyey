@@ -44,10 +44,12 @@ const MAX_ENTRIES: usize = 100_000;
 /// How often to check for expired entries (1 minute).
 const CLEANUP_INTERVAL_SECS: u64 = 60;
 
-/// Default rate limit (messages per second).
+/// Default global rate limit (messages per second).
 ///
-/// This is a soft limit - messages beyond this are dropped.
-const DEFAULT_RATE_LIMIT_PER_SEC: u64 = 1000;
+/// This is a node-wide aggregate backstop against Sybil attacks.
+/// Per-peer rate limiting (in peer_loop.rs) is the primary enforcement;
+/// this global limit is an emergency failsafe.
+const DEFAULT_RATE_LIMIT_PER_SEC: u64 = 5000;
 
 /// Internal tracking entry for a seen message.
 struct SeenEntry {

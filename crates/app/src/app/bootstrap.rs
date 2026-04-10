@@ -168,6 +168,9 @@ impl App {
         self.set_state(super::AppState::Synced).await;
         self.set_current_ledger(lcl_seq).await;
 
+        // Seed validation context so tx queue rejects invalid Soroban txs immediately.
+        self.seed_validation_context();
+
         Ok(())
     }
 }

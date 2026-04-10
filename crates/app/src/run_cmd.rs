@@ -184,6 +184,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     let compat_http_enabled = config.compat_http.enabled;
     let compat_http_port = config.compat_http.port;
     let compat_http_address = config.compat_http.address.clone();
+    let query_thread_pool_size = config.query.thread_pool_size;
 
     // Create the application
     let app = Arc::new(App::new(config).await?);
@@ -212,10 +213,16 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         None
     };
 
-    // Start the HTTP query server if configured
+    // Start the HTTP query server on a dedicated Tokio runtime if configured.
+    // This isolates query I/O from the main consensus runtime, preventing
+    // slow queries from starving SCP, ledger close, or peer messaging.
     let query_handle = if let Some(port) = query_port {
         let query_server = QueryServer::new(port, http_address.clone(), app.clone());
-        Some(spawn_server("HTTP query server", query_server.start()))
+        let thread_pool_size = query_thread_pool_size;
+        Some(spawn_query_server_on_dedicated_runtime(
+            query_server,
+            thread_pool_size,
+        ))
     } else {
         None
     };
@@ -286,6 +293,34 @@ where
         if let Err(e) = future.await {
             tracing::error!(error = %e, "{name} error");
         }
+    })
+}
+
+/// Spawn the query server on a dedicated Tokio runtime backed by `worker_threads`
+/// OS threads. Returns a JoinHandle that completes when the runtime shuts down.
+///
+/// This isolates query I/O (which may involve slow bucket snapshot reads)
+/// from the main consensus runtime. The dedicated runtime uses the
+/// `query.thread_pool_size` config value.
+fn spawn_query_server_on_dedicated_runtime(
+    query_server: QueryServer,
+    worker_threads: usize,
+) -> tokio::task::JoinHandle<()> {
+    // We use tokio::task::spawn_blocking to get a JoinHandle that the
+    // main runtime can track. Inside, we build + block on a separate runtime.
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .thread_name("query-rt")
+            .enable_all()
+            .build()
+            .expect("failed to build query runtime");
+
+        rt.block_on(async move {
+            if let Err(e) = query_server.start().await {
+                tracing::error!(error = %e, "HTTP query server error");
+            }
+        });
     })
 }
 

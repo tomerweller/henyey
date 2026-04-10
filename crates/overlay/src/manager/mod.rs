@@ -138,6 +138,86 @@ pub(super) struct TickConnectCtx {
     pub(super) connection_factory: Arc<dyn ConnectionFactory>,
 }
 
+/// Tracks in-flight connections to prevent duplicate dials/handshakes.
+///
+/// During the window between initiating a connection and completing
+/// registration in `SharedPeerState::peers`, multiple concurrent tasks
+/// could start handshakes to the same destination. This struct provides
+/// dedup at two levels:
+///
+/// - **by_address**: keyed by IP address, prevents outbound dial races
+///   to the same target. Inserted before dial, removed on completion.
+/// - **by_peer_id**: keyed by peer ID (known after HELLO), prevents
+///   concurrent registration attempts for the same node. Inserted after
+///   handshake, removed after register_peer or on failure.
+///
+/// Stale entries (from crashed/hung tasks) are swept periodically from
+/// the tick loop.
+///
+/// Matches stellar-core's `mPendingPeers` dedup (Peer.cpp:1881-1909).
+#[derive(Clone)]
+pub(super) struct PendingConnections {
+    /// In-flight connections by target IP.
+    pub(super) by_address: Arc<DashMap<IpAddr, std::time::Instant>>,
+    /// In-flight connections by peer ID (known after handshake).
+    pub(super) by_peer_id: Arc<DashMap<PeerId, std::time::Instant>>,
+}
+
+/// Maximum age for a pending connection before it is considered stale.
+const PENDING_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl PendingConnections {
+    fn new() -> Self {
+        Self {
+            by_address: Arc::new(DashMap::new()),
+            by_peer_id: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Try to reserve a pending outbound connection to the given IP.
+    /// Returns false if a connection to this IP is already in flight.
+    pub(super) fn try_reserve_address(&self, ip: IpAddr) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.by_address.entry(ip) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(std::time::Instant::now());
+                true
+            }
+        }
+    }
+
+    /// Try to reserve a pending connection for the given peer ID.
+    /// Returns false if a handshake for this peer ID is already in flight.
+    pub(super) fn try_reserve_peer_id(&self, peer_id: &PeerId) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.by_peer_id.entry(peer_id.clone()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(std::time::Instant::now());
+                true
+            }
+        }
+    }
+
+    /// Release a pending address reservation.
+    pub(super) fn release_address(&self, ip: &IpAddr) {
+        self.by_address.remove(ip);
+    }
+
+    /// Release a pending peer ID reservation.
+    pub(super) fn release_peer_id(&self, peer_id: &PeerId) {
+        self.by_peer_id.remove(peer_id);
+    }
+
+    /// Remove stale pending entries older than PENDING_CONNECTION_TIMEOUT.
+    pub(super) fn sweep_stale(&self) {
+        let cutoff = std::time::Instant::now() - PENDING_CONNECTION_TIMEOUT;
+        self.by_address.retain(|_, ts| *ts > cutoff);
+        self.by_peer_id.retain(|_, ts| *ts > cutoff);
+    }
+}
+
 /// Shared state passed to spawned peer tasks.
 ///
 /// Bundles all `Arc`-wrapped state that background tasks need, avoiding
@@ -168,6 +248,8 @@ pub(super) struct SharedPeerState {
     /// Whether the node is tracking consensus (set by the herder/app layer).
     /// When false, the overlay may drop random peers to try new connections.
     pub(super) is_tracking: Arc<AtomicBool>,
+    /// Tracks in-flight connections for dedup.
+    pub(super) pending_connections: PendingConnections,
 }
 
 impl SharedPeerState {
@@ -336,6 +418,8 @@ pub struct OverlayManager {
     pub(super) is_tracking: Arc<AtomicBool>,
     /// Connection factory used for transport establishment.
     pub(super) connection_factory: Arc<dyn ConnectionFactory>,
+    /// Tracks in-flight connections for dedup.
+    pub(super) pending_connections: PendingConnections,
 }
 
 impl OverlayManager {
@@ -417,6 +501,7 @@ impl OverlayManager {
             scp_callback: None,
             is_tracking: Arc::new(AtomicBool::new(false)),
             connection_factory,
+            pending_connections: PendingConnections::new(),
         })
     }
 
@@ -442,6 +527,7 @@ impl OverlayManager {
             peer_event_tx: self.config.peer_event_tx.clone(),
             extra_subscribers: Arc::clone(&self.extra_subscribers),
             is_tracking: Arc::clone(&self.is_tracking),
+            pending_connections: self.pending_connections.clone(),
         }
     }
 
@@ -1230,5 +1316,86 @@ mod tests {
         let addr = PeerAddress::new("10.0.0.1", 11625);
         assert!(manager.add_known_peer(addr.clone()));
         assert!(!manager.add_known_peer(addr));
+    }
+
+    #[test]
+    fn test_pending_connections_address_dedup() {
+        let pending = PendingConnections::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        assert!(
+            pending.try_reserve_address(ip),
+            "first reservation should succeed"
+        );
+        assert!(
+            !pending.try_reserve_address(ip),
+            "duplicate reservation should fail"
+        );
+
+        pending.release_address(&ip);
+        assert!(
+            pending.try_reserve_address(ip),
+            "should succeed after release"
+        );
+    }
+
+    #[test]
+    fn test_pending_connections_peer_id_dedup() {
+        let pending = PendingConnections::new();
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+
+        assert!(
+            pending.try_reserve_peer_id(&peer_id),
+            "first reservation should succeed"
+        );
+        assert!(
+            !pending.try_reserve_peer_id(&peer_id),
+            "duplicate should fail"
+        );
+
+        pending.release_peer_id(&peer_id);
+        assert!(
+            pending.try_reserve_peer_id(&peer_id),
+            "should succeed after release"
+        );
+    }
+
+    #[test]
+    fn test_pending_connections_independent_tracking() {
+        let pending = PendingConnections::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+
+        // Address and peer_id are independent
+        assert!(pending.try_reserve_address(ip));
+        assert!(pending.try_reserve_peer_id(&peer_id));
+
+        // Different IP should work
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(pending.try_reserve_address(ip2));
+    }
+
+    #[test]
+    fn test_pending_connections_sweep_stale() {
+        let pending = PendingConnections::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Insert with a backdated timestamp
+        pending.by_address.insert(
+            ip,
+            std::time::Instant::now() - std::time::Duration::from_secs(60),
+        );
+
+        assert!(
+            !pending.try_reserve_address(ip),
+            "stale entry still blocks before sweep"
+        );
+
+        pending.sweep_stale();
+
+        assert!(
+            pending.try_reserve_address(ip),
+            "should succeed after sweep removes stale entry"
+        );
     }
 }

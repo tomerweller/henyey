@@ -664,15 +664,37 @@ impl App {
         // stream their LedgerCloseMeta to the pipe. This is required for
         // stellar-rpc's bounded replay mode (`catchup --metadata-output-stream fd:3`).
         //
-        // We temporarily move the MetaStreamManager into a shared Arc so the
-        // callback closure can use it. After catchup completes, we move it back.
-        let shared_meta_stream = {
+        // If a MetaWriter is active, use its blocking_send channel to avoid
+        // blocking I/O inline. Otherwise, fall back to the synchronous
+        // Mutex<MetaStreamManager> path.
+        let shared_meta_stream = if self.meta_writer.is_some() {
+            // MetaWriter owns the stream; set up callback using its blocking channel.
+            None
+        } else {
             let mut guard = self.meta_stream.lock().unwrap();
             guard
                 .take()
                 .map(|stream| Arc::new(std::sync::Mutex::new(stream)))
         };
-        if let Some(ref stream_arc) = shared_meta_stream {
+
+        if let Some(ref writer) = self.meta_writer {
+            // Use the MetaWriter's blocking channel for catchup replay.
+            // The writer thread handles rotation and error handling.
+            let writer_tx = writer.clone_sender();
+            catchup_manager.set_meta_callback(Box::new(move |meta| {
+                // Extract ledger_seq from the meta for rotation.
+                let ledger_seq = crate::meta_writer::extract_ledger_seq(&meta);
+                if let Err(e) =
+                    writer_tx.blocking_send(crate::meta_writer::MetaWriteCommand::Write {
+                        meta: Box::new(meta),
+                        ledger_seq,
+                    })
+                {
+                    tracing::error!(error = %e, "Fatal: meta writer channel failed during catchup");
+                    std::process::abort();
+                }
+            }));
+        } else if let Some(ref stream_arc) = shared_meta_stream {
             let stream_for_callback = Arc::clone(stream_arc);
             catchup_manager.set_meta_callback(Box::new(move |meta| {
                 let mut guard = stream_for_callback.lock().unwrap();

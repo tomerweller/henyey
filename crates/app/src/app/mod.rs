@@ -109,6 +109,7 @@ use x25519_dalek::{PublicKey as CurvePublicKey, StaticSecret as CurveSecretKey};
 use crate::config::AppConfig;
 use crate::logging::CatchupProgress;
 use crate::meta_stream::{MetaStreamError, MetaStreamManager};
+use crate::meta_writer::MetaWriter;
 use crate::survey::{SurveyDataManager, SurveyMessageLimiter};
 use henyey_ledger::{close_time as ledger_close_time, compute_header_hash, verify_header_chain};
 use stellar_xdr::curr::TransactionEnvelope;
@@ -367,6 +368,11 @@ pub struct App {
     /// Metadata output stream manager for emitting LedgerCloseMeta.
     meta_stream: std::sync::Mutex<Option<MetaStreamManager>>,
 
+    /// Async meta writer — wraps MetaStreamManager behind a channel + dedicated thread.
+    /// When present, the live ledger-close and catchup paths use this instead of
+    /// blocking on meta_stream directly.
+    meta_writer: Option<MetaWriter>,
+
     /// Close time drift tracker for clock synchronization monitoring.
     drift_tracker: std::sync::Mutex<CloseTimeDriftTracker>,
 
@@ -568,6 +574,14 @@ impl App {
 
         let meta_stream = Self::init_meta_stream(&config, &bucket_dir)?;
 
+        // If streaming is active, wrap the MetaStreamManager in a MetaWriter
+        // for async I/O isolation. The writer owns the stream; the Mutex holds
+        // None during live operation.
+        let (meta_writer, meta_stream_for_mutex) = match meta_stream {
+            Some(ms) if ms.is_streaming() => (Some(MetaWriter::new(ms)), None),
+            other => (None, other),
+        };
+
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
@@ -650,7 +664,8 @@ impl App {
             survey_throttle,
             survey_reporting: RwLock::new(SurveyReportingState::new(now)),
             scp_timeouts: RwLock::new(ScpTimeoutState::new()),
-            meta_stream: std::sync::Mutex::new(meta_stream),
+            meta_stream: std::sync::Mutex::new(meta_stream_for_mutex),
+            meta_writer,
             drift_tracker: std::sync::Mutex::new(CloseTimeDriftTracker::new()),
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             is_applying_ledger: AtomicBool::new(false),
