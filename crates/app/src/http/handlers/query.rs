@@ -127,7 +127,7 @@ pub(crate) async fn getledgerentryraw_handler(
         Ok(response) => response,
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Query task cancelled"})),
+            Json(serde_json::json!({"error": "Query processing failed"})),
         )
             .into_response(),
     }
@@ -250,7 +250,7 @@ pub(crate) async fn getledgerentry_handler(
         Ok(response) => response,
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Query task cancelled"})),
+            Json(serde_json::json!({"error": "Query processing failed"})),
         )
             .into_response(),
     }
