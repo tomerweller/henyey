@@ -155,13 +155,13 @@ fn is_asset_code_valid(code: &[u8], min_chars: usize) -> bool {
 
 /// Validate an asset code (alphaNum4): at least 1 alphanumeric character,
 /// zeros only trailing.
-fn is_asset_code4_valid(code: &AssetCode4) -> bool {
+pub fn is_asset_code4_valid(code: &AssetCode4) -> bool {
     is_asset_code_valid(&code.0, 1)
 }
 
 /// Validate an asset code (alphaNum12): at least 5 alphanumeric characters,
 /// zeros only trailing.
-fn is_asset_code12_valid(code: &AssetCode12) -> bool {
+pub fn is_asset_code12_valid(code: &AssetCode12) -> bool {
     is_asset_code_valid(&code.0, 5)
 }
 

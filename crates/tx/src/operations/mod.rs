@@ -553,17 +553,23 @@ fn validate_allow_trust(
     _protocol_version: u32,
     source_account: Option<&AccountId>,
 ) -> std::result::Result<(), OperationValidationError> {
-    // asset must not be native
-    if matches!(
-        op.asset,
-        stellar_xdr::curr::AssetCode::CreditAlphanum4(_)
-            | stellar_xdr::curr::AssetCode::CreditAlphanum12(_)
-    ) {
-        // valid asset code types — continue
-    } else {
-        return Err(OperationValidationError::InvalidAsset(
-            "AllowTrust asset must be credit".into(),
-        ));
+    // Asset must be a valid credit code. Mirrors stellar-core
+    // AllowTrustOpFrame::doCheckValid() which calls isAssetValid().
+    match &op.asset {
+        stellar_xdr::curr::AssetCode::CreditAlphanum4(code) => {
+            if !henyey_common::asset::is_asset_code4_valid(code) {
+                return Err(OperationValidationError::InvalidAsset(
+                    "invalid asset code".into(),
+                ));
+            }
+        }
+        stellar_xdr::curr::AssetCode::CreditAlphanum12(code) => {
+            if !henyey_common::asset::is_asset_code12_valid(code) {
+                return Err(OperationValidationError::InvalidAsset(
+                    "invalid asset code".into(),
+                ));
+            }
+        }
     }
     // authorize must be a valid trust line flag combination
     // AUTHORIZED_FLAG=1, AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG=2

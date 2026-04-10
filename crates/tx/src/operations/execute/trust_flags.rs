@@ -42,6 +42,20 @@ pub(crate) fn execute_allow_trust(
         return Ok(make_allow_trust_result(AllowTrustResultCode::Malformed));
     }
 
+    // Validate asset code content (defense-in-depth; also checked in validation layer).
+    match &op.asset {
+        stellar_xdr::curr::AssetCode::CreditAlphanum4(code) => {
+            if !henyey_common::asset::is_asset_code4_valid(code) {
+                return Ok(make_allow_trust_result(AllowTrustResultCode::Malformed));
+            }
+        }
+        stellar_xdr::curr::AssetCode::CreditAlphanum12(code) => {
+            if !henyey_common::asset::is_asset_code12_valid(code) {
+                return Ok(make_allow_trust_result(AllowTrustResultCode::Malformed));
+            }
+        }
+    }
+
     // Check source account exists (the issuer)
     // NOTE: stellar-core loads the source account in a nested LedgerTxn (ltxSource)
     // that gets rolled back, so the source account access is NOT recorded in the
@@ -196,8 +210,22 @@ pub(crate) fn execute_set_trust_line_flags(
                 SetTrustLineFlagsResultCode::Malformed,
             ));
         }
-        Asset::CreditAlphanum4(a) => &a.issuer,
-        Asset::CreditAlphanum12(a) => &a.issuer,
+        Asset::CreditAlphanum4(a) => {
+            if !henyey_common::asset::is_asset_code4_valid(&a.asset_code) {
+                return Ok(make_set_flags_result(
+                    SetTrustLineFlagsResultCode::Malformed,
+                ));
+            }
+            &a.issuer
+        }
+        Asset::CreditAlphanum12(a) => {
+            if !henyey_common::asset::is_asset_code12_valid(&a.asset_code) {
+                return Ok(make_set_flags_result(
+                    SetTrustLineFlagsResultCode::Malformed,
+                ));
+            }
+            &a.issuer
+        }
     };
 
     if issuer != source {
@@ -3176,5 +3204,109 @@ mod tests {
             "Expected OpTooManySponsoring, got {:?}",
             result
         );
+    }
+
+    /// Test AUDIT-071: AllowTrust with invalid asset code returns Malformed.
+    #[test]
+    fn test_audit_071_allow_trust_invalid_asset_code_returns_malformed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(1);
+        let trustor_id = create_test_account_id(2);
+
+        state.create_account(AccountEntry {
+            account_id: issuer_id.clone(),
+            balance: 100_000_000,
+            seq_num: SequenceNumber(0),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: AccountFlags::RevocableFlag as u32,
+            home_domain: stellar_xdr::curr::String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: Vec::new().try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        });
+
+        // Asset code with embedded null byte: [b'U', 0, b'S', b'D']
+        let invalid_code = AssetCode4([b'U', 0, b'S', b'D']);
+        let op = AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: stellar_xdr::curr::AssetCode::CreditAlphanum4(invalid_code),
+            authorize: 1,
+        };
+
+        let tx_id = TxIdentity {
+            source_id: &issuer_id,
+            seq: 1,
+            op_index: 0,
+        };
+
+        let result = execute_allow_trust(&op, &issuer_id, &tx_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
+                assert!(
+                    matches!(r, AllowTrustResult::Malformed),
+                    "Expected Malformed for invalid asset code, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Expected AllowTrust result, got {:?}", other),
+        }
+    }
+
+    /// Test AUDIT-071: SetTrustLineFlags with invalid asset code returns Malformed.
+    #[test]
+    fn test_audit_071_set_trust_line_flags_invalid_asset_returns_malformed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(1);
+        let trustor_id = create_test_account_id(2);
+
+        state.create_account(AccountEntry {
+            account_id: issuer_id.clone(),
+            balance: 100_000_000,
+            seq_num: SequenceNumber(0),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: AccountFlags::RevocableFlag as u32,
+            home_domain: stellar_xdr::curr::String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: Vec::new().try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        });
+
+        // Invalid asset with embedded null in code
+        let invalid_asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', 0, b'S', b'D']),
+            issuer: issuer_id.clone(),
+        });
+
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset: invalid_asset,
+            clear_flags: 0,
+            set_flags: 1, // AUTHORIZED_FLAG
+        };
+
+        let tx_id = TxIdentity {
+            source_id: &issuer_id,
+            seq: 1,
+            op_index: 0,
+        };
+
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &tx_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Malformed),
+                    "Expected Malformed for invalid asset, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Expected SetTrustLineFlags result, got {:?}", other),
+        }
     }
 }
