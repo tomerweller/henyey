@@ -51,6 +51,12 @@ pub trait PublishQueueQueries {
     /// Returns the History Archive State JSON that was stored at enqueue
     /// time, or `None` if the checkpoint is not in the queue.
     fn load_publish_has(&self, ledger_seq: u32) -> Result<Option<String>, DbError>;
+
+    /// Loads all HAS JSON values from the publish queue.
+    ///
+    /// Used by bucket cleanup to determine which bucket files are still
+    /// referenced by pending publish queue entries.
+    fn load_all_publish_has(&self) -> Result<Vec<String>, DbError>;
 }
 
 impl PublishQueueQueries for Connection {
@@ -105,6 +111,15 @@ impl PublishQueueQueries for Connection {
         )
         .optional()
         .map_err(DbError::from)
+    }
+
+    fn load_all_publish_has(&self) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.prepare(
+            "SELECT state FROM publishqueue WHERE state != 'pending' ORDER BY ledgerseq ASC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::from)
     }
 }
 

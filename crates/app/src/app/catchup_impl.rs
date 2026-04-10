@@ -209,12 +209,14 @@ impl App {
             let hot_archive_ref = hot_archive_guard.as_ref().unwrap_or(&default_hot_archive);
 
             // Ensure hot archive buckets are persisted to disk for restart recovery.
-            // Hot archive merges during catchup replay are all in-memory (via
-            // from_entries()), so after replay the curr/snap buckets have no
-            // backing file. Without this, a subsequent `run` command will fail to
-            // restore from the persisted HAS because the referenced bucket files
-            // don't exist on disk.
-            self.persist_hot_archive_buckets(hot_archive_ref);
+            // In catchup, this is fatal — we can't write HAS referencing missing files.
+            self.persist_hot_archive_buckets(hot_archive_ref)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to persist hot archive buckets during catchup: {}",
+                        e
+                    )
+                })?;
 
             // Only include hot archive in HAS when protocol >= 23
             let hot_archive_for_has = if final_header.ledger_version >= 23 {
@@ -238,6 +240,12 @@ impl App {
                 .map_err(|e| {
                     anyhow::anyhow!("Failed to serialize header XDR after catchup: {}", e)
                 })?;
+
+            // Flush pending bucket persistence before writing HAS/LCL
+            self.ledger_manager
+                .bucket_list_mut()
+                .flush_pending_persist()
+                .map_err(|e| anyhow::anyhow!("Failed to flush pending bucket persist: {}", e))?;
 
             self.db.transaction(|conn| {
                 conn.store_ledger_header(&final_header, &header_xdr)?;
@@ -302,10 +310,45 @@ impl App {
         {
             let lm = self.ledger_manager.clone();
             let bm = self.bucket_manager.clone();
+            let db = self.db.clone();
+            let sm = self.bucket_snapshot_manager.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 lm.resolve_pending_bucket_merges();
 
-                let hashes = lm.all_referenced_bucket_hashes();
+                let mut hashes = lm.all_referenced_bucket_hashes();
+
+                // Add snapshot manager references
+                hashes.extend(sm.all_referenced_hashes());
+
+                // Add DB HAS and publish queue references
+                if let Ok(extra) = db.with_connection(|conn| {
+                    use henyey_db::queries::publish_queue::PublishQueueQueries;
+                    use henyey_db::queries::StateQueries;
+                    let mut extra_hashes = Vec::new();
+
+                    if let Ok(Some(has_json)) =
+                        conn.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)
+                    {
+                        if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
+                            extra_hashes.extend(has.all_bucket_hashes());
+                        }
+                    }
+
+                    if let Ok(entries) = conn.load_all_publish_has() {
+                        for has_json in entries {
+                            if let Ok(has) =
+                                henyey_history::HistoryArchiveState::from_json(&has_json)
+                            {
+                                extra_hashes.extend(has.all_bucket_hashes());
+                            }
+                        }
+                    }
+
+                    Ok(extra_hashes)
+                }) {
+                    hashes.extend(extra);
+                }
+
                 match bm.retain_buckets(&hashes) {
                     Ok(deleted) => {
                         if deleted > 0 {

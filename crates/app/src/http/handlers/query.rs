@@ -177,7 +177,16 @@ pub(crate) async fn getledgerentryraw_handler(
         },
         None => {
             let seq = live_bl.ledger_seq();
-            let entries = live_bl.load_keys(&keys);
+            let entries = match live_bl.load_keys_result(&keys) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Bucket read error: {}", e)})),
+                    )
+                        .into_response();
+                }
+            };
             (seq, entries)
         }
     };
@@ -510,7 +519,12 @@ fn load_from_live(
             )
         })
     } else {
-        Ok(bl.load_keys(keys))
+        bl.load_keys_result(keys).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Bucket read error: {}", e)})),
+            )
+        })
     }
 }
 

@@ -944,7 +944,10 @@ impl App {
     /// or ledger close the curr/snap/next buckets may have no backing file.
     /// This writes each non-zero bucket that lacks a file to the bucket
     /// directory so that a subsequent restart can restore from the persisted HAS.
-    pub(crate) fn persist_hot_archive_buckets(&self, habl: &HotArchiveBucketList) {
+    pub(crate) fn persist_hot_archive_buckets(
+        &self,
+        habl: &HotArchiveBucketList,
+    ) -> anyhow::Result<()> {
         let bucket_dir = self.bucket_manager.bucket_dir();
         for level in habl.levels() {
             let mut buckets_to_check: Vec<&henyey_bucket::HotArchiveBucket> =
@@ -957,17 +960,18 @@ impl App {
                     let permanent =
                         bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
                     if !permanent.exists() {
-                        if let Err(e) = bucket.save_to_xdr_file(&permanent) {
-                            tracing::warn!(
-                                error = %e,
-                                hash = %bucket.hash().to_hex(),
-                                "Failed to persist in-memory hot archive bucket to disk"
-                            );
-                        }
+                        bucket.save_to_xdr_file(&permanent).map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to persist hot archive bucket {} to disk: {}",
+                                bucket.hash().to_hex(),
+                                e
+                            )
+                        })?;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Set the tracked current ledger sequence.
@@ -1407,10 +1411,45 @@ impl App {
     pub(crate) fn cleanup_stale_bucket_files_background(&self) {
         let lm = self.ledger_manager.clone();
         let bm = self.bucket_manager.clone();
+        let db = self.db.clone();
+        let sm = self.bucket_snapshot_manager.clone();
         tokio::task::spawn_blocking(move || {
             lm.resolve_pending_bucket_merges();
 
-            let hashes = lm.all_referenced_bucket_hashes();
+            let mut hashes = lm.all_referenced_bucket_hashes();
+
+            // Add bucket hashes from the snapshot manager (current + historical
+            // snapshots may reference files not in the live bucket list).
+            hashes.extend(sm.all_referenced_hashes());
+
+            // Add bucket hashes from the DB-stored HAS and publish queue.
+            // Errors are non-fatal — worst case we keep extra files.
+            if let Ok(extra) = db.with_connection(|conn| {
+                use henyey_db::queries::publish_queue::PublishQueueQueries;
+                use henyey_db::queries::StateQueries;
+                let mut extra_hashes = Vec::new();
+
+                // Stored authoritative HAS
+                if let Ok(Some(has_json)) = conn.get_state(state_keys::HISTORY_ARCHIVE_STATE) {
+                    if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
+                        extra_hashes.extend(has.all_bucket_hashes());
+                    }
+                }
+
+                // Publish queue HAS entries
+                if let Ok(entries) = conn.load_all_publish_has() {
+                    for has_json in entries {
+                        if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
+                            extra_hashes.extend(has.all_bucket_hashes());
+                        }
+                    }
+                }
+
+                Ok(extra_hashes)
+            }) {
+                hashes.extend(extra);
+            }
+
             match bm.retain_buckets(&hashes) {
                 Ok(deleted) => {
                     if deleted > 0 {

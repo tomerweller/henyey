@@ -1028,7 +1028,7 @@ pub struct BucketList {
     merge_counters: Arc<MergeCounters>,
     /// Background thread handle for async bucket persistence.
     /// Bounded to one concurrent write; the next add_batch waits for completion.
-    pending_persist: Option<std::thread::JoinHandle<()>>,
+    pending_persist: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
 }
 
 /// Deduplicate ledger entries by key, keeping only the last occurrence.
@@ -1146,6 +1146,23 @@ impl BucketList {
     /// at higher levels can be tens of GB.
     pub fn set_bucket_dir(&mut self, dir: std::path::PathBuf) {
         self.bucket_dir = Some(dir);
+    }
+
+    /// Wait for any pending background persist to complete and propagate errors.
+    /// Call before writing state that references bucket files (HAS, LCL, publish).
+    pub fn flush_pending_persist(&mut self) -> Result<()> {
+        if let Some(handle) = self.pending_persist.take() {
+            let result: std::result::Result<(), String> = handle
+                .join()
+                .expect("background bucket persist thread panicked");
+            result.map_err(|e| {
+                BucketError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("background bucket persist failed: {}", e),
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// Set the merge map for checking cached merge results.
@@ -1925,7 +1942,15 @@ impl BucketList {
         if let Some(ref dir) = self.bucket_dir {
             // Wait for any previous background persist to complete
             if let Some(handle) = self.pending_persist.take() {
-                handle.join().ok();
+                let result: std::result::Result<(), String> = handle
+                    .join()
+                    .expect("background bucket persist thread panicked");
+                result.map_err(|e| {
+                    BucketError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("background bucket persist failed: {}", e),
+                    ))
+                })?;
             }
 
             let mut buckets_to_persist: Vec<(Arc<Bucket>, std::path::PathBuf)> = Vec::new();
@@ -1941,14 +1966,16 @@ impl BucketList {
             }
             if !buckets_to_persist.is_empty() {
                 self.pending_persist = Some(std::thread::spawn(move || {
+                    let mut errors = Vec::new();
                     for (bucket, path) in buckets_to_persist {
                         if let Err(e) = bucket.save_to_xdr_file(&path) {
-                            tracing::warn!(
-                                error = %e,
-                                hash = %bucket.hash().to_hex(),
-                                "Failed to persist in-memory bucket to disk"
-                            );
+                            errors.push(format!("bucket {}: {}", bucket.hash().to_hex(), e));
                         }
+                    }
+                    if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(errors.join("; "))
                     }
                 }));
             }
@@ -3069,7 +3096,13 @@ impl Drop for BucketList {
     fn drop(&mut self) {
         // Wait for any pending background persist to complete
         if let Some(handle) = self.pending_persist.take() {
-            handle.join().ok();
+            let result: std::result::Result<(), String> = match handle.join() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "Background bucket persist failed during drop");
+            }
         }
     }
 }

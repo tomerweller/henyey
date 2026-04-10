@@ -338,6 +338,34 @@ impl HotArchiveBucket {
         }
     }
 
+    /// Like [`iter`](Self::iter) but returns an error if the backing file
+    /// cannot be opened, instead of silently returning an empty iterator.
+    pub fn try_iter(&self) -> crate::Result<HotArchiveIter<'_>> {
+        match &self.storage {
+            HotArchiveStorage::InMemory { entries, .. } => Ok(HotArchiveIter::InMemory {
+                inner: entries.values(),
+            }),
+            HotArchiveStorage::DiskBacked { path, .. } => {
+                let file = std::fs::File::open(path).map_err(|e| {
+                    crate::BucketError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Failed to open hot archive bucket {}: {}",
+                            path.display(),
+                            e
+                        ),
+                    ))
+                })?;
+                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                Ok(HotArchiveIter::DiskBacked {
+                    reader: BufReader::new(file),
+                    file_len,
+                    position: 0,
+                })
+            }
+        }
+    }
+
     /// Compute the hash of the bucket contents.
     ///
     /// This must match stellar-core's bucket hashing:

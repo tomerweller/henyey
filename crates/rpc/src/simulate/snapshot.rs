@@ -51,7 +51,7 @@ impl BucketListSnapshotSource {
     /// archived/expired entries.
     pub(crate) fn get_unfiltered(&self, key: &LedgerKey) -> Option<(LedgerEntry, Option<u32>)> {
         let live_until = get_entry_ttl(&self.snapshot, key);
-        let mut entry = self.snapshot.load(key)?;
+        let mut entry = self.snapshot.load_result(key).ok()??;
         normalize_entry(&mut entry);
         Some((entry, live_until))
     }
@@ -83,8 +83,8 @@ impl SnapshotSource for BucketListSnapshotSource {
         }
 
         // Look up the entry in the bucket list
-        match self.snapshot.load(&ws_key) {
-            Some(mut entry) => {
+        match self.snapshot.load_result(&ws_key) {
+            Ok(Some(mut entry)) => {
                 normalize_entry(&mut entry);
                 // Convert workspace LedgerEntry to P25 LedgerEntry
                 let p25_entry: soroban_host::xdr::LedgerEntry = super::convert::ws_to_p25(&entry)
@@ -96,7 +96,11 @@ impl SnapshotSource for BucketListSnapshotSource {
                 })?;
                 Ok(Some((Rc::new(p25_entry), live_until)))
             }
-            None => Ok(None),
+            Ok(None) => Ok(None),
+            Err(_) => Err(HostError::from(soroban_host::Error::from_type_and_code(
+                soroban_host::xdr::ScErrorType::Storage,
+                soroban_host::xdr::ScErrorCode::InternalError,
+            ))),
         }
     }
 }
@@ -106,7 +110,7 @@ fn get_entry_ttl(snapshot: &SearchableBucketListSnapshot, key: &LedgerKey) -> Op
     let ttl_key = ttl_key_for_ledger_key(key)?;
 
     // Look up the TTL entry
-    let ttl_entry = snapshot.load(&ttl_key)?;
+    let ttl_entry = snapshot.load_result(&ttl_key).ok()??;
     match ttl_entry.data {
         stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) => Some(ttl_data.live_until_ledger_seq),
         _ => None,

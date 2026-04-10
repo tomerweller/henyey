@@ -63,7 +63,10 @@ pub async fn handle(
     // Look up each key individually to preserve key-entry mapping
     let mut result_entries = Vec::new();
     for (key_b64, key) in &ledger_keys {
-        if let Some(entry) = snapshot.load(key) {
+        if let Some(entry) = snapshot
+            .load_result(key)
+            .map_err(|e| JsonRpcError::internal(format!("bucket read error: {e}")))?
+        {
             let mut obj = serde_json::Map::new();
 
             // Key — upstream uses "key" for base64, "keyJson" for JSON
@@ -100,7 +103,10 @@ pub async fn handle(
 
             // For TTL-bearing entries, look up the TTL
             if let Some(ttl_key) = ttl_key_for_entry(&entry) {
-                if let Some(ttl_entry) = snapshot.load(&ttl_key) {
+                if let Some(ttl_entry) = snapshot
+                    .load_result(&ttl_key)
+                    .map_err(|e| JsonRpcError::internal(format!("bucket read error: {e}")))?
+                {
                     if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) = &ttl_entry.data {
                         obj.insert(
                             "liveUntilLedgerSeq".to_string(),

@@ -258,10 +258,10 @@ impl App {
                         encoder.finish()?;
                         tracing::debug!(hash = %hash.to_hex(), "Published hot archive bucket");
                     } else {
-                        tracing::warn!(
-                            hash = %hash.to_hex(),
-                            path = %src.display(),
-                            "Hot archive bucket file not found on disk, skipping"
+                        anyhow::bail!(
+                            "Hot archive bucket file not found on disk: hash={}, path={}",
+                            hash.to_hex(),
+                            src.display()
                         );
                     }
                 }
@@ -326,8 +326,15 @@ impl App {
 
             let mut qsets = Vec::new();
             for hash in qset_hashes_vec {
-                if let Some(qset) = self.db.load_scp_quorum_set(&hash)? {
-                    qsets.push(qset);
+                match self.db.load_scp_quorum_set(&hash)? {
+                    Some(qset) => qsets.push(qset),
+                    None => {
+                        anyhow::bail!(
+                            "Missing quorum set {} referenced by SCP history at ledger {}",
+                            hash,
+                            seq
+                        );
+                    }
                 }
             }
 

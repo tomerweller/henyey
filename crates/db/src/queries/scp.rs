@@ -200,11 +200,17 @@ impl ScpQueries for Connection {
                 qset_hashes.insert(hash);
             }
 
-            // Load referenced quorum sets
+            // Load referenced quorum sets — fail if any are missing
             let mut quorum_sets = Vec::new();
             for hash in &qset_hashes {
-                if let Some(qset) = self.load_scp_quorum_set(hash)? {
-                    quorum_sets.push(qset);
+                match self.load_scp_quorum_set(hash)? {
+                    Some(qset) => quorum_sets.push(qset),
+                    None => {
+                        return Err(DbError::Integrity(format!(
+                            "Missing quorum set {} referenced by SCP history at ledger {}",
+                            hash, ledger_seq
+                        )));
+                    }
                 }
             }
 
@@ -231,13 +237,16 @@ impl ScpQueries for Connection {
     }
 
     fn delete_old_scp_entries(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
-        // Delete old SCP history entries
-        // Note: scphistory may have multiple rows per ledger (one per node)
+        // Delete old SCP history entries by complete ledger boundary.
+        // scphistory may have multiple rows per ledger (one per validator),
+        // so row-limit deletion can split a ledger's data. Instead, select
+        // distinct ledger sequences within the count budget, then delete ALL
+        // rows for those complete ledgers.
         let history_deleted = self.execute(
             r#"
             DELETE FROM scphistory
-            WHERE rowid IN (
-                SELECT rowid FROM scphistory
+            WHERE ledgerseq IN (
+                SELECT DISTINCT ledgerseq FROM scphistory
                 WHERE ledgerseq <= ?1
                 ORDER BY ledgerseq ASC
                 LIMIT ?2
@@ -246,13 +255,14 @@ impl ScpQueries for Connection {
             params![max_ledger, count],
         )?;
 
-        // Delete old quorum sets that are no longer needed
-        // Only delete quorums whose lastledgerseq is below the threshold
+        // Delete old quorum sets by ledger boundary.
+        // Same approach: select distinct lastledgerseq values within budget,
+        // then delete all quorum sets for those complete ledger boundaries.
         let quorums_deleted = self.execute(
             r#"
             DELETE FROM scpquorums
-            WHERE qsethash IN (
-                SELECT qsethash FROM scpquorums
+            WHERE lastledgerseq IN (
+                SELECT DISTINCT lastledgerseq FROM scpquorums
                 WHERE lastledgerseq <= ?1
                 ORDER BY lastledgerseq ASC
                 LIMIT ?2
@@ -686,6 +696,52 @@ mod tests {
             .copy_scp_history_to_stream(200, 10, &mut stream)
             .unwrap();
         assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn test_delete_old_scp_entries_preserves_ledger_boundary() {
+        let conn = setup_db();
+
+        // Store 3 ledgers with 3 envelopes each (simulating 3 validators)
+        for seq in 1..=3u32 {
+            let mut envelopes = Vec::new();
+            for validator in 0..3u8 {
+                let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([validator; 32])));
+                envelopes.push(ScpEnvelope {
+                    statement: stellar_xdr::curr::ScpStatement {
+                        node_id,
+                        slot_index: seq as u64,
+                        pledges: stellar_xdr::curr::ScpStatementPledges::Prepare(
+                            stellar_xdr::curr::ScpStatementPrepare {
+                                quorum_set_hash: Hash([0u8; 32]),
+                                ballot: stellar_xdr::curr::ScpBallot {
+                                    counter: 1,
+                                    value: vec![].try_into().unwrap(),
+                                },
+                                prepared: None,
+                                prepared_prime: None,
+                                n_c: 0,
+                                n_h: 0,
+                            },
+                        ),
+                    },
+                    signature: stellar_xdr::curr::Signature::default(),
+                });
+            }
+            conn.store_scp_history(seq, &envelopes).unwrap();
+        }
+
+        // 3 ledgers × 3 validators = 9 rows total.
+        // Delete with count=1 (1 distinct ledger). Should delete ALL 3 rows
+        // for ledger 1, not just 1 row.
+        let deleted = conn.delete_old_scp_entries(3, 1).unwrap();
+        assert_eq!(deleted, 3, "should delete all 3 rows for ledger 1");
+
+        // Ledger 1 should be completely gone
+        assert!(conn.load_scp_history(1).unwrap().is_empty());
+        // Ledgers 2 and 3 should still have all 3 envelopes
+        assert_eq!(conn.load_scp_history(2).unwrap().len(), 3);
+        assert_eq!(conn.load_scp_history(3).unwrap().len(), 3);
     }
 
     #[test]

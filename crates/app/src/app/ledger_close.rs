@@ -64,7 +64,7 @@ impl App {
             if let Some(qset) = self.herder.get_quorum_set_by_hash(&hash256) {
                 scp_quorum_sets.push((hash256, qset));
             } else {
-                tracing::debug!(hash = %hash256.to_hex(), "Missing quorum set for SCP history");
+                tracing::warn!(hash = %hash256.to_hex(), "Missing quorum set for SCP history — export will fail for this checkpoint");
             }
         }
 
@@ -117,7 +117,7 @@ impl App {
         // Build HAS from current bucket list state for restart recovery.
         // This captures pending merge outputs so a restarted node can
         // reconstruct the bucket list without re-downloading from archives.
-        let has_json = {
+        let (has_json, hot_archive_persisted) = {
             let bucket_list = self.ledger_manager.bucket_list();
             let hot_archive_guard = self.ledger_manager.hot_archive_bucket_list();
             let hot_archive_ref = hot_archive_guard.as_ref();
@@ -125,9 +125,21 @@ impl App {
             // Ensure hot archive buckets are persisted to disk for restart recovery.
             // Hot archive merges are all in-memory, so after each close the curr/snap
             // buckets may have no backing file.
-            if let Some(habl) = hot_archive_ref {
-                self.persist_hot_archive_buckets(habl);
-            }
+            // If persist fails, we skip publish for this checkpoint but don't abort.
+            let hot_archive_persisted = if let Some(habl) = hot_archive_ref {
+                if let Err(e) = self.persist_hot_archive_buckets(habl) {
+                    tracing::error!(
+                        error = %e,
+                        ledger_seq = header.ledger_seq,
+                        "Hot archive bucket persist failed — skipping publish for this checkpoint"
+                    );
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
 
             // Only include hot archive in HAS when protocol >= 23, matching
             // stellar-core. At earlier protocols the header's bucket_list_hash
@@ -176,9 +188,18 @@ impl App {
                 }
             }
 
-            has.to_json()
-                .map_err(|e| anyhow::anyhow!("Failed to serialize HAS: {}", e))?
+            let json = has
+                .to_json()
+                .map_err(|e| anyhow::anyhow!("Failed to serialize HAS: {}", e))?;
+            (json, hot_archive_persisted)
         };
+
+        // Flush any pending background bucket persistence BEFORE writing state
+        // that references those bucket files (HAS, LCL, publish queue).
+        self.ledger_manager
+            .bucket_list_mut()
+            .flush_pending_persist()
+            .map_err(|e| anyhow::anyhow!("Failed to flush pending bucket persist: {}", e))?;
 
         self.db.transaction(|conn| {
             conn.store_ledger_header(header, &header_xdr)?;
@@ -187,7 +208,7 @@ impl App {
             if is_checkpoint_ledger(header.ledger_seq) {
                 let levels = self.ledger_manager.bucket_list_levels();
                 conn.store_bucket_list(header.ledger_seq, &levels)?;
-                if self.is_validator {
+                if self.is_validator && hot_archive_persisted {
                     conn.enqueue_publish(header.ledger_seq, &has_json)?;
                 }
             }
