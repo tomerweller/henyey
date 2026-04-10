@@ -30,6 +30,13 @@ pub(crate) fn execute_create_account(
         return Ok(make_result(CreateAccountResultCode::Malformed));
     }
 
+    // Reject destination == source. Matches stellar-core's doCheckValid
+    // (CreateAccountOpFrame.cpp:187). Defense-in-depth: validation layer
+    // also catches this, but the execute path must agree on the result code.
+    if &op.destination == source {
+        return Ok(make_result(CreateAccountResultCode::Malformed));
+    }
+
     // Check destination doesn't already exist (matches upstream doApply)
     if state.get_account(&op.destination).is_some() {
         return Ok(make_result(CreateAccountResultCode::AlreadyExist));
@@ -512,9 +519,9 @@ mod tests {
         }
     }
 
-    /// Test CreateAccount where destination is the source account returns AlreadyExist.
+    /// Test CreateAccount where destination == source returns Malformed.
     ///
-    /// When trying to create an account that already exists (including self), returns AlreadyExist.
+    /// Matches stellar-core's `doCheckValid` (CreateAccountOpFrame.cpp:187).
     #[test]
     fn test_create_account_self_destination() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
@@ -525,7 +532,7 @@ mod tests {
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
 
         let op = CreateAccountOp {
-            destination: source_id.clone(), // Same as source - already exists
+            destination: source_id.clone(), // Same as source
             starting_balance: 10_000_000,
         };
 
@@ -533,10 +540,9 @@ mod tests {
 
         match result {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
-                // Source account already exists, so creating it again returns AlreadyExist
                 assert!(
-                    matches!(r, CreateAccountResult::AlreadyExist),
-                    "Expected AlreadyExist when dest==source, got {:?}",
+                    matches!(r, CreateAccountResult::Malformed),
+                    "Expected Malformed when dest==source, got {:?}",
                     r
                 );
             }
