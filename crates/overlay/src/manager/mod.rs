@@ -384,8 +384,6 @@ pub struct OverlayManager {
     pub(super) advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
     /// Inbound peers to advertise in Peers messages.
     pub(super) advertised_inbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
-    /// Handle to periodic peer advertiser task.
-    pub(super) peer_advertiser_handle: Option<JoinHandle<()>>,
     /// Total authenticated peers added.
     pub(super) added_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
     /// Total authenticated peers dropped.
@@ -490,7 +488,6 @@ impl OverlayManager {
             known_peers: Arc::new(RwLock::new(config.known_peers.clone())),
             advertised_outbound_peers: Arc::new(RwLock::new(config.known_peers.clone())),
             advertised_inbound_peers: Arc::new(RwLock::new(Vec::new())),
-            peer_advertiser_handle: None,
             added_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dropped_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
@@ -556,7 +553,6 @@ impl OverlayManager {
         // preferred-peer eviction, random-peer drops, and slot filling.
         // Matches stellar-core OverlayManagerImpl::tick().
         self.start_tick_loop();
-        self.start_peer_advertiser();
 
         Ok(())
     }
@@ -1131,9 +1127,6 @@ impl OverlayManager {
             let _ = handle.await;
         }
         if let Some(handle) = self.connector_handle.take() {
-            let _ = handle.await;
-        }
-        if let Some(handle) = self.peer_advertiser_handle.take() {
             let _ = handle.await;
         }
 

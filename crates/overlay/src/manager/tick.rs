@@ -4,12 +4,8 @@
 //! peer connection, outbound slot filling, random peer dropping, and peer
 //! advertisement.
 
-use super::{OutboundMessage, OverlayManager, PeerHandle, SharedPeerState, TickConnectCtx};
-use crate::{
-    connection::{ConnectionDirection, ConnectionPool},
-    peer::PeerInfo,
-    PeerAddress, PeerId,
-};
+use super::{OverlayManager, PeerHandle, SharedPeerState, TickConnectCtx};
+use crate::{connection::ConnectionPool, peer::PeerInfo, PeerAddress, PeerId};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
@@ -49,11 +45,6 @@ const OUTBOUND_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// Brief delay after evicting a peer for a preferred peer, to let the
 /// connection pool settle before checking available slots.
 const EVICTION_SETTLE_DELAY_MS: u64 = 100;
-
-/// Interval between peer advertisement broadcasts (30 seconds).
-///
-/// Controls how often this node sends its peer list to connected peers.
-const PEER_ADVERTISER_INTERVAL_SECS: u64 = 30;
 
 /// Result of a background DNS resolution of configured peers.
 struct ResolvedPeers {
@@ -624,59 +615,6 @@ impl OverlayManager {
                 }
             }
         }
-    }
-
-    pub(super) fn start_peer_advertiser(&mut self) {
-        let peers = Arc::clone(&self.peers);
-        let peer_info_cache = Arc::clone(&self.peer_info_cache);
-        let advertised_outbound_peers = Arc::clone(&self.advertised_outbound_peers);
-        let advertised_inbound_peers = Arc::clone(&self.advertised_inbound_peers);
-        let running = Arc::clone(&self.running);
-        let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
-
-        let handle = tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(PEER_ADVERTISER_INTERVAL_SECS));
-
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.recv() => {
-                        debug!("Peer advertiser shutting down");
-                        break;
-                    }
-                    _ = interval.tick() => {}
-                }
-
-                if !running.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let outbound_snapshot = advertised_outbound_peers.read().clone();
-                let inbound_snapshot = advertised_inbound_peers.read().clone();
-                let message = match OverlayManager::build_peers_message(
-                    &outbound_snapshot,
-                    &inbound_snapshot,
-                    None,
-                ) {
-                    Some(message) => message,
-                    None => continue,
-                };
-
-                // Only send PEERS to inbound peers (peers that connected to us).
-                // stellar-core drops connections from initiators that send PEERS (Peer.cpp:1225-1230).
-                for entry in peer_info_cache.iter() {
-                    if entry.value().direction == ConnectionDirection::Inbound {
-                        if let Some(peer_handle) = peers.get(entry.key()) {
-                            let _ = peer_handle
-                                .outbound_tx
-                                .try_send(OutboundMessage::Send(message.clone()));
-                        }
-                    }
-                }
-            }
-        });
-
-        self.peer_advertiser_handle = Some(handle);
     }
 }
 
