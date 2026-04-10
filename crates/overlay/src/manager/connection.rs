@@ -131,16 +131,7 @@ impl OverlayManager {
         if shared.peers.contains_key(&peer_id) {
             debug!("Rejected duplicate inbound peer {}", peer_id);
             peer.close().await;
-            pool.release_pending();
-            return;
-        }
-        // Prevent concurrent handshakes for the same peer ID.
-        if !shared.pending_connections.try_reserve_peer_id(&peer_id) {
-            debug!(
-                "Rejected inbound peer {} — handshake already in flight",
-                peer_id
-            );
-            peer.close().await;
+            shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
             return;
         }
@@ -316,7 +307,8 @@ impl OverlayManager {
 
                                 let peer_handle = tokio::spawn(async move {
                                     let remote_addr = connection.remote_addr();
-                                    match Peer::accept(connection, local_node, auth_timeout, Arc::clone(&shared.banned_peers)).await {
+                                    let pending_peer_ids = Arc::clone(&shared.pending_connections.by_peer_id);
+                                    match Peer::accept(connection, local_node, auth_timeout, Arc::clone(&shared.banned_peers), pending_peer_ids).await {
                                         Ok(peer) => {
                                             Self::handle_accepted_inbound_peer(peer, shared, pool).await;
                                         }

@@ -75,6 +75,10 @@ pub enum OverlayError {
     #[error("peer is banned: {0}")]
     PeerBanned(String),
 
+    /// Another handshake for the same peer ID is already in flight.
+    #[error("duplicate pending peer: {0}")]
+    PeerDuplicate(String),
+
     /// Already have an active connection to this peer.
     #[error("already connected to peer")]
     AlreadyConnected,

@@ -28,6 +28,7 @@ use crate::{
     flow_control::{msg_body_size, FlowControlConfig},
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
 };
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -243,7 +244,7 @@ impl Peer {
         };
 
         // Perform handshake
-        peer.handshake(timeout_secs, None).await?;
+        peer.handshake(timeout_secs, None, None).await?;
 
         Ok(peer)
     }
@@ -274,7 +275,7 @@ impl Peer {
             stats: Arc::new(PeerStats::default()),
         };
 
-        peer.handshake(timeout_secs, None).await?;
+        peer.handshake(timeout_secs, None, None).await?;
         Ok(peer)
     }
 
@@ -284,6 +285,7 @@ impl Peer {
         local_node: LocalNode,
         timeout_secs: u64,
         banned_peers: Arc<RwLock<HashSet<PeerId>>>,
+        pending_peer_ids: Arc<DashMap<PeerId, Instant>>,
     ) -> Result<Self> {
         debug!("Accepting peer from: {}", connection.remote_addr());
 
@@ -307,8 +309,9 @@ impl Peer {
             stats: Arc::new(PeerStats::default()),
         };
 
-        // Perform handshake (with ban check after HELLO for inbound)
-        peer.handshake(timeout_secs, Some(banned_peers)).await?;
+        // Perform handshake (with ban + pending-dedup checks after HELLO for inbound)
+        peer.handshake(timeout_secs, Some(banned_peers), Some(pending_peer_ids))
+            .await?;
 
         Ok(peer)
     }
@@ -327,6 +330,7 @@ impl Peer {
         &mut self,
         timeout_secs: u64,
         banned_peers: Option<Arc<RwLock<HashSet<PeerId>>>>,
+        pending_peer_ids: Option<Arc<DashMap<PeerId, Instant>>>,
     ) -> Result<()> {
         self.state = PeerState::Handshaking;
         let handshake_start = std::time::Instant::now();
@@ -355,9 +359,42 @@ impl Peer {
                 }
             }
 
-            self.send_hello().await?;
-            self.recv_auth(timeout_secs).await?;
-            self.send_auth_msg().await?;
+            // Reserve a pending peer-ID slot immediately after HELLO reveals
+            // the remote identity. Mirrors stellar-core Peer::recvHello()
+            // which rejects duplicates against getPendingPeers() before AUTH.
+            // Without this, N concurrent connections from the same peer_id
+            // can all occupy pending slots until AUTH completes.
+            if let Some(ref pending) = pending_peer_ids {
+                use dashmap::mapref::entry::Entry;
+                match pending.entry(self.info.peer_id.clone()) {
+                    Entry::Occupied(_) => {
+                        warn!(
+                            "Rejected duplicate inbound peer {} — handshake already in flight",
+                            self.info.peer_id
+                        );
+                        return Err(OverlayError::PeerDuplicate(self.info.peer_id.to_string()));
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(Instant::now());
+                    }
+                }
+            }
+
+            // Remaining handshake steps after peer_id reservation.
+            // If any step fails, clean up the pending peer_id reservation.
+            let result: Result<()> = async {
+                self.send_hello().await?;
+                self.recv_auth(timeout_secs).await?;
+                self.send_auth_msg().await?;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                if let Some(ref pending) = pending_peer_ids {
+                    pending.remove(&self.info.peer_id);
+                }
+                return Err(e);
+            }
         }
 
         self.state = PeerState::Authenticated;
