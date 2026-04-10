@@ -1354,23 +1354,12 @@ impl TransactionQueue {
             Err(result) => return result,
         };
 
-        for evicted in &pending_eviction_list {
-            by_hash.remove(&evicted.hash);
-        }
-        // Clean up seen set and account state for evicted transactions.
-        // Matches stellar-core prepareDropTransaction → mKnownTxHashes.erase()
-        // + dropTransaction() → releaseFeeMaybeEraseAccountState().
-        if !pending_eviction_list.is_empty() {
-            let mut seen = self.seen.write();
-            let mut account_states = self.account_states.write();
-            for evicted in &pending_eviction_list {
-                seen.remove(&evicted.hash);
-                Self::drop_transaction(&mut account_states, evicted);
-            }
-        }
-
-        // Check queue size
-        if by_hash.len() >= self.config.max_size {
+        // Check queue size (accounting for pending evictions that haven't been
+        // committed yet). We defer actual eviction removal until after all
+        // validation passes — parity with stellar-core's tryAdd which only
+        // calls evictTransactions after canAdd succeeds.
+        let effective_len = by_hash.len() - pending_eviction_list.len();
+        if effective_len >= self.config.max_size {
             // Try to evict expired transactions
             let expired: Vec<QueuedTransaction> = by_hash
                 .iter()
@@ -1388,7 +1377,7 @@ impl TransactionQueue {
                 }
             }
 
-            if by_hash.len() >= self.config.max_size {
+            if by_hash.len().saturating_sub(pending_eviction_list.len()) >= self.config.max_size {
                 if let Some((evict_hash, evict_tx)) = by_hash
                     .iter()
                     .min_by(|a, b| {
@@ -1469,6 +1458,21 @@ impl TransactionQueue {
                     // Account doesn't exist
                     return TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxNoAccount));
                 }
+            }
+        }
+
+        // Commit pending evictions now that all validation has passed.
+        // This is deferred from check_and_collect_evictions to match stellar-core's
+        // tryAdd which only calls evictTransactions after canAdd succeeds.
+        for evicted in &pending_eviction_list {
+            by_hash.remove(&evicted.hash);
+        }
+        if !pending_eviction_list.is_empty() {
+            let mut seen = self.seen.write();
+            let mut account_states = self.account_states.write();
+            for evicted in &pending_eviction_list {
+                seen.remove(&evicted.hash);
+                Self::drop_transaction(&mut account_states, evicted);
             }
         }
 
@@ -4208,6 +4212,57 @@ mod tests {
         assert_eq!(result, TxQueueResult::Added);
         // The old tx_a should be replaced, queue still has 2 entries
         assert_eq!(queue.len(), 2);
+    }
+
+    /// AUDIT-089: Evicted transactions must not be removed from the queue if
+    /// a later validation step (fee-balance check) rejects the candidate.
+    /// Prior to this fix, evicted txs were removed before fee validation,
+    /// leaving the queue corrupted on rejection.
+    #[test]
+    fn test_audit_089_eviction_rollback_on_fee_rejection() {
+        struct ZeroBalanceProvider;
+        impl FeeBalanceProvider for ZeroBalanceProvider {
+            fn get_available_balance(&self, _account_id: &AccountId) -> Option<i64> {
+                Some(0) // zero balance → candidate will be rejected
+            }
+        }
+
+        let config = TxQueueConfig {
+            max_queue_ops: Some(1),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+        queue.set_skip_fee_balance_check(false);
+
+        // Add a low-fee victim (1 op)
+        let mut victim = make_test_envelope(100, 1);
+        set_source(&mut victim, 200);
+        let victim_hash = full_hash(&victim);
+        assert_eq!(queue.try_add(victim), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1);
+
+        // Set provider with zero balance so the candidate will be rejected
+        queue.set_fee_balance_provider(Arc::new(ZeroBalanceProvider));
+
+        // Submit a higher-fee candidate that would evict the victim
+        let mut candidate = make_test_envelope(1000, 1);
+        set_source(&mut candidate, 201);
+        let result = queue.try_add(candidate);
+
+        // Candidate must be rejected
+        assert_eq!(
+            result,
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxInsufficientBalance))
+        );
+
+        // Victim must still be in the queue (not evicted)
+        assert!(
+            queue.contains(&victim_hash),
+            "evicted victim must be restored after fee-balance rejection"
+        );
+        assert_eq!(queue.len(), 1);
     }
 
     /// pending_envelopes returns all queued transaction envelopes.
