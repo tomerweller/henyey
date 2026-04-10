@@ -1302,16 +1302,19 @@ impl LedgerStateManager {
     /// This method finds the most recent update to the account and adds the refund.
     /// Uses stellar-core `addBalance` semantics: skips the refund on overflow
     /// or buying-liabilities violation (TransactionUtils.cpp:561-592).
-    pub fn apply_refund_to_delta(&mut self, account_id: &AccountId, refund: i64) {
+    pub fn apply_refund_to_delta(&mut self, account_id: &AccountId, refund: i64) -> bool {
         use henyey_common::asset::try_add_account_balance;
 
-        // Find the most recent update to this account in the delta and add the refund
-        self.delta.apply_refund_to_account(account_id, refund);
+        // Apply refund to the delta's account entry.
+        let applied = self.delta.apply_refund_to_account(account_id, refund);
+        if !applied {
+            return false;
+        }
         // Also update the in-memory account state (without recording a new delta)
         if let Some(acc) = self.accounts.get_mut(account_id) {
-            // Silently skip if overflow or buying liabilities violated
             let _ = try_add_account_balance(acc, refund);
         }
+        true
     }
 
     // ==================== Savepoint Support ====================

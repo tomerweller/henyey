@@ -303,20 +303,30 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
                 let frame = TransactionFrame::with_network(Arc::clone(tx), executor.network_id);
                 let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
 
-                // Apply refund to the account balance in the delta
-                executor.state.apply_refund_to_delta(&fee_source_id, refund);
+                // Apply refund to the account balance in the delta.
+                // Only adjust fee pool if the refund was actually credited.
+                // Matches stellar-core refundSorobanFee (TransactionFrame.cpp:1046-1084):
+                // returns 0 if account merged or addBalance fails.
+                if executor.state.apply_refund_to_delta(&fee_source_id, refund) {
+                    executor.state.delta_mut().add_fee(-refund);
+                    total_refunds += refund;
 
-                // Subtract refund from fee pool
-                executor.state.delta_mut().add_fee(-refund);
-                total_refunds += refund;
-
-                tracing::debug!(
-                    ledger_seq = ledger_seq,
-                    tx_index = idx,
-                    refund = refund,
-                    fee_source = %account_id_to_strkey(&fee_source_id),
-                    "Applied P23+ Soroban fee refund"
-                );
+                    tracing::debug!(
+                        ledger_seq = ledger_seq,
+                        tx_index = idx,
+                        refund = refund,
+                        fee_source = %account_id_to_strkey(&fee_source_id),
+                        "Applied P23+ Soroban fee refund"
+                    );
+                } else {
+                    tracing::debug!(
+                        ledger_seq = ledger_seq,
+                        tx_index = idx,
+                        refund = refund,
+                        fee_source = %account_id_to_strkey(&fee_source_id),
+                        "Skipped Soroban fee refund (account merged or balance overflow)"
+                    );
+                }
             }
         }
         if total_refunds > 0 {
@@ -700,13 +710,15 @@ pub fn execute_soroban_parallel_phase(
     // Apply Soroban fee refunds: stellar-core processPostTxSetApply() calls
     // processRefund() which applies refund to both the account balance
     // (via LedgerTxn) and the fee pool (feePool -= refund).
+    // Only adjust fee pool if the refund was actually credited.
     let mut total_refunds = 0i64;
     for (idx, result) in all_results.iter().enumerate() {
         let refund = result.fee_refund;
         if refund > 0 && idx < flat_txs.len() {
             let source = fee_source_account_id(flat_txs[idx]);
-            delta.apply_refund_to_account(&source, refund)?;
-            total_refunds += refund;
+            if delta.apply_refund_to_account(&source, refund)? {
+                total_refunds += refund;
+            }
         }
     }
     if total_refunds > 0 {

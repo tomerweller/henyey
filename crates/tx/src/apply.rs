@@ -321,7 +321,7 @@ impl LedgerDelta {
     /// If no update exists for this account, the refund is not applied.
     /// Uses stellar-core `addBalance` semantics: skips the refund on overflow
     /// or buying-liabilities violation (TransactionUtils.cpp:561-592).
-    pub fn apply_refund_to_account(&mut self, account_id: &AccountId, refund: i64) {
+    pub fn apply_refund_to_account(&mut self, account_id: &AccountId, refund: i64) -> bool {
         use henyey_common::asset::try_add_account_balance;
         use stellar_xdr::curr::LedgerEntryData;
 
@@ -329,9 +329,7 @@ impl LedgerDelta {
         for entry in self.updated.iter_mut().rev() {
             if let LedgerEntryData::Account(acc) = &mut entry.data {
                 if &acc.account_id == account_id {
-                    // Silently skip if overflow or buying liabilities violated
-                    let _ = try_add_account_balance(acc, refund);
-                    return;
+                    return try_add_account_balance(acc, refund);
                 }
             }
         }
@@ -342,11 +340,14 @@ impl LedgerDelta {
         for entry in self.created.iter_mut().rev() {
             if let LedgerEntryData::Account(acc) = &mut entry.data {
                 if &acc.account_id == account_id {
-                    let _ = try_add_account_balance(acc, refund);
-                    return;
+                    return try_add_account_balance(acc, refund);
                 }
             }
         }
+
+        // Account not found — skip refund (matches stellar-core returning 0
+        // when loadAccount fails after account merge).
+        false
     }
 
     /// Capture the current vector lengths for savepoint support.

@@ -481,7 +481,7 @@ impl LedgerDelta {
     /// Modifies the account's balance in-place within the existing change entry.
     /// Uses stellar-core `addBalance` semantics: skips the refund on overflow
     /// or buying-liabilities violation (TransactionUtils.cpp:561-592).
-    pub fn apply_refund_to_account(&mut self, account_id: &AccountId, refund: i64) -> Result<()> {
+    pub fn apply_refund_to_account(&mut self, account_id: &AccountId, refund: i64) -> Result<bool> {
         use henyey_common::asset::try_add_account_balance;
 
         let key = LedgerKey::Account(LedgerKeyAccount {
@@ -492,22 +492,31 @@ impl LedgerDelta {
             match change {
                 EntryChange::Created(ref mut entry) => {
                     if let LedgerEntryData::Account(ref mut acc) = entry.data {
-                        // Silently skip if overflow or buying liabilities violated
-                        let _ = try_add_account_balance(acc, refund);
+                        if !try_add_account_balance(acc, refund) {
+                            return Ok(false);
+                        }
+                        return Ok(true);
                     }
                 }
                 EntryChange::Updated {
                     ref mut current, ..
                 } => {
                     if let LedgerEntryData::Account(ref mut acc) = current.data {
-                        // Silently skip if overflow or buying liabilities violated
-                        let _ = try_add_account_balance(acc, refund);
+                        if !try_add_account_balance(acc, refund) {
+                            return Ok(false);
+                        }
+                        return Ok(true);
                     }
                 }
-                EntryChange::Deleted { .. } => {}
+                EntryChange::Deleted { .. } => {
+                    // Account was merged — skip refund (matches stellar-core).
+                    return Ok(false);
+                }
             }
         }
-        Ok(())
+        // Account not found in delta — skip refund (matches stellar-core
+        // returning 0 when loadAccount fails).
+        Ok(false)
     }
 
     /// Get the fee pool delta.
@@ -1860,5 +1869,77 @@ mod tests {
             vec![10, 5, 20, 1, 15, 8, 25, 3],
             "drain_categorization_for_bucket_update must preserve insertion order"
         );
+    }
+
+    /// Regression test for AUDIT-067: apply_refund_to_account returns false
+    /// when the account is deleted (merged), and the caller must not adjust
+    /// the fee pool in that case.
+    #[test]
+    fn test_audit_067_refund_skipped_for_deleted_account() {
+        let mut delta = LedgerDelta::new(1);
+        let original = create_test_account(1);
+
+        let account_id = if let LedgerEntryData::Account(ref acc) = original.data {
+            acc.account_id.clone()
+        } else {
+            panic!("expected account");
+        };
+
+        // Record the account as deleted (merged).
+        delta.record_delete(original.clone()).unwrap();
+
+        // Refund should fail — account no longer exists.
+        let applied = delta
+            .apply_refund_to_account(&account_id, 50_000_000)
+            .unwrap();
+        assert!(!applied, "refund must fail for deleted (merged) account");
+    }
+
+    /// Regression test for AUDIT-067: apply_refund_to_account returns false
+    /// when adding the refund would overflow the balance.
+    #[test]
+    fn test_audit_067_refund_skipped_on_balance_overflow() {
+        let mut delta = LedgerDelta::new(1);
+        let original = create_test_account(1);
+        // Set balance near i64::MAX so refund overflows.
+        let mut high_balance = create_test_account(1);
+        if let LedgerEntryData::Account(ref mut acc) = high_balance.data {
+            acc.balance = i64::MAX - 10;
+        }
+        delta
+            .record_update(original.clone(), high_balance.clone())
+            .unwrap();
+
+        let account_id = if let LedgerEntryData::Account(ref acc) = original.data {
+            acc.account_id.clone()
+        } else {
+            panic!("expected account");
+        };
+
+        // Refund of 100 would overflow i64::MAX - 10 + 100.
+        let applied = delta.apply_refund_to_account(&account_id, 100).unwrap();
+        assert!(!applied, "refund must fail when balance would overflow");
+
+        // Verify balance unchanged.
+        let changes: Vec<_> = delta.changes().collect();
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(
+                acc.balance,
+                i64::MAX - 10,
+                "balance must not change on failed refund"
+            );
+        }
+    }
+
+    /// Regression test for AUDIT-067: apply_refund_to_account returns false
+    /// when the account is not in the delta at all.
+    #[test]
+    fn test_audit_067_refund_skipped_for_missing_account() {
+        let mut delta = LedgerDelta::new(1);
+        let nonexistent_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([99u8; 32])));
+        let applied = delta
+            .apply_refund_to_account(&nonexistent_id, 1000)
+            .unwrap();
+        assert!(!applied, "refund must fail for account not in delta");
     }
 }
