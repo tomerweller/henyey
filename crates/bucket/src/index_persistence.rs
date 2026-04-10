@@ -31,6 +31,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use henyey_common::Hash256;
 use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{LedgerEntryType, LedgerKey, Limits, PoolId, ReadXdr, WriteXdr};
 use xorf::BinaryFuse16;
@@ -113,7 +114,7 @@ impl SerializableAssetPoolIdMap {
             .iter()
             .map(|(asset_hash, pool_ids)| {
                 let pool_bytes: Vec<[u8; 32]> = pool_ids.iter().map(|pid| pid.0 .0).collect();
-                (*asset_hash, pool_bytes)
+                (asset_hash.0, pool_bytes)
             })
             .collect();
         Self { entries }
@@ -129,7 +130,7 @@ impl SerializableAssetPoolIdMap {
                     .iter()
                     .map(|bytes| PoolId(Hash(*bytes)))
                     .collect();
-                (*asset_hash, pool_ids)
+                (Hash256(*asset_hash), pool_ids)
             })
             .collect();
         AssetPoolIdMap::from_raw(asset_to_pools)

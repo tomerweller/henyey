@@ -20,7 +20,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
     Asset, ContractDataDurability, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerKey,
     Limits, PoolId, TrustLineAsset, WriteXdr,
@@ -28,7 +27,7 @@ use stellar_xdr::curr::{
 
 use crate::entry::{ledger_entry_data_type, ledger_key_type};
 
-use henyey_common::BucketListDbConfig;
+use henyey_common::{BucketListDbConfig, Hash256};
 
 use crate::bloom_filter::{BucketBloomFilter, HashSeed};
 use crate::entry::{compare_keys, BucketEntry, BucketEntryExt};
@@ -205,7 +204,7 @@ impl BucketEntryCounters {
 #[derive(Debug, Clone, Default)]
 pub struct AssetPoolIdMap {
     /// Maps asset hash to set of pool IDs containing that asset.
-    asset_to_pools: HashMap<[u8; 32], HashSet<PoolId>>,
+    asset_to_pools: HashMap<Hash256, HashSet<PoolId>>,
 }
 
 impl AssetPoolIdMap {
@@ -251,26 +250,21 @@ impl AssetPoolIdMap {
     /// Returns a reference to the raw mapping.
     ///
     /// Used for serialization/persistence.
-    pub fn raw_map(&self) -> &HashMap<[u8; 32], HashSet<PoolId>> {
+    pub fn raw_map(&self) -> &HashMap<Hash256, HashSet<PoolId>> {
         &self.asset_to_pools
     }
 
     /// Constructs an `AssetPoolIdMap` from a raw mapping.
     ///
     /// Used when restoring from persisted data.
-    pub fn from_raw(asset_to_pools: HashMap<[u8; 32], HashSet<PoolId>>) -> Self {
+    pub fn from_raw(asset_to_pools: HashMap<Hash256, HashSet<PoolId>>) -> Self {
         Self { asset_to_pools }
     }
 
     /// Computes a hash for an asset for use as a map key.
-    fn hash_asset(asset: &Asset) -> [u8; 32] {
+    fn hash_asset(asset: &Asset) -> Hash256 {
         let asset_bytes = asset.to_xdr(Limits::none()).unwrap_or_default();
-        let mut hasher = Sha256::new();
-        hasher.update(&asset_bytes);
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
+        Hash256::hash(&asset_bytes)
     }
 }
 
