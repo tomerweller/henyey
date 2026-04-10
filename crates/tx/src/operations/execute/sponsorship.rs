@@ -191,6 +191,14 @@ pub(crate) fn execute_revoke_sponsorship(
                 }
 
                 let old_sponsor = current_sponsor.expect("old sponsor exists");
+                // Check num_sponsoring capacity before mutating (stellar-core
+                // canTransferSponsorshipHelper returns TOO_MANY_SPONSORING).
+                let (num_sponsoring, _) = state
+                    .sponsorship_counts_for_account(&new_sponsor)
+                    .unwrap_or((0, 0));
+                if num_sponsoring > u32::MAX as i64 - multiplier {
+                    return Ok(OperationResult::OpTooManySponsoring);
+                }
                 state.update_num_sponsoring(&old_sponsor, -multiplier)?;
                 state.update_num_sponsoring(&new_sponsor, multiplier)?;
                 state.set_entry_sponsor(ledger_key.clone(), new_sponsor);
@@ -237,6 +245,14 @@ pub(crate) fn execute_revoke_sponsorship(
                     return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
                 }
 
+                // Check num_sponsoring capacity before mutating (stellar-core
+                // canEstablishSponsorshipHelper returns TOO_MANY_SPONSORING).
+                let (num_sponsoring, _) = state
+                    .sponsorship_counts_for_account(&new_sponsor)
+                    .unwrap_or((0, 0));
+                if num_sponsoring > u32::MAX as i64 - multiplier {
+                    return Ok(OperationResult::OpTooManySponsoring);
+                }
                 state.apply_entry_sponsorship_with_sponsor(
                     ledger_key.clone(),
                     &new_sponsor,
@@ -306,6 +322,13 @@ pub(crate) fn execute_revoke_sponsorship(
                 }
 
                 let old_sponsor = current_sponsor.expect("old sponsor exists");
+                // Check num_sponsoring capacity before mutating.
+                let (num_sponsoring, _) = state
+                    .sponsorship_counts_for_account(&new_sponsor)
+                    .unwrap_or((0, 0));
+                if num_sponsoring > u32::MAX as i64 - 1 {
+                    return Ok(OperationResult::OpTooManySponsoring);
+                }
                 state.update_num_sponsoring(&old_sponsor, -1)?;
                 state.update_num_sponsoring(&new_sponsor, 1)?;
                 set_signer_sponsor(state, &owner_id, pos, Some(new_sponsor))?;
@@ -345,6 +368,13 @@ pub(crate) fn execute_revoke_sponsorship(
                     return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
                 }
 
+                // Check num_sponsoring capacity before mutating.
+                let (num_sponsoring, _) = state
+                    .sponsorship_counts_for_account(&new_sponsor)
+                    .unwrap_or((0, 0));
+                if num_sponsoring > u32::MAX as i64 - 1 {
+                    return Ok(OperationResult::OpTooManySponsoring);
+                }
                 state.update_num_sponsoring(&new_sponsor, 1)?;
                 state.update_num_sponsored(&owner_id, 1)?;
                 set_signer_sponsor(state, &owner_id, pos, Some(new_sponsor))?;
