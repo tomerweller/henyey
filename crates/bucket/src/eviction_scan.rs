@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use stellar_xdr::curr::{LedgerEntry, LedgerKey, StateArchivalSettings};
+use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, StateArchivalSettings, WriteXdr};
 
 use crate::bucket::Bucket;
 use crate::bucket_list::BUCKET_LIST_LEVELS;
@@ -63,7 +63,9 @@ pub(crate) fn scan_for_eviction_incremental(
     let mut bytes_remaining = settings.eviction_scan_size as u64;
 
     // Track keys we've seen to avoid duplicates (from shadowed entries)
-    let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
+    // Use XDR-serialized bytes for dedup, not LedgerKey::Hash, to match
+    // the original per-implementation behavior and avoid any Hash/Eq divergence.
+    let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
 
     loop {
         let level = iter.bucket_list_level as usize;
@@ -133,7 +135,7 @@ fn scan_bucket_region(
     max_bytes: u64,
     current_ledger: u32,
     candidates: &mut Vec<EvictionCandidate>,
-    seen_keys: &mut HashSet<LedgerKey>,
+    seen_keys: &mut HashSet<Vec<u8>>,
 ) -> Result<(usize, u64, bool)> {
     let mut entries_scanned = 0;
     let mut bytes_used = 0u64;
@@ -171,7 +173,11 @@ fn scan_bucket_region(
 
             let key = henyey_common::entry_to_key(live_entry);
 
-            if !seen_keys.insert(key.clone()) {
+            let key_bytes = match key.to_xdr(Limits::none()) {
+                Ok(bytes) => bytes,
+                Err(_) => break 'process,
+            };
+            if !seen_keys.insert(key_bytes) {
                 break 'process;
             }
 
