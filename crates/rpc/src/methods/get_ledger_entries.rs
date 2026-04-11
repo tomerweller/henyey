@@ -9,6 +9,7 @@ use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
 use crate::util::{self, ttl_key_for_ledger_key, XdrFormat};
+use henyey_bucket::SearchableBucketListSnapshot;
 
 /// Maximum number of ledger entry keys allowed per request.
 const MAX_KEYS: usize = 200;
@@ -102,18 +103,8 @@ pub async fn handle(
             util::insert_xdr_field(&mut obj, "ext", &entry.ext, format)?;
 
             // For TTL-bearing entries, look up the TTL
-            if let Some(ttl_key) = ttl_key_for_entry(&entry) {
-                if let Some(ttl_entry) = snapshot
-                    .load_result(&ttl_key)
-                    .map_err(|e| JsonRpcError::internal(format!("bucket read error: {e}")))?
-                {
-                    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) = &ttl_entry.data {
-                        obj.insert(
-                            "liveUntilLedgerSeq".to_string(),
-                            json!(ttl_data.live_until_ledger_seq),
-                        );
-                    }
-                }
+            if let Some(live_until) = lookup_ttl(&snapshot, &entry)? {
+                obj.insert("liveUntilLedgerSeq".to_string(), json!(live_until));
             }
 
             result_entries.push(serde_json::Value::Object(obj));
@@ -144,4 +135,25 @@ fn ttl_key_for_entry(entry: &LedgerEntry) -> Option<LedgerKey> {
         _ => return None,
     };
     ttl_key_for_ledger_key(&entry_key)
+}
+
+/// Look up the TTL (live_until_ledger_seq) for an entry, if it has one.
+fn lookup_ttl(
+    snapshot: &SearchableBucketListSnapshot,
+    entry: &LedgerEntry,
+) -> Result<Option<u32>, JsonRpcError> {
+    let Some(ttl_key) = ttl_key_for_entry(entry) else {
+        return Ok(None);
+    };
+    let Some(ttl_entry) = snapshot
+        .load_result(&ttl_key)
+        .map_err(|e| JsonRpcError::internal(format!("bucket read error: {e}")))?
+    else {
+        return Ok(None);
+    };
+    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) = &ttl_entry.data {
+        Ok(Some(ttl_data.live_until_ledger_seq))
+    } else {
+        Ok(None)
+    }
 }
