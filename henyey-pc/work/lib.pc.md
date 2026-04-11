@@ -113,8 +113,7 @@ function snapshot() → list of WorkSnapshot:
     snapshots = for each (id, entry) in entries:
         WorkSnapshot:
             id, name, state, deps, dependents,
-            attempts, retries_left, last_error,
-            last_duration, total_duration
+            attempts, retries_left, last_error
     sort snapshots by id
     → snapshots
 ```
@@ -168,7 +167,6 @@ function run_until_done_with_cancel(cancel):
 
             entry.attempts += 1
             work = take work from entry (replace with placeholder)
-            entry.started_at = now()
             states[id] = Running
             emit_event(id, Running, attempt)
             running.add(id)
@@ -297,10 +295,6 @@ function finalize_entry(id, work):
 
     if work provided:
         entry.work = work      "restore real work (replace placeholder)"
-    if entry.started_at set:
-        elapsed = now() - entry.started_at
-        entry.last_duration = elapsed
-        entry.total_duration += elapsed
 ```
 
 ### Helper: emit_event

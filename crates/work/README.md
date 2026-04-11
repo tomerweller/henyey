@@ -34,7 +34,7 @@ Each work item starts in `Pending`, runs once all dependencies have succeeded, a
 | `WorkScheduler` | DAG scheduler that owns work items, executes ready items, and updates state. |
 | `WorkSchedulerConfig` | Runtime settings for concurrency, default retry delay, and event emission. |
 | `WorkSchedulerMetrics` | Aggregate counts for pending, running, terminal, and retry-related state. |
-| `WorkSnapshot` | Per-item introspection data including dependencies, attempts, errors, and timing. |
+| `WorkSnapshot` | Per-item introspection data including dependencies, attempts, and errors. |
 | `WorkSequence` | Helper for appending a linear chain of dependent work items. |
 | `WorkWithCallback` | Wrapper that runs another work item and invokes a completion callback. |
 | `WorkContext` | Execution context containing the work ID, attempt number, and cancellation token. |

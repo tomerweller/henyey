@@ -1,7 +1,7 @@
 //! Scheduler state, metrics, and execution engine.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -243,11 +243,6 @@ struct WorkEntry {
     /// Incremented before each execution attempt, including retries.
     attempts: u32,
 
-    /// Timestamp when the current or most recent execution started.
-    ///
-    /// Used to calculate execution duration.
-    started_at: Option<Instant>,
-
     /// Token for cooperative cancellation.
     ///
     /// Shared with the [`WorkContext`] provided to the work item during execution.
@@ -313,7 +308,6 @@ impl WorkScheduler {
             deps,
             retries_left: retries,
             attempts: 0,
-            started_at: None,
             cancel_token: CancellationToken::new(),
             work: Some(work),
         };
@@ -530,8 +524,6 @@ impl WorkScheduler {
         let name = entry.name.clone();
         let completion_tx = tx.clone();
         let cancel_token = entry.cancel_token.clone();
-        entry.started_at = Some(Instant::now());
-
         self.transition_state(id, WorkState::Running, attempt);
 
         tokio::spawn(async move {
@@ -629,15 +621,13 @@ impl WorkScheduler {
         self.block_dependents(id);
     }
 
-    /// Restores a work item after execution and records timing.
+    /// Restores a work item after execution.
     ///
     /// Called after a spawned work task completes, regardless of outcome.
-    /// Moves the work implementation back into the entry (replacing `None`)
-    /// and records the elapsed execution time.
+    /// Moves the work implementation back into the entry (replacing `None`).
     fn finalize_entry(&mut self, id: WorkId, work: Box<dyn Work + Send>) {
         if let Some(entry) = self.entries.get_mut(&id) {
             entry.work = Some(work);
-            entry.started_at.take();
         }
     }
 
