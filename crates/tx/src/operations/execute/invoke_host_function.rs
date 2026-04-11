@@ -1126,39 +1126,45 @@ fn apply_soroban_storage_change(
         }
     } else {
         // Deletion case: new_entry is None and live_until is None
-        match &change.key {
-            LedgerKey::ContractData(key) => {
-                state.delete_contract_data(&key.contract, &key.key, key.durability);
-                let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
-                state.delete_ttl(&key_hash);
-            }
-            LedgerKey::ContractCode(key) => {
-                state.delete_contract_code(&key.hash);
-                let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
-                state.delete_ttl(&key_hash);
-            }
-            LedgerKey::Ttl(key) => {
-                state.delete_ttl(&key.key_hash);
-            }
-            // SAC can also delete Account and Trustline entries (rare but possible)
-            LedgerKey::Account(key) => {
-                state.delete_account(&key.account_id);
-            }
-            LedgerKey::Trustline(key) => {
-                if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(asset4) = &key.asset {
-                    let asset = stellar_xdr::curr::Asset::CreditAlphanum4(asset4.clone());
-                    state.delete_trustline(&key.account_id, &asset);
-                } else if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(asset12) =
-                    &key.asset
-                {
-                    let asset = stellar_xdr::curr::Asset::CreditAlphanum12(asset12.clone());
-                    state.delete_trustline(&key.account_id, &asset);
-                }
-            }
-            _ => {}
-        }
+        apply_deletion(state, &change.key, ttl_key_cache);
     }
     was_created
+}
+
+/// Delete a Soroban storage entry and its associated TTL.
+fn apply_deletion(
+    state: &mut LedgerStateManager,
+    key: &LedgerKey,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
+) {
+    match key {
+        LedgerKey::ContractData(k) => {
+            state.delete_contract_data(&k.contract, &k.key, k.durability);
+            let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
+            state.delete_ttl(&key_hash);
+        }
+        LedgerKey::ContractCode(k) => {
+            state.delete_contract_code(&k.hash);
+            let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
+            state.delete_ttl(&key_hash);
+        }
+        LedgerKey::Ttl(k) => {
+            state.delete_ttl(&k.key_hash);
+        }
+        LedgerKey::Account(k) => {
+            state.delete_account(&k.account_id);
+        }
+        LedgerKey::Trustline(k) => {
+            if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(asset4) = &k.asset {
+                let asset = stellar_xdr::curr::Asset::CreditAlphanum4(asset4.clone());
+                state.delete_trustline(&k.account_id, &asset);
+            } else if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(asset12) = &k.asset {
+                let asset = stellar_xdr::curr::Asset::CreditAlphanum12(asset12.clone());
+                state.delete_trustline(&k.account_id, &asset);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn footprint_has_unrestored_archived_entries(
