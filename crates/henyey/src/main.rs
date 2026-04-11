@@ -2967,77 +2967,71 @@ async fn cmd_dump_ledger(
 /// 1. Header chain verification - ensures ledger headers form a valid chain
 /// 2. Bucket hash verification - verifies all bucket files have correct hashes
 /// 3. Crypto benchmarking - measures Ed25519 sign/verify performance
-async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
-    use henyey_bucket::BucketManager;
-    use henyey_crypto::SecretKey;
-    use std::time::Instant;
-
-    let mut all_ok = true;
-
-    // Phase 1: Header chain verification
+/// Verify ledger header chain integrity going backwards.
+/// Returns false if any break in the chain is detected.
+fn self_check_header_chain(db: &henyey_db::Database, latest_seq: u32) -> anyhow::Result<bool> {
     println!("Self-check phase 1: header chain verification");
-    let db = henyey_db::Database::open(&config.database.path)?;
-
-    let Some(latest_seq) = db.get_latest_ledger_seq()? else {
-        println!("  No ledger data in database. Skipping header verification.");
-        println!();
-        return Ok(());
-    };
 
     if latest_seq == 0 {
         println!("  At genesis ledger. Header chain is trivially valid.");
-    } else {
-        // Verify header chain going backwards
-        let depth = std::cmp::min(latest_seq, 100); // Check up to 100 ledgers
-        let mut current_seq = latest_seq;
-        let mut verified = 0u32;
-
-        while current_seq > 0 && verified < depth {
-            let current = db
-                .get_ledger_header(current_seq)?
-                .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", current_seq))?;
-            let prev_seq = current_seq - 1;
-            let prev = db
-                .get_ledger_header(prev_seq)?
-                .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", prev_seq))?;
-
-            let prev_hash = henyey_ledger::compute_header_hash(&prev)?;
-
-            if current.previous_ledger_hash != prev_hash.into() {
-                println!("  ERROR: Header chain broken at ledger {}", current_seq);
-                println!(
-                    "    Previous hash in header: {:?}",
-                    current.previous_ledger_hash
-                );
-                println!("    Computed hash of previous: {:?}", prev_hash);
-                all_ok = false;
-                break;
-            }
-
-            current_seq = prev_seq;
-            verified += 1;
-        }
-
-        if verified == depth {
-            println!(
-                "  Verified {} ledger headers (from {} to {})",
-                verified,
-                latest_seq,
-                latest_seq - verified + 1
-            );
-        }
+        return Ok(true);
     }
 
-    // Phase 2: Bucket hash verification
-    println!();
+    let depth = std::cmp::min(latest_seq, 100);
+    let mut current_seq = latest_seq;
+    let mut verified = 0u32;
+
+    while current_seq > 0 && verified < depth {
+        let current = db
+            .get_ledger_header(current_seq)?
+            .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", current_seq))?;
+        let prev_seq = current_seq - 1;
+        let prev = db
+            .get_ledger_header(prev_seq)?
+            .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", prev_seq))?;
+
+        let prev_hash = henyey_ledger::compute_header_hash(&prev)?;
+
+        if current.previous_ledger_hash != prev_hash.into() {
+            println!("  ERROR: Header chain broken at ledger {}", current_seq);
+            println!(
+                "    Previous hash in header: {:?}",
+                current.previous_ledger_hash
+            );
+            println!("    Computed hash of previous: {:?}", prev_hash);
+            return Ok(false);
+        }
+
+        current_seq = prev_seq;
+        verified += 1;
+    }
+
+    if verified == depth {
+        println!(
+            "  Verified {} ledger headers (from {} to {})",
+            verified,
+            latest_seq,
+            latest_seq - verified + 1
+        );
+    }
+
+    Ok(true)
+}
+
+/// Verify bucket file hashes match their expected values.
+/// Returns false if any bucket fails verification.
+fn self_check_buckets(
+    db: &henyey_db::Database,
+    bucket_config: &henyey_app::config::BucketConfig,
+    latest_seq: u32,
+) -> anyhow::Result<bool> {
+    use henyey_bucket::BucketManager;
+
     println!("Self-check phase 2: bucket hash verification");
 
-    let bucket_manager = BucketManager::with_cache_size(
-        config.buckets.directory.clone(),
-        config.buckets.cache_size,
-    )?;
+    let bucket_manager =
+        BucketManager::with_cache_size(bucket_config.directory.clone(), bucket_config.cache_size)?;
 
-    // Get the checkpoint for the current ledger
     let checkpoint = henyey_history::checkpoint::latest_checkpoint_before_or_at(latest_seq)
         .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", latest_seq))?;
 
@@ -3048,7 +3042,6 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
     let mut buckets_verified = 0;
     let mut buckets_failed = 0;
 
-    // Collect all unique bucket hashes using a set for deduplication
     let hashes_to_verify: std::collections::HashSet<_> = levels
         .iter()
         .flat_map(|(curr, snap)| [*curr, *snap])
@@ -3060,14 +3053,11 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
     for hash in &hashes_to_verify {
         match bucket_manager.load_bucket(hash) {
             Ok(bucket) => {
-                // The bucket's hash is computed from its contents when loaded
-                // If it loads successfully, the hash matches
                 if bucket.hash() != *hash {
                     println!("  ERROR: Bucket hash mismatch for {}", hash);
                     println!("    Expected: {}", hash);
                     println!("    Computed: {}", bucket.hash());
                     buckets_failed += 1;
-                    all_ok = false;
                 } else {
                     buckets_verified += 1;
                 }
@@ -3075,7 +3065,6 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
             Err(e) => {
                 println!("  ERROR: Failed to load bucket {}: {}", hash, e);
                 buckets_failed += 1;
-                all_ok = false;
             }
         }
     }
@@ -3085,18 +3074,22 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
         buckets_verified, buckets_failed
     );
 
-    // Phase 3: Crypto benchmarking
-    println!();
+    Ok(buckets_failed == 0)
+}
+
+/// Benchmark Ed25519 signing and verification performance.
+fn self_check_crypto_benchmark() {
+    use henyey_crypto::SecretKey;
+    use std::time::Instant;
+
     println!("Self-check phase 3: crypto benchmarking");
 
     const BENCHMARK_OPS: usize = 10000;
     let message = b"stellar benchmark test message for ed25519 signing";
 
-    // Generate a keypair for benchmarking
     let secret = SecretKey::generate();
     let public = secret.public_key();
 
-    // Benchmark signing
     let start = Instant::now();
     for _ in 0..BENCHMARK_OPS {
         let _ = secret.sign(message);
@@ -3104,10 +3097,8 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
     let sign_duration = start.elapsed();
     let sign_per_sec = (BENCHMARK_OPS as f64 / sign_duration.as_secs_f64()) as u64;
 
-    // Generate signatures for verification benchmark
     let signature = secret.sign(message);
 
-    // Benchmark verification
     let start = Instant::now();
     for _ in 0..BENCHMARK_OPS {
         let _ = public.verify(message, &signature);
@@ -3117,6 +3108,29 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
 
     println!("  Benchmarked {} signatures / sec", sign_per_sec);
     println!("  Benchmarked {} verifications / sec", verify_per_sec);
+}
+
+async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
+    let db = henyey_db::Database::open(&config.database.path)?;
+
+    let Some(latest_seq) = db.get_latest_ledger_seq()? else {
+        println!("  No ledger data in database. Skipping header verification.");
+        println!();
+        return Ok(());
+    };
+
+    let mut all_ok = true;
+
+    // Phase 1: Header chain verification
+    all_ok &= self_check_header_chain(&db, latest_seq)?;
+
+    // Phase 2: Bucket hash verification
+    println!();
+    all_ok &= self_check_buckets(&db, &config.buckets, latest_seq)?;
+
+    // Phase 3: Crypto benchmarking
+    println!();
+    self_check_crypto_benchmark();
 
     // Final result
     println!();
