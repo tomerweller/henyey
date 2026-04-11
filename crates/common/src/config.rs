@@ -1,4 +1,4 @@
-//! Configuration types for rs-stellar-core.
+//! Configuration types for henyey.
 //!
 //! This module defines the configuration schema for stellar-core nodes.
 //! Configuration is typically loaded from a TOML file and includes settings
@@ -123,7 +123,7 @@ impl<'de> Deserialize<'de> for ThresholdPercent {
     }
 }
 
-/// Main configuration for rs-stellar-core.
+/// Main configuration for henyey.
 ///
 /// This is the top-level configuration struct that encompasses all settings
 /// needed to run a stellar-core node. It can be loaded from a TOML file

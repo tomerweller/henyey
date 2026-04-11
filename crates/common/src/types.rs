@@ -1,4 +1,4 @@
-//! Common types for rs-stellar-core.
+//! Common types for henyey.
 //!
 //! This module provides fundamental types used throughout the codebase,
 //! particularly the [`Hash256`] type for cryptographic hashes.
@@ -112,7 +112,6 @@ impl Hash256 {
     pub fn hash_xdr_streaming<T: stellar_xdr::curr::WriteXdr>(
         value: &T,
     ) -> Result<Self, stellar_xdr::curr::Error> {
-        use sha2::{Digest, Sha256};
         use stellar_xdr::curr::Limited;
 
         struct Sha256Writer(Sha256);

@@ -127,7 +127,7 @@ async fn fee_window_poller(
         if let Err(e) = ingest_metas_with_gap_recovery(&windows, &metas) {
             tracing::warn!(error = %e, "Multiple gaps in LCM data");
             windows.reset();
-            // Already handled the gap above, continue to next poll cycle
+            // Gap recovery attempted inside ingest_metas_with_gap_recovery; reset and retry
             continue;
         }
     }

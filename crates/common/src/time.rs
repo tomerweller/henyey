@@ -1,4 +1,4 @@
-//! Time utilities for rs-stellar-core.
+//! Time utilities for henyey.
 //!
 //! This module provides utilities for working with timestamps in the Stellar
 //! protocol. Stellar uses a custom epoch (January 1, 2000) for some internal

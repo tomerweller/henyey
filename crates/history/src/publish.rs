@@ -59,6 +59,9 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info};
 
+/// Buffer size for gzip-compressing bucket files (64 KiB).
+const GZIP_COPY_BUFFER_SIZE: usize = 64 * 1024;
+
 /// Configuration for history publishing.
 #[derive(Debug, Clone)]
 pub struct PublishConfig {
@@ -450,7 +453,7 @@ impl PublishManager {
             // Fast path: gzip-compress the existing .bucket.xdr file directly.
             // This preserves the exact record-marked format.
             let mut src = std::fs::File::open(backing_path)?;
-            let mut buf = [0u8; 64 * 1024];
+            let mut buf = [0u8; GZIP_COPY_BUFFER_SIZE];
             loop {
                 let n = src.read(&mut buf)?;
                 if n == 0 {

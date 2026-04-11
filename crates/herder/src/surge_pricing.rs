@@ -93,6 +93,7 @@ pub(crate) trait SurgePricingLaneConfig {
 ///
 /// This prevents high-volume DEX trading from crowding out other transaction
 /// types. The DEX lane has its own resource limit independent of the generic lane.
+#[derive(Clone)]
 pub(crate) struct DexLimitingLaneConfig {
     lane_limits: Vec<Resource>,
     use_byte_limit: bool,

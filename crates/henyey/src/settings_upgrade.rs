@@ -33,6 +33,11 @@ use henyey_crypto::{sha256, SecretKey};
 /// This is the same binary embedded in stellar-core via `soroban_test_wasms::WRITE_BYTES`.
 const WRITE_BYTES_WASM: &[u8] = include_bytes!("../wasm/soroban_write_upgrade_bytes_contract.wasm");
 
+/// Pre-computed SHA-256 hash of the WASM contract, used by both restore and upload transactions.
+fn wasm_hash() -> Hash {
+    Hash(sha256(WRITE_BYTES_WASM).0)
+}
+
 fn single_operation(body: OperationBody) -> VecM<Operation, 100> {
     vec![Operation {
         source_account: None,
@@ -86,11 +91,7 @@ fn get_wasm_restore_tx(
     seq_num: i64,
     add_resource_fee: i64,
 ) -> (TransactionEnvelope, LedgerKey) {
-    let wasm_hash = sha256(WRITE_BYTES_WASM);
-
-    let contract_code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
-        hash: Hash(wasm_hash.0),
-    });
+    let contract_code_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: wasm_hash() });
 
     let resources = SorobanResources {
         footprint: LedgerFootprint {
@@ -124,11 +125,8 @@ fn get_wasm_restore_tx(
 /// Build the WASM upload transaction (tx 2 of 4).
 fn get_upload_tx(public_key: &Uint256, seq_num: i64) -> (TransactionEnvelope, LedgerKey) {
     let wasm = WRITE_BYTES_WASM.to_vec();
-    let wasm_hash = sha256(&wasm);
 
-    let contract_code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
-        hash: Hash(wasm_hash.0),
-    });
+    let contract_code_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: wasm_hash() });
 
     let resources = SorobanResources {
         footprint: LedgerFootprint {

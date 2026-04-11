@@ -586,13 +586,14 @@ impl BallotProtocol {
                 }
             }
             ScpStatementPledges::Confirm(conf) => {
+                let value = conf.ballot.value.clone();
                 hint_ballots.push(ScpBallot {
                     counter: conf.n_prepared,
-                    value: conf.ballot.value.clone(),
+                    value: value.clone(),
                 });
                 hint_ballots.push(ScpBallot {
                     counter: u32::MAX,
-                    value: conf.ballot.value.clone(),
+                    value,
                 });
             }
             ScpStatementPledges::Externalize(ext) => {
@@ -621,60 +622,62 @@ impl BallotProtocol {
     pub(crate) fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
         let valid = match &envelope.statement.pledges {
             ScpStatementPledges::Prepare(prep) => {
+                let value = prep.ballot.value.clone();
                 self.current_ballot = Some(prep.ballot.clone());
                 self.prepared = prep.prepared.clone();
                 self.prepared_prime = prep.prepared_prime.clone();
                 if prep.n_c != 0 {
                     self.commit = Some(ScpBallot {
                         counter: prep.n_c,
-                        value: prep.ballot.value.clone(),
+                        value: value.clone(),
                     });
                 }
                 if prep.n_h != 0 {
                     self.high_ballot = Some(ScpBallot {
                         counter: prep.n_h,
-                        value: prep.ballot.value.clone(),
+                        value: value.clone(),
                     });
                 }
-                self.value = Some(prep.ballot.value.clone());
+                self.value = Some(value);
                 self.phase = BallotPhase::Prepare;
                 true
             }
             ScpStatementPledges::Confirm(conf) => {
+                let value = conf.ballot.value.clone();
                 self.current_ballot = Some(conf.ballot.clone());
                 self.prepared = Some(ScpBallot {
                     counter: conf.n_prepared,
-                    value: conf.ballot.value.clone(),
+                    value: value.clone(),
                 });
                 self.prepared_prime = None;
                 self.commit = Some(ScpBallot {
                     counter: conf.n_commit,
-                    value: conf.ballot.value.clone(),
+                    value: value.clone(),
                 });
                 self.high_ballot = Some(ScpBallot {
                     counter: conf.n_h,
-                    value: conf.ballot.value.clone(),
+                    value: value.clone(),
                 });
-                self.value = Some(conf.ballot.value.clone());
+                self.value = Some(value);
                 self.phase = BallotPhase::Confirm;
                 true
             }
             ScpStatementPledges::Externalize(ext) => {
+                let value = ext.commit.value.clone();
                 self.commit = Some(ext.commit.clone());
                 self.high_ballot = Some(ScpBallot {
                     counter: ext.n_h,
-                    value: ext.commit.value.clone(),
+                    value: value.clone(),
                 });
                 self.current_ballot = Some(ScpBallot {
                     counter: u32::MAX,
-                    value: ext.commit.value.clone(),
+                    value: value.clone(),
                 });
-                // stellar-core sets mPrepared = makeBallot(UINT32_MAX, v)
                 self.prepared = Some(ScpBallot {
                     counter: u32::MAX,
-                    value: ext.commit.value.clone(),
+                    value: value.clone(),
                 });
-                self.value = Some(ext.commit.value.clone());
+                self.value = Some(value);
                 self.phase = BallotPhase::Externalize;
                 true
             }

@@ -1184,7 +1184,7 @@ impl TransactionQueue {
                 let Some(evictions) = self.collect_evictions_for_lane_config(EvictionScan {
                     by_hash,
                     queued,
-                    lane_config: Box::new(lane_config),
+                    lane_config: Box::new(lane_config.clone()),
                     ledger_version,
                     exclude: &pending_evictions,
                     filter,
@@ -1192,7 +1192,6 @@ impl TransactionQueue {
                 }) else {
                     return Err(TxQueueResult::QueueFull);
                 };
-                let lane_config = self.build_classic_lane_config().unwrap();
                 self.record_lane_evictions(
                     &lane_config,
                     &self.classic_lane_evicted_inclusion_fee,

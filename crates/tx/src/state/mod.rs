@@ -197,12 +197,6 @@ pub struct Savepoint {
     id_pool: u64,
 }
 
-/// Trait for reading ledger entries from storage.
-pub trait LedgerReader {
-    /// Get a ledger entry by key.
-    fn get_entry(&self, key: &LedgerKey) -> Option<LedgerEntry>;
-}
-
 /// Re-export `StorageKey` from the soroban module as the canonical key type
 /// for contract data entries.
 pub use crate::soroban::StorageKey;

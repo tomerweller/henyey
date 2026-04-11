@@ -90,10 +90,11 @@ impl ScpQueries for Connection {
             return Ok(());
         }
 
-        let mut ordered = envelopes.to_vec();
-        ordered.sort_by_key(|env| node_id_hex(&env.statement.node_id));
+        let mut indices: Vec<usize> = (0..envelopes.len()).collect();
+        indices.sort_by_key(|&i| node_id_hex(&envelopes[i].statement.node_id));
 
-        for envelope in ordered {
+        for i in indices {
+            let envelope = &envelopes[i];
             let node_id = node_id_hex(&envelope.statement.node_id);
             let data = envelope.to_xdr(Limits::none())?;
             self.execute(
@@ -109,13 +110,11 @@ impl ScpQueries for Connection {
         let mut stmt =
             self.prepare("SELECT envelope FROM scphistory WHERE ledgerseq = ?1 ORDER BY nodeid")?;
         let rows = stmt.query_map(params![ledger_seq], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut envelopes = Vec::new();
-        for row in rows {
+        rows.map(|row| {
             let data = row?;
-            let envelope = ScpEnvelope::from_xdr(data.as_slice(), Limits::none())?;
-            envelopes.push(envelope);
-        }
-        Ok(envelopes)
+            Ok(ScpEnvelope::from_xdr(data.as_slice(), Limits::none())?)
+        })
+        .collect()
     }
 
     fn store_scp_quorum_set(

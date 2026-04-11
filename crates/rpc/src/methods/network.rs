@@ -5,12 +5,15 @@ use serde_json::json;
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
 
+const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org/";
+
 pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
     let info = ctx.app.info();
 
     // Provide the friendbot URL for testnet
-    let friendbot_url = if info.network_passphrase == "Test SDF Network ; September 2015" {
-        "https://friendbot.stellar.org/"
+    let friendbot_url = if info.network_passphrase == TESTNET_PASSPHRASE {
+        TESTNET_FRIENDBOT_URL
     } else {
         ""
     };

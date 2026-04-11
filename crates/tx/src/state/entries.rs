@@ -73,15 +73,6 @@ impl LedgerStateManager {
         }
     }
 
-    /// Load initial state from a ledger reader.
-    pub fn load_from_reader<R: LedgerReader>(&mut self, reader: &R, keys: &[LedgerKey]) {
-        for key in keys {
-            if let Some(entry) = reader.get_entry(key) {
-                self.load_entry(entry);
-            }
-        }
-    }
-
     /// Record entry metadata (last_modified, sponsorship ext, sponsor) for a ledger key.
     ///
     /// This is shared by `load_entry` and `load_entry_without_snapshot` to avoid

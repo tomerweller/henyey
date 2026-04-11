@@ -1,5 +1,7 @@
 use flate2::{write::GzEncoder, Compression};
-use henyey_history::download::{decompress_gzip, parse_xdr_stream, parse_xdr_stream_auto};
+use henyey_history::download::{
+    decompress_gzip, parse_record_marked_xdr_stream_or_empty, parse_xdr_stream,
+};
 use stellar_xdr::curr::{
     Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
     StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
@@ -102,7 +104,8 @@ fn test_parse_xdr_stream_record_marked() {
     stream.extend_from_slice(&record_marked(&entry_a_xdr));
     stream.extend_from_slice(&record_marked(&entry_b_xdr));
 
-    let parsed = parse_xdr_stream_auto::<LedgerHeaderHistoryEntry>(&stream).expect("parse");
+    let parsed = parse_record_marked_xdr_stream_or_empty::<LedgerHeaderHistoryEntry>(&stream)
+        .expect("parse");
     assert_eq!(parsed.len(), 2);
     assert_eq!(parsed[0].header.ledger_seq, 127);
     assert_eq!(parsed[1].header.ledger_seq, 128);

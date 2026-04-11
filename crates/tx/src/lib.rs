@@ -193,9 +193,7 @@ pub use operations::{
 pub use stellar_xdr::curr::OperationType;
 
 // Re-export state types
-pub use state::{
-    AssetPair, LedgerReader, LedgerStateManager, OfferDescriptor, OfferIndex, OfferKey,
-};
+pub use state::{AssetPair, LedgerStateManager, OfferDescriptor, OfferIndex, OfferKey};
 
 // Re-export fee bump types
 pub use fee_bump::{

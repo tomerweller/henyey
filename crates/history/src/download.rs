@@ -343,11 +343,11 @@ pub fn parse_record_marked_xdr_stream<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>,
     Ok(entries)
 }
 
-/// Parse an XDR stream, auto-detecting the format.
+/// Parse an XDR stream with record marks, returning an empty vec for empty input.
 ///
-/// This function detects whether the stream uses XDR Record Marking Standard
-/// (RFC 5531) by checking if the high bit is set in the first 4 bytes.
-/// If so, it uses record marking parsing; otherwise, it uses raw XDR parsing.
+/// History and bucket files always use XDR Record Marking Standard (RFC 5531).
+/// This is a convenience wrapper over [`parse_record_marked_xdr_stream`] that
+/// handles the empty-input case.
 ///
 /// # Type Parameters
 ///
@@ -360,7 +360,9 @@ pub fn parse_record_marked_xdr_stream<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>,
 /// # Returns
 ///
 /// A vector of parsed entries, or an error if parsing fails.
-pub fn parse_xdr_stream_auto<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>, HistoryError> {
+pub fn parse_record_marked_xdr_stream_or_empty<T: ReadXdr>(
+    data: &[u8],
+) -> Result<Vec<T>, HistoryError> {
     if data.is_empty() {
         return Ok(Vec::new());
     }

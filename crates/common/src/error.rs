@@ -1,7 +1,7 @@
-//! Common error types for rs-stellar-core.
+//! Common error types for henyey.
 //!
 //! This module provides the unified error type [`enum@Error`] and the convenience
-//! type alias [`Result`] used throughout the rs-stellar-core crates.
+//! type alias [`Result`] used throughout the henyey crates.
 //!
 //! # Error Handling Philosophy
 //!
@@ -26,10 +26,10 @@ use thiserror::Error;
 
 /// A type alias for `Result<T, Error>`.
 ///
-/// This is the standard result type used throughout rs-stellar-core.
+/// This is the standard result type used throughout henyey.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Common error type for rs-stellar-core operations.
+/// Common error type for henyey operations.
 ///
 /// This enum covers the major categories of errors that can occur:
 /// - XDR serialization/deserialization failures

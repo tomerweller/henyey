@@ -102,12 +102,12 @@ mod loadgen_runner {
     ///
     /// Wraps inner state in an `Arc` so it can be shared with background tasks
     /// spawned by `start_load`.
-    pub struct SimulationLoadGenRunner {
+    pub(crate) struct SimulationLoadGenRunner {
         inner: Arc<Inner>,
     }
 
     impl SimulationLoadGenRunner {
-        pub fn new(app: Arc<App>) -> Self {
+        pub(crate) fn new(app: Arc<App>) -> Self {
             let network_passphrase = app.config().network.passphrase.clone();
             Self {
                 inner: Arc::new(Inner {
