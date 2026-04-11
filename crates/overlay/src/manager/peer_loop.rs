@@ -379,6 +379,18 @@ impl PingTracker {
     }
 }
 
+/// Mutable per-peer state passed to message routing.
+///
+/// Bundles the individual tracking fields that `route_received_message` needs,
+/// reducing its parameter count from 9 to 4.
+struct PeerLoopCtx<'a> {
+    peer: &'a mut Peer,
+    received_peers: &'a mut bool,
+    ping: &'a mut PingTracker,
+    query_limiter: &'a mut QueryRateLimiter,
+    peer_rate_limiter: &'a mut PeerRateLimiter,
+}
+
 /// Log received fetch messages and check for ping responses.
 ///
 /// Handles debug-level logging of fetch response details (hashes, types)
@@ -604,17 +616,12 @@ impl OverlayManager {
     /// Applies all filtering rules (handshake, flow-control, watcher, rate
     /// limit, flood-gate dedup) and forwards surviving messages. Returns
     /// `true` if the message was SCP (so the caller can bump the SCP counter).
-    #[allow(clippy::too_many_arguments)]
     fn route_received_message(
         message: &StellarMessage,
         peer_id: &PeerId,
-        peer: &mut Peer,
+        ctx: &mut PeerLoopCtx<'_>,
         state: &SharedPeerState,
         is_validator: bool,
-        received_peers: &mut bool,
-        ping: &mut PingTracker,
-        query_limiter: &mut QueryRateLimiter,
-        peer_rate_limiter: &mut PeerRateLimiter,
     ) -> Option<bool> {
         // Parity: shouldAbort (Peer.cpp:1157-1160) — skip message processing
         // if the overlay is shutting down.
@@ -625,10 +632,10 @@ impl OverlayManager {
         let msg_type = helpers::message_type_name(message);
 
         // OVERLAY_SPEC §7.2: PEERS message validation.
-        match validate_incoming_peers(peer.direction(), *received_peers, message) {
+        match validate_incoming_peers(ctx.peer.direction(), *ctx.received_peers, message) {
             PeersValidation::NotPeers => {}
             PeersValidation::AcceptFirst => {
-                *received_peers = true;
+                *ctx.received_peers = true;
             }
             PeersValidation::RejectWrongDirection => {
                 warn!(
@@ -671,11 +678,12 @@ impl OverlayManager {
             const QUERY_WINDOW: Duration = Duration::from_secs(60);
             let allowed = match message {
                 StellarMessage::GetTxSet(_) => {
-                    query_limiter.tx_set.check_and_increment(QUERY_WINDOW)
+                    ctx.query_limiter.tx_set.check_and_increment(QUERY_WINDOW)
                 }
-                StellarMessage::GetScpQuorumset(_) => {
-                    query_limiter.quorum_set.check_and_increment(QUERY_WINDOW)
-                }
+                StellarMessage::GetScpQuorumset(_) => ctx
+                    .query_limiter
+                    .quorum_set
+                    .check_and_increment(QUERY_WINDOW),
                 _ => true,
             };
             if !allowed {
@@ -690,7 +698,7 @@ impl OverlayManager {
         // Per-peer rate limiter (henyey-specific hardening).
         // SCP messages are exempt (TrafficClass::classify returns None for SCP).
         if let Some(traffic_class) = TrafficClass::classify(message) {
-            if !peer_rate_limiter.allow(traffic_class) {
+            if !ctx.peer_rate_limiter.allow(traffic_class) {
                 debug!(
                     "Dropping {} from {}: per-peer rate limit exceeded ({:?})",
                     msg_type, peer_id, traffic_class
@@ -721,7 +729,7 @@ impl OverlayManager {
             let unique = state
                 .flood_gate
                 .record_seen(hash, Some(peer_id.clone()), lcl);
-            peer.record_flood_stats(unique, message_size);
+            ctx.peer.record_flood_stats(unique, message_size);
             let is_scp = matches!(message, StellarMessage::ScpMessage(_));
             // FloodAdvert/FloodDemand are peer-specific control messages and
             // must not be globally deduplicated. Stellar-core delivers them
@@ -734,8 +742,8 @@ impl OverlayManager {
                 return Some(false);
             }
         } else if is_fetch_message(message) {
-            peer.record_fetch_stats(true, message_size);
-            log_fetch_message(message, peer_id, ping);
+            ctx.peer.record_fetch_stats(true, message_size);
+            log_fetch_message(message, peer_id, ctx.ping);
         }
 
         // Forward to subscribers.
@@ -918,13 +926,15 @@ impl OverlayManager {
                             match Self::route_received_message(
                                 &message,
                                 &peer_id,
-                                &mut peer,
+                                &mut PeerLoopCtx {
+                                    peer: &mut peer,
+                                    received_peers: &mut received_peers,
+                                    ping: &mut ping,
+                                    query_limiter: &mut query_limiter,
+                                    peer_rate_limiter: &mut peer_rate_limiter,
+                                },
                                 &state,
                                 is_validator,
-                                &mut received_peers,
-                                &mut ping,
-                                &mut query_limiter,
-                                &mut peer_rate_limiter,
                             ) {
                                 None => break,
                                 Some(is_scp) => { if is_scp { scp_messages += 1; } }
