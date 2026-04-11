@@ -3,8 +3,6 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use futures::future::BoxFuture;
-use futures::stream::unfold;
-use futures::stream::BoxStream;
 
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
@@ -15,16 +13,6 @@ pub trait Clock: Send + Sync + 'static {
 
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
         Box::pin(tokio::time::sleep(duration))
-    }
-
-    fn interval(&self, period: Duration) -> BoxStream<'static, ()> {
-        Box::pin(unfold(
-            tokio::time::interval(period),
-            |mut interval| async move {
-                interval.tick().await;
-                Some(((), interval))
-            },
-        ))
     }
 }
 
@@ -40,7 +28,6 @@ impl Clock for RealClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
 
     #[test]
     fn real_clock_returns_monotonic_now() {
@@ -54,14 +41,6 @@ mod tests {
     async fn sleep_completes() {
         let clock = RealClock;
         clock.sleep(Duration::from_millis(1)).await;
-    }
-
-    #[tokio::test]
-    async fn interval_yields_ticks() {
-        let clock = RealClock;
-        let mut ticks = clock.interval(Duration::from_millis(1));
-        assert!(ticks.next().await.is_some());
-        assert!(ticks.next().await.is_some());
     }
 
     #[test]

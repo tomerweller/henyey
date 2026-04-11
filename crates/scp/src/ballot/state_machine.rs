@@ -287,8 +287,7 @@ impl BallotProtocol {
             return false;
         }
 
-        let mut candidate = (0u32, 0u32);
-        self.find_extended_interval(&mut candidate, &boundaries, |interval| {
+        let candidate = self.find_extended_interval((0u32, 0u32), &boundaries, |interval| {
             self.federated_accept(
                 |st| self.statement_votes_commit(&ballot, interval, st),
                 |st| self.commit_predicate(&ballot, interval, st),
@@ -381,8 +380,7 @@ impl BallotProtocol {
         }
 
         let boundaries = self.get_commit_boundaries_from_statements(&ballot);
-        let mut candidate = (0u32, 0u32);
-        self.find_extended_interval(&mut candidate, &boundaries, |interval| {
+        let candidate = self.find_extended_interval((0u32, 0u32), &boundaries, |interval| {
             self.federated_ratify(|st| self.commit_predicate(&ballot, interval, st), ctx)
         });
 
@@ -595,12 +593,14 @@ impl BallotProtocol {
 
     fn find_extended_interval<F>(
         &self,
-        candidate: &mut (u32, u32),
+        initial: (u32, u32),
         boundaries: &std::collections::BTreeSet<u32>,
         pred: F,
-    ) where
+    ) -> (u32, u32)
+    where
         F: Fn((u32, u32)) -> bool,
     {
+        let mut candidate = initial;
         for boundary in boundaries.iter().rev() {
             let current = if candidate.0 == 0 {
                 (*boundary, *boundary)
@@ -611,11 +611,12 @@ impl BallotProtocol {
             };
 
             if pred(current) {
-                *candidate = current;
+                candidate = current;
             } else if candidate.0 != 0 {
                 break;
             }
         }
+        candidate
     }
 
     fn hint_ballot_for_commit(hint: &ScpStatement) -> Option<ScpBallot> {

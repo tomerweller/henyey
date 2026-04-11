@@ -458,32 +458,24 @@ fn node_id_cmp(a: &NodeId, b: &NodeId) -> std::cmp::Ordering {
 }
 
 fn quorum_set_cmp(a: &ScpQuorumSet, b: &ScpQuorumSet) -> std::cmp::Ordering {
-    let mut index = 0;
-    let a_vals: Vec<NodeId> = a.validators.iter().cloned().collect();
-    let b_vals: Vec<NodeId> = b.validators.iter().cloned().collect();
-    while index < a_vals.len() && index < b_vals.len() {
-        let ord = node_id_cmp(&a_vals[index], &b_vals[index]);
+    for (a_val, b_val) in a.validators.iter().zip(b.validators.iter()) {
+        let ord = node_id_cmp(a_val, b_val);
         if ord != std::cmp::Ordering::Equal {
             return ord;
         }
-        index += 1;
     }
-    if a_vals.len() != b_vals.len() {
-        return a_vals.len().cmp(&b_vals.len());
+    if a.validators.len() != b.validators.len() {
+        return a.validators.len().cmp(&b.validators.len());
     }
 
-    let mut inner_index = 0;
-    let a_inners: Vec<ScpQuorumSet> = a.inner_sets.iter().cloned().collect();
-    let b_inners: Vec<ScpQuorumSet> = b.inner_sets.iter().cloned().collect();
-    while inner_index < a_inners.len() && inner_index < b_inners.len() {
-        let ord = quorum_set_cmp(&a_inners[inner_index], &b_inners[inner_index]);
+    for (a_inner, b_inner) in a.inner_sets.iter().zip(b.inner_sets.iter()) {
+        let ord = quorum_set_cmp(a_inner, b_inner);
         if ord != std::cmp::Ordering::Equal {
             return ord;
         }
-        inner_index += 1;
     }
-    if a_inners.len() != b_inners.len() {
-        return a_inners.len().cmp(&b_inners.len());
+    if a.inner_sets.len() != b.inner_sets.len() {
+        return a.inner_sets.len().cmp(&b.inner_sets.len());
     }
 
     a.threshold.cmp(&b.threshold)

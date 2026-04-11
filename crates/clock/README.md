@@ -21,7 +21,7 @@ graph TD
     V["VirtualClock"] -->|implements| T
     T --> N["now() -> Instant"]
     T --> W["system_now() -> SystemTime"]
-    T --> K["sleep()/interval()"]
+    T --> K["sleep()"]
     K --> O["tokio::time"]
 ```
 
@@ -29,7 +29,7 @@ graph TD
 
 | Type | Description |
 |------|-------------|
-| `Clock` | Object-safe trait for monotonic time, system time, sleeps, and interval streams |
+| `Clock` | Object-safe trait for monotonic time, system time, and sleeps |
 | `RealClock` | Zero-sized production clock that reads `Instant::now()` directly |
 | `VirtualClock` | Clock that anchors `now()` to a stored base `Instant` while still advancing with elapsed real time |
 
@@ -55,9 +55,6 @@ use std::time::Duration;
 let clock = RealClock;
 
 clock.sleep(Duration::from_millis(10)).await;
-
-let mut ticks = clock.interval(Duration::from_secs(1));
-ticks.next().await;
 # }
 ```
 
@@ -85,7 +82,7 @@ let _shared: Arc<dyn Clock> = Arc::new(clock);
 
 ## Design Notes
 
-- `sleep` and `interval` live as default trait methods, so new clock implementations only need to supply `now()` unless they need custom async timing behavior.
+- `sleep` lives as a default trait method, so new clock implementations only need to supply `now()` unless they need custom async timing behavior.
 - `VirtualClock` is not a manually stepped simulator clock; `now()` is derived from its stored base instant plus elapsed time, so it continues to advance after construction.
 - Real-time and virtual-time modes are split into separate Rust types instead of a single runtime mode enum, which keeps injection simple for `Arc<dyn Clock>` consumers.
 

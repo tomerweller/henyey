@@ -30,7 +30,8 @@ fn parse_nonzero_hash(hex: &str) -> Option<Hash256> {
 }
 
 /// Collect all non-zero bucket hashes from a slice of bucket levels.
-fn collect_bucket_hashes(levels: &[HASBucketLevel], out: &mut Vec<Hash256>) {
+fn collect_bucket_hashes(levels: &[HASBucketLevel]) -> Vec<Hash256> {
+    let mut out = Vec::new();
     for level in levels {
         if let Some(h) = parse_nonzero_hash(&level.curr) {
             out.push(h);
@@ -56,6 +57,7 @@ fn collect_bucket_hashes(levels: &[HASBucketLevel], out: &mut Vec<Hash256>) {
             }
         }
     }
+    out
 }
 
 /// Parse bucket hash pairs (curr, snap) from a slice of bucket levels.
@@ -348,10 +350,9 @@ impl HistoryArchiveState {
     ///
     /// A vector of all unique bucket hashes.
     pub fn all_bucket_hashes(&self) -> Vec<Hash256> {
-        let mut hashes = Vec::new();
-        collect_bucket_hashes(&self.current_buckets, &mut hashes);
+        let mut hashes = collect_bucket_hashes(&self.current_buckets);
         if let Some(ref hot_buckets) = self.hot_archive_buckets {
-            collect_bucket_hashes(hot_buckets, &mut hashes);
+            hashes.extend(collect_bucket_hashes(hot_buckets));
         }
         hashes
     }

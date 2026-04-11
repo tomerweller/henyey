@@ -110,7 +110,7 @@ pub fn extract_ledger_changes(
                 // V0: VecM<OperationMeta> - each OperationMeta has a changes field
                 for op_meta in operations.iter() {
                     for change in op_meta.changes.iter() {
-                        process_ledger_entry_change(
+                        apply_change(
                             change,
                             &mut init_entries,
                             &mut live_entries,
@@ -122,7 +122,7 @@ pub fn extract_ledger_changes(
             TransactionMeta::V1(v1) => {
                 // Process txChanges (before)
                 for change in v1.tx_changes.iter() {
-                    process_ledger_entry_change(
+                    apply_change(
                         change,
                         &mut init_entries,
                         &mut live_entries,
@@ -132,7 +132,7 @@ pub fn extract_ledger_changes(
                 // Process operation changes
                 for op_changes in v1.operations.iter() {
                     for change in op_changes.changes.iter() {
-                        process_ledger_entry_change(
+                        apply_change(
                             change,
                             &mut init_entries,
                             &mut live_entries,
@@ -178,6 +178,20 @@ pub fn extract_ledger_changes(
     Ok((init_entries, live_entries, dead_entries))
 }
 
+fn apply_change(
+    change: &stellar_xdr::curr::LedgerEntryChange,
+    init_entries: &mut Vec<LedgerEntry>,
+    live_entries: &mut Vec<LedgerEntry>,
+    dead_entries: &mut Vec<LedgerKey>,
+) {
+    match classify_ledger_entry_change(change) {
+        LedgerChange::Init(e) => init_entries.push(e),
+        LedgerChange::Live(e) => live_entries.push(e),
+        LedgerChange::Dead(k) => dead_entries.push(k),
+        LedgerChange::None => {}
+    }
+}
+
 /// Extract changes from V2/V3/V4 meta which share tx_changes_before, operations, tx_changes_after.
 ///
 /// The `op_changes` parameter accepts an iterator of `LedgerEntryChanges` references to handle
@@ -192,45 +206,35 @@ fn extract_before_ops_after_changes<'a>(
     dead_entries: &mut Vec<LedgerKey>,
 ) {
     for change in tx_changes_before.iter() {
-        process_ledger_entry_change(change, init_entries, live_entries, dead_entries);
+        apply_change(change, init_entries, live_entries, dead_entries);
     }
     for changes in op_changes {
         for change in changes.iter() {
-            process_ledger_entry_change(change, init_entries, live_entries, dead_entries);
+            apply_change(change, init_entries, live_entries, dead_entries);
         }
     }
     for change in tx_changes_after.iter() {
-        process_ledger_entry_change(change, init_entries, live_entries, dead_entries);
+        apply_change(change, init_entries, live_entries, dead_entries);
     }
 }
 
-/// Process a single ledger entry change.
-fn process_ledger_entry_change(
-    change: &stellar_xdr::curr::LedgerEntryChange,
-    init_entries: &mut Vec<LedgerEntry>,
-    live_entries: &mut Vec<LedgerEntry>,
-    dead_entries: &mut Vec<LedgerKey>,
-) {
+/// Classify a single ledger entry change.
+enum LedgerChange {
+    Init(LedgerEntry),
+    Live(LedgerEntry),
+    Dead(LedgerKey),
+    None,
+}
+
+fn classify_ledger_entry_change(change: &stellar_xdr::curr::LedgerEntryChange) -> LedgerChange {
     use stellar_xdr::curr::LedgerEntryChange;
 
     match change {
-        LedgerEntryChange::Created(entry) => {
-            init_entries.push(entry.clone());
-        }
-        LedgerEntryChange::Updated(entry) => {
-            live_entries.push(entry.clone());
-        }
-        LedgerEntryChange::Removed(key) => {
-            dead_entries.push(key.clone());
-        }
-        LedgerEntryChange::State(_) => {
-            // State entries represent the state before a change,
-            // we don't need to process them for replay
-        }
-        LedgerEntryChange::Restored(entry) => {
-            // Restored entries (from Soroban) are treated as live entries
-            live_entries.push(entry.clone());
-        }
+        LedgerEntryChange::Created(entry) => LedgerChange::Init(entry.clone()),
+        LedgerEntryChange::Updated(entry) => LedgerChange::Live(entry.clone()),
+        LedgerEntryChange::Removed(key) => LedgerChange::Dead(key.clone()),
+        LedgerEntryChange::State(_) => LedgerChange::None,
+        LedgerEntryChange::Restored(entry) => LedgerChange::Live(entry.clone()),
     }
 }
 
