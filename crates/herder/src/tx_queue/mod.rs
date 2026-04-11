@@ -1354,111 +1354,18 @@ impl TransactionQueue {
             Err(result) => return result,
         };
 
-        // Check queue size (accounting for pending evictions that haven't been
-        // committed yet). We defer actual eviction removal until after all
-        // validation passes — parity with stellar-core's tryAdd which only
-        // calls evictTransactions after canAdd succeeds.
-        let effective_len = by_hash.len() - pending_eviction_list.len();
-        if effective_len >= self.config.max_size {
-            // Try to evict expired transactions
-            let expired: Vec<QueuedTransaction> = by_hash
-                .iter()
-                .filter(|(_, tx)| tx.is_expired(self.config.max_age_secs))
-                .map(|(_, tx)| tx.clone())
-                .collect();
-
-            if !expired.is_empty() {
-                let mut seen = self.seen.write();
-                let mut account_states = self.account_states.write();
-                for tx in &expired {
-                    by_hash.remove(&tx.hash);
-                    seen.remove(&tx.hash);
-                    Self::drop_transaction(&mut account_states, tx);
-                }
-            }
-
-            if by_hash.len().saturating_sub(pending_eviction_list.len()) >= self.config.max_size {
-                if let Some((evict_hash, evict_tx)) = by_hash
-                    .iter()
-                    .min_by(|a, b| {
-                        let a_tx = a.1;
-                        let b_tx = b.1;
-                        fee_rate_cmp(
-                            a_tx.inclusion_fee,
-                            a_tx.op_count,
-                            b_tx.inclusion_fee,
-                            b_tx.op_count,
-                        )
-                        .then_with(|| b_tx.hash.0.cmp(&a_tx.hash.0))
-                    })
-                    .map(|(h, tx)| (*h, tx.clone()))
-                {
-                    if queued.is_better_than(&evict_tx) {
-                        by_hash.remove(&evict_hash);
-                        self.seen.write().remove(&evict_hash);
-                        let mut account_states = self.account_states.write();
-                        Self::drop_transaction(&mut account_states, &evict_tx);
-                    } else {
-                        return TxQueueResult::QueueFull;
-                    }
-                } else {
-                    return TxQueueResult::QueueFull;
-                }
-            }
+        // Check queue size (accounting for pending evictions) and evict if needed.
+        if let Err(result) =
+            self.ensure_queue_capacity(&mut by_hash, pending_eviction_list.len(), &queued)
+        {
+            return result;
         }
 
-        // Fee balance validation (if provider is set)
-        // Check that fee-source has sufficient balance for total fees + new fee
-        //
-        // Parity: stellar-core TransactionQueue::canAdd() skips both tx validation
-        // and fee balance checks for loadgen txs under #ifdef BUILD_TESTS.
-        #[cfg(any(test, feature = "test-utils"))]
-        let skip_fee = self
-            .skip_fee_balance_check
-            .load(std::sync::atomic::Ordering::Relaxed);
-        #[cfg(not(any(test, feature = "test-utils")))]
-        let skip_fee = false;
-
-        if let Some(ref provider) = *self.fee_balance_provider.read() {
-            if !skip_fee {
-                let fee_source_id = account_id_from_fee_source_key(&new_fee_source_key);
-
-                // Calculate the net new fee being added
-                let net_new_fee = if let Some(ref old_tx) = replaced_tx {
-                    let old_fee_source_key = fee_source_key(&old_tx.envelope);
-                    if old_fee_source_key == new_fee_source_key {
-                        // Same fee source - only the difference is new
-                        (queued.total_fee as i64).saturating_sub(old_tx.total_fee as i64)
-                    } else {
-                        // Different fee source - full new fee
-                        queued.total_fee as i64
-                    }
-                } else {
-                    queued.total_fee as i64
-                };
-
-                // Get current total fees for this fee-source
-                let current_total_fees = {
-                    let account_states = self.account_states.read();
-                    account_states
-                        .get(&new_fee_source_key)
-                        .map(|s| s.total_fees)
-                        .unwrap_or(0)
-                };
-
-                // Check if fee-source has sufficient balance
-                if let Some(available) = provider.get_available_balance(&fee_source_id) {
-                    // available - net_new_fee < current_total_fees means insufficient
-                    if available.saturating_sub(net_new_fee) < current_total_fees {
-                        return TxQueueResult::Invalid(Some(
-                            henyey_tx::TxResultCode::TxInsufficientBalance,
-                        ));
-                    }
-                } else {
-                    // Account doesn't exist
-                    return TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxNoAccount));
-                }
-            }
+        // Fee balance validation
+        if let Err(result) =
+            self.validate_fee_balance(&queued, &new_fee_source_key, replaced_tx.as_ref())
+        {
+            return result;
         }
 
         // Commit pending evictions now that all validation has passed.
@@ -1542,6 +1449,127 @@ impl TransactionQueue {
         self.seen.write().insert(hash);
 
         TxQueueResult::Added
+    }
+
+    /// Ensure queue has capacity, evicting expired or lowest-fee transactions if needed.
+    fn ensure_queue_capacity(
+        &self,
+        by_hash: &mut parking_lot::RwLockWriteGuard<
+            '_,
+            HashMap<henyey_common::Hash256, QueuedTransaction>,
+        >,
+        pending_eviction_count: usize,
+        queued: &QueuedTransaction,
+    ) -> std::result::Result<(), TxQueueResult> {
+        let effective_len = by_hash.len() - pending_eviction_count;
+        if effective_len < self.config.max_size {
+            return Ok(());
+        }
+
+        // Try to evict expired transactions
+        let expired: Vec<QueuedTransaction> = by_hash
+            .iter()
+            .filter(|(_, tx)| tx.is_expired(self.config.max_age_secs))
+            .map(|(_, tx)| tx.clone())
+            .collect();
+
+        if !expired.is_empty() {
+            let mut seen = self.seen.write();
+            let mut account_states = self.account_states.write();
+            for tx in &expired {
+                by_hash.remove(&tx.hash);
+                seen.remove(&tx.hash);
+                Self::drop_transaction(&mut account_states, tx);
+            }
+        }
+
+        if by_hash.len().saturating_sub(pending_eviction_count) >= self.config.max_size {
+            if let Some((evict_hash, evict_tx)) = by_hash
+                .iter()
+                .min_by(|a, b| {
+                    let a_tx = a.1;
+                    let b_tx = b.1;
+                    fee_rate_cmp(
+                        a_tx.inclusion_fee,
+                        a_tx.op_count,
+                        b_tx.inclusion_fee,
+                        b_tx.op_count,
+                    )
+                    .then_with(|| b_tx.hash.0.cmp(&a_tx.hash.0))
+                })
+                .map(|(h, tx)| (*h, tx.clone()))
+            {
+                if queued.is_better_than(&evict_tx) {
+                    by_hash.remove(&evict_hash);
+                    self.seen.write().remove(&evict_hash);
+                    let mut account_states = self.account_states.write();
+                    Self::drop_transaction(&mut account_states, &evict_tx);
+                } else {
+                    return Err(TxQueueResult::QueueFull);
+                }
+            } else {
+                return Err(TxQueueResult::QueueFull);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate that the fee source has sufficient balance for the transaction.
+    fn validate_fee_balance(
+        &self,
+        queued: &QueuedTransaction,
+        new_fee_source_key: &Vec<u8>,
+        replaced_tx: Option<&QueuedTransaction>,
+    ) -> std::result::Result<(), TxQueueResult> {
+        #[cfg(any(test, feature = "test-utils"))]
+        let skip_fee = self
+            .skip_fee_balance_check
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let skip_fee = false;
+
+        let Some(ref provider) = *self.fee_balance_provider.read() else {
+            return Ok(());
+        };
+        if skip_fee {
+            return Ok(());
+        }
+
+        let fee_source_id = account_id_from_fee_source_key(new_fee_source_key);
+
+        let net_new_fee = if let Some(old_tx) = replaced_tx {
+            let old_fee_source_key = fee_source_key(&old_tx.envelope);
+            if old_fee_source_key == *new_fee_source_key {
+                (queued.total_fee as i64).saturating_sub(old_tx.total_fee as i64)
+            } else {
+                queued.total_fee as i64
+            }
+        } else {
+            queued.total_fee as i64
+        };
+
+        let current_total_fees = {
+            let account_states = self.account_states.read();
+            account_states
+                .get(new_fee_source_key)
+                .map(|s| s.total_fees)
+                .unwrap_or(0)
+        };
+
+        if let Some(available) = provider.get_available_balance(&fee_source_id) {
+            if available.saturating_sub(net_new_fee) < current_total_fees {
+                return Err(TxQueueResult::Invalid(Some(
+                    henyey_tx::TxResultCode::TxInsufficientBalance,
+                )));
+            }
+        } else {
+            return Err(TxQueueResult::Invalid(Some(
+                henyey_tx::TxResultCode::TxNoAccount,
+            )));
+        }
+
+        Ok(())
     }
 
     /// Drop a queued transaction from account_states, releasing fees and
