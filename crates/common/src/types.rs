@@ -95,21 +95,14 @@ impl Hash256 {
     /// and then computes its hash. This is the standard way to hash Stellar
     /// protocol objects.
     ///
+    /// Writes XDR directly into the SHA-256 hasher without allocating
+    /// an intermediate buffer. This is significantly faster for large
+    /// structures (e.g. transaction sets with thousands of entries).
+    ///
     /// # Errors
     ///
     /// Returns an error if XDR serialization fails.
     pub fn hash_xdr<T: stellar_xdr::curr::WriteXdr>(
-        value: &T,
-    ) -> Result<Self, stellar_xdr::curr::Error> {
-        Self::hash_xdr_streaming(value)
-    }
-
-    /// Compute the SHA-256 hash of XDR-encoded data using streaming serialization.
-    ///
-    /// Writes XDR directly into the SHA-256 hasher without allocating
-    /// an intermediate buffer. This is significantly faster for large
-    /// structures (e.g. transaction sets with thousands of entries).
-    pub fn hash_xdr_streaming<T: stellar_xdr::curr::WriteXdr>(
         value: &T,
     ) -> Result<Self, stellar_xdr::curr::Error> {
         use stellar_xdr::curr::Limited;

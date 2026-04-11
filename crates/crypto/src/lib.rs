@@ -50,13 +50,11 @@
 mod curve25519;
 mod error;
 mod hash;
-pub(crate) mod hex;
 mod keys;
 mod random;
 mod sealed_box;
 mod short_hash;
 mod signature;
-mod signer_key;
 
 pub use curve25519::*;
 pub use error::CryptoError;

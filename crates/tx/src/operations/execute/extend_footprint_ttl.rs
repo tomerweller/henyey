@@ -104,7 +104,7 @@ pub(crate) fn execute_extend_footprint_ttl(
     }
 
     for key in footprint.read_only.iter() {
-        if !is_ttl_entry(key) {
+        if !super::invoke_host_function::is_soroban_key(key) {
             return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
         }
     }
@@ -189,10 +189,6 @@ pub(crate) fn execute_extend_footprint_ttl(
     }
 
     Ok(make_result(ExtendFootprintTtlResultCode::Success))
-}
-
-fn is_ttl_entry(key: &LedgerKey) -> bool {
-    matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
 }
 
 /// Create an OperationResult from an ExtendFootprintTtlResultCode.

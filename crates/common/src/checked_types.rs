@@ -310,14 +310,7 @@ pub fn sub_trustline_balance(tl: &mut TrustLineEntry, amount: i64) -> Result<(),
 /// Positive delta = deposit, negative delta = withdrawal. Returns
 /// `BalanceError::Overflow` or `BalanceError::Underflow` on bounds violation.
 pub fn add_pool_reserve(reserve: &mut i64, delta: i64) -> Result<(), BalanceError> {
-    let new_val = CheckedAmount::new(*reserve)
-        .checked_add(delta)
-        .ok_or(BalanceError::Overflow)?;
-    if new_val.is_negative() {
-        return Err(BalanceError::Underflow);
-    }
-    *reserve = new_val.value();
-    Ok(())
+    add_checked_i64(reserve, delta)
 }
 
 /// Apply a checked delta to total pool shares.
@@ -325,13 +318,17 @@ pub fn add_pool_reserve(reserve: &mut i64, delta: i64) -> Result<(), BalanceErro
 /// Positive delta = mint, negative delta = burn. Returns
 /// `BalanceError::Overflow` or `BalanceError::Underflow` on bounds violation.
 pub fn add_pool_shares(shares: &mut i64, delta: i64) -> Result<(), BalanceError> {
-    let new_val = CheckedAmount::new(*shares)
+    add_checked_i64(shares, delta)
+}
+
+fn add_checked_i64(value: &mut i64, delta: i64) -> Result<(), BalanceError> {
+    let new_val = CheckedAmount::new(*value)
         .checked_add(delta)
         .ok_or(BalanceError::Overflow)?;
     if new_val.is_negative() {
         return Err(BalanceError::Underflow);
     }
-    *shares = new_val.value();
+    *value = new_val.value();
     Ok(())
 }
 

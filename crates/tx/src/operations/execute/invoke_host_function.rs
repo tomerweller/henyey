@@ -16,7 +16,7 @@ use henyey_common::protocol::{
 use henyey_common::xdr_encoded_len;
 
 /// Check if a ledger key is for a Soroban entry.
-fn is_soroban_key(key: &LedgerKey) -> bool {
+pub(crate) fn is_soroban_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
 }
 
