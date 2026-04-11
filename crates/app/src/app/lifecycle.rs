@@ -921,21 +921,8 @@ impl App {
                             tracing::debug!(slot, tracking, "EXTERNALIZE Valid — processing slot");
                             if let Some(tx_set_hash) = tx_set_hash {
                                 self.herder.scp_driver().request_tx_set(tx_set_hash, slot);
-                                if self.herder.needs_tx_set(&tx_set_hash) {
-                                    let peer = msg.from_peer.clone();
-                                    if let Some(overlay) = self.overlay().await {
-                                        let request = StellarMessage::GetTxSet(
-                                            stellar_xdr::curr::Uint256(tx_set_hash.0),
-                                        );
-                                        if let Err(e) = overlay.try_send_to(&peer, request) {
-                                            tracing::debug!(
-                                                peer = %peer,
-                                                error = %e,
-                                                "Failed to request tx set from externalize peer"
-                                            );
-                                        }
-                                    }
-                                }
+                                self.maybe_request_tx_set_from_peer(&tx_set_hash, &msg.from_peer)
+                                    .await;
                             }
                             // First, process externalized slots to register pending tx set requests
                             self.process_externalized_slots().await;
@@ -1342,6 +1329,28 @@ impl App {
                 seen_messages = fs.seen_count,
                 dropped_messages = fs.dropped_messages,
                 "Flood gate stats"
+            );
+        }
+    }
+
+    /// Request a tx set from a peer if the herder still needs it.
+    async fn maybe_request_tx_set_from_peer(
+        &self,
+        tx_set_hash: &henyey_common::Hash256,
+        peer: &PeerId,
+    ) {
+        if !self.herder.needs_tx_set(tx_set_hash) {
+            return;
+        }
+        let Some(overlay) = self.overlay().await else {
+            return;
+        };
+        let request = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(tx_set_hash.0));
+        if let Err(e) = overlay.try_send_to(peer, request) {
+            tracing::debug!(
+                peer = %peer,
+                error = %e,
+                "Failed to request tx set from externalize peer"
             );
         }
     }
