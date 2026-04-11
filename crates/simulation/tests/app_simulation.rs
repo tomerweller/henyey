@@ -470,6 +470,12 @@ async fn test_core3_restart_rejoin_over_loopback() {
     let _ = sim.add_connection("node0", "node1").await;
     let _ = sim.add_connection("node0", "node2").await;
 
+    // Wait for peer connections to be fully established before requesting
+    // SCP state. add_connection() spawns the handshake asynchronously, so
+    // without this wait request_scp_state_from_peers() can find zero peers
+    // and silently return without requesting any state.
+    wait_for_peer_count(&sim, "node0", 2, Duration::from_secs(10)).await;
+
     // Request SCP state so node0 learns about externalized slots it missed.
     sim.app("node0")
         .expect("restarted node0 app")
