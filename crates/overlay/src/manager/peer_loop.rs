@@ -391,6 +391,14 @@ struct PeerLoopCtx<'a> {
     peer_rate_limiter: &'a mut PeerRateLimiter,
 }
 
+/// Result from handling a received message — controls the peer loop's flow.
+enum RecvAction {
+    /// Continue the loop normally.
+    Continue,
+    /// Break out of the loop (disconnect).
+    Break,
+}
+
 /// Log received fetch messages and check for ping responses.
 ///
 /// Handles debug-level logging of fetch response details (hashes, types)
@@ -864,95 +872,22 @@ impl OverlayManager {
                                 &mut last_stats_log,
                             );
 
-                            let msg_type = helpers::message_type_name(&message);
-                            trace!("Processing {} from {}", msg_type, peer_id);
-
-                            // Log ERROR messages (Load rejections are expected, log at debug)
-                            if let StellarMessage::ErrorMsg(ref err) = message {
-                                if err.code == ErrorCode::Load {
-                                    debug!(
-                                        "Peer {} sent ERROR: code={:?}, msg={}",
-                                        peer_id, err.code, err.msg.to_string()
-                                    );
-                                } else {
-                                    warn!(
-                                        "Peer {} sent ERROR: code={:?}, msg={}",
-                                        peer_id, err.code, err.msg.to_string()
-                                    );
-                                }
-                                // Parity: stellar-core's recvError() unconditionally
-                                // calls drop() — ErrorMsg is terminal.
-                                break;
-                            }
-
-                            // Flow control: RAII guard locks capacity on creation,
-                            // releases on drop (or explicit finish()).
-                            let capacity_guard = match crate::flow_control::CapacityGuard::new(
-                                Arc::clone(&flow_control),
-                                message.clone(),
-                            ) {
-                                Some(guard) => guard,
-                                None => {
-                                    warn!(
-                                        "Peer {} exceeded flow control capacity, dropping",
-                                        peer_id
-                                    );
-                                    let err = make_error_msg(
-                                        ErrorCode::Load,
-                                        "unexpected flood message, peer at capacity",
-                                    );
-                                    let _ = peer.send(err).await;
-                                    break;
-                                }
-                            };
-
-                            // Handle flow control messages.
-                            match &message {
-                                StellarMessage::SendMore(_) => {
-                                    warn!("Peer {} sent deprecated SEND_MORE, dropping connection", peer_id);
-                                    break;
-                                }
-                                StellarMessage::SendMoreExtended(_) => {
-                                    match Self::handle_send_more_extended(&mut peer, &peer_id, &message, &flow_control).await {
-                                        Ok(sent) => { if sent { last_write = Instant::now(); } }
-                                        Err(()) => break,
-                                    }
-                                }
-                                _ => {}
-                            }
-
-                            // Route message through filtering and dispatch.
-                            // `None` signals the peer should be dropped.
-                            match Self::route_received_message(
-                                &message,
+                            let action = Self::handle_received_message(
+                                message,
                                 &peer_id,
-                                &mut PeerLoopCtx {
-                                    peer: &mut peer,
-                                    received_peers: &mut received_peers,
-                                    ping: &mut ping,
-                                    query_limiter: &mut query_limiter,
-                                    peer_rate_limiter: &mut peer_rate_limiter,
-                                },
+                                &mut peer,
+                                &flow_control,
                                 &state,
                                 is_validator,
-                            ) {
-                                None => break,
-                                Some(is_scp) => { if is_scp { scp_messages += 1; } }
-                            }
-
-                            // Flow control: finish guard to get send-more capacity.
-                            {
-                                let send_more_cap = capacity_guard.finish();
-                                if send_more_cap.should_send() && peer.is_connected() {
-                                    if let Err(e) = peer.send_more_extended(
-                                        send_more_cap.num_flood_messages as u32,
-                                        send_more_cap.num_flood_bytes as u32,
-                                    ).await {
-                                        debug!("Failed to send SendMoreExtended to {}: {}", peer_id, e);
-                                    } else {
-                                        last_write = Instant::now();
-                                    }
-                                }
+                                &mut received_peers,
+                                &mut ping,
+                                &mut query_limiter,
+                                &mut peer_rate_limiter,
+                                &mut scp_messages,
+                                &mut last_write,
+                            ).await;
+                            if matches!(action, RecvAction::Break) {
+                                break;
                             }
                         }
                         Ok(None) => {
@@ -987,6 +922,135 @@ impl OverlayManager {
         // Close peer (owned, no mutex needed)
         peer.close().await;
         debug!("Peer {} loop exited and disconnected", peer_id);
+    }
+
+    /// Process a single received message from a peer.
+    ///
+    /// Handles error messages, flow control, message routing, and SendMore
+    /// grants. Returns `RecvAction::Break` if the peer loop should exit.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_received_message(
+        message: StellarMessage,
+        peer_id: &PeerId,
+        peer: &mut Peer,
+        flow_control: &Arc<FlowControl>,
+        state: &SharedPeerState,
+        is_validator: bool,
+        received_peers: &mut bool,
+        ping: &mut PingTracker,
+        query_limiter: &mut QueryRateLimiter,
+        peer_rate_limiter: &mut PeerRateLimiter,
+        scp_messages: &mut u64,
+        last_write: &mut Instant,
+    ) -> RecvAction {
+        let msg_type = helpers::message_type_name(&message);
+        trace!("Processing message_type={} from {}", msg_type, peer_id);
+
+        // Log ERROR messages (Load rejections are expected, log at debug)
+        if let StellarMessage::ErrorMsg(ref err) = message {
+            if err.code == ErrorCode::Load {
+                debug!(
+                    "Peer sent_error peer={} code={:?} msg={}",
+                    peer_id,
+                    err.code,
+                    err.msg.to_string()
+                );
+            } else {
+                warn!(
+                    "Peer sent_error peer={} code={:?} msg={}",
+                    peer_id,
+                    err.code,
+                    err.msg.to_string()
+                );
+            }
+            // Parity: stellar-core's recvError() unconditionally
+            // calls drop() \u2014 ErrorMsg is terminal.
+            return RecvAction::Break;
+        }
+
+        // Flow control: RAII guard locks capacity on creation,
+        // releases on drop (or explicit finish()).
+        let capacity_guard = match crate::flow_control::CapacityGuard::new(
+            Arc::clone(flow_control),
+            message.clone(),
+        ) {
+            Some(guard) => guard,
+            None => {
+                warn!(
+                    "Peer exceeded_flow_control_capacity peer={}, dropping",
+                    peer_id
+                );
+                let err = make_error_msg(
+                    ErrorCode::Load,
+                    "unexpected flood message, peer at capacity",
+                );
+                let _ = peer.send(err).await;
+                return RecvAction::Break;
+            }
+        };
+
+        // Handle flow control messages.
+        match &message {
+            StellarMessage::SendMore(_) => {
+                warn!(
+                    "Peer sent_deprecated_send_more peer={}, dropping connection",
+                    peer_id
+                );
+                return RecvAction::Break;
+            }
+            StellarMessage::SendMoreExtended(_) => {
+                match Self::handle_send_more_extended(peer, peer_id, &message, flow_control).await {
+                    Ok(sent) => {
+                        if sent {
+                            *last_write = Instant::now();
+                        }
+                    }
+                    Err(()) => return RecvAction::Break,
+                }
+            }
+            _ => {}
+        }
+
+        // Route message through filtering and dispatch.
+        // `None` signals the peer should be dropped.
+        match Self::route_received_message(
+            &message,
+            peer_id,
+            &mut PeerLoopCtx {
+                peer,
+                received_peers,
+                ping,
+                query_limiter,
+                peer_rate_limiter,
+            },
+            state,
+            is_validator,
+        ) {
+            None => return RecvAction::Break,
+            Some(is_scp) => {
+                if is_scp {
+                    *scp_messages += 1;
+                }
+            }
+        }
+
+        // Flow control: finish guard to get send-more capacity.
+        let send_more_cap = capacity_guard.finish();
+        if send_more_cap.should_send() && peer.is_connected() {
+            if let Err(e) = peer
+                .send_more_extended(
+                    send_more_cap.num_flood_messages as u32,
+                    send_more_cap.num_flood_bytes as u32,
+                )
+                .await
+            {
+                debug!("Failed to send SendMoreExtended to peer={}: {}", peer_id, e);
+            } else {
+                *last_write = Instant::now();
+            }
+        }
+
+        RecvAction::Continue
     }
 
     /// Send queued outbound messages that have flow control capacity.
