@@ -123,13 +123,8 @@ impl EventQueries for Connection {
 
         // Contract ID filter
         if !params.contract_ids.is_empty() {
-            let placeholders: Vec<String> = params
-                .contract_ids
-                .iter()
-                .enumerate()
-                .map(|_| "?".to_string())
-                .collect();
-            sql.push_str(&format!(" AND contract_id IN ({})", placeholders.join(",")));
+            let placeholders = vec!["?"; params.contract_ids.len()].join(",");
+            sql.push_str(&format!(" AND contract_id IN ({placeholders})"));
             for cid in params.contract_ids {
                 param_values.push(Box::new(cid.clone()));
             }

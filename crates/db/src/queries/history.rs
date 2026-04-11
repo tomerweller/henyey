@@ -25,12 +25,6 @@ pub enum TxStatus {
     Failed = 1,
 }
 
-impl TxStatus {
-    pub fn as_i32(self) -> i32 {
-        self as i32
-    }
-}
-
 impl TryFrom<i32> for TxStatus {
     type Error = DbError;
 
@@ -187,7 +181,7 @@ impl HistoryQueries for Connection {
                 p.body,
                 p.result,
                 p.meta,
-                p.status.as_i32()
+                p.status as i32
             ],
         )?;
         Ok(())
@@ -387,7 +381,7 @@ impl HistoryQueries for Connection {
 
         if let Some(status) = status_filter {
             conditions.push(format!("status = ?{}", bind_values.len() + 1));
-            bind_values.push(Box::new(status.as_i32()));
+            bind_values.push(Box::new(status as i32));
         }
 
         let limit_idx = bind_values.len() + 1;

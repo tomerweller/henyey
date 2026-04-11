@@ -381,11 +381,24 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn delete_scp_slot_states_below(&self, slot: u64) -> Result<(), DbError> {
-        for (stored_slot, _) in self.load_all_scp_slot_states()? {
-            if stored_slot < slot {
-                self.delete_state(&scp_slot_state_key(stored_slot))?;
-            }
+        let keys_to_delete: Vec<String> = self
+            .load_all_scp_slot_states()?
+            .into_iter()
+            .filter(|(stored_slot, _)| *stored_slot < slot)
+            .map(|(s, _)| scp_slot_state_key(s))
+            .collect();
+
+        if keys_to_delete.is_empty() {
+            return Ok(());
         }
+
+        let placeholders = vec!["?"; keys_to_delete.len()].join(",");
+        let sql = format!("DELETE FROM storestate WHERE statename IN ({placeholders})");
+        let params: Vec<&dyn rusqlite::types::ToSql> = keys_to_delete
+            .iter()
+            .map(|k| k as &dyn rusqlite::types::ToSql)
+            .collect();
+        self.execute(&sql, params.as_slice())?;
         Ok(())
     }
 
