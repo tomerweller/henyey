@@ -110,28 +110,7 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
     let ledger_seq = executor.ledger_seq;
     let protocol_version = executor.protocol_version;
 
-    // Prefetch all statically-known keys for the entire tx set in a single
-    // bucket list pass. This populates the snapshot's prefetch cache so
-    // subsequent per-operation loads hit the cache instead of the bucket list.
-    {
-        let prefetch_start = std::time::Instant::now();
-        let mut all_keys = std::collections::HashSet::new();
-        for (tx, _) in transactions {
-            let frame = TransactionFrame::new(Arc::clone(tx));
-            for key in frame.keys_for_fee_processing() {
-                all_keys.insert(key);
-            }
-            all_keys.extend(frame.keys_for_apply());
-        }
-        let keys_vec: Vec<LedgerKey> = all_keys.into_iter().collect();
-        let stats = snapshot.prefetch(&keys_vec)?;
-        tracing::debug!(
-            requested = stats.requested,
-            loaded = stats.loaded,
-            elapsed_ms = prefetch_start.elapsed().as_millis() as u64,
-            "Prefetched ledger keys for classic phase"
-        );
-    }
+    prefetch_classic_keys(executor, snapshot, transactions)?;
 
     // Pre-deduct fees before executing any TX body.
     // When external_pre_charged is provided (parallel path), fees were already
@@ -156,39 +135,7 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
     };
     let has_pre_charged = !pre_fee_results.is_empty();
 
-    // Protocol 19+ MAX_SEQ_NUM_TO_APPLY: when any transaction in the set
-    // contains an AccountMerge operation, record the maximum sequence number
-    // per source account so that MergeOpFrame::isSeqnumTooFar can prevent
-    // merges that would allow sequence-number reuse after account re-creation.
-    // Matches stellar-core processFeesSeqNums (LedgerManagerImpl.cpp).
-    // This runs regardless of deduct_fee because the external pre-charged path
-    // (parallel Soroban) also needs AccountMerge protection.
-    {
-        let mut merge_seen = false;
-        let mut acc_to_max_seq: HashMap<AccountId, i64> = HashMap::new();
-        for (tx, _) in transactions.iter() {
-            let frame = TransactionFrame::new(Arc::clone(tx));
-            let source_id = frame.source_account_id();
-            let seq = frame.sequence_number();
-            acc_to_max_seq
-                .entry(source_id)
-                .and_modify(|e| *e = (*e).max(seq))
-                .or_insert(seq);
-            if !merge_seen {
-                for op in frame.operations() {
-                    if matches!(op.body, OperationBody::AccountMerge(_)) {
-                        merge_seen = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if merge_seen {
-            executor
-                .state_mut()
-                .set_max_seq_num_to_apply(acc_to_max_seq);
-        }
-    }
+    compute_max_seq_num_to_apply(executor, transactions);
 
     let mut results = Vec::with_capacity(transactions.len());
     let mut tx_results = Vec::with_capacity(transactions.len());
@@ -294,49 +241,8 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
     }
 
     // Protocol 23+: Apply Soroban fee refunds after ALL transactions
-    // This matches stellar-core's processPostTxSetApply() phase
     if has_pre_charged {
-        let mut total_refunds = 0i64;
-        for (idx, (tx, _)) in transactions.iter().enumerate() {
-            let refund = results[idx].fee_refund;
-            if refund > 0 {
-                let frame = TransactionFrame::with_network(Arc::clone(tx), executor.network_id);
-                let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
-
-                // Apply refund to the account balance in the delta.
-                // Only adjust fee pool if the refund was actually credited.
-                // Matches stellar-core refundSorobanFee (TransactionFrame.cpp:1046-1084):
-                // returns 0 if account merged or addBalance fails.
-                if executor.state.apply_refund_to_delta(&fee_source_id, refund) {
-                    executor.state.delta_mut().add_fee(-refund);
-                    total_refunds += refund;
-
-                    tracing::debug!(
-                        ledger_seq = ledger_seq,
-                        tx_index = idx,
-                        refund = refund,
-                        fee_source = %account_id_to_strkey(&fee_source_id),
-                        "Applied P23+ Soroban fee refund"
-                    );
-                } else {
-                    tracing::debug!(
-                        ledger_seq = ledger_seq,
-                        tx_index = idx,
-                        refund = refund,
-                        fee_source = %account_id_to_strkey(&fee_source_id),
-                        "Skipped Soroban fee refund (account merged or balance overflow)"
-                    );
-                }
-            }
-        }
-        if total_refunds > 0 {
-            tracing::debug!(
-                ledger_seq = ledger_seq,
-                total_refunds = total_refunds,
-                tx_count = transactions.len(),
-                "P23+ Soroban fee refunds applied"
-            );
-        }
+        apply_soroban_fee_refunds(executor, transactions, &results, ledger_seq);
     }
 
     // Flush deferred read-only TTL bumps to the delta before applying to bucket list.
@@ -372,6 +278,106 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
         id_pool: executor.id_pool(),
         hot_archive_restored_keys: all_hot_archive_restored_keys,
     })
+}
+
+/// Prefetch all statically-known keys for the transaction set.
+fn prefetch_classic_keys(
+    _executor: &TransactionExecutor,
+    snapshot: &SnapshotHandle,
+    transactions: &[TxWithFee],
+) -> Result<()> {
+    let prefetch_start = std::time::Instant::now();
+    let mut all_keys = std::collections::HashSet::new();
+    for (tx, _) in transactions {
+        let frame = TransactionFrame::new(Arc::clone(tx));
+        for key in frame.keys_for_fee_processing() {
+            all_keys.insert(key);
+        }
+        all_keys.extend(frame.keys_for_apply());
+    }
+    let keys_vec: Vec<LedgerKey> = all_keys.into_iter().collect();
+    let stats = snapshot.prefetch(&keys_vec)?;
+    tracing::debug!(
+        requested = stats.requested,
+        loaded = stats.loaded,
+        elapsed_ms = prefetch_start.elapsed().as_millis() as u64,
+        "Prefetched ledger keys for classic phase"
+    );
+    Ok(())
+}
+
+/// Compute max sequence number per source account for AccountMerge protection.
+fn compute_max_seq_num_to_apply(executor: &mut TransactionExecutor, transactions: &[TxWithFee]) {
+    let mut merge_seen = false;
+    let mut acc_to_max_seq: HashMap<AccountId, i64> = HashMap::new();
+    for (tx, _) in transactions.iter() {
+        let frame = TransactionFrame::new(Arc::clone(tx));
+        let source_id = frame.source_account_id();
+        let seq = frame.sequence_number();
+        acc_to_max_seq
+            .entry(source_id)
+            .and_modify(|e| *e = (*e).max(seq))
+            .or_insert(seq);
+        if !merge_seen {
+            for op in frame.operations() {
+                if matches!(op.body, OperationBody::AccountMerge(_)) {
+                    merge_seen = true;
+                    break;
+                }
+            }
+        }
+    }
+    if merge_seen {
+        executor
+            .state_mut()
+            .set_max_seq_num_to_apply(acc_to_max_seq);
+    }
+}
+
+/// Apply Soroban fee refunds after all transactions (protocol 23+).
+fn apply_soroban_fee_refunds(
+    executor: &mut TransactionExecutor,
+    transactions: &[TxWithFee],
+    results: &[TransactionExecutionResult],
+    ledger_seq: u32,
+) {
+    let mut total_refunds = 0i64;
+    for (idx, (tx, _)) in transactions.iter().enumerate() {
+        let refund = results[idx].fee_refund;
+        if refund > 0 {
+            let frame = TransactionFrame::with_network(Arc::clone(tx), executor.network_id);
+            let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
+
+            if executor.state.apply_refund_to_delta(&fee_source_id, refund) {
+                executor.state.delta_mut().add_fee(-refund);
+                total_refunds += refund;
+
+                tracing::debug!(
+                    ledger_seq = ledger_seq,
+                    tx_index = idx,
+                    refund = refund,
+                    fee_source = %account_id_to_strkey(&fee_source_id),
+                    "Applied P23+ Soroban fee refund"
+                );
+            } else {
+                tracing::debug!(
+                    ledger_seq = ledger_seq,
+                    tx_index = idx,
+                    refund = refund,
+                    fee_source = %account_id_to_strkey(&fee_source_id),
+                    "Skipped Soroban fee refund (account merged or balance overflow)"
+                );
+            }
+        }
+    }
+    if total_refunds > 0 {
+        tracing::debug!(
+            ledger_seq = ledger_seq,
+            total_refunds = total_refunds,
+            tx_count = transactions.len(),
+            "P23+ Soroban fee refunds applied"
+        );
+    }
 }
 
 /// Result of a per-TX global pre-parallel-apply pass.
