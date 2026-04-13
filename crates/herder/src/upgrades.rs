@@ -362,13 +362,12 @@ impl Upgrades {
                 self.params.base_reserve.map_or(false, |r| r == *reserve)
             }
             LedgerUpgrade::Flags(flags) => self.params.flags.map_or(false, |f| f == *flags),
-            LedgerUpgrade::Config(_key) => {
-                // Config upgrades require the node to have a config upgrade set key
-                // configured. Full consistency check (isConsistentWith) requires ledger
-                // state access which we don't have here. For now, just verify the node
-                // has a config upgrade key configured.
-                self.params.config_upgrade_set_key.is_some()
-            }
+            LedgerUpgrade::Config(key) => self
+                .params
+                .config_upgrade_set_key
+                .as_ref()
+                .and_then(|k| k.to_xdr().ok())
+                .map_or(false, |k| k == *key),
             LedgerUpgrade::MaxSorobanTxSetSize(size) => self
                 .params
                 .max_soroban_tx_set_size
@@ -1141,12 +1140,8 @@ mod tests {
     // Validation parity tests (issue #1510)
     // ========================================================================
 
-    /// #1509 — Config upgrade nomination accepts mismatched upgrade-set keys.
-    /// is_valid_for_nomination only checks is_some() on config_upgrade_set_key,
-    /// without comparing the proposed key to the configured one.
-    /// stellar-core: Upgrades.cpp isValidForNomination checks key equality.
+    /// Regression test for #1509 — Config upgrade nomination must compare keys.
     #[test]
-    #[ignore] // Blocked on #1509
     fn test_reject_config_upgrade_mismatched_key() {
         use base64::{engine::general_purpose::STANDARD, Engine};
 
