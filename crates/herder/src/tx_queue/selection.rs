@@ -133,6 +133,7 @@ impl TransactionQueue {
                     protocol_version: vc.protocol_version,
                     network_id: self.config.network_id,
                     ledger_flags: vc.ledger_flags,
+                    max_contract_size_bytes: vc.max_contract_size_bytes,
                 }
             };
             let close_time_bounds = crate::tx_set_utils::CloseTimeBounds::with_offsets(

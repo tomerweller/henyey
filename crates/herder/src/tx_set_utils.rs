@@ -15,7 +15,7 @@ use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::SorobanNetworkInfo;
 use henyey_tx::{
-    check_valid_pre_seq_num, soroban_disk_read_entries, validate_basic, LedgerContext,
+    check_valid_pre_seq_num_with_config, soroban_disk_read_entries, validate_basic, LedgerContext,
     TransactionFrame,
 };
 use stellar_xdr::curr::{
@@ -140,6 +140,8 @@ pub struct TxSetValidationContext {
     pub network_id: NetworkId,
     /// Ledger header flags (LP disable flags etc.).
     pub ledger_flags: u32,
+    /// Max contract WASM size (from Soroban config, if available).
+    pub max_contract_size_bytes: Option<u32>,
 }
 
 impl TxSetValidationContext {
@@ -172,6 +174,7 @@ impl TxSetValidationContext {
             protocol_version,
             network_id,
             ledger_flags,
+            max_contract_size_bytes: None,
         }
     }
 
@@ -278,7 +281,14 @@ pub fn get_invalid_tx_list_with_fee_map(
         let frame = TransactionFrame::from_owned_with_network(tx.clone(), ctx.network_id);
 
         // Stateless structural + per-op validation (shared with queue admission).
-        if check_valid_pre_seq_num(&frame, ctx.protocol_version, ctx.ledger_flags).is_err() {
+        if check_valid_pre_seq_num_with_config(
+            &frame,
+            ctx.protocol_version,
+            ctx.ledger_flags,
+            ctx.max_contract_size_bytes,
+        )
+        .is_err()
+        {
             if let Ok(h) = Hash256::hash_xdr(tx) {
                 seen_invalid.insert(h);
             }
@@ -949,7 +959,7 @@ pub(crate) fn check_tx_set_valid(
         stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
         _ => 0,
     };
-    let ctx = TxSetValidationContext::new(
+    let mut ctx = TxSetValidationContext::new(
         lcl_header.ledger_seq,
         lcl_header.scp_value.close_time.0,
         lcl_header.base_fee,
@@ -958,6 +968,9 @@ pub(crate) fn check_tx_set_valid(
         network_id,
         ledger_flags,
     );
+    if let Some(info) = soroban_info {
+        ctx.max_contract_size_bytes = Some(info.max_contract_size);
+    }
     let close_time_bounds = CloseTimeBounds::with_offsets(close_time_offset, close_time_offset);
 
     let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();

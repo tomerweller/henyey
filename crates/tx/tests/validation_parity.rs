@@ -6,7 +6,7 @@
 //!
 //! Issue tracker: <https://github.com/stellar-experimental/henyey/issues/1510>
 
-use henyey_tx::validation::check_valid_pre_seq_num;
+use henyey_tx::validation::{check_valid_pre_seq_num, check_valid_pre_seq_num_with_config};
 use henyey_tx::{validate_operation, TransactionFrame};
 use stellar_xdr::curr::{
     AccountId, AlphaNum4, Asset, AssetCode4, ClawbackOp, ContractDataDurability, ContractId,
@@ -364,12 +364,10 @@ fn test_reject_create_contract_from_invalid_asset() {
 // ============================================================================
 
 /// UploadContractWasm exceeding max contract size should be rejected before host.
-/// NOTE: The fix needs to thread SorobanNetworkConfig into the validation path.
-/// This test documents the expected post-fix behavior.
 #[test]
-#[ignore] // Blocked on #1481
 fn test_reject_upload_wasm_oversized() {
     // Typical maxContractSizeBytes is 256KB
+    let max_contract_size: u32 = 256 * 1024;
     let oversized_wasm = vec![0u8; 512 * 1024];
 
     let op_body = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
@@ -379,11 +377,18 @@ fn test_reject_upload_wasm_oversized() {
 
     let frame = make_soroban_frame(op_body, empty_footprint(), 50);
 
-    // This currently passes because check_valid_pre_seq_num has no network config.
-    // After #1481 fix, it should reject oversized wasm.
-    let result = check_valid_pre_seq_num(&frame, PROTOCOL_VERSION, 0);
+    // With config, oversized WASM should be rejected.
+    let result =
+        check_valid_pre_seq_num_with_config(&frame, PROTOCOL_VERSION, 0, Some(max_contract_size));
     assert!(
         result.is_err(),
         "UploadContractWasm exceeding max contract size should be rejected"
+    );
+
+    // Without config, the check is skipped (backwards-compatible).
+    let result_no_config = check_valid_pre_seq_num(&frame, PROTOCOL_VERSION, 0);
+    assert!(
+        result_no_config.is_ok(),
+        "Without config, oversized WASM should pass (no config to check against)"
     );
 }

@@ -965,6 +965,17 @@ pub fn check_valid_pre_seq_num(
     protocol_version: u32,
     ledger_flags: u32,
 ) -> std::result::Result<(), PreSeqNumError> {
+    check_valid_pre_seq_num_with_config(frame, protocol_version, ledger_flags, None)
+}
+
+/// Like `check_valid_pre_seq_num` but with optional Soroban network config for
+/// additional validation (e.g., max contract WASM size).
+pub fn check_valid_pre_seq_num_with_config(
+    frame: &TransactionFrame,
+    protocol_version: u32,
+    ledger_flags: u32,
+    max_contract_size_bytes: Option<u32>,
+) -> std::result::Result<(), PreSeqNumError> {
     // 1. Structure: op count, fee > 0, soroban single-op consistency
     if frame.operations().is_empty() {
         return Err(PreSeqNumError::MissingOperation);
@@ -1104,8 +1115,24 @@ pub fn check_valid_pre_seq_num(
                         }
                     }
                 }
-                // InvokeHostFunction: no footprint structure constraints at this level
-                _ => {}
+                // InvokeHostFunction: check WASM size if uploading
+                _ => {
+                    if let Some(max_size) = max_contract_size_bytes {
+                        if let OperationBody::InvokeHostFunction(invoke) = &op.body {
+                            if let stellar_xdr::curr::HostFunction::UploadContractWasm(wasm) =
+                                &invoke.host_function
+                            {
+                                if wasm.len() > max_size as usize {
+                                    return Err(PreSeqNumError::SorobanInvalid(format!(
+                                        "uploaded Wasm size {} exceeds max {}",
+                                        wasm.len(),
+                                        max_size
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     } else {

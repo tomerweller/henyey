@@ -734,6 +734,9 @@ impl App {
                 tx_max_write_ledger_entries: soroban_info.tx_max_write_ledger_entries as u64,
                 tx_max_size_bytes: soroban_info.tx_max_size_bytes as u64,
             });
+            self.herder
+                .tx_queue()
+                .set_max_contract_size(soroban_info.max_contract_size);
             tracing::info!(
                 ledger_seq = header.ledger_seq,
                 "Seeded validation context with Soroban limits"
@@ -1842,6 +1845,9 @@ impl App {
                         stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
                         _ => 0,
                     },
+                    max_contract_size_bytes: self
+                        .soroban_network_info()
+                        .map(|info| info.max_contract_size),
                 };
                 let fee_provider = self.herder.tx_queue().get_fee_balance_provider();
                 let invalid = get_invalid_tx_list(

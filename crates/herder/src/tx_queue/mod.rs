@@ -228,6 +228,8 @@ pub struct ValidationContext {
     pub ledger_flags: u32,
     /// Soroban per-transaction resource limits (if available).
     pub soroban_limits: Option<SorobanTxLimits>,
+    /// Max contract WASM size (from Soroban config, if available).
+    pub max_contract_size_bytes: Option<u32>,
 }
 
 /// Per-transaction Soroban resource limits from network config.
@@ -262,6 +264,7 @@ impl Default for ValidationContext {
             base_reserve: 5_000_000, // 0.5 XLM default
             ledger_flags: 0,
             soroban_limits: None,
+            max_contract_size_bytes: None,
         }
     }
 }
@@ -784,6 +787,11 @@ impl TransactionQueue {
         self.validation_context.write().soroban_limits = Some(limits);
     }
 
+    /// Set the max contract WASM size in the validation context.
+    pub fn set_max_contract_size(&self, max_bytes: u32) {
+        self.validation_context.write().max_contract_size_bytes = Some(max_bytes);
+    }
+
     /// Validate a transaction before queueing.
     fn validate_transaction(
         &self,
@@ -801,8 +809,13 @@ impl TransactionQueue {
 
         // Phase 1: Shared stateless structural validation
         // Mirrors stellar-core's commonValidPreSeqNum subset.
-        henyey_tx::check_valid_pre_seq_num(&frame, ctx.protocol_version, ctx.ledger_flags)
-            .map_err(|e| e.to_tx_result_code())?;
+        henyey_tx::check_valid_pre_seq_num_with_config(
+            &frame,
+            ctx.protocol_version,
+            ctx.ledger_flags,
+            ctx.max_contract_size_bytes,
+        )
+        .map_err(|e| e.to_tx_result_code())?;
 
         // Build ledger context once for time-bound and signature validation.
         let ledger_ctx = LedgerContext::new(

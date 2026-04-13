@@ -60,9 +60,12 @@ impl TransactionExecutor {
         // Phase 1: Shared stateless structural validation
         // Mirrors the stateless subset of stellar-core's commonValidPreSeqNum.
         // Called by both queue admission and preconditions.
-        if let Err(e) =
-            henyey_tx::check_valid_pre_seq_num(&frame, self.protocol_version, self.ledger_flags)
-        {
+        if let Err(e) = henyey_tx::check_valid_pre_seq_num_with_config(
+            &frame,
+            self.protocol_version,
+            self.ledger_flags,
+            Some(self.soroban_config.max_contract_size_bytes),
+        ) {
             let code = e.to_tx_result_code();
             return Ok(Err(if is_fee_bump {
                 fee_bump_outer_fail(code, &e.to_string())
