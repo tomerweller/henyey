@@ -6,7 +6,10 @@
 //!
 //! Issue tracker: <https://github.com/stellar-experimental/henyey/issues/1510>
 
-use henyey_tx::validation::{check_valid_pre_seq_num, check_valid_pre_seq_num_with_config};
+use henyey_common::NetworkId;
+use henyey_tx::validation::{
+    check_valid_pre_seq_num, check_valid_pre_seq_num_with_config, PreSeqNumError,
+};
 use henyey_tx::{validate_operation, TransactionFrame};
 use stellar_xdr::curr::{
     AccountId, AlphaNum4, Asset, AssetCode4, ClawbackOp, ContractDataDurability, ContractId,
@@ -352,8 +355,9 @@ fn test_reject_create_contract_from_invalid_asset() {
     let frame = make_soroban_frame(op_body, empty_footprint(), 50);
     let result = check_valid_pre_seq_num(&frame, PROTOCOL_VERSION, 0);
     assert!(
-        result.is_err(),
-        "CreateContract FROM_ASSET with invalid asset code should be rejected"
+        matches!(result, Err(PreSeqNumError::SorobanInvalid(_))),
+        "CreateContract FROM_ASSET with invalid asset code should be SorobanInvalid, got {:?}",
+        result
     );
 }
 
@@ -390,5 +394,69 @@ fn test_reject_upload_wasm_oversized() {
     assert!(
         result_no_config.is_ok(),
         "Without config, oversized WASM should pass (no config to check against)"
+    );
+}
+
+// ============================================================================
+// validate_basic / validate_full coverage for MAX_RESOURCE_FEE
+// ============================================================================
+
+/// validate_basic must reject Soroban txs with resource_fee > MAX_RESOURCE_FEE.
+#[test]
+fn test_validate_basic_rejects_resource_fee_overflow() {
+    use henyey_tx::validation::validate_basic;
+    use henyey_tx::LedgerContext;
+
+    let overflow_fee: i64 = (1i64 << 50) + 1;
+    let op_body = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+        host_function: HostFunction::UploadContractWasm(vec![0u8; 10].try_into().unwrap()),
+        auth: VecM::default(),
+    });
+
+    // Build a soroban frame with the overflow resource_fee
+    let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+    let op = Operation {
+        source_account: None,
+        body: op_body,
+    };
+    let tx = Transaction {
+        source_account: source,
+        fee: (overflow_fee + 100) as u32,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V1(SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::default(),
+                    read_write: VecM::default(),
+                },
+                instructions: 100,
+                disk_read_bytes: 100,
+                write_bytes: 100,
+            },
+            resource_fee: overflow_fee,
+        }),
+    };
+    let env = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let frame = TransactionFrame::from_owned(env);
+
+    let ctx = LedgerContext::new(
+        100,
+        1000,
+        100,
+        5_000_000,
+        PROTOCOL_VERSION,
+        NetworkId::testnet(),
+    );
+    let result = validate_basic(&frame, &ctx);
+    assert!(
+        result.is_err(),
+        "validate_basic should reject resource_fee > MAX_RESOURCE_FEE"
     );
 }
