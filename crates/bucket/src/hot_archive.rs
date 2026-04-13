@@ -315,8 +315,10 @@ impl HotArchiveBucket {
     /// For DiskBacked buckets, streams entries from the file sequentially.
     pub fn iter(&self) -> HotArchiveIter<'_> {
         match &self.storage {
-            HotArchiveStorage::InMemory { entries, .. } => HotArchiveIter::InMemory {
-                inner: entries.values(),
+            HotArchiveStorage::InMemory {
+                ordered_entries, ..
+            } => HotArchiveIter::InMemory {
+                inner: ordered_entries.iter(),
             },
             HotArchiveStorage::DiskBacked { path, .. } => {
                 // Open the file for streaming iteration
@@ -342,8 +344,10 @@ impl HotArchiveBucket {
     /// cannot be opened, instead of silently returning an empty iterator.
     pub fn try_iter(&self) -> crate::Result<HotArchiveIter<'_>> {
         match &self.storage {
-            HotArchiveStorage::InMemory { entries, .. } => Ok(HotArchiveIter::InMemory {
-                inner: entries.values(),
+            HotArchiveStorage::InMemory {
+                ordered_entries, ..
+            } => Ok(HotArchiveIter::InMemory {
+                inner: ordered_entries.iter(),
             }),
             HotArchiveStorage::DiskBacked { path, .. } => {
                 let file = std::fs::File::open(path).map_err(|e| {
@@ -705,9 +709,9 @@ impl HotArchiveBucket {
 /// Supports both in-memory (reference) and disk-backed (streaming) iteration.
 /// Returns owned entries in both cases for a uniform interface.
 pub enum HotArchiveIter<'a> {
-    /// In-memory iteration over BTreeMap values.
+    /// In-memory iteration over ordered entries (preserves hash-consistent order).
     InMemory {
-        inner: std::collections::btree_map::Values<'a, Vec<u8>, HotArchiveBucketEntry>,
+        inner: std::slice::Iter<'a, HotArchiveBucketEntry>,
     },
     /// Disk-backed streaming iteration.
     DiskBacked {
@@ -1123,6 +1127,7 @@ impl HotArchiveBucketList {
         // Add new entries to level 0
         // Level 0 never uses empty curr (shouldMergeWithEmptyCurr returns false for level 0)
         let keep_tombstones_0 = Self::keep_tombstone_entries(0);
+
         self.levels[0].prepare(protocol_version, new_bucket, keep_tombstones_0, false)?;
         self.levels[0].commit();
 
