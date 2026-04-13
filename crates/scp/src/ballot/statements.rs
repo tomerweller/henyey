@@ -238,7 +238,8 @@ impl BallotProtocol {
                             Self::push_candidate(&mut candidates, &mut seen, top_vote.clone());
                         }
                     }
-                    _ => {}
+                    // Nominate pledges should never reach ballot protocol
+                    _ => debug_assert!(false, "unexpected pledge type in ballot protocol"),
                 }
             }
         }

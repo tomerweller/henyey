@@ -585,7 +585,9 @@ impl BallotProtocol {
                         res.insert(u32::MAX);
                     }
                 }
-                _ => {}
+                // Nominate pledges should never reach ballot protocol
+                // (stellar-core BallotProtocol.cpp:1366)
+                _ => debug_assert!(false, "unexpected pledge type in ballot protocol"),
             }
         }
         res

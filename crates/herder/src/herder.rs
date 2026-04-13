@@ -1702,7 +1702,13 @@ impl Herder {
                 Ok(None) => {
                     map.insert(key, starting_seq);
                 }
-                Err(_) => {}
+                Err(e) => {
+                    tracing::error!(
+                        account = ?account,
+                        error = %e,
+                        "Failed to load account sequence for tx queue"
+                    );
+                }
             }
         }
         Some(map)

@@ -985,7 +985,15 @@ fn apply_soroban_storage_change(
                     was_created = true;
                 }
             }
-            _ => {}
+            other => {
+                // stellar-core generically upserts any entry returned by the host.
+                // If we reach here, the host returned an entry type we don't handle,
+                // which would cause state divergence. Fail loudly.
+                panic!(
+                    "apply_soroban_storage_change: unhandled entry type {:?} returned by host",
+                    std::mem::discriminant(other)
+                );
+            }
         }
 
         // Apply TTL if present for contract entries.
@@ -1163,7 +1171,15 @@ fn apply_deletion(
                 state.delete_trustline(&k.account_id, &asset);
             }
         }
-        _ => {}
+        other => {
+            // stellar-core generically erases any entry. If we reach here,
+            // the host requested deletion of an entry type we don't handle,
+            // which would cause state divergence.
+            panic!(
+                "apply_deletion: unhandled key type {:?}",
+                std::mem::discriminant(other)
+            );
+        }
     }
 }
 

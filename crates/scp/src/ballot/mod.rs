@@ -602,7 +602,8 @@ impl BallotProtocol {
                     value: ext.commit.value.clone(),
                 });
             }
-            _ => {}
+            // Nominate pledges should never reach ballot protocol
+            _ => debug_assert!(false, "unexpected pledge type in ballot protocol"),
         }
         hint_ballots
     }
