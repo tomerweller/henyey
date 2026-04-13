@@ -2884,12 +2884,32 @@ pub struct PriorStageState {
 
 impl PriorStageState {
     /// Build from a delta, capturing both live entries and deletions.
+    ///
+    /// Only Soroban keys (ContractData, ContractCode, Ttl) are included in
+    /// `deleted_keys` because parallel Soroban clusters never read classic
+    /// entry types from `LedgerEntries` — classic entries are loaded directly
+    /// from the snapshot. Including classic deletions would be harmless
+    /// (mark_entry_deleted skips them) but filtering here keeps the invariant
+    /// explicit and avoids unnecessary work.
     pub fn from_delta(delta: &crate::LedgerDelta) -> Self {
         Self {
             entries: delta.current_entries(),
-            deleted_keys: delta.dead_entries(),
+            deleted_keys: delta
+                .dead_entries()
+                .into_iter()
+                .filter(is_soroban_key)
+                .collect(),
         }
     }
+}
+
+/// Returns true if a LedgerKey is a Soroban entry type (ContractData,
+/// ContractCode, or Ttl) relevant for parallel Soroban execution state.
+fn is_soroban_key(key: &LedgerKey) -> bool {
+    matches!(
+        key,
+        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) | LedgerKey::Ttl(_)
+    )
 }
 
 /// Parameters specific to a single cluster or stage within the parallel phase.
@@ -4300,6 +4320,79 @@ mod tests {
         assert!(
             uncapped_balance < 0,
             "without cap, balance goes negative — this is the bug #1106 prevents"
+        );
+    }
+
+    /// Regression test for #1484: PriorStageState::from_delta must filter out
+    /// non-Soroban keys from dead_entries. Classic deletions (Account, Trustline,
+    /// Offer) in the delta are irrelevant for parallel Soroban execution.
+    #[test]
+    fn test_prior_stage_state_filters_non_soroban_deletions() {
+        use crate::LedgerDelta;
+        use stellar_xdr::curr::*;
+
+        let mut delta = LedgerDelta::new(101);
+
+        // Add a Soroban deletion (ContractCode).
+        let code_hash = Hash([0xCC; 32]);
+        let code_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash: code_hash.clone(),
+                code: BytesM::try_from(vec![1u8]).unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        let code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: code_hash.clone(),
+        });
+        delta.record_delete(code_entry).unwrap();
+
+        // Add a classic deletion (Account).
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xAA; 32])));
+        let account_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 10_000_000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        let account_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        delta.record_delete(account_entry).unwrap();
+
+        // Verify delta has both deletions.
+        assert_eq!(
+            delta.dead_entries().len(),
+            2,
+            "delta should have 2 deletions"
+        );
+
+        // PriorStageState should only include the Soroban key.
+        let prior = PriorStageState::from_delta(&delta);
+        assert_eq!(
+            prior.deleted_keys.len(),
+            1,
+            "PriorStageState should filter out non-Soroban deletions"
+        );
+        assert!(
+            prior.deleted_keys.contains(&code_key),
+            "PriorStageState must include Soroban ContractCode deletion"
+        );
+        assert!(
+            !prior.deleted_keys.contains(&account_key),
+            "PriorStageState must NOT include classic Account deletion"
         );
     }
 }

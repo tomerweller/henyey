@@ -1645,6 +1645,9 @@ impl LedgerStateManager {
     /// global entry map as `cleanEmpty` and loaded by
     /// `collectClusterFootprintEntriesFromGlobal`, which blocks BL fallthrough.
     /// This method provides the same blocking behavior for our code.
+    ///
+    /// Only Soroban key types (ContractData, ContractCode, Ttl) are supported.
+    /// Callers must filter to Soroban keys before calling this method.
     pub fn mark_entry_deleted(&mut self, key: &LedgerKey) {
         match key {
             LedgerKey::ContractData(k) => {
@@ -1657,7 +1660,15 @@ impl LedgerStateManager {
             LedgerKey::Ttl(k) => {
                 self.deleted_ttl.insert(k.key_hash.clone());
             }
-            _ => {}
+            other => {
+                // Non-Soroban keys should be filtered by the caller.
+                // If this fires, the caller is passing unfiltered dead_entries.
+                debug_assert!(
+                    false,
+                    "mark_entry_deleted called with non-Soroban key: {:?}",
+                    other.discriminant()
+                );
+            }
         }
     }
 

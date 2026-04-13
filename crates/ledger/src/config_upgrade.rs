@@ -357,13 +357,12 @@ impl ConfigUpgradeSetFrame {
             let previous = match current_entry {
                 Some(entry) => entry,
                 None => {
-                    // Entry doesn't exist - this shouldn't happen for valid upgrades
-                    // as all config settings should exist after protocol 20
-                    warn!(
-                        setting_id = ?setting_id,
-                        "Config setting entry not found during upgrade"
-                    );
-                    continue;
+                    // stellar-core throws here (Upgrades.cpp). All config settings
+                    // must exist after protocol 20; a missing entry is a ledger error.
+                    return Err(LedgerError::UpgradeError(format!(
+                        "Config setting {:?} not found during upgrade — expected to exist",
+                        setting_id
+                    )));
                 }
             };
 
@@ -1590,6 +1589,59 @@ mod tests {
         assert!(
             !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
             "FrozenLedgerKeys should be rejected before protocol 26"
+        );
+    }
+
+    /// Regression test for #1500: apply_to must return Err when a config setting
+    /// entry is missing from the ledger, not silently continue.
+    #[test]
+    fn test_apply_to_errors_on_missing_config_setting() {
+        use crate::close_state::CloseLedgerState;
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+
+        // Build a ConfigUpgradeSetFrame with one setting (ContractComputeV0).
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![ConfigSettingEntry::ContractComputeV0(
+                ConfigSettingContractComputeV0 {
+                    ledger_max_instructions: 100_000_000,
+                    tx_max_instructions: 10_000_000,
+                    fee_rate_per_instructions_increment: 100,
+                    tx_memory_limit: 50_000_000,
+                },
+            )]
+            .try_into()
+            .unwrap(),
+        };
+
+        let frame = ConfigUpgradeSetFrame {
+            config_upgrade_set: upgrade_set,
+            valid_xdr: true,
+            ledger_version: 25,
+        };
+
+        // Empty snapshot — the config setting entry doesn't exist.
+        let empty_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| Ok(None));
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), empty_lookup);
+
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 101,
+            ..Default::default()
+        };
+        let header_hash = henyey_common::Hash256([0u8; 32]);
+        let mut ltx = CloseLedgerState::begin(snapshot, header, header_hash, 101);
+
+        let result = frame.apply_to(&mut ltx);
+        assert!(
+            result.is_err(),
+            "apply_to should return Err when config setting is missing, not silently skip"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("not found during upgrade"),
+            "Error should mention missing config setting, got: {}",
+            err_msg
         );
     }
 }
