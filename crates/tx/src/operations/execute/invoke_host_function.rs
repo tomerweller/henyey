@@ -1163,13 +1163,7 @@ fn apply_deletion(
             state.delete_account(&k.account_id);
         }
         LedgerKey::Trustline(k) => {
-            if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(asset4) = &k.asset {
-                let asset = stellar_xdr::curr::Asset::CreditAlphanum4(asset4.clone());
-                state.delete_trustline(&k.account_id, &asset);
-            } else if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(asset12) = &k.asset {
-                let asset = stellar_xdr::curr::Asset::CreditAlphanum12(asset12.clone());
-                state.delete_trustline(&k.account_id, &asset);
-            }
+            state.delete_trustline_by_trustline_asset(&k.account_id, &k.asset);
         }
         other => {
             // stellar-core generically erases any entry. If we reach here,
