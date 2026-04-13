@@ -385,3 +385,44 @@ impl LedgerStateManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{create_test_account_id, create_test_account_with_sponsorship};
+
+    // ========================================================================
+    // Validation parity test (issue #1510)
+    // ========================================================================
+
+    /// #1499 — update_num_sponsoring missing combined cap check.
+    /// stellar-core's tooManySponsoring (SponsorshipUtils.cpp:34-42) checks
+    /// that numSponsoring + numSubEntries + mult <= UINT32_MAX (on p18+).
+    /// Henyey only checks numSponsoring + delta doesn't overflow individually.
+    #[test]
+    #[ignore] // Blocked on #1499
+    fn test_update_num_sponsoring_rejects_combined_cap_exceeded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let account_id = create_test_account_id(1);
+
+        // Account with numSubEntries near UINT32_MAX and some numSponsoring.
+        // Combined: numSponsoring + numSubEntries should not exceed UINT32_MAX.
+        let account = create_test_account_with_sponsorship(
+            account_id.clone(),
+            100_000_000,
+            u32::MAX - 10, // num_sub_entries: near max
+            0,             // num_sponsored
+            5,             // num_sponsoring: combined = (MAX-10) + 5 = MAX-5
+        );
+        state.create_account(account);
+
+        // Increasing numSponsoring by 10 would exceed combined cap:
+        // (MAX-10) + 5 + 10 = MAX+5 > MAX
+        let result = state.update_num_sponsoring(&account_id, 10);
+        assert!(
+            result.is_err(),
+            "update_num_sponsoring should reject when combined numSponsoring + numSubEntries + delta exceeds UINT32_MAX"
+        );
+    }
+}

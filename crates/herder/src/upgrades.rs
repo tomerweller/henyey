@@ -1136,4 +1136,42 @@ mod tests {
             "Without current Soroban config, upgrade should not be proposed"
         );
     }
+
+    // ========================================================================
+    // Validation parity tests (issue #1510)
+    // ========================================================================
+
+    /// #1509 — Config upgrade nomination accepts mismatched upgrade-set keys.
+    /// is_valid_for_nomination only checks is_some() on config_upgrade_set_key,
+    /// without comparing the proposed key to the configured one.
+    /// stellar-core: Upgrades.cpp isValidForNomination checks key equality.
+    #[test]
+    #[ignore] // Blocked on #1509
+    fn test_reject_config_upgrade_mismatched_key() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let mut params = UpgradeParameters::new(500); // upgrade_time = 500
+
+        // Configure node with key K1
+        params.config_upgrade_set_key = Some(ConfigUpgradeSetKeyJson {
+            contract_id: STANDARD.encode([1u8; 32]),
+            content_hash: STANDARD.encode([2u8; 32]),
+        });
+
+        let upgrades = Upgrades::new(params);
+
+        // Propose upgrade with a DIFFERENT key K2
+        let different_key = ConfigUpgradeSetKey {
+            contract_id: stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash([3u8; 32])),
+            content_hash: stellar_xdr::curr::Hash([4u8; 32]),
+        };
+        let upgrade = LedgerUpgrade::Config(different_key);
+
+        // close_time >= upgrade_time so time check passes
+        let result = upgrades.is_valid_for_nomination(&upgrade, 600);
+        assert!(
+            !result,
+            "Config upgrade with mismatched key should be rejected by nomination validation"
+        );
+    }
 }

@@ -2281,4 +2281,137 @@ mod tests {
         let fee_bump = make_fee_bump_envelope(inner, 500);
         assert_eq!(envelope_inclusion_fee(&fee_bump), 500);
     }
+
+    // ========================================================================
+    // Validation parity tests (issue #1510)
+    // These document missing checks; each is #[ignore]d until the fix lands.
+    // ========================================================================
+
+    /// Build a minimal 2-phase GeneralizedTransactionSet for check_tx_set_valid.
+    fn make_gen_tx_set(
+        classic_txs: Vec<TransactionEnvelope>,
+        soroban_txs: Vec<TransactionEnvelope>,
+    ) -> GeneralizedTransactionSet {
+        use stellar_xdr::curr::{Hash, TransactionSetV1};
+
+        let classic_phase = make_v0_phase_with_fee(classic_txs, Some(100));
+        let soroban_phase = make_v0_phase_with_fee(soroban_txs, Some(100));
+
+        GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![classic_phase, soroban_phase].try_into().unwrap(),
+        })
+    }
+
+    /// #1482 — Soroban phase validation silently bypassed when config unavailable.
+    /// check_tx_set_valid skips check_valid_soroban when soroban_info=None.
+    /// stellar-core rejects tx-sets with Soroban txs when config is unavailable.
+    #[test]
+    #[ignore] // Blocked on #1482
+    fn test_check_tx_set_valid_rejects_soroban_when_config_none() {
+        let soroban_tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let gen_tx_set = make_gen_tx_set(vec![], vec![soroban_tx]);
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+
+        // soroban_info=None should cause rejection, not silent bypass
+        let result = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            0,
+            network_id,
+            None, // no soroban config
+            None,
+        );
+        assert!(
+            !result,
+            "check_tx_set_valid should reject Soroban tx-set when config unavailable"
+        );
+    }
+
+    /// #1504 — SCP tx-set validation skips sequence/account checks.
+    /// get_invalid_tx_list_with_fee_map (called from check_tx_set_valid) does not
+    /// check sequence numbers against account state because it has no ledger access.
+    /// stellar-core's validateTxSet performs full per-tx validation including sequence.
+    #[test]
+    #[ignore] // Blocked on #1504
+    fn test_check_tx_set_valid_rejects_bad_sequence() {
+        // Build a classic tx with an obviously wrong sequence number
+        let bad_seq_tx = make_valid_envelope(200, 999_999_999);
+        let gen_tx_set = make_gen_tx_set(vec![bad_seq_tx], vec![]);
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+
+        // Provide fee balance so the affordability check doesn't reject first
+        let mut fee_provider = MockFeeBalanceProvider::new();
+        fee_provider.set_balance([0u8; 32], 1_000_000);
+
+        let result = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            0,
+            network_id,
+            None,
+            Some(&fee_provider),
+        );
+        // stellar-core would reject a tx whose sequence doesn't match the source
+        // account's expected next seq. Henyey currently passes this through.
+        assert!(
+            !result,
+            "check_tx_set_valid should reject tx-set with bad sequence number"
+        );
+    }
+
+    /// #1503 — SCP tx-set validation skips auth checks.
+    /// get_invalid_tx_list_with_fee_map does not verify transaction signatures.
+    /// stellar-core's validateTxSet checks auth.
+    #[test]
+    #[ignore] // Blocked on #1503
+    fn test_check_tx_set_valid_rejects_bad_auth() {
+        // Build a classic tx with no signatures (empty signature list)
+        let source = MuxedAccount::Ed25519(Uint256([50u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([51u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let no_sig_tx = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(), // no signatures
+        });
+
+        let gen_tx_set = make_gen_tx_set(vec![no_sig_tx], vec![]);
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+
+        let mut fee_provider = MockFeeBalanceProvider::new();
+        fee_provider.set_balance([50u8; 32], 1_000_000);
+
+        let result = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            0,
+            network_id,
+            None,
+            Some(&fee_provider),
+        );
+        // stellar-core would reject unsigned transactions in a tx-set.
+        assert!(
+            !result,
+            "check_tx_set_valid should reject tx-set with unsigned transactions"
+        );
+    }
 }

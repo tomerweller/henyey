@@ -3309,4 +3309,137 @@ mod tests {
             other => panic!("Expected SetTrustLineFlags result, got {:?}", other),
         }
     }
+
+    // ========================================================================
+    // Validation parity test (issue #1510)
+    // ========================================================================
+
+    /// #1505 — Trust-flag revocation leaks sponsorship counters.
+    /// When deauthorizing a trustline causes sponsored offers to be deleted,
+    /// the sponsor's num_sponsoring and the trustor's num_sponsored must be
+    /// correctly decremented. If not, the counters leak and eventually prevent
+    /// future sponsoring operations.
+    #[test]
+    #[ignore] // Blocked on #1505
+    fn test_trust_flag_revocation_decrements_sponsorship_counters() {
+        use crate::test_utils::{create_test_account_id, create_test_account_with_sponsorship};
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(150);
+        let trustor_id = create_test_account_id(151);
+        let sponsor_id = create_test_account_id(152);
+
+        // Issuer: AUTH_REQUIRED | AUTH_REVOCABLE
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
+        ));
+
+        // Trustor: has 1 subentry (the trustline), 1 sponsored entry
+        state.create_account(create_test_account_with_sponsorship(
+            trustor_id.clone(),
+            100_000_000,
+            2, // num_sub_entries: 1 trustline + 1 offer
+            1, // num_sponsored: the offer is sponsored
+            0, // num_sponsoring
+        ));
+
+        // Sponsor: sponsoring 1 entry (the trustor's offer)
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0, // num_sub_entries
+            0, // num_sponsored
+            1, // num_sponsoring
+        ));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Create authorized trustline for trustor
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            balance: 1000,
+            limit: 10000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        // Create a sponsored offer for trustor selling the asset
+        let offer = OfferEntry {
+            seller_id: trustor_id.clone(),
+            offer_id: 1,
+            selling: asset.clone(),
+            buying: Asset::Native,
+            amount: 100,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        state.create_offer(offer);
+
+        // Register sponsorship for the offer
+        let offer_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: trustor_id.clone(),
+            offer_id: 1,
+        });
+        state.set_entry_sponsor(offer_key, sponsor_id.clone());
+
+        // Revoke authorization (clear AUTHORIZED flag)
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset: asset.clone(),
+            clear_flags: TrustLineFlags::AuthorizedFlag as u32,
+            set_flags: 0,
+        };
+        let tx_id = TxIdentity {
+            source_id: &issuer_id,
+            seq: 1,
+            op_index: 0,
+        };
+
+        let _result = execute_set_trust_line_flags(&op, &issuer_id, &tx_id, &mut state, &context);
+
+        // The offer should have been deleted as part of deauthorization
+        assert!(
+            state.get_offer(&trustor_id, 1).is_none(),
+            "Offer should be deleted on trustline deauthorization"
+        );
+
+        // Verify sponsorship counters are decremented
+        let sponsor_account = state.get_account(&sponsor_id).unwrap();
+        let sponsor_ext = match &sponsor_account.ext {
+            AccountEntryExt::V1(v1) => match &v1.ext {
+                AccountEntryExtensionV1Ext::V2(v2) => v2,
+                _ => panic!("Expected V2 extension on sponsor account"),
+            },
+            _ => panic!("Expected V1 extension on sponsor account"),
+        };
+        assert_eq!(
+            sponsor_ext.num_sponsoring, 0,
+            "Sponsor's num_sponsoring should be decremented after offer deletion"
+        );
+
+        let trustor_account = state.get_account(&trustor_id).unwrap();
+        let trustor_ext = match &trustor_account.ext {
+            AccountEntryExt::V1(v1) => match &v1.ext {
+                AccountEntryExtensionV1Ext::V2(v2) => v2,
+                _ => panic!("Expected V2 extension on trustor account"),
+            },
+            _ => panic!("Expected V1 extension on trustor account"),
+        };
+        assert_eq!(
+            trustor_ext.num_sponsored, 0,
+            "Trustor's num_sponsored should be decremented after sponsored offer deletion"
+        );
+    }
 }
