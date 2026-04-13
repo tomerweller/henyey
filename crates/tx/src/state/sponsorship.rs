@@ -213,9 +213,15 @@ impl LedgerStateManager {
         let account = self
             .get_account_mut(account_id)
             .ok_or(TxError::SourceAccountNotFound)?;
+        let num_sub_entries = account.num_sub_entries as u64;
         let ext = ensure_account_ext_v2(account);
         let updated = ext.num_sponsoring as i64 + delta;
         if updated < 0 || updated > u32::MAX as i64 {
+            return Err(TxError::TooManySponsoring);
+        }
+        // Combined cap: numSponsoring + numSubEntries must not exceed UINT32_MAX.
+        // stellar-core: SponsorshipUtils.cpp:21-28 (isSponsoringSubentrySumIncreaseValid)
+        if updated as u64 + num_sub_entries > u32::MAX as u64 {
             return Err(TxError::TooManySponsoring);
         }
         ext.num_sponsoring = updated as u32;
@@ -395,12 +401,8 @@ mod tests {
     // Validation parity test (issue #1510)
     // ========================================================================
 
-    /// #1499 — update_num_sponsoring missing combined cap check.
-    /// stellar-core's tooManySponsoring (SponsorshipUtils.cpp:34-42) checks
-    /// that numSponsoring + numSubEntries + mult <= UINT32_MAX (on p18+).
-    /// Henyey only checks numSponsoring + delta doesn't overflow individually.
+    /// Regression test for #1499 — combined sponsoring cap check.
     #[test]
-    #[ignore] // Blocked on #1499
     fn test_update_num_sponsoring_rejects_combined_cap_exceeded() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
 
