@@ -4,6 +4,8 @@
 //! - AllowTrust (deprecated, but still supported)
 //! - SetTrustLineFlags
 
+use std::collections::HashMap;
+
 use stellar_xdr::curr::{
     AccountFlags, AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset,
     ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceId, Claimant, ClaimantV0, Hash,
@@ -396,24 +398,32 @@ fn remove_offers_with_cleanup(
     account_id: &AccountId,
     asset: &Asset,
 ) {
-    // Get the offers that will be removed (returns the full offer data)
-    let removed_offers = state.remove_offers_by_account_and_asset(account_id, asset);
-
-    // For each removed offer, we need to:
-    // 1. Release liabilities
-    // 2. Decrement num_sub_entries
-    // 3. Handle sponsorship
-    for offer in &removed_offers {
-        // Release liabilities for this offer
-        release_offer_liabilities(state, offer);
-
-        // Handle sponsorship if the offer was sponsored
+    // Collect sponsorship info BEFORE removing offers, since deletion
+    // destroys the sponsor metadata stored in the offer store.
+    let offers = state.get_offers_by_account_and_asset(account_id, asset);
+    let mut sponsor_map: HashMap<i64, AccountId> = HashMap::new();
+    for offer in &offers {
         let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: offer.seller_id.clone(),
             offer_id: offer.offer_id,
         });
         if let Some(sponsor) = state.entry_sponsor(&ledger_key) {
-            let _ = state.update_num_sponsoring(&sponsor, -1);
+            sponsor_map.insert(offer.offer_id, sponsor);
+        }
+    }
+
+    // Now remove the offers (also records deletion in delta)
+    let removed_offers = state.remove_offers_by_account_and_asset(account_id, asset);
+
+    // For each removed offer:
+    // 1. Release liabilities
+    // 2. Decrement sponsorship counters
+    // 3. Decrement num_sub_entries
+    for offer in &removed_offers {
+        release_offer_liabilities(state, offer);
+
+        if let Some(sponsor) = sponsor_map.get(&offer.offer_id) {
+            let _ = state.update_num_sponsoring(sponsor, -1);
             let _ = state.update_num_sponsored(&offer.seller_id, -1);
         }
 
@@ -3320,7 +3330,6 @@ mod tests {
     /// correctly decremented. If not, the counters leak and eventually prevent
     /// future sponsoring operations.
     #[test]
-    #[ignore] // Blocked on #1505
     fn test_trust_flag_revocation_decrements_sponsorship_counters() {
         use crate::test_utils::{create_test_account_id, create_test_account_with_sponsorship};
 
