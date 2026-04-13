@@ -4683,6 +4683,11 @@ impl LedgerCloseContext<'_> {
                         protocol_version,
                         &bucket_list,
                         soroban_state_size,
+                        sample_period,
+                        eviction_settings
+                            .as_ref()
+                            .map(|s| s.live_soroban_state_size_window_sample_size)
+                            .unwrap_or(0),
                     ) {
                         // Remove any existing window entry (e.g. from a config upgrade
                         // that resized the window) — our computed entry includes both

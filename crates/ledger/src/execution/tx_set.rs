@@ -1424,6 +1424,8 @@ pub fn compute_state_size_window_entry(
     protocol_version: u32,
     bucket_list: &henyey_bucket::BucketList,
     soroban_state_size: u64,
+    sample_period: u32,
+    sample_size: u32,
 ) -> Option<LedgerEntry> {
     use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
     use stellar_xdr::curr::{
@@ -1435,19 +1437,7 @@ pub fn compute_state_size_window_entry(
         return None;
     }
 
-    // Load state archival settings to get sample period and size
-    let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::StateArchival,
-    });
-    let archival_entry = bucket_list.get(&archival_key).ok()??;
-    let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival)) =
-        archival_entry.data
-    else {
-        return None;
-    };
-
-    let sample_period = archival.live_soroban_state_size_window_sample_period;
-    let sample_size = archival.live_soroban_state_size_window_sample_size as usize;
+    let sample_size = sample_size as usize;
     if sample_period == 0 || sample_size == 0 {
         return None;
     }
