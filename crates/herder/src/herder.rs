@@ -1517,14 +1517,24 @@ impl Herder {
     ///   5. Sign via `make_stellar_value` and XDR-encode to `Value`
     fn build_nomination_value(&self) -> Option<Value> {
         // 1. Ledger state
-        let (previous_hash, max_txs, starting_seq, header, lcl_close_time) = {
+        let (previous_hash, max_txs, starting_seq, header, lcl_close_time, max_soroban_tx_set_size) = {
             let guard = self.ledger_manager.read();
             if let Some(manager) = guard.as_ref() {
                 let hdr = manager.current_header();
                 let lcl_ct = hdr.scp_value.close_time.0;
                 let max = hdr.max_tx_set_size as usize;
                 let seq = self.build_starting_seq_map(manager);
-                (manager.current_header_hash(), max, seq, hdr, lcl_ct)
+                let soroban_max = manager
+                    .soroban_network_info()
+                    .map(|info| info.ledger_max_tx_count);
+                (
+                    manager.current_header_hash(),
+                    max,
+                    seq,
+                    hdr,
+                    lcl_ct,
+                    soroban_max,
+                )
             } else {
                 (
                     Hash256::ZERO,
@@ -1532,6 +1542,7 @@ impl Herder {
                     None,
                     LedgerHeader::default(),
                     0,
+                    None,
                 )
             }
         };
@@ -1575,7 +1586,7 @@ impl Herder {
                 stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
                 stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
             },
-            max_soroban_tx_set_size: None, // TODO: read from config settings
+            max_soroban_tx_set_size: max_soroban_tx_set_size,
         };
 
         let mut upgrade_list: Vec<LedgerUpgrade> = self
@@ -1588,6 +1599,9 @@ impl Herder {
                 LedgerUpgrade::MaxTxSetSize(s) => *s != state.max_tx_set_size,
                 LedgerUpgrade::BaseReserve(r) => *r != state.base_reserve,
                 LedgerUpgrade::Flags(f) => *f != state.flags,
+                LedgerUpgrade::MaxSorobanTxSetSize(s) => {
+                    state.max_soroban_tx_set_size.map_or(true, |c| *s != c)
+                }
                 _ => true,
             })
             .cloned()

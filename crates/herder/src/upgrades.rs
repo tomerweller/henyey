@@ -1071,4 +1071,69 @@ mod tests {
         });
         assert!(proposals.is_empty());
     }
+
+    /// Regression test for #1506: max_soroban_tx_set_size must filter already-applied upgrades.
+    #[test]
+    fn test_create_upgrades_filters_soroban_tx_set_size() {
+        let params = UpgradeParameters {
+            upgrade_time: 1000,
+            protocol_version: None,
+            base_fee: None,
+            max_tx_set_size: None,
+            base_reserve: None,
+            flags: None,
+            max_soroban_tx_set_size: Some(200),
+            config_upgrade_set_key: None,
+            nomination_timeout_limit: None,
+            expiration_minutes: None,
+        };
+        let upgrades = Upgrades::new(params);
+
+        // Current value matches proposed: should be filtered out
+        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
+            close_time: 1000,
+            protocol_version: 24,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 10000000,
+            flags: 0,
+            max_soroban_tx_set_size: Some(200),
+        });
+        assert!(
+            proposals.is_empty(),
+            "Upgrade to same value should be filtered, got {:?}",
+            proposals
+        );
+
+        // Current value differs from proposed: should emit the upgrade
+        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
+            close_time: 1000,
+            protocol_version: 24,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 10000000,
+            flags: 0,
+            max_soroban_tx_set_size: Some(100),
+        });
+        assert_eq!(proposals.len(), 1);
+        assert!(matches!(
+            proposals[0],
+            LedgerUpgrade::MaxSorobanTxSetSize(200)
+        ));
+
+        // Current value is None (Soroban not yet available): should still emit
+        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
+            close_time: 1000,
+            protocol_version: 24,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 10000000,
+            flags: 0,
+            max_soroban_tx_set_size: None,
+        });
+        assert!(
+            proposals.is_empty(),
+            "Without current Soroban config, upgrade should not be proposed"
+        );
+    }
 }
