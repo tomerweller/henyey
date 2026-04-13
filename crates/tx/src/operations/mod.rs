@@ -791,10 +791,16 @@ fn validate_clawback(
     protocol_version: u32,
     source_account: Option<&AccountId>,
 ) -> std::result::Result<(), OperationValidationError> {
-    // from must not be source
+    // from must not be source — compare full MuxedAccount, not stripped AccountId.
+    // stellar-core: mClawback.from == toMuxedAccount(getSourceID())
+    // toMuxedAccount wraps AccountId as Ed25519, so a MuxedEd25519 `from`
+    // with the same underlying key is considered different (clawback is allowed).
     if let Some(src) = source_account {
-        let from_acct = muxed_to_account_id(&op.from);
-        if &from_acct == src {
+        let key = match &src.0 {
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
+        };
+        let src_muxed = MuxedAccount::Ed25519(key);
+        if op.from == src_muxed {
             return Err(OperationValidationError::Other(
                 "cannot clawback from self".into(),
             ));

@@ -291,9 +291,8 @@ fn test_reject_fee_bump_soroban_resource_fee_overflow() {
 // Henyey: strips to AccountId via muxed_to_account_id → false rejection.
 // ============================================================================
 
-/// MuxedEd25519(key, 42) from Ed25519(key) source should NOT be self-clawback.
+/// Regression test for #1495 — MuxedEd25519 from is not self-clawback.
 #[test]
-#[ignore] // Blocked on #1495
 fn test_reject_clawback_muxed_from_not_self_clawback() {
     let issuer_key = Uint256([6u8; 32]);
     let issuer = AccountId(PublicKey::PublicKeyTypeEd25519(issuer_key.clone()));
