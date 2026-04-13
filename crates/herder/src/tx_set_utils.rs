@@ -22,7 +22,7 @@ use stellar_xdr::curr::{
     AccountId, GeneralizedTransactionSet, LedgerHeader, SorobanTransactionDataExt,
     TransactionEnvelope, TransactionPhase, TxSetComponent,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::tx_queue::FeeBalanceProvider;
 
@@ -992,6 +992,10 @@ pub(crate) fn check_tx_set_valid(
                 if !check_valid_soroban(phase, lcl_header, info) {
                     return false;
                 }
+            } else {
+                // Soroban phase present but no network config — reject.
+                warn!("check_tx_set_valid: Soroban phase present but soroban config unavailable");
+                return false;
             }
         } else if !check_valid_classic(phase, lcl_header.max_tx_set_size) {
             return false;
@@ -2303,11 +2307,8 @@ mod tests {
         })
     }
 
-    /// #1482 — Soroban phase validation silently bypassed when config unavailable.
-    /// check_tx_set_valid skips check_valid_soroban when soroban_info=None.
-    /// stellar-core rejects tx-sets with Soroban txs when config is unavailable.
+    /// Regression test for #1482 — Soroban validation must not be silently bypassed.
     #[test]
-    #[ignore] // Blocked on #1482
     fn test_check_tx_set_valid_rejects_soroban_when_config_none() {
         let soroban_tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
         let gen_tx_set = make_gen_tx_set(vec![], vec![soroban_tx]);
