@@ -948,21 +948,12 @@ fn validate_liquidity_pool_withdraw(
 
 /// Validate InvokeHostFunction operation.
 /// stellar-core: InvokeHostFunctionOpFrame::doCheckValidForSoroban (lines 1283-1313)
+/// Note: Soroban-specific checks (WASM size, CreateContract asset) live in
+/// check_valid_pre_seq_num section 4e so they return SorobanInvalid, not Malformed.
 fn validate_invoke_host_function(
-    op: &InvokeHostFunctionOp,
-    protocol_version: u32,
+    _op: &InvokeHostFunctionOp,
+    _protocol_version: u32,
 ) -> std::result::Result<(), OperationValidationError> {
-    // CreateContract with fromAsset: validate the asset.
-    // stellar-core: InvokeHostFunctionOpFrame.cpp:1301-1309
-    if let stellar_xdr::curr::HostFunction::CreateContract(args) = &op.host_function {
-        if let stellar_xdr::curr::ContractIdPreimage::Asset(asset) = &args.contract_id_preimage {
-            if !is_asset_valid(asset, protocol_version) {
-                return Err(OperationValidationError::InvalidAsset(
-                    "invalid asset in CreateContract fromAsset".into(),
-                ));
-            }
-        }
-    }
     Ok(())
 }
 

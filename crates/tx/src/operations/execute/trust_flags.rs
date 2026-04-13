@@ -709,22 +709,19 @@ fn redeem_into_claimable_balance(
             return Ok(RemoveResult::LowReserve);
         }
 
-        if let Err(_) = state.apply_entry_sponsorship_with_sponsor(
+        if let Err(e) = state.apply_entry_sponsorship_with_sponsor(
             cb_ledger_key,
             &sandwich_sponsor,
             None, // claimable balances are not subentries
             1,
         ) {
-            // Distinguish sponsoring capacity exhaustion from low reserve.
-            // stellar-core returns opTOO_MANY_SPONSORING when num_sponsoring
-            // would exceed u32::MAX.
-            let (num_sponsoring, _) = state
-                .sponsorship_counts_for_account(&sandwich_sponsor)
-                .unwrap_or((0, 0));
-            if num_sponsoring >= u32::MAX as i64 {
-                return Ok(RemoveResult::TooManySponsoring);
-            }
-            return Ok(RemoveResult::LowReserve);
+            // Match the error directly: TooManySponsoring covers both
+            // individual cap and combined (numSponsoring + numSubEntries) cap.
+            return Ok(if matches!(e, crate::error::TxError::TooManySponsoring) {
+                RemoveResult::TooManySponsoring
+            } else {
+                RemoveResult::LowReserve
+            });
         }
     } else {
         // Not in a sandwich — directly establish sponsorship from cb_sponsoring_acc_id.

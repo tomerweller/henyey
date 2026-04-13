@@ -38,7 +38,7 @@
 //! }
 //! ```
 
-use henyey_common::{Hash256, NetworkId};
+use henyey_common::{asset::is_asset_valid, Hash256, NetworkId};
 use henyey_crypto::{PublicKey, Signature};
 use stellar_xdr::curr::{
     AccountEntry, ContractDataDurability, DecoratedSignature, LedgerKey, OperationBody,
@@ -47,6 +47,9 @@ use stellar_xdr::curr::{
 
 use crate::fee_bump::{validate_fee_bump, FeeBumpError, FeeBumpFrame};
 use crate::frame::TransactionFrame;
+
+/// stellar-core: TransactionFrame.cpp:65 — MAX_RESOURCE_FEE = 2^50
+pub(crate) const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
 
 /// Check if a ledger key is a Soroban entry (ContractData or ContractCode).
 /// Mirrors stellar-core: LedgerTypeUtils.h:isSorobanEntry
@@ -537,6 +540,16 @@ fn validate_soroban_resources(
         return Ok(());
     };
 
+    // XDRProvidesValidFee: resource_fee must be in [0, MAX_RESOURCE_FEE].
+    // stellar-core: TransactionFrame.cpp:1763-1779
+    let resource_fee = data.resource_fee;
+    if resource_fee < 0 || resource_fee > MAX_RESOURCE_FEE {
+        return Err(ValidationError::InvalidStructure(format!(
+            "soroban resource fee {} out of valid range [0, {}]",
+            resource_fee, MAX_RESOURCE_FEE
+        )));
+    }
+
     let footprint = &data.resources.footprint;
     if let stellar_xdr::curr::SorobanTransactionDataExt::V1(resource_ext) = &data.ext {
         let mut prev: Option<u32> = None;
@@ -987,9 +1000,8 @@ pub fn check_valid_pre_seq_num_with_config(
     }
 
     // 1b. XDRProvidesValidFee: Soroban txs must have resource_fee in [0, MAX_RESOURCE_FEE].
-    // stellar-core: TransactionFrame.cpp:1763-1779, MAX_RESOURCE_FEE = 1<<50
+    // stellar-core: TransactionFrame.cpp:1763-1779
     if frame.is_soroban() {
-        const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
         let resource_fee = frame.declared_soroban_resource_fee();
         if resource_fee < 0 || resource_fee > MAX_RESOURCE_FEE {
             return Err(PreSeqNumError::Malformed(
@@ -1115,10 +1127,12 @@ pub fn check_valid_pre_seq_num_with_config(
                         }
                     }
                 }
-                // InvokeHostFunction: check WASM size if uploading
+                // InvokeHostFunction: check WASM size and CreateContract asset
                 _ => {
-                    if let Some(max_size) = max_contract_size_bytes {
-                        if let OperationBody::InvokeHostFunction(invoke) = &op.body {
+                    if let OperationBody::InvokeHostFunction(invoke) = &op.body {
+                        // 4e-i. WASM size gate
+                        // stellar-core: InvokeHostFunctionOpFrame.cpp:1290-1299
+                        if let Some(max_size) = max_contract_size_bytes {
                             if let stellar_xdr::curr::HostFunction::UploadContractWasm(wasm) =
                                 &invoke.host_function
                             {
@@ -1128,6 +1142,21 @@ pub fn check_valid_pre_seq_num_with_config(
                                         wasm.len(),
                                         max_size
                                     )));
+                                }
+                            }
+                        }
+                        // 4e-ii. CreateContract fromAsset: validate asset code
+                        // stellar-core: InvokeHostFunctionOpFrame.cpp:1301-1309
+                        if let stellar_xdr::curr::HostFunction::CreateContract(args) =
+                            &invoke.host_function
+                        {
+                            if let stellar_xdr::curr::ContractIdPreimage::Asset(asset) =
+                                &args.contract_id_preimage
+                            {
+                                if !is_asset_valid(asset, protocol_version) {
+                                    return Err(PreSeqNumError::SorobanInvalid(
+                                        "invalid asset in CreateContract fromAsset".to_string(),
+                                    ));
                                 }
                             }
                         }
