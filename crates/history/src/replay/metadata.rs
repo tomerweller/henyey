@@ -252,10 +252,10 @@ fn count_operations(tx_set: &TransactionSetVariant) -> u32 {
                 count += tx.tx.operations.len() as u32;
             }
             TransactionEnvelope::TxFeeBump(tx) => {
-                // Fee bump wraps an inner transaction
+                // Fee bump wraps an inner transaction; +1 for the wrapper itself
                 match &tx.tx.inner_tx {
                     stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                        count += inner.tx.operations.len() as u32;
+                        count += inner.tx.operations.len() as u32 + 1;
                     }
                 }
             }

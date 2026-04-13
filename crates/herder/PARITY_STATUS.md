@@ -360,7 +360,7 @@ Corresponds to: `TxSetFrame.h`
 | `ApplicableTxSetFrame::getTotalInclusionFees()` | _(not implemented)_ | None |
 | `ApplicableTxSetFrame::summary()` | `TransactionSet` summary logging | Partial |
 | `TxSetPhaseFrame` (all methods) | _(not implemented)_ | None |
-| `makeTxSetFromTransactions()` | `build_generalized_tx_set()` | Partial |
+| `makeTxSetFromTransactions()` | `build_generalized_tx_set()` | Full |
 
 ### TxSetUtils (`tx_set_utils.rs`)
 
