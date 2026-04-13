@@ -2575,9 +2575,9 @@ pub struct DeltaSnapshot {
 }
 
 /// Zero-copy view into a range of delta changes between two snapshots.
-/// Avoids cloning vectors by referencing the parent `LedgerDelta` directly.
+/// Avoids cloning vectors by referencing the parent `TxChangeLog` directly.
 pub struct DeltaSlice<'a> {
-    delta: &'a henyey_tx::LedgerDelta,
+    delta: &'a henyey_tx::TxChangeLog,
     start: DeltaSnapshot,
     end: DeltaSnapshot,
 }

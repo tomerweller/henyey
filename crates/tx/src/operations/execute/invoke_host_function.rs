@@ -28,7 +28,7 @@ pub(crate) fn is_soroban_key(key: &LedgerKey) -> bool {
 ///
 /// We can't use state.get_*().is_some() because archived entries are pre-loaded
 /// into state from InMemorySorobanState before Soroban execution.
-fn key_already_created_in_delta(delta: &crate::apply::LedgerDelta, key: &LedgerKey) -> bool {
+fn key_already_created_in_delta(delta: &crate::apply::TxChangeLog, key: &LedgerKey) -> bool {
     use stellar_xdr::curr::LedgerEntryData;
 
     for entry in delta.created_entries() {
@@ -56,7 +56,7 @@ fn key_already_created_in_delta(delta: &crate::apply::LedgerDelta, key: &LedgerK
 
 /// Check if a TTL entry with the given key hash was already created in the delta.
 fn ttl_already_created_in_delta(
-    delta: &crate::apply::LedgerDelta,
+    delta: &crate::apply::TxChangeLog,
     key_hash: &stellar_xdr::curr::Hash,
 ) -> bool {
     use stellar_xdr::curr::LedgerEntryData;

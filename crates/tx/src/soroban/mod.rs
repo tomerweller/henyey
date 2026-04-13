@@ -36,7 +36,7 @@
 //! +---------------------+
 //!            |
 //!            v
-//! Apply to LedgerDelta
+//! Apply to TxChangeLog
 //! ```
 //!
 //! # Protocol Versioning

@@ -39,7 +39,7 @@ use stellar_xdr::curr::{
     AccountId, Asset, LedgerEntry, LedgerEntryData, MuxedAccount, Operation, ScAddress,
 };
 
-use crate::apply::LedgerDelta;
+use crate::apply::TxChangeLog;
 use crate::events::OpEventManager;
 use crate::frame::muxed_to_account_id;
 
@@ -68,7 +68,7 @@ use crate::frame::muxed_to_account_id;
 pub fn reconcile_events(
     tx_source_account: &MuxedAccount,
     operation: &Operation,
-    delta: &LedgerDelta,
+    delta: &TxChangeLog,
     op_event_manager: &mut OpEventManager,
 ) {
     if !op_event_manager.is_enabled() {
@@ -103,7 +103,7 @@ pub fn reconcile_events(
 ///
 /// Iterates through all account entries in the delta and sums up the balance
 /// changes (current - previous).
-fn calculate_balance_delta(delta: &LedgerDelta) -> i64 {
+fn calculate_balance_delta(delta: &TxChangeLog) -> i64 {
     let mut total_delta: i64 = 0;
 
     // Process updated entries (post-state vs pre-state)
@@ -452,7 +452,7 @@ mod tests {
         let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 1000);
 
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = TxChangeLog::new(1);
         delta.record_create(entry);
 
         let balance_delta = calculate_balance_delta(&delta);
@@ -464,7 +464,7 @@ mod tests {
         let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 1000);
 
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = TxChangeLog::new(1);
         delta.record_delete(make_account_key(&account_id), entry);
 
         let balance_delta = calculate_balance_delta(&delta);
@@ -477,7 +477,7 @@ mod tests {
         let prev_entry = make_account_entry(account_id.clone(), 1000);
         let curr_entry = make_account_entry(account_id.clone(), 1500);
 
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = TxChangeLog::new(1);
         delta.record_update(prev_entry, curr_entry);
 
         let balance_delta = calculate_balance_delta(&delta);
@@ -490,7 +490,7 @@ mod tests {
         let account2 = create_test_account_id(2);
         let account3 = create_test_account_id(3);
 
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = TxChangeLog::new(1);
 
         // Create account with 1000
         delta.record_create(make_account_entry(account1.clone(), 1000));
@@ -517,7 +517,7 @@ mod tests {
         let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 1000);
 
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = TxChangeLog::new(1);
         // Update with no balance change
         delta.record_update(entry.clone(), entry);
 

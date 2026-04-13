@@ -441,7 +441,7 @@ Corresponds to: `LedgerTxn.h` (nested commit/rollback)
 | Child commit on success | Savepoint dropped (no-op) | Full |
 | Child rollback on failure | `rollback_to_savepoint()` with three-phase restore | Full |
 | All entry types covered | Accounts, trustlines, offers, data, contract_data, contract_code, TTL, claimable_balances, liquidity_pools | Full |
-| Delta truncation on rollback | `LedgerDelta::truncate_to()` via `DeltaLengths` | Full |
+| Delta truncation on rollback | `TxChangeLog::truncate_to()` via `ChangeLogLengths` | Full |
 | Metadata/sponsorship restore | `entry_last_modified`, `entry_sponsorship` snapshots | Full |
 | ID pool restore | `id_pool` field in `Savepoint` | Full |
 

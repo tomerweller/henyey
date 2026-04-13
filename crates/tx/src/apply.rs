@@ -34,7 +34,7 @@
 //!
 //! # Key Types
 //!
-//! - [`LedgerDelta`]: Accumulates state changes during transaction application.
+//! - [`TxChangeLog`]: Accumulates state changes during transaction application.
 //!   Tracks creates, updates, and deletes with their pre-states for proper
 //!   metadata generation.
 //!
@@ -58,16 +58,16 @@
 //! +---------------------------+
 //! ```
 //!
-//! [`LedgerDelta`] preserves this ordering through `change_order`, allowing
+//! [`TxChangeLog`] preserves this ordering through `change_order`, allowing
 //! metadata to be reconstructed exactly as recorded.
 //!
 //! # Usage Example
 //!
 //! ```ignore
-//! use henyey_tx::{apply_from_history, LedgerDelta, TransactionFrame};
+//! use henyey_tx::{apply_from_history, TxChangeLog, TransactionFrame};
 //!
 //! let frame = TransactionFrame::new(envelope);
-//! let mut delta = LedgerDelta::new(ledger_seq);
+//! let mut delta = TxChangeLog::new(ledger_seq);
 //!
 //! // Apply the historical transaction
 //! let result = apply_from_history(&frame, &tx_result, &tx_meta, &mut delta)?;
@@ -93,7 +93,7 @@ use crate::frame::TransactionFrame;
 use crate::result::{TxApplyResult, TxResultWrapper};
 use crate::Result;
 
-/// Reference to a change in a [`LedgerDelta`], preserving execution order.
+/// Reference to a change in a [`TxChangeLog`], preserving execution order.
 ///
 /// During transaction execution, changes (creates, updates, deletes) can be
 /// interleaved. This enum tracks the order so that changes can be replayed
@@ -110,7 +110,7 @@ pub enum ChangeRef {
 
 /// Accumulator for ledger state changes during transaction execution.
 ///
-/// `LedgerDelta` collects all creates, updates, and deletes that occur during
+/// `TxChangeLog` collects all creates, updates, and deletes that occur during
 /// transaction execution. It maintains both the new state (for updates) and
 /// the pre-state (for building proper transaction metadata).
 ///
@@ -127,7 +127,7 @@ pub enum ChangeRef {
 /// # Example
 ///
 /// ```ignore
-/// let mut delta = LedgerDelta::new(ledger_seq);
+/// let mut delta = TxChangeLog::new(ledger_seq);
 ///
 /// // Record changes during execution
 /// delta.record_create(new_account_entry);
@@ -141,7 +141,7 @@ pub enum ChangeRef {
 /// ```
 /// Captured vector lengths for savepoint support.
 #[derive(Clone)]
-pub struct DeltaLengths {
+pub struct ChangeLogLengths {
     pub created: usize,
     pub updated: usize,
     pub deleted: usize,
@@ -149,7 +149,7 @@ pub struct DeltaLengths {
 }
 
 #[derive(Clone)]
-pub struct LedgerDelta {
+pub struct TxChangeLog {
     /// Ledger sequence this delta applies to.
     ledger_seq: u32,
     /// Entries created.
@@ -170,7 +170,7 @@ pub struct LedgerDelta {
     change_order: Vec<ChangeRef>,
 }
 
-impl LedgerDelta {
+impl TxChangeLog {
     /// Create a new delta for the given ledger sequence.
     pub fn new(ledger_seq: u32) -> Self {
         Self {
@@ -195,7 +195,7 @@ impl LedgerDelta {
         if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
             tracing::debug!(
                 key_hash = ?ttl.key_hash,
-                "LedgerDelta::record_create for Ttl"
+                "TxChangeLog::record_create for Ttl"
             );
         }
         let idx = self.created.len();
@@ -211,7 +211,7 @@ impl LedgerDelta {
         if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &post_state.data {
             tracing::debug!(
                 key_hash = ?ttl.key_hash,
-                "LedgerDelta::record_update for Ttl"
+                "TxChangeLog::record_update for Ttl"
             );
         }
         let idx = self.updated.len();
@@ -351,8 +351,8 @@ impl LedgerDelta {
     }
 
     /// Capture the current vector lengths for savepoint support.
-    pub fn snapshot_lengths(&self) -> DeltaLengths {
-        DeltaLengths {
+    pub fn snapshot_lengths(&self) -> ChangeLogLengths {
+        ChangeLogLengths {
             created: self.created.len(),
             updated: self.updated.len(),
             deleted: self.deleted.len(),
@@ -362,7 +362,7 @@ impl LedgerDelta {
 
     /// Truncate all vectors back to the given lengths.
     /// Used by savepoint rollback to undo speculative delta entries.
-    pub fn truncate_to(&mut self, lengths: &DeltaLengths) {
+    pub fn truncate_to(&mut self, lengths: &ChangeLogLengths) {
         self.created.truncate(lengths.created);
         self.updated.truncate(lengths.updated);
         self.update_states.truncate(lengths.updated);
@@ -373,7 +373,7 @@ impl LedgerDelta {
 
     // SECURITY: fee accumulation validated during tx set construction; overflow not possible with valid tx sets
     /// Merge another delta into this one.
-    pub fn merge(&mut self, other: LedgerDelta) {
+    pub fn merge(&mut self, other: TxChangeLog) {
         // Track offsets for adjusting indices in change_order
         let created_offset = self.created.len();
         let updated_offset = self.updated.len();
@@ -407,7 +407,7 @@ pub fn apply_from_history(
     _frame: &TransactionFrame,
     result: &TransactionResult,
     meta: &TransactionMeta,
-    delta: &mut LedgerDelta,
+    delta: &mut TxChangeLog,
 ) -> Result<TxApplyResult> {
     // Add fee to delta
     delta.add_fee(result.fee_charged);
@@ -427,7 +427,7 @@ pub fn apply_from_history(
 }
 
 /// Apply state changes from transaction meta.
-fn apply_meta_changes(meta: &TransactionMeta, delta: &mut LedgerDelta) -> Result<()> {
+fn apply_meta_changes(meta: &TransactionMeta, delta: &mut TxChangeLog) -> Result<()> {
     match meta {
         TransactionMeta::V0(changes) => {
             for op_meta in changes.iter() {
@@ -470,7 +470,7 @@ fn apply_meta_changes(meta: &TransactionMeta, delta: &mut LedgerDelta) -> Result
 ///
 /// This is used during catchup mode where we replay historical changes.
 /// For updates and deletes, we track the preceding STATE entry as the pre-state.
-fn apply_ledger_entry_changes(changes: &LedgerEntryChanges, delta: &mut LedgerDelta) -> Result<()> {
+fn apply_ledger_entry_changes(changes: &LedgerEntryChanges, delta: &mut TxChangeLog) -> Result<()> {
     let mut pending_state: Option<LedgerEntry> = None;
 
     for change in changes.iter() {
@@ -510,7 +510,7 @@ fn apply_ledger_entry_changes(changes: &LedgerEntryChanges, delta: &mut LedgerDe
 /// Apply fee-only for a failed transaction.
 pub fn apply_fee_only(
     frame: &TransactionFrame,
-    delta: &mut LedgerDelta,
+    delta: &mut TxChangeLog,
     _source_account: &AccountEntry,
 ) -> Result<()> {
     let fee = frame.total_fee();
@@ -521,7 +521,7 @@ pub fn apply_fee_only(
 /// Batch apply multiple transactions from history.
 pub fn apply_transaction_set_from_history(
     transactions: &[(TransactionFrame, TransactionResult, TransactionMeta)],
-    delta: &mut LedgerDelta,
+    delta: &mut TxChangeLog,
 ) -> Result<Vec<TxApplyResult>> {
     let mut results = Vec::with_capacity(transactions.len());
 
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_creation() {
-        let delta = LedgerDelta::new(100);
+        let delta = TxChangeLog::new(100);
         assert_eq!(delta.ledger_seq(), 100);
         assert!(!delta.has_changes());
         assert_eq!(delta.change_count(), 0);
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_changes() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
         let entry = LedgerEntry {
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_fee() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
         assert_eq!(delta.fee_charged(), 0);
 
         delta.add_fee(100);
@@ -604,10 +604,10 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_merge() {
-        let mut delta1 = LedgerDelta::new(100);
+        let mut delta1 = TxChangeLog::new(100);
         delta1.add_fee(100);
 
-        let mut delta2 = LedgerDelta::new(100);
+        let mut delta2 = TxChangeLog::new(100);
         delta2.add_fee(200);
 
         delta1.merge(delta2);
@@ -643,10 +643,10 @@ mod tests {
         }
     }
 
-    /// Test LedgerDelta snapshot and truncate for savepoint support.
+    /// Test TxChangeLog snapshot and truncate for savepoint support.
     #[test]
     fn test_ledger_delta_snapshot_and_truncate() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
 
         let account_id1 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
         let entry1 = LedgerEntry {
@@ -700,10 +700,10 @@ mod tests {
         assert_eq!(delta.created_entries().len(), 1);
     }
 
-    /// Test LedgerDelta apply_refund_to_account modifies the correct account.
+    /// Test TxChangeLog apply_refund_to_account modifies the correct account.
     #[test]
     fn test_ledger_delta_apply_refund() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([3u8; 32])));
         let entry = LedgerEntry {
@@ -746,7 +746,7 @@ mod tests {
     /// Regression test for AUDIT-H18: unchecked `acc.balance += refund` can wrap.
     #[test]
     fn test_ledger_delta_apply_refund_overflow() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([8u8; 32])));
         let entry = LedgerEntry {
@@ -795,7 +795,7 @@ mod tests {
     fn test_ledger_delta_apply_refund_buying_liabilities() {
         use stellar_xdr::curr::{AccountEntryExtensionV1, Liabilities};
 
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32])));
         let entry = LedgerEntry {
@@ -849,7 +849,7 @@ mod tests {
     /// Test change_order preserves execution order.
     #[test]
     fn test_ledger_delta_change_order() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([4u8; 32])));
         let entry = LedgerEntry {
@@ -920,11 +920,11 @@ mod tests {
         }
     }
 
-    /// Test LedgerDelta merge preserves change order with correct offsets.
+    /// Test TxChangeLog merge preserves change order with correct offsets.
     #[test]
     fn test_ledger_delta_merge_change_order() {
-        let mut delta1 = LedgerDelta::new(100);
-        let mut delta2 = LedgerDelta::new(100);
+        let mut delta1 = TxChangeLog::new(100);
+        let mut delta2 = TxChangeLog::new(100);
 
         let account_id1 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([6u8; 32])));
         let entry1 = LedgerEntry {
@@ -975,7 +975,7 @@ mod tests {
         assert!(matches!(order[1], ChangeRef::Created(1)));
     }
 
-    // === Additional LedgerDelta tests ===
+    // === Additional TxChangeLog tests ===
 
     #[test]
     fn test_change_ref_debug() {
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn test_delta_lengths_struct() {
-        let lengths = DeltaLengths {
+        let lengths = ChangeLogLengths {
             created: 5,
             updated: 3,
             deleted: 2,
@@ -1009,7 +1009,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_update_states() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([8u8; 32])));
         let entry = LedgerEntry {
@@ -1052,7 +1052,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_delete_states() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32])));
         let entry = LedgerEntry {
@@ -1090,13 +1090,13 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_has_changes_false() {
-        let delta = LedgerDelta::new(200);
+        let delta = TxChangeLog::new(200);
         assert!(!delta.has_changes());
     }
 
     #[test]
     fn test_ledger_delta_has_changes_after_create() {
-        let mut delta = LedgerDelta::new(200);
+        let mut delta = TxChangeLog::new(200);
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([10u8; 32])));
         let entry = LedgerEntry {
@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_clone() {
-        let mut delta = LedgerDelta::new(300);
+        let mut delta = TxChangeLog::new(300);
         delta.add_fee(500);
 
         let cloned = delta.clone();
@@ -1224,7 +1224,7 @@ mod tests {
     /// within the same tx set, it exists only in `created`.
     #[test]
     fn test_audit_009_apply_refund_to_created_entry() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([42u8; 32])));
         let initial_balance: i64 = 100_000_000;

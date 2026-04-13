@@ -24,7 +24,7 @@ flowchart TD
     C --> SM[LedgerStateManager]
     SB --> SM
     SB --> MC[PersistentModuleCache]
-    H --> D[LedgerDelta]
+    H --> D[TxChangeLog]
     SM --> D
     D --> R[result.rs]
     D --> M[meta_builder.rs]
@@ -40,7 +40,7 @@ flowchart TD
 | `LedgerContext` | Ledger-level inputs used during validation and execution, including network ID and protocol version. |
 | `LiveExecutionContext` | Mutable live-apply context containing ledger state and fee-pool accounting. |
 | `LedgerStateManager` | In-memory execution state with per-operation savepoints and delta tracking. |
-| `LedgerDelta` | Ordered create, update, and delete log used for replay, persistence, and meta reconstruction. |
+| `TxChangeLog` | Ordered create, update, and delete log used for replay, persistence, and meta reconstruction. |
 | `FeeBumpFrame` | Fee-bump-specific helpers for inner transaction validation and result wrapping. |
 | `MutableTransactionResult` | Mutable apply-phase transaction result with Soroban fee/refund tracking. |
 | `TxApplyResult` | Finalized per-transaction outcome with success flag, fee charged, and wrapped XDR result. |
@@ -90,10 +90,10 @@ assert_eq!(ctx.protocol_version(), 25);
 assert_eq!(ctx.fee_pool_delta(), 0);
 ```
 
-Replay a historical transaction into a `LedgerDelta`:
+Replay a historical transaction into a `TxChangeLog`:
 
 ```rust
-use henyey_tx::{apply_from_history, LedgerDelta, TransactionFrame};
+use henyey_tx::{apply_from_history, TxChangeLog, TransactionFrame};
 use stellar_xdr::curr::{TransactionEnvelope, TransactionMeta, TransactionResult};
 
 let envelope: TransactionEnvelope = todo!();
@@ -101,7 +101,7 @@ let result: TransactionResult = todo!();
 let meta: TransactionMeta = todo!();
 
 let frame = TransactionFrame::from_owned(envelope);
-let mut delta = LedgerDelta::new(10_000);
+let mut delta = TxChangeLog::new(10_000);
 apply_from_history(&frame, &result, &meta, &mut delta)?;
 
 assert_eq!(delta.ledger_seq(), 10_000);
@@ -117,7 +117,7 @@ assert!(delta.fee_charged() >= 0);
 | `frame.rs` | `TransactionFrame` envelope wrapper and common transaction accessors. |
 | `validation.rs` | `LedgerContext` plus structure, fee, sequence, bounds, and signature validation. |
 | `live_execution.rs` | Fee/sequence processing, post-apply steps, refunds, and live-apply context. |
-| `apply.rs` | Historical replay helpers and `LedgerDelta` change recording. |
+| `apply.rs` | Historical replay helpers and `TxChangeLog` change recording. |
 | `result.rs` | Mutable/final transaction result wrappers and refundable Soroban fee tracking. |
 | `error.rs` | Crate-level `TxError` definitions. |
 | `fee_bump.rs` | Fee-bump helpers, validation, and result wrapping. |
@@ -170,7 +170,7 @@ assert!(delta.fee_charged() >= 0);
 
 `LedgerStateManager` is intentionally savepoint-based instead of exposing direct mutable access to all entry maps. Each operation can snapshot the current state with `create_savepoint()` and roll back with `rollback_to_savepoint()` if the operation fails, matching stellar-core's nested `LedgerTxn` behavior.
 
-`LedgerDelta` records changes in execution order, not just by entry class. That ordering is needed both for bucket-list persistence and for reconstructing transaction metadata with the same before/after semantics as upstream.
+`TxChangeLog` records changes in execution order, not just by entry class. That ordering is needed both for bucket-list persistence and for reconstructing transaction metadata with the same before/after semantics as upstream.
 
 Soroban execution is protocol-versioned. `soroban-env-host-p24` is used for protocol 24, while `soroban-env-host-p25` is used for protocol 25 and later. `PersistentModuleCache` lets the crate reuse compiled WASM modules without charging compilation work to transaction CPU budgets.
 

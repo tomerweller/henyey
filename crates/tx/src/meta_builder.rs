@@ -441,7 +441,7 @@ impl OperationMetaBuilder {
         self.changes.push(LedgerEntryChange::Restored(entry));
     }
 
-    /// Set ledger changes directly (e.g., from LedgerDelta).
+    /// Set ledger changes directly (e.g., from TxChangeLog).
     ///
     /// This replaces any previously recorded changes.
     pub fn set_ledger_changes(&mut self, changes: Vec<LedgerEntryChange>) {

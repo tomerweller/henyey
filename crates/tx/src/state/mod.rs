@@ -18,7 +18,7 @@ use stellar_xdr::curr::{
 
 use offer_store::{OfferRecord, OfferStore};
 
-use crate::apply::{DeltaLengths, LedgerDelta};
+use crate::apply::{ChangeLogLengths, TxChangeLog};
 use crate::{Result, TxError};
 pub(crate) use henyey_common::asset::asset_to_trustline_asset;
 
@@ -119,13 +119,13 @@ fn rollback_entries<K, V>(
 pub use offer_index::{AssetPair, OfferDescriptor, OfferIndex, OfferKey};
 
 /// Lightweight delta snapshot for TX-level rollback.
-/// Instead of cloning the entire LedgerDelta (O(N) entries), we capture just
+/// Instead of cloning the entire TxChangeLog (O(N) entries), we capture just
 /// the vector lengths and fee_charged value. Since the delta is append-only
 /// between snapshot and rollback, truncating to these lengths restores the
 /// pre-TX state in O(1).
 #[derive(Clone)]
 struct DeltaSnapshot {
-    lengths: DeltaLengths,
+    lengths: ChangeLogLengths,
     fee_charged: i64,
 }
 
@@ -175,7 +175,7 @@ pub struct Savepoint {
     created_trustlines: HashSet<TrustlineKey>,
     created_ttl: HashSet<Hash>,
     // Delta vector lengths for truncation
-    delta_lengths: DeltaLengths,
+    delta_lengths: ChangeLogLengths,
 
     // Modified tracking vec lengths
     modified_accounts_len: usize,
@@ -260,7 +260,7 @@ pub struct LedgerStateManager {
     /// Active sponsorship stack for the current transaction.
     sponsorship_stack: Vec<SponsorshipContext>,
     /// Changes made during execution.
-    delta: LedgerDelta,
+    delta: TxChangeLog,
     /// Track which entries have been modified for rollback.
     modified_accounts: Vec<AccountId>,
     /// Track which trustlines have been modified.
@@ -373,7 +373,7 @@ impl LedgerStateManager {
             op_snapshots_active: false,
             multi_op_mode: false,
             sponsorship_stack: Vec::new(),
-            delta: LedgerDelta::new(ledger_seq),
+            delta: TxChangeLog::new(ledger_seq),
             modified_accounts: Vec::new(),
             modified_trustlines: Vec::new(),
             modified_offers: Vec::new(),
@@ -960,7 +960,7 @@ impl LedgerStateManager {
         self.op_snapshots_active = false;
         self.multi_op_mode = false;
         self.sponsorship_stack.clear();
-        self.delta = LedgerDelta::new(self.ledger_seq);
+        self.delta = TxChangeLog::new(self.ledger_seq);
         self.delta_snapshot = None;
 
         self.modified_accounts.clear();
@@ -1115,17 +1115,17 @@ impl LedgerStateManager {
     // ==================== Delta Operations ====================
 
     /// Get the current delta (read-only).
-    pub fn delta(&self) -> &LedgerDelta {
+    pub fn delta(&self) -> &TxChangeLog {
         &self.delta
     }
 
     /// Get the current delta (mutable).
-    pub fn delta_mut(&mut self) -> &mut LedgerDelta {
+    pub fn delta_mut(&mut self) -> &mut TxChangeLog {
         &mut self.delta
     }
 
     /// Consume self and return the delta.
-    pub fn take_delta(self) -> LedgerDelta {
+    pub fn take_delta(self) -> TxChangeLog {
         self.delta
     }
 
@@ -1686,7 +1686,7 @@ impl LedgerStateManager {
         } else {
             // No snapshot - reset delta but preserve fee_charged.
             let fee_charged = self.delta.fee_charged();
-            self.delta = LedgerDelta::new(self.ledger_seq);
+            self.delta = TxChangeLog::new(self.ledger_seq);
             if fee_charged != 0 {
                 self.delta.add_fee(fee_charged);
             }
@@ -2430,7 +2430,7 @@ mod tests {
 
         // Reset delta by creating a new manager with the same state
         // (simulating the start of a new transaction)
-        manager.delta = LedgerDelta::new(100);
+        manager.delta = TxChangeLog::new(100);
 
         // Now simulate what happens during RevokeSponsorship:
         // 1. Start operation snapshot mode
@@ -2513,7 +2513,7 @@ mod tests {
         manager.commit();
 
         // Reset delta by creating a new one (simulating the start of a new transaction)
-        manager.delta = LedgerDelta::new(100);
+        manager.delta = TxChangeLog::new(100);
 
         // Now simulate what happens during RevokeSponsorship:
         // 1. Start operation snapshot mode
@@ -2592,7 +2592,7 @@ mod tests {
 
         // Reset delta by creating a new manager with the same state
         // (simulating the start of a new transaction)
-        manager.delta = LedgerDelta::new(100);
+        manager.delta = TxChangeLog::new(100);
 
         // Now simulate what happens during RevokeSponsorship:
         // 1. Start operation snapshot mode
@@ -2660,7 +2660,7 @@ mod tests {
 
         let new_ledger = 200;
         manager.set_ledger_seq(new_ledger);
-        manager.delta = LedgerDelta::new(new_ledger);
+        manager.delta = TxChangeLog::new(new_ledger);
 
         manager.begin_op_snapshot();
 
@@ -4290,7 +4290,7 @@ mod tests {
         // Advance to a new ledger
         let new_ledger = 600;
         manager.set_ledger_seq(new_ledger);
-        manager.delta = LedgerDelta::new(new_ledger);
+        manager.delta = TxChangeLog::new(new_ledger);
 
         // Simulate beginning a transaction: snapshot the delta
         manager.snapshot_delta();

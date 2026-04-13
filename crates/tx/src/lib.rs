@@ -24,7 +24,7 @@
 //! - [`LiveExecutionContext`]: Context for live transaction execution including
 //!   ledger state, fee pool tracking, and protocol configuration.
 //!
-//! - [`LedgerDelta`]: Accumulates all state changes (creates, updates, deletes)
+//! - [`TxChangeLog`]: Accumulates all state changes (creates, updates, deletes)
 //!   during transaction execution for later persistence.
 //!
 //! - [`LedgerContext`]: Provides ledger-level context (sequence, close time,
@@ -63,7 +63,7 @@
 //! # Transaction Workflow (Catchup Mode)
 //!
 //! ```ignore
-//! use henyey_tx::{TransactionFrame, apply_from_history, LedgerDelta};
+//! use henyey_tx::{TransactionFrame, apply_from_history, TxChangeLog};
 //! use stellar_xdr::curr::{TransactionEnvelope, TransactionResult, TransactionMeta};
 //!
 //! // Parse transaction from archive
@@ -75,7 +75,7 @@
 //! let frame = TransactionFrame::from_owned(envelope);
 //!
 //! // Apply historical transaction to accumulate state changes
-//! let mut delta = LedgerDelta::new(ledger_seq);
+//! let mut delta = TxChangeLog::new(ledger_seq);
 //! let apply_result = apply_from_history(&frame, &result, &meta, &mut delta)?;
 //!
 //! // Delta now contains all state changes to apply to the bucket list
@@ -164,7 +164,7 @@ pub use frame::{
 
 // Re-export apply types and functions
 pub use apply::{
-    apply_fee_only, apply_from_history, apply_transaction_set_from_history, ChangeRef, LedgerDelta,
+    apply_fee_only, apply_from_history, apply_transaction_set_from_history, ChangeRef, TxChangeLog,
 };
 
 // Re-export result types
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = TxChangeLog::new(100);
 
         assert_eq!(delta.ledger_seq(), 100);
         assert!(!delta.has_changes());

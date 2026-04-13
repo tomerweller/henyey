@@ -39,7 +39,7 @@ pub(super) fn delta_snapshot(state: &LedgerStateManager) -> DeltaSnapshot {
 }
 
 pub(super) fn delta_slice_between(
-    delta: &henyey_tx::LedgerDelta,
+    delta: &henyey_tx::TxChangeLog,
     start: DeltaSnapshot,
     end: DeltaSnapshot,
 ) -> DeltaSlice<'_> {
