@@ -413,7 +413,9 @@ fn test_validate_basic_rejects_resource_fee_overflow() {
         auth: VecM::default(),
     });
 
-    // Build a soroban frame with the overflow resource_fee
+    // Build a soroban frame with the overflow resource_fee.
+    // Use a high fee (u32::MAX) so validate_fee does NOT fail — we want to
+    // isolate the resource_fee check.
     let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
     let op = Operation {
         source_account: None,
@@ -421,7 +423,7 @@ fn test_validate_basic_rejects_resource_fee_overflow() {
     };
     let tx = Transaction {
         source_account: source,
-        fee: (overflow_fee + 100) as u32,
+        fee: u32::MAX,
         seq_num: SequenceNumber(1),
         cond: Preconditions::None,
         memo: Memo::None,
@@ -455,8 +457,14 @@ fn test_validate_basic_rejects_resource_fee_overflow() {
         NetworkId::testnet(),
     );
     let result = validate_basic(&frame, &ctx);
+    let errors = result.expect_err("validate_basic should reject resource_fee > MAX_RESOURCE_FEE");
+    // Verify the error is specifically about resource fee, not just any failure.
+    let has_resource_fee_error = errors.iter().any(|e| {
+        matches!(e, henyey_tx::validation::ValidationError::InvalidStructure(msg) if msg.contains("resource fee"))
+    });
     assert!(
-        result.is_err(),
-        "validate_basic should reject resource_fee > MAX_RESOURCE_FEE"
+        has_resource_fee_error,
+        "expected InvalidStructure error mentioning resource_fee, got: {:?}",
+        errors
     );
 }
