@@ -41,11 +41,28 @@
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::{PublicKey, Signature};
 use stellar_xdr::curr::{
-    AccountEntry, DecoratedSignature, Preconditions, SignerKey, TransactionEnvelope,
+    AccountEntry, ContractDataDurability, DecoratedSignature, LedgerKey, OperationBody,
+    Preconditions, SignerKey, TransactionEnvelope,
 };
 
 use crate::fee_bump::{validate_fee_bump, FeeBumpError, FeeBumpFrame};
 use crate::frame::TransactionFrame;
+
+/// Check if a ledger key is a Soroban entry (ContractData or ContractCode).
+/// Mirrors stellar-core: LedgerTypeUtils.h:isSorobanEntry
+fn is_soroban_entry(key: &LedgerKey) -> bool {
+    matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
+}
+
+/// Check if a ledger key is a persistent Soroban entry.
+/// Mirrors stellar-core: LedgerTypeUtils.h:isPersistentEntry
+fn is_persistent_entry(key: &LedgerKey) -> bool {
+    match key {
+        LedgerKey::ContractCode(_) => true,
+        LedgerKey::ContractData(d) => d.durability == ContractDataDurability::Persistent,
+        _ => false,
+    }
+}
 
 /// Ledger context for transaction validation and execution.
 ///
@@ -1048,6 +1065,47 @@ pub fn check_valid_pre_seq_num(
                         "duplicate key in Soroban footprint".to_string(),
                     ));
                 }
+            }
+
+            // 4e. Per-op footprint structure validation (doCheckValidForSoroban)
+            let op = &frame.operations()[0];
+            match &op.body {
+                // RestoreFootprint: readOnly must be empty, readWrite must be persistent Soroban.
+                // stellar-core: RestoreFootprintOpFrame.cpp:423-453
+                OperationBody::RestoreFootprint(_) => {
+                    if !fp.read_only.is_empty() {
+                        return Err(PreSeqNumError::SorobanInvalid(
+                            "RestoreFootprint: read-only footprint must be empty".to_string(),
+                        ));
+                    }
+                    for key in fp.read_write.iter() {
+                        if !is_persistent_entry(key) {
+                            return Err(PreSeqNumError::SorobanInvalid(
+                                "RestoreFootprint: only persistent Soroban entries can be restored"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                // ExtendFootprintTtl: readWrite must be empty, readOnly must be Soroban.
+                // stellar-core: ExtendFootprintTTLOpFrame.cpp:321-370
+                OperationBody::ExtendFootprintTtl(_) => {
+                    if !fp.read_write.is_empty() {
+                        return Err(PreSeqNumError::SorobanInvalid(
+                            "ExtendFootprintTtl: read-write footprint must be empty".to_string(),
+                        ));
+                    }
+                    for key in fp.read_only.iter() {
+                        if !is_soroban_entry(key) {
+                            return Err(PreSeqNumError::SorobanInvalid(
+                                "ExtendFootprintTtl: only Soroban entries can have TTL extended"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                // InvokeHostFunction: no footprint structure constraints at this level
+                _ => {}
             }
         }
     } else {

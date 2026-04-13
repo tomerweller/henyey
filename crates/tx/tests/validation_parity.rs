@@ -114,7 +114,7 @@ fn empty_footprint() -> LedgerFootprint {
 /// readOnly footprint must be empty for RestoreFootprint.
 /// stellar-core: RestoreFootprintOpFrame.cpp:429-437
 #[test]
-#[ignore] // Blocked on #1490
+
 fn test_reject_restore_footprint_nonempty_readonly() {
     let footprint = LedgerFootprint {
         read_only: vec![contract_code_key()].try_into().unwrap(),
@@ -141,7 +141,7 @@ fn test_reject_restore_footprint_nonempty_readonly() {
 /// readWrite entries must be persistent ContractData/ContractCode only.
 /// stellar-core: RestoreFootprintOpFrame.cpp:439-449
 #[test]
-#[ignore] // Blocked on #1490
+
 fn test_reject_restore_footprint_non_persistent_readwrite() {
     let footprint = LedgerFootprint {
         read_only: VecM::default(),
@@ -173,7 +173,7 @@ fn test_reject_restore_footprint_non_persistent_readwrite() {
 /// readWrite footprint must be empty for ExtendFootprintTTL.
 /// stellar-core: ExtendFootprintTTLOpFrame.cpp:327-336
 #[test]
-#[ignore] // Blocked on #1488
+
 fn test_reject_extend_footprint_ttl_nonempty_readwrite() {
     let footprint = LedgerFootprint {
         read_only: vec![contract_code_key()].try_into().unwrap(),
@@ -201,7 +201,7 @@ fn test_reject_extend_footprint_ttl_nonempty_readwrite() {
 /// readOnly keys must be Soroban entries (ContractData/ContractCode).
 /// stellar-core: ExtendFootprintTTLOpFrame.cpp:338-350
 #[test]
-#[ignore] // Blocked on #1488
+
 fn test_reject_extend_footprint_ttl_non_soroban_key() {
     let footprint = LedgerFootprint {
         read_only: vec![account_key()].try_into().unwrap(),
