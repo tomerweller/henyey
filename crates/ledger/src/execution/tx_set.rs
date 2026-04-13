@@ -451,12 +451,11 @@ fn pre_parallel_apply(
     }
     // Only propagate Soroban key deletions — classic deletions are irrelevant
     // for parallel Soroban execution (classic entries are loaded from snapshot).
-    for key in delta.dead_entries().iter().filter(|k| {
-        matches!(
-            k,
-            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) | LedgerKey::Ttl(_)
-        )
-    }) {
+    for key in delta
+        .dead_entries()
+        .iter()
+        .filter(|k| super::is_soroban_key(k))
+    {
         executor.state.mark_entry_deleted(key);
     }
 

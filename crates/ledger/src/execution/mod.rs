@@ -2905,7 +2905,7 @@ impl PriorStageState {
 
 /// Returns true if a LedgerKey is a Soroban entry type (ContractData,
 /// ContractCode, or Ttl) relevant for parallel Soroban execution state.
-fn is_soroban_key(key: &LedgerKey) -> bool {
+pub(crate) fn is_soroban_key(key: &LedgerKey) -> bool {
     matches!(
         key,
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) | LedgerKey::Ttl(_)

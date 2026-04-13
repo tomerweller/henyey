@@ -641,12 +641,24 @@ impl ConfigUpgradeSetFrame {
 
         let window_entry = match window_entry {
             Some(entry) => entry,
-            None => return Ok(()),
+            None => {
+                // stellar-core hard-asserts existence. A missing window entry
+                // after protocol 20 is a ledger invariant violation.
+                return Err(LedgerError::UpgradeError(
+                    "LiveSorobanStateSizeWindow config setting not found during upgrade"
+                        .to_string(),
+                ));
+            }
         };
 
         let window = match &window_entry.data {
             LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(w)) => w,
-            _ => return Ok(()),
+            _ => {
+                return Err(LedgerError::UpgradeError(format!(
+                    "LiveSorobanStateSizeWindow has unexpected entry type: {:?}",
+                    window_entry.data
+                )));
+            }
         };
 
         let mut window_vec: Vec<u64> = window.iter().copied().collect();
