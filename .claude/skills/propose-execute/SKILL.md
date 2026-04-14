@@ -248,7 +248,7 @@ Substitute `$COMMIT` with the actual commit hash and set `$MODE = review`.
 
 Prepend context about what was implemented:
 ```
-You are reviewing commit {commit_hash} in /Users/tomer/dev/henyey.
+You are reviewing commit {commit_hash} in the current repository.
 This commit implements the proposal from GitHub issue #{issue_number}.
 
 {brief summary of what was implemented}
