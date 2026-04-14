@@ -45,3 +45,4 @@ test-utils = []
 [dev-dependencies]
 tempfile.workspace = true
 henyey-bucket.workspace = true
+henyey-crypto.workspace = true

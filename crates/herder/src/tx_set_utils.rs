@@ -3061,4 +3061,387 @@ mod tests {
             "both txs should be trimmed (bad-seq + auth failure)"
         );
     }
+
+    // ─── Signed transaction test helpers ───────────────────────────────
+
+    use henyey_crypto::{sign_hash, SecretKey as CryptoSecretKey};
+
+    /// Create a properly signed transaction envelope.
+    ///
+    /// Signs the tx hash with the given secret key, producing a
+    /// cryptographically valid `DecoratedSignature`.
+    fn make_signed_envelope(secret: &CryptoSecretKey, fee: u32, seq: i64) -> TransactionEnvelope {
+        let pk_bytes = *secret.public_key().as_bytes();
+        let source = MuxedAccount::Ed25519(Uint256(pk_bytes));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(seq),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(), // placeholder, will be replaced
+        });
+
+        // Compute the tx hash and sign it
+        let network_id = NetworkId::testnet();
+        let tx_hash = TransactionFrame::hash_envelope(&envelope, &network_id).unwrap();
+        let sig = sign_hash(secret, &tx_hash);
+        let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
+        let decorated = DecoratedSignature {
+            hint,
+            signature: XdrSignature(sig.0.to_vec().try_into().unwrap()),
+        };
+
+        // Replace signatures
+        match envelope {
+            TransactionEnvelope::Tx(mut env) => {
+                env.signatures = vec![decorated].try_into().unwrap();
+                TransactionEnvelope::Tx(env)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Create a signed fee-bump envelope wrapping a signed inner tx.
+    fn make_signed_fee_bump_envelope(
+        inner_secret: &CryptoSecretKey,
+        fee_secret: &CryptoSecretKey,
+        inner_fee: u32,
+        inner_seq: i64,
+        bumped_fee: i64,
+    ) -> TransactionEnvelope {
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx,
+        };
+
+        // Build the signed inner envelope
+        let inner_env = match make_signed_envelope(inner_secret, inner_fee, inner_seq) {
+            TransactionEnvelope::Tx(e) => e,
+            _ => unreachable!(),
+        };
+
+        let fee_pk_bytes = *fee_secret.public_key().as_bytes();
+        let fee_source = MuxedAccount::Ed25519(Uint256(fee_pk_bytes));
+
+        let fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source,
+                fee: bumped_fee,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: VecM::default(), // placeholder
+        });
+
+        // Sign the outer envelope
+        let network_id = NetworkId::testnet();
+        let outer_hash = TransactionFrame::hash_envelope(&fee_bump_envelope, &network_id).unwrap();
+        let sig = sign_hash(fee_secret, &outer_hash);
+        let hint = SignatureHint([
+            fee_pk_bytes[28],
+            fee_pk_bytes[29],
+            fee_pk_bytes[30],
+            fee_pk_bytes[31],
+        ]);
+        let decorated = DecoratedSignature {
+            hint,
+            signature: XdrSignature(sig.0.to_vec().try_into().unwrap()),
+        };
+
+        match fee_bump_envelope {
+            TransactionEnvelope::TxFeeBump(mut env) => {
+                env.signatures = vec![decorated].try_into().unwrap();
+                TransactionEnvelope::TxFeeBump(env)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Create a signed envelope with V2 preconditions (extra signers).
+    fn make_signed_envelope_with_extra_signers(
+        secret: &CryptoSecretKey,
+        fee: u32,
+        seq: i64,
+        extra_signer_keys: Vec<SignerKey>,
+    ) -> TransactionEnvelope {
+        let pk_bytes = *secret.public_key().as_bytes();
+        let source = MuxedAccount::Ed25519(Uint256(pk_bytes));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(seq),
+            cond: Preconditions::V2(stellar_xdr::curr::PreconditionsV2 {
+                time_bounds: None,
+                ledger_bounds: None,
+                min_seq_num: None,
+                min_seq_age: stellar_xdr::curr::Duration(0),
+                min_seq_ledger_gap: 0,
+                extra_signers: extra_signer_keys.try_into().unwrap(),
+            }),
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+
+        let network_id = NetworkId::testnet();
+        let tx_hash = TransactionFrame::hash_envelope(&envelope, &network_id).unwrap();
+        let sig = sign_hash(secret, &tx_hash);
+        let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
+        let decorated = DecoratedSignature {
+            hint,
+            signature: XdrSignature(sig.0.to_vec().try_into().unwrap()),
+        };
+
+        match envelope {
+            TransactionEnvelope::Tx(mut env) => {
+                env.signatures = vec![decorated].try_into().unwrap();
+                TransactionEnvelope::Tx(env)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ─── Positive-path signed transaction tests ────────────────────────
+
+    /// Test that a properly signed transaction passes all validation checks.
+    #[test]
+    fn test_validate_signed_tx_passes() {
+        let secret = CryptoSecretKey::from_seed(&[42u8; 32]);
+        let pk_bytes = *secret.public_key().as_bytes();
+        let tx = make_signed_envelope(&secret, 100, 1);
+
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account(pk_bytes, 0); // seq=0, so tx seq=1 is valid
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert!(
+            invalid.is_empty(),
+            "properly signed tx with correct seq should pass validation"
+        );
+    }
+
+    /// Test that a signed tx with wrong sequence is rejected.
+    #[test]
+    fn test_validate_signed_tx_bad_sequence() {
+        let secret = CryptoSecretKey::from_seed(&[42u8; 32]);
+        let pk_bytes = *secret.public_key().as_bytes();
+        let tx = make_signed_envelope(&secret, 100, 5); // seq=5
+
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account(pk_bytes, 0); // seq=0, expects tx seq=1
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(invalid.len(), 1, "tx with bad sequence should be rejected");
+    }
+
+    /// Test that a signed tx with an extra unused signature is rejected.
+    #[test]
+    fn test_validate_signed_tx_extra_signature_rejected() {
+        let secret = CryptoSecretKey::from_seed(&[42u8; 32]);
+        let other_secret = CryptoSecretKey::from_seed(&[99u8; 32]);
+        let pk_bytes = *secret.public_key().as_bytes();
+
+        // Build a valid signed envelope, then add an extra signature
+        let tx = make_signed_envelope(&secret, 100, 1);
+        let network_id = NetworkId::testnet();
+        let tx_hash = TransactionFrame::hash_envelope(&tx, &network_id).unwrap();
+
+        // Sign with the extra key
+        let extra_sig = sign_hash(&other_secret, &tx_hash);
+        let other_pk = other_secret.public_key();
+        let other_bytes = other_pk.as_bytes();
+        let extra_decorated = DecoratedSignature {
+            hint: SignatureHint([
+                other_bytes[28],
+                other_bytes[29],
+                other_bytes[30],
+                other_bytes[31],
+            ]),
+            signature: XdrSignature(extra_sig.0.to_vec().try_into().unwrap()),
+        };
+
+        let tx = match tx {
+            TransactionEnvelope::Tx(mut env) => {
+                let mut sigs: Vec<_> = env.signatures.to_vec();
+                sigs.push(extra_decorated);
+                env.signatures = sigs.try_into().unwrap();
+                TransactionEnvelope::Tx(env)
+            }
+            _ => unreachable!(),
+        };
+
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account(pk_bytes, 0);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "tx with extra unused signature should be rejected (txBAD_AUTH_EXTRA)"
+        );
+    }
+
+    /// Test that a properly signed fee-bump tx passes validation.
+    #[test]
+    fn test_validate_signed_fee_bump_passes() {
+        let inner_secret = CryptoSecretKey::from_seed(&[42u8; 32]);
+        let fee_secret = CryptoSecretKey::from_seed(&[43u8; 32]);
+        let inner_pk = *inner_secret.public_key().as_bytes();
+        let fee_pk = *fee_secret.public_key().as_bytes();
+
+        let tx = make_signed_fee_bump_envelope(&inner_secret, &fee_secret, 100, 1, 200);
+
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account(inner_pk, 0);
+        account_provider.add_account(fee_pk, 0);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert!(
+            invalid.is_empty(),
+            "properly signed fee-bump tx should pass validation"
+        );
+    }
+
+    /// Test that a fee-bump tx with missing fee source account is rejected.
+    #[test]
+    fn test_validate_fee_bump_missing_fee_source() {
+        let inner_secret = CryptoSecretKey::from_seed(&[42u8; 32]);
+        let fee_secret = CryptoSecretKey::from_seed(&[43u8; 32]);
+        let inner_pk = *inner_secret.public_key().as_bytes();
+
+        let tx = make_signed_fee_bump_envelope(&inner_secret, &fee_secret, 100, 1, 200);
+
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account(inner_pk, 0);
+        // fee source NOT added → should be rejected
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "fee-bump with missing fee source should be rejected"
+        );
+    }
+
+    /// Test that a tx with an extra signer in V2 preconditions passes when
+    /// the extra signer's signature is present.
+    #[test]
+    fn test_validate_extra_signer_present_passes() {
+        let tx_secret = CryptoSecretKey::from_seed(&[42u8; 32]);
+        let extra_secret = CryptoSecretKey::from_seed(&[99u8; 32]);
+        let tx_pk = *tx_secret.public_key().as_bytes();
+        let extra_pk = *extra_secret.public_key().as_bytes();
+
+        let extra_signer_key = SignerKey::Ed25519(Uint256(extra_pk));
+        let mut tx =
+            make_signed_envelope_with_extra_signers(&tx_secret, 100, 1, vec![extra_signer_key]);
+
+        // Add the extra signer's signature to the envelope
+        let network_id = NetworkId::testnet();
+        let tx_hash = TransactionFrame::hash_envelope(&tx, &network_id).unwrap();
+        let extra_sig = sign_hash(&extra_secret, &tx_hash);
+        let extra_decorated = DecoratedSignature {
+            hint: SignatureHint([extra_pk[28], extra_pk[29], extra_pk[30], extra_pk[31]]),
+            signature: XdrSignature(extra_sig.0.to_vec().try_into().unwrap()),
+        };
+
+        tx = match tx {
+            TransactionEnvelope::Tx(mut env) => {
+                let mut sigs: Vec<_> = env.signatures.to_vec();
+                sigs.push(extra_decorated);
+                env.signatures = sigs.try_into().unwrap();
+                TransactionEnvelope::Tx(env)
+            }
+            _ => unreachable!(),
+        };
+
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account(tx_pk, 0);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert!(
+            invalid.is_empty(),
+            "tx with satisfied extra signer should pass validation"
+        );
+    }
+
+    /// Test that a tx with extra signers is rejected when the extra signer's
+    /// signature is missing.
+    #[test]
+    fn test_validate_extra_signer_missing_rejected() {
+        let tx_secret = CryptoSecretKey::from_seed(&[42u8; 32]);
+        let extra_secret = CryptoSecretKey::from_seed(&[99u8; 32]);
+        let tx_pk = *tx_secret.public_key().as_bytes();
+        let extra_pk = *extra_secret.public_key().as_bytes();
+
+        let extra_signer_key = SignerKey::Ed25519(Uint256(extra_pk));
+        let tx =
+            make_signed_envelope_with_extra_signers(&tx_secret, 100, 1, vec![extra_signer_key]);
+        // NOTE: extra signer's signature NOT added — only tx source sig is present
+
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account(tx_pk, 0);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "tx with unsatisfied extra signer should be rejected"
+        );
+    }
 }
