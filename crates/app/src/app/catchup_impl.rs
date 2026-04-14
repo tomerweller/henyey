@@ -1593,6 +1593,35 @@ impl App {
             return;
         }
 
+        // When targeting a specific ledger, check if its checkpoint has been
+        // published to the archive BEFORE attempting the download. Without this,
+        // the catchup tries to download headers from an unpublished checkpoint,
+        // failing after ~7s per archive × 3 archives = ~21s per attempt. Multiple
+        // retries block the event loop for 40-50 seconds.
+        if !use_current_target {
+            let target_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
+            match self.get_cached_archive_checkpoint().await {
+                Ok(archive_latest) => {
+                    if archive_latest < target_checkpoint {
+                        tracing::info!(
+                            current_ledger,
+                            target,
+                            target_checkpoint,
+                            archive_latest,
+                            "Buffered catchup skipped: target checkpoint not yet published"
+                        );
+                        *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                        self.catchup_in_progress.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "Failed to check archive for target checkpoint");
+                    // Proceed anyway — let the catchup attempt fail fast if archive is unreachable
+                }
+            }
+        }
+
         // When using CatchupTarget::Current, check if the archive has a newer checkpoint.
         // Use the cached checkpoint to avoid repeated network calls that block the main loop.
         // This check applies regardless of whether we're at a checkpoint ledger — if the
