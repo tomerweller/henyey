@@ -210,7 +210,9 @@ impl UpgradeParameters {
         if self.upgrade_time == 0 {
             return false;
         }
-        current_time > self.upgrade_time + self.expiration_seconds()
+        // Parity: stellar-core Upgrades.cpp:477-479 uses `<=` (boundary-inclusive):
+        //   mUpgradeTime + EXPIRE_UPGRADE_WINDOW_SECONDS <= closeTime
+        current_time >= self.upgrade_time + self.expiration_seconds()
     }
 
     /// Serialize to JSON string.
@@ -660,16 +662,20 @@ mod tests {
         let mut params = UpgradeParameters::new(1000);
         assert!(!params.is_expired(1000));
         assert!(!params.is_expired(1000 + 15 * 60 - 1)); // Just before 15min expiration
+                                                         // Parity: stellar-core treats the exact boundary as expired.
+        assert!(params.is_expired(1000 + 15 * 60)); // At boundary — expired
         assert!(params.is_expired(1000 + 15 * 60 + 1)); // After 15min expiration
 
         // Custom expiration (in minutes) — shorter than default
         params.expiration_minutes = Some(5);
         assert!(!params.is_expired(1000 + 5 * 60 - 1)); // Just before custom expiration
+        assert!(params.is_expired(1000 + 5 * 60)); // At boundary — expired
         assert!(params.is_expired(1000 + 5 * 60 + 1)); // Expires with custom
 
         // Custom expiration — longer than default
         params.expiration_minutes = Some(60 * 24); // 24 hours in minutes
         assert!(!params.is_expired(1000 + 15 * 60 + 1)); // Would have expired with default
+        assert!(params.is_expired(1000 + 24 * 3600)); // At boundary — expired
         assert!(params.is_expired(1000 + 24 * 3600 + 1)); // Expires with custom
     }
 
