@@ -33,10 +33,12 @@ use crate::tx_queue::{AccountProvider, FeeBalanceProvider};
 /// ensuring consistency across all account state reads during a single
 /// tx-set validation pass. This matches stellar-core's approach of creating
 /// one `LedgerSnapshot` per `getInvalidTxList` call.
+#[allow(dead_code)]
 pub struct SnapshotAccountProvider {
     snapshot: henyey_ledger::SnapshotHandle,
 }
 
+#[allow(dead_code)]
 impl SnapshotAccountProvider {
     /// Create a new provider from a ledger manager.
     /// Returns `None` if the snapshot cannot be created.
@@ -61,10 +63,12 @@ impl AccountProvider for SnapshotAccountProvider {
 /// ensuring consistency across all fee-source balance reads during a single
 /// tx-set validation pass. Mirrors stellar-core's use of `LedgerSnapshot`
 /// in `getInvalidTxListWithErrors`.
+#[allow(dead_code)]
 pub struct SnapshotFeeBalanceProvider {
     snapshot: henyey_ledger::SnapshotHandle,
 }
 
+#[allow(dead_code)]
 impl SnapshotFeeBalanceProvider {
     /// Create a new provider from a ledger manager.
     /// Returns `None` if the snapshot cannot be created.

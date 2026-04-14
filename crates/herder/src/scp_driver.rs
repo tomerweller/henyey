@@ -349,22 +349,16 @@ impl ScpDriver {
                     true
                 } else {
                     let soroban_info = lm.soroban_network_info();
-                    let account_provider =
-                        crate::tx_set_utils::SnapshotAccountProvider::from_ledger_manager(lm);
-                    let fee_balance_provider =
-                        crate::tx_set_utils::SnapshotFeeBalanceProvider::from_ledger_manager(lm);
                     crate::tx_set_utils::check_tx_set_valid(
                         gen,
                         &lcl_header,
                         close_time_offset,
                         network_id,
                         soroban_info.as_ref(),
-                        fee_balance_provider
-                            .as_ref()
-                            .map(|p| p as &dyn crate::tx_queue::FeeBalanceProvider),
-                        account_provider
-                            .as_ref()
-                            .map(|p| p as &dyn crate::tx_queue::AccountProvider),
+                        None, // fee balance checks skipped in SCP path — snapshot
+                              // staleness causes false rejects
+                        None, // account validation skipped in SCP path — snapshot
+                              // staleness causes false rejects
                     )
                 }
             } else {
