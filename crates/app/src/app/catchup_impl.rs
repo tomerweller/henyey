@@ -480,9 +480,9 @@ impl App {
         // pending_close chaining handle buffered ledger closing. The
         // select loop (lifecycle.rs) interleaves SCP/fetch message
         // processing between each close, keeping the tx_set cache
-        // populated and preventing gap formation. The post-catchup
-        // call to try_apply_buffered_ledgers() in handle_catchup_result()
-        // kicks off the first close, and chaining takes it from there.
+        // populated and preventing gap formation. The pending_catchup
+        // completion branch kicks off the first close via
+        // try_start_ledger_close(), and chaining takes it from there.
         {
             let current_ledger = self.get_current_ledger().await.unwrap_or(new_lcl);
             let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
@@ -1305,11 +1305,11 @@ impl App {
         };
 
         if sequential_with_tx_set {
-            // Tx set is available, let try_apply_buffered_ledgers() handle it.
+            // Tx set is available — the event loop's pending_close chaining
+            // (try_start_ledger_close) will pick it up on the next iteration.
             // DON'T reset stuck state here - there's a race condition where the tx_set
-            // might have arrived after try_apply_buffered_ledgers() checked but before
-            // this check. The stuck state will naturally become invalid when current_ledger
-            // advances (the match condition state.current_ledger == current_ledger will fail).
+            // might have arrived after the close check but before this check. The stuck
+            // state will naturally become invalid when current_ledger advances.
             tracing::debug!(
                 current_ledger,
                 first_buffered,
@@ -1744,72 +1744,6 @@ impl App {
 
                     tracing::info!(ledger_seq = result.ledger_seq, "{} catchup complete", label);
 
-                    // Request fresh SCP state from peers now that our LCL is
-                    // close to the network head.  This brings EXTERNALIZE for
-                    // the most recent ~12 slots, maximizing the number of gap
-                    // slots we can bridge via rapid close.  We do two rounds:
-                    // first to get EXTERNALIZE, then to fetch the tx_sets.
-                    if let Some(overlay) = self.overlay().await {
-                        let _ = overlay.request_scp_state(result.ledger_seq).await;
-                        tracing::info!(
-                            ledger_seq = result.ledger_seq,
-                            "Requested fresh SCP state before rapid close"
-                        );
-                        // Brief pause to let SCP state responses + tx_set
-                        // responses arrive before we start rapid close.
-                        // Note: we can't call process_externalized_slots here
-                        // (recursive async cycle), but the EXTERNALIZE messages
-                        // arrive via the overlay and get recorded by the herder.
-                        // The pending tx_set requests are registered by
-                        // check_ledger_close when try_apply_buffered_ledgers
-                        // runs below.
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        // Request any pending tx_sets that were registered.
-                        self.request_pending_tx_sets().await;
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    }
-
-                    let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
-                    let pending_count = self.herder.get_pending_tx_sets().len();
-                    let buffer_count = self.syncing_ledgers.read().await.len();
-                    tracing::debug!(
-                        latest_externalized = latest_ext,
-                        last_processed = result.ledger_seq,
-                        pending_tx_sets = pending_count,
-                        buffered_ledgers = buffer_count,
-                        tx_set_cache_size = self.herder.scp_driver().tx_set_cache_size(),
-                        "Post-catchup state before try_apply_buffered_ledgers"
-                    );
-                    self.try_apply_buffered_ledgers().await;
-
-                    // After the initial buffered close, clean up syncing_ledgers:
-                    // - Remove entries at or below current_ledger (already applied)
-                    // - Remove future entries that lack tx_sets (unfulfillable)
-                    // - KEEP future entries that have tx_sets — the main event
-                    //   loop's pending_close chaining will close them.
-                    {
-                        let current_ledger = *self.current_ledger.read().await;
-                        let mut buffer = self.syncing_ledgers.write().await;
-                        let stale_count = buffer.len();
-                        buffer.retain(|&seq, entry| {
-                            if seq <= current_ledger {
-                                return false; // Already applied
-                            }
-                            // Keep future entries only if they have a tx_set
-                            entry.tx_set.is_some()
-                        });
-                        let removed = stale_count - buffer.len();
-                        let kept = buffer.len();
-                        if removed > 0 || kept > 0 {
-                            tracing::info!(
-                                removed,
-                                kept,
-                                current_ledger,
-                                "Cleaned syncing_ledgers after buffered close (kept entries with tx_sets)"
-                            );
-                        }
-                    }
-
                     // Reset last_processed_slot to current_ledger so the main
                     // loop's process_externalized_slots() re-evaluates the gap
                     // from current_ledger+1.  Previously this was set to
@@ -1844,25 +1778,20 @@ impl App {
                     self.reset_tx_set_tracking().await;
                     *self.consensus_stuck_state.write().await = None;
 
-                    // Request SCP state from peers for the slots immediately
-                    // after catchup. Without this, the node often has a gap:
-                    // it caught up to ledger N but slot N+1 was externalized
-                    // seconds ago and peers won't re-broadcast its EXTERNALIZE
-                    // unless we ask. The "next fresh EXTERNALIZE" arrives for
-                    // slot N+40 (where the network is now), not N+1.
-                    //
-                    // This may bring EXTERNALIZE for slots whose tx_sets have
-                    // been evicted from peers (~60s window), but the main loop
-                    // handles that: entries without tx_sets are cleaned up by
-                    // process_externalized_slots, and the recovery escalation
-                    // will trigger catchup if the gap persists.
+                    // Fire-and-forget SCP state request so peers send
+                    // EXTERNALIZE for recent slots. Responses arrive via
+                    // scp_message_rx and the event loop processes them
+                    // non-blockingly (process_externalized_slots →
+                    // try_start_ledger_close). The lifecycle.rs
+                    // pending_catchup_complete branch also kicks off
+                    // try_start_ledger_close immediately for any buffered
+                    // ledgers that are already ready.
                     if let Some(overlay) = self.overlay().await {
                         let current_ledger = *self.current_ledger.read().await;
-                        let _ = overlay.request_scp_state(current_ledger).await;
-                        tracing::info!(
-                            current_ledger,
-                            "Requested SCP state from peers after catchup to fill gap"
-                        );
+                        tokio::spawn(async move {
+                            let _ = overlay.request_scp_state(current_ledger).await;
+                        });
+                        tracing::info!(current_ledger, "Spawned SCP state request after catchup");
                     }
                 } else {
                     tracing::info!(

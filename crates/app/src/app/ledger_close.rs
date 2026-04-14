@@ -1064,7 +1064,8 @@ impl App {
 
         self.update_buffered_tx_set(slot as u32, close_info.tx_set)
             .await;
-        self.try_apply_buffered_ledgers().await;
+        // The actual close is handled by the event loop's pending_close
+        // chaining (try_start_ledger_close), not inline here.
     }
 
     /// Process any externalized slots that need ledger close.
@@ -1236,10 +1237,10 @@ impl App {
             tracing::debug!(latest_externalized, last_processed, "Already processed");
         }
 
-        // Always try to apply buffered ledgers and check for catchup,
-        // even when no new slots - we may need to trigger stuck recovery.
-        self.set_phase(12); // 12 = try_apply_buffered
-        self.try_apply_buffered_ledgers().await;
+        // Always check for catchup even when no new slots - we may need to
+        // trigger stuck recovery. The actual ledger close is handled by the
+        // event loop's pending_close chaining (try_start_ledger_close) which
+        // runs after process_externalized_slots returns.
         self.set_phase(13); // 13 = maybe_buffered_catchup
         self.maybe_start_buffered_catchup().await
     }
@@ -1380,13 +1381,10 @@ impl App {
 
     /// Apply a single buffered ledger (yields to tokio via `spawn_blocking`).
     ///
-    /// Used by callers outside the main select loop (catchup completion, tx set
-    /// handlers). If a background close is already in progress (`is_applying_ledger`),
-    /// returns immediately — the select loop completion handler will chain the next close.
-    ///
-    /// Closes at most ONE ledger to avoid blocking the event loop. Subsequent
-    /// buffered ledgers are picked up by the main select loop's `pending_close`
-    /// chaining or the next `consensus_interval` tick.
+    /// NOTE: This function blocks the calling task until the close completes.
+    /// Production code should use `try_start_ledger_close()` + the event loop's
+    /// `pending_close` chaining instead. This helper is retained only for tests.
+    #[cfg(test)]
     pub(super) async fn try_apply_buffered_ledgers(&self) {
         // If a background close is already running, let the select loop handle chaining.
         if self.is_applying_ledger() {

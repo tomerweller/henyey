@@ -501,7 +501,8 @@ impl App {
         } else if self.attach_tx_set_by_hash(&internal_tx_set).await
             || self.buffer_externalized_tx_set(&internal_tx_set).await
         {
-            self.try_apply_buffered_ledgers().await;
+            // Buffered — the event loop's pending_close chaining will pick
+            // up the close via try_start_ledger_close on the next tick.
         }
     }
 
@@ -669,7 +670,8 @@ impl App {
             || self.buffer_externalized_tx_set(&internal_tx_set).await
         {
             tracing::debug!(hash = %hash, "TxSet matched buffered/externalized slot");
-            self.try_apply_buffered_ledgers().await;
+            // Buffered — the event loop's pending_close chaining will pick
+            // up the close via try_start_ledger_close on the next tick.
         } else {
             tracing::debug!(hash = %hash, "TxSet not matched to any slot or buffer entry");
         }

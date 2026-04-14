@@ -363,6 +363,12 @@ impl App {
                             self.restore_operational_state().await;
                         }
                     }
+
+                    // Kick off first buffered close so the pending_close chain
+                    // starts immediately rather than waiting for the next tick.
+                    if pending_close.is_none() {
+                        pending_close = self.try_start_ledger_close().await;
+                    }
                 }
 
                 // Process SCP messages from dedicated never-drop channel.
@@ -384,6 +390,11 @@ impl App {
                         "SCP message arrived via dedicated channel"
                     );
                     self.handle_overlay_message(scp_msg).await;
+                    // After processing an SCP message (which may buffer an
+                    // EXTERNALIZE), kick off a buffered close if none is running.
+                    if pending_close.is_none() && pending_catchup.is_none() {
+                        pending_close = self.try_start_ledger_close().await;
+                    }
                     tracing::trace!(select_iteration, "BRANCH: scp_message_rx done");
                 }
 
@@ -399,6 +410,11 @@ impl App {
                         "Received fetch message via dedicated channel"
                     );
                     self.handle_overlay_message(fetch_msg).await;
+                    // After processing a fetch response (which may deliver a
+                    // tx_set), kick off a buffered close if none is running.
+                    if pending_close.is_none() && pending_catchup.is_none() {
+                        pending_close = self.try_start_ledger_close().await;
+                    }
                     tracing::trace!(select_iteration, "BRANCH: fetch_response_rx done");
                 }
 
