@@ -1,12 +1,11 @@
 ---
 name: review-fix
 description: Review a committed fix for correctness, test coverage, and similar issues
-argument-hint: <commit-hash> [--apply]
+argument-hint: <commit-hash>
 ---
 
 Parse `$ARGUMENTS`:
 - The first argument is the commit hash (short or full). Replace `$COMMIT` with it.
-- If `--apply` is present, set `$MODE = apply`. Otherwise set `$MODE = review`.
 
 # Fix Review
 
@@ -17,14 +16,6 @@ post-fix review process described in AGENTS.md:
 > After committing a fix, review and consider: Is it true to the design of the
 > system? Can there be similar issues? Can we redesign the system to avoid these
 > category of issues.
-
-## Mode
-
-- **`$MODE = review`** (default): Produce a structured report with findings and
-  recommendations. Do NOT make any changes.
-- **`$MODE = apply`**: After producing the review, act on the findings: add
-  missing regression tests, fix similar issues, and apply straightforward
-  refactors. Commit each logical change separately.
 
 ## Analysis Process
 
@@ -189,45 +180,6 @@ proportionate and the pattern is isolated."
 
 Prioritized list of follow-up actions (if any).
 ```
-
-## Apply Mode
-
-When `$MODE = apply`, first produce the full review report above. Then act on
-the findings in this order:
-
-### 1. Add Missing Regression Tests
-
-If Step 4 identified missing tests:
-- Write the tests in the appropriate module (`#[cfg(test)] mod tests` in the
-  same file, or in `crates/<crate>/tests/` for integration tests).
-- Run `cargo test -p <crate>` to verify the new tests pass.
-- Commit with message: "Add regression test for <brief description of bug>"
-
-### 2. Fix Similar Issues
-
-For each confirmed similar issue from Step 5:
-- Apply the same fix pattern, adapted to the specific location.
-- Run `cargo test -p <crate>` after each fix.
-- Commit each fix separately with message: "Fix similar <category> issue in <location>"
-- If a fix is not straightforward or changes observable behavior, skip it and
-  note it in the report as requiring manual attention.
-
-### 3. Apply Refactoring
-
-For refactoring opportunities from Step 6 that are straightforward:
-- Apply one refactor at a time.
-- Run `cargo clippy -p <crate>` and `cargo test -p <crate>` after each change.
-- Commit with message: "Refactor <description> to prevent <category> issues"
-- If a refactor is large or risky, skip it and note it as a recommendation only.
-
-### Apply Mode Rules
-
-- Work through items in the order above (tests first, then fixes, then refactors).
-- Make one logical change at a time — do not batch unrelated changes.
-- Run `cargo clippy -p <crate>` and `cargo test -p <crate>` after each change.
-- If a change breaks tests or introduces warnings, revert and move on.
-- Stop and report if a change would alter observable behavior unexpectedly.
-- Each commit must include `Co-authored-by` trailers per AGENTS.md.
 
 ## Guidelines
 

@@ -266,31 +266,31 @@ Read the agent result. Extract the verdict from the Fix Analysis section.
 **If `SOUND`**:
 - The implementation is clean. Proceed to Step 5.
 
-**If `CONCERNS` or `INCOMPLETE`**:
-- Extract the specific issues from the review report:
+**If `CONCERNS`, `INCOMPLETE`, or `WRONG`**:
+- Extract every specific issue from the review report:
   - Missing per-op checks
   - Untested code paths
   - Similar issues found
   - Architectural gaps
   - Parity issues
-- For each issue, determine if it is valid by reading the relevant code.
-- Fix all valid issues:
-  1. Make the code changes
-  2. Add tests for untested paths
-  3. Run `cargo test --all` and `cargo clippy --all`
-  4. Commit with a descriptive message
-  5. Push
-- Loop back to 4a with the new commit.
-
-**If `WRONG`**:
-- The implementation has fundamental issues. Re-read the review carefully.
-- Consider reverting and re-implementing from the proposal.
-- If the review identifies a misunderstanding of the proposal, fix it.
-- Commit, push, and loop back to 4a.
+  - Fundamental design issues
+- **Address every single issue.** Do not skip, defer, or dismiss any feedback.
+  Read the relevant code to understand each issue, then fix it. If a reviewer
+  raised it, it gets fixed — period.
+- For each issue:
+  1. Read the relevant code to understand the problem
+  2. Make the code changes to fully resolve it
+  3. Add or update tests to cover the fix
+  4. Run `cargo test --all` and `cargo clippy --all`
+- Once all issues are resolved, commit with a descriptive message, push, and
+  loop back to 4a.
+- If `WRONG`, consider whether a revert and re-implementation is cleaner than
+  incremental fixes. Either way, all feedback must be addressed before the
+  next review round.
 
 **If verdict unclear** (agent error):
-- Treat as `CONCERNS` and manually review the agent output for actionable
-  items.
+- Treat as `CONCERNS` and extract all actionable items from the agent output.
+  Address every item — do not skip any.
 
 ---
 
@@ -350,6 +350,9 @@ Final verdict:      SOUND
   post whatever you have and note the remaining concerns. Do not loop forever.
 - **Be honest about feedback.** If a critic's feedback is wrong, explain why
   in the rewrite. If it is right, fix it. Do not ignore valid feedback.
+- **Address all review-fix feedback.** Every issue raised in a review-fix
+  round must be fully resolved before the next round. No feedback may be
+  skipped, deferred, or dismissed. If the reviewer raised it, fix it.
 - **Use the codebase, not assumptions.** Before rewriting a proposal or
   implementing code, read the actual files. Do not rely on memory or the
   issue description alone.
