@@ -495,7 +495,9 @@ impl App {
         let received_slot = self.herder.receive_tx_set(internal_tx_set.clone());
         if let Some(slot) = received_slot {
             tracing::info!(slot, "Received pending TxSet, attempting ledger close");
-            self.process_externalized_slots().await;
+            if let Some(pending) = self.process_externalized_slots().await {
+                *self.deferred_catchup.lock().await = Some(pending);
+            }
         } else if self.attach_tx_set_by_hash(&internal_tx_set).await
             || self.buffer_externalized_tx_set(&internal_tx_set).await
         {

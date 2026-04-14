@@ -275,6 +275,10 @@ pub struct App {
     last_processed_slot: RwLock<u64>,
     /// Prevent concurrent catchup runs when we fall behind.
     catchup_in_progress: AtomicBool,
+    /// Catchup spawned from a context that cannot return `Option<PendingCatchup>`
+    /// (e.g., `handle_overlay_message`, `handle_generalized_tx_set`).
+    /// The event loop promotes this to the local `pending_catchup` each iteration.
+    deferred_catchup: tokio::sync::Mutex<Option<PendingCatchup>>,
     /// Fatal catchup failure flag (spec §13.3).
     ///
     /// Set when catchup verification detects that the local ledger state is
@@ -621,6 +625,7 @@ impl App {
             scp_envelope_rx: TokioMutex::new(scp_envelope_rx),
             last_processed_slot: RwLock::new(0),
             catchup_in_progress: AtomicBool::new(false),
+            deferred_catchup: tokio::sync::Mutex::new(None),
             catchup_fatal_failure: AtomicBool::new(false),
             catchup_needs_full_reset: AtomicBool::new(false),
             publish_in_progress: AtomicBool::new(false),

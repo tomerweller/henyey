@@ -292,6 +292,10 @@ impl CatchupManager {
                 total,
                 data.header.ledger_seq
             );
+
+            // Yield to the tokio runtime between close_ledger calls so that
+            // the event loop can process SCP messages, heartbeats, etc.
+            tokio::task::yield_now().await;
         }
 
         Ok(())

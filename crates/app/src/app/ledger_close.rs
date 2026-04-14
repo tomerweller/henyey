@@ -1068,13 +1068,13 @@ impl App {
     }
 
     /// Process any externalized slots that need ledger close.
-    pub(super) async fn process_externalized_slots(&self) {
+    pub(super) async fn process_externalized_slots(&self) -> Option<PendingCatchup> {
         // Get the latest externalized slot
         let latest_externalized = match self.herder.latest_externalized_slot() {
             Some(slot) => slot,
             None => {
                 tracing::debug!("No externalized slots yet");
-                return;
+                return None;
             }
         };
 
@@ -1224,8 +1224,12 @@ impl App {
                 let gap = latest_externalized.saturating_sub(current_ledger as u64);
                 if buffered_count == 0 || gap > TX_SET_REQUEST_WINDOW {
                     self.set_phase(11); // 11 = externalized_catchup
-                    self.maybe_start_externalized_catchup(latest_externalized)
+                    let pending = self
+                        .maybe_start_externalized_catchup(latest_externalized)
                         .await;
+                    if pending.is_some() {
+                        return pending;
+                    }
                 }
             }
         } else {
@@ -1237,7 +1241,7 @@ impl App {
         self.set_phase(12); // 12 = try_apply_buffered
         self.try_apply_buffered_ledgers().await;
         self.set_phase(13); // 13 = maybe_buffered_catchup
-        self.maybe_start_buffered_catchup().await;
+        self.maybe_start_buffered_catchup().await
     }
 
     pub(super) fn first_ledger_in_checkpoint(ledger: u32) -> u32 {

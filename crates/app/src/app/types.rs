@@ -274,6 +274,35 @@ pub struct SelfCheckResult {
 
 // ── Internal types ─────────────────────────────────────────────────────
 
+/// State for a catchup operation running on a spawned tokio task.
+///
+/// Created by [`App::spawn_catchup`] and consumed by the event loop's
+/// `pending_catchup` select branch when the oneshot delivers.
+pub(super) struct PendingCatchup {
+    /// Receives the catchup result when the spawned task completes.
+    pub result_rx: tokio::sync::oneshot::Receiver<PendingCatchupResult>,
+    /// Handle for the spawned catchup task (abort on shutdown, panic detection).
+    pub task_handle: tokio::task::JoinHandle<()>,
+    /// Handle for the catchup message caching task (aborted on completion).
+    pub message_cache_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Label for logging ("RecoveryEscalation", "Buffered", "Externalized").
+    pub label: String,
+    /// Whether to reset consensus stuck state on successful catchup.
+    /// `true` for recovery/buffered catchup, `false` for externalized.
+    pub reset_stuck_state: bool,
+    /// Whether to re-arm the sync recovery timer if catchup made progress.
+    /// `true` for recovery catchup only.
+    pub re_arm_recovery: bool,
+}
+
+/// Result payload sent from the spawned catchup task to the event loop.
+pub(super) struct PendingCatchupResult {
+    /// The catchup result (success or failure).
+    pub result: anyhow::Result<CatchupResult>,
+    /// Whether catchup actually advanced the ledger.
+    pub made_progress: bool,
+}
+
 /// State for a ledger close running on a background thread.
 ///
 /// Created by [`App::try_start_ledger_close`] and consumed by

@@ -125,7 +125,7 @@ impl App {
         // Process any externalized slots recorded during catchup BEFORE entering the main loop.
         // This ensures we buffer LedgerCloseInfo before new EXTERNALIZE messages trigger cleanup
         // which would remove older externalized slots (only max_externalized_slots are kept).
-        self.process_externalized_slots().await;
+        let mut pending_catchup: Option<PendingCatchup> = self.process_externalized_slots().await;
 
         // After the pre-loop process_externalized_slots (which may have triggered a
         // rapid close phase), clear all pending tx_set requests and tracking state.
@@ -193,6 +193,15 @@ impl App {
             select_iteration += 1;
             self.tick_event_loop();
             self.set_phase(0); // 0 = waiting in select
+
+            // Promote deferred catchup from handle_overlay_message / tx_flooding
+            if pending_catchup.is_none() {
+                let mut deferred = self.deferred_catchup.lock().await;
+                if deferred.is_some() {
+                    pending_catchup = deferred.take();
+                }
+            }
+
             if select_iteration <= 5 || select_iteration % 1000 == 0 {
                 tracing::debug!(select_iteration, "Main loop: entering select!");
             }
@@ -241,7 +250,11 @@ impl App {
                                 Err(_) => break,
                             }
                         }
-                        self.process_externalized_slots().await;
+                        if pending_catchup.is_none() {
+                            if let Some(pc) = self.process_externalized_slots().await {
+                                pending_catchup = Some(pc);
+                            }
+                        }
 
                         pending_close = self.try_start_ledger_close().await;
 
@@ -281,6 +294,73 @@ impl App {
                                 let _ = overlay.request_scp_state(current_ledger).await;
                             }
                             *self.last_scp_state_request_at.write().await = self.clock.now();
+                        }
+                    }
+                }
+
+                // Await pending catchup completion (spawned background task)
+                catchup_result = async {
+                    match pending_catchup.as_mut() {
+                        Some(p) => (&mut p.result_rx).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.set_phase(15); // 15 = pending_catchup_complete
+                    tracing::info!(select_iteration, "BRANCH: pending_catchup completed");
+                    let pending = pending_catchup.take().unwrap();
+
+                    // Abort message cache task
+                    if let Some(handle) = pending.message_cache_handle {
+                        handle.abort();
+                    }
+
+                    // Reset catchup_in_progress
+                    self.catchup_in_progress.store(false, Ordering::SeqCst);
+
+                    match catchup_result {
+                        Ok(result) => {
+                            self.handle_catchup_result(
+                                result.result,
+                                pending.reset_stuck_state,
+                                &pending.label,
+                            )
+                            .await;
+
+                            if result.made_progress && pending.re_arm_recovery {
+                                // Pre-arm recovery so the main event loop checks
+                                // again on the next tick instead of waiting 35s.
+                                self.recovery_attempts_without_progress
+                                    .store(1, Ordering::SeqCst);
+                                self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        Err(_) => {
+                            // Oneshot sender was dropped — task panicked or was cancelled.
+                            // Check for panic via the task handle.
+                            if pending.task_handle.is_finished() {
+                                match pending.task_handle.await {
+                                    Err(e) if e.is_panic() => {
+                                        tracing::error!(
+                                            label = pending.label,
+                                            "Catchup task panicked: {e}"
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::error!(
+                                            label = pending.label,
+                                            "Catchup task completed without sending result"
+                                        );
+                                    }
+                                }
+                            } else {
+                                tracing::error!(
+                                    label = pending.label,
+                                    "Catchup oneshot dropped but task still running"
+                                );
+                                pending.task_handle.abort();
+                            }
+                            // Restore operational state after failed catchup
+                            self.restore_operational_state().await;
                         }
                     }
                 }
@@ -449,21 +529,31 @@ impl App {
                     }
 
                     // Check if SyncRecoveryManager requested recovery
-                    if self.sync_recovery_pending.swap(false, Ordering::SeqCst) {
+                    if pending_catchup.is_none()
+                        && self.sync_recovery_pending.swap(false, Ordering::SeqCst)
+                    {
                         tracing::info!("Sync recovery requested, starting recovery");
                         // SyncRecoveryManager triggered recovery - perform it now
                         if let Ok(current_ledger) = self.get_current_ledger().await {
                             tracing::info!(current_ledger, "Calling out_of_sync_recovery");
-                            self.out_of_sync_recovery(current_ledger).await;
+                            pending_catchup =
+                                self.out_of_sync_recovery(current_ledger).await;
                             tracing::info!("out_of_sync_recovery completed");
                         }
                         // Also check for buffered catchup (this handles timeout-based catchup)
-                        self.maybe_start_buffered_catchup().await;
+                        if pending_catchup.is_none() {
+                            pending_catchup =
+                                self.maybe_start_buffered_catchup().await;
+                        }
                     }
 
                     // Check for externalized slots to process
                     self.set_phase(10); // 10 = process_externalized
-                    self.process_externalized_slots().await;
+                    if pending_catchup.is_none() {
+                        if let Some(pc) = self.process_externalized_slots().await {
+                            pending_catchup = Some(pc);
+                        }
+                    }
 
                     // Start a background ledger close if one isn't already running.
                     if pending_close.is_none() {
@@ -598,7 +688,7 @@ impl App {
 
                 // Heartbeat for debugging
                 _ = heartbeat_interval.tick() => {
-                    self.set_phase(15); // 15 = heartbeat
+                    self.set_phase(16); // 16 = heartbeat
                     let tracking_slot = self.herder.tracking_slot();
                     let ledger = *self.current_ledger.read().await;
                     let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
@@ -703,6 +793,19 @@ impl App {
                     }
                 }
             }
+        }
+
+        // Clean up pending catchup on shutdown
+        if let Some(pending) = pending_catchup.take() {
+            tracing::info!(
+                label = pending.label,
+                "Aborting pending catchup on shutdown"
+            );
+            pending.task_handle.abort();
+            if let Some(handle) = pending.message_cache_handle {
+                handle.abort();
+            }
+            self.catchup_in_progress.store(false, Ordering::SeqCst);
         }
 
         self.set_state(AppState::ShuttingDown).await;
@@ -939,7 +1042,9 @@ impl App {
                                     .await;
                             }
                             // First, process externalized slots to register pending tx set requests
-                            self.process_externalized_slots().await;
+                            if let Some(pc) = self.process_externalized_slots().await {
+                                *self.deferred_catchup.lock().await = Some(pc);
+                            }
                             // Then, immediately request any pending tx sets
                             self.request_pending_tx_sets().await;
 

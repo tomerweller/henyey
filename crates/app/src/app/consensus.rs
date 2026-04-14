@@ -79,7 +79,7 @@ impl App {
     /// actively request SCP state from peers even with a small gap. After
     /// `RECOVERY_ESCALATION_CATCHUP` attempts (~6s at 1s interval) we trigger
     /// a full catchup.
-    pub(super) async fn out_of_sync_recovery(&self, current_ledger: u32) {
+    pub(super) async fn out_of_sync_recovery(&self, current_ledger: u32) -> Option<PendingCatchup> {
         let latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0);
         let last_processed = *self.last_processed_slot.read().await;
         let pending_tx_sets = self.herder.get_pending_tx_sets();
@@ -130,9 +130,9 @@ impl App {
 
         // --- Escalation: after many failed attempts, force catchup ---
         if attempts >= RECOVERY_ESCALATION_CATCHUP {
-            self.trigger_recovery_catchup(current_ledger, latest_externalized, gap, attempts)
+            return self
+                .trigger_recovery_catchup(current_ledger, latest_externalized, gap, attempts)
                 .await;
-            return;
         }
 
         // When the node is essentially caught up (small or zero gap), the
@@ -208,14 +208,14 @@ impl App {
                          tx_sets evicted from peers, fast-tracking catchup"
                     );
                     // Jump directly to catchup instead of waiting 6 cycles
-                    self.trigger_recovery_catchup(
-                        current_ledger,
-                        latest_externalized,
-                        gap,
-                        attempts,
-                    )
-                    .await;
-                    return;
+                    return self
+                        .trigger_recovery_catchup(
+                            current_ledger,
+                            latest_externalized,
+                            gap,
+                            attempts,
+                        )
+                        .await;
                 }
 
                 tracing::info!(
@@ -225,7 +225,7 @@ impl App {
                     attempts,
                     "Essentially caught up — waiting for fresh EXTERNALIZE"
                 );
-                return;
+                return None;
             } else {
                 // Escalation: request SCP state despite small gap
                 tracing::warn!(
@@ -318,7 +318,7 @@ impl App {
                                  (next slot EXTERNALIZE not available from peers)",
                                 target_checkpoint,
                             );
-                            return;
+                            return None;
                         }
                     } else if target_checkpoint as u64 <= current_ledger as u64 {
                         // We're already at or past the target checkpoint.
@@ -349,14 +349,14 @@ impl App {
                             let mut buffer = self.syncing_ledgers.write().await;
                             buffer.retain(|seq, _| *seq > current_ledger);
                         }
-                        self.trigger_recovery_catchup(
-                            current_ledger,
-                            latest_externalized,
-                            gap,
-                            attempts,
-                        )
-                        .await;
-                        return;
+                        return self
+                            .trigger_recovery_catchup(
+                                current_ledger,
+                                latest_externalized,
+                                gap,
+                                attempts,
+                            )
+                            .await;
                     }
                 }
             } else {
@@ -395,7 +395,7 @@ impl App {
                         .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
                     // Recurse with the escalated counter — this will trigger catchup
                     // on the next recovery tick (within 5s).
-                    return;
+                    return None;
                 }
             }
         }
@@ -412,14 +412,14 @@ impl App {
         tracing::debug!("Acquiring overlay for recovery");
         let Some(overlay) = self.overlay().await else {
             tracing::debug!("No overlay available for out-of-sync recovery");
-            return;
+            return None;
         };
         tracing::debug!("Acquired overlay for recovery");
 
         let peer_count = overlay.peer_count();
         if peer_count == 0 {
             tracing::debug!("No peers connected for out-of-sync recovery");
-            return;
+            return None;
         }
 
         // Broadcast recent SCP envelopes + request SCP state from peers.
@@ -478,6 +478,8 @@ impl App {
             envelope_count,
             "Spawned background task for recovery broadcast"
         );
+
+        None
     }
 
     /// Send SCP state to a peer in response to GetScpState.
@@ -689,7 +691,7 @@ impl App {
         latest_externalized: u64,
         gap: u64,
         attempts: u64,
-    ) {
+    ) -> Option<PendingCatchup> {
         // Fatal-failure guard (spec §13.3): block further catchup after a
         // verification/integrity failure.
         if self.catchup_fatal_failure.load(Ordering::SeqCst) {
@@ -697,7 +699,7 @@ impl App {
                 "Recovery escalation blocked: previous fatal catchup failure — \
                  manual intervention required"
             );
-            return;
+            return None;
         }
 
         tracing::warn!(
@@ -717,113 +719,158 @@ impl App {
             *cache = None;
         }
 
-        // Guard against concurrent catchup
-        if !self.catchup_in_progress.swap(true, Ordering::SeqCst) {
-            let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
 
-            let archive_has_checkpoint = match self.get_cached_archive_checkpoint().await {
-                Ok(archive_latest) => archive_latest >= next_cp,
-                Err(_) => false,
-            };
+        let archive_has_checkpoint = match self.get_cached_archive_checkpoint().await {
+            Ok(archive_latest) => archive_latest >= next_cp,
+            Err(_) => false,
+        };
 
-            if !archive_has_checkpoint {
-                tracing::info!(
-                    current_ledger,
-                    next_checkpoint = next_cp,
-                    "Recovery catchup skipped: archive hasn't published checkpoint yet \
-                     — requesting SCP state from peers as fallback"
-                );
-                self.catchup_in_progress.store(false, Ordering::SeqCst);
-
-                // While waiting for the archive, actively request SCP state
-                // from peers. Some peers may still have tx_sets cached for
-                // the missing slots, especially if they are slightly behind
-                // the network tip. Without this, the node sits idle for 1-5
-                // minutes until the next checkpoint publishes.
-                if let Some(overlay) = self.overlay().await {
-                    let overlay_clone = std::sync::Arc::clone(&overlay);
-                    let ledger = current_ledger;
-                    tokio::spawn(async move {
-                        if let Err(e) = overlay_clone.request_scp_state(ledger).await {
-                            tracing::debug!(
-                                error = %e,
-                                "Failed to request SCP state during inter-checkpoint recovery"
-                            );
-                        }
-                    });
-                }
-
-                // Do NOT re-arm sync_recovery_pending here. Let the
-                // SyncRecoveryManager's 10-second timer drive the next
-                // attempt. Re-arming caused a 1-second spin loop because
-                // the main event loop checks the flag every tick.
-                return;
-            }
-
-            // Archive has the checkpoint — clear stale state NOW, right
-            // before we actually start catchup. Previously this was done
-            // before the archive check, so skipped catchups destroyed the
-            // syncing_ledgers buffer (with tx_sets ready for rapid close),
-            // preventing post-catchup convergence.
-            {
-                let mut buffer = self.syncing_ledgers.write().await;
-                buffer.clear();
-            }
-            self.herder.clear_pending_tx_sets();
-            self.reset_tx_set_tracking().await;
-
-            // Archive has the checkpoint — reset attempts now that we're
-            // actually starting catchup. Previously this was done before
-            // the archive check, so skipped catchups would reset attempts
-            // to 0, preventing escalation from ever accumulating.
-            self.recovery_attempts_without_progress
-                .store(0, Ordering::SeqCst);
-
-            self.set_state(AppState::CatchingUp).await;
-            self.herder.set_state(henyey_herder::HerderState::Syncing);
-
-            let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
-
+        if !archive_has_checkpoint {
             tracing::info!(
                 current_ledger,
                 next_checkpoint = next_cp,
-                "Targeting next checkpoint for recovery catchup"
+                "Recovery catchup skipped: archive hasn't published checkpoint yet \
+                 — requesting SCP state from peers as fallback"
             );
 
-            self.set_phase(14); // 14 = catchup_running
-            let catchup_result = self.catchup(CatchupTarget::Ledger(next_cp)).await;
-            self.set_phase(5); // 5 = back in consensus_tick
-
-            if let Some(handle) = catchup_message_handle {
-                handle.abort();
+            // While waiting for the archive, actively request SCP state
+            // from peers. Some peers may still have tx_sets cached for
+            // the missing slots, especially if they are slightly behind
+            // the network tip. Without this, the node sits idle for 1-5
+            // minutes until the next checkpoint publishes.
+            if let Some(overlay) = self.overlay().await {
+                let overlay_clone = std::sync::Arc::clone(&overlay);
+                let ledger = current_ledger;
+                tokio::spawn(async move {
+                    if let Err(e) = overlay_clone.request_scp_state(ledger).await {
+                        tracing::debug!(
+                            error = %e,
+                            "Failed to request SCP state during inter-checkpoint recovery"
+                        );
+                    }
+                });
             }
-            self.catchup_in_progress.store(false, Ordering::SeqCst);
 
-            // Check if catchup actually made progress before deciding whether
-            // to pre-arm the next recovery tick.
+            // Do NOT re-arm sync_recovery_pending here. Let the
+            // SyncRecoveryManager's 10-second timer drive the next
+            // attempt. Re-arming caused a 1-second spin loop because
+            // the main event loop checks the flag every tick.
+            return None;
+        }
+
+        // Archive has the checkpoint — clear stale state NOW, right
+        // before we actually start catchup. Previously this was done
+        // before the archive check, so skipped catchups destroyed the
+        // syncing_ledgers buffer (with tx_sets ready for rapid close),
+        // preventing post-catchup convergence.
+        {
+            let mut buffer = self.syncing_ledgers.write().await;
+            buffer.clear();
+        }
+        self.herder.clear_pending_tx_sets();
+        self.reset_tx_set_tracking().await;
+
+        // Archive has the checkpoint — reset attempts now that we're
+        // actually starting catchup. Previously this was done before
+        // the archive check, so skipped catchups would reset attempts
+        // to 0, preventing escalation from ever accumulating.
+        self.recovery_attempts_without_progress
+            .store(0, Ordering::SeqCst);
+
+        self.set_state(AppState::CatchingUp).await;
+        self.herder.set_state(henyey_herder::HerderState::Syncing);
+
+        tracing::info!(
+            current_ledger,
+            next_checkpoint = next_cp,
+            "Targeting next checkpoint for recovery catchup"
+        );
+
+        self.spawn_catchup(
+            CatchupTarget::Ledger(next_cp),
+            "RecoveryEscalation",
+            true, // reset_stuck_state
+            true, // re_arm_recovery
+        )
+        .await
+    }
+
+    /// Spawn catchup as a background tokio task.
+    ///
+    /// Returns `Some(PendingCatchup)` if catchup was successfully spawned,
+    /// or `None` if a catchup or ledger close is already in progress.
+    /// The event loop polls the returned `PendingCatchup` in a `select!` branch.
+    pub(super) async fn spawn_catchup(
+        &self,
+        target: CatchupTarget,
+        label: &str,
+        reset_stuck_state: bool,
+        re_arm_recovery: bool,
+    ) -> Option<PendingCatchup> {
+        // Guard: don't start if catchup already running
+        if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
+            tracing::info!(label, "spawn_catchup: catchup already in progress");
+            return None;
+        }
+
+        // Guard: don't start if a live ledger close is in progress
+        // (LedgerManager cannot be mutated concurrently)
+        if self.is_applying_ledger() {
+            tracing::info!(label, "spawn_catchup: ledger close in progress, deferring");
+            self.catchup_in_progress.store(false, Ordering::SeqCst);
+            return None;
+        }
+
+        // Start catchup message caching (belt-and-suspenders for tx_set ordering)
+        let message_cache_handle = self.start_catchup_message_caching_from_self().await;
+
+        // Create oneshot channel for result delivery
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        // Upgrade self_arc for the spawned task
+        let app = {
+            let weak = self.self_arc.read().await;
+            match weak.upgrade() {
+                Some(arc) => arc,
+                None => {
+                    tracing::warn!(label, "spawn_catchup: failed to upgrade self_arc");
+                    self.catchup_in_progress.store(false, Ordering::SeqCst);
+                    if let Some(h) = message_cache_handle {
+                        h.abort();
+                    }
+                    return None;
+                }
+            }
+        };
+
+        let label_owned = label.to_string();
+        let task_handle = tokio::spawn(async move {
+            tracing::info!(label = label_owned, "Spawned catchup task starting");
+            app.set_phase(14); // 14 = catchup_running
+
+            let catchup_result = app.catchup(target).await;
+
             let made_progress = catchup_result
                 .as_ref()
                 .map(|r| r.ledgers_replayed > 0 || r.buckets_applied > 0)
                 .unwrap_or(false);
 
-            self.handle_catchup_result(catchup_result, true, "RecoveryEscalation")
-                .await;
+            let _ = result_tx.send(PendingCatchupResult {
+                result: catchup_result,
+                made_progress,
+            });
+        });
 
-            if made_progress {
-                // Catchup advanced the ledger — pre-arm recovery so the main
-                // event loop checks again on the next tick instead of waiting
-                // 35s for the sync recovery manager's stuck timeout. This
-                // creates a tight catchup loop: catchup → check → catchup →
-                // ... until the captive core is close enough to follow the
-                // validator via SCP.
-                self.recovery_attempts_without_progress
-                    .store(1, Ordering::SeqCst);
-                self.sync_recovery_pending.store(true, Ordering::SeqCst);
-            }
-            // If catchup was a no-op (already at/past target, waiting for next
-            // checkpoint), don't pre-arm. Let the sync recovery manager's
-            // normal 10s tick handle the next check, avoiding a tight loop of
-            // skipped catchup attempts.
-        }
+        tracing::info!(label, "Catchup task spawned");
+
+        Some(PendingCatchup {
+            result_rx,
+            task_handle,
+            message_cache_handle,
+            label: label.to_string(),
+            reset_stuck_state,
+            re_arm_recovery,
+        })
     }
 }

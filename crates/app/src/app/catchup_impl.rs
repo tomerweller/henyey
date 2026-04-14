@@ -1159,11 +1159,11 @@ impl App {
         );
     }
 
-    pub(super) async fn maybe_start_buffered_catchup(&self) {
+    pub(super) async fn maybe_start_buffered_catchup(&self) -> Option<PendingCatchup> {
         // Fatal-failure guard (spec §13.3): block further catchup after a
         // verification/integrity failure.
         if self.catchup_fatal_failure.load(Ordering::SeqCst) {
-            return;
+            return None;
         }
 
         // Early cooldown check: if we recently completed or skipped catchup,
@@ -1183,12 +1183,12 @@ impl App {
                 cooldown_elapsed = ?cooldown_elapsed,
                 "maybe_start_buffered_catchup: skipped due to cooldown"
             );
-            return;
+            return None;
         }
 
         let current_ledger = match self.get_current_ledger().await {
             Ok(seq) => seq,
-            Err(_) => return,
+            Err(_) => return None,
         };
 
         // Guard: if the node is essentially caught up (gap ≤ TX_SET_REQUEST_WINDOW),
@@ -1213,7 +1213,7 @@ impl App {
                 self.reset_tx_set_tracking().await;
                 self.herder.clear_pending_tx_sets();
             }
-            return;
+            return None;
         }
 
         let (first_buffered, last_buffered) = {
@@ -1280,7 +1280,7 @@ impl App {
                         pre_trim_last,
                         "maybe_start_buffered_catchup: empty buffer after trim/evict, returning"
                     );
-                    return;
+                    return None;
                 }
             }
         };
@@ -1315,7 +1315,7 @@ impl App {
                 first_buffered,
                 "Sequential ledger tx set available; skipping buffered catchup"
             );
-            return;
+            return None;
         }
 
         // Calculate gap and determine catchup strategy.
@@ -1532,10 +1532,9 @@ impl App {
                 };
 
                 match action {
-                    ConsensusStuckAction::Wait => return,
+                    ConsensusStuckAction::Wait => return None,
                     ConsensusStuckAction::AttemptRecovery => {
-                        self.out_of_sync_recovery(current_ledger).await;
-                        return;
+                        return self.out_of_sync_recovery(current_ledger).await;
                     }
                     ConsensusStuckAction::TriggerCatchup => {
                         // Fall through to catchup below
@@ -1582,15 +1581,9 @@ impl App {
             }
         };
 
-        if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
-            tracing::info!("Buffered catchup already in progress");
-            return;
-        }
-
         // Skip the target validation if we're using CatchupTarget::Current
         if !use_current_target && (target == 0 || target <= current_ledger) {
-            self.catchup_in_progress.store(false, Ordering::SeqCst);
-            return;
+            return None;
         }
 
         // When targeting a specific ledger, check if its checkpoint has been
@@ -1612,7 +1605,7 @@ impl App {
                         );
                         *self.last_catchup_completed_at.write().await = Some(self.clock.now());
                         self.catchup_in_progress.store(false, Ordering::SeqCst);
-                        return;
+                        return None;
                     }
                 }
                 Err(e) => {
@@ -1632,22 +1625,14 @@ impl App {
             match self.get_cached_archive_checkpoint().await {
                 Ok(latest_checkpoint) => {
                     if latest_checkpoint <= current_ledger {
-                        // This is expected behavior after catchup - archive hasn't published
-                        // the next checkpoint yet. Use debug level to avoid log spam.
                         tracing::debug!(
                             current_ledger,
                             latest_checkpoint,
                             first_buffered,
                             "Skipping catchup: archive has no newer checkpoint"
                         );
-                        // DON'T reset tx_set tracking here - we're not completing catchup,
-                        // just waiting for the next checkpoint. Resetting tracking would
-                        // clear pending requests and prevent responses from being matched.
-                        // Record skip time for cooldown to prevent repeated archive queries.
-                        // This uses the same cooldown mechanism as catchup completion.
                         *self.last_catchup_completed_at.write().await = Some(self.clock.now());
-                        self.catchup_in_progress.store(false, Ordering::SeqCst);
-                        return;
+                        return None;
                     }
                     tracing::info!(
                         current_ledger,
@@ -1662,10 +1647,8 @@ impl App {
                         error = %e,
                         "Failed to query archive for latest checkpoint, skipping catchup"
                     );
-                    // Record skip time for cooldown to prevent repeated archive queries.
                     *self.last_catchup_completed_at.write().await = Some(self.clock.now());
-                    self.catchup_in_progress.store(false, Ordering::SeqCst);
-                    return;
+                    return None;
                 }
             }
         }
@@ -1679,26 +1662,17 @@ impl App {
             "Starting buffered catchup"
         );
 
-        // Start caching messages during catchup to capture tx_sets for gap ledgers
-        let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
-
         let catchup_target = if use_current_target {
             CatchupTarget::Current
         } else {
             CatchupTarget::Ledger(target)
         };
-        let catchup_result = self.catchup(catchup_target).await;
 
-        // Stop the catchup message caching task
-        if let Some(handle) = catchup_message_handle {
-            handle.abort();
-            tracing::debug!("Stopped catchup message caching task (buffered catchup)");
-        }
+        self.set_state(AppState::CatchingUp).await;
+        self.herder.set_state(henyey_herder::HerderState::Syncing);
 
-        self.catchup_in_progress.store(false, Ordering::SeqCst);
-
-        self.handle_catchup_result(catchup_result, true, "Buffered")
-            .await;
+        self.spawn_catchup(catchup_target, "Buffered", true, false)
+            .await
     }
 
     /// Process the result of a catchup operation: update state, bootstrap herder,
@@ -1959,28 +1933,31 @@ impl App {
         }
     }
 
-    pub(super) async fn maybe_start_externalized_catchup(&self, latest_externalized: u64) {
+    pub(super) async fn maybe_start_externalized_catchup(
+        &self,
+        latest_externalized: u64,
+    ) -> Option<PendingCatchup> {
         // Fatal-failure guard (spec §13.3): block further catchup after a
         // verification/integrity failure.
         if self.catchup_fatal_failure.load(Ordering::SeqCst) {
-            return;
+            return None;
         }
 
         let current_ledger = match self.get_current_ledger().await {
             Ok(seq) => seq,
-            Err(_) => return,
+            Err(_) => return None,
         };
         if latest_externalized <= current_ledger as u64 {
-            return;
+            return None;
         }
         let gap = latest_externalized.saturating_sub(current_ledger as u64);
         if gap <= TX_SET_REQUEST_WINDOW {
-            return;
+            return None;
         }
 
         let target = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW) as u32;
         if target == 0 || target <= current_ledger {
-            return;
+            return None;
         }
 
         let target_checkpoint = checkpoint_containing(target);
@@ -1999,15 +1976,10 @@ impl App {
                 latest_externalized,
                 "Skipping archive catchup: will close sequentially from cached EXTERNALIZE"
             );
-            return;
+            return None;
         }
 
         // Cooldown: don't retry immediately after a catchup attempt.
-        // Failed catchups (e.g., archive checkpoint not yet published)
-        // would otherwise trigger rapid-fire retries because
-        // process_externalized_slots() re-evaluates the gap on every
-        // tick.  10 seconds gives the archive time to publish and
-        // avoids wasting resources on repeated download failures.
         const CATCHUP_RETRY_COOLDOWN_SECS: u64 = 10;
         let cooldown_elapsed = self
             .last_catchup_completed_at
@@ -2020,19 +1992,12 @@ impl App {
                 gap,
                 "Externalized catchup skipped due to cooldown"
             );
-            return;
-        }
-
-        if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
-            tracing::info!("Externalized catchup already in progress");
-            return;
+            return None;
         }
 
         // When the target checkpoint is ahead of the latest externalized slot,
         // it may not be published in the archive yet. Check the cached archive
         // checkpoint to avoid blocking the event loop with 404 retries (~50s).
-        // If the archive hasn't published a checkpoint ahead of us, skip this
-        // attempt and let the cooldown timer retry after the archive catches up.
         if target_checkpoint > latest_externalized as u32 {
             match self.get_cached_archive_checkpoint().await {
                 Ok(archive_latest) => {
@@ -2044,8 +2009,7 @@ impl App {
                             "Skipping externalized catchup: archive has no checkpoint ahead of us"
                         );
                         *self.last_catchup_completed_at.write().await = Some(self.clock.now());
-                        self.catchup_in_progress.store(false, Ordering::SeqCst);
-                        return;
+                        return None;
                     }
                 }
                 Err(e) => {
@@ -2054,8 +2018,7 @@ impl App {
                         "Failed to query archive checkpoint, skipping externalized catchup"
                     );
                     *self.last_catchup_completed_at.write().await = Some(self.clock.now());
-                    self.catchup_in_progress.store(false, Ordering::SeqCst);
-                    return;
+                    return None;
                 }
             }
         }
@@ -2080,23 +2043,11 @@ impl App {
             CatchupTarget::Ledger(target)
         };
 
-        // Start caching messages during catchup to capture tx_sets for gap ledgers
-        let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
+        self.set_state(AppState::CatchingUp).await;
+        self.herder.set_state(henyey_herder::HerderState::Syncing);
 
-        self.set_phase(14); // 14 = catchup_running
-        let catchup_result = self.catchup(catchup_target).await;
-        self.set_phase(11); // 11 = back in externalized_catchup
-
-        // Stop the catchup message caching task
-        if let Some(handle) = catchup_message_handle {
-            handle.abort();
-            tracing::debug!("Stopped catchup message caching task (externalized catchup)");
-        }
-
-        self.catchup_in_progress.store(false, Ordering::SeqCst);
-
-        self.handle_catchup_result(catchup_result, false, "Externalized")
-            .await;
+        self.spawn_catchup(catchup_target, "Externalized", false, false)
+            .await
     }
 
     pub(super) fn buffered_catchup_target(
