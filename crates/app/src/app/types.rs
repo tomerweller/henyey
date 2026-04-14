@@ -678,7 +678,9 @@ impl FeeBalanceProvider for LedgerFeeBalanceProvider {
 /// Account provider backed by a fresh ledger snapshot.
 ///
 /// Used by tx-set validation to verify account existence, sequence numbers,
-/// and signatures. Delegates to `SnapshotAccountProvider` in the herder crate.
+/// and signatures. Creates a per-call snapshot for the queue-admission path.
+/// The SCP validation path uses `SnapshotValidationProviders` in the herder
+/// crate, which holds a single snapshot for the entire validation run.
 pub(super) struct LedgerAccountProvider {
     pub ledger_manager: Arc<LedgerManager>,
 }
@@ -689,7 +691,7 @@ impl AccountProvider for LedgerAccountProvider {
         account_id: &stellar_xdr::curr::AccountId,
     ) -> Option<stellar_xdr::curr::AccountEntry> {
         // Create a snapshot per call for the queue-admission path.
-        // The tx-set validation paths (SCP, selection) use SnapshotAccountProvider
+        // The SCP validation path uses SnapshotValidationProviders
         // which holds a single snapshot for the entire validation run.
         let snapshot = self.ledger_manager.create_snapshot().ok()?;
         snapshot.get_account(account_id).ok()?

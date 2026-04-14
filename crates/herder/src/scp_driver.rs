@@ -349,16 +349,34 @@ impl ScpDriver {
                     true
                 } else {
                     let soroban_info = lm.soroban_network_info();
+
+                    // Create snapshot-backed providers for fee + account
+                    // validation, matching stellar-core's LedgerSnapshot in
+                    // getInvalidTxListWithErrors.
+                    let providers =
+                        crate::tx_set_utils::SnapshotValidationProviders::from_ledger_manager(&lm);
+                    if providers.is_none() {
+                        warn!(
+                            "check_and_cache_tx_set_valid: snapshot creation failed, \
+                             rejecting tx-set"
+                        );
+                        return false;
+                    }
+                    let fee_provider = providers
+                        .as_ref()
+                        .map(|p| p as &dyn crate::tx_queue::FeeBalanceProvider);
+                    let account_provider = providers
+                        .as_ref()
+                        .map(|p| p as &dyn crate::tx_queue::AccountProvider);
+
                     crate::tx_set_utils::check_tx_set_valid(
                         gen,
                         &lcl_header,
                         close_time_offset,
                         network_id,
                         soroban_info.as_ref(),
-                        None, // fee balance checks skipped in SCP path — snapshot
-                        // staleness causes false rejects
-                        None, // account validation skipped in SCP path — snapshot
-                              // staleness causes false rejects
+                        fee_provider,
+                        account_provider,
                     )
                 }
             } else {

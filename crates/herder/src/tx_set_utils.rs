@@ -27,20 +27,18 @@ use tracing::{debug, warn};
 
 use crate::tx_queue::{AccountProvider, FeeBalanceProvider};
 
-/// Account provider backed by a single ledger snapshot.
+/// Unified account + fee-balance provider backed by a single ledger snapshot.
 ///
 /// Creates one snapshot at construction time and reuses it for all lookups,
-/// ensuring consistency across all account state reads during a single
-/// tx-set validation pass. This matches stellar-core's approach of creating
-/// one `LedgerSnapshot` per `getInvalidTxList` call.
-#[allow(dead_code)]
-pub struct SnapshotAccountProvider {
+/// ensuring consistency across both account-state and fee-balance reads
+/// during a single tx-set validation pass. Mirrors stellar-core's use of
+/// one `LedgerSnapshot` per `getInvalidTxListWithErrors` call.
+pub struct SnapshotValidationProviders {
     snapshot: henyey_ledger::SnapshotHandle,
 }
 
-#[allow(dead_code)]
-impl SnapshotAccountProvider {
-    /// Create a new provider from a ledger manager.
+impl SnapshotValidationProviders {
+    /// Create a new provider pair from a ledger manager.
     /// Returns `None` if the snapshot cannot be created.
     pub fn from_ledger_manager(ledger_manager: &henyey_ledger::LedgerManager) -> Option<Self> {
         let snapshot = ledger_manager.create_snapshot().ok()?;
@@ -48,7 +46,7 @@ impl SnapshotAccountProvider {
     }
 }
 
-impl AccountProvider for SnapshotAccountProvider {
+impl AccountProvider for SnapshotValidationProviders {
     fn load_account(
         &self,
         account_id: &stellar_xdr::curr::AccountId,
@@ -57,28 +55,7 @@ impl AccountProvider for SnapshotAccountProvider {
     }
 }
 
-/// Fee-balance provider backed by a single ledger snapshot.
-///
-/// Creates one snapshot at construction time and reuses it for all lookups,
-/// ensuring consistency across all fee-source balance reads during a single
-/// tx-set validation pass. Mirrors stellar-core's use of `LedgerSnapshot`
-/// in `getInvalidTxListWithErrors`.
-#[allow(dead_code)]
-pub struct SnapshotFeeBalanceProvider {
-    snapshot: henyey_ledger::SnapshotHandle,
-}
-
-#[allow(dead_code)]
-impl SnapshotFeeBalanceProvider {
-    /// Create a new provider from a ledger manager.
-    /// Returns `None` if the snapshot cannot be created.
-    pub fn from_ledger_manager(ledger_manager: &henyey_ledger::LedgerManager) -> Option<Self> {
-        let snapshot = ledger_manager.create_snapshot().ok()?;
-        Some(Self { snapshot })
-    }
-}
-
-impl FeeBalanceProvider for SnapshotFeeBalanceProvider {
+impl FeeBalanceProvider for SnapshotValidationProviders {
     fn get_available_balance(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
         let acc = self.snapshot.get_account(account_id).ok()??;
         let base_reserve = self.snapshot.header().base_reserve;
@@ -3446,6 +3423,110 @@ mod tests {
             invalid.len(),
             1,
             "tx with unsatisfied extra signer should be rejected"
+        );
+    }
+
+    // ========================================================================
+    // Regression tests for #1476: SCP fee-source affordability
+    // ========================================================================
+
+    /// Build a fee-bump envelope with a custom fee source.
+    fn make_fee_bump_with_fee_source(
+        inner_source: [u8; 32],
+        fee_source: [u8; 32],
+        inner_fee: u32,
+        bumped_fee: i64,
+        seq: i64,
+    ) -> TransactionEnvelope {
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx,
+        };
+
+        let inner = make_envelope_with_source(inner_source, inner_fee, seq);
+        let inner_v1 = match inner {
+            TransactionEnvelope::Tx(e) => e,
+            _ => panic!("expected V1 envelope"),
+        };
+
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256(fee_source)),
+                fee: bumped_fee,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        })
+    }
+
+    /// Regression test for #1476: two fee-bump transactions with different inner
+    /// sources but the same outer fee source. With a provider, cumulative fee
+    /// exceeds balance and both are rejected. Without a provider, both pass.
+    #[test]
+    fn test_fee_bump_shared_fee_source_affordability() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let fee_source = [50u8; 32];
+        // Two fee-bumps: different inner sources, same outer fee source.
+        // Each has bumped_fee=200, total=400.
+        let tx1 = make_fee_bump_with_fee_source([10u8; 32], fee_source, 100, 200, 1);
+        let tx2 = make_fee_bump_with_fee_source([20u8; 32], fee_source, 100, 200, 1);
+
+        // With provider: balance=300 < total_fees=400 → both rejected
+        let mut provider = MockFeeBalanceProvider::new();
+        provider.set_balance(fee_source, 300);
+
+        let invalid = get_invalid_tx_list(
+            &[tx1.clone(), tx2.clone()],
+            &ctx,
+            &bounds,
+            Some(&provider),
+            None,
+        );
+        assert_eq!(
+            invalid.len(),
+            2,
+            "both fee-bump txs should be rejected: shared fee source can't cover aggregate fees"
+        );
+
+        // Without provider: fee check skipped → both pass (this was the bug)
+        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, None, None);
+        assert!(
+            invalid.is_empty(),
+            "without provider, fee affordability is skipped (documents pre-fix gap)"
+        );
+    }
+
+    /// Regression test for #1476: account provider catches bad sequence numbers
+    /// that would be missed when provider is None.
+    #[test]
+    fn test_account_provider_catches_bad_sequence() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        // Create a tx with seq_num=5, but the account has seq_num=10
+        // (tx seq must be account_seq + 1 = 11, so 5 is stale)
+        let tx = make_envelope_with_source([10u8; 32], 200, 5);
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account([10u8; 32], 10);
+
+        // With account provider: bad sequence → rejected
+        let invalid =
+            get_invalid_tx_list(&[tx.clone()], &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "tx with stale sequence should be rejected when account provider is present"
+        );
+
+        // Without account provider: sequence check skipped → passes
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, None);
+        assert!(
+            invalid.is_empty(),
+            "without account provider, sequence check is skipped (documents pre-fix gap)"
         );
     }
 }

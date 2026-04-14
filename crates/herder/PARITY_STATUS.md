@@ -10,7 +10,7 @@
 | Area | Status | Notes |
 |------|--------|-------|
 | Core Herder (state machine, envelope recv) | Partial | Missing metrics, quorum map reanalysis |
-| HerderSCPDriver (value validation, signing) | Partial | Missing SCP metrics, node weight, TxSet validity cache |
+| HerderSCPDriver (value validation, signing) | Partial | Missing SCP metrics, node weight, TxSet validity cache; fee+account checks now wired |
 | HerderPersistence (SCP state DB) | Partial | Missing `copySCPHistoryToStream`, `getNodeQuorumSet` |
 | HerderUtils (value extraction) | Partial | Missing validated hash/quorum-map helpers |
 | LedgerCloseData | Full | All accessors and XDR round-trip |
