@@ -15,8 +15,9 @@ Review the Rust crate at `$TARGET` and identify concrete simplifications.
 ## Mode
 
 - **`$MODE = review`** (default): Produce a ranked list of findings with
-  file:line references. Do NOT make any changes. Cap at **15 findings** per
-  crate — if you find more, keep only the highest-impact ones.
+  file:line references. Do NOT make any changes. Cap findings at
+  **min(15, 1 per 200 non-test lines)** — if you find more, keep only the
+  highest-impact ones.
 - **`$MODE = apply`**: Perform the simplifications directly. For each change,
   briefly state what you changed and why. Run `cargo clippy -p <crate>` and
   `cargo test -p <crate>` after each logical group of changes to verify
@@ -54,14 +55,21 @@ These specific patterns should **always be suppressed**:
   intentional subtle differences that are safer to keep explicit than to abstract.
 
 **Exception**: The Idiom categories (C-STYLE MUTATION, C-STYLE OUTPUT PARAMETER,
-C-STYLE OPTION HANDLING) are exempt — always report them regardless of parity.
+C-STYLE OPTION HANDLING, VERBOSE ERROR PROPAGATION) are exempt — always report
+them regardless of parity.
+
+**Parity-positive findings**: If a simplification would make parity *easier* to
+verify (e.g., renaming to match stellar-core, extracting a function that maps
+1:1 to an upstream function), report it with a `[PARITY+]` tag. These findings
+are allowed even when they touch parity-driven code, because they improve — not
+degrade — the ability to verify alignment.
 
 ## Categories
 
 For each finding, classify it into exactly one category:
 
 ### Structure
- 1. **LARGE MODULE** — any single .rs file over 1000 non-test lines.
+ 1. **LARGE MODULE** — any single .rs file over 1500 non-test lines.
     Suggest reduction via extraction, deduplication, or dead-code removal.
     Only recommend a directory module (`foo/mod.rs`) when 3+ separable concerns
     each exceed ~200 lines. Never split solely to extract tests.
@@ -85,6 +93,8 @@ For each finding, classify it into exactly one category:
     or always return a fixed value. Include evidence (e.g., "no callers found").
  6. **DUPLICATION** — identical or near-identical logic repeated in 2+ places.
     Show the locations and what a shared implementation would look like.
+    When checking for duplicates, also scan `crates/common/` and direct
+    dependency crates for existing equivalents that could be reused.
  7. **DUPLICATE STATE** — the same truth tracked in 2+ places that must be kept
     in sync manually. Suggest which copy to remove.
  8. **SCATTERED CONCERN** — a single logical operation performed in multiple call
@@ -92,9 +102,9 @@ For each finding, classify it into exactly one category:
     net improvement (fewer total lines, clearer intent). Do not report when the
     duplication is incidental or the call sites have meaningful differences.
  9. **UNNECESSARY CLONING** — values cloned where a borrow or move would suffice.
-    **Skip** when the cloned type is small (≤64 bytes), implements or could
-    implement `Copy`, or the clone is in a cold path — the performance cost is
-    negligible and removing it adds no clarity.
+    **Skip** when the cloned type implements or could implement `Copy`, or the
+    clone is in a cold path — the performance cost is negligible and removing
+    it adds no clarity.
 10. **TRIVIAL WRAPPER** — one-liner functions that only delegate with no added
     logic. Inline and remove, unless the wrapper provides meaningful abstraction
     (e.g., a public API shielding an internal signature, semantic naming that
@@ -109,9 +119,10 @@ For each finding, classify it into exactly one category:
     defined by the XDR specification.
 
 ### Visibility
-13. **OVERLY BROAD VISIBILITY** — `pub` items only used within the current
-    module or crate. Suggest narrowing to `pub(crate)`, `pub(super)`, or
-    private.
+13. **OVERLY BROAD VISIBILITY** — items with broader visibility than needed.
+    Includes `pub` items only used within the current crate (narrow to
+    `pub(crate)`, `pub(super)`, or private) and `pub(crate)` items only used
+    within a single module (narrow to `pub(super)` or private).
 
 ### Clippy
 14. **CLIPPY SUPPRESSIONS** — `#[allow(clippy::...)]` or `#[allow(dead_code)]`
@@ -136,8 +147,10 @@ idiomatically Rust, not a transliteration of C++.
     success/failure. The Rust idiom is `Result<(), E>` (or `Option<T>` when
     there is no meaningful error context). Callers benefit from `?` propagation
     instead of `if !func(...) { return error; }` chains.
-    *Example*: `add_account_balance(account: &mut AccountEntry, delta: i64) -> bool`
+    *Example 1*: `add_account_balance(account: &mut AccountEntry, delta: i64) -> bool`
     → `fn add_account_balance(account: &mut AccountEntry, delta: i64) -> Result<(), BalanceError>`.
+    *Example 2*: `process_op(entry: &mut LedgerEntry) -> Result<bool, Error>` where
+    `bool` encodes sub-operation success → `fn process_op(entry: &mut LedgerEntry) -> Result<(), Error>`.
     **Skip**: In-place slice sorting (`sort_by`, `sort_unstable_by`) and mutable
     slice operations are idiomatic Rust, not C-isms.
 18. **C-STYLE OUTPUT PARAMETER** — functions that take `&mut Vec<T>` (or similar
@@ -151,6 +164,27 @@ idiomatically Rust, not a transliteration of C++.
     `match`, or combinators (`.map()`, `.and_then()`, `.ok_or()`). The
     check-then-unwrap pattern risks panic if a future edit separates the check
     from the unwrap.
+20. **VERBOSE ERROR PROPAGATION** — manual `match result { Ok(x) => ...,
+    Err(e) => return Err(e) }` or `if let Err(e) = ... { return Err(e); }`
+    chains that should use `?`, `.map_err()`, or combinators. Also includes
+    no-op `.map_err(|e| e)` and `match x { Ok(v) => Ok(v), Err(e) => Err(e.into()) }`
+    instead of `x?` or `x.map_err(Into::into)?`.
+    *Example*: `match foo() { Ok(v) => v, Err(e) => return Err(e.into()) }`
+    → `foo()?`.
+
+## Analysis Process
+
+Before classifying findings, perform these setup steps:
+
+1. **Run clippy**: Execute `cargo clippy -p <crate> 2>&1` and note any existing
+   warnings. This informs CLIPPY SUPPRESSIONS evaluation — a suppression hiding
+   a real warning is a finding; one hiding a false positive is not.
+2. **Count lines**: Run `wc -l` on each `.rs` file in `$TARGET/src/` (excluding
+   test modules) to identify LARGE MODULE candidates.
+3. **Check parity mapping**: For each source file, check whether a corresponding
+   stellar-core file exists in `stellar-core/src/` using the crate-to-upstream
+   mapping. Record which files have 1:1 counterparts (these get stronger parity
+   protection).
 
 ## Ranking
 
@@ -165,6 +199,8 @@ readability, or prevent bugs. High-impact first.
 ## Scope
 
 - Do not flag issues **within** test code (`#[cfg(test)]`) or in `stellar-core/`.
+- Do not flag issues in auto-generated code (files produced by build scripts,
+  proc macros, or XDR code generators).
 - Test code **may** be referenced as evidence (e.g., to show a function is only
   called from tests when evaluating dead code or visibility).
 
@@ -179,6 +215,17 @@ Per finding:
 - **Suggestion**: concrete fix (keep it brief)
 ```
 
+End the review with a summary table:
+
+```
+## Summary
+
+| Category | Count | Highest Impact |
+|----------|-------|----------------|
+| LARGE MODULE | ... | ... |
+| ... | ... | ... |
+```
+
 ## Apply Mode Guidelines
 
 When `$MODE = apply`:
@@ -187,3 +234,6 @@ When `$MODE = apply`:
 - After each change, verify with `cargo clippy -p <crate>` and `cargo test -p <crate>`.
 - If a change breaks tests or introduces warnings, revert it and move on.
 - Stop and report if a change would alter observable behavior.
+- **Commit strategy**: Commit after each logical group of related changes.
+  Use message format: `"Simplify <crate>: <what changed>"`. Include
+  `Co-authored-by` trailers per AGENTS.md. Push after all changes are complete.
