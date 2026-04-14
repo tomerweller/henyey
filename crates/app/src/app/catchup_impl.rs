@@ -1595,7 +1595,11 @@ impl App {
 
         // When using CatchupTarget::Current, check if the archive has a newer checkpoint.
         // Use the cached checkpoint to avoid repeated network calls that block the main loop.
-        if use_current_target && is_checkpoint_ledger(current_ledger) {
+        // This check applies regardless of whether we're at a checkpoint ledger — if the
+        // archive's latest checkpoint is at or behind our current ledger, catchup will
+        // skip with "Already at or past target" anyway. Checking early avoids the
+        // unnecessary archive query inside catchup() and the associated log spam.
+        if use_current_target {
             match self.get_cached_archive_checkpoint().await {
                 Ok(latest_checkpoint) => {
                     if latest_checkpoint <= current_ledger {

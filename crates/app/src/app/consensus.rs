@@ -730,9 +730,29 @@ impl App {
                 tracing::info!(
                     current_ledger,
                     next_checkpoint = next_cp,
-                    "Recovery catchup skipped: archive hasn't published checkpoint yet"
+                    "Recovery catchup skipped: archive hasn't published checkpoint yet \
+                     — requesting SCP state from peers as fallback"
                 );
                 self.catchup_in_progress.store(false, Ordering::SeqCst);
+
+                // While waiting for the archive, actively request SCP state
+                // from peers. Some peers may still have tx_sets cached for
+                // the missing slots, especially if they are slightly behind
+                // the network tip. Without this, the node sits idle for 1-5
+                // minutes until the next checkpoint publishes.
+                if let Some(overlay) = self.overlay().await {
+                    let overlay_clone = std::sync::Arc::clone(&overlay);
+                    let ledger = current_ledger;
+                    tokio::spawn(async move {
+                        if let Err(e) = overlay_clone.request_scp_state(ledger).await {
+                            tracing::debug!(
+                                error = %e,
+                                "Failed to request SCP state during inter-checkpoint recovery"
+                            );
+                        }
+                    });
+                }
+
                 // Do NOT re-arm sync_recovery_pending here. Let the
                 // SyncRecoveryManager's 10-second timer drive the next
                 // attempt. Re-arming caused a 1-second spin loop because
