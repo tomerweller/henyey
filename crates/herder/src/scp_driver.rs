@@ -356,7 +356,7 @@ impl ScpDriver {
                         network_id,
                         soroban_info.as_ref(),
                         None, // fee balance checks skipped in SCP path — snapshot
-                              // staleness causes false rejects
+                        // staleness causes false rejects
                         None, // account validation skipped in SCP path — snapshot
                               // staleness causes false rejects
                     )
