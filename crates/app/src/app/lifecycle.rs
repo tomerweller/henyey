@@ -335,14 +335,17 @@ impl App {
                             if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
                                 continue;
                             }
-                            // Skip fetch response messages from broadcast channel — they are
-                            // already handled via the dedicated fetch response channel above.
+                            // Skip fetch response and request messages from broadcast channel —
+                            // they are handled via the dedicated fetch channel above.
                             if matches!(
                                 overlay_msg.message,
                                 StellarMessage::GeneralizedTxSet(_)
                                     | StellarMessage::TxSet(_)
                                     | StellarMessage::DontHave(_)
                                     | StellarMessage::ScpQuorumset(_)
+                                    | StellarMessage::GetScpState(_)
+                                    | StellarMessage::GetScpQuorumset(_)
+                                    | StellarMessage::GetTxSet(_)
                             ) {
                                 continue;
                             }
