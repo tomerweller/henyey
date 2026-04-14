@@ -3957,6 +3957,7 @@ impl LedgerCloseContext<'_> {
         // We mirror that: errors are logged and skipped rather than aborting
         // the ledger close.
         let mut version_upgrade_memory_cost_changed = false;
+        let mut version_upgrade_succeeded = prev_version == protocol_version;
 
         // Capture changes from version upgrade side effects (cost types for V25).
         let version_changes = if prev_version != protocol_version {
@@ -3964,6 +3965,7 @@ impl LedgerCloseContext<'_> {
             match self.apply_version_upgrade_side_effects(prev_version, protocol_version) {
                 Ok(memory_cost_changed) => {
                     version_upgrade_memory_cost_changed = memory_cost_changed;
+                    version_upgrade_succeeded = true;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -3990,6 +3992,7 @@ impl LedgerCloseContext<'_> {
         // so that path is never reached. If both were active, stellar-core
         // would run prepareLiabilities twice (once per upgrade). With CloseLedgerState,
         // both passes would see each other's changes through the read path.
+        let mut reserve_upgrade_succeeded = true;
         let reserve_changes = if let Some(new_reserve) = self.upgrade_ctx.base_reserve_upgrade() {
             let did_reserve_increase = new_reserve > self.prev_header.base_reserve;
             if protocol_version_starts_from(protocol_version, ProtocolVersion::V10)
@@ -4009,6 +4012,7 @@ impl LedgerCloseContext<'_> {
                             error = %e,
                             "Exception during reserve upgrade (prepareLiabilities) — skipping"
                         );
+                        reserve_upgrade_succeeded = false;
                         LedgerEntryChanges(VecM::default())
                     }
                 }
@@ -4026,6 +4030,7 @@ impl LedgerCloseContext<'_> {
         let mut config_state_archival_changed = false;
         let mut config_memory_cost_params_changed = false;
         let mut per_config_changes: HashMap<Vec<u8>, LedgerEntryChanges> = HashMap::new();
+        let mut config_upgrade_succeeded = true;
         let delta_count_before_upgrades = self.ltx.num_changes();
         if self.upgrade_ctx.has_config_upgrades() {
             match self.upgrade_ctx.apply_config_upgrades(
@@ -4052,12 +4057,14 @@ impl LedgerCloseContext<'_> {
                         error = %e,
                         "Exception during config upgrade — skipping"
                     );
+                    config_upgrade_succeeded = false;
                 }
             }
         }
 
         // Apply MaxSorobanTxSetSize upgrade through CloseLedgerState (modifies CONFIG_SETTING entry).
         // Parity: Upgrades.cpp upgradeMaxSorobanTxSetSize()
+        let mut max_soroban_upgrade_succeeded = true;
         let max_soroban_changes = if self.upgrade_ctx.max_soroban_tx_set_size_upgrade().is_some() {
             match self
                 .upgrade_ctx
@@ -4069,6 +4076,7 @@ impl LedgerCloseContext<'_> {
                         error = %e,
                         "Exception during MaxSorobanTxSetSize upgrade — skipping"
                     );
+                    max_soroban_upgrade_succeeded = false;
                     LedgerEntryChanges(VecM::default())
                 }
             }
@@ -4076,23 +4084,41 @@ impl LedgerCloseContext<'_> {
             LedgerEntryChanges(VecM::default())
         };
 
-        // Build UpgradeEntryMeta for each upgrade.
-        // Parity: LedgerManagerImpl.cpp:1660-1673
+        // Build UpgradeEntryMeta only for upgrades that succeeded.
+        // Parity: LedgerManagerImpl.cpp:1671-1680 — stellar-core only appends
+        // meta after a successful child-txn commit; failed upgrades produce no meta.
         let mut upgrades_meta = Vec::new();
         for upgrade in std::mem::take(&mut self.close_data.upgrades) {
-            let changes = match &upgrade {
-                LedgerUpgrade::Version(_) => version_changes.clone(),
+            let (succeeded, changes) = match &upgrade {
+                LedgerUpgrade::Version(_) => (version_upgrade_succeeded, version_changes.clone()),
                 LedgerUpgrade::Config(key) => {
-                    let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
-                    per_config_changes
-                        .remove(&key_bytes)
-                        .unwrap_or_else(|| LedgerEntryChanges(VecM::default()))
+                    if config_upgrade_succeeded {
+                        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+                        let changes = per_config_changes
+                            .remove(&key_bytes)
+                            .unwrap_or_else(|| LedgerEntryChanges(VecM::default()));
+                        (true, changes)
+                    } else {
+                        (false, LedgerEntryChanges(VecM::default()))
+                    }
                 }
-                LedgerUpgrade::MaxSorobanTxSetSize(_) => max_soroban_changes.clone(),
-                LedgerUpgrade::BaseReserve(_) => reserve_changes.clone(),
-                _ => LedgerEntryChanges(VecM::default()),
+                LedgerUpgrade::MaxSorobanTxSetSize(_) => {
+                    (max_soroban_upgrade_succeeded, max_soroban_changes.clone())
+                }
+                LedgerUpgrade::BaseReserve(_) => {
+                    (reserve_upgrade_succeeded, reserve_changes.clone())
+                }
+                // BaseFee, MaxTxSetSize, Flags — header-only, always succeed
+                _ => (true, LedgerEntryChanges(VecM::default())),
             };
-            upgrades_meta.push(UpgradeEntryMeta { upgrade, changes });
+            if succeeded {
+                upgrades_meta.push(UpgradeEntryMeta { upgrade, changes });
+            } else {
+                tracing::warn!(
+                    upgrade_type = ?std::mem::discriminant(&upgrade),
+                    "Omitting UpgradeEntryMeta for failed upgrade"
+                );
+            }
         }
 
         // Parity: Upgrades.cpp:1238-1242 and 1449-1453

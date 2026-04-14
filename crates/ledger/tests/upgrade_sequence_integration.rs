@@ -795,6 +795,24 @@ async fn test_failed_config_upgrade_does_not_abort_ledger_close() {
         r.header.base_fee, 300,
         "Valid BaseFee upgrade should be applied despite failed config upgrade"
     );
+
+    // Parity: stellar-core only emits UpgradeEntryMeta for successful upgrades.
+    // The failed config upgrade should NOT appear in close meta.
+    let meta = r.meta.expect("close meta should be present");
+    match meta {
+        LedgerCloseMeta::V2(v2) => {
+            assert_eq!(
+                v2.upgrades_processing.len(),
+                1,
+                "Only the successful BaseFee upgrade should produce UpgradeEntryMeta, not the failed config upgrade"
+            );
+            match &v2.upgrades_processing[0].upgrade {
+                LedgerUpgrade::BaseFee(fee) => assert_eq!(fee, &300),
+                other => panic!("Expected BaseFee upgrade meta, got {:?}", other),
+            }
+        }
+        _ => panic!("expected V2 meta"),
+    }
 }
 
 use stellar_xdr::curr::LedgerCloseMeta;
