@@ -283,6 +283,26 @@ impl InMemorySorobanState {
             && self.pending_ttls.is_empty()
     }
 
+    /// Create a frozen, point-in-time clone of this state for snapshot lookups.
+    ///
+    /// The clone shares `Arc<LedgerEntry>` pointers with the original, so it is
+    /// cheap (O(n) Arc increments, no deep copies).  The snapshot is used by
+    /// `create_snapshot()` to ensure that Soroban entry lookups return data
+    /// consistent with the header captured at the same instant, preventing a
+    /// race where a concurrent `commit()` updates entries before the header is
+    /// published.
+    pub fn snapshot(&self) -> Self {
+        Self {
+            contract_data_entries: self.contract_data_entries.clone(),
+            contract_code_entries: self.contract_code_entries.clone(),
+            config_settings: self.config_settings.clone(),
+            pending_ttls: HashMap::new(),
+            last_closed_ledger_seq: self.last_closed_ledger_seq,
+            contract_data_state_size: self.contract_data_state_size,
+            contract_code_state_size: self.contract_code_state_size,
+        }
+    }
+
     /// Get the last closed ledger sequence number.
     pub fn ledger_seq(&self) -> u32 {
         self.last_closed_ledger_seq
@@ -1541,5 +1561,53 @@ mod tests {
         let result = state.process_entry_update(&data_entry, 25, None);
         assert!(result.is_err(), "update of missing data entry should fail");
         assert_eq!(state.contract_data_count(), 0);
+    }
+
+    #[test]
+    fn test_snapshot_is_frozen_after_mutation() {
+        // Verify that a snapshot is a frozen point-in-time copy: mutations to the
+        // original state after snapshot() must NOT be visible through the snapshot.
+        let mut state = InMemorySorobanState::new();
+        state.set_last_closed_ledger_seq(100);
+
+        // Insert a contract data entry.
+        let entry1 = make_contract_data_entry([10u8; 32]);
+        state.process_entry_create(&entry1, 25, None).unwrap();
+        assert_eq!(state.contract_data_count(), 1);
+
+        // Take a snapshot.
+        let snap = state.snapshot();
+        assert_eq!(snap.contract_data_count(), 1);
+        assert_eq!(snap.ledger_seq(), 100);
+
+        // Mutate the original: add another entry and bump ledger seq.
+        let entry2 = make_contract_data_entry([20u8; 32]);
+        state.process_entry_create(&entry2, 25, None).unwrap();
+        state.set_last_closed_ledger_seq(101);
+        assert_eq!(state.contract_data_count(), 2);
+
+        // Snapshot must still see the old state.
+        assert_eq!(snap.contract_data_count(), 1);
+        assert_eq!(snap.ledger_seq(), 100);
+
+        // Verify the snapshot can look up the original entry but NOT the new one.
+        let make_key = |entry: &LedgerEntry| -> LedgerKey {
+            if let LedgerEntryData::ContractData(cd) = &entry.data {
+                LedgerKey::ContractData(LedgerKeyContractData {
+                    contract: cd.contract.clone(),
+                    key: cd.key.clone(),
+                    durability: cd.durability,
+                })
+            } else {
+                panic!("expected ContractData");
+            }
+        };
+        let key1 = make_key(&entry1);
+        let key2 = make_key(&entry2);
+        assert!(snap.get(&key1).is_some(), "snapshot should contain entry1");
+        assert!(
+            snap.get(&key2).is_none(),
+            "snapshot must NOT contain entry2"
+        );
     }
 }

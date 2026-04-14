@@ -1952,17 +1952,24 @@ impl LedgerManager {
         // point lookups during TX execution don't contend with the write lock held during
         // commit() (add_batch + hash computation). The snapshot holds Arc<Bucket> references
         // which are cheap clones and require no locking.
-        let soroban_state_lookup = self.soroban_state.clone();
+        //
+        // We also snapshot the Soroban state (frozen clone) rather than capturing a live
+        // reference. This ensures lookups see data consistent with the header captured
+        // above. Without this, a concurrent commit() could update soroban_state entries
+        // before commit_close() publishes the new header, causing the snapshot to mix
+        // new Soroban data with the old header.
+        let soroban_snapshot = Arc::new(self.soroban_state.read().snapshot());
         let bucket_list_snapshot = Arc::new({
             let bl = self.bucket_list.read();
             henyey_bucket::BucketListSnapshot::new(&bl, state.header.clone())
         });
+        let soroban_for_lookup = soroban_snapshot.clone();
         let bls_for_lookup = bucket_list_snapshot.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
             // For Soroban entry types, check in-memory state first (O(1)),
             // then fall back to bucket list if not found.
             if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
-                if let Some(entry) = soroban_state_lookup.read().get(key) {
+                if let Some(entry) = soroban_for_lookup.get(key) {
                     return Ok(Some((*entry).clone()));
                 }
                 // Fall through to bucket list for entries not in in-memory state
@@ -1976,30 +1983,27 @@ impl LedgerManager {
         // entries (O(1) cache hits), then falls back to the bucket list for any
         // Soroban entries not found in the in-memory state, then batch-loads
         // remaining non-Soroban keys from the bucket list in a single traversal.
-        let soroban_state_batch = self.soroban_state.clone();
+        let soroban_for_batch = soroban_snapshot.clone();
         let bls_for_batch = bucket_list_snapshot.clone();
         let batch_lookup_fn: crate::snapshot::BatchEntryLookupFn =
             Arc::new(move |keys: &[LedgerKey]| {
                 let mut result = Vec::new();
                 let mut bucket_list_keys = Vec::new();
 
-                // Check soroban state cache for soroban types first (O(1))
-                {
-                    let soroban = soroban_state_batch.read();
-                    for key in keys {
-                        if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
-                            if let Some(entry) = soroban.get(key) {
-                                result.push((*entry).clone());
-                            } else {
-                                // Fall through to bucket list for Soroban entries not
-                                // found in the in-memory state. This handles entries
-                                // that the initialization scan may have missed.
-                                bucket_list_keys.push(key.clone());
-                            }
-                            continue;
+                // Check soroban state snapshot for soroban types first (O(1))
+                for key in keys {
+                    if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
+                        if let Some(entry) = soroban_for_batch.get(key) {
+                            result.push((*entry).clone());
+                        } else {
+                            // Fall through to bucket list for Soroban entries not
+                            // found in the in-memory state. This handles entries
+                            // that the initialization scan may have missed.
+                            bucket_list_keys.push(key.clone());
                         }
-                        bucket_list_keys.push(key.clone());
+                        continue;
                     }
+                    bucket_list_keys.push(key.clone());
                 }
 
                 // Batch-load remaining from bucket list in a single pass
