@@ -158,6 +158,7 @@ CI FIX WORKFLOW:
 (11) CI check — TWO levels of detection are required:
   (11a) Run-level: gh run list --limit 5 --json databaseId,name,status,conclusion,headSha,createdAt --jq '.[] | "\(.name)|\(.status)|\(.conclusion)|\(.headSha[:8])|\(.databaseId)|\(.createdAt)"'. Scan for completed runs with conclusion "failure".
   (11b) Job-level (CRITICAL — catches continue-on-error failures): For the latest completed Quickstart run, check individual jobs: gh run view <ID> --json jobs --jq '.jobs[] | select(.conclusion == "failure") | "\(.name)|\(.conclusion)"'. Workflows with continue-on-error jobs report run-level conclusion "success" even when jobs fail — you MUST check job-level conclusions to catch these. If any jobs have conclusion "failure", treat it the same as a run-level failure.
+REPORTING RULE — NEVER report "ci: all green" if ANY job has conclusion "failure", even if the run-level conclusion is "success". The ci: line in the status report MUST reflect the WORST job-level result. A continue-on-error job failure is NOT "green" — it is RED. Do not qualify failures as "known", "pre-existing", or "cosmetic". A failure that persists across multiple commits is MORE urgent, not less — it means no one has fixed it.
 Compare createdAt with current UTC time (date -u +%Y-%m-%dT%H:%M:%SZ) — only investigate failures from the last 2 hours. CI failures are bugs — they MUST be investigated and fixed immediately, never deferred to "next cycle". For each failure: (a) gh run view <ID> --log-failed 2>&1 | tail -80, (b) categorize: build error, test failure, timeout, infrastructure, (c) investigate root cause and fix the code — whether it's a code bug, flaky test, or infrastructure issue. For flaky tests: fix the flakiness (increase timeout, add retry, fix the race). For infrastructure: fix the workflow config. (d) cargo test --all, commit, push, report: CI FIX — <workflow> failed on <sha>, fixed in <commit>. The goal is all-green CI — no persistent failures are acceptable. If CI is red, this check takes priority over all other checks except process-alive.
 
 INVESTIGATION: For ANY anomaly, investigate to root cause — read source code, check logs, trace code paths. Never dismiss as "expected". See the mainnet-monitor skill's Resource Investigation sections for detailed procedures.
@@ -174,7 +175,7 @@ MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   rpc:    <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
   obsrvr: validating=<Y/N> val24h=<pct>% lag=<N>
   deploy: <up-to-date | pulled N commits (old..new) | SKIPPED (reason)>
-  ci:     <all green | WORKFLOW failed — investigating | WORKFLOW jobs failed (continue-on-error) — investigating>
+  ci:     <all green (run+job level) | WORKFLOW failed | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed>
 Use WARNING for threshold breaches. Use ACTION when a corrective action was taken (restart, deploy, fix). Use SYNC FAILURE (not WARNING) when the node has been running > 15 minutes but is not closing ledgers in real-time — this is a bug that requires immediate investigation.
 ```
 
