@@ -201,9 +201,19 @@ impl UpgradeParameters {
 
     /// Check if the upgrade has expired at the given time.
     ///
-    /// Parity: stellar-core Upgrades.cpp:477-479 — if upgradeTime + expiration <= closeTime,
-    /// all upgrades are removed. There is no special case for upgradeTime == 0.
+    /// `upgrade_time == 0` means "apply immediately" (from HTTP
+    /// `upgradetime=1970-01-01T00:00:00Z`). These never expire because
+    /// in henyey's async runtime, `remove_upgrades` (called on every ledger
+    /// close) can race with the upgrade being proposed — clearing the
+    /// params before they're ever included in an SCP value.
+    ///
+    /// stellar-core doesn't need this carve-out because its
+    /// `triggerNextLedger` runs synchronously after `processExternalized`,
+    /// so upgrades are always proposed before `removeUpgrades` can clear them.
     pub fn is_expired(&self, current_time: u64) -> bool {
+        if self.upgrade_time == 0 {
+            return false;
+        }
         // Parity: stellar-core Upgrades.cpp:477-479 uses `<=` (boundary-inclusive):
         //   mUpgradeTime + EXPIRE_UPGRADE_WINDOW_SECONDS <= closeTime
         current_time >= self.upgrade_time + self.expiration_seconds()
@@ -672,12 +682,13 @@ mod tests {
         assert!(params.is_expired(1000 + 24 * 3600)); // At boundary — expired
         assert!(params.is_expired(1000 + 24 * 3600 + 1)); // Expires with custom
 
-        // Epoch-zero upgrades expire normally — no special carve-out.
-        // stellar-core: 0 + 15min = 900, so at time >= 900 it's expired.
+        // Epoch-zero upgrades never expire (async race protection).
+        // In henyey's async runtime, remove_upgrades can clear params before
+        // propose_value uses them. Epoch-zero means "apply immediately".
         let epoch_params = UpgradeParameters::new(0);
         assert!(!epoch_params.is_expired(899));
-        assert!(epoch_params.is_expired(900)); // 0 + 15*60 = 900
-        assert!(epoch_params.is_expired(1_700_000_000)); // Any real close time
+        assert!(!epoch_params.is_expired(900));
+        assert!(!epoch_params.is_expired(1_700_000_000));
     }
 
     #[test]
