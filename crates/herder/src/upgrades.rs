@@ -201,15 +201,9 @@ impl UpgradeParameters {
 
     /// Check if the upgrade has expired at the given time.
     ///
-    /// `upgrade_time == 0` means "apply immediately" (from HTTP
-    /// `upgradetime=1970-01-01T00:00:00Z`). These never expire because
-    /// in an async runtime, `remove_upgrades` (called on every ledger
-    /// close) can race with the upgrade being proposed — clearing the
-    /// params before they're ever included in an SCP value.
+    /// Parity: stellar-core Upgrades.cpp:477-479 — if upgradeTime + expiration <= closeTime,
+    /// all upgrades are removed. There is no special case for upgradeTime == 0.
     pub fn is_expired(&self, current_time: u64) -> bool {
-        if self.upgrade_time == 0 {
-            return false;
-        }
         // Parity: stellar-core Upgrades.cpp:477-479 uses `<=` (boundary-inclusive):
         //   mUpgradeTime + EXPIRE_UPGRADE_WINDOW_SECONDS <= closeTime
         current_time >= self.upgrade_time + self.expiration_seconds()
@@ -677,6 +671,13 @@ mod tests {
         assert!(!params.is_expired(1000 + 15 * 60 + 1)); // Would have expired with default
         assert!(params.is_expired(1000 + 24 * 3600)); // At boundary — expired
         assert!(params.is_expired(1000 + 24 * 3600 + 1)); // Expires with custom
+
+        // Epoch-zero upgrades expire normally — no special carve-out.
+        // stellar-core: 0 + 15min = 900, so at time >= 900 it's expired.
+        let epoch_params = UpgradeParameters::new(0);
+        assert!(!epoch_params.is_expired(899));
+        assert!(epoch_params.is_expired(900)); // 0 + 15*60 = 900
+        assert!(epoch_params.is_expired(1_700_000_000)); // Any real close time
     }
 
     #[test]
