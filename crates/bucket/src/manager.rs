@@ -96,18 +96,17 @@ pub(crate) fn promote_temp_to_canonical(
 ) -> crate::Result<Bucket> {
     let permanent_path = dir.join(canonical_bucket_filename(hash));
     if !permanent_path.exists() {
-        match durable_rename(temp_path, &permanent_path) {
-            Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    temp = %temp_path.display(),
-                    dest = %permanent_path.display(),
-                    "{label}: failed to rename merge output to permanent path, using temp path"
-                );
-                Bucket::from_xdr_file_disk_backed(temp_path)
-            }
-        }
+        durable_rename(temp_path, &permanent_path).map_err(|e| {
+            crate::BucketError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "{label}: failed to rename {} to {}: {e}",
+                    temp_path.display(),
+                    permanent_path.display()
+                ),
+            ))
+        })?;
+        Bucket::from_xdr_file_disk_backed(&permanent_path)
     } else {
         match Bucket::from_xdr_file_disk_backed(&permanent_path) {
             Ok(existing) if existing.hash() == *hash => {
@@ -121,18 +120,13 @@ pub(crate) fn promote_temp_to_canonical(
                     path = %permanent_path.display(),
                     "{label}: permanent bucket file has wrong hash, replacing"
                 );
-                match durable_rename(temp_path, &permanent_path) {
-                    Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            temp = %temp_path.display(),
-                            dest = %permanent_path.display(),
-                            "{label}: failed to replace corrupt permanent file, using temp path"
-                        );
-                        Bucket::from_xdr_file_disk_backed(temp_path)
-                    }
-                }
+                durable_rename(temp_path, &permanent_path).map_err(|e| {
+                    crate::BucketError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{label}: failed to replace corrupt permanent file: {e}"),
+                    ))
+                })?;
+                Bucket::from_xdr_file_disk_backed(&permanent_path)
             }
             Err(load_err) => {
                 tracing::warn!(
@@ -140,18 +134,13 @@ pub(crate) fn promote_temp_to_canonical(
                     path = %permanent_path.display(),
                     "{label}: failed to load permanent bucket file, replacing"
                 );
-                match durable_rename(temp_path, &permanent_path) {
-                    Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            temp = %temp_path.display(),
-                            dest = %permanent_path.display(),
-                            "{label}: failed to replace unreadable permanent file, using temp path"
-                        );
-                        Bucket::from_xdr_file_disk_backed(temp_path)
-                    }
-                }
+                durable_rename(temp_path, &permanent_path).map_err(|e| {
+                    crate::BucketError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{label}: failed to replace unreadable permanent file: {e}"),
+                    ))
+                })?;
+                Bucket::from_xdr_file_disk_backed(&permanent_path)
             }
         }
     }
