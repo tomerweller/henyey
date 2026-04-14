@@ -59,9 +59,9 @@ pub struct FetchingConfig {
     pub quorum_set_fetcher_config: ItemFetcherConfig,
     /// Maximum slots to track.
     pub max_slots: usize,
-    /// Maximum tx sets to cache. Once exceeded, older slots' tx sets are evicted.
+    /// Maximum tx sets to cache. Once exceeded, an arbitrary entry is evicted.
     pub max_tx_set_cache: usize,
-    /// Maximum quorum sets to cache. Once exceeded, oldest entries are evicted.
+    /// Maximum quorum sets to cache. Once exceeded, an arbitrary entry is evicted.
     pub max_quorum_set_cache: usize,
 }
 
@@ -252,7 +252,7 @@ impl FetchingEnvelopes {
         self.stats.write().tx_sets_received += 1;
 
         // Evict old entries if cache is full
-        self.evict_tx_set_cache_if_full(slot);
+        self.evict_tx_set_cache_if_full();
 
         // Cache the TxSet
         self.tx_set_cache.insert(hash, (slot, data));
@@ -563,7 +563,7 @@ impl FetchingEnvelopes {
 
     /// Add a TxSet to the cache directly (e.g., locally created).
     pub fn cache_tx_set(&self, hash: Hash256, slot: SlotIndex, data: Vec<u8>) {
-        self.evict_tx_set_cache_if_full(slot);
+        self.evict_tx_set_cache_if_full();
         self.tx_set_cache.insert(hash, (slot, data));
     }
 
@@ -573,7 +573,7 @@ impl FetchingEnvelopes {
     /// but want to notify waiting envelopes that the dependency is satisfied.
     pub fn tx_set_available(&self, hash: Hash256, slot: SlotIndex) {
         // Cache it (eviction handled in cache_tx_set)
-        self.evict_tx_set_cache_if_full(slot);
+        self.evict_tx_set_cache_if_full();
         self.tx_set_cache.insert(hash, (slot, Vec::new()));
 
         // Try recv_tx_set which handles tracked items
@@ -617,30 +617,22 @@ impl FetchingEnvelopes {
 
     // --- Internal helpers ---
 
-    /// Evict old tx set cache entries if the cache is full.
-    /// Evicts entries from the oldest slots first.
-    fn evict_tx_set_cache_if_full(&self, current_slot: SlotIndex) {
+    /// Evict a tx set cache entry if the cache is full.
+    /// Removes an arbitrary entry, matching stellar-core's RandomEvictionCache.
+    fn evict_tx_set_cache_if_full(&self) {
         if self.tx_set_cache.len() < self.config.max_tx_set_cache {
             return;
         }
 
-        // Find the oldest slot entry to evict
-        let mut oldest_slot = current_slot;
-        let mut oldest_hash = None;
-
-        for entry in self.tx_set_cache.iter() {
-            if entry.value().0 < oldest_slot {
-                oldest_slot = entry.value().0;
-                oldest_hash = Some(*entry.key());
-            }
-        }
-
-        if let Some(hash) = oldest_hash {
+        // Evict an arbitrary entry. stellar-core uses RandomEvictionCache
+        // which unconditionally evicts on insert when full — no slot-based
+        // logic. We mirror that: just remove the first entry we find.
+        let to_remove = self.tx_set_cache.iter().next().map(|e| *e.key());
+        if let Some(hash) = to_remove {
             self.tx_set_cache.remove(&hash);
             debug!(
-                evicted_slot = oldest_slot,
                 cache_size = self.tx_set_cache.len(),
-                "Evicted old TxSet from cache"
+                "Evicted TxSet from cache"
             );
         }
     }
@@ -1423,6 +1415,39 @@ mod tests {
             result,
             RecvResult::Ready,
             "NOMINATE with all tx_sets cached should be Ready"
+        );
+    }
+
+    /// Regression test for AUDIT-132 (#1491): tx-set cache eviction must
+    /// not be a no-op when all entries share the same slot. Before the fix,
+    /// `evict_tx_set_cache_if_full` initialized `oldest_slot = current_slot`
+    /// and used `<` comparison, so same-slot entries were never evicted.
+    #[test]
+    fn test_evict_tx_set_cache_same_slot_does_not_grow_unbounded() {
+        let mut config = FetchingConfig::default();
+        config.max_tx_set_cache = 4;
+        let fetching = FetchingEnvelopes::new(config);
+
+        let slot = 100;
+        // Fill to the limit
+        for i in 0..4u8 {
+            let hash = Hash256::from_bytes([i; 32]);
+            fetching.cache_tx_set(hash, slot, vec![i]);
+        }
+        assert_eq!(fetching.tx_set_cache_size(), 4);
+
+        // Insert 4 more entries for the same slot — cache should stay at limit.
+        for i in 4..8u8 {
+            let hash = Hash256::from_bytes([i; 32]);
+            fetching.cache_tx_set(hash, slot, vec![i]);
+        }
+
+        // Cache must not exceed the configured limit (previously grew to 8).
+        assert!(
+            fetching.tx_set_cache_size() <= 4,
+            "tx_set_cache should not exceed max_tx_set_cache={}, got {}",
+            4,
+            fetching.tx_set_cache_size()
         );
     }
 }
