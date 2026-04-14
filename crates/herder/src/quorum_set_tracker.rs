@@ -104,6 +104,11 @@ impl QuorumSetTracker {
         // If already pending, add this node_id to the waiting set.
         if let Some(mut entry) = self.pending.get_mut(&hash) {
             entry.request_count += 1;
+            // Track the latest slot that needs this qset, so eviction
+            // doesn't prematurely remove entries still in active use.
+            if slot > entry.first_seen_slot {
+                entry.first_seen_slot = slot;
+            }
             // Cap per-entry node_ids to prevent unbounded growth
             if entry.node_ids.len() < MAX_PENDING_NODE_IDS {
                 entry.node_ids.insert(node_id);
@@ -557,5 +562,32 @@ mod tests {
         // Now the fresh request succeeds.
         assert!(tracker.request(fresh_hash, make_node_id(2), 200));
         assert_eq!(tracker.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_repeated_request_updates_slot_preventing_premature_eviction() {
+        let tracker = QuorumSetTracker::new(node_key(0), None);
+        let hash = Hash256::from_bytes([1; 32]);
+
+        // First seen at slot 50.
+        assert!(tracker.request(hash, make_node_id(1), 50));
+        assert_eq!(tracker.pending_count(), 1);
+
+        // Same hash requested again at slot 150 (different node).
+        assert!(!tracker.request(hash, make_node_id(2), 150));
+
+        // Evict entries below slot 100 — should NOT evict because
+        // the entry was refreshed to slot 150.
+        tracker.evict_pending_below(100);
+        assert_eq!(
+            tracker.pending_count(),
+            1,
+            "Entry refreshed to slot 150 should survive eviction below 100"
+        );
+        assert!(!tracker.pending_node_ids(&hash).is_empty());
+
+        // Evict below 200 — now it should be evicted.
+        tracker.evict_pending_below(200);
+        assert_eq!(tracker.pending_count(), 0);
     }
 }

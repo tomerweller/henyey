@@ -1790,6 +1790,9 @@ impl ScpDriver {
 
         // Clean up quorum set caches to prevent unbounded growth.
         self.qset_tracker.clear_validated_preserving_local();
+
+        // Evict stale pending quorum set requests.
+        self.qset_tracker.evict_pending_below(slot);
     }
 
     /// Get local SCP envelopes for a slot.
