@@ -184,6 +184,7 @@ Corresponds to: `LedgerManagerImpl.h` (transaction execution), `NetworkConfig.h`
 | `processFeesSeqNums()` | Fee charging in `run_transactions_on_executor()` | Full |
 | `applyTransactions()` | `run_transactions_on_executor()` | Full |
 | `TransactionFrame::commonPreApply()` | `pre_apply()` (private) | Full |
+| `TransactionFrame::processSignatures()` | `post_seq_failure_mutations()` + `remove_one_time_signers_phase()` | Full | PreAuthTx signer removal on post-seq validation failures (#1478) |
 | `TransactionFrame::preParallelApply()` | `pre_apply()` (private) | Full |
 | `TransactionFrame::parallelApply()` | `apply_body()` (private) | Full |
 | `SorobanNetworkConfig::loadFromLedger()` | `load_soroban_network_info()` | Full |

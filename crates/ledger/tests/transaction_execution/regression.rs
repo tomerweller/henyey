@@ -4643,3 +4643,389 @@ async fn test_audit_095_pre_parallel_apply_globalizes_seq_bumps() {
         );
     }
 }
+
+/// Regression test for AUDIT-119 (#1478): Post-sequence validation failures
+/// must remove PreAuthTx one-time signers, matching stellar-core's
+/// processSignatures() which always calls removeOneTimeSignerFromAllSourceAccounts()
+/// even when validation fails (protocol 13+).
+///
+/// This test creates a transaction authorized by a PreAuthTx signer with a
+/// min_seq_ledger_gap condition that fails post-seq validation. It verifies:
+/// 1. Sequence number was bumped (post-seq failure still consumes seq)
+/// 2. PreAuthTx signer was removed from the source account
+/// 3. The signer removal + seq bump appear in tx_changes_before meta
+#[test]
+fn test_post_seq_failure_removes_preauth_signer() {
+    let secret = SecretKey::from_seed(&[119u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+    let network_id = NetworkId::testnet();
+
+    // Build the transaction envelope first so we can compute its hash for the
+    // PreAuthTx signer key.
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])));
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // min_seq_ledger_gap=1000 will fail because current ledger (10) - seq_ledger (5) < 1000.
+    // This is a post-seq failure (past_seq_check=true).
+    let preconditions = Preconditions::V2(PreconditionsV2 {
+        time_bounds: None,
+        ledger_bounds: None,
+        min_seq_num: None,
+        min_seq_age: Duration(0),
+        min_seq_ledger_gap: 1000,
+        extra_signers: VecM::default(),
+    });
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: preconditions,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    // Sign the envelope with the ed25519 key.
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // Compute the tx hash to use as the PreAuthTx signer key.
+    let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), network_id);
+    let tx_hash = frame.hash(&network_id).expect("tx hash");
+
+    // Create the PreAuthTx signer matching this transaction's hash.
+    let preauth_signer = Signer {
+        key: SignerKey::PreAuthTx(Uint256(tx_hash.0)),
+        weight: 1,
+    };
+
+    // Create account with seq_num=1, with both ed25519 key weight and PreAuthTx signer.
+    // The account has seq_time/seq_ledger set for min_seq_ledger_gap checking.
+    let (key, entry) = {
+        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 5,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 10_000_000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 1, // one signer
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![preauth_signer].try_into().unwrap(),
+                ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                    liabilities: Liabilities {
+                        buying: 0,
+                        selling: 0,
+                    },
+                    ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                        num_sponsored: 0,
+                        num_sponsoring: 0,
+                        signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                        ext: AccountEntryExtensionV2Ext::V3(AccountEntryExtensionV3 {
+                            ext: ExtensionPoint::V0,
+                            seq_ledger: 5,
+                            seq_time: TimePoint(500),
+                        }),
+                    }),
+                }),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        (key, entry)
+    };
+
+    let snapshot = SnapshotBuilder::new(10)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    // Ledger 10, close_time=1000, base_reserve=5_000_000, protocol 25.
+    let context = henyey_tx::LedgerContext::new(10, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor =
+        TransactionExecutor::new(&context, 0, SorobanConfig::default(), classic_events);
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // The transaction should fail with TxBadMinSeqAgeOrGap (post-seq failure).
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxBadMinSeqAgeOrGap),
+        "Expected post-seq validation failure TxBadMinSeqAgeOrGap"
+    );
+
+    // Verify: sequence number was bumped (state mutation persists).
+    let acc = executor.state().get_account(&account_id);
+    assert!(acc.is_some(), "Account should still exist");
+    let acc = acc.unwrap();
+    assert_eq!(
+        acc.seq_num.0, 2,
+        "Sequence should be bumped to tx seq_num=2 even on post-seq failure"
+    );
+
+    // Verify: PreAuthTx signer was removed.
+    assert!(
+        acc.signers.is_empty(),
+        "PreAuthTx signer should be removed on post-seq failure, \
+         matching stellar-core's processSignatures fast-fail path"
+    );
+
+    // Verify: num_sub_entries decremented (signer removed).
+    assert_eq!(
+        acc.num_sub_entries, 0,
+        "num_sub_entries should be 0 after signer removal"
+    );
+
+    // Verify: tx_meta contains tx_changes_before with the mutations.
+    let meta = result
+        .tx_meta
+        .expect("tx_meta should be populated for post-seq failures");
+    match &meta {
+        TransactionMeta::V4(v4) => {
+            let changes = &v4.tx_changes_before;
+            assert!(
+                !changes.0.is_empty(),
+                "tx_changes_before should contain seq bump + signer removal entries"
+            );
+            // Should have STATE + UPDATED pairs for the account mutation.
+            let has_state = changes
+                .0
+                .iter()
+                .any(|c| matches!(c, LedgerEntryChange::State(_)));
+            let has_updated = changes
+                .0
+                .iter()
+                .any(|c| matches!(c, LedgerEntryChange::Updated(_)));
+            assert!(has_state, "tx_changes_before should have STATE entry");
+            assert!(has_updated, "tx_changes_before should have UPDATED entry");
+        }
+        _ => panic!(
+            "Expected TransactionMeta::V4, got {:?}",
+            std::mem::discriminant(&meta)
+        ),
+    }
+}
+
+/// Regression test for AUDIT-119 (#1478): Fee-bump transactions must remove
+/// the PreAuthTx signer matching the outer (fee-bump) hash from the fee
+/// source account, even on post-seq validation failure.
+#[test]
+fn test_post_seq_failure_removes_fee_bump_outer_signer() {
+    let inner_secret = SecretKey::from_seed(&[120u8; 32]);
+    let inner_account_id: AccountId = (&inner_secret.public_key()).into();
+    let fee_secret = SecretKey::from_seed(&[121u8; 32]);
+    let fee_account_id: AccountId = (&fee_secret.public_key()).into();
+    let network_id = NetworkId::testnet();
+
+    // Build the inner transaction.
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([3u8; 32])));
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // min_seq_ledger_gap=1000 triggers post-seq failure.
+    let preconditions = Preconditions::V2(PreconditionsV2 {
+        time_bounds: None,
+        ledger_bounds: None,
+        min_seq_num: None,
+        min_seq_age: Duration(0),
+        min_seq_ledger_gap: 1000,
+        extra_signers: VecM::default(),
+    });
+
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: preconditions,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut inner_envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: inner_tx.clone(),
+        signatures: VecM::default(),
+    });
+    let inner_sig = sign_envelope(&inner_envelope, &inner_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = inner_envelope {
+        env.signatures = vec![inner_sig].try_into().unwrap();
+    }
+
+    // Wrap in a fee-bump.
+    let fee_bump_tx = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(match inner_envelope {
+            TransactionEnvelope::Tx(ref env) => env.clone(),
+            _ => panic!("expected Tx"),
+        }),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let mut fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump_tx,
+        signatures: VecM::default(),
+    });
+
+    let fee_bump_sig = sign_envelope(&fee_bump_envelope, &fee_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut env) = fee_bump_envelope {
+        env.signatures = vec![fee_bump_sig].try_into().unwrap();
+    }
+
+    // Compute the fee-bump outer hash for the PreAuthTx signer.
+    let fb_frame =
+        henyey_tx::TransactionFrame::from_owned_with_network(fee_bump_envelope.clone(), network_id);
+    let fee_bump_hash = fb_frame.hash(&network_id).expect("fee bump hash");
+
+    // Also compute the inner tx hash for the inner PreAuthTx signer.
+    let inner_frame =
+        henyey_tx::TransactionFrame::from_owned_with_network(inner_envelope.clone(), network_id);
+    let inner_tx_hash = inner_frame.hash(&network_id).expect("inner tx hash");
+
+    // Create fee source account with PreAuthTx signer matching the fee-bump outer hash.
+    let fee_source_preauth = Signer {
+        key: SignerKey::PreAuthTx(Uint256(fee_bump_hash.0)),
+        weight: 1,
+    };
+    let (fee_key, fee_entry) = {
+        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: fee_account_id.clone(),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: fee_account_id.clone(),
+                balance: 10_000_000,
+                seq_num: SequenceNumber(0),
+                num_sub_entries: 1,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![fee_source_preauth].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        (key, entry)
+    };
+
+    // Create inner source account with PreAuthTx signer matching the inner tx hash.
+    let inner_preauth = Signer {
+        key: SignerKey::PreAuthTx(Uint256(inner_tx_hash.0)),
+        weight: 1,
+    };
+    let (inner_key, inner_entry) = {
+        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: inner_account_id.clone(),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 5,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: inner_account_id.clone(),
+                balance: 10_000_000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 1,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![inner_preauth].try_into().unwrap(),
+                ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                    liabilities: Liabilities {
+                        buying: 0,
+                        selling: 0,
+                    },
+                    ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                        num_sponsored: 0,
+                        num_sponsoring: 0,
+                        signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                        ext: AccountEntryExtensionV2Ext::V3(AccountEntryExtensionV3 {
+                            ext: ExtensionPoint::V0,
+                            seq_ledger: 5,
+                            seq_time: TimePoint(500),
+                        }),
+                    }),
+                }),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        (key, entry)
+    };
+
+    let snapshot = SnapshotBuilder::new(10)
+        .add_entry(fee_key, fee_entry)
+        .add_entry(inner_key, inner_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let context = henyey_tx::LedgerContext::new(10, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor =
+        TransactionExecutor::new(&context, 0, SorobanConfig::default(), classic_events);
+    let result = executor
+        .execute_transaction(&snapshot, &fee_bump_envelope, 100, None)
+        .expect("execute");
+
+    // Should fail with TxBadMinSeqAgeOrGap (post-seq failure on inner tx).
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxBadMinSeqAgeOrGap),
+        "Expected post-seq validation failure"
+    );
+
+    // Verify: fee source PreAuthTx signer was removed (outer hash).
+    let fee_acc = executor.state().get_account(&fee_account_id);
+    assert!(fee_acc.is_some(), "Fee source account should exist");
+    let fee_acc = fee_acc.unwrap();
+    assert!(
+        fee_acc.signers.is_empty(),
+        "Fee source PreAuthTx signer (outer hash) should be removed on post-seq failure"
+    );
+
+    // Verify: inner source PreAuthTx signer was removed (inner hash).
+    let inner_acc = executor.state().get_account(&inner_account_id);
+    assert!(inner_acc.is_some(), "Inner source account should exist");
+    let inner_acc = inner_acc.unwrap();
+    assert!(
+        inner_acc.signers.is_empty(),
+        "Inner source PreAuthTx signer should be removed on post-seq failure"
+    );
+
+    // Verify: inner source sequence was bumped.
+    assert_eq!(
+        inner_acc.seq_num.0, 2,
+        "Inner source sequence should be bumped to 2"
+    );
+}

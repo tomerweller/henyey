@@ -1863,26 +1863,31 @@ impl TransactionExecutor {
                 failure_result.fee_refund = soroban_max_refundable;
 
                 // If the validation passed the sequence check (stellar-core's
-                // cv >= kInvalidUpdateSeqNum), bump the sequence number even
-                // though the TX failed. This matches stellar-core's
-                // commonPreApply which calls processSeqNum before returning.
+                // cv >= kInvalidUpdateSeqNum), perform the same post-seq
+                // mutations as stellar-core's commonPreApply:
+                //   1. Fee-bump wrapper: removeOneTimeSignerKeyFromFeeSource
+                //   2. Inner: processSeqNum + processSignatures (which on
+                //      protocol 13+ calls removeOneTimeSignerFromAllSourceAccounts)
+                //   3. pushTxChangesBefore + commit
                 if validation_failure.past_seq_check {
-                    let fail_frame =
-                        TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
-                    let inner_source_id =
-                        henyey_tx::muxed_to_account_id(&fail_frame.inner_source_account());
-                    if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
-                        acc.seq_num =
-                            stellar_xdr::curr::SequenceNumber(fail_frame.sequence_number());
-                        henyey_tx::state::update_account_seq_info(
-                            acc,
-                            self.ledger_seq,
-                            self.close_time,
-                        );
-                    }
-                    // Flush and commit the sequence bump so it persists.
-                    self.state.flush_modified_entries();
-                    self.state.commit();
+                    let (tx_changes_before, _) =
+                        self.post_seq_failure_mutations(snapshot, tx_envelope)?;
+
+                    // Build tx_meta so the seq bump + signer removal appear
+                    // in the ledger close meta, matching stellar-core's
+                    // pushTxChangesBefore(ltxTx) at commonPreApply:2037.
+                    failure_result.tx_meta =
+                        Some(meta::build_transaction_meta(meta::TransactionMetaParts {
+                            tx_changes_before,
+                            op_changes: vec![],
+                            op_events: vec![],
+                            tx_events: vec![],
+                            soroban_return_value: None,
+                            diagnostic_events: vec![],
+                            soroban_fee_info: None,
+                            emit_soroban_tx_meta_ext_v1: self.emit_soroban_tx_meta_ext_v1,
+                            enable_soroban_diagnostic_events: self.enable_soroban_diagnostic_events,
+                        }));
                 }
 
                 return Ok(Err(failure_result));
@@ -2563,6 +2568,145 @@ impl TransactionExecutor {
 
         let us = seq_bump_start.elapsed().as_micros() as u64;
         (seq_changes, seq_created, seq_updated, seq_deleted, us)
+    }
+
+    /// Perform post-sequence-check mutations for a failed transaction.
+    ///
+    /// When validation passes the sequence gate (`past_seq_check == true`) but
+    /// fails afterward (e.g., min_seq_age, signatures), stellar-core's
+    /// `commonPreApply` still runs:
+    ///   1. `processSeqNum(ltxTx)` — bump sequence number
+    ///   2. `processSignatures(cv, ...)` — remove PreAuthTx one-time signers
+    ///   3. `pushTxChangesBefore(ltxTx)` + `ltxTx.commit()`
+    ///
+    /// For fee-bump transactions, `FeeBumpTransactionFrame::apply()` also calls
+    /// `removeOneTimeSignerKeyFromFeeSource(ltxTx)` in a separate scope before
+    /// the inner transaction's `commonPreApply`.
+    ///
+    /// Returns `(tx_changes_before, duration_us)`.
+    fn post_seq_failure_mutations(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &Arc<TransactionEnvelope>,
+    ) -> Result<(LedgerEntryChanges, u64)> {
+        let start = std::time::Instant::now();
+        let frame = TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
+        let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
+        let outer_hash = frame
+            .hash(&self.network_id)
+            .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?;
+
+        let mut all_changes = Vec::new();
+
+        // Step 1: Fee-bump wrapper signer removal (separate scope in stellar-core).
+        // Mirrors FeeBumpTransactionFrame::apply() lines 162-165.
+        if frame.is_fee_bump() {
+            let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
+            let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: fee_source_id.clone(),
+            });
+            if let Some(fee_source_before) = self.state.get_entry(&fee_source_key) {
+                let signer_key = stellar_xdr::curr::SignerKey::PreAuthTx(
+                    stellar_xdr::curr::Uint256(outer_hash.0),
+                );
+                self.state
+                    .remove_account_signer(&fee_source_id, &signer_key);
+                self.state.flush_modified_entries();
+
+                let fee_source_after = self
+                    .state
+                    .get_entry(&fee_source_key)
+                    .unwrap_or_else(|| fee_source_before.clone());
+                all_changes.push(LedgerEntryChange::State(fee_source_before));
+                all_changes.push(LedgerEntryChange::Updated(fee_source_after));
+            }
+        }
+
+        // Step 2: Inner tx mutations (seq bump + signer removal in one scope).
+        // Mirrors commonPreApply lines 2024-2038.
+        //
+        // Take a delta snapshot before any inner mutations so we can capture
+        // the combined STATE/UPDATED entries for tx_changes_before.
+        let delta_before = delta_snapshot(&self.state);
+
+        // Capture pre-mutation account states for STATE entries in the meta.
+        // We need these because after flush, get_entry returns post-mutation values.
+        let inner_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: inner_source_id.clone(),
+        });
+        let mut state_overrides = HashMap::new();
+        if let Some(entry) = self.state.get_entry(&inner_source_key) {
+            state_overrides.insert(inner_source_key, entry);
+        }
+
+        // 2a: Sequence bump (processSeqNum)
+        if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+            acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
+            henyey_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
+        }
+
+        // 2b: Pre-load per-operation source accounts from snapshot so signer
+        // removal can find them. On the success path this is done at line 2055.
+        for op in frame.operations().iter() {
+            if let Some(ref source) = op.source_account {
+                let op_source_id = henyey_tx::muxed_to_account_id(source);
+                self.load_account(snapshot, &op_source_id)?;
+                // Capture pre-mutation state for these accounts too.
+                let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: op_source_id,
+                });
+                if let Some(entry) = self.state.get_entry(&key) {
+                    state_overrides.entry(key).or_insert(entry);
+                }
+            }
+        }
+
+        // 2c: Remove PreAuthTx one-time signers (processSignatures fast-fail path).
+        // For fee-bumps, use the inner TX contents hash; for regular txs, outer hash.
+        let signer_removal_hash = if frame.is_fee_bump() {
+            fee_bump_inner_hash(&frame, &self.network_id)?
+        } else {
+            outer_hash
+        };
+
+        let mut source_accounts = Vec::new();
+        source_accounts.push(inner_source_id.clone());
+        for op in frame.operations().iter() {
+            if let Some(ref source) = op.source_account {
+                source_accounts.push(henyey_tx::muxed_to_account_id(source));
+            }
+        }
+        source_accounts.sort_by(|a, b| a.0.cmp(&b.0));
+        source_accounts.dedup_by(|a, b| a.0 == b.0);
+
+        self.state.remove_one_time_signers_from_all_sources(
+            &signer_removal_hash,
+            &source_accounts,
+            self.protocol_version,
+        );
+
+        // Flush all inner mutations (seq bump + signer removal) and capture delta.
+        self.state.flush_modified_entries();
+        let delta_after = delta_snapshot(&self.state);
+        let delta_slice = delta_slice_between(self.state.delta(), delta_before, delta_after);
+
+        let inner_changes = build_entry_changes_with_state_overrides(
+            &self.state,
+            delta_slice.created(),
+            delta_slice.updated(),
+            delta_slice.deleted(),
+            &state_overrides,
+        );
+        all_changes.extend(inner_changes.0.iter().cloned());
+
+        // Commit all mutations so they persist.
+        self.state.commit();
+
+        let us = start.elapsed().as_micros() as u64;
+        Ok((
+            LedgerEntryChanges(all_changes.try_into().unwrap_or_default()),
+            us,
+        ))
     }
 }
 
