@@ -27,6 +27,34 @@ use tracing::{debug, warn};
 
 use crate::tx_queue::{AccountProvider, FeeBalanceProvider};
 
+/// Account provider backed by a single ledger snapshot.
+///
+/// Creates one snapshot at construction time and reuses it for all lookups,
+/// ensuring consistency across all account state reads during a single
+/// tx-set validation pass. This matches stellar-core's approach of creating
+/// one `LedgerSnapshot` per `getInvalidTxList` call.
+pub struct SnapshotAccountProvider {
+    snapshot: henyey_ledger::SnapshotHandle,
+}
+
+impl SnapshotAccountProvider {
+    /// Create a new provider from a ledger manager.
+    /// Returns `None` if the snapshot cannot be created.
+    pub fn from_ledger_manager(ledger_manager: &henyey_ledger::LedgerManager) -> Option<Self> {
+        let snapshot = ledger_manager.create_snapshot().ok()?;
+        Some(Self { snapshot })
+    }
+}
+
+impl AccountProvider for SnapshotAccountProvider {
+    fn load_account(
+        &self,
+        account_id: &stellar_xdr::curr::AccountId,
+    ) -> Option<stellar_xdr::curr::AccountEntry> {
+        self.snapshot.get_account(account_id).ok()?
+    }
+}
+
 /// Get the declared fee from a transaction envelope.
 ///
 /// For fee-bump transactions, returns the outer (bumped) fee.
@@ -2994,12 +3022,13 @@ mod tests {
             None,
             Some(&account_provider),
         );
-        // tx_good_seq passes seq check but fails auth (no sig)
-        // tx_bad_seq fails seq check
+        // tx_good_seq: seq=1, account seq=0 → passes seq check, fails auth (no real sig)
+        // tx_bad_seq: seq=999, account seq=0 → fails seq check (0+1 ≠ 999)
         // Both should be invalid
-        assert!(
-            valid_classic.len() <= 1,
-            "at least the bad-seq tx should be trimmed"
+        assert_eq!(
+            valid_classic.len(),
+            0,
+            "both txs should be trimmed (bad-seq + auth failure)"
         );
     }
 }

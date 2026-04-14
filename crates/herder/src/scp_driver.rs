@@ -349,14 +349,18 @@ impl ScpDriver {
                     true
                 } else {
                     let soroban_info = lm.soroban_network_info();
+                    let account_provider =
+                        crate::tx_set_utils::SnapshotAccountProvider::from_ledger_manager(lm);
                     crate::tx_set_utils::check_tx_set_valid(
                         gen,
                         &lcl_header,
                         close_time_offset,
                         network_id,
                         soroban_info.as_ref(),
-                        None, // Phase 1: skip fee balance checks
-                        None, // Phase 1: skip account state checks (SCP path)
+                        None, // fee balance checks skipped in SCP path
+                        account_provider
+                            .as_ref()
+                            .map(|p| p as &dyn crate::tx_queue::AccountProvider),
                     )
                 }
             } else {
