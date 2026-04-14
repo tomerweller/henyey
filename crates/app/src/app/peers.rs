@@ -314,7 +314,7 @@ impl App {
                 let port = xdr_addr.port;
 
                 // Skip obviously invalid addresses
-                if port == 0 {
+                if port == 0 || port > u16::MAX as u32 {
                     return None;
                 }
 
