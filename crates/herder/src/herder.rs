@@ -455,6 +455,16 @@ impl Herder {
             return;
         }
         *self.state.write() = state;
+
+        // Keep SharedTrackingState.is_tracking in sync with HerderState.
+        // stellar-core's isTracking() simply checks mState == HERDER_TRACKING_NETWORK_STATE,
+        // but ScpDriver reads SharedTrackingState.is_tracking for value validation.
+        // Without this, transitioning to Syncing leaves is_tracking=true, causing
+        // validate_past_or_future_value to reject far-future EXTERNALIZE messages
+        // instead of returning MaybeValid.
+        if !state.is_tracking() {
+            self.tracking_state.write().is_tracking = false;
+        }
     }
 
     /// Get the current tracking slot.
@@ -3619,6 +3629,42 @@ mod set_state_tests {
             herder.state(),
             HerderState::Tracking,
             "Repeated Tracking→Booting must all be ignored"
+        );
+    }
+
+    /// Regression test: transitioning from Tracking to Syncing must clear
+    /// SharedTrackingState::is_tracking so that ScpDriver's
+    /// validate_past_or_future_value returns MaybeValid (not Invalid)
+    /// for far-future EXTERNALIZE messages. Without this, a watcher that
+    /// loses sync rejects all far-future EXTERNALIZE messages and can
+    /// never re-externalize, causing an infinite recovery loop.
+    #[test]
+    fn test_set_state_tracking_to_syncing_clears_shared_is_tracking() {
+        let herder = make_test_herder();
+
+        // Bootstrap sets is_tracking=true via bootstrap()
+        herder.start_syncing();
+        herder.bootstrap(100);
+        assert_eq!(herder.state(), HerderState::Tracking);
+        assert!(
+            herder.tracking_state.read().is_tracking,
+            "bootstrap should set is_tracking=true"
+        );
+
+        // Transition to Syncing (simulating lost sync)
+        herder.set_state(HerderState::Syncing);
+        assert_eq!(herder.state(), HerderState::Syncing);
+        assert!(
+            !herder.tracking_state.read().is_tracking,
+            "Tracking→Syncing must clear SharedTrackingState::is_tracking"
+        );
+
+        // Re-entering Tracking (via bootstrap after catchup) should restore it
+        herder.bootstrap(200);
+        assert_eq!(herder.state(), HerderState::Tracking);
+        assert!(
+            herder.tracking_state.read().is_tracking,
+            "bootstrap after catchup should set is_tracking=true again"
         );
     }
 
