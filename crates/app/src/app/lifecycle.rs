@@ -887,9 +887,16 @@ impl App {
                 // the envelope (signature check, slot range, etc.). This prevents
                 // forged envelopes from creating immortal pending qset entries.
                 // Matches stellar-core which verifies before any fetch logic.
+                //
+                // Fetching is included because process_scp_envelope may return
+                // Fetching when tx_sets are cached but the quorum set is unknown.
+                // The envelope is buffered in FetchingEnvelopes; we still need
+                // the app layer to register the pending qset request and send
+                // the network fetch so handle_quorum_set accepts the response
+                // (AUDIT-104).
                 if matches!(
                     envelope_result,
-                    EnvelopeState::Valid | EnvelopeState::Pending
+                    EnvelopeState::Valid | EnvelopeState::Pending | EnvelopeState::Fetching
                 ) {
                     if self.herder.request_quorum_set(hash256, sender_node_id) {
                         // New pending request - need to fetch from network

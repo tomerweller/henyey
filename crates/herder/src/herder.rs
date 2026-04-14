@@ -593,6 +593,11 @@ impl Herder {
         // store_quorum_set only updates ScpDriver and the quorum tracker,
         // leaving FetchingEnvelopes unaware (AUDIT-004).
         self.fetching_envelopes.recv_quorum_set(qs_hash, quorum_set);
+
+        // Drain ready queue — envelopes unblocked by this quorum set need
+        // to be fed to SCP. Mirrors receive_tx_set() which also drains
+        // after notifying FetchingEnvelopes (AUDIT-104).
+        self.process_ready_fetching_envelopes();
     }
 
     /// Get a quorum set by hash if available.
@@ -1148,7 +1153,63 @@ impl Herder {
             }
         }
 
-        // All tx sets available - proceed with SCP processing
+        // All tx sets available — check quorum-set availability too.
+        // EXTERNALIZE envelopes bypass this check for the same reason they
+        // bypass the tx_set check: catchup needs them to reach SCP even
+        // without complete dependency resolution.
+        //
+        // For non-EXTERNALIZE: SCP resolves quorum sets through scp_driver;
+        // if the sender's quorum set is unknown, SCP returns Invalid and the
+        // app layer never requests the quorum set (it only fetches for
+        // Valid/Pending). This permanently strands the envelope. Route through
+        // FetchingEnvelopes so it gets buffered until the quorum set
+        // arrives (AUDIT-104).
+        let is_externalize = matches!(
+            envelope.statement.pledges,
+            stellar_xdr::curr::ScpStatementPledges::Externalize(_)
+        );
+        let qs_hash_raw = henyey_common::scp_quorum_set_hash(&envelope.statement);
+        let qs_hash = Hash256::from_bytes(qs_hash_raw.0);
+        if !is_externalize && !self.scp_driver.has_quorum_set_hash(&qs_hash) {
+            debug!(
+                slot,
+                qs_hash = %hex::encode(qs_hash.0),
+                "Envelope has cached tx_set but unknown quorum set, routing through FetchingEnvelopes"
+            );
+
+            use crate::fetching_envelopes::RecvResult;
+
+            // Notify FetchingEnvelopes that the tx_sets are already
+            // available in scp_driver — syncs the dual caches so only
+            // the quorum set remains as a pending dependency.
+            for hash in &tx_set_hashes {
+                self.fetching_envelopes.tx_set_available(*hash, slot);
+            }
+
+            let envelope_clone = envelope.clone();
+            let result = self.fetching_envelopes.recv_envelope(envelope);
+
+            match result {
+                RecvResult::Ready => {
+                    // Quorum set arrived between the check and recv_envelope.
+                    // Safe: any qset in FetchingEnvelopes' cache was stored
+                    // to scp_driver first by store_quorum_set().
+                    debug!(slot, "Envelope ready after qset race, processing now");
+                    return self.process_scp_envelope_with_tx_set(envelope_clone);
+                }
+                RecvResult::Fetching => {
+                    return EnvelopeState::Fetching;
+                }
+                RecvResult::AlreadyProcessed => {
+                    return EnvelopeState::Duplicate;
+                }
+                RecvResult::Discarded => {
+                    return EnvelopeState::Invalid;
+                }
+            }
+        }
+
+        // All tx sets and quorum set available - proceed with SCP processing
         self.process_scp_envelope_with_tx_set(envelope)
     }
 
@@ -3259,16 +3320,160 @@ mod tests {
 
         // After the fix, store_quorum_set mirrors into FetchingEnvelopes,
         // which should now have the quorum set cached and the envelope
-        // moved to the ready queue.
+        // moved to the ready queue AND drained via process_ready_fetching_envelopes.
         assert!(
             herder.fetching_envelopes.has_quorum_set(&qs_hash_bytes),
             "FetchingEnvelopes must learn about the quorum set via store_quorum_set"
         );
 
+        // The ready queue should be empty because process_ready_fetching_envelopes()
+        // drains it as part of store_quorum_set (AUDIT-104 Bug B fix).
         let popped = herder.fetching_envelopes.pop(100);
         assert!(
-            popped.is_some(),
-            "Blocked envelope must be unblocked and poppable after store_quorum_set"
+            popped.is_none(),
+            "Ready queue must be drained by store_quorum_set (envelope already processed through SCP)"
+        );
+    }
+
+    /// Regression test for AUDIT-104 Bug A: when tx_sets are cached but the
+    /// sender's quorum set is unknown, process_scp_envelope must route through
+    /// FetchingEnvelopes instead of sending to SCP (which would return Invalid
+    /// and permanently strand the envelope).
+    #[test]
+    fn test_audit_104_qset_missing_routes_through_fetching() {
+        use stellar_xdr::curr::Hash as XdrHash;
+
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_secret = SecretKey::from_seed(&[1u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        // Use an unknown quorum set (different from the local one)
+        let unknown_qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![other_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let unknown_qs_hash = hash_quorum_set(&unknown_qs);
+
+        // Local quorum includes both nodes so the envelope passes membership check
+        let local_qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(local_qs.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, local_secret);
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, local_qs)
+            .unwrap();
+
+        let tracking = herder.tracking_slot(); // 101
+
+        // Cache a tx_set in scp_driver so the fast path triggers
+        let value = make_valid_value_with_cached_tx_set(&herder, &other_secret);
+
+        // Create a PREPARE envelope from other_node referencing:
+        //   - The cached tx_set (so missing_tx_sets is empty)
+        //   - An unknown quorum set hash (not stored in scp_driver)
+        let statement = ScpStatement {
+            node_id: other_node_id.clone(),
+            slot_index: tracking,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: XdrHash(unknown_qs_hash.0),
+                ballot: ScpBallot { counter: 1, value },
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+        let envelope = sign_statement(&statement, &herder, &other_secret);
+
+        // Before fix: this would go straight to SCP, get Invalid (unknown qset),
+        // and the qset would never be fetched.
+        // After fix: should return Fetching because the qset is unknown.
+        let result = herder.receive_scp_envelope(envelope);
+        assert_eq!(
+            result,
+            EnvelopeState::Fetching,
+            "AUDIT-104: envelope with cached tx_set but unknown qset must return Fetching, not Invalid"
+        );
+
+        // The envelope should be buffered in FetchingEnvelopes (not in ready queue)
+        assert!(
+            herder.fetching_envelopes.stats().envelopes_fetching > 0,
+            "FetchingEnvelopes should be tracking the envelope while waiting for quorum set"
+        );
+    }
+
+    /// Regression test for AUDIT-104 Bug B: store_quorum_set must drain the
+    /// ready queue after notifying FetchingEnvelopes, so envelopes unblocked
+    /// by quorum-set arrival are fed to SCP immediately (not left in the
+    /// ready queue until a tx_set arrival happens to drain it).
+    #[test]
+    fn test_audit_104_store_quorum_set_drains_ready() {
+        use stellar_xdr::curr::Hash as XdrHash;
+
+        let herder = make_test_herder();
+
+        // Build a sane quorum set
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([1u8; 32]),
+        ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let qs_hash = hash_quorum_set(&quorum_set);
+
+        // Submit a nomination envelope waiting for this quorum set
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: node_id.clone(),
+                slot_index: 100,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: XdrHash(qs_hash.0),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        use crate::fetching_envelopes::RecvResult;
+        let result = herder.fetching_envelopes.recv_envelope(envelope);
+        assert_eq!(result, RecvResult::Fetching);
+
+        // store_quorum_set should: mirror to FetchingEnvelopes AND drain ready queue
+        herder.store_quorum_set(&node_id, quorum_set);
+
+        // After the fix, the ready queue should be empty because
+        // process_ready_fetching_envelopes() was called and drained it.
+        // (The envelope gets sent to SCP, which may return Invalid for a
+        // non-tracking herder — that's fine, the point is it was drained.)
+        let popped = herder.fetching_envelopes.pop(100);
+        assert!(
+            popped.is_none(),
+            "AUDIT-104: ready queue must be drained by store_quorum_set (envelope already processed)"
         );
     }
 }
