@@ -406,10 +406,7 @@ impl HotArchiveBucket {
                     hasher.update(&bytes);
                 }
 
-                let result = hasher.finalize();
-                let mut hash_bytes = [0u8; 32];
-                hash_bytes.copy_from_slice(&result);
-                Ok(Hash256::from_bytes(hash_bytes))
+                Ok(Hash256::from_sha256(hasher))
             }
             HotArchiveStorage::DiskBacked { .. } => {
                 // For disk-backed, hash was computed during construction
@@ -643,13 +640,10 @@ impl HotArchiveBucket {
             position += 4 + record_len as u64;
         }
 
-        let result = hasher.finalize();
-        let mut hash_bytes = [0u8; 32];
-        hash_bytes.copy_from_slice(&result);
         let hash = if entry_count == 0 {
             Hash256::from_bytes([0u8; 32])
         } else {
-            Hash256::from_bytes(hash_bytes)
+            Hash256::from_sha256(hasher)
         };
 
         let index = OnceLock::new();
@@ -814,11 +808,7 @@ impl HotArchiveBucketLevel {
         let mut hasher = Sha256::new();
         hasher.update(curr_hash.as_bytes());
         hasher.update(snap_hash.as_bytes());
-        let result = hasher.finalize();
-
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Hash256::from_bytes(bytes)
+        Hash256::from_sha256(hasher)
     }
 
     /// Get reference to the staged next bucket.
@@ -923,10 +913,7 @@ impl HotArchiveBucketList {
             hasher.update(level_hash.as_bytes());
         }
 
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Hash256::from_bytes(bytes)
+        Hash256::from_sha256(hasher)
     }
 
     /// Get the current ledger sequence.

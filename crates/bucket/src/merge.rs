@@ -502,8 +502,7 @@ pub fn merge_buckets_to_file(
         })?
         .sync_all()?;
 
-    let hash_bytes: [u8; 32] = hasher.finalize().into();
-    let hash = Hash256::from_bytes(hash_bytes);
+    let hash = Hash256::from_sha256(hasher);
 
     Ok((hash, entry_count))
 }
@@ -680,8 +679,7 @@ pub fn merge_in_memory(
     }
 
     // Compute final hash
-    let hash_bytes: [u8; 32] = hasher.finalize().into();
-    let hash = Hash256::from_bytes(hash_bytes);
+    let hash = Hash256::from_sha256(hasher);
 
     // DEBUG: Print merge output
     tracing::debug!(

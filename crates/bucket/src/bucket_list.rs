@@ -573,11 +573,7 @@ impl BucketLevel {
         let mut hasher = Sha256::new();
         hasher.update(curr_hash.as_bytes());
         hasher.update(snap_hash.as_bytes());
-        let result = hasher.finalize();
-
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Hash256::from_bytes(bytes)
+        Hash256::from_sha256(hasher)
     }
 
     /// Set the curr bucket.
@@ -1213,10 +1209,7 @@ impl BucketList {
             hasher.update(level.hash().as_bytes());
         }
 
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Hash256::from_bytes(bytes)
+        Hash256::from_sha256(hasher)
     }
 
     /// Get the current ledger sequence.

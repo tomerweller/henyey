@@ -262,8 +262,7 @@ impl BucketInputIterator {
 
     /// Computes the final hash of all entries read.
     pub fn finish_hash(self) -> Hash256 {
-        let hash = self.hasher.finalize();
-        Hash256::from_bytes(hash.into())
+        Hash256::from_sha256(self.hasher)
     }
 
     /// Collects all remaining entries into a vector.
@@ -490,7 +489,7 @@ impl BucketOutputIterator {
             .map_err(|e| std::io::Error::other(format!("Failed to flush writer: {}", e)))?;
         encoder.finish()?;
 
-        let hash = Hash256::from_bytes(self.hasher.finalize().into());
+        let hash = Hash256::from_sha256(self.hasher);
 
         Ok((self.path, hash, self.in_memory_entries))
     }

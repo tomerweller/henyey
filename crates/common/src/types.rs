@@ -135,6 +135,13 @@ impl Hash256 {
         Self(bytes)
     }
 
+    /// Creates a `Hash256` by finalizing a SHA-256 hasher.
+    ///
+    /// This replaces the common boilerplate of `finalize() → copy_from_slice → from_bytes`.
+    pub fn from_sha256(hasher: Sha256) -> Self {
+        Self(hasher.finalize().into())
+    }
+
     /// Creates a `Hash256` from a hexadecimal string.
     ///
     /// The string must be exactly 64 hex characters (representing 32 bytes).

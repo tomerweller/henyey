@@ -241,8 +241,7 @@ impl Bucket {
         }
 
         // Compute final hash
-        let hash_bytes: [u8; 32] = hasher.finalize().into();
-        let hash = Hash256::from_bytes(hash_bytes);
+        let hash = Hash256::from_sha256(hasher);
 
         Ok(Self {
             hash,
@@ -1007,8 +1006,7 @@ impl Bucket {
         }
 
         // Compute final hash
-        let hash_bytes: [u8; 32] = hasher.finalize().into();
-        let hash = Hash256::from_bytes(hash_bytes);
+        let hash = Hash256::from_sha256(hasher);
 
         Ok(Self {
             hash,

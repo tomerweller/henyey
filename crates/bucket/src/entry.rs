@@ -287,10 +287,7 @@ pub fn get_ttl_key(key: &LedgerKey) -> Option<LedgerKey> {
     let key_bytes = key.to_xdr(Limits::none()).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(&key_bytes);
-    let hash_result = hasher.finalize();
-
-    let mut hash_bytes = [0u8; 32];
-    hash_bytes.copy_from_slice(&hash_result);
+    let hash_bytes: [u8; 32] = hasher.finalize().into();
 
     Some(LedgerKey::Ttl(LedgerKeyTtl {
         key_hash: Hash(hash_bytes),
