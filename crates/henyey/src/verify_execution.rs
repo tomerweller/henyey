@@ -246,6 +246,96 @@ fn print_header_field_diffs(
     }
 }
 
+/// Compare fee bump inner results from both sides and print differences.
+fn print_fee_bump_inner_diffs(
+    our_result: &stellar_xdr::curr::TransactionResultResult,
+    cdp_result: &stellar_xdr::curr::TransactionResultResult,
+) {
+    use stellar_xdr::curr::{InnerTransactionResultResult, TransactionResultResult};
+
+    match (our_result, cdp_result) {
+        (
+            TransactionResultResult::TxFeeBumpInnerFailed(our_inner),
+            TransactionResultResult::TxFeeBumpInnerFailed(cdp_inner),
+        ) => {
+            println!(
+                "        Inner fee: ours={} CDP={}",
+                our_inner.result.fee_charged, cdp_inner.result.fee_charged
+            );
+            let our_inner_code = format!("{:?}", std::mem::discriminant(&our_inner.result.result));
+            let cdp_inner_code = format!("{:?}", std::mem::discriminant(&cdp_inner.result.result));
+            println!(
+                "        Inner result type: ours={} CDP={}",
+                our_inner_code, cdp_inner_code
+            );
+            if let (
+                InnerTransactionResultResult::TxFailed(our_ops),
+                InnerTransactionResultResult::TxFailed(cdp_ops),
+            ) = (&our_inner.result.result, &cdp_inner.result.result)
+            {
+                print_op_diffs(our_ops, cdp_ops);
+                if our_ops.len() != cdp_ops.len() {
+                    println!(
+                        "          Inner op count: ours={} CDP={}",
+                        our_ops.len(),
+                        cdp_ops.len()
+                    );
+                }
+            } else {
+                println!("        Inner result ours: {:?}", our_inner.result.result);
+                println!("        Inner result CDP:  {:?}", cdp_inner.result.result);
+            }
+        }
+        (
+            TransactionResultResult::TxFeeBumpInnerSuccess(our_inner),
+            TransactionResultResult::TxFeeBumpInnerSuccess(cdp_inner),
+        ) => {
+            println!(
+                "        Inner fee: ours={} CDP={}",
+                our_inner.result.fee_charged, cdp_inner.result.fee_charged
+            );
+            if let (
+                InnerTransactionResultResult::TxSuccess(our_ops),
+                InnerTransactionResultResult::TxSuccess(cdp_ops),
+            ) = (&our_inner.result.result, &cdp_inner.result.result)
+            {
+                print_op_diffs(our_ops, cdp_ops);
+            }
+        }
+        (
+            TransactionResultResult::TxFeeBumpInnerSuccess(our_inner),
+            TransactionResultResult::TxFeeBumpInnerFailed(cdp_inner),
+        ) => {
+            println!(
+                "        Inner fee: ours={} CDP={}",
+                our_inner.result.fee_charged, cdp_inner.result.fee_charged
+            );
+            if let InnerTransactionResultResult::TxSuccess(our_ops) = &our_inner.result.result {
+                print_all_ops("Ours inner", our_ops);
+            }
+            if let InnerTransactionResultResult::TxFailed(cdp_ops) = &cdp_inner.result.result {
+                print_all_ops("CDP inner", cdp_ops);
+            } else {
+                println!("        CDP inner result: {:?}", cdp_inner.result.result);
+            }
+        }
+        (
+            TransactionResultResult::TxFeeBumpInnerFailed(our_inner),
+            TransactionResultResult::TxFeeBumpInnerSuccess(cdp_inner),
+        ) => {
+            println!(
+                "        Inner fee: ours={} CDP={}",
+                our_inner.result.fee_charged, cdp_inner.result.fee_charged
+            );
+            println!("        Ours inner result: {:?}", our_inner.result.result);
+            if let InnerTransactionResultResult::TxSuccess(cdp_ops) = &cdp_inner.result.result {
+                print_all_ops("CDP inner", cdp_ops);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Prints detailed per-TX result diffs between our results and CDP results.
 ///
 /// Shows ordering differences, then does a TX-by-TX XDR comparison with
@@ -254,7 +344,7 @@ fn print_tx_result_diffs(
     our_results: &[stellar_xdr::curr::TransactionResultPair],
     cdp_results: &[stellar_xdr::curr::TransactionResultPair],
 ) {
-    use stellar_xdr::curr::{InnerTransactionResultResult, TransactionResultResult, WriteXdr};
+    use stellar_xdr::curr::{TransactionResultResult, WriteXdr};
     println!(
         "    TX count: ours={} CDP={}",
         our_results.len(),
@@ -342,96 +432,7 @@ fn print_tx_result_diffs(
             }
 
             // Fee bump inner result details
-            match (our_result, cdp_result) {
-                (
-                    TransactionResultResult::TxFeeBumpInnerFailed(our_inner),
-                    TransactionResultResult::TxFeeBumpInnerFailed(cdp_inner),
-                ) => {
-                    println!(
-                        "        Inner fee: ours={} CDP={}",
-                        our_inner.result.fee_charged, cdp_inner.result.fee_charged
-                    );
-                    let our_inner_code =
-                        format!("{:?}", std::mem::discriminant(&our_inner.result.result));
-                    let cdp_inner_code =
-                        format!("{:?}", std::mem::discriminant(&cdp_inner.result.result));
-                    println!(
-                        "        Inner result type: ours={} CDP={}",
-                        our_inner_code, cdp_inner_code
-                    );
-                    if let (
-                        InnerTransactionResultResult::TxFailed(our_ops),
-                        InnerTransactionResultResult::TxFailed(cdp_ops),
-                    ) = (&our_inner.result.result, &cdp_inner.result.result)
-                    {
-                        print_op_diffs(our_ops, cdp_ops);
-                        if our_ops.len() != cdp_ops.len() {
-                            println!(
-                                "          Inner op count: ours={} CDP={}",
-                                our_ops.len(),
-                                cdp_ops.len()
-                            );
-                        }
-                    } else {
-                        println!("        Inner result ours: {:?}", our_inner.result.result);
-                        println!("        Inner result CDP:  {:?}", cdp_inner.result.result);
-                    }
-                }
-                (
-                    TransactionResultResult::TxFeeBumpInnerSuccess(our_inner),
-                    TransactionResultResult::TxFeeBumpInnerSuccess(cdp_inner),
-                ) => {
-                    println!(
-                        "        Inner fee: ours={} CDP={}",
-                        our_inner.result.fee_charged, cdp_inner.result.fee_charged
-                    );
-                    if let (
-                        InnerTransactionResultResult::TxSuccess(our_ops),
-                        InnerTransactionResultResult::TxSuccess(cdp_ops),
-                    ) = (&our_inner.result.result, &cdp_inner.result.result)
-                    {
-                        print_op_diffs(our_ops, cdp_ops);
-                    }
-                }
-                // Cross-case fee bump inner results
-                (
-                    TransactionResultResult::TxFeeBumpInnerSuccess(our_inner),
-                    TransactionResultResult::TxFeeBumpInnerFailed(cdp_inner),
-                ) => {
-                    println!(
-                        "        Inner fee: ours={} CDP={}",
-                        our_inner.result.fee_charged, cdp_inner.result.fee_charged
-                    );
-                    if let InnerTransactionResultResult::TxSuccess(our_ops) =
-                        &our_inner.result.result
-                    {
-                        print_all_ops("Ours inner", our_ops);
-                    }
-                    if let InnerTransactionResultResult::TxFailed(cdp_ops) =
-                        &cdp_inner.result.result
-                    {
-                        print_all_ops("CDP inner", cdp_ops);
-                    } else {
-                        println!("        CDP inner result: {:?}", cdp_inner.result.result);
-                    }
-                }
-                (
-                    TransactionResultResult::TxFeeBumpInnerFailed(our_inner),
-                    TransactionResultResult::TxFeeBumpInnerSuccess(cdp_inner),
-                ) => {
-                    println!(
-                        "        Inner fee: ours={} CDP={}",
-                        our_inner.result.fee_charged, cdp_inner.result.fee_charged
-                    );
-                    println!("        Ours inner result: {:?}", our_inner.result.result);
-                    if let InnerTransactionResultResult::TxSuccess(cdp_ops) =
-                        &cdp_inner.result.result
-                    {
-                        print_all_ops("CDP inner", cdp_ops);
-                    }
-                }
-                _ => {}
-            }
+            print_fee_bump_inner_diffs(our_result, cdp_result);
 
             // Show CDP ops when ours is TxNotSupported or other non-standard result
             if !matches!(
