@@ -35,7 +35,7 @@ use crate::{
     delta::EntryChange,
     execution::{
         execute_soroban_parallel_phase, load_soroban_network_info, pre_deduct_all_fees_on_delta,
-        run_transactions_on_executor, SorobanContext, SorobanNetworkInfo,
+        run_transactions_on_executor, LedgerAdvanceParams, SorobanContext, SorobanNetworkInfo,
         TransactionExecutionResult, TransactionExecutor, TxSetResult,
     },
     header::{compute_header_hash, create_next_header, NextHeaderFields},
@@ -3629,19 +3629,18 @@ impl LedgerCloseContext<'_> {
             }
         } else {
             // Subsequent ledgers: advance the executor, preserving offers
-            executor_ref.advance_to_ledger(
-                self.close_data.ledger_seq,
-                self.close_data.close_time,
-                self.prev_header.base_reserve,
-                self.prev_header.ledger_version,
-                id_pool,
-                soroban_config.clone(),
-                frozen_key_config.clone(),
-                match &self.prev_header.ext {
+            executor_ref.advance_to_ledger(LedgerAdvanceParams {
+                ledger_seq: self.close_data.ledger_seq,
+                close_time: self.close_data.close_time,
+                base_reserve: self.prev_header.base_reserve,
+                protocol_version: self.prev_header.ledger_version,
+                soroban_config: soroban_config.clone(),
+                frozen_key_config: frozen_key_config.clone(),
+                ledger_flags: match &self.prev_header.ext {
                     stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
                     stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
                 },
-            );
+            });
             // Update module cache and hot archive references (they may have changed)
             if let Some(cache) = module_cache {
                 executor_ref.set_module_cache(cache.clone());

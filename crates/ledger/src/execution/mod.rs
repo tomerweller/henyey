@@ -540,6 +540,17 @@ pub(super) struct PreApplySnapshot {
     pub(super) fee: i64,
 }
 
+/// Parameters for advancing a TransactionExecutor to a new ledger.
+pub struct LedgerAdvanceParams {
+    pub ledger_seq: u32,
+    pub close_time: u64,
+    pub base_reserve: u32,
+    pub protocol_version: u32,
+    pub soroban_config: SorobanConfig,
+    pub frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig,
+    pub ledger_flags: u32,
+}
+
 /// Context for executing transactions during ledger close.
 pub struct TransactionExecutor {
     /// Ledger sequence being processed.
@@ -712,26 +723,15 @@ impl TransactionExecutor {
     /// 3. Using the header's id_pool would give us the wrong starting value for the next ledger
     ///    For the first ledger in a replay session, use TransactionExecutor::new() which takes
     ///    the PREVIOUS ledger's closing id_pool (which equals this ledger's starting id_pool).
-    #[allow(clippy::too_many_arguments)]
-    pub fn advance_to_ledger(
-        &mut self,
-        ledger_seq: u32,
-        close_time: u64,
-        base_reserve: u32,
-        protocol_version: u32,
-        _id_pool: u64, // Intentionally unused - see note above
-        soroban_config: SorobanConfig,
-        frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig,
-        ledger_flags: u32,
-    ) {
-        self.ledger_seq = ledger_seq;
-        self.close_time = close_time;
-        self.base_reserve = base_reserve;
-        self.protocol_version = protocol_version;
-        self.ledger_flags = ledger_flags;
-        self.soroban_config = soroban_config;
-        self.frozen_key_config = frozen_key_config;
-        self.state.set_ledger_seq(ledger_seq);
+    pub fn advance_to_ledger(&mut self, params: LedgerAdvanceParams) {
+        self.ledger_seq = params.ledger_seq;
+        self.close_time = params.close_time;
+        self.base_reserve = params.base_reserve;
+        self.protocol_version = params.protocol_version;
+        self.ledger_flags = params.ledger_flags;
+        self.soroban_config = params.soroban_config;
+        self.frozen_key_config = params.frozen_key_config;
+        self.state.set_ledger_seq(params.ledger_seq);
         // Clear cached entries except offers and offer index
         self.state.clear_cached_entries_preserving_offers();
         // Clear loaded_accounts cache (non-offer)

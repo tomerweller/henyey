@@ -441,18 +441,22 @@ pub(super) enum PreParallelResult {
 /// 4. Returns per-TX results consumed by `execute_single_cluster`.
 ///
 /// After this call, the delta contains all pre-apply mutations. Subsequent
+/// Parameters for the pre-parallel apply phase.
+struct PreParallelParams<'a> {
+    pre_charged_fees: &'a [PreChargedFee],
+    classic_tx_count: usize,
+    soroban_base_prng_seed: [u8; 32],
+}
+
 /// `PriorStageState::from_delta` calls will see bumped sequences and removed
 /// signers, so peer clusters observe correct state.
-#[allow(clippy::too_many_arguments)]
 fn pre_parallel_apply(
     snapshot: &SnapshotHandle,
     phase: &crate::close::SorobanPhaseStructure,
     context: &LedgerContext,
     soroban: &SorobanContext<'_>,
     delta: &mut LedgerDelta,
-    pre_charged_fees: &[PreChargedFee],
-    classic_tx_count: usize,
-    soroban_base_prng_seed: [u8; 32],
+    params: &PreParallelParams<'_>,
 ) -> Result<Vec<PreParallelResult>> {
     let start = std::time::Instant::now();
 
@@ -502,13 +506,14 @@ fn pre_parallel_apply(
         .sum();
     let mut results = Vec::with_capacity(total_txs);
     let mut flat_idx: usize = 0;
-    let mut global_tx_offset: usize = classic_tx_count;
+    let mut global_tx_offset: usize = params.classic_tx_count;
 
     for stage in &phase.stages {
         for cluster in stage {
             for (tx, tx_base_fee) in cluster {
                 let tx_fee = tx_base_fee.unwrap_or(context.base_fee);
-                let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, global_tx_offset as u32);
+                let tx_prng_seed =
+                    sub_sha256(&params.soroban_base_prng_seed, global_tx_offset as u32);
 
                 let pre_result = executor.pre_apply_arc(
                     snapshot,
@@ -529,7 +534,7 @@ fn pre_parallel_apply(
         }
     }
     debug_assert_eq!(flat_idx, total_txs);
-    debug_assert_eq!(flat_idx, pre_charged_fees.len());
+    debug_assert_eq!(flat_idx, params.pre_charged_fees.len());
 
     // Transfer all pre-apply mutations (sequence bumps, signer removals)
     // to the main delta so PriorStageState::from_delta picks them up.
@@ -647,9 +652,11 @@ pub fn execute_soroban_parallel_phase(
             enable_soroban_diagnostic_events: soroban.enable_soroban_diagnostic_events,
         },
         delta,
-        &pre_charged_fees,
-        classic_tx_count,
-        soroban_base_prng_seed,
+        &PreParallelParams {
+            pre_charged_fees: &pre_charged_fees,
+            classic_tx_count,
+            soroban_base_prng_seed,
+        },
     )?;
 
     // Track position in the flattened pre_charged_fees vector.
@@ -690,8 +697,11 @@ pub fn execute_soroban_parallel_phase(
         let stage_clusters_start = std::time::Instant::now();
         let cluster_results = execute_stage_clusters(
             snapshot,
-            stage,
-            global_tx_offset,
+            StageInput {
+                clusters: stage,
+                global_tx_offset,
+                pre_parallel: stage_pre_parallel,
+            },
             context,
             &SorobanContext {
                 config: soroban.config.clone(),
@@ -711,7 +721,6 @@ pub fn execute_soroban_parallel_phase(
                 prior_stage: &prior_stage,
                 pre_charged_fees: stage_pre_charged,
             },
-            stage_pre_parallel,
         )?;
         total_stage_clusters_us += stage_clusters_start.elapsed().as_micros() as u64;
 
@@ -1216,20 +1225,27 @@ pub(super) fn execute_single_cluster(
 /// The executor's state changes are applied to the main delta via `apply_to_delta`.
 /// Soroban TXs don't use the orderbook so `load_orderbook_offers` is skipped.
 ///
+/// Input for a single stage of parallel cluster execution.
+pub(super) struct StageInput<'a> {
+    pub clusters: &'a [Vec<TxWithFee>],
+    pub global_tx_offset: usize,
+    pub pre_parallel: Vec<PreParallelResult>,
+}
+
 /// When a stage has multiple clusters, they are executed in parallel using
 /// `tokio::task::spawn_blocking` (one blocking task per cluster). Results are
 /// merged into `delta` in deterministic cluster order.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn execute_stage_clusters(
     snapshot: &SnapshotHandle,
-    clusters: &[Vec<TxWithFee>],
-    global_tx_offset: usize,
+    stage: StageInput<'_>,
     context: &LedgerContext,
     soroban: &SorobanContext<'_>,
     delta: &mut LedgerDelta,
     params: &ClusterParams<'_>,
-    stage_pre_parallel: Vec<PreParallelResult>,
 ) -> Result<Vec<TxSetResult>> {
+    let clusters = stage.clusters;
+    let global_tx_offset = stage.global_tx_offset;
+    let stage_pre_parallel = stage.pre_parallel;
     // Compute per-cluster global offsets and pre_charged_fees slicing.
     let mut offsets = Vec::with_capacity(clusters.len());
     let mut pre_charge_offsets = Vec::with_capacity(clusters.len());

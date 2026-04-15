@@ -1811,16 +1811,15 @@ fn test_advance_to_ledger() {
 
     // ===== ADVANCE TO LEDGER 2 =====
     // This is the key operation under test: preserving offers across ledger boundaries
-    executor.advance_to_ledger(
-        2,         // new ledger_seq
-        2_000,     // new close_time
-        5_000_000, // base_reserve
-        25,        // protocol_version
-        0,         // id_pool
-        SorobanConfig::default(),
-        henyey_tx::frozen_keys::FrozenKeyConfig::empty(),
-        0, // ledger_flags
-    );
+    executor.advance_to_ledger(LedgerAdvanceParams {
+        ledger_seq: 2,
+        close_time: 2_000,
+        base_reserve: 5_000_000,
+        protocol_version: 25,
+        soroban_config: SorobanConfig::default(),
+        frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::empty(),
+        ledger_flags: 0,
+    });
 
     // Verify offer A is NOT in the executor's state (it was consumed in ledger 1)
     assert!(
