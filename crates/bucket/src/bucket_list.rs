@@ -42,7 +42,6 @@
 //! at each level. The first match is returned (newer entries shadow older).
 //! Dead entries (tombstones) shadow live entries, returning None.
 
-use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -2892,7 +2891,7 @@ impl BucketList {
         let mut bytes_remaining = settings.eviction_scan_size as u64;
 
         // Track keys we've seen to avoid duplicates (from shadowed entries)
-        let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
 
         loop {
             // Get the current bucket
@@ -2957,15 +2956,7 @@ impl BucketList {
     ///
     /// Returns (entries_scanned, bytes_used, finished_bucket).
     ///
-    /// This is the scan phase of the two-phase eviction approach. It collects
-    /// ALL eligible candidates within the byte budget. The `max_entries_to_archive`
-    /// limit is NOT applied here — it's applied in the resolution phase via
-    /// `EvictionResult::resolve()`.
-    ///
-    /// Uses byte-offset-aware iteration: for disk-backed buckets, seeks directly
-    /// to the start offset (instead of reading and skipping millions of entries)
-    /// and reads record sizes from the file format (instead of re-serializing
-    /// every entry to XDR just for byte size computation).
+    /// Delegates to [`crate::eviction::scan_bucket_region`] with `BucketList::get` lookups.
     fn scan_bucket_region(
         &self,
         bucket: &Bucket,
@@ -2973,124 +2964,17 @@ impl BucketList {
         max_bytes: u64,
         current_ledger: u32,
         candidates: &mut Vec<EvictionCandidate>,
-        seen_keys: &mut HashSet<Vec<u8>>,
+        seen_keys: &mut HashSet<LedgerKey>,
     ) -> Result<(usize, u64, bool)> {
-        let mut entries_scanned = 0;
-        let mut bytes_used = 0u64;
-
-        // Skip buckets that predate Soroban; they cannot contain evictable entries.
-        let bucket_protocol = bucket.protocol_version().unwrap_or(0);
-        if bucket_protocol < MIN_SOROBAN_PROTOCOL_VERSION {
-            iter.bucket_file_offset = 0;
-            return Ok((entries_scanned, bytes_used, true));
-        }
-
-        // bucket_file_offset is a byte offset in the bucket file.
-        let start_offset = iter.bucket_file_offset;
-
-        // Use offset-aware iteration: for disk-backed buckets this seeks directly
-        // to start_offset and reads record sizes from record marks (no XDR
-        // re-serialization). For in-memory buckets it computes sizes on the fly
-        // (acceptable since in-memory buckets are small).
-        for result in bucket.iter_from_offset_with_sizes(start_offset)? {
-            let (entry, entry_size) = result?;
-            bytes_used += entry_size;
-            entries_scanned += 1;
-
-            // Process the entry for eviction. The labeled block lets each
-            // skip-branch `break 'process` so that the single budget check
-            // at the end of the loop body is always reached.
-            'process: {
-                let live_entry = match &entry {
-                    BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
-                    BucketEntry::Deadentry(_key) => {
-                        // Parity: stellar-core ignores DEAD entries entirely
-                        // in scanForEvictionInBucket — no key is recorded.
-                        break 'process;
-                    }
-                    BucketEntry::Metaentry(_) => {
-                        break 'process;
-                    }
-                };
-
-                // Only check Soroban entries
-                if !is_soroban_entry(live_entry) {
-                    break 'process;
-                }
-
-                // Get the key for this entry
-                let key = henyey_common::entry_to_key(live_entry);
-
-                // Check if we've already seen this key (from a newer bucket)
-                let key_bytes = match key.to_xdr(Limits::none()) {
-                    Ok(bytes) => bytes,
-                    Err(_) => break 'process,
-                };
-
-                if !seen_keys.insert(key_bytes) {
-                    break 'process;
-                }
-
-                // Get the TTL key
-                let Some(ttl_key) = get_ttl_key(&key) else {
-                    break 'process;
-                };
-
-                // Look up the TTL entry
-                let Some(ttl_entry) = self.get(&ttl_key)? else {
-                    break 'process;
-                };
-
-                // Check if expired
-                let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
-                    break 'process;
-                };
-
-                if !is_expired {
-                    break 'process;
-                }
-
-                // Entry is expired — collect as eviction candidate.
-                // For persistent entries, archive the NEWEST version from the bucket list
-                // (not the potentially stale version from the older bucket being scanned).
-                // See: BucketSnapshot.cpp scanForEviction() lines 247-261
-                let is_temp = is_temporary_entry(live_entry);
-                let entry_for_candidate = if !is_temp {
-                    if let Some(newest_entry) = self.get(&key)? {
-                        newest_entry
-                    } else {
-                        live_entry.clone()
-                    }
-                } else {
-                    live_entry.clone()
-                };
-
-                candidates.push(EvictionCandidate {
-                    entry: entry_for_candidate,
-                    data_key: key,
-                    ttl_key,
-                    is_temporary: is_temp,
-                    position: EvictionIterator {
-                        bucket_list_level: iter.bucket_list_level,
-                        is_curr_bucket: iter.is_curr_bucket,
-                        bucket_file_offset: start_offset + bytes_used,
-                    },
-                });
-            }
-
-            // Single budget check: stop scanning if we've consumed enough bytes.
-            // (max_entries limit is applied in the resolution phase, not here.)
-            if bytes_used >= max_bytes {
-                break;
-            }
-        }
-
-        // Update the iterator position. The third element indicates whether
-        // the bucket was fully scanned (`true`) or we stopped early because
-        // the byte budget was exhausted (`false`).
-        let budget_exhausted = bytes_used >= max_bytes;
-        iter.bucket_file_offset = start_offset + bytes_used;
-        Ok((entries_scanned, bytes_used, !budget_exhausted))
+        crate::eviction::scan_bucket_region(
+            bucket,
+            iter,
+            max_bytes,
+            current_ledger,
+            candidates,
+            seen_keys,
+            |key| self.get(key),
+        )
     }
 }
 

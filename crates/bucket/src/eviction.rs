@@ -77,9 +77,16 @@
 //! - Eviction iterator: `src/ledger/NetworkConfig.h` (EvictionIterator struct)
 //! - State archival CAP: CAP-0046 (Soroban State Archival)
 
+use std::collections::HashSet;
+
+use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use stellar_xdr::curr::{LedgerEntry, LedgerKey, StateArchivalSettings};
 
+use crate::bucket::Bucket;
 use crate::bucket_list::BUCKET_LIST_LEVELS;
+use crate::entry::{
+    get_ttl_key, is_soroban_entry, is_temporary_entry, is_ttl_expired, BucketEntry,
+};
 
 /// Default eviction scan size in bytes per ledger (100 KB).
 pub const DEFAULT_EVICTION_SCAN_SIZE: u32 = 100_000;
@@ -469,6 +476,112 @@ pub fn update_starting_eviction_iterator(
     }
 
     was_reset
+}
+
+/// Scan a region of a bucket for evictable entries (scan phase only).
+///
+/// Returns `(entries_scanned, bytes_used, finished_bucket)`.
+///
+/// This is the shared implementation used by both `BucketList::scan_bucket_region`
+/// and `BucketListSnapshot::scan_bucket_region`. The `lookup` closure abstracts
+/// over the different entry-lookup methods (`BucketList::get` vs
+/// `BucketListSnapshot::get_result`).
+pub(crate) fn scan_bucket_region(
+    bucket: &Bucket,
+    iter: &mut EvictionIterator,
+    max_bytes: u64,
+    current_ledger: u32,
+    candidates: &mut Vec<EvictionCandidate>,
+    seen_keys: &mut HashSet<LedgerKey>,
+    lookup: impl Fn(&LedgerKey) -> crate::Result<Option<LedgerEntry>>,
+) -> crate::Result<(usize, u64, bool)> {
+    let mut entries_scanned = 0;
+    let mut bytes_used = 0u64;
+
+    let bucket_protocol = bucket.protocol_version().unwrap_or(0);
+    if bucket_protocol < MIN_SOROBAN_PROTOCOL_VERSION {
+        iter.bucket_file_offset = 0;
+        return Ok((entries_scanned, bytes_used, true));
+    }
+
+    let start_offset = iter.bucket_file_offset;
+
+    for result in bucket.iter_from_offset_with_sizes(start_offset)? {
+        let (entry, entry_size) = result?;
+        bytes_used += entry_size;
+        entries_scanned += 1;
+
+        'process: {
+            let live_entry = match &entry {
+                BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
+                BucketEntry::Deadentry(_) => {
+                    break 'process;
+                }
+                BucketEntry::Metaentry(_) => {
+                    break 'process;
+                }
+            };
+
+            if !is_soroban_entry(live_entry) {
+                break 'process;
+            }
+
+            let key = henyey_common::entry_to_key(live_entry);
+
+            if !seen_keys.insert(key.clone()) {
+                break 'process;
+            }
+
+            let Some(ttl_key) = get_ttl_key(&key) else {
+                break 'process;
+            };
+
+            let Some(ttl_entry) = lookup(&ttl_key)? else {
+                break 'process;
+            };
+
+            let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
+                break 'process;
+            };
+
+            if !is_expired {
+                break 'process;
+            }
+
+            // Entry is expired — collect as eviction candidate.
+            // For persistent entries, archive the NEWEST version from the bucket list.
+            let is_temp = is_temporary_entry(live_entry);
+            let entry_for_candidate = if !is_temp {
+                if let Some(newest_entry) = lookup(&key)? {
+                    newest_entry
+                } else {
+                    live_entry.clone()
+                }
+            } else {
+                live_entry.clone()
+            };
+
+            candidates.push(EvictionCandidate {
+                entry: entry_for_candidate,
+                data_key: key,
+                ttl_key,
+                is_temporary: is_temp,
+                position: EvictionIterator {
+                    bucket_list_level: iter.bucket_list_level,
+                    is_curr_bucket: iter.is_curr_bucket,
+                    bucket_file_offset: start_offset + bytes_used,
+                },
+            });
+        }
+
+        if bytes_used >= max_bytes {
+            break;
+        }
+    }
+
+    let budget_exhausted = bytes_used >= max_bytes;
+    iter.bucket_file_offset = start_offset + bytes_used;
+    Ok((entries_scanned, bytes_used, !budget_exhausted))
 }
 
 #[cfg(test)]

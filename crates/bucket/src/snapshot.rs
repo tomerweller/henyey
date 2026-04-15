@@ -42,10 +42,7 @@
 
 use crate::{
     bucket_list::BUCKET_LIST_LEVELS,
-    entry::{
-        get_ttl_key, is_soroban_entry, is_temporary_entry, is_ttl_expired, ledger_entry_data_type,
-        ledger_key_type,
-    },
+    entry::{ledger_entry_data_type, ledger_key_type},
     eviction::{
         update_starting_eviction_iterator, EvictionCandidate, EvictionIterator,
         EvictionIteratorExt, EvictionResult,
@@ -54,7 +51,6 @@ use crate::{
     Bucket, BucketEntry, BucketEntryExt, BucketLevel, BucketList, HotArchiveBucket,
     HotArchiveBucketLevel, HotArchiveBucketList,
 };
-use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -614,8 +610,7 @@ impl BucketListSnapshot {
     ///
     /// Returns (entries_scanned, bytes_used, finished_bucket).
     ///
-    /// This is the snapshot-based equivalent of [`BucketList::scan_bucket_region`].
-    /// Uses `self.get_result()` for TTL and entry lookups instead of `BucketList::get()`.
+    /// Delegates to [`crate::eviction::scan_bucket_region`] with snapshot-based lookups.
     fn scan_bucket_region(
         &self,
         bucket: &Bucket,
@@ -625,95 +620,15 @@ impl BucketListSnapshot {
         candidates: &mut Vec<EvictionCandidate>,
         seen_keys: &mut HashSet<LedgerKey>,
     ) -> crate::Result<(usize, u64, bool)> {
-        let mut entries_scanned = 0;
-        let mut bytes_used = 0u64;
-
-        let bucket_protocol = bucket.protocol_version().unwrap_or(0);
-        if bucket_protocol < MIN_SOROBAN_PROTOCOL_VERSION {
-            iter.bucket_file_offset = 0;
-            return Ok((entries_scanned, bytes_used, true));
-        }
-
-        let start_offset = iter.bucket_file_offset;
-
-        for result in bucket.iter_from_offset_with_sizes(start_offset)? {
-            let (entry, entry_size) = result?;
-            bytes_used += entry_size;
-            entries_scanned += 1;
-
-            'process: {
-                let live_entry = match &entry {
-                    BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
-                    BucketEntry::Deadentry(_key) => {
-                        // Parity: stellar-core ignores DEAD entries in scan
-                        break 'process;
-                    }
-                    BucketEntry::Metaentry(_) => {
-                        break 'process;
-                    }
-                };
-
-                if !is_soroban_entry(live_entry) {
-                    break 'process;
-                }
-
-                let key = henyey_common::entry_to_key(live_entry);
-
-                if !seen_keys.insert(key.clone()) {
-                    break 'process;
-                }
-
-                let Some(ttl_key) = get_ttl_key(&key) else {
-                    break 'process;
-                };
-
-                // Look up TTL entry from the snapshot (instead of BucketList::get)
-                let Some(ttl_entry) = self.get_result(&ttl_key)? else {
-                    break 'process;
-                };
-
-                let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
-                    break 'process;
-                };
-
-                if !is_expired {
-                    break 'process;
-                }
-
-                // Entry is expired — collect as eviction candidate.
-                // For persistent entries, archive the NEWEST version from the snapshot.
-                let is_temp = is_temporary_entry(live_entry);
-                let entry_for_candidate = if !is_temp {
-                    if let Some(newest_entry) = self.get_result(&key)? {
-                        newest_entry
-                    } else {
-                        live_entry.clone()
-                    }
-                } else {
-                    live_entry.clone()
-                };
-
-                candidates.push(EvictionCandidate {
-                    entry: entry_for_candidate,
-                    data_key: key,
-                    ttl_key,
-                    is_temporary: is_temp,
-                    position: EvictionIterator {
-                        bucket_list_level: iter.bucket_list_level,
-                        is_curr_bucket: iter.is_curr_bucket,
-                        bucket_file_offset: start_offset + bytes_used,
-                    },
-                });
-            }
-
-            if bytes_used >= max_bytes {
-                break;
-            }
-        }
-
-        let budget_exhausted = bytes_used >= max_bytes;
-        iter.bucket_file_offset = start_offset + bytes_used;
-        Ok((entries_scanned, bytes_used, !budget_exhausted))
+        crate::eviction::scan_bucket_region(
+            bucket,
+            iter,
+            max_bytes,
+            current_ledger,
+            candidates,
+            seen_keys,
+            |key| self.get_result(key),
+        )
     }
 }
 
