@@ -379,16 +379,18 @@ impl PingTracker {
     }
 }
 
-/// Mutable per-peer state passed to message routing.
+/// Mutable per-peer state for the peer loop.
 ///
-/// Bundles the individual tracking fields that `route_received_message` needs,
-/// reducing its parameter count from 9 to 4.
+/// Bundles the individual tracking fields that `handle_received_message` and
+/// `route_received_message` need, keeping their parameter counts manageable.
 struct PeerLoopCtx<'a> {
     peer: &'a mut Peer,
     received_peers: &'a mut bool,
     ping: &'a mut PingTracker,
     query_limiter: &'a mut QueryRateLimiter,
     peer_rate_limiter: &'a mut PeerRateLimiter,
+    scp_messages: &'a mut u64,
+    last_write: &'a mut Instant,
 }
 
 /// Result from handling a received message — controls the peer loop's flow.
@@ -875,16 +877,18 @@ impl OverlayManager {
                             let action = Self::handle_received_message(
                                 message,
                                 &peer_id,
-                                &mut peer,
+                                &mut PeerLoopCtx {
+                                    peer: &mut peer,
+                                    received_peers: &mut received_peers,
+                                    ping: &mut ping,
+                                    query_limiter: &mut query_limiter,
+                                    peer_rate_limiter: &mut peer_rate_limiter,
+                                    scp_messages: &mut scp_messages,
+                                    last_write: &mut last_write,
+                                },
                                 &flow_control,
                                 &state,
                                 is_validator,
-                                &mut received_peers,
-                                &mut ping,
-                                &mut query_limiter,
-                                &mut peer_rate_limiter,
-                                &mut scp_messages,
-                                &mut last_write,
                             ).await;
                             if matches!(action, RecvAction::Break) {
                                 break;
@@ -928,20 +932,13 @@ impl OverlayManager {
     ///
     /// Handles error messages, flow control, message routing, and SendMore
     /// grants. Returns `RecvAction::Break` if the peer loop should exit.
-    #[allow(clippy::too_many_arguments)]
     async fn handle_received_message(
         message: StellarMessage,
         peer_id: &PeerId,
-        peer: &mut Peer,
+        ctx: &mut PeerLoopCtx<'_>,
         flow_control: &Arc<FlowControl>,
         state: &SharedPeerState,
         is_validator: bool,
-        received_peers: &mut bool,
-        ping: &mut PingTracker,
-        query_limiter: &mut QueryRateLimiter,
-        peer_rate_limiter: &mut PeerRateLimiter,
-        scp_messages: &mut u64,
-        last_write: &mut Instant,
     ) -> RecvAction {
         let msg_type = helpers::message_type_name(&message);
         trace!("Processing message_type={} from {}", msg_type, peer_id);
@@ -984,7 +981,7 @@ impl OverlayManager {
                     ErrorCode::Load,
                     "unexpected flood message, peer at capacity",
                 );
-                let _ = peer.send(err).await;
+                let _ = ctx.peer.send(err).await;
                 return RecvAction::Break;
             }
         };
@@ -999,10 +996,12 @@ impl OverlayManager {
                 return RecvAction::Break;
             }
             StellarMessage::SendMoreExtended(_) => {
-                match Self::handle_send_more_extended(peer, peer_id, &message, flow_control).await {
+                match Self::handle_send_more_extended(ctx.peer, peer_id, &message, flow_control)
+                    .await
+                {
                     Ok(sent) => {
                         if sent {
-                            *last_write = Instant::now();
+                            *ctx.last_write = Instant::now();
                         }
                     }
                     Err(()) => return RecvAction::Break,
@@ -1013,31 +1012,20 @@ impl OverlayManager {
 
         // Route message through filtering and dispatch.
         // `None` signals the peer should be dropped.
-        match Self::route_received_message(
-            &message,
-            peer_id,
-            &mut PeerLoopCtx {
-                peer,
-                received_peers,
-                ping,
-                query_limiter,
-                peer_rate_limiter,
-            },
-            state,
-            is_validator,
-        ) {
+        match Self::route_received_message(&message, peer_id, ctx, state, is_validator) {
             None => return RecvAction::Break,
             Some(is_scp) => {
                 if is_scp {
-                    *scp_messages += 1;
+                    *ctx.scp_messages += 1;
                 }
             }
         }
 
         // Flow control: finish guard to get send-more capacity.
         let send_more_cap = capacity_guard.finish();
-        if send_more_cap.should_send() && peer.is_connected() {
-            if let Err(e) = peer
+        if send_more_cap.should_send() && ctx.peer.is_connected() {
+            if let Err(e) = ctx
+                .peer
                 .send_more_extended(
                     send_more_cap.num_flood_messages as u32,
                     send_more_cap.num_flood_bytes as u32,
@@ -1046,7 +1034,7 @@ impl OverlayManager {
             {
                 debug!("Failed to send SendMoreExtended to peer={}: {}", peer_id, e);
             } else {
-                *last_write = Instant::now();
+                *ctx.last_write = Instant::now();
             }
         }
 
