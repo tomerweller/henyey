@@ -18,6 +18,16 @@ where
     P25::from_xdr(&bytes, soroban_host::xdr::Limits::none()).ok()
 }
 
+/// Like [`ws_to_p25`], but returns a `Result<P25, String>` with a descriptive
+/// error message that includes the type name.
+pub(super) fn ws_to_p25_result<WS, P25>(ws_val: &WS, type_name: &str) -> Result<P25, String>
+where
+    WS: stellar_xdr::curr::WriteXdr,
+    P25: soroban_host::xdr::ReadXdr,
+{
+    ws_to_p25(ws_val).ok_or_else(|| format!("failed to convert {} to P25 XDR", type_name))
+}
+
 /// Convert a P25 (v25) type to a workspace (v26) type via XDR bytes.
 ///
 /// Returns `None` if serialization or deserialization fails.

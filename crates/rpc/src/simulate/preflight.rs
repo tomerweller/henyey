@@ -37,10 +37,10 @@ pub(super) fn run_invoke_simulation(
     let snapshot_rc = Rc::new(snapshot_source);
 
     // Convert workspace types to P25 types for the host invocation
-    let p25_host_fn: soroban_host::xdr::HostFunction = super::convert::ws_to_p25(&host_fn)
-        .ok_or_else(|| "failed to convert HostFunction to P25 XDR".to_string())?;
-    let p25_source: soroban_host::xdr::AccountId = super::convert::ws_to_p25(&source_account)
-        .ok_or_else(|| "failed to convert AccountId to P25 XDR".to_string())?;
+    let p25_host_fn: soroban_host::xdr::HostFunction =
+        super::convert::ws_to_p25_result(&host_fn, "HostFunction")?;
+    let p25_source: soroban_host::xdr::AccountId =
+        super::convert::ws_to_p25_result(&source_account, "AccountId")?;
 
     let result = invoke_host_function_in_recording_mode(
         &budget,
@@ -160,8 +160,7 @@ fn resolve_entry(
     use soroban_host::e2e_invoke::entry_size_for_rent;
     use soroban_host::ledger_info::get_key_durability;
 
-    let p25_key: soroban_host::xdr::LedgerKey = super::convert::ws_to_p25(key)
-        .ok_or_else(|| "failed to convert LedgerKey to P25 XDR".to_string())?;
+    let p25_key: soroban_host::xdr::LedgerKey = super::convert::ws_to_p25_result(key, "LedgerKey")?;
 
     let durability = get_key_durability(&p25_key).ok_or_else(|| {
         format!(
@@ -186,8 +185,8 @@ fn resolve_entry(
         .map(|b| b.len() as u32)
         .unwrap_or(0);
 
-    let p25_entry: soroban_host::xdr::LedgerEntry = super::convert::ws_to_p25(&entry)
-        .ok_or_else(|| "failed to convert LedgerEntry to P25 XDR".to_string())?;
+    let p25_entry: soroban_host::xdr::LedgerEntry =
+        super::convert::ws_to_p25_result(&entry, "LedgerEntry")?;
     let entry_rent_size = entry_size_for_rent(budget, &p25_entry, entry_xdr_size)
         .map_err(|e| format!("entry_size_for_rent failed: {e:?}"))?;
 
