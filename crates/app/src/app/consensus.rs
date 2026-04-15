@@ -239,168 +239,177 @@ impl App {
             }
         }
 
-        // Detect gaps in externalized slots to help diagnose sync issues.
+        // Detect gaps in externalized slots and potentially trigger catchup.
+        if let Some(result) = self
+            .analyze_externalized_gaps(current_ledger, latest_externalized, gap, attempts)
+            .await
+        {
+            return result;
+        }
+
+        // Broadcast recent SCP envelopes and request SCP state from peers.
+        self.broadcast_recovery_scp_state(current_ledger).await;
+        None
+    }
+
+    /// Analyze gaps in externalized slots and potentially trigger catchup.
+    ///
+    /// Returns `Some(Some(PendingCatchup))` if catchup was triggered,
+    /// `Some(None)` if the caller should wait (no broadcast needed),
+    /// or `None` if the caller should fall through to SCP broadcast.
+    async fn analyze_externalized_gaps(
+        &self,
+        current_ledger: u32,
+        latest_externalized: u64,
+        gap: u64,
+        attempts: u64,
+    ) -> Option<Option<PendingCatchup>> {
         let next_slot = current_ledger as u64 + 1;
-        if latest_externalized > next_slot {
-            let missing_slots = self
-                .herder
-                .find_missing_slots_in_range(next_slot, latest_externalized);
-            if !missing_slots.is_empty() {
-                // Check if the "missing" slot actually has an EXTERNALIZE
-                // in-flight (received from peer but waiting for tx_set fetch).
-                // This is NOT truly missing — the fetch just needs time.
-                let next_is_fetching = missing_slots.contains(&next_slot)
-                    && self.herder.has_fetching_envelopes_for_slot(next_slot);
+        if latest_externalized <= next_slot {
+            return None; // No gap to analyze — fall through to broadcast
+        }
 
-                let missing_count = missing_slots.len();
-                let first_missing = missing_slots.first().copied().unwrap_or(0);
-                let last_missing = missing_slots.last().copied().unwrap_or(0);
+        let missing_slots = self
+            .herder
+            .find_missing_slots_in_range(next_slot, latest_externalized);
 
-                if next_is_fetching {
-                    // The EXTERNALIZE for next_slot was received but its
-                    // tx_set is still being fetched. This is the normal
-                    // post-catchup state: peers send EXTERNALIZE via SCP
-                    // state response, and we're waiting for the tx_set.
-                    // Don't treat this as "missing" — let the fetch complete.
-                    tracing::info!(
-                        current_ledger,
-                        next_slot,
-                        latest_externalized,
-                        gap,
-                        attempts,
-                        "Next slot EXTERNALIZE in-flight (waiting for tx_set fetch) — waiting"
-                    );
-                    // Fall through to SCP state request to get more envelopes
-                    // for other missing slots, but don't trigger catchup.
-                } else {
-                    tracing::warn!(
-                        current_ledger,
-                        latest_externalized,
-                        missing_count,
-                        first_missing,
-                        last_missing,
-                        missing_slots = ?if missing_count <= 10 { missing_slots.clone() } else { vec![] },
-                        "Detected gap in externalized slots - missing EXTERNALIZE messages"
-                    );
-                }
+        if !missing_slots.is_empty() {
+            let next_is_fetching = missing_slots.contains(&next_slot)
+                && self.herder.has_fetching_envelopes_for_slot(next_slot);
 
-                // If the very next slot is truly missing (not in-flight),
-                // we may need catchup to skip past the gap.
-                if missing_slots.contains(&next_slot) && !next_is_fetching {
-                    let catchup_target =
-                        latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW) as u32;
-                    let target_checkpoint =
-                        henyey_history::checkpoint::checkpoint_containing(catchup_target);
-                    if target_checkpoint as u64 > latest_externalized {
-                        // Checkpoint not yet published by the network.
-                        if attempts <= 2 {
-                            tracing::info!(
-                                current_ledger,
-                                next_slot,
-                                catchup_target,
-                                target_checkpoint,
-                                latest_externalized,
-                                attempts,
-                                "Next slot missing, checkpoint not published — \
-                                 requesting SCP state from peers"
-                            );
-                            // Fall through to SCP state request below.
-                        } else {
-                            // Wait for the checkpoint to be published. Don't
-                            // spin — the SyncRecoveryManager will retry in 10s.
-                            tracing::info!(
-                                current_ledger,
-                                next_slot,
-                                target_checkpoint,
-                                latest_externalized,
-                                attempts,
-                                "Waiting for checkpoint {} to be published \
-                                 (next slot EXTERNALIZE not available from peers)",
-                                target_checkpoint,
-                            );
-                            return None;
-                        }
-                    } else if target_checkpoint as u64 <= current_ledger as u64 {
-                        // We're already at or past the target checkpoint.
-                        // Need the NEXT checkpoint which the archive may not
-                        // have yet. Wait for the SyncRecoveryManager to drive
-                        // escalation to RECOVERY_ESCALATION_CATCHUP threshold,
-                        // which will call trigger_recovery_catchup (targeting
-                        // the next checkpoint ahead of current_ledger).
+            let missing_count = missing_slots.len();
+            let first_missing = missing_slots.first().copied().unwrap_or(0);
+            let last_missing = missing_slots.last().copied().unwrap_or(0);
+
+            if next_is_fetching {
+                tracing::info!(
+                    current_ledger,
+                    next_slot,
+                    latest_externalized,
+                    gap,
+                    attempts,
+                    "Next slot EXTERNALIZE in-flight (waiting for tx_set fetch) — waiting"
+                );
+                // Fall through to SCP state request for other missing slots.
+            } else {
+                tracing::warn!(
+                    current_ledger,
+                    latest_externalized,
+                    missing_count,
+                    first_missing,
+                    last_missing,
+                    missing_slots = ?if missing_count <= 10 { missing_slots.clone() } else { vec![] },
+                    "Detected gap in externalized slots - missing EXTERNALIZE messages"
+                );
+            }
+
+            // If the very next slot is truly missing (not in-flight),
+            // we may need catchup to skip past the gap.
+            if missing_slots.contains(&next_slot) && !next_is_fetching {
+                let catchup_target =
+                    latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW) as u32;
+                let target_checkpoint =
+                    henyey_history::checkpoint::checkpoint_containing(catchup_target);
+                if target_checkpoint as u64 > latest_externalized {
+                    if attempts <= 2 {
+                        tracing::info!(
+                            current_ledger,
+                            next_slot,
+                            catchup_target,
+                            target_checkpoint,
+                            latest_externalized,
+                            attempts,
+                            "Next slot missing, checkpoint not published — \
+                             requesting SCP state from peers"
+                        );
+                        // Fall through to SCP broadcast.
+                    } else {
                         tracing::info!(
                             current_ledger,
                             next_slot,
                             target_checkpoint,
                             latest_externalized,
-                            gap,
                             attempts,
-                            "Already at target checkpoint — waiting for escalation"
+                            "Waiting for checkpoint {} to be published \
+                             (next slot EXTERNALIZE not available from peers)",
+                            target_checkpoint,
                         );
-                        // Fall through to SCP state request below.
-                    } else {
-                        tracing::warn!(
+                        return Some(None); // Wait — no broadcast needed.
+                    }
+                } else if target_checkpoint as u64 <= current_ledger as u64 {
+                    tracing::info!(
+                        current_ledger,
+                        next_slot,
+                        target_checkpoint,
+                        latest_externalized,
+                        gap,
+                        attempts,
+                        "Already at target checkpoint — waiting for escalation"
+                    );
+                    // Fall through to SCP broadcast.
+                } else {
+                    tracing::warn!(
+                        current_ledger,
+                        next_slot,
+                        latest_externalized,
+                        gap,
+                        "Next slot permanently missing — triggering catchup to skip gap"
+                    );
+                    {
+                        let mut buffer = self.syncing_ledgers.write().await;
+                        buffer.retain(|seq, _| *seq > current_ledger);
+                    }
+                    return Some(
+                        self.trigger_recovery_catchup(
                             current_ledger,
-                            next_slot,
                             latest_externalized,
                             gap,
-                            "Next slot permanently missing — triggering catchup to skip gap"
-                        );
-                        {
-                            let mut buffer = self.syncing_ledgers.write().await;
-                            buffer.retain(|seq, _| *seq > current_ledger);
-                        }
-                        return self
-                            .trigger_recovery_catchup(
-                                current_ledger,
-                                latest_externalized,
-                                gap,
-                                attempts,
-                            )
-                            .await;
-                    }
+                            attempts,
+                        )
+                        .await,
+                    );
                 }
-            } else {
-                // No gaps in externalized, but we can't apply - missing tx_sets.
-                // Peers won't have tx_sets for old slots (they cache ~60-72s).
-                // Check if any syncing_ledgers entries actually have tx_sets;
-                // if none do, catchup is the only recovery path.
-                let (total, with_tx_set) = {
-                    let buffer = self.syncing_ledgers.read().await;
-                    let total = buffer.range((current_ledger + 1)..).count();
-                    let with_tx_set = buffer
-                        .range((current_ledger + 1)..)
-                        .filter(|(_, info)| info.tx_set.is_some())
-                        .count();
-                    (total, with_tx_set)
-                };
+            }
+        } else {
+            // No gaps in externalized, but we can't apply — missing tx_sets.
+            let (total, with_tx_set) = {
+                let buffer = self.syncing_ledgers.read().await;
+                let total = buffer.range((current_ledger + 1)..).count();
+                let with_tx_set = buffer
+                    .range((current_ledger + 1)..)
+                    .filter(|(_, info)| info.tx_set.is_some())
+                    .count();
+                (total, with_tx_set)
+            };
 
+            tracing::warn!(
+                current_ledger,
+                latest_externalized,
+                total_buffered = total,
+                with_tx_set,
+                without_tx_set = total - with_tx_set,
+                "All slots externalized but cannot apply - missing tx_sets"
+            );
+
+            if with_tx_set == 0 && total > 0 {
                 tracing::warn!(
                     current_ledger,
                     latest_externalized,
-                    total_buffered = total,
-                    with_tx_set,
-                    without_tx_set = total - with_tx_set,
-                    "All slots externalized but cannot apply - missing tx_sets"
+                    "No tx_sets available for any buffered slot — forcing catchup"
                 );
-
-                // If no buffered entries have tx_sets, requesting SCP state is
-                // futile — force immediate catchup escalation.
-                if with_tx_set == 0 && total > 0 {
-                    tracing::warn!(
-                        current_ledger,
-                        latest_externalized,
-                        "No tx_sets available for any buffered slot — forcing catchup"
-                    );
-                    self.recovery_attempts_without_progress
-                        .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
-                    // Recurse with the escalated counter — this will trigger catchup
-                    // on the next recovery tick (within 5s).
-                    return None;
-                }
+                self.recovery_attempts_without_progress
+                    .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                return Some(None); // Wait for next tick to trigger escalation.
             }
         }
 
-        // Get recent SCP envelopes to broadcast
+        None // Fall through to SCP broadcast.
+    }
+
+    /// Broadcast recent SCP envelopes and request SCP state from peers.
+    ///
+    /// Spawns a background task to avoid blocking the event loop.
+    async fn broadcast_recovery_scp_state(&self, current_ledger: u32) {
         let from_slot = current_ledger.saturating_sub(5) as u64;
         tracing::debug!(from_slot, "Getting SCP state for recovery");
         let (envelopes, _quorum_set) = self.herder.get_scp_state(from_slot);
@@ -409,26 +418,20 @@ impl App {
             "Got SCP state for recovery"
         );
 
-        tracing::debug!("Acquiring overlay for recovery");
         let Some(overlay) = self.overlay().await else {
             tracing::debug!("No overlay available for out-of-sync recovery");
-            return None;
+            return;
         };
-        tracing::debug!("Acquired overlay for recovery");
 
         let peer_count = overlay.peer_count();
         if peer_count == 0 {
             tracing::debug!("No peers connected for out-of-sync recovery");
-            return None;
+            return;
         }
 
-        // Broadcast recent SCP envelopes + request SCP state from peers.
-        // Spawn as a background task so the main event loop is not blocked.
-        // The overlay and envelopes are cheaply clonable (Arc / Vec).
         let overlay_clone = Arc::clone(&overlay);
         let envelope_count = envelopes.len();
         tokio::spawn(async move {
-            // Broadcast all envelopes concurrently
             let broadcast_futures: Vec<_> = envelopes
                 .into_iter()
                 .map(|envelope| {
@@ -450,7 +453,6 @@ impl App {
                 );
             }
 
-            // Request SCP state from peers
             let ledger_seq = current_ledger;
             tracing::info!(
                 ledger_seq,
@@ -478,8 +480,6 @@ impl App {
             envelope_count,
             "Spawned background task for recovery broadcast"
         );
-
-        None
     }
 
     /// Send SCP state to a peer in response to GetScpState.
@@ -765,28 +765,6 @@ impl App {
         // tracking_index < slot_index.
         let target_cp = archive_latest;
 
-        // Archive has the checkpoint — clear stale state NOW, right
-        // before we actually start catchup. Previously this was done
-        // before the archive check, so skipped catchups destroyed the
-        // syncing_ledgers buffer (with tx_sets ready for rapid close),
-        // preventing post-catchup convergence.
-        {
-            let mut buffer = self.syncing_ledgers.write().await;
-            buffer.clear();
-        }
-        self.herder.clear_pending_tx_sets();
-        self.reset_tx_set_tracking().await;
-
-        // Archive has the checkpoint — reset attempts now that we're
-        // actually starting catchup. Previously this was done before
-        // the archive check, so skipped catchups would reset attempts
-        // to 0, preventing escalation from ever accumulating.
-        self.recovery_attempts_without_progress
-            .store(0, Ordering::SeqCst);
-
-        self.set_state(AppState::CatchingUp).await;
-        self.herder.set_state(henyey_herder::HerderState::Syncing);
-
         tracing::info!(
             current_ledger,
             next_checkpoint = next_cp,
@@ -794,13 +772,31 @@ impl App {
             "Targeting latest archive checkpoint for recovery catchup"
         );
 
-        self.spawn_catchup(
-            CatchupTarget::Ledger(target_cp),
-            "RecoveryEscalation",
-            true, // reset_stuck_state
-            true, // re_arm_recovery
-        )
-        .await
+        let result = self
+            .spawn_catchup(
+                CatchupTarget::Ledger(target_cp),
+                "RecoveryEscalation",
+                true, // reset_stuck_state
+                true, // re_arm_recovery
+            )
+            .await;
+
+        if result.is_some() {
+            // Clear stale state only after confirming spawn succeeded.
+            // Previously done unconditionally before spawn, so a failed
+            // spawn would needlessly destroy the syncing_ledgers buffer
+            // and reset recovery counters.
+            {
+                let mut buffer = self.syncing_ledgers.write().await;
+                buffer.clear();
+            }
+            self.herder.clear_pending_tx_sets();
+            self.reset_tx_set_tracking().await;
+            self.recovery_attempts_without_progress
+                .store(0, Ordering::SeqCst);
+        }
+
+        result
     }
 
     /// Spawn catchup as a background tokio task.
@@ -828,6 +824,13 @@ impl App {
             self.catchup_in_progress.store(false, Ordering::SeqCst);
             return None;
         }
+
+        // Transition to CatchingUp/Syncing state now that we know we'll
+        // actually start. Previously callers did this before spawn_catchup,
+        // which falsely mutated state when spawn returned None (incrementing
+        // lost_sync_count, clearing is_tracking).
+        self.set_state(AppState::CatchingUp).await;
+        self.herder.set_state(henyey_herder::HerderState::Syncing);
 
         // Start catchup message caching (belt-and-suspenders for tx_set ordering)
         let message_cache_handle = self.start_catchup_message_caching_from_self().await;

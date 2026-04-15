@@ -1543,113 +1543,68 @@ impl App {
             }
         }
 
+        // Compute target and spawn catchup.
+        self.compute_target_and_spawn_buffered_catchup(
+            current_ledger,
+            first_buffered,
+            last_buffered,
+        )
+        .await
+    }
+
+    /// Compute the catchup target from buffered state and spawn catchup if valid.
+    ///
+    /// Handles target computation, archive checkpoint validation, and
+    /// CatchupTarget::Current fallback. Returns `Some(PendingCatchup)` on
+    /// successful spawn, `None` if catchup was skipped.
+    async fn compute_target_and_spawn_buffered_catchup(
+        &self,
+        current_ledger: u32,
+        first_buffered: u32,
+        last_buffered: u32,
+    ) -> Option<PendingCatchup> {
         // Determine catchup target
         tracing::debug!(
             current_ledger,
             first_buffered,
             last_buffered,
-            "maybe_start_buffered_catchup: computing catchup target"
+            "computing buffered catchup target"
         );
-        let target = Self::buffered_catchup_target(current_ledger, first_buffered, last_buffered);
-        let target = match target {
-            Some(t) => Some(t),
-            None => {
-                // Fallback: use timeout-based target if buffered_catchup_target returns None
-                // but we've decided to catchup due to timeout
+        let target = Self::buffered_catchup_target(current_ledger, first_buffered, last_buffered)
+            .or_else(|| {
                 Self::compute_catchup_target_for_timeout(
                     last_buffered,
                     first_buffered,
                     current_ledger,
                 )
-            }
-        };
+            });
 
         // If we still don't have a target, catch up to the latest checkpoint from archive.
-        // This handles the case where we're stuck with a gap we can't bridge via buffered messages.
         let use_current_target = target.is_none();
-        let target = match target {
-            Some(t) => t,
-            None => {
-                tracing::info!(
-                    current_ledger,
-                    first_buffered,
-                    last_buffered,
-                    "No buffered catchup target; catching up to latest checkpoint from archive"
-                );
-                // We'll use CatchupTarget::Current below
-                0
-            }
-        };
+        let target = target.unwrap_or(0);
 
         // Skip the target validation if we're using CatchupTarget::Current
         if !use_current_target && (target == 0 || target <= current_ledger) {
             return None;
         }
 
-        // When targeting a specific ledger, check if its checkpoint has been
-        // published to the archive BEFORE attempting the download. Without this,
-        // the catchup tries to download headers from an unpublished checkpoint,
-        // failing after ~7s per archive × 3 archives = ~21s per attempt. Multiple
-        // retries block the event loop for 40-50 seconds.
+        // Validate target checkpoint is published before attempting download.
         if !use_current_target {
-            let target_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
-            match self.get_cached_archive_checkpoint().await {
-                Ok(archive_latest) => {
-                    if archive_latest < target_checkpoint {
-                        tracing::info!(
-                            current_ledger,
-                            target,
-                            target_checkpoint,
-                            archive_latest,
-                            "Buffered catchup skipped: target checkpoint not yet published"
-                        );
-                        *self.last_catchup_completed_at.write().await = Some(self.clock.now());
-                        self.catchup_in_progress.store(false, Ordering::SeqCst);
-                        return None;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "Failed to check archive for target checkpoint");
-                    // Proceed anyway — let the catchup attempt fail fast if archive is unreachable
-                }
+            if !self
+                .validate_target_checkpoint_published(current_ledger, target)
+                .await
+            {
+                return None;
             }
         }
 
-        // When using CatchupTarget::Current, check if the archive has a newer checkpoint.
-        // Use the cached checkpoint to avoid repeated network calls that block the main loop.
-        // This check applies regardless of whether we're at a checkpoint ledger — if the
-        // archive's latest checkpoint is at or behind our current ledger, catchup will
-        // skip with "Already at or past target" anyway. Checking early avoids the
-        // unnecessary archive query inside catchup() and the associated log spam.
+        // For CatchupTarget::Current, check archive has a newer checkpoint.
         if use_current_target {
-            match self.get_cached_archive_checkpoint().await {
-                Ok(latest_checkpoint) => {
-                    if latest_checkpoint <= current_ledger {
-                        tracing::debug!(
-                            current_ledger,
-                            latest_checkpoint,
-                            first_buffered,
-                            "Skipping catchup: archive has no newer checkpoint"
-                        );
-                        *self.last_catchup_completed_at.write().await = Some(self.clock.now());
-                        return None;
-                    }
-                    tracing::info!(
-                        current_ledger,
-                        latest_checkpoint,
-                        first_buffered,
-                        "Archive has newer checkpoint, proceeding with catchup"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        current_ledger,
-                        error = %e,
-                        "Failed to query archive for latest checkpoint, skipping catchup"
-                    );
-                    *self.last_catchup_completed_at.write().await = Some(self.clock.now());
-                    return None;
-                }
+            if !self
+                .validate_archive_has_newer_checkpoint(current_ledger, first_buffered)
+                .await
+            {
+                return None;
             }
         }
 
@@ -1668,15 +1623,78 @@ impl App {
             CatchupTarget::Ledger(target)
         };
 
-        self.set_state(AppState::CatchingUp).await;
-        self.herder.set_state(henyey_herder::HerderState::Syncing);
-
         self.spawn_catchup(catchup_target, "Buffered", true, false)
             .await
     }
 
+    /// Check that the target's checkpoint has been published to the archive.
+    /// Returns `true` if valid (or unknown), `false` if not yet published.
+    async fn validate_target_checkpoint_published(&self, current_ledger: u32, target: u32) -> bool {
+        let target_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
+        match self.get_cached_archive_checkpoint().await {
+            Ok(archive_latest) => {
+                if archive_latest < target_checkpoint {
+                    tracing::info!(
+                        current_ledger,
+                        target,
+                        target_checkpoint,
+                        archive_latest,
+                        "Buffered catchup skipped: target checkpoint not yet published"
+                    );
+                    *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                    return false;
+                }
+                true
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to check archive for target checkpoint");
+                true // Proceed anyway — let catchup fail fast if archive unreachable
+            }
+        }
+    }
+
+    /// Check that the archive has a checkpoint newer than current_ledger.
+    /// Returns `true` if valid, `false` if archive is behind or unreachable.
+    async fn validate_archive_has_newer_checkpoint(
+        &self,
+        current_ledger: u32,
+        first_buffered: u32,
+    ) -> bool {
+        match self.get_cached_archive_checkpoint().await {
+            Ok(latest_checkpoint) => {
+                if latest_checkpoint <= current_ledger {
+                    tracing::debug!(
+                        current_ledger,
+                        latest_checkpoint,
+                        first_buffered,
+                        "Skipping catchup: archive has no newer checkpoint"
+                    );
+                    *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                    return false;
+                }
+                tracing::info!(
+                    current_ledger,
+                    latest_checkpoint,
+                    first_buffered,
+                    "Archive has newer checkpoint, proceeding with catchup"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    current_ledger,
+                    error = %e,
+                    "Failed to query archive for latest checkpoint, skipping catchup"
+                );
+                *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                false
+            }
+        }
+    }
+
     /// Process the result of a catchup operation: update state, bootstrap herder,
-    /// and apply buffered ledgers. Shared by buffered and externalized catchup paths.
+    /// and reset tracking so the main loop can close buffered ledgers.
+    /// Shared by buffered and externalized catchup paths.
     pub(super) async fn handle_catchup_result(
         &self,
         catchup_result: anyhow::Result<CatchupResult>,
@@ -1971,9 +1989,6 @@ impl App {
             );
             CatchupTarget::Ledger(target)
         };
-
-        self.set_state(AppState::CatchingUp).await;
-        self.herder.set_state(henyey_herder::HerderState::Syncing);
 
         self.spawn_catchup(catchup_target, "Externalized", false, false)
             .await

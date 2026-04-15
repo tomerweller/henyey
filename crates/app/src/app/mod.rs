@@ -1752,7 +1752,8 @@ impl App {
                              3=broadcast, 4=scp_broadcast, 5=consensus_tick, \
                              6=pending_close, 10=process_externalized, \
                              11=externalized_catchup, 12=try_apply_buffered, \
-                             13=buffered_catchup, 14=catchup_running, 15=heartbeat, \
+                             13=buffered_catchup, 14=catchup_running, \
+                             15=pending_catchup_complete, 16=heartbeat, \
                              20=stats, 21=tx_advert, 22=tx_demand, 23=survey, \
                              24=survey_req, 25=survey_phase, 26=scp_timeout, \
                              27=ping, 28=peer_maint, 29=peer_refresh, 30=herder_cleanup"
@@ -2963,7 +2964,8 @@ mod tests {
     }
 
     // ============================================================
-    // Fix A: try_apply_buffered_ledgers state reset tests
+    // State reset tests (exercised via try_apply_buffered_ledgers helper,
+    // which mirrors the reset logic in try_start_ledger_close)
     // ============================================================
 
     #[tokio::test]
@@ -3050,8 +3052,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_apply_buffered_state_reset_block_mirrors_rapid_close() {
-        // Verify the state-reset block in try_apply_buffered_ledgers matches
-        // the reset done in the pending_close handler.  We can't easily close
+        // Verify the state-reset block in try_apply_buffered_ledgers (which
+        // mirrors try_start_ledger_close) behaves correctly when closed_any=true.
         // a real ledger in a unit test, so we directly exercise the reset logic
         // that fires when closed_any=true and verify the fields are cleared.
         // This is structurally identical to test_tx_set_state_cleanup_after_rapid_close.
