@@ -225,6 +225,9 @@ impl Default for TxQueueConfig {
     }
 }
 
+/// Default base reserve in stroops (0.5 XLM).
+const DEFAULT_BASE_RESERVE: u32 = 5_000_000;
+
 /// Validation context for transaction queue.
 #[derive(Debug, Clone)]
 pub struct ValidationContext {
@@ -275,7 +278,7 @@ impl Default for ValidationContext {
                 .as_secs(),
             protocol_version: 21,
             base_fee: 100,
-            base_reserve: 5_000_000, // 0.5 XLM default
+            base_reserve: DEFAULT_BASE_RESERVE,
             ledger_flags: 0,
             soroban_limits: None,
             max_contract_size_bytes: None,
@@ -857,7 +860,7 @@ impl TransactionQueue {
             ctx.ledger_seq,
             ctx.close_time,
             base_fee,
-            5_000_000, // base reserve
+            ctx.base_reserve,
             ctx.protocol_version,
             self.config.network_id,
         );
@@ -897,7 +900,7 @@ impl TransactionQueue {
                 ctx.ledger_seq,
                 upper_close_time,
                 base_fee,
-                5_000_000,
+                ctx.base_reserve,
                 ctx.protocol_version,
                 self.config.network_id,
             );
@@ -1960,26 +1963,25 @@ impl TransactionQueue {
         // Process account states: increment age, auto-ban stale transactions
         for (account_key, state) in account_states.iter_mut() {
             // Only increment age if there's a pending transaction
-            if state.transaction.is_some() {
+            if let Some(ref queued_tx) = state.transaction {
                 state.age += 1;
 
                 // Auto-ban at pending_depth
                 if state.age >= self.pending_depth {
-                    if let Some(ref queued_tx) = state.transaction {
-                        // Add to banned set
-                        if let Some(newest) = banned.back_mut() {
-                            newest.insert(queued_tx.hash);
-                        }
-                        // Remove from by_hash and track for seen cleanup
-                        by_hash.remove(&queued_tx.hash);
-                        evicted_hashes.push(queued_tx.hash);
-
-                        // Track fee release for the fee-source account
-                        let tx_fee_source_key = fee_source_key(&queued_tx.envelope);
-                        fee_releases.push((tx_fee_source_key, queued_tx.total_fee));
-
-                        evicted_due_to_age += 1;
+                    // Add to banned set
+                    if let Some(newest) = banned.back_mut() {
+                        newest.insert(queued_tx.hash);
                     }
+                    // Remove from by_hash and track for seen cleanup
+                    by_hash.remove(&queued_tx.hash);
+                    evicted_hashes.push(queued_tx.hash);
+
+                    // Track fee release for the fee-source account
+                    let tx_fee_source_key = fee_source_key(&queued_tx.envelope);
+                    fee_releases.push((tx_fee_source_key, queued_tx.total_fee));
+
+                    evicted_due_to_age += 1;
+
                     state.transaction = None;
 
                     // Mark for removal if no fees tracked (will check again after fee release)

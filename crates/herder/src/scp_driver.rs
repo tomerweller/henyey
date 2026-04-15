@@ -1518,17 +1518,19 @@ impl ScpDriver {
         std::array::from_fn(|i| hash[i] ^ mask[i])
     }
 
-    /// Sign an SCP envelope.
-    pub fn sign_envelope(&self, statement: &ScpStatement) -> Option<Signature> {
-        let secret_key = self.secret_key.as_ref()?;
-
-        // Create the data to sign: network ID + ENVELOPE_TYPE_SCP + statement XDR
-        // ENVELOPE_TYPE_SCP = 1 (as i32 big-endian)
+    /// Build the data-to-sign for an SCP statement: network ID + ENVELOPE_TYPE_SCP + XDR.
+    fn scp_signing_data(&self, statement: &ScpStatement) -> Option<Vec<u8>> {
         let statement_bytes = statement.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
         let mut data = self.network_id.0.to_vec();
         data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP
         data.extend_from_slice(&statement_bytes);
+        Some(data)
+    }
 
+    /// Sign an SCP envelope.
+    pub fn sign_envelope(&self, statement: &ScpStatement) -> Option<Signature> {
+        let secret_key = self.secret_key.as_ref()?;
+        let data = self.scp_signing_data(statement)?;
         Some(secret_key.sign(&data))
     }
 
@@ -1539,16 +1541,9 @@ impl ScpDriver {
         let public_key = PublicKey::try_from(&node_id.0)
             .map_err(|_| HerderError::Internal("Invalid node ID".to_string()))?;
 
-        // Create the data that was signed: network ID + ENVELOPE_TYPE_SCP + statement XDR
-        // ENVELOPE_TYPE_SCP = 1 (as i32 big-endian)
-        let statement_bytes = envelope
-            .statement
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .map_err(|e| HerderError::Internal(format!("Failed to encode statement: {}", e)))?;
-
-        let mut data = self.network_id.0.to_vec();
-        data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP
-        data.extend_from_slice(&statement_bytes);
+        let data = self
+            .scp_signing_data(&envelope.statement)
+            .ok_or_else(|| HerderError::Internal("Failed to encode statement".to_string()))?;
 
         // Verify signature
         let sig_bytes: [u8; 64] = envelope

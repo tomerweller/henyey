@@ -1767,19 +1767,16 @@ impl Herder {
             .ok_or_else(|| HerderError::Internal("No secret key for signing".to_string()))?;
         let network_id = self.scp_driver.network_id();
         let mut sign_data = network_id.0.to_vec();
-        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).map_err(
-            |e| HerderError::Internal(format!("Failed to encode envelope type: {}", e)),
-        )?);
-        sign_data.extend_from_slice(
-            &xdr_tx_set_hash.to_xdr(Limits::none()).map_err(|e| {
-                HerderError::Internal(format!("Failed to encode tx set hash: {}", e))
-            })?,
-        );
-        sign_data.extend_from_slice(
-            &xdr_close_time.to_xdr(Limits::none()).map_err(|e| {
-                HerderError::Internal(format!("Failed to encode close time: {}", e))
-            })?,
-        );
+        fn encode_xdr(
+            val: &impl WriteXdr,
+            name: &str,
+        ) -> std::result::Result<Vec<u8>, HerderError> {
+            val.to_xdr(Limits::none())
+                .map_err(|e| HerderError::Internal(format!("Failed to encode {}: {}", name, e)))
+        }
+        sign_data.extend_from_slice(&encode_xdr(&EnvelopeType::Scpvalue, "envelope type")?);
+        sign_data.extend_from_slice(&encode_xdr(&xdr_tx_set_hash, "tx set hash")?);
+        sign_data.extend_from_slice(&encode_xdr(&xdr_close_time, "close time")?);
         let sig = secret_key.sign(&sign_data);
         let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
             *secret_key.public_key().as_bytes(),
