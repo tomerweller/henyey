@@ -615,55 +615,7 @@ impl LedgerDelta {
 
     /// Result of categorizing delta entries for bucket list update.
     pub fn categorize_for_bucket_update(&self) -> DeltaCategorization {
-        let mut init = Vec::new();
-        let mut live = Vec::new();
-        let mut dead = Vec::new();
-        let mut created = 0usize;
-        let mut updated = 0usize;
-        let mut deleted = 0usize;
-        let mut has_offers = false;
-        let mut has_pool_share_trustlines = false;
-        for change in self.changes() {
-            // Check entry data type for fast-path in commit_close
-            let entry_ref = match change {
-                EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
-                EntryChange::Updated { current, .. } => current,
-            };
-            match &entry_ref.data {
-                stellar_xdr::curr::LedgerEntryData::Offer(_) => has_offers = true,
-                stellar_xdr::curr::LedgerEntryData::Trustline(tl)
-                    if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) =>
-                {
-                    has_pool_share_trustlines = true;
-                }
-                _ => {}
-            }
-            match change {
-                EntryChange::Created(entry) => {
-                    created += 1;
-                    init.push(entry.clone());
-                }
-                EntryChange::Updated { current, .. } => {
-                    updated += 1;
-                    live.push((**current).clone());
-                }
-                EntryChange::Deleted { previous } => {
-                    deleted += 1;
-                    dead.push(henyey_common::entry_to_key(previous));
-                }
-            }
-        }
-        DeltaCategorization {
-            init_entries: init,
-            live_entries: live,
-            dead_keys: dead,
-            created_count: created,
-            updated_count: updated,
-            deleted_count: deleted,
-            has_offers,
-            has_pool_share_trustlines,
-            offer_pool_changes: Vec::new(),
-        }
+        categorize_changes(self.changes().cloned(), false)
     }
 
     /// Drains entries from the delta, categorizing them for bucket list update.
@@ -671,70 +623,14 @@ impl LedgerDelta {
     /// Metadata (fee_pool_delta, total_coins_delta) is preserved.
     /// Offer and pool share trustline changes are collected separately for commit_close.
     pub fn drain_categorization_for_bucket_update(&mut self) -> DeltaCategorization {
-        let mut init = Vec::new();
-        let mut live = Vec::new();
-        let mut dead = Vec::new();
-        let mut created = 0usize;
-        let mut updated = 0usize;
-        let mut deleted = 0usize;
-        let mut has_offers = false;
-        let mut has_pool_share_trustlines = false;
-        let mut offer_pool_changes = Vec::new();
-
         // Iterate using change_order for deterministic ordering.
         // drain() on a HashMap iterates in arbitrary order, which would
         // produce non-deterministic bucket list updates across nodes.
         let order = std::mem::take(&mut self.change_order);
-        for key in order {
-            let Some(change) = self.changes.remove(&key) else {
-                continue;
-            };
-            let entry_ref = match &change {
-                EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
-                EntryChange::Updated { current, .. } => current,
-            };
-            let is_offer_or_pool = match &entry_ref.data {
-                stellar_xdr::curr::LedgerEntryData::Offer(_) => {
-                    has_offers = true;
-                    true
-                }
-                stellar_xdr::curr::LedgerEntryData::Trustline(tl)
-                    if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) =>
-                {
-                    has_pool_share_trustlines = true;
-                    true
-                }
-                _ => false,
-            };
-            if is_offer_or_pool {
-                offer_pool_changes.push(change.clone());
-            }
-            match change {
-                EntryChange::Created(entry) => {
-                    created += 1;
-                    init.push(entry);
-                }
-                EntryChange::Updated { current, .. } => {
-                    updated += 1;
-                    live.push(*current);
-                }
-                EntryChange::Deleted { previous } => {
-                    deleted += 1;
-                    dead.push(henyey_common::entry_to_key(&previous));
-                }
-            }
-        }
-        DeltaCategorization {
-            init_entries: init,
-            live_entries: live,
-            dead_keys: dead,
-            created_count: created,
-            updated_count: updated,
-            deleted_count: deleted,
-            has_offers,
-            has_pool_share_trustlines,
-            offer_pool_changes,
-        }
+        let changes = order
+            .into_iter()
+            .filter_map(|key| self.changes.remove(&key));
+        categorize_changes(changes, true)
     }
 
     /// Get a specific change by key.
@@ -893,6 +789,73 @@ impl LedgerDelta {
         self.change_order.clear();
         self.fee_pool_delta = 0;
         self.total_coins_delta = 0;
+    }
+}
+
+/// Categorize an iterator of entry changes for bucket list update.
+///
+/// When `collect_offer_pool` is true, offer and pool-share trustline changes
+/// are cloned into `offer_pool_changes` for commit_close processing.
+fn categorize_changes(
+    changes: impl Iterator<Item = EntryChange>,
+    collect_offer_pool: bool,
+) -> DeltaCategorization {
+    let mut init = Vec::new();
+    let mut live = Vec::new();
+    let mut dead = Vec::new();
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    let mut deleted = 0usize;
+    let mut has_offers = false;
+    let mut has_pool_share_trustlines = false;
+    let mut offer_pool_changes = Vec::new();
+
+    for change in changes {
+        let entry_ref = match &change {
+            EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
+            EntryChange::Updated { current, .. } => current,
+        };
+        let is_offer_or_pool = match &entry_ref.data {
+            stellar_xdr::curr::LedgerEntryData::Offer(_) => {
+                has_offers = true;
+                true
+            }
+            stellar_xdr::curr::LedgerEntryData::Trustline(tl)
+                if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) =>
+            {
+                has_pool_share_trustlines = true;
+                true
+            }
+            _ => false,
+        };
+        if collect_offer_pool && is_offer_or_pool {
+            offer_pool_changes.push(change.clone());
+        }
+        match change {
+            EntryChange::Created(entry) => {
+                created += 1;
+                init.push(entry);
+            }
+            EntryChange::Updated { current, .. } => {
+                updated += 1;
+                live.push(*current);
+            }
+            EntryChange::Deleted { previous } => {
+                deleted += 1;
+                dead.push(henyey_common::entry_to_key(&previous));
+            }
+        }
+    }
+    DeltaCategorization {
+        init_entries: init,
+        live_entries: live,
+        dead_keys: dead,
+        created_count: created,
+        updated_count: updated,
+        deleted_count: deleted,
+        has_offers,
+        has_pool_share_trustlines,
+        offer_pool_changes,
     }
 }
 
