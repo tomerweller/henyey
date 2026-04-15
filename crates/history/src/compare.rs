@@ -120,22 +120,22 @@ pub async fn compare_checkpoint(
     // --- HAS ---
     let local_has = local.fetch_checkpoint_has(checkpoint).await?;
     let ref_has = reference.fetch_checkpoint_has(checkpoint).await?;
-    compare_has(&local_has, &ref_has, &mut mismatches);
+    mismatches.extend(compare_has(&local_has, &ref_has));
 
     // --- Ledger headers ---
     let local_headers = local.fetch_ledger_headers(checkpoint).await?;
     let ref_headers = reference.fetch_ledger_headers(checkpoint).await?;
-    compare_ledger_headers(&local_headers, &ref_headers, &mut mismatches);
+    mismatches.extend(compare_ledger_headers(&local_headers, &ref_headers));
 
     // --- Transactions ---
     let local_txs = local.fetch_transactions(checkpoint).await?;
     let ref_txs = reference.fetch_transactions(checkpoint).await?;
-    compare_entries(&local_txs, &ref_txs, &mut mismatches);
+    mismatches.extend(compare_entries(&local_txs, &ref_txs));
 
     // --- Results ---
     let local_results = local.fetch_results(checkpoint).await?;
     let ref_results = reference.fetch_results(checkpoint).await?;
-    compare_entries(&local_results, &ref_results, &mut mismatches);
+    mismatches.extend(compare_entries(&local_results, &ref_results));
 
     Ok(CheckpointComparison {
         checkpoint,
@@ -147,11 +147,8 @@ pub async fn compare_checkpoint(
 // HAS comparison
 // ============================================================================
 
-fn compare_has(
-    local: &HistoryArchiveState,
-    reference: &HistoryArchiveState,
-    out: &mut Vec<Mismatch>,
-) {
+fn compare_has(local: &HistoryArchiveState, reference: &HistoryArchiveState) -> Vec<Mismatch> {
+    let mut out = Vec::new();
     if local.current_ledger != reference.current_ledger {
         out.push(Mismatch {
             category: Category::Has,
@@ -175,7 +172,7 @@ fn compare_has(
                 ref_levels.len()
             ),
         });
-        return;
+        return out;
     }
 
     for (i, (l, r)) in local_levels.iter().zip(ref_levels.iter()).enumerate() {
@@ -215,7 +212,7 @@ fn compare_has(
                         r_hot.len()
                     ),
                 });
-                return;
+                return out;
             }
             for (i, (l, r)) in l_hot.iter().zip(r_hot.iter()).enumerate() {
                 if l.curr != r.curr {
@@ -256,6 +253,7 @@ fn compare_has(
             });
         }
     }
+    out
 }
 
 // ============================================================================
@@ -265,8 +263,8 @@ fn compare_has(
 fn compare_ledger_headers(
     local: &[LedgerHeaderHistoryEntry],
     reference: &[LedgerHeaderHistoryEntry],
-    out: &mut Vec<Mismatch>,
-) {
+) -> Vec<Mismatch> {
+    let mut out = Vec::new();
     if local.len() != reference.len() {
         out.push(Mismatch {
             category: Category::LedgerHeaders,
@@ -397,6 +395,7 @@ fn compare_ledger_headers(
             ),
         });
     }
+    out
 }
 
 // ============================================================================
@@ -441,7 +440,8 @@ impl ComparableEntry for TransactionHistoryResultEntry {
     }
 }
 
-fn compare_entries<T: ComparableEntry>(local: &[T], reference: &[T], out: &mut Vec<Mismatch>) {
+fn compare_entries<T: ComparableEntry>(local: &[T], reference: &[T]) -> Vec<Mismatch> {
+    let mut out = Vec::new();
     let category = T::category();
     if local.len() != reference.len() {
         out.push(Mismatch {
@@ -490,6 +490,7 @@ fn compare_entries<T: ComparableEntry>(local: &[T], reference: &[T], out: &mut V
             _ => {}
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -520,8 +521,7 @@ mod tests {
     #[test]
     fn test_has_match() {
         let has = make_has(63, &["aaaa", "bbbb"]);
-        let mut mismatches = Vec::new();
-        compare_has(&has, &has.clone(), &mut mismatches);
+        let mismatches = compare_has(&has, &has.clone());
         assert!(mismatches.is_empty());
     }
 
@@ -529,8 +529,7 @@ mod tests {
     fn test_has_ledger_mismatch() {
         let a = make_has(63, &["aaaa"]);
         let b = make_has(127, &["aaaa"]);
-        let mut mismatches = Vec::new();
-        compare_has(&a, &b, &mut mismatches);
+        let mismatches = compare_has(&a, &b);
         assert_eq!(mismatches.len(), 1);
         assert!(mismatches[0].detail.contains("currentLedger"));
     }
@@ -539,8 +538,7 @@ mod tests {
     fn test_has_bucket_mismatch() {
         let a = make_has(63, &["aaaa"]);
         let b = make_has(63, &["bbbb"]);
-        let mut mismatches = Vec::new();
-        compare_has(&a, &b, &mut mismatches);
+        let mismatches = compare_has(&a, &b);
         assert_eq!(mismatches.len(), 1);
         assert!(mismatches[0].detail.contains("curr"));
     }
@@ -549,8 +547,7 @@ mod tests {
     fn test_has_level_count_mismatch() {
         let a = make_has(63, &["aaaa", "bbbb"]);
         let b = make_has(63, &["aaaa"]);
-        let mut mismatches = Vec::new();
-        compare_has(&a, &b, &mut mismatches);
+        let mismatches = compare_has(&a, &b);
         assert_eq!(mismatches.len(), 1);
         assert!(mismatches[0].detail.contains("bucket level count"));
     }
