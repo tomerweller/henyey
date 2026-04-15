@@ -690,7 +690,7 @@ mod tests {
         Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntryExt, StellarValue,
         StellarValueExt, TimePoint, TransactionHistoryEntry, TransactionHistoryEntryExt,
         TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
-        TransactionSet, VecM,
+        VecM,
     };
 
     fn make_header(seq: u32) -> LedgerHeaderHistoryEntry {
@@ -725,10 +725,7 @@ mod tests {
     fn make_tx_entry(seq: u32) -> TransactionHistoryEntry {
         TransactionHistoryEntry {
             ledger_seq: seq,
-            tx_set: TransactionSet {
-                previous_ledger_hash: Hash([0; 32]),
-                txs: VecM::default(),
-            },
+            tx_set: crate::make_empty_tx_set(),
             ext: TransactionHistoryEntryExt::default(),
         }
     }

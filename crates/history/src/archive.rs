@@ -375,10 +375,7 @@ impl HistoryArchive {
         }
 
         // Return empty transaction set if no transactions for this ledger
-        Ok(stellar_xdr::curr::TransactionSet {
-            previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            txs: stellar_xdr::curr::VecM::default(),
-        })
+        Ok(crate::make_empty_tx_set())
     }
 }
 

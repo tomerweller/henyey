@@ -6,9 +6,9 @@ use henyey_common::{Hash256, NetworkId};
 
 use henyey_tx::TransactionFrame;
 use stellar_xdr::curr::{
-    Hash, LedgerHeader, ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
+    LedgerHeader, ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
     TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultPair,
-    TransactionResultSet, TransactionSet, WriteXdr,
+    TransactionResultSet, WriteXdr,
 };
 use tracing::warn;
 
@@ -47,10 +47,7 @@ impl CatchupManager {
                                 TransactionSetVariant::Generalized(set) => {
                                     TransactionHistoryEntry {
                                         ledger_seq: data.header.ledger_seq,
-                                        tx_set: TransactionSet {
-                                            previous_ledger_hash: Hash([0u8; 32]),
-                                            txs: Default::default(),
-                                        },
+                                        tx_set: crate::make_empty_tx_set(),
                                         ext: TransactionHistoryEntryExt::V1(set.clone()),
                                     }
                                 }

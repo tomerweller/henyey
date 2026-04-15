@@ -364,10 +364,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn make_empty_tx_set() -> TransactionSet {
-        TransactionSet {
-            previous_ledger_hash: Hash([0u8; 32]),
-            txs: VecM::default(),
-        }
+        crate::make_empty_tx_set()
     }
 
     #[test]
