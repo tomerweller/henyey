@@ -1879,14 +1879,7 @@ impl TransactionQueue {
 
                         // Collect fee release info
                         let tx_fee = queued_tx.total_fee as i64;
-                        let tx_fee_source_id = henyey_tx::muxed_to_account_id(
-                            &henyey_tx::TransactionFrame::from_owned_with_network(
-                                queued_tx.envelope.clone(),
-                                self.config.network_id,
-                            )
-                            .fee_source_account(),
-                        );
-                        let tx_fee_source_key = account_key_from_account_id(&tx_fee_source_id);
+                        let tx_fee_source_key = self::fee_source_key(&queued_tx.envelope);
                         fee_releases.push((tx_fee_source_key, tx_fee));
 
                         state.transaction = None;
