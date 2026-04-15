@@ -509,6 +509,35 @@ pub(super) fn build_entry_changes_with_hot_archive(
             )
         }
 
+        /// Sort Soroban create indices by (associated_key_hash, type_order) so TTL
+        /// entries appear immediately before their ContractData/ContractCode pair.
+        fn sort_soroban_creates(indices: Vec<usize>, created: &[LedgerEntry]) -> Vec<usize> {
+            use sha2::{Digest, Sha256};
+
+            fn associated_sort_key(entry: &LedgerEntry) -> (Vec<u8>, u8) {
+                match &entry.data {
+                    stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => (ttl.key_hash.0.to_vec(), 0),
+                    stellar_xdr::curr::LedgerEntryData::ContractData(_)
+                    | stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
+                        let key = henyey_common::entry_to_key(entry);
+                        if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                            let key_hash = Sha256::digest(&key_bytes);
+                            return (key_hash.to_vec(), 1);
+                        }
+                        (Vec::new(), 1)
+                    }
+                    _ => (Vec::new(), 2),
+                }
+            }
+
+            let mut entries_with_sort: Vec<(usize, (Vec<u8>, u8))> = indices
+                .into_iter()
+                .map(|idx| (idx, associated_sort_key(&created[idx])))
+                .collect();
+            entries_with_sort.sort_by(|(_, a), (_, b)| a.cmp(b));
+            entries_with_sort.into_iter().map(|(idx, _)| idx).collect()
+        }
+
         // Track which keys have been created (for deduplication)
         let mut created_keys: HashSet<LedgerKey> = HashSet::new();
 
@@ -574,43 +603,10 @@ pub(super) fn build_entry_changes_with_hot_archive(
         for group in groups {
             match group {
                 ChangeGroup::SorobanCreates { indices } => {
-                    // stellar-core groups TTL entries with their associated ContractData/ContractCode.
-                    // Sort by (associated_key_hash, type_order) where TTL comes before its data.
-                    use sha2::{Digest, Sha256};
-
-                    fn get_associated_hash_and_type(entry: &LedgerEntry) -> (Vec<u8>, u8) {
-                        match &entry.data {
-                            stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
-                                // TTL: associated_hash is key_hash, type_order=0 (first)
-                                (ttl.key_hash.0.to_vec(), 0)
-                            }
-                            stellar_xdr::curr::LedgerEntryData::ContractData(_)
-                            | stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
-                                // Data/Code: associated_hash is SHA256 of key XDR, type_order=1 (second)
-                                let key = henyey_common::entry_to_key(entry);
-                                if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
-                                    let key_hash = Sha256::digest(&key_bytes);
-                                    return (key_hash.to_vec(), 1);
-                                }
-                                (Vec::new(), 1)
-                            }
-                            _ => (Vec::new(), 2),
-                        }
-                    }
-
-                    let mut entries_with_sort: Vec<(usize, (Vec<u8>, u8))> = indices
-                        .into_iter()
-                        .map(|idx| (idx, get_associated_hash_and_type(&created[idx])))
-                        .collect();
-
-                    // Sort by associated_hash (groups TTL with its data), then type_order (TTL=0 first)
-                    entries_with_sort.sort_by(|(_, a), (_, b)| a.cmp(b));
-
-                    for (idx, _) in entries_with_sort {
+                    for idx in sort_soroban_creates(indices, created) {
                         let entry = &created[idx];
                         let key = henyey_common::entry_to_key(entry);
-                        if !created_keys.contains(&key) {
-                            created_keys.insert(key.clone());
+                        if created_keys.insert(key.clone()) {
                             push_created_or_restored(
                                 &mut changes,
                                 entry,
@@ -624,8 +620,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                 ChangeGroup::ClassicCreate { idx } => {
                     let entry = &created[idx];
                     let key = henyey_common::entry_to_key(entry);
-                    if !created_keys.contains(&key) {
-                        created_keys.insert(key.clone());
+                    if created_keys.insert(key.clone()) {
                         push_created_or_restored(
                             &mut changes,
                             entry,
