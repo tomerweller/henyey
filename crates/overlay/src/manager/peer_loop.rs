@@ -688,9 +688,11 @@ impl OverlayManager {
 
         // Per-peer query rate limit (parity: Peer.cpp:1423-1438).
         // stellar-core's window = expectedLedgerCloseTime * MAX_SLOTS_TO_REMEMBER.
-        // We use a fixed 60s window (5s close time * 12 slots).
         {
-            const QUERY_WINDOW: Duration = Duration::from_secs(60);
+            const EXPECTED_LEDGER_CLOSE_SECS: u64 = 5;
+            const MAX_SLOTS_TO_REMEMBER: u64 = 12;
+            const QUERY_WINDOW: Duration =
+                Duration::from_secs(EXPECTED_LEDGER_CLOSE_SECS * MAX_SLOTS_TO_REMEMBER);
             let allowed = match message {
                 StellarMessage::GetTxSet(_) => {
                     ctx.query_limiter.tx_set.check_and_increment(QUERY_WINDOW)

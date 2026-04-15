@@ -574,6 +574,24 @@ impl AuthContext {
         Ok(())
     }
 
+    /// Get the send MAC key, or error if not yet established.
+    fn check_send_key(&self) -> Result<()> {
+        if self.send_mac_key.is_some() {
+            Ok(())
+        } else {
+            Err(OverlayError::AuthenticationFailed(
+                "send key not established".into(),
+            ))
+        }
+    }
+
+    /// Get the recv MAC key, or error if not yet established.
+    fn recv_key(&self) -> Result<&HmacSha256Key> {
+        self.recv_mac_key
+            .as_ref()
+            .ok_or_else(|| OverlayError::AuthenticationFailed("recv key not established".into()))
+    }
+
     /// Wraps a message with sequence number and MAC for sending.
     ///
     /// This should only be called after authentication is complete.
@@ -583,15 +601,13 @@ impl AuthContext {
     ///
     /// Returns an error if the send MAC key is not established.
     pub fn wrap_message(&mut self, message: StellarMessage) -> Result<AuthenticatedMessage> {
-        let send_key = self.send_mac_key.as_ref().ok_or_else(|| {
-            OverlayError::AuthenticationFailed("send key not established".to_string())
-        })?;
+        self.check_send_key()?;
 
         let sequence = self.send_sequence;
         self.send_sequence += 1;
 
         // Compute MAC
-        let mac = self.compute_mac(send_key, sequence, &message)?;
+        let mac = self.compute_mac(self.send_mac_key.as_ref().unwrap(), sequence, &message)?;
 
         Ok(AuthenticatedMessage::V0(AuthenticatedMessageV0 {
             sequence,
@@ -647,9 +663,7 @@ impl AuthContext {
                     // Verify MAC before advancing sequence counter.
                     // Parity: stellar-core Hmac.cpp:60 increments mRecvMacSeq
                     // only after hmacSha256Verify succeeds.
-                    let recv_key = self.recv_mac_key.as_ref().ok_or_else(|| {
-                        OverlayError::AuthenticationFailed("recv key not established".to_string())
-                    })?;
+                    let recv_key = self.recv_key()?;
 
                     let expected_mac = self.compute_mac(recv_key, v0.sequence, &v0.message)?;
                     tracing::debug!(
@@ -716,15 +730,13 @@ impl AuthContext {
     /// a valid MAC to prove we derived the correct keys. This proves to the peer
     /// that we successfully completed the key exchange.
     pub fn wrap_auth_message(&self, message: StellarMessage) -> Result<AuthenticatedMessage> {
-        let send_key = self.send_mac_key.as_ref().ok_or_else(|| {
-            OverlayError::AuthenticationFailed("send key not established".to_string())
-        })?;
+        self.check_send_key()?;
 
         // Auth message uses sequence 0
         let sequence = 0u64;
 
         // Compute MAC
-        let mac = self.compute_mac(send_key, sequence, &message)?;
+        let mac = self.compute_mac(self.send_mac_key.as_ref().unwrap(), sequence, &message)?;
 
         Ok(AuthenticatedMessage::V0(AuthenticatedMessageV0 {
             sequence,
