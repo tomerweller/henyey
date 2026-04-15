@@ -309,7 +309,8 @@ impl NominationProtocol {
     /// Adopt values from round leaders' nominations.
     fn adopt_leader_values<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) -> bool {
         let mut updated = false;
-        for leader in self.round_leaders.clone() {
+        let leaders: Vec<_> = self.round_leaders.iter().cloned().collect();
+        for leader in leaders {
             let Some(env) = self.latest_nominations.get(&leader) else {
                 continue;
             };

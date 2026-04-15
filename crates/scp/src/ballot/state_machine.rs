@@ -187,10 +187,11 @@ impl BallotProtocol {
             value: new_h_ballot.value.clone(),
         };
 
-        let current = self.current_ballot.clone().unwrap_or(ScpBallot {
+        let fallback = ScpBallot {
             counter: 0,
             value: new_h_ballot.value.clone(),
-        });
+        };
+        let current = self.current_ballot.as_ref().unwrap_or(&fallback);
 
         let can_set_commit = self.commit.is_none()
             && self
@@ -206,7 +207,7 @@ impl BallotProtocol {
 
         if can_set_commit {
             for ballot in candidates[..=new_h_index].iter().rev() {
-                if ballot_compare(ballot, &current) == Ordering::Less {
+                if ballot_compare(ballot, current) == Ordering::Less {
                     break;
                 }
                 if !are_ballots_less_and_compatible(ballot, new_h_ballot) {
@@ -302,13 +303,14 @@ impl BallotProtocol {
         if self.phase != BallotPhase::Confirm
             || candidate.1 > self.high_ballot.as_ref().map(|b| b.counter).unwrap_or(0)
         {
+            let value = ballot.value;
             let c = ScpBallot {
                 counter: candidate.0,
-                value: ballot.value.clone(),
+                value: value.clone(),
             };
             let h = ScpBallot {
                 counter: candidate.1,
-                value: ballot.value.clone(),
+                value,
             };
             return self.set_accept_commit(c, h, ctx);
         }
@@ -388,13 +390,14 @@ impl BallotProtocol {
             return false;
         }
 
+        let value = ballot.value;
         let c = ScpBallot {
             counter: candidate.0,
-            value: ballot.value.clone(),
+            value: value.clone(),
         };
         let h = ScpBallot {
             counter: candidate.1,
-            value: ballot.value.clone(),
+            value,
         };
         self.set_confirm_commit(c, h, ctx)
     }
@@ -660,7 +663,8 @@ impl BallotProtocol {
                     if !ballot_compatible(current_prepared, &ballot) {
                         self.prepared_prime = Some(current_prepared.clone());
                     }
-                    self.prepared = Some(ballot.clone());
+                    driver.ballot_did_prepare(slot_index, &ballot);
+                    self.prepared = Some(ballot);
                     did_work = true;
                 }
                 Ordering::Greater => {
@@ -672,19 +676,17 @@ impl BallotProtocol {
                         }
                     };
                     if should_update_prime {
-                        self.prepared_prime = Some(ballot.clone());
+                        driver.ballot_did_prepare(slot_index, &ballot);
+                        self.prepared_prime = Some(ballot);
                         did_work = true;
                     }
                 }
                 Ordering::Equal => {}
             }
         } else {
-            self.prepared = Some(ballot.clone());
-            did_work = true;
-        }
-
-        if did_work {
             driver.ballot_did_prepare(slot_index, &ballot);
+            self.prepared = Some(ballot);
+            did_work = true;
         }
 
         did_work
