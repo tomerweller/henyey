@@ -97,145 +97,87 @@ pub(crate) fn replay_ledger(
 /// - init_entries: Entries that were created
 /// - live_entries: Entries that were updated or restored
 /// - dead_entries: Keys of entries that were deleted
+/// Accumulated ledger entry changes from transaction meta.
+struct LedgerChanges {
+    init: Vec<LedgerEntry>,
+    live: Vec<LedgerEntry>,
+    dead: Vec<LedgerKey>,
+}
+
+impl LedgerChanges {
+    fn new() -> Self {
+        Self {
+            init: Vec::new(),
+            live: Vec::new(),
+            dead: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, change: &stellar_xdr::curr::LedgerEntryChange) {
+        use stellar_xdr::curr::LedgerEntryChange;
+        match change {
+            LedgerEntryChange::Created(entry) => self.init.push(entry.clone()),
+            LedgerEntryChange::Updated(entry) => self.live.push(entry.clone()),
+            LedgerEntryChange::Removed(key) => self.dead.push(key.clone()),
+            LedgerEntryChange::State(_) => {}
+            LedgerEntryChange::Restored(entry) => self.live.push(entry.clone()),
+        }
+    }
+
+    fn push_all(&mut self, changes: &stellar_xdr::curr::LedgerEntryChanges) {
+        for change in changes.iter() {
+            self.push(change);
+        }
+    }
+
+    fn into_tuple(self) -> (Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>) {
+        (self.init, self.live, self.dead)
+    }
+}
+
 pub(crate) fn extract_ledger_changes(
     tx_metas: &[TransactionMeta],
 ) -> Result<(Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>)> {
-    let mut init_entries = Vec::new();
-    let mut live_entries = Vec::new();
-    let mut dead_entries = Vec::new();
+    let mut changes = LedgerChanges::new();
 
     for meta in tx_metas {
         match meta {
             TransactionMeta::V0(operations) => {
-                // V0: VecM<OperationMeta> - each OperationMeta has a changes field
                 for op_meta in operations.iter() {
-                    for change in op_meta.changes.iter() {
-                        apply_change(
-                            change,
-                            &mut init_entries,
-                            &mut live_entries,
-                            &mut dead_entries,
-                        );
-                    }
+                    changes.push_all(&op_meta.changes);
                 }
             }
             TransactionMeta::V1(v1) => {
-                // Process txChanges (before)
-                for change in v1.tx_changes.iter() {
-                    apply_change(
-                        change,
-                        &mut init_entries,
-                        &mut live_entries,
-                        &mut dead_entries,
-                    );
-                }
-                // Process operation changes
+                changes.push_all(&v1.tx_changes);
                 for op_changes in v1.operations.iter() {
-                    for change in op_changes.changes.iter() {
-                        apply_change(
-                            change,
-                            &mut init_entries,
-                            &mut live_entries,
-                            &mut dead_entries,
-                        );
-                    }
+                    changes.push_all(&op_changes.changes);
                 }
             }
-            // V2, V3, and V4 share the same before/operations/after structure
             TransactionMeta::V2(v2) => {
-                extract_before_ops_after_changes(
-                    &v2.tx_changes_before,
-                    v2.operations.iter().map(|op| &op.changes),
-                    &v2.tx_changes_after,
-                    &mut init_entries,
-                    &mut live_entries,
-                    &mut dead_entries,
-                );
+                changes.push_all(&v2.tx_changes_before);
+                for op in v2.operations.iter() {
+                    changes.push_all(&op.changes);
+                }
+                changes.push_all(&v2.tx_changes_after);
             }
             TransactionMeta::V3(v3) => {
-                extract_before_ops_after_changes(
-                    &v3.tx_changes_before,
-                    v3.operations.iter().map(|op| &op.changes),
-                    &v3.tx_changes_after,
-                    &mut init_entries,
-                    &mut live_entries,
-                    &mut dead_entries,
-                );
+                changes.push_all(&v3.tx_changes_before);
+                for op in v3.operations.iter() {
+                    changes.push_all(&op.changes);
+                }
+                changes.push_all(&v3.tx_changes_after);
             }
             TransactionMeta::V4(v4) => {
-                extract_before_ops_after_changes(
-                    &v4.tx_changes_before,
-                    v4.operations.iter().map(|op| &op.changes),
-                    &v4.tx_changes_after,
-                    &mut init_entries,
-                    &mut live_entries,
-                    &mut dead_entries,
-                );
+                changes.push_all(&v4.tx_changes_before);
+                for op in v4.operations.iter() {
+                    changes.push_all(&op.changes);
+                }
+                changes.push_all(&v4.tx_changes_after);
             }
         }
     }
 
-    Ok((init_entries, live_entries, dead_entries))
-}
-
-fn apply_change(
-    change: &stellar_xdr::curr::LedgerEntryChange,
-    init_entries: &mut Vec<LedgerEntry>,
-    live_entries: &mut Vec<LedgerEntry>,
-    dead_entries: &mut Vec<LedgerKey>,
-) {
-    match classify_ledger_entry_change(change) {
-        LedgerChange::Init(e) => init_entries.push(e),
-        LedgerChange::Live(e) => live_entries.push(e),
-        LedgerChange::Dead(k) => dead_entries.push(k),
-        LedgerChange::None => {}
-    }
-}
-
-/// Extract changes from V2/V3/V4 meta which share tx_changes_before, operations, tx_changes_after.
-///
-/// The `op_changes` parameter accepts an iterator of `LedgerEntryChanges` references to handle
-/// both `OperationMeta` (V2/V3) and `OperationMetaV2` (V4), which differ in type but both
-/// have a `.changes` field of type `LedgerEntryChanges`.
-fn extract_before_ops_after_changes<'a>(
-    tx_changes_before: &stellar_xdr::curr::LedgerEntryChanges,
-    op_changes: impl Iterator<Item = &'a stellar_xdr::curr::LedgerEntryChanges>,
-    tx_changes_after: &stellar_xdr::curr::LedgerEntryChanges,
-    init_entries: &mut Vec<LedgerEntry>,
-    live_entries: &mut Vec<LedgerEntry>,
-    dead_entries: &mut Vec<LedgerKey>,
-) {
-    for change in tx_changes_before.iter() {
-        apply_change(change, init_entries, live_entries, dead_entries);
-    }
-    for changes in op_changes {
-        for change in changes.iter() {
-            apply_change(change, init_entries, live_entries, dead_entries);
-        }
-    }
-    for change in tx_changes_after.iter() {
-        apply_change(change, init_entries, live_entries, dead_entries);
-    }
-}
-
-/// Classify a single ledger entry change.
-enum LedgerChange {
-    Init(LedgerEntry),
-    Live(LedgerEntry),
-    Dead(LedgerKey),
-    None,
-}
-
-fn classify_ledger_entry_change(change: &stellar_xdr::curr::LedgerEntryChange) -> LedgerChange {
-    use stellar_xdr::curr::LedgerEntryChange;
-
-    match change {
-        LedgerEntryChange::Created(entry) => LedgerChange::Init(entry.clone()),
-        LedgerEntryChange::Updated(entry) => LedgerChange::Live(entry.clone()),
-        LedgerEntryChange::Removed(key) => LedgerChange::Dead(key.clone()),
-        LedgerEntryChange::State(_) => LedgerChange::None,
-        LedgerEntryChange::Restored(entry) => LedgerChange::Live(entry.clone()),
-    }
+    Ok(changes.into_tuple())
 }
 
 /// Count the total number of operations in a transaction set.
