@@ -316,23 +316,9 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// # Default Implementation
     /// The default implementation does nothing. Applications that want
-    /// timer-based timeout handling should override this method.
-    ///
-    /// # Example
-    /// ```ignore
-    /// fn setup_timer(&self, slot_index: u64, timer_type: SCPTimerType, timeout: Duration) {
-    ///     let slot = slot_index;
-    ///     let timer = timer_type;
-    ///     tokio::spawn(async move {
-    ///         tokio::time::sleep(timeout).await;
-    ///         // Call SCP timeout handler
-    ///         match timer {
-    ///             SCPTimerType::Nomination => scp.nominate_timeout(slot, ...),
-    ///             SCPTimerType::Ballot => scp.bump_ballot_on_timeout(slot),
-    ///         }
-    ///     });
-    /// }
-    /// ```
+    /// timer-based timeout handling should override this method to spawn
+    /// an async task that sleeps for `timeout` and then calls the
+    /// appropriate SCP handler (`nominate_timeout` or `bump_ballot_on_timeout`).
     fn setup_timer(&self, _slot_index: u64, _timer_type: SCPTimerType, _timeout: Duration) {
         // Default: do nothing, timers managed externally
     }
