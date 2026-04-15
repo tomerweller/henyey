@@ -23,7 +23,7 @@ use crate::{reserves, trustlines, LedgerError, Result};
 use henyey_common::asset::{add_balance, is_issuer};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_tx::operations::execute::{
-    adjust_offer_amount, exchange_v10_without_price_error_thresholds, RoundingType,
+    adjust_offer_amount, exchange_v10_without_price_error_thresholds, ExchangeResult, RoundingType,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use stellar_xdr::curr::{
@@ -73,46 +73,33 @@ fn add_liabilities(
     // If already None (overflow), stay None.
 }
 
-/// Compute the buying liabilities implied by an offer.
-///
-/// Parity: TransactionUtils.cpp:908-923 `getOfferBuyingLiabilities`
-fn get_offer_buying_liabilities(offer: &OfferEntry) -> Result<i64> {
-    let res = exchange_v10_without_price_error_thresholds(
+/// Run the exchange calculation for an offer's liabilities.
+fn compute_offer_exchange(offer: &OfferEntry) -> Result<ExchangeResult> {
+    exchange_v10_without_price_error_thresholds(
         offer.price.clone(),
         offer.amount,
         i64::MAX,
         i64::MAX,
         i64::MAX,
         RoundingType::Normal,
-    );
-    match res {
-        Ok(r) => Ok(r.num_sheep_send),
-        Err(e) => Err(LedgerError::Internal(format!(
-            "getOfferBuyingLiabilities failed for offer {}: {:?}",
-            offer.offer_id, e
-        ))),
-    }
+    )
+    .map_err(|e| {
+        LedgerError::Internal(format!("offer {} exchange failed: {:?}", offer.offer_id, e))
+    })
+}
+
+/// Compute the buying liabilities implied by an offer.
+///
+/// Parity: TransactionUtils.cpp:908-923 `getOfferBuyingLiabilities`
+fn get_offer_buying_liabilities(offer: &OfferEntry) -> Result<i64> {
+    compute_offer_exchange(offer).map(|r| r.num_sheep_send)
 }
 
 /// Compute the selling liabilities implied by an offer.
 ///
 /// Parity: TransactionUtils.cpp:932-947 `getOfferSellingLiabilities`
 fn get_offer_selling_liabilities(offer: &OfferEntry) -> Result<i64> {
-    let res = exchange_v10_without_price_error_thresholds(
-        offer.price.clone(),
-        offer.amount,
-        i64::MAX,
-        i64::MAX,
-        i64::MAX,
-        RoundingType::Normal,
-    );
-    match res {
-        Ok(r) => Ok(r.num_wheat_received),
-        Err(e) => Err(LedgerError::Internal(format!(
-            "getOfferSellingLiabilities failed for offer {}: {:?}",
-            offer.offer_id, e
-        ))),
-    }
+    compute_offer_exchange(offer).map(|r| r.num_wheat_received)
 }
 
 /// Get the available balance for an asset excluding liabilities.

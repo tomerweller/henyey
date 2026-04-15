@@ -568,12 +568,11 @@ fn sorted_component_txs<'a>(
     sorted_for_apply_sequential(collect_component_txs(components), set_hash)
 }
 
-fn extend_flattened_parallel_stages(all_txs: &mut Vec<TxWithFee>, stages: &ParallelStages) {
-    for stage in stages {
-        for cluster in stage {
-            all_txs.extend(cluster.iter().cloned());
-        }
-    }
+fn flatten_parallel_stages(stages: &ParallelStages) -> impl Iterator<Item = TxWithFee> + '_ {
+    stages
+        .iter()
+        .flat_map(|stage| stage.iter())
+        .flat_map(|cluster| cluster.iter().cloned())
 }
 
 fn build_tx_meta(all_txs: &[TxWithFee]) -> Vec<TxMeta> {
@@ -835,7 +834,7 @@ impl TransactionSetVariant {
                                 })
                                 .collect();
 
-                            extend_flattened_parallel_stages(&mut all_txs, &stages);
+                            all_txs.extend(flatten_parallel_stages(&stages));
 
                             if !stages.is_empty() {
                                 soroban_phase = Some(SorobanPhaseStructure { base_fee, stages });
@@ -893,7 +892,7 @@ impl TransactionSetVariant {
                             );
 
                             // Flatten stages into all_txs
-                            extend_flattened_parallel_stages(&mut all_txs, &stages);
+                            all_txs.extend(flatten_parallel_stages(&stages));
 
                             if !stages.is_empty() {
                                 soroban_phase = Some(SorobanPhaseStructure { base_fee, stages });

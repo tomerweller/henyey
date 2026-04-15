@@ -136,23 +136,25 @@ pub(super) fn collect_soroban_restored_entries(
         .collect();
     // For transaction meta emission: only emit RESTORED for keys in created
     // Keep original set for bucket list operations
-    let hot_archive_for_bucket_list = hot_archive.clone();
     // For RestoreFootprint, the data entries are prefetched from hot archive
     // into state, so they won't be in `created_keys` (only the TTL is created).
     // We need to emit RESTORED for all hot archive keys without filtering.
     // For InvokeHostFunction, we filter by created_keys because the auto-restore
     // creates the entries during execution.
-    let hot_archive_for_meta: HashSet<LedgerKey> = if op_type == OperationType::RestoreFootprint {
-        // Don't filter - all hot archive keys should emit RESTORED
-        hot_archive.clone()
-    } else {
-        // Filter by created_keys for InvokeHostFunction
-        hot_archive
-            .iter()
-            .filter(|k| created_keys.contains(k))
-            .cloned()
-            .collect()
-    };
+    let (hot_archive_for_bucket_list, hot_archive_for_meta) =
+        if op_type == OperationType::RestoreFootprint {
+            // Both need the full set — clone once, move the other
+            let for_meta = hot_archive.clone();
+            (hot_archive, for_meta)
+        } else {
+            // Filter by created_keys for InvokeHostFunction
+            let for_meta = hot_archive
+                .iter()
+                .filter(|k| created_keys.contains(k))
+                .cloned()
+                .collect();
+            (hot_archive, for_meta)
+        };
     let ha_after = hot_archive_for_meta.len();
     // Log when we filter out entries
     if ha_before != ha_after {
@@ -162,7 +164,7 @@ pub(super) fn collect_soroban_restored_entries(
             ha_after,
             live_bl_count = restored.live_bucket_list.len(),
             created_count = created_keys.len(),
-            ?hot_archive,
+            ?hot_archive_for_bucket_list,
             ?created_keys,
             op_type = ?op_type,
             "Filtered hot archive keys: live BL restores and already-restored entries"

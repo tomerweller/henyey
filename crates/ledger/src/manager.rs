@@ -2249,20 +2249,17 @@ impl LedgerManager {
         }
 
         // Module cache
-        {
-            let mc = self.module_cache.read();
-            if mc.is_some() {
-                // Heuristic: compiled modules are ~4x their WASM size
-                let soroban = self.soroban_state.read();
-                let wasm_bytes = soroban.contract_code_state_size().max(0) as u64;
-                let code_count = soroban.contract_code_count() as u64;
-                let estimated_compiled = wasm_bytes * 4;
-                components.push(ComponentMemory::new(
-                    "module_cache",
-                    estimated_compiled,
-                    code_count,
-                ));
-            }
+        if self.module_cache.read().is_some() {
+            // Heuristic: compiled modules are ~4x their WASM size
+            let soroban = self.soroban_state.read();
+            let wasm_bytes = soroban.contract_code_state_size().max(0) as u64;
+            let code_count = soroban.contract_code_count() as u64;
+            let estimated_compiled = wasm_bytes * 4;
+            components.push(ComponentMemory::new(
+                "module_cache",
+                estimated_compiled,
+                code_count,
+            ));
         }
 
         // Transaction executor state (LedgerStateManager with offers, accounts, etc.)
