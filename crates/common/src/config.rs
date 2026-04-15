@@ -385,15 +385,15 @@ impl BucketListDbConfig {
 }
 
 fn default_index_page_size_exponent() -> u32 {
-    14 // 16384 bytes
+    14 // 16384 bytes — matches stellar-core BUCKET_INDEX_PAGE_SIZE_EXPONENT
 }
 
 fn default_index_cutoff_mb() -> usize {
-    20
+    20 // matches stellar-core BUCKETLIST_DB_INDEX_CUTOFF (20 MB)
 }
 
 fn default_memory_for_caching_mb() -> usize {
-    1024
+    1024 // 1 GB — matches stellar-core BUCKETLIST_DB_PERSIST_INDEX_CACHE_SIZE
 }
 
 fn default_persist_index() -> bool {
@@ -417,19 +417,19 @@ pub struct LoggingConfig {
 }
 
 fn default_peer_port() -> u16 {
-    11625
+    11625 // stellar network default peer port
 }
 
 fn default_http_port() -> u16 {
-    11626
+    11626 // stellar network default HTTP admin port
 }
 
 fn default_max_peers() -> usize {
-    25
+    25 // matches stellar-core MAX_ADDITIONAL_PEER_COUNT + TARGET_PEER_COUNT
 }
 
 fn default_target_peers() -> usize {
-    8
+    8 // matches stellar-core DEFAULT_PEER_NUM_FAILURES_TO_BACKOFF
 }
 
 impl Config {
