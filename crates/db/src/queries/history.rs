@@ -17,6 +17,10 @@ use stellar_xdr::curr::{
 
 use crate::error::DbError;
 
+fn write_integrity_err(entity: &str, e: impl std::fmt::Display) -> DbError {
+    DbError::Integrity(format!("Failed to write {entity} entry: {e}"))
+}
+
 /// Transaction status stored in the `status` column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -303,7 +307,7 @@ impl HistoryQueries for Connection {
                 let entry = TransactionHistoryEntry::from_xdr(data.as_slice(), Limits::none())?;
                 tx_stream
                     .write_one(&entry)
-                    .map_err(|e| DbError::Integrity(format!("Failed to write tx entry: {}", e)))?;
+                    .map_err(|e| write_integrity_err("tx", e))?;
                 tx_written += 1;
             }
         }
@@ -318,9 +322,9 @@ impl HistoryQueries for Connection {
                 let data = row?;
                 let entry =
                     TransactionHistoryResultEntry::from_xdr(data.as_slice(), Limits::none())?;
-                result_stream.write_one(&entry).map_err(|e| {
-                    DbError::Integrity(format!("Failed to write result entry: {}", e))
-                })?;
+                result_stream
+                    .write_one(&entry)
+                    .map_err(|e| write_integrity_err("result", e))?;
                 result_written += 1;
             }
         }
