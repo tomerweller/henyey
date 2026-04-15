@@ -336,7 +336,7 @@ impl BallotProtocol {
                 .map(|b| ballot_compare(b, &c) != Ordering::Equal)
                 .unwrap_or(true)
         {
-            self.commit = Some(c.clone());
+            self.commit = Some(c);
             self.high_ballot = Some(h.clone());
             did_work = true;
         }
@@ -405,9 +405,9 @@ impl BallotProtocol {
         h: ScpBallot,
         ctx: &SlotContext<'_, D>,
     ) -> bool {
-        self.commit = Some(c.clone());
-        self.high_ballot = Some(h.clone());
         self.update_current_if_needed(&h);
+        self.commit = Some(c);
+        self.high_ballot = Some(h);
         self.phase = BallotPhase::Externalize;
 
         self.emit_current_state(ctx);
@@ -416,7 +416,8 @@ impl BallotProtocol {
         self.needs_stop_nomination = true;
 
         // stellar-core uses mCommit->getBallot().value (c.value) for valueExternalized
-        ctx.driver.value_externalized(ctx.slot_index, &c.value);
+        ctx.driver
+            .value_externalized(ctx.slot_index, &self.commit.as_ref().unwrap().value);
         true
     }
 

@@ -440,7 +440,7 @@ impl CatchupManager {
         buckets_downloaded: u32,
         ledger_manager: &LedgerManager,
     ) -> Result<CatchupResult> {
-        let (final_header, final_hash, ledgers_applied) = if checkpoint_seq >= target {
+        let (final_seq, final_hash, ledgers_applied) = if checkpoint_seq >= target {
             // No replay needed — target is exactly at checkpoint.
             self.persist_header_only(checkpoint_header)?;
 
@@ -455,23 +455,23 @@ impl CatchupManager {
             );
             self.emit_meta(checkpoint_header.ledger_seq, meta);
 
-            (checkpoint_header.clone(), checkpoint_hash, 0)
+            (checkpoint_header.ledger_seq, checkpoint_hash, 0)
         } else {
             let (header, hash, applied) = self
                 .download_verify_and_replay_with_retry(target, ledger_manager)
                 .await?;
-            (header, hash, applied)
+            (header.ledger_seq, hash, applied)
         };
 
         self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
 
         info!(
             "Catchup completed: ledger {}, hash {}, {} ledgers replayed",
-            final_header.ledger_seq, final_hash, ledgers_applied
+            final_seq, final_hash, ledgers_applied
         );
 
         Ok(CatchupResult {
-            ledger_seq: final_header.ledger_seq,
+            ledger_seq: final_seq,
             ledger_hash: final_hash,
             ledgers_applied,
             buckets_downloaded,

@@ -18,6 +18,12 @@ use super::{CatchupManager, CatchupStatus, LedgerData};
 /// progress is preserved (mirroring stellar-core's `resetIter()`).
 pub(super) const REPLAY_RETRY_COUNT: u32 = 5;
 
+/// Base delay in milliseconds for exponential backoff between retries.
+const RETRY_BASE_DELAY_MS: u64 = 200;
+
+/// Maximum number of bit-shifts applied to the base delay (caps at 200 * 2^4 = 3200ms).
+const RETRY_MAX_BACKOFF_SHIFT: u32 = 4;
+
 /// Decode ledger upgrades from a header's SCP value.
 ///
 /// Each `upgrade` in `header.scp_value.upgrades` is an XDR-encoded `LedgerUpgrade`.
@@ -116,7 +122,8 @@ impl CatchupManager {
 
         for attempt in 0..=REPLAY_RETRY_COUNT {
             if attempt > 0 {
-                let delay_ms = 200 * (1 << (attempt - 1).min(4));
+                let delay_ms =
+                    RETRY_BASE_DELAY_MS * (1 << (attempt - 1).min(RETRY_MAX_BACKOFF_SHIFT));
                 warn!(
                     attempt,
                     max_attempts = REPLAY_RETRY_COUNT + 1,

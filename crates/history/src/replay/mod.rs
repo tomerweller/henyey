@@ -61,7 +61,7 @@ use stellar_xdr::curr::{
 
 // Re-export public items from submodules.
 pub use execution::replay_ledger_with_execution;
-pub use metadata::{extract_ledger_changes, replay_ledger};
+pub(crate) use metadata::replay_ledger;
 
 /// The result of replaying a single ledger.
 ///

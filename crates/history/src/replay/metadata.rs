@@ -30,7 +30,7 @@ use super::{LedgerReplayResult, ReplayConfig};
 /// # Returns
 ///
 /// A `LedgerReplayResult` containing the changes to apply to ledger state.
-pub fn replay_ledger(
+pub(crate) fn replay_ledger(
     header: &LedgerHeader,
     tx_set: &TransactionSetVariant,
     tx_results: &[TransactionResultPair],
@@ -97,7 +97,7 @@ pub fn replay_ledger(
 /// - init_entries: Entries that were created
 /// - live_entries: Entries that were updated or restored
 /// - dead_entries: Keys of entries that were deleted
-pub fn extract_ledger_changes(
+pub(crate) fn extract_ledger_changes(
     tx_metas: &[TransactionMeta],
 ) -> Result<(Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>)> {
     let mut init_entries = Vec::new();
@@ -240,29 +240,25 @@ fn classify_ledger_entry_change(change: &stellar_xdr::curr::LedgerEntryChange) -
 
 /// Count the total number of operations in a transaction set.
 fn count_operations(tx_set: &TransactionSetVariant) -> u32 {
-    let mut count = 0;
-
-    for tx_env in tx_set.transactions().into_iter() {
-        use stellar_xdr::curr::TransactionEnvelope;
-        match tx_env {
-            TransactionEnvelope::TxV0(tx) => {
-                count += tx.tx.operations.len() as u32;
-            }
-            TransactionEnvelope::Tx(tx) => {
-                count += tx.tx.operations.len() as u32;
-            }
-            TransactionEnvelope::TxFeeBump(tx) => {
-                // Fee bump wraps an inner transaction; +1 for the wrapper itself
-                match &tx.tx.inner_tx {
-                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                        count += inner.tx.operations.len() as u32 + 1;
+    tx_set
+        .transactions()
+        .into_iter()
+        .map(|tx_env| {
+            use stellar_xdr::curr::TransactionEnvelope;
+            match tx_env {
+                TransactionEnvelope::TxV0(tx) => tx.tx.operations.len() as u32,
+                TransactionEnvelope::Tx(tx) => tx.tx.operations.len() as u32,
+                TransactionEnvelope::TxFeeBump(tx) => {
+                    // Fee bump wraps an inner transaction; +1 for the wrapper itself
+                    match &tx.tx.inner_tx {
+                        stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                            inner.tx.operations.len() as u32 + 1
+                        }
                     }
                 }
             }
-        }
-    }
-
-    count
+        })
+        .sum()
 }
 
 #[cfg(test)]

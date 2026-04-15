@@ -24,6 +24,9 @@ use crate::archive::HistoryArchive;
 use crate::archive_state::HistoryArchiveState;
 use crate::error::HistoryError;
 
+/// Number of leading hex characters to display when showing hash prefixes.
+const HASH_DISPLAY_PREFIX_LEN: usize = 16;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -182,8 +185,8 @@ fn compare_has(
                 detail: format!(
                     "bucket level {} curr: local={} reference={}",
                     i,
-                    &l.curr[..16.min(l.curr.len())],
-                    &r.curr[..16.min(r.curr.len())],
+                    &l.curr[..HASH_DISPLAY_PREFIX_LEN.min(l.curr.len())],
+                    &r.curr[..HASH_DISPLAY_PREFIX_LEN.min(r.curr.len())],
                 ),
             });
         }
@@ -193,8 +196,8 @@ fn compare_has(
                 detail: format!(
                     "bucket level {} snap: local={} reference={}",
                     i,
-                    &l.snap[..16.min(l.snap.len())],
-                    &r.snap[..16.min(r.snap.len())],
+                    &l.snap[..HASH_DISPLAY_PREFIX_LEN.min(l.snap.len())],
+                    &r.snap[..HASH_DISPLAY_PREFIX_LEN.min(r.snap.len())],
                 ),
             });
         }
@@ -221,8 +224,8 @@ fn compare_has(
                         detail: format!(
                             "hot archive bucket level {} curr: local={} reference={}",
                             i,
-                            &l.curr[..16.min(l.curr.len())],
-                            &r.curr[..16.min(r.curr.len())],
+                            &l.curr[..HASH_DISPLAY_PREFIX_LEN.min(l.curr.len())],
+                            &r.curr[..HASH_DISPLAY_PREFIX_LEN.min(r.curr.len())],
                         ),
                     });
                 }
@@ -232,8 +235,8 @@ fn compare_has(
                         detail: format!(
                             "hot archive bucket level {} snap: local={} reference={}",
                             i,
-                            &l.snap[..16.min(l.snap.len())],
-                            &r.snap[..16.min(r.snap.len())],
+                            &l.snap[..HASH_DISPLAY_PREFIX_LEN.min(l.snap.len())],
+                            &r.snap[..HASH_DISPLAY_PREFIX_LEN.min(r.snap.len())],
                         ),
                     });
                 }
