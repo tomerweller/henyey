@@ -424,7 +424,7 @@ pub(super) fn build_entry_changes_with_state_overrides(
     build_entry_changes_with_hot_archive(
         state,
         &ledger_changes,
-        None,
+        false,
         0, // ledger_seq not used for non-operation changes
     )
 }
@@ -451,7 +451,7 @@ pub(super) struct LedgerChanges<'a> {
 /// - Convert STATE+UPDATED to RESTORED (entry had expired TTL in live BL)
 /// - Emit RESTORED for associated data/code entries even if not directly modified
 ///
-/// When `footprint` is provided (for Soroban operations), entries are ordered according to
+/// When `is_soroban` is true, entries are ordered according to
 /// the footprint's read_write order to match stellar-core behavior.
 /// For classic operations, entries are ordered according to the execution order tracked
 /// in `change_order` to match stellar-core behavior, emitting STATE/UPDATED pairs
@@ -459,7 +459,7 @@ pub(super) struct LedgerChanges<'a> {
 pub(super) fn build_entry_changes_with_hot_archive(
     state: &LedgerStateManager,
     changes: &LedgerChanges<'_>,
-    footprint: Option<&stellar_xdr::curr::LedgerFootprint>,
+    is_soroban: bool,
     current_ledger_seq: u32,
 ) -> LedgerEntryChanges {
     let &LedgerChanges {
@@ -494,12 +494,12 @@ pub(super) fn build_entry_changes_with_hot_archive(
     let mut changes: Vec<LedgerEntryChange> = Vec::new();
     let mut processed_keys: HashSet<LedgerKey> = HashSet::new();
 
-    // For Soroban operations with footprint, use change_order but sort consecutive Soroban creates by key_hash.
+    // For Soroban operations, use change_order but sort consecutive Soroban creates by key_hash.
     // For classic operations, use change_order to preserve execution order.
     // Key insight: change_order captures the execution sequence. For Soroban, we must preserve
     // the positions of classic entry changes (Account, Trustline) while sorting Soroban creates
     // (TTL, ContractData, ContractCode) by their associated key_hash to match stellar-core behavior.
-    if footprint.is_some() {
+    if is_soroban {
         fn is_soroban_entry(entry: &LedgerEntry) -> bool {
             matches!(
                 &entry.data,

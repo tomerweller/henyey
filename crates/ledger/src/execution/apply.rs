@@ -542,7 +542,7 @@ impl TransactionExecutor {
                         let op_changes_local = build_entry_changes_with_hot_archive(
                             &self.state,
                             &ledger_changes,
-                            footprint,
+                            footprint.is_some(),
                             self.ledger_seq,
                         );
 
