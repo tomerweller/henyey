@@ -373,13 +373,15 @@ fn merge_with_shadows_impl(
         normalize_init_entries,
         counters,
         |entry| {
-            maybe_put(
+            if let Some(entry) = maybe_put(
                 entry,
                 &mut shadow_cursors,
                 keep_shadowed_lifecycle_entries,
-                &mut merged,
                 counters,
-            )
+            )? {
+                merged.push(entry);
+            }
+            Ok(())
         },
     )?;
 
@@ -763,14 +765,16 @@ fn is_shadowed(entry: &BucketEntry, cursors: &mut [ShadowCursor<'_>]) -> Result<
 /// unless it's a lifecycle entry (INIT/DEAD) and `keep_shadowed_lifecycle_entries`
 /// is true (protocol 11+).
 ///
-/// When `shadow_cursors` is empty, this is equivalent to `output.push(entry)`.
+/// Decide whether to keep a bucket entry, given the current shadow cursors.
+///
+/// Returns `Ok(Some(entry))` if the entry should be emitted, or `Ok(None)` if shadowed.
+/// When `shadow_cursors` is empty, this always returns `Some(entry)`.
 fn maybe_put(
     entry: BucketEntry,
     shadow_cursors: &mut [ShadowCursor<'_>],
     keep_shadowed_lifecycle_entries: bool,
-    output: &mut Vec<BucketEntry>,
     counters: Option<&MergeCounters>,
-) -> Result<()> {
+) -> Result<Option<BucketEntry>> {
     if !shadow_cursors.is_empty() {
         if keep_shadowed_lifecycle_entries && (entry.is_init() || entry.is_dead()) {
             // Lifecycle entries (INIT/DEAD) are preserved even when shadowed
@@ -778,11 +782,10 @@ fn maybe_put(
             if let Some(c) = counters {
                 c.record_shadowed();
             }
-            return Ok(());
+            return Ok(None);
         }
     }
-    output.push(entry);
-    Ok(())
+    Ok(Some(entry))
 }
 
 /// Check if an entry should be kept in the merged output.
