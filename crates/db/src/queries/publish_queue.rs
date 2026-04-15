@@ -88,18 +88,19 @@ impl PublishQueueQueries for Connection {
 
     fn load_publish_queue(&self, limit: Option<usize>) -> Result<Vec<u32>, DbError> {
         let row_fn = |row: &rusqlite::Row<'_>| row.get::<_, i64>(0).map(|v| v as u32);
-        let mut sql = String::from("SELECT ledgerseq FROM publishqueue ORDER BY ledgerseq ASC");
-        if limit.is_some() {
-            sql.push_str(" LIMIT ?1");
-        }
-        let mut stmt = self.prepare(&sql)?;
-        let rows = if let Some(limit) = limit {
-            stmt.query_map(params![limit as i64], row_fn)?
+        if let Some(limit) = limit {
+            let mut stmt =
+                self.prepare("SELECT ledgerseq FROM publishqueue ORDER BY ledgerseq ASC LIMIT ?1")?;
+            let rows = stmt.query_map(params![limit as i64], row_fn)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(DbError::from)
         } else {
-            stmt.query_map([], row_fn)?
-        };
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(DbError::from)
+            let mut stmt =
+                self.prepare("SELECT ledgerseq FROM publishqueue ORDER BY ledgerseq ASC")?;
+            let rows = stmt.query_map([], row_fn)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(DbError::from)
+        }
     }
 
     fn load_publish_has(&self, ledger_seq: u32) -> Result<Option<String>, DbError> {

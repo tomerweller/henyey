@@ -343,8 +343,8 @@ pub trait ScpStatePersistenceQueries {
     fn has_tx_set_data(&self, hash: &Hash) -> Result<bool, DbError>;
 
     /// Delete old transaction set data.
-    /// Note: This is a no-op in the simple implementation since tx sets
-    /// aren't directly linked to slots. Use a separate cleanup mechanism.
+    /// Note: Currently a no-op since tx sets aren't directly linked to slots.
+    /// Use a separate cleanup mechanism.
     fn delete_old_tx_set_data(&self, slot: u64) -> Result<(), DbError>;
 }
 

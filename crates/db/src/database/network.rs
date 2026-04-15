@@ -142,9 +142,6 @@ impl Database {
     ///
     /// Filters by maximum failures, next attempt time, and optionally peer type.
     /// Results are randomized to distribute connection attempts.
-    /// Loads random peers matching the specified filter criteria.
-    ///
-    /// Results are randomized to distribute connection attempts.
     pub fn query_random_peers(
         &self,
         limit: usize,
