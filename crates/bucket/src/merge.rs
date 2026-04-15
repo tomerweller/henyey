@@ -653,8 +653,9 @@ pub fn merge_in_memory(
     };
 
     // Add metadata first if present
-    if let Some(ref meta) = output_meta {
-        add_entry(meta.clone())?;
+    let metadata_count = if output_meta.is_some() { 1 } else { 0 };
+    if let Some(meta) = output_meta {
+        add_entry(meta)?;
     }
 
     // Level 0 always keeps tombstones (they may shadow entries in deeper levels)
@@ -673,11 +674,8 @@ pub fn merge_in_memory(
         |entry| add_entry(entry),
     )?;
 
-    // Handle empty result
+    // Handle empty result (metadata was already added above if present)
     if all_entries.is_empty() {
-        if let Some(meta) = output_meta {
-            return Bucket::from_sorted_entries_with_in_memory(vec![meta]);
-        }
         return Ok(Bucket::empty());
     }
 
@@ -692,9 +690,6 @@ pub fn merge_in_memory(
         hash = %hash.to_hex(),
         "merge_in_memory: finished merge"
     );
-
-    // Count metadata entries (typically 0 or 1, always at the start)
-    let metadata_count = if output_meta.is_some() { 1 } else { 0 };
 
     // Create bucket directly with pre-computed hash
     // Use shared level zero state - no cloning needed!

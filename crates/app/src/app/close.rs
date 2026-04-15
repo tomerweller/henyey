@@ -20,7 +20,7 @@ impl HerderCallback for App {
     async fn close_ledger(
         &self,
         ledger_seq: u32,
-        tx_set: henyey_herder::TransactionSet,
+        mut tx_set: henyey_herder::TransactionSet,
         close_time: u64,
         upgrades: Vec<UpgradeType>,
         stellar_value_ext: StellarValueExt,
@@ -38,7 +38,7 @@ impl HerderCallback for App {
         let prev_hash = tx_set.previous_ledger_hash;
 
         // Create the transaction set
-        let tx_set_variant = if let Some(gen_tx_set) = tx_set.generalized_tx_set.clone() {
+        let tx_set_variant = if let Some(gen_tx_set) = tx_set.generalized_tx_set.take() {
             TransactionSetVariant::Generalized(gen_tx_set)
         } else {
             TransactionSetVariant::Classic(TransactionSet {
