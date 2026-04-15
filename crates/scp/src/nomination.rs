@@ -31,7 +31,6 @@
 //! to start the ballot protocol.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 
 use stellar_xdr::curr::{
     Limits, NodeId, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementPledges,
@@ -854,25 +853,12 @@ impl NominationProtocol {
 
         while self.round_leaders.len() < max_leader_count {
             let mut new_leaders = HashSet::new();
-            let mut top_priority = self.get_node_priority(
-                &normalized_qs,
-                ctx.driver,
-                ctx.slot_index,
-                prev_value,
-                ctx.local_node_id,
-                ctx.local_node_id,
-            );
+            let mut top_priority =
+                self.get_node_priority(ctx, &normalized_qs, prev_value, ctx.local_node_id);
             new_leaders.insert(ctx.local_node_id.clone());
 
             Self::for_all_nodes(&normalized_qs, &mut |node| {
-                let priority = self.get_node_priority(
-                    &normalized_qs,
-                    ctx.driver,
-                    ctx.slot_index,
-                    prev_value,
-                    ctx.local_node_id,
-                    node,
-                );
+                let priority = self.get_node_priority(ctx, &normalized_qs, prev_value, node);
                 if priority > top_priority {
                     top_priority = priority;
                     new_leaders.clear();
@@ -898,22 +884,23 @@ impl NominationProtocol {
 
     fn get_node_priority<D: SCPDriver>(
         &self,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
-        slot_index: u64,
+        ctx: &SlotContext<'_, D>,
+        quorum_set: &ScpQuorumSet,
         prev_value: &Value,
-        local_node_id: &NodeId,
         node_id: &NodeId,
     ) -> u64 {
-        let is_local = node_id == local_node_id;
-        let weight = crate::driver::base_get_node_weight(node_id, local_quorum_set, is_local);
+        let is_local = node_id == ctx.local_node_id;
+        let weight = crate::driver::base_get_node_weight(node_id, quorum_set, is_local);
         if weight == 0 {
             return 0;
         }
 
-        let hash = driver.compute_hash_node(slot_index, prev_value, false, self.round, node_id);
+        let hash =
+            ctx.driver
+                .compute_hash_node(ctx.slot_index, prev_value, false, self.round, node_id);
         if hash <= weight {
-            driver.compute_hash_node(slot_index, prev_value, true, self.round, node_id)
+            ctx.driver
+                .compute_hash_node(ctx.slot_index, prev_value, true, self.round, node_id)
         } else {
             0
         }
