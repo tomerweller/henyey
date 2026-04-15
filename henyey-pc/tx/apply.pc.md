@@ -157,27 +157,29 @@ wrapper = TxResultWrapper from result
 meta version switch:
   V0:
     for each op_meta in changes:
-      apply_ledger_entry_changes(op_meta.changes, delta)
+      delta.extend_from_changes(op_meta.changes)
 
   V1:
-    apply_ledger_entry_changes(tx_changes, delta)
+    delta.extend_from_changes(tx_changes)
     for each op_meta in operations:
-      apply_ledger_entry_changes(op_meta.changes, delta)
+      delta.extend_from_changes(op_meta.changes)
 
   V2, V3, V4:
-    apply_ledger_entry_changes(tx_changes_before, delta)
+    delta.extend_from_changes(tx_changes_before)
     for each op_meta in operations:
-      apply_ledger_entry_changes(op_meta.changes, delta)
-    apply_ledger_entry_changes(tx_changes_after, delta)
+      delta.extend_from_changes(op_meta.changes)
+    delta.extend_from_changes(tx_changes_after)
 ```
 
-**Calls:** [`apply_ledger_entry_changes`](#apply_ledger_entry_changes)
+**Calls:** [`TxChangeLog::extend_from_changes`](#txchangelogextend_from_changes)
 
 ---
 
-### apply_ledger_entry_changes
+### TxChangeLog::extend_from_changes
 
-"Replay historical changes. STATE entries precede UPDATED/REMOVED as pre-state."
+"Replay historical changes. STATE entries precede UPDATED/REMOVED as pre-state.
+Each call starts with fresh pending_state — no leakage across calls.
+Returns error (not panic) on malformed XDR missing STATE before UPDATED/REMOVED."
 
 ```
 pending_state = nil
@@ -186,25 +188,26 @@ for each change in changes:
   change type switch:
     CREATED:
       pending_state = nil
-      delta.record_create(entry)
+      self.record_create(entry)
 
     UPDATED:
-      pre_state = pending_state or entry itself
+      if pending_state is nil:
+        return Error("UPDATED must be preceded by STATE")
+      self.record_update(pending_state, entry)
       pending_state = nil
-      delta.record_update(pre_state, entry)
 
     REMOVED:
-      if pending_state exists:
-        delta.record_delete(key, pending_state)
+      if pending_state is nil:
+        return Error("REMOVED must be preceded by STATE")
+      self.record_delete(key, pending_state)
       pending_state = nil
-      NOTE: "If no STATE preceded REMOVED, skip (invalid meta)"
 
     STATE:
       pending_state = entry
 
     RESTORED:
       pending_state = nil
-      delta.record_create(entry)
+      self.record_create(entry)
 ```
 
 ---

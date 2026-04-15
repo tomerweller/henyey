@@ -89,6 +89,7 @@ use stellar_xdr::curr::{
     TransactionMeta, TransactionResult,
 };
 
+use crate::error::TxError;
 use crate::frame::TransactionFrame;
 use crate::result::{TxApplyResult, TxResultWrapper};
 use crate::Result;
@@ -396,6 +397,59 @@ impl TxChangeLog {
             self.change_order.push(adjusted);
         }
     }
+
+    /// Apply a set of ledger entry changes from XDR metadata.
+    ///
+    /// Used during catchup/replay mode where we replay historical changes.
+    /// For updates and deletes, the preceding STATE entry is tracked as the pre-state.
+    ///
+    /// Each call starts with a fresh `pending_state`, so STATE entries cannot
+    /// leak across separate invocations.
+    fn extend_from_changes(&mut self, changes: &LedgerEntryChanges) -> Result<()> {
+        let mut pending_state: Option<LedgerEntry> = None;
+
+        for change in changes.iter() {
+            match change {
+                LedgerEntryChange::Created(entry) => {
+                    pending_state = None;
+                    self.record_create(entry.clone());
+                }
+                LedgerEntryChange::Updated(entry) => {
+                    let pre_state = match pending_state.take() {
+                        Some(s) => s,
+                        None => {
+                            return Err(TxError::Internal(
+                                "UPDATED entry must be preceded by STATE in ledger entry changes"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    self.record_update(pre_state, entry.clone());
+                }
+                LedgerEntryChange::Removed(key) => {
+                    let pre_state = match pending_state.take() {
+                        Some(s) => s,
+                        None => {
+                            return Err(TxError::Internal(
+                                "REMOVED entry must be preceded by STATE in ledger entry changes"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    self.record_delete(key.clone(), pre_state);
+                }
+                LedgerEntryChange::State(entry) => {
+                    pending_state = Some(entry.clone());
+                }
+                LedgerEntryChange::Restored(entry) => {
+                    pending_state = None;
+                    self.record_create(entry.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // SECURITY: fee accumulation validated during tx set construction; overflow not possible with valid tx sets
@@ -431,13 +485,13 @@ fn apply_meta_changes(meta: &TransactionMeta, delta: &mut TxChangeLog) -> Result
     match meta {
         TransactionMeta::V0(changes) => {
             for op_meta in changes.iter() {
-                apply_ledger_entry_changes(&op_meta.changes, delta)?;
+                delta.extend_from_changes(&op_meta.changes)?;
             }
         }
         TransactionMeta::V1(v1) => {
-            apply_ledger_entry_changes(&v1.tx_changes, delta)?;
+            delta.extend_from_changes(&v1.tx_changes)?;
             for op_meta in v1.operations.iter() {
-                apply_ledger_entry_changes(&op_meta.changes, delta)?;
+                delta.extend_from_changes(&op_meta.changes)?;
             }
         }
         TransactionMeta::V2(v2) => {
@@ -475,52 +529,11 @@ fn apply_before_ops_after<'a>(
     after: &LedgerEntryChanges,
     delta: &mut TxChangeLog,
 ) -> Result<()> {
-    apply_ledger_entry_changes(before, delta)?;
+    delta.extend_from_changes(before)?;
     for changes in op_changes {
-        apply_ledger_entry_changes(changes, delta)?;
+        delta.extend_from_changes(changes)?;
     }
-    apply_ledger_entry_changes(after, delta)?;
-    Ok(())
-}
-
-/// Apply a set of ledger entry changes to the delta.
-///
-/// This is used during catchup mode where we replay historical changes.
-/// For updates and deletes, we track the preceding STATE entry as the pre-state.
-fn apply_ledger_entry_changes(changes: &LedgerEntryChanges, delta: &mut TxChangeLog) -> Result<()> {
-    let mut pending_state: Option<LedgerEntry> = None;
-
-    for change in changes.iter() {
-        match change {
-            LedgerEntryChange::Created(entry) => {
-                pending_state = None;
-                delta.record_create(entry.clone());
-            }
-            LedgerEntryChange::Updated(entry) => {
-                // STATE must always precede UPDATED in valid XDR meta
-                let pre_state = pending_state
-                    .take()
-                    .expect("UPDATED entry must be preceded by STATE in ledger entry changes");
-                delta.record_update(pre_state, entry.clone());
-            }
-            LedgerEntryChange::Removed(key) => {
-                // STATE must always precede REMOVED in valid XDR meta
-                let pre_state = pending_state
-                    .take()
-                    .expect("REMOVED entry must be preceded by STATE in ledger entry changes");
-                delta.record_delete(key.clone(), pre_state);
-            }
-            LedgerEntryChange::State(entry) => {
-                // Store STATE for the next UPDATED/REMOVED
-                pending_state = Some(entry.clone());
-            }
-            LedgerEntryChange::Restored(entry) => {
-                pending_state = None;
-                delta.record_create(entry.clone());
-            }
-        }
-    }
-
+    delta.extend_from_changes(after)?;
     Ok(())
 }
 
@@ -1281,6 +1294,168 @@ mod tests {
             balance,
             initial_balance + refund,
             "AUDIT-009: Refund must be applied to created entries"
+        );
+    }
+
+    /// Helper: create a simple account LedgerEntry for testing.
+    fn make_account_entry(balance: i64) -> LedgerEntry {
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id,
+                balance,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    /// Helper: create a simple account LedgerKey for testing.
+    fn make_account_key() -> LedgerKey {
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        LedgerKey::Account(LedgerKeyAccount { account_id })
+    }
+
+    #[test]
+    fn test_extend_from_changes_created() {
+        let mut delta = TxChangeLog::new(100);
+        let entry = make_account_entry(1_000_000);
+        let changes: LedgerEntryChanges = vec![LedgerEntryChange::Created(entry.clone())]
+            .try_into()
+            .unwrap();
+
+        delta.extend_from_changes(&changes).unwrap();
+
+        assert_eq!(delta.created_entries().len(), 1);
+        assert_eq!(delta.change_count(), 1);
+        assert!(matches!(delta.change_order()[0], ChangeRef::Created(0)));
+    }
+
+    #[test]
+    fn test_extend_from_changes_state_updated() {
+        let mut delta = TxChangeLog::new(100);
+        let pre_state = make_account_entry(1_000_000);
+        let post_state = make_account_entry(2_000_000);
+        let changes: LedgerEntryChanges = vec![
+            LedgerEntryChange::State(pre_state.clone()),
+            LedgerEntryChange::Updated(post_state.clone()),
+        ]
+        .try_into()
+        .unwrap();
+
+        delta.extend_from_changes(&changes).unwrap();
+
+        assert_eq!(delta.updated_entries().len(), 1);
+        assert_eq!(delta.update_states().len(), 1);
+        // Verify pre-state balance
+        if let LedgerEntryData::Account(acc) = &delta.update_states()[0].data {
+            assert_eq!(acc.balance, 1_000_000);
+        } else {
+            panic!("Expected account entry in pre-state");
+        }
+        // Verify post-state balance
+        if let LedgerEntryData::Account(acc) = &delta.updated_entries()[0].data {
+            assert_eq!(acc.balance, 2_000_000);
+        } else {
+            panic!("Expected account entry in post-state");
+        }
+    }
+
+    #[test]
+    fn test_extend_from_changes_state_removed() {
+        let mut delta = TxChangeLog::new(100);
+        let pre_state = make_account_entry(1_000_000);
+        let key = make_account_key();
+        let changes: LedgerEntryChanges = vec![
+            LedgerEntryChange::State(pre_state.clone()),
+            LedgerEntryChange::Removed(key.clone()),
+        ]
+        .try_into()
+        .unwrap();
+
+        delta.extend_from_changes(&changes).unwrap();
+
+        assert_eq!(delta.deleted_keys().len(), 1);
+        assert_eq!(delta.delete_states().len(), 1);
+        if let LedgerEntryData::Account(acc) = &delta.delete_states()[0].data {
+            assert_eq!(acc.balance, 1_000_000);
+        } else {
+            panic!("Expected account entry in delete pre-state");
+        }
+    }
+
+    #[test]
+    fn test_extend_from_changes_restored() {
+        let mut delta = TxChangeLog::new(100);
+        let entry = make_account_entry(1_000_000);
+        let changes: LedgerEntryChanges = vec![LedgerEntryChange::Restored(entry.clone())]
+            .try_into()
+            .unwrap();
+
+        delta.extend_from_changes(&changes).unwrap();
+
+        // Restored is treated as Created
+        assert_eq!(delta.created_entries().len(), 1);
+        assert_eq!(delta.change_count(), 1);
+    }
+
+    #[test]
+    fn test_extend_from_changes_state_isolation() {
+        // Pending STATE from one call must not leak into the next call.
+        let mut delta = TxChangeLog::new(100);
+
+        // First call: just a STATE with no following UPDATED/REMOVED
+        let changes1: LedgerEntryChanges =
+            vec![LedgerEntryChange::State(make_account_entry(1_000_000))]
+                .try_into()
+                .unwrap();
+        delta.extend_from_changes(&changes1).unwrap();
+
+        // Second call: UPDATED without STATE should fail (not use leaked state)
+        let changes2: LedgerEntryChanges =
+            vec![LedgerEntryChange::Updated(make_account_entry(2_000_000))]
+                .try_into()
+                .unwrap();
+        let result = delta.extend_from_changes(&changes2);
+        assert!(result.is_err(), "STATE must not leak across calls");
+    }
+
+    #[test]
+    fn test_extend_from_changes_updated_without_state_errors() {
+        let mut delta = TxChangeLog::new(100);
+        let changes: LedgerEntryChanges =
+            vec![LedgerEntryChange::Updated(make_account_entry(1_000_000))]
+                .try_into()
+                .unwrap();
+
+        let result = delta.extend_from_changes(&changes);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("UPDATED"),
+            "Error should mention UPDATED"
+        );
+    }
+
+    #[test]
+    fn test_extend_from_changes_removed_without_state_errors() {
+        let mut delta = TxChangeLog::new(100);
+        let changes: LedgerEntryChanges = vec![LedgerEntryChange::Removed(make_account_key())]
+            .try_into()
+            .unwrap();
+
+        let result = delta.extend_from_changes(&changes);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("REMOVED"),
+            "Error should mention REMOVED"
         );
     }
 }
