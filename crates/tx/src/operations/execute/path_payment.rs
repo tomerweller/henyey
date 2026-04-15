@@ -241,7 +241,7 @@ pub(crate) fn execute_path_payment_strict_send(
     }
 
     let mut offers_claimed: Vec<ClaimAtom> = Vec::new();
-    let mut full_path: Vec<Asset> = op.path.iter().cloned().collect();
+    let mut full_path: Vec<Asset> = op.path.to_vec();
     full_path.push(op.dest_asset.clone());
 
     let mut send_asset = op.send_asset.clone();

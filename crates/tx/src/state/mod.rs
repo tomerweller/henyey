@@ -2185,7 +2185,7 @@ fn build_signer_sponsoring_ids(count: usize) -> VecM<SponsorshipDescriptor, 20> 
 }
 
 fn ensure_signer_sponsoring_ids(v2: &mut AccountEntryExtensionV2, signer_count: usize) {
-    let mut ids: Vec<SponsorshipDescriptor> = v2.signer_sponsoring_i_ds.iter().cloned().collect();
+    let mut ids: Vec<SponsorshipDescriptor> = v2.signer_sponsoring_i_ds.to_vec();
     if ids.len() < signer_count {
         ids.extend(std::iter::repeat(SponsorshipDescriptor(None)).take(signer_count - ids.len()));
     } else if ids.len() > signer_count {

@@ -314,8 +314,7 @@ impl LedgerStateManager {
         };
 
         // Remove the signer from the vec
-        let mut new_signers: Vec<stellar_xdr::curr::Signer> =
-            account.signers.iter().cloned().collect();
+        let mut new_signers: Vec<stellar_xdr::curr::Signer> = account.signers.to_vec();
         new_signers.remove(idx);
         account.signers = new_signers.try_into().unwrap_or_default();
 
@@ -380,8 +379,7 @@ impl LedgerStateManager {
                 if let AccountEntryExt::V1(v1) = &mut account.ext {
                     if let AccountEntryExtensionV1Ext::V2(v2) = &mut v1.ext {
                         if signer_index < v2.signer_sponsoring_i_ds.len() {
-                            let mut ids: Vec<_> =
-                                v2.signer_sponsoring_i_ds.iter().cloned().collect();
+                            let mut ids: Vec<_> = v2.signer_sponsoring_i_ds.to_vec();
                             ids.remove(signer_index);
                             v2.signer_sponsoring_i_ds = ids.try_into().unwrap_or_default();
                         }

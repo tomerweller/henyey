@@ -441,28 +441,45 @@ fn apply_meta_changes(meta: &TransactionMeta, delta: &mut TxChangeLog) -> Result
             }
         }
         TransactionMeta::V2(v2) => {
-            apply_ledger_entry_changes(&v2.tx_changes_before, delta)?;
-            for op_meta in v2.operations.iter() {
-                apply_ledger_entry_changes(&op_meta.changes, delta)?;
-            }
-            apply_ledger_entry_changes(&v2.tx_changes_after, delta)?;
+            apply_before_ops_after(
+                &v2.tx_changes_before,
+                v2.operations.iter().map(|op| &op.changes),
+                &v2.tx_changes_after,
+                delta,
+            )?;
         }
         TransactionMeta::V3(v3) => {
-            apply_ledger_entry_changes(&v3.tx_changes_before, delta)?;
-            for op_meta in v3.operations.iter() {
-                apply_ledger_entry_changes(&op_meta.changes, delta)?;
-            }
-            apply_ledger_entry_changes(&v3.tx_changes_after, delta)?;
+            apply_before_ops_after(
+                &v3.tx_changes_before,
+                v3.operations.iter().map(|op| &op.changes),
+                &v3.tx_changes_after,
+                delta,
+            )?;
         }
         TransactionMeta::V4(v4) => {
-            apply_ledger_entry_changes(&v4.tx_changes_before, delta)?;
-            for op_meta in v4.operations.iter() {
-                apply_ledger_entry_changes(&op_meta.changes, delta)?;
-            }
-            apply_ledger_entry_changes(&v4.tx_changes_after, delta)?;
+            apply_before_ops_after(
+                &v4.tx_changes_before,
+                v4.operations.iter().map(|op| &op.changes),
+                &v4.tx_changes_after,
+                delta,
+            )?;
         }
     }
 
+    Ok(())
+}
+
+fn apply_before_ops_after<'a>(
+    before: &LedgerEntryChanges,
+    op_changes: impl Iterator<Item = &'a LedgerEntryChanges>,
+    after: &LedgerEntryChanges,
+    delta: &mut TxChangeLog,
+) -> Result<()> {
+    apply_ledger_entry_changes(before, delta)?;
+    for changes in op_changes {
+        apply_ledger_entry_changes(changes, delta)?;
+    }
+    apply_ledger_entry_changes(after, delta)?;
     Ok(())
 }
 

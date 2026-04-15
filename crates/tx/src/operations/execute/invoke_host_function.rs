@@ -375,7 +375,7 @@ fn execute_contract_invocation(
     } = request;
 
     // Convert auth entries to a slice
-    let auth_entries: Vec<_> = op.auth.iter().cloned().collect();
+    let auth_entries: Vec<_> = op.auth.to_vec();
 
     if footprint_has_unrestored_archived_entries(
         state,

@@ -349,7 +349,7 @@ fn verify_ed25519_signed_payload(sig: &DecoratedSignature, signer: &Signer) -> b
 /// Creates a signer list from the account's explicit signers plus the master
 /// key (using the account's master weight from `thresholds[0]`).
 pub fn collect_signers_for_account(account: &stellar_xdr::curr::AccountEntry) -> Vec<Signer> {
-    let mut signers: Vec<Signer> = account.signers.iter().cloned().collect();
+    let mut signers: Vec<Signer> = account.signers.to_vec();
 
     // Add the master key as a signer with weight from thresholds[0]
     let master_weight = account.thresholds.0[0] as u32;

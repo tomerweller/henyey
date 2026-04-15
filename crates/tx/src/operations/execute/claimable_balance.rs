@@ -187,7 +187,7 @@ pub(crate) fn execute_create_claimable_balance(
     }
 
     // Convert any relative time predicates into absolute times.
-    let mut claimants: Vec<Claimant> = op.claimants.iter().cloned().collect();
+    let mut claimants: Vec<Claimant> = op.claimants.to_vec();
     for claimant in &mut claimants {
         let Claimant::ClaimantTypeV0(cv0) = claimant;
         update_predicate_for_apply(&mut cv0.predicate, context.close_time);

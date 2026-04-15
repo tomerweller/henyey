@@ -440,7 +440,7 @@ impl OpEventManager {
                     if (from_is_issuer && to_is_issuer) || (!from_is_issuer && !to_is_issuer) {
                         continue;
                     }
-                    let mut topics_vec: Vec<ScVal> = topics.iter().cloned().collect();
+                    let mut topics_vec: Vec<ScVal> = Vec::from(topics);
                     if from_is_issuer {
                         topics_vec[0] = make_symbol_scval("mint");
                         topics_vec.remove(1);
@@ -452,7 +452,7 @@ impl OpEventManager {
                 }
                 b"mint" | b"clawback" | b"set_authorized" => {
                     if topics.len() == 4 {
-                        let mut topics_vec: Vec<ScVal> = topics.iter().cloned().collect();
+                        let mut topics_vec: Vec<ScVal> = Vec::from(topics);
                         topics_vec.remove(1);
                         body.topics = topics_vec.try_into().unwrap_or_default();
                     }

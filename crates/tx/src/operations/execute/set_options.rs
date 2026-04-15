@@ -354,7 +354,7 @@ fn apply_signer_update(
     }
 
     let sponsor = sponsor_info.map(|info| info.sponsor_id.clone());
-    let mut signers_vec: Vec<Signer> = source_account.signers.iter().cloned().collect();
+    let mut signers_vec: Vec<Signer> = source_account.signers.to_vec();
     let has_v2 = matches!(
         source_account.ext,
         AccountEntryExt::V1(AccountEntryExtensionV1 {
@@ -366,7 +366,7 @@ fn apply_signer_update(
     let mut sponsoring_ids: Vec<SponsorshipDescriptor> =
         if let AccountEntryExt::V1(v1) = &source_account.ext {
             if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
-                v2.signer_sponsoring_i_ds.iter().cloned().collect()
+                v2.signer_sponsoring_i_ds.to_vec()
             } else {
                 Vec::new()
             }

@@ -492,8 +492,7 @@ fn set_signer_sponsor(
         .get_account_mut(account_id)
         .ok_or(TxError::SourceAccountNotFound)?;
     let ext = crate::state::ensure_account_ext_v2(account);
-    let mut sponsoring_ids: Vec<SponsorshipDescriptor> =
-        ext.signer_sponsoring_i_ds.iter().cloned().collect();
+    let mut sponsoring_ids: Vec<SponsorshipDescriptor> = ext.signer_sponsoring_i_ds.to_vec();
     if sponsoring_ids.len() <= pos {
         return Err(TxError::Internal(
             "signer sponsoring ids out of range".to_string(),
