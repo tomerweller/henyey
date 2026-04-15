@@ -10,15 +10,28 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::error::DbError;
 
 /// Extracts a `(host, port, PeerRecord)` tuple from a row.
+///
+/// Column order matches the SELECT in `load_peers()`:
+/// host(0), port(1), next_attempt(2), num_failures(3), type(4)
 fn peer_row(row: &Row<'_>) -> rusqlite::Result<(String, u16, PeerRecord)> {
-    let host: String = row.get(0)?;
-    let port: i64 = row.get(1)?;
-    let raw_type: i32 = row.get(4)?;
+    const COL_HOST: usize = 0;
+    const COL_PORT: usize = 1;
+    const COL_NEXT_ATTEMPT: usize = 2;
+    const COL_NUM_FAILURES: usize = 3;
+    const COL_TYPE: usize = 4;
+
+    let host: String = row.get(COL_HOST)?;
+    let port: i64 = row.get(COL_PORT)?;
+    let raw_type: i32 = row.get(COL_TYPE)?;
     let record = PeerRecord {
-        next_attempt: row.get(2)?,
-        num_failures: row.get::<_, i64>(3)? as u32,
+        next_attempt: row.get(COL_NEXT_ATTEMPT)?,
+        num_failures: row.get::<_, i64>(COL_NUM_FAILURES)? as u32,
         peer_type: StoredPeerType::try_from(raw_type).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Integer, e.into())
+            rusqlite::Error::FromSqlConversionFailure(
+                COL_TYPE,
+                rusqlite::types::Type::Integer,
+                e.into(),
+            )
         })?,
     };
     Ok((host, port as u16, record))

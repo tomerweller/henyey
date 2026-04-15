@@ -175,36 +175,51 @@ impl EventQueries for Connection {
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
 
+        // Column indices matching the SELECT:
+        // id(0), ledger(1), tx_idx(2), op_idx(3), tx_hash(4),
+        // contract_id(5), event_type(6), topic1..4(7..10), xdr(11), success(12)
+        const COL_ID: usize = 0;
+        const COL_LEDGER: usize = 1;
+        const COL_TX_INDEX: usize = 2;
+        const COL_OP_INDEX: usize = 3;
+        const COL_TX_HASH: usize = 4;
+        const COL_CONTRACT_ID: usize = 5;
+        const COL_EVENT_TYPE: usize = 6;
+        const COL_TOPIC_START: usize = 7;
+        const COL_TOPIC_END: usize = 10;
+        const COL_EVENT_XDR: usize = 11;
+        const COL_SUCCESS: usize = 12;
+
         let mut stmt = self.prepare(&sql)?;
         let rows = stmt.query_map(params_refs.as_slice(), |row| {
             let mut topics = Vec::new();
-            for i in 7..=10 {
+            for i in COL_TOPIC_START..=COL_TOPIC_END {
                 if let Some(t) = row.get::<_, Option<String>>(i)? {
                     topics.push(t);
                 }
             }
 
-            let in_success: i32 = row.get(12)?;
+            let in_success: i32 = row.get(COL_SUCCESS)?;
 
             Ok(EventRecord {
-                id: row.get(0)?,
-                ledger_seq: row.get(1)?,
-                tx_index: row.get(2)?,
-                op_index: row.get(3)?,
-                tx_hash: row.get(4)?,
-                contract_id: row.get(5)?,
+                id: row.get(COL_ID)?,
+                ledger_seq: row.get(COL_LEDGER)?,
+                tx_index: row.get(COL_TX_INDEX)?,
+                op_index: row.get(COL_OP_INDEX)?,
+                tx_hash: row.get(COL_TX_HASH)?,
+                contract_id: row.get(COL_CONTRACT_ID)?,
                 event_type: {
-                    let raw: i32 = row.get(6)?;
+                    let raw: i32 = row.get(COL_EVENT_TYPE)?;
                     ContractEventType::try_from(raw).map_err(|_| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            6,
+                            COL_EVENT_TYPE,
                             rusqlite::types::Type::Integer,
                             format!("invalid event type: {raw}").into(),
                         )
                     })?
                 },
                 topics,
-                event_xdr: row.get(11)?,
+                event_xdr: row.get(COL_EVENT_XDR)?,
                 in_successful_contract_call: in_success != 0,
             })
         })?;
