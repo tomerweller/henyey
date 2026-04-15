@@ -393,6 +393,14 @@ struct PeerLoopCtx<'a> {
     last_write: &'a mut Instant,
 }
 
+/// Read-only timing and message counters for timeout checks.
+struct PeerTimingInfo {
+    last_read: Instant,
+    last_write: Instant,
+    total_messages: u64,
+    scp_messages: u64,
+}
+
 /// Result from handling a received message — controls the peer loop's flow.
 enum RecvAction {
     /// Continue the loop normally.
@@ -508,11 +516,8 @@ impl OverlayManager {
     /// Returns `true` if the peer should be dropped.
     fn check_peer_timeouts(
         peer_id: &PeerId,
-        last_read: Instant,
-        last_write: Instant,
+        timing: &PeerTimingInfo,
         flow_control: &FlowControl,
-        total_messages: u64,
-        scp_messages: u64,
     ) -> bool {
         const PEER_TIMEOUT: Duration = Duration::from_secs(30);
         const PEER_STRAGGLER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -520,19 +525,19 @@ impl OverlayManager {
         const PEER_SEND_MODE_IDLE_TIMEOUT_SECS: u64 = 60;
 
         let now = Instant::now();
-        if now.duration_since(last_read) >= PEER_TIMEOUT
-            && now.duration_since(last_write) >= PEER_TIMEOUT
+        if now.duration_since(timing.last_read) >= PEER_TIMEOUT
+            && now.duration_since(timing.last_write) >= PEER_TIMEOUT
         {
             warn!(
                 "Dropping peer {} due to idle timeout (total_msgs={}, scp_msgs={})",
-                peer_id, total_messages, scp_messages
+                peer_id, timing.total_messages, timing.scp_messages
             );
             return true;
         }
-        if now.duration_since(last_write) >= PEER_STRAGGLER_TIMEOUT {
+        if now.duration_since(timing.last_write) >= PEER_STRAGGLER_TIMEOUT {
             warn!(
                 "Dropping peer {} due to straggler timeout (total_msgs={}, scp_msgs={})",
-                peer_id, total_messages, scp_messages
+                peer_id, timing.total_messages, timing.scp_messages
             );
             return true;
         }
@@ -907,7 +912,12 @@ impl OverlayManager {
 
                 // Periodic tasks: ping, timeout checks
                 _ = periodic_interval.tick() => {
-                    if Self::check_peer_timeouts(&peer_id, last_read, last_write, &flow_control, total_messages, scp_messages) {
+                    if Self::check_peer_timeouts(&peer_id, &PeerTimingInfo {
+                        last_read,
+                        last_write,
+                        total_messages,
+                        scp_messages,
+                    }, &flow_control) {
                         break;
                     }
 
