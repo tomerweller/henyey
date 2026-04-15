@@ -1287,28 +1287,14 @@ impl App {
             }
 
             StellarMessage::GetScpState(ledger_seq) => {
-                // Rate-limit GET_SCP_STATE requests per peer (spec §OVERLAY).
-                // Window = expected_ledger_close_time * MAX_SLOTS_TO_REMEMBER ≈ 60s.
-                // Max = GET_SCP_STATE_MAX_RATE (10) per window.
-                let close_time_secs = self.herder.ledger_close_time() as u64;
-                // MAX_SLOTS_TO_REMEMBER = checkpoint_frequency * 2
-                // (matches herder_config.max_externalized_slots / freq computation).
-                // stellar-core uses config.MAX_SLOTS_TO_REMEMBER which defaults to 12.
-                let max_slots = MAX_SLOTS_TO_REMEMBER;
-                let window = Duration::from_secs(close_time_secs * max_slots);
-                let allowed = {
-                    let mut map = self.scp_state_query_info.write().await;
-                    let info = map
-                        .entry(msg.from_peer.clone())
-                        .or_insert_with(QueryInfo::new);
-                    if info.allow(window, GET_SCP_STATE_MAX_RATE) {
-                        info.num_queries += 1;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if allowed {
+                if self
+                    .check_peer_rate_limit(
+                        &self.scp_state_query_info,
+                        &msg.from_peer,
+                        GET_SCP_STATE_MAX_RATE,
+                    )
+                    .await
+                {
                     tracing::debug!(ledger_seq, peer = %msg.from_peer, "Peer requested SCP state");
                     self.send_scp_state(&msg.from_peer, ledger_seq).await;
                 } else {
@@ -1317,25 +1303,12 @@ impl App {
             }
 
             StellarMessage::GetScpQuorumset(hash) => {
-                // Rate-limit GET_SCP_QUORUMSET requests per peer.
-                // Matches stellar-core's Peer::process(mQSetQueryInfo).
-                let close_time_secs = self.herder.ledger_close_time() as u64;
-                let max_slots = MAX_SLOTS_TO_REMEMBER;
-                let window = Duration::from_secs(close_time_secs * max_slots);
-                let max_rate = (window.as_secs() as u32) * QUERY_RESPONSE_MULTIPLIER;
-                let allowed = {
-                    let mut map = self.qset_query_info.write().await;
-                    let info = map
-                        .entry(msg.from_peer.clone())
-                        .or_insert_with(QueryInfo::new);
-                    if info.allow(window, max_rate) {
-                        info.num_queries += 1;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if allowed {
+                let max_rate =
+                    self.rate_limit_window().as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER;
+                if self
+                    .check_peer_rate_limit(&self.qset_query_info, &msg.from_peer, max_rate)
+                    .await
+                {
                     tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested quorum set");
                     self.send_quorum_set(&msg.from_peer, hash).await;
                 } else {
@@ -1406,25 +1379,12 @@ impl App {
             }
 
             StellarMessage::GetTxSet(hash) => {
-                // Rate-limit GET_TX_SET requests per peer.
-                // Matches stellar-core's Peer::process(mTxSetQueryInfo).
-                let close_time_secs = self.herder.ledger_close_time() as u64;
-                let max_slots = MAX_SLOTS_TO_REMEMBER;
-                let window = Duration::from_secs(close_time_secs * max_slots);
-                let max_rate = (window.as_secs() as u32) * QUERY_RESPONSE_MULTIPLIER;
-                let allowed = {
-                    let mut map = self.tx_set_query_info.write().await;
-                    let info = map
-                        .entry(msg.from_peer.clone())
-                        .or_insert_with(QueryInfo::new);
-                    if info.allow(window, max_rate) {
-                        info.num_queries += 1;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if allowed {
+                let max_rate =
+                    self.rate_limit_window().as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER;
+                if self
+                    .check_peer_rate_limit(&self.tx_set_query_info, &msg.from_peer, max_rate)
+                    .await
+                {
                     tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested TxSet");
                     self.send_tx_set(&msg.from_peer, &henyey_common::Hash256(hash.0))
                         .await;
@@ -1565,5 +1525,29 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Compute the standard per-peer rate-limit window.
+    fn rate_limit_window(&self) -> Duration {
+        let close_time_secs = self.herder.ledger_close_time() as u64;
+        Duration::from_secs(close_time_secs * MAX_SLOTS_TO_REMEMBER)
+    }
+
+    /// Check per-peer rate limit. Returns true if the request is allowed.
+    async fn check_peer_rate_limit(
+        &self,
+        map: &tokio::sync::RwLock<std::collections::HashMap<henyey_overlay::PeerId, QueryInfo>>,
+        peer: &henyey_overlay::PeerId,
+        max_rate: u32,
+    ) -> bool {
+        let window = self.rate_limit_window();
+        let mut guard = map.write().await;
+        let info = guard.entry(peer.clone()).or_insert_with(QueryInfo::new);
+        if info.allow(window, max_rate) {
+            info.num_queries += 1;
+            true
+        } else {
+            false
+        }
     }
 }
