@@ -35,9 +35,39 @@
 //! ```
 
 use std::cmp::Ordering;
+use std::fmt;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 use crate::math::is_representable_as_i64;
+
+/// Error type for checked Resource arithmetic operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceError {
+    /// The two Resources have different numbers of dimensions.
+    SizeMismatch { lhs: usize, rhs: usize },
+    /// Addition would overflow i64 in the given dimension.
+    Overflow { dimension: usize },
+    /// Subtraction would underflow (go negative) in the given dimension.
+    Underflow { dimension: usize },
+}
+
+impl fmt::Display for ResourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceError::SizeMismatch { lhs, rhs } => {
+                write!(f, "resource size mismatch: {} vs {}", lhs, rhs)
+            }
+            ResourceError::Overflow { dimension } => {
+                write!(f, "resource overflow in dimension {}", dimension)
+            }
+            ResourceError::Underflow { dimension } => {
+                write!(f, "resource underflow in dimension {}", dimension)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResourceError {}
 
 /// Number of resource dimensions for classic transactions (operations only).
 pub const NUM_CLASSIC_TX_RESOURCES: usize = 1;
@@ -203,7 +233,19 @@ impl Resource {
     }
 
     /// Returns `true` if adding `other` to this resource would not overflow.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and `other` have different numbers of dimensions
+    /// (matches stellar-core's `releaseAssert`).
     pub fn can_add(&self, other: &Resource) -> bool {
+        assert_eq!(
+            self.values.len(),
+            other.values.len(),
+            "Resource::can_add size mismatch: {} vs {}",
+            self.values.len(),
+            other.values.len()
+        );
         self.values
             .iter()
             .zip(other.values.iter())
@@ -213,16 +255,75 @@ impl Resource {
     /// Returns `true` if all values in `self` are less than or equal to corresponding values in `other`.
     ///
     /// This is used to check if a resource usage fits within a limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and `other` have different numbers of dimensions
+    /// (matches stellar-core's `releaseAssert`).
     pub fn leq(&self, other: &Resource) -> bool {
+        assert_eq!(
+            self.values.len(),
+            other.values.len(),
+            "Resource::leq size mismatch: {} vs {}",
+            self.values.len(),
+            other.values.len()
+        );
         self.values
             .iter()
             .zip(other.values.iter())
             .all(|(a, b)| a <= b)
     }
+
+    /// Checked addition. Returns a new `Resource` or an error on size mismatch / overflow.
+    pub fn checked_add(&self, other: &Resource) -> Result<Resource, ResourceError> {
+        if self.values.len() != other.values.len() {
+            return Err(ResourceError::SizeMismatch {
+                lhs: self.values.len(),
+                rhs: other.values.len(),
+            });
+        }
+        let mut values = Vec::with_capacity(self.values.len());
+        for (i, (a, b)) in self.values.iter().zip(other.values.iter()).enumerate() {
+            values.push(
+                a.checked_add(*b)
+                    .ok_or(ResourceError::Overflow { dimension: i })?,
+            );
+        }
+        Ok(Resource { values })
+    }
+
+    /// Checked subtraction. Returns a new `Resource` or an error on size mismatch / underflow.
+    ///
+    /// Underflow means any dimension of `self` is less than the corresponding
+    /// dimension of `other` (result would be negative).
+    pub fn checked_sub(&self, other: &Resource) -> Result<Resource, ResourceError> {
+        if self.values.len() != other.values.len() {
+            return Err(ResourceError::SizeMismatch {
+                lhs: self.values.len(),
+                rhs: other.values.len(),
+            });
+        }
+        let mut values = Vec::with_capacity(self.values.len());
+        for (i, (a, b)) in self.values.iter().zip(other.values.iter()).enumerate() {
+            if *a < *b {
+                return Err(ResourceError::Underflow { dimension: i });
+            }
+            values.push(*a - *b);
+        }
+        Ok(Resource { values })
+    }
 }
 
 impl AddAssign for Resource {
+    /// # Panics
+    ///
+    /// Panics on size mismatch or if any dimension would overflow
+    /// (matches stellar-core's `releaseAssert(canAdd(other))`).
     fn add_assign(&mut self, other: Self) {
+        assert!(
+            self.can_add(&other),
+            "Resource addition overflow or size mismatch"
+        );
         for (a, b) in self.values.iter_mut().zip(other.values) {
             *a += b;
         }
@@ -230,8 +331,21 @@ impl AddAssign for Resource {
 }
 
 impl SubAssign for Resource {
+    /// # Panics
+    ///
+    /// Panics on size mismatch or if any dimension of `self` is less than
+    /// the corresponding dimension of `other` (matches stellar-core's
+    /// `releaseAssert(mResources[i] >= other.mResources[i])`).
     fn sub_assign(&mut self, other: Self) {
+        assert_eq!(
+            self.values.len(),
+            other.values.len(),
+            "Resource subtraction size mismatch: {} vs {}",
+            self.values.len(),
+            other.values.len()
+        );
         for (a, b) in self.values.iter_mut().zip(other.values) {
+            assert!(*a >= b, "Resource subtraction underflow: {} < {}", *a, b);
             *a -= b;
         }
     }
@@ -257,6 +371,9 @@ impl Sub for Resource {
 
 impl PartialOrd for Resource {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self.values.len() != other.values.len() {
+            return None; // incomparable — different dimensions
+        }
         let all_le = self.leq(other);
         let all_ge = other.leq(self);
         if all_le && all_ge {
@@ -274,14 +391,38 @@ impl PartialOrd for Resource {
 /// Returns `true` if any dimension of `lhs` is greater than the corresponding dimension of `rhs`.
 ///
 /// This is useful for detecting when a resource vector exceeds a limit in any dimension.
+///
+/// # Panics
+///
+/// Panics if `lhs` and `rhs` have different numbers of dimensions
+/// (matches stellar-core's `releaseAssert`).
 pub fn any_greater(lhs: &Resource, rhs: &Resource) -> bool {
+    assert_eq!(
+        lhs.values.len(),
+        rhs.values.len(),
+        "any_greater size mismatch: {} vs {}",
+        lhs.values.len(),
+        rhs.values.len()
+    );
     lhs.values.iter().zip(rhs.values.iter()).any(|(a, b)| a > b)
 }
 
 /// Subtracts `rhs` from `lhs`, clamping each dimension to a minimum of 0.
 ///
 /// This is useful for computing remaining capacity after deducting usage.
+///
+/// # Panics
+///
+/// Panics if `lhs` and `rhs` have different numbers of dimensions
+/// (matches stellar-core's `releaseAssert`).
 pub fn subtract_non_negative(lhs: &Resource, rhs: &Resource) -> Resource {
+    assert_eq!(
+        lhs.values.len(),
+        rhs.values.len(),
+        "subtract_non_negative size mismatch: {} vs {}",
+        lhs.values.len(),
+        rhs.values.len()
+    );
     Resource::new(
         lhs.values
             .iter()
@@ -550,5 +691,156 @@ mod tests {
         let divided = big_divide_resource(&r, 3, 2, Rounding::Down).unwrap();
         assert_eq!(divided.get_val(ResourceType::Operations), 150);
         assert_eq!(divided.get_val(ResourceType::Instructions), 300);
+    }
+
+    // ── Hardened operator tests (parity with stellar-core releaseAssert) ──
+
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn test_add_assign_overflow_panics() {
+        let mut a = Resource::new(vec![i64::MAX, 0]);
+        let b = Resource::new(vec![1, 0]);
+        a += b;
+    }
+
+    #[test]
+    #[should_panic(expected = "underflow")]
+    fn test_sub_assign_underflow_panics() {
+        let mut a = Resource::new(vec![0, 5]);
+        let b = Resource::new(vec![1, 0]);
+        a -= b;
+    }
+
+    #[test]
+    #[should_panic(expected = "size mismatch")]
+    fn test_add_assign_size_mismatch_panics() {
+        let mut a = Resource::new(vec![1, 2]);
+        let b = Resource::make_empty_soroban();
+        a += b;
+    }
+
+    #[test]
+    #[should_panic(expected = "size mismatch")]
+    fn test_sub_assign_size_mismatch_panics() {
+        let mut a = Resource::new(vec![1, 2]);
+        let b = Resource::make_empty_soroban();
+        a -= b;
+    }
+
+    #[test]
+    #[should_panic(expected = "size mismatch")]
+    fn test_can_add_size_mismatch_panics() {
+        let a = Resource::new(vec![1, 2]);
+        let b = Resource::make_empty_soroban();
+        a.can_add(&b);
+    }
+
+    #[test]
+    #[should_panic(expected = "size mismatch")]
+    fn test_leq_size_mismatch_panics() {
+        let a = Resource::new(vec![1, 2]);
+        let b = Resource::make_empty_soroban();
+        a.leq(&b);
+    }
+
+    #[test]
+    #[should_panic(expected = "size mismatch")]
+    fn test_any_greater_size_mismatch_panics() {
+        let a = Resource::new(vec![1, 2]);
+        let b = Resource::make_empty_soroban();
+        any_greater(&a, &b);
+    }
+
+    #[test]
+    #[should_panic(expected = "size mismatch")]
+    fn test_subtract_non_negative_size_mismatch_panics() {
+        let a = Resource::new(vec![1, 2]);
+        let b = Resource::make_empty_soroban();
+        subtract_non_negative(&a, &b);
+    }
+
+    #[test]
+    fn test_partial_ord_size_mismatch_returns_none() {
+        let a = Resource::new(vec![1, 2]);
+        let b = Resource::make_empty_soroban();
+        assert_eq!(a.partial_cmp(&b), None);
+    }
+
+    #[test]
+    fn test_add_assign_valid() {
+        let mut a = Resource::new(vec![10, 20]);
+        let b = Resource::new(vec![5, 3]);
+        a += b;
+        assert_eq!(a.get_val(ResourceType::Operations), 15);
+        assert_eq!(a.get_val(ResourceType::Instructions), 23);
+    }
+
+    #[test]
+    fn test_sub_assign_valid() {
+        let mut a = Resource::new(vec![10, 20]);
+        let b = Resource::new(vec![5, 3]);
+        a -= b;
+        assert_eq!(a.get_val(ResourceType::Operations), 5);
+        assert_eq!(a.get_val(ResourceType::Instructions), 17);
+    }
+
+    #[test]
+    fn test_sub_assign_to_zero() {
+        let mut a = Resource::new(vec![10, 20]);
+        let b = Resource::new(vec![10, 20]);
+        a -= b;
+        assert!(a.is_zero());
+    }
+
+    // ── checked_add / checked_sub tests ──
+
+    #[test]
+    fn test_checked_add_valid() {
+        let a = Resource::new(vec![10, 20]);
+        let b = Resource::new(vec![5, 3]);
+        let result = a.checked_add(&b).unwrap();
+        assert_eq!(result.get_val(ResourceType::Operations), 15);
+        assert_eq!(result.get_val(ResourceType::Instructions), 23);
+    }
+
+    #[test]
+    fn test_checked_add_overflow() {
+        let a = Resource::new(vec![i64::MAX, 0]);
+        let b = Resource::new(vec![1, 0]);
+        let err = a.checked_add(&b).unwrap_err();
+        assert_eq!(err, ResourceError::Overflow { dimension: 0 });
+    }
+
+    #[test]
+    fn test_checked_add_size_mismatch() {
+        let a = Resource::new(vec![1, 2]);
+        let b = Resource::make_empty_soroban();
+        let err = a.checked_add(&b).unwrap_err();
+        assert_eq!(err, ResourceError::SizeMismatch { lhs: 2, rhs: 7 });
+    }
+
+    #[test]
+    fn test_checked_sub_valid() {
+        let a = Resource::new(vec![10, 20]);
+        let b = Resource::new(vec![5, 3]);
+        let result = a.checked_sub(&b).unwrap();
+        assert_eq!(result.get_val(ResourceType::Operations), 5);
+        assert_eq!(result.get_val(ResourceType::Instructions), 17);
+    }
+
+    #[test]
+    fn test_checked_sub_underflow() {
+        let a = Resource::new(vec![0, 5]);
+        let b = Resource::new(vec![1, 0]);
+        let err = a.checked_sub(&b).unwrap_err();
+        assert_eq!(err, ResourceError::Underflow { dimension: 0 });
+    }
+
+    #[test]
+    fn test_checked_sub_size_mismatch() {
+        let a = Resource::new(vec![1, 2]);
+        let b = Resource::make_empty_soroban();
+        let err = a.checked_sub(&b).unwrap_err();
+        assert_eq!(err, ResourceError::SizeMismatch { lhs: 2, rhs: 7 });
     }
 }

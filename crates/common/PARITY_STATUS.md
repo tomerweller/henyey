@@ -13,7 +13,7 @@
 | Hash and ledger key utilities | Full | Hash xor, zero-check, key extraction implemented |
 | Asset and balance helpers | Partial | `getIssuer`/`isIssuer` not fully generic across all XDR asset variants |
 | Numeric helpers | Full | 64-bit and 128-bit helpers match mapped APIs |
-| Resource accounting | Partial | `anyLessThan()` and `limitTo()` missing |
+| Resource accounting | Partial | Checked arithmetic with assert-on-violation matching stellar-core `releaseAssert`; `anyLessThan()` and `limitTo()` missing |
 | Metadata normalization | Partial | `TransactionMeta` only; `LedgerCloseMeta` normalization missing |
 | XDR frame streams | Partial | `readPage()` missing |
 | Durable filesystem rename | Full | Crash-safe rename implemented |
@@ -228,9 +228,9 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rationale**: The crate implements only the stream operations current Rust callers need.
 
 3. **Resource arithmetic**
-   - **stellar-core**: Uses friend functions and operators on a small utility class.
-   - **Rust**: Uses trait impls (`Add`, `Sub`, `PartialOrd`) and free helper functions.
-   - **Rationale**: Trait-based arithmetic is the idiomatic Rust equivalent.
+   - **stellar-core**: Uses friend functions and operators on a small utility class. All operators assert preconditions (`releaseAssert` on overflow, underflow, and size mismatch).
+   - **Rust**: Uses trait impls (`Add`, `Sub`, `PartialOrd`) and free helper functions. `AddAssign`/`SubAssign` assert on overflow/underflow/size-mismatch matching stellar-core. `checked_add`/`checked_sub` return `Result` for callers that need fallible arithmetic.
+   - **Rationale**: Trait-based arithmetic is the idiomatic Rust equivalent; assert-on-violation mirrors upstream `releaseAssert` semantics.
 
 4. **Filesystem utilities**
    - **stellar-core**: Centralizes many helpers in the `fs` namespace (lock, mkpath, findfiles, hexStr, etc.).
@@ -246,7 +246,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Balance helpers | 1 TEST_CASE | 1 `#[test]` | `add_balance()` behavior is covered |
+| Balance helpers | 1 TEST_CASE | 13 `#[test]` | Direction guards, overflow, underflow, and liability tests |
 | Big divide and roots | 4 TEST_CASE / 9 SECTION | 15 `#[test]` | Good coverage for 64-bit and 128-bit math |
 | Uint128 helpers | 3 TEST_CASE / 6 SECTION | 15 `#[test]` | Rust covers the ported numeric128 helpers |
 | XDR stream I/O | 2 TEST_CASE / 3 SECTION | 13 `#[test]` | Roundtrip and durable-write coverage is stronger than upstream |
@@ -254,7 +254,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Filesystem rename | 4 TEST_CASE | 3 `#[test]` | Durable rename happy-path and error cases covered |
 | Protocol version | — | 4 `#[test]` | Rust has dedicated version comparison tests |
 | Asset validation | — | 11 `#[test]` | Comprehensive asset/issuer/balance/code tests |
-| Resource accounting | — | 13 `#[test]` | Arithmetic, scaling, and display tests |
+| Resource accounting | — | 31 `#[test]` | Arithmetic, scaling, overflow/underflow assertions, checked methods, and display tests |
 | Types/Hash | — | 8 `#[test]` | Hash creation, hex conversion, XOR, entry_to_key |
 | Version string | — | 5 `#[test]` | Version format and protocol invariant |
 | Memory estimation | — | 5 `#[test]` | Heap estimation helpers |

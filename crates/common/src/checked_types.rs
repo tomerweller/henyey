@@ -231,10 +231,16 @@ pub fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
 
 /// Credit `delta` to an account's native balance.
 ///
-/// Returns `BalanceError::Overflow` if the addition overflows, or
+/// `delta` must be non-negative (use [`sub_account_balance`] for debits).
+///
+/// Returns `BalanceError::Underflow` if `delta` is negative,
+/// `BalanceError::Overflow` if the addition overflows, or
 /// `BalanceError::LiabilityViolation` if the new balance would violate
 /// the buying liability constraint.
 pub fn add_account_balance(account: &mut AccountEntry, delta: i64) -> Result<(), BalanceError> {
+    if delta < 0 {
+        return Err(BalanceError::Underflow);
+    }
     let new_balance = CheckedAmount::new(account.balance)
         .checked_add(delta)
         .ok_or(BalanceError::Overflow)?;
@@ -251,10 +257,16 @@ pub fn add_account_balance(account: &mut AccountEntry, delta: i64) -> Result<(),
 
 /// Credit `delta` to a trustline balance.
 ///
-/// Returns `BalanceError::ExceedsLimit` if the new balance would exceed the
+/// `delta` must be non-negative (use [`sub_trustline_balance`] for debits).
+///
+/// Returns `BalanceError::Underflow` if `delta` is negative,
+/// `BalanceError::ExceedsLimit` if the new balance would exceed the
 /// trustline limit, or `BalanceError::LiabilityViolation` if it would violate
 /// the buying liability constraint.
 pub fn add_trustline_balance(tl: &mut TrustLineEntry, delta: i64) -> Result<(), BalanceError> {
+    if delta < 0 {
+        return Err(BalanceError::Underflow);
+    }
     let headroom = CheckedAmount::new(tl.limit)
         .checked_sub(tl.balance)
         .ok_or(BalanceError::Overflow)?;
@@ -277,9 +289,15 @@ pub fn add_trustline_balance(tl: &mut TrustLineEntry, delta: i64) -> Result<(), 
 
 /// Subtract `amount` from an account's native balance.
 ///
-/// Returns `BalanceError::Underflow` if the result would be negative.
+/// `amount` must be non-negative (use [`add_account_balance`] for credits).
+///
+/// Returns `BalanceError::Overflow` if `amount` is negative,
+/// `BalanceError::Underflow` if the result would be negative.
 /// No liability checks — used for debits where the caller has already validated.
 pub fn sub_account_balance(account: &mut AccountEntry, amount: i64) -> Result<(), BalanceError> {
+    if amount < 0 {
+        return Err(BalanceError::Overflow);
+    }
     let new_balance = CheckedAmount::new(account.balance)
         .checked_sub(amount)
         .ok_or(BalanceError::Underflow)?;
@@ -292,9 +310,15 @@ pub fn sub_account_balance(account: &mut AccountEntry, amount: i64) -> Result<()
 
 /// Subtract `amount` from a trustline balance.
 ///
-/// Returns `BalanceError::Underflow` if the result would be negative.
+/// `amount` must be non-negative (use [`add_trustline_balance`] for credits).
+///
+/// Returns `BalanceError::Overflow` if `amount` is negative,
+/// `BalanceError::Underflow` if the result would be negative.
 /// No liability or limit checks.
 pub fn sub_trustline_balance(tl: &mut TrustLineEntry, amount: i64) -> Result<(), BalanceError> {
+    if amount < 0 {
+        return Err(BalanceError::Overflow);
+    }
     let new_balance = CheckedAmount::new(tl.balance)
         .checked_sub(amount)
         .ok_or(BalanceError::Underflow)?;
@@ -530,5 +554,123 @@ mod tests {
             "liability constraint violated"
         );
         assert_eq!(BalanceError::ExceedsLimit.to_string(), "exceeds limit");
+    }
+
+    // ── Balance direction guard tests ──
+
+    fn make_account(balance: i64) -> AccountEntry {
+        use stellar_xdr::curr::*;
+        AccountEntry {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+            balance,
+            seq_num: SequenceNumber(0),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: Default::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: Default::default(),
+            ext: AccountEntryExt::V0,
+        }
+    }
+
+    fn make_trustline(balance: i64, limit: i64) -> TrustLineEntry {
+        use stellar_xdr::curr::*;
+        TrustLineEntry {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32]))),
+            }),
+            balance,
+            limit,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_add_account_balance_rejects_negative_delta() {
+        let mut acc = make_account(100);
+        assert_eq!(
+            add_account_balance(&mut acc, -1),
+            Err(BalanceError::Underflow)
+        );
+        assert_eq!(acc.balance, 100); // unchanged
+    }
+
+    #[test]
+    fn test_add_account_balance_positive_delta_ok() {
+        let mut acc = make_account(100);
+        assert!(add_account_balance(&mut acc, 50).is_ok());
+        assert_eq!(acc.balance, 150);
+    }
+
+    #[test]
+    fn test_add_account_balance_zero_delta_ok() {
+        let mut acc = make_account(100);
+        assert!(add_account_balance(&mut acc, 0).is_ok());
+        assert_eq!(acc.balance, 100);
+    }
+
+    #[test]
+    fn test_add_trustline_balance_rejects_negative_delta() {
+        let mut tl = make_trustline(100, 1000);
+        assert_eq!(
+            add_trustline_balance(&mut tl, -1),
+            Err(BalanceError::Underflow)
+        );
+        assert_eq!(tl.balance, 100); // unchanged
+    }
+
+    #[test]
+    fn test_add_trustline_balance_positive_delta_ok() {
+        let mut tl = make_trustline(100, 1000);
+        assert!(add_trustline_balance(&mut tl, 50).is_ok());
+        assert_eq!(tl.balance, 150);
+    }
+
+    #[test]
+    fn test_sub_account_balance_rejects_negative_amount() {
+        let mut acc = make_account(100);
+        assert_eq!(
+            sub_account_balance(&mut acc, -1),
+            Err(BalanceError::Overflow)
+        );
+        assert_eq!(acc.balance, 100); // unchanged
+    }
+
+    #[test]
+    fn test_sub_account_balance_positive_amount_ok() {
+        let mut acc = make_account(100);
+        assert!(sub_account_balance(&mut acc, 50).is_ok());
+        assert_eq!(acc.balance, 50);
+    }
+
+    #[test]
+    fn test_sub_account_balance_exceeds_balance() {
+        let mut acc = make_account(50);
+        assert_eq!(
+            sub_account_balance(&mut acc, 100),
+            Err(BalanceError::Underflow)
+        );
+        assert_eq!(acc.balance, 50); // unchanged
+    }
+
+    #[test]
+    fn test_sub_trustline_balance_rejects_negative_amount() {
+        let mut tl = make_trustline(100, 1000);
+        assert_eq!(
+            sub_trustline_balance(&mut tl, -1),
+            Err(BalanceError::Overflow)
+        );
+        assert_eq!(tl.balance, 100); // unchanged
+    }
+
+    #[test]
+    fn test_sub_trustline_balance_positive_amount_ok() {
+        let mut tl = make_trustline(100, 1000);
+        assert!(sub_trustline_balance(&mut tl, 50).is_ok());
+        assert_eq!(tl.balance, 50);
     }
 }
