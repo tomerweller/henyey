@@ -182,6 +182,10 @@ impl App {
         // In-progress background ledger close. Polled in the select loop.
         let mut pending_close: Option<PendingLedgerClose> = None;
 
+        // In-progress background persist (DB writes + bucket flush).
+        // Gated: next close won't start until persist completes.
+        let mut pending_persist: Option<PendingPersist> = None;
+
         // Maximum messages to drain from SCP/fetch channels per tick.
         // On mainnet with 24+ validators, SCP messages can arrive faster
         // than they're processed.  An unbounded drain starves everything
@@ -218,26 +222,25 @@ impl App {
                     self.set_phase(6); // 6 = pending_close
                     tracing::debug!(select_iteration, "BRANCH: pending_close completed");
                     let pending = pending_close.take().unwrap();
-                    let success = self.handle_close_complete(pending, join_result).await;
-                    // Chain next close if successful.
+                    let (success, persist_task) = self.handle_close_complete(pending, join_result).await;
+                    // Chain persist and next close if successful.
                     if success {
+                        // Track the deferred persist task. The next close
+                        // will be started when persist completes (see the
+                        // pending_persist branch below).
+                        if let Some(pt) = persist_task {
+                            pending_persist = Some(pt);
+                        }
+
                         // Publish queued history checkpoints (if any).
-                        // This runs synchronously to ensure archives are up to date
-                        // before captive core instances need them.
                         self.maybe_publish_history().await;
 
-                        // Trigger consensus immediately after a successful close, matching
-                        // stellar-core's triggerNextLedger() call inside closeLedger().
+                        // Trigger consensus immediately after a successful close.
                         if self.is_validator {
                             self.try_trigger_consensus().await;
                         }
 
-                        // Before trying the next close, drain SCP + fetch response channels.
-                        // During rapid buffered closes the select! loop may not poll these
-                        // channels frequently enough, so EXTERNALIZEs and TxSet responses
-                        // can sit unprocessed.  Draining here ensures we have the latest
-                        // network state before deciding whether another close is ready.
-                        // Bounded to avoid starvation on high-traffic mainnet.
+                        // Drain SCP + fetch response channels.
                         for _ in 0..MAX_DRAIN_PER_TICK {
                             match scp_message_rx.try_recv() {
                                 Ok(scp_msg) => self.handle_overlay_message(scp_msg).await,
@@ -256,34 +259,24 @@ impl App {
                             }
                         }
 
-                        pending_close = self.try_start_ledger_close().await;
+                        // Don't start the next close here — wait for
+                        // pending_persist to complete first. This ensures
+                        // the DB has the previous ledger's data before the
+                        // next close references it.
+                        //
+                        // If there's no persist task (shouldn't happen on
+                        // success, but defensive), start next close now.
+                        if pending_persist.is_none() {
+                            pending_close = self.try_start_ledger_close().await;
+                        }
 
-                        // If no more buffered ledgers to close, we just finished a rapid
-                        // close cycle.
-                        if pending_close.is_none() {
+                        // If no close is pending AND no persist is pending,
+                        // we just finished a rapid close cycle.
+                        if pending_close.is_none() && pending_persist.is_none() {
                             let current_ledger = self.current_ledger_seq();
-
-                            // Reset last_externalized_at so the heartbeat stall detector
-                            // doesn't fire prematurely based on the timestamp of the
-                            // EXTERNALIZE that was received 8-10s ago during rapid closes.
                             *self.last_externalized_at.write().await = self.clock.now();
-
-                            // Reset tx_set tracking so fresh requests can be made for
-                            // buffered entries that still need tx_sets. Don't evict
-                            // the entries themselves — they may be closeable once
-                            // their tx_sets arrive from peers.
                             self.reset_tx_set_tracking().await;
-
-                            // Also reset consensus stuck state since we just successfully
-                            // closed ledgers — we're not stuck.
                             *self.consensus_stuck_state.write().await = None;
-
-                            // Always request SCP state from peers after a rapid close
-                            // cycle ends. The next slot's EXTERNALIZE was likely
-                            // broadcast seconds ago and peers won't re-send it unless
-                            // asked. Without this, the node waits for the "next natural
-                            // EXTERNALIZE" which arrives for slot N+7 (where the network
-                            // is now), not N+1 — creating a gap that triggers catchup.
                             let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
                             tracing::info!(
                                 current_ledger,
@@ -368,6 +361,53 @@ impl App {
                     // starts immediately rather than waiting for the next tick.
                     if pending_close.is_none() {
                         pending_close = self.try_start_ledger_close().await;
+                    }
+                }
+
+                // Await deferred persist completion.
+                // Once the DB writes and bucket flush finish, we can start
+                // the next ledger close.
+                persist_result = async {
+                    match pending_persist.as_mut() {
+                        Some(p) => (&mut p.handle).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let persist = pending_persist.take().unwrap();
+                    if let Err(e) = persist_result {
+                        tracing::error!(
+                            error = %e,
+                            ledger_seq = persist.ledger_seq,
+                            "Persist task panicked"
+                        );
+                        std::process::abort();
+                    }
+                    tracing::debug!(
+                        ledger_seq = persist.ledger_seq,
+                        "Persist completed, starting next close"
+                    );
+
+                    // Now start the next close (persist is done, DB is up to date).
+                    if pending_close.is_none() {
+                        pending_close = self.try_start_ledger_close().await;
+
+                        // If no more closes ready, rapid close cycle ended.
+                        if pending_close.is_none() {
+                            let current_ledger = self.current_ledger_seq();
+                            *self.last_externalized_at.write().await = self.clock.now();
+                            self.reset_tx_set_tracking().await;
+                            *self.consensus_stuck_state.write().await = None;
+                            let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+                            tracing::info!(
+                                current_ledger,
+                                latest_ext,
+                                "Rapid close cycle ended (post-persist); requesting SCP state"
+                            );
+                            if let Some(overlay) = self.overlay().await {
+                                let _ = overlay.request_scp_state(current_ledger).await;
+                            }
+                            *self.last_scp_state_request_at.write().await = self.clock.now();
+                        }
                     }
                 }
 

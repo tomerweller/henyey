@@ -324,6 +324,19 @@ pub(super) struct PendingLedgerClose {
     pub upgrades: Vec<UpgradeType>,
 }
 
+/// State for a deferred ledger persist running on a background task.
+///
+/// Created by [`App::handle_close_complete`] and tracked in the main
+/// event loop. The next ledger close is gated on persist completion
+/// to ensure the DB has the previous ledger's data before the next
+/// close references it.
+pub(super) struct PendingPersist {
+    /// Join handle for the spawned async task that runs the persist.
+    pub handle: tokio::task::JoinHandle<()>,
+    /// Sequence number being persisted (for logging).
+    pub ledger_seq: u32,
+}
+
 #[derive(Debug)]
 pub(super) struct TxAdvertHistory {
     entries: HashMap<Hash256, u32>,

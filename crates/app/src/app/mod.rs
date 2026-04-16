@@ -63,9 +63,7 @@ use henyey_common::protocol::{
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::queries::StateQueries;
 use henyey_db::schema::state_keys;
-use henyey_db::{
-    BucketListQueries, EventQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, ScpQueries,
-};
+use henyey_db::LedgerQueries;
 use henyey_herder::{
     drift_tracker::CloseTimeDriftTracker,
     flow_control::compute_max_tx_size,
@@ -2416,7 +2414,7 @@ mod tests {
 
         let mut pending = pending;
         let join_result = (&mut pending.handle).await;
-        let success = app.handle_close_complete(pending, join_result).await;
+        let (success, _persist) = app.handle_close_complete(pending, join_result).await;
 
         assert!(!success, "should return false on error");
         assert!(
@@ -2458,7 +2456,7 @@ mod tests {
 
         let mut pending = pending;
         let join_result = (&mut pending.handle).await;
-        let success = app.handle_close_complete(pending, join_result).await;
+        let (success, _persist) = app.handle_close_complete(pending, join_result).await;
 
         assert!(!success, "should return false on panic");
         assert!(
@@ -2516,7 +2514,7 @@ mod tests {
 
         let mut pending = pending;
         let join_result = (&mut pending.handle).await;
-        let success = app.handle_close_complete(pending, join_result).await;
+        let (success, _persist) = app.handle_close_complete(pending, join_result).await;
 
         assert!(!success);
         // Buffer should have been cleared due to hash mismatch.
