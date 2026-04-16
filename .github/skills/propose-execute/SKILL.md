@@ -331,7 +331,7 @@ Final verdict: **SOUND**
 {bullet list of changes}
 
 ### What was deferred (if any)
-{bullet list of follow-up items}
+{bullet list of follow-up items with issue links}
 
 ---
 
@@ -339,6 +339,44 @@ Final verdict: **SOUND**
 DONE_EOF
 )"
 ```
+
+### 5b: File Issues for Deferred Work
+
+If the completion summary includes deferred items (from the "What was deferred"
+section, reviewer recommendations, or remaining concerns noted during
+implementation), create a GitHub issue for **each** deferred item:
+
+```bash
+gh issue create \
+  --title "<short imperative title>" \
+  --body "Follow-up from #$ISSUE (<original issue title>).
+
+## Context
+<why this was deferred — e.g., out of scope, needs design, blocked on X>
+
+## What needs to happen
+<concrete description of the work>
+
+## References
+- Parent issue: #$ISSUE
+- Implementation commit(s): <commit hashes>" \
+  --label "follow-up"
+```
+
+Guidelines for deferred-work issues:
+- One issue per distinct work item — do not bundle unrelated items.
+- Title should be actionable and imperative (e.g., "Add integration tests for
+  RPC semaphore rejection", not "Testing gaps").
+- Include enough context that someone unfamiliar with the parent issue can
+  understand and execute the work.
+- Reference the parent issue and implementation commits.
+- Add relevant labels beyond `follow-up` (e.g., `testing`, `refactor`,
+  crate-specific labels).
+- If a deferred item is trivial or speculative, skip it — only file issues for
+  work that genuinely should be done.
+
+Update the completion comment's "What was deferred" section to include the
+newly created issue links (edit the comment or post a follow-up).
 
 Print a summary to the terminal:
 
@@ -348,6 +386,7 @@ Issue:              #$ISSUE
 Proposal rounds:    {proposal_round} / {max_proposal_rounds}
 Review rounds:      {review_round} / {max_review_rounds}
 Commits:            {count}
+Deferred issues:    {count} filed
 Final verdict:      SOUND
 ═════════════════════════════════
 ```
