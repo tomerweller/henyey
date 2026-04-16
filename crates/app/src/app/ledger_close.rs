@@ -1893,45 +1893,17 @@ impl App {
         // deadlock from awaiting spawn_blocking inline in the select! loop.
         let persist_task = match persist_data {
             Ok(data) => {
-                let db = self.db.clone();
-                let ledger_manager = self.ledger_manager.clone();
-                let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
                 let ledger_seq = pending.ledger_seq;
-                let handle = tokio::spawn(async move {
-                    // Persist hot archive buckets to disk (file I/O) and
-                    // flush pending bucket persist (thread join) — both
-                    // on spawn_blocking to avoid stalling the event loop.
-                    super::persist::flush_hot_archive_and_buckets(&ledger_manager, bucket_dir)
-                        .await;
-
-                    // SQLite transaction with all ledger close data.
-                    let db2 = db.clone();
-                    if let Err(e) = tokio::task::spawn_blocking(move || data.write_to_db(&db2))
-                        .await
-                        .unwrap_or_else(|e| Err(anyhow::anyhow!("persist task panicked: {}", e)))
-                    {
-                        super::persist::fatal_persist_error("ledger close DB write", &e);
-                    }
-
-                    // LedgerCloseMeta for RPC (non-fatal).
-                    if let Some(meta) = meta_xdr {
-                        let db3 = db.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            if let Err(e) = db3.store_ledger_close_meta(ledger_seq, &meta) {
-                                tracing::warn!(
-                                    error = %e,
-                                    ledger_seq,
-                                    "Failed to persist LedgerCloseMeta"
-                                );
-                            }
-                        })
-                        .await;
-                    }
-                });
-                Some(PendingPersist {
-                    handle,
-                    ledger_seq: pending.ledger_seq,
-                })
+                Some(super::persist::spawn_persist_task(
+                    super::persist::PersistJob::LedgerClose {
+                        write_fn: Box::new(move |db| data.write_to_db(db)),
+                        meta_xdr: meta_xdr,
+                        db: self.db.clone(),
+                        ledger_manager: self.ledger_manager.clone(),
+                        bucket_dir: self.bucket_manager.bucket_dir().to_path_buf(),
+                    },
+                    ledger_seq,
+                ))
             }
             Err(err) => {
                 super::persist::fatal_persist_error("prepare ledger persist data", &err);

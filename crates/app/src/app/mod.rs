@@ -181,6 +181,7 @@ mod tx_flooding;
 mod types;
 mod upgrades;
 
+pub(crate) use persist::CatchupPersistData;
 use types::*;
 pub use types::{
     AppInfo, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary, ScpSlotSnapshot,

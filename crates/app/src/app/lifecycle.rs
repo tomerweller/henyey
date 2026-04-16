@@ -229,6 +229,10 @@ impl App {
                         // will be started when persist completes (see the
                         // pending_persist branch below).
                         if let Some(pt) = persist_task {
+                            debug_assert!(
+                                pending_persist.is_none(),
+                                "new close persist while previous persist still pending"
+                            );
                             pending_persist = Some(pt);
                         }
 
@@ -317,51 +321,20 @@ impl App {
                             // the EVENT LOOP (not from inside the catchup task),
                             // avoiding the spawn_blocking pool deadlock (#1713).
                             if let Some(persist_data) = result.persist_data {
-                                let db = self.db.clone();
-                                let lm = self.ledger_manager.clone();
                                 let seq = persist_data.header.ledger_seq;
-                                let persist_handle = tokio::spawn(async move {
-                                    super::persist::flush_bucket_persist(&lm).await;
-
-                                    // Catchup DB transaction (header + HAS + LCL).
-                                    let db2 = db.clone();
-                                    if let Err(e) = tokio::task::spawn_blocking(move || {
-                                        use henyey_db::queries::*;
-                                        db2.transaction(|conn| {
-                                            conn.store_ledger_header(
-                                                &persist_data.header,
-                                                &persist_data.header_xdr,
-                                            )?;
-                                            conn.set_state(
-                                                henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE,
-                                                &persist_data.has_json,
-                                            )?;
-                                            conn.set_last_closed_ledger(
-                                                persist_data.header.ledger_seq,
-                                            )?;
-                                            Ok(())
-                                        })
-                                    })
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        Err(henyey_db::DbError::Integrity(e.to_string()))
-                                    })
-                                    {
-                                        super::persist::fatal_persist_error(
-                                            "catchup DB write",
-                                            &e,
-                                        );
-                                    }
-
-                                    tracing::info!(
-                                        ledger_seq = seq,
-                                        "Catchup persist completed"
-                                    );
-                                });
-                                pending_persist = Some(PendingPersist {
-                                    handle: persist_handle,
-                                    ledger_seq: seq,
-                                });
+                                debug_assert!(
+                                    pending_persist.is_none(),
+                                    "new catchup persist while previous persist still pending"
+                                );
+                                pending_persist =
+                                    Some(super::persist::spawn_persist_task(
+                                        super::persist::PersistJob::Catchup {
+                                            data: Box::new(persist_data),
+                                            db: self.db.clone(),
+                                            ledger_manager: self.ledger_manager.clone(),
+                                        },
+                                        seq,
+                                    ));
                             }
                         }
                         Err(_) => {
