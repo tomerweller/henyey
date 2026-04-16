@@ -6,6 +6,7 @@ use stellar_xdr::curr::{Limits, WriteXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
+use crate::util;
 
 pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
     let ledger = ctx.app.ledger_summary();
@@ -21,17 +22,20 @@ pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcE
         .unwrap_or_default();
 
     // Load full LedgerCloseMeta from the database for metadataXdr.
-    let metadata_xdr = ctx
-        .app
-        .database()
-        .with_connection(|conn| {
+    let ledger_num = ledger.num;
+    let metadata_xdr = util::blocking_db(ctx, move |db| {
+        db.with_connection(|conn| {
             use henyey_db::LedgerCloseMetaQueries;
-            conn.load_ledger_close_meta(ledger.num)
+            conn.load_ledger_close_meta(ledger_num)
         })
-        .ok()
-        .flatten()
-        .map(|meta_bytes| BASE64.encode(&meta_bytes))
-        .unwrap_or_default();
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = ?e, "getLatestLedger DB error");
+        None
+    })
+    .map(|meta_bytes| BASE64.encode(&meta_bytes))
+    .unwrap_or_default();
 
     Ok(json!({
         "id": hash,

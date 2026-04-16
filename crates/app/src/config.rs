@@ -1000,6 +1000,21 @@ pub struct RpcConfig {
     /// Limits CPU/memory pressure from Soroban host execution.
     #[serde(default = "default_max_concurrent_simulations")]
     pub max_concurrent_simulations: u32,
+
+    /// Maximum number of concurrent request executions.
+    /// Requests beyond this limit receive an immediate `server_busy` error.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+
+    /// Request execution timeout in seconds for read-only methods.
+    /// `sendTransaction` is exempt (side-effectful).
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+
+    /// Maximum concurrent RPC database queries.
+    /// Should be ≤ the database connection pool size (10) to avoid contention.
+    #[serde(default = "default_rpc_db_concurrency")]
+    pub rpc_db_concurrency: usize,
 }
 
 impl Default for RpcConfig {
@@ -1010,7 +1025,26 @@ impl Default for RpcConfig {
             retention_window: default_rpc_retention_window(),
             max_healthy_ledger_latency_secs: default_max_healthy_ledger_latency(),
             max_concurrent_simulations: default_max_concurrent_simulations(),
+            max_concurrent_requests: default_max_concurrent_requests(),
+            request_timeout_secs: default_request_timeout_secs(),
+            rpc_db_concurrency: default_rpc_db_concurrency(),
         }
+    }
+}
+
+impl RpcConfig {
+    /// Validate config values at startup.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_concurrent_requests == 0 {
+            return Err("rpc.max_concurrent_requests must be > 0".to_string());
+        }
+        if self.request_timeout_secs == 0 {
+            return Err("rpc.request_timeout_secs must be > 0".to_string());
+        }
+        if self.rpc_db_concurrency == 0 {
+            return Err("rpc.rpc_db_concurrency must be > 0".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -1028,6 +1062,18 @@ fn default_max_healthy_ledger_latency() -> u64 {
 
 fn default_max_concurrent_simulations() -> u32 {
     10
+}
+
+fn default_max_concurrent_requests() -> usize {
+    64
+}
+
+fn default_request_timeout_secs() -> u64 {
+    30
+}
+
+fn default_rpc_db_concurrency() -> usize {
+    8
 }
 
 /// Build-time metadata populated by the binary crate's `build.rs`.
@@ -1519,6 +1565,13 @@ impl AppConfig {
             if let Err(err) = henyey_scp::is_quorum_set_sane(&quorum_set, true) {
                 anyhow::bail!("Invalid quorum set: {}", err);
             }
+        }
+
+        // Validate RPC config
+        if self.rpc.enabled {
+            self.rpc
+                .validate()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
 
         Ok(())

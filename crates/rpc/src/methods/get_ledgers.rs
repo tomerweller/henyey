@@ -23,7 +23,7 @@ pub async fn handle(
 ) -> Result<serde_json::Value, JsonRpcError> {
     let format = util::parse_format(&params)?;
 
-    let lctx = util::LedgerContext::from_app(&ctx.app);
+    let lctx = util::LedgerContext::from_app(ctx).await?;
 
     // Parse parameters
     let start_ledger = params
@@ -54,14 +54,17 @@ pub async fn handle(
     let end_ledger = lctx.latest_ledger + 1;
 
     // Query ledger close metas from database
-    let metas = ctx
-        .app
-        .database()
-        .with_connection(|conn| {
+    let metas = util::blocking_db(ctx, move |db| {
+        db.with_connection(|conn| {
             use henyey_db::LedgerCloseMetaQueries;
             conn.load_ledger_close_metas_in_range(effective_start, end_ledger, effective_limit)
         })
-        .map_err(|e| JsonRpcError::internal(format!("database error: {}", e)))?;
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = ?e, "get_ledgers DB error");
+        JsonRpcError::internal("database error")
+    })?;
 
     // Build response
     let mut ledgers = Vec::with_capacity(metas.len());
@@ -69,7 +72,7 @@ pub async fn handle(
 
     for (sequence, meta_bytes) in &metas {
         let lcm = LedgerCloseMeta::from_xdr(meta_bytes.as_slice(), Limits::none())
-            .map_err(|e| JsonRpcError::internal(format!("corrupt LedgerCloseMeta: {e}")))?;
+            .map_err(|e| JsonRpcError::internal_logged("corrupt ledger data", &e))?;
 
         let header_entry = util::ledger_header_entry(&lcm);
         let hash = hex::encode(header_entry.hash.0);

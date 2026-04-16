@@ -19,22 +19,36 @@ pub async fn handle(
 
     let format = util::parse_format(&params)?;
 
-    let lctx = util::LedgerContext::from_app(&ctx.app);
+    let lctx = util::LedgerContext::from_app(ctx).await?;
 
-    // Look up the transaction in the database
-    let tx_record = ctx
-        .app
-        .database()
-        .with_connection(|conn| {
-            use henyey_db::HistoryQueries;
-            conn.load_transaction(hash)
+    // Look up the transaction and its close time in a single blocking DB call
+    let hash_owned = hash.to_string();
+    let tx_record_with_time = util::blocking_db(ctx, move |db| {
+        db.with_connection(|conn| {
+            use henyey_db::{HistoryQueries, LedgerQueries};
+            let record = conn.load_transaction(&hash_owned)?;
+            match record {
+                Some(record) => {
+                    let close_time = conn
+                        .batch_close_times(&[record.ledger_seq])?
+                        .get(&record.ledger_seq)
+                        .copied()
+                        .unwrap_or(0);
+                    Ok(Some((record, close_time)))
+                }
+                None => Ok(None),
+            }
         })
-        .map_err(|e| JsonRpcError::internal(format!("database error: {}", e)))?;
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = ?e, "get_transaction DB error");
+        JsonRpcError::internal("database error")
+    })?;
 
-    match tx_record {
-        Some(record) => {
-            // Look up the ledger close time
-            let created_at = util::ledger_close_time(&ctx.app, record.ledger_seq).to_string();
+    match tx_record_with_time {
+        Some((record, close_time)) => {
+            let created_at = close_time.to_string();
 
             let mut obj = super::transaction_response::build_transaction_object(
                 &record,

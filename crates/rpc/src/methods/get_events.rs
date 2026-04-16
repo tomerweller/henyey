@@ -24,7 +24,7 @@ pub async fn handle(
 ) -> Result<serde_json::Value, JsonRpcError> {
     let format = util::parse_format(&params)?;
 
-    let lctx = util::LedgerContext::from_app(&ctx.app);
+    let lctx = util::LedgerContext::from_app(ctx).await?;
 
     let start_ledger = params
         .get("startLedger")
@@ -52,33 +52,45 @@ pub async fn handle(
         .and_then(|p| p.get("cursor"))
         .and_then(|v| v.as_str());
 
-    // Query events from database
-    let events = ctx
-        .app
-        .database()
-        .with_connection(|conn| {
-            use henyey_db::EventQueries;
-            conn.query_events(&henyey_db::EventQueryParams {
+    // Convert borrowed cursor to owned for the blocking closure
+    let cursor_owned = cursor.map(String::from);
+
+    // Query events and batch-load close times in a single blocking DB call
+    let (events, close_time_cache) = util::blocking_db(ctx, move |db| {
+        db.with_connection(|conn| {
+            use henyey_db::{EventQueries, LedgerQueries};
+            let events = conn.query_events(&henyey_db::EventQueryParams {
                 start_ledger,
                 end_ledger,
                 event_type,
                 contract_ids: &contract_ids,
                 topics: &topic_filters,
-                cursor,
+                cursor: cursor_owned.as_deref(),
                 limit,
-            })
+            })?;
+            let seqs: Vec<u32> = events
+                .iter()
+                .map(|e| e.ledger_seq)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let close_times = conn.batch_close_times(&seqs)?;
+            Ok((events, close_times))
         })
-        .map_err(|e| JsonRpcError::internal(format!("database error: {}", e)))?;
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = ?e, "get_events DB error");
+        JsonRpcError::internal("database error")
+    })?;
 
-    // Look up ledger close times for the events, caching per ledger_seq
-    // to avoid N+1 queries (each call decodes a full XDR header).
-    let mut close_time_cache: std::collections::HashMap<u32, u64> =
-        std::collections::HashMap::new();
+    // Build response using pre-fetched close times
     let mut event_json: Vec<serde_json::Value> = Vec::with_capacity(events.len());
     for event in &events {
-        let close_time_unix = *close_time_cache
-            .entry(event.ledger_seq)
-            .or_insert_with(|| util::ledger_close_time(&ctx.app, event.ledger_seq));
+        let close_time_unix = close_time_cache
+            .get(&event.ledger_seq)
+            .copied()
+            .unwrap_or(0);
         let close_time = format_unix_timestamp_utc(close_time_unix);
 
         let event_type_str = match event.event_type {
@@ -250,7 +262,7 @@ fn insert_event_fields(
             // value: JSON representation of the ScVal
             if let Some(val) = extract_event_value(event_xdr_b64) {
                 let json_val = serde_json::to_value(&val)
-                    .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+                    .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
                 obj.insert("valueJson".into(), json_val);
             }
             // topic: array of JSON ScVals
@@ -259,7 +271,7 @@ fn insert_event_fields(
                 let bytes = BASE64.decode(t).unwrap_or_default();
                 if let Ok(scval) = ScVal::from_xdr(&bytes, Limits::none()) {
                     let jv = serde_json::to_value(&scval).map_err(|e| {
-                        JsonRpcError::internal(format!("JSON serialize error: {e}"))
+                        JsonRpcError::internal_logged("serialization error", &e)
                     })?;
                     topic_json.push(jv);
                 }

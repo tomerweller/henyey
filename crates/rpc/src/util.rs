@@ -7,7 +7,57 @@ use stellar_xdr::curr::{
     TransactionMeta, TransactionResultCode, TransactionResultPair, WriteXdr,
 };
 
+use crate::context::RpcContext;
 use crate::error::JsonRpcError;
+
+// ---------------------------------------------------------------------------
+// Async DB access
+// ---------------------------------------------------------------------------
+
+/// Internal error type for RPC database access — not exposed to clients.
+#[derive(Debug)]
+pub(crate) enum DbAccessError {
+    Db(henyey_db::DbError),
+    JoinError(tokio::task::JoinError),
+    SemaphoreClosed,
+}
+
+impl std::fmt::Display for DbAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DbAccessError::Db(e) => write!(f, "database error: {e}"),
+            DbAccessError::JoinError(e) => write!(f, "task join error: {e}"),
+            DbAccessError::SemaphoreClosed => write!(f, "semaphore closed"),
+        }
+    }
+}
+
+/// Run a synchronous database closure on a blocking thread, with
+/// semaphore-bounded concurrency.
+///
+/// The DB semaphore permit is moved into the blocking closure via
+/// `OwnedSemaphorePermit`, so it remains held until the DB work completes
+/// even if the caller's future is cancelled by a timeout.
+pub(crate) async fn blocking_db<T, F>(ctx: &RpcContext, f: F) -> Result<T, DbAccessError>
+where
+    T: Send + 'static,
+    F: FnOnce(&henyey_db::Database) -> Result<T, henyey_db::DbError> + Send + 'static,
+{
+    let permit = ctx
+        .db_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| DbAccessError::SemaphoreClosed)?;
+    let db = ctx.app.database().clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit; // held until closure returns
+        f(&db)
+    })
+    .await
+    .map_err(DbAccessError::JoinError)?
+    .map_err(DbAccessError::Db)
+}
 
 // ---------------------------------------------------------------------------
 // XDR format helpers (xdrFormat / "format" parameter support)
@@ -98,12 +148,12 @@ pub(crate) fn insert_xdr_field_styled<T: WriteXdr + Serialize>(
         XdrFormat::Base64 => {
             let bytes = val
                 .to_xdr(Limits::none())
-                .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
+                .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
             obj.insert(key, serde_json::Value::String(BASE64.encode(&bytes)));
         }
         XdrFormat::Json => {
             let json_val = serde_json::to_value(val)
-                .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+                .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
             obj.insert(key, json_val);
         }
     }
@@ -130,9 +180,9 @@ pub(crate) fn insert_raw_xdr_field<T: ReadXdr + Serialize>(
         }
         XdrFormat::Json => {
             let val = T::from_xdr(bytes, Limits::none())
-                .map_err(|e| JsonRpcError::internal(format!("XDR decode error: {e}")))?;
+                .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
             let json_val = serde_json::to_value(&val)
-                .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+                .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
             obj.insert(format!("{base_name}Json"), json_val);
         }
     }
@@ -170,7 +220,7 @@ pub(crate) fn insert_xdr_array_field_styled<T: WriteXdr + Serialize>(
                 .map(|item| {
                     item.to_xdr(Limits::none())
                         .map(|b| serde_json::Value::String(BASE64.encode(&b)))
-                        .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))
+                        .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))
                 })
                 .collect::<Result<_, _>>()?;
             obj.insert(key, serde_json::Value::Array(encoded));
@@ -180,7 +230,7 @@ pub(crate) fn insert_xdr_array_field_styled<T: WriteXdr + Serialize>(
                 .iter()
                 .map(|item| {
                     serde_json::to_value(item)
-                        .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))
+                        .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))
                 })
                 .collect::<Result<_, _>>()?;
             obj.insert(key, serde_json::Value::Array(json_items));
@@ -315,27 +365,6 @@ pub(crate) fn extract_result_xdr(result_pair_bytes: &[u8]) -> Option<Vec<u8>> {
     pair.result.to_xdr(Limits::none()).ok()
 }
 
-/// Get the oldest ledger sequence from the database, defaulting to 1 on error.
-pub(crate) fn oldest_ledger(app: &henyey_app::App) -> u32 {
-    app.database()
-        .get_oldest_ledger_seq()
-        .unwrap_or(Some(1))
-        .unwrap_or(1)
-}
-
-/// Get the close time (unix seconds) for a given ledger, returning 0 on error.
-pub(crate) fn ledger_close_time(app: &henyey_app::App, ledger_seq: u32) -> u64 {
-    app.database()
-        .with_connection(|conn| {
-            use henyey_db::LedgerQueries;
-            conn.load_ledger_header(ledger_seq)
-        })
-        .ok()
-        .flatten()
-        .map(|h| h.scp_value.close_time.0)
-        .unwrap_or(0)
-}
-
 /// Common ledger context fields included in most RPC responses.
 ///
 /// Captures the latest and oldest ledger sequence numbers and their close
@@ -349,17 +378,31 @@ pub(crate) struct LedgerContext {
 }
 
 impl LedgerContext {
-    /// Build from the running app state.
-    pub fn from_app(app: &henyey_app::App) -> Self {
-        let summary = app.ledger_summary();
-        let oldest = oldest_ledger(app);
-        let oldest_close = ledger_close_time(app, oldest);
-        Self {
+    /// Build from the running app state, batching DB lookups into one blocking call.
+    pub async fn from_app(ctx: &RpcContext) -> Result<Self, JsonRpcError> {
+        let summary = ctx.app.ledger_summary();
+        let (oldest, oldest_close) = blocking_db(ctx, move |db| {
+            db.with_connection(|conn| {
+                use henyey_db::LedgerQueries;
+                let oldest = conn.get_oldest_ledger_seq()?.unwrap_or(1);
+                let close = conn
+                    .load_ledger_header(oldest)?
+                    .map(|h| h.scp_value.close_time.0)
+                    .unwrap_or(0);
+                Ok((oldest, close))
+            })
+        })
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = ?e, "LedgerContext DB error");
+            JsonRpcError::internal("database error")
+        })?;
+        Ok(Self {
             latest_ledger: summary.num,
             latest_close_time: summary.close_time,
             oldest_ledger: oldest,
             oldest_close_time: oldest_close,
-        }
+        })
     }
 
     /// Insert the four standard fields into a `serde_json::Map`.

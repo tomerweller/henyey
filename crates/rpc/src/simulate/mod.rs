@@ -206,37 +206,41 @@ struct SimulationContext {
 
 impl SimulationContext {
     /// Build from the running app state.
+    ///
+    /// Uses the snapshot's own ledger header instead of `app.ledger_summary()`
+    /// to avoid TOCTOU: the snapshot and header are captured atomically.
     fn from_app(app: &henyey_app::App) -> Result<Self, JsonRpcError> {
         let bl_snapshot = app
             .bucket_snapshot_manager()
             .copy_searchable_live_snapshot()
             .ok_or_else(|| JsonRpcError::internal("bucket list snapshot not available"))?;
 
-        let ledger = app.ledger_summary();
         let soroban_info = app
             .soroban_network_info()
             .ok_or_else(|| JsonRpcError::internal("soroban network config not available"))?;
 
+        let header = bl_snapshot.ledger_header();
+        let ledger_num = bl_snapshot.ledger_seq();
         let network_id = henyey_common::NetworkId::from_passphrase(&app.info().network_passphrase);
 
         let ledger_info = soroban_host::LedgerInfo {
-            protocol_version: ledger.version,
-            sequence_number: ledger.num,
-            timestamp: ledger.close_time,
+            protocol_version: header.ledger_version,
+            sequence_number: ledger_num,
+            timestamp: header.scp_value.close_time.0,
             network_id: network_id.0 .0,
-            base_reserve: ledger.base_reserve,
+            base_reserve: header.base_reserve,
             min_temp_entry_ttl: soroban_info.min_temporary_ttl,
             min_persistent_entry_ttl: soroban_info.min_persistent_ttl,
             max_entry_ttl: soroban_info.max_entry_ttl,
         };
 
-        let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger.num);
+        let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger_num);
 
         Ok(Self {
             snapshot_source,
             ledger_info,
             soroban_info,
-            latest_ledger: ledger.num,
+            latest_ledger: ledger_num,
         })
     }
 }
@@ -270,7 +274,7 @@ where
     let result =
         tokio::task::spawn_blocking(move || sim_fn(&snapshot_source, &ledger_info, &soroban_info))
             .await
-            .map_err(|e| JsonRpcError::internal(format!("simulation task failed: {e}")))?;
+            .map_err(|e| JsonRpcError::internal_logged("simulation failed", &e))?;
 
     match result {
         Ok(tx_data) => build_footprint_response(tx_data, latest_ledger, format),
@@ -488,7 +492,7 @@ async fn handle_invoke(request: InvokeRequest) -> Result<serde_json::Value, Json
         )
     })
     .await
-    .map_err(|e| JsonRpcError::internal(format!("simulation task failed: {e}")))?;
+    .map_err(|e| JsonRpcError::internal_logged("simulation failed", &e))?;
 
     match result {
         Ok(sim_output) => build_invoke_response(

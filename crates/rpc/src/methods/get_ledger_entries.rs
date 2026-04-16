@@ -61,54 +61,79 @@ pub async fn handle(
 
     let ledger_seq = snapshot.ledger_seq();
 
-    // Look up each key individually to preserve key-entry mapping
-    let mut result_entries = Vec::new();
-    for (key_b64, key) in &ledger_keys {
-        if let Some(entry) = snapshot
-            .load_result(key)
-            .map_err(|e| JsonRpcError::internal(format!("bucket read error: {e}")))?
-        {
-            let mut obj = serde_json::Map::new();
-
-            // Key — upstream uses "key" for base64, "keyJson" for JSON
-            match format {
-                XdrFormat::Base64 => {
-                    obj.insert("key".into(), json!(key_b64));
+    // Look up entries in a blocking task (bucket reads can hit disk)
+    let snapshot_results = tokio::task::spawn_blocking(move || {
+        #[allow(clippy::type_complexity)]
+        let mut results: Vec<(String, Option<(LedgerEntry, Option<u32>)>)> =
+            Vec::with_capacity(ledger_keys.len());
+        for (key_b64, key) in &ledger_keys {
+            let entry = snapshot.load_result(key)?;
+            match entry {
+                Some(entry) => {
+                    let live_until = lookup_ttl(&snapshot, &entry)?;
+                    results.push((key_b64.clone(), Some((entry, live_until))));
                 }
-                XdrFormat::Json => {
-                    util::insert_xdr_field(&mut obj, "key", key, format)?;
+                None => {
+                    results.push((key_b64.clone(), None));
                 }
             }
-
-            // Data XDR — upstream uses "xdr" for base64, "dataJson" for JSON
-            match format {
-                XdrFormat::Base64 => {
-                    let bytes = entry
-                        .data
-                        .to_xdr(Limits::none())
-                        .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
-                    obj.insert("xdr".into(), json!(BASE64.encode(&bytes)));
-                }
-                XdrFormat::Json => {
-                    util::insert_xdr_field(&mut obj, "data", &entry.data, XdrFormat::Json)?;
-                }
-            }
-
-            obj.insert(
-                "lastModifiedLedgerSeq".into(),
-                json!(entry.last_modified_ledger_seq),
-            );
-
-            // Ext field — upstream uses "extXdr" / "extJson"
-            util::insert_xdr_field(&mut obj, "ext", &entry.ext, format)?;
-
-            // For TTL-bearing entries, look up the TTL
-            if let Some(live_until) = lookup_ttl(&snapshot, &entry)? {
-                obj.insert("liveUntilLedgerSeq".to_string(), json!(live_until));
-            }
-
-            result_entries.push(serde_json::Value::Object(obj));
         }
+        Ok::<_, henyey_bucket::BucketError>(results)
+    })
+    .await
+    .map_err(|e| JsonRpcError::internal_logged("internal error", &e))?
+    .map_err(|e| JsonRpcError::internal_logged("internal error", &e))?;
+
+    // Build JSON response from snapshot results
+    let mut result_entries = Vec::new();
+    for (key_b64, entry_with_ttl) in &snapshot_results {
+        let Some((entry, live_until)) = entry_with_ttl else {
+            continue;
+        };
+
+        let mut obj = serde_json::Map::new();
+
+        // Key — upstream uses "key" for base64, "keyJson" for JSON
+        match format {
+            XdrFormat::Base64 => {
+                obj.insert("key".into(), json!(key_b64));
+            }
+            XdrFormat::Json => {
+                // Re-decode the key for JSON output
+                let key_bytes = BASE64.decode(key_b64).unwrap();
+                let key = LedgerKey::from_xdr(&key_bytes, Limits::none()).unwrap();
+                util::insert_xdr_field(&mut obj, "key", &key, format)?;
+            }
+        }
+
+        // Data XDR — upstream uses "xdr" for base64, "dataJson" for JSON
+        match format {
+            XdrFormat::Base64 => {
+                let bytes = entry
+                    .data
+                    .to_xdr(Limits::none())
+                    .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
+                obj.insert("xdr".into(), json!(BASE64.encode(&bytes)));
+            }
+            XdrFormat::Json => {
+                util::insert_xdr_field(&mut obj, "data", &entry.data, XdrFormat::Json)?;
+            }
+        }
+
+        obj.insert(
+            "lastModifiedLedgerSeq".into(),
+            json!(entry.last_modified_ledger_seq),
+        );
+
+        // Ext field — upstream uses "extXdr" / "extJson"
+        util::insert_xdr_field(&mut obj, "ext", &entry.ext, format)?;
+
+        // For TTL-bearing entries
+        if let Some(ttl) = live_until {
+            obj.insert("liveUntilLedgerSeq".to_string(), json!(ttl));
+        }
+
+        result_entries.push(serde_json::Value::Object(obj));
     }
 
     Ok(json!({
@@ -141,14 +166,11 @@ fn ttl_key_for_entry(entry: &LedgerEntry) -> Option<LedgerKey> {
 fn lookup_ttl(
     snapshot: &SearchableBucketListSnapshot,
     entry: &LedgerEntry,
-) -> Result<Option<u32>, JsonRpcError> {
+) -> Result<Option<u32>, henyey_bucket::BucketError> {
     let Some(ttl_key) = ttl_key_for_entry(entry) else {
         return Ok(None);
     };
-    let Some(ttl_entry) = snapshot
-        .load_result(&ttl_key)
-        .map_err(|e| JsonRpcError::internal(format!("bucket read error: {e}")))?
-    else {
+    let Some(ttl_entry) = snapshot.load_result(&ttl_key)? else {
         return Ok(None);
     };
     if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) = &ttl_entry.data {

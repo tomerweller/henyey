@@ -23,7 +23,7 @@ pub async fn handle(
 ) -> Result<serde_json::Value, JsonRpcError> {
     let format = util::parse_format(&params)?;
 
-    let lctx = util::LedgerContext::from_app(&ctx.app);
+    let lctx = util::LedgerContext::from_app(ctx).await?;
 
     // Parse optional status filter
     let status_filter = match params.get("status").and_then(|v| v.as_str()) {
@@ -76,36 +76,46 @@ pub async fn handle(
     // End ledger for query: latest + 1 (exclusive upper bound)
     let end_ledger = lctx.latest_ledger + 1;
 
-    // Query transactions from database
-    let records = ctx
-        .app
-        .database()
-        .with_connection(|conn| {
-            use henyey_db::HistoryQueries;
-            conn.load_transactions_in_range(
+    // Query transactions and batch-load close times in a single blocking DB call
+    let (records, close_time_cache) = util::blocking_db(ctx, move |db| {
+        db.with_connection(|conn| {
+            use henyey_db::{HistoryQueries, LedgerQueries};
+            let records = conn.load_transactions_in_range(
                 query_start_ledger,
                 query_start_tx_index,
                 end_ledger,
                 effective_limit,
                 status_filter,
-            )
+            )?;
+            let seqs: Vec<u32> = records
+                .iter()
+                .map(|r| r.ledger_seq)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let close_times = conn.batch_close_times(&seqs)?;
+            Ok((records, close_times))
         })
-        .map_err(|e| JsonRpcError::internal(format!("database error: {}", e)))?;
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = ?e, "get_transactions DB error");
+        JsonRpcError::internal("database error")
+    })?;
 
-    // Build response, caching ledger close times per ledger_seq to avoid N+1 queries
+    // Build response using pre-fetched close times
     let mut transactions = Vec::with_capacity(records.len());
     let mut last_cursor = String::new();
-    let mut close_time_cache: std::collections::HashMap<u32, u64> =
-        std::collections::HashMap::new();
 
     for record in &records {
         // Application order is 1-based (txindex is 0-based in DB)
         let application_order = record.tx_index + 1;
 
         // Ledger close time — returned as a number (not string) per upstream getTransactions
-        let created_at = *close_time_cache
-            .entry(record.ledger_seq)
-            .or_insert_with(|| util::ledger_close_time(&ctx.app, record.ledger_seq));
+        let created_at = close_time_cache
+            .get(&record.ledger_seq)
+            .copied()
+            .unwrap_or(0);
 
         // Build TOID cursor for this transaction
         let toid = util::toid_encode(record.ledger_seq, application_order, 0);

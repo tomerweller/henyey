@@ -45,4 +45,11 @@ impl JsonRpcError {
     pub(crate) fn server_busy(msg: impl Into<String>) -> Self {
         Self::new(SERVER_BUSY, msg)
     }
+
+    /// Internal error that logs full details server-side and returns only a
+    /// generic category string to the client.
+    pub(crate) fn internal_logged(category: &str, err: &dyn std::fmt::Debug) -> Self {
+        tracing::warn!(error = ?err, category, "RPC internal error");
+        Self::internal(category.to_string())
+    }
 }

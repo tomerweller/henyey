@@ -70,9 +70,15 @@ pub(super) fn run_invoke_simulation(
                     state_changes,
                 })
             }
-            Err(e) => Err(format!("host function invocation failed: {e:?}")),
+            Err(e) => {
+                tracing::warn!(error = ?e, "host function invocation failed");
+                Err("host function invocation failed".to_string())
+            }
         },
-        Err(e) => Err(format!("simulation failed: {e:?}")),
+        Err(e) => {
+            tracing::warn!(error = ?e, "simulation failed");
+            Err("simulation failed".to_string())
+        }
     }
 }
 
@@ -163,10 +169,7 @@ fn resolve_entry(
     let p25_key: soroban_host::xdr::LedgerKey = super::convert::ws_to_p25_result(key, "LedgerKey")?;
 
     let durability = get_key_durability(&p25_key).ok_or_else(|| {
-        format!(
-            "cannot operate on key {:?}: only contract data/code entries have TTL",
-            key.discriminant()
-        )
+        "only contract data/code entries have TTL".to_string()
     })?;
 
     let Some((entry, live_until)) = snapshot.get_unfiltered(key) else {
@@ -174,10 +177,7 @@ fn resolve_entry(
     };
 
     let current_live_until = live_until.ok_or_else(|| {
-        format!(
-            "missing TTL for key that must have TTL: {:?}",
-            key.discriminant()
-        )
+        "missing TTL for key that must have TTL".to_string()
     })?;
 
     let entry_xdr_size = entry
@@ -188,7 +188,10 @@ fn resolve_entry(
     let p25_entry: soroban_host::xdr::LedgerEntry =
         super::convert::ws_to_p25_result(&entry, "LedgerEntry")?;
     let entry_rent_size = entry_size_for_rent(budget, &p25_entry, entry_xdr_size)
-        .map_err(|e| format!("entry_size_for_rent failed: {e:?}"))?;
+        .map_err(|e| {
+            tracing::warn!(error = ?e, "entry_size_for_rent failed");
+            "entry_size_for_rent failed".to_string()
+        })?;
 
     Ok(Some(ResolvedEntry {
         durability,
@@ -323,13 +326,10 @@ pub(super) fn simulate_restore_op(
 
     for key in keys {
         let resolved = resolve_entry(key, snapshot, &budget)?
-            .ok_or_else(|| format!("missing entry to restore for key {:?}", key.discriminant()))?;
+            .ok_or_else(|| "missing entry to restore".to_string())?;
 
         if resolved.durability != soroban_host::xdr::ContractDataDurability::Persistent {
-            return Err(format!(
-                "cannot restore key {:?}: only persistent entries can be restored",
-                key.discriminant()
-            ));
+            return Err("only persistent entries can be restored".to_string());
         }
 
         // Skip entries that are still live (not expired)

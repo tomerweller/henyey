@@ -69,6 +69,16 @@ pub trait LedgerQueries {
     ///
     /// Returns `None` if no ledgers have been stored.
     fn get_oldest_ledger_seq(&self) -> Result<Option<u32>, DbError>;
+
+    /// Returns close times for the given ledger sequences.
+    ///
+    /// Reads directly from the indexed `closetime` column, avoiding full
+    /// XDR header deserialization. Returns a map from sequence → close time
+    /// for all sequences that exist in the database.
+    fn batch_close_times(
+        &self,
+        seqs: &[u32],
+    ) -> Result<std::collections::HashMap<u32, u64>, DbError>;
 }
 
 impl LedgerQueries for Connection {
@@ -212,6 +222,34 @@ impl LedgerQueries for Connection {
             })
             .optional()?;
         Ok(result.flatten())
+    }
+
+    fn batch_close_times(
+        &self,
+        seqs: &[u32],
+    ) -> Result<std::collections::HashMap<u32, u64>, DbError> {
+        use std::collections::HashMap;
+
+        if seqs.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders: String = seqs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT ledgerseq, closetime FROM ledgerheaders WHERE ledgerseq IN ({})",
+            placeholders
+        );
+        let mut stmt = self.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(seqs.iter()), |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, u64>(1)?))
+        })?;
+
+        let mut map = HashMap::with_capacity(seqs.len());
+        for row in rows {
+            let (seq, time) = row?;
+            map.insert(seq, time);
+        }
+        Ok(map)
     }
 }
 
@@ -445,5 +483,34 @@ mod tests {
         for seq in 1..=5 {
             assert!(conn.load_ledger_header(seq).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn test_batch_close_times() {
+        let conn = setup_db();
+
+        // Store headers with different close times
+        for seq in [10u32, 20, 30] {
+            let mut header = create_test_header(seq);
+            header.scp_value.close_time = TimePoint(1000 + seq as u64 * 100);
+            let data = header.to_xdr(Limits::none()).unwrap();
+            conn.store_ledger_header(&header, &data).unwrap();
+        }
+
+        // Query all three
+        let result = conn.batch_close_times(&[10, 20, 30]).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[&10], 2000);
+        assert_eq!(result[&20], 3000);
+        assert_eq!(result[&30], 4000);
+
+        // Query with a missing seq
+        let result = conn.batch_close_times(&[10, 99]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[&10], 2000);
+
+        // Empty input
+        let result = conn.batch_close_times(&[]).unwrap();
+        assert!(result.is_empty());
     }
 }

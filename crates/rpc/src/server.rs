@@ -34,12 +34,18 @@ impl RpcServer {
         let rpc_config = &self.app.config().rpc;
         let retention = rpc_config.retention_window;
         let max_sims = rpc_config.max_concurrent_simulations.max(1) as usize;
+        let max_requests = rpc_config.max_concurrent_requests.max(1);
+        let db_concurrency = rpc_config.rpc_db_concurrency.max(1);
+        let request_timeout = std::time::Duration::from_secs(rpc_config.request_timeout_secs);
         let fee_windows = Arc::new(FeeWindows::new(retention));
 
         let ctx = Arc::new(RpcContext {
             app: self.app.clone(),
             fee_windows: fee_windows.clone(),
             simulation_semaphore: Arc::new(tokio::sync::Semaphore::new(max_sims)),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(max_requests)),
+            db_semaphore: Arc::new(tokio::sync::Semaphore::new(db_concurrency)),
+            request_timeout,
         });
 
         let mut shutdown_rx = self.app.subscribe_shutdown();
@@ -116,11 +122,28 @@ async fn fee_window_poller(
             window_latest + 1
         };
 
-        let metas = match load_fee_window_metas(&app, start, current_ledger + 1, retention) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to load LCMs for fee window");
-                continue;
+        let metas = {
+            let poller_db = app.database().clone();
+            let s = start;
+            let e = current_ledger + 1;
+            let r = retention;
+            match tokio::task::spawn_blocking(move || {
+                poller_db.with_connection(|conn| {
+                    use henyey_db::LedgerCloseMetaQueries;
+                    conn.load_ledger_close_metas_in_range(s, e, r)
+                })
+            })
+            .await
+            {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "Failed to load LCMs for fee window");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Fee window DB task panicked");
+                    continue;
+                }
             }
         };
 
@@ -189,7 +212,12 @@ fn load_fee_window_metas(
     end: u32,
     retention: u32,
 ) -> Result<Vec<(u32, Vec<u8>)>, henyey_db::DbError> {
-    app.database().with_connection(|conn| {
+    let db = app.database().clone();
+    // Run synchronous DB call in blocking thread context.
+    // This function is called from both bulk_load_fees (startup, before server
+    // is serving) and fee_window_poller (background task). Neither path is a
+    // request handler, so no DB semaphore is needed.
+    db.with_connection(|conn| {
         use henyey_db::LedgerCloseMetaQueries;
         conn.load_ledger_close_metas_in_range(start, end, retention)
     })
@@ -231,8 +259,39 @@ async fn rpc_handler(
         ));
     }
 
-    let resp = dispatch::dispatch(&ctx, &request.method, request.id, request.params).await;
-    ok_json_response(resp)
+    // Acquire request execution permit (immediate reject, not backpressure)
+    let _permit = match ctx.request_semaphore.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ok_json_response(JsonRpcResponse::error(
+                request.id,
+                JsonRpcError::server_busy("too many concurrent requests"),
+            ));
+        }
+    };
+
+    // Per-method timeout: sendTransaction is side-effectful — timing out after
+    // tx submission would mislead the client into thinking it failed.
+    let is_write_method = request.method == "sendTransaction";
+
+    if is_write_method {
+        let resp =
+            dispatch::dispatch(&ctx, &request.method, request.id, request.params).await;
+        ok_json_response(resp)
+    } else {
+        match tokio::time::timeout(
+            ctx.request_timeout,
+            dispatch::dispatch(&ctx, &request.method, request.id.clone(), request.params),
+        )
+        .await
+        {
+            Ok(resp) => ok_json_response(resp),
+            Err(_) => ok_json_response(JsonRpcResponse::error(
+                request.id,
+                JsonRpcError::internal("request timed out"),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

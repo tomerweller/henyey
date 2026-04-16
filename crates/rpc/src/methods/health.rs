@@ -11,7 +11,17 @@ pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcE
     let ledger = ctx.app.ledger_summary();
     let rpc_config = &ctx.app.config().rpc;
 
-    let oldest_ledger = util::oldest_ledger(&ctx.app);
+    let oldest_ledger = util::blocking_db(ctx, |db| {
+        db.with_connection(|conn| {
+            use henyey_db::LedgerQueries;
+            Ok(conn.get_oldest_ledger_seq()?.unwrap_or(1))
+        })
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = ?e, "health check DB error");
+        1
+    });
 
     // Determine health status based on ledger age
     let max_latency = rpc_config.max_healthy_ledger_latency_secs;
