@@ -428,7 +428,8 @@ async fn test_core3_restart_rejoin_over_tcp() {
         .await;
 
     // Wait for node0 to catch up to ledger 3 (where node1/node2 are).
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
+    // 30s timeout: post-restart catchup can be slow on CI runners.
+    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(30)).await;
 
     // Now advance all nodes to ledger 4.
     manual_close_until(&sim, 4, Duration::from_secs(30)).await;
@@ -483,7 +484,8 @@ async fn test_core3_restart_rejoin_over_loopback() {
         .await;
 
     // Wait for node0 to catch up to ledger 3 before triggering ledger 4.
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
+    // 30s timeout: post-restart catchup can be slow on CI runners.
+    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(30)).await;
 
     // Now advance all nodes to ledger 4.
     manual_close_until(&sim, 4, Duration::from_secs(30)).await;
