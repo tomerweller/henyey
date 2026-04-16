@@ -219,6 +219,21 @@ pub struct AppInfo {
     pub meta_stream_writes_total: u64,
     /// SCP signature-verify pipeline metrics (issue #1734 Phase B).
     pub scp_verify: ScpVerifyMetrics,
+    /// Overlay fetch-channel depth metrics (issue #1741).
+    pub overlay_fetch_channel: OverlayFetchChannelMetrics,
+}
+
+/// Metrics for the overlay fetch-response channel (issue #1741).
+///
+/// The fetch channel is unbounded so that SCP fetch-request and fetch-response
+/// messages are never dropped. These gauges expose the queue depth to make
+/// wedge-induced growth observable before it becomes a memory problem.
+#[derive(Debug, Clone, Default)]
+pub struct OverlayFetchChannelMetrics {
+    /// Current depth of the overlay fetch-response channel (event-loop sampled).
+    pub depth: i64,
+    /// Monotonic maximum depth observed since process start.
+    pub depth_max: i64,
 }
 
 /// Metrics for the SCP signature-verify pipeline (issue #1734 Phase B).

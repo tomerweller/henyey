@@ -95,7 +95,7 @@ impl App {
             Some(rx) => rx,
             None => {
                 // Create a dummy receiver that never receives
-                let (_tx, rx) = tokio::sync::mpsc::channel::<OverlayMessage>(1);
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OverlayMessage>();
                 rx
             }
         };
@@ -266,6 +266,7 @@ impl App {
                                 Err(_) => break,
                             }
                         }
+                        self.sample_fetch_channel_depth(fetch_response_rx.len());
                         if pending_catchup.is_none() {
                             if let Some(pc) = self.process_externalized_slots().await {
                                 pending_catchup = Some(pc);
@@ -472,6 +473,7 @@ impl App {
                         "Received fetch message via dedicated channel"
                     );
                     self.handle_overlay_message(fetch_msg).await;
+                    self.sample_fetch_channel_depth(fetch_response_rx.len());
                     // After processing a fetch response (which may deliver a
                     // tx_set), kick off a buffered close if none is running.
                     if pending_close.is_none() && pending_catchup.is_none() {
@@ -605,6 +607,7 @@ impl App {
                             Err(_) => break,
                         }
                     }
+                    self.sample_fetch_channel_depth(fetch_response_rx.len());
 
                     // Check if SyncRecoveryManager requested recovery
                     if pending_catchup.is_none()

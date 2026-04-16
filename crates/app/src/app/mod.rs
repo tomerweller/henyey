@@ -42,7 +42,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -184,8 +184,9 @@ mod upgrades;
 pub(crate) use persist::CatchupPersistData;
 use types::*;
 pub use types::{
-    AppInfo, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary, ScpSlotSnapshot,
-    SelfCheckResult, SimulationDebugStats, SurveyPeerReport, SurveyReport,
+    AppInfo, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary,
+    OverlayFetchChannelMetrics, ScpSlotSnapshot, ScpVerifyMetrics, SelfCheckResult,
+    SimulationDebugStats, SurveyPeerReport, SurveyReport,
 };
 
 /// The main application struct coordinating all Stellar Core subsystems.
@@ -317,6 +318,15 @@ pub struct App {
     /// Updated by the event loop each time it touches `verified_rx`, so
     /// `/metrics` reflects the true output-side backlog.
     pub(crate) scp_verify_output_backlog: AtomicU64,
+    /// Sampled depth of the overlay fetch-response channel (see
+    /// [`OverlayManager::subscribe_fetch_responses`]). Updated by the event
+    /// loop each time it touches `fetch_response_rx`. Exposed via `/metrics`
+    /// (`henyey_overlay_fetch_channel_depth`). Also read by the watchdog.
+    pub(crate) fetch_channel_depth: Arc<AtomicI64>,
+    /// Monotonic maximum depth observed on the overlay fetch-response
+    /// channel since process start. Exposed via `/metrics`
+    /// (`henyey_overlay_fetch_channel_depth_max`).
+    pub(crate) fetch_channel_depth_max: Arc<AtomicI64>,
     /// Number of attempts to trigger the next consensus round.
     consensus_trigger_attempts: AtomicU64,
     /// Number of successful trigger_next_ledger calls.
@@ -656,6 +666,8 @@ impl App {
             scp_verify_latency_us_sum: AtomicU64::new(0),
             scp_verify_latency_count: AtomicU64::new(0),
             scp_verify_output_backlog: AtomicU64::new(0),
+            fetch_channel_depth: Arc::new(AtomicI64::new(0)),
+            fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
             consensus_trigger_attempts: AtomicU64::new(0),
             consensus_trigger_successes: AtomicU64::new(0),
             consensus_trigger_failures: AtomicU64::new(0),
@@ -1608,6 +1620,10 @@ impl App {
                 verify_latency_us_sum: self.scp_verify_latency_us_sum.load(Ordering::Relaxed),
                 verify_latency_count: self.scp_verify_latency_count.load(Ordering::Relaxed),
             },
+            overlay_fetch_channel: OverlayFetchChannelMetrics {
+                depth: self.fetch_channel_depth.load(Ordering::Relaxed),
+                depth_max: self.fetch_channel_depth_max.load(Ordering::Relaxed),
+            },
         }
     }
 
@@ -1732,6 +1748,19 @@ impl App {
         self.event_loop_phase.store(phase, Ordering::Relaxed);
     }
 
+    /// Sample the current depth of the overlay fetch-response channel and
+    /// update both the current-depth and monotonic-max gauges. Called by the
+    /// event loop every time it drains `fetch_response_rx` so that the
+    /// `/metrics` gauges and watchdog reflect the true live depth.
+    #[inline]
+    pub(crate) fn sample_fetch_channel_depth(&self, depth: usize) {
+        update_fetch_channel_depth_gauges(
+            &self.fetch_channel_depth,
+            &self.fetch_channel_depth_max,
+            depth,
+        );
+    }
+
     /// Record a new event loop tick (for watchdog freshness tracking).
     #[inline]
     fn tick_event_loop(&self) {
@@ -1761,6 +1790,8 @@ impl App {
 
         let tick_ms = Arc::clone(&self.last_event_loop_tick_ms);
         let phase = Arc::clone(&self.event_loop_phase);
+        let fetch_depth = Arc::clone(&self.fetch_channel_depth);
+        let fetch_depth_max = Arc::clone(&self.fetch_channel_depth_max);
         let pid = std::process::id();
         let verifier = self.herder.scp_verifier_handle();
 
@@ -1784,11 +1815,15 @@ impl App {
                         .as_millis() as u64;
                     let stale_secs = now_ms.saturating_sub(last_tick) / 1000;
                     let current_phase = phase.load(Ordering::Relaxed);
+                    let fetch_channel_depth = fetch_depth.load(Ordering::Relaxed);
+                    let fetch_channel_depth_max = fetch_depth_max.load(Ordering::Relaxed);
 
                     if stale_secs >= 30 {
                         tracing::error!(
                             stale_secs,
                             phase = current_phase,
+                            fetch_channel_depth,
+                            fetch_channel_depth_max,
                             pid,
                             "WATCHDOG: Event loop appears frozen! \
                              Phase codes: 0=select, 1=scp_msg, 2=fetch_resp, \
@@ -1830,6 +1865,8 @@ impl App {
                         tracing::warn!(
                             stale_secs,
                             phase = current_phase,
+                            fetch_channel_depth,
+                            fetch_channel_depth_max,
                             "WATCHDOG: Event loop slow (>15s since last tick)"
                         );
                     }
@@ -1868,11 +1905,78 @@ impl App {
     }
 }
 
+/// Update the `(current, max)` fetch-channel depth gauges from a freshly
+/// sampled queue length.
+///
+/// - `current` is stored unconditionally (it is the instantaneous depth).
+/// - `max` is advanced only when the new sample exceeds the previously
+///   observed maximum. A CAS loop is used so the store is correct even if
+///   the watchdog thread happens to read the gauge concurrently.
+///
+/// Issue #1741: exposes unbounded growth of the now-unbounded fetch channel
+/// to operators via `/metrics` before it becomes OOM.
+#[inline]
+fn update_fetch_channel_depth_gauges(current: &AtomicI64, max: &AtomicI64, depth: usize) {
+    let d = depth as i64;
+    current.store(d, Ordering::Relaxed);
+    let mut prev = max.load(Ordering::Relaxed);
+    while d > prev {
+        match max.compare_exchange_weak(prev, d, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => prev = observed,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use stellar_xdr::curr::StellarValueExt;
     use tempfile;
+
+    /// Issue #1741 regression: the fetch-channel depth gauge must track the
+    /// current queue size, and the `_max` gauge must be monotonically
+    /// non-decreasing across a sequence of samples — including zero samples
+    /// (drained state).
+    #[test]
+    fn fetch_depth_metric_tracks_queue() {
+        let current = AtomicI64::new(0);
+        let max = AtomicI64::new(0);
+
+        // Empty queue: both gauges stay at zero.
+        update_fetch_channel_depth_gauges(&current, &max, 0);
+        assert_eq!(current.load(Ordering::Relaxed), 0);
+        assert_eq!(max.load(Ordering::Relaxed), 0);
+
+        // Grow the queue: both gauges track upward.
+        update_fetch_channel_depth_gauges(&current, &max, 12);
+        assert_eq!(current.load(Ordering::Relaxed), 12);
+        assert_eq!(max.load(Ordering::Relaxed), 12);
+
+        // Grow further.
+        update_fetch_channel_depth_gauges(&current, &max, 100);
+        assert_eq!(current.load(Ordering::Relaxed), 100);
+        assert_eq!(max.load(Ordering::Relaxed), 100);
+
+        // Drain: current drops, max holds.
+        update_fetch_channel_depth_gauges(&current, &max, 7);
+        assert_eq!(current.load(Ordering::Relaxed), 7);
+        assert_eq!(
+            max.load(Ordering::Relaxed),
+            100,
+            "depth_max must be monotonic non-decreasing"
+        );
+
+        // Fully drain: current zero, max unchanged.
+        update_fetch_channel_depth_gauges(&current, &max, 0);
+        assert_eq!(current.load(Ordering::Relaxed), 0);
+        assert_eq!(max.load(Ordering::Relaxed), 100);
+
+        // New peak: max advances.
+        update_fetch_channel_depth_gauges(&current, &max, 250);
+        assert_eq!(current.load(Ordering::Relaxed), 250);
+        assert_eq!(max.load(Ordering::Relaxed), 250);
+    }
 
     #[tokio::test]
     async fn test_app_creation() {

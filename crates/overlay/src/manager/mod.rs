@@ -73,10 +73,6 @@ const MAX_KNOWN_PEERS: usize = 1000;
 /// mainnet traffic bursts from multiple peers.
 const BROADCAST_CHANNEL_SIZE: usize = 4096;
 
-/// Buffer size for the dedicated fetch-response mpsc channel
-/// (GetTxSet / GetScpQuorumSet replies).
-const FETCH_RESPONSE_CHANNEL_SIZE: usize = 4096;
-
 /// Maximum number of peer addresses included in a single PEERS message.
 ///
 /// Matches stellar-core's limit of 50 addresses per Peers message
@@ -233,7 +229,7 @@ pub(super) struct SharedPeerState {
     pub(super) running: Arc<AtomicBool>,
     pub(super) message_tx: broadcast::Sender<OverlayMessage>,
     pub(super) scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
-    pub(super) fetch_response_tx: mpsc::Sender<OverlayMessage>,
+    pub(super) fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
     pub(super) peer_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
     pub(super) advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
     pub(super) advertised_inbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
@@ -310,7 +306,7 @@ impl SharedPeerState {
         }
 
         if is_fetch_response || is_fetch_request {
-            if let Err(e) = self.fetch_response_tx.try_send(msg.clone()) {
+            if let Err(e) = self.fetch_response_tx.send(msg.clone()) {
                 error!(
                     "Fetch channel send FAILED for peer {}: {}",
                     msg.from_peer, e
@@ -413,12 +409,14 @@ pub struct OverlayManager {
     pub(super) scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
     /// Receiver end of the SCP channel. Taken once via `subscribe_scp()`.
     scp_message_rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<OverlayMessage>>>>,
-    /// Dedicated bounded channel for fetch response messages.
-    /// Routes GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset through
-    /// a dedicated channel. Buffer (4096) is generous for fetch responses.
-    pub(super) fetch_response_tx: mpsc::Sender<OverlayMessage>,
+    /// Dedicated unbounded channel for fetch response messages.
+    /// Routes GeneralizedTxSet, TxSet, DontHave, ScpQuorumset, GetScpState,
+    /// GetScpQuorumset, and GetTxSet through a never-drop channel, matching
+    /// stellar-core's synchronous IO-loop dispatch. Depth is exposed via
+    /// `henyey_overlay_fetch_channel_depth` gauges for operator visibility.
+    pub(super) fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
     /// Receiver end of the fetch response channel. Taken once via `subscribe_fetch_responses()`.
-    fetch_response_rx: Arc<TokioMutex<Option<mpsc::Receiver<OverlayMessage>>>>,
+    fetch_response_rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<OverlayMessage>>>>,
     /// Dynamic extra subscribers for catchup-critical messages (SCP + TxSet).
     /// Created on demand via `subscribe_catchup()` and cleaned up when dropped.
     /// Uses parking_lot::RwLock for minimal contention in the hot path (read-heavy).
@@ -467,7 +465,7 @@ impl OverlayManager {
         let (message_tx, _) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
         let (shutdown_tx, _) = broadcast::channel(1);
         let (scp_message_tx, scp_message_rx) = mpsc::unbounded_channel();
-        let (fetch_response_tx, fetch_response_rx) = mpsc::channel(FETCH_RESPONSE_CHANNEL_SIZE);
+        let (fetch_response_tx, fetch_response_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             config: config.clone(),
@@ -903,13 +901,17 @@ impl OverlayManager {
 
     /// Subscribe to the dedicated fetch response message channel.
     ///
-    /// Routes GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset messages
-    /// through a bounded channel. Buffer is generous (4096) to handle
-    /// realistic traffic while preventing unbounded memory growth.
+    /// Routes GeneralizedTxSet, TxSet, DontHave, ScpQuorumset, GetScpState,
+    /// GetScpQuorumset, and GetTxSet messages through a dedicated unbounded
+    /// channel so that no fetch-related traffic is ever silently dropped.
+    /// Queue depth is sampled into `App` atomics and exported via `/metrics`
+    /// (`henyey_overlay_fetch_channel_depth{,_max}`).
     ///
     /// Can only be called once (takes ownership of the receiver). Returns `None`
     /// if already called.
-    pub async fn subscribe_fetch_responses(&self) -> Option<mpsc::Receiver<OverlayMessage>> {
+    pub async fn subscribe_fetch_responses(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<OverlayMessage>> {
         self.fetch_response_rx.lock().await.take()
     }
 
@@ -1435,7 +1437,7 @@ mod tests {
     fn test_shared_state(preferred: Vec<PeerAddress>) -> SharedPeerState {
         let (message_tx, _) = tokio::sync::broadcast::channel(1);
         let (scp_message_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (fetch_response_tx, _) = tokio::sync::mpsc::channel(1);
+        let (fetch_response_tx, _) = tokio::sync::mpsc::unbounded_channel();
         SharedPeerState {
             peers: Arc::new(DashMap::new()),
             flood_gate: Arc::new(FloodGate::new()),
@@ -1705,7 +1707,7 @@ mod tests {
         let (message_tx, _) = tokio::sync::broadcast::channel(64);
         let mut broadcast_rx = message_tx.subscribe();
         let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (fetch_response_tx, mut fetch_rx) = tokio::sync::mpsc::channel(64);
+        let (fetch_response_tx, mut fetch_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
@@ -1769,6 +1771,180 @@ mod tests {
         assert!(
             broadcast_result.is_err(),
             "fetch-request messages must NOT appear on the lossy broadcast channel"
+        );
+    }
+
+    /// Build a SharedPeerState wired up for `route_to_subscribers` routing tests.
+    /// Returns the shared state plus the broadcast and fetch receivers so the
+    /// test can assert per-channel delivery.
+    fn make_routing_shared_state() -> (
+        SharedPeerState,
+        tokio::sync::broadcast::Receiver<OverlayMessage>,
+        tokio::sync::mpsc::UnboundedReceiver<OverlayMessage>,
+    ) {
+        let (message_tx, _) = tokio::sync::broadcast::channel(1024);
+        let broadcast_rx = message_tx.subscribe();
+        let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fetch_response_tx, fetch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = SharedPeerState {
+            peers: Arc::new(DashMap::new()),
+            flood_gate: Arc::new(FloodGate::new()),
+            running: Arc::new(AtomicBool::new(true)),
+            message_tx,
+            scp_message_tx,
+            fetch_response_tx,
+            peer_handles: Arc::new(RwLock::new(Vec::new())),
+            advertised_outbound_peers: Arc::new(RwLock::new(Vec::new())),
+            advertised_inbound_peers: Arc::new(RwLock::new(Vec::new())),
+            added_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            banned_peers: Arc::new(RwLock::new(HashSet::new())),
+            peer_info_cache: Arc::new(DashMap::new()),
+            last_closed_ledger: Arc::new(AtomicU32::new(0)),
+            scp_callback: None,
+            is_validator: false,
+            peer_event_tx: None,
+            extra_subscribers: Arc::new(RwLock::new(Vec::new())),
+            is_tracking: Arc::new(AtomicBool::new(true)),
+            pending_connections: PendingConnections::new(),
+            preferred_peers: Arc::new(Vec::new()),
+        };
+        (shared, broadcast_rx, fetch_rx)
+    }
+
+    /// Build one `OverlayMessage` for each of the seven fetch variants.
+    fn all_fetch_variant_messages(peer: &PeerId) -> Vec<OverlayMessage> {
+        let variants = vec![
+            StellarMessage::GetScpState(0),
+            StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256([1u8; 32])),
+            StellarMessage::GetTxSet(stellar_xdr::curr::Uint256([2u8; 32])),
+            StellarMessage::GeneralizedTxSet(stellar_xdr::curr::GeneralizedTransactionSet::V1(
+                stellar_xdr::curr::TransactionSetV1 {
+                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    phases: vec![].try_into().unwrap(),
+                },
+            )),
+            StellarMessage::TxSet(stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            }),
+            StellarMessage::DontHave(stellar_xdr::curr::DontHave {
+                type_: stellar_xdr::curr::MessageType::TxSet,
+                req_hash: stellar_xdr::curr::Uint256([3u8; 32]),
+            }),
+            StellarMessage::ScpQuorumset(stellar_xdr::curr::ScpQuorumSet {
+                threshold: 1,
+                validators: stellar_xdr::curr::VecM::default(),
+                inner_sets: stellar_xdr::curr::VecM::default(),
+            }),
+        ];
+        variants
+            .into_iter()
+            .map(|m| OverlayMessage {
+                from_peer: peer.clone(),
+                message: m,
+                received_at: std::time::Instant::now(),
+            })
+            .collect()
+    }
+
+    /// Classification helper: which fetch variant does this message match?
+    fn fetch_variant_key(msg: &StellarMessage) -> Option<&'static str> {
+        match msg {
+            StellarMessage::GetScpState(_) => Some("GetScpState"),
+            StellarMessage::GetScpQuorumset(_) => Some("GetScpQuorumset"),
+            StellarMessage::GetTxSet(_) => Some("GetTxSet"),
+            StellarMessage::GeneralizedTxSet(_) => Some("GeneralizedTxSet"),
+            StellarMessage::TxSet(_) => Some("TxSet"),
+            StellarMessage::DontHave(_) => Some("DontHave"),
+            StellarMessage::ScpQuorumset(_) => Some("ScpQuorumset"),
+            _ => None,
+        }
+    }
+
+    /// Issue #1741 regression: the fetch channel must be unbounded so that a
+    /// lagging app loop never drops SCP fetch traffic. Push 10_000 messages
+    /// across all 7 fetch variants while the receiver is parked, then drain
+    /// and assert per-variant counts. This test would fail under the old
+    /// bounded (4096) `try_send` implementation.
+    #[tokio::test]
+    async fn fetch_channel_unbounded_all_variants() {
+        let (shared, _broadcast_rx, mut fetch_rx) = make_routing_shared_state();
+        let peer = PeerId::from_bytes([7u8; 32]);
+        let variants = all_fetch_variant_messages(&peer);
+        let variant_count = variants.len();
+        assert_eq!(variant_count, 7, "expected 7 fetch variants");
+
+        const TOTAL: usize = 10_000;
+        let mut sent_counts: std::collections::HashMap<&'static str, usize> =
+            std::collections::HashMap::new();
+        for i in 0..TOTAL {
+            let msg = variants[i % variant_count].clone();
+            let key = fetch_variant_key(&msg.message).expect("fetch variant");
+            *sent_counts.entry(key).or_insert(0) += 1;
+            shared.route_to_subscribers(msg);
+        }
+
+        let mut received_counts: std::collections::HashMap<&'static str, usize> =
+            std::collections::HashMap::new();
+        let mut drained = 0usize;
+        while let Ok(msg) = fetch_rx.try_recv() {
+            let key = fetch_variant_key(&msg.message).expect("received fetch variant");
+            *received_counts.entry(key).or_insert(0) += 1;
+            drained += 1;
+        }
+        assert_eq!(
+            drained, TOTAL,
+            "all {} messages must survive — unbounded channel never drops",
+            TOTAL
+        );
+        assert_eq!(
+            sent_counts, received_counts,
+            "per-variant counts must match"
+        );
+    }
+
+    /// Each of the 7 fetch variants must be routed exclusively to the
+    /// dedicated fetch channel — they must NOT appear on the lossy broadcast.
+    #[tokio::test]
+    async fn fetch_variants_not_delivered_to_broadcast() {
+        let (shared, mut broadcast_rx, _fetch_rx) = make_routing_shared_state();
+        let peer = PeerId::from_bytes([9u8; 32]);
+        for msg in all_fetch_variant_messages(&peer) {
+            let key = fetch_variant_key(&msg.message).unwrap();
+            shared.route_to_subscribers(msg);
+            assert!(
+                matches!(
+                    broadcast_rx.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ),
+                "{} must NOT appear on broadcast channel",
+                key
+            );
+        }
+    }
+
+    /// Positive counterpart: each of the 7 fetch variants DOES land on the
+    /// dedicated fetch channel exactly once.
+    #[tokio::test]
+    async fn fetch_variants_routed_to_dedicated_channel() {
+        let (shared, _broadcast_rx, mut fetch_rx) = make_routing_shared_state();
+        let peer = PeerId::from_bytes([11u8; 32]);
+        let variants = all_fetch_variant_messages(&peer);
+        let expected: std::collections::HashSet<&'static str> = variants
+            .iter()
+            .map(|m| fetch_variant_key(&m.message).unwrap())
+            .collect();
+        for msg in variants {
+            shared.route_to_subscribers(msg);
+        }
+        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        while let Ok(msg) = fetch_rx.try_recv() {
+            seen.insert(fetch_variant_key(&msg.message).unwrap());
+        }
+        assert_eq!(
+            seen, expected,
+            "every fetch variant must reach fetch channel"
         );
     }
 }

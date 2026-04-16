@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
 
+use crate::app::AppInfo;
+
 use super::super::types::MetricsResponse;
 use super::super::ServerState;
 
@@ -24,7 +26,20 @@ pub(crate) async fn metrics_handler(State(state): State<Arc<ServerState>>) -> im
         is_validator: app_info.is_validator,
     };
 
-    // Return Prometheus-style text format
+    let prometheus_text = render_prometheus_text(&metrics, &app_info);
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        prometheus_text,
+    )
+}
+
+/// Render the Prometheus text-format body for `/metrics`.
+///
+/// Extracted as a pure function so the format can be unit-tested without
+/// bringing up a full `App`/`ServerState` stack.
+pub(crate) fn render_prometheus_text(metrics: &MetricsResponse, app_info: &AppInfo) -> String {
     let mut prometheus_text = format!(
         "# HELP stellar_ledger_sequence Current ledger sequence number\n\
          # TYPE stellar_ledger_sequence gauge\n\
@@ -96,9 +111,90 @@ pub(crate) async fn metrics_handler(State(state): State<Arc<ServerState>>) -> im
         sv.verify_latency_count,
     ));
 
-    (
-        StatusCode::OK,
-        [("content-type", "text/plain; version=0.0.4")],
-        prometheus_text,
-    )
+    // Overlay fetch-response channel depth gauges (issue #1741).
+    let ofc = &app_info.overlay_fetch_channel;
+    prometheus_text.push_str(&format!(
+        "# HELP henyey_overlay_fetch_channel_depth Current depth of the overlay fetch-response channel (event-loop sampled)\n\
+         # TYPE henyey_overlay_fetch_channel_depth gauge\n\
+         henyey_overlay_fetch_channel_depth {}\n\
+         # HELP henyey_overlay_fetch_channel_depth_max Monotonic maximum depth of the overlay fetch-response channel since process start\n\
+         # TYPE henyey_overlay_fetch_channel_depth_max gauge\n\
+         henyey_overlay_fetch_channel_depth_max {}\n",
+        ofc.depth, ofc.depth_max,
+    ));
+
+    prometheus_text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{AppInfo, OverlayFetchChannelMetrics, ScpVerifyMetrics};
+
+    fn dummy_app_info() -> AppInfo {
+        AppInfo {
+            version: String::new(),
+            commit_hash: String::new(),
+            build_timestamp: String::new(),
+            node_name: String::new(),
+            public_key: String::new(),
+            network_passphrase: String::new(),
+            is_validator: false,
+            database_path: std::path::PathBuf::new(),
+            meta_stream_bytes_total: 0,
+            meta_stream_writes_total: 0,
+            scp_verify: ScpVerifyMetrics::default(),
+            overlay_fetch_channel: OverlayFetchChannelMetrics::default(),
+        }
+    }
+
+    fn dummy_metrics() -> MetricsResponse {
+        MetricsResponse {
+            ledger_seq: 0,
+            peer_count: 0,
+            pending_transactions: 0,
+            uptime_seconds: 0,
+            state: String::new(),
+            is_validator: false,
+        }
+    }
+
+    /// Issue #1741 regression: `/metrics` must expose both the current-depth
+    /// and monotonic-max gauges for the overlay fetch-response channel so
+    /// unbounded growth under a wedged app loop is operator-visible.
+    #[test]
+    fn metrics_endpoint_exposes_fetch_channel_depth() {
+        let mut app_info = dummy_app_info();
+        app_info.overlay_fetch_channel = OverlayFetchChannelMetrics {
+            depth: 17,
+            depth_max: 42,
+        };
+        let body = render_prometheus_text(&dummy_metrics(), &app_info);
+        assert!(
+            body.contains("# HELP henyey_overlay_fetch_channel_depth "),
+            "missing HELP line for fetch_channel_depth"
+        );
+        assert!(
+            body.contains("# TYPE henyey_overlay_fetch_channel_depth gauge"),
+            "missing TYPE line for fetch_channel_depth"
+        );
+        assert!(
+            body.contains("\nhenyey_overlay_fetch_channel_depth 17\n"),
+            "sample value for fetch_channel_depth not emitted; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("# HELP henyey_overlay_fetch_channel_depth_max "),
+            "missing HELP line for fetch_channel_depth_max"
+        );
+        assert!(
+            body.contains("# TYPE henyey_overlay_fetch_channel_depth_max gauge"),
+            "missing TYPE line for fetch_channel_depth_max"
+        );
+        assert!(
+            body.contains("\nhenyey_overlay_fetch_channel_depth_max 42\n"),
+            "sample value for fetch_channel_depth_max not emitted; got:\n{}",
+            body
+        );
+    }
 }
