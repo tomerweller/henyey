@@ -48,8 +48,8 @@ use henyey_ledger::LedgerManager;
 use henyey_scp::{BallotPhase, SlotIndex, SCP};
 use stellar_xdr::curr::{
     EnvelopeType, LedgerCloseValueSignature, LedgerHeader, LedgerUpgrade, Limits, NodeId, ReadXdr,
-    ScpEnvelope, ScpQuorumSet, Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint,
-    TransactionEnvelope, Uint256, UpgradeType, Value, WriteXdr,
+    ScpEnvelope, ScpQuorumSet, ScpStatementPledges, Signature as XdrSignature, StellarValue,
+    StellarValueExt, TimePoint, TransactionEnvelope, Uint256, UpgradeType, Value, WriteXdr,
 };
 
 use crate::error::HerderError;
@@ -278,6 +278,15 @@ pub struct Herder {
     /// Parity: stellar-core captures the value by-copy in the nomination timer
     /// lambda (NominationProtocol.cpp:654-659) so timeouts replay the same value.
     cached_nomination_value: RwLock<Option<(SlotIndex, Value)>>,
+    /// Handle to the dedicated SCP signature-verify worker thread.
+    /// See [`crate::scp_verify`]. Optional so Herder can be constructed in
+    /// tests / observer scenarios that never call `scp_verifier_handle()`.
+    scp_verifier_handle: Option<crate::scp_verify::SignatureVerifierHandle>,
+    /// Receiver for verified envelopes. Taken exactly once by the event loop
+    /// (see `Herder::take_verified_rx`).
+    verified_rx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::scp_verify::VerifiedEnvelope>>,
+    >,
 }
 
 impl Herder {
@@ -390,6 +399,20 @@ impl Herder {
         let runtime_upgrades = Arc::new(RwLock::new(Upgrades::default()));
         scp_driver.set_upgrades(Arc::clone(&runtime_upgrades));
 
+        // Spawn the dedicated SCP signature-verification worker thread.
+        // Failure to spawn (e.g. OS resource exhaustion) is reported but not
+        // fatal: the synchronous `receive_scp_envelope` path remains available.
+        let (scp_verifier_handle, verified_rx) = match crate::scp_verify::spawn_scp_verifier(
+            config.network_id,
+            crate::scp_verify::DEFAULT_VERIFIER_QUEUE_CAPACITY,
+        ) {
+            Ok(spawned) => (Some(spawned.handle), Some(spawned.verified_rx)),
+            Err(e) => {
+                error!(error = %e, "Failed to spawn scp-verify worker thread");
+                (None, None)
+            }
+        };
+
         Self {
             config,
             state: RwLock::new(HerderState::Booting),
@@ -408,7 +431,24 @@ impl Herder {
             runtime_upgrades,
             queue_full_count: AtomicU64::new(0),
             cached_nomination_value: RwLock::new(None),
+            scp_verifier_handle,
+            verified_rx: std::sync::Mutex::new(verified_rx),
         }
+    }
+
+    /// Handle to the dedicated SCP signature-verification worker (or `None`
+    /// if the worker failed to spawn). The event loop uses this to enqueue
+    /// pre-filtered envelopes and the watchdog uses it to monitor liveness.
+    pub fn scp_verifier_handle(&self) -> Option<crate::scp_verify::SignatureVerifierHandle> {
+        self.scp_verifier_handle.clone()
+    }
+
+    /// Take the verified-envelope receiver. Exactly one consumer (the event
+    /// loop) should call this once at startup; subsequent calls return `None`.
+    pub fn take_verified_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<crate::scp_verify::VerifiedEnvelope>> {
+        self.verified_rx.lock().ok()?.take()
     }
 
     /// Set runtime upgrade parameters (called from HTTP `/upgrades?mode=set`).
@@ -886,54 +926,94 @@ impl Herder {
     }
 
     /// Receive an SCP envelope from the network.
+    ///
+    /// Synchronous wrapper around [`Herder::pre_filter_scp_envelope`],
+    /// [`ScpDriver::verify_envelope`] and [`Herder::process_verified`].
+    /// Retained for the synchronous catchup path and tests; production SCP
+    /// flow on the event loop goes through the pipelined worker (see
+    /// [`crate::scp_verify`]).
     pub fn receive_scp_envelope(&self, envelope: ScpEnvelope) -> EnvelopeState {
+        use crate::scp_verify::{PipelinedIntake, PreFilter, Verdict, VerifiedEnvelope};
+        let slot = envelope.statement.slot_index;
+        let is_externalize = matches!(
+            &envelope.statement.pledges,
+            ScpStatementPledges::Externalize(_)
+        );
+        match self.pre_filter_scp_envelope(&envelope) {
+            PreFilter::Accept(_) => {}
+            PreFilter::Reject(reason) => {
+                use crate::scp_verify::PreFilterRejectReason as R;
+                debug!(
+                    slot,
+                    reason = reason.as_str(),
+                    "pre-filter rejected envelope"
+                );
+                return match reason {
+                    R::Range => EnvelopeState::TooOld,
+                    R::CannotReceiveScp | R::CloseTime => EnvelopeState::Invalid,
+                };
+            }
+        }
+        if let Err(e) = self.scp_driver.verify_envelope(&envelope) {
+            debug!(slot, error = %e, "Invalid SCP envelope signature");
+            return EnvelopeState::InvalidSignature;
+        }
+        let intake = PipelinedIntake {
+            envelope,
+            slot,
+            is_externalize,
+            peer_id: None,
+            enqueue_at: Instant::now(),
+        };
+        self.process_verified(VerifiedEnvelope {
+            intake,
+            verdict: Verdict::Ok,
+        })
+    }
+
+    /// Pre-verify filter: runs the cheap mutable-state gates that would cause
+    /// an envelope to be dropped regardless of signature validity.
+    ///
+    /// Order preserved from the original `receive_scp_envelope`:
+    /// 1. `can_receive_scp` state check (HerderState.cpp)
+    /// 2. Close-time pre-filter (tracking / non-tracking, checkpoint exception)
+    /// 3. Slot-range check with `effective_min` derived from LCL
+    ///
+    /// Signature verification is **not** performed here. Accepted envelopes are
+    /// returned as a [`PipelinedIntake`] carrying metadata needed downstream.
+    pub fn pre_filter_scp_envelope(&self, envelope: &ScpEnvelope) -> crate::scp_verify::PreFilter {
+        use crate::scp_verify::{PipelinedIntake, PreFilter, PreFilterRejectReason};
         let state = self.state();
         let slot = envelope.statement.slot_index;
         let current_slot = self.tracking_slot();
-        let pending_slot = self.pending_envelopes.current_slot();
 
-        // Check if we can receive SCP messages
         if !state.can_receive_scp() {
             debug!(
                 "Rejecting SCP envelope: herder in {:?} state (cannot receive)",
                 state
             );
-            return EnvelopeState::Invalid;
+            return PreFilter::Reject(PreFilterRejectReason::CannotReceiveScp);
         }
 
-        // **** First perform checks that do NOT require signature verification
-        // This allows fast-failing messages we'd throw away anyway (matching stellar-core)
-
-        // Close-time pre-filter: reject envelopes with invalid close times
-        // before incurring the cost of signature verification
-        if !self.check_envelope_close_time(&envelope, false) {
+        // Close-time pre-filter (tracking: check drift; non-tracking: check recency)
+        if !self.check_envelope_close_time(envelope, false) {
             debug!(
                 slot,
                 "Rejecting SCP envelope: close-time pre-filter failed (check_envelope_close_time(false))"
             );
-            return EnvelopeState::Invalid;
+            return PreFilter::Reject(PreFilterRejectReason::CloseTime);
         }
 
         let checkpoint = self.get_most_recent_checkpoint_seq();
         let mut max_ledger_seq: u64 = u64::MAX;
 
         if state.is_tracking() {
-            // When tracking, filter messages based on consensus information
             max_ledger_seq = self.next_consensus_ledger_index() + LEDGER_VALIDITY_BRACKET;
         } else {
-            // When not tracking, apply recency-based close-time filtering.
-            // Allow checkpoint messages through even if close time is stale.
-            // enforce_recent = true only if we've never been in sync (tracking index <= genesis)
             let tracking_consensus_index = current_slot.saturating_sub(1);
-            // enforce_recent = true only if:
-            // 1. We've never been in sync (tracking index <= genesis), AND
-            // 2. This is NOT the next consensus slot (which we're actively working on)
-            // This matches stellar-core:
-            //   trackingConsensusLedgerIndex() <= GENESIS_LEDGER_SEQ
-            //       && index != nextConsensusLedgerIndex()
             let enforce_recent = tracking_consensus_index <= GENESIS_LEDGER_SEQ
                 && slot != self.next_consensus_ledger_index();
-            if !self.check_envelope_close_time(&envelope, enforce_recent) && slot != checkpoint {
+            if !self.check_envelope_close_time(envelope, enforce_recent) && slot != checkpoint {
                 debug!(
                     slot,
                     tracking_consensus_index,
@@ -942,18 +1022,16 @@ impl Herder {
                     "Rejecting SCP envelope: close-time filter (non-tracking, enforce_recent={})",
                     enforce_recent
                 );
-                return EnvelopeState::Invalid;
+                return PreFilter::Reject(PreFilterRejectReason::CloseTime);
             }
         }
 
-        // Calculate the minimum acceptable slot
         let min_ledger_seq = if current_slot > MAX_SLOTS_TO_REMEMBER {
             current_slot - MAX_SLOTS_TO_REMEMBER + 1
         } else {
             1
         };
 
-        // Early check: reject envelopes for already-closed slots (from catchup)
         let lcl = self
             .ledger_manager
             .read()
@@ -962,8 +1040,6 @@ impl Herder {
 
         let effective_min = lcl.map_or(min_ledger_seq, |l| min_ledger_seq.max(l + 1));
 
-        // Range check: slot must be in [effective_min, max_ledger_seq], with
-        // checkpoint exception (matching stellar-core)
         if (slot > max_ledger_seq || slot < effective_min) && slot != checkpoint {
             debug!(
                 slot,
@@ -974,14 +1050,68 @@ impl Herder {
                 checkpoint,
                 "Rejecting envelope: slot outside validity bracket"
             );
-            return EnvelopeState::TooOld;
+            return PreFilter::Reject(PreFilterRejectReason::Range);
         }
 
-        // **** From this point, we have to check signatures (matching stellar-core)
-        if let Err(e) = self.scp_driver.verify_envelope(&envelope) {
-            debug!(slot, error = %e, "Invalid SCP envelope signature");
-            return EnvelopeState::InvalidSignature;
+        let is_externalize = matches!(
+            &envelope.statement.pledges,
+            ScpStatementPledges::Externalize(_)
+        );
+        PreFilter::Accept(PipelinedIntake {
+            envelope: envelope.clone(),
+            slot,
+            is_externalize,
+            peer_id: None,
+            enqueue_at: Instant::now(),
+        })
+    }
+
+    /// Post-verification processing.
+    ///
+    /// Assumes signature verification already succeeded (or the verdict is
+    /// surfaced as `InvalidSignature`). Re-runs the mutable pre-filter gates
+    /// (state may have drifted while the worker was verifying) before
+    /// executing self-message skip, non-quorum reject, slot_quorum_tracker
+    /// update, EXTERNALIZE tx-set prefetch and `pending_envelopes.add` /
+    /// `process_scp_envelope`.
+    pub fn process_verified(&self, ve: crate::scp_verify::VerifiedEnvelope) -> EnvelopeState {
+        use crate::scp_verify::{PreFilter, Verdict};
+        let crate::scp_verify::VerifiedEnvelope { intake, verdict } = ve;
+        let slot = intake.slot;
+
+        match verdict {
+            Verdict::Ok => {}
+            Verdict::InvalidSignature => {
+                debug!(slot, "SCP envelope rejected (InvalidSignature)");
+                return EnvelopeState::InvalidSignature;
+            }
+            Verdict::Panic => {
+                debug!(slot, "SCP verify worker panicked on this envelope");
+                return EnvelopeState::Invalid;
+            }
         }
+
+        let envelope = intake.envelope;
+
+        // Re-check mutable gates (state may have drifted during verify).
+        match self.pre_filter_scp_envelope(&envelope) {
+            PreFilter::Accept(_) => {}
+            PreFilter::Reject(reason) => {
+                use crate::scp_verify::PreFilterRejectReason as R;
+                debug!(
+                    slot,
+                    reason = reason.as_str(),
+                    "post-verify gate drift rejected envelope"
+                );
+                return match reason {
+                    R::Range => EnvelopeState::TooOld,
+                    R::CannotReceiveScp | R::CloseTime => EnvelopeState::Invalid,
+                };
+            }
+        }
+
+        let current_slot = self.tracking_slot();
+        let pending_slot = self.pending_envelopes.current_slot();
 
         // Parity: skip self-messages (HerderImpl.cpp:885-891)
         let local_node_id = node_id_from_public_key(&self.config.node_public_key);
@@ -992,8 +1122,6 @@ impl Herder {
 
         // Parity: reject envelopes from nodes not in our transitive quorum
         // (PendingEnvelopes.cpp:293-298 isNodeDefinitelyInQuorum)
-        // Only enforce when a quorum set is configured (validators and watchers
-        // with a quorum set). Observers without a quorum set accept all envelopes.
         if self.config.local_quorum_set.is_some()
             && !self
                 .quorum_tracker
@@ -1013,13 +1141,17 @@ impl Herder {
             .record_envelope(slot, envelope.statement.node_id.clone());
 
         // Pre-fetch tx sets from EXTERNALIZE envelopes immediately so they're
-        // available by the time SCP processes the envelope (after pending buffering).
+        // available by the time SCP processes the envelope.
+        let lcl = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .map(|m| m.current_ledger_seq() as u64);
         if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
             &envelope.statement.pledges
         {
             if let Ok(sv) = StellarValue::from_xdr(&ext.commit.value.0, Limits::none()) {
                 let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                // Only request tx sets for slots we haven't already closed via catchup
                 if lcl.map_or(true, |l| slot > l) {
                     if self.scp_driver.request_tx_set(tx_set_hash, slot) {
                         debug!(slot, hash = %tx_set_hash, "Requesting tx set from EXTERNALIZE");
@@ -1028,13 +1160,9 @@ impl Herder {
             }
         }
 
-        // Check if this is for a future slot
+        // Future slot: buffer via PendingEnvelopes.
         if slot > current_slot {
-            // Clone the envelope in case we need to process it after pending.add fails
-            // due to a race condition (another thread advanced pending.current_slot)
             let envelope_clone = envelope.clone();
-
-            // Buffer for later
             match self.pending_envelopes.add(slot, envelope) {
                 PendingResult::Added => {
                     debug!("Buffered envelope for future slot {}", slot);
@@ -1051,16 +1179,12 @@ impl Herder {
                     return EnvelopeState::Invalid;
                 }
                 PendingResult::SlotTooOld => {
-                    // This can happen due to race condition when pending.current_slot
-                    // was advanced by another thread. Since we already checked against
-                    // effective_min, treat this as a race and process directly.
                     debug!(
                         slot,
                         current_slot,
                         pending_slot,
                         "Pending said TooOld but slot is within window, processing directly"
                     );
-                    // Process using the clone since original was consumed
                     return self.process_scp_envelope(envelope_clone);
                 }
                 PendingResult::BufferFull => {
@@ -1070,7 +1194,7 @@ impl Herder {
             }
         }
 
-        // Process the envelope - it's for current slot or a recent slot within the window
+        // Current or recent slot — process directly.
         self.process_scp_envelope(envelope)
     }
 

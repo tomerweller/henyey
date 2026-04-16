@@ -1507,37 +1507,57 @@ impl ScpDriver {
         Some(secret_key.sign(&data))
     }
 
-    /// Verify an SCP envelope signature.
-    pub fn verify_envelope(&self, envelope: &ScpEnvelope) -> Result<()> {
-        // Extract the public key from the node ID
-        let node_id = &envelope.statement.node_id;
-        let public_key = PublicKey::try_from(&node_id.0)
-            .map_err(|_| HerderError::Internal("Invalid node ID".to_string()))?;
-
-        // Create the data that was signed: network ID + ENVELOPE_TYPE_SCP + statement XDR
-        // ENVELOPE_TYPE_SCP = 1 (as i32 big-endian)
+    /// Build the signed-payload bytes for an SCP envelope:
+    /// `network_id || ENVELOPE_TYPE_SCP(1, i32 BE) || statement XDR`.
+    ///
+    /// Pure function (no `&self`); used by the off-event-loop verification
+    /// worker (`scp_verify.rs`) so XDR serialization does not run on the
+    /// tokio event loop.
+    pub fn build_signed_bytes(network_id: &Hash256, envelope: &ScpEnvelope) -> Result<Vec<u8>> {
         let statement_bytes = envelope
             .statement
             .to_xdr(stellar_xdr::curr::Limits::none())
             .map_err(|e| HerderError::Internal(format!("Failed to encode statement: {}", e)))?;
-
-        let mut data = self.network_id.0.to_vec();
+        let mut data = Vec::with_capacity(32 + 4 + statement_bytes.len());
+        data.extend_from_slice(&network_id.0);
         data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP
         data.extend_from_slice(&statement_bytes);
+        Ok(data)
+    }
 
-        // Verify signature
-        let sig_bytes: [u8; 64] = envelope
-            .signature
+    /// Verify a pre-serialised signed-payload `data` against `node_id` and
+    /// `sig`. Pure function (no `&self`); used off the event loop.
+    pub fn verify_signed_bytes(
+        data: &[u8],
+        node_id: &NodeId,
+        sig: &stellar_xdr::curr::Signature,
+    ) -> Result<()> {
+        let public_key = PublicKey::try_from(&node_id.0)
+            .map_err(|_| HerderError::Internal("Invalid node ID".to_string()))?;
+
+        let sig_bytes: [u8; 64] = sig
             .0
             .as_slice()
             .try_into()
             .map_err(|_| HerderError::Internal("Invalid signature length".to_string()))?;
-
         let signature = henyey_crypto::Signature::from_bytes(sig_bytes);
 
         public_key
-            .verify(&data, &signature)
+            .verify(data, &signature)
             .map_err(|_| HerderError::Scp(henyey_scp::ScpError::SignatureVerificationFailed))
+    }
+
+    /// Verify an SCP envelope signature.
+    ///
+    /// This is a thin synchronous wrapper over [`ScpDriver::build_signed_bytes`]
+    /// and [`ScpDriver::verify_signed_bytes`]. The event-loop fast path moves
+    /// these two steps to a dedicated worker thread (see
+    /// [`crate::scp_verify`]). This method is retained for the synchronous
+    /// catchup verification path (`catchup_impl.rs`, which already runs inside
+    /// `tokio::spawn`) and for tests.
+    pub fn verify_envelope(&self, envelope: &ScpEnvelope) -> Result<()> {
+        let data = Self::build_signed_bytes(&self.network_id, envelope)?;
+        Self::verify_signed_bytes(&data, &envelope.statement.node_id, &envelope.signature)
     }
 
     /// Construct and broadcast an EXTERNALIZE envelope for a slot that was

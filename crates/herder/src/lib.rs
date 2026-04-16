@@ -120,6 +120,7 @@ mod persistence;
 mod quorum_set_tracker;
 mod quorum_tracker;
 mod scp_driver;
+pub mod scp_verify;
 mod state;
 mod surge_pricing;
 pub mod sync_recovery;

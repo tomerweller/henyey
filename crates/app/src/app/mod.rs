@@ -443,7 +443,9 @@ pub struct App {
     ///        4=scp_broadcast, 5=consensus_tick, 6=pending_close,
     ///        10=process_externalized, 11=maybe_externalized_catchup,
     ///        12=try_apply_buffered, 13=maybe_buffered_catchup,
-    ///        14=catchup_running, 15=heartbeat
+    ///        14=catchup_running, 15=heartbeat,
+    ///        31=scp_verifier (unused: reserved for future phase),
+    ///        32=scp_verified (draining verified envelopes)
     event_loop_phase: Arc<AtomicU64>,
 }
 
@@ -1710,14 +1712,26 @@ impl App {
     /// it checks the last event loop tick timestamp. If the event loop hasn't
     /// ticked in 30+ seconds, it logs an error with the current phase code
     /// and thread backtraces to help diagnose deadlocks.
+    ///
+    /// It also monitors the SCP signature-verifier thread (see
+    /// [`henyey_herder::scp_verify`]): it fires an error if the worker is
+    /// `Dead`, or if its heartbeat is stuck while there is a non-empty backlog
+    /// for at least [`BACKLOG_STALE_TICKS`] consecutive ticks.
     pub fn start_event_loop_watchdog(&self) {
+        /// Number of consecutive 10s ticks the verifier heartbeat must be
+        /// stuck (with a non-empty backlog) before the watchdog logs.
+        const BACKLOG_STALE_TICKS: u32 = 3;
+
         let tick_ms = Arc::clone(&self.last_event_loop_tick_ms);
         let phase = Arc::clone(&self.event_loop_phase);
         let pid = std::process::id();
+        let verifier = self.herder.scp_verifier_handle();
 
         std::thread::Builder::new()
             .name("watchdog".into())
             .spawn(move || {
+                let mut last_hb_seen: u64 = 0;
+                let mut stale_hb_ticks: u32 = 0;
                 loop {
                     std::thread::sleep(Duration::from_secs(10));
 
@@ -1748,7 +1762,8 @@ impl App {
                              15=pending_catchup_complete, 16=heartbeat, \
                              20=stats, 21=tx_advert, 22=tx_demand, 23=survey, \
                              24=survey_req, 25=survey_phase, 26=scp_timeout, \
-                             27=ping, 28=peer_maint, 29=peer_refresh, 30=herder_cleanup"
+                             27=ping, 28=peer_maint, 29=peer_refresh, \
+                             30=herder_cleanup, 31=scp_verifier, 32=scp_verified"
                         );
 
                         // Log thread states from /proc for debugging
@@ -1780,6 +1795,32 @@ impl App {
                             phase = current_phase,
                             "WATCHDOG: Event loop slow (>15s since last tick)"
                         );
+                    }
+
+                    // SCP verifier health block (issue #1734 Phase B).
+                    if let Some(v) = verifier.as_ref() {
+                        let vstate = v.state();
+                        if matches!(vstate, henyey_herder::scp_verify::VerifierState::Dead) {
+                            tracing::error!(pid, "WATCHDOG: scp-verify worker thread is dead");
+                        } else {
+                            let hb = v.heartbeat();
+                            let backlog = v.backlog();
+                            if backlog > 0 && hb == last_hb_seen {
+                                stale_hb_ticks += 1;
+                                if stale_hb_ticks >= BACKLOG_STALE_TICKS {
+                                    tracing::error!(
+                                        backlog,
+                                        hb,
+                                        stale_hb_ticks,
+                                        "WATCHDOG: scp-verify worker stuck \
+                                         (heartbeat not advancing while backlog > 0)"
+                                    );
+                                }
+                            } else {
+                                stale_hb_ticks = 0;
+                                last_hb_seen = hb;
+                            }
+                        }
                     }
                 }
             })

@@ -100,6 +100,18 @@ impl App {
             }
         };
 
+        // Take the verified-SCP-envelope receiver from the herder. If the
+        // verifier worker failed to spawn (or the receiver was already
+        // taken), fall back to a dummy receiver so the `select!` arm below
+        // compiles — the dummy never resolves and the synchronous
+        // `process_scp_message_sync` path is used instead.
+        let mut verified_rx = self.herder.take_verified_rx().unwrap_or_else(|| {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                henyey_herder::scp_verify::VerifiedEnvelope,
+            >();
+            rx
+        });
+
         // Main run loop
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut consensus_interval = tokio::time::interval(Duration::from_secs(1));
@@ -247,7 +259,7 @@ impl App {
                         // Drain SCP + fetch response channels.
                         for _ in 0..MAX_DRAIN_PER_TICK {
                             match scp_message_rx.try_recv() {
-                                Ok(scp_msg) => self.handle_overlay_message(scp_msg).await,
+                                Ok(scp_msg) => self.pump_scp_intake(scp_msg, &mut verified_rx).await,
                                 Err(_) => break,
                             }
                         }
@@ -408,6 +420,20 @@ impl App {
                     }
                 }
 
+                // Process verified SCP envelopes from the dedicated verifier
+                // worker thread (issue #1734 Phase B). Placed alongside the
+                // overlay channels — NOT biased — so timers and other intake
+                // stay fair under verified-backlog bursts.
+                Some(ve) = verified_rx.recv() => {
+                    self.set_phase(32); // 32 = scp_verified
+                    tracing::trace!(select_iteration, "BRANCH: verified_rx");
+                    self.process_verified(ve).await;
+                    if pending_close.is_none() && pending_catchup.is_none() {
+                        pending_close = self.try_start_ledger_close().await;
+                    }
+                    tracing::trace!(select_iteration, "BRANCH: verified_rx done");
+                }
+
                 // Process SCP messages from dedicated never-drop channel.
                 // These are guaranteed to arrive even if the broadcast channel overflows.
                 Some(scp_msg) = scp_message_rx.recv() => {
@@ -426,7 +452,7 @@ impl App {
                         latency_ms = scp_msg.received_at.elapsed().as_millis(),
                         "SCP message arrived via dedicated channel"
                     );
-                    self.handle_overlay_message(scp_msg).await;
+                    self.pump_scp_intake(scp_msg, &mut verified_rx).await;
                     // After processing an SCP message (which may buffer an
                     // EXTERNALIZE), kick off a buffered close if none is running.
                     if pending_close.is_none() && pending_catchup.is_none() {
@@ -568,7 +594,7 @@ impl App {
                     // Drain dedicated SCP channel first (highest priority)
                     for _ in 0..MAX_DRAIN_PER_TICK {
                         match scp_message_rx.try_recv() {
-                            Ok(scp_msg) => self.handle_overlay_message(scp_msg).await,
+                            Ok(scp_msg) => self.pump_scp_intake(scp_msg, &mut verified_rx).await,
                             Err(_) => break,
                         }
                     }
@@ -1022,200 +1048,17 @@ impl App {
     async fn handle_overlay_message(&self, msg: OverlayMessage) {
         match msg.message {
             StellarMessage::ScpMessage(envelope) => {
-                let slot = envelope.statement.slot_index;
-                let tracking = self.herder.tracking_slot();
-
-                let sample = {
-                    let mut latency = self.scp_latency.write().await;
-                    let now = self.clock.now();
-                    latency.record_first_seen(slot, now);
-                    latency.record_other_after_self(slot, now)
-                };
-                if let Some(ms) = sample {
-                    let mut survey_data = self.survey_data.write().await;
-                    survey_data.record_scp_self_to_other_latency(ms);
-                }
-
-                // Check if this is an EXTERNALIZE message so we can request the tx set
-                let is_externalize = matches!(
-                    &envelope.statement.pledges,
-                    stellar_xdr::curr::ScpStatementPledges::Externalize(_)
-                );
-                let tx_set_hash = match &envelope.statement.pledges {
-                    stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
-                        match StellarValue::from_xdr(
-                            &ext.commit.value.0,
-                            stellar_xdr::curr::Limits::none(),
-                        ) {
-                            Ok(stellar_value) => {
-                                Some(Hash256::from_bytes(stellar_value.tx_set_hash.0))
-                            }
-                            Err(err) => {
-                                tracing::warn!(slot, error = %err, "Failed to parse externalized StellarValue");
-                                None
-                            }
-                        }
-                    }
-                    _ => None,
-                };
-
-                let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
-                let hash256 = henyey_common::Hash256::from_bytes(hash.0);
-                let sender_node_id = envelope.statement.node_id.clone();
-
-                let envelope_result = self.herder.receive_scp_envelope(envelope);
-
-                // Request quorum set only after receive_scp_envelope validates
-                // the envelope (signature check, slot range, etc.). This prevents
-                // forged envelopes from creating immortal pending qset entries.
-                // Matches stellar-core which verifies before any fetch logic.
+                // Legacy synchronous SCP path (pre-issue #1734 Phase B).
                 //
-                // Fetching is included because process_scp_envelope may return
-                // Fetching when tx_sets are cached but the quorum set is unknown.
-                // The envelope is buffered in FetchingEnvelopes; we still need
-                // the app layer to register the pending qset request and send
-                // the network fetch so handle_quorum_set accepts the response
-                // (AUDIT-104).
-                if matches!(
-                    envelope_result,
-                    EnvelopeState::Valid | EnvelopeState::Pending | EnvelopeState::Fetching
-                ) {
-                    if self.herder.request_quorum_set(hash256, sender_node_id) {
-                        // New pending request - need to fetch from network
-                        let peer = msg.from_peer.clone();
-                        if let Some(overlay) = self.overlay().await {
-                            let request =
-                                StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
-                            if let Err(e) = overlay.try_send_to(&peer, request) {
-                                tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
-                            }
-                        }
-                    }
-                }
-
-                match envelope_result {
-                    EnvelopeState::Valid => {
-                        tracing::debug!(slot, tracking, "SCP envelope accepted (Valid)");
-                        // NOTE: We intentionally do NOT send a sync recovery
-                        // heartbeat here.  SCP messages flowing (including
-                        // EXTERNALIZE) is not evidence of ledger progress —
-                        // the node may have all the EXTERNALIZE messages but
-                        // be missing tx_sets needed to actually close ledgers.
-                        // The heartbeat is sent only on actual ledger close
-                        // (see ledger_close.rs handle_close_complete) so the
-                        // stuck timer fires when ledgers stop advancing.
-
-                        // For EXTERNALIZE messages, immediately try to close ledger and request tx set
-                        if is_externalize {
-                            tracing::debug!(slot, tracking, "EXTERNALIZE Valid — processing slot");
-                            if let Some(tx_set_hash) = tx_set_hash {
-                                self.herder.scp_driver().request_tx_set(tx_set_hash, slot);
-                                self.maybe_request_tx_set_from_peer(&tx_set_hash, &msg.from_peer)
-                                    .await;
-                            }
-                            // First, process externalized slots to register pending tx set requests
-                            if let Some(pc) = self.process_externalized_slots().await {
-                                *self.deferred_catchup.lock().await = Some(pc);
-                            }
-                            // Then, immediately request any pending tx sets
-                            self.request_pending_tx_sets().await;
-
-                            let current_ledger = self.current_ledger_seq() as u64;
-                            if slot > current_ledger + 1 {
-                                self.sync_recovery_pending.store(true, Ordering::SeqCst);
-                                // If the gap is large, fast-track to catchup
-                                if slot > current_ledger + 2 {
-                                    self.recovery_attempts_without_progress
-                                        .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
-                                }
-                            }
-                        }
-                    }
-                    EnvelopeState::Pending => {
-                        tracing::debug!(slot, tracking, "SCP envelope buffered for future slot");
-                        // If we receive a Pending EXTERNALIZE for a slot far ahead of
-                        // our current ledger, the network has moved on without us.
-                        // Immediately escalate recovery to trigger catchup rather than
-                        // waiting 60+ seconds for the normal escalation path.
-                        //
-                        // IMPORTANT: Only fast-track if the next slot (current_ledger+1)
-                        // is NOT in syncing_ledgers. After catchup, the node has buffered
-                        // entries with tx_sets ready for rapid close. Fresh EXTERNALIZE
-                        // envelopes from SCP state responses are always far ahead (gap 10+),
-                        // and fast-tracking would destroy the buffer via
-                        // trigger_recovery_catchup → buffer.clear(), preventing convergence.
-                        if is_externalize {
-                            let current_ledger = self.current_ledger_seq() as u64;
-                            if slot > current_ledger + 2 {
-                                let next_slot = current_ledger as u32 + 1;
-                                let have_next = self
-                                    .syncing_ledgers
-                                    .read()
-                                    .await
-                                    .get(&next_slot)
-                                    .map(|info| info.tx_set.is_some())
-                                    .unwrap_or(false);
-                                if have_next {
-                                    tracing::debug!(
-                                        slot,
-                                        current_ledger,
-                                        gap = slot - current_ledger,
-                                        "Pending EXTERNALIZE far ahead but next slot buffered — \
-                                         letting rapid close proceed"
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        slot,
-                                        current_ledger,
-                                        gap = slot - current_ledger,
-                                        "Pending EXTERNALIZE far ahead — fast-tracking catchup"
-                                    );
-                                    self.recovery_attempts_without_progress
-                                        .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
-                                    self.sync_recovery_pending.store(true, Ordering::SeqCst);
-                                }
-                            }
-                        }
-                    }
-                    EnvelopeState::Duplicate => {
-                        // Expected, ignore silently
-                    }
-                    EnvelopeState::TooOld => {
-                        tracing::debug!(slot, tracking, "SCP envelope rejected (TooOld)");
-                    }
-                    EnvelopeState::Invalid => {
-                        tracing::debug!(slot, peer = %msg.from_peer, "SCP envelope rejected (Invalid)");
-                    }
-                    EnvelopeState::InvalidSignature => {
-                        tracing::warn!(slot, peer = %msg.from_peer, "SCP envelope with invalid signature");
-                    }
-                    EnvelopeState::Fetching => {
-                        // Envelope is waiting for its tx set to be fetched.
-                        // Request the tx set from the peer that sent this envelope.
-                        tracing::debug!(
-                            slot,
-                            peer = %msg.from_peer,
-                            "SCP EXTERNALIZE waiting for tx set (Fetching)"
-                        );
-                        if let Some(tx_set_hash) = tx_set_hash {
-                            let peer = msg.from_peer.clone();
-                            if let Some(overlay) = self.overlay().await {
-                                let request = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(
-                                    tx_set_hash.0,
-                                ));
-                                if let Err(e) = overlay.try_send_to(&peer, request) {
-                                    tracing::debug!(
-                                        peer = %peer,
-                                        error = %e,
-                                        "Failed to request tx set for fetching envelope"
-                                    );
-                                }
-                            }
-                        }
-                        // Also request any other pending tx sets
-                        self.request_pending_tx_sets().await;
-                    }
-                }
+                // Production SCP intake goes through `pump_scp_intake`, which
+                // pre-filters, dispatches to the dedicated signature-verify
+                // worker thread, and routes verified results back through
+                // `process_verified`. This arm is retained as a defensive
+                // fallback for the rare case an SCP envelope reaches here via
+                // the non-SCP broadcast channel (the main loop skips it at
+                // the SCP check guard).
+                self.process_scp_message_sync(envelope, msg.from_peer.clone())
+                    .await;
             }
 
             StellarMessage::Transaction(tx_env) => {
@@ -1601,5 +1444,345 @@ impl App {
         } else {
             false
         }
+    }
+
+    // ---------------------------------------------------------------
+    // SCP envelope pipeline (issue #1734 Phase B)
+    // ---------------------------------------------------------------
+
+    /// Maximum number of verified envelopes drained per `pump_scp_intake`
+    /// call before yielding to the outer select! (so timers and intake
+    /// from other channels stay responsive under verified-backlog bursts).
+    const VERIFIED_DRAIN_BUDGET: usize = 32;
+
+    /// Drain one new SCP message into the dedicated verifier worker while
+    /// opportunistically draining already-verified envelopes from the
+    /// worker's output channel.
+    ///
+    /// On entry this method has an [`OverlayMessage`] that the main loop
+    /// already decided is an SCP envelope. The helper:
+    ///
+    /// 1. Pre-filters the envelope (cheap state gates) on the event loop.
+    /// 2. Reserves capacity in the verifier queue via `Sender::reserve().await`
+    ///    — this is the backpressure point: the event loop parks here rather
+    ///    than dropping envelopes when the worker is saturated.
+    /// 3. While waiting for capacity, pulls up to [`VERIFIED_DRAIN_BUDGET`]
+    ///    verified envelopes from `verified_rx` via a biased inner select
+    ///    (the bias is *local* to this helper — the outer select! remains
+    ///    non-biased, preserving timer fairness).
+    ///
+    /// Envelopes the pre-filter rejects never reach the worker.
+    pub(super) async fn pump_scp_intake(
+        &self,
+        scp_msg: OverlayMessage,
+        verified_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
+            henyey_herder::scp_verify::VerifiedEnvelope,
+        >,
+    ) {
+        use henyey_herder::scp_verify::PreFilter;
+
+        let envelope = match scp_msg.message {
+            StellarMessage::ScpMessage(e) => e,
+            other => {
+                tracing::warn!("pump_scp_intake called with non-SCP message: {other:?}");
+                return;
+            }
+        };
+
+        let from_peer = scp_msg.from_peer;
+
+        let verifier = match self.herder.scp_verifier_handle() {
+            Some(v) => v,
+            None => {
+                // Worker never spawned — fall back to the synchronous path.
+                self.process_scp_message_sync(envelope, from_peer).await;
+                return;
+            }
+        };
+
+        let mut drained: usize = 0;
+        loop {
+            tokio::select! {
+                biased;
+
+                Some(ve) = verified_rx.recv(), if drained < Self::VERIFIED_DRAIN_BUDGET => {
+                    self.process_verified(ve).await;
+                    drained += 1;
+                }
+
+                permit_res = verifier.tx.reserve() => {
+                    let permit = match permit_res {
+                        Ok(p) => p,
+                        Err(_closed) => {
+                            tracing::error!(
+                                "scp-verify worker channel closed (worker likely dead); \
+                                 dropping envelope"
+                            );
+                            return;
+                        }
+                    };
+                    match self.herder.pre_filter_scp_envelope(&envelope) {
+                        PreFilter::Accept(mut intake) => {
+                            intake.peer_id = Some(from_peer);
+                            permit.send(intake);
+                        }
+                        PreFilter::Reject(_) => {
+                            drop(permit);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Process a fully-verified envelope on the event loop, running the
+    /// post-verify gates and side-effect block that used to live inline in
+    /// `handle_overlay_message`'s SCP arm.
+    pub(super) async fn process_verified(&self, ve: henyey_herder::scp_verify::VerifiedEnvelope) {
+        use henyey_herder::scp_verify::Verdict;
+        self.set_phase(32); // 32 = scp_verified
+
+        let slot = ve.intake.slot;
+        let tracking = self.herder.tracking_slot();
+        let is_externalize = ve.intake.is_externalize;
+
+        // SCP latency bookkeeping (moved here from the pre-verify
+        // handle_overlay_message entry: we now time from "arrived at
+        // process_verified" instead of "arrived at overlay dispatch",
+        // which better reflects user-visible processing latency).
+        {
+            let mut latency = self.scp_latency.write().await;
+            let now = self.clock.now();
+            latency.record_first_seen(slot, now);
+            if let Some(ms) = latency.record_other_after_self(slot, now) {
+                let mut survey_data = self.survey_data.write().await;
+                survey_data.record_scp_self_to_other_latency(ms);
+            }
+        }
+
+        // Fast-path reject surfaced by the worker (invalid signature or
+        // panic) — log, emit the same warning handle_overlay_message used
+        // to emit, and skip the rest of the side-effect block.
+        if !matches!(ve.verdict, Verdict::Ok) {
+            let peer = ve
+                .intake
+                .peer_id
+                .as_ref()
+                .map(|p| format!("{}", p))
+                .unwrap_or_else(|| "<unknown>".into());
+            match ve.verdict {
+                Verdict::InvalidSignature => {
+                    tracing::warn!(slot, peer = %peer, "SCP envelope with invalid signature");
+                }
+                Verdict::Panic => {
+                    tracing::error!(slot, peer = %peer, "SCP envelope verification panicked");
+                }
+                Verdict::Ok => unreachable!(),
+            }
+            // Feed into Herder so internal accounting stays consistent
+            // (pre-filter drop reasons are not re-run here; the Herder's
+            // `process_verified` handles the InvalidSignature/Panic cases
+            // without running downstream logic).
+            let _ = self.herder.process_verified(ve);
+            return;
+        }
+
+        let envelope = ve.intake.envelope.clone();
+        let from_peer_opt = ve.intake.peer_id.clone();
+
+        let tx_set_hash = if is_externalize {
+            match &envelope.statement.pledges {
+                stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
+                    match StellarValue::from_xdr(
+                        &ext.commit.value.0,
+                        stellar_xdr::curr::Limits::none(),
+                    ) {
+                        Ok(stellar_value) => Some(Hash256::from_bytes(stellar_value.tx_set_hash.0)),
+                        Err(err) => {
+                            tracing::warn!(
+                                slot, error = %err,
+                                "Failed to parse externalized StellarValue"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
+        let hash256 = henyey_common::Hash256::from_bytes(hash.0);
+        let sender_node_id = envelope.statement.node_id.clone();
+
+        // Hand off to Herder for gate recheck + self-message skip +
+        // non-quorum reject + slot_quorum_tracker + prefetch + pending.add.
+        let envelope_result = self.herder.process_verified(ve);
+
+        // Request quorum set only after Herder has validated the envelope.
+        if matches!(
+            envelope_result,
+            EnvelopeState::Valid | EnvelopeState::Pending | EnvelopeState::Fetching
+        ) {
+            if self.herder.request_quorum_set(hash256, sender_node_id) {
+                if let Some(peer) = from_peer_opt.as_ref() {
+                    if let Some(overlay) = self.overlay().await {
+                        let request =
+                            StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
+                        if let Err(e) = overlay.try_send_to(peer, request) {
+                            tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
+                        }
+                    }
+                }
+            }
+        }
+
+        match envelope_result {
+            EnvelopeState::Valid => {
+                tracing::debug!(slot, tracking, "SCP envelope accepted (Valid)");
+                if is_externalize {
+                    tracing::debug!(slot, tracking, "EXTERNALIZE Valid — processing slot");
+                    if let Some(tx_set_hash) = tx_set_hash {
+                        self.herder.scp_driver().request_tx_set(tx_set_hash, slot);
+                        if let Some(peer) = from_peer_opt.as_ref() {
+                            self.maybe_request_tx_set_from_peer(&tx_set_hash, peer)
+                                .await;
+                        }
+                    }
+                    if let Some(pc) = self.process_externalized_slots().await {
+                        *self.deferred_catchup.lock().await = Some(pc);
+                    }
+                    self.request_pending_tx_sets().await;
+
+                    let current_ledger = self.current_ledger_seq() as u64;
+                    if slot > current_ledger + 1 {
+                        self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                        if slot > current_ledger + 2 {
+                            self.recovery_attempts_without_progress
+                                .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+            EnvelopeState::Pending => {
+                tracing::debug!(slot, tracking, "SCP envelope buffered for future slot");
+                if is_externalize {
+                    let current_ledger = self.current_ledger_seq() as u64;
+                    if slot > current_ledger + 2 {
+                        let next_slot = current_ledger as u32 + 1;
+                        let have_next = self
+                            .syncing_ledgers
+                            .read()
+                            .await
+                            .get(&next_slot)
+                            .map(|info| info.tx_set.is_some())
+                            .unwrap_or(false);
+                        if have_next {
+                            tracing::debug!(
+                                slot,
+                                current_ledger,
+                                gap = slot - current_ledger,
+                                "Pending EXTERNALIZE far ahead but next slot buffered — \
+                                 letting rapid close proceed"
+                            );
+                        } else {
+                            tracing::info!(
+                                slot,
+                                current_ledger,
+                                gap = slot - current_ledger,
+                                "Pending EXTERNALIZE far ahead — fast-tracking catchup"
+                            );
+                            self.recovery_attempts_without_progress
+                                .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                            self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+            EnvelopeState::Duplicate => {}
+            EnvelopeState::TooOld => {
+                tracing::debug!(slot, tracking, "SCP envelope rejected (TooOld)");
+            }
+            EnvelopeState::Invalid => {
+                let peer_str = from_peer_opt
+                    .as_ref()
+                    .map(|p| format!("{p}"))
+                    .unwrap_or_else(|| "<unknown>".into());
+                tracing::debug!(slot, peer = %peer_str, "SCP envelope rejected (Invalid)");
+            }
+            EnvelopeState::InvalidSignature => {
+                let peer_str = from_peer_opt
+                    .as_ref()
+                    .map(|p| format!("{p}"))
+                    .unwrap_or_else(|| "<unknown>".into());
+                tracing::warn!(slot, peer = %peer_str, "SCP envelope with invalid signature");
+            }
+            EnvelopeState::Fetching => {
+                let peer_str = from_peer_opt
+                    .as_ref()
+                    .map(|p| format!("{p}"))
+                    .unwrap_or_else(|| "<unknown>".into());
+                tracing::debug!(
+                    slot,
+                    peer = %peer_str,
+                    "SCP EXTERNALIZE waiting for tx set (Fetching)"
+                );
+                if let Some(tx_set_hash) = tx_set_hash {
+                    if let Some(peer) = from_peer_opt.as_ref() {
+                        if let Some(overlay) = self.overlay().await {
+                            let request =
+                                StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(tx_set_hash.0));
+                            if let Err(e) = overlay.try_send_to(peer, request) {
+                                tracing::debug!(
+                                    peer = %peer,
+                                    error = %e,
+                                    "Failed to request tx set for fetching envelope"
+                                );
+                            }
+                        }
+                    }
+                }
+                self.request_pending_tx_sets().await;
+            }
+        }
+    }
+
+    /// Legacy synchronous SCP admission path.
+    ///
+    /// Invoked when the dedicated verifier worker is unavailable (spawn
+    /// failure) or when an SCP envelope leaks into a non-SCP channel.
+    /// Runs the full `receive_scp_envelope` pipeline inline on the event
+    /// loop (including signature verification) and then routes the result
+    /// through [`App::process_verified_result_side_effects`] via a
+    /// synthesised [`VerifiedEnvelope`].
+    pub(super) async fn process_scp_message_sync(
+        &self,
+        envelope: stellar_xdr::curr::ScpEnvelope,
+        from_peer: henyey_overlay::PeerId,
+    ) {
+        use henyey_herder::scp_verify::{PipelinedIntake, Verdict, VerifiedEnvelope};
+        let slot = envelope.statement.slot_index;
+        let is_externalize = matches!(
+            &envelope.statement.pledges,
+            stellar_xdr::curr::ScpStatementPledges::Externalize(_)
+        );
+        // Verify on the event loop (legacy behaviour) and route through
+        // process_verified for uniform side-effect handling.
+        let verdict = match self.herder.scp_driver().verify_envelope(&envelope) {
+            Ok(()) => Verdict::Ok,
+            Err(_) => Verdict::InvalidSignature,
+        };
+        let intake = PipelinedIntake {
+            envelope,
+            slot,
+            is_externalize,
+            peer_id: Some(from_peer),
+            enqueue_at: std::time::Instant::now(),
+        };
+        self.process_verified(VerifiedEnvelope { intake, verdict })
+            .await;
     }
 }
