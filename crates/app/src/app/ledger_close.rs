@@ -17,7 +17,6 @@ struct LedgerPersistData {
     scp_envelopes: Vec<stellar_xdr::curr::ScpEnvelope>,
     scp_quorum_sets: Vec<(Hash256, stellar_xdr::curr::ScpQuorumSet)>,
     has_json: String,
-    hot_archive_persisted: bool,
     bucket_list_levels: Option<Vec<(Hash256, Hash256)>>,
     is_validator: bool,
 }
@@ -33,7 +32,7 @@ impl LedgerPersistData {
                 if let Some(ref levels) = self.bucket_list_levels {
                     conn.store_bucket_list(self.header.ledger_seq, levels)?;
                 }
-                if self.is_validator && self.hot_archive_persisted {
+                if self.is_validator {
                     conn.enqueue_publish(self.header.ledger_seq, &self.has_json)?;
                 }
             }
@@ -199,26 +198,12 @@ impl App {
             ext: TransactionHistoryResultEntryExt::default(),
         };
 
-        // Build HAS from in-memory bucket list state (no file I/O).
-        let (has_json, hot_archive_persisted) = {
+        // Build HAS from in-memory bucket list state. Hot archive bucket
+        // persistence (file I/O) is deferred to the persist task.
+        let has_json = {
             let bucket_list = self.ledger_manager.bucket_list();
             let hot_archive_guard = self.ledger_manager.hot_archive_bucket_list();
             let hot_archive_ref = hot_archive_guard.as_ref();
-
-            let hot_archive_persisted = if let Some(habl) = hot_archive_ref {
-                if let Err(e) = self.persist_hot_archive_buckets(habl) {
-                    tracing::error!(
-                        error = %e,
-                        ledger_seq = header.ledger_seq,
-                        "Hot archive bucket persist failed"
-                    );
-                    false
-                } else {
-                    true
-                }
-            } else {
-                true
-            };
 
             let hot_archive_for_has = if hot_archive_supported(header.ledger_version) {
                 hot_archive_ref
@@ -254,7 +239,7 @@ impl App {
             let json = has
                 .to_json()
                 .map_err(|e| anyhow::anyhow!("Failed to serialize HAS: {}", e))?;
-            (json, hot_archive_persisted)
+            json
         };
 
         let bucket_list_levels = if is_checkpoint_ledger(header.ledger_seq) {
@@ -276,7 +261,6 @@ impl App {
             scp_envelopes,
             scp_quorum_sets,
             has_json,
-            hot_archive_persisted,
             bucket_list_levels,
             is_validator: self.is_validator,
         })
@@ -1911,12 +1895,47 @@ impl App {
             Ok(data) => {
                 let db = self.db.clone();
                 let ledger_manager = self.ledger_manager.clone();
+                let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
                 let ledger_seq = pending.ledger_seq;
                 let handle = tokio::spawn(async move {
-                    // Flush pending bucket persist (waits for background
-                    // thread via std::thread::join — must be on spawn_blocking).
+                    // Persist hot archive buckets to disk (file I/O) and
+                    // flush pending bucket persist (thread join) — both
+                    // on spawn_blocking to avoid stalling the event loop.
                     let lm = ledger_manager.clone();
+                    let bd = bucket_dir.clone();
                     if let Err(e) = tokio::task::spawn_blocking(move || {
+                        // Persist hot archive buckets to disk.
+                        let habl_guard = lm.hot_archive_bucket_list();
+                        if let Some(habl) = habl_guard.as_ref() {
+                            for level in habl.levels() {
+                                let mut buckets: Vec<&henyey_bucket::HotArchiveBucket> =
+                                    vec![level.curr(), level.snap_bucket()];
+                                if let Some(next) = level.next() {
+                                    buckets.push(next);
+                                }
+                                for bucket in buckets {
+                                    if bucket.backing_file_path().is_none()
+                                        && !bucket.hash().is_zero()
+                                    {
+                                        let path =
+                                            bd.join(henyey_bucket::canonical_bucket_filename(
+                                                &bucket.hash(),
+                                            ));
+                                        if !path.exists() {
+                                            if let Err(e) = bucket.save_to_xdr_file(&path) {
+                                                tracing::error!(
+                                                    error = %e,
+                                                    "Failed to persist hot archive bucket"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        drop(habl_guard);
+
+                        // Flush pending bucket persist (thread join).
                         lm.bucket_list_mut()
                             .flush_pending_persist()
                             .map_err(|e| format!("flush_pending_persist: {}", e))

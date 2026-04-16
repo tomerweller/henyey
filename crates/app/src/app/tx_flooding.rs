@@ -808,25 +808,15 @@ impl App {
             tracing::warn!("No peers connected, cannot request tx sets");
             return;
         }
+        // Prefer outbound peers for tx_set requests. Previously did a
+        // synchronous db.load_peer() per inbound peer which blocked the
+        // event loop on SQLite I/O (#1713). Connection direction is a
+        // sufficient heuristic.
         let mut peers = Vec::new();
         let mut fallback = Vec::new();
         for info in peer_infos {
             fallback.push(info.peer_id.clone());
-            let is_outbound = matches!(info.direction, ConnectionDirection::Outbound);
-            let is_preferred = if is_outbound {
-                true
-            } else {
-                let host = info.address.ip().to_string();
-                let port = info.address.port();
-                match self.db.load_peer(&host, port) {
-                    Ok(Some(record)) => {
-                        record.peer_type == StoredPeerType::Preferred
-                            || record.peer_type == StoredPeerType::Outbound
-                    }
-                    _ => false,
-                }
-            };
-            if is_outbound || is_preferred {
+            if matches!(info.direction, ConnectionDirection::Outbound) {
                 peers.push(info.peer_id);
             }
         }
