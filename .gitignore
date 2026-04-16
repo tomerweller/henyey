@@ -52,6 +52,8 @@ reports/
 # Claude local files
 .claude/*.local.md
 .claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
 .opencode/*
 !.opencode/skills/
 .serena/
