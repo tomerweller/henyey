@@ -656,13 +656,13 @@ impl App {
                     if pending_catchup.is_none()
                         && self.sync_recovery_pending.swap(false, Ordering::SeqCst)
                     {
-                        tracing::info!("Sync recovery requested, starting recovery");
+                        tracing::debug!("Sync recovery requested, starting recovery");
                         // SyncRecoveryManager triggered recovery - perform it now
                         if let Ok(current_ledger) = self.get_current_ledger().await {
-                            tracing::info!(current_ledger, "Calling out_of_sync_recovery");
+                            tracing::debug!(current_ledger, "Calling out_of_sync_recovery");
                             pending_catchup =
                                 self.out_of_sync_recovery(current_ledger).await;
-                            tracing::info!("out_of_sync_recovery completed");
+                            tracing::debug!("out_of_sync_recovery completed");
                         }
                         // Also check for buffered catchup (this handles timeout-based catchup)
                         if pending_catchup.is_none() {

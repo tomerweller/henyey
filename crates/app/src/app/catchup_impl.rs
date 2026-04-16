@@ -1211,7 +1211,7 @@ impl App {
         if gap <= TX_SET_REQUEST_WINDOW {
             // Clear stale state that might trigger unnecessary catchup
             if self.tx_set_all_peers_exhausted.load(Ordering::SeqCst) {
-                tracing::info!(
+                tracing::debug!(
                     current_ledger,
                     latest_externalized,
                     gap,

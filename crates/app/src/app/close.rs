@@ -126,7 +126,7 @@ impl SyncRecoveryCallback for App {
     }
 
     fn on_out_of_sync_recovery(&self) {
-        tracing::info!("SyncRecoveryManager triggered out-of-sync recovery");
+        tracing::debug!("SyncRecoveryManager triggered out-of-sync recovery");
         // Set flag so the main event loop will trigger recovery and buffered catchup.
         // The main loop checks this flag and calls maybe_start_buffered_catchup()
         // which handles the actual recovery logic including timeout-based catchup.

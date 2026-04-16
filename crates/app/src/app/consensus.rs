@@ -99,7 +99,7 @@ impl App {
             .recovery_attempts_without_progress
             .fetch_add(1, Ordering::SeqCst);
 
-        tracing::info!(
+        tracing::debug!(
             current_ledger,
             latest_externalized,
             last_processed,
@@ -218,7 +218,7 @@ impl App {
                         .await;
                 }
 
-                tracing::info!(
+                tracing::debug!(
                     current_ledger,
                     latest_externalized,
                     gap,
@@ -702,7 +702,7 @@ impl App {
             return None;
         }
 
-        tracing::warn!(
+        tracing::info!(
             current_ledger,
             latest_externalized,
             gap,

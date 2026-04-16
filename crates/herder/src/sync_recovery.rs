@@ -369,7 +369,7 @@ impl<C: SyncRecoveryCallback> SyncRecoveryManager<C> {
 
     /// Perform out-of-sync recovery actions.
     fn perform_recovery(&self) {
-        info!("Performing out-of-sync recovery");
+        debug!("Performing out-of-sync recovery");
 
         // Notify callback to perform recovery actions
         self.callback.on_out_of_sync_recovery();

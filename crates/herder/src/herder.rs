@@ -1258,7 +1258,7 @@ impl Herder {
                 // Check if this slot is now externalized
                 if self.scp.is_slot_externalized(slot) {
                     if let Some(value) = self.scp.get_externalized_value(slot) {
-                        info!(slot, "Slot externalized via SCP consensus");
+                        debug!(slot, "Slot externalized via SCP consensus");
 
                         // Request the tx_set so we can close this ledger.
                         // During rapid catch-up the node may externalize

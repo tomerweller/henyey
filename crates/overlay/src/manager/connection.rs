@@ -313,7 +313,7 @@ impl OverlayManager {
                                             Self::handle_accepted_inbound_peer(peer, shared, pool).await;
                                         }
                                         Err(e) => {
-                                            warn!("Failed to accept peer: {}", e);
+                                            debug!("Failed to accept peer: {}", e);
                                             shared.send_peer_event(PeerEvent::Failed(
                                                 PeerAddress::from(remote_addr),
                                                 PeerType::Inbound,
