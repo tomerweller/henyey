@@ -1935,11 +1935,20 @@ mod tests {
             .build();
 
         let app = App::new(config).await.unwrap();
+
+        // Seed the shared atomics to non-zero values and assert they reach
+        // AppInfo via App::info(). Guards against future regressions that
+        // might silently drop either field from the wiring.
+        app.fetch_channel_depth.store(17, Ordering::Relaxed);
+        app.fetch_channel_depth_max.store(42, Ordering::Relaxed);
+
         let info = app.info();
 
         assert_eq!(info.node_name, "test-node");
         assert!(!info.public_key.is_empty());
         assert!(info.public_key.starts_with('G'));
+        assert_eq!(info.overlay_fetch_channel.depth, 17);
+        assert_eq!(info.overlay_fetch_channel.depth_max, 42);
     }
 
     #[tokio::test]

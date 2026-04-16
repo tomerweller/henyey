@@ -2011,4 +2011,33 @@ mod tests {
             "every fetch variant must reach fetch channel"
         );
     }
+
+    /// Wedged-loop regression: depth/max advance on enqueue even when the
+    /// receiver is never polled. This is the exact failure mode the metric is
+    /// meant to diagnose — receiver-side sampling would miss it.
+    #[tokio::test]
+    async fn fetch_channel_depth_tracks_enqueue_with_parked_receiver() {
+        let (shared, _broadcast_rx, _fetch_rx) = make_routing_shared_state();
+        // Parked: never call fetch_rx.recv(). Hold the rx alive so sends succeed.
+        let peer = PeerId::from_bytes([22u8; 32]);
+        let variants = all_fetch_variant_messages(&peer);
+        let n = variants.len() as i64;
+
+        assert_eq!(shared.fetch_channel_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.fetch_channel_depth_max.load(Ordering::Relaxed), 0);
+
+        for msg in variants {
+            shared.route_to_subscribers(msg);
+        }
+
+        assert_eq!(
+            shared.fetch_channel_depth.load(Ordering::Relaxed),
+            n,
+            "depth must reflect every enqueued fetch message without any recv"
+        );
+        assert!(
+            shared.fetch_channel_depth_max.load(Ordering::Relaxed) >= n,
+            "max must advance to at least the observed depth"
+        );
+    }
 }
