@@ -217,6 +217,29 @@ pub struct AppInfo {
     pub meta_stream_bytes_total: u64,
     /// Total frames written to metadata output stream.
     pub meta_stream_writes_total: u64,
+    /// SCP signature-verify pipeline metrics (issue #1734 Phase B).
+    pub scp_verify: ScpVerifyMetrics,
+}
+
+/// Metrics for the SCP signature-verify pipeline (issue #1734 Phase B).
+#[derive(Debug, Clone, Default)]
+pub struct ScpVerifyMetrics {
+    /// Pre-filter rejects by reason (cumulative).
+    pub prefilter_reject_cannot_receive: u64,
+    pub prefilter_reject_close_time: u64,
+    pub prefilter_reject_range: u64,
+    /// Drops after verification (gate drift, self-message, non-quorum, invalid).
+    pub post_verify_drops: u64,
+    /// Currently used slots in the verifier input channel.
+    pub verifier_queue_len: u64,
+    /// Currently queued verified envelopes awaiting the event loop.
+    pub verified_backlog: u64,
+    /// Worker thread state (0=Running, 1=Stopping, 2=Dead).
+    pub verifier_thread_state: u64,
+    /// Cumulative enqueue→post-verify latency microseconds (sum).
+    pub verify_latency_us_sum: u64,
+    /// Count of samples accumulated in `verify_latency_us_sum`.
+    pub verify_latency_count: u64,
 }
 
 impl std::fmt::Display for AppInfo {

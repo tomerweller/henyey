@@ -304,6 +304,15 @@ pub struct App {
     scp_externalize_sent: AtomicU64,
     /// Count of SCP envelopes received by this node.
     scp_messages_received: AtomicU64,
+    /// SCP pre-filter rejections by reason (issue #1734 Phase B metrics).
+    scp_prefilter_reject_cannot_receive: AtomicU64,
+    scp_prefilter_reject_close_time: AtomicU64,
+    scp_prefilter_reject_range: AtomicU64,
+    /// Post-verify drops (gate drift, self-message, non-quorum, invalid).
+    scp_post_verify_drops: AtomicU64,
+    /// Poor-man's histogram for verify latency (enqueue → post-verify dispatch).
+    scp_verify_latency_us_sum: AtomicU64,
+    scp_verify_latency_count: AtomicU64,
     /// Number of attempts to trigger the next consensus round.
     consensus_trigger_attempts: AtomicU64,
     /// Number of successful trigger_next_ledger calls.
@@ -444,7 +453,7 @@ pub struct App {
     ///        10=process_externalized, 11=maybe_externalized_catchup,
     ///        12=try_apply_buffered, 13=maybe_buffered_catchup,
     ///        14=catchup_running, 15=heartbeat,
-    ///        31=scp_verifier (unused: reserved for future phase),
+    ///        31=scp_verifier (pump_scp_intake: pre-filter + verifier enqueue),
     ///        32=scp_verified (draining verified envelopes)
     event_loop_phase: Arc<AtomicU64>,
 }
@@ -636,6 +645,12 @@ impl App {
             scp_confirm_sent: AtomicU64::new(0),
             scp_externalize_sent: AtomicU64::new(0),
             scp_messages_received: AtomicU64::new(0),
+            scp_prefilter_reject_cannot_receive: AtomicU64::new(0),
+            scp_prefilter_reject_close_time: AtomicU64::new(0),
+            scp_prefilter_reject_range: AtomicU64::new(0),
+            scp_post_verify_drops: AtomicU64::new(0),
+            scp_verify_latency_us_sum: AtomicU64::new(0),
+            scp_verify_latency_count: AtomicU64::new(0),
             consensus_trigger_attempts: AtomicU64::new(0),
             consensus_trigger_successes: AtomicU64::new(0),
             consensus_trigger_failures: AtomicU64::new(0),
@@ -1571,6 +1586,23 @@ impl App {
             database_path: self.config.database.path.clone(),
             meta_stream_bytes_total: meta_bytes,
             meta_stream_writes_total: meta_writes,
+            scp_verify: ScpVerifyMetrics {
+                prefilter_reject_cannot_receive: self
+                    .scp_prefilter_reject_cannot_receive
+                    .load(Ordering::Relaxed),
+                prefilter_reject_close_time: self
+                    .scp_prefilter_reject_close_time
+                    .load(Ordering::Relaxed),
+                prefilter_reject_range: self.scp_prefilter_reject_range.load(Ordering::Relaxed),
+                post_verify_drops: self.scp_post_verify_drops.load(Ordering::Relaxed),
+                // Sample live from the verifier handle so the gauge reflects
+                // the current moment instead of the last `pump_scp_intake` tick.
+                verifier_queue_len: self.herder.scp_verifier_handle().queue_len() as u64,
+                verified_backlog: self.herder.scp_verifier_handle().backlog() as u64,
+                verifier_thread_state: self.herder.scp_verifier_handle().state() as u64,
+                verify_latency_us_sum: self.scp_verify_latency_us_sum.load(Ordering::Relaxed),
+                verify_latency_count: self.scp_verify_latency_count.load(Ordering::Relaxed),
+            },
         }
     }
 
@@ -1798,7 +1830,8 @@ impl App {
                     }
 
                     // SCP verifier health block (issue #1734 Phase B).
-                    if let Some(v) = verifier.as_ref() {
+                    {
+                        let v = &verifier;
                         let vstate = v.state();
                         if matches!(vstate, henyey_herder::scp_verify::VerifierState::Dead) {
                             tracing::error!(pid, "WATCHDOG: scp-verify worker thread is dead");

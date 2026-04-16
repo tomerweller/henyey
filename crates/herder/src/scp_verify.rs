@@ -142,6 +142,11 @@ impl SignatureVerifierHandle {
     pub fn backlog(&self) -> usize {
         self.backlog.load(Ordering::Relaxed)
     }
+
+    /// Currently-used slots in the verifier input channel (approx queue depth).
+    pub fn queue_len(&self) -> usize {
+        self.tx.max_capacity() - self.tx.capacity()
+    }
 }
 
 /// Outputs returned from [`spawn_scp_verifier`].

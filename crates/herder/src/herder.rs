@@ -279,9 +279,9 @@ pub struct Herder {
     /// lambda (NominationProtocol.cpp:654-659) so timeouts replay the same value.
     cached_nomination_value: RwLock<Option<(SlotIndex, Value)>>,
     /// Handle to the dedicated SCP signature-verify worker thread.
-    /// See [`crate::scp_verify`]. Optional so Herder can be constructed in
-    /// tests / observer scenarios that never call `scp_verifier_handle()`.
-    scp_verifier_handle: Option<crate::scp_verify::SignatureVerifierHandle>,
+    /// See [`crate::scp_verify`]. The worker is a core component; failure
+    /// to spawn it is fatal (see [`Herder::build`]).
+    scp_verifier_handle: crate::scp_verify::SignatureVerifierHandle,
     /// Receiver for verified envelopes. Taken exactly once by the event loop
     /// (see `Herder::take_verified_rx`).
     verified_rx: std::sync::Mutex<
@@ -400,18 +400,16 @@ impl Herder {
         scp_driver.set_upgrades(Arc::clone(&runtime_upgrades));
 
         // Spawn the dedicated SCP signature-verification worker thread.
-        // Failure to spawn (e.g. OS resource exhaustion) is reported but not
-        // fatal: the synchronous `receive_scp_envelope` path remains available.
-        let (scp_verifier_handle, verified_rx) = match crate::scp_verify::spawn_scp_verifier(
+        // The worker is a core component of the event-loop pipeline
+        // (issue #1734 Phase B); spawn failure is fatal rather than
+        // silently falling back to event-loop verification.
+        let spawned = crate::scp_verify::spawn_scp_verifier(
             config.network_id,
             crate::scp_verify::DEFAULT_VERIFIER_QUEUE_CAPACITY,
-        ) {
-            Ok(spawned) => (Some(spawned.handle), Some(spawned.verified_rx)),
-            Err(e) => {
-                error!(error = %e, "Failed to spawn scp-verify worker thread");
-                (None, None)
-            }
-        };
+        )
+        .expect("scp-verify worker thread must spawn (OS resource exhaustion?)");
+        let scp_verifier_handle = spawned.handle;
+        let verified_rx = Some(spawned.verified_rx);
 
         Self {
             config,
@@ -436,10 +434,11 @@ impl Herder {
         }
     }
 
-    /// Handle to the dedicated SCP signature-verification worker (or `None`
-    /// if the worker failed to spawn). The event loop uses this to enqueue
-    /// pre-filtered envelopes and the watchdog uses it to monitor liveness.
-    pub fn scp_verifier_handle(&self) -> Option<crate::scp_verify::SignatureVerifierHandle> {
+    /// Handle to the dedicated SCP signature-verification worker.
+    /// The event loop uses this to enqueue pre-filtered envelopes and the
+    /// watchdog uses it to monitor liveness. The worker is guaranteed to
+    /// exist (see [`Herder::build`]).
+    pub fn scp_verifier_handle(&self) -> crate::scp_verify::SignatureVerifierHandle {
         self.scp_verifier_handle.clone()
     }
 
@@ -3812,5 +3811,298 @@ mod set_state_tests {
         let (slot, val) = cached.as_ref().unwrap();
         assert_eq!(*slot, 11);
         assert_eq!(*val, test_value_2);
+    }
+}
+
+// =============================================================================
+// Phase B pipeline tests (issue #1734): pre_filter_scp_envelope and
+// process_verified behavior under the split-pipeline architecture.
+// =============================================================================
+
+#[cfg(test)]
+mod scp_pipeline_tests {
+    use super::*;
+    use crate::scp_verify::{
+        spawn_scp_verifier, PipelinedIntake, PreFilter, PreFilterRejectReason, Verdict,
+        VerifiedEnvelope, VerifierState,
+    };
+    use henyey_crypto::SecretKey;
+    use stellar_xdr::curr::{
+        NodeId as XdrNodeId, ScpNomination, ScpStatement, ScpStatementPledges,
+        Signature as XdrSignature,
+    };
+    fn make_test_herder() -> Herder {
+        Herder::new(HerderConfig::default())
+    }
+
+    fn make_unsigned_envelope(slot: u64, node_seed: u8) -> ScpEnvelope {
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([node_seed; 32]),
+        ));
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        }
+    }
+
+    #[test]
+    fn test_pre_filter_rejects_in_booting_state() {
+        let herder = make_test_herder();
+        assert_eq!(herder.state(), HerderState::Booting);
+
+        let env = make_unsigned_envelope(100, 1);
+        match herder.pre_filter_scp_envelope(&env) {
+            PreFilter::Reject(PreFilterRejectReason::CannotReceiveScp) => {}
+            other => panic!(
+                "expected CannotReceiveScp reject in Booting state, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_pre_filter_accepts_valid_envelope_in_syncing() {
+        let herder = make_test_herder();
+        herder.start_syncing();
+        herder.pending_envelopes.set_current_slot(95);
+
+        // Construct a PREPARE envelope with a current close time so
+        // check_envelope_close_time passes.
+        let secret = SecretKey::from_seed(&[1u8; 32]);
+        let env = make_signed_test_envelope_outer(100, &herder, &secret);
+        match herder.pre_filter_scp_envelope(&env) {
+            PreFilter::Accept(intake) => {
+                assert_eq!(intake.slot, 100);
+                assert!(!intake.is_externalize);
+            }
+            PreFilter::Reject(r) => panic!("expected Accept, got Reject({:?})", r),
+        }
+    }
+
+    fn make_signed_test_envelope_outer(
+        slot: u64,
+        herder: &Herder,
+        secret: &SecretKey,
+    ) -> ScpEnvelope {
+        use stellar_xdr::curr::{
+            LedgerCloseValueSignature, Limits, NodeId as XdrNodeId, ScpNomination, ScpStatement,
+            ScpStatementPledges, Signature as XdrSignature, StellarValue, StellarValueExt,
+            TimePoint, Value, WriteXdr,
+        };
+        let public = secret.public_key();
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*public.as_bytes()),
+        ));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Build a signed StellarValue so check_envelope_close_time accepts it.
+        let tx_set_hash = stellar_xdr::curr::Hash([0u8; 32]);
+        let close_time = TimePoint(now);
+        let mut sign_data = herder.scp_driver.network_id().0.to_vec();
+        sign_data.extend_from_slice(
+            &stellar_xdr::curr::EnvelopeType::Scpvalue
+                .to_xdr(Limits::none())
+                .unwrap(),
+        );
+        sign_data.extend_from_slice(&tx_set_hash.to_xdr(Limits::none()).unwrap());
+        sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).unwrap());
+        let value_sig = secret.sign(&sign_data);
+        let sv = StellarValue {
+            tx_set_hash,
+            close_time,
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id: node_id.clone(),
+                signature: stellar_xdr::curr::Signature(
+                    value_sig.0.to_vec().try_into().unwrap_or_default(),
+                ),
+            }),
+        };
+        let vote = Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+
+        let statement = ScpStatement {
+            node_id,
+            slot_index: slot,
+            pledges: ScpStatementPledges::Nominate(ScpNomination {
+                quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                votes: vec![vote].try_into().unwrap(),
+                accepted: vec![].try_into().unwrap(),
+            }),
+        };
+        let mut data = herder.scp_driver.network_id().0.to_vec();
+        data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP
+        data.extend_from_slice(&statement.to_xdr(Limits::none()).unwrap());
+        let sig = secret.sign(&data);
+        ScpEnvelope {
+            statement,
+            signature: XdrSignature(sig.0.to_vec().try_into().unwrap()),
+        }
+    }
+
+    #[test]
+    fn test_process_verified_invalid_signature_short_circuits() {
+        let herder = make_test_herder();
+        herder.start_syncing();
+        herder.pending_envelopes.set_current_slot(95);
+
+        let env = make_unsigned_envelope(100, 1);
+        let intake = PipelinedIntake {
+            envelope: env,
+            slot: 100,
+            is_externalize: false,
+            peer_id: None,
+            enqueue_at: std::time::Instant::now(),
+        };
+        let result = herder.process_verified(VerifiedEnvelope {
+            intake,
+            verdict: Verdict::InvalidSignature,
+        });
+        assert_eq!(result, EnvelopeState::InvalidSignature);
+    }
+
+    #[test]
+    fn test_process_verified_panic_surfaces_invalid() {
+        let herder = make_test_herder();
+        herder.start_syncing();
+        let env = make_unsigned_envelope(100, 1);
+        let intake = PipelinedIntake {
+            envelope: env,
+            slot: 100,
+            is_externalize: false,
+            peer_id: None,
+            enqueue_at: std::time::Instant::now(),
+        };
+        let result = herder.process_verified(VerifiedEnvelope {
+            intake,
+            verdict: Verdict::Panic,
+        });
+        assert_eq!(result, EnvelopeState::Invalid);
+    }
+
+    #[test]
+    fn test_process_verified_self_message_skipped() {
+        // Build a validator herder whose local node_id matches the envelope.
+        let seed = [5u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let node_id = node_id_from_public_key(&public);
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(config, secret.clone());
+        herder.start_syncing();
+        herder.pending_envelopes.set_current_slot(95);
+
+        // Build an envelope whose statement.node_id == the local node_id.
+        let env = make_signed_test_envelope_outer(100, &herder, &secret);
+        let intake = PipelinedIntake {
+            envelope: env,
+            slot: 100,
+            is_externalize: false,
+            peer_id: None,
+            enqueue_at: std::time::Instant::now(),
+        };
+        let result = herder.process_verified(VerifiedEnvelope {
+            intake,
+            verdict: Verdict::Ok,
+        });
+        assert_eq!(
+            result,
+            EnvelopeState::Invalid,
+            "self-message must be skipped as Invalid"
+        );
+    }
+
+    #[test]
+    fn test_process_verified_post_verify_gate_drift_too_old() {
+        // Pre-filter accepts while Syncing, but by the time process_verified
+        // runs the herder has slipped to a state that rejects via Range.
+        // We simulate this by placing the slot far below effective_min.
+        let herder = make_test_herder();
+        herder.start_syncing();
+        herder.pending_envelopes.set_current_slot(10_000);
+
+        let env = make_unsigned_envelope(1, 1); // slot 1, current_slot 10_000
+        let intake = PipelinedIntake {
+            envelope: env,
+            slot: 1,
+            is_externalize: false,
+            peer_id: None,
+            enqueue_at: std::time::Instant::now(),
+        };
+        let result = herder.process_verified(VerifiedEnvelope {
+            intake,
+            verdict: Verdict::Ok,
+        });
+        // Either TooOld (range reject) or Invalid (close-time reject) is
+        // acceptable — both paths represent gate-drift rejection; the exact
+        // reason depends on which gate in the pre-filter trips first.
+        assert!(
+            matches!(result, EnvelopeState::TooOld | EnvelopeState::Invalid),
+            "expected post-verify drift rejection, got {:?}",
+            result
+        );
+    }
+
+    // -------- scp_verify::worker tests --------
+
+    #[test]
+    fn test_verifier_worker_dead_state_is_observable() {
+        let spawned = spawn_scp_verifier(Hash256::from_bytes([4u8; 32]), 8).expect("spawn");
+        let state = spawned.handle.state.clone();
+        let tx = spawned.handle.tx.clone();
+        let verified_rx = spawned.verified_rx;
+        assert_eq!(
+            VerifierState::from_u8(state.load(Ordering::Relaxed)),
+            VerifierState::Running
+        );
+
+        // Close all senders so blocking_recv returns None and the worker
+        // transitions to Dead. The output receiver closure is not required
+        // but we drop it for symmetry.
+        drop(spawned.handle); // original handle owns one tx
+        drop(tx); // our clone
+        drop(verified_rx);
+
+        // Spin for up to 2s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline
+            && VerifierState::from_u8(state.load(Ordering::Relaxed)) != VerifierState::Dead
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            VerifierState::from_u8(state.load(Ordering::Relaxed)),
+            VerifierState::Dead,
+            "worker should transition to Dead after input channel closes"
+        );
+    }
+
+    #[test]
+    fn test_verifier_handle_queue_len_reports_used_slots() {
+        let spawned = spawn_scp_verifier(Hash256::from_bytes([9u8; 32]), 4).expect("spawn");
+        // The worker will drain as it receives; queue_len is best-effort.
+        // Immediately after construction, no items are queued.
+        assert!(spawned.handle.queue_len() <= 4);
+        assert!(matches!(spawned.handle.state(), VerifierState::Running));
     }
 }

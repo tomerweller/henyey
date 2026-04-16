@@ -100,17 +100,14 @@ impl App {
             }
         };
 
-        // Take the verified-SCP-envelope receiver from the herder. If the
-        // verifier worker failed to spawn (or the receiver was already
-        // taken), fall back to a dummy receiver so the `select!` arm below
-        // compiles — the dummy never resolves and the synchronous
-        // `process_scp_message_sync` path is used instead.
-        let mut verified_rx = self.herder.take_verified_rx().unwrap_or_else(|| {
-            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<
-                henyey_herder::scp_verify::VerifiedEnvelope,
-            >();
-            rx
-        });
+        // Take the verified-SCP-envelope receiver from the herder. The
+        // verifier worker is a core component — if it failed to spawn,
+        // Herder::build would have panicked. `take_verified_rx` must
+        // succeed exactly once.
+        let mut verified_rx = self
+            .herder
+            .take_verified_rx()
+            .expect("scp-verify verified_rx must be taken exactly once at startup");
 
         // Main run loop
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -1047,18 +1044,19 @@ impl App {
     /// Handle a message from the overlay network.
     async fn handle_overlay_message(&self, msg: OverlayMessage) {
         match msg.message {
-            StellarMessage::ScpMessage(envelope) => {
-                // Legacy synchronous SCP path (pre-issue #1734 Phase B).
-                //
-                // Production SCP intake goes through `pump_scp_intake`, which
-                // pre-filters, dispatches to the dedicated signature-verify
-                // worker thread, and routes verified results back through
-                // `process_verified`. This arm is retained as a defensive
-                // fallback for the rare case an SCP envelope reaches here via
-                // the non-SCP broadcast channel (the main loop skips it at
-                // the SCP check guard).
-                self.process_scp_message_sync(envelope, msg.from_peer.clone())
-                    .await;
+            StellarMessage::ScpMessage(_) => {
+                // SCP envelopes are routed through the dedicated scp_message_rx
+                // channel (issue #1734 Phase B): the main loop admits them via
+                // `pump_scp_intake`, which pre-filters and dispatches to the
+                // dedicated verifier worker. If one reaches this legacy path
+                // via the generic broadcast channel, it is a bug — the main
+                // select! arms currently skip SCP on that channel. Log and
+                // drop rather than silently re-verifying on the event loop.
+                tracing::warn!(
+                    peer = %msg.from_peer,
+                    "SCP envelope reached generic overlay handler; dropping \
+                     (should arrive via dedicated SCP channel)"
+                );
             }
 
             StellarMessage::Transaction(tx_env) => {
@@ -1481,6 +1479,13 @@ impl App {
     ) {
         use henyey_herder::scp_verify::PreFilter;
 
+        // Phase 31 marks time spent in this helper: pre-filtering, reserving
+        // verifier-queue capacity (the backpressure park point), and draining
+        // verified envelopes interleaved with that wait. The watchdog uses
+        // this to distinguish "stuck waiting for the verify worker" from
+        // "stuck inside select!".
+        self.set_phase(31); // 31 = scp_verifier
+
         let envelope = match scp_msg.message {
             StellarMessage::ScpMessage(e) => e,
             other => {
@@ -1490,15 +1495,7 @@ impl App {
         };
 
         let from_peer = scp_msg.from_peer;
-
-        let verifier = match self.herder.scp_verifier_handle() {
-            Some(v) => v,
-            None => {
-                // Worker never spawned — fall back to the synchronous path.
-                self.process_scp_message_sync(envelope, from_peer).await;
-                return;
-            }
-        };
+        let verifier = self.herder.scp_verifier_handle();
 
         let mut drained: usize = 0;
         loop {
@@ -1526,7 +1523,8 @@ impl App {
                             intake.peer_id = Some(from_peer);
                             permit.send(intake);
                         }
-                        PreFilter::Reject(_) => {
+                        PreFilter::Reject(reason) => {
+                            self.record_prefilter_reject(reason);
                             drop(permit);
                         }
                     }
@@ -1534,6 +1532,16 @@ impl App {
                 }
             }
         }
+    }
+
+    fn record_prefilter_reject(&self, reason: henyey_herder::scp_verify::PreFilterRejectReason) {
+        use henyey_herder::scp_verify::PreFilterRejectReason as R;
+        let counter = match reason {
+            R::CannotReceiveScp => &self.scp_prefilter_reject_cannot_receive,
+            R::CloseTime => &self.scp_prefilter_reject_close_time,
+            R::Range => &self.scp_prefilter_reject_range,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Process a fully-verified envelope on the event loop, running the
@@ -1547,10 +1555,24 @@ impl App {
         let tracking = self.herder.tracking_slot();
         let is_externalize = ve.intake.is_externalize;
 
-        // SCP latency bookkeeping (moved here from the pre-verify
-        // handle_overlay_message entry: we now time from "arrived at
-        // process_verified" instead of "arrived at overlay dispatch",
-        // which better reflects user-visible processing latency).
+        // Record verify latency (enqueue → post-verify dispatch) into the
+        // poor-man's histogram (sum + count) so the average can be read
+        // from the /metrics endpoint.
+        let verify_latency_us = ve.intake.enqueue_at.elapsed().as_micros() as u64;
+        self.scp_verify_latency_us_sum
+            .fetch_add(verify_latency_us, Ordering::Relaxed);
+        self.scp_verify_latency_count
+            .fetch_add(1, Ordering::Relaxed);
+
+        // SCP latency bookkeeping.
+        //
+        // IMPORTANT ordering: we intentionally record `first_seen` / the
+        // self-to-other latency *here*, AFTER the worker has verified the
+        // signature, rather than at overlay dispatch. This makes the
+        // recorded latency reflect "user-visible processing" (time from
+        // envelope admit to post-verify handling) including any time the
+        // envelope spent queued on the verifier. Pre-verify bookkeeping
+        // would undercount under verifier backpressure.
         {
             let mut latency = self.scp_latency.write().await;
             let now = self.clock.now();
@@ -1621,6 +1643,16 @@ impl App {
         // Hand off to Herder for gate recheck + self-message skip +
         // non-quorum reject + slot_quorum_tracker + prefetch + pending.add.
         let envelope_result = self.herder.process_verified(ve);
+
+        // Post-verify drop counter: these are envelopes that were accepted
+        // by pre_filter but dropped downstream (gate drift, self-message,
+        // non-quorum, too-old, invalid).
+        if matches!(
+            envelope_result,
+            EnvelopeState::TooOld | EnvelopeState::Invalid | EnvelopeState::InvalidSignature
+        ) {
+            self.scp_post_verify_drops.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Request quorum set only after Herder has validated the envelope.
         if matches!(
@@ -1748,41 +1780,5 @@ impl App {
                 self.request_pending_tx_sets().await;
             }
         }
-    }
-
-    /// Legacy synchronous SCP admission path.
-    ///
-    /// Invoked when the dedicated verifier worker is unavailable (spawn
-    /// failure) or when an SCP envelope leaks into a non-SCP channel.
-    /// Runs the full `receive_scp_envelope` pipeline inline on the event
-    /// loop (including signature verification) and then routes the result
-    /// through [`App::process_verified_result_side_effects`] via a
-    /// synthesised [`VerifiedEnvelope`].
-    pub(super) async fn process_scp_message_sync(
-        &self,
-        envelope: stellar_xdr::curr::ScpEnvelope,
-        from_peer: henyey_overlay::PeerId,
-    ) {
-        use henyey_herder::scp_verify::{PipelinedIntake, Verdict, VerifiedEnvelope};
-        let slot = envelope.statement.slot_index;
-        let is_externalize = matches!(
-            &envelope.statement.pledges,
-            stellar_xdr::curr::ScpStatementPledges::Externalize(_)
-        );
-        // Verify on the event loop (legacy behaviour) and route through
-        // process_verified for uniform side-effect handling.
-        let verdict = match self.herder.scp_driver().verify_envelope(&envelope) {
-            Ok(()) => Verdict::Ok,
-            Err(_) => Verdict::InvalidSignature,
-        };
-        let intake = PipelinedIntake {
-            envelope,
-            slot,
-            is_externalize,
-            peer_id: Some(from_peer),
-            enqueue_at: std::time::Instant::now(),
-        };
-        self.process_verified(VerifiedEnvelope { intake, verdict })
-            .await;
     }
 }
