@@ -2,11 +2,13 @@
 
 use super::*;
 
-/// All data needed to write a ledger close to SQLite.
-/// Prepared on the event loop (CPU work only), written on a blocking thread.
-struct LedgerPersistData {
+/// Raw inputs for a ledger-close persist job, captured on the event loop.
+///
+/// Phase A of #1733: the event loop captures only cheap clones (no XDR/JSON
+/// serialization). The persist task performs all serialization on a
+/// blocking thread via [`LedgerPersistInputs::serialize_and_write_to_db`].
+struct LedgerPersistInputs {
     header: stellar_xdr::curr::LedgerHeader,
-    header_xdr: Vec<u8>,
     tx_history_entry: TransactionHistoryEntry,
     tx_result_entry: TransactionHistoryResultEntry,
     ordered_txs: Vec<std::sync::Arc<TransactionEnvelope>>,
@@ -16,16 +18,51 @@ struct LedgerPersistData {
     network_id: NetworkId,
     scp_envelopes: Vec<stellar_xdr::curr::ScpEnvelope>,
     scp_quorum_sets: Vec<(Hash256, stellar_xdr::curr::ScpQuorumSet)>,
-    has_json: String,
+    /// HAS struct built on the event loop under bucket-list read guards.
+    /// JSON serialization happens later on the blocking thread.
+    has: HistoryArchiveState,
     bucket_list_levels: Option<Vec<(Hash256, Hash256)>>,
     is_validator: bool,
 }
 
-impl LedgerPersistData {
-    fn write_to_db(&self, db: &henyey_db::Database) -> anyhow::Result<()> {
+impl LedgerPersistInputs {
+    /// Serialize XDR/JSON and write to SQLite on a blocking thread.
+    fn serialize_and_write_to_db(&self, db: &henyey_db::Database) -> anyhow::Result<()> {
         use henyey_db::queries::*;
+
+        let header_xdr = self
+            .header
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .map_err(|e| anyhow::anyhow!("Failed to serialize header XDR: {}", e))?;
+
+        // Diagnostic: compare HAS-derived bucket_list_hash against header.
+        // Non-fatal; logged only.
+        {
+            let expected_hash = Hash256::from_bytes(self.header.bucket_list_hash.0);
+            match self.has.compute_bucket_list_hash() {
+                Ok(go_sdk_hash) => {
+                    if go_sdk_hash != expected_hash {
+                        tracing::error!(
+                            ledger_seq = self.header.ledger_seq,
+                            go_sdk_hash = %go_sdk_hash.to_hex(),
+                            header_hash = %expected_hash.to_hex(),
+                            "DIAGNOSTIC: HAS bucket_list_hash does NOT match header!"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to compute diagnostic Go SDK hash");
+                }
+            }
+        }
+
+        let has_json = self
+            .has
+            .to_json()
+            .map_err(|e| anyhow::anyhow!("Failed to serialize HAS: {}", e))?;
+
         db.transaction(|conn| {
-            conn.store_ledger_header(&self.header, &self.header_xdr)?;
+            conn.store_ledger_header(&self.header, &header_xdr)?;
             conn.store_tx_history_entry(self.header.ledger_seq, &self.tx_history_entry)?;
             conn.store_tx_result_entry(self.header.ledger_seq, &self.tx_result_entry)?;
             if is_checkpoint_ledger(self.header.ledger_seq) {
@@ -33,7 +70,7 @@ impl LedgerPersistData {
                     conn.store_bucket_list(self.header.ledger_seq, levels)?;
                 }
                 if self.is_validator {
-                    conn.enqueue_publish(self.header.ledger_seq, &self.has_json)?;
+                    conn.enqueue_publish(self.header.ledger_seq, &has_json)?;
                 }
             }
             for index in 0..self.tx_count {
@@ -95,7 +132,7 @@ impl LedgerPersistData {
                 conn.store_scp_quorum_set(hash, self.header.ledger_seq, qset)?;
             }
 
-            conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &self.has_json)?;
+            conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
             conn.set_last_closed_ledger(self.header.ledger_seq)?;
 
             Ok(())
@@ -142,16 +179,18 @@ impl App {
         }
     }
 
-    /// Prepare all data needed for the persist transaction (CPU work only,
-    /// no SQLite I/O or file I/O). Runs on the event loop.
-    fn prepare_persist_data(
+    /// Prepare cheap inputs for the persist job (clones + bucket-list read).
+    ///
+    /// Expensive serialization (header XDR, HAS JSON, diagnostic hash)
+    /// happens later in [`LedgerPersistInputs::serialize_and_write_to_db`]
+    /// on a blocking thread — not on the event loop.
+    fn build_persist_inputs(
         &self,
         header: &stellar_xdr::curr::LedgerHeader,
         tx_set_variant: &TransactionSetVariant,
         tx_results: &[TransactionResultPair],
         tx_metas: Option<&[TransactionMeta]>,
-    ) -> anyhow::Result<LedgerPersistData> {
-        let header_xdr = header.to_xdr(stellar_xdr::curr::Limits::none())?;
+    ) -> anyhow::Result<LedgerPersistInputs> {
         let network_id = NetworkId::from_passphrase(&self.config.network.passphrase);
         let ordered_txs: Vec<std::sync::Arc<TransactionEnvelope>> = tx_set_variant
             .transactions_with_base_fee()
@@ -198,9 +237,9 @@ impl App {
             ext: TransactionHistoryResultEntryExt::default(),
         };
 
-        // Build HAS from in-memory bucket list state. Hot archive bucket
-        // persistence (file I/O) is deferred to the persist task.
-        let has_json = {
+        // Build HAS from in-memory bucket list state. JSON serialization
+        // and diagnostic hash are deferred to the persist task.
+        let has = {
             let bucket_list = self.ledger_manager.bucket_list();
             let hot_archive_guard = self.ledger_manager.hot_archive_bucket_list();
             let hot_archive_ref = hot_archive_guard.as_ref();
@@ -211,35 +250,13 @@ impl App {
                 None
             };
 
-            let has = build_history_archive_state(
+            build_history_archive_state(
                 header.ledger_seq,
                 &bucket_list,
                 hot_archive_for_has,
                 Some(self.config.network.passphrase.clone()),
             )
-            .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
-
-            let expected_hash = henyey_common::Hash256::from_bytes(header.bucket_list_hash.0);
-            match has.compute_bucket_list_hash() {
-                Ok(go_sdk_hash) => {
-                    if go_sdk_hash != expected_hash {
-                        tracing::error!(
-                            ledger_seq = header.ledger_seq,
-                            go_sdk_hash = %go_sdk_hash.to_hex(),
-                            header_hash = %expected_hash.to_hex(),
-                            "DIAGNOSTIC: HAS bucket_list_hash does NOT match header!"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to compute diagnostic Go SDK hash");
-                }
-            }
-
-            let json = has
-                .to_json()
-                .map_err(|e| anyhow::anyhow!("Failed to serialize HAS: {}", e))?;
-            json
+            .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?
         };
 
         let bucket_list_levels = if is_checkpoint_ledger(header.ledger_seq) {
@@ -248,9 +265,8 @@ impl App {
             None
         };
 
-        Ok(LedgerPersistData {
+        Ok(LedgerPersistInputs {
             header: header.clone(),
-            header_xdr,
             tx_history_entry,
             tx_result_entry,
             ordered_txs,
@@ -260,7 +276,7 @@ impl App {
             network_id,
             scp_envelopes,
             scp_quorum_sets,
-            has_json,
+            has,
             bucket_list_levels,
             is_validator: self.is_validator,
         })
@@ -1654,7 +1670,7 @@ impl App {
         // SQLite transaction) is deferred to a background task to avoid
         // blocking the event loop (#1713/#1518).
         let tx_metas = result.meta.as_ref().map(Self::extract_tx_metas);
-        let persist_data = self.prepare_persist_data(
+        let persist_data = self.build_persist_inputs(
             &result.header,
             &pending.tx_set_variant,
             &result.tx_results,
@@ -1896,7 +1912,7 @@ impl App {
                 let ledger_seq = pending.ledger_seq;
                 Some(super::persist::spawn_persist_task(
                     super::persist::PersistJob::LedgerClose {
-                        write_fn: Box::new(move |db| data.write_to_db(db)),
+                        write_fn: Box::new(move |db| data.serialize_and_write_to_db(db)),
                         meta_xdr: meta_xdr,
                         db: self.db.clone(),
                         ledger_manager: self.ledger_manager.clone(),
