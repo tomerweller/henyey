@@ -1935,10 +1935,18 @@ impl App {
                         }
                         drop(habl_guard);
 
-                        // Flush pending bucket persist (thread join).
-                        lm.bucket_list_mut()
-                            .flush_pending_persist()
-                            .map_err(|e| format!("flush_pending_persist: {}", e))
+                        // Take the pending persist handle with a brief write
+                        // lock, then join WITHOUT holding the lock. This
+                        // prevents blocking concurrent bucket_list() reads
+                        // from prepare_persist_data on the event loop.
+                        let pending_handle = lm.bucket_list_mut().take_pending_persist();
+                        if let Some(handle) = pending_handle {
+                            handle
+                                .join()
+                                .expect("bucket persist thread panicked")
+                                .map_err(|e| format!("flush_pending_persist: {}", e))?;
+                        }
+                        Ok(())
                     })
                     .await
                     .unwrap_or_else(|e| Err(format!("flush task panicked: {}", e)))

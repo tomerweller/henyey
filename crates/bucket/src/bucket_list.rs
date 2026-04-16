@@ -1164,6 +1164,17 @@ impl BucketList {
         Ok(())
     }
 
+    /// Take the pending persist join handle without joining it.
+    ///
+    /// The caller is responsible for joining the handle. This allows
+    /// releasing the bucket list lock before the (potentially slow)
+    /// thread join, preventing lock contention with concurrent readers.
+    pub fn take_pending_persist(
+        &mut self,
+    ) -> Option<std::thread::JoinHandle<std::result::Result<(), String>>> {
+        self.pending_persist.take()
+    }
+
     /// Set the merge map for checking cached merge results.
     ///
     /// When set, `prepare_with_normalization` checks the merge map before starting
