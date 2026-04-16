@@ -56,6 +56,7 @@ pub trait EventQueries {
     fn query_events(&self, params: &EventQueryParams) -> Result<Vec<EventRecord>, DbError>;
 
     /// Deletes events at or below the given ledger sequence.
+    /// `count` limits the number of distinct ledgers deleted per call.
     fn delete_old_events(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
 }
 

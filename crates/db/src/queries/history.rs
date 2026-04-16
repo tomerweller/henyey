@@ -165,8 +165,9 @@ pub trait HistoryQueries {
     /// Deletes old transaction history entries with `ledgerseq <= max_ledger`.
     ///
     /// Cleans `txhistory`, `txsets`, and `txresults` tables.
-    /// Removes at most `count` entries from each table.
-    /// Returns the total number of entries deleted across all tables.
+    /// `count` limits distinct ledgers deleted from `txhistory`; single-row-per-ledger
+    /// tables (`txsets`, `txresults`) use the same count independently.
+    /// Returns the total number of rows deleted across all tables.
     fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
 }
 

@@ -28,8 +28,8 @@ impl Database {
 
     /// Deletes old contract events up to and including `max_ledger`.
     ///
-    /// Removes at most `count` entries. Used by the Maintainer for garbage
-    /// collection of old event history.
+    /// Deletes at most `count` distinct ledgers' worth of events.
+    /// Used by the Maintainer for garbage collection of old event history.
     pub fn delete_old_events(&self, max_ledger: u32, count: u32) -> Result<u32> {
         self.with_connection(|conn| {
             use queries::EventQueries;
@@ -61,8 +61,8 @@ impl Database {
 
     /// Deletes old transaction history entries up to and including `max_ledger`.
     ///
-    /// Removes at most `count` entries from `txhistory`, `txsets`, and `txresults`.
-    /// Used by the Maintainer for garbage collection.
+    /// Cleans `txhistory`, `txsets`, and `txresults`. `count` limits distinct
+    /// ledgers deleted from multi-row tables. Used by the Maintainer for GC.
     pub fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32> {
         self.with_connection(|conn| {
             use queries::HistoryQueries;
