@@ -1748,17 +1748,19 @@ impl App {
         self.event_loop_phase.store(phase, Ordering::Relaxed);
     }
 
-    /// Sample the current depth of the overlay fetch-response channel and
-    /// update both the current-depth and monotonic-max gauges. Called by the
-    /// event loop every time it drains `fetch_response_rx` so that the
-    /// `/metrics` gauges and watchdog reflect the true live depth.
+    /// Decrement the overlay fetch-channel depth gauge by one, clamped at
+    /// zero. Called by the event loop for every successful `recv()` on
+    /// `fetch_response_rx`. Accounting is done on the send side (see
+    /// [`OverlayManager`]) so the gauge stays fresh even when the loop
+    /// wedges — which is the exact failure mode the metric is meant to
+    /// diagnose (issue #1741).
     #[inline]
-    pub(crate) fn sample_fetch_channel_depth(&self, depth: usize) {
-        update_fetch_channel_depth_gauges(
-            &self.fetch_channel_depth,
-            &self.fetch_channel_depth_max,
-            depth,
-        );
+    pub(crate) fn decrement_fetch_channel_depth(&self) {
+        let _ = self
+            .fetch_channel_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some((v - 1).max(0))
+            });
     }
 
     /// Record a new event loop tick (for watchdog freshness tracking).
@@ -1905,78 +1907,11 @@ impl App {
     }
 }
 
-/// Update the `(current, max)` fetch-channel depth gauges from a freshly
-/// sampled queue length.
-///
-/// - `current` is stored unconditionally (it is the instantaneous depth).
-/// - `max` is advanced only when the new sample exceeds the previously
-///   observed maximum. A CAS loop is used so the store is correct even if
-///   the watchdog thread happens to read the gauge concurrently.
-///
-/// Issue #1741: exposes unbounded growth of the now-unbounded fetch channel
-/// to operators via `/metrics` before it becomes OOM.
-#[inline]
-fn update_fetch_channel_depth_gauges(current: &AtomicI64, max: &AtomicI64, depth: usize) {
-    let d = depth as i64;
-    current.store(d, Ordering::Relaxed);
-    let mut prev = max.load(Ordering::Relaxed);
-    while d > prev {
-        match max.compare_exchange_weak(prev, d, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(observed) => prev = observed,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use stellar_xdr::curr::StellarValueExt;
     use tempfile;
-
-    /// Issue #1741 regression: the fetch-channel depth gauge must track the
-    /// current queue size, and the `_max` gauge must be monotonically
-    /// non-decreasing across a sequence of samples — including zero samples
-    /// (drained state).
-    #[test]
-    fn fetch_depth_metric_tracks_queue() {
-        let current = AtomicI64::new(0);
-        let max = AtomicI64::new(0);
-
-        // Empty queue: both gauges stay at zero.
-        update_fetch_channel_depth_gauges(&current, &max, 0);
-        assert_eq!(current.load(Ordering::Relaxed), 0);
-        assert_eq!(max.load(Ordering::Relaxed), 0);
-
-        // Grow the queue: both gauges track upward.
-        update_fetch_channel_depth_gauges(&current, &max, 12);
-        assert_eq!(current.load(Ordering::Relaxed), 12);
-        assert_eq!(max.load(Ordering::Relaxed), 12);
-
-        // Grow further.
-        update_fetch_channel_depth_gauges(&current, &max, 100);
-        assert_eq!(current.load(Ordering::Relaxed), 100);
-        assert_eq!(max.load(Ordering::Relaxed), 100);
-
-        // Drain: current drops, max holds.
-        update_fetch_channel_depth_gauges(&current, &max, 7);
-        assert_eq!(current.load(Ordering::Relaxed), 7);
-        assert_eq!(
-            max.load(Ordering::Relaxed),
-            100,
-            "depth_max must be monotonic non-decreasing"
-        );
-
-        // Fully drain: current zero, max unchanged.
-        update_fetch_channel_depth_gauges(&current, &max, 0);
-        assert_eq!(current.load(Ordering::Relaxed), 0);
-        assert_eq!(max.load(Ordering::Relaxed), 100);
-
-        // New peak: max advances.
-        update_fetch_channel_depth_gauges(&current, &max, 250);
-        assert_eq!(current.load(Ordering::Relaxed), 250);
-        assert_eq!(max.load(Ordering::Relaxed), 250);
-    }
 
     #[tokio::test]
     async fn test_app_creation() {

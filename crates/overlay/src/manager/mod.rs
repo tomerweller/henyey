@@ -50,7 +50,7 @@ use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stellar_xdr::curr::{
@@ -252,6 +252,16 @@ pub(super) struct SharedPeerState {
     /// Preferred peer addresses from config, used for inbound admission priority.
     /// Matches stellar-core's `mConfigurationPreferredPeers` in `isPreferred`.
     pub(super) preferred_peers: Arc<Vec<PeerAddress>>,
+    /// Current depth of the dedicated fetch channel. Incremented on every
+    /// successful send from `route_to_subscribers` and decremented by the
+    /// consumer on every successful `recv()`. Exposed via `/metrics` as
+    /// `henyey_overlay_fetch_channel_depth`. Tracked on the send side so the
+    /// gauge stays fresh even when the app event loop wedges (issue #1741).
+    pub(super) fetch_channel_depth: Arc<AtomicI64>,
+    /// Monotonic high-water mark for `fetch_channel_depth`. Advanced on the
+    /// send side from `route_to_subscribers` via a CAS loop. Exposed via
+    /// `/metrics` as `henyey_overlay_fetch_channel_depth_max`.
+    pub(super) fetch_channel_depth_max: Arc<AtomicI64>,
 }
 
 impl SharedPeerState {
@@ -311,6 +321,24 @@ impl SharedPeerState {
                     "Fetch channel send FAILED for peer {}: {}",
                     msg.from_peer, e
                 );
+            } else {
+                // Issue #1741: account for the enqueue on the send side so the
+                // depth gauge reflects backlog even when the event loop is
+                // wedged (which is the exact failure mode the metric is meant
+                // to diagnose).
+                let new_depth = self.fetch_channel_depth.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut prev = self.fetch_channel_depth_max.load(Ordering::Relaxed);
+                while new_depth > prev {
+                    match self.fetch_channel_depth_max.compare_exchange_weak(
+                        prev,
+                        new_depth,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(observed) => prev = observed,
+                    }
+                }
             }
         }
 
@@ -432,6 +460,11 @@ pub struct OverlayManager {
     pub(super) connection_factory: Arc<dyn ConnectionFactory>,
     /// Tracks in-flight connections for dedup.
     pub(super) pending_connections: PendingConnections,
+    /// Shared with `SharedPeerState`; see field docs there. Plumbed in from
+    /// the app so the same atomics back both the `/metrics` gauge and the
+    /// watchdog read path.
+    pub(super) fetch_channel_depth: Arc<AtomicI64>,
+    pub(super) fetch_channel_depth_max: Arc<AtomicI64>,
 }
 
 impl OverlayManager {
@@ -458,6 +491,27 @@ impl OverlayManager {
         config: OverlayConfig,
         local_node: LocalNode,
         connection_factory: Arc<dyn ConnectionFactory>,
+    ) -> Result<Self> {
+        Self::new_with_fetch_metrics(
+            config,
+            local_node,
+            connection_factory,
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+        )
+    }
+
+    /// Create a new overlay manager with externally-owned atomics for the
+    /// fetch channel depth metrics. The caller (typically `App`) keeps its
+    /// own `Arc` handles so the same atomics back `/metrics` and the
+    /// watchdog. Issue #1741.
+    // SECURITY: subscriber count bounded by internal callers; no external input
+    pub fn new_with_fetch_metrics(
+        config: OverlayConfig,
+        local_node: LocalNode,
+        connection_factory: Arc<dyn ConnectionFactory>,
+        fetch_channel_depth: Arc<AtomicI64>,
+        fetch_channel_depth_max: Arc<AtomicI64>,
     ) -> Result<Self> {
         // Broadcast channel for non-critical overlay messages (TX floods, etc.).
         // SCP and fetch-response messages bypass this channel via dedicated mpsc
@@ -516,6 +570,8 @@ impl OverlayManager {
             is_tracking: Arc::new(AtomicBool::new(false)),
             connection_factory,
             pending_connections: PendingConnections::new(),
+            fetch_channel_depth,
+            fetch_channel_depth_max,
         })
     }
 
@@ -543,6 +599,8 @@ impl OverlayManager {
             is_tracking: Arc::clone(&self.is_tracking),
             pending_connections: self.pending_connections.clone(),
             preferred_peers: Arc::new(self.config.preferred_peers.clone()),
+            fetch_channel_depth: Arc::clone(&self.fetch_channel_depth),
+            fetch_channel_depth_max: Arc::clone(&self.fetch_channel_depth_max),
         }
     }
 
@@ -1460,6 +1518,8 @@ mod tests {
             is_tracking: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
             preferred_peers: Arc::new(preferred),
+            fetch_channel_depth: Arc::new(AtomicI64::new(0)),
+            fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -1731,6 +1791,8 @@ mod tests {
             is_tracking: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
             preferred_peers: Arc::new(Vec::new()),
+            fetch_channel_depth: Arc::new(AtomicI64::new(0)),
+            fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
         };
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
@@ -1808,6 +1870,8 @@ mod tests {
             is_tracking: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
             preferred_peers: Arc::new(Vec::new()),
+            fetch_channel_depth: Arc::new(AtomicI64::new(0)),
+            fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
         };
         (shared, broadcast_rx, fetch_rx)
     }

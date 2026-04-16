@@ -262,11 +262,13 @@ impl App {
                         }
                         for _ in 0..MAX_DRAIN_PER_TICK {
                             match fetch_response_rx.try_recv() {
-                                Ok(fetch_msg) => self.handle_overlay_message(fetch_msg).await,
+                                Ok(fetch_msg) => {
+                                    self.decrement_fetch_channel_depth();
+                                    self.handle_overlay_message(fetch_msg).await;
+                                }
                                 Err(_) => break,
                             }
                         }
-                        self.sample_fetch_channel_depth(fetch_response_rx.len());
                         if pending_catchup.is_none() {
                             if let Some(pc) = self.process_externalized_slots().await {
                                 pending_catchup = Some(pc);
@@ -472,8 +474,8 @@ impl App {
                         latency_ms = fetch_msg.received_at.elapsed().as_millis(),
                         "Received fetch message via dedicated channel"
                     );
+                    self.decrement_fetch_channel_depth();
                     self.handle_overlay_message(fetch_msg).await;
-                    self.sample_fetch_channel_depth(fetch_response_rx.len());
                     // After processing a fetch response (which may deliver a
                     // tx_set), kick off a buffered close if none is running.
                     if pending_close.is_none() && pending_catchup.is_none() {
@@ -603,11 +605,13 @@ impl App {
                     // Drain dedicated fetch response channel (tx_sets, dont_have, etc.)
                     for _ in 0..MAX_DRAIN_PER_TICK {
                         match fetch_response_rx.try_recv() {
-                            Ok(fetch_msg) => self.handle_overlay_message(fetch_msg).await,
+                            Ok(fetch_msg) => {
+                                self.decrement_fetch_channel_depth();
+                                self.handle_overlay_message(fetch_msg).await;
+                            }
                             Err(_) => break,
                         }
                     }
-                    self.sample_fetch_channel_depth(fetch_response_rx.len());
 
                     // Check if SyncRecoveryManager requested recovery
                     if pending_catchup.is_none()
@@ -1013,10 +1017,12 @@ impl App {
             "Creating overlay with config"
         );
 
-        let mut overlay = OverlayManager::new_with_connection_factory(
+        let mut overlay = OverlayManager::new_with_fetch_metrics(
             overlay_config,
             local_node,
             Arc::clone(&self.overlay_connection_factory),
+            Arc::clone(&self.fetch_channel_depth),
+            Arc::clone(&self.fetch_channel_depth_max),
         )?;
         overlay.set_scp_callback(Arc::new(super::HerderScpCallback {
             herder: Arc::clone(&self.herder),
