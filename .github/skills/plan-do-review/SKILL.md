@@ -1,7 +1,7 @@
 ---
 name: plan-do-review
 description: Review a proposal issue with adversarial critics, converge on a plan, execute it, and iterate review-fix until clean
-argument-hint: "<issue-number> [--model <model>] [--max-proposal-rounds N] [--max-review-rounds N] [--dry-run]"
+argument-hint: "<issue-number> [--model <model>] [--max-proposal-rounds N] [--max-review-rounds N]"
 ---
 
 Parse `$ARGUMENTS`:
@@ -9,7 +9,6 @@ Parse `$ARGUMENTS`:
 - `--model <model>`: Model for critic and review agents (default: `"gpt-5.4"`).
 - `--max-proposal-rounds N`: Max proposal↔critic iterations (default: 5).
 - `--max-review-rounds N`: Max implement↔review-fix iterations (default: 3).
-- `--dry-run`: Run through proposal convergence only; do not execute or commit.
 
 # Plan-Do-Review
 
@@ -102,7 +101,7 @@ Repeat until `VERDICT: APPROVED` or `proposal_round >= max_proposal_rounds`:
 
 Increment `proposal_round`.
 
-**Post the proposal draft to the issue** (unless `--dry-run`):
+**Post the proposal draft to the issue**:
 
 ```bash
 gh issue comment $ISSUE --body "$(cat <<'DRAFT_EOF'
@@ -199,7 +198,7 @@ case where X is None at file.rs:123" is actionable.
 
 Read the agent result. Extract the verdict line.
 
-**Post the critic response to the issue** (unless `--dry-run`):
+**Post the critic response to the issue**:
 
 ```bash
 gh issue comment $ISSUE --body "$(cat <<'CRITIC_EOF'
@@ -253,9 +252,6 @@ review using the `plan-do-review` skill.*
 PROPOSAL_EOF
 )"
 ```
-
-If `--dry-run` is set, print the proposal to stdout instead of posting and
-**stop here**.
 
 ---
 
@@ -421,7 +417,11 @@ REVIEW_EOF
 
 ## Step 5: Completion
 
-Post a completion comment on the GitHub issue:
+Post a completion comment on the GitHub issue and unassign yourself:
+
+```bash
+gh issue edit $ISSUE --remove-assignee @me
+```
 
 ```bash
 gh issue comment $ISSUE --body "$(cat <<'DONE_EOF'

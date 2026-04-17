@@ -1,7 +1,7 @@
 ---
 name: plan-do-review-all
 description: Iterate over all open GitHub issues, AI-triage each for readiness, and call /plan-do-review on actionable ones
-argument-hint: "[--label <label>] [--model <model>] [--batch-size N] [--max-proposal-rounds N] [--max-review-rounds N] [--dry-run]"
+argument-hint: "[--label <label>] [--model <model>] [--batch-size N] [--max-proposal-rounds N] [--max-review-rounds N]"
 ---
 
 Parse `$ARGUMENTS`:
@@ -14,7 +14,6 @@ Parse `$ARGUMENTS`:
   fetched.
 - `--max-proposal-rounds N`: Passed through to `/plan-do-review` (default: 5).
 - `--max-review-rounds N`: Passed through to `/plan-do-review` (default: 3).
-- `--dry-run`: Print the triaged queue only; do not execute anything.
 
 # Propose-Execute Loop
 
@@ -227,8 +226,6 @@ Update cumulative counters:
 - `total_actionable += A`
 - `total_skipped += S`
 
-If `--dry-run` is set, **skip Step 4** and continue to the next batch.
-
 ---
 
 ### Step 4: Execute Batch
@@ -275,6 +272,10 @@ completion comment.
 #### 4c: Handle Success
 
 If `/plan-do-review` completes successfully:
+- Unassign yourself from the issue:
+  ```bash
+  gh issue edit <number> --remove-assignee @me
+  ```
 - Record the issue as completed.
 - Increment `total_completed`.
 - Collect any new commits into `all_commits`.
@@ -301,7 +302,11 @@ or any other error):
    ```bash
    gh issue edit <number> --add-label "plan-do-review-all-failed"
    ```
-3. Post a comment explaining the failure:
+3. Unassign yourself from the issue:
+   ```bash
+   gh issue edit <number> --remove-assignee @me
+   ```
+4. Post a comment explaining the failure:
    ```bash
    gh issue comment <number> --body "## plan-do-review-all: Failed
 
@@ -315,9 +320,9 @@ or any other error):
    ---
    *Automated by the \`plan-do-review-all\` skill.*"
    ```
-4. Increment `total_failed`.
-5. Print: `  ✗ #<number> — failed: <reason>`
-6. Continue to the next issue.
+5. Increment `total_failed`.
+6. Print: `  ✗ #<number> — failed: <reason>`
+7. Continue to the next issue.
 
 #### 4e: Progress Update
 

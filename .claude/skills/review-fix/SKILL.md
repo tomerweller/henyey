@@ -191,8 +191,7 @@ Prioritized list of follow-up actions (if any).
 - Focus on observable behavior. Different code structure with identical behavior
   is not a finding.
 - If the commit touches protocol, consensus, or ledger logic, always verify
-  against stellar-core. Use the crate-to-upstream mapping from the
-  `deep-compare` skill (`.claude/skills/deep-compare/SKILL.md`).
+  against stellar-core.
 - Do not inflate findings. If the fix is sound, the tests are adequate, and
   there are no similar issues, say so. A clean report is a valid outcome.
 - Use subagents for codebase-wide searches to keep the analysis thorough without
