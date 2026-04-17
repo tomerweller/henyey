@@ -1235,10 +1235,13 @@ impl App {
         let recovery_exhausted = recovery_attempts >= MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
 
         if catchup_triggered {
-            // A catchup is in flight. Don't re-trigger. Keep peer-SCP
-            // recovery running on schedule so we can still bridge small
-            // gaps while the catchup does its work.
-            if schedule_due {
+            // A catchup is in flight. Don't re-trigger. If the archive is
+            // also known behind the target checkpoint, the in-flight catchup
+            // is effectively stalled waiting for the archive — in that case
+            // keep peer-SCP recovery running on schedule so small gaps can
+            // still be bridged. Otherwise, defer entirely to the in-flight
+            // catchup (which will bring in all the slots anyway) and wait.
+            if archive_behind && schedule_due {
                 ConsensusStuckAction::AttemptRecovery
             } else {
                 ConsensusStuckAction::Wait
@@ -2287,10 +2290,26 @@ mod tests {
     }
 
     #[test]
-    fn test_decide_post_catchup_action_catchup_in_flight_recovers_when_due() {
-        // Even with catchup in flight, peer-SCP recovery runs on schedule.
+    fn test_decide_post_catchup_action_catchup_in_flight_waits_when_due_and_archive_ok() {
+        // Catchup in flight and archive NOT behind — defer entirely to the
+        // in-flight catchup; do not run redundant peer-SCP recovery.
         let action = App::decide_post_catchup_action(true, 0, TIMER, false);
+        assert_eq!(action, ConsensusStuckAction::Wait);
+
+        let action = App::decide_post_catchup_action(true, 0, TIMER * 100, false);
+        assert_eq!(action, ConsensusStuckAction::Wait);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_catchup_in_flight_recovers_when_archive_behind() {
+        // Catchup in flight but archive is known behind (so catchup is
+        // effectively stalled) — keep peer-SCP recovery running on schedule.
+        let action = App::decide_post_catchup_action(true, 0, TIMER, true);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+
+        // Not yet due: wait.
+        let action = App::decide_post_catchup_action(true, 0, TIMER - 1, true);
+        assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
     #[test]
@@ -2298,9 +2317,12 @@ mod tests {
         // If a catchup is in flight, we must not trigger another one even if
         // recovery_attempts has already saturated.
         let action = App::decide_post_catchup_action(true, MAX + 5, TIMER, false);
+        assert_eq!(action, ConsensusStuckAction::Wait);
+
+        let action = App::decide_post_catchup_action(true, MAX + 5, TIMER, true);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
 
-        let action = App::decide_post_catchup_action(true, MAX + 5, 0, false);
+        let action = App::decide_post_catchup_action(true, MAX + 5, 0, true);
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
@@ -2342,5 +2364,127 @@ mod tests {
 
         let action = App::decide_post_catchup_action(false, MAX - 1, TIMER, false);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    }
+
+    /// Regression test for #1753: the buffered-catchup skip paths must not
+    /// stamp `last_catchup_completed_at` (which would refresh the
+    /// post-catchup recovery window and cause the spin loop). Instead they
+    /// must arm `archive_behind_until` and clear `catchup_triggered`.
+    #[tokio::test]
+    async fn test_validate_target_checkpoint_skip_does_not_stamp_completion() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Seed the archive-checkpoint cache with a stale value so
+        // validate_target_checkpoint_published takes the skip branch without
+        // needing a live archive.
+        let stale_archive_latest: u32 = 100;
+        let target: u32 = 10_000; // forces archive_latest < target_checkpoint
+        {
+            let mut cache = app.cached_archive_checkpoint.write().await;
+            *cache = Some((stale_archive_latest, app.clock.now()));
+        }
+
+        // Seed a ConsensusStuckState with catchup_triggered=true, so we can
+        // observe the helper clearing it on skip.
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger: 5_000,
+                first_buffered: 5_001,
+                stuck_start: app.clock.now(),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 0,
+                catchup_triggered: true,
+            });
+        }
+
+        // Pre-conditions.
+        assert!(
+            app.last_catchup_completed_at.read().await.is_none(),
+            "precondition: no prior catchup completion stamp"
+        );
+        assert!(
+            app.archive_behind_until.read().await.is_none(),
+            "precondition: no prior archive-behind backoff"
+        );
+
+        // Drive the skip path.
+        let ok = app
+            .validate_target_checkpoint_published(50, target)
+            .await;
+        assert!(!ok, "skip path must return false");
+
+        // Post-conditions — the core #1753 regression guard:
+        assert!(
+            app.last_catchup_completed_at.read().await.is_none(),
+            "SKIP must NOT stamp last_catchup_completed_at (would cause #1753 spin loop)"
+        );
+        assert!(
+            app.archive_behind_until.read().await.is_some(),
+            "SKIP must arm archive_behind_until backoff"
+        );
+        let state = app.consensus_stuck_state.read().await;
+        let state = state.as_ref().expect("stuck state must still exist");
+        assert!(
+            !state.catchup_triggered,
+            "SKIP must clear catchup_triggered so later catchups can re-trigger"
+        );
+    }
+
+    /// Sibling regression for the other skip path:
+    /// `validate_archive_has_newer_checkpoint` — same invariants apply.
+    #[tokio::test]
+    async fn test_validate_archive_has_newer_checkpoint_skip_does_not_stamp_completion() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Cache a checkpoint <= current_ledger to force the skip branch.
+        let current_ledger: u32 = 5_000;
+        let stale_archive_latest: u32 = 4_000;
+        {
+            let mut cache = app.cached_archive_checkpoint.write().await;
+            *cache = Some((stale_archive_latest, app.clock.now()));
+        }
+
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger: 5_000,
+                first_buffered: 5_001,
+                stuck_start: app.clock.now(),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 0,
+                catchup_triggered: true,
+            });
+        }
+
+        let ok = app
+            .validate_archive_has_newer_checkpoint(current_ledger, current_ledger + 1)
+            .await;
+        assert!(!ok, "skip path must return false");
+
+        assert!(
+            app.last_catchup_completed_at.read().await.is_none(),
+            "SKIP must NOT stamp last_catchup_completed_at (would cause #1753 spin loop)"
+        );
+        assert!(
+            app.archive_behind_until.read().await.is_some(),
+            "SKIP must arm archive_behind_until backoff"
+        );
+        let state = app.consensus_stuck_state.read().await;
+        let state = state.as_ref().expect("stuck state must still exist");
+        assert!(
+            !state.catchup_triggered,
+            "SKIP must clear catchup_triggered"
+        );
     }
 }
