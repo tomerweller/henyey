@@ -42,16 +42,27 @@ Two classes of fix exist in this skill; treat them differently.
   YAML). Read logs, fix the code in the main checkout, commit, push. The
   monitoring loop is allowed to do this work directly. This is the one
   exception to "do not implement fixes inline."
-- **Node bugs — delegated to a spawned Agent in a worktree.** Hash
-  mismatches, crashes, consensus/sync failures, pruning defects, memory
-  leaks. These require investigation and larger code changes that risk
-  interfering with the running node if done in the main checkout. Open a
-  GitHub issue, then spawn an Agent with `isolation: "worktree"` to
-  implement the fix.
+- **Node bugs — delegated to a spawned Agent in a worktree, then
+  auto-merged to main after review.** Hash mismatches, crashes,
+  consensus/sync failures, pruning defects, memory leaks. These require
+  investigation and larger code changes; the worktree keeps the Agent's
+  edits off the running node's checkout during development. After the
+  Agent commits a tested, passing fix on its worktree branch, the monitor
+  **reviews the diff and cherry-picks it onto main without waiting for
+  user approval** — that is the expected flow (see Bug Investigation
+  Workflow §5 for the exact steps and §"When to block the auto-merge" for
+  the refuse criteria). The next redeploy tick rebuilds and restarts the
+  node on the merged fix.
 
-If you are unsure, err toward delegating. "A spawned agent fixed a trivial
-CI issue" is cheap; "the monitor touched the running node's source tree
-while investigating a consensus bug and corrupted the build" is not.
+The rationale: the worktree exists to isolate the *editing* environment,
+not to gate the *merging* decision. Holding a reviewed consensus fix in
+a worktree branch while a validator degrades is worse than any shipping
+risk the review already screened for.
+
+If you are unsure whether to delegate at all, err toward spawning an
+Agent. "A spawned agent fixed a trivial CI issue" is cheap; "the monitor
+touched the running node's source tree while investigating a consensus
+bug and corrupted the build" is not.
 
 ## Configurations
 
@@ -120,18 +131,34 @@ When a bug is detected (hash mismatch, error, crash, sync failure):
    code paths. Document findings with file:line references.
 2. **File a GitHub issue** with the investigation findings, root cause
    analysis, and proposed fix approach using `gh issue create`.
-3. **Spawn an agent** to implement the fix:
-   - Use the Agent tool with a detailed prompt including the issue number,
-     root cause, affected files, and proposed approach.
-   - The agent runs in a worktree (`isolation: "worktree"`) to avoid
-     interfering with the running node.
-   - Review the agent's changes before merging.
-4. **Do NOT implement node-bug fixes inline** in the monitoring loop. For
-   node bugs (hash mismatches, crashes, sync failures, pruning defects,
-   leaks) the monitor's job is to detect, investigate, file, and delegate
-   to an Agent — not to edit the main checkout while monitoring. **CI fixes
-   are the one exception** (see the Fix-Routing Policy section): small
-   fix-forward changes for build/test/clippy failures may be made inline.
+3. **Spawn an Agent in a worktree** (`isolation: "worktree"`) to implement
+   the fix. The worktree isolates code edits from the running node's
+   checkout. The Agent writes its own tests, runs `cargo test --all`,
+   `cargo fmt --all -- --check`, and `cargo clippy --all -- -D warnings`,
+   and commits on its worktree branch.
+4. **Review the Agent's commit** — read the diff, confirm the test
+   coverage, sanity-check the root-cause analysis.
+5. **Auto-merge to main** if the review passes. Cherry-pick the Agent's
+   commit onto main, `git pull --rebase`, `git push`. The next loop tick
+   will deploy it via the normal redeploy path (check 10). **This is the
+   expected flow — do not wait for explicit user approval before merging
+   a reviewed, passing fix.** The monitor is trusted to keep the node
+   operational, and that includes shipping consensus-code fixes.
+6. **Do NOT edit the main checkout directly while fixing a node bug.** The
+   worktree isolation is the point — the Agent writes the code, the
+   monitor reviews and cherry-picks. Inline edits on main can race the
+   running validator's recompile path. CI-only fixes (build errors, test
+   failures, clippy, workflow YAML) are exempt per the Fix-Routing Policy.
+
+### When to block the auto-merge
+
+Refuse to cherry-pick and instead post a summary for the user if:
+- Tests fail or the Agent didn't run them.
+- The diff touches files far outside the root-cause area (suggests drift).
+- The Agent's root-cause analysis is missing or vague.
+- The commit includes unrelated refactors bundled with the fix.
+
+Otherwise, cherry-pick and push.
 
 ## Startup
 
@@ -275,7 +302,7 @@ COMMIT POLICY (must match the skill body's Commit Policy section; update both to
 
 FIX-ROUTING POLICY (must match the skill body's Fix-Routing Policy section):
 - CI fixes (build errors, test failures, clippy, workflow YAML) are handled INLINE in the main checkout by this loop.
-- Node bugs (hash mismatches, crashes, consensus/sync failures, pruning defects, memory leaks) are DELEGATED to a spawned Agent in an isolated worktree — never edit the main checkout to fix a node bug while the monitored process is running against it.
+- Node bugs (hash mismatches, crashes, consensus/sync failures, pruning defects, memory leaks) are DELEGATED to a spawned Agent in an isolated worktree. After the Agent commits a tested, passing fix, REVIEW the diff and cherry-pick it onto main without waiting for user approval. Refuse the merge only if tests fail, scope drifted, root-cause analysis is vague, or unrelated refactors are bundled in. The worktree isolates editing, not merging — the next redeploy tick rebuilds and restarts on the merged fix.
 
 DEPLOY REGRESSION POLICY:
 If the node fails after a deploy: (a) file a GitHub issue with the regression details (commit range, symptoms, WATCHDOG data), (b) if the regression was from YOUR commits, revert and fix forward, (c) if the regression was from ANOTHER developer's commits, restart the node on the last known-good binary (rebuild from the previous commit) but do NOT revert their commits — file the issue and let them fix it.
@@ -619,6 +646,8 @@ When stopping (user interrupts):
 - All henyey issues are in scope: mainnet bugs, testnet parity bugs, CI
   failures, performance regressions, infrastructure problems.
 - **Push after every fix commit** — do not accumulate unpushed commits.
-- **Do not implement fixes inline** — file GitHub issues and spawn agents
-  for code changes. The monitor loop's job is detection, investigation,
-  and delegation.
+- **Node-bug fixes come from spawned Agents in worktrees.** After the
+  Agent's commit passes review (tests green, narrow scope, clear root
+  cause), cherry-pick it onto main and push — do NOT wait for explicit
+  user approval. The worktree isolates editing; the merge is autonomous.
+- CI-only fixes are inline per the Fix-Routing Policy.
