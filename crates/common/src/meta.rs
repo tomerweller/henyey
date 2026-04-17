@@ -190,7 +190,10 @@ mod tests {
         // XDR byte ordering: length 2 < length 3, so key_a < key_b
         let a_bytes = key_a.to_xdr(Limits::none()).unwrap();
         let b_bytes = key_b.to_xdr(Limits::none()).unwrap();
-        assert!(a_bytes < b_bytes, "byte ordering: key_a_bytes < key_b_bytes");
+        assert!(
+            a_bytes < b_bytes,
+            "byte ordering: key_a_bytes < key_b_bytes"
+        );
 
         // The two orderings disagree — verify sort_changes uses struct ordering
         let entry_a = LedgerEntry {
@@ -230,7 +233,10 @@ mod tests {
 
         // After sort, key_b (Bytes([0x00,...])) should come first (struct order)
         let first_key = change_key(&changes.0[0]);
-        assert_eq!(first_key, key_b, "sort should use struct ordering: key_b first");
+        assert_eq!(
+            first_key, key_b,
+            "sort should use struct ordering: key_b first"
+        );
     }
 
     #[test]

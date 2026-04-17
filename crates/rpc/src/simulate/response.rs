@@ -55,9 +55,9 @@ pub(super) fn build_invoke_response(
     // Estimate the transaction size for fee computation
     let op = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
         host_function: ctx.host_fn.clone(),
-        auth: ws_auth[..].try_into().map_err(|_| {
-            JsonRpcError::internal("auth entries exceed VecM maximum length")
-        })?,
+        auth: ws_auth[..]
+            .try_into()
+            .map_err(|_| JsonRpcError::internal("auth entries exceed VecM maximum length"))?,
     });
     let tx_size = estimate_tx_size_for_op(&op, &adjusted_resources);
 
