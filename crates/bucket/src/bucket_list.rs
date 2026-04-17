@@ -4482,18 +4482,19 @@ mod tests {
         );
     }
 
-    /// Regression test for AUDIT-013 (bucket): DEAD-entry keys must NOT be added
-    /// to seen_keys during eviction scan. stellar-core ignores DEAD entries entirely
-    /// in scanForEvictionInBucket, so stale LIVE entries in deeper buckets can still
-    /// be evaluated for eviction.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_audit_013_dead_key_dedup_does_not_block_eviction() {
+    /// Regression test for AUDIT-013 + AUDIT-156: DEAD data key with alive TTL
+    /// is an invariant violation. When the incremental scan encounters a stale
+    /// persistent entry whose data key is shadowed by a DEAD tombstone, the
+    /// lookup returns None and the scan must panic (matching stellar-core's
+    /// releaseAssertOrThrow / nullptr-deref at BucketListSnapshot.cpp:756-758).
+    #[test]
+    #[should_panic(expected = "persistent entry not found")]
+    fn test_audit_013_dead_persistent_entry_panics_during_eviction() {
         use crate::entry::get_ttl_key;
 
         let seed: u8 = 42;
         let contract_hash = Hash([seed; 32]);
 
-        // Soroban contract code entry (qualifies for eviction)
         let data_key = LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: contract_hash.clone(),
         });
@@ -4507,7 +4508,6 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        // TTL entry for this contract code — expired at current_ledger=100
         let ttl_key = get_ttl_key(&data_key).expect("contract code should have TTL key");
         let ttl_key_hash = match &ttl_key {
             LedgerKey::Ttl(t) => t.key_hash.clone(),
@@ -4517,16 +4517,15 @@ mod tests {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::Ttl(TtlEntry {
                 key_hash: ttl_key_hash,
-                live_until_ledger_seq: 50, // expired: 50 < 100
+                live_until_ledger_seq: 50,
             }),
             ext: LedgerEntryExt::V0,
         };
 
         let current_ledger: u32 = 100;
-
         let mut bl = BucketList::new();
 
-        // Level 0 curr: expired TTL (found by self.get() during scan)
+        // Level 0 curr: expired TTL (found by lookup during scan)
         let ttl_bucket = Bucket::from_entries(vec![
             BucketListEntry::Metaentry(BucketMetadata {
                 ledger_version: TEST_PROTOCOL,
@@ -4537,7 +4536,7 @@ mod tests {
         .unwrap();
         bl.level_mut(0).unwrap().curr = Arc::new(ttl_bucket);
 
-        // Level 1 curr: DEAD entry for the contract code key
+        // Level 1 curr: DEAD tombstone for data key (shadows the live entry)
         let dead_bucket = Bucket::from_entries(vec![
             BucketListEntry::Metaentry(BucketMetadata {
                 ledger_version: TEST_PROTOCOL,
@@ -4548,7 +4547,7 @@ mod tests {
         .unwrap();
         bl.level_mut(1).unwrap().curr = Arc::new(dead_bucket);
 
-        // Level 2 curr: stale LIVE entry for the same key (deep copy)
+        // Level 2 curr: stale LIVE entry (scan encounters this, lookup finds DEAD → None)
         let stale_bucket = Bucket::from_entries(vec![
             BucketListEntry::Metaentry(BucketMetadata {
                 ledger_version: TEST_PROTOCOL,
@@ -4569,27 +4568,16 @@ mod tests {
             live_soroban_state_size_window_sample_size: 0,
             live_soroban_state_size_window_sample_period: 0,
             eviction_scan_size: 1_000_000,
-            starting_eviction_scan_level: 1,
+            starting_eviction_scan_level: 2,
         };
 
         let iter = crate::EvictionIterator {
-            bucket_list_level: 1,
+            bucket_list_level: 2,
             is_curr_bucket: true,
             bucket_file_offset: 0,
         };
 
-        let result = bl
-            .scan_for_eviction_incremental(iter, current_ledger, &settings)
-            .unwrap();
-
-        // Before fix: 0 candidates (DEAD key blocked the stale LIVE at level 2)
-        // After fix: DEAD entry is ignored, stale LIVE at level 2 is evaluated
-        // and found expired → 1 candidate
-        assert!(
-            !result.candidates.is_empty(),
-            "AUDIT-013: DEAD entry must not block eviction of stale LIVE in deeper bucket. \
-             Got {} candidates, expected >= 1",
-            result.candidates.len(),
-        );
+        // Should panic: persistent entry lookup returns None (DEAD tombstone)
+        let _ = bl.scan_for_eviction_incremental(iter, current_ledger, &settings);
     }
 }

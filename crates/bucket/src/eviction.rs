@@ -557,11 +557,16 @@ pub(crate) fn scan_bucket_region(
             // For persistent entries, archive the NEWEST version from the bucket list.
             let is_temp = is_temporary_entry(live_entry);
             let entry_for_candidate = if !is_temp {
-                if let Some(newest_entry) = lookup(&key)? {
-                    newest_entry
-                } else {
-                    live_entry.clone()
-                }
+                // stellar-core asserts the newest version exists
+                // (BucketListSnapshot.cpp:756). If lookup returns None,
+                // a DEAD tombstone shadows the data while the TTL is
+                // still alive — an invariant violation.
+                lookup(&key)?.unwrap_or_else(|| {
+                    panic!(
+                        "BUG: persistent entry not found in bucket list during eviction scan: {:?}",
+                        key
+                    )
+                })
             } else {
                 live_entry.clone()
             };

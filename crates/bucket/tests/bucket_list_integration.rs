@@ -2056,3 +2056,159 @@ async fn test_eviction_scan_zero_budget_does_not_advance_iterator() {
         "Zero budget must not change the iterator bucket selector"
     );
 }
+
+// =============================================================================
+// AUDIT-156: Eviction persistent entry lookup must panic on missing data key
+// =============================================================================
+
+/// Regression test for AUDIT-156: when a persistent entry's data key is shadowed
+/// by a DEAD tombstone while its TTL is still alive and expired, the incremental
+/// eviction scan must panic (matching stellar-core's halt behavior at
+/// BucketListSnapshot.cpp:756-758).
+#[test]
+#[should_panic(expected = "persistent entry not found")]
+fn test_audit_156_incremental_eviction_panics_on_dead_persistent_entry() {
+    use std::sync::Arc;
+
+    let seed: u8 = 99;
+    let code_entry = make_contract_code_entry(seed, 1);
+    let code_key = make_contract_code_key(seed);
+    let ttl_entry = make_ttl_entry(&code_key, 50, 1); // expires at ledger 50
+
+    let mut bl = BucketList::new();
+
+    // Level 0 curr: expired TTL entry (lookup finds this)
+    let ttl_bucket = henyey_bucket::Bucket::from_entries(vec![
+        BucketEntry::Metaentry(BucketMetadata {
+            ledger_version: TEST_PROTOCOL,
+            ext: BucketMetadataExt::V0,
+        }),
+        BucketEntry::Liveentry(ttl_entry),
+    ])
+    .unwrap();
+    bl.level_mut(0).unwrap().curr = Arc::new(ttl_bucket);
+
+    // Level 1 curr: DEAD tombstone for data key (shadows the live entry)
+    let dead_bucket = henyey_bucket::Bucket::from_entries(vec![
+        BucketEntry::Metaentry(BucketMetadata {
+            ledger_version: TEST_PROTOCOL,
+            ext: BucketMetadataExt::V0,
+        }),
+        BucketEntry::Deadentry(code_key),
+    ])
+    .unwrap();
+    bl.level_mut(1).unwrap().curr = Arc::new(dead_bucket);
+
+    // Level 2 curr: stale LIVE entry (scan encounters this, lookup returns None → panic)
+    let stale_bucket = henyey_bucket::Bucket::from_entries(vec![
+        BucketEntry::Metaentry(BucketMetadata {
+            ledger_version: TEST_PROTOCOL,
+            ext: BucketMetadataExt::V0,
+        }),
+        BucketEntry::Liveentry(code_entry),
+    ])
+    .unwrap();
+    bl.level_mut(2).unwrap().curr = Arc::new(stale_bucket);
+
+    let settings = StateArchivalSettings {
+        starting_eviction_scan_level: 2,
+        eviction_scan_size: 1_000_000,
+        max_entries_to_archive: 100,
+        ..Default::default()
+    };
+
+    let iter = EvictionIterator {
+        bucket_list_level: 2,
+        is_curr_bucket: true,
+        bucket_file_offset: 0,
+    };
+
+    // Should panic: persistent entry lookup returns None (DEAD tombstone)
+    let _ = bl.scan_for_eviction_incremental(iter, 100, &settings);
+}
+
+/// Same as above but exercises the BucketListSnapshot path.
+#[test]
+#[should_panic(expected = "persistent entry not found")]
+fn test_audit_156_snapshot_incremental_eviction_panics_on_dead_persistent_entry() {
+    use henyey_bucket::BucketListSnapshot;
+    use std::sync::Arc;
+
+    let seed: u8 = 98;
+    let code_entry = make_contract_code_entry(seed, 1);
+    let code_key = make_contract_code_key(seed);
+    let ttl_entry = make_ttl_entry(&code_key, 50, 1);
+
+    let mut bl = BucketList::new();
+
+    let ttl_bucket = henyey_bucket::Bucket::from_entries(vec![
+        BucketEntry::Metaentry(BucketMetadata {
+            ledger_version: TEST_PROTOCOL,
+            ext: BucketMetadataExt::V0,
+        }),
+        BucketEntry::Liveentry(ttl_entry),
+    ])
+    .unwrap();
+    bl.level_mut(0).unwrap().curr = Arc::new(ttl_bucket);
+
+    let dead_bucket = henyey_bucket::Bucket::from_entries(vec![
+        BucketEntry::Metaentry(BucketMetadata {
+            ledger_version: TEST_PROTOCOL,
+            ext: BucketMetadataExt::V0,
+        }),
+        BucketEntry::Deadentry(code_key),
+    ])
+    .unwrap();
+    bl.level_mut(1).unwrap().curr = Arc::new(dead_bucket);
+
+    let stale_bucket = henyey_bucket::Bucket::from_entries(vec![
+        BucketEntry::Metaentry(BucketMetadata {
+            ledger_version: TEST_PROTOCOL,
+            ext: BucketMetadataExt::V0,
+        }),
+        BucketEntry::Liveentry(code_entry),
+    ])
+    .unwrap();
+    bl.level_mut(2).unwrap().curr = Arc::new(stale_bucket);
+
+    let header = LedgerHeader {
+        ledger_version: TEST_PROTOCOL,
+        previous_ledger_hash: Hash([0; 32]),
+        scp_value: StellarValue {
+            tx_set_hash: Hash([0; 32]),
+            close_time: TimePoint(0),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0; 32]),
+        bucket_list_hash: Hash([0; 32]),
+        ledger_seq: 100,
+        total_coins: 0,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 5000000,
+        max_tx_set_size: 100,
+        skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+        ext: LedgerHeaderExt::V0,
+    };
+
+    let snapshot = BucketListSnapshot::new(&bl, header);
+
+    let settings = StateArchivalSettings {
+        starting_eviction_scan_level: 2,
+        eviction_scan_size: 1_000_000,
+        max_entries_to_archive: 100,
+        ..Default::default()
+    };
+
+    let iter = EvictionIterator {
+        bucket_list_level: 2,
+        is_curr_bucket: true,
+        bucket_file_offset: 0,
+    };
+
+    // Should panic: snapshot lookup also returns None for DEAD-shadowed key
+    let _ = snapshot.scan_for_eviction_incremental(iter, 100, &settings);
+}
