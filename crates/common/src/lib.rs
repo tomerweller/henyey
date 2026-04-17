@@ -19,6 +19,7 @@
 //! - [`protocol`] - Protocol version constants and feature gating utilities
 //! - [`resource`] - Resource accounting for transaction limits and surge pricing
 //! - [`time`] - Time utilities for Unix/Stellar timestamp conversions
+//! - [`tracking`] - Per-call and per-phase timing telemetry primitives
 //! - [`types`] - Core types like [`Hash256`] used throughout the codebase
 //! - [`version`] - Version string construction and protocol version invariant
 //! - [`xdr_stream`] - Size-prefixed XDR frame I/O (RFC 4506 record marking)
@@ -58,6 +59,7 @@ pub mod network;
 pub mod protocol;
 pub mod resource;
 pub mod time;
+pub mod tracking;
 pub mod types;
 pub mod version;
 pub mod xdr_stream;

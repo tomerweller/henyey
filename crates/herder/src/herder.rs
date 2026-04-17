@@ -2453,18 +2453,45 @@ impl Herder {
     ///
     /// This also processes any envelopes that were waiting for this tx set,
     /// feeding them to SCP now that the dependency is satisfied.
+    ///
+    /// ### Per-phase telemetry (#1772)
+    ///
+    /// This entry point has been observed to consume 300+ ms on the
+    /// event-loop thread during mainnet freezes (see issue #1772). The
+    /// work splits into three phases:
+    ///
+    /// - `tracker_receive_ms` — XDR-serialize + SHA-256 of the tx set
+    ///   and the DashMap cache insert inside
+    ///   [`TxSetTracker::receive`](crate::tx_set_tracker::TxSetTracker).
+    /// - `tx_set_available_ms` — fetching-envelopes notify.
+    /// - `process_ready_ms` — SCP envelope dispatch for every slot
+    ///   whose tx-set dependency just became satisfied.
+    ///
+    /// A [`PhaseTimer`](henyey_common::tracking::PhaseTimer) records
+    /// each phase and emits a single structured WARN line with the
+    /// breakdown iff the total call reaches
+    /// [`LOCK_SLOW_THRESHOLD`](henyey_common::tracking::LOCK_SLOW_THRESHOLD).
+    /// That WARN is the evidence the next (Phase 2) fix — off-loading
+    /// the dominant phase via `tokio::task::spawn_blocking` — depends
+    /// on.
     pub fn receive_tx_set(&self, tx_set: TransactionSet) -> Option<SlotIndex> {
+        let mut timer = crate::tracked_lock::PhaseTimer::start();
         let hash = tx_set.hash;
+
         let slot = self.scp_driver.receive_tx_set(tx_set);
+        timer.mark("tracker_receive_ms");
 
         // Notify the fetching envelopes manager that this tx set is now available.
         // Use the slot from scp_driver, or tracking_slot as fallback.
         let notify_slot = slot.unwrap_or_else(|| self.tracking_slot());
         self.fetching_envelopes.tx_set_available(hash, notify_slot);
+        timer.mark("tx_set_available_ms");
 
         // Process any envelopes that became ready
         self.process_ready_fetching_envelopes();
+        timer.mark("process_ready_ms");
 
+        timer.finish("herder.receive_tx_set");
         slot
     }
 

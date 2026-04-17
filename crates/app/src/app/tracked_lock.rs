@@ -1,4 +1,4 @@
-//! Lock-latency telemetry for #1759 freeze investigation.
+//! Lock-latency telemetry for #1759 / #1772 freeze investigation.
 //!
 //! The first-run diagnostics in `f569b9ac` wrapped event-loop compute
 //! hotspots with [`warn_if_slow`](super::warn_if_slow) to catch
@@ -26,25 +26,21 @@
 //!    `Herder::*` entry points invoked from the event loop.
 //!
 //! The helpers here wrap (1) directly via [`tracked_write`] /
-//! [`tracked_read`], and observe (2)+(3) indirectly via [`time_call`]
-//! around the synchronous herder entry points. Any acquire-wait or
-//! hold-time (or end-to-end call time) exceeding
-//! [`LOCK_SLOW_THRESHOLD`] emits a single `WARN` log line tagged
-//! `lock=<label>` or `call=<label>`, naming the offending site.
+//! [`tracked_read`]. For (2)+(3), the synchronous `time_call` /
+//! `PhaseTimer` primitives live in [`henyey_common::tracking`] and
+//! are re-exported below so call sites in this crate keep using the
+//! familiar `tracked_lock::time_call` path.
 //!
-//! See `docs/spec-eval/` and issue #1759 for the full investigation
-//! trail.
+//! See `docs/spec-eval/` and issues #1759 / #1768 / #1772 for the full
+//! investigation trail.
 
 use std::ops::{Deref, DerefMut};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// Threshold above which a lock acquire-wait, hold, or end-to-end
-/// call emits a `WARN` log line.
-///
-/// 250 ms is conservative relative to the observed multi-second-to-
-/// multi-minute #1759 freezes while being well above normal-case
-/// baselines (sub-millisecond on a healthy node).
-pub(crate) const LOCK_SLOW_THRESHOLD: Duration = Duration::from_millis(250);
+// Re-export the shared primitives so in-crate call sites continue to
+// write `tracked_lock::time_call(...)` / `tracked_lock::LOCK_SLOW_THRESHOLD`
+// without needing to reach into `henyey_common::tracking` directly.
+pub(crate) use henyey_common::tracking::{time_call, LOCK_SLOW_THRESHOLD};
 
 /// RAII guard wrapper that emits a single `WARN` log line on drop
 /// if the lock was held for at least [`LOCK_SLOW_THRESHOLD`].
@@ -152,35 +148,11 @@ pub(crate) async fn tracked_read<'a, T>(
     }
 }
 
-/// Time a synchronous function call, emitting a `WARN` if the total
-/// wall time exceeded [`LOCK_SLOW_THRESHOLD`].
-///
-/// Intended for wrapping event-loop-facing herder entry points (which
-/// internally acquire `parking_lot::RwLock`s on `Herder::state` and
-/// `ScpDriver::externalized`). A WARN here conflates lock-wait time
-/// with compute time — but since [`warn_if_slow`](super::warn_if_slow)
-/// has already eliminated the sustained-compute-stall hypothesis for
-/// #1759 (zero fires over 150+ freeze events), any WARN emitted by
-/// `time_call` in practice points at lock contention.
-pub(crate) fn time_call<R, F: FnOnce() -> R>(label: &'static str, f: F) -> R {
-    let start = Instant::now();
-    let result = f();
-    let elapsed = start.elapsed();
-    if elapsed >= LOCK_SLOW_THRESHOLD {
-        tracing::warn!(
-            call = label,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "Slow herder call (>= {}ms) — possible #1759 contributor",
-            LOCK_SLOW_THRESHOLD.as_millis()
-        );
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::sync::RwLock as TokioRwLock;
     use tracing::{
         field::{Field, Visit},
@@ -188,16 +160,18 @@ mod tests {
         Event, Metadata,
     };
 
-    /// Captured tracing event: `(level, lock_label, call_label, kind, ms)`.
+    /// Captured tracing event: `(level, lock_label, kind, ms)`.
+    ///
+    /// `time_call` has its own capturing-subscriber tests in
+    /// `henyey_common::tracking::tests` now; this module only exercises
+    /// the tokio-specific `tracked_read` / `tracked_write` wrappers.
     #[derive(Clone, Debug, Default)]
     struct CapturedEvent {
         level: String,
         lock: Option<String>,
-        call: Option<String>,
         kind: Option<String>,
         hold_ms: Option<u64>,
         acquire_wait_ms: Option<u64>,
-        elapsed_ms: Option<u64>,
     }
 
     #[derive(Clone, Default)]
@@ -209,7 +183,6 @@ mod tests {
         fn record_str(&mut self, field: &Field, value: &str) {
             match field.name() {
                 "lock" => self.lock = Some(value.to_string()),
-                "call" => self.call = Some(value.to_string()),
                 "kind" => self.kind = Some(value.to_string()),
                 _ => {}
             }
@@ -219,7 +192,6 @@ mod tests {
             match field.name() {
                 "hold_ms" => self.hold_ms = Some(value),
                 "acquire_wait_ms" => self.acquire_wait_ms = Some(value),
-                "elapsed_ms" => self.elapsed_ms = Some(value),
                 _ => {}
             }
         }
@@ -403,70 +375,5 @@ mod tests {
             ms,
             LOCK_SLOW_THRESHOLD.as_millis()
         );
-    }
-
-    /// `time_call` emits one WARN on the slow path.
-    #[test]
-    fn time_call_warns_on_slow_call() {
-        let sub = CapturingSubscriber::default();
-        let events = sub.events.clone();
-
-        with_default(sub, || {
-            let _ = time_call("herder.test_slow", || {
-                std::thread::sleep(TEST_HOLD_DURATION);
-                42u32
-            });
-        });
-
-        let evs = events.lock().unwrap();
-        let call_events: Vec<_> = evs
-            .iter()
-            .filter(|e| e.call.as_deref() == Some("herder.test_slow"))
-            .collect();
-        assert_eq!(call_events.len(), 1);
-        assert_eq!(call_events[0].level, "WARN");
-        let ms = call_events[0].elapsed_ms.expect("elapsed_ms missing");
-        assert!(ms >= LOCK_SLOW_THRESHOLD.as_millis() as u64);
-    }
-
-    /// `time_call` is silent on the fast path.
-    #[test]
-    fn time_call_silent_on_fast_call() {
-        let sub = CapturingSubscriber::default();
-        let events = sub.events.clone();
-
-        with_default(sub, || {
-            let _ = time_call("herder.test_fast", || 42u32);
-        });
-
-        let evs = events.lock().unwrap();
-        let call_events: Vec<_> = evs
-            .iter()
-            .filter(|e| e.call.as_deref() == Some("herder.test_fast"))
-            .collect();
-        assert_eq!(call_events.len(), 0);
-    }
-
-    /// Boundary: `time_call` fires when elapsed exactly equals
-    /// threshold (the `>=` comparison is load-bearing).
-    #[test]
-    fn time_call_boundary_inclusive() {
-        let sub = CapturingSubscriber::default();
-        let events = sub.events.clone();
-
-        with_default(sub, || {
-            // We can't force exactly-equal via sleep. Instead sleep
-            // long enough that elapsed is reliably >= threshold.
-            let _ = time_call("herder.test_boundary", || {
-                std::thread::sleep(LOCK_SLOW_THRESHOLD + Duration::from_millis(10));
-            });
-        });
-
-        let evs = events.lock().unwrap();
-        let call_events: Vec<_> = evs
-            .iter()
-            .filter(|e| e.call.as_deref() == Some("herder.test_boundary"))
-            .collect();
-        assert_eq!(call_events.len(), 1);
     }
 }

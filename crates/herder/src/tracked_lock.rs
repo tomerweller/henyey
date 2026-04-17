@@ -59,21 +59,18 @@
 //! every SCP envelope (~100/sec peak), < 10 µs/sec budget.
 
 use std::ops::{Deref, DerefMut};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-/// Threshold above which a lock acquire-wait or hold emits a
-/// `WARN` log line.
-///
-/// 250 ms is conservative relative to the observed multi-second
-/// to multi-minute #1759 freezes while remaining well above
-/// normal-case baselines (sub-millisecond on a healthy node).
-///
-/// Matches the app-crate threshold
-/// (`crates/app/src/app/tracked_lock.rs`) so both instrumentation
-/// families speak the same language in the validator log.
-pub(crate) const LOCK_SLOW_THRESHOLD: Duration = Duration::from_millis(250);
+// Re-export the shared timing primitives so in-crate call sites keep
+// using the familiar `tracked_lock::time_call(...)` path without
+// reaching into `henyey_common::tracking` directly. `LOCK_SLOW_THRESHOLD`
+// is defined once in `henyey-common` and consumed by both this crate
+// and the app-crate tokio companion, so both instrumentation families
+// speak the same language in the validator log.
+#[allow(unused_imports)]
+pub(crate) use henyey_common::tracking::{time_call, PhaseTimer, LOCK_SLOW_THRESHOLD};
 
 /// RAII wrapper around a `parking_lot` RwLock guard that emits
 /// a single `WARN lock=<label> kind="hold"` on drop iff the
@@ -206,6 +203,7 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::Duration;
     use tracing::{
         field::{Field, Visit},
         subscriber::{with_default, Subscriber},
