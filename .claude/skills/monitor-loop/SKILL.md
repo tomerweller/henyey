@@ -158,6 +158,42 @@ lands on main — rebuild, kill, restart. The bug-fix progress itself is
 tracked on the issue and by `/plan-do-review`'s own reporting; the
 monitor does not block on it.
 
+### Recurrence + new evidence → re-spawn `/plan-do-review` autonomously
+
+When a previously-filed bug (open, already had one or more `/plan-do-review`
+runs) recurs, the monitor's default is **not** "wait and see"; it is
+"did the recurrence give us new evidence, and if so, re-spawn
+`/plan-do-review <N>`". Specifically, re-spawn when any of the
+following is true versus the state at the last `/plan-do-review` run:
+
+- The bug reproduces on a different commit or a different process,
+  strengthening the "this is deterministic, not a one-off" case.
+- New instrumentation output has landed on the issue (log lines,
+  stack dumps, `/proc/wchan`, profile data, metric deltas) that
+  the prior run didn't have access to.
+- A negative finding rules out the prior run's root-cause hypothesis
+  (e.g. the prior proposal blamed compute backpressure but fresh
+  telemetry shows zero compute-side warnings).
+- The candidate site set has narrowed (specific locks, functions,
+  ledger numbers) in a way the prior proposal didn't cover.
+
+Do not wait for the user to ask "is there enough information now?" —
+the decision rule is "would the next `/plan-do-review` run have
+strictly more information than the last one?" If yes, spawn it; brief
+the new agent with pointers to the new comments so it doesn't retrace
+the prior ground.
+
+What the monitor does NOT do on recurrence:
+- Re-file a duplicate issue (`/plan-do-review` re-runs against the
+  existing issue number).
+- Wait for the existing `/plan-do-review` agent to finish before
+  queueing the next one if the existing agent is already running on
+  stale evidence. Exception: if the existing agent is still in its
+  proposal-convergence stage and the new evidence is purely additive,
+  posting the new evidence as a comment on the issue (so the running
+  agent picks it up) may be sufficient; escalate to a re-spawn only if
+  the existing agent is past the proposal stage.
+
 ## Startup
 
 1. **Concurrency lock.** Acquire a single-holder lock so a second
