@@ -183,7 +183,8 @@ impl App {
             self.herder.clear_pending_tx_sets();
             // Also clear syncing_ledgers entries that have no tx_set — these are
             // unfulfillable entries created from stale EXTERNALIZE messages.
-            let mut buffer = self.syncing_ledgers.write().await;
+            let mut buffer =
+                tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
             let pre_count = buffer.len();
             buffer.retain(|seq, info| {
                 // Keep entries that are above current_ledger AND have a tx_set.
@@ -1654,7 +1655,15 @@ impl App {
                             return;
                         }
                     };
-                    match self.herder.pre_filter_scp_envelope(&envelope) {
+                    // Time-wrapped (#1759 diagnostics): this is the
+                    // event-loop-side pre-filter for every SCP envelope,
+                    // acquiring `Herder::state` + `ScpDriver::externalized`
+                    // (both parking_lot::RwLock) before handing off to
+                    // the verify worker.
+                    match tracked_lock::time_call(
+                        "herder.pre_filter_scp_envelope",
+                        || self.herder.pre_filter_scp_envelope(&envelope),
+                    ) {
                         PreFilter::Accept(mut intake) => {
                             intake.peer_id = Some(from_peer);
                             permit.send(intake);

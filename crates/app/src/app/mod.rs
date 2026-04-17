@@ -199,6 +199,7 @@ mod peers;
 mod persist;
 mod publish;
 mod survey_impl;
+mod tracked_lock;
 mod tx_flooding;
 mod types;
 mod upgrades;
@@ -1882,12 +1883,21 @@ impl App {
                              30=herder_cleanup, 31=scp_verifier, 32=scp_verified"
                         );
 
-                        // Log thread states from /proc for debugging
+                        // Log thread states AND kernel wait-channels
+                        // (wchan) from /proc. The wchan histogram is
+                        // the direct fallback when py-spy / gdb are
+                        // not installed on a production validator
+                        // host: the 21:07 #1759 live capture used
+                        // exactly this signal to identify futex
+                        // contention as the freeze mechanism.
                         if let Ok(entries) = std::fs::read_dir(format!("/proc/{}/task", pid)) {
                             let mut states: std::collections::HashMap<String, u32> =
                                 std::collections::HashMap::new();
+                            let mut wchans: std::collections::HashMap<String, u32> =
+                                std::collections::HashMap::new();
                             for entry in entries.flatten() {
-                                let status_path = format!("{}/status", entry.path().display());
+                                let task_path = entry.path();
+                                let status_path = format!("{}/status", task_path.display());
                                 if let Ok(status) = std::fs::read_to_string(&status_path) {
                                     let state = status
                                         .lines()
@@ -1896,12 +1906,34 @@ impl App {
                                         .unwrap_or_else(|| "Unknown".into());
                                     *states.entry(state).or_insert(0) += 1;
                                 }
+                                // wchan: single-line kernel wait
+                                // channel symbol (e.g.
+                                // "futex_wait_queue", "ep_poll",
+                                // "hrtimer_nanosleep"). Best effort
+                                // — some kernels permission-restrict.
+                                let wchan_path = format!("{}/wchan", task_path.display());
+                                if let Ok(wchan) = std::fs::read_to_string(&wchan_path) {
+                                    let key = wchan.trim().to_string();
+                                    let key = if key.is_empty() {
+                                        "(running)".to_string()
+                                    } else {
+                                        key
+                                    };
+                                    *wchans.entry(key).or_insert(0) += 1;
+                                }
                             }
                             for (state, count) in &states {
                                 tracing::error!(
                                     count,
                                     state = state.as_str(),
                                     "WATCHDOG: Thread state summary"
+                                );
+                            }
+                            for (wchan, count) in &wchans {
+                                tracing::error!(
+                                    count,
+                                    wchan = wchan.as_str(),
+                                    "WATCHDOG: Thread wchan summary"
                                 );
                             }
                         }

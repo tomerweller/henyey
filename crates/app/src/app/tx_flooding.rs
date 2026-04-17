@@ -561,7 +561,10 @@ impl App {
             "Processing GeneralizedTxSet"
         );
 
-        if !self.herder.needs_tx_set(&hash) {
+        // Time-wrapped (#1759 diagnostics): acquires
+        // `Herder::scp_driver.needs_tx_set`'s internal
+        // parking_lot::RwLock on every inbound GeneralizedTxSet.
+        if !tracked_lock::time_call("herder.needs_tx_set", || self.herder.needs_tx_set(&hash)) {
             tracing::debug!(hash = %hash, "GeneralizedTxSet not pending");
         }
 
@@ -672,7 +675,13 @@ impl App {
             map.remove(&internal_tx_set.hash);
         }
 
-        let received_slot = self.herder.receive_tx_set(internal_tx_set.clone());
+        // Time-wrapped (#1759 diagnostics): writes
+        // `Herder::scp_driver`'s pending-tx-set table under its
+        // parking_lot::RwLock. Called once per inbound
+        // GeneralizedTxSet in the event loop hot path.
+        let received_slot = tracked_lock::time_call("herder.receive_tx_set", || {
+            self.herder.receive_tx_set(internal_tx_set.clone())
+        });
         if let Some(slot) = received_slot {
             tracing::debug!(
                 slot,

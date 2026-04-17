@@ -127,7 +127,9 @@ impl App {
         let latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0);
         let last_processed = *self.last_processed_slot.read().await;
         let pending_tx_sets = self.herder.get_pending_tx_sets();
-        let buffer_count = self.syncing_ledgers.read().await.len();
+        let buffer_count = tracked_lock::tracked_read("syncing_ledgers", &self.syncing_ledgers)
+            .await
+            .len();
         let gap = latest_externalized.saturating_sub(current_ledger as u64);
 
         // Track consecutive recovery attempts without progress.
@@ -210,7 +212,8 @@ impl App {
             // but recovery would immediately clear the request, so the
             // tx_set was never fetched and the slot could never close.
             {
-                let mut buffer = self.syncing_ledgers.write().await;
+                let mut buffer =
+                    tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
                 let pre_count = buffer.len();
                 buffer.retain(|seq, _| *seq > current_ledger);
                 let removed = pre_count - buffer.len();
@@ -404,7 +407,9 @@ impl App {
                         "Next slot permanently missing — triggering catchup to skip gap"
                     );
                     {
-                        let mut buffer = self.syncing_ledgers.write().await;
+                        let mut buffer =
+                            tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers)
+                                .await;
                         buffer.retain(|seq, _| *seq > current_ledger);
                     }
                     return Some(
@@ -438,7 +443,8 @@ impl App {
             // distinct `buffered_sequence_gap` warning when the true cause is a
             // sequence gap, so operators can triage the right subsystem.
             let (total, with_tx_set, first_buffered, last_buffered) = {
-                let buffer = self.syncing_ledgers.read().await;
+                let buffer =
+                    tracked_lock::tracked_read("syncing_ledgers", &self.syncing_ledgers).await;
                 let total = buffer.range((current_ledger + 1)..).count();
                 let with_tx_set = buffer
                     .range((current_ledger + 1)..)
@@ -955,7 +961,8 @@ impl App {
             // spawn would needlessly destroy the syncing_ledgers buffer
             // and reset recovery counters.
             {
-                let mut buffer = self.syncing_ledgers.write().await;
+                let mut buffer =
+                    tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
                 buffer.clear();
             }
             self.herder.clear_pending_tx_sets();

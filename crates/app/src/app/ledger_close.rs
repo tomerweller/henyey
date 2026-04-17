@@ -1069,14 +1069,19 @@ impl App {
 
     /// Process any externalized slots that need ledger close.
     pub(super) async fn process_externalized_slots(&self) -> Option<PendingCatchup> {
-        // Get the latest externalized slot
-        let latest_externalized = match self.herder.latest_externalized_slot() {
-            Some(slot) => slot,
-            None => {
-                tracing::debug!("No externalized slots yet");
-                return None;
-            }
-        };
+        // Get the latest externalized slot. Time-wrapped (#1759
+        // diagnostics): this acquires `ScpDriver::latest_externalized`
+        // (parking_lot::RwLock) and is on the egress critical path.
+        let latest_externalized =
+            match tracked_lock::time_call("herder.latest_externalized_slot", || {
+                self.herder.latest_externalized_slot()
+            }) {
+                Some(slot) => slot,
+                None => {
+                    tracing::debug!("No externalized slots yet");
+                    return None;
+                }
+            };
 
         tracing::debug!(latest_externalized, "Processing externalized slots");
 
@@ -1111,7 +1116,8 @@ impl App {
             let mut pes_iterated: u64 = 0;
             {
                 let current_ledger = self.current_ledger_seq();
-                let mut buffer = self.syncing_ledgers.write().await;
+                let mut buffer =
+                    tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
 
                 // Only iterate slots that peers are likely to still have
                 // tx_sets for.  When the gap between last_processed and
@@ -1330,7 +1336,8 @@ impl App {
         let Some(tx_set) = tx_set else {
             return;
         };
-        let mut buffer = self.syncing_ledgers.write().await;
+        let mut buffer =
+            tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
         if let Some(entry) = buffer.get_mut(&slot) {
             if tx_set.hash != entry.tx_set_hash {
                 tracing::warn!(
@@ -1352,7 +1359,8 @@ impl App {
         &self,
         tx_set: &henyey_herder::TransactionSet,
     ) -> bool {
-        let mut buffer = self.syncing_ledgers.write().await;
+        let mut buffer =
+            tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
         for (slot, entry) in buffer.iter_mut() {
             if entry.tx_set.is_none() && entry.tx_set_hash == tx_set.hash {
                 entry.tx_set = Some(tx_set.clone());
@@ -1377,7 +1385,8 @@ impl App {
             return false;
         };
         {
-            let mut buffer = self.syncing_ledgers.write().await;
+            let mut buffer =
+                tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
             buffer.entry(info.slot as u32).or_insert(info);
         }
         self.update_buffered_tx_set(slot as u32, Some(tx_set.clone()))
@@ -1451,7 +1460,8 @@ impl App {
         let next_seq = current_ledger.saturating_add(1);
 
         let close_info = {
-            let mut buffer = self.syncing_ledgers.write().await;
+            let mut buffer =
+                tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
             Self::trim_syncing_ledgers(&mut buffer, current_ledger);
             match buffer.get(&next_seq) {
                 Some(info) if info.tx_set.is_some() => info.clone(),
@@ -1506,7 +1516,8 @@ impl App {
                 found = %tx_set.hash.to_hex(),
                 "Buffered tx set hash mismatch"
             );
-            let mut buffer = self.syncing_ledgers.write().await;
+            let mut buffer =
+                tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
             if let Some(entry) = buffer.get_mut(&next_seq) {
                 entry.tx_set = None;
             }
@@ -1556,7 +1567,8 @@ impl App {
 
         // Remove from buffer before spawning (optimistic).
         {
-            let mut buffer = self.syncing_ledgers.write().await;
+            let mut buffer =
+                tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
             buffer.remove(&next_seq);
         }
 
@@ -1638,7 +1650,8 @@ impl App {
                     "Background ledger close failed"
                 );
                 if is_hash_mismatch {
-                    let mut buffer = self.syncing_ledgers.write().await;
+                    let mut buffer =
+                        tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
                     let cleared_count = buffer.len();
                     buffer.clear();
                     tracing::warn!(
