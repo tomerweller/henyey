@@ -413,6 +413,15 @@ Corresponds to: `ParallelTxSetBuilder.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `buildSurgePricedParallelSorobanPhase()` | `build_surge_priced_parallel_soroban_phase()` | Full |
+| Fee-rate ordering (per-op via SurgePricingPriorityQueue) | `fee_rate_cmp` cross-multiply sort | Full — fixed #1717 |
+
+### Selection (`tx_queue/selection.rs`)
+
+Corresponds to: `TxSetFrame.cpp` build logic
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| Instruction limit relaxation for parallel phases (TxSetFrame.cpp:513-524) | `build_soroban_phase()` sets Instructions to i64::MAX | Full — fixed #1710 |
 
 ## Intentional Omissions
 

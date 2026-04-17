@@ -502,9 +502,26 @@ fn build_with_stage_count(
         .collect();
 
     // Sort transactions by fee rate (descending) for greedy assignment.
-    // Highest-fee transactions get placed first.
+    // Uses per-operation fee rate (inclusion_fee / num_ops) via cross-multiply
+    // to match stellar-core's SurgePricingPriorityQueue ordering. Ties are
+    // broken by transaction hash (ascending) for determinism.
     let mut sorted_ids: Vec<usize> = (0..n).collect();
-    sorted_ids.sort_by(|&a, &b| tx_inclusion_fee(&txs[b]).cmp(&tx_inclusion_fee(&txs[a])));
+    sorted_ids.sort_by(|&a, &b| {
+        let a_fee = tx_inclusion_fee(&txs[a]);
+        let b_fee = tx_inclusion_fee(&txs[b]);
+        let a_ops = (crate::tx_set_utils::envelope_num_ops(&txs[a]) as u32).max(1);
+        let b_ops = (crate::tx_set_utils::envelope_num_ops(&txs[b]) as u32).max(1);
+        // Descending fee rate: compare b vs a
+        match crate::tx_queue::fee_rate_cmp(b_fee as u64, b_ops, a_fee as u64, a_ops) {
+            std::cmp::Ordering::Equal => {
+                // Ascending hash for determinism
+                let a_hash = Hash256::hash_xdr(&txs[a]).unwrap_or_default();
+                let b_hash = Hash256::hash_xdr(&txs[b]).unwrap_or_default();
+                a_hash.0.cmp(&b_hash.0)
+            }
+            other => other,
+        }
+    });
 
     // Build stages greedily.
     let mut stages: Vec<Stage> = (0..stage_count)
@@ -818,7 +835,8 @@ pub fn build_two_phase_tx_set(
 mod tests {
     use super::*;
     use stellar_xdr::curr::{
-        LedgerFootprint, LedgerKey, LedgerKeyContractData, Memo, MuxedAccount, Preconditions,
+        HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, LedgerKey,
+        LedgerKeyContractData, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
         ScAddress, ScVal, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
         Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
     };
@@ -849,13 +867,28 @@ mod tests {
             },
             resource_fee: 100,
         };
+        // Include a minimal InvokeHostFunction op so envelope_num_ops returns 1,
+        // matching real Soroban transactions for fee-rate ordering.
+        let invoke_op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(stellar_xdr::curr::ContractId(
+                        stellar_xdr::curr::Hash([seed; 32]),
+                    )),
+                    function_name: stellar_xdr::curr::ScSymbol("test".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                auth: Default::default(),
+            }),
+        };
         let tx = Transaction {
             source_account: source,
             fee: 1000,
             seq_num: stellar_xdr::curr::SequenceNumber(seq),
             cond: Preconditions::None,
             memo: Memo::None,
-            operations: VecM::default(),
+            operations: vec![invoke_op].try_into().unwrap(),
             ext: TransactionExt::V1(soroban_data),
         };
         TransactionEnvelope::Tx(TransactionV1Envelope {
@@ -1063,7 +1096,8 @@ mod tests {
     }
 
     #[test]
-    fn test_audit_018_parallel_builder_uses_inclusion_fee_ordering() {
+    fn test_audit_018_parallel_builder_uses_fee_rate_ordering() {
+        // Both 1-op txs → fee rate = absolute fee. High inclusion fee should win.
         let tx_low_inclusion =
             make_soroban_tx_with_fees(1, 1, vec![], vec![contract_key(1)], 60_000, 1_000, 900);
         let tx_high_inclusion =
@@ -1082,6 +1116,53 @@ mod tests {
         // tx_high_inclusion is index 1 in the input slice
         assert_eq!(stages[0][0], vec![1]);
         assert_eq!(total_inclusion_fee, 800);
+    }
+
+    /// Regression test for #1717: fee-bump Soroban tx has numOps=2 (inner op +
+    /// fee-bump wrapper). With absolute fee ordering, a fee-bumped tx with
+    /// fee=1000 beats a normal tx with fee=800. With per-op fee-rate ordering,
+    /// the normal tx (800/1=800 rate) beats the fee-bumped tx (1000/2=500 rate).
+    #[test]
+    fn test_fee_bump_soroban_uses_per_op_rate() {
+        use stellar_xdr::curr::{FeeBumpTransaction, FeeBumpTransactionEnvelope,
+            FeeBumpTransactionInnerTx, FeeBumpTransactionExt};
+
+        // Normal tx: fee=800, resource_fee=0, inclusion_fee=800, 1 op → rate=800
+        let tx_normal =
+            make_soroban_tx_with_fees(1, 1, vec![], vec![contract_key(1)], 60_000, 800, 0);
+
+        // Fee-bumped tx: inner fee=500, resource_fee=0, outer fee=1000
+        // inclusion_fee=1000, 2 ops (inner+wrapper) → rate=500
+        let inner_tx =
+            make_soroban_tx_with_fees(2, 1, vec![], vec![contract_key(2)], 60_000, 500, 0);
+        let inner_env = match inner_tx {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx envelope"),
+        };
+        let fee_bump = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([99; 32])),
+                fee: 1000,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: Default::default(),
+        });
+
+        // Only room for 1 tx (instruction limit). Per-op rate ordering should
+        // pick tx_normal (rate=800) over fee_bump (rate=500).
+        let (stages, _) = build_with_stage_count(
+            &[fee_bump, tx_normal],
+            test_network_id(),
+            100_000,
+            1,
+            1,
+        );
+
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].len(), 1);
+        // tx_normal is index 1 in the input slice
+        assert_eq!(stages[0][0], vec![1], "per-op rate ordering should prefer normal tx");
     }
 
     #[test]
@@ -1245,7 +1326,8 @@ mod tests {
 mod stages_to_xdr_phase_tests {
     use super::*;
     use stellar_xdr::curr::{
-        LedgerFootprint, LedgerKey, LedgerKeyContractData, Memo, MuxedAccount, Preconditions,
+        HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, LedgerKey,
+        LedgerKeyContractData, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
         ScAddress, ScVal, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
         Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
     };
@@ -1271,13 +1353,26 @@ mod stages_to_xdr_phase_tests {
             },
             resource_fee: 100,
         };
+        let invoke_op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(stellar_xdr::curr::ContractId(
+                        stellar_xdr::curr::Hash([seed; 32]),
+                    )),
+                    function_name: stellar_xdr::curr::ScSymbol("test".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                auth: Default::default(),
+            }),
+        };
         let tx = Transaction {
             source_account: source,
             fee: 1000,
             seq_num: stellar_xdr::curr::SequenceNumber(seq),
             cond: Preconditions::None,
             memo: Memo::None,
-            operations: VecM::default(),
+            operations: vec![invoke_op].try_into().unwrap(),
             ext: TransactionExt::V1(soroban_data),
         };
         TransactionEnvelope::Tx(TransactionV1Envelope {

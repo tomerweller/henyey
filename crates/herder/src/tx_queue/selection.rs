@@ -381,6 +381,19 @@ impl TransactionQueue {
             let clamped = (byte_limit as i64).min(current);
             limit.set_val(ResourceType::TxByteSize, clamped);
         }
+        // When building Soroban tx sets with parallel execution support,
+        // instructions are accounted for by the parallel builder logic, not by
+        // the surge pricing config. Relax the instruction limit so surge pricing
+        // doesn't prematurely reject transactions that could fit across stages.
+        // Mirrors stellar-core TxSetFrame.cpp:513-524.
+        let use_parallel = self.config.ledger_max_instructions > 0
+            && self.config.ledger_max_dependent_tx_clusters > 0
+            && self.config.soroban_phase_max_stage_count > 0;
+        if use_parallel {
+            if let Some(limit) = soroban_limit.as_mut() {
+                limit.set_val(ResourceType::Instructions, i64::MAX);
+            }
+        }
         let (soroban_selected, soroban_limited) = if let Some(limit) = soroban_limit {
             let mut had_not_fitting = [false];
             let lane_config = SorobanGenericLaneConfig::new(limit);
