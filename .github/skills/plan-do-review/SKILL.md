@@ -272,7 +272,41 @@ safe result, do the refactor rather than working around it. File any
 intentionally-deferred refactors as follow-up issues so they aren't
 lost; don't paper them over with inline workarounds.
 
-### 3a: Plan the Implementation
+### 3a: Create an isolated worktree for implementation
+
+All code edits in Step 3 happen in a git worktree rooted on a dedicated
+branch, NOT in the caller's main checkout. Rationale: this skill may be
+invoked from a running `/monitor-loop`, a CI-driving script, or another
+long-lived session that owns the main checkout. Dirtying that checkout
+mid-implementation blocks its git operations (pull, status checks,
+other deploys) until we commit and push. A worktree costs ~30 s to
+create and makes the isolation guarantee explicit.
+
+```bash
+# Create a dedicated worktree and branch off origin/main
+WORKTREE_BRANCH="plan-do-review/issue-$ISSUE"
+WORKTREE_PATH=".claude/worktrees/plan-do-review-$ISSUE"
+
+git fetch origin main
+git worktree add -B "$WORKTREE_BRANCH" "$WORKTREE_PATH" origin/main
+
+cd "$WORKTREE_PATH"
+```
+
+For the remainder of Step 3 (Plan, Implement, Verify, Commit), all
+`cargo`, `git`, and editor operations happen inside `$WORKTREE_PATH`.
+Any tool or subagent you invoke for implementation work must be pointed
+at this directory (via `cwd`, the agent `Plan` tool's worktree option,
+or an explicit `cd`).
+
+If the worktree or branch already exists from a prior failed run
+(`$ISSUE` has been worked before), inspect it first rather than
+clobbering — `git worktree list` + `git log -3 "$WORKTREE_BRANCH"` — and
+decide whether to resume (checkout + rebase onto current origin/main)
+or discard (`git worktree remove --force` then recreate). Do not
+silently overwrite uncommitted work.
+
+### 3b: Plan the Implementation
 
 Break the proposal into concrete implementation steps. Use SQL todos for
 tracking:
@@ -284,27 +318,28 @@ INSERT INTO todos (id, title, description, status) VALUES
 INSERT INTO todo_deps (todo_id, depends_on) VALUES ('step-2', 'step-1');
 ```
 
-### 3b: Implement
+### 3c: Implement
 
-For each step:
+For each step (inside `$WORKTREE_PATH`):
 1. Update the todo to `in_progress`
 2. Make the code changes
 3. Run `cargo check --all` after each logical change
 4. Run focused tests: `cargo test -p <crate>`
 5. Update the todo to `done`
 
-### 3c: Verify
+### 3d: Verify
 
-After all steps are complete:
+After all steps are complete (inside `$WORKTREE_PATH`):
 1. `cargo test --all` — full test suite passes
 2. `cargo clippy --all` — no warnings
 3. `cargo fmt --all -- --check` — formatting clean
 
 Fix any issues before proceeding.
 
-### 3d: Commit and Push
+### 3e: Commit on the worktree branch
 
 ```bash
+# Still inside $WORKTREE_PATH
 git add -A
 git commit -m "<short imperative description>
 
@@ -313,11 +348,55 @@ git commit -m "<short imperative description>
 Closes #$ISSUE
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+```
+
+This commit lives on `$WORKTREE_BRANCH`, NOT on main. We land it on
+main in the next sub-step.
+
+### 3f: Land the change on main and clean up
+
+The commit needs to reach `origin/main` for the caller (e.g. the
+monitoring loop) to pick it up on its next redeploy. From the main
+checkout (NOT the worktree), fast-forward or rebase main onto the
+worktree branch and push:
+
+```bash
+# Return to the main checkout root — wherever the caller invoked us
+cd "$MAIN_CHECKOUT"   # typically the repo root, not $WORKTREE_PATH
+
+git fetch origin main
+git checkout main
+git pull --rebase
+
+# Fast-forward main to the worktree branch.
+# If this fails, rebase the worktree branch onto main and retry.
+if ! git merge --ff-only "$WORKTREE_BRANCH"; then
+  git -C "$WORKTREE_PATH" rebase main
+  git merge --ff-only "$WORKTREE_BRANCH"
+fi
 
 git push
 ```
 
-If push is rejected, `git pull --rebase && git push`.
+If the push is rejected (upstream moved between `pull --rebase` and
+`push`), `git pull --rebase && git push` and retry once.
+
+After the push succeeds, clean up the worktree and its branch:
+
+```bash
+git worktree remove "$WORKTREE_PATH"
+git branch -d "$WORKTREE_BRANCH"
+```
+
+If the push fails repeatedly (branch protection blocks direct pushes,
+for example), open a PR from `$WORKTREE_BRANCH` with
+`gh pr create --fill` and let the PR-level review gate handle the
+landing. The worktree stays until the PR merges; do NOT `git worktree
+remove` it in that case.
+
+If any verification step (3c–3e) failed and you could not converge on a
+green state, do NOT clean up — leave the worktree in place so the
+caller or a follow-up invocation can inspect the partial work.
 
 ---
 
@@ -402,11 +481,16 @@ REVIEW_EOF
   raised it, it gets fixed — period.
 - For each issue:
   1. Read the relevant code to understand the problem
-  2. Make the code changes to fully resolve it
+  2. Make the code changes to fully resolve it — **inside the same
+     `$WORKTREE_PATH` worktree used in Step 3**. If the worktree was
+     already cleaned up (3f completed), recreate it with
+     `git worktree add -B "$WORKTREE_BRANCH" "$WORKTREE_PATH" main`
+     and rebase onto main before editing.
   3. Add or update tests to cover the fix
-  4. Run `cargo test --all` and `cargo clippy --all`
-- Once all issues are resolved, commit with a descriptive message, push, and
-  loop back to 4a.
+  4. Run `cargo test --all` and `cargo clippy --all` inside the worktree
+- Once all issues are resolved, commit on the worktree branch, land on
+  main via the Step 3f "fast-forward + push" recipe (re-clean the
+  worktree after landing), and loop back to 4a.
 - If `WRONG`, consider whether a revert and re-implementation is cleaner than
   incremental fixes. Either way, all feedback must be addressed before the
   next review round.
