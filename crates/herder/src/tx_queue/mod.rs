@@ -1066,7 +1066,12 @@ impl TransactionQueue {
 
                 let current_seq = envelope_sequence_number(&current_tx.envelope);
                 if new_seq < current_seq {
-                    return Err(TxQueueResult::Invalid(None));
+                    // Parity: stellar-core TransactionQueue::canAdd returns
+                    // ADD_STATUS_ERROR with txBAD_SEQ when the new tx's seq is
+                    // below the pending tx's seq for the same account.
+                    return Err(TxQueueResult::Invalid(Some(
+                        henyey_tx::TxResultCode::TxBadSeq,
+                    )));
                 }
 
                 if !is_fee_bump {
@@ -1334,7 +1339,15 @@ impl TransactionQueue {
         // Create queued transaction
         let queued = match QueuedTransaction::new(envelope) {
             Ok(q) => q,
-            Err(_) => return TxQueueResult::Invalid(None),
+            Err(e) => {
+                // QueuedTransaction::new only fails on XDR-hash failure or
+                // negative declared/inclusion fee — both indicate a malformed
+                // envelope. Surface as txMALFORMED rather than a generic
+                // internal error so clients don't retry or treat the tx as a
+                // transient server fault.
+                tracing::debug!(error = %e, "Rejecting malformed transaction");
+                return TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxMalformed));
+            }
         };
 
         // Check if already seen
@@ -1377,7 +1390,9 @@ impl TransactionQueue {
                     reason = %reason,
                     "Rejecting Soroban tx: resources exceed network config"
                 );
-                return TxQueueResult::Invalid(None);
+                // Parity: stellar-core rejects resource-exceeding Soroban txs
+                // with txSOROBAN_INVALID.
+                return TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxSorobanInvalid));
             }
         }
 
@@ -4895,6 +4910,39 @@ mod tests {
 
         // Should return Filtered result
         assert_eq!(queue.try_add(envelope), TxQueueResult::Filtered);
+    }
+
+    /// Regression: a tx with a sequence number lower than the account's
+    /// pending tx must be rejected with a specific `txBAD_SEQ` code rather
+    /// than `Invalid(None)` (which maps to `txINTERNAL_ERROR` over the
+    /// compat HTTP API and is treated as a fatal server fault by clients
+    /// like friendbot and stellar-rpc).
+    #[test]
+    fn test_try_add_lower_seq_returns_bad_seq_not_invalid_none() {
+        let config = TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: false,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx_a = make_test_envelope(200, 1);
+        let mut tx_b = make_test_envelope(200, 1);
+        // Same source account, seq_a > seq_b.
+        if let TransactionEnvelope::Tx(env) = &mut tx_a {
+            env.tx.seq_num = SequenceNumber(10);
+        }
+        if let TransactionEnvelope::Tx(env) = &mut tx_b {
+            env.tx.seq_num = SequenceNumber(5);
+        }
+
+        assert_eq!(queue.try_add(tx_a), TxQueueResult::Added);
+        // The second tx with a lower seq must surface txBAD_SEQ, not
+        // Invalid(None).
+        assert_eq!(
+            queue.try_add(tx_b),
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxBadSeq))
+        );
     }
 
     #[test]
