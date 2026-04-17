@@ -33,7 +33,7 @@ use henyey_crypto::SecretKey;
 use henyey_herder::scp_verify::{
     self, PostVerifyReason, PreFilter, PreFilterRejectReason, VerifiedEnvelope,
 };
-use henyey_herder::{Herder, HerderConfig};
+use henyey_herder::{Herder, HerderConfig, HerderState};
 use stellar_xdr::curr::{
     Hash as XdrHash, Limits, NodeId as XdrNodeId, PublicKey as XdrPublicKey, ScpBallot,
     ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementExternalize,
@@ -421,6 +421,25 @@ fn row_07_drift_range_postverify() {
         h.set_pending_current_slot_for_testing(TRACKING_SLOT + 10_000);
     });
     assert_eq!(stage, Stage::PostVerify(PostVerifyReason::GateDriftRange));
+}
+
+#[test]
+fn row_07b_drift_cannot_receive_postverify() {
+    let fix = fixture_tracking();
+    // Envelope initially in a state that can receive SCP (Syncing, set by
+    // `fixture_tracking` via `start_syncing`). Mid-flight, force the Herder
+    // state back to `Booting` so the pre-filter rerun in `process_verified`
+    // sees `can_receive_scp() == false` and fires the `CannotReceiveScp`
+    // drift gate. We use `force_state_for_testing` because the normal
+    // `set_state` rejects Syncing→Booting transitions.
+    let env = nominate_envelope(TRACKING_SLOT, NOW, &fix.peer_secret, &fix.network_id);
+    let stage = run(&fix, env, |h| {
+        h.force_state_for_testing(HerderState::Booting);
+    });
+    assert_eq!(
+        stage,
+        Stage::PostVerify(PostVerifyReason::GateDriftCannotReceive)
+    );
 }
 
 #[test]

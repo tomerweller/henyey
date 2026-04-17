@@ -134,9 +134,10 @@ pub struct VerifiedEnvelope {
 /// 5. Accepted (reached SCP / processed directly) → `Accepted`
 /// 6. Verdict-driven short-circuits    → `InvalidSignature`, `PanicVerdict`
 ///
-/// The enum itself is always compiled (the internal `process_verified_inner`
-/// always computes it) but only made accessible to external callers via the
-/// `test-support` feature.
+/// This enum is only compiled under the `test-support` feature. It is not
+/// part of the public release API — the production post-verify path returns
+/// only [`crate::EnvelopeState`].
+#[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostVerifyReason {
     InvalidSignature,

@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use henyey_common::Hash256;
 use henyey_crypto::SecretKey;
-use henyey_herder::scp_verify::{self, PreFilter};
+use henyey_herder::scp_verify::{self, PostVerifyReason, PreFilter};
 use henyey_herder::{EnvelopeState, Herder, HerderConfig};
 use stellar_xdr::curr::{
     Hash as XdrHash, Limits, NodeId as XdrNodeId, PublicKey as XdrPublicKey, ScpBallot,
@@ -246,25 +246,41 @@ fn synthesize(rng: &mut Rng, network_id: &Hash256) -> (ScpEnvelope, bool) {
 // ---------------------------------------------------------------------------
 
 /// Run the wrapper path on a fresh herder and return its outcome.
-fn run_wrapper(network_id: Hash256, envelope: ScpEnvelope) -> EnvelopeState {
+fn run_wrapper(network_id: Hash256, envelope: ScpEnvelope) -> (EnvelopeState, PostVerifyReason) {
     let herder = build_herder(network_id);
-    herder.receive_scp_envelope(envelope)
+    herder.receive_scp_envelope_sync_detailed(envelope)
 }
 
 /// Run the explicit split path on a fresh herder and return its outcome.
-fn run_split(network_id: Hash256, envelope: ScpEnvelope) -> EnvelopeState {
+fn run_split(network_id: Hash256, envelope: ScpEnvelope) -> (EnvelopeState, PostVerifyReason) {
     let herder = build_herder(network_id);
     let pf = herder.pre_filter_scp_envelope(&envelope);
     match scp_verify::verify_envelope_sync(&network_id, pf) {
         Err(reason) => {
-            // Pre-filter rejection — mirror the wrapper's mapping.
             use scp_verify::PreFilterRejectReason as R;
+            // Mirror the wrapper's pre-filter mapping. `GateDrift*` is a
+            // shared reason vocabulary across wrapper and split paths; see
+            // `Herder::receive_scp_envelope_sync_detailed` for rationale.
             match reason {
-                R::Range => EnvelopeState::TooOld,
-                R::CannotReceiveScp | R::CloseTime => EnvelopeState::Invalid,
+                R::Range => (EnvelopeState::TooOld, PostVerifyReason::GateDriftRange),
+                R::CloseTime => (EnvelopeState::Invalid, PostVerifyReason::GateDriftCloseTime),
+                R::CannotReceiveScp => (
+                    EnvelopeState::Invalid,
+                    PostVerifyReason::GateDriftCannotReceive,
+                ),
             }
         }
-        Ok(ve) => herder.process_verified_detailed(ve).0,
+        Ok(ve) => {
+            if matches!(ve.verdict, scp_verify::Verdict::InvalidSignature) {
+                // Wrapper's `scp_driver.verify_envelope` short-circuits here
+                // with the same mapping.
+                return (
+                    EnvelopeState::InvalidSignature,
+                    PostVerifyReason::InvalidSignature,
+                );
+            }
+            herder.process_verified_detailed(ve)
+        }
     }
 }
 
