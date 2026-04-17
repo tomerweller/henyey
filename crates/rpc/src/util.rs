@@ -216,6 +216,11 @@ pub(crate) fn insert_raw_xdr_field<T: ReadXdr + Serialize>(
     bytes: &[u8],
     format: XdrFormat,
 ) -> Result<(), JsonRpcError> {
+    // Always validate stored bytes, regardless of output format.
+    let parsed = T::from_xdr(bytes, Limits::none()).map_err(|e| RpcXdrError::XdrParse {
+        type_name: std::any::type_name::<T>(),
+        cause: e.to_string(),
+    })?;
     match format {
         XdrFormat::Base64 => {
             obj.insert(
@@ -224,9 +229,7 @@ pub(crate) fn insert_raw_xdr_field<T: ReadXdr + Serialize>(
             );
         }
         XdrFormat::Json => {
-            let val = T::from_xdr(bytes, Limits::none())
-                .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
-            let json_val = serde_json::to_value(&val)
+            let json_val = serde_json::to_value(&parsed)
                 .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
             obj.insert(format!("{base_name}Json"), json_val);
         }

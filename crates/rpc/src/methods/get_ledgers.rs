@@ -72,7 +72,7 @@ pub async fn handle(
 
     for (sequence, meta_bytes) in &metas {
         let lcm = LedgerCloseMeta::from_xdr(meta_bytes.as_slice(), Limits::none())
-            .map_err(|e| JsonRpcError::internal_logged("corrupt ledger data", &e))?;
+            .map_err(|e| JsonRpcError::internal_logged("XDR data integrity error", &e))?;
 
         let header_entry = util::ledger_header_entry(&lcm);
         let hash = hex::encode(header_entry.hash.0);

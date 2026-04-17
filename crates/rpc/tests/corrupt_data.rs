@@ -14,7 +14,9 @@ mod common;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use henyey_db::{EventQueries, EventRecord, HistoryQueries, StoreTxParams, TxStatus};
+use henyey_db::{
+    EventQueries, EventRecord, HistoryQueries, LedgerCloseMetaQueries, StoreTxParams, TxStatus,
+};
 use henyey_rpc::RpcServer;
 use serde_json::json;
 use stellar_xdr::curr::{
@@ -547,6 +549,110 @@ async fn get_events_skips_corrupt_topic_json_mode() {
         "corrupt-topic event should be skipped in JSON mode"
     );
     assert_eq!(events[0]["id"], "0000000008589934592-0000000020");
+
+    handle.abort();
+    drop(sim);
+}
+
+// ---------------------------------------------------------------------------
+// getLatestLedger corrupt / missing metadata tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_latest_ledger_corrupt_metadata() {
+    let (sim, url, client, app, handle) = setup_rpc().await;
+
+    // Overwrite the current ledger's LedgerCloseMeta with corrupt bytes.
+    let ledger_num = app.ledger_summary().num;
+    app.database()
+        .with_connection(|conn| conn.store_ledger_close_meta(ledger_num, CORRUPT_BYTES))
+        .unwrap();
+
+    let id = json!("latest-corrupt-meta");
+    let (status, resp) = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLatestLedger"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_xdr_integrity_error(&resp, &id);
+
+    handle.abort();
+    drop(sim);
+}
+
+#[tokio::test]
+async fn get_latest_ledger_missing_metadata() {
+    let (sim, url, client, app, handle) = setup_rpc().await;
+
+    // Delete the current ledger's LedgerCloseMeta row so it appears missing.
+    let ledger_num = app.ledger_summary().num;
+    app.database()
+        .with_connection(|conn| conn.delete_old_ledger_close_meta(ledger_num, 1000))
+        .unwrap();
+
+    let id = json!("latest-missing-meta");
+    let (status, resp) = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLatestLedger"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_envelope(&resp, &id);
+    let result = &resp["result"];
+    assert_eq!(
+        result["metadataXdr"], "",
+        "missing metadata should produce empty string"
+    );
+    // Other fields should still be present.
+    assert!(result["sequence"].as_u64().unwrap() > 0);
+    assert!(!result["headerXdr"].as_str().unwrap().is_empty());
+
+    handle.abort();
+    drop(sim);
+}
+
+// ---------------------------------------------------------------------------
+// getLedgers corrupt metadata test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_ledgers_corrupt_metadata() {
+    let (sim, url, client, app, handle) = setup_rpc().await;
+
+    // Overwrite ledger 2's LedgerCloseMeta with corrupt bytes.
+    let ledger_num = app.ledger_summary().num;
+    app.database()
+        .with_connection(|conn| conn.store_ledger_close_meta(ledger_num, CORRUPT_BYTES))
+        .unwrap();
+
+    let id = json!("ledgers-corrupt-meta");
+    let (status, resp) = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLedgers",
+            "params": {"startLedger": ledger_num}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_xdr_integrity_error(&resp, &id);
 
     handle.abort();
     drop(sim);
