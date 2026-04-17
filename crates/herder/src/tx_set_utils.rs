@@ -986,6 +986,45 @@ fn is_restore_footprint_envelope(env: &TransactionEnvelope) -> bool {
         )
 }
 
+/// Get the XDR-encoded size of a Soroban transaction envelope for resource
+/// accounting.
+///
+/// Mirrors stellar-core's TX_BYTE_SIZE resource dimension:
+/// - Non-fee-bump: `TransactionFrame::getSize()` = `xdr_size(mEnvelope)`
+/// - Fee-bump: `FeeBumpTransactionFrame::getResources()` inherits the **inner**
+///   tx's size (does NOT override TX_BYTE_SIZE), so we compute the inner
+///   envelope's XDR size.
+fn envelope_soroban_tx_size(env: &TransactionEnvelope) -> i64 {
+    match env {
+        TransactionEnvelope::TxFeeBump(e) => {
+            // Fee-bump: use inner tx envelope size, matching stellar-core's
+            // FeeBumpTransactionFrame::getResources() which inherits inner
+            // tx size unchanged.
+            match &e.tx.inner_tx {
+                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                    let inner_env = TransactionEnvelope::Tx(inner.clone());
+                    henyey_common::xdr_stream::xdr_encoded_len(&inner_env) as i64
+                }
+            }
+        }
+        _ => henyey_common::xdr_stream::xdr_encoded_len(env) as i64,
+    }
+}
+
+/// Get the operation count for a Soroban transaction in the resource dimension.
+///
+/// Mirrors stellar-core's OPERATIONS resource dimension:
+/// - Non-fee-bump Soroban: hardcoded to 1
+///   (`TransactionFrame::getResources()`: `int64_t const opCount = 1`)
+/// - Fee-bump Soroban: `FeeBumpTransactionFrame::getNumOperations()` =
+///   `inner_ops + 1`, overriding the OPERATIONS dimension.
+fn envelope_soroban_op_count(env: &TransactionEnvelope) -> i64 {
+    match env {
+        TransactionEnvelope::TxFeeBump(_) => envelope_num_ops(env) as i64,
+        _ => 1,
+    }
+}
+
 /// Validate that component base fees and per-TX inclusion fees meet minimums.
 ///
 /// Mirrors stellar-core's `checkFeeMap()` (TxSetFrame.cpp:722-751).
@@ -1145,12 +1184,14 @@ pub(crate) fn check_valid_soroban(
         return false;
     }
 
-    // Aggregate total resources across all TXs
+    // Aggregate total resources across all TXs (all 7 dimensions)
     let mut total_instructions: i64 = 0;
     let mut total_read_entries: i64 = 0;
     let mut total_read_bytes: i64 = 0;
     let mut total_write_entries: i64 = 0;
     let mut total_write_bytes: i64 = 0;
+    let mut total_tx_size_bytes: i64 = 0;
+    let mut total_ops: i64 = 0;
 
     let all_txs = collect_phase_txs(phase);
 
@@ -1159,6 +1200,8 @@ pub(crate) fn check_valid_soroban(
             debug!("Got bad txSet: non-Soroban transaction found in Soroban phase");
             return false;
         }
+        total_tx_size_bytes = total_tx_size_bytes.saturating_add(envelope_soroban_tx_size(tx));
+        total_ops = total_ops.saturating_add(envelope_soroban_op_count(tx));
         if let Some(resources) = envelope_soroban_resources(tx) {
             total_instructions = total_instructions.saturating_add(resources.instructions as i64);
             // Parity: For protocol >= 23, use disk read entries (only classic + archived)
@@ -1207,6 +1250,20 @@ pub(crate) fn check_valid_soroban(
         debug!(
             "Got bad txSet: Soroban write bytes {} > ledger max {}",
             total_write_bytes, soroban_info.ledger_max_write_bytes
+        );
+        return false;
+    }
+    if total_tx_size_bytes > soroban_info.ledger_max_tx_size_bytes as i64 {
+        debug!(
+            "Got bad txSet: Soroban tx size bytes {} > ledger max {}",
+            total_tx_size_bytes, soroban_info.ledger_max_tx_size_bytes
+        );
+        return false;
+    }
+    if total_ops > soroban_info.ledger_max_tx_count as i64 {
+        debug!(
+            "Got bad txSet: Soroban tx count {} > ledger max {}",
+            total_ops, soroban_info.ledger_max_tx_count
         );
         return false;
     }
@@ -2439,6 +2496,8 @@ mod tests {
             ledger_max_write_ledger_entries: 50,
             ledger_max_write_bytes: 50_000,
             ledger_max_dependent_tx_clusters: 4,
+            ledger_max_tx_size_bytes: 1_000_000, // 1 MB
+            ledger_max_tx_count: 100,
             ..Default::default()
         }
     }
@@ -2658,6 +2717,141 @@ mod tests {
         let tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
         assert!(!check_valid_classic(&phase, 100));
+    }
+
+    // --- AUDIT-153: TX_SIZE_BYTES and OPERATIONS resource limit tests ---
+
+    #[test]
+    fn test_check_valid_soroban_tx_size_bytes_exceed_limit() {
+        let tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let tx_size = henyey_common::xdr_stream::xdr_encoded_len(&tx) as u32;
+        // Set limit to less than one envelope's size
+        let mut info = make_soroban_network_info();
+        info.ledger_max_tx_size_bytes = tx_size - 1;
+        let header = make_soroban_lcl_header(22);
+        let phase = make_v0_phase_with_fee(vec![tx], Some(100));
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_tx_size_at_boundary() {
+        let tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let tx_size = henyey_common::xdr_stream::xdr_encoded_len(&tx) as u32;
+        let header = make_soroban_lcl_header(22);
+
+        // Exactly at limit: should pass
+        let mut info = make_soroban_network_info();
+        info.ledger_max_tx_size_bytes = tx_size;
+        let phase = make_v0_phase_with_fee(vec![tx.clone()], Some(100));
+        assert!(check_valid_soroban(&phase, &header, &info));
+
+        // Two TXs exceed the single-TX limit
+        let phase = make_v0_phase_with_fee(vec![tx.clone(), tx], Some(100));
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_ops_exceed_limit() {
+        let mut info = make_soroban_network_info();
+        info.ledger_max_tx_count = 2;
+        let header = make_soroban_lcl_header(22);
+        // 3 TXs, each with 1 op → total_ops = 3 > limit of 2
+        let txs: Vec<_> = (0..3)
+            .map(|_| make_soroban_envelope(100, 100, 100, vec![], vec![]))
+            .collect();
+        let phase = make_v0_phase_with_fee(txs, Some(100));
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_ops_at_boundary() {
+        let mut info = make_soroban_network_info();
+        info.ledger_max_tx_count = 2;
+        let header = make_soroban_lcl_header(22);
+        // 2 TXs exactly at limit → should pass
+        let txs: Vec<_> = (0..2)
+            .map(|_| make_soroban_envelope(100, 100, 100, vec![], vec![]))
+            .collect();
+        let phase = make_v0_phase_with_fee(txs, Some(100));
+        assert!(check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_fee_bump_tx_size() {
+        // Fee-bump Soroban should use inner envelope size, not outer
+        let inner = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let inner_size = henyey_common::xdr_stream::xdr_encoded_len(&inner) as u32;
+        let fee_bump = make_fee_bump_envelope(inner, 50000);
+        let outer_size = henyey_common::xdr_stream::xdr_encoded_len(&fee_bump) as u32;
+        // Verify the inner and outer sizes are different
+        assert!(outer_size > inner_size);
+
+        let header = make_soroban_lcl_header(22);
+
+        // Set limit between inner and outer size: should pass (uses inner size)
+        let mut info = make_soroban_network_info();
+        info.ledger_max_tx_size_bytes = inner_size;
+        let phase = make_v0_phase_with_fee(vec![fee_bump.clone()], Some(100));
+        assert!(check_valid_soroban(&phase, &header, &info));
+
+        // Set limit below inner size: should fail
+        info.ledger_max_tx_size_bytes = inner_size - 1;
+        let phase = make_v0_phase_with_fee(vec![fee_bump], Some(100));
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_fee_bump_ops_count() {
+        // Fee-bump Soroban: ops = inner_ops + 1 = 1 + 1 = 2
+        let inner = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let fee_bump = make_fee_bump_envelope(inner, 50000);
+        let header = make_soroban_lcl_header(22);
+
+        // Limit of 2: 1 fee-bump tx with 2 ops should pass
+        let mut info = make_soroban_network_info();
+        info.ledger_max_tx_count = 2;
+        let phase = make_v0_phase_with_fee(vec![fee_bump.clone()], Some(100));
+        assert!(check_valid_soroban(&phase, &header, &info));
+
+        // Limit of 1: 1 fee-bump tx with 2 ops should fail
+        info.ledger_max_tx_count = 1;
+        let phase = make_v0_phase_with_fee(vec![fee_bump], Some(100));
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_envelope_soroban_tx_size_non_fee_bump() {
+        let tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let expected = henyey_common::xdr_stream::xdr_encoded_len(&tx) as i64;
+        assert_eq!(envelope_soroban_tx_size(&tx), expected);
+        assert!(expected > 0);
+    }
+
+    #[test]
+    fn test_envelope_soroban_tx_size_fee_bump_uses_inner() {
+        let inner = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let inner_size = henyey_common::xdr_stream::xdr_encoded_len(&inner) as i64;
+        let fee_bump = make_fee_bump_envelope(inner, 50000);
+        let outer_size = henyey_common::xdr_stream::xdr_encoded_len(&fee_bump) as i64;
+        let computed = envelope_soroban_tx_size(&fee_bump);
+        // Must equal inner size, not outer
+        assert_eq!(computed, inner_size);
+        assert_ne!(computed, outer_size);
+    }
+
+    #[test]
+    fn test_envelope_soroban_op_count_non_fee_bump() {
+        let tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        // Non-fee-bump Soroban: hardcoded 1
+        assert_eq!(envelope_soroban_op_count(&tx), 1);
+    }
+
+    #[test]
+    fn test_envelope_soroban_op_count_fee_bump() {
+        let inner = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let fee_bump = make_fee_bump_envelope(inner, 50000);
+        // Fee-bump: inner ops (1) + 1 = 2
+        assert_eq!(envelope_soroban_op_count(&fee_bump), 2);
     }
 
     /// Regression: get_invalid_tx_list must reject txs that fail check_valid_pre_seq_num
