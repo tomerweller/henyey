@@ -408,7 +408,7 @@ mod tests {
         assert!(!is_newer_nomination_or_ballot_st(&confirm_st, &prepare_st));
     }
 
-    /// Node mismatch returns false (SCP.cpp:420).
+    /// Node mismatch returns false even for same-type newer statements (SCP.cpp:420).
     #[test]
     fn test_node_mismatch_returns_false() {
         let node1 = make_node_id(1);
@@ -416,6 +416,7 @@ mod tests {
         let qs = make_quorum_set(vec![node1.clone()], 1);
         let qs_hash = crate::quorum::hash_quorum_set(&qs);
 
+        // Same-type (Prepare) where st2 would be newer if identity matched
         let st1 = ScpStatement {
             node_id: node1,
             slot_index: 1,
@@ -432,25 +433,28 @@ mod tests {
         let st2 = ScpStatement {
             node_id: node2,
             slot_index: 1,
-            pledges: ScpStatementPledges::Confirm(stellar_xdr::curr::ScpStatementConfirm {
-                ballot: make_ballot(1, &[1]),
-                n_prepared: 1,
-                n_commit: 1,
-                n_h: 1,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
                 quorum_set_hash: qs_hash.into(),
+                ballot: make_ballot(5, &[1]), // higher counter = newer
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
             }),
         };
 
+        // Identity guard rejects despite st2 being "newer" by ballot
         assert!(!is_newer_nomination_or_ballot_st(&st1, &st2));
     }
 
-    /// Slot mismatch returns false (SCP.cpp:420).
+    /// Slot mismatch returns false even for same-type newer statements (SCP.cpp:420).
     #[test]
     fn test_slot_mismatch_returns_false() {
         let node = make_node_id(1);
         let qs = make_quorum_set(vec![node.clone()], 1);
         let qs_hash = crate::quorum::hash_quorum_set(&qs);
 
+        // Same-type (Prepare) where st2 would be newer if identity matched
         let st1 = ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
@@ -467,15 +471,17 @@ mod tests {
         let st2 = ScpStatement {
             node_id: node,
             slot_index: 2,
-            pledges: ScpStatementPledges::Confirm(stellar_xdr::curr::ScpStatementConfirm {
-                ballot: make_ballot(1, &[1]),
-                n_prepared: 1,
-                n_commit: 1,
-                n_h: 1,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
                 quorum_set_hash: qs_hash.into(),
+                ballot: make_ballot(5, &[1]), // higher counter = newer
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
             }),
         };
 
+        // Identity guard rejects despite st2 being "newer" by ballot
         assert!(!is_newer_nomination_or_ballot_st(&st1, &st2));
     }
 
