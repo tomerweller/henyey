@@ -42,27 +42,22 @@ Two classes of fix exist in this skill; treat them differently.
   YAML). Read logs, fix the code in the main checkout, commit, push. The
   monitoring loop is allowed to do this work directly. This is the one
   exception to "do not implement fixes inline."
-- **Node bugs — delegated to a spawned Agent in a worktree, then
-  auto-merged to main after review.** Hash mismatches, crashes,
-  consensus/sync failures, pruning defects, memory leaks. These require
-  investigation and larger code changes; the worktree keeps the Agent's
-  edits off the running node's checkout during development. After the
-  Agent commits a tested, passing fix on its worktree branch, the monitor
-  **reviews the diff and cherry-picks it onto main without waiting for
-  user approval** — that is the expected flow (see Bug Investigation
-  Workflow §5 for the exact steps and §"When to block the auto-merge" for
-  the refuse criteria). The next redeploy tick rebuilds and restarts the
-  node on the merged fix.
+- **Node bugs — delegated to a spawned Agent that runs `/plan-do-review`
+  on the filed issue.** Hash mismatches, crashes, consensus/sync failures,
+  pruning defects, memory leaks. The monitor's job ends at filing the
+  issue; a spawned Agent takes over and runs the `/plan-do-review <N>`
+  skill, which handles adversarial proposal critique, implementation,
+  review-fix iteration, and landing the change. The monitor does **not**
+  run a separate worktree-Agent, review the diff, or cherry-pick — all
+  of that lives inside `/plan-do-review`. The next redeploy tick rebuilds
+  and restarts the node whenever `/plan-do-review` has landed its fix on
+  main.
 
-The rationale: the worktree exists to isolate the *editing* environment,
-not to gate the *merging* decision. Holding a reviewed consensus fix in
-a worktree branch while a validator degrades is worse than any shipping
-risk the review already screened for.
-
-If you are unsure whether to delegate at all, err toward spawning an
-Agent. "A spawned agent fixed a trivial CI issue" is cheap; "the monitor
-touched the running node's source tree while investigating a consensus
-bug and corrupted the build" is not.
+If you are unsure whether to delegate at all, err toward filing an issue
+and spawning the `/plan-do-review` Agent. "A spawned agent fixed a
+trivial CI issue" is cheap; "the monitor touched the running node's
+source tree while investigating a consensus bug and corrupted the build"
+is not.
 
 ## Configurations
 
@@ -131,68 +126,25 @@ When a bug is detected (hash mismatch, error, crash, sync failure):
    code paths. Document findings with file:line references.
 2. **File a GitHub issue** with the investigation findings, root cause
    analysis, and proposed fix approach using `gh issue create`. Capture
-   the issue number returned by `gh`.
-3. **Assign the issue to yourself** immediately after filing, before
-   spawning the Agent:
-   ```
-   gh issue edit <N> --add-assignee @me
-   ```
-   This is a **coordination lock**, not just bookkeeping — it tells
-   other `/monitor-loop` invocations, other agents, and humans that this
-   bug is actively being worked, so they don't start a parallel fix.
-   Every node-bug issue filed by this workflow MUST be assigned before
-   any Agent spawn. If `gh issue edit --add-assignee @me` fails (network
-   blip, permissions), retry once; if still failing, stop and report to
-   the user rather than silently leaving the issue unassigned.
-4. **Spawn an Agent in a worktree** (`isolation: "worktree"`) to implement
-   the fix. The worktree isolates code edits from the running node's
-   checkout. The Agent writes its own tests, runs `cargo test --all`,
-   `cargo fmt --all -- --check`, and `cargo clippy --all -- -D warnings`,
-   and commits on its worktree branch. Include the issue number in the
-   Agent prompt so its commit message references the assigned issue.
-5. **Review the Agent's commit** — read the diff, confirm the test
-   coverage, sanity-check the root-cause analysis.
-6. **Auto-merge to main** if the review passes. Cherry-pick the Agent's
-   commit onto main, `git pull --rebase`, `git push`. The next loop tick
-   will deploy it via the normal redeploy path (check 10). **This is the
-   expected flow — do not wait for explicit user approval before merging
-   a reviewed, passing fix.** The monitor is trusted to keep the node
-   operational, and that includes shipping consensus-code fixes.
-   The closing commit message should include `Closes #<N>` so the issue
-   is auto-closed on push; the assignment naturally ends with the close.
-7. **Do NOT edit the main checkout directly while fixing a node bug.** The
-   worktree isolation is the point — the Agent writes the code, the
-   monitor reviews and cherry-picks. Inline edits on main can race the
-   running validator's recompile path. CI-only fixes (build errors, test
-   failures, clippy, workflow YAML) are exempt per the Fix-Routing Policy.
+   the issue number `N` returned by `gh`. Write the issue body as a
+   proposal `/plan-do-review` can consume: clear symptom, evidence,
+   suspected root cause, and a concrete fix sketch with file:line
+   references.
+3. **Spawn an Agent that runs `/plan-do-review <N>`** on the filed issue.
+   `/plan-do-review` handles everything downstream — adversarial
+   proposal critique, implementation (in its own isolated workspace),
+   iterative review-fix, and landing the change. The monitor's
+   responsibility ends here: no worktree management, no cherry-pick,
+   no diff review, no merge decision. Those all live inside
+   `/plan-do-review`.
+4. **Do NOT edit the main checkout to fix a node bug.** CI-only fixes
+   (build errors, test failures, clippy, workflow YAML) are exempt per
+   the Fix-Routing Policy.
 
-### When to block the auto-merge
-
-Refuse to cherry-pick and instead post a summary for the user if:
-- Tests fail or the Agent didn't run them.
-- The diff touches files far outside the root-cause area (suggests drift).
-- The Agent's root-cause analysis is missing or vague.
-- The commit includes unrelated refactors bundled with the fix.
-
-When refusing, **unassign yourself** from the issue so another agent or
-human can take over the fix:
-```
-gh issue edit <N> --remove-assignee @me
-```
-Also post a comment on the issue summarizing why the auto-merge was
-blocked (which refuse criterion tripped, what the Agent produced, what
-still needs attention). The next `/monitor-loop` or human responder
-reads the comment, picks up the issue, and re-assigns themselves if
-they start work. An unassigned issue with a critic comment is the hand-off
-signal; a still-assigned issue means the original monitor still owns it.
-
-Otherwise, cherry-pick and push (assignment clears on issue auto-close).
-
-### When to unassign without merging
-
-If the loop is being torn down (user interrupt, CronDelete) while an
-Agent is still running on a bug you filed, unassign the issue so the
-next invocation can pick it up. Do this as part of Teardown.
+The next redeploy tick (check 10) will pick up whatever `/plan-do-review`
+lands on main — rebuild, kill, restart. The bug-fix progress itself is
+tracked on the issue and by `/plan-do-review`'s own reporting; the
+monitor does not block on it.
 
 ## Startup
 
@@ -336,7 +288,7 @@ COMMIT POLICY (must match the skill body's Commit Policy section; update both to
 
 FIX-ROUTING POLICY (must match the skill body's Fix-Routing Policy section):
 - CI fixes (build errors, test failures, clippy, workflow YAML) are handled INLINE in the main checkout by this loop.
-- Node bugs (hash mismatches, crashes, consensus/sync failures, pruning defects, memory leaks) are DELEGATED to a spawned Agent in an isolated worktree. After the Agent commits a tested, passing fix, REVIEW the diff and cherry-pick it onto main without waiting for user approval. Refuse the merge only if tests fail, scope drifted, root-cause analysis is vague, or unrelated refactors are bundled in. The worktree isolates editing, not merging — the next redeploy tick rebuilds and restarts on the merged fix.
+- Node bugs (hash mismatches, crashes, consensus/sync failures, pruning defects, memory leaks) are DELEGATED: file a GitHub issue, then spawn an Agent whose task is to run `/plan-do-review <N>` on that issue. Do NOT run a separate worktree Agent, review diffs, or cherry-pick — adversarial critique, implementation, review-fix iteration, and landing all live inside `/plan-do-review`. The next redeploy tick (check 10) will pick up whatever it lands on main.
 
 DEPLOY REGRESSION POLICY:
 If the node fails after a deploy: (a) file a GitHub issue with the regression details (commit range, symptoms, WATCHDOG data), (b) if the regression was from YOUR commits, revert and fix forward, (c) if the regression was from ANOTHER developer's commits, restart the node on the last known-good binary (rebuild from the previous commit) but do NOT revert their commits — file the issue and let them fix it.
@@ -350,9 +302,7 @@ Compare createdAt with current UTC time (date -u +%Y-%m-%dT%H:%M:%SZ) — only i
 
 INVESTIGATION: For ANY anomaly, investigate to root cause — read source code, check logs, trace code paths. Never dismiss as "expected". File a GitHub issue for every anomaly that isn't immediately explained.
 
-BUG FIX WORKFLOW (node bugs only — CI fixes go through check 11): If a hash mismatch, error, or crash is found: (1) identify failing ledger and error type, (2) investigate to root cause — read source code, trace code paths, (3) file a GitHub issue with findings using `gh issue create` and capture the returned issue number N, (4) **immediately assign the issue to yourself** with `gh issue edit <N> --add-assignee @me` — this is a coordination lock that prevents other monitor-loop runs, agents, or humans from picking up the same bug in parallel, (5) spawn an Agent (isolation: worktree) to implement the fix, passing the issue number so its commit message includes `Closes #<N>`. Do NOT edit the main checkout to fix a node bug.
-
-ASSIGNMENT HAND-OFF: If you end up blocking the auto-merge (tests failing, scope drift, vague root cause, or unrelated refactors bundled in), `gh issue edit <N> --remove-assignee @me` and post a comment explaining why. Unassigning is the hand-off signal — it tells the next responder the issue is up for grabs. If the loop is being torn down while an Agent is still running on a bug you filed, unassign during Teardown so the next invocation can pick up the work.
+BUG FIX WORKFLOW (node bugs only — CI fixes go through check 11): If a hash mismatch, error, or crash is found: (1) identify failing ledger and error type, (2) investigate to root cause — read source code, trace code paths, (3) file a GitHub issue with findings using `gh issue create` and capture the returned issue number N; write the body as a proposal that `/plan-do-review` can consume (symptom, evidence, suspected root cause, fix sketch with file:line references), (4) spawn an Agent whose sole task is to run `/plan-do-review <N>` on the filed issue — that skill handles adversarial critique, implementation, review-fix iteration, and landing the change. Do NOT edit the main checkout to fix a node bug. Do NOT run a separate worktree Agent, review the diff yourself, or cherry-pick — all of that lives inside `/plan-do-review`. The next redeploy tick (check 10) will pick up whatever `/plan-do-review` lands on main.
 
 OUTPUT: Print a multiline status report:
 MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
@@ -668,20 +618,16 @@ When stopping (user interrupts):
    interface the user set it up with (for `ScheduleWakeup`-based loops,
    simply do not re-schedule; for CronCreate-based loops, call
    `CronDelete` on the registered trigger).
-3. **Unassign any open bug issues you still own.** For each issue this
-   loop filed and assigned to itself (§Bug Investigation Workflow step 3)
-   that is still open AND still assigned to `@me`, run
-   `gh issue edit <N> --remove-assignee @me` and post a short comment
-   noting that the loop tore down mid-investigation. This releases the
-   coordination lock so the next monitor-loop run or a human can pick
-   the work up. Track these issue numbers during the session so you
-   can enumerate them at teardown without a GitHub query.
-4. **Release the concurrency lock** by letting the shell close fd 9
+3. **Release the concurrency lock** by letting the shell close fd 9
    (it closes automatically on exit; no explicit step required unless
    the lock FD was kept alive by a spawned subshell).
-5. Print a final status: uptime, latest ledger seen, bugs found/fixed,
-   issues unassigned.
-6. Do NOT remove logs or cache — they may be useful for debugging.
+4. Print a final status: uptime, latest ledger seen, bugs found/fixed.
+5. Do NOT remove logs or cache — they may be useful for debugging.
+
+Any `/plan-do-review` Agents spawned during the session keep running
+independently — tearing down the monitor does not cancel them. That is
+intentional: if the monitor stops, the fix-it pipeline should still
+land its work so the next invocation starts from a better state.
 
 ## Guidelines
 
@@ -691,8 +637,8 @@ When stopping (user interrupts):
 - All henyey issues are in scope: mainnet bugs, testnet parity bugs, CI
   failures, performance regressions, infrastructure problems.
 - **Push after every fix commit** — do not accumulate unpushed commits.
-- **Node-bug fixes come from spawned Agents in worktrees.** After the
-  Agent's commit passes review (tests green, narrow scope, clear root
-  cause), cherry-pick it onto main and push — do NOT wait for explicit
-  user approval. The worktree isolates editing; the merge is autonomous.
+- **Node-bug fixes come from spawned Agents that run `/plan-do-review <N>`
+  on the filed issue.** The monitor's role is to detect, investigate,
+  file, and spawn — not to implement, review, or merge. All of that
+  lives inside `/plan-do-review`.
 - CI-only fixes are inline per the Fix-Routing Policy.
