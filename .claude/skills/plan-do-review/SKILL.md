@@ -1,5 +1,5 @@
 ---
-name: propose-execute
+name: plan-do-review
 description: Review a proposal issue with adversarial critics, converge on a plan, execute it, and iterate review-fix until clean
 argument-hint: "<issue-number> [--model <model>] [--max-proposal-rounds N] [--max-review-rounds N] [--dry-run]"
 ---
@@ -100,15 +100,6 @@ Evaluate this proposal thoroughly:
 5. **Scope**: Is the scope appropriate? Too broad? Too narrow?
 6. **Stellar-core parity**: Will the proposed changes maintain or improve
    parity with stellar-core?
-7. **Structural ambition**: Does the proposal go far enough? Could a
-   bigger refactor — changing public APIs, restructuring types, using
-   Arc/Cow/lifetimes, redesigning enums — eliminate the root cause
-   rather than patching symptoms? Prefer structural solutions that make
-   the problem impossible over minimal fixes that address one instance.
-8. **Rust idiom quality**: Does the proposal move the code toward
-   idiomatic Rust? Ownership instead of cloning, references instead of
-   copies, iterators instead of index loops, enums instead of booleans,
-   newtypes for type safety?
 
 ## Output Format
 
@@ -163,7 +154,7 @@ gh issue comment $ISSUE --body "$(cat <<'PROPOSAL_EOF'
 ---
 
 *This proposal was refined through {proposal_round} round(s) of adversarial
-review using the `propose-execute` skill.*
+review using the `plan-do-review` skill.*
 PROPOSAL_EOF
 )"
 ```
@@ -177,12 +168,6 @@ If `--dry-run` is set, print the proposal to stdout instead of posting and
 
 Implement the converged proposal in full. This is the core implementation
 phase — you (the orchestrator) do the actual coding work.
-
-**Prefer structural solutions over minimal patches.** If the proposal calls
-for a large refactor — changing public API signatures, restructuring types,
-introducing Arc/Cow/lifetimes, redesigning enums, or modifying cross-crate
-interfaces — do it. The goal is clean, idiomatic, scalable Rust code, not
-the smallest possible diff.
 
 ### 3a: Plan the Implementation
 
@@ -263,7 +248,7 @@ Substitute `$COMMIT` with the actual commit hash and set `$MODE = review`.
 
 Prepend context about what was implemented:
 ```
-You are reviewing commit {commit_hash} in /Users/tomer/dev/henyey.
+You are reviewing commit {commit_hash} in the current repository.
 This commit implements the proposal from GitHub issue #{issue_number}.
 
 {brief summary of what was implemented}
@@ -281,31 +266,31 @@ Read the agent result. Extract the verdict from the Fix Analysis section.
 **If `SOUND`**:
 - The implementation is clean. Proceed to Step 5.
 
-**If `CONCERNS` or `INCOMPLETE`**:
-- Extract the specific issues from the review report:
+**If `CONCERNS`, `INCOMPLETE`, or `WRONG`**:
+- Extract every specific issue from the review report:
   - Missing per-op checks
   - Untested code paths
   - Similar issues found
   - Architectural gaps
   - Parity issues
-- For each issue, determine if it is valid by reading the relevant code.
-- Fix all valid issues:
-  1. Make the code changes
-  2. Add tests for untested paths
-  3. Run `cargo test --all` and `cargo clippy --all`
-  4. Commit with a descriptive message
-  5. Push
-- Loop back to 4a with the new commit.
-
-**If `WRONG`**:
-- The implementation has fundamental issues. Re-read the review carefully.
-- Consider reverting and re-implementing from the proposal.
-- If the review identifies a misunderstanding of the proposal, fix it.
-- Commit, push, and loop back to 4a.
+  - Fundamental design issues
+- **Address every single issue.** Do not skip, defer, or dismiss any feedback.
+  Read the relevant code to understand each issue, then fix it. If a reviewer
+  raised it, it gets fixed — period.
+- For each issue:
+  1. Read the relevant code to understand the problem
+  2. Make the code changes to fully resolve it
+  3. Add or update tests to cover the fix
+  4. Run `cargo test --all` and `cargo clippy --all`
+- Once all issues are resolved, commit with a descriptive message, push, and
+  loop back to 4a.
+- If `WRONG`, consider whether a revert and re-implementation is cleaner than
+  incremental fixes. Either way, all feedback must be addressed before the
+  next review round.
 
 **If verdict unclear** (agent error):
-- Treat as `CONCERNS` and manually review the agent output for actionable
-  items.
+- Treat as `CONCERNS` and extract all actionable items from the agent output.
+  Address every item — do not skip any.
 
 ---
 
@@ -331,52 +316,14 @@ Final verdict: **SOUND**
 {bullet list of changes}
 
 ### What was deferred (if any)
-{bullet list of follow-up items with issue links}
+{bullet list of follow-up items}
 
 ---
 
-*Implemented and reviewed using the `propose-execute` skill.*
+*Implemented and reviewed using the `plan-do-review` skill.*
 DONE_EOF
 )"
 ```
-
-### 5b: File Issues for Deferred Work
-
-If the completion summary includes deferred items (from the "What was deferred"
-section, reviewer recommendations, or remaining concerns noted during
-implementation), create a GitHub issue for **each** deferred item:
-
-```bash
-gh issue create \
-  --title "<short imperative title>" \
-  --body "Follow-up from #$ISSUE (<original issue title>).
-
-## Context
-<why this was deferred — e.g., out of scope, needs design, blocked on X>
-
-## What needs to happen
-<concrete description of the work>
-
-## References
-- Parent issue: #$ISSUE
-- Implementation commit(s): <commit hashes>" \
-  --label "follow-up"
-```
-
-Guidelines for deferred-work issues:
-- One issue per distinct work item — do not bundle unrelated items.
-- Title should be actionable and imperative (e.g., "Add integration tests for
-  RPC semaphore rejection", not "Testing gaps").
-- Include enough context that someone unfamiliar with the parent issue can
-  understand and execute the work.
-- Reference the parent issue and implementation commits.
-- Add relevant labels beyond `follow-up` (e.g., `testing`, `refactor`,
-  crate-specific labels).
-- If a deferred item is trivial or speculative, skip it — only file issues for
-  work that genuinely should be done.
-
-Update the completion comment's "What was deferred" section to include the
-newly created issue links (edit the comment or post a follow-up).
 
 Print a summary to the terminal:
 
@@ -386,7 +333,6 @@ Issue:              #$ISSUE
 Proposal rounds:    {proposal_round} / {max_proposal_rounds}
 Review rounds:      {review_round} / {max_review_rounds}
 Commits:            {count}
-Deferred issues:    {count} filed
 Final verdict:      SOUND
 ═════════════════════════════════
 ```
@@ -404,6 +350,9 @@ Final verdict:      SOUND
   post whatever you have and note the remaining concerns. Do not loop forever.
 - **Be honest about feedback.** If a critic's feedback is wrong, explain why
   in the rewrite. If it is right, fix it. Do not ignore valid feedback.
+- **Address all review-fix feedback.** Every issue raised in a review-fix
+  round must be fully resolved before the next round. No feedback may be
+  skipped, deferred, or dismissed. If the reviewer raised it, fix it.
 - **Use the codebase, not assumptions.** Before rewriting a proposal or
   implementing code, read the actual files. Do not rely on memory or the
   issue description alone.
@@ -411,17 +360,3 @@ Final verdict:      SOUND
   one commit addressing all feedback from that round.
 - **Parity is non-negotiable.** For any change touching protocol, consensus,
   or ledger logic, verify against stellar-core.
-- **Big swings are expected.** Large refactors, public API modifications,
-  struct redesigns, and design-level changes are not only permitted — they
-  are preferred when the result is cleaner, more idiomatic Rust, and more
-  scalable. Do not artificially constrain scope to minimal patches.
-  Examples of encouraged changes:
-  - Changing function signatures to accept `&T` or `Arc<T>` instead of
-    requiring callers to clone
-  - Restructuring types (adding Cow, newtype wrappers, splitting enums)
-  - Moving fields between structs to improve ownership semantics
-  - Cross-crate API changes when a pattern spans module boundaries
-  - Replacing C-style output parameters with return values
-  - Introducing trait bounds or generics to eliminate repetition
-  The bar is: does the code end up clearer, cleaner, and more maintainable?
-  If yes, the refactor is worth it regardless of diff size.
