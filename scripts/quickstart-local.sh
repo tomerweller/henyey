@@ -82,6 +82,9 @@ fi
 # ── Step 3: Build overlay image ───────────────────────────────────────────────
 echo "==> Building Docker image..."
 cd "$PROJECT_ROOT"
+# Refresh henyey-binary from target/release so the image never picks up a stale
+# copy left over from a previous run.
+cp -f "$PROJECT_ROOT/target/release/henyey" "$PROJECT_ROOT/henyey-binary"
 docker build -f Dockerfile.quickstart-local -t "$IMAGE_TAG" . 2>&1
 echo "    Done."
 
