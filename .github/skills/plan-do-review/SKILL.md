@@ -11,7 +11,7 @@ Parse `$ARGUMENTS`:
 - `--max-review-rounds N`: Max implement↔review-fix iterations (default: 3).
 - `--dry-run`: Run through proposal convergence only; do not execute or commit.
 
-# Propose-Execute
+# Plan-Do-Review
 
 Adversarial proposal refinement → full implementation → iterative review-fix.
 
@@ -23,6 +23,48 @@ and iterate until the review is clean.
 The orchestrator (you) manages state, rewrites proposals, and implements code.
 All reviews and critiques are delegated to independent sub-agents so that
 review is adversarial and unbiased.
+
+---
+
+## Guiding Principles
+
+**Prefer long-term readable, sustainable, elegant, safe building blocks over
+short-term patches — even at the cost of significant refactors.**
+
+These principles apply at every stage of this skill — when rewriting the
+proposal, when critiquing it, and when executing it:
+
+- **Root causes over symptoms.** Address the underlying design flaw, not the
+  surface manifestation. A fix that handles only the one caller that reported
+  a bug is almost always the wrong answer when several callers share the same
+  broken assumption.
+- **Readable.** Favor code that is easy for a newcomer to read and reason
+  about. Name things well. Break long functions. Let control flow mirror the
+  problem domain.
+- **Sustainable.** Favor designs that remain correct as the code evolves.
+  Push invariants into types (newtypes, enums, const generics), constructors,
+  and shared helpers so future changes cannot accidentally violate them.
+- **Elegant.** Favor the minimum set of concepts that expresses the
+  solution cleanly. Prefer standard Rust idioms — ownership over cloning,
+  iterators over index loops, `?` over `match` chains, `Result`/`Option` over
+  sentinel values.
+- **Safe.** Favor designs that make incorrect states unrepresentable and
+  error paths explicit. Never fail silently. Close races; don't paper over
+  them with retries or sleeps.
+- **Scope honestly.** If the best fix requires changing a public API,
+  restructuring types, introducing `Arc`/`Cow`/lifetimes, splitting or
+  merging modules, or touching several crates — propose that. The goal is
+  long-term code health, not the smallest possible diff. Deferred
+  refactors should be filed as follow-up issues, not papered over.
+- **Parity-preserving.** In protocol/consensus/ledger code, long-term
+  elegance never justifies diverging from stellar-core behavior. Match
+  stellar-core semantics exactly; elegance applies to *how* we express
+  those semantics in Rust.
+
+When these principles conflict with proposal minimalism, the principles
+win. A significant refactor that produces a sound, idiomatic foundation is
+always preferable to a narrow patch that leaves the latent design problem
+in place.
 
 ---
 
@@ -102,13 +144,22 @@ Evaluate this proposal thoroughly:
    parity with stellar-core?
 7. **Structural ambition**: Does the proposal go far enough? Could a
    bigger refactor — changing public APIs, restructuring types, using
-   Arc/Cow/lifetimes, redesigning enums — eliminate the root cause
-   rather than patching symptoms? Prefer structural solutions that make
-   the problem impossible over minimal fixes that address one instance.
-8. **Rust idiom quality**: Does the proposal move the code toward
-   idiomatic Rust? Ownership instead of cloning, references instead of
-   copies, iterators instead of index loops, enums instead of booleans,
-   newtypes for type safety?
+   Arc/Cow/lifetimes, redesigning enums, splitting or merging modules —
+   eliminate the *class* of bug rather than patching the one symptom?
+   Prefer structural solutions that make incorrect states
+   unrepresentable over minimal fixes that address one instance.
+8. **Readability & sustainability**: Will the resulting code be easy to
+   read, modify, and extend in six months? Does it push invariants into
+   types (newtypes, enums, constructors) or shared helpers so future
+   callers can't silently get it wrong? Does it use idiomatic Rust —
+   ownership over cloning, iterators over index loops, `?` over match
+   chains, `Result`/`Option` over sentinel values? Does it name things
+   well and keep functions focused?
+9. **Long-term vs. short-term tradeoff**: Is the proposed fix a durable
+   building block, or a short-term patch that leaves the underlying
+   design problem in place? If the latter, flag it — this skill
+   explicitly prefers significant refactors that produce sound
+   foundations over narrow patches that will need to be undone.
 
 ## Output Format
 
@@ -178,11 +229,15 @@ If `--dry-run` is set, print the proposal to stdout instead of posting and
 Implement the converged proposal in full. This is the core implementation
 phase — you (the orchestrator) do the actual coding work.
 
-**Prefer structural solutions over minimal patches.** If the proposal calls
-for a large refactor — changing public API signatures, restructuring types,
-introducing Arc/Cow/lifetimes, redesigning enums, or modifying cross-crate
-interfaces — do it. The goal is clean, idiomatic, scalable Rust code, not
-the smallest possible diff.
+**Apply the Guiding Principles above.** Implement the proposal as a
+durable building block, not a short-term patch. If carrying out the
+proposal reveals that a larger refactor — changing public API
+signatures, restructuring types, introducing Arc/Cow/lifetimes,
+redesigning enums, splitting modules, or touching several crates —
+would produce a significantly more readable, sustainable, elegant, or
+safe result, do the refactor rather than working around it. File any
+intentionally-deferred refactors as follow-up issues so they aren't
+lost; don't paper them over with inline workarounds.
 
 ### 3a: Plan the Implementation
 
