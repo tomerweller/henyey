@@ -39,3 +39,13 @@ where
     let bytes = p25_val.to_xdr(soroban_host::xdr::Limits::none()).ok()?;
     WS::from_xdr(&bytes, stellar_xdr::curr::Limits::none()).ok()
 }
+
+/// Like [`p25_to_ws`], but returns a `Result<WS, String>` with a descriptive
+/// error message that includes the type name.
+pub(super) fn p25_to_ws_result<P25, WS>(p25_val: &P25, type_name: &str) -> Result<WS, String>
+where
+    P25: soroban_host::xdr::WriteXdr,
+    WS: stellar_xdr::curr::ReadXdr,
+{
+    p25_to_ws(p25_val).ok_or_else(|| format!("failed to convert {} from P25 XDR", type_name))
+}

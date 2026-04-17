@@ -99,7 +99,10 @@ fn extract_modified_entries(
 
         let key = match LedgerKey::from_xdr(&change.encoded_key, Limits::none()) {
             Ok(k) => k,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to decode LedgerKey from change, skipping");
+                continue;
+            }
         };
 
         // Get state before: re-query the snapshot for the entry
@@ -119,10 +122,16 @@ fn extract_modified_entries(
         };
 
         // Get state after: decode from encoded_new_value
-        let state_after = change
-            .encoded_new_value
-            .as_ref()
-            .and_then(|v| stellar_xdr::curr::LedgerEntry::from_xdr(v, Limits::none()).ok());
+        let state_after = match change.encoded_new_value.as_ref() {
+            Some(v) => match stellar_xdr::curr::LedgerEntry::from_xdr(v, Limits::none()) {
+                Ok(e) => Some(e),
+                Err(err) => {
+                    tracing::warn!(error = ?err, "failed to decode new LedgerEntry from change, skipping");
+                    continue;
+                }
+            },
+            None => None,
+        };
 
         // Skip entries where both before and after are None (no diff)
         if state_before.is_none() && state_after.is_none() {
@@ -181,7 +190,7 @@ fn resolve_entry(
     let entry_xdr_size = entry
         .to_xdr(Limits::none())
         .map(|b| b.len() as u32)
-        .unwrap_or(0);
+        .map_err(|e| format!("failed to serialize entry to XDR: {e}"))?;
 
     let p25_entry: soroban_host::xdr::LedgerEntry =
         super::convert::ws_to_p25_result(&entry, "LedgerEntry")?;

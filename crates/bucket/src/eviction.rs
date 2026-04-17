@@ -498,7 +498,7 @@ pub(crate) fn scan_bucket_region(
     let mut entries_scanned = 0;
     let mut bytes_used = 0u64;
 
-    let bucket_protocol = bucket.protocol_version().unwrap_or(0);
+    let bucket_protocol = bucket.protocol_version()?.unwrap_or(0);
     if bucket_protocol < MIN_SOROBAN_PROTOCOL_VERSION {
         iter.bucket_file_offset = 0;
         return Ok((entries_scanned, bytes_used, true));

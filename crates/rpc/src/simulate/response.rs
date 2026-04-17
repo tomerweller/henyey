@@ -1,11 +1,10 @@
 //! Response construction: building the JSON-RPC response from simulation
 //! results, encoding XDR fields, error formatting.
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
 use soroban_env_host_p25 as soroban_host;
 use stellar_xdr::curr::{
-    HostFunction, InvokeHostFunctionOp, Limits, OperationBody, SorobanTransactionData,
+    HostFunction, InvokeHostFunctionOp, OperationBody, SorobanTransactionData,
     SorobanTransactionDataExt, WriteXdr,
 };
 
@@ -29,11 +28,12 @@ pub(super) fn build_invoke_response(
     state_changes: Vec<LedgerEntryDiff>,
     ctx: InvokeResponseContext<'_>,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    use super::convert::p25_to_ws;
+    use super::convert::{p25_to_ws, p25_to_ws_result};
 
     // Convert P25 resources to workspace types
-    let resources: stellar_xdr::curr::SorobanResources = p25_to_ws(&sim_result.resources)
-        .ok_or_else(|| JsonRpcError::internal("failed to convert SorobanResources from P25"))?;
+    let resources: stellar_xdr::curr::SorobanResources =
+        p25_to_ws_result(&sim_result.resources, "SorobanResources")
+            .map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e))?;
 
     // Apply resource adjustments (mirrors soroban-simulation default_adjustment)
     let mut adjusted_resources = resources.clone();
@@ -46,13 +46,18 @@ pub(super) fn build_invoke_response(
     let ws_auth: Vec<stellar_xdr::curr::SorobanAuthorizationEntry> = sim_result
         .auth
         .iter()
-        .filter_map(|a| p25_to_ws(a))
-        .collect();
+        .map(|a| {
+            p25_to_ws_result(a, "SorobanAuthorizationEntry")
+                .map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Estimate the transaction size for fee computation
     let op = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
         host_function: ctx.host_fn.clone(),
-        auth: ws_auth[..].try_into().unwrap_or_default(),
+        auth: ws_auth[..].try_into().map_err(|_| {
+            JsonRpcError::internal("auth entries exceed VecM maximum length")
+        })?,
     });
     let tx_size = estimate_tx_size_for_op(&op, &adjusted_resources);
 
@@ -67,7 +72,9 @@ pub(super) fn build_invoke_response(
                 .restored_rw_entry_indices
                 .clone()
                 .try_into()
-                .unwrap_or_default(),
+                .map_err(|_| {
+                    JsonRpcError::internal("restored entry indices exceed VecM maximum length")
+                })?,
         })
     };
 
@@ -102,18 +109,31 @@ pub(super) fn build_invoke_response(
     );
     obj.insert("latestLedger".into(), json!(ctx.latest_ledger));
 
-    // Diagnostic events — convert P25 to workspace, then serialize
+    // Diagnostic events — convert P25 to workspace, then serialize.
+    // Conversion failures are logged but don't fail the response: diagnostic
+    // events are informational and stellar-core treats them as non-fatal.
     if !diagnostic_events.is_empty() {
-        let ws_events: Vec<stellar_xdr::curr::DiagnosticEvent> = diagnostic_events
-            .iter()
-            .filter_map(|e| p25_to_ws(e))
-            .collect();
-        insert_sim_xdr_array_field(&mut obj, "events", &ws_events, ctx.format)?;
+        let mut ws_events: Vec<stellar_xdr::curr::DiagnosticEvent> =
+            Vec::with_capacity(diagnostic_events.len());
+        for e in &diagnostic_events {
+            match p25_to_ws(e) {
+                Some(ws) => ws_events.push(ws),
+                None => {
+                    tracing::warn!("failed to convert DiagnosticEvent from P25 XDR, skipping");
+                }
+            }
+        }
+        if !ws_events.is_empty() {
+            insert_sim_xdr_array_field(&mut obj, "events", &ws_events, ctx.format)?;
+        }
     }
 
     // Encode auth entries and return value
     let return_value: Option<stellar_xdr::curr::ScVal> = match &sim_result.invoke_result {
-        Ok(val) => p25_to_ws(val),
+        Ok(val) => Some(
+            p25_to_ws_result(val, "ScVal (return value)")
+                .map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e))?,
+        ),
         Err(_) => None,
     };
 
@@ -121,26 +141,7 @@ pub(super) fn build_invoke_response(
         let mut result_obj = serde_json::Map::new();
 
         // auth array (already converted to workspace types)
-        match ctx.format {
-            XdrFormat::Base64 => {
-                let auth_b64: Vec<serde_json::Value> = ws_auth
-                    .iter()
-                    .filter_map(|a| {
-                        a.to_xdr(Limits::none())
-                            .ok()
-                            .map(|b| serde_json::Value::String(BASE64.encode(&b)))
-                    })
-                    .collect();
-                result_obj.insert("auth".into(), serde_json::Value::Array(auth_b64));
-            }
-            XdrFormat::Json => {
-                let auth_json: Vec<serde_json::Value> = ws_auth
-                    .iter()
-                    .filter_map(|a| serde_json::to_value(a).ok())
-                    .collect();
-                result_obj.insert("authJson".into(), serde_json::Value::Array(auth_json));
-            }
-        }
+        insert_sim_xdr_array_field(&mut result_obj, "auth", &ws_auth, ctx.format)?;
 
         // return value
         if let Some(rv) = &return_value {

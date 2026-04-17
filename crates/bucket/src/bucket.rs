@@ -876,14 +876,19 @@ impl Bucket {
     }
 
     /// Get the protocol version from bucket metadata, if present.
-    pub fn protocol_version(&self) -> Option<u32> {
-        let iter = self.iter().ok()?;
-        for entry in iter.flatten() {
-            if let BucketEntry::Metaentry(meta) = entry {
-                return Some(meta.ledger_version);
+    ///
+    /// Returns `Ok(None)` for empty buckets (no entries, no metadata).
+    /// Returns `Err` on I/O or deserialization errors from disk-backed buckets.
+    pub fn protocol_version(&self) -> Result<Option<u32>> {
+        let iter = self.iter()?;
+        for entry_result in iter {
+            match entry_result {
+                Ok(BucketEntry::Metaentry(meta)) => return Ok(Some(meta.ledger_version)),
+                Ok(_) => {}
+                Err(e) => return Err(e),
             }
         }
-        None
+        Ok(None)
     }
 
     /// Convert bucket contents to uncompressed XDR bytes.

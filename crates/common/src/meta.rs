@@ -17,7 +17,7 @@
 //! # Sorting Order
 //!
 //! Changes are sorted by:
-//! 1. Ledger entry key (XDR-encoded bytes)
+//! 1. Ledger entry key (`LedgerKey::cmp`, matching stellar-core's xdrpp ordering)
 //! 2. Change type (State, Created, Updated, Removed, Restored)
 //! 3. Full change hash (for stability when keys and types are equal)
 //!
@@ -33,9 +33,7 @@
 
 use crate::types::entry_to_key;
 use crate::Hash256;
-use stellar_xdr::curr::{
-    LedgerEntryChange, LedgerEntryChanges, LedgerKey, Limits, TransactionMeta, WriteXdr,
-};
+use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges, LedgerKey, TransactionMeta};
 
 /// Extracts the ledger key from a ledger entry change.
 fn change_key(change: &LedgerEntryChange) -> LedgerKey {
@@ -63,18 +61,19 @@ fn change_type_order(change: &LedgerEntryChange) -> u8 {
 
 /// Sorts a list of ledger entry changes into canonical order.
 ///
-/// Changes are sorted by (key_bytes, change_type, change_hash) to ensure
-/// deterministic ordering regardless of the original order.
+/// Changes are sorted by (key, change_type, change_hash) to ensure
+/// deterministic ordering regardless of the original order. Uses
+/// `LedgerKey::cmp` (derived `Ord`) which matches stellar-core's xdrpp
+/// `operator<` ordering — see `crates/bucket/src/entry.rs:143-151`.
 fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::curr::Error> {
-    let mut entries: Vec<(Vec<u8>, u8, [u8; 32], LedgerEntryChange)> =
+    let mut entries: Vec<(LedgerKey, u8, [u8; 32], LedgerEntryChange)> =
         Vec::with_capacity(changes.0.len());
 
     for change in changes.0.iter().cloned() {
         let key = change_key(&change);
-        let key_bytes = key.to_xdr(Limits::none())?;
         let change_hash = Hash256::hash_xdr(&change)?.0;
         let order = change_type_order(&change);
-        entries.push((key_bytes, order, change_hash, change));
+        entries.push((key, order, change_hash, change));
     }
 
     entries.sort_by(|a, b| {
@@ -154,4 +153,125 @@ pub fn normalize_transaction_meta(
         )?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::*;
+
+    /// Verify that sort_changes uses LedgerKey::cmp (struct ordering), not XDR
+    /// byte ordering. For ContractData keys with variable-length ScVal fields,
+    /// these orderings can differ because XDR length-prefixes variable fields
+    /// (making byte comparison length-first) while LedgerKey::cmp compares
+    /// element-by-element.
+    #[test]
+    fn test_sort_changes_uses_struct_ordering() {
+        let contract = ScAddress::Contract(ContractId(Hash([0xAA; 32])));
+
+        // Key A: Bytes(short) — XDR: length=2, then 2 bytes
+        let key_a = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract.clone(),
+            key: ScVal::Bytes(ScBytes(vec![0xFF, 0xFF].try_into().unwrap())),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        // Key B: Bytes(longer) — XDR: length=3, then 3 bytes (all 0x00)
+        let key_b = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract.clone(),
+            key: ScVal::Bytes(ScBytes(vec![0x00, 0x00, 0x00].try_into().unwrap())),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        // Struct ordering: Bytes([0x00,0x00,0x00]) < Bytes([0xFF,0xFF])
+        // (element-by-element: 0x00 < 0xFF)
+        assert!(key_b < key_a, "struct ordering: key_b < key_a");
+
+        // XDR byte ordering: length 2 < length 3, so key_a < key_b
+        let a_bytes = key_a.to_xdr(Limits::none()).unwrap();
+        let b_bytes = key_b.to_xdr(Limits::none()).unwrap();
+        assert!(a_bytes < b_bytes, "byte ordering: key_a_bytes < key_b_bytes");
+
+        // The two orderings disagree — verify sort_changes uses struct ordering
+        let entry_a = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: contract.clone(),
+                key: ScVal::Bytes(ScBytes(vec![0xFF, 0xFF].try_into().unwrap())),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::U32(1),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        let entry_b = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: contract.clone(),
+                key: ScVal::Bytes(ScBytes(vec![0x00, 0x00, 0x00].try_into().unwrap())),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::U32(2),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Put them in byte order (key_a first) — struct ordering should reverse
+        let mut changes = LedgerEntryChanges(
+            vec![
+                LedgerEntryChange::Updated(entry_a.clone()),
+                LedgerEntryChange::Updated(entry_b.clone()),
+            ]
+            .try_into()
+            .unwrap(),
+        );
+
+        sort_changes(&mut changes).unwrap();
+
+        // After sort, key_b (Bytes([0x00,...])) should come first (struct order)
+        let first_key = change_key(&changes.0[0]);
+        assert_eq!(first_key, key_b, "sort should use struct ordering: key_b first");
+    }
+
+    #[test]
+    fn test_sort_changes_by_type_order() {
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32]))),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32]))),
+                balance: 100,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: Default::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: Default::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Sorted order: State, Created, Updated, Removed
+        let mut changes = LedgerEntryChanges(
+            vec![
+                LedgerEntryChange::Updated(entry.clone()),
+                LedgerEntryChange::State(entry.clone()),
+                LedgerEntryChange::Removed(key.clone()),
+                LedgerEntryChange::Created(entry.clone()),
+            ]
+            .try_into()
+            .unwrap(),
+        );
+
+        sort_changes(&mut changes).unwrap();
+
+        assert!(matches!(changes.0[0], LedgerEntryChange::State(_)));
+        assert!(matches!(changes.0[1], LedgerEntryChange::Created(_)));
+        assert!(matches!(changes.0[2], LedgerEntryChange::Updated(_)));
+        assert!(matches!(changes.0[3], LedgerEntryChange::Removed(_)));
+    }
 }

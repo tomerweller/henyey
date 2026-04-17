@@ -2656,7 +2656,7 @@ impl BucketList {
             );
 
             // Determine merge parameters
-            let merge_protocol_version = prev_snap.protocol_version().unwrap_or(protocol_version);
+            let merge_protocol_version = prev_snap.protocol_version()?.unwrap_or(protocol_version);
             // Note: stellar-core never normalizes INIT to LIVE during merges - the keepTombstoneEntries
             // flag only affects DEAD entry filtering, not INIT entry transformation.
             let keep_dead = Self::keep_tombstone_entries(i);

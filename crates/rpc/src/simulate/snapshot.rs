@@ -62,10 +62,17 @@ impl SnapshotSource for BucketListSnapshotSource {
         &self,
         key: &Rc<soroban_host::xdr::LedgerKey>,
     ) -> Result<Option<EntryWithLiveUntil>, HostError> {
-        // Convert P25 LedgerKey to workspace LedgerKey for bucket list lookup
+        // Convert P25 LedgerKey to workspace LedgerKey for bucket list lookup.
+        // Conversion failure is an internal error (structurally valid P25 keys
+        // should always convert), not "key not found".
         let ws_key: LedgerKey = match super::convert::p25_to_ws(key.as_ref()) {
             Some(k) => k,
-            None => return Ok(None),
+            None => {
+                return Err(HostError::from(soroban_host::Error::from_type_and_code(
+                    soroban_host::xdr::ScErrorType::Value,
+                    soroban_host::xdr::ScErrorCode::InternalError,
+                )));
+            }
         };
 
         let make_err = || {

@@ -434,8 +434,14 @@ fn resolve_auth_mode(
         "enforce" => {
             let p25_auth: Vec<soroban_host::xdr::SorobanAuthorizationEntry> = tx_auth
                 .iter()
-                .map(|a| convert::ws_to_p25(a).expect("SorobanAuthorizationEntry XDR conversion"))
-                .collect();
+                .map(|a| {
+                    convert::ws_to_p25(a).ok_or_else(|| {
+                        JsonRpcError::invalid_params(
+                            "invalid SorobanAuthorizationEntry XDR in auth entries",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(RecordingInvocationAuthMode::Enforcing(p25_auth))
         }
         "record" => {
@@ -462,9 +468,13 @@ fn resolve_auth_mode(
                 let p25_auth: Vec<soroban_host::xdr::SorobanAuthorizationEntry> = tx_auth
                     .iter()
                     .map(|a| {
-                        convert::ws_to_p25(a).expect("SorobanAuthorizationEntry XDR conversion")
+                        convert::ws_to_p25(a).ok_or_else(|| {
+                            JsonRpcError::invalid_params(
+                                "invalid SorobanAuthorizationEntry XDR in auth entries",
+                            )
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(RecordingInvocationAuthMode::Enforcing(p25_auth))
             }
         }
@@ -927,6 +937,47 @@ mod tests {
         // Source should be from inner tx (key byte 2), not fee bump source (key byte 3)
         match account_id.0 {
             PublicKey::PublicKeyTypeEd25519(k) => assert_eq!(k, Uint256([2u8; 32])),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_auth_mode: error propagation (regression for #1738)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_auth_mode_enforce_valid() {
+        let auth = vec![SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::SourceAccount,
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0xAA; 32]))),
+                    function_name: ScSymbol("test".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                sub_invocations: Default::default(),
+            },
+        }];
+        let result = resolve_auth_mode("enforce", &auth);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_auth_mode_record_rejects_auth() {
+        let auth = vec![SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::SourceAccount,
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0xAA; 32]))),
+                    function_name: ScSymbol("test".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                sub_invocations: Default::default(),
+            },
+        }];
+        let result = resolve_auth_mode("record", &auth);
+        match result {
+            Err(e) => assert!(e.message.contains("record")),
+            Ok(_) => panic!("expected error for 'record' mode with auth entries"),
         }
     }
 }
