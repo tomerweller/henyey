@@ -42,6 +42,14 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::tracked_lock::{tracked_read, tracked_write};
+
+// Lock telemetry labels — see `crate::tracked_lock` and issue #1768.
+// Defined as `&'static str` constants so a call-site typo becomes
+// a compile error rather than a silently-mislabelled WARN.
+const LOCK_HERDER_STATE: &str = "herder.state";
+const LOCK_TRACKING_STATE: &str = "shared.tracking_state";
+
 use henyey_common::Hash256;
 use henyey_crypto::{PublicKey, SecretKey};
 use henyey_ledger::LedgerManager;
@@ -475,7 +483,7 @@ impl Herder {
 
     /// Get the current state of the Herder.
     pub fn state(&self) -> HerderState {
-        *self.state.read()
+        *tracked_read(LOCK_HERDER_STATE, &self.state)
     }
 
     /// Test-only: set the wall-clock override (seconds since UNIX epoch) seen
@@ -535,7 +543,7 @@ impl Herder {
     /// SYNCING→BOOTING are forbidden.  If an invalid transition is attempted,
     /// it is logged and ignored.
     pub fn set_state(&self, state: HerderState) {
-        let current = *self.state.read();
+        let current = *tracked_read(LOCK_HERDER_STATE, &self.state);
         if !current.can_transition_to(state) {
             tracing::warn!(
                 from = %current,
@@ -544,7 +552,7 @@ impl Herder {
             );
             return;
         }
-        *self.state.write() = state;
+        *tracked_write(LOCK_HERDER_STATE, &self.state) = state;
 
         // Keep SharedTrackingState.is_tracking in sync with HerderState.
         // stellar-core's isTracking() simply checks mState == HERDER_TRACKING_NETWORK_STATE,
@@ -553,19 +561,19 @@ impl Herder {
         // validate_past_or_future_value to reject far-future EXTERNALIZE messages
         // instead of returning MaybeValid.
         if !state.is_tracking() {
-            self.tracking_state.write().is_tracking = false;
+            tracked_write(LOCK_TRACKING_STATE, &self.tracking_state).is_tracking = false;
         }
     }
 
     /// Get the current tracking slot.
     pub fn tracking_slot(&self) -> u64 {
-        self.tracking_state.read().consensus_index
+        tracked_read(LOCK_TRACKING_STATE, &self.tracking_state).consensus_index
     }
 
     /// Get the tracking consensus close time.
     /// Matches stellar-core `HerderImpl::trackingConsensusCloseTime()`.
     pub fn tracking_consensus_close_time(&self) -> u64 {
-        self.tracking_state.read().consensus_close_time
+        tracked_read(LOCK_TRACKING_STATE, &self.tracking_state).consensus_close_time
     }
 
     /// Get the next consensus ledger index.
@@ -829,7 +837,7 @@ impl Herder {
 
         // Update shared tracking state (immediately visible to ScpDriver)
         {
-            let mut ts = self.tracking_state.write();
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &self.tracking_state);
             ts.is_tracking = true;
             ts.consensus_index = slot;
             ts.consensus_close_time = close_time;
@@ -840,7 +848,7 @@ impl Herder {
         self.pending_envelopes.set_current_slot(slot);
 
         // Transition to tracking state
-        *self.state.write() = HerderState::Tracking;
+        *tracked_write(LOCK_HERDER_STATE, &self.state) = HerderState::Tracking;
 
         // Release any pending envelopes for this slot and previous
         let pending = self.pending_envelopes.release_up_to(slot);
@@ -866,7 +874,7 @@ impl Herder {
     /// Start syncing (called when catchup begins).
     pub fn start_syncing(&self) {
         info!("Herder entering syncing state");
-        *self.state.write() = HerderState::Syncing;
+        *tracked_write(LOCK_HERDER_STATE, &self.state) = HerderState::Syncing;
     }
 
     /// Check close time of all values in an SCP envelope.
@@ -1709,7 +1717,7 @@ impl Herder {
             .unwrap_or(0);
 
         let should_advance = {
-            let mut ts = self.tracking_state.write();
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &self.tracking_state);
             if externalized_slot >= ts.consensus_index {
                 ts.is_tracking = true;
                 ts.consensus_index = externalized_slot + 1;
@@ -1729,7 +1737,7 @@ impl Herder {
             // in HerderSCPDriver::valueExternalized which always sets
             // HERDER_TRACKING_NETWORK_STATE on externalization.
             {
-                let mut state = self.state.write();
+                let mut state = tracked_write(LOCK_HERDER_STATE, &self.state);
                 if *state != HerderState::Tracking {
                     info!(
                         slot = externalized_slot,

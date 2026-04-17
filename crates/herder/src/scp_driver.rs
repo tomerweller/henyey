@@ -31,6 +31,15 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::RwLock;
 use tracing::{debug, trace, warn};
 
+use crate::tracked_lock::{tracked_read, tracked_write};
+
+// Lock telemetry labels — see `crate::tracked_lock` and issue #1768.
+// Defined as `&'static str` constants so a call-site typo becomes
+// a compile error rather than a silently-mislabelled WARN.
+const LOCK_SCP_EXTERNALIZED: &str = "scp_driver.externalized";
+const LOCK_SCP_LATEST_EXTERNALIZED: &str = "scp_driver.latest_externalized";
+const LOCK_TRACKING_STATE: &str = "shared.tracking_state";
+
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::{PublicKey, SecretKey, Signature};
@@ -498,22 +507,26 @@ impl ScpDriver {
 
     /// Get the latest externalized slot.
     pub fn latest_externalized_slot(&self) -> Option<SlotIndex> {
-        *self.latest_externalized.read()
+        *tracked_read(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized)
     }
 
     /// Get an externalized slot.
     pub fn get_externalized(&self, slot: SlotIndex) -> Option<ExternalizedSlot> {
-        self.externalized.read().get(&slot).cloned()
+        tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized)
+            .get(&slot)
+            .cloned()
     }
 
     /// Find the slot for a given tx set hash in recent externalized values.
     pub fn find_externalized_slot_by_tx_set_hash(&self, hash: &Hash256) -> Option<SlotIndex> {
-        self.externalized.read().iter().find_map(|(slot, ext)| {
-            ext.tx_set_hash
-                .as_ref()
-                .filter(|tx_hash| *tx_hash == hash)
-                .map(|_| *slot)
-        })
+        tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized)
+            .iter()
+            .find_map(|(slot, ext)| {
+                ext.tx_set_hash
+                    .as_ref()
+                    .filter(|tx_hash| *tx_hash == hash)
+                    .map(|_| *slot)
+            })
     }
 
     /// Get all externalized slot indices in a range (inclusive).
@@ -523,7 +536,7 @@ impl ScpDriver {
         from: SlotIndex,
         to: SlotIndex,
     ) -> Vec<SlotIndex> {
-        let externalized = self.externalized.read();
+        let externalized = tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized);
         let mut slots: Vec<SlotIndex> = externalized
             .keys()
             .filter(|&&slot| slot >= from && slot <= to)
@@ -539,7 +552,7 @@ impl ScpDriver {
         if from > to {
             return vec![];
         }
-        let externalized = self.externalized.read();
+        let externalized = tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized);
         let mut missing = Vec::new();
         for slot in from..=to {
             if !externalized.contains_key(&slot) {
@@ -777,14 +790,18 @@ impl ScpDriver {
             (header.ledger_seq as u64, header.scp_value.close_time.0)
         } else {
             // No ledger manager available — fall back to externalized data
-            if let Some(latest) = *self.latest_externalized.read() {
-                if let Some(externalized) = self.externalized.read().get(&latest) {
+            if let Some(latest) =
+                *tracked_read(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized)
+            {
+                if let Some(externalized) =
+                    tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).get(&latest)
+                {
                     (externalized.slot, externalized.close_time)
                 } else {
                     (0, 0)
                 }
             } else {
-                let ts = self.tracking_state.read();
+                let ts = tracked_read(LOCK_TRACKING_STATE, &self.tracking_state);
                 if ts.is_tracking {
                     // When tracking but no ledger manager or externalized data (e.g., after
                     // bootstrap), derive the LCL from the tracking consensus index.
@@ -882,7 +899,7 @@ impl ScpDriver {
             ValueValidation::Valid
         } else {
             // Past or future slot — partial validation
-            let ts = *self.tracking_state.read();
+            let ts = *tracked_read(LOCK_TRACKING_STATE, &self.tracking_state);
             let tracking = if ts.is_tracking { Some(ts) } else { None };
 
             self.validate_past_or_future_value(
@@ -1618,7 +1635,7 @@ impl ScpDriver {
 
         // Check if we're overwriting an existing externalized value with different content
         {
-            let existing = self.externalized.read();
+            let existing = tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized);
             if let Some(old) = existing.get(&slot) {
                 if old.value != value {
                     // Parse old value's stellar_value_ext for comparison
@@ -1647,10 +1664,10 @@ impl ScpDriver {
             externalized_at: std::time::Instant::now(),
         };
 
-        self.externalized.write().insert(slot, externalized);
+        tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized).insert(slot, externalized);
 
         // Update latest
-        let mut latest = self.latest_externalized.write();
+        let mut latest = tracked_write(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized);
         if latest.map(|l| slot > l).unwrap_or(true) {
             *latest = Some(slot);
         }
@@ -1660,7 +1677,9 @@ impl ScpDriver {
 
     /// Get the close time of an externalized slot.
     pub fn get_externalized_close_time(&self, slot: SlotIndex) -> Option<u64> {
-        self.externalized.read().get(&slot).map(|e| e.close_time)
+        tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized)
+            .get(&slot)
+            .map(|e| e.close_time)
     }
 
     /// Emit an envelope to the network.
@@ -1687,7 +1706,7 @@ impl ScpDriver {
 
     /// Get the externalized slots count.
     pub fn externalized_size(&self) -> usize {
-        self.externalized.read().len()
+        tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).len()
     }
 
     /// Get the quorum sets count (by node ID).
@@ -1708,7 +1727,7 @@ impl ScpDriver {
             tx_set_cache: tx_sizes.cache,
             pending_tx_sets: tx_sizes.pending,
             pending_quorum_sets: qset_sizes.pending,
-            externalized: self.externalized.read().len(),
+            externalized: tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).len(),
             quorum_sets: qset_sizes.by_node,
             quorum_sets_by_hash: qset_sizes.by_hash,
             tx_set_valid_cache: tx_sizes.valid_cache,
@@ -1717,7 +1736,7 @@ impl ScpDriver {
 
     /// Clear old externalized slots.
     pub fn cleanup_externalized(&self, keep_count: usize) {
-        let mut externalized = self.externalized.write();
+        let mut externalized = tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized);
         if externalized.len() <= keep_count {
             return;
         }
@@ -1743,10 +1762,10 @@ impl ScpDriver {
     pub fn clear_all_caches(&self) {
         let tx_sizes = self.tx_tracker.sizes();
         let qset_sizes = self.qset_tracker.sizes();
-        let externalized_count = self.externalized.read().len();
+        let externalized_count = tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).len();
 
         self.tx_tracker.clear_all();
-        self.externalized.write().clear();
+        tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized).clear();
         self.qset_tracker.clear_validated_preserving_local();
 
         if tx_sizes.cache > 0
@@ -1770,18 +1789,19 @@ impl ScpDriver {
     /// pending requests that will be needed for buffered ledgers.
     pub fn trim_stale_caches(&self, keep_after_slot: SlotIndex) {
         let initial_pending_count = self.tx_tracker.pending_count();
-        let initial_externalized_count = self.externalized.read().len();
+        let initial_externalized_count =
+            tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).len();
 
         self.tx_tracker.trim_stale_pending(keep_after_slot);
 
         // Trim externalized - keep slots > keep_after_slot
         {
-            let mut externalized = self.externalized.write();
+            let mut externalized = tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized);
             externalized.retain(|slot, _| *slot > keep_after_slot);
         }
 
         let kept_pending = self.tx_tracker.pending_count();
-        let kept_externalized = self.externalized.read().len();
+        let kept_externalized = tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).len();
 
         tracing::info!(
             initial_pending_count,
@@ -1800,7 +1820,7 @@ impl ScpDriver {
     pub fn purge_slots_below(&self, slot: SlotIndex) {
         // Remove externalized slots below the threshold
         {
-            let mut externalized = self.externalized.write();
+            let mut externalized = tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized);
             let slots_to_remove: Vec<_> = externalized
                 .keys()
                 .filter(|&s| *s < slot)

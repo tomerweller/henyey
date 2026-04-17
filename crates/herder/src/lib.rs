@@ -125,6 +125,7 @@ mod state;
 mod surge_pricing;
 pub mod sync_recovery;
 pub(crate) mod timer_manager;
+mod tracked_lock;
 pub(crate) mod tx_broadcast;
 mod tx_queue;
 mod tx_queue_limiter;
