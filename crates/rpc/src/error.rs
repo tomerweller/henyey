@@ -58,3 +58,50 @@ impl JsonRpcError {
         Self::internal(category.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `internal_logged` must return only the generic category string to the
+    /// client.  The detailed error is logged server-side but must never appear
+    /// in the response message or data fields.
+    #[test]
+    fn internal_logged_strips_sensitive_details() {
+        let detail = "SELECT * FROM accounts WHERE id = 'GABCD': SQLITE_CORRUPT";
+        let err = JsonRpcError::internal_logged("database error", &detail);
+
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert_eq!(err.message, "database error");
+        assert!(err.data.is_none());
+
+        // Negative: no sensitive info leaked
+        assert!(!err.message.contains("SELECT"));
+        assert!(!err.message.contains("GABCD"));
+        assert!(!err.message.contains("SQLITE"));
+    }
+
+    /// Same contract with a complex `Debug`-implementing type — the formatted
+    /// debug output must not leak into the client-visible response.
+    #[test]
+    fn internal_logged_with_complex_debug_type() {
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct InternalDbError {
+            query: String,
+            backtrace: String,
+        }
+        let err = InternalDbError {
+            query: "DELETE FROM ledgers".into(),
+            backtrace: "at src/db.rs:42".into(),
+        };
+        let rpc_err = JsonRpcError::internal_logged("storage failure", &err);
+
+        assert_eq!(rpc_err.code, INTERNAL_ERROR);
+        assert_eq!(rpc_err.message, "storage failure");
+        assert!(rpc_err.data.is_none());
+        assert!(!rpc_err.message.contains("DELETE"));
+        assert!(!rpc_err.message.contains("backtrace"));
+        assert!(!rpc_err.message.contains("src/db.rs"));
+    }
+}

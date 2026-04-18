@@ -400,6 +400,196 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // -------------------------------------------------------------------
+    // Shared test helper: boot a single-node simulation App
+    // -------------------------------------------------------------------
+
+    use std::time::Duration;
+
+    use henyey_app::config::QuorumSetConfig;
+    use henyey_app::AppState;
+    use henyey_common::Hash256;
+    use henyey_crypto::SecretKey;
+    use henyey_simulation::{Simulation, SimulationMode};
+    use tokio::sync::Semaphore;
+
+    /// Boot a single-node standalone simulation and close one ledger so
+    /// the DB has data.  Returns the `Simulation` (must be kept alive) and
+    /// the `Arc<App>`.
+    async fn boot_test_app() -> (Simulation, std::sync::Arc<App>) {
+        let mut sim =
+            Simulation::with_network(SimulationMode::OverTcp, "Test SDF Network ; September 2015");
+
+        let seed = Hash256::hash(b"RPC_SERVER_UNIT_TEST_NODE");
+        let secret = SecretKey::from_seed(&seed.0);
+        let quorum_set = QuorumSetConfig {
+            threshold_percent: 100,
+            validators: vec![secret.public_key().to_strkey()],
+            inner_sets: Vec::new(),
+        };
+
+        sim.add_app_node("node0", secret, quorum_set);
+        sim.start_all_nodes().await;
+
+        let app = sim.app("node0").expect("app node");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if app.state().await == AppState::Validating {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(app.state().await, AppState::Validating);
+
+        let closed = sim
+            .manual_close_all_app_nodes()
+            .await
+            .expect("manual close");
+        assert_eq!(closed, vec![2]);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if sim.have_all_app_nodes_externalized(2, 0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(sim.have_all_app_nodes_externalized(2, 0));
+
+        (sim, app)
+    }
+
+    /// Build an `RpcContext` with custom semaphore sizes and timeout.
+    fn make_ctx(
+        app: std::sync::Arc<App>,
+        request_sem: usize,
+        db_sem: usize,
+        timeout: Duration,
+    ) -> std::sync::Arc<RpcContext> {
+        std::sync::Arc::new(RpcContext {
+            app,
+            fee_windows: std::sync::Arc::new(FeeWindows::new(10)),
+            simulation_semaphore: std::sync::Arc::new(Semaphore::new(1)),
+            request_semaphore: std::sync::Arc::new(Semaphore::new(request_sem)),
+            db_semaphore: std::sync::Arc::new(Semaphore::new(db_sem)),
+            request_timeout: timeout,
+        })
+    }
+
+    /// Call `rpc_handler` directly and parse the JSON response.
+    async fn call_handler(
+        ctx: &std::sync::Arc<RpcContext>,
+        body: &[u8],
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, Json(resp)) =
+            rpc_handler(State(ctx.clone()), axum::body::Bytes::from(body.to_vec())).await;
+        let json = serde_json::to_value(&resp).unwrap();
+        (status, json)
+    }
+
+    // -------------------------------------------------------------------
+    // Category I: Runtime hardening — concurrency & timeout (#1743)
+    // -------------------------------------------------------------------
+
+    /// When the request semaphore is full, `rpc_handler` must return
+    /// `-32000` (SERVER_BUSY) immediately without dispatching the method.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_server_busy_when_semaphore_exhausted() {
+        let (_sim, app) = boot_test_app().await;
+        let ctx = make_ctx(app, 1, 1, Duration::from_secs(30));
+
+        // Exhaust the single permit
+        let _held = ctx.request_semaphore.try_acquire().unwrap();
+
+        let body = br#"{"jsonrpc":"2.0","id":42,"method":"getHealth"}"#;
+        let (status, resp) = call_handler(&ctx, body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 42);
+        assert!(resp.get("result").is_none() || resp["result"].is_null());
+        let err = &resp["error"];
+        assert_eq!(err["code"], json!(-32000));
+        assert_eq!(err["message"], "too many concurrent requests");
+        assert!(
+            err.get("data").is_none() || err["data"].is_null(),
+            "SERVER_BUSY must not include data"
+        );
+    }
+
+    /// Read-only methods must be subject to `request_timeout`. When the
+    /// timeout fires, the response must be `-32603` / "request timed out".
+    /// After timeout, the request permit must be released.
+    ///
+    /// Strategy: hold the DB semaphore so `getHealth`'s `blocking_db` call
+    /// blocks indefinitely on `acquire_owned()`. The 100ms timeout fires
+    /// reliably because the semaphore is never released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_read_only_timeout_releases_permit() {
+        let (_sim, app) = boot_test_app().await;
+        let ctx = make_ctx(app, 2, 1, Duration::from_millis(100));
+
+        // Hold the DB semaphore so getHealth's blocking_db call blocks
+        // indefinitely on acquire_owned().
+        let _db_held = ctx.db_semaphore.clone().try_acquire_owned().unwrap();
+
+        let body = br#"{"jsonrpc":"2.0","id":77,"method":"getHealth"}"#;
+        let (status, resp) = call_handler(&ctx, body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 77);
+        assert!(resp.get("result").is_none() || resp["result"].is_null());
+        let err = &resp["error"];
+        assert_eq!(err["code"], json!(-32603));
+        assert_eq!(err["message"], "request timed out");
+        assert!(
+            err.get("data").is_none() || err["data"].is_null(),
+            "timeout error must not include data"
+        );
+
+        // Request permit must be released after the handler returns.
+        assert!(
+            ctx.request_semaphore.try_acquire().is_ok(),
+            "request_semaphore permit must be released after timeout"
+        );
+    }
+
+    /// `sendTransaction` must NOT be subject to `request_timeout`.
+    /// With the same short timeout, `sendTransaction` with invalid params
+    /// returns its method-specific error immediately — not a timeout error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_send_transaction_exempt_from_timeout() {
+        let (_sim, app) = boot_test_app().await;
+        let ctx = make_ctx(app, 2, 1, Duration::from_millis(100));
+
+        // Hold DB semaphore — would cause read-only methods to timeout,
+        // but sendTransaction doesn't use blocking_db.
+        let _db_held = ctx.db_semaphore.clone().try_acquire_owned().unwrap();
+
+        let body = br#"{"jsonrpc":"2.0","id":99,"method":"sendTransaction","params":{}}"#;
+        let (status, resp) = call_handler(&ctx, body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 99);
+        // sendTransaction with missing 'transaction' param returns invalid_params
+        let err = &resp["error"];
+        assert_eq!(
+            err["code"],
+            json!(-32602),
+            "sendTransaction should return INVALID_PARAMS, not timeout"
+        );
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing 'transaction' parameter"),
+            "expected missing-parameter error, got: {}",
+            err["message"]
+        );
+    }
+
     #[test]
     fn test_parse_valid_request() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"getHealth"}"#;

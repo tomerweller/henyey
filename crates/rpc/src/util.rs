@@ -931,4 +931,109 @@ mod tests {
         });
         assert!(ttl_key_for_ledger_key(&key).is_none());
     }
+
+    // -------------------------------------------------------------------
+    // blocking_db cancellation-safety (#1743)
+    // -------------------------------------------------------------------
+
+    /// `blocking_db` moves an `OwnedSemaphorePermit` into the
+    /// `spawn_blocking` closure.  If the caller's future is cancelled
+    /// (e.g. by a timeout), the permit must remain held until the blocking
+    /// work finishes — otherwise the DB concurrency bound is violated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_blocking_db_permit_survives_cancellation() {
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+
+        use henyey_app::config::QuorumSetConfig;
+        use henyey_app::AppState;
+        use henyey_common::Hash256;
+        use henyey_crypto::SecretKey;
+        use henyey_simulation::{Simulation, SimulationMode};
+
+        // --- Boot a minimal App ---
+        let mut sim =
+            Simulation::with_network(SimulationMode::OverTcp, "Test SDF Network ; September 2015");
+        let seed = Hash256::hash(b"RPC_UTIL_CANCEL_TEST_NODE");
+        let secret = SecretKey::from_seed(&seed.0);
+        let quorum_set = QuorumSetConfig {
+            threshold_percent: 100,
+            validators: vec![secret.public_key().to_strkey()],
+            inner_sets: Vec::new(),
+        };
+        sim.add_app_node("node0", secret, quorum_set);
+        sim.start_all_nodes().await;
+        let app = sim.app("node0").expect("app");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if app.state().await == AppState::Validating {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // --- Build RpcContext with db_semaphore capacity = 1 ---
+        let ctx = StdArc::new(RpcContext {
+            app: app.clone(),
+            fee_windows: StdArc::new(crate::fee_window::FeeWindows::new(10)),
+            simulation_semaphore: StdArc::new(tokio::sync::Semaphore::new(1)),
+            request_semaphore: StdArc::new(tokio::sync::Semaphore::new(1)),
+            db_semaphore: StdArc::new(tokio::sync::Semaphore::new(1)),
+            request_timeout: Duration::from_secs(30),
+        });
+
+        // Channel: closure signals "I'm running and hold the permit"
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        // Barrier: test tells closure "you may finish now"
+        let barrier = StdArc::new(std::sync::Barrier::new(2));
+        let barrier2 = barrier.clone();
+
+        let ctx2 = ctx.clone();
+        let handle = tokio::spawn(async move {
+            blocking_db(&ctx2, move |_db| {
+                // Signal: we are inside spawn_blocking, permit is held.
+                let _ = tx.send(());
+                // Wait for the test to tell us to finish.
+                barrier2.wait();
+                Ok(())
+            })
+            .await
+        });
+
+        // Wait for the closure to start (permit is now held inside spawn_blocking).
+        rx.recv().expect("closure must signal start");
+
+        // Cancel the outer future.
+        handle.abort();
+        let join_result = handle.await;
+        assert!(
+            join_result.unwrap_err().is_cancelled(),
+            "task must be cancelled"
+        );
+
+        // The permit must still be held by the blocking thread.
+        assert!(
+            ctx.db_semaphore.try_acquire().is_err(),
+            "permit must still be held after caller cancellation"
+        );
+
+        // Let the closure finish — releases the permit.
+        barrier.wait();
+
+        // Poll until the permit is returned (bounded, no fixed sleep).
+        let mut acquired = false;
+        for _ in 0..100 {
+            if ctx.db_semaphore.try_acquire().is_ok() {
+                acquired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            acquired,
+            "db_semaphore permit must be returned after blocking work completes"
+        );
+
+        drop(sim);
+    }
 }
