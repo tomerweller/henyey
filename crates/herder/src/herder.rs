@@ -4784,4 +4784,154 @@ mod advance_tracking_slot_tests {
         assert_eq!(ts.consensus_index, 104);
         assert!(ts.is_tracking);
     }
+
+    /// Regression test for #1783: build_nomination_value must create exactly
+    /// ONE snapshot for both build_starting_seq_map and trim_invalid_two_phase,
+    /// not O(N_txs) snapshots.
+    #[tokio::test]
+    async fn test_nomination_value_uses_single_snapshot() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+        use henyey_ledger::LedgerManagerConfig;
+        use stellar_xdr::curr::{
+            CreateAccountOp, DecoratedSignature, Hash, LedgerHeader, LedgerHeaderExt, Memo,
+            MuxedAccount, Operation, OperationBody, Preconditions, SequenceNumber, SignatureHint,
+            StellarValue, StellarValueExt, TimePoint, Transaction, TransactionEnvelope,
+            TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        };
+
+        fn make_synthetic_envelope(seed: u8) -> TransactionEnvelope {
+            let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
+            let dest =
+                stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                    Uint256([seed.wrapping_add(128); 32]),
+                ));
+            let tx = Transaction {
+                source_account: source,
+                fee: 200,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::CreateAccount(CreateAccountOp {
+                        destination: dest,
+                        starting_balance: 1_000_000_000,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            };
+            TransactionEnvelope::Tx(TransactionV1Envelope {
+                tx,
+                signatures: vec![DecoratedSignature {
+                    hint: SignatureHint([0u8; 4]),
+                    signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                }]
+                .try_into()
+                .unwrap(),
+            })
+        }
+
+        // Set up a validator herder with a LedgerManager.
+        let seed = [7u8; 32];
+        let secret_for_herder = henyey_crypto::SecretKey::from_seed(&seed);
+        let public = secret_for_herder.public_key();
+        let node_id = super::node_id_from_public_key(&public);
+        let quorum_set = stellar_xdr::curr::ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(config, secret_for_herder);
+
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 10,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            BucketList::new(),
+            HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+
+        let lm = Arc::new(lm);
+        herder.set_ledger_manager(lm.clone());
+
+        // Populate the tx queue with N transactions from distinct accounts.
+        let n_txs = 20u8;
+        for i in 1..=n_txs {
+            let tx = make_synthetic_envelope(i);
+            herder.tx_queue.try_add(tx);
+        }
+        assert!(
+            herder.tx_queue.len() >= n_txs as usize,
+            "Queue should have at least {} txs, got {}",
+            n_txs,
+            herder.tx_queue.len()
+        );
+
+        // Bootstrap herder to Tracking state.
+        herder.bootstrap(10);
+
+        // Measure snapshot count before nomination.
+        let before = lm.test_snapshot_count();
+
+        // Trigger nomination (builds nomination value internally).
+        let _ = herder.trigger_next_ledger(11).await;
+
+        // Measure snapshot count after.
+        let after = lm.test_snapshot_count();
+        let delta = after - before;
+
+        // The nomination path should create exactly 1 snapshot (shared between
+        // build_starting_seq_map and trim_invalid_two_phase). Pre-fix it would
+        // be O(N_txs * ops * 2) = 40+ snapshots for 20 txs.
+        assert!(
+            delta <= 2,
+            "Nomination should create O(1) snapshots, but created {} \
+             (before={}, after={}). This suggests the per-call snapshot \
+             anti-pattern has regressed.",
+            delta,
+            before,
+            after
+        );
+    }
 }
