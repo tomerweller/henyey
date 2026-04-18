@@ -1762,7 +1762,7 @@ impl App {
                         archive_latest,
                         "Buffered catchup skipped: target checkpoint not yet published"
                     );
-                    self.arm_archive_behind_backoff().await;
+                    self.arm_archive_behind_backoff(current_ledger).await;
                     return false;
                 }
                 true
@@ -1798,7 +1798,7 @@ impl App {
                         first_buffered,
                         "Skipping catchup: archive has no newer checkpoint"
                     );
-                    self.arm_archive_behind_backoff().await;
+                    self.arm_archive_behind_backoff(current_ledger).await;
                     return false;
                 }
                 tracing::info!(
@@ -1830,15 +1830,35 @@ impl App {
     /// Called from the catchup skip paths when we **observed** the archive
     /// is behind or unreachable (authoritative negative signal). The
     /// backoff suppresses redundant archive queries and suppresses
-    /// `TriggerCatchup` in the post-catchup decision helper for
-    /// `ARCHIVE_BEHIND_BACKOFF_SECS`. Clearing `catchup_triggered` keeps
-    /// the stuck-state semantics consistent: a skipped catchup is not
-    /// "in flight", so a future catchup (once the archive catches up)
-    /// must be allowed to trigger.
-    async fn arm_archive_behind_backoff(&self) {
-        let deadline = self.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
+    /// `TriggerCatchup` in the post-catchup decision helper. Clearing
+    /// `catchup_triggered` keeps the stuck-state semantics consistent: a
+    /// skipped catchup is not "in flight", so a future catchup (once the
+    /// archive catches up) must be allowed to trigger.
+    ///
+    /// The backoff duration is checkpoint-distance-relative: when the next
+    /// publishable checkpoint is imminent (within `freq / 3` ledgers), a
+    /// shorter 15s backoff is used instead of the default 60s. This reduces
+    /// the stall between catchup completion and the first post-catchup
+    /// ledger close (#1754).
+    async fn arm_archive_behind_backoff(&self, current_ledger: u32) {
+        let backoff_secs = Self::archive_behind_backoff_secs(current_ledger);
+        let deadline = self.clock.now() + Duration::from_secs(backoff_secs);
         *self.archive_behind_until.write().await = Some(deadline);
         self.clear_catchup_triggered_on_skip().await;
+    }
+
+    /// Compute the appropriate archive-behind backoff duration based on how
+    /// close `current_ledger` is to the next checkpoint boundary.
+    pub(super) fn archive_behind_backoff_secs(current_ledger: u32) -> u64 {
+        let freq = henyey_history::checkpoint::checkpoint_frequency();
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+        let distance = next_cp.saturating_sub(current_ledger);
+        let imminent_threshold = freq / 3;
+        if distance <= imminent_threshold {
+            ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS
+        } else {
+            ARCHIVE_BEHIND_BACKOFF_SECS
+        }
     }
 
     /// Clear `catchup_triggered` on a catchup skip without arming the
@@ -2553,5 +2573,52 @@ mod tests {
             app.archive_checkpoint_cache.is_refreshing(),
             "a hanging fetcher should leave exactly one refresh in flight"
         );
+    }
+
+    // --- archive_behind_backoff_secs tests (#1754) ---
+
+    #[test]
+    fn test_archive_behind_backoff_far_from_checkpoint() {
+        // Default checkpoint frequency is 64. Checkpoints fall at 63, 127, 191, …
+        // Ledger 65: next_cp = checkpoint_containing(66) = 127. Distance = 62.
+        // Threshold = 64/3 = 21 → full 60s backoff.
+        let secs = App::archive_behind_backoff_secs(65);
+        assert_eq!(secs, ARCHIVE_BEHIND_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn test_archive_behind_backoff_imminent_checkpoint() {
+        // Ledger 120: next_cp = checkpoint_containing(121) = 127. Distance = 7.
+        // 7 ≤ 21 → imminent.
+        let secs = App::archive_behind_backoff_secs(120);
+        assert_eq!(secs, ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn test_archive_behind_backoff_at_checkpoint_boundary() {
+        // Ledger 127 IS a checkpoint. next_cp = checkpoint_containing(128) = 191.
+        // Distance = 64 → full backoff (just started a new checkpoint range).
+        let secs = App::archive_behind_backoff_secs(127);
+        assert_eq!(secs, ARCHIVE_BEHIND_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn test_archive_behind_backoff_one_before_checkpoint() {
+        // Ledger 126: next_cp = checkpoint_containing(127) = 127. Distance = 1 → imminent.
+        let secs = App::archive_behind_backoff_secs(126);
+        assert_eq!(secs, ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn test_archive_behind_backoff_at_threshold_boundary() {
+        // Distance exactly = freq/3 (21) should still be imminent (<=).
+        // Ledger 106: next_cp = checkpoint_containing(107) = 127. Distance = 21 → imminent.
+        let secs = App::archive_behind_backoff_secs(106);
+        assert_eq!(secs, ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS);
+
+        // Distance = 22 (one past threshold) → full backoff.
+        // Ledger 105: next_cp = checkpoint_containing(106) = 127. Distance = 22.
+        let secs = App::archive_behind_backoff_secs(105);
+        assert_eq!(secs, ARCHIVE_BEHIND_BACKOFF_SECS);
     }
 }

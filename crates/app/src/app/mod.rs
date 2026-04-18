@@ -176,6 +176,19 @@ const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
 /// request SCP state from peers (a separate, cheap action) on every tick.
 const ARCHIVE_BEHIND_BACKOFF_SECS: u64 = 60;
 
+/// Shorter archive-behind backoff when the next checkpoint is imminent.
+///
+/// When the node is in the final third of a checkpoint cycle (i.e., the next
+/// publishable checkpoint is ≤ `checkpoint_frequency / 3` ledgers away), the
+/// archive is expected to publish soon. Polling every 15s instead of 60s during
+/// this window reduces the stall between catchup completion and the first
+/// post-catchup ledger close, directly addressing the RPC health latency flake
+/// described in #1754.
+///
+/// Uses `checkpoint_frequency()` so it works for both the default 64-ledger
+/// cycle and the accelerated 8-ledger cycle.
+const ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS: u64 = 15;
+
 /// Post-catchup recovery window: after completing catchup, prefer SCP recovery
 /// over triggering another catchup for at least one full checkpoint cycle (~5 min).
 /// The first checkpoint after initial catchup won't be published to archives for

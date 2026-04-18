@@ -875,14 +875,16 @@ impl App {
                 }
                 Some(latest) => {
                     // Archive responded but is still behind. Arm the backoff.
-                    let deadline =
-                        self.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
+                    // Use shorter backoff when the next checkpoint is imminent
+                    // (within freq/3 ledgers of publication). See #1754.
+                    let backoff_secs = Self::archive_behind_backoff_secs(current_ledger);
+                    let deadline = self.clock.now() + Duration::from_secs(backoff_secs);
                     let mut guard = self.archive_behind_until.write().await;
                     *guard = Some(deadline);
                     tracing::debug!(
                         archive_latest = latest,
                         next_checkpoint = next_cp,
-                        backoff_secs = ARCHIVE_BEHIND_BACKOFF_SECS,
+                        backoff_secs,
                         "Archive behind next checkpoint — arming backoff"
                     );
                     None
