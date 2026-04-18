@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -102,7 +103,16 @@ pub(crate) async fn compat_tx_handler(
             let xdr_result_result = code
                 .map(|c| c.to_xdr_result())
                 .unwrap_or(TransactionResultResult::TxInternalError);
-            let error_b64 = encode_tx_result(xdr_result_result, 0);
+            let error_b64 = match encode_tx_result(xdr_result_result, 0) {
+                Ok(b64) => b64,
+                Err(e) => {
+                    tracing::error!(%e, "Failed to encode transaction result XDR");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"exception": "Internal error: failed to encode transaction result"})),
+                    ).into_response();
+                }
+            };
             CompatTxResponse {
                 status: "ERROR".to_string(),
                 error: Some(error_b64),
@@ -110,7 +120,16 @@ pub(crate) async fn compat_tx_handler(
             }
         }
         TxQueueResult::Banned => {
-            let error_b64 = encode_tx_result(TransactionResultResult::TxBadAuth, 0);
+            let error_b64 = match encode_tx_result(TransactionResultResult::TxBadAuth, 0) {
+                Ok(b64) => b64,
+                Err(e) => {
+                    tracing::error!(%e, "Failed to encode transaction result XDR");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"exception": "Internal error: failed to encode transaction result"})),
+                    ).into_response();
+                }
+            };
             CompatTxResponse {
                 status: "ERROR".to_string(),
                 error: Some(error_b64),
@@ -118,7 +137,16 @@ pub(crate) async fn compat_tx_handler(
             }
         }
         TxQueueResult::FeeTooLow => {
-            let error_b64 = encode_tx_result(TransactionResultResult::TxInsufficientFee, 0);
+            let error_b64 = match encode_tx_result(TransactionResultResult::TxInsufficientFee, 0) {
+                Ok(b64) => b64,
+                Err(e) => {
+                    tracing::error!(%e, "Failed to encode transaction result XDR");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"exception": "Internal error: failed to encode transaction result"})),
+                    ).into_response();
+                }
+            };
             CompatTxResponse {
                 status: "ERROR".to_string(),
                 error: Some(error_b64),
@@ -131,14 +159,17 @@ pub(crate) async fn compat_tx_handler(
 }
 
 /// Encode a `TransactionResultResult` into a base64-encoded `TransactionResult` XDR.
-fn encode_tx_result(result: TransactionResultResult, fee_charged: i64) -> String {
+fn encode_tx_result(
+    result: TransactionResultResult,
+    fee_charged: i64,
+) -> Result<String, stellar_xdr::curr::Error> {
     let tx_result = TransactionResult {
         fee_charged,
         result,
         ext: TransactionResultExt::V0,
     };
-    let bytes = tx_result.to_xdr(Limits::none()).unwrap_or_default();
-    BASE64.encode(&bytes)
+    let bytes = tx_result.to_xdr(Limits::none())?;
+    Ok(BASE64.encode(&bytes))
 }
 
 /// stellar-core compatible tx submission response.
@@ -247,12 +278,13 @@ mod tests {
         }
     }
 
-    /// Verify `encode_tx_result` produces valid base64.
+    /// Verify `encode_tx_result` produces valid base64 and round-trips through XDR.
     #[test]
     fn test_encode_tx_result_produces_valid_base64() {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-        let b64 = encode_tx_result(TransactionResultResult::TxInternalError, 0);
+        let b64 = encode_tx_result(TransactionResultResult::TxInternalError, 0)
+            .expect("encoding TxInternalError should succeed");
         assert!(!b64.is_empty(), "encoded result should not be empty");
 
         // Should be valid base64
@@ -263,5 +295,58 @@ mod tests {
         let bytes = decoded.unwrap();
         let result = TransactionResult::from_xdr(&bytes, Limits::none());
         assert!(result.is_ok(), "should be valid TransactionResult XDR");
+    }
+
+    /// Round-trip verification for all handler-used result variants.
+    #[test]
+    fn test_encode_tx_result_round_trip_all_variants() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use stellar_xdr::curr::TransactionResultCode;
+
+        let cases: &[(TransactionResultResult, i64, TransactionResultCode)] = &[
+            (
+                TransactionResultResult::TxInternalError,
+                0,
+                TransactionResultCode::TxInternalError,
+            ),
+            (
+                TransactionResultResult::TxBadAuth,
+                0,
+                TransactionResultCode::TxBadAuth,
+            ),
+            (
+                TransactionResultResult::TxInsufficientFee,
+                0,
+                TransactionResultCode::TxInsufficientFee,
+            ),
+            (
+                TransactionResultResult::TxFailed(Default::default()),
+                100,
+                TransactionResultCode::TxFailed,
+            ),
+        ];
+
+        for (result_variant, fee, expected_code) in cases {
+            let b64 = encode_tx_result(result_variant.clone(), *fee)
+                .unwrap_or_else(|e| panic!("encoding {:?} should succeed: {}", expected_code, e));
+
+            let bytes = BASE64
+                .decode(&b64)
+                .unwrap_or_else(|e| panic!("base64 decode for {:?} failed: {}", expected_code, e));
+
+            let parsed = TransactionResult::from_xdr(&bytes, Limits::none())
+                .unwrap_or_else(|e| panic!("XDR parse for {:?} failed: {}", expected_code, e));
+
+            assert_eq!(
+                parsed.fee_charged, *fee,
+                "fee_charged mismatch for {:?}",
+                expected_code
+            );
+            assert_eq!(
+                parsed.result.discriminant(),
+                *expected_code,
+                "result code mismatch"
+            );
+        }
     }
 }
