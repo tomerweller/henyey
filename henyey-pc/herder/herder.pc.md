@@ -62,8 +62,10 @@ STRUCT Herder:
 function build(config, secret_key) -> Herder:
   pending_config = config.pending_config
   max_slots = max(config.max_externalized_slots, 1)
-  pending_config.max_slots = min(pending_config.max_slots, max_slots)
-  pending_config.max_slot_distance = min(pending_config.max_slot_distance, max_slots)
+  // pending_config is NOT clamped against max_externalized_slots: the
+  // pending buffer's forward capacity and the already-externalized
+  // retention window are independent (LEDGER_VALIDITY_BRACKET vs
+  // MAX_SLOTS_TO_REMEMBER in stellar-core).
 
   scp_driver = create ScpDriver with config
   if secret_key exists:

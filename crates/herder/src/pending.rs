@@ -58,11 +58,13 @@ impl Default for PendingConfig {
     fn default() -> Self {
         Self {
             max_per_slot: 100,
-            // Sized to cover a full `LEDGER_VALIDITY_BRACKET = 100` window so
+            // Sized to cover a full `LEDGER_VALIDITY_BRACKET` window so
             // that post-catchup buffering can hold one envelope per slot
-            // across the pre-filter horizon. Worst-case memory cost:
+            // across the pre-filter horizon. Bound to the constant so the
+            // invariant ("buffer capacity == pre-filter horizon") is
+            // locked in at the type level. Worst-case memory cost:
             // `max_per_slot × max_slots × ~2 KB = ~20 MB`.
-            max_slots: 100,
+            max_slots: crate::sync_recovery::LEDGER_VALIDITY_BRACKET as usize,
             max_age: Duration::from_secs(300),
         }
     }

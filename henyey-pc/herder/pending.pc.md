@@ -7,15 +7,13 @@
 
 ```
 CONST MAX_PER_SLOT     = 100
-CONST MAX_SLOTS        = 12
+CONST MAX_SLOTS        = 100   // matches LEDGER_VALIDITY_BRACKET
 CONST MAX_AGE          = 300 seconds
-CONST MAX_SLOT_DISTANCE = 12
 
 PendingConfig:
   max_per_slot:      int
   max_slots:         int
   max_age:           Duration
-  max_slot_distance: u64
 ```
 
 ### Data: PendingEnvelope
@@ -46,7 +44,6 @@ PendingStats:
   added:      u64
   duplicates: u64
   too_old:    u64
-  too_far:    u64
   released:   u64
   evicted:    u64
 ```
@@ -54,7 +51,7 @@ PendingStats:
 ### Data: PendingResult
 
 ```
-PendingResult: Added | Duplicate | SlotTooFar | SlotTooOld | BufferFull
+PendingResult: Added | Duplicate | SlotTooOld | BufferFull
 ```
 
 ### PendingEnvelope::new
@@ -82,8 +79,9 @@ function add(slot, envelope):
   current = self.current_slot
 
   GUARD slot < current        → SlotTooOld
-  GUARD slot > current + config.max_slot_distance
-                              → SlotTooFar
+  // No per-slot-distance gate — the envelope-acceptance horizon is
+  // enforced ONCE at the pre-filter layer via LEDGER_VALIDITY_BRACKET.
+  // See Herder::pre_filter_scp_envelope.
 
   pending = PendingEnvelope.new(envelope)
 
