@@ -1867,26 +1867,25 @@ impl App {
     /// checkpoint, return the backoff duration. Extracted for unit testing
     /// under different `freq` values without mutating the process-global
     /// `CHECKPOINT_FREQ` OnceLock.
+    ///
+    /// In accelerated mode (`freq < DEFAULT_CHECKPOINT_FREQUENCY`), the archive
+    /// is localhost and publishes checkpoints every ~1s during the primary's
+    /// rapid-close phase. A multi-second backoff stacks with the cache TTL
+    /// into a dead window where catchup cannot see freshly published
+    /// checkpoints. Use a fixed 1s backoff in accelerated mode regardless of
+    /// distance-to-checkpoint; archive queries against localhost cost
+    /// < 10 ms so a short retry cadence is cheap.
     pub(super) fn archive_behind_backoff_secs_for(freq: u32, distance: u32) -> u64 {
-        let imminent_threshold = freq / 3;
         let default_freq = henyey_history::DEFAULT_CHECKPOINT_FREQUENCY;
-        let (default_secs, imminent_secs) = if freq < default_freq {
-            let scale = |base: u64| -> u64 { ((base * freq as u64) / default_freq as u64).max(2) };
-            (
-                scale(ARCHIVE_BEHIND_BACKOFF_SECS),
-                scale(ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS),
-            )
-        } else {
-            (
-                ARCHIVE_BEHIND_BACKOFF_SECS,
-                ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS,
-            )
-        };
+        if freq < default_freq {
+            return 1;
+        }
 
+        let imminent_threshold = freq / 3;
         if distance <= imminent_threshold {
-            imminent_secs
+            ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS
         } else {
-            default_secs
+            ARCHIVE_BEHIND_BACKOFF_SECS
         }
     }
 
@@ -2663,32 +2662,23 @@ mod tests {
     }
 
     /// Regression for Quickstart local/rpc stall: in accelerated mode
-    /// (`checkpoint_frequency = 8`), a 60s archive-behind backoff spans ~7
-    /// checkpoints and stalls captive-core catchup. The scaled backoff must
-    /// complete well under one checkpoint cycle.
+    /// (`checkpoint_frequency = 8`) the archive is localhost and publishes
+    /// checkpoints every ~1s during rapid-close. A multi-second backoff
+    /// stacks with the cache TTL and starves catchup. Enforce a 1s backoff
+    /// in accelerated mode regardless of distance-to-checkpoint.
     #[test]
-    fn test_archive_behind_backoff_accelerated_mode() {
+    fn test_archive_behind_backoff_accelerated_mode_is_one_second() {
         let accel = henyey_history::ACCELERATED_CHECKPOINT_FREQUENCY; // 8
 
-        // Far from checkpoint: distance = 5 (threshold = 8/3 = 2) → default.
-        // Scaled default = 60 * 8 / 64 = 7s.
-        let secs = App::archive_behind_backoff_secs_for(accel, 5);
-        assert_eq!(secs, 7);
+        // Both "far" and "imminent" in accelerated mode should collapse to 1s.
+        assert_eq!(App::archive_behind_backoff_secs_for(accel, 5), 1);
+        assert_eq!(App::archive_behind_backoff_secs_for(accel, 2), 1);
+        assert_eq!(App::archive_behind_backoff_secs_for(accel, 0), 1);
 
-        // Imminent: distance = 2 (<= threshold) → imminent.
-        // Scaled imminent = 15 * 8 / 64 = 1 → clamped to min 2s.
-        let secs = App::archive_behind_backoff_secs_for(accel, 2);
-        assert_eq!(secs, 2);
-
-        // Sanity: the scaled backoff must not exceed one accelerated
-        // checkpoint cycle worth of real time (8 ledgers × ~1s = 8s).
-        // Allowing up to 10s covers clock jitter; anything larger stalls
-        // catchup in the Quickstart/local test harness.
-        assert!(
-            App::archive_behind_backoff_secs_for(accel, 5) <= 10,
-            "accelerated-mode default backoff must be <= 10s to avoid \
-             captive-core catchup stall"
-        );
+        // Hard invariant: at 1s/ledger with 8-ledger checkpoints, any
+        // backoff > 2s risks missing multiple published checkpoints in a
+        // single wait.
+        assert!(App::archive_behind_backoff_secs_for(accel, 5) <= 2);
     }
 
     #[test]

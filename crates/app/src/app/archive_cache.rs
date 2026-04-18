@@ -39,16 +39,19 @@ pub(super) const ARCHIVE_CHECKPOINT_CACHE_SECS: u64 = 60;
 
 /// Return the effective cache TTL given the current checkpoint frequency.
 ///
-/// In accelerated mode the archive publishes checkpoints every ~8 seconds;
-/// a 60s TTL would let captive-core stay ~7 checkpoints behind and stall
-/// buffered catchup ("target checkpoint not yet published"). Scale by
-/// `freq / DEFAULT_CHECKPOINT_FREQUENCY` with a 3s floor so a bounded
-/// number of checkpoints are missed per refresh cycle.
+/// In accelerated mode the archive is localhost and publishes checkpoints
+/// rapidly — during the primary's rapid-close phase a new checkpoint can
+/// arrive every ~1s. A stale cache blocks captive-core from seeing these
+/// fresh checkpoints for the duration of the TTL, stacking with the
+/// archive-behind backoff into a multi-second dead window where catchup
+/// cannot progress. Use an aggressive 1s TTL in accelerated mode; the
+/// archive fetch against localhost costs < 10 ms so frequent refreshes
+/// are essentially free.
 pub(super) fn cache_ttl_secs() -> u64 {
     let freq = henyey_history::checkpoint::checkpoint_frequency();
     let default_freq = henyey_history::DEFAULT_CHECKPOINT_FREQUENCY;
     if freq < default_freq {
-        ((ARCHIVE_CHECKPOINT_CACHE_SECS * freq as u64) / default_freq as u64).max(3)
+        1
     } else {
         ARCHIVE_CHECKPOINT_CACHE_SECS
     }
