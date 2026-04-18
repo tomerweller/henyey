@@ -436,12 +436,11 @@ impl LedgerContext {
         let (oldest, oldest_close) = blocking_db(ctx, move |db| {
             db.with_connection(|conn| {
                 use henyey_db::LedgerQueries;
-                let oldest = conn.get_oldest_ledger_seq()?.unwrap_or(1);
-                let close = conn
-                    .load_ledger_header(oldest)?
-                    .map(|h| h.scp_value.close_time.0)
-                    .unwrap_or(0);
-                Ok((oldest, close))
+                match conn.get_oldest_ledger_info()? {
+                    Some((seq, close_time)) => Ok((seq, close_time)),
+                    // Empty DB at startup — no headers yet
+                    None => Ok((1, 0)),
+                }
             })
         })
         .await

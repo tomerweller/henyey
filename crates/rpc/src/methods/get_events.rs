@@ -74,7 +74,7 @@ pub async fn handle(
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            let close_times = conn.batch_close_times(&seqs)?;
+            let close_times = conn.require_close_times(&seqs)?;
             Ok((events, close_times))
         })
     })
@@ -87,10 +87,7 @@ pub async fn handle(
     // Build response using pre-fetched close times
     let mut event_json: Vec<serde_json::Value> = Vec::with_capacity(events.len());
     for event in &events {
-        let close_time_unix = close_time_cache
-            .get(&event.ledger_seq)
-            .copied()
-            .unwrap_or(0);
+        let close_time_unix = close_time_cache[&event.ledger_seq];
         let close_time = format_unix_timestamp_utc(close_time_unix);
 
         let event_type_str = match event.event_type {

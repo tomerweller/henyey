@@ -29,11 +29,14 @@ pub async fn handle(
             let record = conn.load_transaction(&hash_owned)?;
             match record {
                 Some(record) => {
-                    let close_time = conn
-                        .batch_close_times(&[record.ledger_seq])?
-                        .get(&record.ledger_seq)
-                        .copied()
-                        .unwrap_or(0);
+                    // Atomic retention check: if the tx's ledger is below the
+                    // oldest retained header, treat as not found.
+                    let oldest = conn.get_oldest_ledger_seq()?.unwrap_or(0);
+                    if record.ledger_seq < oldest {
+                        return Ok(None);
+                    }
+                    let close_times = conn.require_close_times(&[record.ledger_seq])?;
+                    let close_time = close_times[&record.ledger_seq];
                     Ok(Some((record, close_time)))
                 }
                 None => Ok(None),

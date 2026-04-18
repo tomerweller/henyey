@@ -93,7 +93,7 @@ pub async fn handle(
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            let close_times = conn.batch_close_times(&seqs)?;
+            let close_times = conn.require_close_times(&seqs)?;
             Ok((records, close_times))
         })
     })
@@ -112,10 +112,7 @@ pub async fn handle(
         let application_order = record.tx_index + 1;
 
         // Ledger close time — returned as a number (not string) per upstream getTransactions
-        let created_at = close_time_cache
-            .get(&record.ledger_seq)
-            .copied()
-            .unwrap_or(0);
+        let created_at = close_time_cache[&record.ledger_seq];
 
         // Build TOID cursor for this transaction
         let toid = util::toid_encode(record.ledger_seq, application_order, 0);

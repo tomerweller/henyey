@@ -79,6 +79,23 @@ pub trait LedgerQueries {
         &self,
         seqs: &[u32],
     ) -> Result<std::collections::HashMap<u32, u64>, DbError>;
+
+    /// Like [`batch_close_times`](Self::batch_close_times), but returns
+    /// `Err(DbError::Integrity)` if any requested sequence is missing.
+    ///
+    /// Use this in RPC handlers where a missing close time indicates a
+    /// data integrity issue (header pruned while the record is still retained).
+    fn require_close_times(
+        &self,
+        seqs: &[u32],
+    ) -> Result<std::collections::HashMap<u32, u64>, DbError>;
+
+    /// Returns the oldest ledger sequence and its close time atomically.
+    ///
+    /// Uses a single SQL query to avoid TOCTOU races between
+    /// `get_oldest_ledger_seq` and `load_ledger_header`.
+    /// Returns `None` if no ledger headers exist in the database.
+    fn get_oldest_ledger_info(&self) -> Result<Option<(u32, u64)>, DbError>;
 }
 
 impl LedgerQueries for Connection {
@@ -250,6 +267,32 @@ impl LedgerQueries for Connection {
             map.insert(seq, time);
         }
         Ok(map)
+    }
+
+    fn require_close_times(
+        &self,
+        seqs: &[u32],
+    ) -> Result<std::collections::HashMap<u32, u64>, DbError> {
+        let map = self.batch_close_times(seqs)?;
+        for seq in seqs {
+            if !map.contains_key(seq) {
+                return Err(DbError::Integrity(format!(
+                    "missing close time for ledger {seq} (header pruned?)"
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    fn get_oldest_ledger_info(&self) -> Result<Option<(u32, u64)>, DbError> {
+        let result: Option<(u32, u64)> = self
+            .query_row(
+                "SELECT ledgerseq, closetime FROM ledgerheaders ORDER BY ledgerseq ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(result)
     }
 }
 
@@ -512,5 +555,69 @@ mod tests {
         // Empty input
         let result = conn.batch_close_times(&[]).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_require_close_times_all_present() {
+        let conn = setup_db();
+
+        for seq in [10u32, 20, 30] {
+            let mut header = create_test_header(seq);
+            header.scp_value.close_time = TimePoint(1000 + seq as u64 * 100);
+            let data = header.to_xdr(Limits::none()).unwrap();
+            conn.store_ledger_header(&header, &data).unwrap();
+        }
+
+        let result = conn.require_close_times(&[10, 20, 30]).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[&10], 2000);
+        assert_eq!(result[&20], 3000);
+        assert_eq!(result[&30], 4000);
+
+        // Duplicate seqs should also work
+        let result = conn.require_close_times(&[10, 10, 20]).unwrap();
+        assert_eq!(result.len(), 2);
+
+        // Empty input
+        let result = conn.require_close_times(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_require_close_times_missing_seq() {
+        let conn = setup_db();
+
+        let header = create_test_header(10);
+        let data = header.to_xdr(Limits::none()).unwrap();
+        conn.store_ledger_header(&header, &data).unwrap();
+
+        let err = conn.require_close_times(&[10, 99]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing close time for ledger 99"),
+            "expected integrity error about ledger 99, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_get_oldest_ledger_info() {
+        let conn = setup_db();
+
+        for seq in [30u32, 10, 20] {
+            let mut header = create_test_header(seq);
+            header.scp_value.close_time = TimePoint(1000 + seq as u64 * 100);
+            let data = header.to_xdr(Limits::none()).unwrap();
+            conn.store_ledger_header(&header, &data).unwrap();
+        }
+
+        let (seq, close_time) = conn.get_oldest_ledger_info().unwrap().unwrap();
+        assert_eq!(seq, 10);
+        assert_eq!(close_time, 2000);
+    }
+
+    #[test]
+    fn test_get_oldest_ledger_info_empty() {
+        let conn = setup_db();
+        assert!(conn.get_oldest_ledger_info().unwrap().is_none());
     }
 }
