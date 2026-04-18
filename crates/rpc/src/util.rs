@@ -1300,4 +1300,104 @@ mod tests {
             "permit must be returned after blocking work completes"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Bucket I/O (get_ledger_entries) cancellation-safety regression (#1744)
+    // -------------------------------------------------------------------
+
+    /// `bounded_blocking` with the bucket_io_semaphore must hold the permit
+    /// inside the blocking closure even after the caller is cancelled.
+    /// This simulates the get_ledger_entries handler path: timeout fires,
+    /// but the bucket read's semaphore permit stays held until the read finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bucket_io_permit_held_after_timeout_cancellation() {
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+
+        let sem = StdArc::new(tokio::sync::Semaphore::new(1));
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let barrier = StdArc::new(std::sync::Barrier::new(2));
+        let barrier2 = barrier.clone();
+
+        let sem2 = sem.clone();
+        // Simulate a bucket read that blocks (e.g. disk I/O).
+        let handle = tokio::spawn(async move {
+            bounded_blocking(&sem2, move || {
+                let _ = tx.send(());
+                barrier2.wait();
+                Ok::<Vec<u8>, String>(vec![1, 2, 3])
+            })
+            .await
+        });
+
+        // Wait for the "bucket read" to start.
+        rx.recv().expect("closure must signal start");
+
+        // Simulate timeout cancellation of the outer request.
+        handle.abort();
+        let join_result = handle.await;
+        assert!(
+            join_result.unwrap_err().is_cancelled(),
+            "task must be cancelled"
+        );
+
+        // The bucket_io permit must still be held by the blocking thread.
+        assert!(
+            sem.try_acquire().is_err(),
+            "bucket_io_semaphore permit must be held after timeout cancellation"
+        );
+
+        // Let the "bucket read" finish.
+        barrier.wait();
+
+        // Poll until the permit is returned.
+        let mut acquired = false;
+        for _ in 0..100 {
+            if sem.try_acquire().is_ok() {
+                acquired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            acquired,
+            "bucket_io_semaphore permit must be returned after bucket read completes"
+        );
+    }
+
+    /// When bucket_io_semaphore is exhausted, `bounded_blocking` must wait
+    /// (backpressure) rather than reject immediately. Once a permit is
+    /// released, the blocked caller proceeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bucket_io_bounded_blocking_waits_for_permit() {
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+
+        let sem = StdArc::new(tokio::sync::Semaphore::new(1));
+        // Hold the single permit.
+        let held = sem.clone().try_acquire_owned().unwrap();
+
+        let sem2 = sem.clone();
+        // Start a bounded_blocking that will wait for the permit.
+        let handle =
+            tokio::spawn(async move { bounded_blocking(&sem2, || Ok::<i32, String>(42)).await });
+
+        // Give it a moment to start waiting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Release the held permit.
+        drop(held);
+
+        // The blocked call should now complete successfully.
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("should complete within 5s")
+            .expect("join should succeed");
+        assert_eq!(
+            result.unwrap(),
+            42,
+            "bounded_blocking should return the closure result"
+        );
+    }
 }

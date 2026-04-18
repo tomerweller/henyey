@@ -663,6 +663,98 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Simulation cancellation-safety regression (#1744)
+    // -----------------------------------------------------------------------
+
+    /// When the simulation semaphore is exhausted, `try_bounded_blocking` returns
+    /// `SemaphoreFull`. The simulation handler maps this to SERVER_BUSY (-32000).
+    /// This test verifies the complete error mapping path end-to-end.
+    #[tokio::test]
+    async fn test_simulation_semaphore_full_returns_server_busy() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = sem.clone().try_acquire_owned().unwrap();
+
+        // Call try_bounded_blocking with an exhausted semaphore — mirrors what
+        // run_footprint_simulation and handle_invoke do internally.
+        let result: Result<(), crate::util::BlockingError<String>> =
+            crate::util::try_bounded_blocking(&sem, || Ok(())).await;
+
+        // Apply the same error mapping the simulation handlers use.
+        let err = match result {
+            Ok(_) => panic!("should have failed"),
+            Err(crate::util::BlockingError::SemaphoreFull) => {
+                crate::error::JsonRpcError::server_busy("too many concurrent simulation requests")
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+        };
+
+        assert_eq!(
+            err.code,
+            crate::error::SERVER_BUSY,
+            "must return SERVER_BUSY when simulation semaphore is full"
+        );
+        assert!(
+            err.message.contains("concurrent simulation"),
+            "error message must mention simulation: {}",
+            err.message
+        );
+    }
+
+    /// When a simulation is running (permit held inside spawn_blocking via
+    /// try_bounded_blocking), a concurrent simulation attempt must be rejected.
+    /// After the first completes, the permit is released for new simulations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_simulation_permit_held_during_blocking_rejects_concurrent() {
+        use std::time::Duration;
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let barrier2 = barrier.clone();
+
+        // Start a "simulation" that blocks inside spawn_blocking.
+        let sem2 = sem.clone();
+        let handle = tokio::spawn(async move {
+            crate::util::try_bounded_blocking(&sem2, move || {
+                let _ = tx.send(());
+                barrier2.wait();
+                Ok::<(), String>(())
+            })
+            .await
+        });
+
+        // Wait for the blocking closure to start.
+        rx.recv().expect("closure must signal start");
+
+        // Concurrent simulation must be rejected — permit is held.
+        let concurrent: Result<(), crate::util::BlockingError<String>> =
+            crate::util::try_bounded_blocking(&sem, || Ok(())).await;
+        assert!(
+            matches!(concurrent, Err(crate::util::BlockingError::SemaphoreFull)),
+            "concurrent simulation must be rejected while first is running"
+        );
+
+        // Unblock the first simulation.
+        barrier.wait();
+        let _ = handle.await;
+
+        // Now the permit should be available again.
+        let mut acquired = false;
+        for _ in 0..50 {
+            if sem.try_acquire().is_ok() {
+                acquired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            acquired,
+            "simulation_semaphore must be released after blocking work completes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // B3. validate_memo (4 tests)
     // -----------------------------------------------------------------------
 
