@@ -117,12 +117,8 @@ pub async fn handle(
 
     // Build response using pre-fetched close times
     let mut transactions = Vec::with_capacity(records.len());
-    let mut last_cursor = String::new();
 
     for record in &records {
-        // Application order is 1-based (txindex is 0-based in DB)
-        let application_order = record.tx_index + 1;
-
         // Ledger close time — returned as a number (not string) per upstream getTransactions.
         // Skip records whose header was pruned during a maintenance race.
         let Some(created_at) = close_time_cache.get(&record.ledger_seq).copied() else {
@@ -133,10 +129,6 @@ pub async fn handle(
             continue;
         };
 
-        // Build TOID cursor for this transaction
-        let toid = util::toid_encode(record.ledger_seq, application_order, 0);
-        last_cursor = toid.to_string();
-
         let obj = super::transaction_response::build_transaction_object(
             record,
             json!(created_at),
@@ -145,6 +137,16 @@ pub async fn handle(
         )?;
         transactions.push(serde_json::Value::Object(obj));
     }
+
+    // Cursor advances past ALL queried records (including skipped ones) to
+    // guarantee forward progress even when headers are pruned mid-page.
+    let last_cursor = records
+        .last()
+        .map(|r| {
+            let app_order = r.tx_index + 1;
+            util::toid_encode(r.ledger_seq, app_order, 0).to_string()
+        })
+        .unwrap_or_default();
 
     let mut result = serde_json::json!({
         "transactions": transactions,
