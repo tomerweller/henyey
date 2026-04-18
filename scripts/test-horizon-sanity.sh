@@ -163,10 +163,14 @@ echo ""
 # ── 2. Fund accounts via friendbot ──────────────────────────────────────────
 echo "── Fund accounts ────────────────────────────────────────────────────"
 
-# Generate keypairs (no --fund: generates locally without funding)
-stellar keys generate "$ALICE_KEY" --overwrite 2>/dev/null
+# Generate keypairs without touching the network. `--no-fund` is required
+# in stellar-cli >= 22.8 where `generate` tries to fund against the default
+# configured network by default (and errors out when no network is
+# configured). We fund via friendbot in the next step, so we don't need
+# the CLI to do it.
+stellar keys generate --no-fund "$ALICE_KEY" --overwrite 2>/dev/null
 ALICE_ADDR=$(stellar keys address "$ALICE_KEY")
-stellar keys generate "$BOB_KEY" --overwrite 2>/dev/null
+stellar keys generate --no-fund "$BOB_KEY" --overwrite 2>/dev/null
 BOB_ADDR=$(stellar keys address "$BOB_KEY")
 
 echo "Alice: $ALICE_ADDR"

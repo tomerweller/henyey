@@ -236,8 +236,11 @@ pass "account setup"
 # When using a custom RPC, wait for accounts to become visible in getLedgerEntries.
 # Some nodes (e.g. henyey) catch up in batches and need time to index new accounts.
 if $CUSTOM_RPC; then
-  ALICE_LEDGER_KEY=$(stellar xdr encode --type LedgerKey \
-    "{\"account\":{\"account_id\":\"$ALICE_ADDR\"}}" 2>/dev/null)
+  # stellar-cli >= 22.8 dropped positional-argument support for `xdr encode`
+  # and requires the JSON payload on stdin. Pipe the payload in to stay
+  # compatible with both old and new CLIs.
+  ALICE_LEDGER_KEY=$(printf '{"account":{"account_id":"%s"}}' "$ALICE_ADDR" \
+    | stellar xdr encode --type LedgerKey 2>/dev/null)
   if [[ -n "$ALICE_LEDGER_KEY" ]]; then
     echo "Waiting for accounts to appear in RPC node (up to 10 min)..."
     for _wait_i in $(seq 1 120); do
@@ -282,9 +285,10 @@ echo ""
 # ── 5. getLedgerEntries — fetch Alice's account ─────────────────────────────
 echo "── getLedgerEntries ─────────────────────────────────────────────────"
 
-# Encode Alice's account as an XDR LedgerKey (base64). The stellar CLI can do this.
-if ALICE_LEDGER_KEY=$(stellar xdr encode --type LedgerKey \
-    "{\"account\":{\"account_id\":\"$ALICE_ADDR\"}}" 2>/dev/null); then
+# Encode Alice's account as an XDR LedgerKey (base64). The stellar CLI
+# takes the JSON payload on stdin (see note at first-use above).
+if ALICE_LEDGER_KEY=$(printf '{"account":{"account_id":"%s"}}' "$ALICE_ADDR" \
+    | stellar xdr encode --type LedgerKey 2>/dev/null); then
   PARAMS="{\"keys\":[\"$ALICE_LEDGER_KEY\"]}"
   if resp=$(rpc_call getLedgerEntries "$PARAMS") && \
      echo "$resp" | jq -e '.result.entries[0].xdr' &>/dev/null; then
@@ -520,9 +524,12 @@ echo ""
 echo "── getEvents ────────────────────────────────────────────────────────"
 
 if [[ -n "$CONTRACT_ID" && -n "$TX_LEDGER" && -n "$ALICE_ADDR" ]]; then
-  # Encode filter topics: transfer symbol + Alice's address as ScVal
-  TRANSFER_TOPIC=$(stellar xdr encode --type ScVal '{"symbol":"transfer"}' 2>/dev/null)
-  ALICE_TOPIC=$(stellar xdr encode --type ScVal "{\"address\":\"$ALICE_ADDR\"}" 2>/dev/null)
+  # Encode filter topics: transfer symbol + Alice's address as ScVal.
+  # stellar-cli >= 22.8 reads the JSON payload from stdin only.
+  TRANSFER_TOPIC=$(printf '{"symbol":"transfer"}' \
+    | stellar xdr encode --type ScVal 2>/dev/null)
+  ALICE_TOPIC=$(printf '{"address":"%s"}' "$ALICE_ADDR" \
+    | stellar xdr encode --type ScVal 2>/dev/null)
 
   # Filter by contract + transfer topic + Alice as sender, starting from the tx ledger
   PARAMS=$(cat <<JSONEOF
