@@ -15,7 +15,7 @@
 //! ```text
 //! pre_filter_scp_envelope(env)
 //!   -> verify_envelope_sync(network_id, pf)
-//!   -> process_verified_detailed(ve)
+//!   -> process_verified(ve)
 //! ```
 //!
 //! # Scope
@@ -248,7 +248,7 @@ fn synthesize(rng: &mut Rng, network_id: &Hash256) -> (ScpEnvelope, bool) {
 /// Run the wrapper path on a fresh herder and return its outcome.
 fn run_wrapper(network_id: Hash256, envelope: ScpEnvelope) -> (EnvelopeState, PostVerifyReason) {
     let herder = build_herder(network_id);
-    herder.receive_scp_envelope_sync_detailed(envelope)
+    herder.receive_scp_envelope_detailed(envelope)
 }
 
 /// Run the explicit split path on a fresh herder and return its outcome.
@@ -279,7 +279,7 @@ fn run_split(network_id: Hash256, envelope: ScpEnvelope) -> (EnvelopeState, Post
                     PostVerifyReason::InvalidSignature,
                 );
             }
-            herder.process_verified_detailed(ve)
+            herder.process_verified(ve)
         }
     }
 }

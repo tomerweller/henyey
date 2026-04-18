@@ -1345,17 +1345,6 @@ impl Herder {
         )
     }
 
-    /// Post-verification processing (test-support: also available as
-    /// `process_verified_detailed` alias for backward compatibility).
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn process_verified_detailed(
-        &self,
-        ve: crate::scp_verify::VerifiedEnvelope,
-    ) -> (EnvelopeState, crate::scp_verify::PostVerifyReason) {
-        self.process_verified(ve)
-    }
-
     /// Process an SCP envelope (internal).
     ///
     /// This follows the stellar-core pattern: we only feed envelopes to SCP

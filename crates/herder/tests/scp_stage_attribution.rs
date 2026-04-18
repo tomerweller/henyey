@@ -2,7 +2,7 @@
 //!
 //! Issue #1742 (Layer 1 of the proposal).
 //!
-//! Drives the full `pre_filter → verify_envelope_sync → process_verified_detailed`
+//! Drives the full `pre_filter → verify_envelope_sync → process_verified`
 //! pipeline via the test-only hooks gated under `feature = "test-support"` and
 //! asserts, for each row in the table below, which *stage* claimed the
 //! envelope:
@@ -10,7 +10,7 @@
 //! | Stage            | Meaning                                                        |
 //! |------------------|----------------------------------------------------------------|
 //! | `PreFilter(r)`   | `Herder::pre_filter_scp_envelope` returned `Reject(r)`         |
-//! | `PostVerify(r)`  | `Herder::process_verified_detailed` returned `(_, r)`          |
+//! | `PostVerify(r)`  | `Herder::process_verified` returned `(_, r)`                   |
 //! | `Accepted`       | Post-verify hit `Accepted` (envelope forwarded to SCP)         |
 //!
 //! The test is authoritative about **stage attribution**, not about whether
@@ -239,7 +239,7 @@ fn externalize_envelope(
 /// Runs the split pipeline end-to-end and returns the attributed `Stage`.
 ///
 /// The `mutate` closure is invoked between `verify_envelope_sync` and
-/// `process_verified_detailed` so drift-recheck rows can perturb tracking
+/// `process_verified` so drift-recheck rows can perturb tracking
 /// state mid-flight (mirroring what the real event loop does while the
 /// verifier thread is busy).
 fn run<F>(fix: &Fixture, envelope: ScpEnvelope, mutate: F) -> Stage
@@ -268,7 +268,7 @@ where
     // Perturb state mid-flight (drift-recheck rows).
     mutate(herder);
 
-    let (_state, reason) = herder.process_verified_detailed(verified);
+    let (_state, reason) = herder.process_verified(verified);
     match reason {
         PostVerifyReason::Accepted => Stage::Accepted,
         other => Stage::PostVerify(other),
@@ -406,7 +406,7 @@ fn row_06_invalid_signature() {
         verdict
     );
     // By contract the split pipeline short-circuits before any post-verify
-    // gate can fire — `process_verified_detailed` is never called.
+    // gate can fire — `process_verified` is never called.
 }
 
 #[test]
@@ -538,7 +538,7 @@ fn row_12_precedence_self_message_beats_non_quorum() {
     let pf = herder.pre_filter_scp_envelope(&env);
     assert!(matches!(pf, PreFilter::Accept(_)));
     let verified = scp_verify::verify_envelope_sync(&network_id, pf).unwrap();
-    let (_, reason) = herder.process_verified_detailed(verified);
+    let (_, reason) = herder.process_verified(verified);
     assert_eq!(reason, PostVerifyReason::SelfMessage);
 }
 
@@ -599,7 +599,7 @@ fn smoke_fixture_envelopes_round_trip_sign_verify() {
     assert!(matches!(ve.verdict, scp_verify::Verdict::Ok));
     let _ = Instant::now();
     // Sanity: the resulting VerifiedEnvelope carries the same slot/envelope
-    // in its intake so `process_verified_detailed` can consume it.
+    // in its intake so `process_verified` can consume it.
     let _: &VerifiedEnvelope = &ve;
 }
 
