@@ -1637,6 +1637,23 @@ impl App {
         join_result: Result<std::result::Result<LedgerCloseResult, String>, tokio::task::JoinError>,
         finalize: super::persist::LedgerCloseFinalizer,
     ) -> bool {
+        // Per-phase timing inside handle_close_complete (#1775 Phase 1).
+        // The outer wrapper (`handle_close_complete`) already emits a
+        // ≥500 ms `warn_if_slow` WARN for event-loop alerting; this
+        // timer fires at the shared 250 ms threshold and names the
+        // dominant sub-phase so a follow-up can off-load the CPU-bound
+        // work (same cadence as #1772 → #1773 for `receive_tx_set`).
+        //
+        // Early returns inside the `match join_result` arm drop the
+        // timer without calling `finish`, which is the intended fast-
+        // path silence: no marks recorded, no WARN emitted, no
+        // allocation leak. The six marks below cover every line between
+        // here and the `match finalize.0` dispatch at the bottom; the
+        // dispatch itself is outside the timer because the Inline
+        // variant awaits persist-handle I/O (not CPU) and the Deferred
+        // variant never blocks the event loop.
+        let mut timer = tracked_lock::PhaseTimer::start();
+
         self.set_applying_ledger(false);
 
         let result = match join_result {
@@ -1671,6 +1688,7 @@ impl App {
                 return false;
             }
         };
+        timer.mark("join_match_ms");
 
         // Emit LedgerCloseMeta to stream.
         // If a MetaWriter is active (async channel + dedicated thread), use it
@@ -1717,6 +1735,7 @@ impl App {
                 }
             }
         }
+        timer.mark("meta_emit_ms");
 
         // Prepare persist data (CPU work only — XDR serialization, HAS
         // building, SCP envelope collection). The actual I/O (bucket flush,
@@ -1760,6 +1779,7 @@ impl App {
                 }
             }
         }
+        timer.mark("build_persist_inputs_ms");
 
         // Track non-empty ledger closes for the `ledger.transaction.count` metric.
         if !pending.tx_set.transactions.is_empty() {
@@ -1823,6 +1843,7 @@ impl App {
                 tracing::warn!("{}", warning);
             }
         }
+        timer.mark("herder_ledger_closed_ms");
 
         let ledger_flags = match &result.header.ext {
             stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
@@ -1915,6 +1936,7 @@ impl App {
                 }
             }
         }
+        timer.mark("tx_queue_invalidation_ms");
 
         // Update current ledger tracking.
         *self.last_processed_slot.write().await = pending.ledger_seq as u64;
@@ -1976,6 +1998,12 @@ impl App {
             },
             pending.ledger_seq,
         );
+        timer.mark("post_close_bookkeeping_ms");
+
+        // Emit the PhaseTimer WARN (if total ≥ 250 ms). Placed before
+        // the finalizer dispatch so the Inline-await persist-handle I/O
+        // latency does not pollute the compute signal — see #1775.
+        timer.finish("app.handle_close_complete");
 
         // Dispatch on the finalizer. Inline drives the persist to
         // completion (matches the prior `let _ = pt.handle.await;` at

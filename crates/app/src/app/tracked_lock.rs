@@ -40,7 +40,7 @@ use std::time::Instant;
 // Re-export the shared primitives so in-crate call sites continue to
 // write `tracked_lock::time_call(...)` / `tracked_lock::LOCK_SLOW_THRESHOLD`
 // without needing to reach into `henyey_common::tracking` directly.
-pub(crate) use henyey_common::tracking::{time_call, LOCK_SLOW_THRESHOLD};
+pub(crate) use henyey_common::tracking::{time_call, PhaseTimer, LOCK_SLOW_THRESHOLD};
 
 /// RAII guard wrapper that emits a single `WARN` log line on drop
 /// if the lock was held for at least [`LOCK_SLOW_THRESHOLD`].
