@@ -439,11 +439,10 @@ impl App {
         self.tx_set_all_peers_exhausted
             .store(false, Ordering::SeqCst);
 
-        // Update cache with the ledger we caught up to (it's a checkpoint)
-        {
-            let mut cache = self.cached_archive_checkpoint.write().await;
-            *cache = Some((output.ledger_seq, self.clock.now()));
-        }
+        // Update cache with the ledger we caught up to (it's a checkpoint).
+        // This uses the cache's seed() API directly rather than going through
+        // a fetcher since we already have the authoritative value.
+        self.archive_checkpoint_cache.seed(output.ledger_seq);
 
         // Clear archive-behind backoff — a successful catchup proves the
         // archive is now publishing, so the next recovery cycle (if any)
@@ -557,84 +556,38 @@ impl App {
         Ok(catchup_result)
     }
 
-    /// Get the latest checkpoint from history archives, using a cache to avoid repeated network calls.
-    /// The cache is valid for ARCHIVE_CHECKPOINT_CACHE_SECS.
-    pub(super) async fn get_cached_archive_checkpoint(&self) -> anyhow::Result<u32> {
-        // Check cache first
-        {
-            let cache = self.cached_archive_checkpoint.read().await;
-            if let Some((checkpoint, queried_at)) = *cache {
-                if queried_at.elapsed().as_secs() < ARCHIVE_CHECKPOINT_CACHE_SECS {
-                    tracing::debug!(
-                        checkpoint,
-                        age_secs = queried_at.elapsed().as_secs(),
-                        "Using cached archive checkpoint"
-                    );
-                    return Ok(checkpoint);
-                }
-            }
-        }
-
-        // Cache miss or expired, query archive
-        let checkpoint = self.get_latest_checkpoint().await?;
-
-        // Update cache
-        {
-            let mut cache = self.cached_archive_checkpoint.write().await;
-            *cache = Some((checkpoint, self.clock.now()));
-        }
-
-        Ok(checkpoint)
+    /// Return the latest cached archive checkpoint WITHOUT blocking.
+    ///
+    /// Intended for event-loop callers (phase=13 buffered catchup,
+    /// phase=11 externalized catchup, consensus.rs recovery). If the cache
+    /// is cold or older than `ARCHIVE_CHECKPOINT_CACHE_SECS`, the call
+    /// returns immediately with the current (stale or `None`) value and
+    /// kicks off a background refresh — which completes by the next
+    /// recovery tick (10 s later).
+    ///
+    /// Returning `None` means "unknown — skip this tick"; callers MUST NOT
+    /// block to discover the fresh value.
+    ///
+    /// This replaces the previous `get_cached_archive_checkpoint` whose
+    /// fall-through path awaited `fetch_root_has()` inline on the event
+    /// loop, causing up to 89 s freezes (issue #1784).
+    pub(super) fn get_cached_archive_checkpoint_nonblocking(&self) -> Option<u32> {
+        self.archive_checkpoint_cache.get_cached()
     }
 
-    /// Query history archives for the latest checkpoint (single attempt).
+    /// Synchronously fetch the latest archive checkpoint, awaiting the
+    /// underlying HTTP calls. May block for up to
+    /// `DownloadConfig::retries × timeout` seconds.
     ///
-    /// This is called from `get_cached_archive_checkpoint()` on cache miss.
-    /// It does NOT retry — returning quickly is critical because callers
-    /// run on the main event loop. For startup scenarios where the archive
-    /// may not have published yet, use `wait_for_archive_checkpoint()`.
-    async fn get_latest_checkpoint(&self) -> anyhow::Result<u32> {
-        tracing::info!("Querying history archives for latest checkpoint");
-
-        for archive_config in &self.config.history.archives {
-            match HistoryArchive::new(&archive_config.url) {
-                Ok(archive) => match archive.fetch_current_ledger().await {
-                    Ok(ledger) => {
-                        tracing::info!(
-                            ledger,
-                            archive = %archive_config.url,
-                            "Got current ledger from archive"
-                        );
-                        match henyey_history::checkpoint::latest_checkpoint_before_or_at(ledger) {
-                            Some(checkpoint) => return Ok(checkpoint),
-                            None => {
-                                tracing::info!(ledger, "Archive has no completed checkpoint yet");
-                                // Try next archive
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            archive = %archive_config.url,
-                            error = %e,
-                            "Failed to get current ledger from archive"
-                        );
-                        continue;
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        archive = %archive_config.url,
-                        error = %e,
-                        "Failed to create archive client"
-                    );
-                    continue;
-                }
-            }
-        }
-
-        Err(anyhow::anyhow!("No checkpoint available from any archive"))
+    /// MUST NOT be called from the event-loop task. Acceptable callers:
+    ///   - `wait_for_archive_checkpoint` (startup-only)
+    ///   - `run_catchup_work` and anything else running inside a spawned
+    ///     catchup task.
+    pub(super) async fn get_cached_archive_checkpoint_blocking(&self) -> anyhow::Result<u32> {
+        let fetcher = archive_cache::ArchiveHttpFetcher::for_blocking_catchup(
+            self.config.history.archives.clone(),
+        );
+        self.archive_checkpoint_cache.fetch_blocking(&fetcher).await
     }
 
     /// Wait for an archive to publish a checkpoint, retrying with backoff.
@@ -653,13 +606,8 @@ impl App {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
 
-            match self.get_latest_checkpoint().await {
-                Ok(checkpoint) => {
-                    // Update the cache so subsequent calls are fast
-                    let mut cache = self.cached_archive_checkpoint.write().await;
-                    *cache = Some((checkpoint, self.clock.now()));
-                    return Ok(checkpoint);
-                }
+            match self.get_cached_archive_checkpoint_blocking().await {
+                Ok(checkpoint) => return Ok(checkpoint),
                 Err(e) => {
                     if attempt == MAX_RETRIES - 1 {
                         return Err(anyhow::anyhow!(
@@ -1772,8 +1720,12 @@ impl App {
     /// trapped in the "recently caught up" decision branch (see #1753).
     async fn validate_target_checkpoint_published(&self, current_ledger: u32, target: u32) -> bool {
         let target_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
-        match self.get_cached_archive_checkpoint().await {
-            Ok(archive_latest) => {
+        // Non-blocking read: a `None` result means the cache is cold or
+        // stale (a background refresh has been spawned). Mirror the
+        // existing `Err(e)` branch: proceed anyway — the spawned catchup
+        // task itself queries the archive and will fail fast if unreachable.
+        match self.get_cached_archive_checkpoint_nonblocking() {
+            Some(archive_latest) => {
                 if archive_latest < target_checkpoint {
                     tracing::info!(
                         current_ledger,
@@ -1787,8 +1739,8 @@ impl App {
                 }
                 true
             }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to check archive for target checkpoint");
+            None => {
+                tracing::debug!("Archive checkpoint cache cold/stale; proceeding (catchup will query archive itself)");
                 true // Proceed anyway — let catchup fail fast if archive unreachable
             }
         }
@@ -1805,8 +1757,12 @@ impl App {
         current_ledger: u32,
         first_buffered: u32,
     ) -> bool {
-        match self.get_cached_archive_checkpoint().await {
-            Ok(latest_checkpoint) => {
+        // Non-blocking read: `None` means cold/stale cache — mirror the
+        // existing `Err(e)` branch and skip this tick (arming backoff),
+        // letting the background refresh warm the cache before the next
+        // recovery cycle 10 s later.
+        match self.get_cached_archive_checkpoint_nonblocking() {
+            Some(latest_checkpoint) => {
                 if latest_checkpoint <= current_ledger {
                     tracing::debug!(
                         current_ledger,
@@ -1825,11 +1781,10 @@ impl App {
                 );
                 true
             }
-            Err(e) => {
+            None => {
                 tracing::warn!(
                     current_ledger,
-                    error = %e,
-                    "Failed to query archive for latest checkpoint, skipping catchup"
+                    "Archive checkpoint cache cold/stale; skipping catchup (will retry next tick)"
                 );
                 self.arm_archive_behind_backoff().await;
                 false
@@ -2105,9 +2060,14 @@ impl App {
         // When the target checkpoint is ahead of the latest externalized slot,
         // it may not be published in the archive yet. Check the cached archive
         // checkpoint to avoid blocking the event loop with 404 retries (~50s).
+        //
+        // Non-blocking: `None` means cold/stale cache — mirror the existing
+        // `Err(e)` branch exactly (stamp `last_catchup_completed_at`,
+        // return). The background refresh will warm the cache before the
+        // next cycle.
         if target_checkpoint > latest_externalized as u32 {
-            match self.get_cached_archive_checkpoint().await {
-                Ok(archive_latest) => {
+            match self.get_cached_archive_checkpoint_nonblocking() {
+                Some(archive_latest) => {
                     if archive_latest <= current_ledger {
                         tracing::debug!(
                             current_ledger,
@@ -2119,10 +2079,9 @@ impl App {
                         return None;
                     }
                 }
-                Err(e) => {
+                None => {
                     tracing::warn!(
-                        error = %e,
-                        "Failed to query archive checkpoint, skipping externalized catchup"
+                        "Archive checkpoint cache cold/stale; skipping externalized catchup"
                     );
                     *self.last_catchup_completed_at.write().await = Some(self.clock.now());
                     return None;
@@ -2384,10 +2343,7 @@ mod tests {
         // needing a live archive.
         let stale_archive_latest: u32 = 100;
         let target: u32 = 10_000; // forces archive_latest < target_checkpoint
-        {
-            let mut cache = app.cached_archive_checkpoint.write().await;
-            *cache = Some((stale_archive_latest, app.clock.now()));
-        }
+        app.archive_checkpoint_cache.seed(stale_archive_latest);
 
         // Seed a ConsensusStuckState with catchup_triggered=true, so we can
         // observe the helper clearing it on skip.
@@ -2448,10 +2404,7 @@ mod tests {
         // Cache a checkpoint <= current_ledger to force the skip branch.
         let current_ledger: u32 = 5_000;
         let stale_archive_latest: u32 = 4_000;
-        {
-            let mut cache = app.cached_archive_checkpoint.write().await;
-            *cache = Some((stale_archive_latest, app.clock.now()));
-        }
+        app.archive_checkpoint_cache.seed(stale_archive_latest);
 
         {
             let mut guard = app.consensus_stuck_state.write().await;
@@ -2483,6 +2436,76 @@ mod tests {
         assert!(
             !state.catchup_triggered,
             "SKIP must clear catchup_triggered"
+        );
+    }
+
+    /// Regression test for issue #1784: when the configured history
+    /// archives hang indefinitely (TCP/DNS/TLS stall), the event-loop
+    /// callers that query the archive checkpoint must NOT block.
+    ///
+    /// Before the fix, `validate_target_checkpoint_published` awaited
+    /// `get_cached_archive_checkpoint().await` → `get_latest_checkpoint`
+    /// which synchronously waited for a `fetch_root_has()` completion —
+    /// up to 60 s per retry × 5 retries per archive × N archives. The
+    /// observed mainnet freeze was 89 s of stale_secs at phase=13.
+    ///
+    /// After the fix, the cache's non-blocking accessor returns `None`
+    /// immediately on the first call (cold cache) and schedules a
+    /// background refresh; the event-loop caller preserves its existing
+    /// error semantics (proceed / skip tick / arm backoff).
+    #[tokio::test]
+    async fn test_event_loop_archive_query_does_not_block_on_hanging_archive() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Replace the archive fetcher with one that hangs forever. In
+        // the pre-fix code this would cause the subsequent
+        // `validate_target_checkpoint_published().await` to block for
+        // tens of seconds. After the fix it must return within a
+        // millisecond budget.
+        struct HangingFetcher;
+        #[async_trait::async_trait]
+        impl super::archive_cache::ArchiveCheckpointFetcher for HangingFetcher {
+            async fn fetch(&self) -> anyhow::Result<u32> {
+                let gate = tokio::sync::Notify::new();
+                gate.notified().await;
+                unreachable!();
+            }
+        }
+        app.archive_checkpoint_cache
+            .set_background_fetcher(std::sync::Arc::new(HangingFetcher));
+
+        // Ensure the cache is cold so the validator takes the
+        // `None`-from-non-blocking path.
+        app.archive_checkpoint_cache.clear();
+
+        // Drive the call site that freezes on mainnet (phase=13).
+        let target: u32 = 10_000;
+        let start = Instant::now();
+        let ok = app.validate_target_checkpoint_published(50, target).await;
+        let elapsed = start.elapsed();
+
+        // Existing behavior on cold cache: proceed (let catchup itself
+        // fail fast if the archive is unreachable). The critical
+        // assertion here is the wall-clock bound.
+        assert!(ok, "cold-cache branch must proceed (mirrors Err(e) path)");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "event-loop archive query must not block on a hanging \
+             archive; took {:?} (pre-fix: ~60s)",
+            elapsed
+        );
+
+        // And the background refresh was spawned.
+        assert!(
+            app.archive_checkpoint_cache.is_refreshing(),
+            "a hanging fetcher should leave exactly one refresh in flight"
         );
     }
 }

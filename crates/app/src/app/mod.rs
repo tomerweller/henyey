@@ -150,9 +150,9 @@ const TX_SET_REQUEST_TIMEOUT_SECS: u64 = 10;
 /// Matches stellar-core's OUT_OF_SYNC_RECOVERY_TIMER.
 const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
 
-/// How long to cache the archive checkpoint before re-querying.
-/// This prevents repeated network calls to the archive when we're stuck.
-const ARCHIVE_CHECKPOINT_CACHE_SECS: u64 = 60;
+// The archive-checkpoint cache TTL now lives in
+// `archive_cache::ARCHIVE_CHECKPOINT_CACHE_SECS` (see that module for the
+// full non-blocking-cache rationale; issue #1784).
 
 /// How long to back off archive queries after learning the archive's latest
 /// checkpoint is still behind the one we need.
@@ -189,6 +189,7 @@ const POST_CATCHUP_RECOVERY_WINDOW_SECS: u64 = 300;
 /// recovery will never succeed. 3 attempts × 10s interval = 30s before fallback.
 const MAX_POST_CATCHUP_RECOVERY_ATTEMPTS: u32 = 3;
 
+mod archive_cache;
 mod bootstrap;
 mod catchup_impl;
 mod close;
@@ -392,8 +393,16 @@ pub struct App {
     consensus_stuck_state: RwLock<Option<ConsensusStuckState>>,
     /// When catchup last completed (for cooldown).
     last_catchup_completed_at: RwLock<Option<Instant>>,
-    /// Cached archive checkpoint (ledger, queried_at) to avoid repeated network calls.
-    cached_archive_checkpoint: RwLock<Option<(u32, Instant)>>,
+    /// Non-blocking cache for the latest archive checkpoint. Event-loop
+    /// callers read via `get_cached_archive_checkpoint_nonblocking`;
+    /// startup and spawned-catchup callers read via
+    /// `get_cached_archive_checkpoint_blocking`.
+    ///
+    /// Replaces the old `RwLock<Option<(u32, Instant)>>`: that type forced
+    /// every caller to `.await` on the tokio RwLock, and on cache miss
+    /// synchronously awaited the archive HTTP fetch — the root cause of
+    /// the 89 s event-loop freeze in issue #1784.
+    archive_checkpoint_cache: Arc<archive_cache::ArchiveCheckpointCache>,
     /// Instant at which the archive-behind backoff expires.
     ///
     /// Set when `trigger_recovery_catchup` observes the archive's latest
@@ -660,6 +669,18 @@ impl App {
         let (scp_envelope_tx, scp_envelope_rx) = tokio::sync::mpsc::channel(100);
         let now = clock.now();
 
+        // Build the non-blocking archive-checkpoint cache. The background
+        // refresh uses a tightened DownloadConfig (1 retry, 15 s timeout)
+        // so it gives up quickly; callers that need the full-retry budget
+        // (wait_for_archive_checkpoint, run_catchup_work) build their own
+        // fetcher via `archive_cache::ArchiveHttpFetcher::for_blocking_catchup`.
+        let archive_checkpoint_cache = Arc::new(archive_cache::ArchiveCheckpointCache::new(
+            Arc::clone(&clock),
+            Arc::new(archive_cache::ArchiveHttpFetcher::for_background_refresh(
+                config.history.archives.clone(),
+            )),
+        ));
+
         // Wire up envelope sender for validators
         if config.node.is_validator {
             let tx = scp_envelope_tx.clone();
@@ -734,7 +755,7 @@ impl App {
             tx_set_exhausted_warned: RwLock::new(HashSet::new()),
             consensus_stuck_state: RwLock::new(None),
             last_catchup_completed_at: RwLock::new(None),
-            cached_archive_checkpoint: RwLock::new(None),
+            archive_checkpoint_cache,
             archive_behind_until: RwLock::new(None),
             scp_latency: RwLock::new(ScpLatencyTracker::default()),
             survey_scheduler: RwLock::new(SurveyScheduler::new(now)),
@@ -1423,6 +1444,11 @@ impl App {
             consensus_trigger_attempts: self.consensus_trigger_attempts.load(Ordering::Relaxed),
             consensus_trigger_successes: self.consensus_trigger_successes.load(Ordering::Relaxed),
             consensus_trigger_failures: self.consensus_trigger_failures.load(Ordering::Relaxed),
+            archive_checkpoint_stale_returns: self.archive_checkpoint_cache.stale_returns(),
+            archive_checkpoint_cold_returns: self.archive_checkpoint_cache.cold_returns(),
+            archive_checkpoint_refresh_timeouts: self.archive_checkpoint_cache.refresh_timeouts(),
+            archive_checkpoint_refresh_errors: self.archive_checkpoint_cache.refresh_errors(),
+            archive_checkpoint_refresh_successes: self.archive_checkpoint_cache.refresh_successes(),
         }
     }
 
@@ -4018,7 +4044,7 @@ mod tests {
                 app.clock.now(),
             );
             // Confirm: within the window the recovery code would observe
-            // backoff_active=true and skip `get_cached_archive_checkpoint`.
+            // backoff_active=true and skip the archive lookup entirely.
             let backoff_active = app.clock.now() < armed;
             assert!(
                 backoff_active,

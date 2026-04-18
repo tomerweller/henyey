@@ -116,6 +116,12 @@ pub struct SimulationDebugStats {
     pub consensus_trigger_attempts: u64,
     pub consensus_trigger_successes: u64,
     pub consensus_trigger_failures: u64,
+    // Archive checkpoint cache (issue #1784)
+    pub archive_checkpoint_stale_returns: u64,
+    pub archive_checkpoint_cold_returns: u64,
+    pub archive_checkpoint_refresh_timeouts: u64,
+    pub archive_checkpoint_refresh_errors: u64,
+    pub archive_checkpoint_refresh_successes: u64,
 }
 
 /// Target for catchup operation.

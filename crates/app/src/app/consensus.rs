@@ -836,15 +836,18 @@ impl App {
         };
 
         if !backoff_active {
-            // Invalidate the archive checkpoint cache so CatchupTarget::Current
-            // queries the archive for the freshest checkpoint. In local mode
-            // (1 ledger/sec, checkpoints every 8 ledgers), a 60s-stale cache
-            // returns a checkpoint ~60 ledgers behind the validator, causing
-            // catchup to be a no-op when the captive core is already past it.
-            let mut cache = self.cached_archive_checkpoint.write().await;
-            *cache = None;
+            // Invalidate the archive checkpoint cache so the next
+            // non-blocking read sees "cold" and schedules a fresh refresh.
+            // In local mode (1 ledger/sec, checkpoints every 8 ledgers),
+            // a 60s-stale cache returns a checkpoint ~60 ledgers behind
+            // the validator, causing catchup to be a no-op.
+            self.archive_checkpoint_cache.clear();
         }
 
+        // Non-blocking read. `None` means cold/stale cache — treat it as
+        // the existing `Err(e)` branch (archive unreachable): arm the
+        // backoff and fall through to the peer-SCP fallback. The
+        // background refresh will warm the cache before the next cycle.
         let archive_latest = if backoff_active {
             tracing::debug!(
                 current_ledger,
@@ -854,14 +857,14 @@ impl App {
             );
             None
         } else {
-            match self.get_cached_archive_checkpoint().await {
-                Ok(latest) if latest >= next_cp => {
+            match self.get_cached_archive_checkpoint_nonblocking() {
+                Some(latest) if latest >= next_cp => {
                     // Archive is current enough — clear any prior backoff.
                     let mut guard = self.archive_behind_until.write().await;
                     *guard = None;
                     Some(latest)
                 }
-                Ok(latest) => {
+                Some(latest) => {
                     // Archive responded but is still behind. Arm the backoff.
                     let deadline =
                         self.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
@@ -875,19 +878,18 @@ impl App {
                     );
                     None
                 }
-                Err(e) => {
-                    // Archive unreachable. Arm a shorter backoff to avoid a
-                    // per-tick query storm against a flaky archive while still
-                    // retrying periodically.
+                None => {
+                    // Cache cold/stale (background refresh in flight).
+                    // Arm the backoff to avoid a per-tick query storm;
+                    // still fall through to peer-SCP fallback below.
                     let deadline =
                         self.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
                     let mut guard = self.archive_behind_until.write().await;
                     *guard = Some(deadline);
                     tracing::debug!(
-                        error = %e,
                         next_checkpoint = next_cp,
                         backoff_secs = ARCHIVE_BEHIND_BACKOFF_SECS,
-                        "Archive query failed — arming backoff"
+                        "Archive checkpoint cache cold/stale — arming backoff"
                     );
                     None
                 }
