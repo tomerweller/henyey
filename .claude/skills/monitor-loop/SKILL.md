@@ -158,19 +158,19 @@ lands on main — rebuild, kill, restart. The bug-fix progress itself is
 tracked on the issue and by `/plan-do-review`'s own reporting; the
 monitor does not block on it.
 
-### Recurrence + new evidence → re-spawn `/plan-do-review` autonomously
+### Recurrence + new evidence → file a fresh issue, spawn `/plan-do-review` on it
 
 When a previously-filed bug (open, already had one or more `/plan-do-review`
 runs) recurs, the monitor's default is **not** "wait and see"; it is
-"did the recurrence give us new evidence, and if so, re-spawn
-`/plan-do-review <N>`". Specifically, re-spawn when any of the
-following is true versus the state at the last `/plan-do-review` run:
+"did the recurrence give us new evidence, and if so, file a fresh scoped
+issue and spawn `/plan-do-review <new-N>`". Act when any of the following
+is true versus the state at the last `/plan-do-review` run:
 
 - The bug reproduces on a different commit or a different process,
   strengthening the "this is deterministic, not a one-off" case.
-- New instrumentation output has landed on the issue (log lines,
-  stack dumps, `/proc/wchan`, profile data, metric deltas) that
-  the prior run didn't have access to.
+- New instrumentation output exists (log lines, stack dumps,
+  `/proc/wchan`, profile data, metric deltas) that the prior run
+  didn't have access to.
 - A negative finding rules out the prior run's root-cause hypothesis
   (e.g. the prior proposal blamed compute backpressure but fresh
   telemetry shows zero compute-side warnings).
@@ -179,20 +179,47 @@ following is true versus the state at the last `/plan-do-review` run:
 
 Do not wait for the user to ask "is there enough information now?" —
 the decision rule is "would the next `/plan-do-review` run have
-strictly more information than the last one?" If yes, spawn it; brief
-the new agent with pointers to the new comments so it doesn't retrace
-the prior ground.
+strictly more information than the last one?" If yes, act on it.
 
-What the monitor does NOT do on recurrence:
-- Re-file a duplicate issue (`/plan-do-review` re-runs against the
-  existing issue number).
-- Wait for the existing `/plan-do-review` agent to finish before
-  queueing the next one if the existing agent is already running on
-  stale evidence. Exception: if the existing agent is still in its
-  proposal-convergence stage and the new evidence is purely additive,
-  posting the new evidence as a comment on the issue (so the running
-  agent picks it up) may be sufficient; escalate to a re-spawn only if
-  the existing agent is past the proposal stage.
+**Prefer filing a new issue over piling onto the existing one.** Long
+umbrella issues with many `/plan-do-review` iterations get hard to
+reason about: the original symptom, multiple retired hypotheses, the
+current hypothesis, and landed-fix comments all interleave. A fresh
+`/plan-do-review` Agent given an umbrella-issue number has to
+reconstruct which comments are still load-bearing before it can even
+start, and it often gets this wrong.
+
+Use this rule when a recurrence brings new evidence:
+
+- **File a new scoped issue** whenever the new evidence points at a
+  different named subsystem, a different phase/mark, a different root-
+  cause hypothesis, or a different candidate site set than the prior
+  issue's current scope. Default toward "new issue" when in doubt —
+  splitting is cheap, merging is cheap, but re-scoping a monster issue
+  is expensive. In the new issue body:
+  - State the specific symptom and the evidence backing it (log
+    snippets, metric tables, phase breakdowns).
+  - Name the prior issue as `Related to #<prior>` and summarize the
+    one-line difference in scope (e.g. "#1759 tracked `phase=2
+    fetch_resp` freezes; this issue is scoped to the
+    `tx_queue_background_wait_ms` sub-phase that now dominates after
+    the #1759 fix chain landed").
+  - Write the body as a `/plan-do-review`-consumable proposal (symptom,
+    evidence, suspected root cause, fix sketch with file:line
+    references).
+  - Post a brief back-link comment on the prior issue pointing at the
+    new one so future readers can trace the lineage.
+- **Only append as a comment on the existing issue** when the
+  recurrence is genuinely the same bug at the same site with purely
+  additive incremental data (e.g. "reproduces at L61340500 too with
+  the same stack signature"), AND the existing `/plan-do-review` run
+  hasn't converged yet. This should be the narrower path.
+
+Once the issue (new or existing) has the new evidence, spawn a fresh
+Agent on `/plan-do-review <N>` with a brief that points at the
+specific new-evidence anchor. Do not wait for any previously-spawned
+`/plan-do-review` Agent to finish — it was running on the older
+evidence and will be superseded by the new run.
 
 ## Startup
 
@@ -351,6 +378,8 @@ Compare createdAt with current UTC time (date -u +%Y-%m-%dT%H:%M:%SZ) — only i
 INVESTIGATION: For ANY anomaly, investigate to root cause — read source code, check logs, trace code paths. Never dismiss as "expected". File a GitHub issue for every anomaly that isn't immediately explained.
 
 BUG FIX WORKFLOW (node bugs only — CI fixes go through check 11): If a hash mismatch, error, or crash is found: (1) identify failing ledger and error type, (2) investigate to root cause — read source code, trace code paths, (3) file a GitHub issue with findings using `gh issue create` and capture the returned issue number N; write the body as a proposal that `/plan-do-review` can consume (symptom, evidence, suspected root cause, fix sketch with file:line references), (4) spawn an Agent whose sole task is to run `/plan-do-review <N>` on the filed issue — that skill handles adversarial critique, implementation, review-fix iteration, and landing the change. Do NOT edit the main checkout to fix a node bug. Do NOT run a separate worktree Agent, review the diff yourself, or cherry-pick — all of that lives inside `/plan-do-review`. The next redeploy tick (check 10) will pick up whatever `/plan-do-review` lands on main.
+
+RECURRENCE POLICY: If a previously-filed bug recurs with material new evidence (new instrumentation output, a different commit reproducing it, a negative finding ruling out the prior hypothesis, narrowed candidate sites), **prefer filing a new scoped issue** over piling onto the existing one. Umbrella issues with many /plan-do-review iterations become monsters that confuse the next Agent. File a new issue whenever the evidence points at a different named subsystem, a different phase/mark, a different root-cause hypothesis, or a different candidate site set; include `Related to #<prior>` + one-line scope-diff; post a back-link comment on the prior issue. Only append a comment on the existing issue when the recurrence is genuinely the same bug at the same site with purely additive incremental data AND the prior /plan-do-review run hasn't converged yet. Default toward "new issue" when in doubt.
 
 OUTPUT: Print a multiline status report:
 MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
