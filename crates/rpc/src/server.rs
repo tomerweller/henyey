@@ -11,7 +11,7 @@ use henyey_app::App;
 use crate::context::RpcContext;
 use crate::dispatch;
 use crate::error::JsonRpcError;
-use crate::fee_window::FeeWindows;
+use crate::fee_window::{FeeWindowError, FeeWindows};
 use crate::types::{JsonRpcRequest, JsonRpcResponse};
 
 /// Maximum allowed JSON-RPC request body size (512 KiB).
@@ -178,38 +178,85 @@ async fn fee_window_poller(
             }
         };
 
-        if let Err(e) = ingest_metas_with_gap_recovery(&windows, &metas) {
-            tracing::warn!(error = %e, "Multiple gaps in LCM data");
-            windows.reset();
-            // Gap recovery attempted inside ingest_metas_with_gap_recovery; reset and retry
-            continue;
-        }
+        ingest_metas_best_effort(&windows, &metas);
     }
 }
 
-/// Ingest a sequence of LCMs into the fee windows, recovering from a single gap.
+/// Summary of what happened during best-effort LCM ingestion.
+#[derive(Default, Debug)]
+struct IngestionSummary {
+    /// Number of entries successfully ingested.
+    ingested: u32,
+    /// Number of times the window was reset (due to gaps).
+    resets: u32,
+    /// Number of corrupt entries skipped (parse failures or DB/XDR mismatch).
+    corrupt_skipped: u32,
+}
+
+/// Ingest LCMs into fee windows using best-effort suffix recovery.
 ///
-/// If a gap is detected (ingestion fails), the windows are reset and
-/// re-ingestion starts from the gap position. Returns `Err` if a second gap is
-/// found in the post-gap suffix.
-fn ingest_metas_with_gap_recovery(
-    windows: &FeeWindows,
-    metas: &[(u32, Vec<u8>)],
-) -> Result<(), String> {
-    for (i, (_seq, meta_bytes)) in metas.iter().enumerate() {
-        if let Err(e) = windows.ingest_ledger_close_meta(meta_bytes) {
-            // Gap detected — reset and re-ingest from this point forward
-            tracing::warn!(error = %e, "Gap in LCM data, resetting fee window to post-gap range");
-            windows.reset();
-            for (_seq2, meta_bytes2) in &metas[i..] {
-                if let Err(e2) = windows.ingest_ledger_close_meta(meta_bytes2) {
-                    return Err(format!("multiple gaps in fee window data: {e2}"));
+/// Scans forward through `metas`. On parse error (corrupt XDR or DB/XDR
+/// sequence mismatch), the entry is skipped without resetting — this preserves
+/// the valid prefix when corruption is at the end. On contiguity gap, the
+/// windows are reset and the current entry is re-ingested as the new start.
+///
+/// This naturally converges to the latest valid contiguous suffix of the input.
+fn ingest_metas_best_effort(windows: &FeeWindows, metas: &[(u32, Vec<u8>)]) -> IngestionSummary {
+    let mut summary = IngestionSummary::default();
+
+    for (seq, meta_bytes) in metas {
+        match windows.ingest_ledger_close_meta(*seq, meta_bytes) {
+            Ok(()) => {
+                summary.ingested += 1;
+            }
+            Err(FeeWindowError::Parse(msg)) => {
+                // Skip corrupt entry without resetting. If this is mid-stream,
+                // the next valid entry will trigger a gap (handled below). If
+                // this is at the end, the valid prefix is preserved.
+                tracing::warn!(
+                    ledger_seq = seq,
+                    error = %msg,
+                    "Skipping corrupt LCM in fee window"
+                );
+                summary.corrupt_skipped += 1;
+            }
+            Err(FeeWindowError::Gap { expected, got }) => {
+                // Contiguity gap — reset and re-ingest current entry as new start
+                tracing::warn!(
+                    ledger_seq = seq,
+                    expected,
+                    got,
+                    "Gap in LCM data, resetting fee window"
+                );
+                windows.reset();
+                summary.resets += 1;
+                match windows.ingest_ledger_close_meta(*seq, meta_bytes) {
+                    Ok(()) => summary.ingested += 1,
+                    Err(e) => {
+                        // Should not happen (window is empty after reset), but
+                        // handle defensively.
+                        tracing::warn!(
+                            ledger_seq = seq,
+                            error = %e,
+                            "Failed to re-ingest after gap reset"
+                        );
+                        windows.reset();
+                    }
                 }
             }
-            return Ok(());
         }
     }
-    Ok(())
+
+    if summary.resets > 0 || summary.corrupt_skipped > 0 {
+        tracing::info!(
+            ingested = summary.ingested,
+            resets = summary.resets,
+            corrupt_skipped = summary.corrupt_skipped,
+            "Fee window ingestion completed with recovery"
+        );
+    }
+
+    summary
 }
 
 /// Bulk-load the last N ledgers' fees from the database.
@@ -230,9 +277,7 @@ fn bulk_load_fees(app: &App, windows: &FeeWindows, retention: u32) -> Result<(),
         "Bulk-loading fee window from DB"
     );
 
-    // Ingest metas, skipping over any gaps (e.g., from catchup).
-    // Only keep the contiguous suffix so the window starts clean.
-    ingest_metas_with_gap_recovery(windows, &metas)?;
+    ingest_metas_best_effort(windows, &metas);
 
     Ok(())
 }
@@ -511,5 +556,226 @@ mod tests {
         assert_eq!(crate::error::PARSE_ERROR, -32700);
         let err = JsonRpcError::parse_error("test");
         assert_eq!(err.code, -32700);
+    }
+
+    // -----------------------------------------------------------------------
+    // Category H: Fee window ingestion recovery (AUDIT-175 regression tests)
+    // -----------------------------------------------------------------------
+
+    use stellar_xdr::curr::{
+        Hash, LedgerCloseMetaV0, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry,
+        LedgerHeaderHistoryEntryExt, Limits, StellarValue, StellarValueExt, TimePoint,
+        TransactionSet, WriteXdr,
+    };
+
+    /// Build minimal valid LedgerCloseMeta XDR bytes for a given ledger sequence.
+    fn make_lcm_bytes(seq: u32) -> Vec<u8> {
+        let lcm = stellar_xdr::curr::LedgerCloseMeta::V0(LedgerCloseMetaV0 {
+            ledger_header: LedgerHeaderHistoryEntry {
+                hash: Hash([0; 32]),
+                header: LedgerHeader {
+                    ledger_version: 21,
+                    previous_ledger_hash: Hash([0; 32]),
+                    scp_value: StellarValue {
+                        tx_set_hash: Hash([0; 32]),
+                        close_time: TimePoint(0),
+                        upgrades: vec![].try_into().unwrap(),
+                        ext: StellarValueExt::Basic,
+                    },
+                    tx_set_result_hash: Hash([0; 32]),
+                    bucket_list_hash: Hash([0; 32]),
+                    ledger_seq: seq,
+                    total_coins: 0,
+                    fee_pool: 0,
+                    inflation_seq: 0,
+                    id_pool: 0,
+                    base_fee: 100,
+                    base_reserve: 5_000_000,
+                    max_tx_set_size: 100,
+                    skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+                    ext: LedgerHeaderExt::V0,
+                },
+                ext: LedgerHeaderHistoryEntryExt::V0,
+            },
+            tx_set: TransactionSet {
+                previous_ledger_hash: Hash([0; 32]),
+                txs: vec![].try_into().unwrap(),
+            },
+            tx_processing: vec![].try_into().unwrap(),
+            upgrades_processing: vec![].try_into().unwrap(),
+            scp_info: vec![].try_into().unwrap(),
+        });
+        lcm.to_xdr(Limits::none()).unwrap()
+    }
+
+    const CORRUPT_BYTES: &[u8] = &[0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0x00, 0x01, 0x02, 0x03];
+
+    #[test]
+    fn test_all_valid_entries_ingested() {
+        let fw = FeeWindows::new(100);
+        let metas: Vec<(u32, Vec<u8>)> = (10..=12).map(|s| (s, make_lcm_bytes(s))).collect();
+        let summary = ingest_metas_best_effort(&fw, &metas);
+        assert_eq!(summary.ingested, 3);
+        assert_eq!(summary.resets, 0);
+        assert_eq!(summary.corrupt_skipped, 0);
+        assert_eq!(fw.latest_ledger(), 12);
+    }
+
+    #[test]
+    fn test_corrupt_at_start_accepted_after() {
+        let fw = FeeWindows::new(100);
+        let metas = vec![
+            (10, CORRUPT_BYTES.to_vec()),
+            (11, make_lcm_bytes(11)),
+            (12, make_lcm_bytes(12)),
+        ];
+        let summary = ingest_metas_best_effort(&fw, &metas);
+        assert_eq!(summary.corrupt_skipped, 1);
+        assert_eq!(summary.ingested, 2);
+        assert_eq!(fw.latest_ledger(), 12);
+    }
+
+    #[test]
+    fn test_corrupt_in_middle_resets_to_suffix() {
+        let fw = FeeWindows::new(100);
+        let metas = vec![
+            (10, make_lcm_bytes(10)),
+            (11, make_lcm_bytes(11)),
+            (12, CORRUPT_BYTES.to_vec()),
+            (13, make_lcm_bytes(13)),
+            (14, make_lcm_bytes(14)),
+        ];
+        let summary = ingest_metas_best_effort(&fw, &metas);
+        assert_eq!(summary.corrupt_skipped, 1);
+        // 10, 11 ingested; 12 skipped; 13 triggers gap (expected 12, got 13) → reset, re-ingest; 14 ingested
+        assert!(summary.resets >= 1);
+        assert_eq!(fw.latest_ledger(), 14);
+        // Window should contain [13, 14] (post-reset)
+    }
+
+    #[test]
+    fn test_corrupt_at_end_preserves_prefix() {
+        let fw = FeeWindows::new(100);
+        let metas = vec![
+            (10, make_lcm_bytes(10)),
+            (11, make_lcm_bytes(11)),
+            (12, CORRUPT_BYTES.to_vec()),
+        ];
+        let summary = ingest_metas_best_effort(&fw, &metas);
+        assert_eq!(summary.corrupt_skipped, 1);
+        assert_eq!(summary.resets, 0);
+        // Prefix preserved — this is the key fix for the original bug
+        assert_eq!(fw.latest_ledger(), 11);
+    }
+
+    #[test]
+    fn test_gap_recovery_keeps_current_entry() {
+        let fw = FeeWindows::new(100);
+        let metas = vec![
+            (10, make_lcm_bytes(10)),
+            (11, make_lcm_bytes(11)),
+            (20, make_lcm_bytes(20)),
+            (21, make_lcm_bytes(21)),
+        ];
+        let summary = ingest_metas_best_effort(&fw, &metas);
+        assert_eq!(summary.resets, 1);
+        assert_eq!(fw.latest_ledger(), 21);
+    }
+
+    #[test]
+    fn test_mixed_gap_and_corrupt() {
+        let fw = FeeWindows::new(100);
+        let metas = vec![
+            (10, make_lcm_bytes(10)),
+            (11, make_lcm_bytes(11)),
+            (12, CORRUPT_BYTES.to_vec()),
+            (20, make_lcm_bytes(20)),
+            (21, make_lcm_bytes(21)),
+        ];
+        let summary = ingest_metas_best_effort(&fw, &metas);
+        assert!(summary.corrupt_skipped >= 1);
+        assert!(summary.resets >= 1);
+        assert_eq!(fw.latest_ledger(), 21);
+    }
+
+    #[test]
+    fn test_all_corrupt_produces_empty_window() {
+        let fw = FeeWindows::new(100);
+        let metas = vec![(10, CORRUPT_BYTES.to_vec()), (11, CORRUPT_BYTES.to_vec())];
+        let summary = ingest_metas_best_effort(&fw, &metas);
+        assert_eq!(summary.corrupt_skipped, 2);
+        assert_eq!(summary.ingested, 0);
+        assert_eq!(fw.latest_ledger(), 0);
+    }
+
+    #[test]
+    fn test_multiple_consecutive_corrupt() {
+        let fw = FeeWindows::new(100);
+        let metas = vec![
+            (10, make_lcm_bytes(10)),
+            (11, CORRUPT_BYTES.to_vec()),
+            (12, CORRUPT_BYTES.to_vec()),
+            (13, make_lcm_bytes(13)),
+            (14, make_lcm_bytes(14)),
+        ];
+        let summary = ingest_metas_best_effort(&fw, &metas);
+        assert_eq!(summary.corrupt_skipped, 2);
+        assert_eq!(fw.latest_ledger(), 14);
+    }
+
+    #[test]
+    fn test_db_seq_xdr_seq_mismatch_treated_as_corrupt() {
+        let fw = FeeWindows::new(100);
+        // Valid XDR for seq 10, but db_seq says 99
+        let metas = vec![
+            (99, make_lcm_bytes(10)),
+            (11, make_lcm_bytes(11)),
+            (12, make_lcm_bytes(12)),
+        ];
+        let summary = ingest_metas_best_effort(&fw, &metas);
+        assert_eq!(summary.corrupt_skipped, 1);
+        assert_eq!(fw.latest_ledger(), 12);
+    }
+
+    #[test]
+    fn test_multiple_gaps_converges_to_suffix() {
+        let fw = FeeWindows::new(100);
+        let metas = vec![
+            (10, make_lcm_bytes(10)),
+            (11, make_lcm_bytes(11)),
+            (20, make_lcm_bytes(20)),
+            (21, make_lcm_bytes(21)),
+            (30, make_lcm_bytes(30)),
+            (31, make_lcm_bytes(31)),
+        ];
+        let summary = ingest_metas_best_effort(&fw, &metas);
+        assert_eq!(summary.resets, 2);
+        assert_eq!(fw.latest_ledger(), 31);
+    }
+
+    #[test]
+    fn test_no_partial_mutation_on_gap() {
+        let fw = FeeWindows::new(100);
+        // Ingest one entry, then trigger a gap
+        fw.ingest_ledger_close_meta(10, &make_lcm_bytes(10))
+            .unwrap();
+        assert_eq!(fw.latest_ledger(), 10);
+
+        // Try to ingest a non-contiguous entry
+        let result = fw.ingest_ledger_close_meta(20, &make_lcm_bytes(20));
+        assert!(matches!(result, Err(FeeWindowError::Gap { .. })));
+
+        // Window should be unchanged (no partial mutation)
+        assert_eq!(fw.latest_ledger(), 10);
+    }
+
+    #[test]
+    fn test_empty_metas_no_op() {
+        let fw = FeeWindows::new(100);
+        let summary = ingest_metas_best_effort(&fw, &[]);
+        assert_eq!(summary.ingested, 0);
+        assert_eq!(summary.resets, 0);
+        assert_eq!(summary.corrupt_skipped, 0);
+        assert_eq!(fw.latest_ledger(), 0);
     }
 }

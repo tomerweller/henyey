@@ -31,6 +31,31 @@ use stellar_xdr::curr::{
 };
 
 // ---------------------------------------------------------------------------
+// FeeWindowError
+// ---------------------------------------------------------------------------
+
+/// Errors from fee window ingestion, distinguishing parse failures from
+/// contiguity gaps so callers can recover appropriately.
+#[derive(Debug)]
+pub(crate) enum FeeWindowError {
+    /// XDR bytes are corrupt, unrecognizable, or DB/XDR sequence mismatch.
+    Parse(String),
+    /// Ledger sequence is not contiguous with the window's current state.
+    Gap { expected: u32, got: u32 },
+}
+
+impl std::fmt::Display for FeeWindowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(msg) => write!(f, "parse error: {msg}"),
+            Self::Gap { expected, got } => {
+                write!(f, "contiguity gap: expected seq {expected}, got {got}")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FeeDistribution
 // ---------------------------------------------------------------------------
 
@@ -303,20 +328,52 @@ impl FeeWindows {
     ///
     /// Extracts classic and Soroban fees from each transaction in the meta
     /// and appends them to the appropriate window.
-    pub(crate) fn ingest_ledger_close_meta(&self, meta_bytes: &[u8]) -> Result<(), String> {
+    ///
+    /// `db_seq` is the ledger sequence from the database row, used for
+    /// validation and logging (since corrupt XDR cannot provide a sequence).
+    ///
+    /// Returns [`FeeWindowError::Parse`] if the XDR is corrupt or the parsed
+    /// sequence doesn't match `db_seq`. Returns [`FeeWindowError::Gap`] if
+    /// `db_seq` is not contiguous with the window's current state. The gap
+    /// check happens before any mutation, so neither window is modified on
+    /// error.
+    pub(crate) fn ingest_ledger_close_meta(
+        &self,
+        db_seq: u32,
+        meta_bytes: &[u8],
+    ) -> Result<(), FeeWindowError> {
         let lcm = LedgerCloseMeta::from_xdr(meta_bytes, Limits::none())
-            .map_err(|e| format!("failed to parse LedgerCloseMeta: {e}"))?;
+            .map_err(|e| FeeWindowError::Parse(format!("failed to parse LedgerCloseMeta: {e}")))?;
 
-        let ledger_seq = crate::util::ledger_header_entry(&lcm).header.ledger_seq;
+        let parsed_seq = crate::util::ledger_header_entry(&lcm).header.ledger_seq;
+        if parsed_seq != db_seq {
+            return Err(FeeWindowError::Parse(format!(
+                "DB/XDR sequence mismatch: db_seq={db_seq}, parsed_seq={parsed_seq}"
+            )));
+        }
+
+        // Pre-mutation contiguity check against the classic window (both
+        // windows are always appended together, so checking one suffices).
+        let classic_latest = self.classic.latest_ledger();
+        if classic_latest > 0 {
+            let expected = classic_latest + 1;
+            if db_seq != expected {
+                return Err(FeeWindowError::Gap {
+                    expected,
+                    got: db_seq,
+                });
+            }
+        }
 
         let (classic_fees, soroban_fees) = extract_fees_from_lcm(&lcm);
 
+        // Both appends are infallible after the pre-check above.
         self.classic
-            .append(ledger_seq, classic_fees)
-            .map_err(|e| format!("classic window: {e}"))?;
+            .append(db_seq, classic_fees)
+            .expect("classic append failed after pre-check");
         self.soroban
-            .append(ledger_seq, soroban_fees)
-            .map_err(|e| format!("soroban window: {e}"))?;
+            .append(db_seq, soroban_fees)
+            .expect("soroban append failed after pre-check");
 
         Ok(())
     }
