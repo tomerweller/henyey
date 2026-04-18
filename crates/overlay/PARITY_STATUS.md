@@ -74,11 +74,11 @@ Corresponds to: `Floodgate.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `Floodgate()` | `FloodGate::new()` / `with_ttl()` | Full |
-| `clearBelow()` | `clear_below()` | Full |
+| `clearBelow()` | `clear_below()` | Full (+ henyey-specific TTL expiry) |
 | `addRecord()` | `record_seen()` | Full |
 | `broadcast()` | `get_forward_peers()` + external send | Full |
 | `getPeersKnows()` | `get_forward_peers()` | Full |
-| `forgetRecord()` | TTL-based cleanup | Full |
+| `forgetRecord()` | Handled within `clear_below()` | Full |
 | `shutdown()` | `clear()` | Full |
 
 ### FlowControl (`flow_control.rs`)
@@ -312,7 +312,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `broadcastMessage()` | (via broadcast channel + flood gate) | Full |
 | `recvFloodedMsgID()` | `FloodGate::record_seen()` | Full |
 | `recvTransaction()` | (via broadcast channel + flood gate) | Full |
-| `forgetFloodedMsg()` | (TTL-based cleanup) | Full |
+| `forgetFloodedMsg()` | Handled within `clear_below()` at ledger close | Full |
 | `recvTxDemand()` | `TxDemandsManager::recv_demand()` | Full |
 | `getRandomAuthenticatedPeers()` | (shuffled peer list) | Full |
 | `getRandomInboundAuthenticatedPeers()` | N/A | None |

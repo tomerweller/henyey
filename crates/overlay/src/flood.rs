@@ -13,8 +13,9 @@
 //! - **Peer Tracking**: Records which peers have sent each message, so we
 //!   don't forward messages back to peers that already have them.
 //!
-//! - **TTL-based Expiry**: Old entries are automatically cleaned up after
-//!   a configurable TTL (default 5 minutes) to prevent unbounded memory growth.
+//! - **Ledger-boundary Cleanup**: Entries are removed at ledger close via
+//!   [`FloodGate::clear_below`], matching stellar-core's `clearBelow()`.
+//!   A secondary TTL check removes stale entries as a defensive measure.
 //!
 //! - **Rate Limiting**: Soft limit on messages per second to prevent
 //!   overwhelming the node during traffic spikes.
@@ -23,26 +24,24 @@ use dashmap::DashMap;
 use henyey_common::Hash256;
 use parking_lot::RwLock;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::StellarMessage;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::PeerId;
 
 /// Default TTL for seen messages (5 minutes).
 ///
-/// Messages older than this are forgotten, allowing them to be flooded again
-/// if re-received (which shouldn't normally happen).
+/// Used by [`FloodGate::clear_below`] as a secondary expiry mechanism
+/// during ledger-boundary cleanup.
 const DEFAULT_TTL_SECS: u64 = 300;
 
-/// Maximum entries before forced cleanup.
+/// Threshold for warning about large flood gate size.
 ///
-/// Prevents unbounded memory growth under heavy traffic.
-const MAX_ENTRIES: usize = 100_000;
-
-/// How often to check for expired entries (1 minute).
-const CLEANUP_INTERVAL_SECS: u64 = 60;
+/// If the map exceeds this many entries between ledger closes, a one-shot
+/// warning is logged to alert operators.
+const LARGE_MAP_WARN_THRESHOLD: usize = 500_000;
 
 /// Default global rate limit (messages per second).
 ///
@@ -108,10 +107,8 @@ impl SeenEntry {
 pub struct FloodGate {
     /// Map of message hash to tracking entry.
     seen: DashMap<Hash256, SeenEntry>,
-    /// Time-to-live for message entries.
+    /// Time-to-live for message entries (used by `clear_below`).
     ttl: Duration,
-    /// Last time we ran cleanup.
-    last_cleanup: RwLock<Instant>,
     /// Counter: total messages processed.
     messages_seen: AtomicU64,
     /// Counter: duplicate messages dropped.
@@ -122,6 +119,8 @@ pub struct FloodGate {
     rate_window_start: RwLock<Instant>,
     /// Messages counted in current window.
     rate_window_count: AtomicU64,
+    /// Whether the large-map warning has already been emitted.
+    large_map_warned: AtomicBool,
 }
 
 impl FloodGate {
@@ -135,12 +134,12 @@ impl FloodGate {
         Self {
             seen: DashMap::new(),
             ttl,
-            last_cleanup: RwLock::new(Instant::now()),
             messages_seen: AtomicU64::new(0),
             messages_dropped: AtomicU64::new(0),
             rate_limit: DEFAULT_RATE_LIMIT_PER_SEC,
             rate_window_start: RwLock::new(Instant::now()),
             rate_window_count: AtomicU64::new(0),
+            large_map_warned: AtomicBool::new(false),
         }
     }
 
@@ -162,6 +161,10 @@ impl FloodGate {
     ///
     /// The `ledger_seq` parameter records the current ledger sequence for
     /// ledger-based cleanup via [`clear_below`](FloodGate::clear_below).
+    ///
+    /// This is a pure insert/lookup operation with no automatic cleanup,
+    /// matching stellar-core's `addRecord()`. Cleanup happens at ledger
+    /// boundaries via [`clear_below`](FloodGate::clear_below).
     pub fn record_seen(
         &self,
         message_hash: Hash256,
@@ -169,9 +172,6 @@ impl FloodGate {
         ledger_seq: u32,
     ) -> bool {
         self.messages_seen.fetch_add(1, Ordering::Relaxed);
-
-        // Try cleanup if needed
-        self.maybe_cleanup();
 
         // Check if we've seen this message
         if let Some(mut entry) = self.seen.get_mut(&message_hash) {
@@ -190,6 +190,17 @@ impl FloodGate {
             entry.add_peer(peer);
         }
         self.seen.insert(message_hash, entry);
+
+        // One-shot warning if the map grows unexpectedly large between ledger closes
+        let len = self.seen.len();
+        if len > LARGE_MAP_WARN_THRESHOLD && !self.large_map_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                entries = len,
+                "FloodGate map exceeds {} entries; cleanup happens at ledger close",
+                LARGE_MAP_WARN_THRESHOLD
+            );
+        }
+
         trace!("New message: {}", message_hash);
         true
     }
@@ -235,40 +246,6 @@ impl FloodGate {
         self.seen.contains_key(message_hash)
     }
 
-    /// Forces immediate cleanup of expired entries.
-    ///
-    /// Normally cleanup happens automatically, but this can be called
-    /// to free memory immediately.
-    pub fn cleanup(&self) {
-        let now = Instant::now();
-        let ttl = self.ttl;
-
-        let before_count = self.seen.len();
-        self.seen.retain(|_, entry| !entry.is_expired(ttl));
-        // Use saturating_sub to avoid panic if entries were added by another thread
-        // between the two len() calls
-        let removed = before_count.saturating_sub(self.seen.len());
-
-        if removed > 0 {
-            debug!("FloodGate cleanup: removed {} expired entries", removed);
-        }
-
-        *self.last_cleanup.write() = now;
-    }
-
-    /// Runs cleanup if the interval has passed or we've exceeded max entries.
-    fn maybe_cleanup(&self) {
-        let should_cleanup = {
-            let last = *self.last_cleanup.read();
-            last.elapsed() > Duration::from_secs(CLEANUP_INTERVAL_SECS)
-                || self.seen.len() > MAX_ENTRIES
-        };
-
-        if should_cleanup {
-            self.cleanup();
-        }
-    }
-
     /// Returns current statistics about the flood gate.
     pub fn stats(&self) -> FloodGateStats {
         FloodGateStats {
@@ -281,8 +258,9 @@ impl FloodGate {
     /// Removes flood records from ledgers before `ledger_seq`.
     ///
     /// Matches upstream stellar-core's `clearBelow(maxLedger)` which removes
-    /// records from ledgers before `maxLedger`. Also runs time-based TTL
-    /// cleanup as a secondary mechanism.
+    /// records from ledgers before `maxLedger`. Additionally removes
+    /// TTL-expired entries as a henyey-specific defensive measure (stellar-core's
+    /// `clearBelow` is purely ledger-based).
     pub fn clear_below(&self, ledger_seq: u32) {
         let ttl = self.ttl;
         let before_count = self.seen.len();
@@ -297,7 +275,8 @@ impl FloodGate {
             );
         }
 
-        *self.last_cleanup.write() = Instant::now();
+        // Reset the large-map warning so it can fire again if growth recurs
+        self.large_map_warned.store(false, Ordering::Relaxed);
     }
 
     /// Clears all entries from the flood gate.
@@ -306,7 +285,7 @@ impl FloodGate {
     /// flooded again.
     pub fn clear(&self) {
         self.seen.clear();
-        *self.last_cleanup.write() = Instant::now();
+        self.large_map_warned.store(false, Ordering::Relaxed);
     }
 }
 
@@ -457,8 +436,8 @@ mod tests {
         // Wait for expiry
         std::thread::sleep(Duration::from_millis(20));
 
-        // Force cleanup
-        gate.cleanup();
+        // clear_below with a high ledger seq removes expired entries
+        gate.clear_below(u32::MAX);
 
         // Should be able to flood again
         assert!(gate.should_flood(&hash));
@@ -532,5 +511,42 @@ mod tests {
         assert_eq!(gate.stats().seen_count, 2);
         assert!(gate.has_seen(&hash1));
         assert!(gate.has_seen(&hash2));
+    }
+
+    /// Regression test for AUDIT-174: record_seen() must NOT trigger automatic
+    /// cleanup. Expired entries should only be removed by explicit clear_below().
+    #[test]
+    fn test_record_seen_does_not_auto_cleanup() {
+        // Use a short TTL so entries expire quickly
+        let gate = FloodGate::with_ttl(Duration::from_millis(50));
+
+        // Insert 5 entries at ledger 1
+        for i in 0..5u8 {
+            gate.record_seen(make_hash(i), None, 1);
+        }
+        assert_eq!(gate.stats().seen_count, 5);
+
+        // Wait for all entries to expire (2x TTL for generous margin)
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Insert 5 new entries at ledger 2 via record_seen
+        for i in 10..15u8 {
+            gate.record_seen(make_hash(i), None, 2);
+        }
+
+        // All 10 entries should still be present — record_seen does not clean up
+        assert_eq!(gate.stats().seen_count, 10);
+
+        // Now clear_below(2) should remove ledger-1 entries (and any expired)
+        gate.clear_below(2);
+        assert_eq!(gate.stats().seen_count, 5);
+
+        // Only ledger-2 entries remain
+        for i in 10..15u8 {
+            assert!(gate.has_seen(&make_hash(i)));
+        }
+        for i in 0..5u8 {
+            assert!(!gate.has_seen(&make_hash(i)));
+        }
     }
 }

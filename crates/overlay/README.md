@@ -124,7 +124,7 @@ let overlay = OverlayManager::new_with_connection_factory(config, local_node, fa
 | `connection.rs` | Raw connections, listeners, split send/recv halves, and connection-slot accounting. |
 | `connection_factory.rs` | Transport abstraction trait plus the default TCP implementation. |
 | `error.rs` | `OverlayError` and retry/fatal classification helpers. |
-| `flood.rs` | Flood deduplication, peer exclusion, TTL cleanup, and message hashing. |
+| `flood.rs` | Flood deduplication, peer exclusion, ledger-boundary cleanup, and message hashing. |
 | `flow_control.rs` | Priority outbound queues, message/byte capacity tracking, and `CapacityGuard`. |
 | `item_fetcher.rs` | `ItemFetcher` and `Tracker` state machines for missing tx/quorum set retrieval. |
 | `loopback.rs` | In-process loopback transport for tests and simulations. |
