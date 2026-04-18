@@ -14,7 +14,7 @@
 | HerderPersistence (SCP state DB) | Partial | Missing `copySCPHistoryToStream`, `getNodeQuorumSet` |
 | HerderUtils (value extraction) | Partial | Missing validated hash/quorum-map helpers |
 | LedgerCloseData | Full | All accessors and XDR round-trip |
-| PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache |
+| PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache; release-up-to drain now matches `processSCPQueueUpToIndex` |
 | QuorumTracker | Full | expand, rebuild, closest validators |
 | TransactionQueue | Partial | Missing arb damping; fee release and drop now implemented |
 | TxQueueLimiter | Partial | Missing visitTopTxs with custom limits |

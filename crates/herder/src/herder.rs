@@ -851,18 +851,7 @@ impl Herder {
         *tracked_write(LOCK_HERDER_STATE, &self.state) = HerderState::Tracking;
 
         // Release any pending envelopes for this slot and previous
-        let pending = self.pending_envelopes.release_up_to(slot);
-        for (pending_slot, envelopes) in pending {
-            debug!(
-                "Released {} pending envelopes for slot {}",
-                envelopes.len(),
-                pending_slot
-            );
-            for envelope in envelopes {
-                // Process released envelopes (ignore result as they may be old)
-                let _ = self.process_scp_envelope(envelope);
-            }
-        }
+        self.drain_and_process_pending(slot);
 
         debug!(
             lcl,
@@ -1708,6 +1697,26 @@ impl Herder {
         }
     }
 
+    /// Drain all pending envelopes up to and including `slot` and process them
+    /// through SCP. The `BTreeMap` returned by `release_up_to` iterates in
+    /// ascending key order, ensuring deterministic slot-ordered processing.
+    ///
+    /// Mirrors stellar-core's `processSCPQueueUpToIndex` which pops all
+    /// envelopes for slots ≤ target in a loop.
+    fn drain_and_process_pending(&self, slot: u64) {
+        let pending = self.pending_envelopes.release_up_to(slot);
+        for (pending_slot, envelopes) in pending {
+            debug!(
+                "Released {} pending envelopes for slot {}",
+                envelopes.len(),
+                pending_slot
+            );
+            for env in envelopes {
+                let _ = self.process_scp_envelope(env);
+            }
+        }
+    }
+
     /// Advance tracking slot after externalization.
     fn advance_tracking_slot(&self, externalized_slot: u64) {
         // Extract close time from the externalized value for tracking
@@ -1747,11 +1756,11 @@ impl Herder {
                 }
             }
 
-            // Release any pending envelopes for the new slot
-            let pending = self.pending_envelopes.release(externalized_slot + 1);
-            for env in pending {
-                let _ = self.process_scp_envelope(env);
-            }
+            // Release any pending envelopes up to and including the new slot.
+            // Uses release_up_to (via drain_and_process_pending) to match
+            // stellar-core's processSCPQueueUpToIndex which drains all
+            // slots up to the target index, not just a single slot.
+            self.drain_and_process_pending(externalized_slot + 1);
         }
     }
 
@@ -4722,5 +4731,80 @@ mod scp_pipeline_tests {
             3,
             "three enqueued items must report queue_len == 3"
         );
+    }
+}
+
+// =============================================================================
+// AUDIT-166 regression test: advance_tracking_slot must drain all intermediate
+// pending envelopes, not just the single target slot.
+// =============================================================================
+
+#[cfg(test)]
+mod advance_tracking_slot_tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        Hash, NodeId as XdrNodeId, PublicKey, ScpEnvelope, ScpNomination, ScpStatement,
+        ScpStatementPledges, Uint256,
+    };
+
+    fn make_test_envelope(slot: u64) -> ScpEnvelope {
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: Hash([0u8; 32]),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+        }
+    }
+
+    /// AUDIT-166: advance_tracking_slot must drain all intermediate pending
+    /// envelopes via drain_and_process_pending (release_up_to), not just the
+    /// single target+1 slot.
+    ///
+    /// Before fix: release(externalized_slot + 1) only drained one slot.
+    /// After fix: drain_and_process_pending(externalized_slot + 1) drains all
+    /// slots up to the target, matching stellar-core's processSCPQueueUpToIndex.
+    #[test]
+    fn test_advance_tracking_slot_drains_intermediate_pending() {
+        let herder = Herder::new(HerderConfig::default());
+
+        // Set initial tracking state: consensus_index = 100
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.consensus_index = 100;
+            ts.is_tracking = true;
+        }
+        herder.pending_envelopes.set_current_slot(100);
+
+        // Buffer envelopes for intermediate slots 101-104
+        for slot in 101..=104 {
+            herder.pending_envelopes.add(slot, make_test_envelope(slot));
+        }
+        assert_eq!(herder.pending_envelopes.slot_count(), 4);
+
+        // Simulate fast-forward: externalize slot 103 (jumps from 100 to 103)
+        // advance_tracking_slot sets consensus_index = 104 and calls
+        // drain_and_process_pending(104)
+        herder.advance_tracking_slot(103);
+
+        // All intermediate slots (101-104) should have been drained.
+        // Before the fix, only slot 104 would have been released.
+        assert_eq!(
+            herder.pending_envelopes.slot_count(),
+            0,
+            "All intermediate pending envelopes (101-104) must be drained after \
+             fast-forward externalization of slot 103"
+        );
+
+        // Verify tracking state was updated
+        let ts = herder.tracking_state.read();
+        assert_eq!(ts.consensus_index, 104);
+        assert!(ts.is_tracking);
     }
 }

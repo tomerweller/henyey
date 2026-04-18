@@ -207,7 +207,7 @@ impl PendingEnvelopes {
     }
 
     /// Release all envelopes for a slot that has become active.
-    pub fn release(&self, slot: SlotIndex) -> Vec<ScpEnvelope> {
+    fn release(&self, slot: SlotIndex) -> Vec<ScpEnvelope> {
         if let Some((_, envelopes)) = self.slots.remove(&slot) {
             let count = envelopes.len() as u64;
             self.stats.write().released += count;
@@ -501,5 +501,36 @@ mod tests {
             PendingResult::Added,
             "Envelope rejected as BufferFull should not be permanently stuck in seen_hashes"
         );
+    }
+
+    /// Verify release_up_to drains all intermediate slots in ascending order.
+    /// This is the core invariant that advance_tracking_slot relies on
+    /// for parity with stellar-core's processSCPQueueUpToIndex.
+    #[test]
+    fn test_release_up_to_intermediate_slots() {
+        let pending = PendingEnvelopes::with_defaults();
+        pending.set_current_slot(100);
+
+        // Buffer envelopes for 5 consecutive slots
+        for slot in 101..=105 {
+            pending.add(slot, make_test_envelope(slot));
+        }
+        assert_eq!(pending.slot_count(), 5);
+
+        // Simulate fast-forward: release up to slot 104
+        let released = pending.release_up_to(104);
+
+        // All 4 intermediate slots (101-104) must be released
+        assert_eq!(released.len(), 4);
+        let released_slots: Vec<SlotIndex> = released.keys().copied().collect();
+        assert_eq!(released_slots, vec![101, 102, 103, 104]);
+
+        // Each slot should have exactly 1 envelope
+        for (_slot, envs) in &released {
+            assert_eq!(envs.len(), 1);
+        }
+
+        // Slot 105 should remain in the buffer
+        assert_eq!(pending.slot_count(), 1);
     }
 }
