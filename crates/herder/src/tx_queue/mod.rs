@@ -143,6 +143,55 @@ pub trait AccountProvider: Send + Sync {
     fn load_account(&self, account_id: &AccountId) -> Option<AccountEntry>;
 }
 
+/// Single-snapshot provider for batch tx-set validation.
+///
+/// Wraps one [`henyey_ledger::SnapshotHandle`] and impls both [`AccountProvider`]
+/// and [`FeeBalanceProvider`], so the same frozen snapshot serves all lookups
+/// during a nomination or post-close validation pass.
+///
+/// # Parity
+///
+/// Mirrors stellar-core's single `LedgerSnapshot ls(app)` per
+/// `getInvalidTxListWithErrors` call (`TxSetUtils.cpp:167`).
+///
+/// # When to use
+///
+/// * **Batch paths** (N txs → 1 snapshot): use this type.
+/// * **Admission paths** (1 tx → 1 snapshot per call): keep the per-call
+///   providers on the queue — no amplification, no benefit.
+pub struct SnapshotProviders {
+    snapshot: henyey_ledger::SnapshotHandle,
+}
+
+impl SnapshotProviders {
+    /// Build providers from an existing snapshot handle.
+    pub fn new(snapshot: henyey_ledger::SnapshotHandle) -> Self {
+        Self { snapshot }
+    }
+
+    /// Access the underlying snapshot (e.g., for reading header/base_reserve).
+    pub fn snapshot(&self) -> &henyey_ledger::SnapshotHandle {
+        &self.snapshot
+    }
+}
+
+impl AccountProvider for SnapshotProviders {
+    fn load_account(&self, account_id: &AccountId) -> Option<AccountEntry> {
+        self.snapshot.get_account(account_id).ok().flatten()
+    }
+}
+
+impl FeeBalanceProvider for SnapshotProviders {
+    fn get_available_balance(&self, account_id: &AccountId) -> Option<i64> {
+        let acc = self.snapshot.get_account(account_id).ok().flatten()?;
+        let base_reserve = self.snapshot.header().base_reserve;
+        Some(henyey_ledger::reserves::available_to_send(
+            &acc,
+            base_reserve,
+        ))
+    }
+}
+
 /// Configuration for the transaction queue.
 #[derive(Debug, Clone)]
 pub struct TxQueueConfig {
@@ -6259,5 +6308,175 @@ mod pending_depth_tests {
         let r2 = queue.shift();
         assert_eq!(r2.unbanned_count, 1);
         assert!(!queue.is_banned(&hash));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_providers_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A counting provider that tracks how many times it is called.
+    /// Used to verify that override providers are used instead of queue defaults.
+    struct CountingFeeProvider {
+        call_count: AtomicU64,
+    }
+
+    impl CountingFeeProvider {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicU64::new(0),
+            }
+        }
+        fn calls(&self) -> u64 {
+            self.call_count.load(Ordering::Relaxed)
+        }
+    }
+
+    impl FeeBalanceProvider for CountingFeeProvider {
+        fn get_available_balance(&self, _account_id: &AccountId) -> Option<i64> {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            // Return a large balance so no tx is trimmed for fee reasons.
+            Some(i64::MAX)
+        }
+    }
+
+    struct CountingAccountProvider {
+        call_count: AtomicU64,
+    }
+
+    impl CountingAccountProvider {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicU64::new(0),
+            }
+        }
+        fn calls(&self) -> u64 {
+            self.call_count.load(Ordering::Relaxed)
+        }
+    }
+
+    impl AccountProvider for CountingAccountProvider {
+        fn load_account(&self, _account_id: &AccountId) -> Option<AccountEntry> {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// A provider that panics if called — used to verify the queue's stored
+    /// providers are NOT consulted when override providers are supplied.
+    struct PanicFeeProvider;
+
+    impl FeeBalanceProvider for PanicFeeProvider {
+        fn get_available_balance(&self, _account_id: &AccountId) -> Option<i64> {
+            panic!("Queue's stored FeeBalanceProvider should not be called when override is set");
+        }
+    }
+
+    struct PanicAccountProvider;
+
+    impl AccountProvider for PanicAccountProvider {
+        fn load_account(&self, _account_id: &AccountId) -> Option<AccountEntry> {
+            panic!("Queue's stored AccountProvider should not be called when override is set");
+        }
+    }
+
+    fn make_test_envelope_with_source(fee: u32, source_seed: u8) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([source_seed; 32]));
+        let operations: Vec<Operation> = vec![Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(stellar_xdr::curr::CreateAccountOp {
+                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
+                starting_balance: 1_000_000_000,
+            }),
+        }];
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    use stellar_xdr::curr::{
+        AccountId, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+        PublicKey, SequenceNumber, SignatureHint, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionV1Envelope, Uint256,
+    };
+
+    #[test]
+    fn test_override_providers_used_instead_of_queue_defaults() {
+        // Set up queue — add txs first, then install panic providers.
+        // If the override providers work correctly, the panic providers
+        // should never be called during build_generalized_tx_set_with_providers.
+        let queue = TransactionQueue::with_defaults();
+
+        // Add some txs to the queue (before setting panic providers).
+        for i in 1..=5 {
+            let tx = make_test_envelope_with_source(1000 * i, i as u8);
+            queue.try_add(tx);
+        }
+
+        // NOW set queue's stored providers to ones that panic.
+        queue.set_fee_balance_provider(Arc::new(PanicFeeProvider));
+        queue.set_account_provider(Arc::new(PanicAccountProvider));
+
+        // Create counting override providers.
+        let fee_provider = CountingFeeProvider::new();
+        let account_provider = CountingAccountProvider::new();
+
+        // Build tx set with override providers — should NOT panic.
+        let (_tx_set, _gen_tx_set) = queue.build_generalized_tx_set_with_providers(
+            Hash256::ZERO,
+            100,
+            None,
+            0,
+            Some(&fee_provider),
+            Some(&account_provider),
+        );
+
+        // The override providers should have been called (at least once
+        // per source account for the fee provider during trim_invalid).
+        assert!(
+            fee_provider.calls() > 0 || account_provider.calls() > 0,
+            "Override providers should be consulted during trim_invalid"
+        );
+    }
+
+    #[test]
+    fn test_no_override_uses_queue_defaults() {
+        // When no override providers are given, queue's stored providers are used.
+        let queue = TransactionQueue::with_defaults();
+
+        let counting_fee = Arc::new(CountingFeeProvider::new());
+        let counting_account = Arc::new(CountingAccountProvider::new());
+        queue.set_fee_balance_provider(counting_fee.clone());
+        queue.set_account_provider(counting_account.clone());
+
+        for i in 1..=3 {
+            let tx = make_test_envelope_with_source(1000 * i, i as u8);
+            queue.try_add(tx);
+        }
+
+        // Build without override — should use queue's stored providers.
+        let (_tx_set, _gen_tx_set) =
+            queue.build_generalized_tx_set_with_providers(Hash256::ZERO, 100, None, 0, None, None);
+
+        assert!(
+            counting_fee.calls() > 0 || counting_account.calls() > 0,
+            "Queue's stored providers should be consulted when no override"
+        );
     }
 }

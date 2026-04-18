@@ -1919,17 +1919,50 @@ impl Herder {
     ///   4. Merge config + runtime upgrades, filter already-applied
     ///   5. Sign via `make_stellar_value` and XDR-encode to `Value`
     fn build_nomination_value(&self) -> Option<Value> {
-        // 1. Ledger state
-        let (previous_hash, max_txs, starting_seq, header, lcl_close_time, max_soroban_tx_set_size) = {
+        // 1. Ledger state — create ONE snapshot for the entire nomination pass.
+        // This snapshot is shared between build_starting_seq_map and the
+        // trim_invalid_two_phase validation, eliminating O(N) per-call snapshots.
+        let (
+            previous_hash,
+            max_txs,
+            starting_seq,
+            header,
+            lcl_close_time,
+            max_soroban_tx_set_size,
+            snapshot_providers,
+        ) = {
             let guard = self.ledger_manager.read();
             if let Some(manager) = guard.as_ref() {
                 let hdr = manager.current_header();
                 let lcl_ct = hdr.scp_value.close_time.0;
                 let max = hdr.max_tx_set_size as usize;
-                let seq = self.build_starting_seq_map(manager);
                 let soroban_max = manager
                     .soroban_network_info()
                     .map(|info| info.ledger_max_tx_count);
+
+                // Build one snapshot for both seq-map and validation providers.
+                let providers = match manager.create_snapshot() {
+                    Ok(snapshot) => {
+                        let ledger_seq = manager.current_ledger_seq();
+                        let seq = self.build_starting_seq_map(&snapshot, ledger_seq);
+                        let sp = crate::tx_queue::SnapshotProviders::new(snapshot);
+                        Some((seq, sp))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to create snapshot for nomination; \
+                             trim_invalid will use per-call providers"
+                        );
+                        None
+                    }
+                };
+
+                let (seq, sp) = match providers {
+                    Some((seq, sp)) => (seq, Some(sp)),
+                    None => (None, None),
+                };
+
                 (
                     manager.current_header_hash(),
                     max,
@@ -1937,6 +1970,7 @@ impl Herder {
                     hdr,
                     lcl_ct,
                     soroban_max,
+                    sp,
                 )
             } else {
                 (
@@ -1945,6 +1979,7 @@ impl Herder {
                     None,
                     LedgerHeader::default(),
                     0,
+                    None,
                     None,
                 )
             }
@@ -1963,11 +1998,18 @@ impl Herder {
         let close_time_offset = close_time - lcl_close_time;
 
         // 3. Build & cache tx set, trimming against proposed close time.
-        let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set_with_starting_seq(
+        // Use the pre-built snapshot providers for O(1) snapshot creation.
+        let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set_with_providers(
             previous_hash,
             max_txs,
             starting_seq.as_ref(),
             close_time_offset,
+            snapshot_providers
+                .as_ref()
+                .map(|sp| sp as &dyn crate::tx_queue::FeeBalanceProvider),
+            snapshot_providers
+                .as_ref()
+                .map(|sp| sp as &dyn crate::tx_queue::AccountProvider),
         );
         debug!(
             hash = %tx_set.hash,
@@ -2095,10 +2137,9 @@ impl Herder {
 
     fn build_starting_seq_map(
         &self,
-        manager: &Arc<LedgerManager>,
+        snapshot: &henyey_ledger::SnapshotHandle,
+        ledger_seq: u32,
     ) -> Option<HashMap<Vec<u8>, i64>> {
-        let snapshot = manager.create_snapshot().ok()?;
-        let ledger_seq = manager.current_ledger_seq();
         if ledger_seq > i32::MAX as u32 {
             return None;
         }

@@ -89,6 +89,31 @@ impl TransactionQueue {
         starting_seq: Option<&HashMap<Vec<u8>, i64>>,
         close_time_offset: u64,
     ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
+        self.build_generalized_tx_set_with_providers(
+            previous_ledger_hash,
+            max_ops,
+            starting_seq,
+            close_time_offset,
+            None,
+            None,
+        )
+    }
+
+    /// Build a GeneralizedTransactionSet with caller-supplied snapshot providers.
+    ///
+    /// When `override_fee_provider` / `override_account_provider` are `Some`,
+    /// they are used for the `trim_invalid_two_phase` pass instead of the
+    /// queue's stored per-call providers. This avoids creating O(N) snapshots
+    /// on batch paths (nomination, post-close re-validation).
+    pub fn build_generalized_tx_set_with_providers(
+        &self,
+        previous_ledger_hash: Hash256,
+        max_ops: usize,
+        starting_seq: Option<&HashMap<Vec<u8>, i64>>,
+        close_time_offset: u64,
+        override_fee_provider: Option<&dyn FeeBalanceProvider>,
+        override_account_provider: Option<&dyn AccountProvider>,
+    ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
         use stellar_xdr::curr::{GeneralizedTransactionSet, WriteXdr};
 
         let SelectedTxs {
@@ -121,10 +146,26 @@ impl TransactionQueue {
         // We only run this when a fee balance provider is available. Txs are already
         // individually validated at queue admission; the cross-phase trim catches the case
         // where cumulative fees across both phases exceed a source's balance.
-        let fee_provider = self.get_fee_balance_provider();
-        let account_provider = self.get_account_provider();
-        let (classic_txs, mut soroban_txs) = if fee_provider.is_some() || account_provider.is_some()
-        {
+        //
+        // When override providers are supplied (batch paths like nomination), use them
+        // directly — they wrap a single pre-built snapshot. Otherwise fall back to the
+        // queue's stored per-call providers (admission path).
+        let queue_fee = if override_fee_provider.is_none() {
+            self.get_fee_balance_provider()
+        } else {
+            None
+        };
+        let queue_account = if override_account_provider.is_none() {
+            self.get_account_provider()
+        } else {
+            None
+        };
+        let fee_ref: Option<&dyn FeeBalanceProvider> =
+            override_fee_provider.or(queue_fee.as_deref());
+        let account_ref: Option<&dyn AccountProvider> =
+            override_account_provider.or(queue_account.as_deref());
+
+        let (classic_txs, mut soroban_txs) = if fee_ref.is_some() || account_ref.is_some() {
             let ctx = {
                 let vc = self.validation_context.read();
                 crate::tx_set_utils::TxSetValidationContext {
@@ -147,8 +188,8 @@ impl TransactionQueue {
                 &soroban_txs,
                 &ctx,
                 &close_time_bounds,
-                fee_provider.as_deref(),
-                account_provider.as_deref(),
+                fee_ref,
+                account_ref,
             )
         } else {
             (classic_txs, soroban_txs)

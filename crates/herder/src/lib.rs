@@ -172,6 +172,7 @@ pub use tx_set_utils::{
 // Fee balance provider trait (used by tx_set_utils for affordability checks)
 pub use tx_queue::AccountProvider;
 pub use tx_queue::FeeBalanceProvider;
+pub use tx_queue::SnapshotProviders;
 
 // Parallel tx set builder
 pub use parallel_tx_set_builder::build_two_phase_tx_set;
