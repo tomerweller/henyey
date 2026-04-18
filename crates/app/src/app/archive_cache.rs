@@ -260,10 +260,15 @@ impl ArchiveCheckpointCache {
         });
     }
 
-    /// Clear the cached value. Used by `trigger_recovery_catchup` to
-    /// force the next non-blocking read to be "cold", so the background
-    /// refresh spawns immediately — matching the previous behavior of
-    /// invalidating the cache before a recovery-escalation archive query.
+    /// Clear the cached value.
+    ///
+    /// Historically called by `trigger_recovery_catchup` to force a
+    /// cold non-blocking read (see `consensus.rs` comment dated
+    /// 2026-04-18 for why that was removed — net-negative behavior). No
+    /// production caller remains; this is retained for the existing
+    /// regression tests that need to exercise the cold-cache branch of
+    /// `get_cached()`.
+    #[cfg(test)]
     pub(super) fn clear(&self) {
         *self.value.write() = None;
     }

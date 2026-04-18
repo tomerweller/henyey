@@ -844,14 +844,29 @@ impl App {
             }
         };
 
-        if !backoff_active {
-            // Invalidate the archive checkpoint cache so the next
-            // non-blocking read sees "cold" and schedules a fresh refresh.
-            // In local mode (1 ledger/sec, checkpoints every 8 ledgers),
-            // a 60s-stale cache returns a checkpoint ~60 ledgers behind
-            // the validator, causing catchup to be a no-op.
-            self.archive_checkpoint_cache.clear();
-        }
+        // NOTE (#1755 debug, 2026-04-18): Previously this branch called
+        // `archive_checkpoint_cache.clear()` with the stated goal of
+        // forcing a fresh archive read. In practice the clear was
+        // catastrophic: the immediately-following non-blocking read then
+        // returned `None` (cold cache), which logs "archive hasn't
+        // published checkpoint yet" and skips the catchup. A background
+        // refresh fires and populates the cache ~1s later, but the next
+        // recovery tick (10s later) clears the cache again before reading
+        // it. Net result: a stuck recovery loop that *never* acts on the
+        // archive, even though the archive is reachable and well ahead of
+        // our ledger. Reproduced on Quickstart local/rpc shard where the
+        // validator sat at ledger=13 with archive already at ledger=719.
+        //
+        // The cache's own `get_cached()` already spawns a background
+        // refresh on BOTH cold and stale reads, so the clear is not
+        // needed to trigger a refresh. And accepting a stale-by-TTL
+        // value is strictly better than an infinite stall: it just
+        // means we may catchup in smaller steps, which is a performance
+        // concern, not a correctness one.
+        //
+        // Left the `backoff_active` branch in place as a no-op so the
+        // variable retains documentation value for the read below.
+        let _ = backoff_active;
 
         // Non-blocking read. `None` means cold/stale cache — treat it as
         // the existing `Err(e)` branch (archive unreachable): arm the
