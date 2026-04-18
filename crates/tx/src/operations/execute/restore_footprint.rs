@@ -1098,9 +1098,9 @@ mod tests {
         );
     }
 
-    /// Regression test: no TTL + entry present → does NOT panic, returns success.
-    /// This is the hot-archive path; the entry should be skipped (not restored from
-    /// live BL) since hot archive restores are handled separately.
+    /// Regression test: no TTL + no entry → does NOT panic, returns success.
+    /// When no TTL exists, the entry is not in the live bucket list (may need
+    /// hot archive restore, which is handled separately). This must not panic.
     #[test]
     fn test_restore_footprint_no_ttl_skips_without_panic() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
@@ -1111,7 +1111,7 @@ mod tests {
             hash: Hash([1u8; 32]),
         });
 
-        // No TTL entry, but data entry exists — should just skip
+        // No TTL entry, no data entry — should just skip
         let op = RestoreFootprintOp {
             ext: ExtensionPoint::V0,
         };
