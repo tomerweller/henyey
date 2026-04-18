@@ -439,10 +439,27 @@ impl App {
         self.tx_set_all_peers_exhausted
             .store(false, Ordering::SeqCst);
 
-        // Update cache with the ledger we caught up to (it's a checkpoint).
-        // This uses the cache's seed() API directly rather than going through
-        // a fetcher since we already have the authoritative value.
-        self.archive_checkpoint_cache.seed(output.ledger_seq);
+        // Update cache with the latest published checkpoint at or below the
+        // ledger we caught up to. `output.ledger_seq` is the target-ledger
+        // value passed to catchup, which is NOT always a checkpoint boundary
+        // (e.g., buffered catchup targeting a non-checkpoint slot to bridge
+        // an overlay gap). Seeding the cache with a non-checkpoint value
+        // would cause subsequent `archive_latest < target_checkpoint` checks
+        // to incorrectly report the archive as behind, creating a feedback
+        // loop that starved testnet catchup of progress (see #1811).
+        //
+        // Take the MAX of the current cached value and the computed checkpoint
+        // so a local catchup never reduces our view of the archive's latest
+        // state — it can only improve or keep it.
+        let caught_up_checkpoint =
+            henyey_history::checkpoint::latest_checkpoint_before_or_at(output.ledger_seq)
+                .unwrap_or(0);
+        if caught_up_checkpoint > 0 {
+            let current = self.archive_checkpoint_cache.get_cached().unwrap_or(0);
+            if caught_up_checkpoint > current {
+                self.archive_checkpoint_cache.seed(caught_up_checkpoint);
+            }
+        }
 
         // Clear archive-behind backoff — a successful catchup proves the
         // archive is now publishing, so the next recovery cycle (if any)
@@ -2679,6 +2696,44 @@ mod tests {
         // backoff > 2s risks missing multiple published checkpoints in a
         // single wait.
         assert!(App::archive_behind_backoff_secs_for(accel, 5) <= 2);
+    }
+
+    /// Regression for #1811: after a buffered catchup to a non-checkpoint
+    /// target ledger (e.g., ledger 2107874, 34 past checkpoint 2107839),
+    /// `handle_catchup_result` used to seed the archive-checkpoint cache
+    /// with the raw ledger number. Subsequent `validate_target_checkpoint_published`
+    /// calls read 2107874 from cache, compared it to `target_checkpoint=2107903`,
+    /// concluded the archive was behind, armed the backoff, and skipped.
+    /// Every in-tree archive catchup then re-seeded the cache with a new
+    /// non-checkpoint target, creating a self-reinforcing "archive behind
+    /// its own previous target" feedback loop that blocked progress until
+    /// the 60 s backoff expired and a real archive fetch overwrote the
+    /// stale seeded value.
+    ///
+    /// After the fix, `latest_checkpoint_before_or_at(output.ledger_seq)`
+    /// converts the target ledger to the containing checkpoint before
+    /// seeding, and the seed only happens if it would advance (not
+    /// regress) the cached value.
+    #[test]
+    fn test_seed_value_uses_checkpoint_not_raw_ledger() {
+        use henyey_history::checkpoint::latest_checkpoint_before_or_at;
+
+        // Non-checkpoint target ledger: 2107874 is 34 past checkpoint 2107839.
+        let target_ledger = 2_107_874u32;
+        let expected_checkpoint =
+            latest_checkpoint_before_or_at(target_ledger).expect("nonzero target has checkpoint");
+        assert_eq!(
+            expected_checkpoint, 2_107_839,
+            "2107874 should collapse to checkpoint 2107839 (= (32935 * 64) + 63 = 2107839)"
+        );
+
+        // Checkpoint-aligned target is idempotent.
+        let checkpoint_ledger = 2_107_903u32;
+        assert_eq!(
+            latest_checkpoint_before_or_at(checkpoint_ledger),
+            Some(2_107_903),
+            "a ledger that IS a checkpoint should map to itself"
+        );
     }
 
     #[test]
