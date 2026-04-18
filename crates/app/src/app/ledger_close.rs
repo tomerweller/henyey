@@ -121,7 +121,8 @@ impl LedgerPersistInputs {
                     &self.tx_results,
                     metas,
                     self.network_id,
-                );
+                )
+                .map_err(|e| henyey_db::DbError::Integrity(e.to_string()))?;
                 if !events.is_empty() {
                     conn.store_events(&events)?;
                 }
@@ -197,7 +198,14 @@ impl App {
             .into_iter()
             .map(|(tx, _)| tx)
             .collect();
-        let tx_count = ordered_txs.len().min(tx_results.len());
+        if ordered_txs.len() != tx_results.len() {
+            anyhow::bail!(
+                "tx count mismatch: {} envelopes vs {} results",
+                ordered_txs.len(),
+                tx_results.len()
+            );
+        }
+        let tx_count = ordered_txs.len();
 
         let scp_envelopes = self.herder.get_scp_envelopes(header.ledger_seq as u64);
         let mut scp_quorum_sets = Vec::new();
@@ -229,7 +237,10 @@ impl App {
             },
         };
         let tx_result_set = TransactionResultSet {
-            results: tx_results.to_vec().try_into().unwrap_or_default(),
+            results: tx_results
+                .to_vec()
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("failed to convert tx results to XDR VecM: {e}"))?,
         };
         let tx_result_entry = TransactionHistoryResultEntry {
             ledger_seq: header.ledger_seq,
@@ -289,38 +300,42 @@ impl App {
         tx_results: &[TransactionResultPair],
         tx_metas: &[TransactionMeta],
         network_id: NetworkId,
-    ) -> Vec<henyey_db::EventRecord> {
+    ) -> anyhow::Result<Vec<henyey_db::EventRecord>> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
         use stellar_xdr::curr::{ContractEvent, Limits, TransactionResultCode};
 
         let mut all_events = Vec::new();
 
         for (tx_index, meta) in tx_metas.iter().enumerate() {
-            // Compute tx hash
-            let tx = match ordered_txs.get(tx_index) {
-                Some(tx) => tx,
-                None => continue,
-            };
+            // Compute tx hash — missing envelope is a fatal inconsistency
+            let tx = ordered_txs.get(tx_index).ok_or_else(|| {
+                anyhow::anyhow!("tx_metas[{tx_index}] has no corresponding transaction envelope")
+            })?;
             let frame = TransactionFrame::with_network(tx.clone(), network_id);
-            let tx_hash_hex = match frame.hash(&network_id) {
-                Ok(h) => h.to_hex(),
-                Err(_) => continue,
+            let tx_hash_hex = frame
+                .hash(&network_id)
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to hash transaction at index {tx_index}: {e}")
+                })?
+                .to_hex();
+
+            // Determine if the tx succeeded — missing result is a fatal inconsistency
+            let tx_succeeded = {
+                let result = tx_results.get(tx_index).ok_or_else(|| {
+                    anyhow::anyhow!("tx_results[{tx_index}] missing for event extraction")
+                })?;
+                let code = result.result.result.discriminant();
+                code == TransactionResultCode::TxSuccess
+                    || code == TransactionResultCode::TxFeeBumpInnerSuccess
             };
 
-            // Determine if the tx succeeded
-            let tx_succeeded = tx_results
-                .get(tx_index)
-                .map(|r| {
-                    let code = r.result.result.discriminant();
-                    code == TransactionResultCode::TxSuccess
-                        || code == TransactionResultCode::TxFeeBumpInnerSuccess
-                })
-                .unwrap_or(false);
-
-            // Extract events from the meta based on version
+            // Extract events from the meta based on version.
+            // V0/V1/V2 predate Soroban and have no contract events.
             let contract_events: Vec<(u32, &ContractEvent)> = match meta {
+                TransactionMeta::V0(_) | TransactionMeta::V1(_) | TransactionMeta::V2(_) => {
+                    Vec::new()
+                }
                 TransactionMeta::V3(v3) => {
-                    // V3: contract events in soroban_meta.events
                     if let Some(ref soroban) = v3.soroban_meta {
                         soroban.events.iter().map(|e| (0u32, e)).collect()
                     } else {
@@ -328,7 +343,6 @@ impl App {
                     }
                 }
                 TransactionMeta::V4(v4) => {
-                    // V4: contract events are per-operation in operations[i].events
                     let mut events = Vec::new();
                     for (op_idx, op_meta) in v4.operations.iter().enumerate() {
                         for event in op_meta.events.iter() {
@@ -341,7 +355,6 @@ impl App {
                     }
                     events
                 }
-                _ => Vec::new(),
             };
 
             for (event_index, (op_index, event)) in contract_events.iter().enumerate() {
@@ -350,29 +363,33 @@ impl App {
                     ((ledger_seq as u64) << 32) | ((tx_index as u64) << 12) | (*op_index as u64);
                 let event_id = format!("{:019}-{:010}", toid, event_index);
 
-                // Event type
                 let event_type = event.type_;
 
-                // Contract ID
                 let contract_id = event
                     .contract_id
                     .as_ref()
                     .map(|h| stellar_strkey::Contract(h.0.clone().into()).to_string());
 
-                // Extract topics
+                // Serialize topics — propagate errors instead of silently dropping
                 let topics: Vec<String> = match &event.body {
                     stellar_xdr::curr::ContractEventBody::V0(body) => body
                         .topics
                         .iter()
-                        .filter_map(|t| t.to_xdr(Limits::none()).ok().map(|b| BASE64.encode(&b)))
-                        .collect(),
+                        .map(|t| {
+                            t.to_xdr(Limits::none())
+                                .map(|b| BASE64.encode(&b))
+                                .map_err(|e| {
+                                    anyhow::anyhow!("failed to serialize event topic: {e}")
+                                })
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?,
                 };
 
-                // Encode full event as base64 XDR
-                let event_xdr = match event.to_xdr(Limits::none()) {
-                    Ok(b) => BASE64.encode(&b),
-                    Err(_) => continue,
-                };
+                // Serialize full event — propagate errors instead of silently skipping
+                let event_xdr = event
+                    .to_xdr(Limits::none())
+                    .map(|b| BASE64.encode(&b))
+                    .map_err(|e| anyhow::anyhow!("failed to serialize contract event: {e}"))?;
 
                 all_events.push(henyey_db::EventRecord {
                     id: event_id,
@@ -389,7 +406,7 @@ impl App {
             }
         }
 
-        all_events
+        Ok(all_events)
     }
 
     /// Attempt to restore node state from persisted DB and on-disk bucket files.
@@ -2273,5 +2290,233 @@ impl App {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod extract_contract_events_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use stellar_xdr::curr::{
+        ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, ExtensionPoint, Hash,
+        Memo, MuxedAccount, Preconditions, ScVal, SequenceNumber, SorobanTransactionMeta,
+        SorobanTransactionMetaExt, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionMeta, TransactionMetaV3, TransactionResult, TransactionResultExt,
+        TransactionResultPair, TransactionResultResult, TransactionV1Envelope, Uint256,
+    };
+
+    fn test_network_id() -> NetworkId {
+        NetworkId::from_passphrase("Test SDF Network ; September 2015")
+    }
+
+    fn test_envelope() -> Arc<TransactionEnvelope> {
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        Arc::new(TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        }))
+    }
+
+    fn test_result_pair(success: bool) -> TransactionResultPair {
+        let result_code = if success {
+            TransactionResultResult::TxSuccess(Default::default())
+        } else {
+            TransactionResultResult::TxFailed(Default::default())
+        };
+        TransactionResultPair {
+            transaction_hash: Hash([0u8; 32]),
+            result: TransactionResult {
+                fee_charged: 100,
+                result: result_code,
+                ext: TransactionResultExt::V0,
+            },
+        }
+    }
+
+    fn test_event() -> ContractEvent {
+        ContractEvent {
+            ext: ExtensionPoint::V0,
+            contract_id: None,
+            type_: ContractEventType::Contract,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: vec![ScVal::U32(1)].try_into().unwrap(),
+                data: ScVal::U32(42),
+            }),
+        }
+    }
+
+    fn v3_meta_with_events(events: Vec<ContractEvent>) -> TransactionMeta {
+        TransactionMeta::V3(TransactionMetaV3 {
+            ext: ExtensionPoint::V0,
+            tx_changes_before: Default::default(),
+            operations: Default::default(),
+            tx_changes_after: Default::default(),
+            soroban_meta: Some(SorobanTransactionMeta {
+                ext: SorobanTransactionMetaExt::V0,
+                events: events.try_into().unwrap(),
+                return_value: ScVal::Void,
+                diagnostic_events: Default::default(),
+            }),
+        })
+    }
+
+    fn v3_meta_no_events() -> TransactionMeta {
+        TransactionMeta::V3(TransactionMetaV3 {
+            ext: ExtensionPoint::V0,
+            tx_changes_before: Default::default(),
+            operations: Default::default(),
+            tx_changes_after: Default::default(),
+            soroban_meta: None,
+        })
+    }
+
+    #[test]
+    fn test_extract_v3_happy_path() {
+        let env = test_envelope();
+        let result = test_result_pair(true);
+        let meta = v3_meta_with_events(vec![test_event()]);
+        let network_id = test_network_id();
+
+        let events = App::extract_contract_events(100, &[env], &[result], &[meta], network_id)
+            .expect("should succeed");
+
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.ledger_seq, 100);
+        assert_eq!(e.tx_index, 0);
+        assert!(e.in_successful_contract_call);
+        assert_eq!(e.topics.len(), 1);
+        assert!(!e.event_xdr.is_empty());
+    }
+
+    #[test]
+    fn test_extract_v3_failed_tx_sets_flag_false() {
+        let env = test_envelope();
+        let result = test_result_pair(false);
+        let meta = v3_meta_with_events(vec![test_event()]);
+        let network_id = test_network_id();
+
+        let events = App::extract_contract_events(100, &[env], &[result], &[meta], network_id)
+            .expect("should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].in_successful_contract_call);
+    }
+
+    #[test]
+    fn test_extract_v3_no_soroban_meta_returns_empty() {
+        let env = test_envelope();
+        let result = test_result_pair(true);
+        let meta = v3_meta_no_events();
+        let network_id = test_network_id();
+
+        let events = App::extract_contract_events(100, &[env], &[result], &[meta], network_id)
+            .expect("should succeed");
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_extract_v4_per_op_events() {
+        use stellar_xdr::curr::{OperationMetaV2, TransactionMetaV4};
+
+        let env = test_envelope();
+        let result = test_result_pair(true);
+        let event = test_event();
+
+        let meta = TransactionMeta::V4(TransactionMetaV4 {
+            ext: ExtensionPoint::V0,
+            tx_changes_before: Default::default(),
+            operations: vec![OperationMetaV2 {
+                ext: ExtensionPoint::V0,
+                changes: Default::default(),
+                events: vec![event.clone()].try_into().unwrap(),
+            }]
+            .try_into()
+            .unwrap(),
+            tx_changes_after: Default::default(),
+            events: Default::default(),
+            soroban_meta: None,
+            diagnostic_events: Default::default(),
+        });
+
+        let network_id = test_network_id();
+        let events = App::extract_contract_events(200, &[env], &[result], &[meta], network_id)
+            .expect("should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].op_index, 0);
+        assert_eq!(events[0].ledger_seq, 200);
+    }
+
+    #[test]
+    fn test_extract_missing_tx_envelope_errors() {
+        let result = test_result_pair(true);
+        let meta = v3_meta_with_events(vec![test_event()]);
+        let network_id = test_network_id();
+
+        // No envelopes but one meta
+        let err =
+            App::extract_contract_events(100, &[], &[result], &[meta], network_id).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("no corresponding transaction envelope"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_extract_missing_tx_result_errors() {
+        let env = test_envelope();
+        let meta = v3_meta_with_events(vec![test_event()]);
+        let network_id = test_network_id();
+
+        // No results but one meta
+        let err = App::extract_contract_events(100, &[env], &[], &[meta], network_id).unwrap_err();
+
+        assert!(
+            err.to_string().contains("missing for event extraction"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_extract_v0_meta_yields_no_events() {
+        let env = test_envelope();
+        let result = test_result_pair(true);
+        let meta = TransactionMeta::V0(Default::default());
+        let network_id = test_network_id();
+
+        let events = App::extract_contract_events(100, &[env], &[result], &[meta], network_id)
+            .expect("should succeed");
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_extract_toid_computation() {
+        let env = test_envelope();
+        let result = test_result_pair(true);
+        let meta = v3_meta_with_events(vec![test_event()]);
+        let network_id = test_network_id();
+
+        let events = App::extract_contract_events(42, &[env], &[result], &[meta], network_id)
+            .expect("should succeed");
+
+        // TOID = (ledger_seq << 32) | (tx_index << 12) | op_index
+        // For ledger 42, tx 0, op 0: toid = 42 << 32 = 180388626432
+        let expected_toid = (42u64 << 32) | (0u64 << 12) | 0u64;
+        let expected_id = format!("{:019}-{:010}", expected_toid, 0);
+        assert_eq!(events[0].id, expected_id);
     }
 }
