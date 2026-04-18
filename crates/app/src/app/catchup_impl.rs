@@ -1849,15 +1849,44 @@ impl App {
 
     /// Compute the appropriate archive-behind backoff duration based on how
     /// close `current_ledger` is to the next checkpoint boundary.
+    ///
+    /// In **accelerated mode** (`checkpoint_frequency == 8`, 1s/ledger used by
+    /// Quickstart local/testnet shards and integration tests), the default 60s
+    /// backoff would span ~7 checkpoints and stall captive-core catchup
+    /// indefinitely. Scale both the default and imminent backoffs by the
+    /// `freq / DEFAULT_CHECKPOINT_FREQUENCY` ratio so the number of
+    /// checkpoints skipped during a backoff is network-independent.
     pub(super) fn archive_behind_backoff_secs(current_ledger: u32) -> u64 {
         let freq = henyey_history::checkpoint::checkpoint_frequency();
         let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
         let distance = next_cp.saturating_sub(current_ledger);
+        Self::archive_behind_backoff_secs_for(freq, distance)
+    }
+
+    /// Pure helper: given checkpoint frequency and distance to next
+    /// checkpoint, return the backoff duration. Extracted for unit testing
+    /// under different `freq` values without mutating the process-global
+    /// `CHECKPOINT_FREQ` OnceLock.
+    pub(super) fn archive_behind_backoff_secs_for(freq: u32, distance: u32) -> u64 {
         let imminent_threshold = freq / 3;
-        if distance <= imminent_threshold {
-            ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS
+        let default_freq = henyey_history::DEFAULT_CHECKPOINT_FREQUENCY;
+        let (default_secs, imminent_secs) = if freq < default_freq {
+            let scale = |base: u64| -> u64 { ((base * freq as u64) / default_freq as u64).max(2) };
+            (
+                scale(ARCHIVE_BEHIND_BACKOFF_SECS),
+                scale(ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS),
+            )
         } else {
-            ARCHIVE_BEHIND_BACKOFF_SECS
+            (
+                ARCHIVE_BEHIND_BACKOFF_SECS,
+                ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS,
+            )
+        };
+
+        if distance <= imminent_threshold {
+            imminent_secs
+        } else {
+            default_secs
         }
     }
 
@@ -2620,5 +2649,50 @@ mod tests {
         // Ledger 105: next_cp = checkpoint_containing(106) = 127. Distance = 22.
         let secs = App::archive_behind_backoff_secs(105);
         assert_eq!(secs, ARCHIVE_BEHIND_BACKOFF_SECS);
+    }
+
+    /// Regression for Quickstart local/rpc stall: in accelerated mode
+    /// (`checkpoint_frequency = 8`), a 60s archive-behind backoff spans ~7
+    /// checkpoints and stalls captive-core catchup. The scaled backoff must
+    /// complete well under one checkpoint cycle.
+    #[test]
+    fn test_archive_behind_backoff_accelerated_mode() {
+        let accel = henyey_history::ACCELERATED_CHECKPOINT_FREQUENCY; // 8
+
+        // Far from checkpoint: distance = 5 (threshold = 8/3 = 2) → default.
+        // Scaled default = 60 * 8 / 64 = 7s.
+        let secs = App::archive_behind_backoff_secs_for(accel, 5);
+        assert_eq!(secs, 7);
+
+        // Imminent: distance = 2 (<= threshold) → imminent.
+        // Scaled imminent = 15 * 8 / 64 = 1 → clamped to min 2s.
+        let secs = App::archive_behind_backoff_secs_for(accel, 2);
+        assert_eq!(secs, 2);
+
+        // Sanity: the scaled backoff must not exceed one accelerated
+        // checkpoint cycle worth of real time (8 ledgers × ~1s = 8s).
+        // Allowing up to 10s covers clock jitter; anything larger stalls
+        // catchup in the Quickstart/local test harness.
+        assert!(
+            App::archive_behind_backoff_secs_for(accel, 5) <= 10,
+            "accelerated-mode default backoff must be <= 10s to avoid \
+             captive-core catchup stall"
+        );
+    }
+
+    #[test]
+    fn test_archive_behind_backoff_default_mode_pure_helper() {
+        let def = henyey_history::DEFAULT_CHECKPOINT_FREQUENCY; // 64
+
+        // Distance = 5 (<= 64/3 = 21) → imminent = 15s.
+        assert_eq!(
+            App::archive_behind_backoff_secs_for(def, 5),
+            ARCHIVE_BEHIND_IMMINENT_BACKOFF_SECS
+        );
+        // Distance = 30 (> 21) → default = 60s.
+        assert_eq!(
+            App::archive_behind_backoff_secs_for(def, 30),
+            ARCHIVE_BEHIND_BACKOFF_SECS
+        );
     }
 }
