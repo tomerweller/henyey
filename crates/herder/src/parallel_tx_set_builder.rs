@@ -331,9 +331,10 @@ impl Stage {
         false
     }
 
-    /// Extract the transaction ID sets for each cluster.
-    fn cluster_tx_ids(&self) -> Vec<&BitSet> {
-        self.clusters.iter().map(|c| &c.tx_ids).collect()
+    /// Extract the transaction ID sets for each bin (execution thread).
+    /// Bins are the result of packing conflict clusters into parallel slots.
+    fn bin_tx_ids(&self) -> &[BitSet] {
+        &self.bin_packing
     }
 }
 
@@ -551,15 +552,19 @@ fn build_with_stage_count(
         // If not added to any stage, the TX is dropped (doesn't fit).
     }
 
-    // Extract results: for each stage, for each cluster, collect the TX IDs.
+    // Extract results: for each stage, for each bin, collect the TX IDs.
+    // stellar-core groups TXs by bins (execution threads), not by conflict
+    // clusters — see ParallelTxSetBuilder.cpp:visitAllTransactions which uses
+    // cluster->mBinId as the output key. Each bin is a DependentTxCluster in
+    // the XDR output, representing a single execution thread.
     let result_stages: Vec<Vec<Vec<usize>>> = stages
         .iter()
         .map(|stage| {
             stage
-                .cluster_tx_ids()
+                .bin_tx_ids()
                 .iter()
                 .map(|tx_ids| tx_ids.iter_ones().collect::<Vec<_>>())
-                .filter(|cluster| !cluster.is_empty())
+                .filter(|bin| !bin.is_empty())
                 .collect::<Vec<_>>()
         })
         .filter(|stage| !stage.is_empty())
@@ -1055,9 +1060,10 @@ mod tests {
         let stages =
             build_parallel_soroban_phase(vec![tx_a, tx_b], test_network_id(), 100_000, 8, 1, 1).0;
 
-        // No conflicts: should be 2 separate clusters in 1 stage
+        // No conflicts: both TXs fit in the same bin (execution thread)
         assert_eq!(stages.len(), 1);
-        assert_eq!(stages[0].len(), 2);
+        assert_eq!(stages[0].len(), 1); // 1 bin containing both TXs
+        assert_eq!(stages[0][0].len(), 2);
     }
 
     #[test]
@@ -1568,5 +1574,712 @@ mod stages_to_xdr_phase_tests {
         let xdr1 = phase1.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
         let xdr2 = phase2.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
         assert_eq!(xdr1, xdr2, "stages_to_xdr_phase should be idempotent");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// stellar-core parity tests
+// ---------------------------------------------------------------------------
+// Ports test scenarios from stellar-core's runParallelTxSetBuildingTest
+// (TxSetTests.cpp:2493-3155). Each test runs both variable-stage-count
+// (min=1, max=4) and fixed-stage-count (min=4, max=4) variants.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod stellar_core_parity_tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        ContractDataDurability, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
+        LedgerFootprint, LedgerKey, LedgerKeyContractData, Memo, MuxedAccount, Operation,
+        OperationBody, Preconditions, ScAddress, ScVal, SorobanResources, SorobanTransactionData,
+        SorobanTransactionDataExt, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionV1Envelope, Uint256, VecM,
+    };
+
+    const STAGE_COUNT: u32 = 4;
+    const CLUSTER_COUNT: u32 = 8;
+    const LEDGER_MAX_INSTRUCTIONS: i64 = 400_000_000;
+    const LEDGER_BASE_FEE: i64 = 100;
+
+    fn test_network_id() -> NetworkId {
+        NetworkId(henyey_common::Hash256([0u8; 32]))
+    }
+
+    /// Generate a contract data ledger key from an i32 ID.
+    /// Durability alternates: even=Persistent, odd=Temporary (matches stellar-core).
+    fn contract_data_key(id: i32) -> LedgerKey {
+        let durability = if id % 2 == 0 {
+            ContractDataDurability::Persistent
+        } else {
+            ContractDataDurability::Temporary
+        };
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(
+                [0u8; 32],
+            ))),
+            key: ScVal::I32(id),
+            durability,
+        })
+    }
+
+    /// Create a Soroban TX with i32 key IDs for large key spaces.
+    /// Auto-increments account_id to ensure unique source accounts.
+    fn make_parity_tx(
+        account_id: &mut u32,
+        instructions: i32,
+        ro_keys: &[i32],
+        rw_keys: &[i32],
+        inclusion_fee: i64,
+    ) -> TransactionEnvelope {
+        let id = *account_id;
+        *account_id += 1;
+
+        let mut source_bytes = [0u8; 32];
+        source_bytes[..4].copy_from_slice(&id.to_le_bytes());
+        let source = MuxedAccount::Ed25519(Uint256(source_bytes));
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: ro_keys
+                        .iter()
+                        .map(|&k| contract_data_key(k))
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap_or_default(),
+                    read_write: rw_keys
+                        .iter()
+                        .map(|&k| contract_data_key(k))
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap_or_default(),
+                },
+                instructions: instructions as u32,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let invoke_op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(stellar_xdr::curr::ContractId(
+                        stellar_xdr::curr::Hash(source_bytes),
+                    )),
+                    function_name: stellar_xdr::curr::ScSymbol("test".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                auth: Default::default(),
+            }),
+        };
+
+        // fee = inclusion_fee + resource_fee (resource_fee=0 so fee=inclusion_fee)
+        let tx = Transaction {
+            source_account: source,
+            fee: inclusion_fee as u32,
+            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![invoke_op].try_into().unwrap(),
+            ext: TransactionExt::V1(soroban_data),
+        };
+
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        })
+    }
+
+    /// Verify uniform shape: all stages have same cluster count, all clusters same TX count.
+    fn validate_shape(
+        stages: &[Vec<Vec<TransactionEnvelope>>],
+        expected_stages: usize,
+        expected_clusters_per_stage: usize,
+        expected_txs_per_cluster: usize,
+    ) {
+        assert_eq!(
+            stages.len(),
+            expected_stages,
+            "expected {} stages, got {}",
+            expected_stages,
+            stages.len()
+        );
+        for (i, stage) in stages.iter().enumerate() {
+            assert_eq!(
+                stage.len(),
+                expected_clusters_per_stage,
+                "stage {}: expected {} clusters, got {}",
+                i,
+                expected_clusters_per_stage,
+                stage.len()
+            );
+            for (j, cluster) in stage.iter().enumerate() {
+                assert_eq!(
+                    cluster.len(),
+                    expected_txs_per_cluster,
+                    "stage {} cluster {}: expected {} txs, got {}",
+                    i,
+                    j,
+                    expected_txs_per_cluster,
+                    cluster.len()
+                );
+            }
+        }
+    }
+
+    /// Compute base fee from builder output. Matches selection.rs:compute_soroban_base_fee logic.
+    fn compute_base_fee(stages: &[Vec<Vec<TransactionEnvelope>>], had_tx_not_fitting: bool) -> i64 {
+        if !had_tx_not_fitting {
+            return LEDGER_BASE_FEE;
+        }
+        stages
+            .iter()
+            .flat_map(|s| s.iter())
+            .flat_map(|c| c.iter())
+            .map(|tx| crate::tx_set_utils::envelope_inclusion_fee(tx))
+            .min()
+            .unwrap_or(LEDGER_BASE_FEE)
+    }
+
+    /// Run a scenario with both variable and fixed stage count configurations.
+    fn run_both<F>(f: F)
+    where
+        F: Fn(bool), // true = variable stage count
+    {
+        f(true);
+        f(false);
+    }
+
+    fn stage_range(variable: bool) -> (u32, u32) {
+        if variable {
+            (1, STAGE_COUNT)
+        } else {
+            (STAGE_COUNT, STAGE_COUNT)
+        }
+    }
+
+    // ---- No-conflict scenarios ----
+
+    #[test]
+    fn test_parity_no_conflicts_single_stage() {
+        run_both(|variable| {
+            let mut account_id = 0u32;
+            let txs: Vec<_> = (0..CLUSTER_COUNT as i32)
+                .map(|i| {
+                    make_parity_tx(
+                        &mut account_id,
+                        100_000_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        1000,
+                    )
+                })
+                .collect();
+
+            let (min, max) = stage_range(variable);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
+
+            if variable {
+                // With variable stages: 1 stage, 2 clusters (bin-packed), 4 txs each
+                validate_shape(
+                    &stages,
+                    1,
+                    CLUSTER_COUNT as usize / STAGE_COUNT as usize,
+                    STAGE_COUNT as usize,
+                );
+            } else {
+                // With fixed stages: 1 stage, 8 clusters, 1 tx each
+                validate_shape(&stages, 1, CLUSTER_COUNT as usize, 1);
+            }
+            assert_eq!(compute_base_fee(&stages, had_drop), LEDGER_BASE_FEE);
+        });
+    }
+
+    #[test]
+    fn test_parity_no_conflicts_all_stages() {
+        run_both(|variable| {
+            let mut account_id = 0u32;
+            let txs: Vec<_> = (0..(STAGE_COUNT * CLUSTER_COUNT) as i32)
+                .map(|i| {
+                    make_parity_tx(
+                        &mut account_id,
+                        100_000_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        1000,
+                    )
+                })
+                .collect();
+
+            let (min, max) = stage_range(variable);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
+
+            if variable {
+                validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
+            } else {
+                validate_shape(&stages, STAGE_COUNT as usize, CLUSTER_COUNT as usize, 1);
+            }
+            assert_eq!(compute_base_fee(&stages, had_drop), LEDGER_BASE_FEE);
+        });
+    }
+
+    #[test]
+    fn test_parity_no_conflicts_all_stages_smaller_txs() {
+        run_both(|variable| {
+            let mut account_id = 0u32;
+            let txs: Vec<_> = (0..(STAGE_COUNT * CLUSTER_COUNT * 5) as i32)
+                .map(|i| {
+                    make_parity_tx(
+                        &mut account_id,
+                        20_000_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        1000,
+                    )
+                })
+                .collect();
+
+            let (min, max) = stage_range(variable);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
+
+            if variable {
+                validate_shape(
+                    &stages,
+                    1,
+                    CLUSTER_COUNT as usize,
+                    (STAGE_COUNT * 5) as usize,
+                );
+            } else {
+                validate_shape(&stages, STAGE_COUNT as usize, CLUSTER_COUNT as usize, 5);
+            }
+            assert_eq!(compute_base_fee(&stages, had_drop), LEDGER_BASE_FEE);
+        });
+    }
+
+    #[test]
+    fn test_parity_no_conflicts_prioritization() {
+        run_both(|variable| {
+            let mut account_id = 0u32;
+            let txs: Vec<_> = (0..(STAGE_COUNT * CLUSTER_COUNT * 10) as i32)
+                .map(|i| {
+                    make_parity_tx(
+                        &mut account_id,
+                        20_000_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        (i as i64 + 1) * 1000,
+                    )
+                })
+                .collect();
+
+            let (min, max) = stage_range(variable);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
+
+            if variable {
+                validate_shape(
+                    &stages,
+                    1,
+                    CLUSTER_COUNT as usize,
+                    (STAGE_COUNT * 5) as usize,
+                );
+            } else {
+                validate_shape(&stages, STAGE_COUNT as usize, CLUSTER_COUNT as usize, 5);
+            }
+
+            assert!(had_drop, "half the txs should be evicted");
+            // Base fee: the lowest fee of the surviving (highest-fee) half.
+            // 320 TXs with fees 1000..320000. Survivors are the top 160.
+            // Lowest survivor fee = 10 * STAGE_COUNT * CLUSTER_COUNT * 1000 / 2 + 1000
+            let expected_base_fee =
+                10 * STAGE_COUNT as i64 * CLUSTER_COUNT as i64 * 1000 / 2 + 1000;
+            assert_eq!(compute_base_fee(&stages, had_drop), expected_base_fee);
+        });
+    }
+
+    #[test]
+    fn test_parity_no_conflicts_instruction_limit_reached() {
+        run_both(|variable| {
+            let mut account_id = 0u32;
+            // Reduced instruction limits: 2.5M per tx, 10M per ledger
+            let ledger_max_instructions: i64 = 10_000_000;
+            let txs: Vec<_> = (0..(STAGE_COUNT * CLUSTER_COUNT * 4) as i32)
+                .map(|i| {
+                    make_parity_tx(
+                        &mut account_id,
+                        2_500_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        100 + i as i64,
+                    )
+                })
+                .collect();
+
+            let (min, max) = stage_range(variable);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                ledger_max_instructions,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
+
+            if variable {
+                validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
+            } else {
+                validate_shape(&stages, STAGE_COUNT as usize, CLUSTER_COUNT as usize, 1);
+            }
+
+            assert!(had_drop);
+            // 128 input TXs, 32 survive (4 per cluster × 8 clusters or equivalent).
+            // Base fee = fee of lowest survivor = 100 + (128 - 32) = 196.
+            let expected_base_fee =
+                100 + (STAGE_COUNT * CLUSTER_COUNT * 4 - STAGE_COUNT * CLUSTER_COUNT) as i64;
+            assert_eq!(compute_base_fee(&stages, had_drop), expected_base_fee);
+        });
+    }
+
+    // ---- Conflict scenarios ----
+
+    #[test]
+    fn test_parity_all_rw_conflicting() {
+        run_both(|variable| {
+            let mut account_id = 0u32;
+            let txs: Vec<_> = (0..(CLUSTER_COUNT * STAGE_COUNT) as i32)
+                .map(|i| {
+                    // All TXs write key 0 → all conflict with each other
+                    make_parity_tx(
+                        &mut account_id,
+                        100_000_000,
+                        &[4 * i + 1, 4 * i + 2],
+                        &[4 * i + 3, 0, 4 * i + 4],
+                        100 + i as i64,
+                    )
+                })
+                .collect();
+
+            let (min, max) = stage_range(variable);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
+
+            if variable {
+                validate_shape(&stages, 1, 1, STAGE_COUNT as usize);
+            } else {
+                validate_shape(&stages, STAGE_COUNT as usize, 1, 1);
+            }
+
+            assert!(had_drop);
+            let expected_base_fee = 100 + (CLUSTER_COUNT * STAGE_COUNT - STAGE_COUNT) as i64;
+            assert_eq!(compute_base_fee(&stages, had_drop), expected_base_fee);
+        });
+    }
+
+    #[test]
+    fn test_parity_chain_of_conflicts() {
+        // tx[i] reads key i, writes key i+1. Chain: 0→1→2→...
+        // Stages break the chain since tx[i] and tx[i+1] conflict on key i+1.
+        run_both(|_variable| {
+            let mut account_id = 0u32;
+            let txs: Vec<_> = (0..(CLUSTER_COUNT * STAGE_COUNT) as i32)
+                .map(|i| {
+                    make_parity_tx(&mut account_id, 100_000_000, &[i], &[i + 1], 100 + i as i64)
+                })
+                .collect();
+
+            // Chain of conflicts always produces STAGE_COUNT stages regardless of min
+            let (stages, _had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                1,
+                STAGE_COUNT,
+            );
+
+            validate_shape(&stages, STAGE_COUNT as usize, CLUSTER_COUNT as usize, 1);
+            assert_eq!(compute_base_fee(&stages, false), LEDGER_BASE_FEE);
+        });
+    }
+
+    #[test]
+    fn test_parity_conflict_clusters_not_exceeding_max_insns() {
+        // 8 clusters of 4 conflicting TXs. Each cluster: 4 TXs that write the same key i.
+        run_both(|variable| {
+            let mut account_id = 0u32;
+            let mut txs = Vec::new();
+            for i in 0..CLUSTER_COUNT as i32 {
+                for j in 0..STAGE_COUNT as i32 {
+                    txs.push(make_parity_tx(
+                        &mut account_id,
+                        100_000_000,
+                        &[i * STAGE_COUNT as i32 + j + 1000],
+                        &[i, i * STAGE_COUNT as i32 + j + 10000],
+                        100 + i as i64,
+                    ));
+                }
+            }
+
+            let (min, max) = stage_range(variable);
+            let (stages, _had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
+
+            if variable {
+                validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
+            } else {
+                validate_shape(&stages, STAGE_COUNT as usize, CLUSTER_COUNT as usize, 1);
+            }
+            assert_eq!(compute_base_fee(&stages, false), LEDGER_BASE_FEE);
+        });
+    }
+
+    #[test]
+    fn test_parity_small_conflict_clusters_with_excluded_txs() {
+        // 8 clusters × 5 TXs per cluster (STAGE_COUNT + 1). All TXs in cluster i write key i.
+        // Only STAGE_COUNT per cluster can fit → 1 TX per cluster evicted.
+        run_both(|variable| {
+            let mut account_id = 0u32;
+            let mut txs = Vec::new();
+            for i in 0..CLUSTER_COUNT as i32 {
+                for j in 0..(STAGE_COUNT as i32 + 1) {
+                    txs.push(make_parity_tx(
+                        &mut account_id,
+                        100_000_000,
+                        &[],
+                        &[i],
+                        100 + (i * (STAGE_COUNT as i32 + 1) + j) as i64,
+                    ));
+                }
+            }
+
+            let (min, max) = stage_range(variable);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
+
+            if variable {
+                validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
+            } else {
+                validate_shape(&stages, STAGE_COUNT as usize, CLUSTER_COUNT as usize, 1);
+            }
+
+            assert!(had_drop);
+            // 1 cluster worth of txs excluded. Lowest surviving fee = 101.
+            assert_eq!(compute_base_fee(&stages, had_drop), 101);
+        });
+    }
+
+    #[test]
+    fn test_parity_one_sparse_conflict_cluster() {
+        assert!(CLUSTER_COUNT > STAGE_COUNT);
+
+        run_both(|variable| {
+            let mut account_id = 0u32;
+            let mut txs = Vec::new();
+
+            // Dense cluster: STAGE_COUNT TXs with RW conflict on key 1000, high fee.
+            for i in 0..STAGE_COUNT as i32 {
+                txs.push(make_parity_tx(
+                    &mut account_id,
+                    100_000_000,
+                    &[],
+                    &[i, 1000],
+                    1_000_000 - i as i64,
+                ));
+            }
+
+            // Sparse: (CLUSTER_COUNT-1) TXs per stage with RO-RW conflict.
+            for i in 0..STAGE_COUNT as i32 {
+                for j in 0..(CLUSTER_COUNT as i32 - 1) {
+                    txs.push(make_parity_tx(
+                        &mut account_id,
+                        100_000_000,
+                        &[i],
+                        &[i * CLUSTER_COUNT as i32 + j + 10_000],
+                        1000 + (i * CLUSTER_COUNT as i32 + j) as i64,
+                    ));
+                }
+            }
+
+            // Cheap conflicting TXs that shouldn't fit.
+            for i in 0..(CLUSTER_COUNT - STAGE_COUNT) as i32 {
+                txs.push(make_parity_tx(
+                    &mut account_id,
+                    100_000_000,
+                    &[i % STAGE_COUNT as i32],
+                    &[i + 100_000],
+                    100 + i as i64,
+                ));
+            }
+
+            let (min, max) = stage_range(variable);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
+
+            if variable {
+                validate_shape(
+                    &stages,
+                    2,
+                    CLUSTER_COUNT as usize,
+                    (STAGE_COUNT / 2) as usize,
+                );
+            } else {
+                validate_shape(&stages, STAGE_COUNT as usize, CLUSTER_COUNT as usize, 1);
+            }
+
+            // 4 cheap TXs don't fit instruction limits → base fee = 1000
+            assert_eq!(compute_base_fee(&stages, had_drop), 1000);
+        });
+    }
+
+    #[test]
+    fn test_parity_many_clusters_with_small_transactions() {
+        run_both(|_variable| {
+            let mut account_id = 0u32;
+            let mut txs = Vec::new();
+            for i in 0..CLUSTER_COUNT as i32 {
+                for j in 0..(10 * STAGE_COUNT as i32) {
+                    txs.push(make_parity_tx(
+                        &mut account_id,
+                        10_000_000,
+                        &[1000 + i * 10 + j],
+                        &[i, 10_000 + i * 10 + j],
+                        100 + (i * (STAGE_COUNT as i32 + 1) + j) as i64,
+                    ));
+                }
+            }
+
+            // Both variable and fixed produce the same shape here
+            let (stages, _had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                1,
+                STAGE_COUNT,
+            );
+
+            validate_shape(&stages, STAGE_COUNT as usize, CLUSTER_COUNT as usize, 10);
+            assert_eq!(compute_base_fee(&stages, false), LEDGER_BASE_FEE);
+        });
+    }
+
+    #[test]
+    fn test_parity_all_ro_conflict_with_one_rw() {
+        run_both(|variable| {
+            let mut account_id = 0u32;
+            let mut txs = Vec::new();
+
+            // 1 high-fee TX that writes key 0 (conflicts with all RO readers).
+            txs.push(make_parity_tx(
+                &mut account_id,
+                100_000_000,
+                &[1, 2],
+                &[0, 3, 4],
+                1_000_000,
+            ));
+
+            // 159 TXs that read key 0 (RO-RW conflict with the first TX).
+            for i in 1..(CLUSTER_COUNT * STAGE_COUNT * 5) as i32 {
+                txs.push(make_parity_tx(
+                    &mut account_id,
+                    20_000_000,
+                    &[0, 4 * i + 1, 4 * i + 2],
+                    &[4 * i + 3, 4 * i + 4],
+                    100 + i as i64,
+                ));
+            }
+
+            let (min, max) = stage_range(variable);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                txs,
+                test_network_id(),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
+
+            // Custom shape assertion: one stage has the high-fee TX alone,
+            // other stages have CLUSTER_COUNT clusters of small TXs.
+            let mut single_thread_stages = 0;
+            for stage in &stages {
+                if stage.len() == 1 && stage[0].len() == 1 {
+                    single_thread_stages += 1;
+                } else {
+                    assert_eq!(
+                        stage.len(),
+                        CLUSTER_COUNT as usize,
+                        "non-single stage should have {} clusters",
+                        CLUSTER_COUNT
+                    );
+                    for cluster in stage {
+                        assert_eq!(cluster.len(), 5, "each cluster should have 5 txs");
+                    }
+                }
+            }
+            assert_eq!(
+                single_thread_stages, 1,
+                "expected exactly one single-thread stage"
+            );
+
+            // Base fee = 100 + CLUSTER_COUNT * 5 (the small txs that couldn't fit
+            // in the same stage as the RW tx).
+            let expected_base_fee = 100 + CLUSTER_COUNT as i64 * 5;
+            assert_eq!(compute_base_fee(&stages, had_drop), expected_base_fee);
+        });
     }
 }
