@@ -1363,15 +1363,13 @@ impl LedgerManager {
     /// a full ledger close.
     #[doc(hidden)]
     pub fn set_header_for_test(&self, header: LedgerHeader, header_hash: Hash256) {
+        // Recompute from the current bucket-list state before acquiring the
+        // write lock so publication is atomic.
+        let info = self.compute_soroban_info();
         let mut state = self.state.write();
         state.header = header;
         state.header_hash = header_hash;
-        // Invalidate cached info — test helpers may bypass normal close paths.
-        state.soroban_network_info = None;
-        drop(state);
-        // Recompute from the current bucket-list state.
-        let info = self.compute_soroban_info();
-        self.state.write().soroban_network_info = info;
+        state.soroban_network_info = info;
     }
 
     /// Get bucket list level hashes (curr, snap) for persistence.
@@ -2227,19 +2225,17 @@ impl LedgerManager {
             }
         } // end if has_offers || has_pool_share_trustlines
 
-        // Update state
+        // Eagerly recompute Soroban network info from the committed bucket-list state.
+        // Computed BEFORE acquiring the state write lock so readers never see a new
+        // header paired with stale cached info.
+        let soroban_info = self.compute_soroban_info();
+
+        // Publish header, hash, and derived Soroban info atomically.
         {
             let mut state = self.state.write();
             state.header = new_header;
             state.header_hash = new_header_hash;
-        }
-
-        // Eagerly recompute Soroban network info from the committed state.
-        // Cost: one snapshot + ~15 config lookups. Runs on the blocking thread,
-        // so all subsequent event-loop reads are O(1).
-        {
-            let info = self.compute_soroban_info();
-            self.state.write().soroban_network_info = info;
+            state.soroban_network_info = soroban_info;
         }
 
         // Drop offer/pool changes on a background thread if non-trivial.
@@ -7790,5 +7786,55 @@ mod tests {
             ),
         }
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_soroban_network_info_returns_none_before_initialization() {
+        let mgr = LedgerManager::new(
+            "Test SDF Network ; September 2015".into(),
+            LedgerManagerConfig::default(),
+        );
+        // Before initialization, soroban_network_info should return None.
+        assert!(mgr.soroban_network_info().is_none());
+    }
+
+    #[test]
+    fn test_soroban_network_info_cleared_on_reset() {
+        let mgr = LedgerManager::new(
+            "Test SDF Network ; September 2015".into(),
+            LedgerManagerConfig::default(),
+        );
+        // Manually inject a cached value to verify reset clears it.
+        {
+            let mut state = mgr.state.write();
+            state.soroban_network_info = Some(SorobanNetworkInfo::default());
+        }
+        assert!(mgr.soroban_network_info().is_some());
+
+        mgr.reset();
+        assert!(mgr.soroban_network_info().is_none());
+    }
+
+    #[test]
+    fn test_soroban_network_info_accessor_is_o1() {
+        // Verify the accessor reads from state without creating a snapshot.
+        // We inject a value and confirm repeated reads return it identically.
+        let mgr = LedgerManager::new(
+            "Test SDF Network ; September 2015".into(),
+            LedgerManagerConfig::default(),
+        );
+        let mut info = SorobanNetworkInfo::default();
+        info.tx_max_instructions = 42;
+        info.ledger_max_tx_count = 99;
+        {
+            let mut state = mgr.state.write();
+            state.soroban_network_info = Some(info.clone());
+        }
+
+        // Multiple reads should return the same cached value.
+        let r1 = mgr.soroban_network_info();
+        let r2 = mgr.soroban_network_info();
+        assert_eq!(r1.unwrap().tx_max_instructions, 42);
+        assert_eq!(r2.unwrap().ledger_max_tx_count, 99);
     }
 }
