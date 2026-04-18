@@ -995,16 +995,20 @@ fn map_storage_changes(
             .unwrap_or(false);
 
         if is_modification || is_deletion || ttl_extended {
-            // Determine the kind based on the three-way discrimination that
-            // mirrors apply_soroban_storage_change's if/else chain:
+            // Determine the kind based on the three-way discrimination:
             //   1. encoded_new_value present → Modified
-            //   2. encoded_new_value absent, live_until present → TtlOnly
-            //   3. encoded_new_value absent, live_until absent → Deleted
+            //   2. ttl_extended (implies live_until present) → TtlOnly
+            //   3. !ttl_extended, live_until present → no-op (skip, parity)
+            //   4. everything else → Deleted
             //
-            // CRITICAL: when is_deletion=true AND live_until=Some(...), the
-            // current code enters the TTL-only path (not deletion), which
-            // contains the hot_archive_restored_keys short-circuit. We must
-            // preserve this by mapping to TtlOnly, not Deleted.
+            // CRITICAL: when is_deletion=true AND ttl_extended=true, the old code
+            // entered the TTL-only path (not deletion), which contains the
+            // hot_archive_restored_keys short-circuit. We preserve this by
+            // mapping to TtlOnly, not Deleted.
+            //
+            // When is_deletion=true AND live_until.is_some() AND ttl_extended=false,
+            // the old code was a no-op (TTL branch preempted deletion, then
+            // ttl_extended check caused skip). We preserve parity by skipping.
             let kind = if is_modification {
                 let entry = change
                     .encoded_new_value
@@ -1018,11 +1022,21 @@ fn map_storage_changes(
                     live_until: change.ttl_new_live_until_ledger,
                     ttl_extended,
                 }
-            } else if let Some(live_until) = change.ttl_new_live_until_ledger {
+            } else if ttl_extended {
+                // TTL-only: entry data wasn't modified but its TTL was extended.
+                // ttl_extended=true implies ttl_new_live_until_ledger.is_some().
                 StorageChangeKind::TtlOnly {
-                    live_until,
+                    live_until: change
+                        .ttl_new_live_until_ledger
+                        .expect("ttl_extended implies live_until is Some"),
                     read_only: change.read_only,
                 }
+            } else if change.ttl_new_live_until_ledger.is_some() {
+                // Edge case: deletion with live_until present but TTL not actually
+                // extended. Old code entered the TTL-only branch (preempting
+                // deletion) and skipped because ttl_extended=false → no-op.
+                // Preserve parity: don't emit a change.
+                continue;
             } else {
                 StorageChangeKind::Deleted
             };
@@ -2182,6 +2196,75 @@ mod tests {
         let result = map_storage_changes(changes, &state, None, &make_error).unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0].kind, StorageChangeKind::Deleted));
+
+        // TtlOnly: read-only entry with TTL extended
+        // We need a TTL that is greater than ledger-start to trigger ttl_extended=true.
+        // LedgerStateManager starts with no TTLs, so any live_until > 0 means extended.
+        let key2 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: Hash([2u8; 32]),
+        });
+        let encoded_key2 = key2.to_xdr(Limits::none()).unwrap();
+        let changes = vec![NormalizedLedgerChange {
+            encoded_key: encoded_key2.clone(),
+            read_only: true,
+            encoded_new_value: None,
+            old_entry_size_bytes_for_rent: 0,
+            ttl_new_live_until_ledger: Some(6_000_000),
+        }];
+        let result = map_storage_changes(changes, &state, None, &make_error).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            result[0].kind,
+            StorageChangeKind::TtlOnly {
+                live_until: 6_000_000,
+                read_only: true
+            }
+        ));
+
+        // is_deletion && ttl_extended → TtlOnly (not Deleted)
+        // This is the hot-archive edge case.
+        let changes = vec![NormalizedLedgerChange {
+            encoded_key: encoded_key2.clone(),
+            read_only: false,
+            encoded_new_value: None,
+            old_entry_size_bytes_for_rent: 0,
+            ttl_new_live_until_ledger: Some(6_000_000),
+        }];
+        let result = map_storage_changes(changes, &state, None, &make_error).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(
+            matches!(
+                result[0].kind,
+                StorageChangeKind::TtlOnly {
+                    live_until: 6_000_000,
+                    read_only: false
+                }
+            ),
+            "is_deletion && ttl_extended must map to TtlOnly, not Deleted"
+        );
+
+        // is_deletion && live_until present && !ttl_extended → no-op (skipped)
+        // Set ledger-start TTL to 6_000_000 so that live_until <= ledger_start_ttl.
+        let key_hash = crate::soroban::compute_key_hash(&key2);
+        let mut state_with_ttl = LedgerStateManager::new(5_000_000, 100);
+        state_with_ttl.create_ttl(stellar_xdr::curr::TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 6_000_000,
+        });
+        state_with_ttl.capture_ttl_bucket_list_snapshot();
+        let changes = vec![NormalizedLedgerChange {
+            encoded_key: encoded_key2,
+            read_only: false,
+            encoded_new_value: None,
+            old_entry_size_bytes_for_rent: 0,
+            ttl_new_live_until_ledger: Some(5_999_999), // less than ledger-start TTL
+        }];
+        let result = map_storage_changes(changes, &state_with_ttl, None, &make_error).unwrap();
+        assert_eq!(
+            result.len(),
+            0,
+            "is_deletion with live_until but !ttl_extended should be a no-op"
+        );
     }
 
     /// Test that `convert_diagnostic_events_cross_version` skips events that
