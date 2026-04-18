@@ -84,9 +84,24 @@ pub(crate) fn render_prometheus_text(metrics: &MetricsResponse, app_info: &AppIn
          henyey_scp_prefilter_rejects_total{{reason=\"cannot_receive\"}} {}\n\
          henyey_scp_prefilter_rejects_total{{reason=\"close_time\"}} {}\n\
          henyey_scp_prefilter_rejects_total{{reason=\"range\"}} {}\n\
-         # HELP henyey_scp_post_verify_drops_total Envelopes dropped after verification (gate drift, self-message, non-quorum, invalid)\n\
+         # HELP henyey_scp_post_verify_drops_total Envelopes dropped after verification (aggregate)\n\
          # TYPE henyey_scp_post_verify_drops_total counter\n\
          henyey_scp_post_verify_drops_total {}\n\
+         # HELP henyey_scp_post_verify_total Envelopes processed by post-verify, by reason\n\
+         # TYPE henyey_scp_post_verify_total counter\n\
+         henyey_scp_post_verify_total{{reason=\"drift_range\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"drift_close_time\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"drift_cannot_receive\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"self_message\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"non_quorum\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"too_far\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"buffer_full\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"accepted\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"buffered\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"duplicate\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"processed_directly\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"invalid_sig\"}} {}\n\
+         henyey_scp_post_verify_total{{reason=\"panic\"}} {}\n\
          # HELP henyey_scp_verify_input_backlog Current depth of the SCP signature-verify input channel (event-loop sampled)\n\
          # TYPE henyey_scp_verify_input_backlog gauge\n\
          henyey_scp_verify_input_backlog {}\n\
@@ -104,6 +119,19 @@ pub(crate) fn render_prometheus_text(metrics: &MetricsResponse, app_info: &AppIn
         sv.prefilter_reject_close_time,
         sv.prefilter_reject_range,
         sv.post_verify_drops,
+        sv.pv_drift_range,
+        sv.pv_drift_close_time,
+        sv.pv_drift_cannot_receive,
+        sv.pv_self_message,
+        sv.pv_non_quorum,
+        sv.pv_too_far,
+        sv.pv_buffer_full,
+        sv.pv_accepted,
+        sv.pv_buffered,
+        sv.pv_duplicate,
+        sv.pv_processed_directly,
+        sv.pv_invalid_sig,
+        sv.pv_panic,
         sv.verify_input_backlog,
         sv.verify_output_backlog,
         sv.verifier_thread_state,
@@ -196,5 +224,61 @@ mod tests {
             "sample value for fetch_channel_depth_max not emitted; got:\n{}",
             body
         );
+    }
+
+    /// Issue #1733: `/metrics` must expose per-reason post-verify counters
+    /// as labeled `henyey_scp_post_verify_total{reason="..."}` lines.
+    #[test]
+    fn metrics_endpoint_exposes_per_reason_post_verify_counters() {
+        let mut app_info = dummy_app_info();
+        app_info.scp_verify.pv_drift_range = 3;
+        app_info.scp_verify.pv_accepted = 42;
+        app_info.scp_verify.pv_panic = 1;
+        let body = render_prometheus_text(&dummy_metrics(), &app_info);
+        assert!(
+            body.contains("# HELP henyey_scp_post_verify_total "),
+            "missing HELP line for post_verify_total"
+        );
+        assert!(
+            body.contains("# TYPE henyey_scp_post_verify_total counter"),
+            "missing TYPE line for post_verify_total"
+        );
+        assert!(
+            body.contains("henyey_scp_post_verify_total{reason=\"drift_range\"} 3"),
+            "drift_range counter not rendered correctly; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("henyey_scp_post_verify_total{reason=\"accepted\"} 42"),
+            "accepted counter not rendered correctly; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("henyey_scp_post_verify_total{reason=\"panic\"} 1"),
+            "panic counter not rendered correctly; got:\n{}",
+            body
+        );
+        // Verify all 13 reason labels are present
+        for reason in [
+            "drift_range",
+            "drift_close_time",
+            "drift_cannot_receive",
+            "self_message",
+            "non_quorum",
+            "too_far",
+            "buffer_full",
+            "accepted",
+            "buffered",
+            "duplicate",
+            "processed_directly",
+            "invalid_sig",
+            "panic",
+        ] {
+            let label = format!("henyey_scp_post_verify_total{{reason=\"{reason}\"}}");
+            assert!(
+                body.contains(&label),
+                "missing counter for reason={reason}; got:\n{body}"
+            );
+        }
     }
 }

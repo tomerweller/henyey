@@ -1809,7 +1809,8 @@ impl App {
             // (pre-filter drop reasons are not re-run here; the Herder's
             // `process_verified` handles the InvalidSignature/Panic cases
             // without running downstream logic).
-            let _ = self.herder.process_verified(ve);
+            let (_, reason) = self.herder.process_verified(ve);
+            self.record_post_verify_reason(reason);
             return;
         }
 
@@ -1845,11 +1846,13 @@ impl App {
 
         // Hand off to Herder for gate recheck + self-message skip +
         // non-quorum reject + slot_quorum_tracker + prefetch + pending.add.
-        let envelope_result = self.herder.process_verified(ve);
+        let (envelope_result, reason) = self.herder.process_verified(ve);
 
-        // Post-verify drop counter: these are envelopes that were accepted
-        // by pre_filter but dropped downstream (gate drift, self-message,
-        // non-quorum, too-old, invalid).
+        // Per-reason post-verify metric.
+        self.record_post_verify_reason(reason);
+
+        // Aggregate post-verify drop counter (backward compat): envelopes that
+        // were accepted by pre_filter but dropped downstream.
         if matches!(
             envelope_result,
             EnvelopeState::TooOld | EnvelopeState::Invalid | EnvelopeState::InvalidSignature
@@ -1983,6 +1986,28 @@ impl App {
                 self.request_pending_tx_sets().await;
             }
         }
+    }
+
+    /// Increment the per-reason post-verify counter.
+    fn record_post_verify_reason(&self, reason: henyey_herder::scp_verify::PostVerifyReason) {
+        use henyey_herder::scp_verify::PostVerifyReason;
+        let counter = match reason {
+            PostVerifyReason::GateDriftRange => &self.scp_pv_drift_range,
+            PostVerifyReason::GateDriftCloseTime => &self.scp_pv_drift_close_time,
+            PostVerifyReason::GateDriftCannotReceive => &self.scp_pv_drift_cannot_receive,
+            PostVerifyReason::SelfMessage => &self.scp_pv_self_message,
+            PostVerifyReason::NonQuorum => &self.scp_pv_non_quorum,
+            PostVerifyReason::PendingAddTooFar => &self.scp_pv_too_far,
+            PostVerifyReason::PendingAddBufferFull => &self.scp_pv_buffer_full,
+            PostVerifyReason::Accepted => &self.scp_pv_accepted,
+            PostVerifyReason::PendingAddBuffered => &self.scp_pv_buffered,
+            PostVerifyReason::PendingAddDuplicate => &self.scp_pv_duplicate,
+            PostVerifyReason::PendingAddProcessedDirectly => &self.scp_pv_processed_directly,
+            PostVerifyReason::InvalidSignature => &self.scp_pv_invalid_sig,
+            PostVerifyReason::PanicVerdict => &self.scp_pv_panic,
+            _ => return, // #[non_exhaustive] future variants
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 

@@ -122,22 +122,18 @@ pub struct VerifiedEnvelope {
 
 /// Attribution for a post-verify-stage gate outcome.
 ///
-/// Returned alongside [`crate::EnvelopeState`] by the test-only
-/// `Herder::process_verified_detailed` so integration tests can assert WHICH
-/// gate in `process_verified` fired. The ordering of variants mirrors the
-/// in-code gate evaluation order:
+/// Returned alongside [`crate::EnvelopeState`] by
+/// [`crate::Herder::process_verified`] so callers can attribute outcomes to
+/// specific gates for metrics and diagnostics. The ordering of variants
+/// mirrors the in-code gate evaluation order:
 ///
-/// 1. Drift recheck (pre-filter rerun) → `GateDrift*`
-/// 2. Self-message skip                → `SelfMessage`
-/// 3. Non-quorum reject                → `NonQuorum`
-/// 4. `pending_envelopes.add` outcomes → `PendingAdd*`
-/// 5. Accepted (reached SCP / processed directly) → `Accepted`
-/// 6. Verdict-driven short-circuits    → `InvalidSignature`, `PanicVerdict`
-///
-/// This enum is only compiled under the `test-support` feature. It is not
-/// part of the public release API — the production post-verify path returns
-/// only [`crate::EnvelopeState`].
-#[cfg(feature = "test-support")]
+/// 1. Verdict-driven short-circuits    → `InvalidSignature`, `PanicVerdict`
+/// 2. Drift recheck (pre-filter rerun) → `GateDrift*`
+/// 3. Self-message skip                → `SelfMessage`
+/// 4. Non-quorum reject                → `NonQuorum`
+/// 5. `pending_envelopes.add` outcomes → `PendingAdd*`
+/// 6. Accepted (reached SCP / processed directly) → `Accepted`
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostVerifyReason {
     InvalidSignature,
@@ -155,7 +151,7 @@ pub enum PostVerifyReason {
     Accepted,
 }
 
-/// Test-only synchronous equivalent of the worker's verify step.
+/// Synchronous equivalent of the worker's verify step.
 ///
 /// Takes the `network_id` explicitly since [`PreFilter`] does not carry it
 /// (the production path gets it from [`crate::scp_driver::ScpDriver::build_signed_bytes`]
@@ -164,10 +160,8 @@ pub enum PostVerifyReason {
 /// outcome) or an error if the pre-filter rejected the envelope before
 /// verification.
 ///
-/// Used by the Phase B parity tests under `crates/herder/tests/` — not
-/// part of the production event-loop pipeline.
-#[cfg(feature = "test-support")]
-#[doc(hidden)]
+/// Used by the Phase B parity tests under `crates/herder/tests/` and by
+/// the synchronous catchup path — not part of the async event-loop pipeline.
 pub fn verify_envelope_sync(
     network_id: &Hash256,
     pf: PreFilter,

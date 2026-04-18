@@ -602,3 +602,78 @@ fn smoke_fixture_envelopes_round_trip_sign_verify() {
     // in its intake so `process_verified_detailed` can consume it.
     let _: &VerifiedEnvelope = &ve;
 }
+
+// ---------------------------------------------------------------------------
+// Checkpoint exception tests (issue #1733 observability polish)
+// ---------------------------------------------------------------------------
+
+/// Row 16: Range checkpoint exception — slot = checkpoint, below effective_min,
+/// bypasses the range gate via `slot != checkpoint` exception.
+///
+/// With TRACKING_SLOT=101 and checkpoint_frequency=64, the most recent
+/// checkpoint seq is 64. effective_min = max(1, 101-12+1) = 90. Slot 64 is
+/// below 90 and would normally be rejected, but the checkpoint exception
+/// exempts it.
+#[test]
+fn row_16_checkpoint_exception_range() {
+    let fix = fixture_tracking();
+    // Verify our expectation of the checkpoint value.
+    assert_eq!(fix.herder.get_most_recent_checkpoint_seq(), 64);
+
+    // slot=64 (= checkpoint), close_time=NOW (passes close-time gate).
+    let env = nominate_envelope(64, NOW, &fix.peer_secret, &fix.network_id);
+    let stage = run(&fix, env, |_| {});
+    // The envelope clears pre-filter (checkpoint exception on range), clears
+    // verify, and reaches process_verified where it is accepted (or buffered).
+    // It should NOT be PreFilter(Range).
+    assert!(
+        !matches!(stage, Stage::PreFilter(PreFilterRejectReason::Range)),
+        "checkpoint exception must bypass range gate, got {:?}",
+        stage
+    );
+}
+
+/// Row 17: Close-time checkpoint exception (non-tracking) — close-time check
+/// fails, but slot = checkpoint → the `slot != checkpoint` exception in the
+/// non-tracking branch of `pre_filter_scp_envelope` allows the envelope through.
+#[test]
+fn row_17_checkpoint_exception_close_time_non_tracking() {
+    // Use a fixture that is NOT tracking — `Fixture::new()` starts in Booting
+    // but we need a state that `can_receive_scp()` and is not tracking.
+    let fix = Fixture::new();
+    fix.herder.start_syncing();
+    // In syncing-non-tracking state. Set tracking for our slot state but the
+    // herder won't be in the "tracking" branch of `pre_filter_scp_envelope`.
+    fix.herder
+        .set_tracking_for_testing(TRACKING_SLOT, TRACKING_CLOSE_TIME);
+    fix.herder
+        .set_pending_current_slot_for_testing(TRACKING_SLOT);
+
+    // Need herder state to NOT be tracking. `start_syncing` puts us in
+    // ConnectedToNetwork which is_tracking() = false.
+    assert!(
+        !fix.herder.state().is_tracking(),
+        "fixture must be in non-tracking state"
+    );
+
+    let checkpoint = fix.herder.get_most_recent_checkpoint_seq();
+    assert_eq!(checkpoint, 64);
+
+    // Build an envelope at slot=checkpoint (64) with a close_time that would
+    // fail (too old — below tracking_consensus_close_time).
+    let bad_close_time = TRACKING_CLOSE_TIME.saturating_sub(1000);
+    let env = nominate_envelope(
+        checkpoint,
+        bad_close_time,
+        &fix.peer_secret,
+        &fix.network_id,
+    );
+    let stage = run(&fix, env, |_| {});
+    // The close-time check fails, but the checkpoint exception allows it through.
+    // It should NOT be PreFilter(CloseTime).
+    assert!(
+        !matches!(stage, Stage::PreFilter(PreFilterRejectReason::CloseTime)),
+        "checkpoint close-time exception must bypass close_time gate in non-tracking, got {:?}",
+        stage
+    );
+}

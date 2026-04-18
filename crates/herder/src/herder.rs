@@ -1017,23 +1017,17 @@ impl Herder {
             intake,
             verdict: Verdict::Ok,
         })
+        .0
     }
 
-    /// Test-only variant of [`Self::receive_scp_envelope`] that additionally
-    /// returns a [`crate::scp_verify::PostVerifyReason`] attributing the
-    /// outcome to the gate that fired. Used by the Phase B split-path
-    /// equivalence test (Layer 2) so it can compare the wrapper path against
-    /// the explicit `pre_filter → verify → process_verified_detailed` path at
-    /// reason-level granularity — catching refactors that preserve
-    /// `EnvelopeState` but diverge on WHICH gate claimed the envelope.
+    /// Variant of [`Self::receive_scp_envelope`] that returns both
+    /// [`EnvelopeState`] and [`crate::scp_verify::PostVerifyReason`].
     ///
     /// Pre-filter rejections are mapped to the `GateDrift*` reasons so the
     /// wrapper and split paths use a single reason vocabulary. (In the split
-    /// path these reasons arise when `process_verified_inner`'s rerun fires;
-    /// in the wrapper path they arise on the first and only pre-filter call.)
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn receive_scp_envelope_sync_detailed(
+    /// path these reasons arise when `process_verified`'s rerun fires; in the
+    /// wrapper path they arise on the first and only pre-filter call.)
+    pub fn receive_scp_envelope_detailed(
         &self,
         envelope: ScpEnvelope,
     ) -> (EnvelopeState, crate::scp_verify::PostVerifyReason) {
@@ -1078,7 +1072,7 @@ impl Herder {
             peer_id: None,
             enqueue_at: Instant::now(),
         };
-        self.process_verified_detailed(VerifiedEnvelope {
+        self.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Ok,
         })
@@ -1195,151 +1189,16 @@ impl Herder {
 
     /// Post-verification processing.
     ///
+    /// Returns both [`EnvelopeState`] and [`crate::scp_verify::PostVerifyReason`]
+    /// so callers can attribute outcomes to specific gates for metrics.
+    ///
     /// Assumes signature verification already succeeded (or the verdict is
     /// surfaced as `InvalidSignature`). Re-runs the mutable pre-filter gates
     /// (state may have drifted while the worker was verifying) before
     /// executing self-message skip, non-quorum reject, slot_quorum_tracker
     /// update, EXTERNALIZE tx-set prefetch and `pending_envelopes.add` /
     /// `process_scp_envelope`.
-    #[cfg(not(feature = "test-support"))]
-    pub fn process_verified(&self, ve: crate::scp_verify::VerifiedEnvelope) -> EnvelopeState {
-        use crate::scp_verify::{PreFilter, Verdict};
-        let crate::scp_verify::VerifiedEnvelope { intake, verdict } = ve;
-        let slot = intake.slot;
-
-        match verdict {
-            Verdict::Ok => {}
-            Verdict::InvalidSignature => {
-                debug!(slot, "SCP envelope rejected (InvalidSignature)");
-                return EnvelopeState::InvalidSignature;
-            }
-            Verdict::Panic => {
-                debug!(slot, "SCP verify worker panicked on this envelope");
-                return EnvelopeState::Invalid;
-            }
-        }
-
-        let envelope = intake.envelope;
-
-        // Re-check mutable gates (state may have drifted during verify).
-        match self.pre_filter_scp_envelope(&envelope) {
-            PreFilter::Accept(_) => {}
-            PreFilter::Reject(reason) => {
-                use crate::scp_verify::PreFilterRejectReason as R;
-                debug!(
-                    slot,
-                    reason = reason.as_str(),
-                    "post-verify gate drift rejected envelope"
-                );
-                return match reason {
-                    R::Range => EnvelopeState::TooOld,
-                    R::CloseTime | R::CannotReceiveScp => EnvelopeState::Invalid,
-                };
-            }
-        }
-
-        let current_slot = self.tracking_slot();
-        let pending_slot = self.pending_envelopes.current_slot();
-
-        // Parity: skip self-messages (HerderImpl.cpp:885-891)
-        let local_node_id = node_id_from_public_key(&self.config.node_public_key);
-        if envelope.statement.node_id == local_node_id {
-            trace!(slot, "Skipping self-message");
-            return EnvelopeState::Invalid;
-        }
-
-        // Parity: reject envelopes from nodes not in our transitive quorum
-        // (PendingEnvelopes.cpp:293-298 isNodeDefinitelyInQuorum)
-        if self.config.local_quorum_set.is_some()
-            && !self
-                .quorum_tracker
-                .read()
-                .is_node_definitely_in_quorum(&envelope.statement.node_id)
-        {
-            debug!(
-                slot,
-                node = ?envelope.statement.node_id,
-                "Rejecting envelope from non-quorum node"
-            );
-            return EnvelopeState::Invalid;
-        }
-
-        self.slot_quorum_tracker
-            .write()
-            .record_envelope(slot, envelope.statement.node_id.clone());
-
-        let lcl = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|m| m.current_ledger_seq() as u64);
-        if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
-            &envelope.statement.pledges
-        {
-            if let Ok(sv) = StellarValue::from_xdr(&ext.commit.value.0, Limits::none()) {
-                let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                if lcl.map_or(true, |l| slot > l) {
-                    if self.scp_driver.request_tx_set(tx_set_hash, slot) {
-                        debug!(slot, hash = %tx_set_hash, "Requesting tx set from EXTERNALIZE");
-                    }
-                }
-            }
-        }
-
-        if slot > current_slot {
-            let envelope_clone = envelope.clone();
-            match self.pending_envelopes.add(slot, envelope) {
-                PendingResult::Added => {
-                    debug!("Buffered envelope for future slot {}", slot);
-                    return EnvelopeState::Pending;
-                }
-                PendingResult::Duplicate => {
-                    return EnvelopeState::Duplicate;
-                }
-                PendingResult::SlotTooFar => {
-                    debug!(
-                        slot,
-                        current_slot, pending_slot, "Envelope rejected: slot too far ahead"
-                    );
-                    return EnvelopeState::Invalid;
-                }
-                PendingResult::SlotTooOld => {
-                    debug!(
-                        slot,
-                        current_slot,
-                        pending_slot,
-                        "Pending said TooOld but slot is within window, processing directly"
-                    );
-                    return self.process_scp_envelope(envelope_clone);
-                }
-                PendingResult::BufferFull => {
-                    debug!("Pending envelope buffer full");
-                    return EnvelopeState::Invalid;
-                }
-            }
-        }
-
-        self.process_scp_envelope(envelope)
-    }
-
-    /// Post-verification processing (test-support build).
-    ///
-    /// Thin wrapper around [`Self::process_verified_detailed`] that drops the
-    /// [`crate::scp_verify::PostVerifyReason`] attribution. Production builds
-    /// use a separate non-attributing implementation to keep `PostVerifyReason`
-    /// out of the public release API entirely.
-    #[cfg(feature = "test-support")]
-    pub fn process_verified(&self, ve: crate::scp_verify::VerifiedEnvelope) -> EnvelopeState {
-        self.process_verified_detailed(ve).0
-    }
-
-    /// Test-only variant of [`Self::process_verified`] that additionally
-    /// returns a [`crate::scp_verify::PostVerifyReason`] attributing the
-    /// outcome to a specific gate. See `PostVerifyReason` for the gate
-    /// ordering. Used by the Phase B parity integration tests.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn process_verified_detailed(
+    pub fn process_verified(
         &self,
         ve: crate::scp_verify::VerifiedEnvelope,
     ) -> (EnvelopeState, crate::scp_verify::PostVerifyReason) {
@@ -1484,6 +1343,17 @@ impl Herder {
             self.process_scp_envelope(envelope),
             PostVerifyReason::Accepted,
         )
+    }
+
+    /// Post-verification processing (test-support: also available as
+    /// `process_verified_detailed` alias for backward compatibility).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn process_verified_detailed(
+        &self,
+        ve: crate::scp_verify::VerifiedEnvelope,
+    ) -> (EnvelopeState, crate::scp_verify::PostVerifyReason) {
+        self.process_verified(ve)
     }
 
     /// Process an SCP envelope (internal).
@@ -4378,8 +4248,8 @@ mod set_state_tests {
 mod scp_pipeline_tests {
     use super::*;
     use crate::scp_verify::{
-        spawn_scp_verifier, PipelinedIntake, PreFilter, PreFilterRejectReason, Verdict,
-        VerifiedEnvelope, VerifierState,
+        spawn_scp_verifier, PipelinedIntake, PostVerifyReason, PreFilter, PreFilterRejectReason,
+        Verdict, VerifiedEnvelope, VerifierState,
     };
     use henyey_crypto::SecretKey;
     use stellar_xdr::curr::{
@@ -4519,11 +4389,12 @@ mod scp_pipeline_tests {
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
         };
-        let result = herder.process_verified(VerifiedEnvelope {
+        let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::InvalidSignature,
         });
-        assert_eq!(result, EnvelopeState::InvalidSignature);
+        assert_eq!(state, EnvelopeState::InvalidSignature);
+        assert_eq!(reason, PostVerifyReason::InvalidSignature);
     }
 
     #[test]
@@ -4538,11 +4409,12 @@ mod scp_pipeline_tests {
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
         };
-        let result = herder.process_verified(VerifiedEnvelope {
+        let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Panic,
         });
-        assert_eq!(result, EnvelopeState::Invalid);
+        assert_eq!(state, EnvelopeState::Invalid);
+        assert_eq!(reason, PostVerifyReason::PanicVerdict);
     }
 
     #[test]
@@ -4576,15 +4448,16 @@ mod scp_pipeline_tests {
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
         };
-        let result = herder.process_verified(VerifiedEnvelope {
+        let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Ok,
         });
         assert_eq!(
-            result,
+            state,
             EnvelopeState::Invalid,
             "self-message must be skipped as Invalid"
         );
+        assert_eq!(reason, PostVerifyReason::SelfMessage);
     }
 
     #[test]
@@ -4612,15 +4485,16 @@ mod scp_pipeline_tests {
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
         };
-        let result = herder.process_verified(VerifiedEnvelope {
+        let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Ok,
         });
         assert_eq!(
-            result,
+            state,
             EnvelopeState::TooOld,
             "post-verify Range gate should reject drifted slot as TooOld"
         );
+        assert_eq!(reason, PostVerifyReason::GateDriftRange);
     }
 
     // -------- scp_verify::worker tests --------
