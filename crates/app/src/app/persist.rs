@@ -31,7 +31,7 @@ use super::types::PendingPersist;
 /// Prepared inside `catchup_with_mode`, persisted on the event loop as a
 /// [`PendingPersist`] task to avoid blocking inside `tokio::spawn`.
 #[derive(Clone)]
-pub struct CatchupPersistData {
+pub(super) struct CatchupPersistData {
     pub header: stellar_xdr::curr::LedgerHeader,
     pub header_xdr: Vec<u8>,
     pub has_json: String,
@@ -69,10 +69,15 @@ pub(super) enum CatchupFinalizerInner {
         db: Database,
         ledger_manager: Arc<LedgerManager>,
     },
-    /// Send persist data to the caller over a oneshot. The caller is
-    /// responsible for driving the finalize on its own timeline (typically
-    /// as a [`PersistJob::Catchup`] task in the event loop).
-    Deferred(tokio::sync::oneshot::Sender<CatchupPersistData>),
+    /// Send a ready-to-spawn persist job to the caller over a oneshot.
+    /// The caller is responsible for calling `.spawn()` on the received
+    /// [`CatchupPersistReady`] on its own timeline (typically from the
+    /// event loop, where `spawn_blocking` is safe to call directly).
+    Deferred {
+        db: Database,
+        ledger_manager: Arc<LedgerManager>,
+        persist_tx: tokio::sync::oneshot::Sender<CatchupPersistReady>,
+    },
 }
 
 impl CatchupFinalizer {
@@ -88,11 +93,66 @@ impl CatchupFinalizer {
         Self(CatchupFinalizerInner::Inline { db, ledger_manager })
     }
 
-    /// Hand persist data off to the caller via a oneshot. The caller
-    /// drives the actual persist on its own (e.g. via
-    /// [`spawn_persist_task`] + [`PersistJob::Catchup`]).
-    pub(crate) fn deferred(tx: tokio::sync::oneshot::Sender<CatchupPersistData>) -> Self {
-        Self(CatchupFinalizerInner::Deferred(tx))
+    /// Send a ready-to-spawn [`CatchupPersistReady`] to the caller via a
+    /// oneshot. The caller calls `.spawn()` to start the persist task on a
+    /// blocking thread (e.g. from the event loop's select branches, where
+    /// `spawn_blocking` is safe to call directly).
+    pub(crate) fn deferred(
+        db: Database,
+        ledger_manager: Arc<LedgerManager>,
+        persist_tx: tokio::sync::oneshot::Sender<CatchupPersistReady>,
+    ) -> Self {
+        Self(CatchupFinalizerInner::Deferred {
+            db,
+            ledger_manager,
+            persist_tx,
+        })
+    }
+}
+
+/// Ready-to-spawn catchup persist job. Constructed inside `catchup_with_mode`
+/// and sent through the `Deferred` finalizer's oneshot.
+///
+/// This is a **risk-reduction** measure — `#[must_use]` on both the type and
+/// `.spawn()` makes silent drops produce compiler warnings, and private fields
+/// prevent callers from destructuring around the safety layer. However,
+/// `let _ = ready` still compiles; Rust's `#[must_use]` is advisory.
+///
+/// ## Send-failure semantics
+///
+/// If the oneshot receiver is dropped before the send (catchup task
+/// cancellation), the `CatchupPersistReady` drops with it — no persist task
+/// is spawned, no untracked work exists.
+#[must_use = "catchup persist job must be spawned via .spawn()"]
+pub(crate) struct CatchupPersistReady {
+    job: PersistJob,
+    ledger_seq: u32,
+}
+
+impl CatchupPersistReady {
+    /// Construct from persist data + resources.
+    ///
+    /// `ledger_seq` is derived from `data.header.ledger_seq` to prevent
+    /// divergence between the job's data and the tracked sequence number.
+    pub(super) fn new(
+        data: CatchupPersistData,
+        db: Database,
+        ledger_manager: Arc<LedgerManager>,
+    ) -> Self {
+        let (job, ledger_seq) = PersistJob::catchup(data, db, ledger_manager);
+        Self { job, ledger_seq }
+    }
+
+    /// Spawn the persist job on a blocking thread.
+    #[must_use = "the returned PendingPersist handle must be tracked"]
+    pub(super) fn spawn(self) -> PendingPersist {
+        spawn_persist_task(self.job, self.ledger_seq)
+    }
+
+    /// The ledger sequence being persisted (for logging/assertions).
+    #[allow(dead_code)]
+    pub(super) fn ledger_seq(&self) -> u32 {
+        self.ledger_seq
     }
 }
 
@@ -161,6 +221,27 @@ pub(super) enum PersistJob {
 }
 
 impl PersistJob {
+    /// Construct a catchup persist job from the prepared data.
+    ///
+    /// Returns the job and the ledger sequence for logging/tracking.
+    /// Used by both the Inline and Deferred finalization paths in
+    /// `catchup_with_mode` to centralize `PersistJob::Catchup` construction.
+    pub(super) fn catchup(
+        data: CatchupPersistData,
+        db: Database,
+        ledger_manager: Arc<LedgerManager>,
+    ) -> (Self, u32) {
+        let seq = data.header.ledger_seq;
+        (
+            PersistJob::Catchup {
+                data: Box::new(data),
+                db,
+                ledger_manager,
+            },
+            seq,
+        )
+    }
+
     /// Run the entire persist pipeline synchronously on the calling thread.
     ///
     /// Every persist operation is blocking (file I/O, thread join, SQLite
@@ -391,5 +472,139 @@ mod tests {
         let (tx, _rx) = tokio::sync::oneshot::channel::<crate::app::types::PendingPersist>();
         let deferred = LedgerCloseFinalizer::deferred(tx);
         assert!(matches!(deferred.0, LedgerCloseFinalizerInner::Deferred(_)));
+    }
+
+    /// Shape-level regression for #1750: `CatchupFinalizer::deferred` must
+    /// produce the `Deferred` variant carrying `db`, `ledger_manager`, and
+    /// `persist_tx`. This ensures the Deferred path has everything it needs
+    /// to construct a `CatchupPersistReady` inside `catchup_with_mode`.
+    #[test]
+    fn catchup_finalizer_deferred_shape() {
+        let db = Database::open_in_memory().unwrap();
+        let lm = Arc::new(LedgerManager::new(
+            "Test Network".to_string(),
+            Default::default(),
+        ));
+        let (tx, _rx) = tokio::sync::oneshot::channel::<CatchupPersistReady>();
+        let finalizer = CatchupFinalizer::deferred(db, lm, tx);
+        assert!(matches!(
+            finalizer.0,
+            CatchupFinalizerInner::Deferred {
+                db: _,
+                ledger_manager: _,
+                persist_tx: _,
+            }
+        ));
+    }
+
+    /// #1750: `CatchupPersistReady::new` derives `ledger_seq` from the
+    /// persist data's header, and `.spawn()` returns a `PendingPersist`
+    /// with the correct `ledger_seq`.
+    #[tokio::test]
+    async fn catchup_persist_ready_spawn_returns_correct_seq() {
+        let db = Database::open_in_memory().unwrap();
+        let lm = Arc::new(LedgerManager::new(
+            "Test Network".to_string(),
+            Default::default(),
+        ));
+        let (header, header_xdr) = make_header(99);
+        let data = CatchupPersistData {
+            header,
+            header_xdr,
+            has_json: "{}".to_string(),
+        };
+        let ready = CatchupPersistReady::new(data, db, lm);
+        assert_eq!(ready.ledger_seq(), 99);
+        let pending = ready.spawn();
+        assert_eq!(pending.ledger_seq, 99);
+        // Let the persist task complete (it will attempt write_to_db on
+        // the in-memory DB and abort on failure, but the test tokio
+        // runtime won't observe that — the task runs on a blocking thread).
+        let _ = pending.handle.await;
+    }
+
+    /// #1750: when no persist data is produced (no-work catchup), the
+    /// oneshot sender is dropped without sending. The receiver must
+    /// observe `TryRecvError::Closed`.
+    #[test]
+    fn no_work_catchup_drops_sender() {
+        let db = Database::open_in_memory().unwrap();
+        let lm = Arc::new(LedgerManager::new(
+            "Test Network".to_string(),
+            Default::default(),
+        ));
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<CatchupPersistReady>();
+        // Construct the finalizer but never send on it (simulating
+        // a no-work catchup that doesn't produce persist data).
+        let _finalizer = CatchupFinalizer::deferred(db, lm, tx);
+        drop(_finalizer);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// #1750: `PendingCatchupResult::take_persist_ready` returns `Some`
+    /// on the first call and `None` on subsequent calls.
+    #[test]
+    fn take_persist_ready_is_take_once() {
+        let db = Database::open_in_memory().unwrap();
+        let lm = Arc::new(LedgerManager::new(
+            "Test Network".to_string(),
+            Default::default(),
+        ));
+        let (header, header_xdr) = make_header(50);
+        let data = CatchupPersistData {
+            header,
+            header_xdr,
+            has_json: "{}".to_string(),
+        };
+        let ready = CatchupPersistReady::new(data, db, lm);
+        let result_ok = Ok(crate::app::types::CatchupResult {
+            ledger_seq: 50,
+            ledger_hash: henyey_common::Hash256::default(),
+            buckets_applied: 1,
+            ledgers_replayed: 0,
+        });
+        let mut result = crate::app::types::PendingCatchupResult::new(result_ok, Some(ready));
+        assert!(result.made_progress, "buckets_applied > 0 → made_progress");
+        assert!(
+            result.take_persist_ready().is_some(),
+            "first take should be Some"
+        );
+        assert!(
+            result.take_persist_ready().is_none(),
+            "second take should be None"
+        );
+    }
+
+    /// #1750: `PendingCatchupResult::new` derives `made_progress` correctly.
+    #[test]
+    fn pending_catchup_result_derives_made_progress() {
+        // Error → no progress
+        let err_result =
+            crate::app::types::PendingCatchupResult::new(Err(anyhow::anyhow!("test error")), None);
+        assert!(!err_result.made_progress);
+
+        // Success with no work → no progress
+        let no_work = crate::app::types::PendingCatchupResult::new(
+            Ok(crate::app::types::CatchupResult {
+                ledger_seq: 1,
+                ledger_hash: henyey_common::Hash256::default(),
+                buckets_applied: 0,
+                ledgers_replayed: 0,
+            }),
+            None,
+        );
+        assert!(!no_work.made_progress);
+
+        // Success with ledgers replayed → progress
+        let with_progress = crate::app::types::PendingCatchupResult::new(
+            Ok(crate::app::types::CatchupResult {
+                ledger_seq: 10,
+                ledger_hash: henyey_common::Hash256::default(),
+                buckets_applied: 0,
+                ledgers_replayed: 5,
+            }),
+            None,
+        );
+        assert!(with_progress.made_progress);
     }
 }

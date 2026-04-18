@@ -36,25 +36,21 @@ impl App {
             // `tokio::spawn` task (see run_cmd::run_node). Calling
             // spawn_blocking here risks the deadlock class from #1713 if the
             // blocking pool is saturated. Use the Deferred finalizer pattern
-            // exactly as the event-loop recovery path does: collect persist
-            // data via a oneshot, then drive the PersistJob::Catchup task to
+            // exactly as the event-loop recovery path does: receive a
+            // ready-to-spawn persist job, then spawn and drive it to
             // completion.
             let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
-            let finalize = super::persist::CatchupFinalizer::deferred(persist_tx);
+            let finalize = super::persist::CatchupFinalizer::deferred(
+                self.db.clone(),
+                self.ledger_manager.clone(),
+                persist_tx,
+            );
             let _result = self.catchup(CatchupTarget::Current, finalize).await?;
-            if let Ok(persist_data) = persist_rx.try_recv() {
-                let seq = persist_data.header.ledger_seq;
-                let pending = super::persist::spawn_persist_task(
-                    super::persist::PersistJob::Catchup {
-                        data: Box::new(persist_data),
-                        db: self.db.clone(),
-                        ledger_manager: self.ledger_manager.clone(),
-                    },
-                    seq,
-                );
+            if let Ok(ready) = persist_rx.try_recv() {
                 // Drive the persist task to completion before continuing.
                 // The persist task aborts the process on failure, so we only
                 // observe success here.
+                let pending = ready.spawn();
                 if let Err(e) = pending.handle.await {
                     anyhow::bail!("startup catchup persist task failed: {e}");
                 }
@@ -377,7 +373,11 @@ impl App {
                     self.catchup_in_progress.store(false, Ordering::SeqCst);
 
                     match catchup_result {
-                        Ok(result) => {
+                        Ok(mut result) => {
+                            // Take persist_ready before moving result.result
+                            let persist_ready = result.take_persist_ready();
+                            let made_progress = result.made_progress;
+
                             self.handle_catchup_result(
                                 result.result,
                                 pending.reset_stuck_state,
@@ -385,7 +385,7 @@ impl App {
                             )
                             .await;
 
-                            if result.made_progress && pending.re_arm_recovery {
+                            if made_progress && pending.re_arm_recovery {
                                 self.recovery_attempts_without_progress
                                     .store(1, Ordering::SeqCst);
                                 self.sync_recovery_pending.store(true, Ordering::SeqCst);
@@ -394,21 +394,12 @@ impl App {
                             // Spawn catchup persist task on a blocking thread.
                             // Dispatched from the event loop (not inside the catchup
                             // task) to avoid nested spawn_blocking (#1713, #1735).
-                            if let Some(persist_data) = result.persist_data {
-                                let seq = persist_data.header.ledger_seq;
+                            if let Some(ready) = persist_ready {
                                 debug_assert!(
                                     pending_persist.is_none(),
                                     "new catchup persist while previous persist still pending"
                                 );
-                                pending_persist =
-                                    Some(super::persist::spawn_persist_task(
-                                        super::persist::PersistJob::Catchup {
-                                            data: Box::new(persist_data),
-                                            db: self.db.clone(),
-                                            ledger_manager: self.ledger_manager.clone(),
-                                        },
-                                        seq,
-                                    ));
+                                pending_persist = Some(ready.spawn());
                             }
                         }
                         Err(_) => {

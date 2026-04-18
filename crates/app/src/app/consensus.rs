@@ -1051,26 +1051,23 @@ impl App {
             tracing::info!(label = label_owned, "Spawned catchup task starting");
             app.set_phase(14); // 14 = catchup_running
 
-            // Oneshot used only inside this task to capture persist data
-            // from `catchup_with_mode`'s Deferred finalizer, so we can
-            // forward it to the event loop alongside the CatchupResult.
+            // Oneshot used only inside this task to capture the ready-to-spawn
+            // persist job from `catchup_with_mode`'s Deferred finalizer, so we
+            // can forward it to the event loop alongside the CatchupResult.
             let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
-            let finalize = super::persist::CatchupFinalizer::deferred(persist_tx);
+            let finalize = super::persist::CatchupFinalizer::deferred(
+                app.database().clone(),
+                app.ledger_manager().clone(),
+                persist_tx,
+            );
             let catchup_result = app.catchup(target, finalize).await;
 
-            let (made_progress, persist_data) = match &catchup_result {
-                Ok(r) => {
-                    let pd = persist_rx.try_recv().ok();
-                    (r.ledgers_replayed > 0 || r.buckets_applied > 0, pd)
-                }
-                Err(_) => (false, None),
+            let persist_ready = match &catchup_result {
+                Ok(_) => persist_rx.try_recv().ok(),
+                Err(_) => None,
             };
 
-            let _ = result_tx.send(PendingCatchupResult {
-                result: catchup_result,
-                made_progress,
-                persist_data,
-            });
+            let _ = result_tx.send(PendingCatchupResult::new(catchup_result, persist_ready));
         });
 
         tracing::info!(label, "Catchup task spawned");

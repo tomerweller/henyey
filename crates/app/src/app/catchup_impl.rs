@@ -46,7 +46,7 @@ impl App {
         finalize: CatchupFinalizer,
     ) -> anyhow::Result<CatchupResult> {
         #[allow(unused_assignments)]
-        let mut catchup_persist_data: Option<CatchupPersistData> = None;
+        let mut catchup_persist_data: Option<super::persist::CatchupPersistData> = None;
         // Fatal-failure guard (spec §13.3): a previous catchup detected a
         // verification/integrity failure.  Further attempts are futile and
         // must be blocked until the operator intervenes.
@@ -278,7 +278,7 @@ impl App {
             // here deadlocks when the blocking pool is saturated (#1713).
             // Instead, return the persist data so the event loop can
             // spawn the persist as a PendingPersist task.
-            catchup_persist_data = Some(CatchupPersistData {
+            catchup_persist_data = Some(super::persist::CatchupPersistData {
                 header: final_header.clone(),
                 header_xdr,
                 has_json,
@@ -539,12 +539,8 @@ impl App {
         if let Some(persist_data) = catchup_persist_data {
             match finalize.0 {
                 super::persist::CatchupFinalizerInner::Inline { db, ledger_manager } => {
-                    let seq = persist_data.header.ledger_seq;
-                    let job = super::persist::PersistJob::Catchup {
-                        data: Box::new(persist_data),
-                        db,
-                        ledger_manager,
-                    };
+                    let (job, seq) =
+                        super::persist::PersistJob::catchup(persist_data, db, ledger_manager);
                     tokio::task::spawn_blocking(move || job.run_blocking(seq))
                         .await
                         .expect("inline catchup persist panicked");
@@ -553,10 +549,17 @@ impl App {
                         "Catchup persist completed (inline)"
                     );
                 }
-                super::persist::CatchupFinalizerInner::Deferred(tx) => {
-                    // Receiver may have been dropped if the spawning task was
-                    // cancelled — that's fine, nothing to do.
-                    let _ = tx.send(persist_data);
+                super::persist::CatchupFinalizerInner::Deferred {
+                    db,
+                    ledger_manager,
+                    persist_tx,
+                } => {
+                    let ready =
+                        super::persist::CatchupPersistReady::new(persist_data, db, ledger_manager);
+                    // Send-failure tolerance: if the receiver was dropped
+                    // (caller cancellation), `ready` drops here — no persist
+                    // task spawned, no untracked work.
+                    let _ = persist_tx.send(ready);
                 }
             }
         }

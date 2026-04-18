@@ -363,9 +363,33 @@ pub(super) struct PendingCatchupResult {
     pub result: anyhow::Result<CatchupResult>,
     /// Whether catchup actually advanced the ledger.
     pub made_progress: bool,
-    /// Persist data to be written after catchup completes.
-    /// None if catchup failed or didn't do work.
-    pub persist_data: Option<super::persist::CatchupPersistData>,
+    /// Ready-to-spawn persist job. Private to force callers through
+    /// [`Self::take_persist_ready`], which returns a `#[must_use]` value.
+    persist_ready: Option<super::persist::CatchupPersistReady>,
+}
+
+impl PendingCatchupResult {
+    /// Construct a result, deriving `made_progress` from the catchup outcome.
+    pub(super) fn new(
+        result: anyhow::Result<CatchupResult>,
+        persist_ready: Option<super::persist::CatchupPersistReady>,
+    ) -> Self {
+        let made_progress = result
+            .as_ref()
+            .map_or(false, |r| r.ledgers_replayed > 0 || r.buckets_applied > 0);
+        Self {
+            result,
+            made_progress,
+            persist_ready,
+        }
+    }
+
+    /// Take the persist-ready job, if any. Returns `None` if catchup failed
+    /// or did no work requiring persistence.
+    #[must_use = "the returned CatchupPersistReady must be spawned"]
+    pub(super) fn take_persist_ready(&mut self) -> Option<super::persist::CatchupPersistReady> {
+        self.persist_ready.take()
+    }
 }
 
 /// State for a ledger close running on a background thread.
