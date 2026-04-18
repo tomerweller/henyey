@@ -30,7 +30,29 @@ use crate::config::HistoryArchiveEntry;
 
 /// How long to cache the archive checkpoint before triggering a background
 /// refresh. Matches the previous `ARCHIVE_CHECKPOINT_CACHE_SECS` constant.
+///
+/// This is the mainnet-tuned value (checkpoint_frequency=64, ~5 min per
+/// checkpoint). In accelerated mode (checkpoint_frequency=8, ~8s per
+/// checkpoint) it is scaled down by [`cache_ttl_secs`] so the cache does
+/// not serve values that are 7+ checkpoints out of date.
 pub(super) const ARCHIVE_CHECKPOINT_CACHE_SECS: u64 = 60;
+
+/// Return the effective cache TTL given the current checkpoint frequency.
+///
+/// In accelerated mode the archive publishes checkpoints every ~8 seconds;
+/// a 60s TTL would let captive-core stay ~7 checkpoints behind and stall
+/// buffered catchup ("target checkpoint not yet published"). Scale by
+/// `freq / DEFAULT_CHECKPOINT_FREQUENCY` with a 3s floor so a bounded
+/// number of checkpoints are missed per refresh cycle.
+pub(super) fn cache_ttl_secs() -> u64 {
+    let freq = henyey_history::checkpoint::checkpoint_frequency();
+    let default_freq = henyey_history::DEFAULT_CHECKPOINT_FREQUENCY;
+    if freq < default_freq {
+        ((ARCHIVE_CHECKPOINT_CACHE_SECS * freq as u64) / default_freq as u64).max(3)
+    } else {
+        ARCHIVE_CHECKPOINT_CACHE_SECS
+    }
+}
 
 /// Hard ceiling on a single background refresh. Three recovery ticks
 /// (3 × `OUT_OF_SYNC_RECOVERY_TIMER_SECS`) — if the refresh hasn't
@@ -204,7 +226,7 @@ impl ArchiveCheckpointCache {
             match *guard {
                 Some(c) => {
                     let age = self.clock.now().saturating_duration_since(c.queried_at);
-                    let stale = age.as_secs() >= ARCHIVE_CHECKPOINT_CACHE_SECS;
+                    let stale = age.as_secs() >= cache_ttl_secs();
                     (Some(c.checkpoint), stale)
                 }
                 None => (None, true),
