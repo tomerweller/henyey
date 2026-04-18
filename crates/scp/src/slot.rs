@@ -455,11 +455,59 @@ impl Slot {
         // redundant validate_value calls. Matches stellar-core which
         // checks is_newer_statement before validateValues.
         if self.ballot.is_stale_ballot_statement(&envelope.statement) {
-            tracing::info!(
+            // Attribution: pair the incoming pledge's (phase, counter)
+            // with what we already have stored for this peer. With
+            // RUST_LOG=henyey::envelope_path=debug this renders e.g.
+            //   incoming=(Externalize, 1) stored=Some((Externalize, 1))
+            // which is decisive evidence of whether the reject is a
+            // benign peer rebroadcast (phases & counters identical)
+            // or a parity regression in `is_newer_ballot_st`
+            // (incoming strictly newer per stellar-core
+            // `BallotProtocol::isNewerStatement` yet still rejected).
+            let incoming = match crate::compare::ballot_summary_of(&envelope.statement.pledges) {
+                Some(summary) => summary,
+                None => {
+                    // Invariant: `process_ballot_envelope` is only
+                    // invoked by `Slot::process_envelope` when the
+                    // pledge is Prepare/Confirm/Externalize (the
+                    // nomination path routes to `process_nomination_envelope`).
+                    // Reaching this arm means a caller bypassed that
+                    // dispatch guard. Log loudly and stay on the
+                    // conservative reject path.
+                    debug_assert!(
+                        false,
+                        "stale-ballot path must be reached only with \
+                         ballot pledges (Prepare/Confirm/Externalize); \
+                         Nominate should have been dispatched to \
+                         process_nomination_envelope upstream",
+                    );
+                    tracing::error!(
+                        target: "henyey::envelope_path",
+                        slot = self.slot_index,
+                        node_id = ?envelope.statement.node_id,
+                        "stale-ballot path hit with non-ballot pledge — invariant violation",
+                    );
+                    return EnvelopeState::Invalid;
+                }
+            };
+            let stored = self
+                .ballot
+                .stored_ballot_summary(&envelope.statement.node_id);
+            // Demoted from info! to debug! — this reject fires on every
+            // periodic Externalize rebroadcast from every peer for every
+            // in-flight slot, generating ~2000 lines per failing 4-min
+            // testnet Quickstart run with no diagnostic value at steady
+            // state. Pre-check against run 24615357897 artifact (74
+            // distinct slots, same-peer repeat pattern, all consistent
+            // with Externalize→Externalize rebroadcasts) confirmed the
+            // gate matches stellar-core parity; see #1811.
+            tracing::debug!(
                 target: "henyey::envelope_path",
                 slot = self.slot_index,
                 node_id = ?envelope.statement.node_id,
                 scp_gate = "stale_ballot",
+                ?incoming,
+                ?stored,
                 "scp receive rejected (ballot)",
             );
             return EnvelopeState::Invalid;

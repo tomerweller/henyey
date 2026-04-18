@@ -6,7 +6,25 @@ use stellar_xdr::curr::{
     ScpNomination, ScpStatement, ScpStatementConfirm, ScpStatementPledges, ScpStatementPrepare,
 };
 
-use crate::ballot::{ballot_compare, cmp_opt_ballot};
+use crate::ballot::{ballot_compare, cmp_opt_ballot, BallotPhase};
+
+/// Extract the `(phase, counter)` of a ballot-bearing pledge.
+///
+/// Returns `None` iff the pledge is a `Nominate` (nomination statements
+/// do not carry a ballot). Diagnostic-only: used by the stale-ballot
+/// reject log attribution at `slot::process_ballot_envelope` so a single
+/// artifact line exposes both the incoming and stored ballot counters.
+///
+/// Grouped in this module alongside `ballot_rank` because both perform
+/// the same per-variant dispatch on `ScpStatementPledges`.
+pub(crate) fn ballot_summary_of(pledges: &ScpStatementPledges) -> Option<(BallotPhase, u32)> {
+    match pledges {
+        ScpStatementPledges::Prepare(p) => Some((BallotPhase::Prepare, p.ballot.counter)),
+        ScpStatementPledges::Confirm(c) => Some((BallotPhase::Confirm, c.ballot.counter)),
+        ScpStatementPledges::Externalize(e) => Some((BallotPhase::Externalize, e.commit.counter)),
+        ScpStatementPledges::Nominate(_) => None,
+    }
+}
 
 /// Compare two nominations or ballot statements for ordering.
 ///

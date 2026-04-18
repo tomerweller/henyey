@@ -427,6 +427,21 @@ impl BallotProtocol {
         &self.latest_envelopes
     }
 
+    /// `(phase, counter)` of the latest stored ballot envelope from
+    /// `node_id`, if any.
+    ///
+    /// Returns `None` when either no envelope is stored for that peer
+    /// or the stored pledge is a `Nominate` (the latter should not
+    /// happen on `BallotProtocol::latest_envelopes` in practice, but
+    /// `ballot_summary_of` is defensive). Used by the stale-ballot
+    /// reject log attribution in `slot::process_ballot_envelope` so a
+    /// single artifact line shows both sides of the comparison that
+    /// caused the reject.
+    pub(crate) fn stored_ballot_summary(&self, node_id: &NodeId) -> Option<(BallotPhase, u32)> {
+        let env = self.latest_envelopes.get(node_id)?;
+        crate::compare::ballot_summary_of(&env.statement.pledges)
+    }
+
     /// Get the state of a node in the ballot protocol.
     ///
     /// Returns the QuorumInfoNodeState for a given node based on their
@@ -3622,5 +3637,164 @@ mod tests {
             ),
             ValidationLevel::FullyValidated
         );
+    }
+
+    // ---- stored/incoming ballot summary tests (issue #1811) ----
+    //
+    // Lock in the diagnostic-only (phase, counter) extraction used by
+    // the stale-ballot reject log attribution in
+    // `slot::process_ballot_envelope`. The helpers are pure; these
+    // tests do not depend on a tracing subscriber.
+
+    use crate::compare::ballot_summary_of;
+    use stellar_xdr::curr::{Hash, ScpStatementConfirm, ScpStatementExternalize, Signature};
+
+    fn zero_hash() -> Hash {
+        Hash::from([0u8; 32])
+    }
+
+    fn make_prepare_pledges(counter: u32, val: u8) -> ScpStatementPledges {
+        ScpStatementPledges::Prepare(ScpStatementPrepare {
+            quorum_set_hash: zero_hash(),
+            ballot: ScpBallot {
+                counter,
+                value: vec![val].try_into().unwrap(),
+            },
+            prepared: None,
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 0,
+        })
+    }
+
+    fn make_confirm_pledges(counter: u32, val: u8) -> ScpStatementPledges {
+        ScpStatementPledges::Confirm(ScpStatementConfirm {
+            ballot: ScpBallot {
+                counter,
+                value: vec![val].try_into().unwrap(),
+            },
+            n_prepared: 0,
+            n_commit: 0,
+            n_h: 0,
+            quorum_set_hash: zero_hash(),
+        })
+    }
+
+    fn make_externalize_pledges(counter: u32, val: u8) -> ScpStatementPledges {
+        ScpStatementPledges::Externalize(ScpStatementExternalize {
+            commit: ScpBallot {
+                counter,
+                value: vec![val].try_into().unwrap(),
+            },
+            n_h: 0,
+            commit_quorum_set_hash: zero_hash(),
+        })
+    }
+
+    fn make_nominate_pledges() -> ScpStatementPledges {
+        ScpStatementPledges::Nominate(ScpNomination {
+            quorum_set_hash: zero_hash(),
+            votes: VecM::default(),
+            accepted: VecM::default(),
+        })
+    }
+
+    fn envelope_with_pledges(
+        node_id: NodeId,
+        slot_index: u64,
+        pledges: ScpStatementPledges,
+    ) -> ScpEnvelope {
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index,
+                pledges,
+            },
+            signature: Signature(Vec::new().try_into().unwrap_or_default()),
+        }
+    }
+
+    #[test]
+    fn ballot_summary_of_prepare_returns_prepare_and_ballot_counter() {
+        let pledges = make_prepare_pledges(7, 0);
+        assert_eq!(ballot_summary_of(&pledges), Some((BallotPhase::Prepare, 7)));
+    }
+
+    #[test]
+    fn ballot_summary_of_confirm_returns_confirm_and_ballot_counter() {
+        let pledges = make_confirm_pledges(9, 0);
+        assert_eq!(ballot_summary_of(&pledges), Some((BallotPhase::Confirm, 9)));
+    }
+
+    #[test]
+    fn ballot_summary_of_externalize_returns_externalize_and_commit_counter() {
+        let pledges = make_externalize_pledges(3, 0);
+        assert_eq!(
+            ballot_summary_of(&pledges),
+            Some((BallotPhase::Externalize, 3))
+        );
+    }
+
+    #[test]
+    fn ballot_summary_of_nominate_returns_none() {
+        let pledges = make_nominate_pledges();
+        assert_eq!(ballot_summary_of(&pledges), None);
+    }
+
+    #[test]
+    fn stored_ballot_summary_returns_none_for_unknown_node() {
+        let ballot = BallotProtocol::new();
+        let node_id = make_node_id(1);
+        assert_eq!(ballot.stored_ballot_summary(&node_id), None);
+    }
+
+    #[test]
+    fn stored_ballot_summary_returns_latest_envelopes_summary_prepare() {
+        let mut ballot = BallotProtocol::new();
+        let node_id = make_node_id(2);
+        let env = envelope_with_pledges(node_id.clone(), 42, make_prepare_pledges(5, 1));
+        ballot.latest_envelopes.insert(node_id.clone(), env);
+        assert_eq!(
+            ballot.stored_ballot_summary(&node_id),
+            Some((BallotPhase::Prepare, 5)),
+        );
+    }
+
+    #[test]
+    fn stored_ballot_summary_returns_latest_envelopes_summary_confirm() {
+        let mut ballot = BallotProtocol::new();
+        let node_id = make_node_id(3);
+        let env = envelope_with_pledges(node_id.clone(), 42, make_confirm_pledges(4, 1));
+        ballot.latest_envelopes.insert(node_id.clone(), env);
+        assert_eq!(
+            ballot.stored_ballot_summary(&node_id),
+            Some((BallotPhase::Confirm, 4)),
+        );
+    }
+
+    #[test]
+    fn stored_ballot_summary_returns_latest_envelopes_summary_externalize() {
+        let mut ballot = BallotProtocol::new();
+        let node_id = make_node_id(4);
+        let env = envelope_with_pledges(node_id.clone(), 42, make_externalize_pledges(1, 1));
+        ballot.latest_envelopes.insert(node_id.clone(), env);
+        assert_eq!(
+            ballot.stored_ballot_summary(&node_id),
+            Some((BallotPhase::Externalize, 1)),
+        );
+    }
+
+    #[test]
+    fn stored_ballot_summary_returns_none_if_latest_envelope_is_nominate() {
+        // Paranoid test: if a Nominate envelope is ever present in
+        // BallotProtocol::latest_envelopes (which should not occur
+        // through normal code paths — nominations live in
+        // NominationProtocol::latest_nominations), stored_ballot_summary
+        // returns None rather than panicking or returning garbage.
+        let mut ballot = BallotProtocol::new();
+        let node_id = make_node_id(5);
+        let env = envelope_with_pledges(node_id.clone(), 42, make_nominate_pledges());
+        ballot.latest_envelopes.insert(node_id.clone(), env);
+        assert_eq!(ballot.stored_ballot_summary(&node_id), None);
     }
 }
