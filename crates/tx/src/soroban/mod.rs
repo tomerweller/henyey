@@ -83,6 +83,7 @@
 //! snapshot, matching stellar-core behavior.
 
 mod budget;
+pub mod convert;
 mod error;
 mod host;
 pub mod protocol;

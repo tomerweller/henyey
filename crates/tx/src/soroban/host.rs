@@ -9,7 +9,6 @@ use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use sha2::{Digest, Sha256};
 
 // Use soroban-env-host types for Host interaction
-use soroban_env_host24::xdr::ReadXdr as ReadXdrP24;
 use soroban_env_host24::{
     budget::{AsBudget, Budget},
     fees::compute_rent_fee,
@@ -552,16 +551,7 @@ fn get_entry_ttl_with_cache(
     }
 }
 
-fn convert_contract_cost_params_to_p24(
-    params: &stellar_xdr::curr::ContractCostParams,
-) -> Option<soroban_env_host24::xdr::ContractCostParams> {
-    let bytes = params.to_xdr(Limits::none()).ok()?;
-    soroban_env_host24::xdr::ContractCostParams::from_xdr(
-        &bytes,
-        soroban_env_host24::xdr::Limits::none(),
-    )
-    .ok()
-}
+// Removed: convert_contract_cost_params_to_p24 — use super::convert::try_convert_cost_params_to_p24
 
 /// Macro to define a `WasmCompilationContext` struct for a given protocol version.
 ///
@@ -1020,10 +1010,18 @@ fn execute_host_function_p24(
     let memory_limit = soroban_config.tx_max_memory_bytes;
 
     let budget = if soroban_config.has_valid_cost_params() {
-        let cpu_cost_params = convert_contract_cost_params_to_p24(&soroban_config.cpu_cost_params)
-            .ok_or_else(make_xdr_setup_error)?;
-        let mem_cost_params = convert_contract_cost_params_to_p24(&soroban_config.mem_cost_params)
-            .ok_or_else(make_xdr_setup_error)?;
+        let cpu_cost_params =
+            super::convert::try_convert_cost_params_to_p24(&soroban_config.cpu_cost_params)
+                .map_err(|e| {
+                    tracing::warn!("P24 cost params conversion failed: {e}");
+                    make_xdr_setup_error()
+                })?;
+        let mem_cost_params =
+            super::convert::try_convert_cost_params_to_p24(&soroban_config.mem_cost_params)
+                .map_err(|e| {
+                    tracing::warn!("P24 cost params conversion failed: {e}");
+                    make_xdr_setup_error()
+                })?;
         Budget::try_from_configs(
             instruction_limit,
             memory_limit,
@@ -1257,23 +1255,27 @@ fn execute_host_function_p25(
 
     let budget = if soroban_config.has_valid_cost_params() {
         let p25_cpu =
-            convert_cost_params_ws_to_p25(&soroban_config.cpu_cost_params).ok_or_else(|| {
-                make_setup_error(HostErrorP25::from(
-                    soroban_env_host25::Error::from_type_and_code(
-                        soroban_env_host25::xdr::ScErrorType::Context,
-                        soroban_env_host25::xdr::ScErrorCode::InternalError,
-                    ),
-                ))
-            })?;
+            super::convert::try_convert_cost_params_ws_to_p25(&soroban_config.cpu_cost_params)
+                .map_err(|e| {
+                    tracing::warn!("P25 cost params conversion failed: {e}");
+                    make_setup_error(HostErrorP25::from(
+                        soroban_env_host25::Error::from_type_and_code(
+                            soroban_env_host25::xdr::ScErrorType::Context,
+                            soroban_env_host25::xdr::ScErrorCode::InternalError,
+                        ),
+                    ))
+                })?;
         let p25_mem =
-            convert_cost_params_ws_to_p25(&soroban_config.mem_cost_params).ok_or_else(|| {
-                make_setup_error(HostErrorP25::from(
-                    soroban_env_host25::Error::from_type_and_code(
-                        soroban_env_host25::xdr::ScErrorType::Context,
-                        soroban_env_host25::xdr::ScErrorCode::InternalError,
-                    ),
-                ))
-            })?;
+            super::convert::try_convert_cost_params_ws_to_p25(&soroban_config.mem_cost_params)
+                .map_err(|e| {
+                    tracing::warn!("P25 cost params conversion failed: {e}");
+                    make_setup_error(HostErrorP25::from(
+                        soroban_env_host25::Error::from_type_and_code(
+                            soroban_env_host25::xdr::ScErrorType::Context,
+                            soroban_env_host25::xdr::ScErrorCode::InternalError,
+                        ),
+                    ))
+                })?;
         Budget::try_from_configs(instruction_limit, memory_limit, p25_cpu, p25_mem)
             .map_err(make_setup_error)?
     } else {
@@ -1559,23 +1561,7 @@ fn rent_fee_config_p25_to_p24(
     }
 }
 
-/// Convert workspace (v26) ContractCostParams to P25 (v25) ContractCostParams via XDR bytes.
-///
-/// v26 may have more cost type entries than v25 knows about (e.g. 86 vs 85).
-/// The XDR encoding is a length-prefixed array, so v25 will accept any count up to
-/// its max (1024). Both versions use the same wire format for ContractCostParamEntry,
-/// so the byte-level roundtrip works correctly.
-fn convert_cost_params_ws_to_p25(
-    params: &stellar_xdr::curr::ContractCostParams,
-) -> Option<soroban_env_host25::xdr::ContractCostParams> {
-    let bytes = params.to_xdr(Limits::none()).ok()?;
-    use soroban_env_host25::xdr::ReadXdr as ReadXdrP25;
-    soroban_env_host25::xdr::ContractCostParams::from_xdr(
-        &bytes,
-        soroban_env_host25::xdr::Limits::none(),
-    )
-    .ok()
-}
+// Removed: convert_cost_params_ws_to_p25 — use super::convert::try_convert_cost_params_ws_to_p25
 
 /// Convert workspace (v26) RentFeeConfiguration to P26 RentFeeConfiguration.
 ///

@@ -34,7 +34,6 @@ pub(super) use henyey_common::checked_types::{
 };
 // Re-export liability accessors used by submodules.
 pub(super) use henyey_common::checked_types::{account_liabilities, trustline_liabilities};
-use soroban_env_host24::xdr::ReadXdr as ReadXdrP24;
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
 use soroban_env_host_p26 as soroban_env_host26;
@@ -568,31 +567,43 @@ pub fn entry_size_for_rent_by_protocol_with_cost_params(
         &stellar_xdr::curr::ContractCostParams,
     )>,
 ) -> u32 {
+    use crate::soroban::convert::{
+        try_convert_ledger_entry_to_p24, try_convert_ledger_entry_ws_to_p25,
+    };
     if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
         let budget = match cost_params {
             Some((cpu, mem)) => build_budget_p24(cpu, mem),
             None => soroban_env_host24::budget::Budget::default(),
         };
-        let entry = convert_ledger_entry_to_p24(entry);
-        entry
-            .and_then(|entry| {
-                soroban_env_host24::e2e_invoke::entry_size_for_rent(&budget, &entry, entry_xdr_size)
-                    .ok()
-            })
-            .unwrap_or(entry_xdr_size)
+        match try_convert_ledger_entry_to_p24(entry) {
+            Ok(p24_entry) => soroban_env_host24::e2e_invoke::entry_size_for_rent(
+                &budget,
+                &p24_entry,
+                entry_xdr_size,
+            )
+            .unwrap_or(entry_xdr_size),
+            Err(e) => {
+                tracing::warn!("entry_size_for_rent: {e}, falling back to XDR size");
+                entry_xdr_size
+            }
+        }
     } else {
         let budget = match cost_params {
             Some((cpu, mem)) => build_budget_p25(cpu, mem),
             None => soroban_env_host25::budget::Budget::default(),
         };
-        // Convert workspace LedgerEntry to P25 LedgerEntry via XDR bytes.
-        let p25_entry = convert_ledger_entry_ws_to_p25(entry);
-        p25_entry
-            .and_then(|e| {
-                soroban_env_host25::e2e_invoke::entry_size_for_rent(&budget, &e, entry_xdr_size)
-                    .ok()
-            })
-            .unwrap_or(entry_xdr_size)
+        match try_convert_ledger_entry_ws_to_p25(entry) {
+            Ok(p25_entry) => soroban_env_host25::e2e_invoke::entry_size_for_rent(
+                &budget,
+                &p25_entry,
+                entry_xdr_size,
+            )
+            .unwrap_or(entry_xdr_size),
+            Err(e) => {
+                tracing::warn!("entry_size_for_rent: {e}, falling back to XDR size");
+                entry_xdr_size
+            }
+        }
     }
 }
 
@@ -601,76 +612,43 @@ fn build_budget_p24(
     cpu_cost_params: &stellar_xdr::curr::ContractCostParams,
     mem_cost_params: &stellar_xdr::curr::ContractCostParams,
 ) -> soroban_env_host24::budget::Budget {
-    let cpu = convert_cost_params_to_p24(cpu_cost_params);
-    let mem = convert_cost_params_to_p24(mem_cost_params);
-    match (cpu, mem) {
-        (Some(cpu), Some(mem)) => {
+    use crate::soroban::convert::try_convert_cost_params_to_p24;
+    match (
+        try_convert_cost_params_to_p24(cpu_cost_params),
+        try_convert_cost_params_to_p24(mem_cost_params),
+    ) {
+        (Ok(cpu), Ok(mem)) => {
             // Use limits of 0 — we only need the cost model, not actual metering
             soroban_env_host24::budget::Budget::try_from_configs(0, 0, cpu, mem)
                 .unwrap_or_else(|_| soroban_env_host24::budget::Budget::default())
         }
-        _ => soroban_env_host24::budget::Budget::default(),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!("build_budget_p24: {e}, using default budget");
+            soroban_env_host24::budget::Budget::default()
+        }
     }
 }
 
 /// Build a P25 Budget from on-chain cost parameters.
-/// Converts workspace (v26) ContractCostParams to P25 (v25) types via XDR bytes.
 fn build_budget_p25(
     cpu_cost_params: &stellar_xdr::curr::ContractCostParams,
     mem_cost_params: &stellar_xdr::curr::ContractCostParams,
 ) -> soroban_env_host25::budget::Budget {
-    let cpu = convert_cost_params_ws_to_p25(cpu_cost_params);
-    let mem = convert_cost_params_ws_to_p25(mem_cost_params);
-    match (cpu, mem) {
-        (Some(cpu), Some(mem)) => {
-            soroban_env_host25::budget::Budget::try_from_configs(0, 0, cpu, mem)
-                .unwrap_or_else(|_| soroban_env_host25::budget::Budget::default())
+    use crate::soroban::convert::try_convert_cost_params_ws_to_p25;
+    match (
+        try_convert_cost_params_ws_to_p25(cpu_cost_params),
+        try_convert_cost_params_ws_to_p25(mem_cost_params),
+    ) {
+        (Ok(cpu), Ok(mem)) => soroban_env_host25::budget::Budget::try_from_configs(0, 0, cpu, mem)
+            .unwrap_or_else(|_| soroban_env_host25::budget::Budget::default()),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!("build_budget_p25: {e}, using default budget");
+            soroban_env_host25::budget::Budget::default()
         }
-        _ => soroban_env_host25::budget::Budget::default(),
     }
 }
 
-fn convert_cost_params_to_p24(
-    params: &stellar_xdr::curr::ContractCostParams,
-) -> Option<soroban_env_host24::xdr::ContractCostParams> {
-    let bytes = params.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
-    soroban_env_host24::xdr::ContractCostParams::from_xdr(
-        &bytes,
-        soroban_env_host24::xdr::Limits::none(),
-    )
-    .ok()
-}
-
-fn convert_ledger_entry_to_p24(
-    entry: &stellar_xdr::curr::LedgerEntry,
-) -> Option<soroban_env_host24::xdr::LedgerEntry> {
-    let bytes = entry.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
-    soroban_env_host24::xdr::LedgerEntry::from_xdr(&bytes, soroban_env_host24::xdr::Limits::none())
-        .ok()
-}
-
-/// Convert workspace (v26) ContractCostParams to P25 (v25) ContractCostParams via XDR bytes.
-fn convert_cost_params_ws_to_p25(
-    params: &stellar_xdr::curr::ContractCostParams,
-) -> Option<soroban_env_host25::xdr::ContractCostParams> {
-    let bytes = params.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
-    use soroban_env_host25::xdr::ReadXdr as ReadXdrP25;
-    soroban_env_host25::xdr::ContractCostParams::from_xdr(
-        &bytes,
-        soroban_env_host25::xdr::Limits::none(),
-    )
-    .ok()
-}
-
-/// Convert workspace (v26) LedgerEntry to P25 (v25) LedgerEntry via XDR bytes.
-fn convert_ledger_entry_ws_to_p25(
-    entry: &stellar_xdr::curr::LedgerEntry,
-) -> Option<soroban_env_host25::xdr::LedgerEntry> {
-    let bytes = entry.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
-    use soroban_env_host25::xdr::ReadXdr as ReadXdrP25;
-    soroban_env_host25::xdr::LedgerEntry::from_xdr(&bytes, soroban_env_host25::xdr::Limits::none())
-        .ok()
-}
+// Local conversion functions removed — use crate::soroban::convert::try_convert_* instead.
 
 fn rent_snapshot_for_keys(
     keys: &[stellar_xdr::curr::LedgerKey],
@@ -689,7 +667,10 @@ fn rent_snapshot_for_keys(
         };
         let entry_xdr = entry
             .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::error!("rent_snapshot_for_keys: failed to serialize LedgerEntry: {e}");
+                Vec::new()
+            });
         let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
             protocol_version,
             &entry,
@@ -731,7 +712,12 @@ fn rent_changes_from_snapshots(
         };
         let entry_xdr = entry
             .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    "rent_changes_from_snapshots: failed to serialize LedgerEntry: {e}"
+                );
+                Vec::new()
+            });
         let new_size_bytes = entry_size_for_rent_by_protocol_with_cost_params(
             protocol_version,
             &entry,
@@ -1048,7 +1034,12 @@ pub fn execute_operation_with_soroban(
                             if let Some(entry) = state.get_entry(key) {
                                 let entry_xdr = entry
                                     .to_xdr(stellar_xdr::curr::Limits::none())
-                                    .unwrap_or_default();
+                                    .unwrap_or_else(|e| {
+                                        tracing::error!(
+                                            "restore: failed to serialize LedgerEntry: {e}"
+                                        );
+                                        Vec::new()
+                                    });
                                 let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
                                     context.protocol_version,
                                     &entry,

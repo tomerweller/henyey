@@ -50,6 +50,9 @@ use henyey_common::protocol::{
 };
 use henyey_common::Hash256;
 use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
+use henyey_tx::soroban::convert::{
+    try_convert_cost_params_ws_to_p25, try_convert_ledger_entry_ws_to_p25,
+};
 use soroban_env_host25::budget::Budget;
 use soroban_env_host25::e2e_invoke::entry_size_for_rent as entry_size_for_rent_p25;
 use soroban_env_host_p25 as soroban_env_host25;
@@ -125,28 +128,7 @@ impl Default for SorobanRentConfig {
     }
 }
 
-/// Convert workspace (v26) ContractCostParams to P25 (v25) ContractCostParams via XDR bytes.
-fn convert_cost_params_ws_to_p25(
-    params: &ContractCostParams,
-) -> Option<soroban_env_host25::xdr::ContractCostParams> {
-    let bytes = params.to_xdr(Limits::none()).ok()?;
-    use soroban_env_host25::xdr::ReadXdr as ReadXdrP25;
-    soroban_env_host25::xdr::ContractCostParams::from_xdr(
-        &bytes,
-        soroban_env_host25::xdr::Limits::none(),
-    )
-    .ok()
-}
-
-/// Convert workspace (v26) LedgerEntry to P25 (v25) LedgerEntry via XDR bytes.
-fn convert_ledger_entry_ws_to_p25(
-    entry: &LedgerEntry,
-) -> Option<soroban_env_host25::xdr::LedgerEntry> {
-    let bytes = entry.to_xdr(Limits::none()).ok()?;
-    use soroban_env_host25::xdr::ReadXdr as ReadXdrP25;
-    soroban_env_host25::xdr::LedgerEntry::from_xdr(&bytes, soroban_env_host25::xdr::Limits::none())
-        .ok()
-}
+// Local conversion functions removed — use henyey_tx::soroban::convert::try_convert_* instead.
 
 fn build_rent_budget(rent_config: Option<&SorobanRentConfig>) -> Budget {
     let Some(config) = rent_config else {
@@ -158,12 +140,19 @@ fn build_rent_budget(rent_config: Option<&SorobanRentConfig>) -> Budget {
 
     let instruction_limit = config.tx_max_instructions.saturating_mul(2);
     let memory_limit = config.tx_max_memory_bytes.saturating_mul(2);
-    // Convert workspace (v26) cost params to P25 (v25) types via XDR bytes.
-    let Some(cpu_params) = convert_cost_params_ws_to_p25(&config.cpu_cost_params) else {
-        return Budget::default();
+    let cpu_params = match try_convert_cost_params_ws_to_p25(&config.cpu_cost_params) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("build_rent_budget: {e}, using default budget");
+            return Budget::default();
+        }
     };
-    let Some(mem_params) = convert_cost_params_ws_to_p25(&config.mem_cost_params) else {
-        return Budget::default();
+    let mem_params = match try_convert_cost_params_ws_to_p25(&config.mem_cost_params) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("build_rent_budget: {e}, using default budget");
+            return Budget::default();
+        }
     };
     Budget::try_from_configs(instruction_limit, memory_limit, cpu_params, mem_params)
         .unwrap_or_else(|_| Budget::default())
@@ -184,7 +173,10 @@ impl ContractDataMapEntry {
         self.ledger_entry
             .to_xdr(Limits::none())
             .map(|v| v.len() as u32)
-            .unwrap_or(0)
+            .unwrap_or_else(|e| {
+                tracing::error!("ContractDataMapEntry::xdr_size: failed to serialize: {e}");
+                0
+            })
     }
 }
 
@@ -208,7 +200,10 @@ impl ContractCodeMapEntry {
         self.ledger_entry
             .to_xdr(Limits::none())
             .map(|v| v.len() as u32)
-            .unwrap_or(0)
+            .unwrap_or_else(|e| {
+                tracing::error!("ContractCodeMapEntry::xdr_size: failed to serialize: {e}");
+                0
+            })
     }
 }
 
@@ -785,7 +780,10 @@ impl InMemorySorobanState {
         let xdr_size = entry
             .to_xdr(Limits::none())
             .map(|v| v.len() as u32)
-            .unwrap_or(0);
+            .unwrap_or_else(|e| {
+                tracing::error!("calculate_code_size: failed to serialize LedgerEntry: {e}");
+                0
+            });
         if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
             let cost_params = rent_config.map(|rc| (&rc.cpu_cost_params, &rc.mem_cost_params));
             return entry_size_for_rent_by_protocol_with_cost_params(
@@ -796,10 +794,15 @@ impl InMemorySorobanState {
             );
         }
         let budget = build_rent_budget(rent_config);
-        // Convert workspace (v26) LedgerEntry to P25 (v25) type via XDR bytes.
-        convert_ledger_entry_ws_to_p25(entry)
-            .and_then(|p25_entry| entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).ok())
-            .unwrap_or(xdr_size)
+        match try_convert_ledger_entry_ws_to_p25(entry) {
+            Ok(p25_entry) => {
+                entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).unwrap_or(xdr_size)
+            }
+            Err(e) => {
+                tracing::warn!("calculate_code_size: {e}, falling back to XDR size");
+                xdr_size
+            }
+        }
     }
 
     /// Update state with new entries from a ledger close.
@@ -965,16 +968,24 @@ impl InMemorySorobanState {
                 .ledger_entry
                 .to_xdr(Limits::none())
                 .map(|v| v.len() as u32)
-                .unwrap_or(0);
+                .unwrap_or_else(|e| {
+                    tracing::error!("recompute_contract_code_sizes: failed to serialize: {e}");
+                    0
+                });
 
             // Use the same logic as calculate_code_size
             let new_size = if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
-                // Convert workspace (v26) LedgerEntry to P25 (v25) type via XDR bytes.
-                convert_ledger_entry_ws_to_p25(&entry.ledger_entry)
-                    .and_then(|p25_entry| {
-                        entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).ok()
-                    })
-                    .unwrap_or(xdr_size)
+                match try_convert_ledger_entry_ws_to_p25(&entry.ledger_entry) {
+                    Ok(p25_entry) => {
+                        entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).unwrap_or(xdr_size)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "recompute_contract_code_sizes: {e}, falling back to XDR size"
+                        );
+                        xdr_size
+                    }
+                }
             } else {
                 let cost_params = rent_config.map(|rc| (&rc.cpu_cost_params, &rc.mem_cost_params));
                 entry_size_for_rent_by_protocol_with_cost_params(
