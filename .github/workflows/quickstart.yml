@@ -20,9 +20,12 @@ name: Quickstart
 #
 # Reusable-workflow behaviour: stellar/quickstart injects an implicit
 # matrix of network=["local"] × enable=["core","rpc","core,rpc,horizon",
-# "galexie"] for every image. Those default shards repeatedly flake on
-# upstream friendbot/spawn errors unrelated to henyey. The image-level
-# `tests.continue-on-error: true` below ensures they do not block merges.
+# "galexie"] for every image. Failures in these shards (and the
+# additional testnet shard) are treated the same as any other CI failure
+# — continue-on-error is not used here. Policy: every job must either
+# pass or the build goes red. If a shard flakes for reasons outside
+# henyey's control, file an issue and either skip that shard explicitly
+# or fix the flake; do not silently swallow the failure.
 
 on:
   pull_request:
@@ -50,9 +53,8 @@ jobs:
               { "name": "core", "repo": "${{ github.event.pull_request.head.repo.full_name || github.repository }}", "ref": "${{ github.event.pull_request.head.sha || github.sha }}" }
             ],
             "tests": {
-              "continue-on-error": true,
               "additional-tests": [
-                { "arch": "amd64", "network": "testnet", "enable": "core,rpc,horizon", "continue-on-error": true },
+                { "arch": "amd64", "network": "testnet", "enable": "core,rpc,horizon" },
                 { "arch": "amd64", "network": "pubnet", "enable": "core,rpc,horizon" }
               ]
             }
