@@ -42,6 +42,7 @@ use crate::{
     connection_factory::{ConnectionFactory, TcpConnectionFactory},
     flood::{compute_message_hash, FloodGate, FloodGateStats},
     flow_control::{FlowControl, ScpQueueCallback},
+    metrics::OverlayMetrics,
     peer::{PeerInfo, PeerStats, PeerStatsSnapshot},
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, Result,
 };
@@ -262,6 +263,8 @@ pub(super) struct SharedPeerState {
     /// send side from `route_to_subscribers` via a CAS loop. Exposed via
     /// `/metrics` as `henyey_overlay_fetch_channel_depth_max`.
     pub(super) fetch_channel_depth_max: Arc<AtomicI64>,
+    /// Shared overlay metrics counters.
+    pub(super) metrics: Arc<OverlayMetrics>,
 }
 
 impl SharedPeerState {
@@ -465,6 +468,9 @@ pub struct OverlayManager {
     /// watchdog read path.
     pub(super) fetch_channel_depth: Arc<AtomicI64>,
     pub(super) fetch_channel_depth_max: Arc<AtomicI64>,
+    /// Overlay metrics counters. Shared with peer loops and exposed via
+    /// `/metrics` as `stellar_overlay_*` gauges and counters.
+    pub(super) metrics: Arc<OverlayMetrics>,
 }
 
 impl OverlayManager {
@@ -572,6 +578,7 @@ impl OverlayManager {
             pending_connections: PendingConnections::new(),
             fetch_channel_depth,
             fetch_channel_depth_max,
+            metrics: Arc::new(OverlayMetrics::new()),
         })
     }
 
@@ -601,6 +608,7 @@ impl OverlayManager {
             preferred_peers: Arc::new(self.config.preferred_peers.clone()),
             fetch_channel_depth: Arc::clone(&self.fetch_channel_depth),
             fetch_channel_depth_max: Arc::clone(&self.fetch_channel_depth_max),
+            metrics: Arc::clone(&self.metrics),
         }
     }
 
@@ -732,6 +740,7 @@ impl OverlayManager {
         }
 
         debug!("Broadcast {} to {} peers", msg_type, sent);
+        self.metrics.messages_broadcast.add(sent as u64);
         Ok(sent)
     }
 
@@ -803,6 +812,11 @@ impl OverlayManager {
     /// Uses the peer info cache for lock-free access.
     pub fn peer_count(&self) -> usize {
         self.peer_info_cache.len()
+    }
+
+    /// Get the shared overlay metrics.
+    pub fn overlay_metrics(&self) -> &OverlayMetrics {
+        &self.metrics
     }
 
     /// Get a list of connected peer IDs.
@@ -1520,6 +1534,7 @@ mod tests {
             preferred_peers: Arc::new(preferred),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
+            metrics: Arc::new(OverlayMetrics::new()),
         }
     }
 
@@ -1793,6 +1808,7 @@ mod tests {
             preferred_peers: Arc::new(Vec::new()),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
+            metrics: Arc::new(OverlayMetrics::new()),
         };
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
@@ -1872,6 +1888,7 @@ mod tests {
             preferred_peers: Arc::new(Vec::new()),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
+            metrics: Arc::new(OverlayMetrics::new()),
         };
         (shared, broadcast_rx, fetch_rx)
     }

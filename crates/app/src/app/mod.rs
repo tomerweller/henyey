@@ -1871,6 +1871,35 @@ impl App {
     pub fn local_quorum_set(&self) -> Option<stellar_xdr::curr::ScpQuorumSet> {
         self.herder.local_quorum_set()
     }
+
+    // ── Metrics accessors ──────────────────────────────────────────────
+
+    /// SCP envelope counters: (sent, received).
+    pub fn scp_envelope_counters(&self) -> (u64, u64) {
+        (
+            self.scp_messages_sent.load(Ordering::Relaxed),
+            self.scp_messages_received.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Total lost-sync events.
+    pub fn lost_sync_count(&self) -> u64 {
+        self.lost_sync_count.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot of live bucket merge counters.
+    pub fn merge_counters_snapshot(&self) -> henyey_bucket::MergeCountersSnapshot {
+        self.ledger_manager
+            .bucket_list()
+            .merge_counters()
+            .snapshot()
+    }
+
+    /// Snapshot of overlay metrics (if overlay is running).
+    pub async fn overlay_metrics_snapshot(&self) -> Option<henyey_overlay::OverlayMetricsSnapshot> {
+        let overlay = self.overlay.read().await;
+        overlay.as_ref().map(|o| o.overlay_metrics().snapshot())
+    }
 }
 
 impl App {

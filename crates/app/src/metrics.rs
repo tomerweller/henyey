@@ -41,6 +41,49 @@ pub const OVERLAY_FETCH_CHANNEL_DEPTH: &str = "henyey_overlay_fetch_channel_dept
 pub const OVERLAY_FETCH_CHANNEL_DEPTH_MAX: &str = "henyey_overlay_fetch_channel_depth_max";
 pub const POST_CATCHUP_HARD_RESET_TOTAL: &str = "henyey_post_catchup_hard_reset_total";
 
+// SCP/herder counters (Phase 1 — expose already-tracked App-level counters).
+pub const SCP_ENVELOPE_EMIT_TOTAL: &str = "stellar_scp_envelope_emit_total";
+pub const SCP_ENVELOPE_RECEIVE_TOTAL: &str = "stellar_scp_envelope_receive_total";
+pub const HERDER_LOST_SYNC_TOTAL: &str = "stellar_herder_lost_sync_total";
+pub const HERDER_STATE: &str = "stellar_herder_state";
+pub const HERDER_PENDING_ENVELOPES: &str = "stellar_herder_pending_envelopes";
+pub const HERDER_CACHED_TX_SETS: &str = "stellar_herder_cached_tx_sets";
+pub const HERDER_PENDING_RECEIVED_TOTAL: &str = "stellar_herder_pending_received_total";
+pub const HERDER_PENDING_DUPLICATES_TOTAL: &str = "stellar_herder_pending_duplicates_total";
+pub const HERDER_PENDING_TOO_OLD_TOTAL: &str = "stellar_herder_pending_too_old_total";
+pub const HERDER_PENDING_EVICTED_TOTAL: &str = "stellar_herder_pending_evicted_total";
+
+// Bucket merge counters (Phase 1 — live MergeCounters from BucketList).
+pub const BUCKET_MERGE_COMPLETED_TOTAL: &str = "stellar_bucket_merge_completed_total";
+pub const BUCKET_MERGE_TIME_US_TOTAL: &str = "stellar_bucket_merge_time_us_total";
+pub const BUCKET_MERGE_NEW_LIVE_TOTAL: &str = "stellar_bucket_merge_new_live_total";
+pub const BUCKET_MERGE_NEW_DEAD_TOTAL: &str = "stellar_bucket_merge_new_dead_total";
+pub const BUCKET_MERGE_NEW_INIT_TOTAL: &str = "stellar_bucket_merge_new_init_total";
+pub const BUCKET_MERGE_NEW_META_TOTAL: &str = "stellar_bucket_merge_new_meta_total";
+pub const BUCKET_MERGE_SHADOWED_TOTAL: &str = "stellar_bucket_merge_shadowed_total";
+pub const BUCKET_MERGE_ANNIHILATED_TOTAL: &str = "stellar_bucket_merge_annihilated_total";
+
+// Overlay counters (Phase 1 — wired to OverlayMetrics in OverlayManager).
+pub const OVERLAY_MESSAGE_READ_TOTAL: &str = "stellar_overlay_message_read_total";
+pub const OVERLAY_MESSAGE_WRITE_TOTAL: &str = "stellar_overlay_message_write_total";
+pub const OVERLAY_MESSAGE_DROP_TOTAL: &str = "stellar_overlay_message_drop_total";
+pub const OVERLAY_MESSAGE_BROADCAST_TOTAL: &str = "stellar_overlay_message_broadcast_total";
+pub const OVERLAY_BYTE_READ_TOTAL: &str = "stellar_overlay_byte_read_total";
+pub const OVERLAY_BYTE_WRITE_TOTAL: &str = "stellar_overlay_byte_write_total";
+pub const OVERLAY_ERROR_READ_TOTAL: &str = "stellar_overlay_error_read_total";
+pub const OVERLAY_ERROR_WRITE_TOTAL: &str = "stellar_overlay_error_write_total";
+pub const OVERLAY_TIMEOUT_IDLE_TOTAL: &str = "stellar_overlay_timeout_idle_total";
+pub const OVERLAY_TIMEOUT_STRAGGLER_TOTAL: &str = "stellar_overlay_timeout_straggler_total";
+pub const OVERLAY_PENDING_PEERS: &str = "stellar_overlay_pending_peers";
+pub const OVERLAY_AUTHENTICATED_PEERS: &str = "stellar_overlay_authenticated_peers";
+pub const OVERLAY_FLOOD_DEMANDED_TOTAL: &str = "stellar_overlay_flood_demanded_total";
+pub const OVERLAY_FLOOD_FULFILLED_TOTAL: &str = "stellar_overlay_flood_fulfilled_total";
+pub const OVERLAY_DEMAND_TIMEOUT_TOTAL: &str = "stellar_overlay_demand_timeout_total";
+pub const OVERLAY_CONNECTION_LATENCY_US_SUM: &str = "stellar_overlay_connection_latency_us_sum";
+pub const OVERLAY_CONNECTION_LATENCY_US_COUNT: &str = "stellar_overlay_connection_latency_us_count";
+pub const OVERLAY_TX_PULL_LATENCY_US_SUM: &str = "stellar_overlay_tx_pull_latency_us_sum";
+pub const OVERLAY_TX_PULL_LATENCY_US_COUNT: &str = "stellar_overlay_tx_pull_latency_us_count";
+
 // ── Registration ───────────────────────────────────────────────────────
 
 /// Register HELP/TYPE annotations for all metrics.
@@ -117,6 +160,151 @@ pub fn describe_metrics() {
         POST_CATCHUP_HARD_RESET_TOTAL,
         "Total post-catchup hard resets performed"
     );
+
+    // SCP/herder counters.
+    describe_counter!(
+        SCP_ENVELOPE_EMIT_TOTAL,
+        "Total SCP envelopes emitted by the local node"
+    );
+    describe_counter!(
+        SCP_ENVELOPE_RECEIVE_TOTAL,
+        "Total SCP envelopes received from peers"
+    );
+    describe_counter!(
+        HERDER_LOST_SYNC_TOTAL,
+        "Total lost-sync events (transitions out of Tracking)"
+    );
+    describe_gauge!(
+        HERDER_STATE,
+        "Herder state (0=Booting, 1=Syncing, 2=Tracking)"
+    );
+    describe_gauge!(
+        HERDER_PENDING_ENVELOPES,
+        "SCP envelopes queued in pending pool"
+    );
+    describe_gauge!(
+        HERDER_CACHED_TX_SETS,
+        "Transaction sets cached for pending SCP slots"
+    );
+    describe_counter!(
+        HERDER_PENDING_RECEIVED_TOTAL,
+        "Total envelopes received by pending pool"
+    );
+    describe_counter!(
+        HERDER_PENDING_DUPLICATES_TOTAL,
+        "Envelopes rejected as duplicates by pending pool"
+    );
+    describe_counter!(
+        HERDER_PENDING_TOO_OLD_TOTAL,
+        "Envelopes rejected as too old by pending pool"
+    );
+    describe_counter!(
+        HERDER_PENDING_EVICTED_TOTAL,
+        "Envelopes evicted from pending pool"
+    );
+
+    // Bucket merge counters.
+    describe_counter!(
+        BUCKET_MERGE_COMPLETED_TOTAL,
+        "Total bucket merges completed"
+    );
+    describe_counter!(
+        BUCKET_MERGE_TIME_US_TOTAL,
+        "Total bucket merge time in microseconds"
+    );
+    describe_counter!(
+        BUCKET_MERGE_NEW_LIVE_TOTAL,
+        "Total new LIVEENTRY entries written during merges"
+    );
+    describe_counter!(
+        BUCKET_MERGE_NEW_DEAD_TOTAL,
+        "Total new DEADENTRY entries written during merges"
+    );
+    describe_counter!(
+        BUCKET_MERGE_NEW_INIT_TOTAL,
+        "Total new INITENTRY entries written during merges"
+    );
+    describe_counter!(
+        BUCKET_MERGE_NEW_META_TOTAL,
+        "Total new METAENTRY entries written during merges"
+    );
+    describe_counter!(
+        BUCKET_MERGE_SHADOWED_TOTAL,
+        "Total entries shadowed during merges"
+    );
+    describe_counter!(
+        BUCKET_MERGE_ANNIHILATED_TOTAL,
+        "Total INIT+DEAD entry pairs annihilated during merges"
+    );
+
+    // Overlay counters.
+    describe_counter!(
+        OVERLAY_MESSAGE_READ_TOTAL,
+        "Total overlay messages read from peers"
+    );
+    describe_counter!(
+        OVERLAY_MESSAGE_WRITE_TOTAL,
+        "Total overlay messages written to peers"
+    );
+    describe_counter!(OVERLAY_MESSAGE_DROP_TOTAL, "Total overlay messages dropped");
+    describe_counter!(
+        OVERLAY_MESSAGE_BROADCAST_TOTAL,
+        "Total overlay messages broadcast to all peers"
+    );
+    describe_counter!(
+        OVERLAY_BYTE_READ_TOTAL,
+        "Total bytes read from overlay peers"
+    );
+    describe_counter!(
+        OVERLAY_BYTE_WRITE_TOTAL,
+        "Total bytes written to overlay peers"
+    );
+    describe_counter!(OVERLAY_ERROR_READ_TOTAL, "Total overlay read errors");
+    describe_counter!(OVERLAY_ERROR_WRITE_TOTAL, "Total overlay write errors");
+    describe_counter!(
+        OVERLAY_TIMEOUT_IDLE_TOTAL,
+        "Total peers dropped due to idle timeout"
+    );
+    describe_counter!(
+        OVERLAY_TIMEOUT_STRAGGLER_TOTAL,
+        "Total peers dropped due to straggler timeout"
+    );
+    describe_gauge!(
+        OVERLAY_PENDING_PEERS,
+        "Number of overlay peers in pending (unauthenticated) state"
+    );
+    describe_gauge!(
+        OVERLAY_AUTHENTICATED_PEERS,
+        "Number of authenticated overlay peers"
+    );
+    describe_counter!(
+        OVERLAY_FLOOD_DEMANDED_TOTAL,
+        "Total transaction flood demands sent to peers"
+    );
+    describe_counter!(
+        OVERLAY_FLOOD_FULFILLED_TOTAL,
+        "Total transaction flood demands fulfilled by peers"
+    );
+    describe_counter!(
+        OVERLAY_DEMAND_TIMEOUT_TOTAL,
+        "Total transaction flood demands that timed out"
+    );
+    describe_gauge!(
+        OVERLAY_CONNECTION_LATENCY_US_SUM,
+        "Connection auth latency microseconds (cumulative sum)"
+    );
+    describe_gauge!(
+        OVERLAY_CONNECTION_LATENCY_US_COUNT,
+        "Connection auth latency sample count"
+    );
+    describe_gauge!(
+        OVERLAY_TX_PULL_LATENCY_US_SUM,
+        "Tx pull latency microseconds (cumulative sum)"
+    );
+    describe_gauge!(
+        OVERLAY_TX_PULL_LATENCY_US_COUNT,
+        "Tx pull latency sample count"
+    );
 }
 
 /// Pre-register all metrics with initial values so that every metric appears
@@ -149,6 +337,49 @@ pub fn register_label_series() {
     // Counters.
     counter!(SCP_POST_VERIFY_DROPS_TOTAL).absolute(0);
     counter!(POST_CATCHUP_HARD_RESET_TOTAL).absolute(0);
+
+    // SCP/herder counters.
+    counter!(SCP_ENVELOPE_EMIT_TOTAL).absolute(0);
+    counter!(SCP_ENVELOPE_RECEIVE_TOTAL).absolute(0);
+    counter!(HERDER_LOST_SYNC_TOTAL).absolute(0);
+    gauge!(HERDER_STATE).set(0.0);
+    gauge!(HERDER_PENDING_ENVELOPES).set(0.0);
+    gauge!(HERDER_CACHED_TX_SETS).set(0.0);
+    counter!(HERDER_PENDING_RECEIVED_TOTAL).absolute(0);
+    counter!(HERDER_PENDING_DUPLICATES_TOTAL).absolute(0);
+    counter!(HERDER_PENDING_TOO_OLD_TOTAL).absolute(0);
+    counter!(HERDER_PENDING_EVICTED_TOTAL).absolute(0);
+
+    // Bucket merge counters.
+    counter!(BUCKET_MERGE_COMPLETED_TOTAL).absolute(0);
+    counter!(BUCKET_MERGE_TIME_US_TOTAL).absolute(0);
+    counter!(BUCKET_MERGE_NEW_LIVE_TOTAL).absolute(0);
+    counter!(BUCKET_MERGE_NEW_DEAD_TOTAL).absolute(0);
+    counter!(BUCKET_MERGE_NEW_INIT_TOTAL).absolute(0);
+    counter!(BUCKET_MERGE_NEW_META_TOTAL).absolute(0);
+    counter!(BUCKET_MERGE_SHADOWED_TOTAL).absolute(0);
+    counter!(BUCKET_MERGE_ANNIHILATED_TOTAL).absolute(0);
+
+    // Overlay counters.
+    counter!(OVERLAY_MESSAGE_READ_TOTAL).absolute(0);
+    counter!(OVERLAY_MESSAGE_WRITE_TOTAL).absolute(0);
+    counter!(OVERLAY_MESSAGE_DROP_TOTAL).absolute(0);
+    counter!(OVERLAY_MESSAGE_BROADCAST_TOTAL).absolute(0);
+    counter!(OVERLAY_BYTE_READ_TOTAL).absolute(0);
+    counter!(OVERLAY_BYTE_WRITE_TOTAL).absolute(0);
+    counter!(OVERLAY_ERROR_READ_TOTAL).absolute(0);
+    counter!(OVERLAY_ERROR_WRITE_TOTAL).absolute(0);
+    counter!(OVERLAY_TIMEOUT_IDLE_TOTAL).absolute(0);
+    counter!(OVERLAY_TIMEOUT_STRAGGLER_TOTAL).absolute(0);
+    gauge!(OVERLAY_PENDING_PEERS).set(0.0);
+    gauge!(OVERLAY_AUTHENTICATED_PEERS).set(0.0);
+    counter!(OVERLAY_FLOOD_DEMANDED_TOTAL).absolute(0);
+    counter!(OVERLAY_FLOOD_FULFILLED_TOTAL).absolute(0);
+    counter!(OVERLAY_DEMAND_TIMEOUT_TOTAL).absolute(0);
+    gauge!(OVERLAY_CONNECTION_LATENCY_US_SUM).set(0.0);
+    gauge!(OVERLAY_CONNECTION_LATENCY_US_COUNT).set(0.0);
+    gauge!(OVERLAY_TX_PULL_LATENCY_US_SUM).set(0.0);
+    gauge!(OVERLAY_TX_PULL_LATENCY_US_COUNT).set(0.0);
 
     // Labeled counters — all reason labels pre-registered at zero.
     for reason in PreFilterRejectReason::ALL {
@@ -208,6 +439,63 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
 
     // Catchup.
     counter!(POST_CATCHUP_HARD_RESET_TOTAL).absolute(app_info.post_catchup_hard_reset_total);
+
+    // SCP/herder counters.
+    let (scp_sent, scp_received) = state.app.scp_envelope_counters();
+    counter!(SCP_ENVELOPE_EMIT_TOTAL).absolute(scp_sent);
+    counter!(SCP_ENVELOPE_RECEIVE_TOTAL).absolute(scp_received);
+    counter!(HERDER_LOST_SYNC_TOTAL).absolute(state.app.lost_sync_count());
+
+    let herder = state.app.herder_stats();
+    let herder_state_val = match herder.state {
+        henyey_herder::HerderState::Booting => 0.0,
+        henyey_herder::HerderState::Syncing => 1.0,
+        henyey_herder::HerderState::Tracking => 2.0,
+    };
+    gauge!(HERDER_STATE).set(herder_state_val);
+    gauge!(HERDER_PENDING_ENVELOPES).set(herder.pending_envelopes as f64);
+    gauge!(HERDER_CACHED_TX_SETS).set(herder.cached_tx_sets as f64);
+
+    let pstats = &herder.pending_envelope_stats;
+    counter!(HERDER_PENDING_RECEIVED_TOTAL).absolute(pstats.received);
+    counter!(HERDER_PENDING_DUPLICATES_TOTAL).absolute(pstats.duplicates);
+    counter!(HERDER_PENDING_TOO_OLD_TOTAL).absolute(pstats.too_old);
+    counter!(HERDER_PENDING_EVICTED_TOTAL).absolute(pstats.evicted);
+
+    // Bucket merge counters.
+    let mc = state.app.merge_counters_snapshot();
+    counter!(BUCKET_MERGE_COMPLETED_TOTAL).absolute(mc.merges_completed);
+    counter!(BUCKET_MERGE_TIME_US_TOTAL).absolute(mc.merge_time_us);
+    counter!(BUCKET_MERGE_NEW_LIVE_TOTAL).absolute(mc.new_live_entries);
+    counter!(BUCKET_MERGE_NEW_DEAD_TOTAL).absolute(mc.new_dead_entries);
+    counter!(BUCKET_MERGE_NEW_INIT_TOTAL).absolute(mc.new_init_entries);
+    counter!(BUCKET_MERGE_NEW_META_TOTAL).absolute(mc.new_meta_entries);
+    counter!(BUCKET_MERGE_SHADOWED_TOTAL).absolute(mc.old_entries_shadowed);
+    counter!(BUCKET_MERGE_ANNIHILATED_TOTAL).absolute(mc.entries_annihilated);
+
+    // Overlay counters (if overlay is running).
+    if let Some(ov) = state.app.overlay_metrics_snapshot().await {
+        counter!(OVERLAY_MESSAGE_READ_TOTAL).absolute(ov.messages_read);
+        counter!(OVERLAY_MESSAGE_WRITE_TOTAL).absolute(ov.messages_written);
+        counter!(OVERLAY_MESSAGE_DROP_TOTAL).absolute(ov.messages_dropped);
+        counter!(OVERLAY_MESSAGE_BROADCAST_TOTAL).absolute(ov.messages_broadcast);
+        counter!(OVERLAY_BYTE_READ_TOTAL).absolute(ov.bytes_read);
+        counter!(OVERLAY_BYTE_WRITE_TOTAL).absolute(ov.bytes_written);
+        counter!(OVERLAY_ERROR_READ_TOTAL).absolute(ov.errors_read);
+        counter!(OVERLAY_ERROR_WRITE_TOTAL).absolute(ov.errors_write);
+        counter!(OVERLAY_TIMEOUT_IDLE_TOTAL).absolute(ov.timeouts_idle);
+        counter!(OVERLAY_TIMEOUT_STRAGGLER_TOTAL).absolute(ov.timeouts_straggler);
+        gauge!(OVERLAY_PENDING_PEERS).set(ov.pending_peers as f64);
+        gauge!(OVERLAY_AUTHENTICATED_PEERS).set(ov.authenticated_peers as f64);
+        counter!(OVERLAY_FLOOD_DEMANDED_TOTAL).absolute(ov.flood_demanded);
+        counter!(OVERLAY_FLOOD_FULFILLED_TOTAL).absolute(ov.flood_fulfilled);
+        counter!(OVERLAY_DEMAND_TIMEOUT_TOTAL).absolute(ov.demand_timeouts);
+        gauge!(OVERLAY_CONNECTION_LATENCY_US_SUM)
+            .set(ov.connection_latency.total.as_micros() as f64);
+        gauge!(OVERLAY_CONNECTION_LATENCY_US_COUNT).set(ov.connection_latency.count as f64);
+        gauge!(OVERLAY_TX_PULL_LATENCY_US_SUM).set(ov.tx_pull_latency.total.as_micros() as f64);
+        gauge!(OVERLAY_TX_PULL_LATENCY_US_COUNT).set(ov.tx_pull_latency.count as f64);
+    }
 }
 
 // ── Test helper ────────────────────────────────────────────────────────
@@ -280,6 +568,44 @@ mod tests {
             output.contains("# HELP henyey_post_catchup_hard_reset_total"),
             "missing HELP for hard_reset_total"
         );
+
+        // Phase 1: SCP/herder.
+        assert!(
+            output.contains("# HELP stellar_scp_envelope_emit_total"),
+            "missing HELP for scp_envelope_emit_total"
+        );
+        assert!(
+            output.contains("# HELP stellar_herder_state"),
+            "missing HELP for herder_state"
+        );
+        assert!(
+            output.contains("# HELP stellar_herder_pending_envelopes"),
+            "missing HELP for herder_pending_envelopes"
+        );
+
+        // Phase 1: Bucket merge.
+        assert!(
+            output.contains("# HELP stellar_bucket_merge_completed_total"),
+            "missing HELP for bucket_merge_completed_total"
+        );
+        assert!(
+            output.contains("# HELP stellar_bucket_merge_shadowed_total"),
+            "missing HELP for bucket_merge_shadowed_total"
+        );
+
+        // Phase 1: Overlay.
+        assert!(
+            output.contains("# HELP stellar_overlay_message_read_total"),
+            "missing HELP for overlay_message_read_total"
+        );
+        assert!(
+            output.contains("# HELP stellar_overlay_timeout_idle_total"),
+            "missing HELP for overlay_timeout_idle_total"
+        );
+        assert!(
+            output.contains("# HELP stellar_overlay_connection_latency_us_sum"),
+            "missing HELP for overlay_connection_latency_us_sum"
+        );
     }
 
     #[test]
@@ -319,6 +645,44 @@ mod tests {
         assert!(
             output.contains("# TYPE henyey_post_catchup_hard_reset_total counter"),
             "missing TYPE counter for hard_reset_total"
+        );
+
+        // Phase 1: SCP/herder types.
+        assert!(
+            output.contains("# TYPE stellar_scp_envelope_emit_total counter"),
+            "missing TYPE counter for scp_envelope_emit_total"
+        );
+        assert!(
+            output.contains("# TYPE stellar_herder_state gauge"),
+            "missing TYPE gauge for herder_state"
+        );
+        assert!(
+            output.contains("# TYPE stellar_herder_pending_received_total counter"),
+            "missing TYPE counter for herder_pending_received_total"
+        );
+
+        // Phase 1: Bucket merge types.
+        assert!(
+            output.contains("# TYPE stellar_bucket_merge_completed_total counter"),
+            "missing TYPE counter for bucket_merge_completed_total"
+        );
+        assert!(
+            output.contains("# TYPE stellar_bucket_merge_annihilated_total counter"),
+            "missing TYPE counter for bucket_merge_annihilated_total"
+        );
+
+        // Phase 1: Overlay types.
+        assert!(
+            output.contains("# TYPE stellar_overlay_message_read_total counter"),
+            "missing TYPE counter for overlay_message_read_total"
+        );
+        assert!(
+            output.contains("# TYPE stellar_overlay_authenticated_peers gauge"),
+            "missing TYPE gauge for overlay_authenticated_peers"
+        );
+        assert!(
+            output.contains("# TYPE stellar_overlay_connection_latency_us_sum gauge"),
+            "missing TYPE gauge for overlay_connection_latency_us_sum"
         );
     }
 

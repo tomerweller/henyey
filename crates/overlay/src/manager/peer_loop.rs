@@ -516,6 +516,7 @@ impl OverlayManager {
         peer_id: &PeerId,
         timing: &PeerTimingInfo,
         flow_control: &FlowControl,
+        metrics: &crate::metrics::OverlayMetrics,
     ) -> bool {
         const PEER_TIMEOUT: Duration = Duration::from_secs(30);
         const PEER_STRAGGLER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -530,6 +531,7 @@ impl OverlayManager {
                 "Dropping peer {} due to idle timeout (total_msgs={}, scp_msgs={})",
                 peer_id, timing.total_messages, timing.scp_messages
             );
+            metrics.timeouts_idle.inc();
             return true;
         }
         if now.duration_since(timing.last_write) >= PEER_STRAGGLER_TIMEOUT {
@@ -537,6 +539,7 @@ impl OverlayManager {
                 "Dropping peer {} due to straggler timeout (total_msgs={}, scp_msgs={})",
                 peer_id, timing.total_messages, timing.scp_messages
             );
+            metrics.timeouts_straggler.inc();
             return true;
         }
         if flow_control.no_outbound_capacity_timeout(PEER_SEND_MODE_IDLE_TIMEOUT_SECS) {
@@ -544,6 +547,7 @@ impl OverlayManager {
                 "Dropping peer {} due to PEER_SEND_MODE_IDLE_TIMEOUT (no SEND_MORE_EXTENDED for {}s)",
                 peer_id, PEER_SEND_MODE_IDLE_TIMEOUT_SECS
             );
+            metrics.timeouts_idle.inc();
             return true;
         }
         false
@@ -831,8 +835,10 @@ impl OverlayManager {
                         Some(OutboundMessage::Send(m)) => {
                             if let Err(e) = peer.send(m).await {
                                 debug!("Failed to send to {}: {}", peer_id, e);
+                                state.metrics.errors_write.inc();
                                 break;
                             }
+                            state.metrics.messages_written.inc();
                             last_write = Instant::now();
                         }
                         Some(OutboundMessage::Flood(m)) => {
@@ -870,6 +876,9 @@ impl OverlayManager {
                             last_read = Instant::now();
                             total_messages += 1;
 
+                            // Overlay metrics: message read.
+                            state.metrics.messages_read.inc();
+
                             // Periodic per-peer stats (every 60s)
                             Self::maybe_log_peer_stats(
                                 &peer_id,
@@ -904,6 +913,7 @@ impl OverlayManager {
                             break;
                         }
                         Err(e) => {
+                            state.metrics.errors_read.inc();
                             info!("Peer {} loop exiting: recv error: {} (total_msgs={}, scp_msgs={})", peer_id, e, total_messages, scp_messages);
                             break;
                         }
@@ -917,7 +927,7 @@ impl OverlayManager {
                         last_write,
                         total_messages,
                         scp_messages,
-                    }, &flow_control) {
+                    }, &flow_control, &state.metrics) {
                         break;
                     }
 
