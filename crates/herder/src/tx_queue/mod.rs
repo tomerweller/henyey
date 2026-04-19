@@ -6780,3 +6780,503 @@ mod snapshot_providers_tests {
         );
     }
 }
+
+/// Parity tests for resource-limit-based filtering in the parallel TxSet builder pipeline.
+///
+/// Ports stellar-core `TxSetTests.cpp:2727-2863`: the "no conflicts" resource-limit scenarios
+/// that exercise surge pricing → parallel builder → base fee computation when ledger-wide
+/// resource limits cause transaction eviction.
+#[cfg(test)]
+mod resource_limit_parity_tests {
+    use super::*;
+    use henyey_common::{Resource, ResourceType};
+    use stellar_xdr::curr::{
+        ContractDataDurability, GeneralizedTransactionSet, HostFunction, InvokeContractArgs,
+        InvokeHostFunctionOp, LedgerFootprint, LedgerKey, LedgerKeyContractData, Memo,
+        MuxedAccount, Operation, OperationBody, Preconditions, ScAddress, ScVal, SorobanResources,
+        SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope,
+        TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    };
+
+    const STAGE_COUNT: u32 = 4;
+    const CLUSTER_COUNT: u32 = 8;
+    const LEDGER_MAX_INSTRUCTIONS: i64 = 400_000_000;
+
+    /// Protocol version for parallel Soroban phase (v23).
+    const PROTOCOL_VERSION: u32 = 23;
+
+    /// Generate a contract data ledger key from an i32 ID.
+    /// Durability alternates: even=Persistent, odd=Temporary (matches stellar-core).
+    fn contract_data_key(id: i32) -> LedgerKey {
+        let durability = if id % 2 == 0 {
+            ContractDataDurability::Persistent
+        } else {
+            ContractDataDurability::Temporary
+        };
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(
+                [0u8; 32],
+            ))),
+            key: ScVal::I32(id),
+            durability,
+        })
+    }
+
+    /// Create a Soroban TX with specified resource fields and unique source account.
+    fn make_resource_limit_tx(
+        account_id: &mut u32,
+        instructions: u32,
+        ro_keys: &[i32],
+        rw_keys: &[i32],
+        inclusion_fee: i64,
+        disk_read_bytes: u32,
+        write_bytes: u32,
+    ) -> TransactionEnvelope {
+        let id = *account_id;
+        *account_id += 1;
+
+        let mut source_bytes = [0u8; 32];
+        source_bytes[..4].copy_from_slice(&id.to_le_bytes());
+        let source = MuxedAccount::Ed25519(Uint256(source_bytes));
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: ro_keys
+                        .iter()
+                        .map(|&k| contract_data_key(k))
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap_or_default(),
+                    read_write: rw_keys
+                        .iter()
+                        .map(|&k| contract_data_key(k))
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap_or_default(),
+                },
+                instructions,
+                disk_read_bytes,
+                write_bytes,
+            },
+            resource_fee: 0,
+        };
+
+        let invoke_op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(stellar_xdr::curr::ContractId(
+                        stellar_xdr::curr::Hash(source_bytes),
+                    )),
+                    function_name: stellar_xdr::curr::ScSymbol("test".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                auth: Default::default(),
+            }),
+        };
+
+        // fee = inclusion_fee + resource_fee (resource_fee=0 so fee=inclusion_fee)
+        let tx = Transaction {
+            source_account: source,
+            fee: inclusion_fee as u32,
+            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![invoke_op].try_into().unwrap(),
+            ext: TransactionExt::V1(soroban_data),
+        };
+
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        })
+    }
+
+    /// Default Soroban ledger-wide resource limits matching stellar-core test config.
+    fn default_soroban_limits() -> Resource {
+        Resource::soroban_ledger_limits(
+            1000, // tx_count (mLedgerMaxTxCount)
+            LEDGER_MAX_INSTRUCTIONS,
+            i64::MAX,  // tx_size_bytes (no effective byte limit by default)
+            1_000_000, // read_bytes (mLedgerMaxDiskReadBytes)
+            100_000,   // write_bytes (mLedgerMaxWriteBytes)
+            3_000,     // read_ledger_entries (mLedgerMaxDiskReadEntries)
+            2_000,     // write_ledger_entries (mLedgerMaxWriteLedgerEntries)
+        )
+    }
+
+    /// Create a TransactionQueue configured for parallel Soroban phase building
+    /// with the given resource limits for selection.
+    fn make_parallel_queue(
+        soroban_limit: Resource,
+        min_stage: u32,
+        max_stage: u32,
+    ) -> TransactionQueue {
+        let config = TxQueueConfig {
+            max_size: 1000,
+            ledger_max_instructions: LEDGER_MAX_INSTRUCTIONS,
+            ledger_max_dependent_tx_clusters: CLUSTER_COUNT,
+            soroban_phase_min_stage_count: min_stage,
+            soroban_phase_max_stage_count: max_stage,
+            validate_signatures: false,
+            validate_time_bounds: false,
+            max_soroban_bytes: None,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+        queue.update_soroban_selection_limits(soroban_limit);
+        queue.update_validation_context(0, 0, PROTOCOL_VERSION, 100, 5_000_000, 0);
+        #[cfg(test)]
+        queue.set_skip_fee_balance_check(true);
+        queue
+    }
+
+    /// Run a test with both variable (min=1, max=4) and fixed (min=4, max=4) stage counts.
+    fn run_both<F>(f: F)
+    where
+        F: Fn(u32, u32),
+    {
+        f(1, STAGE_COUNT);
+        f(STAGE_COUNT, STAGE_COUNT);
+    }
+
+    /// Extract the Soroban phase shape from a GeneralizedTransactionSet.
+    /// Returns (num_stages, clusters_per_stage, txs_per_cluster) for uniform shapes.
+    fn extract_soroban_phase(
+        gen_tx_set: &GeneralizedTransactionSet,
+    ) -> &stellar_xdr::curr::ParallelTxsComponent {
+        match gen_tx_set {
+            GeneralizedTransactionSet::V1(v1) => {
+                // Phase 1 is the Soroban phase
+                let phase = &v1.phases[1];
+                match phase {
+                    stellar_xdr::curr::TransactionPhase::V1(component) => component,
+                    _ => panic!("expected V1 soroban phase"),
+                }
+            }
+        }
+    }
+
+    /// Validate that the Soroban phase has the expected uniform shape.
+    fn validate_phase_shape(
+        gen_tx_set: &GeneralizedTransactionSet,
+        expected_stages: usize,
+        expected_clusters_per_stage: usize,
+        expected_txs_per_cluster: usize,
+    ) {
+        let component = extract_soroban_phase(gen_tx_set);
+        let stages = &component.execution_stages;
+
+        assert_eq!(
+            stages.len(),
+            expected_stages,
+            "expected {} stages, got {}",
+            expected_stages,
+            stages.len()
+        );
+        for (i, stage) in stages.iter().enumerate() {
+            assert_eq!(
+                stage.0.len(),
+                expected_clusters_per_stage,
+                "stage {}: expected {} clusters, got {}",
+                i,
+                expected_clusters_per_stage,
+                stage.0.len()
+            );
+            for (j, cluster) in stage.0.iter().enumerate() {
+                assert_eq!(
+                    cluster.0.len(),
+                    expected_txs_per_cluster,
+                    "stage {} cluster {}: expected {} txs, got {}",
+                    i,
+                    j,
+                    expected_txs_per_cluster,
+                    cluster.0.len()
+                );
+            }
+        }
+    }
+
+    /// Extract the base fee from the Soroban phase.
+    fn extract_phase_base_fee(gen_tx_set: &GeneralizedTransactionSet) -> Option<i64> {
+        extract_soroban_phase(gen_tx_set).base_fee
+    }
+
+    /// Count total transactions in the Soroban phase.
+    fn count_soroban_txs(gen_tx_set: &GeneralizedTransactionSet) -> usize {
+        let component = extract_soroban_phase(gen_tx_set);
+        component
+            .execution_stages
+            .iter()
+            .flat_map(|stage| stage.0.iter())
+            .flat_map(|cluster| cluster.0.iter())
+            .count()
+    }
+
+    /// Run a resource-limit scenario: create 32 TXs, add to queue, build tx set,
+    /// validate shape and base fee.
+    fn run_resource_limit_scenario(
+        soroban_limit: Resource,
+        min_stage: u32,
+        max_stage: u32,
+        make_tx: impl Fn(&mut u32, i32) -> TransactionEnvelope,
+        expected_stages: usize,
+        expected_clusters: usize,
+        expected_txs_per_cluster: usize,
+        expected_base_fee: i64,
+    ) {
+        let queue = make_parallel_queue(soroban_limit, min_stage, max_stage);
+
+        let mut account_id = 0u32;
+        let total_txs = (STAGE_COUNT * CLUSTER_COUNT) as i32;
+        for i in 0..total_txs {
+            let tx = make_tx(&mut account_id, i);
+            let result = queue.try_add(tx);
+            assert_eq!(
+                result,
+                TxQueueResult::Added,
+                "tx {} should be added, got {:?}",
+                i,
+                result
+            );
+        }
+
+        let expected_survivor_count =
+            expected_stages * expected_clusters * expected_txs_per_cluster;
+        let max_ops = 1000;
+        let (_tx_set, gen_tx_set) = queue.build_generalized_tx_set(Hash256::ZERO, max_ops);
+
+        validate_phase_shape(
+            &gen_tx_set,
+            expected_stages,
+            expected_clusters,
+            expected_txs_per_cluster,
+        );
+        assert_eq!(
+            count_soroban_txs(&gen_tx_set),
+            expected_survivor_count,
+            "expected {} survivors",
+            expected_survivor_count
+        );
+        assert_eq!(
+            extract_phase_base_fee(&gen_tx_set),
+            Some(expected_base_fee),
+            "expected base fee {}",
+            expected_base_fee
+        );
+    }
+
+    // ---- Resource-limit scenarios ----
+    // Ports stellar-core TxSetTests.cpp:2727-2863
+
+    #[test]
+    fn test_parity_resource_limit_read_bytes() {
+        // Each TX uses 100KB read bytes. Ledger max = 1MB → 10 fit.
+        // 32 TXs with fees 100..131, top 10 survive (fees 122..131), base fee = 122.
+        run_both(|min, max| {
+            let limits = default_soroban_limits();
+            run_resource_limit_scenario(
+                limits,
+                min,
+                max,
+                |account_id, i| {
+                    make_resource_limit_tx(
+                        account_id,
+                        1_000_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        100 + i as i64,
+                        100_000, // 100KB read bytes
+                        100,     // default write bytes
+                    )
+                },
+                1,
+                1,
+                10,
+                100 + (STAGE_COUNT * CLUSTER_COUNT) as i64 - 10,
+            );
+        });
+    }
+
+    #[test]
+    fn test_parity_resource_limit_read_entries() {
+        // stellar-core sets mTxMaxDiskReadEntries=43 and mLedgerMaxDiskReadEntries=43.
+        // However, at protocol v23+ soroban_disk_read_entries() only counts non-Soroban keys.
+        // Our test TXs use ContractData keys exclusively, so per-TX ReadLedgerEntries = 0.
+        // The actual bottleneck is disk_read_bytes (100KB/TX, 1MB ledger max → 10 fit).
+        // We match stellar-core by also setting read_entries=43 in our limits, verifying the
+        // same outcome.
+        run_both(|min, max| {
+            let mut limits = default_soroban_limits();
+            limits.set_val(ResourceType::ReadLedgerEntries, 43);
+
+            // Verify our understanding: ContractData keys produce 0 disk read entries at v23+.
+            {
+                let mut id = 0u32;
+                let tx =
+                    make_resource_limit_tx(&mut id, 1_000_000, &[0, 1], &[2, 3], 100, 100_000, 100);
+                let frame =
+                    henyey_tx::TransactionFrame::from_owned_with_network(tx, NetworkId::testnet());
+                let resources = frame.resources(false, PROTOCOL_VERSION);
+                assert_eq!(
+                    resources.get_val(ResourceType::ReadLedgerEntries),
+                    0,
+                    "ContractData keys should produce 0 disk read entries at protocol v23+"
+                );
+            }
+
+            run_resource_limit_scenario(
+                limits,
+                min,
+                max,
+                |account_id, i| {
+                    make_resource_limit_tx(
+                        account_id,
+                        1_000_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        100 + i as i64,
+                        100_000,
+                        100,
+                    )
+                },
+                1,
+                1,
+                10,
+                100 + (STAGE_COUNT * CLUSTER_COUNT) as i64 - 10,
+            );
+        });
+    }
+
+    #[test]
+    fn test_parity_resource_limit_write_bytes() {
+        // Each TX uses 10KB write bytes. Ledger max = 100KB → 10 fit.
+        run_both(|min, max| {
+            let limits = default_soroban_limits();
+            run_resource_limit_scenario(
+                limits,
+                min,
+                max,
+                |account_id, i| {
+                    make_resource_limit_tx(
+                        account_id,
+                        1_000_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        100 + i as i64,
+                        100,    // default read bytes
+                        10_000, // 10KB write bytes
+                    )
+                },
+                1,
+                1,
+                10,
+                100 + (STAGE_COUNT * CLUSTER_COUNT) as i64 - 10,
+            );
+        });
+    }
+
+    #[test]
+    fn test_parity_resource_limit_write_entries() {
+        // stellar-core sets mTxMaxWriteLedgerEntries=21, mLedgerMaxWriteLedgerEntries=21.
+        // Each TX has 2 RW keys → 2 write entries. 21/2 = 10 fit.
+        run_both(|min, max| {
+            let mut limits = default_soroban_limits();
+            limits.set_val(ResourceType::WriteLedgerEntries, 21);
+            run_resource_limit_scenario(
+                limits,
+                min,
+                max,
+                |account_id, i| {
+                    make_resource_limit_tx(
+                        account_id,
+                        1_000_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        100 + i as i64,
+                        1_000,
+                        100,
+                    )
+                },
+                1,
+                1,
+                10,
+                100 + (STAGE_COUNT * CLUSTER_COUNT) as i64 - 10,
+            );
+        });
+    }
+
+    #[test]
+    fn test_parity_resource_limit_tx_size() {
+        // stellar-core sets mLedgerMaxTransactionsSizeBytes = 11 * single_tx_size - 1.
+        // This means only 10 TXs fit. We compute actual XDR size at runtime.
+        // Note: this tests the TxByteSize dimension of Resource, not max_soroban_bytes config.
+        run_both(|min, max| {
+            // First, compute the XDR size of one test TX.
+            let mut id = 0u32;
+            let sample_tx =
+                make_resource_limit_tx(&mut id, 1_000_000, &[0, 1], &[2, 3], 100, 1_000, 100);
+            let tx_size = sample_tx
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap()
+                .len() as i64;
+
+            let mut limits = default_soroban_limits();
+            limits.set_val(ResourceType::TxByteSize, 11 * tx_size - 1);
+
+            run_resource_limit_scenario(
+                limits,
+                min,
+                max,
+                |account_id, i| {
+                    make_resource_limit_tx(
+                        account_id,
+                        1_000_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        100 + i as i64,
+                        1_000,
+                        100,
+                    )
+                },
+                1,
+                1,
+                10,
+                100 + (STAGE_COUNT * CLUSTER_COUNT) as i64 - 10,
+            );
+        });
+    }
+
+    #[test]
+    fn test_parity_resource_limit_tx_count() {
+        // stellar-core sets mLedgerMaxTxCount = 5.
+        // Operations dimension limits to 5 TXs (each has 1 op).
+        // 32 TXs with fees 100..131, top 5 survive (fees 127..131), base fee = 127.
+        run_both(|min, max| {
+            let mut limits = default_soroban_limits();
+            limits.set_val(ResourceType::Operations, 5);
+            run_resource_limit_scenario(
+                limits,
+                min,
+                max,
+                |account_id, i| {
+                    make_resource_limit_tx(
+                        account_id,
+                        1_000_000,
+                        &[4 * i, 4 * i + 1],
+                        &[4 * i + 2, 4 * i + 3],
+                        100 + i as i64,
+                        1_000,
+                        100,
+                    )
+                },
+                1,
+                1,
+                5,
+                100 + (STAGE_COUNT * CLUSTER_COUNT) as i64 - 5,
+            );
+        });
+    }
+}
