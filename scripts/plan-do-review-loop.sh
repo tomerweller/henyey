@@ -14,9 +14,10 @@
 #   LOOP_LOG_DIR       Directory for per-run logs (default: ~/data/plan-do-review-loop)
 #
 # Selection rule: oldest open issue that is unassigned AND does not have the
-# `plan-do-review-loop-failed` or `not-ready` labels. Assigning the issue to
-# @me serves as the lock; failures are labeled and unassigned so the loop
-# moves on.
+# `plan-do-review-loop-failed` or `not-ready` labels. Issues labeled `ready`
+# are prioritized; if none exist, falls back to any eligible issue. Assigning
+# the issue to @me serves as the lock; failures are labeled and unassigned so
+# the loop moves on.
 #
 # Crashed runs leave the issue assigned to you. The loop will NOT auto-pick it
 # up again — unassign manually once you've reviewed what happened.
@@ -67,18 +68,29 @@ log "Log dir:   $LOOP_LOG_DIR"
 
 # --- Main loop ---
 while true; do
-  search="sort:created-asc -label:$FAIL_LABEL -label:$NOT_READY_LABEL"
+  base_search="sort:created-asc -label:$FAIL_LABEL -label:$NOT_READY_LABEL"
   if [[ -n "$LOOP_LABEL" ]]; then
-    search="$search label:$LOOP_LABEL"
+    base_search="$base_search label:$LOOP_LABEL"
   fi
 
+  # Prioritize issues labeled "ready"; fall back to any eligible issue.
   issue_num="$(gh issue list \
     --state open \
     --assignee '' \
-    --search "$search" \
+    --search "$base_search label:ready" \
     --json number \
     --limit 1 \
     --jq '.[0].number // empty')"
+
+  if [[ -z "$issue_num" ]]; then
+    issue_num="$(gh issue list \
+      --state open \
+      --assignee '' \
+      --search "$base_search" \
+      --json number \
+      --limit 1 \
+      --jq '.[0].number // empty')"
+  fi
 
   if [[ -z "$issue_num" ]]; then
     log "No eligible issues. Sleeping ${LOOP_EMPTY_SLEEP}s…"
