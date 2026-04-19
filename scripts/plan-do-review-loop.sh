@@ -3,7 +3,7 @@
 # `/plan-do-review` skill on one open GitHub issue at a time.
 #
 # Usage:
-#   ./scripts/plan-do-review-loop.sh                  # process oldest open unassigned issue
+#   ./scripts/plan-do-review-loop.sh                  # process newest open unassigned issue
 #   LOOP_LABEL=proposal ./scripts/plan-do-review-loop.sh
 #   LOOP_MODEL=claude-opus-4.6 ./scripts/plan-do-review-loop.sh
 #
@@ -13,7 +13,7 @@
 #   LOOP_EMPTY_SLEEP   Seconds to sleep when no issues found (default: 60)
 #   LOOP_LOG_DIR       Directory for per-run logs (default: ~/data/plan-do-review-loop)
 #
-# Selection rule: oldest open issue that is unassigned AND does not have the
+# Selection rule: newest open issue that is unassigned AND does not have the
 # `plan-do-review-loop-failed` or `not-ready` labels. Issues labeled `ready`
 # are prioritized; if none exist, falls back to any eligible issue. Assigning
 # the issue to @me serves as the lock; failures are labeled and unassigned so
@@ -68,7 +68,7 @@ log "Log dir:   $LOOP_LOG_DIR"
 
 # --- Main loop ---
 while true; do
-  base_search="sort:created-asc -label:$FAIL_LABEL -label:$NOT_READY_LABEL"
+  base_search="sort:created-desc -label:$FAIL_LABEL -label:$NOT_READY_LABEL"
   if [[ -n "$LOOP_LABEL" ]]; then
     base_search="$base_search label:$LOOP_LABEL"
   fi
