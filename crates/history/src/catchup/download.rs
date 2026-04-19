@@ -8,11 +8,9 @@ use henyey_common::Hash256;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
-use henyey_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
-    GeneralizedTransactionSet, LedgerHeader, LedgerHeaderHistoryEntry, ScpHistoryEntry,
-    TransactionHistoryEntry, TransactionHistoryResultEntry, TransactionSet, TransactionSetV1,
+    LedgerHeader, LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry,
+    TransactionHistoryResultEntry,
 };
 use tracing::{debug, info, warn};
 
@@ -323,60 +321,17 @@ impl CatchupManager {
                 .tx_entries
                 .iter()
                 .find(|entry| entry.ledger_seq == seq)
-                .cloned();
-            let tx_set = tx_history_entry
-                .as_ref()
-                .map(|entry| super::tx_set_from_history_entry(entry))
-                .unwrap_or_else(|| {
-                    // For protocol 20+, use GeneralizedTransactionSet format
-                    // For earlier protocols, use Classic TransactionSet
-                    if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20) {
-                        // Create empty GeneralizedTransactionSet with proper phases
-                        // Phase 0: empty classic phase (V0 with no components)
-                        // Phase 1: empty soroban phase (V1 with no stages)
-                        use stellar_xdr::curr::{ParallelTxsComponent, TransactionPhase, VecM};
-
-                        // Empty classic phase (no components)
-                        let classic_phase = TransactionPhase::V0(VecM::default());
-                        // Empty soroban phase (no execution stages)
-                        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
-                            base_fee: None,
-                            execution_stages: VecM::default(),
-                        });
-
-                        TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(
-                            TransactionSetV1 {
-                                previous_ledger_hash: header.previous_ledger_hash.clone(),
-                                phases: vec![classic_phase, soroban_phase]
-                                    .try_into()
-                                    .unwrap_or_default(),
-                            },
-                        ))
-                    } else {
-                        TransactionSetVariant::Classic(TransactionSet {
-                            previous_ledger_hash: header.previous_ledger_hash.clone(),
-                            txs: Default::default(),
-                        })
-                    }
-                });
+                .cloned()
+                .unwrap_or_else(|| super::empty_tx_history_entry(&header));
 
             let tx_result_entry = cache
                 .result_entries
                 .iter()
                 .find(|entry| entry.ledger_seq == seq)
-                .cloned();
-            let tx_results = tx_result_entry
-                .as_ref()
-                .map(|entry| entry.tx_result_set.results.iter().cloned().collect())
-                .unwrap_or_else(Vec::new);
+                .cloned()
+                .unwrap_or_else(|| super::empty_tx_result_entry(seq));
 
-            data.push(LedgerData {
-                header,
-                tx_set,
-                tx_results,
-                tx_history_entry,
-                tx_result_entry,
-            });
+            data.push(LedgerData::new(header, tx_history_entry, tx_result_entry)?);
         }
 
         Ok(data)

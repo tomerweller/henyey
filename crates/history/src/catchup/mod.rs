@@ -885,18 +885,135 @@ fn checkpoint_header_from_headers(
 }
 
 /// Data downloaded for a single ledger.
+///
+/// Fields are private and construction goes through [`LedgerData::new`], which
+/// validates that header/entry ledger sequence numbers match and that the
+/// transaction count equals the result count. This eliminates the class of
+/// silent-divergence bugs that arose from the previous redundant field pairs
+/// (#1760, #1802).
 #[derive(Debug, Clone)]
 pub struct LedgerData {
+    header: LedgerHeader,
+    tx_history_entry: TransactionHistoryEntry,
+    tx_result_entry: TransactionHistoryResultEntry,
+}
+
+impl LedgerData {
+    /// Construct a new `LedgerData`, validating invariants:
+    ///
+    /// - `header.ledger_seq` must equal both entries' `ledger_seq`
+    /// - Transaction count in the set must equal result count
+    pub fn new(
+        header: LedgerHeader,
+        tx_history_entry: TransactionHistoryEntry,
+        tx_result_entry: TransactionHistoryResultEntry,
+    ) -> Result<Self> {
+        if header.ledger_seq != tx_history_entry.ledger_seq {
+            return Err(HistoryError::VerificationFailed(format!(
+                "ledger_seq mismatch: header={} tx_history_entry={}",
+                header.ledger_seq, tx_history_entry.ledger_seq
+            )));
+        }
+        if header.ledger_seq != tx_result_entry.ledger_seq {
+            return Err(HistoryError::VerificationFailed(format!(
+                "ledger_seq mismatch: header={} tx_result_entry={}",
+                header.ledger_seq, tx_result_entry.ledger_seq
+            )));
+        }
+        let tx_set = tx_set_from_history_entry(&tx_history_entry);
+        let tx_count = tx_set.transactions_with_base_fee().len();
+        let result_count = tx_result_entry.tx_result_set.results.len();
+        if tx_count != result_count {
+            return Err(HistoryError::VerificationFailed(format!(
+                "tx/result count mismatch for ledger {}: {} txs vs {} results",
+                header.ledger_seq, tx_count, result_count
+            )));
+        }
+        Ok(Self {
+            header,
+            tx_history_entry,
+            tx_result_entry,
+        })
+    }
+
     /// The ledger header.
-    pub header: LedgerHeader,
-    /// The transaction set.
-    pub tx_set: TransactionSetVariant,
-    /// Transaction results.
-    pub tx_results: Vec<TransactionResultPair>,
-    /// Transaction history entry (tx set) when available.
-    pub tx_history_entry: Option<TransactionHistoryEntry>,
-    /// Transaction result history entry when available.
-    pub tx_result_entry: Option<TransactionHistoryResultEntry>,
+    pub fn header(&self) -> &LedgerHeader {
+        &self.header
+    }
+
+    /// Extract the transaction set from the history entry.
+    ///
+    /// This clones the underlying XDR data. Callers needing repeated access
+    /// should cache the result.
+    pub fn tx_set(&self) -> TransactionSetVariant {
+        tx_set_from_history_entry(&self.tx_history_entry)
+    }
+
+    /// The transaction history entry containing the full tx set.
+    pub fn tx_history_entry(&self) -> &TransactionHistoryEntry {
+        &self.tx_history_entry
+    }
+
+    /// The transaction result history entry.
+    pub fn tx_result_entry(&self) -> &TransactionHistoryResultEntry {
+        &self.tx_result_entry
+    }
+
+    /// Reference to the transaction result pairs.
+    pub fn tx_results(&self) -> &[TransactionResultPair] {
+        &self.tx_result_entry.tx_result_set.results
+    }
+}
+
+/// Construct an empty [`TransactionHistoryEntry`] for a ledger with no transactions.
+///
+/// Uses the header's protocol version to select the correct encoding:
+/// - Protocol ≥ 20: generalized tx set with empty classic + soroban phases
+/// - Protocol < 20: classic tx set with empty txs vec
+pub(crate) fn empty_tx_history_entry(header: &LedgerHeader) -> TransactionHistoryEntry {
+    use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+    use stellar_xdr::curr::{
+        ParallelTxsComponent, TransactionHistoryEntryExt, TransactionPhase, TransactionSet, VecM,
+    };
+
+    if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20) {
+        let classic_phase = TransactionPhase::V0(VecM::default());
+        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: None,
+            execution_stages: VecM::default(),
+        });
+        TransactionHistoryEntry {
+            ledger_seq: header.ledger_seq,
+            tx_set: crate::make_empty_tx_set(),
+            ext: TransactionHistoryEntryExt::V1(GeneralizedTransactionSet::V1(TransactionSetV1 {
+                previous_ledger_hash: header.previous_ledger_hash.clone(),
+                phases: vec![classic_phase, soroban_phase]
+                    .try_into()
+                    .unwrap_or_default(),
+            })),
+        }
+    } else {
+        TransactionHistoryEntry {
+            ledger_seq: header.ledger_seq,
+            tx_set: TransactionSet {
+                previous_ledger_hash: header.previous_ledger_hash.clone(),
+                txs: Default::default(),
+            },
+            ext: TransactionHistoryEntryExt::V0,
+        }
+    }
+}
+
+/// Construct an empty [`TransactionHistoryResultEntry`] for a ledger with no results.
+pub(crate) fn empty_tx_result_entry(ledger_seq: u32) -> TransactionHistoryResultEntry {
+    use stellar_xdr::curr::{TransactionHistoryResultEntryExt, TransactionResultSet};
+    TransactionHistoryResultEntry {
+        ledger_seq,
+        tx_result_set: TransactionResultSet {
+            results: Default::default(),
+        },
+        ext: TransactionHistoryResultEntryExt::default(),
+    }
 }
 
 /// Options for catchup operations.

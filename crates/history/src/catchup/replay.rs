@@ -58,7 +58,7 @@ impl CatchupManager {
         }
 
         // Extract headers for chain verification
-        let headers: Vec<_> = ledger_data.iter().map(|d| d.header.clone()).collect();
+        let headers: Vec<_> = ledger_data.iter().map(|d| d.header().clone()).collect();
 
         // Skip header chain and trust anchor verification when verify_results
         // is false (maps from CatchupOptions::verify_headers). This allows
@@ -71,24 +71,25 @@ impl CatchupManager {
             verify::verify_chain_anchors(&headers, anchors)?;
         }
 
-        // Verify transaction sets match header hashes
+        // Verify transaction sets and result sets match header hashes.
+        // With canonical LedgerData, entries are always populated (no Option),
+        // so verification is unconditional.
         for data in ledger_data {
-            if let Some(entry) = data.tx_history_entry.as_ref() {
-                let tx_set = super::tx_set_from_history_entry(entry);
-                verify::verify_tx_set(&data.header, &tx_set)?;
-            }
-            if let Some(entry) = data.tx_result_entry.as_ref() {
-                let xdr = entry
-                    .tx_result_set
-                    .to_xdr(stellar_xdr::curr::Limits::none())
-                    .map_err(|e| {
-                        HistoryError::CatchupFailed(format!(
-                            "Failed to serialize tx result set for ledger {}: {}",
-                            data.header.ledger_seq, e
-                        ))
-                    })?;
-                verify::verify_tx_result_set(&data.header, &xdr)?;
-            }
+            let tx_set = data.tx_set();
+            verify::verify_tx_set(data.header(), &tx_set)?;
+
+            let xdr = data
+                .tx_result_entry()
+                .tx_result_set
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .map_err(|e| {
+                    HistoryError::CatchupFailed(format!(
+                        "Failed to serialize tx result set for ledger {}: {}",
+                        data.header().ledger_seq,
+                        e
+                    ))
+                })?;
+            verify::verify_tx_result_set(data.header(), &xdr)?;
         }
 
         info!("Verified header chain for {} ledgers", headers.len());
@@ -235,7 +236,7 @@ impl CatchupManager {
         let mut pq_fell_behind = false;
 
         for (i, data) in ledger_data.iter().enumerate() {
-            self.progress.current_ledger = data.header.ledger_seq;
+            self.progress.current_ledger = data.header().ledger_seq;
 
             // Apply publish queue backpressure if enabled (offline catchup).
             if self.replay_config.wait_for_publish {
@@ -243,37 +244,39 @@ impl CatchupManager {
             }
 
             // Decode upgrades from the header's scp_value.upgrades
-            let upgrades = decode_upgrades_from_header(&data.header);
+            let upgrades = decode_upgrades_from_header(data.header());
 
             let close_data = LedgerCloseData::new(
-                data.header.ledger_seq,
-                data.tx_set.clone(),
-                data.header.scp_value.close_time.0,
+                data.header().ledger_seq,
+                data.tx_set(),
+                data.header().scp_value.close_time.0,
                 ledger_manager.current_header_hash(),
             )
-            .with_stellar_value_ext(data.header.scp_value.ext.clone())
+            .with_stellar_value_ext(data.header().scp_value.ext.clone())
             .with_upgrades(upgrades);
 
             let result = ledger_manager.close_ledger(close_data, None).map_err(|e| {
                 HistoryError::CatchupFailed(format!(
                     "close_ledger failed at ledger {}: {}",
-                    data.header.ledger_seq, e
+                    data.header().ledger_seq,
+                    e
                 ))
             })?;
 
             // Verify computed header hash matches archive
             if self.replay_config.verify_bucket_list {
                 let expected_hash =
-                    henyey_ledger::compute_header_hash(&data.header).map_err(|e| {
+                    henyey_ledger::compute_header_hash(data.header()).map_err(|e| {
                         HistoryError::CatchupFailed(format!(
                             "Failed to compute header hash for ledger {}: {}",
-                            data.header.ledger_seq, e
+                            data.header().ledger_seq,
+                            e
                         ))
                     })?;
                 if result.header_hash != expected_hash {
                     return Err(HistoryError::CatchupFailed(format!(
                         "Header hash mismatch at ledger {}: computed={}, expected={}",
-                        data.header.ledger_seq,
+                        data.header().ledger_seq,
                         result.header_hash.to_hex(),
                         expected_hash.to_hex()
                     )));
@@ -283,14 +286,14 @@ impl CatchupManager {
             // Emit metadata to SQLite and external consumers (e.g., stellar-rpc's
             // meta pipe in bounded replay mode: `catchup --metadata-output-stream fd:3`).
             if let Some(meta) = result.meta {
-                self.emit_meta(data.header.ledger_seq, meta);
+                self.emit_meta(data.header().ledger_seq, meta);
             }
 
             debug!(
                 "Replayed ledger {}/{} via close_ledger: seq={}",
                 i + 1,
                 total,
-                data.header.ledger_seq
+                data.header().ledger_seq
             );
 
             // Yield to the tokio runtime between close_ledger calls so that
