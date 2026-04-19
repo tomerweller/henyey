@@ -1685,14 +1685,8 @@ impl TransactionExecutor {
         }
 
         // Compute fee using the same logic as execute_transaction_with_fee_mode
-        // For fee bump transactions, the required fee includes an extra base fee for the wrapper
-        let num_ops = std::cmp::max(1, frame.operation_count() as i64);
-        let required_fee = if frame.is_fee_bump() {
-            // Fee bumps pay baseFee * (numOps + 1) - extra charge for the fee bump wrapper
-            base_fee as i64 * (num_ops + 1)
-        } else {
-            base_fee as i64 * num_ops
-        };
+        let num_ops = std::cmp::max(1, frame.resource_operation_count() as i64);
+        let required_fee = base_fee as i64 * num_ops;
         let inclusion_fee = frame.inclusion_fee();
         // For Soroban, the resource fee is charged in full, plus the inclusion fee up to required.
         // For classic transactions, charge up to the required_fee (base_fee * num_ops).
@@ -1897,14 +1891,8 @@ impl TransactionExecutor {
 
         let validation_us = tx_timing_start.elapsed().as_micros() as u64;
 
-        // For fee bump transactions, the required fee includes an extra base fee for the wrapper
-        let num_ops = std::cmp::max(1, frame.operation_count() as i64);
-        let required_fee = if frame.is_fee_bump() {
-            // Fee bumps pay baseFee * (numOps + 1) - extra charge for the fee bump wrapper
-            base_fee as i64 * (num_ops + 1)
-        } else {
-            base_fee as i64 * num_ops
-        };
+        let num_ops = std::cmp::max(1, frame.resource_operation_count() as i64);
+        let required_fee = base_fee as i64 * num_ops;
         let inclusion_fee = frame.inclusion_fee();
         // For Soroban, the resource fee is charged in full, plus the inclusion fee up to required.
         // For classic transactions, charge up to the required_fee (base_fee * num_ops).
@@ -3115,12 +3103,8 @@ fn pre_deduct_soroban_fees(
                 let fee_source = fee_source_account_id(tx);
 
                 // Compute the fee using the same logic as execute_transaction_with_fee_mode.
-                let num_ops = std::cmp::max(1, frame.operation_count() as i64);
-                let required_fee = if frame.is_fee_bump() {
-                    tx_fee as i64 * (num_ops + 1)
-                } else {
-                    tx_fee as i64 * num_ops
-                };
+                let num_ops = std::cmp::max(1, frame.resource_operation_count() as i64);
+                let required_fee = tx_fee as i64 * num_ops;
                 let inclusion_fee = frame.inclusion_fee();
                 let computed_fee = frame.declared_soroban_resource_fee()
                     + std::cmp::min(inclusion_fee, required_fee);

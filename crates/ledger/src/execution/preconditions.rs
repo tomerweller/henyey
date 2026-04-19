@@ -130,8 +130,7 @@ impl TransactionExecutor {
         // Phase 3: Fee validation
         // SECURITY: fee computation overflow prevented by tx validation bounds (max_fee * max_ops fits i64)
         if frame.is_fee_bump() {
-            let op_count = frame.operation_count() as i64;
-            let outer_op_count = std::cmp::max(1_i64, op_count + 1);
+            let outer_op_count = frame.resource_operation_count() as i64;
             let outer_min_inclusion_fee = base_fee as i64 * outer_op_count;
             let outer_inclusion_fee = frame.inclusion_fee();
 
@@ -155,7 +154,8 @@ impl TransactionExecutor {
             };
 
             if inner_inclusion_fee >= 0 {
-                let inner_min_inclusion_fee = base_fee as i64 * std::cmp::max(1_i64, op_count);
+                let inner_min_inclusion_fee =
+                    base_fee as i64 * std::cmp::max(1_i64, frame.operation_count() as i64);
                 let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
                 let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
                 if v1 < v2 {
