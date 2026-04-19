@@ -213,7 +213,7 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
         {
             let header = &header_entry.header;
             let tx_set = TransactionSetVariant::from(tx_entry);
-            let tx_set_hash = verify::compute_tx_set_hash(&tx_set).unwrap_or(Hash256::ZERO);
+            let tx_set_hash = verify::compute_tx_set_hash(&tx_set)?;
             let expected_tx_set = Hash256::from(header.scp_value.tx_set_hash.0);
             if tx_set_hash != expected_tx_set {
                 anyhow::bail!(

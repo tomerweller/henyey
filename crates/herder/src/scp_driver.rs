@@ -1589,7 +1589,7 @@ impl ScpDriver {
 
         // Create the data to sign: network ID + ENVELOPE_TYPE_SCP + statement XDR
         // ENVELOPE_TYPE_SCP = 1 (as i32 big-endian)
-        let statement_bytes = statement.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
+        let statement_bytes = henyey_common::xdr_to_bytes(statement);
         let mut data = self.network_id.0.to_vec();
         data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP
         data.extend_from_slice(&statement_bytes);
