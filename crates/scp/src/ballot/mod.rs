@@ -535,6 +535,22 @@ impl BallotProtocol {
     }
 
     /// Process a ballot protocol envelope.
+    ///
+    /// # Caller contract
+    ///
+    /// - **Input**: must be a ballot pledge (Prepare/Confirm/Externalize).
+    ///   Nominate pledges are rejected with `unexpected_pledge`.
+    /// - **Sanity**: caller should have verified `is_statement_sane` before
+    ///   invoking this method.
+    /// - **Freshness**: this method performs its own `is_newer_statement`
+    ///   check as a defensive guard. On the `Slot::process_ballot_envelope`
+    ///   production path, the upstream `is_stale_ballot_statement` pre-check
+    ///   already rejects stale envelopes before this method is called, so
+    ///   the inner freshness gate is unreachable there. Direct callers
+    ///   (e.g. unit tests) still rely on it.
+    /// - **Validation**: `validation` must reflect the result of validating
+    ///   the statement's values (via `validate_statement_values` or
+    ///   equivalent) and be consistent with the statement content.
     pub(crate) fn process_envelope<D: SCPDriver>(
         &mut self,
         envelope: &ScpEnvelope,
@@ -560,11 +576,22 @@ impl BallotProtocol {
         }
 
         if !self.is_newer_statement(node_id, &envelope.statement) {
-            tracing::info!(
+            // On the Slot::process_ballot_envelope production path, the
+            // upstream is_stale_ballot_statement check already rejected
+            // stale envelopes against the same latest_envelopes map (no
+            // mutation occurs between the two checks). This gate is a
+            // defensive guard for direct callers of process_envelope.
+            // Demoted to debug for consistency with the stale_ballot gate
+            // (also debug); see #1814.
+            let incoming = crate::compare::ballot_summary_of(&envelope.statement.pledges);
+            let stored = self.stored_ballot_summary(node_id);
+            tracing::debug!(
                 target: "henyey::envelope_path",
                 slot = envelope.statement.slot_index,
                 node_id = ?node_id,
                 scp_gate = "not_newer_statement",
+                ?incoming,
+                ?stored,
                 "scp receive rejected (ballot)",
             );
             return EnvelopeState::Invalid;
