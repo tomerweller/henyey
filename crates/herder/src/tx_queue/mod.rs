@@ -418,10 +418,11 @@ impl QueuedTransaction {
 
     /// Compare this transaction's fee rate against a FeeEntry (from the index).
     fn is_better_than_entry(&self, entry: &FeeEntry) -> bool {
+        // inclusion_fee is u64 validated non-negative at construction (from XDR i64).
         match fee_rate_cmp(
-            self.inclusion_fee,
+            self.inclusion_fee as i64,
             self.op_count,
-            entry.inclusion_fee,
+            entry.inclusion_fee as i64,
             entry.op_count,
         ) {
             Ordering::Greater => true,
@@ -483,17 +484,25 @@ pub(super) fn envelope_fee_per_op(envelope: &TransactionEnvelope) -> Option<(u64
         })
 }
 
-pub(crate) fn fee_rate_cmp(a_fee: u64, a_ops: u32, b_fee: u64, b_ops: u32) -> Ordering {
-    let left = (a_fee as u128).saturating_mul(b_ops as u128);
-    let right = (b_fee as u128).saturating_mul(a_ops as u128);
+/// Compare fee rates via cross-multiplication, matching stellar-core's
+/// `feeRate3WayCompare(int64_t, uint32_t, int64_t, uint32_t)`.
+///
+/// Asserts that fees are non-negative (stellar-core's `bigMultiply`
+/// release-asserts the same at `numeric.cpp:129`).
+pub(crate) fn fee_rate_cmp(a_fee: i64, a_ops: u32, b_fee: i64, b_ops: u32) -> Ordering {
+    assert!(a_fee >= 0, "fee_rate_cmp: negative fee {a_fee}");
+    assert!(b_fee >= 0, "fee_rate_cmp: negative fee {b_fee}");
+    let left = (a_fee as i128) * (b_ops as i128);
+    let right = (b_fee as i128) * (a_ops as i128);
     left.cmp(&right)
 }
 
 fn better_fee_ratio(new_tx: &QueuedTransaction, old_tx: &QueuedTransaction) -> bool {
+    // inclusion_fee is u64 validated non-negative at construction (from XDR i64).
     match fee_rate_cmp(
-        new_tx.inclusion_fee,
+        new_tx.inclusion_fee as i64,
         new_tx.op_count,
-        old_tx.inclusion_fee,
+        old_tx.inclusion_fee as i64,
         old_tx.op_count,
     ) {
         Ordering::Greater => true,
@@ -517,7 +526,14 @@ fn min_inclusion_fee_to_beat(evicted: (u64, u32), tx: &QueuedTransaction) -> u64
     if evicted.1 == 0 {
         return 0;
     }
-    if fee_rate_cmp(evicted.0, evicted.1, tx.inclusion_fee, tx.op_count) != Ordering::Less {
+    // inclusion_fee values are u64 validated non-negative at construction (from XDR i64).
+    if fee_rate_cmp(
+        evicted.0 as i64,
+        evicted.1,
+        tx.inclusion_fee as i64,
+        tx.op_count,
+    ) != Ordering::Less
+    {
         compute_better_fee(evicted.0, evicted.1, tx.op_count)
     } else {
         0
@@ -595,10 +611,11 @@ impl FeeEntry {
 
 impl Ord for FeeEntry {
     fn cmp(&self, other: &Self) -> Ordering {
+        // inclusion_fee is u64 validated non-negative at construction (from XDR i64).
         fee_rate_cmp(
-            self.inclusion_fee,
+            self.inclusion_fee as i64,
             self.op_count,
-            other.inclusion_fee,
+            other.inclusion_fee as i64,
             other.op_count,
         )
         .then_with(|| other.hash.0.cmp(&self.hash.0))
@@ -7787,5 +7804,58 @@ mod eviction_queue_tests {
             store.soroban_eviction_queue.is_none(),
             "soroban queue should be invalidated after limit update"
         );
+    }
+}
+
+#[cfg(test)]
+mod fee_rate_cmp_tests {
+    use super::fee_rate_cmp;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn test_fee_rate_cmp_equal_rates() {
+        // 100/2 == 200/4
+        assert_eq!(fee_rate_cmp(100, 2, 200, 4), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_fee_rate_cmp_greater() {
+        // 300/2 > 100/2
+        assert_eq!(fee_rate_cmp(300, 2, 100, 2), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_fee_rate_cmp_less() {
+        // 100/2 < 300/2
+        assert_eq!(fee_rate_cmp(100, 2, 300, 2), Ordering::Less);
+    }
+
+    #[test]
+    fn test_fee_rate_cmp_zero_fee() {
+        assert_eq!(fee_rate_cmp(0, 1, 100, 1), Ordering::Less);
+        assert_eq!(fee_rate_cmp(100, 1, 0, 1), Ordering::Greater);
+        assert_eq!(fee_rate_cmp(0, 1, 0, 1), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_fee_rate_cmp_cross_multiply_no_overflow() {
+        // Large values that would overflow u64 multiplication but fit in i128.
+        let large_fee = i64::MAX;
+        assert_eq!(fee_rate_cmp(large_fee, 1, large_fee, 1), Ordering::Equal);
+        // large_fee/2 vs large_fee/1 → large_fee*1 vs large_fee*2 → Less
+        assert_eq!(fee_rate_cmp(large_fee, 2, large_fee, 1), Ordering::Less);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee_rate_cmp: negative fee")]
+    fn test_fee_rate_cmp_panics_on_negative_a_fee() {
+        // Matches stellar-core's releaseAssertOrThrow in bigMultiply.
+        fee_rate_cmp(-1, 1, 100, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee_rate_cmp: negative fee")]
+    fn test_fee_rate_cmp_panics_on_negative_b_fee() {
+        fee_rate_cmp(100, 1, -1, 1);
     }
 }

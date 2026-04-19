@@ -55,9 +55,7 @@ fn compute_better_fee(evicted_fee: i64, evicted_ops: u32, new_fee: i64, new_ops:
     }
 
     // Check if new transaction already beats the evicted one (strictly)
-    if fee_rate_cmp(evicted_fee as u64, evicted_ops, new_fee as u64, new_ops)
-        == std::cmp::Ordering::Less
-    {
+    if fee_rate_cmp(evicted_fee, evicted_ops, new_fee, new_ops) == std::cmp::Ordering::Less {
         return 0;
     }
 

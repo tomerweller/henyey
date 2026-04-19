@@ -287,10 +287,11 @@ impl PartialOrd for QueueEntry {
 
 impl Ord for QueueEntry {
     fn cmp(&self, other: &Self) -> Ordering {
+        // inclusion_fee is u64 validated non-negative at construction (from XDR i64).
         let ord = fee_rate_cmp(
-            self.inclusion_fee,
+            self.inclusion_fee as i64,
             self.op_count,
-            other.inclusion_fee,
+            other.inclusion_fee as i64,
             other.op_count,
         );
         if ord != Ordering::Equal {
@@ -704,9 +705,9 @@ impl SurgePricingPriorityQueue {
             };
 
             if fee_rate_cmp(
-                entry.inclusion_fee,
+                entry.inclusion_fee as i64,
                 entry.op_count,
-                tx.inclusion_fee,
+                tx.inclusion_fee as i64,
                 tx.op_count,
             ) != Ordering::Less
             {

@@ -548,7 +548,7 @@ fn build_with_stage_count(
         let a_ops = (crate::tx_set_utils::envelope_num_ops(&txs[a]) as u32).max(1);
         let b_ops = (crate::tx_set_utils::envelope_num_ops(&txs[b]) as u32).max(1);
         // Descending fee rate: compare b vs a
-        match crate::tx_queue::fee_rate_cmp(b_fee as u64, b_ops, a_fee as u64, a_ops) {
+        match crate::tx_queue::fee_rate_cmp(b_fee, b_ops, a_fee, a_ops) {
             std::cmp::Ordering::Equal => {
                 // Ascending hash for determinism
                 let a_hash = Hash256::hash_xdr(&txs[a]);
@@ -1622,6 +1622,31 @@ mod tests {
         // both stage counts meet. The builder should select the option with
         // fewer actual stages.
         assert!(stages.len() <= 2, "should produce 1 or 2 stages");
+    }
+
+    /// Regression test: a Soroban envelope with `fee < resource_fee` produces a
+    /// negative inclusion fee. Before the fix, `as u64` wrapping caused the
+    /// negative-fee tx to sort as highest-fee. Now `fee_rate_cmp` panics on
+    /// negative fees, matching stellar-core's `releaseAssertOrThrow`.
+    #[test]
+    #[should_panic(expected = "fee_rate_cmp: negative fee")]
+    fn test_negative_inclusion_fee_panics_in_sort() {
+        // fee=50, resource_fee=100 → inclusion_fee = 50 - 100 = -50
+        let negative_fee_tx =
+            make_soroban_tx_with_fees(1, 1, vec![], vec![contract_key(1)], 10_000, 50, 100);
+        // fee=1000, resource_fee=100 → inclusion_fee = 900 (normal)
+        let normal_tx =
+            make_soroban_tx_with_fees(2, 1, vec![], vec![contract_key(2)], 10_000, 1000, 100);
+
+        // This should panic because the sort encounters a negative inclusion fee.
+        build_parallel_soroban_phase(
+            vec![negative_fee_tx, normal_tx],
+            test_network_id(),
+            100_000,
+            8,
+            1,
+            1,
+        );
     }
 }
 
