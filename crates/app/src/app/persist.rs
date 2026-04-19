@@ -621,6 +621,22 @@ mod tests {
     /// exercises that path under a saturated blocking pool (1 thread, fully
     /// occupied) and verifies the persist completes once the slot frees up,
     /// with correct DB side effects.
+    ///
+    /// # Architectural invariant
+    ///
+    /// `spawn_persist_task` must use exactly one `spawn_blocking` call that
+    /// runs the entire pipeline synchronously. The type system enforces this:
+    /// `run_blocking` is a synchronous `fn`, not `async fn`, so it cannot
+    /// call `spawn_blocking` internally without creating a nested runtime.
+    ///
+    /// # Flush paths
+    ///
+    /// The test uses a LedgerManager with no pending bucket persist and no
+    /// hot archive, so `flush_hot_archive_and_buckets_sync` and
+    /// `flush_bucket_persist_sync` are no-ops. This is intentional: the
+    /// regression target is the dispatch pattern (single vs. multiple
+    /// `spawn_blocking`), not the flush logic itself. Testing real flushes
+    /// requires bucket infrastructure that is out of scope here.
     #[test]
     fn test_spawn_persist_task_completes_under_pool_saturation() {
         use std::sync::{mpsc, Barrier};
