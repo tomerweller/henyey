@@ -324,7 +324,7 @@ fn calculate_fee_to_charge(
     base_fee_override: Option<i64>,
 ) -> i64 {
     let base_fee = base_fee_override.unwrap_or(crate::NETWORK_MIN_BASE_FEE);
-    let op_count = std::cmp::max(1, frame.operation_count() as i64);
+    let op_count = std::cmp::max(1, frame.resource_operation_count() as i64);
     let adjusted_fee = base_fee * op_count;
 
     if frame.is_soroban() {
@@ -1343,6 +1343,71 @@ mod tests {
         // Fee charged should be min(100, 0) = 0
         let fee = calculate_fee_to_charge(&frame, 21, Some(0));
         assert_eq!(fee, 0, "With base_fee=0, fee should be 0");
+    }
+
+    /// Regression test for #1821: fee-bump transactions must use resource_operation_count()
+    /// (inner ops + 1) for fee calculation, not plain operation_count().
+    #[test]
+    fn test_calculate_fee_to_charge_fee_bump() {
+        use stellar_xdr::curr::{
+            DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope,
+            FeeBumpTransactionExt, FeeBumpTransactionInnerTx,
+        };
+
+        let inner_source_id = create_test_account_id(1);
+        // Inner tx: 1 payment op, fee=100, seq=1
+        let inner_tx = Transaction {
+            source_account: match inner_source_id.0.clone() {
+                PublicKey::PublicKeyTypeEd25519(key) => MuxedAccount::Ed25519(key),
+            },
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: stellar_xdr::curr::Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+                    asset: stellar_xdr::curr::Asset::Native,
+                    amount: 1000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let inner_envelope = TransactionV1Envelope {
+            tx: inner_tx,
+            signatures: vec![].try_into().unwrap(),
+        };
+
+        let fee_bump_tx = FeeBumpTransaction {
+            fee_source: match create_test_account_id(2).0 {
+                PublicKey::PublicKeyTypeEd25519(key) => MuxedAccount::Ed25519(key),
+            },
+            fee: 1000,
+            inner_tx: FeeBumpTransactionInnerTx::Tx(inner_envelope),
+            ext: FeeBumpTransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: fee_bump_tx,
+            signatures: stellar_xdr::curr::VecM::<DecoratedSignature, 20>::default(),
+        });
+
+        let frame = TransactionFrame::from_owned(envelope);
+        assert!(frame.is_fee_bump());
+        // 1 inner op → resource_operation_count() = 2 (inner ops + 1 for fee-bump wrapper)
+        assert_eq!(frame.resource_operation_count(), 2);
+
+        // base_fee=100, resource ops=2 → adjusted_fee = 200
+        // declared outer fee = 1000 (classic path: min(1000, 200) = 200)
+        let fee = calculate_fee_to_charge(&frame, 21, Some(100));
+        assert_eq!(
+            fee, 200,
+            "Fee-bump with 1 inner op should charge base_fee * 2 = 200, not base_fee * 1 = 100"
+        );
     }
 
     /// Regression test for AUDIT-051: fee-bump seq num must advance on the inner source,
