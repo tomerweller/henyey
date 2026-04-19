@@ -3397,4 +3397,69 @@ mod tests {
             "ephemeral key should produce nonzero jitter_seed"
         );
     }
+
+    /// Issue #1822: consensus_stuck_state read produces correct stall signal
+    /// for /health handler logic.
+    #[tokio::test]
+    async fn test_health_stall_signal_from_consensus_stuck_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("health-stall-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // No stuck state → no stall.
+        {
+            let guard = app.consensus_stuck_state.read().await;
+            let stall_elapsed = guard.as_ref().map(|s| s.stuck_start.elapsed().as_secs());
+            assert!(
+                stall_elapsed.is_none(),
+                "no stuck state should mean no stall"
+            );
+        }
+
+        // Set stuck state with stuck_start 70 seconds ago (>HEALTH_STALL_SECS=60).
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger: 1000,
+                first_buffered: 1001,
+                stuck_start: app.clock.now() - std::time::Duration::from_secs(70),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 3,
+                catchup_triggered: false,
+            });
+        }
+
+        // Read back — stall_elapsed should be >= 60.
+        {
+            let guard = app.consensus_stuck_state.read().await;
+            let stall_elapsed = guard.as_ref().map(|s| s.stuck_start.elapsed().as_secs());
+            let elapsed = stall_elapsed.expect("should have stuck state");
+            assert!(
+                elapsed >= super::HEALTH_STALL_SECS,
+                "stall_elapsed={elapsed} should be >= HEALTH_STALL_SECS={}",
+                super::HEALTH_STALL_SECS,
+            );
+        }
+
+        // Recent stuck state (10 seconds ago) → no stall threshold crossed.
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            if let Some(ref mut state) = *guard {
+                state.stuck_start = app.clock.now() - std::time::Duration::from_secs(10);
+            }
+        }
+        {
+            let guard = app.consensus_stuck_state.read().await;
+            let stall_elapsed = guard.as_ref().map(|s| s.stuck_start.elapsed().as_secs());
+            let elapsed = stall_elapsed.expect("should have stuck state");
+            assert!(
+                elapsed < super::HEALTH_STALL_SECS,
+                "stall_elapsed={elapsed} should be < HEALTH_STALL_SECS={}",
+                super::HEALTH_STALL_SECS,
+            );
+        }
+    }
 }

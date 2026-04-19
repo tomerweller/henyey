@@ -333,4 +333,25 @@ mod tests {
             );
         }
     }
+
+    /// Issue #1822: `/metrics` must expose the post-catchup hard-reset counter.
+    #[test]
+    fn metrics_endpoint_exposes_hard_reset_counter() {
+        let mut app_info = dummy_app_info();
+        app_info.post_catchup_hard_reset_total = 3;
+        let body = render_prometheus_text(&dummy_metrics(), &app_info);
+        assert!(
+            body.contains("# HELP henyey_post_catchup_hard_reset_total "),
+            "missing HELP line for hard_reset_total"
+        );
+        assert!(
+            body.contains("# TYPE henyey_post_catchup_hard_reset_total counter"),
+            "missing TYPE line for hard_reset_total"
+        );
+        assert!(
+            body.contains("\nhenyey_post_catchup_hard_reset_total 3\n"),
+            "sample value for hard_reset_total not emitted; got:\n{}",
+            body
+        );
+    }
 }
