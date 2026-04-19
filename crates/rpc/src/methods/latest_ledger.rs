@@ -8,21 +8,37 @@ use crate::context::RpcContext;
 use crate::error::JsonRpcError;
 use crate::util;
 
+/// Handle the `getLatestLedger` JSON-RPC method.
+///
+/// # Consistency guarantees
+///
+/// All in-memory response fields (`id`, `protocolVersion`, `sequence`,
+/// `closeTime`, `headerXdr`) are derived from a single atomic
+/// [`HeaderSnapshot`](henyey_ledger::HeaderSnapshot) and are guaranteed
+/// to describe the same ledger close.
+///
+/// `metadataXdr` is loaded from the database and is **best-effort**: after a
+/// ledger close the async persist job may not have written the
+/// `LedgerCloseMeta` yet, so the field may be an empty string. When present,
+/// the blob is validated against the expected sequence number via
+/// [`parse_ledger_close_meta_checked`](util::parse_ledger_close_meta_checked).
 pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
-    let ledger = ctx.app.ledger_summary();
-    let hash = ledger.hash.to_hex();
+    // Read all in-memory fields from a single atomic snapshot so they cannot
+    // straddle a ledger close boundary.
+    let snap = ctx.app.ledger_snapshot();
+    let ledger_num = snap.header.ledger_seq;
+    let hash = snap.hash.to_hex();
+    let close_time = snap.header.scp_value.close_time.0;
 
     // Encode the LedgerHeader as base64 XDR.
-    // Re-serializing from the in-memory header is deterministic and avoids
-    // an extra DB round-trip for the raw bytes.
-    let header = ctx.app.ledger_manager().current_header();
-    let header_xdr = header
+    let header_xdr = snap
+        .header
         .to_xdr(Limits::none())
         .map(|b| BASE64.encode(&b))
         .map_err(|e| JsonRpcError::internal_logged("XDR data integrity error", &e))?;
 
     // Load full LedgerCloseMeta from the database for metadataXdr.
-    let ledger_num = ledger.num;
+    // Best-effort: may return None if the async persist job hasn't run yet.
     let metadata_xdr = util::blocking_db(ctx, move |db| {
         db.with_connection(|conn| {
             use henyey_db::LedgerCloseMetaQueries;
@@ -44,9 +60,9 @@ pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcE
 
     Ok(json!({
         "id": hash,
-        "protocolVersion": ledger.version,
-        "sequence": ledger.num,
-        "closeTime": ledger.close_time.to_string(),
+        "protocolVersion": snap.header.ledger_version,
+        "sequence": ledger_num,
+        "closeTime": close_time.to_string(),
         "headerXdr": header_xdr,
         "metadataXdr": metadata_xdr
     }))

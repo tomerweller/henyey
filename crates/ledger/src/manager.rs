@@ -1124,6 +1124,19 @@ impl Default for LedgerManagerConfig {
     }
 }
 
+/// Atomically-captured ledger header and its hash.
+///
+/// Returned by [`LedgerManager::header_snapshot()`] to guarantee that the
+/// header and hash describe the same ledger close. Reading `current_header()`
+/// and `current_header_hash()` separately can race with `commit_close()`.
+#[derive(Debug, Clone)]
+pub struct HeaderSnapshot {
+    /// The ledger header at the time of the snapshot.
+    pub header: LedgerHeader,
+    /// SHA-256 hash of the header's XDR encoding.
+    pub hash: Hash256,
+}
+
 /// Internal state of the ledger manager.
 ///
 /// This struct holds the mutable state that changes with each ledger close.
@@ -1345,6 +1358,19 @@ impl LedgerManager {
     /// Get the current header hash.
     pub fn current_header_hash(&self) -> Hash256 {
         self.state.read().header_hash
+    }
+
+    /// Atomically snapshot the current header and its hash.
+    ///
+    /// Prefer this over separate `current_header()` + `current_header_hash()`
+    /// calls when both values are needed together, to avoid a race with
+    /// `commit_close()` advancing the ledger between reads.
+    pub fn header_snapshot(&self) -> HeaderSnapshot {
+        let state = self.state.read();
+        HeaderSnapshot {
+            header: state.header.clone(),
+            hash: state.header_hash,
+        }
     }
 
     /// Override the stored ledger header version for testing.

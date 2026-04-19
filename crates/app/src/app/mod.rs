@@ -1244,46 +1244,48 @@ impl App {
     }
 
     pub fn ledger_info(&self) -> LedgerInfo {
-        let header = self.ledger_manager.current_header();
-        let hash = self.ledger_manager.current_header_hash();
-        let close_time = ledger_close_time(&header);
+        let snap = self.ledger_manager.header_snapshot();
+        let close_time = ledger_close_time(&snap.header);
         LedgerInfo {
-            ledger_seq: header.ledger_seq,
-            hash,
+            ledger_seq: snap.header.ledger_seq,
+            hash: snap.hash,
             close_time,
-            protocol_version: header.ledger_version,
+            protocol_version: snap.header.ledger_version,
         }
     }
 
     /// Get a rich ledger summary with all header fields needed for the
     /// `/info` endpoint.
+    ///
+    /// All fields are derived from a single atomic [`HeaderSnapshot`] so they
+    /// are guaranteed to describe the same ledger close.
     pub fn ledger_summary(&self) -> LedgerSummary {
-        let info = self.ledger_info();
-        let header = self.ledger_manager.current_header();
+        let snap = self.ledger_manager.header_snapshot();
+        let close_time = ledger_close_time(&snap.header);
         let now = self
             .clock
             .system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let age = if info.close_time > 0 {
-            now.saturating_sub(info.close_time)
+        let age = if close_time > 0 {
+            now.saturating_sub(close_time)
         } else {
             0
         };
         // Extract flags from LedgerHeaderExt::V1 if present.
-        let flags = match &header.ext {
+        let flags = match &snap.header.ext {
             stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
             stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
         };
         LedgerSummary {
-            num: info.ledger_seq,
-            hash: info.hash,
-            close_time: info.close_time,
-            version: info.protocol_version,
-            base_fee: header.base_fee,
-            base_reserve: header.base_reserve,
-            max_tx_set_size: header.max_tx_set_size,
+            num: snap.header.ledger_seq,
+            hash: snap.hash,
+            close_time,
+            version: snap.header.ledger_version,
+            base_fee: snap.header.base_fee,
+            base_reserve: snap.header.base_reserve,
+            max_tx_set_size: snap.header.max_tx_set_size,
             flags,
             age,
         }

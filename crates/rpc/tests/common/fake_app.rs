@@ -12,7 +12,7 @@ use henyey_app::config::AppConfig;
 use henyey_app::{AppState, LedgerSummary};
 use henyey_bucket::BucketSnapshotManager;
 use henyey_herder::TxQueueResult;
-use henyey_ledger::{LedgerManager, LedgerManagerConfig, SorobanNetworkInfo};
+use henyey_ledger::{HeaderSnapshot, LedgerManager, LedgerManagerConfig, SorobanNetworkInfo};
 use henyey_rpc::{RpcAppHandle, RpcServer};
 use stellar_xdr::curr::TransactionEnvelope;
 use tokio::sync::broadcast;
@@ -73,30 +73,30 @@ impl RpcAppHandle for FakeRpcApp {
     }
 
     fn ledger_summary(&self) -> LedgerSummary {
-        let header = self.ledger_manager.current_header();
-        let flags = match &header.ext {
+        let snap = self.ledger_manager.header_snapshot();
+        let flags = match &snap.header.ext {
             stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
             stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
         };
         LedgerSummary {
-            num: self.ledger_seq_override.unwrap_or(header.ledger_seq),
-            hash: self.ledger_manager.current_header_hash(),
+            num: self.ledger_seq_override.unwrap_or(snap.header.ledger_seq),
+            hash: snap.hash,
             close_time: self
                 .close_time_override
-                .unwrap_or(header.scp_value.close_time.0),
+                .unwrap_or(snap.header.scp_value.close_time.0),
             version: self
                 .protocol_version_override
-                .unwrap_or(header.ledger_version),
-            base_fee: self.base_fee_override.unwrap_or(header.base_fee),
-            base_reserve: header.base_reserve,
-            max_tx_set_size: header.max_tx_set_size,
+                .unwrap_or(snap.header.ledger_version),
+            base_fee: self.base_fee_override.unwrap_or(snap.header.base_fee),
+            base_reserve: snap.header.base_reserve,
+            max_tx_set_size: snap.header.max_tx_set_size,
             flags,
             age: 0,
         }
     }
 
-    fn ledger_manager(&self) -> &Arc<LedgerManager> {
-        &self.ledger_manager
+    fn ledger_snapshot(&self) -> HeaderSnapshot {
+        self.ledger_manager.header_snapshot()
     }
 
     fn database(&self) -> &henyey_db::Database {

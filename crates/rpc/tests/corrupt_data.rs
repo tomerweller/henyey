@@ -768,3 +768,81 @@ async fn get_latest_ledger_sequence_mismatch() {
     handle.abort();
     drop(sim);
 }
+
+// ---------------------------------------------------------------------------
+// getLatestLedger consistency regression test
+// ---------------------------------------------------------------------------
+
+/// Verify that all in-memory fields in the `getLatestLedger` response are
+/// derived from the same atomic header snapshot. Decodes `headerXdr` and
+/// asserts it matches `sequence`, `protocolVersion`, `closeTime`, and `id`.
+///
+/// This is a regression guard: if someone re-introduces multi-read (separate
+/// `current_header()` + `current_header_hash()` calls), a ledger close
+/// between reads can cause these fields to disagree.
+#[tokio::test]
+async fn get_latest_ledger_fields_consistent_with_header_xdr() {
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::{LedgerHeader, ReadXdr};
+
+    let (sim, url, client, _app, handle) = setup_rpc().await;
+
+    let id = json!("consistency-check");
+    let (status, resp) = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLatestLedger"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_envelope(&resp, &id);
+    let result = &resp["result"];
+
+    // Decode headerXdr
+    let header_b64 = result["headerXdr"]
+        .as_str()
+        .expect("headerXdr must be a string");
+    let header_bytes = BASE64.decode(header_b64).expect("valid base64");
+    let header =
+        LedgerHeader::from_xdr(&header_bytes, Limits::none()).expect("valid LedgerHeader XDR");
+
+    // Assert all in-memory fields match the decoded header
+    let resp_seq = result["sequence"].as_u64().expect("sequence");
+    assert_eq!(
+        resp_seq, header.ledger_seq as u64,
+        "response sequence must match headerXdr.ledger_seq"
+    );
+
+    let resp_version = result["protocolVersion"].as_u64().expect("protocolVersion");
+    assert_eq!(
+        resp_version, header.ledger_version as u64,
+        "response protocolVersion must match headerXdr.ledger_version"
+    );
+
+    let resp_close_time: u64 = result["closeTime"]
+        .as_str()
+        .expect("closeTime string")
+        .parse()
+        .expect("closeTime parses as u64");
+    assert_eq!(
+        resp_close_time, header.scp_value.close_time.0,
+        "response closeTime must match headerXdr.scp_value.close_time"
+    );
+
+    // Verify id == hex(SHA-256(headerXdr bytes))
+    let resp_id = result["id"].as_str().expect("id");
+    let computed_hash = Sha256::digest(&header_bytes);
+    let computed_hex = hex::encode(computed_hash);
+    assert_eq!(
+        resp_id, computed_hex,
+        "response id must equal SHA-256 of headerXdr bytes"
+    );
+
+    handle.abort();
+    drop(sim);
+}

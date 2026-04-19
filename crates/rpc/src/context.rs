@@ -6,7 +6,7 @@ use henyey_app::config::{AppConfig, RpcConfig};
 use henyey_app::{App, AppState, LedgerSummary};
 use henyey_bucket::BucketSnapshotManager;
 use henyey_herder::TxQueueResult;
-use henyey_ledger::{LedgerManager, SorobanNetworkInfo};
+use henyey_ledger::{HeaderSnapshot, SorobanNetworkInfo};
 use stellar_xdr::curr::TransactionEnvelope;
 use tokio::sync::Semaphore;
 
@@ -31,8 +31,11 @@ pub trait RpcAppHandle: Send + Sync + 'static {
     fn info(&self) -> AppInfo;
     /// Current ledger header snapshot (sequence, hash, close time, etc.).
     fn ledger_summary(&self) -> LedgerSummary;
-    /// Ledger manager (for raw header access in `getLatestLedger`).
-    fn ledger_manager(&self) -> &Arc<LedgerManager>;
+    /// Atomically snapshot the current ledger header and its hash.
+    ///
+    /// Used by `getLatestLedger` to produce `headerXdr` and the in-memory
+    /// response fields from a single consistent read.
+    fn ledger_snapshot(&self) -> HeaderSnapshot;
     /// Database connection pool.
     fn database(&self) -> &henyey_db::Database;
     /// Bucket list snapshot manager (for Soroban simulation).
@@ -58,8 +61,8 @@ impl RpcAppHandle for App {
     fn ledger_summary(&self) -> LedgerSummary {
         App::ledger_summary(self)
     }
-    fn ledger_manager(&self) -> &Arc<LedgerManager> {
-        App::ledger_manager(self)
+    fn ledger_snapshot(&self) -> HeaderSnapshot {
+        App::ledger_manager(self).header_snapshot()
     }
     fn database(&self) -> &henyey_db::Database {
         App::database(self)
