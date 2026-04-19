@@ -556,9 +556,9 @@ impl App {
         if let Some(persist_data) = catchup_persist_data {
             match finalize.0 {
                 super::persist::CatchupFinalizerInner::Inline { db, ledger_manager } => {
-                    let (job, seq) =
-                        super::persist::PersistJob::catchup(persist_data, db, ledger_manager);
-                    tokio::task::spawn_blocking(move || job.run_blocking(seq))
+                    super::persist::CatchupPersistReady::new(persist_data, db, ledger_manager)
+                        .spawn()
+                        .handle
                         .await
                         .expect("inline catchup persist panicked");
                     tracing::info!(

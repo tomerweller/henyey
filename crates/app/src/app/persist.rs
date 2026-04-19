@@ -198,8 +198,7 @@ type PersistWriteFn = Box<dyn FnOnce(&Database) -> anyhow::Result<()> + Send>;
 /// Describes the work to be done by a persist task.
 ///
 /// Created by `handle_close_complete` (ledger close) or the catchup
-/// completion handler, then dispatched via [`spawn_persist_task`] or
-/// called directly via [`PersistJob::run_blocking`].
+/// completion handler, then dispatched via [`spawn_persist_task`].
 pub(super) enum PersistJob {
     /// Post-catchup: flush buckets + write catchup state to DB.
     Catchup {
@@ -224,9 +223,8 @@ impl PersistJob {
     /// Construct a catchup persist job from the prepared data.
     ///
     /// Returns the job and the ledger sequence for logging/tracking.
-    /// Used by both the Inline and Deferred finalization paths in
-    /// `catchup_with_mode` to centralize `PersistJob::Catchup` construction.
-    pub(super) fn catchup(
+    /// Called only by [`CatchupPersistReady::new`].
+    fn catchup(
         data: CatchupPersistData,
         db: Database,
         ledger_manager: Arc<LedgerManager>,
@@ -246,11 +244,10 @@ impl PersistJob {
     ///
     /// Every persist operation is blocking (file I/O, thread join, SQLite
     /// transaction). This is the single source of truth for all persist
-    /// work — both the Deferred path (via [`spawn_persist_task`]) and the
-    /// Inline path call this method. Any failure on the critical path
-    /// aborts the process via [`fatal_persist_error`]; LedgerCloseMeta
-    /// write failures are non-fatal (warned only).
-    pub(super) fn run_blocking(self, ledger_seq: u32) {
+    /// work — called only by [`spawn_persist_task`]. Any failure on the
+    /// critical path aborts the process via [`fatal_persist_error`];
+    /// LedgerCloseMeta write failures are non-fatal (warned only).
+    fn run_blocking(self, ledger_seq: u32) {
         match self {
             PersistJob::Catchup {
                 data,
