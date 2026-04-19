@@ -956,7 +956,9 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
             for component in components.iter() {
                 let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
                 if let Some(base_fee) = comp.base_fee {
-                    if (base_fee as u32) < lcl_base_fee {
+                    // Compare as signed i64 — stellar-core promotes uint32_t baseFee
+                    // to int64_t, so a negative XDR base_fee correctly fails.
+                    if base_fee < lcl_base_fee as i64 {
                         debug!(
                             "Got bad txSet: component base fee {} < lcl base fee {}",
                             base_fee, lcl_base_fee
@@ -982,7 +984,9 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
         }
         TransactionPhase::V1(parallel) => {
             if let Some(base_fee) = parallel.base_fee {
-                if (base_fee as u32) < lcl_base_fee {
+                // Compare as signed i64 — stellar-core promotes uint32_t baseFee
+                // to int64_t, so a negative XDR base_fee correctly fails.
+                if base_fee < lcl_base_fee as i64 {
                     debug!(
                         "Got bad txSet: parallel base fee {} < lcl base fee {}",
                         base_fee, lcl_base_fee
@@ -2270,6 +2274,26 @@ mod tests {
         let tx = make_valid_envelope(200, 1);
         // base_fee=50 < lcl_base_fee=100
         let phase = make_v0_phase_with_fee(vec![tx], Some(50));
+        assert!(!check_fee_map(&phase, 100));
+    }
+
+    #[test]
+    fn test_check_fee_map_negative_base_fee_rejected() {
+        // A negative base_fee in the XDR should be rejected.
+        // Before the fix, `base_fee as u32` would wrap -1 to u32::MAX,
+        // passing the >= lcl_base_fee check incorrectly.
+        let tx = make_valid_envelope(200, 1);
+        let phase = make_v0_phase_with_fee(vec![tx], Some(-1));
+        assert!(!check_fee_map(&phase, 100));
+    }
+
+    #[test]
+    fn test_check_fee_map_negative_parallel_base_fee_rejected() {
+        use stellar_xdr::curr::ParallelTxsComponent;
+        let phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: Some(-1),
+            execution_stages: vec![].try_into().unwrap(),
+        });
         assert!(!check_fee_map(&phase, 100));
     }
 
