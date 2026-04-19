@@ -607,4 +607,117 @@ mod tests {
         );
         assert!(with_progress.made_progress);
     }
+
+    /// Regression test for #1735 / commit 48d878b8.
+    ///
+    /// The old `spawn_persist_task` used `tokio::spawn(async { ... })` with
+    /// multiple sequential `spawn_blocking` calls inside — one for hot-archive
+    /// + bucket flush, one for the DB write, and optionally one for
+    /// LedgerCloseMeta. Under blocking-pool saturation, each `spawn_blocking`
+    /// independently competes for a pool slot, multiplying queueing latency.
+    ///
+    /// The fix consolidated all persist work into `PersistJob::run_blocking`,
+    /// dispatched via a single `tokio::task::spawn_blocking`. This test
+    /// exercises that path under a saturated blocking pool (1 thread, fully
+    /// occupied) and verifies the persist completes once the slot frees up,
+    /// with correct DB side effects.
+    #[test]
+    fn test_spawn_persist_task_completes_under_pool_saturation() {
+        use std::sync::{mpsc, Barrier};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            // -- Phase 1: saturate the single blocking thread --
+            let started_signal = {
+                let (tx, rx) = mpsc::channel::<()>();
+                let release_barrier = Arc::new(Barrier::new(2));
+                let barrier_clone = release_barrier.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    tx.send(()).unwrap();
+                    barrier_clone.wait();
+                });
+
+                // Wait for the blocker to actually start (owns the slot).
+                rx.recv().unwrap();
+
+                release_barrier
+            };
+
+            // -- Phase 2: queue a persist job (LedgerClose path) --
+            let db = Database::open_in_memory().unwrap();
+            let lm = Arc::new(LedgerManager::new(
+                "Test Network ; September 2015".to_string(),
+                Default::default(),
+            ));
+            let bucket_dir = tempfile::tempdir().unwrap();
+
+            let test_seq: u32 = 77;
+            let test_meta = vec![0xCA, 0xFE];
+            let (header, header_xdr) = make_header(test_seq);
+
+            // Clone db for the write_fn closure (it receives &Database from
+            // run_blocking, but we need our handle for assertions later).
+            let db_for_write = db.clone();
+            let write_fn: Box<dyn FnOnce(&Database) -> anyhow::Result<()> + Send> =
+                Box::new(move |db| {
+                    use henyey_db::queries::*;
+                    db.with_connection(|conn| {
+                        conn.store_ledger_header(&header, &header_xdr)?;
+                        conn.set_last_closed_ledger(test_seq)?;
+                        Ok(())
+                    })
+                    .map_err(|e| anyhow::anyhow!(e))
+                });
+
+            let job = PersistJob::LedgerClose {
+                write_fn,
+                meta_xdr: Some(test_meta.clone()),
+                db: db_for_write,
+                ledger_manager: lm,
+                bucket_dir: bucket_dir.path().to_path_buf(),
+            };
+
+            let pending = spawn_persist_task(job, test_seq);
+
+            // -- Phase 3: release the blocker from a thread (not async) --
+            std::thread::spawn(move || {
+                started_signal.wait();
+            });
+
+            // -- Phase 4: assert completion with timeout --
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), pending.handle).await;
+            assert!(
+                result.is_ok(),
+                "persist task must complete within 10s once blocking slot frees"
+            );
+            result.unwrap().expect("persist task must not panic");
+
+            // -- Phase 5: verify DB side effects --
+            let lcl: u32 = db
+                .with_connection(|c| c.get_last_closed_ledger())
+                .unwrap()
+                .unwrap();
+            assert_eq!(lcl, test_seq, "LCL must be persisted");
+
+            let meta = db
+                .with_connection(|c| {
+                    use henyey_db::queries::LedgerCloseMetaQueries;
+                    c.load_ledger_close_meta(test_seq)
+                })
+                .unwrap();
+            assert_eq!(
+                meta.as_deref(),
+                Some(test_meta.as_slice()),
+                "LedgerCloseMeta must be persisted"
+            );
+        });
+    }
 }
