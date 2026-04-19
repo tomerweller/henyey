@@ -1201,6 +1201,9 @@ impl TransactionQueue {
         // Invalidate the persistent soroban eviction queue so it gets rebuilt
         // with the new limits on next admission.
         self.store.write().soroban_eviction_queue = None;
+        // Reset cached Soroban eviction thresholds to avoid stale FeeTooLow
+        // rejections when limits expand.
+        self.soroban_lane_evicted_inclusion_fee.write().clear();
     }
 
     /// Update Soroban resource limits for tx-set selection (1x ledger max).
@@ -7687,21 +7690,38 @@ mod eviction_queue_tests {
     }
 
     /// After clear(), eviction queues should be None, seed regenerated,
-    /// and eviction thresholds reset.
+    /// and eviction thresholds reset so low-fee txs are accepted again.
     #[test]
     fn test_persistent_eviction_queues_cleared() {
-        let queue = make_eviction_test_queue();
+        // Use a small queue that will trigger evictions and set thresholds.
+        let queue = TransactionQueue::new(TxQueueConfig {
+            max_size: 3,
+            max_age_secs: 300,
+            max_queue_ops: None,
+            max_queue_dex_ops: None,
+            max_queue_classic_bytes: None,
+            ..Default::default()
+        });
 
-        let mut tx1 = make_test_envelope(200, 1);
-        set_source(&mut tx1, 1);
-        queue.try_add(tx1);
+        // Fill queue to capacity.
+        for i in 1..=3u8 {
+            let mut tx = make_test_envelope(200 + i as u32, 1);
+            set_source(&mut tx, i);
+            assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+        }
+        assert_eq!(queue.len(), 3);
 
-        let mut tx2 = make_test_envelope(300, 1);
-        set_source(&mut tx2, 2);
-        queue.try_add(tx2);
+        // A low-fee tx should be rejected (queue is full, fee too low to evict).
+        let mut low_fee_tx = make_test_envelope(100, 1);
+        set_source(&mut low_fee_tx, 10);
+        let result = queue.try_add(low_fee_tx.clone());
+        assert!(
+            result == TxQueueResult::FeeTooLow || result == TxQueueResult::QueueFull,
+            "expected rejection, got {:?}",
+            result
+        );
 
-        // Use TransactionQueue::clear() (not store.clear()) to verify
-        // full reset including eviction thresholds.
+        // Clear should reset everything.
         queue.clear();
 
         let store = queue.store.read();
@@ -7709,6 +7729,10 @@ mod eviction_queue_tests {
         assert!(store.soroban_eviction_queue.is_none());
         assert!(store.global_ops_queue.is_none());
         assert_eq!(store.by_hash.len(), 0);
+        drop(store);
+
+        // After clear, the same low-fee tx should be accepted (thresholds reset, queue empty).
+        assert_eq!(queue.try_add(low_fee_tx), TxQueueResult::Added);
     }
 
     /// After remove_applied removes txs, eviction queues stay consistent.
