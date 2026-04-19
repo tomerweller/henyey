@@ -2229,9 +2229,9 @@ pub(crate) fn format_watchdog_diagnostic_hint(pid: u32) -> String {
 
 /// Two-way synchronization gate for the `process_externalized_slots`
 /// split-writer regression test. The iteration loop signals `entered`
-/// after the first non-stale slot's `check_ledger_close`, then blocks
-/// on `resume`. This gives the test a deterministic window to verify
-/// that `syncing_ledgers` write lock is NOT held during phase 2.
+/// on the first non-stale slot (before `check_ledger_close`), then
+/// blocks on `resume`. This gives the test a deterministic window to
+/// verify that `syncing_ledgers` write lock is NOT held during phase 2.
 #[cfg(test)]
 pub(crate) struct PesIterationGate {
     /// Signaled by the iteration loop when phase 2 is in progress.
