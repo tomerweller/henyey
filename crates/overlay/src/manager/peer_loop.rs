@@ -556,7 +556,12 @@ impl OverlayManager {
     /// Send a ping (GetScpQuorumset with a random hash) if due and idle.
     ///
     /// Returns `true` if a message was written (so the caller can update `last_write`).
-    async fn maybe_send_ping(peer: &mut Peer, peer_id: &PeerId, ping: &mut PingTracker) -> bool {
+    async fn maybe_send_ping(
+        peer: &mut Peer,
+        peer_id: &PeerId,
+        ping: &mut PingTracker,
+        metrics: &crate::metrics::OverlayMetrics,
+    ) -> bool {
         if !peer.is_connected() || !ping.is_idle() {
             return false;
         }
@@ -568,8 +573,10 @@ impl OverlayManager {
         let ping_msg = StellarMessage::GetScpQuorumset(hash.clone());
         if let Err(e) = peer.send(ping_msg).await {
             debug!("Failed to send ping to {}: {}", peer_id, e);
+            metrics.errors_write.inc();
             false
         } else {
+            metrics.messages_written.inc();
             ping.record_sent(hash);
             true
         }
@@ -605,6 +612,7 @@ impl OverlayManager {
         peer_id: &PeerId,
         message: &StellarMessage,
         flow_control: &FlowControl,
+        metrics: &crate::metrics::OverlayMetrics,
     ) -> std::result::Result<bool, ()> {
         if let StellarMessage::SendMoreExtended(sme) = message {
             debug!(
@@ -616,7 +624,7 @@ impl OverlayManager {
                 return Err(());
             }
             flow_control.maybe_release_capacity(message);
-            match Self::send_flow_controlled_batch(peer, flow_control).await {
+            match Self::send_flow_controlled_batch(peer, flow_control, metrics).await {
                 Ok(sent) => Ok(sent),
                 Err(e) => {
                     debug!("Failed to drain queue to {}: {}", peer_id, e);
@@ -845,7 +853,7 @@ impl OverlayManager {
                             // Enqueue in FlowControl with priority-based trimming
                             flow_control.add_msg_and_maybe_trim_queue(m);
                             // Send whatever has capacity
-                            match Self::send_flow_controlled_batch(&mut peer, &flow_control).await {
+                            match Self::send_flow_controlled_batch(&mut peer, &flow_control, &state.metrics).await {
                                 Ok(sent) => {
                                     if sent {
                                         last_write = Instant::now();
@@ -934,7 +942,7 @@ impl OverlayManager {
                     ticks_since_ping += 1;
                     if ticks_since_ping >= PING_INTERVAL_TICKS {
                         ticks_since_ping = 0;
-                        if Self::maybe_send_ping(&mut peer, &peer_id, &mut ping).await {
+                        if Self::maybe_send_ping(&mut peer, &peer_id, &mut ping, &state.metrics).await {
                             last_write = Instant::now();
                         }
                         Self::maybe_log_peer_stats(&peer_id, total_messages, scp_messages, &ping, &mut last_stats_log);
@@ -1002,6 +1010,7 @@ impl OverlayManager {
                     "unexpected flood message, peer at capacity",
                 );
                 let _ = ctx.peer.send(err).await;
+                state.metrics.messages_written.inc();
                 return RecvAction::Break;
             }
         };
@@ -1016,8 +1025,14 @@ impl OverlayManager {
                 return RecvAction::Break;
             }
             StellarMessage::SendMoreExtended(_) => {
-                match Self::handle_send_more_extended(ctx.peer, peer_id, &message, flow_control)
-                    .await
+                match Self::handle_send_more_extended(
+                    ctx.peer,
+                    peer_id,
+                    &message,
+                    flow_control,
+                    &state.metrics,
+                )
+                .await
                 {
                     Ok(sent) => {
                         if sent {
@@ -1053,7 +1068,9 @@ impl OverlayManager {
                 .await
             {
                 debug!("Failed to send SendMoreExtended to peer={}: {}", peer_id, e);
+                state.metrics.errors_write.inc();
             } else {
+                state.metrics.messages_written.inc();
                 *ctx.last_write = Instant::now();
             }
         }
@@ -1069,6 +1086,7 @@ impl OverlayManager {
     pub(super) async fn send_flow_controlled_batch(
         peer: &mut Peer,
         flow_control: &FlowControl,
+        metrics: &crate::metrics::OverlayMetrics,
     ) -> crate::Result<bool> {
         use crate::flow_control::MessagePriority;
 
@@ -1086,8 +1104,10 @@ impl OverlayManager {
             if let Err(e) = peer.send(queued.message.clone()).await {
                 // Send failed — process what we've sent so far, then propagate error
                 flow_control.process_sent_messages(&sent_by_priority);
+                metrics.errors_write.inc();
                 return Err(e);
             }
+            metrics.messages_written.inc();
             if let Some(p) = priority {
                 sent_by_priority[p as usize].push(queued.message);
             }

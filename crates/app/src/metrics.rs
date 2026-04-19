@@ -66,23 +66,11 @@ pub const BUCKET_MERGE_ANNIHILATED_TOTAL: &str = "stellar_bucket_merge_annihilat
 // Overlay counters (Phase 1 — wired to OverlayMetrics in OverlayManager).
 pub const OVERLAY_MESSAGE_READ_TOTAL: &str = "stellar_overlay_message_read_total";
 pub const OVERLAY_MESSAGE_WRITE_TOTAL: &str = "stellar_overlay_message_write_total";
-pub const OVERLAY_MESSAGE_DROP_TOTAL: &str = "stellar_overlay_message_drop_total";
 pub const OVERLAY_MESSAGE_BROADCAST_TOTAL: &str = "stellar_overlay_message_broadcast_total";
-pub const OVERLAY_BYTE_READ_TOTAL: &str = "stellar_overlay_byte_read_total";
-pub const OVERLAY_BYTE_WRITE_TOTAL: &str = "stellar_overlay_byte_write_total";
 pub const OVERLAY_ERROR_READ_TOTAL: &str = "stellar_overlay_error_read_total";
 pub const OVERLAY_ERROR_WRITE_TOTAL: &str = "stellar_overlay_error_write_total";
 pub const OVERLAY_TIMEOUT_IDLE_TOTAL: &str = "stellar_overlay_timeout_idle_total";
 pub const OVERLAY_TIMEOUT_STRAGGLER_TOTAL: &str = "stellar_overlay_timeout_straggler_total";
-pub const OVERLAY_PENDING_PEERS: &str = "stellar_overlay_pending_peers";
-pub const OVERLAY_AUTHENTICATED_PEERS: &str = "stellar_overlay_authenticated_peers";
-pub const OVERLAY_FLOOD_DEMANDED_TOTAL: &str = "stellar_overlay_flood_demanded_total";
-pub const OVERLAY_FLOOD_FULFILLED_TOTAL: &str = "stellar_overlay_flood_fulfilled_total";
-pub const OVERLAY_DEMAND_TIMEOUT_TOTAL: &str = "stellar_overlay_demand_timeout_total";
-pub const OVERLAY_CONNECTION_LATENCY_US_SUM: &str = "stellar_overlay_connection_latency_us_sum";
-pub const OVERLAY_CONNECTION_LATENCY_US_COUNT: &str = "stellar_overlay_connection_latency_us_count";
-pub const OVERLAY_TX_PULL_LATENCY_US_SUM: &str = "stellar_overlay_tx_pull_latency_us_sum";
-pub const OVERLAY_TX_PULL_LATENCY_US_COUNT: &str = "stellar_overlay_tx_pull_latency_us_count";
 
 // ── Registration ───────────────────────────────────────────────────────
 
@@ -246,18 +234,9 @@ pub fn describe_metrics() {
         OVERLAY_MESSAGE_WRITE_TOTAL,
         "Total overlay messages written to peers"
     );
-    describe_counter!(OVERLAY_MESSAGE_DROP_TOTAL, "Total overlay messages dropped");
     describe_counter!(
         OVERLAY_MESSAGE_BROADCAST_TOTAL,
         "Total overlay messages broadcast to all peers"
-    );
-    describe_counter!(
-        OVERLAY_BYTE_READ_TOTAL,
-        "Total bytes read from overlay peers"
-    );
-    describe_counter!(
-        OVERLAY_BYTE_WRITE_TOTAL,
-        "Total bytes written to overlay peers"
     );
     describe_counter!(OVERLAY_ERROR_READ_TOTAL, "Total overlay read errors");
     describe_counter!(OVERLAY_ERROR_WRITE_TOTAL, "Total overlay write errors");
@@ -268,42 +247,6 @@ pub fn describe_metrics() {
     describe_counter!(
         OVERLAY_TIMEOUT_STRAGGLER_TOTAL,
         "Total peers dropped due to straggler timeout"
-    );
-    describe_gauge!(
-        OVERLAY_PENDING_PEERS,
-        "Number of overlay peers in pending (unauthenticated) state"
-    );
-    describe_gauge!(
-        OVERLAY_AUTHENTICATED_PEERS,
-        "Number of authenticated overlay peers"
-    );
-    describe_counter!(
-        OVERLAY_FLOOD_DEMANDED_TOTAL,
-        "Total transaction flood demands sent to peers"
-    );
-    describe_counter!(
-        OVERLAY_FLOOD_FULFILLED_TOTAL,
-        "Total transaction flood demands fulfilled by peers"
-    );
-    describe_counter!(
-        OVERLAY_DEMAND_TIMEOUT_TOTAL,
-        "Total transaction flood demands that timed out"
-    );
-    describe_gauge!(
-        OVERLAY_CONNECTION_LATENCY_US_SUM,
-        "Connection auth latency microseconds (cumulative sum)"
-    );
-    describe_gauge!(
-        OVERLAY_CONNECTION_LATENCY_US_COUNT,
-        "Connection auth latency sample count"
-    );
-    describe_gauge!(
-        OVERLAY_TX_PULL_LATENCY_US_SUM,
-        "Tx pull latency microseconds (cumulative sum)"
-    );
-    describe_gauge!(
-        OVERLAY_TX_PULL_LATENCY_US_COUNT,
-        "Tx pull latency sample count"
     );
 }
 
@@ -363,23 +306,11 @@ pub fn register_label_series() {
     // Overlay counters.
     counter!(OVERLAY_MESSAGE_READ_TOTAL).absolute(0);
     counter!(OVERLAY_MESSAGE_WRITE_TOTAL).absolute(0);
-    counter!(OVERLAY_MESSAGE_DROP_TOTAL).absolute(0);
     counter!(OVERLAY_MESSAGE_BROADCAST_TOTAL).absolute(0);
-    counter!(OVERLAY_BYTE_READ_TOTAL).absolute(0);
-    counter!(OVERLAY_BYTE_WRITE_TOTAL).absolute(0);
     counter!(OVERLAY_ERROR_READ_TOTAL).absolute(0);
     counter!(OVERLAY_ERROR_WRITE_TOTAL).absolute(0);
     counter!(OVERLAY_TIMEOUT_IDLE_TOTAL).absolute(0);
     counter!(OVERLAY_TIMEOUT_STRAGGLER_TOTAL).absolute(0);
-    gauge!(OVERLAY_PENDING_PEERS).set(0.0);
-    gauge!(OVERLAY_AUTHENTICATED_PEERS).set(0.0);
-    counter!(OVERLAY_FLOOD_DEMANDED_TOTAL).absolute(0);
-    counter!(OVERLAY_FLOOD_FULFILLED_TOTAL).absolute(0);
-    counter!(OVERLAY_DEMAND_TIMEOUT_TOTAL).absolute(0);
-    gauge!(OVERLAY_CONNECTION_LATENCY_US_SUM).set(0.0);
-    gauge!(OVERLAY_CONNECTION_LATENCY_US_COUNT).set(0.0);
-    gauge!(OVERLAY_TX_PULL_LATENCY_US_SUM).set(0.0);
-    gauge!(OVERLAY_TX_PULL_LATENCY_US_COUNT).set(0.0);
 
     // Labeled counters — all reason labels pre-registered at zero.
     for reason in PreFilterRejectReason::ALL {
@@ -477,24 +408,11 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     if let Some(ov) = state.app.overlay_metrics_snapshot().await {
         counter!(OVERLAY_MESSAGE_READ_TOTAL).absolute(ov.messages_read);
         counter!(OVERLAY_MESSAGE_WRITE_TOTAL).absolute(ov.messages_written);
-        counter!(OVERLAY_MESSAGE_DROP_TOTAL).absolute(ov.messages_dropped);
         counter!(OVERLAY_MESSAGE_BROADCAST_TOTAL).absolute(ov.messages_broadcast);
-        counter!(OVERLAY_BYTE_READ_TOTAL).absolute(ov.bytes_read);
-        counter!(OVERLAY_BYTE_WRITE_TOTAL).absolute(ov.bytes_written);
         counter!(OVERLAY_ERROR_READ_TOTAL).absolute(ov.errors_read);
         counter!(OVERLAY_ERROR_WRITE_TOTAL).absolute(ov.errors_write);
         counter!(OVERLAY_TIMEOUT_IDLE_TOTAL).absolute(ov.timeouts_idle);
         counter!(OVERLAY_TIMEOUT_STRAGGLER_TOTAL).absolute(ov.timeouts_straggler);
-        gauge!(OVERLAY_PENDING_PEERS).set(ov.pending_peers as f64);
-        gauge!(OVERLAY_AUTHENTICATED_PEERS).set(ov.authenticated_peers as f64);
-        counter!(OVERLAY_FLOOD_DEMANDED_TOTAL).absolute(ov.flood_demanded);
-        counter!(OVERLAY_FLOOD_FULFILLED_TOTAL).absolute(ov.flood_fulfilled);
-        counter!(OVERLAY_DEMAND_TIMEOUT_TOTAL).absolute(ov.demand_timeouts);
-        gauge!(OVERLAY_CONNECTION_LATENCY_US_SUM)
-            .set(ov.connection_latency.total.as_micros() as f64);
-        gauge!(OVERLAY_CONNECTION_LATENCY_US_COUNT).set(ov.connection_latency.count as f64);
-        gauge!(OVERLAY_TX_PULL_LATENCY_US_SUM).set(ov.tx_pull_latency.total.as_micros() as f64);
-        gauge!(OVERLAY_TX_PULL_LATENCY_US_COUNT).set(ov.tx_pull_latency.count as f64);
     }
 }
 
@@ -602,10 +520,6 @@ mod tests {
             output.contains("# HELP stellar_overlay_timeout_idle_total"),
             "missing HELP for overlay_timeout_idle_total"
         );
-        assert!(
-            output.contains("# HELP stellar_overlay_connection_latency_us_sum"),
-            "missing HELP for overlay_connection_latency_us_sum"
-        );
     }
 
     #[test]
@@ -677,12 +591,8 @@ mod tests {
             "missing TYPE counter for overlay_message_read_total"
         );
         assert!(
-            output.contains("# TYPE stellar_overlay_authenticated_peers gauge"),
-            "missing TYPE gauge for overlay_authenticated_peers"
-        );
-        assert!(
-            output.contains("# TYPE stellar_overlay_connection_latency_us_sum gauge"),
-            "missing TYPE gauge for overlay_connection_latency_us_sum"
+            output.contains("# TYPE stellar_overlay_error_write_total counter"),
+            "missing TYPE counter for overlay_error_write_total"
         );
     }
 
