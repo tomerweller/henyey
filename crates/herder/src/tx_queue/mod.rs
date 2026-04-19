@@ -724,10 +724,13 @@ impl QueueStore {
         }
     }
 
-    fn clear(&mut self) {
+    /// Clear only the transaction data (by_hash + fee_index).
+    /// Does NOT invalidate eviction queues — the caller is responsible for
+    /// calling `regenerate_eviction_seed()` or using a `TransactionQueue`
+    /// invalidation helper.
+    fn clear_data(&mut self) {
         self.by_hash.clear();
         self.fee_index.clear();
-        self.regenerate_eviction_seed();
     }
 
     /// Regenerate the eviction seed and invalidate all persistent eviction
@@ -802,7 +805,7 @@ impl QueueStore {
     /// Verify persistent eviction queues match a cold rebuild from by_hash.
     ///
     /// For each active eviction queue, rebuilds a fresh queue from scratch and
-    /// compares total/per-lane resource counts and entry counts.
+    /// compares total/per-lane resource counts and ordered entry hashes.
     #[cfg(test)]
     #[allow(dead_code)]
     fn assert_eviction_queues_consistent(&self, ledger_version: u32) {
@@ -839,6 +842,11 @@ impl QueueStore {
                     fresh.lane_resources(lane),
                     "classic eviction queue lane {lane} resources mismatch"
                 );
+                assert_eq!(
+                    queue.lane_entry_hashes(lane),
+                    fresh.lane_entry_hashes(lane),
+                    "classic eviction queue lane {lane} entries mismatch"
+                );
             }
         }
 
@@ -864,6 +872,13 @@ impl QueueStore {
                 fresh.total_resources(),
                 "soroban eviction queue total resources mismatch"
             );
+            for lane in 0..queue.get_num_lanes() {
+                assert_eq!(
+                    queue.lane_entry_hashes(lane),
+                    fresh.lane_entry_hashes(lane),
+                    "soroban eviction queue lane {lane} entries mismatch"
+                );
+            }
         }
 
         // Check global ops queue
@@ -880,6 +895,13 @@ impl QueueStore {
                 fresh.total_resources(),
                 "global ops eviction queue total resources mismatch"
             );
+            for lane in 0..queue.get_num_lanes() {
+                assert_eq!(
+                    queue.lane_entry_hashes(lane),
+                    fresh.lane_entry_hashes(lane),
+                    "global ops eviction queue lane {lane} entries mismatch"
+                );
+            }
         }
     }
 
@@ -1076,6 +1098,43 @@ fn account_id_from_fee_source_key(key: &[u8]) -> AccountId {
 ///
 /// Transactions that sit in the queue for too long (pending_depth ledgers) are
 /// automatically banned. This prevents stale transactions from occupying queue space.
+/// Cached min-fee thresholds from the most recent eviction pass.
+/// Used for fast-path admission rejection without rebuilding eviction queues.
+///
+/// These thresholds live in `TransactionQueue` (not `QueueStore`) because
+/// they're read during the admission fast-path under separate `RwLock`s
+/// without holding the store lock.
+struct EvictionThresholds {
+    /// Lane eviction thresholds for classic queue admission.
+    classic_lane_fees: RwLock<Vec<(u64, u32)>>,
+    /// Lane eviction thresholds for Soroban queue admission.
+    soroban_lane_fees: RwLock<Vec<(u64, u32)>>,
+    /// Eviction threshold for global queue limits.
+    global_fees: RwLock<(u64, u32)>,
+}
+
+impl EvictionThresholds {
+    fn new() -> Self {
+        Self {
+            classic_lane_fees: RwLock::new(Vec::new()),
+            soroban_lane_fees: RwLock::new(Vec::new()),
+            global_fees: RwLock::new((0, 0)),
+        }
+    }
+
+    /// Reset all cached thresholds.
+    fn reset_all(&self) {
+        self.classic_lane_fees.write().clear();
+        self.soroban_lane_fees.write().clear();
+        *self.global_fees.write() = (0, 0);
+    }
+
+    /// Reset only Soroban lane thresholds.
+    fn reset_soroban(&self) {
+        self.soroban_lane_fees.write().clear();
+    }
+}
+
 pub struct TransactionQueue {
     /// Configuration.
     config: TxQueueConfig,
@@ -1085,12 +1144,8 @@ pub struct TransactionQueue {
     seen: RwLock<HashSet<Hash256>>,
     /// Validation context (ledger state info for validation).
     validation_context: RwLock<ValidationContext>,
-    /// Lane eviction thresholds for classic queue admission.
-    classic_lane_evicted_inclusion_fee: RwLock<Vec<(u64, u32)>>,
-    /// Lane eviction thresholds for Soroban queue admission.
-    soroban_lane_evicted_inclusion_fee: RwLock<Vec<(u64, u32)>>,
-    /// Eviction threshold for global queue limits.
-    global_evicted_inclusion_fee: RwLock<(u64, u32)>,
+    /// Cached eviction fee thresholds for fast-path admission rejection.
+    eviction_thresholds: EvictionThresholds,
     /// Banned transaction hashes, organized as a deque of sets.
     /// Each set represents one ledger's worth of banned transactions.
     /// The front is the oldest, the back is the newest.
@@ -1160,9 +1215,7 @@ impl TransactionQueue {
             config,
             seen: RwLock::new(HashSet::new()),
             validation_context: RwLock::new(ctx),
-            classic_lane_evicted_inclusion_fee: RwLock::new(Vec::new()),
-            soroban_lane_evicted_inclusion_fee: RwLock::new(Vec::new()),
-            global_evicted_inclusion_fee: RwLock::new((0, 0)),
+            eviction_thresholds: EvictionThresholds::new(),
             banned_transactions: RwLock::new(banned),
             account_states: RwLock::new(HashMap::new()),
             pending_depth,
@@ -1215,12 +1268,8 @@ impl TransactionQueue {
     /// the pool ledger multiplier.
     pub fn update_soroban_resource_limits(&self, resources: Resource) {
         *self.dynamic_queue_soroban_resources.write() = Some(resources);
-        // Invalidate the persistent soroban eviction queue so it gets rebuilt
-        // with the new limits on next admission.
-        self.store.write().soroban_eviction_queue = None;
-        // Reset cached Soroban eviction thresholds to avoid stale FeeTooLow
-        // rejections when limits expand.
-        self.soroban_lane_evicted_inclusion_fee.write().clear();
+        // Invalidate Soroban eviction state: persistent queue + cached thresholds.
+        self.invalidate_soroban_eviction_state(&mut self.store.write());
     }
 
     /// Update Soroban resource limits for tx-set selection (1x ledger max).
@@ -1644,7 +1693,7 @@ impl TransactionQueue {
         if lane_fees.len() != lane_config.lane_limits().len() {
             lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
         }
-        let global_fee = *self.global_evicted_inclusion_fee.read();
+        let global_fee = *self.eviction_thresholds.global_fees.read();
         let mut min_fee = min_inclusion_fee_to_beat(lane_fees[lane], queued);
         min_fee = min_fee.max(min_inclusion_fee_to_beat(lane_fees[GENERIC_LANE], queued));
         if self.config.max_queue_ops.is_some() {
@@ -1665,7 +1714,7 @@ impl TransactionQueue {
         // Phase 1: Check minimum inclusion fee for each lane (cheap, read-only)
         if !candidate.is_soroban {
             if let Some(lane_config) = self.build_classic_lane_config() {
-                let mut lane_fees = self.classic_lane_evicted_inclusion_fee.write();
+                let mut lane_fees = self.eviction_thresholds.classic_lane_fees.write();
                 if self.fee_below_lane_threshold(
                     &lane_config,
                     &mut lane_fees,
@@ -1680,7 +1729,7 @@ impl TransactionQueue {
         if candidate.is_soroban {
             if let Some(limit) = self.effective_queue_soroban_resources() {
                 let lane_config = SorobanGenericLaneConfig::new(limit);
-                let mut lane_fees = self.soroban_lane_evicted_inclusion_fee.write();
+                let mut lane_fees = self.eviction_thresholds.soroban_lane_fees.write();
                 if self.fee_below_lane_threshold(
                     &lane_config,
                     &mut lane_fees,
@@ -1693,7 +1742,7 @@ impl TransactionQueue {
         }
 
         if self.config.max_queue_ops.is_some() {
-            let global_fee = *self.global_evicted_inclusion_fee.read();
+            let global_fee = *self.eviction_thresholds.global_fees.read();
             if min_inclusion_fee_to_beat(global_fee, candidate.queued) > 0 {
                 return Err(TxQueueResult::FeeTooLow);
             }
@@ -1736,7 +1785,7 @@ impl TransactionQueue {
                 };
                 self.record_lane_evictions(
                     &lane_config,
-                    &self.classic_lane_evicted_inclusion_fee,
+                    &self.eviction_thresholds.classic_lane_fees,
                     evictions,
                     &mut pending_evictions,
                     &mut pending_eviction_list,
@@ -1777,7 +1826,7 @@ impl TransactionQueue {
                 let lane_config_for_record = SorobanGenericLaneConfig::new(limit);
                 self.record_lane_evictions(
                     &lane_config_for_record,
-                    &self.soroban_lane_evicted_inclusion_fee,
+                    &self.eviction_thresholds.soroban_lane_fees,
                     evictions,
                     &mut pending_evictions,
                     &mut pending_eviction_list,
@@ -1818,7 +1867,7 @@ impl TransactionQueue {
                 if !pending_evictions.insert(evicted.hash) {
                     continue;
                 }
-                let mut global_fee = self.global_evicted_inclusion_fee.write();
+                let mut global_fee = self.eviction_thresholds.global_fees.write();
                 *global_fee = (evicted.inclusion_fee, evicted.op_count);
                 pending_eviction_list.push(evicted);
             }
@@ -2200,10 +2249,20 @@ impl TransactionQueue {
     ///
     /// Called whenever the queue is rebuilt or transactions are evicted/shifted
     /// so that stale minimum-fee requirements are not carried forward.
-    fn reset_eviction_thresholds(&self) {
-        self.classic_lane_evicted_inclusion_fee.write().clear();
-        self.soroban_lane_evicted_inclusion_fee.write().clear();
-        *self.global_evicted_inclusion_fee.write() = (0, 0);
+    /// Invalidate all persistent eviction queues and cached fee thresholds.
+    /// Regenerates the eviction seed, causing queues to be lazily rebuilt.
+    /// Used by shift(), clear(), and reset_and_rebuild().
+    fn invalidate_all_eviction_state(&self, store: &mut QueueStore) {
+        store.regenerate_eviction_seed();
+        self.eviction_thresholds.reset_all();
+    }
+
+    /// Invalidate Soroban-only eviction state: drops the soroban persistent
+    /// queue and resets soroban cached thresholds.
+    /// Used by update_soroban_resource_limits().
+    fn invalidate_soroban_eviction_state(&self, store: &mut QueueStore) {
+        store.soroban_eviction_queue = None;
+        self.eviction_thresholds.reset_soroban();
     }
 
     /// Clear expired transactions.
@@ -2232,15 +2291,17 @@ impl TransactionQueue {
         }
 
         // Mirror stellar-core: clear eviction thresholds after aging to avoid
-        // carrying stale min-fee requirements.
-        self.reset_eviction_thresholds();
+        // carrying stale min-fee requirements. Queues are already updated
+        // incrementally by store.remove() above.
+        self.eviction_thresholds.reset_all();
     }
 
     /// Clear all transactions.
     pub fn clear(&self) {
-        self.store.write().clear();
+        let mut store = self.store.write();
+        store.clear_data();
+        self.invalidate_all_eviction_state(&mut store);
         self.account_states.write().clear();
-        self.reset_eviction_thresholds();
         // Don't clear seen - prevents replay
     }
 
@@ -2511,13 +2572,10 @@ impl TransactionQueue {
             account_states.remove(&account_key);
         }
 
-        // Reset eviction thresholds for the new ledger
-        self.reset_eviction_thresholds();
-
-        // Regenerate eviction seed and invalidate persistent queues for the
+        // Invalidate all eviction state (seed + queues + thresholds) for the
         // new ledger. Parity: stellar-core regenerates mBroadcastSeed in shift()
         // and calls resetBestFeeTxs() with the new seed.
-        store.regenerate_eviction_seed();
+        self.invalidate_all_eviction_state(&mut store);
 
         // Clean up seen set for evicted transactions
         if !evicted_hashes.is_empty() {
@@ -2554,7 +2612,9 @@ impl TransactionQueue {
         // Clear queue state but preserve bans (bans cannot be invalidated
         // by a protocol upgrade, matching upstream).
         {
-            self.store.write().clear();
+            let mut store = self.store.write();
+            store.clear_data();
+            self.invalidate_all_eviction_state(&mut store);
         }
         {
             let mut seen = self.seen.write();
@@ -2564,7 +2624,6 @@ impl TransactionQueue {
             let mut account_states = self.account_states.write();
             account_states.clear();
         }
-        self.reset_eviction_thresholds();
 
         // Re-add all existing transactions. The surge pricing logic in
         // try_add() will handle sorting and evictions based on new limits.
@@ -7626,6 +7685,52 @@ mod eviction_queue_tests {
         })
     }
 
+    fn make_soroban_envelope_with_resources(fee: u32, instructions: u32) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                    function_name: ScSymbol("test".try_into().unwrap()),
+                    args: VecM::default(),
+                }),
+                auth: VecM::default(),
+            }),
+        };
+        let resources = SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: VecM::default(),
+                read_write: VecM::default(),
+            },
+            instructions,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources,
+                resource_fee: 0,
+            }),
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
     /// After adding several txs via try_add, the persistent eviction queues
     /// should match a cold rebuild from by_hash.
     #[test]
@@ -7775,6 +7880,58 @@ mod eviction_queue_tests {
         let store = queue.store.read();
         store.assert_consistent();
         store.assert_eviction_queues_consistent(0);
+    }
+
+    /// After update_soroban_resource_limits expands limits, a previously-rejected
+    /// Soroban tx (FeeTooLow due to stale thresholds) should now be accepted.
+    /// Regression test for the bug caught during #1813 review.
+    #[test]
+    fn test_soroban_fee_too_low_cleared_after_limit_expansion() {
+        use henyey_common::{ResourceType, NUM_SOROBAN_TX_RESOURCES};
+
+        // Start with tight Soroban limits: only 100 instructions allowed total.
+        let mut initial_limit = Resource::new(vec![i64::MAX; NUM_SOROBAN_TX_RESOURCES]);
+        initial_limit.set_val(ResourceType::Instructions, 100);
+        let config = TxQueueConfig {
+            max_queue_soroban_resources: Some(initial_limit),
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Fill to capacity: tx with 80 instructions uses most of the budget.
+        let mut tx1 = make_soroban_envelope_with_resources(4000, 80);
+        set_source(&mut tx1, 91);
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+
+        // tx2 also needs 80 instructions — evicts tx1 (higher fee wins).
+        let mut tx2 = make_soroban_envelope_with_resources(8000, 80);
+        set_source(&mut tx2, 92);
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1, "tx1 should have been evicted");
+
+        // tx3 has fee=4000 which equals the evicted tx1's fee — should be
+        // rejected as FeeTooLow because cached thresholds remember the eviction.
+        let mut tx3 = make_soroban_envelope_with_resources(4000, 80);
+        set_source(&mut tx3, 93);
+        assert_eq!(
+            queue.try_add(tx3.clone()),
+            TxQueueResult::FeeTooLow,
+            "tx3 should be rejected before limit expansion"
+        );
+
+        // Expand limits: now 200 instructions allowed — both tx2 and tx3 can fit.
+        let mut expanded_limit = Resource::new(vec![i64::MAX; NUM_SOROBAN_TX_RESOURCES]);
+        expanded_limit.set_val(ResourceType::Instructions, 200);
+        queue.update_soroban_resource_limits(expanded_limit);
+
+        // After limit expansion, tx3 should now be accepted (thresholds were reset).
+        assert_eq!(
+            queue.try_add(tx3),
+            TxQueueResult::Added,
+            "tx3 should be accepted after Soroban limit expansion resets thresholds"
+        );
+        assert_eq!(queue.len(), 2);
     }
 
     /// After update_soroban_resource_limits, the soroban eviction queue

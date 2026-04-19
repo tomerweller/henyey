@@ -495,6 +495,14 @@ impl SurgePricingPriorityQueue {
         self.erase(lane, entry, ledger_version, network_id);
     }
 
+    /// Return ordered entry hashes for the given lane (ascending by fee rate).
+    /// Test-only: used by `assert_eviction_queues_consistent()` to compare
+    /// lane contents against a fresh rebuild.
+    #[cfg(test)]
+    pub(crate) fn lane_entry_hashes(&self, lane: usize) -> Vec<[u8; 32]> {
+        self.lanes[lane].iter().map(|e| e.hash).collect()
+    }
+
     pub(crate) fn pop_top_txs(
         &mut self,
         allow_gaps: bool,
