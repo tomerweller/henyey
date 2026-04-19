@@ -391,9 +391,7 @@ pub struct App {
     /// Count of SCP envelopes received by this node.
     scp_messages_received: AtomicU64,
     /// SCP pre-filter rejections by reason (issue #1734 Phase B metrics).
-    scp_prefilter_reject_cannot_receive: AtomicU64,
-    scp_prefilter_reject_close_time: AtomicU64,
-    scp_prefilter_reject_range: AtomicU64,
+    scp_prefilter_counters: henyey_herder::scp_verify::PreFilterCounters<AtomicU64>,
     /// Post-verify drops (gate drift, self-message, non-quorum, invalid).
     /// Aggregate counter — kept for backward compatibility with existing dashboards.
     scp_post_verify_drops: AtomicU64,
@@ -809,9 +807,7 @@ impl App {
             scp_confirm_sent: AtomicU64::new(0),
             scp_externalize_sent: AtomicU64::new(0),
             scp_messages_received: AtomicU64::new(0),
-            scp_prefilter_reject_cannot_receive: AtomicU64::new(0),
-            scp_prefilter_reject_close_time: AtomicU64::new(0),
-            scp_prefilter_reject_range: AtomicU64::new(0),
+            scp_prefilter_counters: henyey_herder::scp_verify::PreFilterCounters::default(),
             scp_post_verify_drops: AtomicU64::new(0),
             scp_pv_counters: henyey_herder::scp_verify::PostVerifyCounters::default(),
             scp_verify_latency_us_sum: AtomicU64::new(0),
@@ -1792,13 +1788,9 @@ impl App {
             meta_stream_bytes_total: meta_bytes,
             meta_stream_writes_total: meta_writes,
             scp_verify: ScpVerifyMetrics {
-                prefilter_reject_cannot_receive: self
-                    .scp_prefilter_reject_cannot_receive
-                    .load(Ordering::Relaxed),
-                prefilter_reject_close_time: self
-                    .scp_prefilter_reject_close_time
-                    .load(Ordering::Relaxed),
-                prefilter_reject_range: self.scp_prefilter_reject_range.load(Ordering::Relaxed),
+                prefilter_counters: henyey_herder::scp_verify::PreFilterCounters::from_fn(|r| {
+                    self.scp_prefilter_counters[r].load(Ordering::Relaxed)
+                }),
                 post_verify_drops: self.scp_post_verify_drops.load(Ordering::Relaxed),
                 pv_counters: henyey_herder::scp_verify::PostVerifyCounters::from_fn(|r| {
                     self.scp_pv_counters[r].load(Ordering::Relaxed)

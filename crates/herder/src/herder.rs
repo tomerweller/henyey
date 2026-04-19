@@ -1003,7 +1003,7 @@ impl Herder {
                 use crate::scp_verify::PreFilterRejectReason as R;
                 debug!(
                     slot,
-                    reason = reason.as_str(),
+                    reason = reason.label(),
                     "pre-filter rejected envelope"
                 );
                 return match reason {
@@ -1055,7 +1055,7 @@ impl Herder {
             PreFilter::Reject(reason) => {
                 debug!(
                     slot,
-                    reason = reason.as_str(),
+                    reason = reason.label(),
                     "pre-filter rejected envelope"
                 );
                 return match reason {
@@ -1240,7 +1240,7 @@ impl Herder {
                 use crate::scp_verify::PreFilterRejectReason as R;
                 debug!(
                     slot,
-                    reason = reason.as_str(),
+                    reason = reason.label(),
                     "post-verify gate drift rejected envelope"
                 );
                 let (state, post) = match reason {

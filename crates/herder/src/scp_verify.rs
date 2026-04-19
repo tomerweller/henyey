@@ -65,20 +65,83 @@ impl VerifierState {
 }
 
 /// Reason a pre-filter rejected an envelope.
+#[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreFilterRejectReason {
-    CannotReceiveScp,
-    CloseTime,
-    Range,
+    CannotReceiveScp = 0,
+    CloseTime = 1,
+    Range = 2,
 }
 
 impl PreFilterRejectReason {
-    pub fn as_str(self) -> &'static str {
+    /// All variants in discriminant order. This is the single source of truth
+    /// for iteration, counter allocation, and Prometheus label generation.
+    pub const ALL: [Self; 3] = [Self::CannotReceiveScp, Self::CloseTime, Self::Range];
+
+    /// Prometheus metric label for this reason.
+    pub const fn label(&self) -> &'static str {
         match self {
-            PreFilterRejectReason::CannotReceiveScp => "can_receive",
-            PreFilterRejectReason::CloseTime => "close_time",
-            PreFilterRejectReason::Range => "range",
+            Self::CannotReceiveScp => "cannot_receive",
+            Self::CloseTime => "close_time",
+            Self::Range => "range",
         }
+    }
+}
+
+// Compile-time: ALL is complete, ordered, and covers every discriminant.
+const _: () = {
+    let mut i = 0;
+    while i < PreFilterRejectReason::ALL.len() {
+        assert!(PreFilterRejectReason::ALL[i] as usize == i);
+        i += 1;
+    }
+    assert!(PreFilterRejectReason::ALL.len() == PreFilterRejectReason::Range as usize + 1);
+};
+
+/// Fixed-size counter array indexed by [`PreFilterRejectReason`].
+///
+/// Wraps `[T; N]` so callers never perform raw ordinal arithmetic.
+/// Used for both the live `AtomicU64` counters in `App` and the
+/// plain `u64` snapshot in `ScpVerifyMetrics`.
+#[derive(Debug)]
+pub struct PreFilterCounters<T>([T; PreFilterRejectReason::ALL.len()]);
+
+impl<T: Default> Default for PreFilterCounters<T> {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| T::default()))
+    }
+}
+
+impl<T: Clone> Clone for PreFilterCounters<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> PreFilterCounters<T> {
+    /// Build from a function that maps each reason to a value.
+    pub fn from_fn(mut f: impl FnMut(PreFilterRejectReason) -> T) -> Self {
+        Self(std::array::from_fn(|i| f(PreFilterRejectReason::ALL[i])))
+    }
+
+    /// Iterate `(reason, &value)` pairs in discriminant order.
+    pub fn iter(&self) -> impl Iterator<Item = (PreFilterRejectReason, &T)> {
+        PreFilterRejectReason::ALL
+            .iter()
+            .map(|&r| (r, &self.0[r as usize]))
+    }
+}
+
+impl<T> std::ops::Index<PreFilterRejectReason> for PreFilterCounters<T> {
+    type Output = T;
+    fn index(&self, reason: PreFilterRejectReason) -> &T {
+        &self.0[reason as usize]
+    }
+}
+
+impl<T> std::ops::IndexMut<PreFilterRejectReason> for PreFilterCounters<T> {
+    fn index_mut(&mut self, reason: PreFilterRejectReason) -> &mut T {
+        &mut self.0[reason as usize]
     }
 }
 

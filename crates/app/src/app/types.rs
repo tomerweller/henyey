@@ -245,10 +245,8 @@ pub struct OverlayFetchChannelMetrics {
 /// Metrics for the SCP signature-verify pipeline (issue #1734 Phase B).
 #[derive(Debug, Clone, Default)]
 pub struct ScpVerifyMetrics {
-    /// Pre-filter rejects by reason (cumulative).
-    pub prefilter_reject_cannot_receive: u64,
-    pub prefilter_reject_close_time: u64,
-    pub prefilter_reject_range: u64,
+    /// Pre-filter rejects by reason (cumulative), indexed by [`PreFilterRejectReason`].
+    pub prefilter_counters: henyey_herder::scp_verify::PreFilterCounters<u64>,
     /// Drops after verification (gate drift, self-message, non-quorum, invalid).
     /// Aggregate — kept for backward compatibility.
     pub post_verify_drops: u64,

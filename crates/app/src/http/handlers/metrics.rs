@@ -78,18 +78,27 @@ pub(crate) fn render_prometheus_text(metrics: &MetricsResponse, app_info: &AppIn
 
     // SCP signature-verify pipeline metrics (issue #1734 Phase B).
     let sv = &app_info.scp_verify;
+    // Pre-filter rejects — driven from PreFilterRejectReason::ALL (issue #1817).
+    {
+        use std::fmt::Write;
+        prometheus_text.push_str(
+            "# HELP henyey_scp_prefilter_rejects_total SCP envelopes rejected by the event-loop pre-filter, by reason\n\
+             # TYPE henyey_scp_prefilter_rejects_total counter\n",
+        );
+        for (reason, count) in sv.prefilter_counters.iter() {
+            write!(
+                prometheus_text,
+                "henyey_scp_prefilter_rejects_total{{reason=\"{}\"}} {}\n",
+                reason.label(),
+                count,
+            )
+            .unwrap();
+        }
+    }
     prometheus_text.push_str(&format!(
-        "# HELP henyey_scp_prefilter_rejects_total SCP envelopes rejected by the event-loop pre-filter, by reason\n\
-         # TYPE henyey_scp_prefilter_rejects_total counter\n\
-         henyey_scp_prefilter_rejects_total{{reason=\"cannot_receive\"}} {}\n\
-         henyey_scp_prefilter_rejects_total{{reason=\"close_time\"}} {}\n\
-         henyey_scp_prefilter_rejects_total{{reason=\"range\"}} {}\n\
-         # HELP henyey_scp_post_verify_drops_total Envelopes dropped after verification (aggregate)\n\
+        "# HELP henyey_scp_post_verify_drops_total Envelopes dropped after verification (aggregate)\n\
          # TYPE henyey_scp_post_verify_drops_total counter\n\
          henyey_scp_post_verify_drops_total {}\n",
-        sv.prefilter_reject_cannot_receive,
-        sv.prefilter_reject_close_time,
-        sv.prefilter_reject_range,
         sv.post_verify_drops,
     ));
     // Per-reason post-verify counters — driven from PostVerifyReason::ALL (issue #1792).
@@ -256,6 +265,56 @@ mod tests {
         for reason in PostVerifyReason::ALL {
             let label = format!(
                 "henyey_scp_post_verify_total{{reason=\"{}\"}}",
+                reason.label()
+            );
+            assert!(
+                body.contains(&label),
+                "missing counter for reason={}; got:\n{body}",
+                reason.label()
+            );
+        }
+    }
+
+    /// Issue #1817: `/metrics` must expose per-reason prefilter reject counters
+    /// as labeled `henyey_scp_prefilter_rejects_total{reason="..."}` lines,
+    /// driven from `PreFilterRejectReason::ALL`.
+    #[test]
+    fn metrics_endpoint_exposes_per_reason_prefilter_counters() {
+        use henyey_herder::scp_verify::PreFilterRejectReason;
+
+        let mut app_info = dummy_app_info();
+        app_info.scp_verify.prefilter_counters[PreFilterRejectReason::CannotReceiveScp] = 7;
+        app_info.scp_verify.prefilter_counters[PreFilterRejectReason::CloseTime] = 3;
+        app_info.scp_verify.prefilter_counters[PreFilterRejectReason::Range] = 11;
+        let body = render_prometheus_text(&dummy_metrics(), &app_info);
+        assert!(
+            body.contains("# HELP henyey_scp_prefilter_rejects_total "),
+            "missing HELP line for prefilter_rejects_total"
+        );
+        assert!(
+            body.contains("# TYPE henyey_scp_prefilter_rejects_total counter"),
+            "missing TYPE line for prefilter_rejects_total"
+        );
+        assert!(
+            body.contains("henyey_scp_prefilter_rejects_total{reason=\"cannot_receive\"} 7"),
+            "cannot_receive counter not rendered correctly; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("henyey_scp_prefilter_rejects_total{reason=\"close_time\"} 3"),
+            "close_time counter not rendered correctly; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("henyey_scp_prefilter_rejects_total{reason=\"range\"} 11"),
+            "range counter not rendered correctly; got:\n{}",
+            body
+        );
+        // Verify all reason labels are present — driven from PreFilterRejectReason::ALL
+        // so adding a variant automatically extends this check.
+        for reason in PreFilterRejectReason::ALL {
+            let label = format!(
+                "henyey_scp_prefilter_rejects_total{{reason=\"{}\"}}",
                 reason.label()
             );
             assert!(

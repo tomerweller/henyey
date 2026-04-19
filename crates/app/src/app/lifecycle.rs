@@ -1724,13 +1724,7 @@ impl App {
     }
 
     fn record_prefilter_reject(&self, reason: henyey_herder::scp_verify::PreFilterRejectReason) {
-        use henyey_herder::scp_verify::PreFilterRejectReason as R;
-        let counter = match reason {
-            R::CannotReceiveScp => &self.scp_prefilter_reject_cannot_receive,
-            R::CloseTime => &self.scp_prefilter_reject_close_time,
-            R::Range => &self.scp_prefilter_reject_range,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
+        self.scp_prefilter_counters[reason].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Process a fully-verified envelope on the event loop, running the
