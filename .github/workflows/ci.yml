@@ -42,6 +42,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all
+      # Run herder tests gated behind test-support (SCP stage attribution, split equivalence)
+      - run: cargo test -p henyey-herder --features test-support --tests
 
   build-release:
     name: Build (release-ci)
