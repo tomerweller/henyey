@@ -2493,4 +2493,285 @@ mod stellar_core_parity_tests {
             assert_eq!(compute_base_fee(&stages, had_drop), expected_base_fee);
         });
     }
+
+    // ---- Randomized smoke test (adapted from TxSetTests.cpp:3085-3154) ----
+
+    /// Extract the RO and RW ledger key sets from a transaction envelope's
+    /// Soroban footprint, serialized to bytes for set operations.
+    fn extract_footprint_keys(tx: &TransactionEnvelope) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let data = match tx {
+            TransactionEnvelope::Tx(env) => match &env.tx.ext {
+                TransactionExt::V1(d) => d,
+                _ => return (vec![], vec![]),
+            },
+            _ => return (vec![], vec![]),
+        };
+        let ro: Vec<Vec<u8>> = data
+            .resources
+            .footprint
+            .read_only
+            .iter()
+            .map(|k| k.to_xdr(Limits::none()).unwrap())
+            .collect();
+        let rw: Vec<Vec<u8>> = data
+            .resources
+            .footprint
+            .read_write
+            .iter()
+            .map(|k| k.to_xdr(Limits::none()).unwrap())
+            .collect();
+        (ro, rw)
+    }
+
+    /// Extract instruction count from a transaction envelope.
+    fn extract_instructions(tx: &TransactionEnvelope) -> u64 {
+        match tx {
+            TransactionEnvelope::Tx(env) => match &env.tx.ext {
+                TransactionExt::V1(d) => d.resources.instructions as u64,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    /// Verify no two clusters within a stage have RW-RW or RO-RW footprint conflicts.
+    fn assert_no_intra_stage_conflicts(stages: &[Vec<Vec<TransactionEnvelope>>], context: &str) {
+        use std::collections::HashSet;
+
+        for (si, stage) in stages.iter().enumerate() {
+            // Collect per-cluster RW and RO key sets.
+            let cluster_keys: Vec<(HashSet<Vec<u8>>, HashSet<Vec<u8>>)> = stage
+                .iter()
+                .map(|cluster| {
+                    let mut ro_set = HashSet::new();
+                    let mut rw_set = HashSet::new();
+                    for tx in cluster {
+                        let (ro, rw) = extract_footprint_keys(tx);
+                        ro_set.extend(ro);
+                        rw_set.extend(rw);
+                    }
+                    (ro_set, rw_set)
+                })
+                .collect();
+
+            // Check pairwise: no RW-RW or RO-RW conflicts between clusters.
+            for i in 0..cluster_keys.len() {
+                for j in (i + 1)..cluster_keys.len() {
+                    let (_, rw_i) = &cluster_keys[i];
+                    let (ro_j, rw_j) = &cluster_keys[j];
+                    let (ro_i, _) = &cluster_keys[i];
+
+                    // RW-RW conflict
+                    let rw_rw: Vec<_> = rw_i.intersection(rw_j).collect();
+                    assert!(
+                        rw_rw.is_empty(),
+                        "{context}: stage {si} clusters {i} and {j} have RW-RW conflict"
+                    );
+                    // RO-RW conflict (i reads, j writes)
+                    let ro_rw: Vec<_> = ro_i.intersection(rw_j).collect();
+                    assert!(
+                        ro_rw.is_empty(),
+                        "{context}: stage {si} clusters {i} and {j} have RO-RW conflict (i reads, j writes)"
+                    );
+                    // RO-RW conflict (j reads, i writes)
+                    let rw_ro: Vec<_> = rw_i.intersection(ro_j).collect();
+                    assert!(
+                        rw_ro.is_empty(),
+                        "{context}: stage {si} clusters {i} and {j} have RO-RW conflict (j reads, i writes)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_smoke_randomized_parallel_builder() {
+        use rand::distributions::Uniform;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::collections::HashSet;
+        use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
+
+        let mut variable_multistage_count = 0u32;
+
+        for iter in 0..10u64 {
+            let seed = 42 + iter;
+            let mut rng = StdRng::seed_from_u64(seed);
+
+            // Per-iteration distribution bounds (matching stellar-core pattern).
+            let max_insns: i32 = rng.gen_range(20_000_000..=100_000_000);
+            let key_range: i32 = rng.gen_range(50..=1000);
+
+            let insns_dist = Uniform::new_inclusive(1_000_000, max_insns);
+            let key_count_dist = Uniform::new_inclusive(1, 10);
+            let key_dist = Uniform::new_inclusive(1, key_range);
+            let fee_dist = Uniform::new_inclusive(100i64, 100_000i64);
+
+            let mut account_id = 0u32;
+            let mut txs = Vec::with_capacity(500);
+            for _ in 0..500 {
+                let ro_count: usize = rng.sample(key_count_dist) as usize;
+                let rw_count: usize = rng.sample(key_count_dist) as usize;
+
+                // Generate unique keys (matching stellar-core's dedup loop).
+                let mut used_keys = HashSet::new();
+                let mut ro_keys = Vec::with_capacity(ro_count);
+                let mut rw_keys = Vec::with_capacity(rw_count);
+                for i in 0..(ro_count + rw_count) {
+                    let mut key: i32 = rng.sample(key_dist);
+                    while used_keys.contains(&key) {
+                        key = rng.sample(key_dist);
+                    }
+                    used_keys.insert(key);
+                    if i < ro_count {
+                        ro_keys.push(key);
+                    } else {
+                        rw_keys.push(key);
+                    }
+                }
+
+                let instructions: i32 = rng.sample(insns_dist);
+                let fee: i64 = rng.sample(fee_dist);
+
+                txs.push(make_parity_tx(
+                    &mut account_id,
+                    instructions,
+                    &ro_keys,
+                    &rw_keys,
+                    fee,
+                ));
+            }
+
+            // Collect input TX hashes for conservation check.
+            let input_hashes: HashSet<[u8; 32]> = txs
+                .iter()
+                .map(|tx| Hash256::hash_xdr(tx).expect("hash input tx").0)
+                .collect();
+            assert_eq!(
+                input_hashes.len(),
+                500,
+                "seed={seed}: input TXs should all have unique hashes"
+            );
+
+            // Run with both variable and fixed stage configs.
+            for (mode, min_stages, max_stages) in [
+                ("variable", 1u32, STAGE_COUNT),
+                ("fixed", STAGE_COUNT, STAGE_COUNT),
+            ] {
+                let ctx = format!("seed={seed}, iter={iter}, mode={mode}");
+
+                let (stages, had_drop) = build_parallel_soroban_phase(
+                    txs.clone(),
+                    test_network_id(),
+                    LEDGER_MAX_INSTRUCTIONS,
+                    CLUSTER_COUNT,
+                    min_stages,
+                    max_stages,
+                );
+
+                // 1. Stage count checks.
+                assert!(
+                    !stages.is_empty(),
+                    "{ctx}: builder should produce at least 1 stage"
+                );
+                if mode == "fixed" {
+                    assert_eq!(
+                        stages.len(),
+                        STAGE_COUNT as usize,
+                        "{ctx}: fixed mode should produce exactly STAGE_COUNT stages"
+                    );
+                } else {
+                    assert!(
+                        stages.len() <= STAGE_COUNT as usize,
+                        "{ctx}: variable mode should produce at most STAGE_COUNT stages"
+                    );
+                    if stages.len() > 1 {
+                        variable_multistage_count += 1;
+                    }
+                }
+
+                // 2. No intra-stage footprint conflicts.
+                assert_no_intra_stage_conflicts(&stages, &ctx);
+
+                // 3. Sequential instruction budget: sum of max-cluster-insns per
+                //    stage must not exceed LEDGER_MAX_INSTRUCTIONS.
+                let sequential_insns: u64 = stages
+                    .iter()
+                    .map(|stage| {
+                        stage
+                            .iter()
+                            .map(|cluster| cluster.iter().map(extract_instructions).sum::<u64>())
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                assert!(
+                    sequential_insns <= LEDGER_MAX_INSTRUCTIONS as u64,
+                    "{ctx}: sequential instructions {sequential_insns} exceeds limit {LEDGER_MAX_INSTRUCTIONS}"
+                );
+
+                // 4. TX conservation: all output TXs from input, no duplicates.
+                let mut output_hashes = Vec::new();
+                for stage in &stages {
+                    for cluster in stage {
+                        for tx in cluster {
+                            let h = Hash256::hash_xdr(tx).expect("hash output tx").0;
+                            assert!(
+                                input_hashes.contains(&h),
+                                "{ctx}: output TX not found in input set"
+                            );
+                            output_hashes.push(h);
+                        }
+                    }
+                }
+                let output_set: HashSet<[u8; 32]> = output_hashes.iter().copied().collect();
+                assert_eq!(
+                    output_set.len(),
+                    output_hashes.len(),
+                    "{ctx}: duplicate TX in output"
+                );
+
+                // 5. had_drop / base_fee consistency.
+                if !had_drop {
+                    assert_eq!(
+                        output_hashes.len(),
+                        500,
+                        "{ctx}: had_drop=false but not all TXs included"
+                    );
+                    assert_eq!(
+                        compute_base_fee(&stages, false),
+                        LEDGER_BASE_FEE,
+                        "{ctx}: base_fee should be LEDGER_BASE_FEE when no TXs dropped"
+                    );
+                } else {
+                    assert!(
+                        output_hashes.len() < 500,
+                        "{ctx}: had_drop=true but all TXs included"
+                    );
+                }
+
+                // 6. XDR roundtrip via stages_to_xdr_phase.
+                let base_fee = compute_base_fee(&stages, had_drop);
+                let phase = stages_to_xdr_phase(stages, Some(base_fee));
+                let xdr_bytes = phase
+                    .to_xdr(Limits::none())
+                    .expect(&format!("{ctx}: XDR serialization failed"));
+                let decoded = TransactionPhase::from_xdr(&xdr_bytes, Limits::none())
+                    .expect(&format!("{ctx}: XDR deserialization failed"));
+                let re_encoded = decoded
+                    .to_xdr(Limits::none())
+                    .expect(&format!("{ctx}: XDR re-serialization failed"));
+                assert_eq!(
+                    xdr_bytes, re_encoded,
+                    "{ctx}: XDR roundtrip produced different bytes"
+                );
+            }
+        }
+
+        // Across 10 iterations, variable mode should produce >1 stages at least once.
+        assert!(
+            variable_multistage_count > 0,
+            "variable mode never produced >1 stages across 10 seeded iterations"
+        );
+    }
 }
