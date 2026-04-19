@@ -1,5 +1,12 @@
 //! Shared test helpers for RPC integration tests.
 
+// Functions in this module are used by different test binaries — not all
+// functions are referenced from every binary, which triggers dead_code
+// warnings when compiling individual test crates.
+#![allow(dead_code, unused_imports)]
+
+pub mod fake_app;
+
 use std::time::Duration;
 
 use henyey_app::config::QuorumSetConfig;
