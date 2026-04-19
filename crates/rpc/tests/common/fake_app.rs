@@ -11,11 +11,12 @@ use henyey_app::app::AppInfo;
 use henyey_app::config::AppConfig;
 use henyey_app::{AppState, LedgerSummary};
 use henyey_bucket::BucketSnapshotManager;
-use henyey_common::Hash256;
 use henyey_herder::TxQueueResult;
-use henyey_ledger::{HeaderSnapshot, LedgerManager, LedgerManagerConfig, SorobanNetworkInfo};
+use henyey_ledger::{
+    compute_header_hash, HeaderSnapshot, LedgerManager, LedgerManagerConfig, SorobanNetworkInfo,
+};
 use henyey_rpc::{RpcAppHandle, RpcServer};
-use stellar_xdr::curr::{LedgerHeader, Limits, TransactionEnvelope, WriteXdr};
+use stellar_xdr::curr::{LedgerHeader, TransactionEnvelope};
 use tokio::sync::broadcast;
 
 // ---------------------------------------------------------------------------
@@ -24,8 +25,12 @@ use tokio::sync::broadcast;
 
 /// A lightweight [`RpcAppHandle`] implementation backed by in-memory state.
 ///
-/// Suitable for testing RPC dispatch logic, envelope validation, error codes,
-/// and response shapes without booting a full `App` / simulation node.
+/// All RPC-exposed header-derived fields (`sequence`, `protocolVersion`,
+/// `closeTime`, `baseFee`, `id`/hash) are stored in a single
+/// [`LedgerManager`] and served consistently by both [`ledger_summary()`]
+/// and [`ledger_snapshot()`]. Builder scalar setters (`.ledger_seq()`,
+/// `.close_time()`, etc.) mutate the underlying header at build time rather
+/// than storing independent overrides.
 ///
 /// Construct via [`FakeRpcApp::builder()`] or [`FakeRpcApp::default()`].
 pub struct FakeRpcApp {
@@ -36,12 +41,6 @@ pub struct FakeRpcApp {
     shutdown_tx: broadcast::Sender<()>,
     state: AppState,
     submit_result: TxQueueResult,
-    // Optional overrides for ledger_summary(); when None, derived from
-    // ledger_manager.current_header().
-    ledger_seq_override: Option<u32>,
-    close_time_override: Option<u64>,
-    protocol_version_override: Option<u32>,
-    base_fee_override: Option<u32>,
 }
 
 impl Default for FakeRpcApp {
@@ -80,15 +79,11 @@ impl RpcAppHandle for FakeRpcApp {
             stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
         };
         LedgerSummary {
-            num: self.ledger_seq_override.unwrap_or(snap.header.ledger_seq),
+            num: snap.header.ledger_seq,
             hash: snap.hash,
-            close_time: self
-                .close_time_override
-                .unwrap_or(snap.header.scp_value.close_time.0),
-            version: self
-                .protocol_version_override
-                .unwrap_or(snap.header.ledger_version),
-            base_fee: self.base_fee_override.unwrap_or(snap.header.base_fee),
+            close_time: snap.header.scp_value.close_time.0,
+            version: snap.header.ledger_version,
+            base_fee: snap.header.base_fee,
             base_reserve: snap.header.base_reserve,
             max_tx_set_size: snap.header.max_tx_set_size,
             flags,
@@ -130,6 +125,12 @@ impl RpcAppHandle for FakeRpcApp {
 // ---------------------------------------------------------------------------
 
 /// Builder for [`FakeRpcApp`] with sensible defaults.
+///
+/// At build time, all scalar overrides (`.ledger_seq()`, `.close_time()`,
+/// etc.) are applied to a base [`LedgerHeader`] and stored in the
+/// [`LedgerManager`] via `set_header_for_test()`. This ensures
+/// [`FakeRpcApp::ledger_summary()`] and [`FakeRpcApp::ledger_snapshot()`]
+/// always return consistent RPC-exposed header-derived fields.
 pub struct FakeRpcAppBuilder {
     state: AppState,
     submit_result: TxQueueResult,
@@ -195,12 +196,11 @@ impl FakeRpcAppBuilder {
         self
     }
 
-    /// Set a custom [`LedgerHeader`] on the underlying [`LedgerManager`].
+    /// Set a base [`LedgerHeader`] for the underlying [`LedgerManager`].
     ///
-    /// The header hash is computed automatically from the XDR encoding.
-    /// When set, `ledger_summary()` derives `num`, `close_time`, and
-    /// `version` from this header (unless explicitly overridden), keeping
-    /// `ledger_summary()` and `ledger_snapshot()` consistent.
+    /// Scalar builder setters (`.ledger_seq()`, `.close_time()`, etc.) are
+    /// applied on top of this header at build time. If no scalar overrides
+    /// are set, the header is used as-is.
     #[allow(dead_code)]
     pub fn header_snapshot(mut self, header: LedgerHeader) -> Self {
         self.header_snapshot = Some(header);
@@ -217,22 +217,28 @@ impl FakeRpcAppBuilder {
             LedgerManagerConfig::default(),
         ));
 
-        // Apply the header snapshot if provided, and derive overrides from it.
-        let (ledger_seq_override, close_time_override, protocol_version_override) =
-            if let Some(ref header) = self.header_snapshot {
-                let xdr_bytes = header.to_xdr(Limits::none()).expect("header XDR encoding");
-                let hash = Hash256::hash(&xdr_bytes);
-                ledger_manager.set_header_for_test(header.clone(), hash);
-                // Derive overrides from the header; explicit builder values take
-                // precedence so callers can still tweak individual fields.
-                (
-                    Some(self.ledger_seq.unwrap_or(header.ledger_seq)),
-                    Some(self.close_time.unwrap_or(header.scp_value.close_time.0)),
-                    Some(self.protocol_version.unwrap_or(header.ledger_version)),
-                )
-            } else {
-                (self.ledger_seq, self.close_time, self.protocol_version)
-            };
+        // Build the header: start from a custom base or the LedgerManager default,
+        // then apply any scalar overrides. This ensures ledger_summary() and
+        // ledger_snapshot() always agree on RPC-exposed fields.
+        let mut header = self
+            .header_snapshot
+            .unwrap_or_else(|| ledger_manager.header_snapshot().header);
+
+        if let Some(seq) = self.ledger_seq {
+            header.ledger_seq = seq;
+        }
+        if let Some(time) = self.close_time {
+            header.scp_value.close_time.0 = time;
+        }
+        if let Some(version) = self.protocol_version {
+            header.ledger_version = version;
+        }
+        if let Some(fee) = self.base_fee {
+            header.base_fee = fee;
+        }
+
+        let hash = compute_header_hash(&header).expect("header XDR encoding");
+        ledger_manager.set_header_for_test(header, hash);
 
         let database =
             henyey_db::Database::open_in_memory().expect("in-memory database must succeed");
@@ -249,10 +255,6 @@ impl FakeRpcAppBuilder {
             shutdown_tx,
             state: self.state,
             submit_result: self.submit_result,
-            ledger_seq_override,
-            close_time_override,
-            protocol_version_override,
-            base_fee_override: self.base_fee,
         }
     }
 }
