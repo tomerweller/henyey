@@ -1823,14 +1823,18 @@ mod tests {
     /// tx_set arrival there is no stored verdict to "upgrade"; re-feeding
     /// the same EXTERNALIZE to SCP would be rejected by
     /// `is_stale_ballot_statement`. This test proves the end states are
-    /// identical.
+    /// identical by driving both slots through externalization.
     #[test]
     fn test_issue_1796_maybe_valid_deferred_externalize_end_state() {
         use crate::driver::ValidationLevel;
+        use crate::test_utils::make_quorum_set as make_qs;
 
         let local_node = make_node_id(1);
         let peer_node = make_node_id(2);
-        let qs = make_quorum_set();
+        // Quorum set: threshold=1, validators=[peer_node].
+        // A single EXTERNALIZE from peer_node satisfies the quorum,
+        // driving the slot to externalization.
+        let qs = Arc::new(make_qs(vec![peer_node.clone()], 1));
         let value: Value = vec![42, 43, 44].try_into().unwrap();
 
         // Build a peer EXTERNALIZE envelope.
@@ -1854,6 +1858,7 @@ mod tests {
         // --- Slot A: MaybeValidDeferred (simulates missing tx_set fast-path) ---
         let driver_deferred = Arc::new(
             MockDriverBuilder::new()
+                .quorum_set((*qs).clone())
                 .validation_level(ValidationLevel::MaybeValidDeferred)
                 .build(),
         );
@@ -1861,8 +1866,6 @@ mod tests {
         assert!(slot_a.fully_validated, "validator starts fully_validated");
 
         let result_a = slot_a.process_envelope(envelope.clone(), &driver_deferred);
-        // EXTERNALIZE from a single peer won't necessarily externalize the
-        // slot (depends on quorum), but it MUST NOT clear fully_validated.
         assert!(
             slot_a.fully_validated,
             "MaybeValidDeferred must not clear fully_validated (#1796)"
@@ -1871,6 +1874,7 @@ mod tests {
         // --- Slot B: FullyValidated (normal path, tx_set present) ---
         let driver_validated = Arc::new(
             MockDriverBuilder::new()
+                .quorum_set((*qs).clone())
                 .validation_level(ValidationLevel::FullyValidated)
                 .build(),
         );
@@ -1879,15 +1883,20 @@ mod tests {
 
         let result_b = slot_b.process_envelope(envelope.clone(), &driver_validated);
 
+        // Both slots must have externalized with the peer's value.
+        assert!(
+            slot_a.is_externalized(),
+            "MaybeValidDeferred slot must externalize"
+        );
+        assert!(
+            slot_b.is_externalized(),
+            "FullyValidated slot must externalize"
+        );
+
         // Assert identical end states.
         assert_eq!(
             slot_a.fully_validated, slot_b.fully_validated,
             "fully_validated must be identical for both validation levels"
-        );
-        assert_eq!(
-            slot_a.is_externalized(),
-            slot_b.is_externalized(),
-            "externalization status must be identical"
         );
         assert_eq!(
             slot_a.get_externalized_value(),
@@ -1905,6 +1914,10 @@ mod tests {
             slot_a.get_externalizing_state().len(),
             slot_b.get_externalizing_state().len(),
             "externalizing state visibility must be identical"
+        );
+        assert!(
+            !slot_a.get_externalizing_state().is_empty(),
+            "externalizing state must include the local EXTERNALIZE when fully_validated"
         );
     }
 }
