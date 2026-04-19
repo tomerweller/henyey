@@ -710,16 +710,7 @@ impl QueueStore {
     fn clear(&mut self) {
         self.by_hash.clear();
         self.fee_index.clear();
-        self.classic_eviction_queue = None;
-        self.soroban_eviction_queue = None;
-        self.global_ops_queue = None;
-        // Regenerate seed on reset (parity: stellar-core creates new queues with
-        // fresh seeds in TxQueueLimiter::reset()).
-        self.eviction_seed = if cfg!(test) {
-            0
-        } else {
-            rand::thread_rng().gen()
-        };
+        self.regenerate_eviction_seed();
     }
 
     /// Regenerate the eviction seed and invalidate all persistent eviction
@@ -2229,6 +2220,7 @@ impl TransactionQueue {
     pub fn clear(&self) {
         self.store.write().clear();
         self.account_states.write().clear();
+        self.reset_eviction_thresholds();
         // Don't clear seen - prevents replay
     }
 
@@ -7694,7 +7686,8 @@ mod eviction_queue_tests {
         );
     }
 
-    /// After clear(), eviction queues should be None and seed regenerated.
+    /// After clear(), eviction queues should be None, seed regenerated,
+    /// and eviction thresholds reset.
     #[test]
     fn test_persistent_eviction_queues_cleared() {
         let queue = make_eviction_test_queue();
@@ -7707,7 +7700,9 @@ mod eviction_queue_tests {
         set_source(&mut tx2, 2);
         queue.try_add(tx2);
 
-        queue.store.write().clear();
+        // Use TransactionQueue::clear() (not store.clear()) to verify
+        // full reset including eviction thresholds.
+        queue.clear();
 
         let store = queue.store.read();
         assert!(store.classic_eviction_queue.is_none());
