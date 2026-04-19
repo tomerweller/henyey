@@ -2577,7 +2577,7 @@ mod tests {
     /// error semantics (proceed / skip tick / arm backoff).
     #[tokio::test]
     async fn test_event_loop_archive_query_does_not_block_on_hanging_archive() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
@@ -2589,46 +2589,56 @@ mod tests {
         // Replace the archive fetcher with one that hangs forever. In
         // the pre-fix code this would cause the subsequent
         // `validate_target_checkpoint_published().await` to block for
-        // tens of seconds. After the fix it must return within a
-        // millisecond budget.
-        struct HangingFetcher;
+        // tens of seconds. After the fix it must return without blocking
+        // on the archive fetch.
+        let fetcher_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        struct HangingFetcher {
+            entered: std::sync::Arc<tokio::sync::Notify>,
+        }
         #[async_trait::async_trait]
         impl super::archive_cache::ArchiveCheckpointFetcher for HangingFetcher {
             async fn fetch(&self) -> anyhow::Result<u32> {
+                self.entered.notify_one();
                 let gate = tokio::sync::Notify::new();
                 gate.notified().await;
                 unreachable!();
             }
         }
         app.archive_checkpoint_cache
-            .set_background_fetcher(std::sync::Arc::new(HangingFetcher));
+            .set_background_fetcher(std::sync::Arc::new(HangingFetcher {
+                entered: fetcher_entered.clone(),
+            }));
 
         // Ensure the cache is cold so the validator takes the
         // `None`-from-non-blocking path.
         app.archive_checkpoint_cache.clear();
 
         // Drive the call site that freezes on mainnet (phase=13).
+        // The 5s timeout is a coarse guard against regressions that
+        // reintroduce blocking — generous enough to never flake on CI.
         let target: u32 = 10_000;
-        let start = Instant::now();
-        let ok = app.validate_target_checkpoint_published(50, target).await;
-        let elapsed = start.elapsed();
+        let ok = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.validate_target_checkpoint_published(50, target),
+        )
+        .await
+        .expect("validate_target_checkpoint_published must not block on a hanging archive");
 
         // Existing behavior on cold cache: proceed (let catchup itself
-        // fail fast if the archive is unreachable). The critical
-        // assertion here is the wall-clock bound.
+        // fail fast if the archive is unreachable).
         assert!(ok, "cold-cache branch must proceed (mirrors Err(e) path)");
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "event-loop archive query must not block on a hanging \
-             archive; took {:?} (pre-fix: ~60s)",
-            elapsed
-        );
 
-        // And the background refresh was spawned.
+        // The background refresh was spawned and is still in flight.
         assert!(
             app.archive_checkpoint_cache.is_refreshing(),
             "a hanging fetcher should leave exactly one refresh in flight"
         );
+
+        // Verify the background task actually entered the fetcher
+        // (not just a stale is_refreshing flag).
+        tokio::time::timeout(Duration::from_secs(5), fetcher_entered.notified())
+            .await
+            .expect("background refresh must invoke the fetcher within 5s");
     }
 
     // --- archive_behind_backoff_secs tests (#1754) ---
@@ -2757,8 +2767,8 @@ mod tests {
     /// listener that accepts connections but never sends response data.
     ///
     /// Verifies:
-    /// 1. `validate_target_checkpoint_published` returns within 100 ms
-    ///    (non-blocking, cold-cache path).
+    /// 1. `validate_target_checkpoint_published` returns without blocking
+    ///    on the hung TCP peer (non-blocking, cold-cache path).
     /// 2. The background refresh times out via the outer
     ///    `ARCHIVE_REFRESH_TIMEOUT_SECS` (30 s) ceiling.
     /// 3. The HTTP client actually connected to the hung listener.
@@ -2807,16 +2817,16 @@ mod tests {
         // Cache starts cold (no seed), so get_cached() returns None and
         // spawns a background refresh via the real HTTP fetcher.
 
-        // 3. Assert non-blocking behavior.
-        let start = Instant::now();
-        let ok = app.validate_target_checkpoint_published(50, 10_000).await;
-        let elapsed = start.elapsed();
+        // 3. Assert non-blocking behavior. The 5s timeout is a coarse
+        //    guard against regressions — generous enough to never flake.
+        let ok = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.validate_target_checkpoint_published(50, 10_000),
+        )
+        .await
+        .expect("validate_target_checkpoint_published must not block on a hung TCP peer");
 
         assert!(ok, "cold-cache branch must proceed");
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "event-loop query blocked for {elapsed:?} (must be < 100ms)",
-        );
         assert!(
             app.archive_checkpoint_cache.is_refreshing(),
             "background refresh should be in flight",

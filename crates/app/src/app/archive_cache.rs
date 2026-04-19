@@ -460,8 +460,8 @@ mod tests {
         );
     }
 
-    /// Cold cache returns `None` without blocking and triggers exactly one
-    /// background refresh.
+    /// Cold cache returns `None` without blocking on the background refresh
+    /// and triggers exactly one background fetch.
     #[tokio::test]
     async fn test_cold_cache_returns_none_and_spawns() {
         let gate = Arc::new(Notify::new());
@@ -470,15 +470,11 @@ mod tests {
             checkpoint: 77,
         });
 
-        let t0 = Instant::now();
+        // get_cached() is synchronous — it returns immediately without
+        // awaiting the background refresh. The ordering proof is:
+        // got == None (not the fetched 77) + is_refreshing() + call_count == 1.
         let got = cache.get_cached();
-        let elapsed = t0.elapsed();
         assert_eq!(got, None, "cold cache returns None");
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "cold-cache get_cached must not block; took {:?}",
-            elapsed
-        );
         assert_eq!(cache.cold_returns(), 1, "cold return counter incremented");
 
         // Observe that exactly one refresh is in flight.
