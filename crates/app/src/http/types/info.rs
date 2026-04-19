@@ -69,9 +69,11 @@ pub struct LedgerResponse {
 }
 
 /// Response for the /health endpoint.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub state: String,
     pub ledger_seq: u32,
     pub peer_count: usize,

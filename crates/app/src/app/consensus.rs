@@ -1039,6 +1039,15 @@ impl App {
         self.set_state(AppState::CatchingUp).await;
         self.herder.set_state(henyey_herder::HerderState::Syncing);
 
+        // A catchup is now in flight — the stuck signal is stale. Clear it
+        // so /health reflects CatchingUp truthfully. If the catchup fails,
+        // the next buffered-catchup tick re-detects the stall and
+        // repopulates the state.
+        {
+            let mut guard = self.consensus_stuck_state.write().await;
+            *guard = None;
+        }
+
         // Start catchup message caching (belt-and-suspenders for tx_set ordering)
         self.set_phase_sub(super::phase::PHASE_13_12_SPAWN_CATCHUP_MSG_CACHE);
         let message_cache_handle = self.start_catchup_message_caching_from_self().await;

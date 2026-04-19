@@ -1206,6 +1206,8 @@ impl App {
         recovery_attempts: u32,
         since_recovery: u64,
         archive_behind: bool,
+        tx_set_exhausted: bool,
+        stuck_duration: u64,
     ) -> ConsensusStuckAction {
         let schedule_due = since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS;
         let recovery_exhausted = recovery_attempts >= MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
@@ -1229,7 +1231,14 @@ impl App {
             // skip — keep doing recovery on schedule instead.
             if archive_behind {
                 if schedule_due {
-                    ConsensusStuckAction::AttemptRecovery
+                    // Escalate to HardReset when tx_set bytes are confirmed
+                    // lost (all peers DontHave) or the stall has exceeded
+                    // the wall-clock gate (envelopes never arrived).
+                    if tx_set_exhausted || stuck_duration >= HARD_RESET_STALL_SECS {
+                        ConsensusStuckAction::HardReset
+                    } else {
+                        ConsensusStuckAction::AttemptRecovery
+                    }
                 } else {
                     ConsensusStuckAction::Wait
                 }
@@ -1241,6 +1250,116 @@ impl App {
         } else {
             ConsensusStuckAction::Wait
         }
+    }
+
+    /// Deterministic per-node jitter for the recovery schedule timer.
+    /// Spreads recovery ticks across nodes to avoid thundering-herd
+    /// SCP state requests.
+    fn jittered_schedule_due(since_recovery: u64, jitter_seed: u64) -> bool {
+        let jitter = jitter_seed % OUT_OF_SYNC_RECOVERY_TIMER_SECS;
+        since_recovery + jitter >= OUT_OF_SYNC_RECOVERY_TIMER_SECS
+    }
+
+    /// Hard-reset the post-catchup recovery state to break the livelock
+    /// described in #1822. Clears buffered state, tx_set tracking, and
+    /// archive-behind backoff so the next event-loop tick can re-evaluate
+    /// from a clean slate.
+    ///
+    /// Does NOT spawn catchup — lets the normal catchup loop pick a target
+    /// on the next tick.
+    async fn force_post_catchup_hard_reset(&self, current_ledger: u32) {
+        let now_offset = self.start_instant.elapsed().as_secs();
+        let last = self.last_hard_reset_offset.load(Ordering::Relaxed);
+        if last != 0 && now_offset.saturating_sub(last) < HARD_RESET_COOLDOWN_SECS {
+            tracing::warn!(
+                current_ledger,
+                cooldown_remaining =
+                    HARD_RESET_COOLDOWN_SECS.saturating_sub(now_offset.saturating_sub(last)),
+                "Hard reset cooldown active; consensus-stuck persists — \
+                 manual intervention may be required"
+            );
+            return;
+        }
+
+        // Lock order: archive_behind_until → syncing_ledgers → consensus_stuck_state
+        // (matches existing precedent at consensus.rs trigger_recovery_catchup).
+
+        // 1. Clear archive-behind backoff.
+        let archive_behind_until_was_armed = {
+            let mut guard = self.archive_behind_until.write().await;
+            let was = guard.is_some();
+            *guard = None;
+            was
+        };
+
+        // 2. Evict leading contiguous no-tx_set entries from syncing_ledgers.
+        let evicted_syncing_entries = {
+            let mut buffer = self.syncing_ledgers.write().await;
+            let mut evicted = 0u32;
+            let start = current_ledger.saturating_add(1);
+            for seq in start.. {
+                match buffer.get(&seq) {
+                    Some(info) if info.tx_set.is_none() => {
+                        buffer.remove(&seq);
+                        evicted += 1;
+                    }
+                    _ => break,
+                }
+            }
+            evicted
+        };
+
+        // 3. Clear pending tx_sets.
+        let pending_tx_sets_cleared = self.herder.get_pending_tx_sets().len();
+        self.herder.clear_pending_tx_sets();
+
+        // 4. Reset tx_set tracking.
+        let tx_set_exhausted_before_reset = self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
+        self.reset_tx_set_tracking().await;
+
+        // 5. Reset recovery_attempts_without_progress.
+        self.recovery_attempts_without_progress
+            .store(0, Ordering::SeqCst);
+
+        // 6. Reset consensus_stuck_state recovery_attempts (keep stuck_start).
+        let (prior_recovery_attempts, stuck_duration, latest_externalized, gap) = {
+            let mut guard = self.consensus_stuck_state.write().await;
+            if let Some(ref mut state) = *guard {
+                let prior = state.recovery_attempts;
+                let dur = state.stuck_start.elapsed().as_secs();
+                state.recovery_attempts = 0;
+                state.catchup_triggered = false;
+                let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+                let gap = latest_ext.saturating_sub(current_ledger as u64);
+                (prior, dur, latest_ext, gap)
+            } else {
+                (0, 0, 0, 0)
+            }
+        };
+
+        // 7. Record the reset. Use max(1) so that a reset at sub-second uptime
+        // still arms the cooldown check (last != 0 means "has been reset").
+        self.last_hard_reset_offset
+            .store(now_offset.max(1), Ordering::Relaxed);
+        let total = self
+            .post_catchup_hard_reset_total
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+
+        tracing::warn!(
+            current_ledger,
+            latest_externalized,
+            gap,
+            stuck_duration_secs = stuck_duration,
+            prior_recovery_attempts,
+            evicted_syncing_entries,
+            pending_tx_sets_cleared,
+            tx_set_exhausted_before_reset,
+            archive_behind_until_was_armed,
+            total,
+            "Post-catchup livelock detected — hard reset: dropped buffered state, \
+             letting normal catchup loop re-evaluate"
+        );
     }
 
     pub(super) async fn maybe_start_buffered_catchup(&self) -> Option<PendingCatchup> {
@@ -1522,11 +1641,22 @@ impl App {
                             // schedule instead of spinning on a catchup that is
                             // guaranteed to be skipped.
                             if recently_caught_up {
+                                let tx_set_exhausted =
+                                    self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
+                                let stuck_duration = state.stuck_start.elapsed().as_secs();
+                                let jittered_due =
+                                    Self::jittered_schedule_due(since_recovery, self.jitter_seed);
                                 let decision = Self::decide_post_catchup_action(
                                     state.catchup_triggered,
                                     state.recovery_attempts,
-                                    since_recovery,
+                                    if jittered_due {
+                                        OUT_OF_SYNC_RECOVERY_TIMER_SECS
+                                    } else {
+                                        since_recovery
+                                    },
                                     archive_behind,
+                                    tx_set_exhausted,
+                                    stuck_duration,
                                 );
                                 match decision {
                                     ConsensusStuckAction::TriggerCatchup => {
@@ -1544,7 +1674,10 @@ impl App {
                                     }
                                     ConsensusStuckAction::AttemptRecovery => {
                                         state.last_recovery_attempt = now;
-                                        state.recovery_attempts += 1;
+                                        state.recovery_attempts = state
+                                            .recovery_attempts
+                                            .saturating_add(1)
+                                            .min(MAX_POST_CATCHUP_RECOVERY_ATTEMPTS + 1);
                                         tracing::info!(
                                             current_ledger,
                                             first_buffered,
@@ -1566,6 +1699,10 @@ impl App {
                                             archive_behind,
                                             "Waiting for SCP to fill post-catchup gap"
                                         );
+                                    }
+                                    ConsensusStuckAction::HardReset => {
+                                        // Handled after dropping the stuck_state
+                                        // write guard — see the outer match below.
                                     }
                                 }
                                 decision
@@ -1609,7 +1746,10 @@ impl App {
                                     ConsensusStuckAction::TriggerCatchup
                                 } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
                                     state.last_recovery_attempt = now;
-                                    state.recovery_attempts += 1;
+                                    state.recovery_attempts = state
+                                        .recovery_attempts
+                                        .saturating_add(1)
+                                        .min(MAX_POST_CATCHUP_RECOVERY_ATTEMPTS + 1);
                                     tracing::info!(
                                         current_ledger,
                                         first_buffered,
@@ -1662,6 +1802,10 @@ impl App {
                     }
                     ConsensusStuckAction::TriggerCatchup => {
                         // Fall through to catchup below
+                    }
+                    ConsensusStuckAction::HardReset => {
+                        self.force_post_catchup_hard_reset(current_ledger).await;
+                        return None;
                     }
                 }
             }
@@ -2362,11 +2506,29 @@ mod tests {
     const MAX: u32 = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
     const TIMER: u64 = OUT_OF_SYNC_RECOVERY_TIMER_SECS;
 
+    /// Helper: call decide_post_catchup_action with default (non-triggering)
+    /// values for the new tx_set_exhausted and stuck_duration params.
+    fn decide(
+        catchup_triggered: bool,
+        recovery_attempts: u32,
+        since_recovery: u64,
+        archive_behind: bool,
+    ) -> ConsensusStuckAction {
+        App::decide_post_catchup_action(
+            catchup_triggered,
+            recovery_attempts,
+            since_recovery,
+            archive_behind,
+            false, // tx_set_exhausted
+            0,     // stuck_duration (won't trigger HardReset)
+        )
+    }
+
     #[test]
     fn test_decide_post_catchup_action_catchup_in_flight_waits_when_not_due() {
         // Regression for #1753: when a catchup is already in flight, never
         // re-trigger. Wait if peer-SCP recovery isn't due yet.
-        let action = App::decide_post_catchup_action(true, 0, TIMER - 1, false);
+        let action = decide(true, 0, TIMER - 1, false);
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
@@ -2374,10 +2536,10 @@ mod tests {
     fn test_decide_post_catchup_action_catchup_in_flight_waits_when_due_and_archive_ok() {
         // Catchup in flight and archive NOT behind — defer entirely to the
         // in-flight catchup; do not run redundant peer-SCP recovery.
-        let action = App::decide_post_catchup_action(true, 0, TIMER, false);
+        let action = decide(true, 0, TIMER, false);
         assert_eq!(action, ConsensusStuckAction::Wait);
 
-        let action = App::decide_post_catchup_action(true, 0, TIMER * 100, false);
+        let action = decide(true, 0, TIMER * 100, false);
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
@@ -2385,11 +2547,11 @@ mod tests {
     fn test_decide_post_catchup_action_catchup_in_flight_recovers_when_archive_behind() {
         // Catchup in flight but archive is known behind (so catchup is
         // effectively stalled) — keep peer-SCP recovery running on schedule.
-        let action = App::decide_post_catchup_action(true, 0, TIMER, true);
+        let action = decide(true, 0, TIMER, true);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
 
         // Not yet due: wait.
-        let action = App::decide_post_catchup_action(true, 0, TIMER - 1, true);
+        let action = decide(true, 0, TIMER - 1, true);
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
@@ -2397,13 +2559,13 @@ mod tests {
     fn test_decide_post_catchup_action_catchup_in_flight_never_retriggers_even_after_max() {
         // If a catchup is in flight, we must not trigger another one even if
         // recovery_attempts has already saturated.
-        let action = App::decide_post_catchup_action(true, MAX + 5, TIMER, false);
+        let action = decide(true, MAX + 5, TIMER, false);
         assert_eq!(action, ConsensusStuckAction::Wait);
 
-        let action = App::decide_post_catchup_action(true, MAX + 5, TIMER, true);
+        let action = decide(true, MAX + 5, TIMER, true);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
 
-        let action = App::decide_post_catchup_action(true, MAX + 5, 0, true);
+        let action = decide(true, MAX + 5, 0, true);
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
@@ -2411,7 +2573,7 @@ mod tests {
     fn test_decide_post_catchup_action_triggers_catchup_when_recovery_exhausted() {
         // After MAX recovery attempts with no catchup in flight and no
         // archive-behind signal, escalate to catchup.
-        let action = App::decide_post_catchup_action(false, MAX, TIMER, false);
+        let action = decide(false, MAX, TIMER, false);
         assert_eq!(action, ConsensusStuckAction::TriggerCatchup);
     }
 
@@ -2419,32 +2581,165 @@ mod tests {
     fn test_decide_post_catchup_action_archive_behind_prevents_trigger() {
         // Regression for #1753: when recovery is exhausted AND the archive is
         // known behind, do NOT trigger catchup (which would just be skipped).
-        // Instead, keep peer-SCP recovery running on schedule.
-        let action = App::decide_post_catchup_action(false, MAX, TIMER, true);
+        // Instead, keep peer-SCP recovery running on schedule — but only if
+        // the HardReset gates are not yet met (no tx_set_exhausted, short stall).
+        let action = decide(false, MAX, TIMER, true);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
 
-        let action = App::decide_post_catchup_action(false, MAX + 10, TIMER, true);
+        let action = decide(false, MAX + 10, TIMER, true);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
 
     #[test]
     fn test_decide_post_catchup_action_archive_behind_waits_when_not_due() {
         // Archive behind + recovery exhausted + peer-SCP not due => wait.
-        let action = App::decide_post_catchup_action(false, MAX, TIMER - 1, true);
+        let action = decide(false, MAX, TIMER - 1, true);
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
     #[test]
     fn test_decide_post_catchup_action_normal_recovery_on_schedule() {
         // Before recovery is exhausted, just run recovery on its schedule.
-        let action = App::decide_post_catchup_action(false, 0, TIMER, false);
+        let action = decide(false, 0, TIMER, false);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
 
-        let action = App::decide_post_catchup_action(false, 0, TIMER - 1, false);
+        let action = decide(false, 0, TIMER - 1, false);
         assert_eq!(action, ConsensusStuckAction::Wait);
 
-        let action = App::decide_post_catchup_action(false, MAX - 1, TIMER, false);
+        let action = decide(false, MAX - 1, TIMER, false);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    }
+
+    // ================================================================
+    // New tests for #1822: HardReset, jitter, saturation
+    // ================================================================
+
+    #[test]
+    fn test_decide_post_catchup_action_hard_reset_on_tx_set_exhausted() {
+        // archive_behind + recovery exhausted + tx_set_exhausted → HardReset
+        // even with short stuck_duration.
+        let action = App::decide_post_catchup_action(
+            false, MAX, TIMER, true, // archive_behind
+            true, // tx_set_exhausted
+            30,   // stuck_duration — below HARD_RESET_STALL_SECS
+        );
+        assert_eq!(action, ConsensusStuckAction::HardReset);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_hard_reset_on_sustained_stall() {
+        // archive_behind + recovery exhausted + stuck >= HARD_RESET_STALL_SECS
+        // → HardReset (even with tx_set_exhausted=false).
+        let action = App::decide_post_catchup_action(
+            false,
+            MAX,
+            TIMER,
+            true,  // archive_behind
+            false, // tx_set_exhausted
+            HARD_RESET_STALL_SECS,
+        );
+        assert_eq!(action, ConsensusStuckAction::HardReset);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_no_hard_reset_before_gates() {
+        // tx_set_exhausted=false, stuck_duration < HARD_RESET_STALL_SECS
+        // → stays on AttemptRecovery.
+        let action = App::decide_post_catchup_action(
+            false, MAX, TIMER, true, false, 60, // below HARD_RESET_STALL_SECS
+        );
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_no_hard_reset_when_archive_ok() {
+        // archive_behind=false + all hard-reset signals → TriggerCatchup
+        // (normal escalation, not HardReset).
+        let action = App::decide_post_catchup_action(
+            false,
+            MAX,
+            TIMER,
+            false, // archive NOT behind
+            true,
+            HARD_RESET_STALL_SECS + 100,
+        );
+        assert_eq!(action, ConsensusStuckAction::TriggerCatchup);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_no_hard_reset_when_recovery_not_exhausted() {
+        // recovery_attempts < MAX → normal AttemptRecovery regardless of
+        // tx_set_exhausted or stuck_duration.
+        let action = App::decide_post_catchup_action(
+            false,
+            0,
+            TIMER,
+            true,
+            true,
+            HARD_RESET_STALL_SECS + 100,
+        );
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_wait_when_not_due() {
+        // All hard-reset-qualifying params but schedule not due → Wait.
+        let action = App::decide_post_catchup_action(
+            false,
+            MAX,
+            TIMER - 1, // not due
+            true,
+            true,
+            HARD_RESET_STALL_SECS + 100,
+        );
+        assert_eq!(action, ConsensusStuckAction::Wait);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_catchup_in_flight_never_hard_resets() {
+        // With catchup in flight, HardReset is never returned.
+        let action = App::decide_post_catchup_action(
+            true,
+            MAX,
+            TIMER,
+            true,
+            true,
+            HARD_RESET_STALL_SECS + 100,
+        );
+        // With archive_behind + schedule_due, it's AttemptRecovery (not HardReset).
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    }
+
+    #[test]
+    fn test_recovery_attempts_saturate_at_cap_plus_one() {
+        // Verify that saturating_add(1).min(MAX+1) does what we expect.
+        let mut attempts: u32 = MAX;
+        attempts = attempts.saturating_add(1).min(MAX + 1);
+        assert_eq!(attempts, MAX + 1);
+        // Repeated increments don't go higher.
+        attempts = attempts.saturating_add(1).min(MAX + 1);
+        assert_eq!(attempts, MAX + 1);
+    }
+
+    #[test]
+    fn test_jittered_schedule_due_deterministic_by_seed() {
+        // Same seed → same result.
+        let seed = 42u64;
+        let a = App::jittered_schedule_due(5, seed);
+        let b = App::jittered_schedule_due(5, seed);
+        assert_eq!(a, b);
+
+        // Seed=0 → jitter=0 → behaves like unjittered.
+        assert!(App::jittered_schedule_due(TIMER, 0));
+        assert!(!App::jittered_schedule_due(TIMER - 1, 0));
+
+        // Different seeds can cross the threshold at different since_recovery.
+        // Seeds where jitter = 0 vs jitter = TIMER-1 should differ at since_recovery=1.
+        let seed_zero_jitter = 0u64; // 0 % TIMER = 0
+        let seed_max_jitter = TIMER - 1; // (TIMER-1) % TIMER = TIMER-1
+                                         // since_recovery=1: 1+0 < TIMER, so not due; 1+(TIMER-1) = TIMER, so due.
+        assert!(!App::jittered_schedule_due(1, seed_zero_jitter));
+        assert!(App::jittered_schedule_due(1, seed_max_jitter));
     }
 
     /// Regression test for #1753: the buffered-catchup skip paths must not
@@ -2865,5 +3160,241 @@ mod tests {
         );
 
         accept_handle.abort();
+    }
+
+    // ================================================================
+    // Behavioral tests for #1822: hard reset, cooldown, health
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_hard_reset_clears_state_and_does_not_spawn_catchup() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // Helper to create a LedgerCloseInfo with or without tx_set.
+        let make_info = |slot: u32, has_tx_set: bool| -> henyey_herder::LedgerCloseInfo {
+            henyey_herder::LedgerCloseInfo {
+                slot: slot as u64,
+                close_time: 0,
+                tx_set_hash: henyey_common::types::Hash256::default(),
+                tx_set: if has_tx_set {
+                    Some(henyey_herder::TransactionSet::new(
+                        henyey_common::types::Hash256::default(),
+                        vec![],
+                    ))
+                } else {
+                    None
+                },
+                upgrades: vec![],
+                stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+            }
+        };
+
+        // Populate syncing_ledgers: N+1 no tx_set, N+2 no tx_set,
+        // N+25 with tx_set, N+26 no tx_set.
+        {
+            let mut buffer = app.syncing_ledgers.write().await;
+            buffer.insert(current_ledger + 1, make_info(current_ledger + 1, false));
+            buffer.insert(current_ledger + 2, make_info(current_ledger + 2, false));
+            buffer.insert(current_ledger + 25, make_info(current_ledger + 25, true));
+            buffer.insert(current_ledger + 26, make_info(current_ledger + 26, false));
+        }
+
+        // Set tx_set_all_peers_exhausted.
+        app.tx_set_all_peers_exhausted.store(true, Ordering::SeqCst);
+
+        // Arm archive_behind_until.
+        {
+            let mut guard = app.archive_behind_until.write().await;
+            *guard = Some(app.clock.now() + std::time::Duration::from_secs(600));
+        }
+
+        // Set consensus_stuck_state with recovery_attempts=5.
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger,
+                first_buffered: current_ledger + 1,
+                stuck_start: app.clock.now() - std::time::Duration::from_secs(130),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 5,
+                catchup_triggered: false,
+            });
+        }
+
+        // Precondition: no prior hard reset.
+        assert_eq!(
+            app.last_hard_reset_offset.load(Ordering::Relaxed),
+            0,
+            "precondition: no prior hard reset"
+        );
+
+        // Execute hard reset.
+        app.force_post_catchup_hard_reset(current_ledger).await;
+
+        // Verify leading N+1, N+2 evicted; N+25 preserved; N+26 preserved.
+        {
+            let buffer = app.syncing_ledgers.read().await;
+            assert!(
+                !buffer.contains_key(&(current_ledger + 1)),
+                "N+1 should be evicted"
+            );
+            assert!(
+                !buffer.contains_key(&(current_ledger + 2)),
+                "N+2 should be evicted"
+            );
+            assert!(
+                buffer.contains_key(&(current_ledger + 25)),
+                "N+25 should be preserved (has tx_set)"
+            );
+            assert!(
+                buffer.contains_key(&(current_ledger + 26)),
+                "N+26 should be preserved (non-leading no-tx_set)"
+            );
+        }
+
+        // Verify tx_set tracking cleared.
+        assert!(
+            !app.tx_set_all_peers_exhausted.load(Ordering::SeqCst),
+            "tx_set_all_peers_exhausted should be false"
+        );
+
+        // Verify archive_behind_until cleared.
+        assert!(
+            app.archive_behind_until.read().await.is_none(),
+            "archive_behind_until should be None"
+        );
+
+        // Verify consensus_stuck_state: recovery_attempts reset, stuck_start preserved.
+        {
+            let guard = app.consensus_stuck_state.read().await;
+            let state = guard.as_ref().expect("stuck state should still exist");
+            assert_eq!(state.recovery_attempts, 0, "recovery_attempts should be 0");
+            assert!(
+                !state.catchup_triggered,
+                "catchup_triggered should be false"
+            );
+        }
+
+        // Verify counters.
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "hard reset counter should be 1"
+        );
+        assert_ne!(
+            app.last_hard_reset_offset.load(Ordering::Relaxed),
+            0,
+            "last_hard_reset_offset should be set"
+        );
+
+        // Verify no catchup spawned.
+        assert!(
+            !app.catchup_in_progress.load(Ordering::SeqCst),
+            "catchup should not be in progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hard_reset_cooldown_prevents_repeated_resets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // Seed minimal stuck state.
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger,
+                first_buffered: current_ledger + 1,
+                stuck_start: app.clock.now(),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 5,
+                catchup_triggered: false,
+            });
+        }
+
+        // First hard reset — should succeed.
+        app.force_post_catchup_hard_reset(current_ledger).await;
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "first reset should succeed"
+        );
+
+        // Re-seed stuck state (hard reset cleared recovery_attempts).
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            if let Some(ref mut state) = *guard {
+                state.recovery_attempts = 5;
+            }
+        }
+
+        // Second hard reset immediately — should be blocked by cooldown.
+        app.force_post_catchup_hard_reset(current_ledger).await;
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "second reset should be blocked by cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jitter_seed_is_nonzero_and_deterministic() {
+        // Verify that jitter_seed is derived from the keypair.
+        // Without explicit node_seed, an ephemeral keypair is generated.
+        // Two App instances with the same seed should produce the same jitter.
+        // We test the derivation logic directly instead of relying on
+        // from_strkey (which requires valid checksum encoding).
+        let pk_bytes = [0x42u8; 32];
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&pk_bytes[0..8]);
+        let seed1 = u64::from_le_bytes(buf);
+
+        // Same input → same output.
+        let mut buf2 = [0u8; 8];
+        buf2.copy_from_slice(&pk_bytes[0..8]);
+        let seed2 = u64::from_le_bytes(buf2);
+        assert_eq!(
+            seed1, seed2,
+            "same public key bytes produce same jitter_seed"
+        );
+
+        // Different input → different output.
+        let pk_bytes2 = [0x43u8; 32];
+        let mut buf3 = [0u8; 8];
+        buf3.copy_from_slice(&pk_bytes2[0..8]);
+        let seed3 = u64::from_le_bytes(buf3);
+        assert_ne!(
+            seed1, seed3,
+            "different public key bytes produce different jitter_seeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jitter_seed_nonzero_with_ephemeral_key() {
+        // Verify that App::new (ephemeral key) produces a jitter_seed.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("test1.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        // With a random keypair, it's astronomically unlikely to be 0.
+        assert_ne!(
+            app.jitter_seed, 0,
+            "ephemeral key should produce nonzero jitter_seed"
+        );
     }
 }

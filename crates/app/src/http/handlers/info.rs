@@ -109,12 +109,32 @@ pub(crate) async fn status_handler(State(state): State<Arc<ServerState>>) -> Jso
 
 pub(crate) async fn health_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let app_state = state.app.state().await;
-    let is_healthy = matches!(app_state, AppState::Synced | AppState::Validating);
     let ledger_seq = state.app.ledger_info().ledger_seq;
     let peer_count = state.app.peer_snapshots().await.len();
 
+    // Inline stall check: read consensus_stuck_state under lock.
+    let stall_elapsed = {
+        let guard = state.app.consensus_stuck_state.read().await;
+        guard.as_ref().map(|s| s.stuck_start.elapsed().as_secs())
+    };
+
+    let state_healthy = matches!(app_state, AppState::Synced | AppState::Validating);
+    let stalled = stall_elapsed
+        .map(|e| e >= crate::app::HEALTH_STALL_SECS)
+        .unwrap_or(false);
+    let is_healthy = state_healthy && !stalled;
+
+    let reason = if !state_healthy {
+        Some("not_synced".to_string())
+    } else if stalled {
+        Some("post_catchup_stalled".to_string())
+    } else {
+        None
+    };
+
     let response = HealthResponse {
         status: if is_healthy { "healthy" } else { "unhealthy" }.to_string(),
+        reason,
         state: format!("{}", app_state),
         ledger_seq,
         peer_count,

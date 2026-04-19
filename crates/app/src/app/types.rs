@@ -227,6 +227,8 @@ pub struct AppInfo {
     pub scp_verify: ScpVerifyMetrics,
     /// Overlay fetch-channel depth metrics (issue #1741).
     pub overlay_fetch_channel: OverlayFetchChannelMetrics,
+    /// Total post-catchup hard resets performed (issue #1822).
+    pub post_catchup_hard_reset_total: u64,
 }
 
 /// Metrics for the overlay fetch-response channel (issue #1741).
@@ -465,7 +467,7 @@ pub(super) struct TxSetRequestState {
 /// State for tracking consensus stuck condition.
 /// Matches stellar-core's out-of-sync recovery behavior.
 #[derive(Debug, Clone)]
-pub(super) struct ConsensusStuckState {
+pub(crate) struct ConsensusStuckState {
     /// Current ledger when stuck was detected.
     pub current_ledger: u32,
     /// First buffered ledger when stuck was detected.
@@ -491,6 +493,10 @@ pub(super) enum ConsensusStuckAction {
     AttemptRecovery,
     /// Trigger catchup after timeout.
     TriggerCatchup,
+    /// Hard reset: clear buffered state and let the normal catchup loop
+    /// re-evaluate on the next tick. Fires when archive_behind + recovery
+    /// exhausted + either tx_set bytes lost or wall-clock stall exceeded.
+    HardReset,
 }
 
 /// Ordered, deduplicated queue of pending transaction hashes to advertise.

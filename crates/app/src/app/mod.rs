@@ -214,6 +214,22 @@ const POST_CATCHUP_RECOVERY_WINDOW_SECS: u64 = 300;
 /// recovery will never succeed. 3 attempts × 10s interval = 30s before fallback.
 const MAX_POST_CATCHUP_RECOVERY_ATTEMPTS: u32 = 3;
 
+/// Wall-clock gate for HardReset when tx_set_exhausted stays false (the
+/// "envelopes never arrived" path). 120s = 12 ticks of
+/// OUT_OF_SYNC_RECOVERY_TIMER_SECS.
+const HARD_RESET_STALL_SECS: u64 = 120;
+
+/// Minimum interval between hard resets. One checkpoint cycle; after
+/// this, if the stall persists, we hard-reset again and operators get
+/// another WARN in logs.
+const HARD_RESET_COOLDOWN_SECS: u64 = 300;
+
+/// /health returns unhealthy (503) when consensus_stuck_state has been
+/// populated for at least this long. Strictly less than
+/// HARD_RESET_STALL_SECS so operators see the stall *before* the node
+/// tries to self-heal.
+pub(crate) const HEALTH_STALL_SECS: u64 = 60;
+
 mod archive_cache;
 mod bootstrap;
 mod catchup_impl;
@@ -451,7 +467,7 @@ pub struct App {
     tx_set_exhausted_warned: RwLock<HashSet<Hash256>>,
     /// When we detected consensus is stuck (for timeout detection).
     /// Stores (current_ledger, first_buffered, stuck_start_time, last_recovery_attempt).
-    consensus_stuck_state: RwLock<Option<ConsensusStuckState>>,
+    pub(crate) consensus_stuck_state: RwLock<Option<ConsensusStuckState>>,
     /// When catchup last completed (for cooldown).
     last_catchup_completed_at: RwLock<Option<Instant>>,
     /// Non-blocking cache for the latest archive checkpoint. Event-loop
@@ -540,6 +556,18 @@ pub struct App {
     /// The ledger sequence at which recovery_attempts_without_progress was
     /// last reset.  Used to detect progress.
     recovery_baseline_ledger: AtomicU64,
+
+    /// Monotonic offset (seconds since `start_instant`) of the last hard reset.
+    /// 0 means "never". Used for cooldown enforcement.
+    last_hard_reset_offset: AtomicU64,
+    /// Total number of post-catchup hard resets performed.
+    pub(crate) post_catchup_hard_reset_total: AtomicU64,
+    /// Deterministic per-node jitter seed derived from the keypair's public key.
+    /// Used to stagger recovery timer across nodes.
+    jitter_seed: u64,
+    /// Monotonic instant at process start, used as the reference for
+    /// `last_hard_reset_offset` (avoids wall-clock skew).
+    start_instant: Instant,
 
     /// Total number of times the node lost sync.
     lost_sync_count: AtomicU64,
@@ -751,6 +779,16 @@ impl App {
         // Create channel for outbound SCP envelopes
         let (scp_envelope_tx, scp_envelope_rx) = tokio::sync::mpsc::channel(100);
         let now = clock.now();
+        let start_instant = now;
+
+        // Derive deterministic per-node jitter seed from public key.
+        let jitter_seed = {
+            let pk = keypair.public_key();
+            let pk_bytes = pk.as_bytes();
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&pk_bytes[0..8]);
+            u64::from_le_bytes(buf)
+        };
 
         // Build the non-blocking archive-checkpoint cache. The background
         // refresh uses a tightened DownloadConfig (1 retry, 15 s timeout)
@@ -860,6 +898,10 @@ impl App {
             sync_recovery_pending: AtomicBool::new(false),
             recovery_attempts_without_progress: AtomicU64::new(0),
             recovery_baseline_ledger: AtomicU64::new(0),
+            last_hard_reset_offset: AtomicU64::new(0),
+            post_catchup_hard_reset_total: AtomicU64::new(0),
+            jitter_seed,
+            start_instant,
             lost_sync_count: AtomicU64::new(0),
             max_observed_externalize_slot: AtomicU64::new(0),
             ledger_tx_count: AtomicU64::new(0),
@@ -1807,6 +1849,9 @@ impl App {
                 depth: self.fetch_channel_depth.load(Ordering::Relaxed),
                 depth_max: self.fetch_channel_depth_max.load(Ordering::Relaxed),
             },
+            post_catchup_hard_reset_total: self
+                .post_catchup_hard_reset_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -2585,6 +2630,7 @@ mod tests {
             ConsensusStuckAction::Wait,
             ConsensusStuckAction::AttemptRecovery,
             ConsensusStuckAction::TriggerCatchup,
+            ConsensusStuckAction::HardReset,
         ];
 
         for action in actions {
@@ -2592,6 +2638,7 @@ mod tests {
                 ConsensusStuckAction::Wait => {}
                 ConsensusStuckAction::AttemptRecovery => {}
                 ConsensusStuckAction::TriggerCatchup => {}
+                ConsensusStuckAction::HardReset => {}
             }
         }
     }

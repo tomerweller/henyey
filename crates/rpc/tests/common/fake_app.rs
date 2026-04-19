@@ -69,6 +69,7 @@ impl RpcAppHandle for FakeRpcApp {
             meta_stream_writes_total: 0,
             scp_verify: Default::default(),
             overlay_fetch_channel: Default::default(),
+            post_catchup_hard_reset_total: 0,
         }
     }
 

@@ -151,6 +151,14 @@ pub(crate) fn render_prometheus_text(metrics: &MetricsResponse, app_info: &AppIn
         ofc.depth, ofc.depth_max,
     ));
 
+    // Post-catchup hard reset counter (issue #1822).
+    prometheus_text.push_str(&format!(
+        "# HELP henyey_post_catchup_hard_reset_total Total post-catchup hard resets performed\n\
+         # TYPE henyey_post_catchup_hard_reset_total counter\n\
+         henyey_post_catchup_hard_reset_total {}\n",
+        app_info.post_catchup_hard_reset_total,
+    ));
+
     prometheus_text
 }
 
@@ -173,6 +181,7 @@ mod tests {
             meta_stream_writes_total: 0,
             scp_verify: ScpVerifyMetrics::default(),
             overlay_fetch_channel: OverlayFetchChannelMetrics::default(),
+            post_catchup_hard_reset_total: 0,
         }
     }
 
