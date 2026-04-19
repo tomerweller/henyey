@@ -108,6 +108,11 @@ pub struct RunOptions {
     /// Optional callback that spawns extra server tasks (e.g. JSON-RPC).
     /// Receives `Arc<App>`, returns a vec of join handles to abort on shutdown.
     pub extra_server_spawner: Option<ExtraServerSpawner>,
+
+    /// Prometheus metrics handle for the `/metrics` endpoint.
+    /// When set, the HTTP status server renders metrics via the `metrics` crate
+    /// recorder instead of the legacy hand-rolled format.
+    pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 }
 
 /// Callback type for spawning extra servers alongside the main node.
@@ -135,6 +140,7 @@ impl Default for RunOptions {
             #[cfg(feature = "loadgen")]
             loadgen_runner_factory: None,
             extra_server_spawner: None,
+            prometheus_handle: None,
         }
     }
 }
@@ -204,6 +210,9 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     let http_handle = if http_enabled {
         #[cfg_attr(not(feature = "loadgen"), allow(unused_mut))]
         let mut status_server = StatusServer::new(http_port, http_address.clone(), app.clone());
+        if let Some(handle) = options.prometheus_handle.clone() {
+            status_server.set_prometheus_handle(handle);
+        }
         #[cfg(feature = "loadgen")]
         if let Some(ref factory) = options.loadgen_runner_factory {
             status_server.set_loadgen_runner(factory(app.clone()));

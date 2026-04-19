@@ -109,17 +109,6 @@ pub struct SelfCheckResponse {
     pub message: Option<String>,
 }
 
-/// Response for the /metrics endpoint (Prometheus format).
-#[derive(Serialize)]
-pub struct MetricsResponse {
-    pub ledger_seq: u32,
-    pub peer_count: usize,
-    pub pending_transactions: u64,
-    pub uptime_seconds: u64,
-    pub state: String,
-    pub is_validator: bool,
-}
-
 /// Query parameters for /dumpproposedsettings endpoint.
 #[derive(Deserialize)]
 pub struct DumpProposedSettingsParams {

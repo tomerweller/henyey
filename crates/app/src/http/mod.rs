@@ -49,6 +49,8 @@ pub(crate) struct ServerState {
     /// ISO 8601 UTC timestamp of when the server started.
     pub started_on: String,
     pub log_handle: Option<crate::logging::LogLevelHandle>,
+    /// Prometheus metrics handle for rendering `/metrics` output.
+    pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     /// Load generation state (only present when `loadgen` feature is enabled).
     #[cfg(feature = "loadgen")]
     pub loadgen_state: Option<Arc<handlers::generateload::GenerateLoadState>>,
@@ -169,6 +171,7 @@ pub struct StatusServer {
     app: Arc<App>,
     start_time: Instant,
     log_handle: Option<crate::logging::LogLevelHandle>,
+    prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     #[cfg(feature = "loadgen")]
     loadgen_state: Option<Arc<handlers::generateload::GenerateLoadState>>,
 }
@@ -182,6 +185,7 @@ impl StatusServer {
             app,
             start_time: Instant::now(),
             log_handle: None,
+            prometheus_handle: None,
             #[cfg(feature = "loadgen")]
             loadgen_state: None,
         }
@@ -200,9 +204,15 @@ impl StatusServer {
             app,
             start_time: Instant::now(),
             log_handle: Some(log_handle),
+            prometheus_handle: None,
             #[cfg(feature = "loadgen")]
             loadgen_state: None,
         }
+    }
+
+    /// Set the Prometheus metrics handle for the `/metrics` endpoint.
+    pub fn set_prometheus_handle(&mut self, handle: metrics_exporter_prometheus::PrometheusHandle) {
+        self.prometheus_handle = Some(handle);
     }
 
     /// Set the load generation backend (must be called before `start()`).
@@ -221,6 +231,7 @@ impl StatusServer {
             start_time: self.start_time,
             started_on,
             log_handle: self.log_handle,
+            prometheus_handle: self.prometheus_handle,
             #[cfg(feature = "loadgen")]
             loadgen_state: self.loadgen_state,
         });

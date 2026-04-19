@@ -843,6 +843,10 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging
     init_logging(&cli)?;
 
+    // Install the Prometheus metrics recorder (process-global, one-shot).
+    // This must happen before any code calls metrics macros.
+    let prometheus_handle = henyey_app::metrics::install_recorder();
+
     // Check if local mode is requested (needed before config loading).
     let local = matches!(cli.command, Commands::Run { local: true, .. });
 
@@ -896,7 +900,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 RunMode::Full
             };
-            cmd_run(config, mode, force_catchup, local).await
+            cmd_run(config, mode, force_catchup, local, prometheus_handle).await
         }
 
         Commands::Catchup {
@@ -1300,6 +1304,7 @@ async fn cmd_run(
     mode: RunMode,
     force_catchup: bool,
     local: bool,
+    prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> anyhow::Result<()> {
     // In local mode, auto-initialize database and history if needed.
     let config = if local {
@@ -1382,6 +1387,7 @@ async fn cmd_run(
         } else {
             None
         },
+        prometheus_handle: Some(prometheus_handle),
         ..Default::default()
     };
 

@@ -4,354 +4,75 @@ use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
 
-use crate::app::AppInfo;
-
-use super::super::types::MetricsResponse;
 use super::super::ServerState;
+use crate::metrics::refresh_gauges;
 
 pub(crate) async fn metrics_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let app_state = state.app.state().await;
-    let uptime = state.start_time.elapsed().as_secs();
-    let ledger_seq = state.app.ledger_info().ledger_seq;
-    let peer_count = state.app.peer_snapshots().await.len();
-    let pending_transactions = state.app.pending_transaction_count() as u64;
-    let app_info = state.app.info();
-
-    let metrics = MetricsResponse {
-        ledger_seq,
-        peer_count,
-        pending_transactions,
-        uptime_seconds: uptime,
-        state: format!("{}", app_state),
-        is_validator: app_info.is_validator,
+    refresh_gauges(&state).await;
+    let body = match &state.prometheus_handle {
+        Some(handle) => handle.render(),
+        None => "# metrics recorder not installed\n".to_string(),
     };
-
-    let prometheus_text = render_prometheus_text(&metrics, &app_info);
-
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],
-        prometheus_text,
+        body,
     )
-}
-
-/// Render the Prometheus text-format body for `/metrics`.
-///
-/// Extracted as a pure function so the format can be unit-tested without
-/// bringing up a full `App`/`ServerState` stack.
-pub(crate) fn render_prometheus_text(metrics: &MetricsResponse, app_info: &AppInfo) -> String {
-    let mut prometheus_text = format!(
-        "# HELP stellar_ledger_sequence Current ledger sequence number\n\
-         # TYPE stellar_ledger_sequence gauge\n\
-         stellar_ledger_sequence {}\n\
-         # HELP stellar_peer_count Number of connected peers\n\
-         # TYPE stellar_peer_count gauge\n\
-         stellar_peer_count {}\n\
-         # HELP stellar_pending_transactions Number of pending transactions\n\
-         # TYPE stellar_pending_transactions gauge\n\
-         stellar_pending_transactions {}\n\
-         # HELP stellar_uptime_seconds Node uptime in seconds\n\
-         # TYPE stellar_uptime_seconds counter\n\
-         stellar_uptime_seconds {}\n\
-         # HELP stellar_is_validator Whether this node is a validator\n\
-         # TYPE stellar_is_validator gauge\n\
-         stellar_is_validator {}\n",
-        metrics.ledger_seq,
-        metrics.peer_count,
-        metrics.pending_transactions,
-        metrics.uptime_seconds,
-        if metrics.is_validator { 1 } else { 0 }
-    );
-
-    // Add meta stream metrics if active
-    if app_info.meta_stream_bytes_total > 0 || app_info.meta_stream_writes_total > 0 {
-        prometheus_text.push_str(&format!(
-            "# HELP stellar_meta_stream_bytes_total Total bytes written to metadata output stream\n\
-             # TYPE stellar_meta_stream_bytes_total counter\n\
-             stellar_meta_stream_bytes_total {}\n\
-             # HELP stellar_meta_stream_writes_total Total frames written to metadata output stream\n\
-             # TYPE stellar_meta_stream_writes_total counter\n\
-             stellar_meta_stream_writes_total {}\n",
-            app_info.meta_stream_bytes_total, app_info.meta_stream_writes_total
-        ));
-    }
-
-    // SCP signature-verify pipeline metrics (issue #1734 Phase B).
-    let sv = &app_info.scp_verify;
-    // Pre-filter rejects — driven from PreFilterRejectReason::ALL (issue #1817).
-    {
-        use std::fmt::Write;
-        prometheus_text.push_str(
-            "# HELP henyey_scp_prefilter_rejects_total SCP envelopes rejected by the event-loop pre-filter, by reason\n\
-             # TYPE henyey_scp_prefilter_rejects_total counter\n",
-        );
-        for (reason, count) in sv.prefilter_counters.iter() {
-            write!(
-                prometheus_text,
-                "henyey_scp_prefilter_rejects_total{{reason=\"{}\"}} {}\n",
-                reason.label(),
-                count,
-            )
-            .unwrap();
-        }
-    }
-    prometheus_text.push_str(&format!(
-        "# HELP henyey_scp_post_verify_drops_total Envelopes dropped after verification (aggregate)\n\
-         # TYPE henyey_scp_post_verify_drops_total counter\n\
-         henyey_scp_post_verify_drops_total {}\n",
-        sv.post_verify_drops,
-    ));
-    // Per-reason post-verify counters — driven from PostVerifyReason::ALL (issue #1792).
-    {
-        use std::fmt::Write;
-        prometheus_text.push_str(
-            "# HELP henyey_scp_post_verify_total Envelopes processed by post-verify, by reason\n\
-             # TYPE henyey_scp_post_verify_total counter\n",
-        );
-        for (reason, count) in sv.pv_counters.iter() {
-            write!(
-                prometheus_text,
-                "henyey_scp_post_verify_total{{reason=\"{}\"}} {}\n",
-                reason.label(),
-                count,
-            )
-            .unwrap();
-        }
-    }
-    prometheus_text.push_str(&format!(
-        "# HELP henyey_scp_verify_input_backlog Current depth of the SCP signature-verify input channel (event-loop sampled)\n\
-         # TYPE henyey_scp_verify_input_backlog gauge\n\
-         henyey_scp_verify_input_backlog {}\n\
-         # HELP henyey_scp_verify_output_backlog Current depth of the verified-envelope output channel (envelopes awaiting the event loop)\n\
-         # TYPE henyey_scp_verify_output_backlog gauge\n\
-         henyey_scp_verify_output_backlog {}\n\
-         # HELP henyey_scp_verifier_thread_state Worker thread state (0=Running, 1=Stopping, 2=Dead)\n\
-         # TYPE henyey_scp_verifier_thread_state gauge\n\
-         henyey_scp_verifier_thread_state {}\n\
-         # HELP henyey_scp_verify_latency_us Enqueue-to-post-verify latency (sum + count; average = sum/count)\n\
-         # TYPE henyey_scp_verify_latency_us summary\n\
-         henyey_scp_verify_latency_us_sum {}\n\
-         henyey_scp_verify_latency_us_count {}\n",
-        sv.verify_input_backlog,
-        sv.verify_output_backlog,
-        sv.verifier_thread_state,
-        sv.verify_latency_us_sum,
-        sv.verify_latency_count,
-    ));
-
-    // Overlay fetch-response channel depth gauges (issue #1741).
-    let ofc = &app_info.overlay_fetch_channel;
-    prometheus_text.push_str(&format!(
-        "# HELP henyey_overlay_fetch_channel_depth Current depth of the overlay fetch-response channel (event-loop sampled)\n\
-         # TYPE henyey_overlay_fetch_channel_depth gauge\n\
-         henyey_overlay_fetch_channel_depth {}\n\
-         # HELP henyey_overlay_fetch_channel_depth_max Monotonic maximum depth of the overlay fetch-response channel since process start\n\
-         # TYPE henyey_overlay_fetch_channel_depth_max gauge\n\
-         henyey_overlay_fetch_channel_depth_max {}\n",
-        ofc.depth, ofc.depth_max,
-    ));
-
-    // Post-catchup hard reset counter (issue #1822).
-    prometheus_text.push_str(&format!(
-        "# HELP henyey_post_catchup_hard_reset_total Total post-catchup hard resets performed\n\
-         # TYPE henyey_post_catchup_hard_reset_total counter\n\
-         henyey_post_catchup_hard_reset_total {}\n",
-        app_info.post_catchup_hard_reset_total,
-    ));
-
-    prometheus_text
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::app::{AppInfo, OverlayFetchChannelMetrics, ScpVerifyMetrics};
+    use crate::metrics;
 
-    fn dummy_app_info() -> AppInfo {
-        AppInfo {
-            version: String::new(),
-            commit_hash: String::new(),
-            build_timestamp: String::new(),
-            node_name: String::new(),
-            public_key: String::new(),
-            network_passphrase: String::new(),
-            is_validator: false,
-            database_path: std::path::PathBuf::new(),
-            meta_stream_bytes_total: 0,
-            meta_stream_writes_total: 0,
-            scp_verify: ScpVerifyMetrics::default(),
-            overlay_fetch_channel: OverlayFetchChannelMetrics::default(),
-            post_catchup_hard_reset_total: 0,
-        }
-    }
-
-    fn dummy_metrics() -> MetricsResponse {
-        MetricsResponse {
-            ledger_seq: 0,
-            peer_count: 0,
-            pending_transactions: 0,
-            uptime_seconds: 0,
-            state: String::new(),
-            is_validator: false,
-        }
-    }
-
-    /// Issue #1741 regression: `/metrics` must expose both the current-depth
-    /// and monotonic-max gauges for the overlay fetch-response channel so
-    /// unbounded growth under a wedged app loop is operator-visible.
+    /// Ensure the metrics handler returns valid Prometheus text when a recorder
+    /// is installed and `refresh_gauges` has been called.
     #[test]
-    fn metrics_endpoint_exposes_fetch_channel_depth() {
-        let mut app_info = dummy_app_info();
-        app_info.overlay_fetch_channel = OverlayFetchChannelMetrics {
-            depth: 17,
-            depth_max: 42,
-        };
-        let body = render_prometheus_text(&dummy_metrics(), &app_info);
-        assert!(
-            body.contains("# HELP henyey_overlay_fetch_channel_depth "),
-            "missing HELP line for fetch_channel_depth"
-        );
-        assert!(
-            body.contains("# TYPE henyey_overlay_fetch_channel_depth gauge"),
-            "missing TYPE line for fetch_channel_depth"
-        );
-        assert!(
-            body.contains("\nhenyey_overlay_fetch_channel_depth 17\n"),
-            "sample value for fetch_channel_depth not emitted; got:\n{}",
-            body
-        );
-        assert!(
-            body.contains("# HELP henyey_overlay_fetch_channel_depth_max "),
-            "missing HELP line for fetch_channel_depth_max"
-        );
-        assert!(
-            body.contains("# TYPE henyey_overlay_fetch_channel_depth_max gauge"),
-            "missing TYPE line for fetch_channel_depth_max"
-        );
-        assert!(
-            body.contains("\nhenyey_overlay_fetch_channel_depth_max 42\n"),
-            "sample value for fetch_channel_depth_max not emitted; got:\n{}",
-            body
-        );
-    }
+    fn test_describe_metrics_and_label_series() {
+        let handle = metrics::ensure_test_recorder();
+        metrics::describe_metrics();
+        metrics::register_label_series();
+        let output = handle.render();
 
-    /// Issue #1733: `/metrics` must expose per-reason post-verify counters
-    /// as labeled `henyey_scp_post_verify_total{reason="..."}` lines.
-    #[test]
-    fn metrics_endpoint_exposes_per_reason_post_verify_counters() {
-        use henyey_herder::scp_verify::PostVerifyReason;
+        // HELP lines for key metrics.
+        assert!(
+            output.contains("# HELP stellar_ledger_sequence"),
+            "missing HELP for ledger_sequence"
+        );
+        assert!(
+            output.contains("# HELP henyey_scp_prefilter_rejects_total"),
+            "missing HELP for prefilter_rejects_total"
+        );
+        assert!(
+            output.contains("# HELP henyey_post_catchup_hard_reset_total"),
+            "missing HELP for hard_reset_total"
+        );
 
-        let mut app_info = dummy_app_info();
-        app_info.scp_verify.pv_counters[PostVerifyReason::GateDriftRange] = 3;
-        app_info.scp_verify.pv_counters[PostVerifyReason::Accepted] = 42;
-        app_info.scp_verify.pv_counters[PostVerifyReason::PanicVerdict] = 1;
-        let body = render_prometheus_text(&dummy_metrics(), &app_info);
-        assert!(
-            body.contains("# HELP henyey_scp_post_verify_total "),
-            "missing HELP line for post_verify_total"
-        );
-        assert!(
-            body.contains("# TYPE henyey_scp_post_verify_total counter"),
-            "missing TYPE line for post_verify_total"
-        );
-        assert!(
-            body.contains("henyey_scp_post_verify_total{reason=\"drift_range\"} 3"),
-            "drift_range counter not rendered correctly; got:\n{}",
-            body
-        );
-        assert!(
-            body.contains("henyey_scp_post_verify_total{reason=\"accepted\"} 42"),
-            "accepted counter not rendered correctly; got:\n{}",
-            body
-        );
-        assert!(
-            body.contains("henyey_scp_post_verify_total{reason=\"panic\"} 1"),
-            "panic counter not rendered correctly; got:\n{}",
-            body
-        );
-        // Verify all reason labels are present — driven from PostVerifyReason::ALL
-        // so adding a variant automatically extends this check (issue #1792).
-        for reason in PostVerifyReason::ALL {
-            let label = format!(
-                "henyey_scp_post_verify_total{{reason=\"{}\"}}",
-                reason.label()
-            );
-            assert!(
-                body.contains(&label),
-                "missing counter for reason={}; got:\n{body}",
-                reason.label()
-            );
-        }
-    }
-
-    /// Issue #1817: `/metrics` must expose per-reason prefilter reject counters
-    /// as labeled `henyey_scp_prefilter_rejects_total{reason="..."}` lines,
-    /// driven from `PreFilterRejectReason::ALL`.
-    #[test]
-    fn metrics_endpoint_exposes_per_reason_prefilter_counters() {
+        // All prefilter reason labels present.
         use henyey_herder::scp_verify::PreFilterRejectReason;
-
-        let mut app_info = dummy_app_info();
-        app_info.scp_verify.prefilter_counters[PreFilterRejectReason::CannotReceiveScp] = 7;
-        app_info.scp_verify.prefilter_counters[PreFilterRejectReason::CloseTime] = 3;
-        app_info.scp_verify.prefilter_counters[PreFilterRejectReason::Range] = 11;
-        let body = render_prometheus_text(&dummy_metrics(), &app_info);
-        assert!(
-            body.contains("# HELP henyey_scp_prefilter_rejects_total "),
-            "missing HELP line for prefilter_rejects_total"
-        );
-        assert!(
-            body.contains("# TYPE henyey_scp_prefilter_rejects_total counter"),
-            "missing TYPE line for prefilter_rejects_total"
-        );
-        assert!(
-            body.contains("henyey_scp_prefilter_rejects_total{reason=\"cannot_receive\"} 7"),
-            "cannot_receive counter not rendered correctly; got:\n{}",
-            body
-        );
-        assert!(
-            body.contains("henyey_scp_prefilter_rejects_total{reason=\"close_time\"} 3"),
-            "close_time counter not rendered correctly; got:\n{}",
-            body
-        );
-        assert!(
-            body.contains("henyey_scp_prefilter_rejects_total{reason=\"range\"} 11"),
-            "range counter not rendered correctly; got:\n{}",
-            body
-        );
-        // Verify all reason labels are present — driven from PreFilterRejectReason::ALL
-        // so adding a variant automatically extends this check.
         for reason in PreFilterRejectReason::ALL {
             let label = format!(
                 "henyey_scp_prefilter_rejects_total{{reason=\"{}\"}}",
                 reason.label()
             );
             assert!(
-                body.contains(&label),
-                "missing counter for reason={}; got:\n{body}",
+                output.contains(&label),
+                "missing counter for reason={}; got:\n{output}",
                 reason.label()
             );
         }
-    }
 
-    /// Issue #1822: `/metrics` must expose the post-catchup hard-reset counter.
-    #[test]
-    fn metrics_endpoint_exposes_hard_reset_counter() {
-        let mut app_info = dummy_app_info();
-        app_info.post_catchup_hard_reset_total = 3;
-        let body = render_prometheus_text(&dummy_metrics(), &app_info);
-        assert!(
-            body.contains("# HELP henyey_post_catchup_hard_reset_total "),
-            "missing HELP line for hard_reset_total"
-        );
-        assert!(
-            body.contains("# TYPE henyey_post_catchup_hard_reset_total counter"),
-            "missing TYPE line for hard_reset_total"
-        );
-        assert!(
-            body.contains("\nhenyey_post_catchup_hard_reset_total 3\n"),
-            "sample value for hard_reset_total not emitted; got:\n{}",
-            body
-        );
+        // All post-verify reason labels present.
+        use henyey_herder::scp_verify::PostVerifyReason;
+        for reason in PostVerifyReason::ALL {
+            let label = format!(
+                "henyey_scp_post_verify_total{{reason=\"{}\"}}",
+                reason.label()
+            );
+            assert!(
+                output.contains(&label),
+                "missing counter for reason={}; got:\n{output}",
+                reason.label()
+            );
+        }
     }
 }

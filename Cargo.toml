@@ -118,6 +118,10 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
 # Error handling
 thiserror = "1"
 anyhow = "1"

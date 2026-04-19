@@ -41,6 +41,10 @@ toml.workspace = true
 # Logging
 tracing.workspace = true
 
+# Metrics
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
 # Error handling
 anyhow.workspace = true
 
