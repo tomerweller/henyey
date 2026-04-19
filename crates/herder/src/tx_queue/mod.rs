@@ -625,8 +625,8 @@ struct QueueStore {
     /// Persistent eviction queue for global ops limit (OpsOnlyLaneConfig).
     /// Lazy-initialized when max_queue_ops is configured.
     global_ops_queue: Option<SurgePricingPriorityQueue>,
-    /// Fixed seed for eviction queue tie-breaking. Set once at creation,
-    /// regenerated on reset_and_rebuild. Matches stellar-core's per-reset seed.
+    /// Seed for eviction queue tie-breaking. Regenerated on clear() and shift()
+    /// to match stellar-core's per-reset/per-ledger seed lifecycle.
     eviction_seed: u64,
     /// Network ID for TransactionFrame creation during queue operations.
     network_id: NetworkId,
@@ -713,6 +713,28 @@ impl QueueStore {
         self.classic_eviction_queue = None;
         self.soroban_eviction_queue = None;
         self.global_ops_queue = None;
+        // Regenerate seed on reset (parity: stellar-core creates new queues with
+        // fresh seeds in TxQueueLimiter::reset()).
+        self.eviction_seed = if cfg!(test) {
+            0
+        } else {
+            rand::thread_rng().gen()
+        };
+    }
+
+    /// Regenerate the eviction seed and invalidate all persistent eviction
+    /// queues. They will be lazily rebuilt with the new seed on next admission.
+    /// Parity: stellar-core regenerates the tie-break seed in shift() and
+    /// creates new queues with fresh seeds in TxQueueLimiter::reset().
+    fn regenerate_eviction_seed(&mut self) {
+        self.eviction_seed = if cfg!(test) {
+            0
+        } else {
+            rand::thread_rng().gen()
+        };
+        self.classic_eviction_queue = None;
+        self.soroban_eviction_queue = None;
+        self.global_ops_queue = None;
     }
 
     fn get(&self, hash: &Hash256) -> Option<&QueuedTransaction> {
@@ -765,6 +787,90 @@ impl QueueStore {
                 self.fee_index.contains(&entry),
                 "QueueStore: tx {:?} in by_hash but not in fee_index",
                 hash
+            );
+        }
+    }
+
+    /// Verify persistent eviction queues match a cold rebuild from by_hash.
+    ///
+    /// For each active eviction queue, rebuilds a fresh queue from scratch and
+    /// compares total/per-lane resource counts and entry counts.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn assert_eviction_queues_consistent(&self, ledger_version: u32) {
+        // Check classic queue
+        if let Some(ref queue) = self.classic_eviction_queue {
+            let mut fresh = SurgePricingPriorityQueue::new(
+                Box::new(DexLimitingLaneConfig::new(
+                    queue.lane_limits(GENERIC_LANE),
+                    if queue.get_num_lanes() > 1 {
+                        Some(queue.lane_limits(1))
+                    } else {
+                        None
+                    },
+                )),
+                self.eviction_seed,
+            );
+            for tx in self.by_hash.values() {
+                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                    tx.envelope.clone(),
+                    self.network_id,
+                );
+                if !frame.is_soroban() {
+                    fresh.add(tx.clone(), &self.network_id, ledger_version);
+                }
+            }
+            assert_eq!(
+                queue.total_resources(),
+                fresh.total_resources(),
+                "classic eviction queue total resources mismatch"
+            );
+            for lane in 0..queue.get_num_lanes() {
+                assert_eq!(
+                    queue.lane_resources(lane),
+                    fresh.lane_resources(lane),
+                    "classic eviction queue lane {lane} resources mismatch"
+                );
+            }
+        }
+
+        // Check soroban queue
+        if let Some(ref queue) = self.soroban_eviction_queue {
+            let mut fresh = SurgePricingPriorityQueue::new(
+                Box::new(SorobanGenericLaneConfig::new(
+                    queue.lane_limits(GENERIC_LANE),
+                )),
+                self.eviction_seed,
+            );
+            for tx in self.by_hash.values() {
+                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                    tx.envelope.clone(),
+                    self.network_id,
+                );
+                if frame.is_soroban() {
+                    fresh.add(tx.clone(), &self.network_id, ledger_version);
+                }
+            }
+            assert_eq!(
+                queue.total_resources(),
+                fresh.total_resources(),
+                "soroban eviction queue total resources mismatch"
+            );
+        }
+
+        // Check global ops queue
+        if let Some(ref queue) = self.global_ops_queue {
+            let mut fresh = SurgePricingPriorityQueue::new(
+                Box::new(OpsOnlyLaneConfig::new(queue.lane_limits(GENERIC_LANE))),
+                self.eviction_seed,
+            );
+            for tx in self.by_hash.values() {
+                fresh.add(tx.clone(), &self.network_id, ledger_version);
+            }
+            assert_eq!(
+                queue.total_resources(),
+                fresh.total_resources(),
+                "global ops eviction queue total resources mismatch"
             );
         }
     }
@@ -2395,6 +2501,11 @@ impl TransactionQueue {
 
         // Reset eviction thresholds for the new ledger
         self.reset_eviction_thresholds();
+
+        // Regenerate eviction seed and invalidate persistent queues for the
+        // new ledger. Parity: stellar-core regenerates mBroadcastSeed in shift()
+        // and calls resetBestFeeTxs() with the new seed.
+        store.regenerate_eviction_seed();
 
         // Clean up seen set for evicted transactions
         if !evicted_hashes.is_empty() {
@@ -7435,5 +7546,227 @@ mod resource_limit_parity_tests {
                 100 + (STAGE_COUNT * CLUSTER_COUNT) as i64 - 5,
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod eviction_queue_tests {
+    use super::*;
+    use henyey_common::types::Hash256;
+    use stellar_xdr::curr::*;
+
+    fn make_test_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let operations: Vec<Operation> = (0..ops)
+            .map(|_| Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
+                    starting_balance: 1000000000,
+                }),
+            })
+            .collect();
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    fn set_source(envelope: &mut TransactionEnvelope, seed: u8) {
+        let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
+        match envelope {
+            TransactionEnvelope::TxV0(env) => {
+                env.tx.source_account_ed25519 = Uint256([seed; 32]);
+            }
+            TransactionEnvelope::Tx(env) => {
+                env.tx.source_account = source;
+            }
+            TransactionEnvelope::TxFeeBump(env) => match &mut env.tx.inner_tx {
+                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                    inner.tx.source_account = source;
+                }
+            },
+        }
+    }
+
+    fn make_eviction_test_queue() -> TransactionQueue {
+        TransactionQueue::new(TxQueueConfig {
+            max_size: 100,
+            max_age_secs: 300,
+            max_queue_ops: Some(50),
+            max_queue_dex_ops: Some(20),
+            max_queue_classic_bytes: None,
+            ..Default::default()
+        })
+    }
+
+    /// After adding several txs via try_add, the persistent eviction queues
+    /// should match a cold rebuild from by_hash.
+    #[test]
+    fn test_persistent_eviction_queues_consistent_after_inserts() {
+        let queue = make_eviction_test_queue();
+
+        for i in 1..=5u8 {
+            let mut tx = make_test_envelope(100 + i as u32, 1);
+            set_source(&mut tx, i);
+            assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+        }
+
+        let store = queue.store.read();
+        store.assert_consistent();
+        store.assert_eviction_queues_consistent(0);
+    }
+
+    /// After ban() removes txs, eviction queues should stay consistent.
+    #[test]
+    fn test_persistent_eviction_queues_consistent_after_ban() {
+        let queue = make_eviction_test_queue();
+
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        let hash1 = Hash256::hash_xdr(&tx1);
+        let mut tx2 = make_test_envelope(300, 1);
+        set_source(&mut tx2, 2);
+        let mut tx3 = make_test_envelope(400, 1);
+        set_source(&mut tx3, 3);
+
+        queue.try_add(tx1);
+        queue.try_add(tx2);
+        queue.try_add(tx3);
+        assert_eq!(queue.len(), 3);
+
+        queue.ban(&[hash1]);
+        assert_eq!(queue.len(), 2);
+
+        let store = queue.store.read();
+        store.assert_consistent();
+        store.assert_eviction_queues_consistent(0);
+    }
+
+    /// After shift() auto-bans stale txs, eviction queues should be invalidated
+    /// and rebuilt consistently on next access.
+    #[test]
+    fn test_persistent_eviction_queues_invalidated_after_shift() {
+        let queue = TransactionQueue::with_ban_depth(
+            TxQueueConfig {
+                max_size: 100,
+                max_age_secs: 300,
+                max_queue_ops: Some(50),
+                max_queue_dex_ops: Some(20),
+                max_queue_classic_bytes: None,
+                ..Default::default()
+            },
+            3,
+        );
+
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        queue.try_add(tx1);
+
+        let mut tx2 = make_test_envelope(300, 1);
+        set_source(&mut tx2, 2);
+        queue.try_add(tx2);
+
+        queue.shift();
+
+        let store = queue.store.read();
+        assert!(
+            store.classic_eviction_queue.is_none(),
+            "classic queue should be invalidated after shift"
+        );
+        assert!(
+            store.global_ops_queue.is_none(),
+            "global ops queue should be invalidated after shift"
+        );
+    }
+
+    /// After clear(), eviction queues should be None and seed regenerated.
+    #[test]
+    fn test_persistent_eviction_queues_cleared() {
+        let queue = make_eviction_test_queue();
+
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        queue.try_add(tx1);
+
+        let mut tx2 = make_test_envelope(300, 1);
+        set_source(&mut tx2, 2);
+        queue.try_add(tx2);
+
+        queue.store.write().clear();
+
+        let store = queue.store.read();
+        assert!(store.classic_eviction_queue.is_none());
+        assert!(store.soroban_eviction_queue.is_none());
+        assert!(store.global_ops_queue.is_none());
+        assert_eq!(store.by_hash.len(), 0);
+    }
+
+    /// After remove_applied removes txs, eviction queues stay consistent.
+    #[test]
+    fn test_persistent_eviction_queues_consistent_after_remove_applied() {
+        let queue = make_eviction_test_queue();
+
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        let mut tx2 = make_test_envelope(300, 1);
+        set_source(&mut tx2, 2);
+        let mut tx3 = make_test_envelope(400, 1);
+        set_source(&mut tx3, 3);
+
+        queue.try_add(tx1.clone());
+        queue.try_add(tx2.clone());
+        queue.try_add(tx3.clone());
+        assert_eq!(queue.len(), 3);
+
+        queue.remove_applied(&[(tx1, 1)]);
+        assert_eq!(queue.len(), 2);
+
+        let store = queue.store.read();
+        store.assert_consistent();
+        store.assert_eviction_queues_consistent(0);
+    }
+
+    /// After update_soroban_resource_limits, the soroban eviction queue
+    /// should be invalidated (set to None) for lazy rebuild.
+    #[test]
+    fn test_soroban_queue_invalidated_on_limit_update() {
+        let queue = TransactionQueue::new(TxQueueConfig {
+            max_size: 100,
+            max_age_secs: 300,
+            max_queue_soroban_resources: Some(Resource::new(vec![
+                100, 100, 100, 100, 100, 100, 100,
+            ])),
+            ..Default::default()
+        });
+
+        {
+            let mut store = queue.store.write();
+            store.ensure_soroban_queue(Resource::new(vec![100, 100, 100, 100, 100, 100, 100]), 0);
+            assert!(store.soroban_eviction_queue.is_some());
+        }
+
+        queue
+            .update_soroban_resource_limits(Resource::new(vec![200, 200, 200, 200, 200, 200, 200]));
+
+        let store = queue.store.read();
+        assert!(
+            store.soroban_eviction_queue.is_none(),
+            "soroban queue should be invalidated after limit update"
+        );
     }
 }
