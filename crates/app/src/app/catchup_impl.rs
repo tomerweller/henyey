@@ -1441,16 +1441,27 @@ impl App {
                 tracing::warn!(
                     current_ledger,
                     archive_latest = latest,
-                    "Hard reset: archive at/behind us, no catchup to spawn"
+                    "Hard reset: archive at/behind us, requesting SCP state from peers"
                 );
+                // Re-bootstrap consensus pipeline: without fresh EXTERNALIZE
+                // messages, syncing_ledgers stays empty and the node deadlocks
+                // (see #1851).
+                *self.last_scp_state_request_at.write().await = self.clock.now();
+                self.request_scp_state_from_peers().await;
                 None
             }
             None => {
-                tracing::debug!(
+                tracing::warn!(
                     current_ledger,
-                    "Hard reset: archive cache cold/stale, skipping catchup spawn \
+                    "Hard reset: archive cache cold, requesting SCP state from peers \
                      (background refresh will warm cache)"
                 );
+                // Expedite archive cache refresh — the node needs a checkpoint
+                // target ASAP for the next recovery cycle.
+                self.archive_checkpoint_cache.set_urgent(true);
+                // Re-bootstrap consensus pipeline (see #1851).
+                *self.last_scp_state_request_at.write().await = self.clock.now();
+                self.request_scp_state_from_peers().await;
                 None
             }
         }

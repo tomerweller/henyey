@@ -877,9 +877,13 @@ mod tests {
         // background refresh was spawned. We verify by checking the
         // stale_returns counter (incremented when get_cached returns a
         // stale value).
-        let stale_before = cache.stale_returns.load(std::sync::atomic::Ordering::Relaxed);
+        let stale_before = cache
+            .stale_returns
+            .load(std::sync::atomic::Ordering::Relaxed);
         let _ = cache.get_cached();
-        let stale_after = cache.stale_returns.load(std::sync::atomic::Ordering::Relaxed);
+        let stale_after = cache
+            .stale_returns
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             stale_after > stale_before,
             "seed_stale with equal checkpoint must mark cache as stale"
