@@ -184,7 +184,10 @@ impl App {
         }
 
         // --- Escalation: after many failed attempts, force catchup ---
-        if attempts >= RECOVERY_ESCALATION_CATCHUP {
+        // Only escalate when the node is genuinely behind consensus.
+        // `gap` uses `saturating_sub` so `gap == 0` conflates "caught up"
+        // with "ahead of consensus" — use the explicit comparison instead.
+        if attempts >= RECOVERY_ESCALATION_CATCHUP && latest_externalized > current_ledger as u64 {
             self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
             return self
                 .trigger_recovery_catchup(current_ledger, latest_externalized, gap, attempts)
@@ -255,7 +258,7 @@ impl App {
                 // validator in quickstart/local mode where the validator closes
                 // ledgers every second.
                 let scp_total = self.scp_messages_received.load(Ordering::Relaxed);
-                if attempts >= 1 && scp_total > 0 && gap == 0 {
+                if attempts >= 1 && scp_total > 0 && latest_externalized == current_ledger as u64 {
                     tracing::warn!(
                         current_ledger,
                         latest_externalized,
@@ -847,15 +850,30 @@ impl App {
             let cache_age = self.archive_checkpoint_cache.last_query_age();
             let cache_age_secs = cache_age.map(|d| d.as_secs());
             let urgent = self.archive_checkpoint_cache.is_urgent();
-            tracing::info!(
-                current_ledger,
-                latest_externalized,
-                gap,
-                attempts,
-                ?cache_age_secs,
-                urgent,
-                "Recovery stalled for too long — forcing catchup"
-            );
+            // Demote to debug when the node is not actually behind consensus.
+            // The fast-track caller already emits its own WARN before entering
+            // this function, so the INFO here is redundant noise at gap=0.
+            if latest_externalized <= current_ledger as u64 {
+                tracing::debug!(
+                    current_ledger,
+                    latest_externalized,
+                    gap,
+                    attempts,
+                    ?cache_age_secs,
+                    urgent,
+                    "Recovery stalled for too long — forcing catchup"
+                );
+            } else {
+                tracing::info!(
+                    current_ledger,
+                    latest_externalized,
+                    gap,
+                    attempts,
+                    ?cache_age_secs,
+                    urgent,
+                    "Recovery stalled for too long — forcing catchup"
+                );
+            }
         }
 
         let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
