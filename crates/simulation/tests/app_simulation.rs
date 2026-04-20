@@ -14,19 +14,51 @@ async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(sim.have_all_app_nodes_externalized(target_ledger, 1));
+    let diag = collect_node_diagnostics(sim).await;
+    assert!(
+        sim.have_all_app_nodes_externalized(target_ledger, 1),
+        "timed out after {timeout:?} waiting for ledger {target_ledger}.{diag}"
+    );
 }
 
 async fn manual_close_until(sim: &Simulation, target_ledger: u32, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_err: Option<String> = None;
     while tokio::time::Instant::now() < deadline {
         if sim.have_all_app_nodes_externalized(target_ledger, 1) {
             return;
         }
-        let _ = sim.manual_close_all_app_nodes().await;
+        if let Err(e) = sim.manual_close_all_app_nodes().await {
+            last_err = Some(e.to_string());
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(sim.have_all_app_nodes_externalized(target_ledger, 1));
+    let mut diag = collect_node_diagnostics(sim).await;
+    if let Some(err) = &last_err {
+        diag.push_str(&format!("\n  last manual_close error: {err}"));
+    }
+    assert!(
+        sim.have_all_app_nodes_externalized(target_ledger, 1),
+        "manual_close_until timed out after {timeout:?} waiting for ledger {target_ledger}.{diag}"
+    );
+}
+
+async fn collect_node_diagnostics(sim: &Simulation) -> String {
+    let mut diag = String::new();
+    for id in sim.app_node_ids() {
+        match sim.app_debug_stats(&id).await {
+            Some(stats) => {
+                diag.push_str(&format!(
+                    "\n  {id}: ledger={}, peers={}, state={}, herder={}",
+                    stats.current_ledger, stats.peer_count, stats.app_state, stats.herder_state
+                ));
+            }
+            None => {
+                diag.push_str(&format!("\n  {id}: <not running>"));
+            }
+        }
+    }
+    diag
 }
 
 async fn wait_for_app_operational(sim: &Simulation, node_id: &str, timeout: Duration) {
@@ -428,11 +460,11 @@ async fn test_core3_restart_rejoin_over_tcp() {
         .await;
 
     // Wait for node0 to catch up to ledger 3 (where node1/node2 are).
-    // 30s timeout: post-restart catchup can be slow on CI runners.
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(30)).await;
+    // 60s timeout: post-restart catchup can be slow on CI runners.
+    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(60)).await;
 
     // Now advance all nodes to ledger 4.
-    manual_close_until(&sim, 4, Duration::from_secs(30)).await;
+    manual_close_until(&sim, 4, Duration::from_secs(60)).await;
 
     sim.stop_all_nodes()
         .await
@@ -484,11 +516,11 @@ async fn test_core3_restart_rejoin_over_loopback() {
         .await;
 
     // Wait for node0 to catch up to ledger 3 before triggering ledger 4.
-    // 30s timeout: post-restart catchup can be slow on CI runners.
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(30)).await;
+    // 60s timeout: post-restart catchup can be slow on CI runners.
+    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(60)).await;
 
     // Now advance all nodes to ledger 4.
-    manual_close_until(&sim, 4, Duration::from_secs(30)).await;
+    manual_close_until(&sim, 4, Duration::from_secs(60)).await;
 
     sim.stop_all_nodes()
         .await
