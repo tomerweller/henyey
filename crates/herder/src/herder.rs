@@ -4604,25 +4604,20 @@ mod scp_pipeline_tests {
         let state = spawned.handle.state.clone();
         let tx = spawned.handle.tx.clone();
         let verified_rx = spawned.verified_rx;
+        let join_handle = spawned.join_handle;
         assert_eq!(
             VerifierState::from_u8(state.load(Ordering::Relaxed)),
             VerifierState::Running
         );
 
         // Close all senders so blocking_recv returns None and the worker
-        // transitions to Dead. The output receiver closure is not required
-        // but we drop it for symmetry.
+        // transitions to Dead.
         drop(spawned.handle); // original handle owns one tx
         drop(tx); // our clone
         drop(verified_rx);
 
-        // Spin for up to 2s.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline
-            && VerifierState::from_u8(state.load(Ordering::Relaxed)) != VerifierState::Dead
-        {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        // Deterministically wait for the worker thread to exit.
+        join_handle.join().expect("worker thread should not panic");
         assert_eq!(
             VerifierState::from_u8(state.load(Ordering::Relaxed)),
             VerifierState::Dead,
@@ -4638,6 +4633,7 @@ mod scp_pipeline_tests {
         let spawned = spawn_scp_verifier(Hash256::from_bytes([11u8; 32]), 8).expect("spawn");
         let h = spawned.handle.clone();
         let mut verified_rx = spawned.verified_rx;
+        let join_handle = spawned.join_handle;
 
         let intake = PipelinedIntake {
             envelope: make_unsigned_envelope(1, 1),
@@ -4657,10 +4653,10 @@ mod scp_pipeline_tests {
             ve.verdict
         );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline && h.state() != VerifierState::Dead {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        // Deterministically wait for the worker thread to exit.
+        join_handle
+            .join()
+            .expect("worker thread should not panic (catch_unwind handles it)");
         assert_eq!(
             h.state(),
             VerifierState::Dead,

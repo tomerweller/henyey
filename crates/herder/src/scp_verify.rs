@@ -24,8 +24,15 @@
 //! - `heartbeat`: incremented every iteration (even for signature rejects)
 //! - `backlog`: `verifier_rx.len()` sampled on each dequeue
 //!
-//! A `Dead` state is reached on channel close, panic, or thread join. The
-//! watchdog also fires if `backlog > 0` while the heartbeat is stuck for
+//! The worker transitions to `Dead` and returns on any of:
+//! - **Input channel close**: all `Sender` halves dropped → `blocking_recv()` returns `None`
+//! - **Output receiver close**: `verified_tx.send()` returns `Err` → loop breaks
+//! - **Caught panic**: `catch_unwind` fires → emits `Verdict::Panic` → returns early
+//!
+//! [`SpawnedVerifier::join_handle`] can be used to deterministically wait for
+//! the worker thread to exit (e.g. in tests).
+//!
+//! The watchdog also fires if `backlog > 0` while the heartbeat is stuck for
 //! several ticks.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -385,12 +392,21 @@ impl SignatureVerifierHandle {
 pub struct SpawnedVerifier {
     pub handle: SignatureVerifierHandle,
     pub verified_rx: tokio::sync::mpsc::UnboundedReceiver<VerifiedEnvelope>,
+    /// Worker thread join handle. `join()` blocks until the worker thread
+    /// returns (after setting `state` to [`VerifierState::Dead`]).
+    ///
+    /// **Precondition**: the worker only returns when its input channel
+    /// closes, its output send fails, or it catches a panic. Calling
+    /// `join()` while input senders are still alive and no panic has
+    /// occurred will block indefinitely.
+    pub join_handle: std::thread::JoinHandle<()>,
 }
 
 /// Spawn the verifier worker thread.
 ///
 /// The worker owns its input receiver and output sender; when the input channel
-/// is closed it drains and exits, setting `state` to `Dead`.
+/// is closed it drains and exits, setting `state` to `Dead`. The returned
+/// [`SpawnedVerifier::join_handle`] can be used to wait for the thread to exit.
 pub fn spawn_scp_verifier(
     network_id: Hash256,
     capacity: usize,
@@ -405,7 +421,7 @@ pub fn spawn_scp_verifier(
     let heartbeat_worker = Arc::clone(&heartbeat);
     let backlog_worker = Arc::clone(&backlog);
 
-    std::thread::Builder::new()
+    let join_handle = std::thread::Builder::new()
         .name("scp-verify".into())
         .spawn(move || {
             scp_verify_worker(
@@ -426,6 +442,7 @@ pub fn spawn_scp_verifier(
             backlog,
         },
         verified_rx,
+        join_handle,
     })
 }
 
