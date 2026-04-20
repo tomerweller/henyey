@@ -297,26 +297,23 @@ impl ArchiveCheckpointCache {
     /// published during the catchup window without waiting for the normal
     /// 60s TTL to expire.
     ///
-    /// Monotonic: only writes if `checkpoint > current_cached_value`.
+    /// Monotonic: only writes if `checkpoint >= current_cached_value`.
+    /// Equal checkpoints are written to ensure the timestamp is marked stale
+    /// (the common post-catchup case where the cache already holds the
+    /// caught-up checkpoint from a prior blocking fetch).
     pub(super) fn seed_stale(&self, checkpoint: u32) {
         let mut guard = self.value.write();
         let should_write = match *guard {
-            Some(c) => checkpoint > c.checkpoint,
+            Some(c) => checkpoint >= c.checkpoint,
             None => true,
         };
         if should_write {
             // Use a `queried_at` far enough in the past that the cache
-            // is immediately stale regardless of effective TTL mode.
-            // If the process is too young for checked_sub to succeed,
-            // use the earliest possible Instant (now minus whatever is
-            // available) — in practice this means the process just started
-            // and the cache was cold anyway.
+            // is immediately stale regardless of effective TTL mode
+            // (normal=60s, urgent=10s, accelerated=1s).
             let ttl_duration = Duration::from_secs(ARCHIVE_CHECKPOINT_CACHE_SECS * 2);
-            let stale_time = self.clock.now().checked_sub(ttl_duration).unwrap_or(
-                // If we can't go back far enough, go back as far as we can.
-                // Even 1s in the past will be stale at the 1s accelerated TTL.
-                self.clock.now() - Duration::from_secs(1),
-            );
+            let now = self.clock.now();
+            let stale_time = now.checked_sub(ttl_duration).unwrap_or(now);
             *guard = Some(CachedCheckpoint {
                 checkpoint,
                 queried_at: stale_time,
@@ -855,6 +852,37 @@ mod tests {
             cache.get_cached(),
             Some(300),
             "seed_stale should accept a higher value"
+        );
+    }
+
+    /// `seed_stale` with the same checkpoint value still marks it stale,
+    /// ensuring a refresh is triggered even when catchup completes at
+    /// the same checkpoint already in the cache (the common case).
+    #[tokio::test]
+    async fn test_seed_stale_same_checkpoint_marks_stale() {
+        let (cache, _fetcher) = mk_cache(MockResponse::Ok(999));
+
+        // Seed fresh with checkpoint 200 (simulates a prior blocking fetch).
+        cache.seed(200);
+        // Verify it's fresh (no refresh triggered on next read).
+        let val = cache.get_cached();
+        assert_eq!(val, Some(200));
+
+        // Now seed_stale with the same value (simulates post-catchup seeding).
+        cache.seed_stale(200);
+        // The value should still be readable.
+        assert_eq!(cache.get_cached(), Some(200));
+
+        // The key assertion: the cache should now be stale, meaning a
+        // background refresh was spawned. We verify by checking the
+        // stale_returns counter (incremented when get_cached returns a
+        // stale value).
+        let stale_before = cache.stale_returns.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = cache.get_cached();
+        let stale_after = cache.stale_returns.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            stale_after > stale_before,
+            "seed_stale with equal checkpoint must mark cache as stale"
         );
     }
 
