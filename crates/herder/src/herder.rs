@@ -4665,6 +4665,37 @@ mod scp_pipeline_tests {
     }
 
     #[test]
+    fn test_worker_output_receiver_close_exits() {
+        let spawned = spawn_scp_verifier(Hash256::from_bytes([5u8; 32]), 8).expect("spawn");
+        let h = spawned.handle.clone();
+        let join_handle = spawned.join_handle;
+
+        // Drop the output receiver — the next send() in the worker will fail.
+        drop(spawned.verified_rx);
+
+        // Send one non-panic envelope so the worker processes it and hits
+        // the failed send path.
+        let intake = PipelinedIntake {
+            envelope: make_unsigned_envelope(1, 1),
+            slot: 1,
+            is_externalize: false,
+            peer_id: None,
+            enqueue_at: std::time::Instant::now(),
+        };
+        h.tx.blocking_send(intake).expect("send");
+
+        // Deterministically wait for the worker thread to exit.
+        join_handle
+            .join()
+            .expect("worker thread should not panic on output-close");
+        assert_eq!(
+            h.state(),
+            VerifierState::Dead,
+            "worker must transition to Dead when output receiver is dropped"
+        );
+    }
+
+    #[test]
     fn test_verifier_handle_queue_len_reports_used_slots() {
         // Construct a SignatureVerifierHandle directly (no spawned worker)
         // so the channel isn't being drained. This tests only the queue
