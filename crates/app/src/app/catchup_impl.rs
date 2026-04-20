@@ -448,17 +448,17 @@ impl App {
         // to incorrectly report the archive as behind, creating a feedback
         // loop that starved testnet catchup of progress (see #1811).
         //
-        // Take the MAX of the current cached value and the computed checkpoint
-        // so a local catchup never reduces our view of the archive's latest
-        // state — it can only improve or keep it.
+        // Use `seed_stale` so the cache value is immediately eligible for
+        // background refresh. This allows recovery to discover any checkpoint
+        // published during the catchup window without waiting for the normal
+        // 60s TTL to expire (#1850). The monotonic write inside `seed_stale`
+        // ensures we never regress the cached value.
         let caught_up_checkpoint =
             henyey_history::checkpoint::latest_checkpoint_before_or_at(output.ledger_seq)
                 .unwrap_or(0);
         if caught_up_checkpoint > 0 {
-            let current = self.archive_checkpoint_cache.get_cached().unwrap_or(0);
-            if caught_up_checkpoint > current {
-                self.archive_checkpoint_cache.seed(caught_up_checkpoint);
-            }
+            self.archive_checkpoint_cache
+                .seed_stale(caught_up_checkpoint);
         }
 
         // Clear archive-behind backoff — a successful catchup proves the

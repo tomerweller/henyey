@@ -278,15 +278,50 @@ impl ArchiveCheckpointCache {
         Ok(checkpoint)
     }
 
-    /// Overwrite the cached value. Used by `handle_catchup_result` to
-    /// seed the cache with the ledger we just caught up to (an
-    /// authoritative checkpoint value), and by tests to pre-warm the
-    /// cache without going through the HTTP fetcher.
+    /// Overwrite the cached value with a fresh timestamp. Used by tests to
+    /// pre-warm the cache without going through the HTTP fetcher.
+    #[cfg(test)]
     pub(super) fn seed(&self, checkpoint: u32) {
         *self.value.write() = Some(CachedCheckpoint {
             checkpoint,
             queried_at: self.clock.now(),
         });
+    }
+
+    /// Seed the cache with a checkpoint value that's immediately considered
+    /// stale. The value is available for reading, but the next `get_cached()`
+    /// call will trigger a background refresh to discover any newer checkpoint.
+    ///
+    /// Used after catchup: the caught-up checkpoint provides a baseline for
+    /// recovery paths, but we want to immediately discover any checkpoint
+    /// published during the catchup window without waiting for the normal
+    /// 60s TTL to expire.
+    ///
+    /// Monotonic: only writes if `checkpoint > current_cached_value`.
+    pub(super) fn seed_stale(&self, checkpoint: u32) {
+        let mut guard = self.value.write();
+        let should_write = match *guard {
+            Some(c) => checkpoint > c.checkpoint,
+            None => true,
+        };
+        if should_write {
+            // Use a `queried_at` far enough in the past that the cache
+            // is immediately stale regardless of effective TTL mode.
+            // If the process is too young for checked_sub to succeed,
+            // use the earliest possible Instant (now minus whatever is
+            // available) — in practice this means the process just started
+            // and the cache was cold anyway.
+            let ttl_duration = Duration::from_secs(ARCHIVE_CHECKPOINT_CACHE_SECS * 2);
+            let stale_time = self.clock.now().checked_sub(ttl_duration).unwrap_or(
+                // If we can't go back far enough, go back as far as we can.
+                // Even 1s in the past will be stale at the 1s accelerated TTL.
+                self.clock.now() - Duration::from_secs(1),
+            );
+            *guard = Some(CachedCheckpoint {
+                checkpoint,
+                queried_at: stale_time,
+            });
+        }
     }
 
     /// Test / setup hook: overwrite the cached value with an explicit
@@ -760,5 +795,82 @@ mod tests {
             "fresh seed should have small age, got {:?}",
             age
         );
+    }
+
+    /// `seed_stale` makes the cache value available but immediately stale,
+    /// so the next `get_cached()` triggers a background refresh.
+    #[tokio::test]
+    async fn test_seed_stale_triggers_refresh_on_next_get_cached() {
+        let newer_checkpoint = 200u32;
+        let (cache, fetcher) = mk_cache(MockResponse::Ok(newer_checkpoint));
+
+        // Seed stale with an older checkpoint (simulates post-catchup state).
+        cache.seed_stale(128);
+
+        // The value should be readable.
+        let val = cache.get_cached();
+        assert_eq!(val, Some(128), "seed_stale value should be readable");
+
+        // get_cached should have counted it as stale and spawned a refresh.
+        assert_eq!(cache.stale_returns(), 1, "should be counted as stale");
+
+        // Wait for the background refresh to complete.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            fetcher.call_count.load(Ordering::SeqCst),
+            1,
+            "refresh should have been spawned"
+        );
+        // After refresh, the cache should contain the newer value from fetcher.
+        let refreshed = cache.get_cached();
+        assert_eq!(
+            refreshed,
+            Some(newer_checkpoint),
+            "cache should be updated to fetcher's value after refresh"
+        );
+    }
+
+    /// `seed_stale` is monotonic — it never regresses the cached value.
+    #[tokio::test]
+    async fn test_seed_stale_is_monotonic() {
+        let (cache, _fetcher) = mk_cache(MockResponse::Ok(999));
+
+        // Seed with a higher value first.
+        cache.seed_stale(200);
+        assert_eq!(cache.get_cached(), Some(200));
+
+        // Attempt to seed with a lower value — should be ignored.
+        cache.seed_stale(100);
+        assert_eq!(
+            cache.get_cached(),
+            Some(200),
+            "seed_stale must not regress the cached value"
+        );
+
+        // Seed with a higher value — should succeed.
+        cache.seed_stale(300);
+        assert_eq!(
+            cache.get_cached(),
+            Some(300),
+            "seed_stale should accept a higher value"
+        );
+    }
+
+    /// `seed_stale` on a cold cache populates it with the stale value.
+    #[tokio::test]
+    async fn test_seed_stale_on_cold_cache() {
+        // Use a fetcher that returns a value lower than what we'll seed,
+        // so the monotonic guard doesn't interfere.
+        let (cache, _fetcher) = mk_cache(MockResponse::Ok(50));
+
+        // Cache starts cold.
+        assert_eq!(cache.get_cached(), None);
+
+        // Seed with a value higher than the fetcher returns.
+        cache.seed_stale(128);
+        let val = cache.get_cached();
+        assert_eq!(val, Some(128), "seed_stale should populate a cold cache");
     }
 }
