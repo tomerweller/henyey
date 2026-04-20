@@ -4504,18 +4504,12 @@ mod tests {
     ///
     /// Scenario: node has fallen slightly behind. tx_sets are evicted from
     /// peers. Recovery escalates every 10s (OUT_OF_SYNC_RECOVERY_TIMER_SECS).
-    /// On each tick, `trigger_recovery_catchup` used to:
-    ///   1. unconditionally clear the archive checkpoint cache, and
-    ///   2. re-query the archive,
-    /// even though the archive publishes checkpoints every ~5 minutes. This
-    /// produced N archive queries per stall (one per 10s) with identical
-    /// "Recovery catchup skipped" results — a hot-loop.
     ///
-    /// The fix arms a dedicated `archive_behind_until` backoff lasting
-    /// `ARCHIVE_BEHIND_BACKOFF_SECS` whenever the archive is observed to be
-    /// behind the needed checkpoint. While the backoff is active, subsequent
-    /// ticks skip the archive query entirely. The peer-SCP fallback still
-    /// runs every tick (cheap, genuinely helpful).
+    /// The `archive_behind_until` backoff suppresses redundant archive
+    /// queries. It is armed by the buffered-catchup validation paths in
+    /// `catchup_impl.rs` (see `arm_archive_behind_backoff`).  Note that
+    /// `trigger_recovery_catchup` itself no longer arms this backoff
+    /// (see #1847) — it relies on the cache TTL and urgent mode instead.
     ///
     /// This test exercises the backoff lifecycle directly on an `App`:
     ///   1. Initially backoff is None — query is allowed.

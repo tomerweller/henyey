@@ -37,6 +37,11 @@ use crate::config::HistoryArchiveEntry;
 /// not serve values that are 7+ checkpoints out of date.
 pub(super) const ARCHIVE_CHECKPOINT_CACHE_SECS: u64 = 60;
 
+/// Reduced cache TTL used when the node is archive-dependent and peers
+/// cannot supply tx_sets (urgent mode — see [`ArchiveCheckpointCache::set_urgent`]).
+/// Set to one recovery-timer tick so the cache refreshes on every cycle.
+pub(super) const ARCHIVE_CHECKPOINT_CACHE_URGENT_SECS: u64 = 10;
+
 /// Return the effective cache TTL given the current checkpoint frequency.
 ///
 /// In accelerated mode the archive is localhost and publishes checkpoints
@@ -187,6 +192,13 @@ struct CachedCheckpoint {
 pub(super) struct ArchiveCheckpointCache {
     value: RwLock<Option<CachedCheckpoint>>,
     refreshing: AtomicBool,
+    /// When true, the effective TTL is reduced to
+    /// [`ARCHIVE_CHECKPOINT_CACHE_URGENT_SECS`] so the node detects
+    /// a freshly-published checkpoint within one recovery tick (~10 s).
+    /// Set by `trigger_recovery_catchup` when the archive is the only
+    /// recovery path (peers' tx_sets evicted); cleared on progress or
+    /// after successful catchup.  See issue #1847.
+    urgent: AtomicBool,
     stale_returns: AtomicU64,
     cold_returns: AtomicU64,
     refresh_timeouts: AtomicU64,
@@ -206,6 +218,7 @@ impl ArchiveCheckpointCache {
         Self {
             value: RwLock::new(None),
             refreshing: AtomicBool::new(false),
+            urgent: AtomicBool::new(false),
             stale_returns: AtomicU64::new(0),
             cold_returns: AtomicU64::new(0),
             refresh_timeouts: AtomicU64::new(0),
@@ -224,12 +237,13 @@ impl ArchiveCheckpointCache {
     ///
     /// Event-loop callers MUST treat `None` as "unknown — skip this tick".
     pub(super) fn get_cached(self: &Arc<Self>) -> Option<u32> {
+        let effective_ttl = self.effective_ttl_secs();
         let (value, needs_refresh) = {
             let guard = self.value.read();
             match *guard {
                 Some(c) => {
                     let age = self.clock.now().saturating_duration_since(c.queried_at);
-                    let stale = age.as_secs() >= cache_ttl_secs();
+                    let stale = age.as_secs() >= effective_ttl;
                     (Some(c.checkpoint), stale)
                 }
                 None => (None, true),
@@ -296,6 +310,45 @@ impl ArchiveCheckpointCache {
     #[cfg(test)]
     pub(super) fn clear(&self) {
         *self.value.write() = None;
+    }
+
+    /// Enable or disable urgent mode.
+    ///
+    /// When urgent, the effective cache TTL is reduced to
+    /// [`ARCHIVE_CHECKPOINT_CACHE_URGENT_SECS`] so background refreshes
+    /// fire on every recovery tick (~10 s) instead of every 60 s.
+    /// This is activated by `trigger_recovery_catchup` when the archive
+    /// is the sole recovery path (peers' tx_sets evicted), and cleared
+    /// on ledger progress or successful catchup.
+    pub(super) fn set_urgent(&self, urgent: bool) {
+        self.urgent.store(urgent, Ordering::Relaxed);
+    }
+
+    /// Whether urgent mode is currently active.
+    pub(super) fn is_urgent(&self) -> bool {
+        self.urgent.load(Ordering::Relaxed)
+    }
+
+    /// The effective TTL in seconds: urgent mode wins over normal mode,
+    /// and accelerated mode (checkpoint_frequency < 64) always uses 1 s.
+    fn effective_ttl_secs(&self) -> u64 {
+        let base = cache_ttl_secs();
+        if base <= ARCHIVE_CHECKPOINT_CACHE_URGENT_SECS {
+            // Accelerated mode already uses an aggressive TTL.
+            base
+        } else if self.urgent.load(Ordering::Relaxed) {
+            ARCHIVE_CHECKPOINT_CACHE_URGENT_SECS
+        } else {
+            base
+        }
+    }
+
+    /// Age of the cached value, or `None` if the cache is cold.
+    /// Used for observability logging in `trigger_recovery_catchup`.
+    pub(super) fn last_query_age(&self) -> Option<Duration> {
+        self.value
+            .read()
+            .map(|c| self.clock.now().saturating_duration_since(c.queried_at))
     }
 
     /// Test hook: replace the background fetcher. Production code never
@@ -626,5 +679,86 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(cache.refresh_errors(), 2);
+    }
+
+    /// Urgent mode reduces the effective TTL, causing the cache to
+    /// spawn background refreshes more frequently.
+    #[tokio::test]
+    async fn test_urgent_mode_reduces_ttl() {
+        let (cache, fetcher) = mk_cache(MockResponse::Ok(200));
+
+        // Seed with a value 15 seconds ago (> urgent TTL, < normal TTL).
+        let queried_at = std::time::Instant::now() - Duration::from_secs(15);
+        cache.seed_with_queried_at(100, queried_at);
+
+        // Normal mode: 15s < 60s TTL → not stale, no refresh.
+        assert!(!cache.is_urgent());
+        let stale_before = cache.stale_returns();
+        let val = cache.get_cached();
+        assert_eq!(val, Some(100));
+        assert_eq!(
+            cache.stale_returns(),
+            stale_before,
+            "should NOT be stale in normal mode"
+        );
+
+        // Enable urgent mode: 15s > 10s urgent TTL → stale, triggers refresh.
+        cache.set_urgent(true);
+        assert!(cache.is_urgent());
+        let stale_before = cache.stale_returns();
+        let val = cache.get_cached();
+        assert_eq!(val, Some(100), "returns stale value immediately");
+        assert_eq!(
+            cache.stale_returns(),
+            stale_before + 1,
+            "should be stale in urgent mode"
+        );
+
+        // Wait for refresh to complete.
+        for _ in 0..100 {
+            if !cache.is_refreshing() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            fetcher.call_count.load(Ordering::SeqCst) >= 1,
+            "urgent mode should have triggered a refresh"
+        );
+
+        // Disable urgent mode.
+        cache.set_urgent(false);
+        assert!(!cache.is_urgent());
+    }
+
+    /// `last_query_age` returns `None` for a cold cache and `Some(age)`
+    /// for a warm cache.
+    #[tokio::test]
+    async fn test_last_query_age() {
+        let (cache, _fetcher) = mk_cache(MockResponse::Ok(100));
+
+        // Cold cache → None.
+        assert!(cache.last_query_age().is_none());
+
+        // Seed with a known age.
+        let queried_at = std::time::Instant::now() - Duration::from_secs(42);
+        cache.seed_with_queried_at(100, queried_at);
+        let age = cache.last_query_age().expect("should have age");
+        // Allow 1s tolerance for test execution time.
+        assert!(
+            age.as_secs() >= 41 && age.as_secs() <= 44,
+            "expected ~42s, got {:?}",
+            age
+        );
+
+        // Fresh seed → small age.
+        cache.seed(200);
+        let age = cache.last_query_age().expect("should have age");
+        assert!(
+            age.as_secs() < 2,
+            "fresh seed should have small age, got {:?}",
+            age
+        );
     }
 }

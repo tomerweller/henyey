@@ -2203,6 +2203,10 @@ impl App {
                     self.reset_tx_set_tracking().await;
                     *self.consensus_stuck_state.write().await = None;
 
+                    // Clear urgent cache mode — catchup succeeded, the node
+                    // is no longer archive-dependent (#1847).
+                    self.archive_checkpoint_cache.set_urgent(false);
+
                     // Fire-and-forget SCP state request so peers send
                     // EXTERNALIZE for recent slots. Responses arrive via
                     // scp_message_rx and the event loop processes them

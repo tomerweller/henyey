@@ -143,10 +143,12 @@ impl App {
                 .store(current_ledger as u64, Ordering::SeqCst);
             self.recovery_attempts_without_progress
                 .store(0, Ordering::SeqCst);
-            // Also clear any archive-behind backoff — the node is advancing
-            // again, so the next stall (if any) should query fresh.
+            // Also clear any archive-behind backoff and urgent cache mode —
+            // the node is advancing again, so the next stall (if any) should
+            // query fresh.
             let mut guard = self.archive_behind_until.write().await;
             *guard = None;
+            self.archive_checkpoint_cache.set_urgent(false);
         }
         let attempts = self
             .recovery_attempts_without_progress
@@ -838,11 +840,16 @@ impl App {
                 "Recovery stalled (archive-behind backoff active)"
             );
         } else {
+            let cache_age = self.archive_checkpoint_cache.last_query_age();
+            let cache_age_secs = cache_age.map(|d| d.as_secs());
+            let urgent = self.archive_checkpoint_cache.is_urgent();
             tracing::info!(
                 current_ledger,
                 latest_externalized,
                 gap,
                 attempts,
+                ?cache_age_secs,
+                urgent,
                 "Recovery stalled for too long — forcing catchup"
             );
         }
@@ -888,24 +895,34 @@ impl App {
         } else {
             match self.get_cached_archive_checkpoint_nonblocking() {
                 Some(latest) if latest >= next_cp => {
-                    // Archive is current enough — clear any prior backoff.
+                    // Archive is current enough — clear any prior backoff
+                    // and urgent mode.
                     let mut guard = self.archive_behind_until.write().await;
                     *guard = None;
+                    self.archive_checkpoint_cache.set_urgent(false);
                     Some(latest)
                 }
                 Some(latest) => {
-                    // Archive responded but is still behind. Arm the backoff.
-                    // Use shorter backoff when the next checkpoint is imminent
-                    // (within freq/3 ledgers of publication). See #1754.
-                    let backoff_secs = Self::archive_behind_backoff_secs(current_ledger);
-                    let deadline = self.clock.now() + Duration::from_secs(backoff_secs);
-                    let mut guard = self.archive_behind_until.write().await;
-                    *guard = Some(deadline);
+                    // Archive responded but is still behind the next
+                    // checkpoint.  Do NOT arm `archive_behind_until` here:
+                    // the cache's own TTL already throttles actual HTTP
+                    // queries, and adding a 15–60 s backoff on top prevents
+                    // this function from even reading the cache for that
+                    // window — delaying detection of a newly-published
+                    // checkpoint by up to 120 s (see #1847).
+                    //
+                    // Instead, enable urgent-mode on the cache so the TTL
+                    // drops to ~10 s, and let the normal recovery timer
+                    // (10 s) drive the re-check cadence.  The catchup_impl
+                    // validation paths still arm their own backoff
+                    // independently (see `arm_archive_behind_backoff`).
+                    if self.tx_set_all_peers_exhausted.load(Ordering::SeqCst) {
+                        self.archive_checkpoint_cache.set_urgent(true);
+                    }
                     tracing::debug!(
                         archive_latest = latest,
                         next_checkpoint = next_cp,
-                        backoff_secs,
-                        "Archive behind next checkpoint — arming backoff"
+                        "Archive behind next checkpoint — relying on cache TTL"
                     );
                     None
                 }
