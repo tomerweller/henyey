@@ -1376,10 +1376,14 @@ impl LedgerManager {
     /// Override the stored ledger header version for testing.
     ///
     /// This simulates a network upgrade beyond supported versions.
+    /// The header hash is recomputed so that `header_snapshot()` and
+    /// `current_header_hash()` remain consistent with the mutated header.
     #[doc(hidden)]
     pub fn set_header_version_for_test(&self, version: u32) {
         let mut state = self.state.write();
         state.header.ledger_version = version;
+        state.header_hash = compute_header_hash(&state.header)
+            .expect("header hash computation should not fail in tests");
     }
 
     /// Override the stored ledger header and header hash for testing.
@@ -7884,5 +7888,65 @@ mod tests {
         let r2 = mgr.soroban_network_info();
         assert_eq!(r1.unwrap().tx_max_instructions, 42);
         assert_eq!(r2.unwrap().ledger_max_tx_count, 99);
+    }
+
+    /// Regression test: `set_header_version_for_test()` must recompute the
+    /// header hash so that `current_header_hash()` and `header_snapshot()`
+    /// remain consistent with the mutated header.
+    #[test]
+    fn test_set_header_version_for_test_recomputes_hash() {
+        use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        manager
+            .initialize(
+                bucket_list,
+                hot_archive_bucket_list,
+                header.clone(),
+                header_hash,
+            )
+            .expect("initialization should succeed");
+
+        let old_hash = manager.current_header_hash();
+
+        // Mutate the version — the hash must change.
+        let new_version = CURRENT_LEDGER_PROTOCOL_VERSION - 1;
+        manager.set_header_version_for_test(new_version);
+
+        // current_header_hash() must match recomputed hash.
+        let current_hash = manager.current_header_hash();
+        let expected_hash = crate::compute_header_hash(&manager.current_header()).expect("hash");
+        assert_eq!(
+            current_hash, expected_hash,
+            "current_header_hash() is stale"
+        );
+        assert_ne!(
+            current_hash, old_hash,
+            "hash should change after version mutation"
+        );
+
+        // header_snapshot() must be internally consistent.
+        let snapshot = manager.header_snapshot();
+        assert_eq!(snapshot.header.ledger_version, new_version);
+        let snapshot_expected = crate::compute_header_hash(&snapshot.header).expect("hash");
+        assert_eq!(
+            snapshot.hash, snapshot_expected,
+            "header_snapshot() hash is stale"
+        );
     }
 }
