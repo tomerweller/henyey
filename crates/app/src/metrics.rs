@@ -1406,6 +1406,7 @@ mod tests {
     fn test_phase3_soroban_config_metrics_described() {
         let handle = ensure_test_recorder();
         describe_metrics();
+        register_label_series();
         let output = handle.render();
 
         let config_metrics = [
