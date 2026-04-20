@@ -77,6 +77,8 @@ pub struct CloseTimeDriftTracker {
     window_size: usize,
     /// Drift threshold for warnings (in seconds).
     threshold: i64,
+    /// Cached stats from the last completed window (survives window clears).
+    last_completed_stats: Option<DriftStats>,
 }
 
 impl Default for CloseTimeDriftTracker {
@@ -105,6 +107,7 @@ impl CloseTimeDriftTracker {
             window: BTreeMap::new(),
             window_size,
             threshold,
+            last_completed_stats: None,
         }
     }
 
@@ -184,6 +187,9 @@ impl CloseTimeDriftTracker {
     /// Computes the 75th percentile of drift values and returns a warning
     /// if it exceeds the threshold. Clears the window afterward.
     fn check_and_clear_drift(&mut self) -> Option<String> {
+        // Cache drift stats before clearing the window so metrics survive the clear.
+        self.last_completed_stats = self.get_drift_stats();
+
         let result = self
             .sorted_completed_drifts()
             .and_then(|drifts| match drift_p75(&drifts) {
@@ -233,6 +239,15 @@ impl CloseTimeDriftTracker {
             p75,
             sample_count: drifts.len(),
         })
+    }
+
+    /// Get the cached drift stats from the last completed window.
+    ///
+    /// Returns `None` until the first full window (120 ledgers) completes.
+    /// After that, always returns the stats from the most recent completed window,
+    /// even while the next window is accumulating.
+    pub fn last_drift_stats(&self) -> Option<DriftStats> {
+        self.last_completed_stats
     }
 
     fn sorted_completed_drifts(&self) -> Option<Vec<i64>> {
@@ -490,5 +505,48 @@ mod tests {
         // Wait, sorted: [-5, -2, 0, 1, 3, 5, 8, 12]
         // Index 5 is value 5
         assert_eq!(stats.p75, 5);
+    }
+
+    #[test]
+    fn test_last_drift_stats_survives_window_clear() {
+        let window_size = 5;
+        let mut tracker = CloseTimeDriftTracker::with_config(window_size, 100);
+
+        // No completed stats before first window
+        assert!(tracker.last_drift_stats().is_none());
+
+        // Fill the window by interleaving record + externalize so all entries
+        // are completed before the window-full check triggers.
+        for i in 0..(window_size as u32 - 1) {
+            tracker.record_local_close_time(100 + i, 1000 + i as u64 * 5);
+            // drift = 2 for all
+            tracker.record_externalized_close_time(100 + i, 1002 + i as u64 * 5);
+        }
+        // Window has 4 entries, all externalized. Add the 5th to trigger clear.
+        let last = window_size as u32 - 1;
+        tracker.record_local_close_time(100 + last, 1000 + last as u64 * 5);
+        tracker.record_externalized_close_time(100 + last, 1002 + last as u64 * 5);
+
+        // Window should be cleared
+        assert_eq!(tracker.window_len(), 0);
+
+        // But last_drift_stats should have the cached values
+        let stats = tracker
+            .last_drift_stats()
+            .expect("should have cached stats after window clear");
+        assert_eq!(stats.min, 2);
+        assert_eq!(stats.max, 2);
+        assert_eq!(stats.median, 2);
+        assert_eq!(stats.p75, 2);
+        assert_eq!(stats.sample_count, window_size);
+
+        // Start filling a new window — last_drift_stats should still return old values
+        tracker.record_local_close_time(200, 2000);
+        tracker.record_externalized_close_time(200, 2003);
+
+        let stats = tracker
+            .last_drift_stats()
+            .expect("cached stats should persist across new window");
+        assert_eq!(stats.min, 2); // still from previous window
     }
 }

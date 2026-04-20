@@ -529,6 +529,12 @@ pub struct App {
     /// Close time drift tracker for clock synchronization monitoring.
     drift_tracker: std::sync::Mutex<CloseTimeDriftTracker>,
 
+    /// Last successful ledger close stats for metrics reporting.
+    last_close_stats: parking_lot::RwLock<henyey_ledger::LedgerCloseStats>,
+
+    /// Last successful ledger close performance data for metrics reporting.
+    last_close_perf: parking_lot::RwLock<Option<henyey_ledger::LedgerClosePerf>>,
+
     /// Handle for sending commands to the sync recovery manager.
     /// Uses parking_lot::RwLock for synchronous access from callbacks.
     sync_recovery_handle: parking_lot::RwLock<Option<SyncRecoveryHandle>>,
@@ -900,6 +906,8 @@ impl App {
             meta_stream: std::sync::Mutex::new(meta_stream_for_mutex),
             meta_writer,
             drift_tracker: std::sync::Mutex::new(CloseTimeDriftTracker::new()),
+            last_close_stats: parking_lot::RwLock::new(Default::default()),
+            last_close_perf: parking_lot::RwLock::new(None),
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             is_applying_ledger: AtomicBool::new(false),
             #[cfg(test)]
@@ -1577,6 +1585,24 @@ impl App {
 
     pub fn herder_stats(&self) -> HerderStats {
         self.herder.stats()
+    }
+
+    /// Get the last successful ledger close stats for metrics.
+    pub fn last_close_stats(&self) -> henyey_ledger::LedgerCloseStats {
+        self.last_close_stats.read().clone()
+    }
+
+    /// Get the last successful ledger close performance data for metrics.
+    pub fn last_close_perf(&self) -> Option<henyey_ledger::LedgerClosePerf> {
+        self.last_close_perf.read().clone()
+    }
+
+    /// Get the cached drift stats from the last completed window.
+    pub fn drift_stats(&self) -> Option<henyey_herder::drift_tracker::DriftStats> {
+        self.drift_tracker
+            .lock()
+            .ok()
+            .and_then(|t| t.last_drift_stats())
     }
 
     pub async fn simulation_debug_stats(&self) -> SimulationDebugStats {
@@ -2462,6 +2488,7 @@ mod tests {
             tx_results: Vec::new(),
             meta: None,
             perf: None,
+            stats: Default::default(),
         }
     }
 
@@ -4964,6 +4991,7 @@ mod tests {
                     tx_results: Vec::new(),
                     meta: None,
                     perf: None,
+                    stats: Default::default(),
                 })
             }),
             ledger_seq: 1,
@@ -5178,6 +5206,7 @@ mod tests {
                     tx_results: Vec::new(),
                     meta: None,
                     perf: None,
+                    stats: Default::default(),
                 })
             }),
             ledger_seq: 1,
@@ -5363,6 +5392,7 @@ mod tests {
                         tx_results: Vec::new(),
                         meta: None,
                         perf: None,
+                        stats: Default::default(),
                     })
                 }),
                 ledger_seq: 1,

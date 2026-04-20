@@ -72,6 +72,34 @@ pub const OVERLAY_ERROR_WRITE_TOTAL: &str = "stellar_overlay_error_write_total";
 pub const OVERLAY_TIMEOUT_IDLE_TOTAL: &str = "stellar_overlay_timeout_idle_total";
 pub const OVERLAY_TIMEOUT_STRAGGLER_TOTAL: &str = "stellar_overlay_timeout_straggler_total";
 
+// Ledger close metrics (Phase 2 — per-ledger snapshot gauges).
+pub const LEDGER_CLOSE_TIME_MS: &str = "stellar_ledger_close_time_ms";
+pub const LEDGER_TX_COUNT: &str = "stellar_ledger_tx_count";
+pub const LEDGER_OP_COUNT: &str = "stellar_ledger_op_count";
+pub const LEDGER_TX_SUCCESS_COUNT: &str = "stellar_ledger_tx_success_count";
+pub const LEDGER_TX_FAILED_COUNT: &str = "stellar_ledger_tx_failed_count";
+pub const LEDGER_TOTAL_FEES: &str = "stellar_ledger_total_fees";
+pub const LEDGER_ENTRIES_CREATED: &str = "stellar_ledger_entries_created";
+pub const LEDGER_ENTRIES_UPDATED: &str = "stellar_ledger_entries_updated";
+pub const LEDGER_ENTRIES_DELETED: &str = "stellar_ledger_entries_deleted";
+pub const LEDGER_APPLY_US: &str = "stellar_ledger_apply_us";
+
+// Herder tx queue metrics (Phase 2 — from TxQueueStats).
+pub const HERDER_TX_QUEUE_ACCOUNTS: &str = "stellar_herder_tx_queue_accounts";
+pub const HERDER_TX_QUEUE_BANNED: &str = "stellar_herder_tx_queue_banned";
+pub const HERDER_TX_QUEUE_SEEN: &str = "stellar_herder_tx_queue_seen";
+
+// Herder pending envelope metrics (Phase 2 — completing the set).
+pub const HERDER_PENDING_ADDED_TOTAL: &str = "stellar_herder_pending_added_total";
+pub const HERDER_PENDING_RELEASED_TOTAL: &str = "stellar_herder_pending_released_total";
+
+// Clock drift metrics (Phase 2 — from CloseTimeDriftTracker).
+pub const DRIFT_MIN_SECONDS: &str = "henyey_herder_drift_min_seconds";
+pub const DRIFT_MAX_SECONDS: &str = "henyey_herder_drift_max_seconds";
+pub const DRIFT_MEDIAN_SECONDS: &str = "henyey_herder_drift_median_seconds";
+pub const DRIFT_P75_SECONDS: &str = "henyey_herder_drift_p75_seconds";
+pub const DRIFT_SAMPLE_COUNT: &str = "henyey_herder_drift_sample_count";
+
 // ── Registration ───────────────────────────────────────────────────────
 
 /// Register HELP/TYPE annotations for all metrics.
@@ -248,6 +276,85 @@ pub fn describe_metrics() {
         OVERLAY_TIMEOUT_STRAGGLER_TOTAL,
         "Total peers dropped due to straggler timeout"
     );
+
+    // Ledger close metrics.
+    describe_gauge!(
+        LEDGER_CLOSE_TIME_MS,
+        "Wall-clock time of the most recent ledger close (milliseconds)"
+    );
+    describe_gauge!(LEDGER_TX_COUNT, "Transactions processed in the last close");
+    describe_gauge!(LEDGER_OP_COUNT, "Operations executed in the last close");
+    describe_gauge!(
+        LEDGER_TX_SUCCESS_COUNT,
+        "Successful transactions in the last close"
+    );
+    describe_gauge!(
+        LEDGER_TX_FAILED_COUNT,
+        "Failed transactions in the last close"
+    );
+    describe_gauge!(
+        LEDGER_TOTAL_FEES,
+        "Fees collected in the last close (stroops)"
+    );
+    describe_gauge!(
+        LEDGER_ENTRIES_CREATED,
+        "Ledger entries created in the last close"
+    );
+    describe_gauge!(
+        LEDGER_ENTRIES_UPDATED,
+        "Ledger entries updated in the last close"
+    );
+    describe_gauge!(
+        LEDGER_ENTRIES_DELETED,
+        "Ledger entries deleted in the last close"
+    );
+    describe_gauge!(LEDGER_APPLY_US, "Total ledger close time in microseconds");
+
+    // Herder tx queue metrics.
+    describe_gauge!(
+        HERDER_TX_QUEUE_ACCOUNTS,
+        "Accounts with pending transactions in the queue"
+    );
+    describe_gauge!(
+        HERDER_TX_QUEUE_BANNED,
+        "Currently banned transactions in the queue"
+    );
+    describe_gauge!(
+        HERDER_TX_QUEUE_SEEN,
+        "Deduplicated transaction hashes in the seen set"
+    );
+
+    // Herder pending envelope metrics.
+    describe_counter!(
+        HERDER_PENDING_ADDED_TOTAL,
+        "Envelopes added to the pending pool"
+    );
+    describe_counter!(
+        HERDER_PENDING_RELEASED_TOTAL,
+        "Envelopes released from the pending pool"
+    );
+
+    // Clock drift metrics.
+    describe_gauge!(
+        DRIFT_MIN_SECONDS,
+        "Minimum close time drift in the last completed window (seconds)"
+    );
+    describe_gauge!(
+        DRIFT_MAX_SECONDS,
+        "Maximum close time drift in the last completed window (seconds)"
+    );
+    describe_gauge!(
+        DRIFT_MEDIAN_SECONDS,
+        "Median close time drift in the last completed window (seconds)"
+    );
+    describe_gauge!(
+        DRIFT_P75_SECONDS,
+        "75th percentile close time drift in the last completed window (seconds)"
+    );
+    describe_gauge!(
+        DRIFT_SAMPLE_COUNT,
+        "Number of samples in the last completed drift window"
+    );
 }
 
 /// Pre-register all metrics with initial values so that every metric appears
@@ -311,6 +418,34 @@ pub fn register_label_series() {
     counter!(OVERLAY_ERROR_WRITE_TOTAL).absolute(0);
     counter!(OVERLAY_TIMEOUT_IDLE_TOTAL).absolute(0);
     counter!(OVERLAY_TIMEOUT_STRAGGLER_TOTAL).absolute(0);
+
+    // Ledger close gauges (Phase 2).
+    gauge!(LEDGER_CLOSE_TIME_MS).set(0.0);
+    gauge!(LEDGER_TX_COUNT).set(0.0);
+    gauge!(LEDGER_OP_COUNT).set(0.0);
+    gauge!(LEDGER_TX_SUCCESS_COUNT).set(0.0);
+    gauge!(LEDGER_TX_FAILED_COUNT).set(0.0);
+    gauge!(LEDGER_TOTAL_FEES).set(0.0);
+    gauge!(LEDGER_ENTRIES_CREATED).set(0.0);
+    gauge!(LEDGER_ENTRIES_UPDATED).set(0.0);
+    gauge!(LEDGER_ENTRIES_DELETED).set(0.0);
+    gauge!(LEDGER_APPLY_US).set(0.0);
+
+    // Herder tx queue gauges (Phase 2).
+    gauge!(HERDER_TX_QUEUE_ACCOUNTS).set(0.0);
+    gauge!(HERDER_TX_QUEUE_BANNED).set(0.0);
+    gauge!(HERDER_TX_QUEUE_SEEN).set(0.0);
+
+    // Herder pending envelope counters (Phase 2).
+    counter!(HERDER_PENDING_ADDED_TOTAL).absolute(0);
+    counter!(HERDER_PENDING_RELEASED_TOTAL).absolute(0);
+
+    // Clock drift gauges (Phase 2).
+    gauge!(DRIFT_MIN_SECONDS).set(0.0);
+    gauge!(DRIFT_MAX_SECONDS).set(0.0);
+    gauge!(DRIFT_MEDIAN_SECONDS).set(0.0);
+    gauge!(DRIFT_P75_SECONDS).set(0.0);
+    gauge!(DRIFT_SAMPLE_COUNT).set(0.0);
 
     // Labeled counters — all reason labels pre-registered at zero.
     for reason in PreFilterRejectReason::ALL {
@@ -413,6 +548,48 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         counter!(OVERLAY_ERROR_WRITE_TOTAL).absolute(ov.errors_write);
         counter!(OVERLAY_TIMEOUT_IDLE_TOTAL).absolute(ov.timeouts_idle);
         counter!(OVERLAY_TIMEOUT_STRAGGLER_TOTAL).absolute(ov.timeouts_straggler);
+    }
+
+    // Ledger close stats (Phase 2).
+    let lcs = state.app.last_close_stats();
+    gauge!(LEDGER_CLOSE_TIME_MS).set(lcs.close_time_ms as f64);
+    gauge!(LEDGER_TX_COUNT).set(lcs.tx_count as f64);
+    gauge!(LEDGER_OP_COUNT).set(lcs.op_count as f64);
+    gauge!(LEDGER_TX_SUCCESS_COUNT).set(lcs.tx_success_count as f64);
+    gauge!(LEDGER_TX_FAILED_COUNT).set(lcs.tx_failed_count as f64);
+    gauge!(LEDGER_TOTAL_FEES).set(lcs.total_fees as f64);
+    gauge!(LEDGER_ENTRIES_CREATED).set(lcs.entries_created as f64);
+    gauge!(LEDGER_ENTRIES_UPDATED).set(lcs.entries_updated as f64);
+    gauge!(LEDGER_ENTRIES_DELETED).set(lcs.entries_deleted as f64);
+
+    // Ledger apply timing (Phase 2).
+    if let Some(perf) = state.app.last_close_perf() {
+        gauge!(LEDGER_APPLY_US).set(perf.total_us as f64);
+    }
+
+    // Herder tx queue stats (Phase 2).
+    let tq = &herder.tx_queue_stats;
+    gauge!(HERDER_TX_QUEUE_ACCOUNTS).set(tq.account_count as f64);
+    gauge!(HERDER_TX_QUEUE_BANNED).set(tq.banned_count as f64);
+    gauge!(HERDER_TX_QUEUE_SEEN).set(tq.seen_count as f64);
+
+    // Herder pending envelope stats — added + released (Phase 2).
+    counter!(HERDER_PENDING_ADDED_TOTAL).absolute(pstats.added);
+    counter!(HERDER_PENDING_RELEASED_TOTAL).absolute(pstats.released);
+
+    // Clock drift (Phase 2) — always write, zeros when no completed window.
+    if let Some(ds) = state.app.drift_stats() {
+        gauge!(DRIFT_MIN_SECONDS).set(ds.min as f64);
+        gauge!(DRIFT_MAX_SECONDS).set(ds.max as f64);
+        gauge!(DRIFT_MEDIAN_SECONDS).set(ds.median as f64);
+        gauge!(DRIFT_P75_SECONDS).set(ds.p75 as f64);
+        gauge!(DRIFT_SAMPLE_COUNT).set(ds.sample_count as f64);
+    } else {
+        gauge!(DRIFT_MIN_SECONDS).set(0.0);
+        gauge!(DRIFT_MAX_SECONDS).set(0.0);
+        gauge!(DRIFT_MEDIAN_SECONDS).set(0.0);
+        gauge!(DRIFT_P75_SECONDS).set(0.0);
+        gauge!(DRIFT_SAMPLE_COUNT).set(0.0);
     }
 }
 
@@ -671,6 +848,131 @@ mod tests {
                 !output.contains(&format!("# HELP {}", name)),
                 "metric {} should not be registered (no production producer)",
                 name
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase2_ledger_metrics_present() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        // Ledger close gauges.
+        let ledger_metrics = [
+            LEDGER_CLOSE_TIME_MS,
+            LEDGER_TX_COUNT,
+            LEDGER_OP_COUNT,
+            LEDGER_TX_SUCCESS_COUNT,
+            LEDGER_TX_FAILED_COUNT,
+            LEDGER_TOTAL_FEES,
+            LEDGER_ENTRIES_CREATED,
+            LEDGER_ENTRIES_UPDATED,
+            LEDGER_ENTRIES_DELETED,
+            LEDGER_APPLY_US,
+        ];
+        for name in &ledger_metrics {
+            assert!(
+                output.contains(&format!("# TYPE {} gauge", name)),
+                "missing TYPE gauge for {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("# HELP {}", name)),
+                "missing HELP for {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase2_herder_metrics_present() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        // Tx queue gauges.
+        let queue_gauges = [
+            HERDER_TX_QUEUE_ACCOUNTS,
+            HERDER_TX_QUEUE_BANNED,
+            HERDER_TX_QUEUE_SEEN,
+        ];
+        for name in &queue_gauges {
+            assert!(
+                output.contains(&format!("# TYPE {} gauge", name)),
+                "missing TYPE gauge for {}",
+                name
+            );
+        }
+
+        // Pending envelope counters.
+        let pending_counters = [HERDER_PENDING_ADDED_TOTAL, HERDER_PENDING_RELEASED_TOTAL];
+        for name in &pending_counters {
+            assert!(
+                output.contains(&format!("# TYPE {} counter", name)),
+                "missing TYPE counter for {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase2_drift_metrics_present() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        let drift_metrics = [
+            DRIFT_MIN_SECONDS,
+            DRIFT_MAX_SECONDS,
+            DRIFT_MEDIAN_SECONDS,
+            DRIFT_P75_SECONDS,
+            DRIFT_SAMPLE_COUNT,
+        ];
+        for name in &drift_metrics {
+            assert!(
+                output.contains(&format!("# TYPE {} gauge", name)),
+                "missing TYPE gauge for {}",
+                name
+            );
+            // All drift gauges should be pre-registered at 0.
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "drift metric {} should be pre-registered at 0",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase2_ledger_metrics_pre_registered_at_zero() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        // Before any close, all ledger gauges should be 0.
+        let zero_metrics = [
+            LEDGER_CLOSE_TIME_MS,
+            LEDGER_TX_COUNT,
+            LEDGER_OP_COUNT,
+            LEDGER_TX_SUCCESS_COUNT,
+            LEDGER_TX_FAILED_COUNT,
+            LEDGER_TOTAL_FEES,
+            LEDGER_ENTRIES_CREATED,
+            LEDGER_ENTRIES_UPDATED,
+            LEDGER_ENTRIES_DELETED,
+            LEDGER_APPLY_US,
+        ];
+        for name in &zero_metrics {
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "ledger metric {} should be pre-registered at 0; output:\n{}",
+                name,
+                output
             );
         }
     }

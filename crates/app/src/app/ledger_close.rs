@@ -1790,6 +1790,10 @@ impl App {
         };
         timer.mark("join_match_ms");
 
+        // Store last-close stats and perf for metrics reporting.
+        *self.last_close_stats.write() = result.stats.clone();
+        *self.last_close_perf.write() = result.perf.clone();
+
         // Emit LedgerCloseMeta to stream.
         // If a MetaWriter is active (async channel + dedicated thread), use it
         // for non-blocking I/O. Otherwise fall back to the synchronous Mutex path

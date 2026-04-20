@@ -5405,7 +5405,8 @@ impl LedgerCloseContext<'_> {
         Ok(LedgerCloseResult::new(new_header, header_hash)
             .with_tx_results(self.tx_results)
             .with_meta(meta)
-            .with_perf(perf))
+            .with_perf(perf)
+            .with_stats(self.stats))
     }
 }
 

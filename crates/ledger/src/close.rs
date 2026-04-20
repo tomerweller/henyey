@@ -949,6 +949,9 @@ pub struct LedgerCloseResult {
 
     /// Performance metrics for the ledger close.
     pub perf: Option<LedgerClosePerf>,
+
+    /// Statistics from ledger close processing (tx counts, fees, entry changes).
+    pub stats: LedgerCloseStats,
 }
 
 /// Per-transaction timing data.
@@ -1052,6 +1055,7 @@ impl LedgerCloseResult {
             tx_results: Vec::new(),
             meta: None,
             perf: None,
+            stats: LedgerCloseStats::default(),
         }
     }
 
@@ -1070,6 +1074,12 @@ impl LedgerCloseResult {
     /// Add performance metrics.
     pub fn with_perf(mut self, perf: LedgerClosePerf) -> Self {
         self.perf = Some(perf);
+        self
+    }
+
+    /// Add ledger close statistics.
+    pub fn with_stats(mut self, stats: LedgerCloseStats) -> Self {
+        self.stats = stats;
         self
     }
 
