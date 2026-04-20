@@ -95,7 +95,7 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
 pub(crate) async fn status_handler(State(state): State<Arc<ServerState>>) -> Json<NodeStatus> {
     let info = state.app.ledger_info();
     let stats = state.app.herder_stats();
-    let peer_count = state.app.peer_snapshots().await.len();
+    let peer_count = state.app.peer_count().await;
     Json(NodeStatus {
         ledger_seq: info.ledger_seq,
         ledger_hash: Some(info.hash.to_hex()),
@@ -110,7 +110,7 @@ pub(crate) async fn status_handler(State(state): State<Arc<ServerState>>) -> Jso
 pub(crate) async fn health_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let app_state = state.app.state().await;
     let ledger_seq = state.app.ledger_info().ledger_seq;
-    let peer_count = state.app.peer_snapshots().await.len();
+    let peer_count = state.app.peer_count().await;
 
     // Inline stall check: read consensus_stuck_state under lock.
     let stall_elapsed = {

@@ -646,7 +646,7 @@ impl NodeRunner {
     pub async fn status(&self) -> NodeStatus {
         let info = self.app.ledger_info();
         let stats = self.app.herder_stats();
-        let peer_count = self.app.peer_snapshots().await.len();
+        let peer_count = self.app.peer_count().await;
         NodeStatus {
             ledger_seq: info.ledger_seq,
             ledger_hash: Some(info.hash.to_hex()),
