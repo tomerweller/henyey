@@ -515,8 +515,7 @@ impl App {
                     latest_externalized,
                     "No tx_sets available for any buffered slot — forcing catchup"
                 );
-                self.recovery_attempts_without_progress
-                    .fetch_max(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                self.escalate_recovery_to_catchup();
                 return Some(None); // Wait for next tick to trigger escalation.
             }
         }

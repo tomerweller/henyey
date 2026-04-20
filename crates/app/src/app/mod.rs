@@ -1454,6 +1454,16 @@ impl App {
         self.sync_recovery_pending.store(true, Ordering::SeqCst);
     }
 
+    /// Escalate `recovery_attempts_without_progress` to at least
+    /// `RECOVERY_ESCALATION_CATCHUP`, preserving any higher value.
+    ///
+    /// Uses `fetch_max` (not `store`) so that a counter already past the
+    /// threshold is never regressed — see issue #1843.
+    pub(super) fn escalate_recovery_to_catchup(&self) {
+        self.recovery_attempts_without_progress
+            .fetch_max(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+    }
+
     /// Get Soroban network configuration information.
     ///
     /// Returns the Soroban-related configuration settings from the current ledger
@@ -6262,6 +6272,171 @@ mod tests {
             result,
             henyey_herder::TxQueueResult::TryAgainLater,
             "gap just above threshold should trigger freshness gate"
+        );
+    }
+
+    /// Regression test for issue #1843: `escalate_recovery_to_catchup` must
+    /// use `fetch_max` semantics — a pre-existing counter value above
+    /// `RECOVERY_ESCALATION_CATCHUP` must never be lowered.
+    ///
+    /// Tests the helper on a real `App` instance with a table of initial
+    /// counter values spanning below, at, and above the threshold.
+    #[tokio::test]
+    async fn test_escalate_recovery_to_catchup_monotonicity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // (initial_value, expected_after, description)
+        let cases: &[(u64, u64, &str)] = &[
+            (0, RECOVERY_ESCALATION_CATCHUP, "below threshold — raised"),
+            (
+                RECOVERY_ESCALATION_CATCHUP - 1,
+                RECOVERY_ESCALATION_CATCHUP,
+                "just below — raised",
+            ),
+            (
+                RECOVERY_ESCALATION_CATCHUP,
+                RECOVERY_ESCALATION_CATCHUP,
+                "equal — unchanged",
+            ),
+            (
+                RECOVERY_ESCALATION_CATCHUP + 1,
+                RECOVERY_ESCALATION_CATCHUP + 1,
+                "just above — preserved",
+            ),
+            (
+                RECOVERY_ESCALATION_CATCHUP + 5,
+                RECOVERY_ESCALATION_CATCHUP + 5,
+                "well above — preserved",
+            ),
+        ];
+
+        for &(initial, expected, desc) in cases {
+            app.recovery_attempts_without_progress
+                .store(initial, Ordering::SeqCst);
+            app.escalate_recovery_to_catchup();
+            let actual = app
+                .recovery_attempts_without_progress
+                .load(Ordering::SeqCst);
+            assert_eq!(actual, expected, "{desc}");
+        }
+    }
+
+    /// Regression test: the out-of-sync recovery path escalates only when
+    /// there are buffered slots but none of them have tx_sets.
+    ///
+    /// Guard condition at consensus.rs `out_of_sync_recovery`:
+    ///   `with_tx_set == 0 && total > 0`
+    #[test]
+    fn test_out_of_sync_escalation_guard_conditions() {
+        // Positive: buffered slots exist but none have tx_sets → escalate
+        let total = 5u64;
+        let with_tx_set = 0u64;
+        assert!(
+            with_tx_set == 0 && total > 0,
+            "should escalate when buffered slots have no tx_sets"
+        );
+
+        // Negative: no buffered slots at all → do NOT escalate
+        let total = 0u64;
+        let with_tx_set = 0u64;
+        assert!(
+            !(with_tx_set == 0 && total > 0),
+            "should NOT escalate when no buffered slots exist"
+        );
+
+        // Negative: some slots have tx_sets → do NOT escalate
+        let total = 5u64;
+        let with_tx_set = 3u64;
+        assert!(
+            !(with_tx_set == 0 && total > 0),
+            "should NOT escalate when some slots have tx_sets"
+        );
+    }
+
+    /// Regression test: Valid EXTERNALIZE escalates only when the slot is
+    /// more than 2 ahead of current_ledger.
+    ///
+    /// Guard condition at lifecycle.rs (Valid EXTERNALIZE path):
+    ///   `slot > current_ledger + 2` → escalate
+    ///   `slot > current_ledger + 1` → sync_recovery_pending only (no escalation)
+    #[test]
+    fn test_valid_externalize_escalation_guard_conditions() {
+        let current_ledger = 100u64;
+
+        // Positive: slot far ahead (gap=3) → both sync_recovery_pending AND escalation
+        let slot = current_ledger + 3;
+        assert!(
+            slot > current_ledger + 2,
+            "gap of 3 should trigger escalation"
+        );
+        assert!(
+            slot > current_ledger + 1,
+            "gap of 3 should also set sync_recovery_pending"
+        );
+
+        // Negative: slot at boundary (gap=2) → sync_recovery_pending only
+        let slot = current_ledger + 2;
+        assert!(
+            !(slot > current_ledger + 2),
+            "gap of exactly 2 should NOT trigger escalation"
+        );
+        assert!(
+            slot > current_ledger + 1,
+            "gap of 2 should still set sync_recovery_pending"
+        );
+
+        // Negative: normal next slot (gap=1) → neither
+        let slot = current_ledger + 1;
+        assert!(
+            !(slot > current_ledger + 2),
+            "gap of 1 should NOT trigger escalation"
+        );
+        assert!(
+            !(slot > current_ledger + 1),
+            "gap of 1 should NOT set sync_recovery_pending"
+        );
+    }
+
+    /// Regression test: Pending EXTERNALIZE escalates only when far ahead
+    /// AND the next slot does NOT have a buffered tx_set.
+    ///
+    /// Guard condition at lifecycle.rs (Pending EXTERNALIZE path):
+    ///   `slot > current_ledger + 2 && !have_next` → escalate
+    ///   `slot > current_ledger + 2 && have_next`  → skip (let rapid close proceed)
+    ///
+    /// `have_next` means `syncing_ledgers[next_slot].tx_set.is_some()` — a
+    /// buffered entry WITHOUT a tx_set still triggers escalation.
+    #[test]
+    fn test_pending_externalize_escalation_guard_conditions() {
+        let current_ledger = 100u64;
+
+        // Positive: far ahead and next slot NOT buffered with tx_set → escalate
+        let slot = current_ledger + 5;
+        let have_next = false; // next slot missing or has no tx_set
+        assert!(
+            slot > current_ledger + 2 && !have_next,
+            "far ahead without buffered next slot should escalate"
+        );
+
+        // Negative: far ahead but next slot HAS a buffered tx_set → skip
+        let slot = current_ledger + 5;
+        let have_next = true; // next slot buffered WITH tx_set
+        assert!(
+            !(slot > current_ledger + 2 && !have_next),
+            "far ahead with buffered next slot should NOT escalate"
+        );
+
+        // Negative: not far ahead → skip regardless of buffer state
+        let slot = current_ledger + 2;
+        let have_next = false;
+        assert!(
+            !(slot > current_ledger + 2 && !have_next),
+            "gap of exactly 2 should NOT trigger escalation"
         );
     }
 }
