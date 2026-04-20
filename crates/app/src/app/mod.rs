@@ -535,6 +535,15 @@ pub struct App {
     /// Last successful ledger close performance data for metrics reporting.
     last_close_perf: parking_lot::RwLock<Option<henyey_ledger::LedgerClosePerf>>,
 
+    // Phase 3 cumulative metrics — accumulated in handle_close_complete().
+    cumulative_apply_success: AtomicU64,
+    cumulative_apply_failure: AtomicU64,
+    cumulative_soroban_success: AtomicU64,
+    cumulative_soroban_failure: AtomicU64,
+    /// Soroban parallel execution structure from last close (sticky).
+    last_soroban_stage_count: AtomicU64,
+    last_soroban_max_cluster_count: AtomicU64,
+
     /// Handle for sending commands to the sync recovery manager.
     /// Uses parking_lot::RwLock for synchronous access from callbacks.
     sync_recovery_handle: parking_lot::RwLock<Option<SyncRecoveryHandle>>,
@@ -908,6 +917,12 @@ impl App {
             drift_tracker: std::sync::Mutex::new(CloseTimeDriftTracker::new()),
             last_close_stats: parking_lot::RwLock::new(Default::default()),
             last_close_perf: parking_lot::RwLock::new(None),
+            cumulative_apply_success: AtomicU64::new(0),
+            cumulative_apply_failure: AtomicU64::new(0),
+            cumulative_soroban_success: AtomicU64::new(0),
+            cumulative_soroban_failure: AtomicU64::new(0),
+            last_soroban_stage_count: AtomicU64::new(0),
+            last_soroban_max_cluster_count: AtomicU64::new(0),
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             is_applying_ledger: AtomicBool::new(false),
             #[cfg(test)]
@@ -1930,6 +1945,29 @@ impl App {
             post_catchup_hard_reset_total: self
                 .post_catchup_hard_reset_total
                 .load(Ordering::Relaxed),
+            // Phase 3 cumulative counters.
+            cumulative_apply_success: self.cumulative_apply_success.load(Ordering::Relaxed),
+            cumulative_apply_failure: self.cumulative_apply_failure.load(Ordering::Relaxed),
+            cumulative_soroban_success: self.cumulative_soroban_success.load(Ordering::Relaxed),
+            cumulative_soroban_failure: self.cumulative_soroban_failure.load(Ordering::Relaxed),
+            soroban_stage_count: self.last_soroban_stage_count.load(Ordering::Relaxed),
+            soroban_max_cluster_count: self.last_soroban_max_cluster_count.load(Ordering::Relaxed),
+            // Phase 3 last-close phase timing (lightweight snapshot).
+            soroban_exec_us: self
+                .last_close_perf
+                .read()
+                .as_ref()
+                .map_or(0, |p| p.soroban_exec_us),
+            classic_exec_us: self
+                .last_close_perf
+                .read()
+                .as_ref()
+                .map_or(0, |p| p.classic_exec_us),
+            prefetch_hit_ratio: self
+                .last_close_perf
+                .read()
+                .as_ref()
+                .map_or(0.0, |p| p.cache.hit_rate),
         }
     }
 

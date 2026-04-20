@@ -2004,6 +2004,8 @@ impl LedgerManager {
             timing_post_exec_us: 0,
             tx_perf: Vec::new(),
             soroban_fee_write_1kb: 0,
+            soroban_stage_count: 0,
+            soroban_max_cluster_count: 0,
         })
     }
 
@@ -2613,6 +2615,9 @@ struct LedgerCloseContext<'a> {
     /// Soroban fee per 1KB write (rent fee), cached from SorobanConfig for meta ext V1.
     /// Set during close_ledger() when SorobanConfig is loaded.
     soroban_fee_write_1kb: i64,
+    /// Soroban parallel phase structure metrics (captured during close_ledger).
+    soroban_stage_count: usize,
+    soroban_max_cluster_count: usize,
 }
 
 impl LedgerCloseContext<'_> {
@@ -3862,6 +3867,11 @@ impl LedgerCloseContext<'_> {
                 soroban_clusters = phase.stages.iter().map(|s| s.len()).sum::<usize>(),
                 "Executed parallel Soroban phase"
             );
+
+            // Capture Soroban phase structure metrics.
+            self.soroban_stage_count = phase.stages.len();
+            self.soroban_max_cluster_count =
+                phase.stages.iter().map(|s| s.len()).max().unwrap_or(0);
 
             classic_result
         } else {
@@ -5400,6 +5410,8 @@ impl LedgerCloseContext<'_> {
             cache: cache_perf,
             rss_before_bytes: rss_before,
             rss_after_bytes: rss_after,
+            soroban_stage_count: self.soroban_stage_count,
+            soroban_max_cluster_count: self.soroban_max_cluster_count,
         };
 
         Ok(LedgerCloseResult::new(new_header, header_hash)
@@ -7130,6 +7142,8 @@ mod tests {
             timing_post_exec_us: 0,
             tx_perf: Vec::new(),
             soroban_fee_write_1kb: 0,
+            soroban_stage_count: 0,
+            soroban_max_cluster_count: 0,
         }
     }
 

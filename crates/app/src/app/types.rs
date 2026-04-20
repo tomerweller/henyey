@@ -244,6 +244,18 @@ pub struct AppMetricsSnapshot {
     pub scp_verify: ScpVerifyMetrics,
     pub overlay_fetch_channel: OverlayFetchChannelMetrics,
     pub post_catchup_hard_reset_total: u64,
+    // Phase 3: cumulative ledger apply counters.
+    pub cumulative_apply_success: u64,
+    pub cumulative_apply_failure: u64,
+    pub cumulative_soroban_success: u64,
+    pub cumulative_soroban_failure: u64,
+    // Phase 3: Soroban parallel execution structure (sticky).
+    pub soroban_stage_count: u64,
+    pub soroban_max_cluster_count: u64,
+    // Phase 3: last-close phase timing (lightweight — no Vec clone).
+    pub soroban_exec_us: u64,
+    pub classic_exec_us: u64,
+    pub prefetch_hit_ratio: f64,
 }
 
 /// Metrics for the overlay fetch-response channel (issue #1741).

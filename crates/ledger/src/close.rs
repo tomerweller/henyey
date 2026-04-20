@@ -1019,6 +1019,11 @@ pub struct LedgerClosePerf {
     /// RSS in bytes at start and end of ledger close.
     pub rss_before_bytes: u64,
     pub rss_after_bytes: u64,
+
+    /// Number of parallel Soroban stages in this ledger close (0 if no Soroban phase).
+    pub soroban_stage_count: usize,
+    /// Maximum number of clusters in any single stage (0 if no Soroban phase).
+    pub soroban_max_cluster_count: usize,
 }
 
 impl std::ops::AddAssign<&LedgerClosePerf> for LedgerClosePerf {
@@ -1043,6 +1048,8 @@ impl std::ops::AddAssign<&LedgerClosePerf> for LedgerClosePerf {
         self.fee_pre_deduct_us += rhs.fee_pre_deduct_us;
         self.post_exec_us += rhs.post_exec_us;
         self.tx_count += rhs.tx_count;
+        // soroban_stage_count and soroban_max_cluster_count are per-close
+        // (not cumulative), so take the latest rather than summing.
     }
 }
 

@@ -108,6 +108,54 @@ pub const JEMALLOC_MAPPED_BYTES: &str = "henyey_jemalloc_mapped_bytes";
 pub const JEMALLOC_RETAINED_BYTES: &str = "henyey_jemalloc_retained_bytes";
 pub const JEMALLOC_FRAGMENTATION_PCT: &str = "henyey_jemalloc_fragmentation_pct";
 
+// Phase 3 — Ledger apply cumulative counters.
+pub const LEDGER_APPLY_SUCCESS_TOTAL: &str = "stellar_ledger_apply_success_total";
+pub const LEDGER_APPLY_FAILURE_TOTAL: &str = "stellar_ledger_apply_failure_total";
+pub const LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL: &str = "stellar_ledger_apply_soroban_success_total";
+pub const LEDGER_APPLY_SOROBAN_FAILURE_TOTAL: &str = "stellar_ledger_apply_soroban_failure_total";
+pub const LEDGER_APPLY_SOROBAN_MAX_CLUSTERS: &str = "stellar_ledger_apply_soroban_max_clusters";
+pub const LEDGER_APPLY_SOROBAN_STAGES: &str = "stellar_ledger_apply_soroban_stages";
+pub const LEDGER_AGE_CURRENT_SECONDS: &str = "stellar_ledger_age_current_seconds";
+
+// Phase 3 — Soroban network config limits (counter, absolute-set per scrape).
+pub const SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE: &str =
+    "stellar_soroban_config_contract_max_rw_key_byte";
+pub const SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE: &str =
+    "stellar_soroban_config_contract_max_rw_data_byte";
+pub const SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE: &str =
+    "stellar_soroban_config_contract_max_rw_code_byte";
+pub const SOROBAN_CONFIG_TX_MAX_SIZE_BYTE: &str = "stellar_soroban_config_tx_max_size_byte";
+pub const SOROBAN_CONFIG_TX_MAX_CPU_INSN: &str = "stellar_soroban_config_tx_max_cpu_insn";
+pub const SOROBAN_CONFIG_TX_MAX_MEM_BYTE: &str = "stellar_soroban_config_tx_max_mem_byte";
+pub const SOROBAN_CONFIG_TX_MAX_READ_ENTRY: &str = "stellar_soroban_config_tx_max_read_entry";
+pub const SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE: &str =
+    "stellar_soroban_config_tx_max_read_ledger_byte";
+pub const SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY: &str = "stellar_soroban_config_tx_max_write_entry";
+pub const SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE: &str =
+    "stellar_soroban_config_tx_max_write_ledger_byte";
+pub const SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE: &str =
+    "stellar_soroban_config_tx_max_emit_event_byte";
+pub const SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT: &str = "stellar_soroban_config_ledger_max_tx_count";
+pub const SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN: &str = "stellar_soroban_config_ledger_max_cpu_insn";
+pub const SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE: &str =
+    "stellar_soroban_config_ledger_max_txs_size_byte";
+pub const SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY: &str =
+    "stellar_soroban_config_ledger_max_read_entry";
+pub const SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE: &str =
+    "stellar_soroban_config_ledger_max_read_ledger_byte";
+pub const SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY: &str =
+    "stellar_soroban_config_ledger_max_write_entry";
+pub const SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE: &str =
+    "stellar_soroban_config_ledger_max_write_ledger_byte";
+pub const SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE: &str =
+    "stellar_soroban_config_bucket_list_target_size_byte";
+pub const SOROBAN_CONFIG_FEE_WRITE_1KB: &str = "stellar_soroban_config_fee_write_1kb";
+
+// Phase 3 — Henyey-specific observability.
+pub const LEDGER_SOROBAN_EXEC_US: &str = "henyey_ledger_soroban_exec_us";
+pub const LEDGER_CLASSIC_EXEC_US: &str = "henyey_ledger_classic_exec_us";
+pub const LEDGER_PREFETCH_HIT_RATIO: &str = "henyey_ledger_prefetch_hit_ratio";
+
 // ── Registration ───────────────────────────────────────────────────────
 
 /// Register HELP/TYPE annotations for all metrics.
@@ -389,6 +437,132 @@ pub fn describe_metrics() {
         JEMALLOC_FRAGMENTATION_PCT,
         "Allocator fragmentation: (resident - allocated) / allocated * 100"
     );
+
+    // Phase 3: Ledger apply counters.
+    describe_counter!(
+        LEDGER_APPLY_SUCCESS_TOTAL,
+        "Cumulative successful transaction applies"
+    );
+    describe_counter!(
+        LEDGER_APPLY_FAILURE_TOTAL,
+        "Cumulative failed transaction applies"
+    );
+    describe_counter!(
+        LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL,
+        "Cumulative successful Soroban transaction applies"
+    );
+    describe_counter!(
+        LEDGER_APPLY_SOROBAN_FAILURE_TOTAL,
+        "Cumulative failed Soroban transaction applies"
+    );
+    describe_counter!(
+        LEDGER_APPLY_SOROBAN_MAX_CLUSTERS,
+        "Max dependent tx clusters in the last Soroban ledger close"
+    );
+    describe_counter!(
+        LEDGER_APPLY_SOROBAN_STAGES,
+        "Number of parallel stages in the last Soroban ledger close"
+    );
+    describe_counter!(
+        LEDGER_AGE_CURRENT_SECONDS,
+        "Seconds since the last ledger close"
+    );
+
+    // Phase 3: Soroban config limits.
+    describe_counter!(
+        SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE,
+        "Soroban config: max contract data key size in bytes"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE,
+        "Soroban config: max contract data entry size in bytes"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE,
+        "Soroban config: max contract code size in bytes"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_TX_MAX_SIZE_BYTE,
+        "Soroban config: max transaction size in bytes"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_TX_MAX_CPU_INSN,
+        "Soroban config: max CPU instructions per transaction"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_TX_MAX_MEM_BYTE,
+        "Soroban config: max memory per transaction in bytes"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_TX_MAX_READ_ENTRY,
+        "Soroban config: max read entries per transaction"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE,
+        "Soroban config: max read bytes per transaction"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY,
+        "Soroban config: max write entries per transaction"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE,
+        "Soroban config: max write bytes per transaction"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE,
+        "Soroban config: max event bytes per transaction"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT,
+        "Soroban config: max transactions per ledger"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN,
+        "Soroban config: max CPU instructions per ledger"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE,
+        "Soroban config: max total transaction size per ledger"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY,
+        "Soroban config: max read entries per ledger"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE,
+        "Soroban config: max read bytes per ledger"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY,
+        "Soroban config: max write entries per ledger"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE,
+        "Soroban config: max write bytes per ledger"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE,
+        "Soroban config: bucket list target size in bytes"
+    );
+    describe_counter!(
+        SOROBAN_CONFIG_FEE_WRITE_1KB,
+        "Soroban config: fee for 1KB write"
+    );
+
+    // Phase 3: Henyey-specific observability.
+    describe_gauge!(
+        LEDGER_SOROBAN_EXEC_US,
+        "Soroban parallel phase execution time in microseconds (last close)"
+    );
+    describe_gauge!(
+        LEDGER_CLASSIC_EXEC_US,
+        "Classic phase execution time in microseconds (last close)"
+    );
+    describe_gauge!(
+        LEDGER_PREFETCH_HIT_RATIO,
+        "Ledger entry prefetch cache hit ratio (0.0-1.0, last close)"
+    );
 }
 
 /// Pre-register all metrics with initial values so that every metric appears
@@ -496,6 +670,42 @@ pub fn register_label_series() {
     for reason in PostVerifyReason::ALL {
         counter!(SCP_POST_VERIFY_TOTAL, "reason" => reason.label()).absolute(0);
     }
+
+    // Phase 3: Ledger apply counters.
+    counter!(LEDGER_APPLY_SUCCESS_TOTAL).absolute(0);
+    counter!(LEDGER_APPLY_FAILURE_TOTAL).absolute(0);
+    counter!(LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL).absolute(0);
+    counter!(LEDGER_APPLY_SOROBAN_FAILURE_TOTAL).absolute(0);
+    counter!(LEDGER_APPLY_SOROBAN_MAX_CLUSTERS).absolute(0);
+    counter!(LEDGER_APPLY_SOROBAN_STAGES).absolute(0);
+    counter!(LEDGER_AGE_CURRENT_SECONDS).absolute(0);
+
+    // Phase 3: Soroban config (pre-registered at zero for first-scrape visibility).
+    counter!(SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_TX_MAX_SIZE_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_TX_MAX_CPU_INSN).absolute(0);
+    counter!(SOROBAN_CONFIG_TX_MAX_MEM_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_TX_MAX_READ_ENTRY).absolute(0);
+    counter!(SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY).absolute(0);
+    counter!(SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT).absolute(0);
+    counter!(SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN).absolute(0);
+    counter!(SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY).absolute(0);
+    counter!(SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY).absolute(0);
+    counter!(SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE).absolute(0);
+    counter!(SOROBAN_CONFIG_FEE_WRITE_1KB).absolute(0);
+
+    // Phase 3: Henyey-specific gauges.
+    gauge!(LEDGER_SOROBAN_EXEC_US).set(0.0);
+    gauge!(LEDGER_CLASSIC_EXEC_US).set(0.0);
+    gauge!(LEDGER_PREFETCH_HIT_RATIO).set(0.0);
 }
 
 // ── Scrape-time refresh ────────────────────────────────────────────────
@@ -645,6 +855,65 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
             (alloc.resident as f64 - alloc.allocated as f64) / alloc.allocated as f64 * 100.0;
         gauge!(JEMALLOC_FRAGMENTATION_PCT).set(frag);
     }
+
+    // Phase 3: Ledger apply cumulative counters.
+    counter!(LEDGER_APPLY_SUCCESS_TOTAL).absolute(snap.cumulative_apply_success);
+    counter!(LEDGER_APPLY_FAILURE_TOTAL).absolute(snap.cumulative_apply_failure);
+    counter!(LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL).absolute(snap.cumulative_soroban_success);
+    counter!(LEDGER_APPLY_SOROBAN_FAILURE_TOTAL).absolute(snap.cumulative_soroban_failure);
+    counter!(LEDGER_APPLY_SOROBAN_MAX_CLUSTERS).absolute(snap.soroban_max_cluster_count);
+    counter!(LEDGER_APPLY_SOROBAN_STAGES).absolute(snap.soroban_stage_count);
+
+    // Phase 3: Ledger age from header close_time.
+    let ledger_info = state.app.ledger_info();
+    if ledger_info.close_time > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let age = now.saturating_sub(ledger_info.close_time);
+        counter!(LEDGER_AGE_CURRENT_SECONDS).absolute(age);
+    }
+
+    // Phase 3: Soroban config limits.
+    if let Some(info) = state.app.soroban_network_info() {
+        counter!(SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE)
+            .absolute(info.max_contract_data_key_size as u64);
+        counter!(SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE)
+            .absolute(info.max_contract_data_entry_size as u64);
+        counter!(SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE).absolute(info.max_contract_size as u64);
+        counter!(SOROBAN_CONFIG_TX_MAX_SIZE_BYTE).absolute(info.tx_max_size_bytes as u64);
+        counter!(SOROBAN_CONFIG_TX_MAX_CPU_INSN).absolute(info.tx_max_instructions.max(0) as u64);
+        counter!(SOROBAN_CONFIG_TX_MAX_MEM_BYTE).absolute(info.tx_memory_limit as u64);
+        counter!(SOROBAN_CONFIG_TX_MAX_READ_ENTRY).absolute(info.tx_max_read_ledger_entries as u64);
+        counter!(SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE).absolute(info.tx_max_read_bytes as u64);
+        counter!(SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY)
+            .absolute(info.tx_max_write_ledger_entries as u64);
+        counter!(SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE).absolute(info.tx_max_write_bytes as u64);
+        counter!(SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE)
+            .absolute(info.tx_max_contract_events_size_bytes as u64);
+        counter!(SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT).absolute(info.ledger_max_tx_count as u64);
+        counter!(SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN)
+            .absolute(info.ledger_max_instructions.max(0) as u64);
+        counter!(SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE)
+            .absolute(info.ledger_max_tx_size_bytes as u64);
+        counter!(SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY)
+            .absolute(info.ledger_max_read_ledger_entries as u64);
+        counter!(SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE)
+            .absolute(info.ledger_max_read_bytes as u64);
+        counter!(SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY)
+            .absolute(info.ledger_max_write_ledger_entries as u64);
+        counter!(SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE)
+            .absolute(info.ledger_max_write_bytes as u64);
+        counter!(SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE)
+            .absolute(info.state_target_size_bytes.max(0) as u64);
+        counter!(SOROBAN_CONFIG_FEE_WRITE_1KB).absolute(info.fee_write_1kb.max(0) as u64);
+    }
+
+    // Phase 3: Henyey-specific observability.
+    gauge!(LEDGER_SOROBAN_EXEC_US).set(snap.soroban_exec_us as f64);
+    gauge!(LEDGER_CLASSIC_EXEC_US).set(snap.classic_exec_us as f64);
+    gauge!(LEDGER_PREFETCH_HIT_RATIO).set(snap.prefetch_hit_ratio);
 }
 
 // ── Test helper ────────────────────────────────────────────────────────
@@ -1061,6 +1330,115 @@ mod tests {
             assert!(
                 output.contains(&format!("{} 0", name)),
                 "jemalloc metric {} should be pre-registered at 0",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase3_ledger_apply_counters_present() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        let counter_metrics = [
+            LEDGER_APPLY_SUCCESS_TOTAL,
+            LEDGER_APPLY_FAILURE_TOTAL,
+            LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL,
+            LEDGER_APPLY_SOROBAN_FAILURE_TOTAL,
+            LEDGER_APPLY_SOROBAN_MAX_CLUSTERS,
+            LEDGER_APPLY_SOROBAN_STAGES,
+            LEDGER_AGE_CURRENT_SECONDS,
+        ];
+        for name in &counter_metrics {
+            assert!(
+                output.contains(&format!("# TYPE {} counter", name)),
+                "missing TYPE counter for {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("# HELP {}", name)),
+                "missing HELP for {}",
+                name
+            );
+            // Pre-registered at 0.
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "phase3 counter {} should be pre-registered at 0",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase3_henyey_specific_gauges_present() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        let gauge_metrics = [
+            LEDGER_SOROBAN_EXEC_US,
+            LEDGER_CLASSIC_EXEC_US,
+            LEDGER_PREFETCH_HIT_RATIO,
+        ];
+        for name in &gauge_metrics {
+            assert!(
+                output.contains(&format!("# TYPE {} gauge", name)),
+                "missing TYPE gauge for {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("# HELP {}", name)),
+                "missing HELP for {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "phase3 gauge {} should be pre-registered at 0",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase3_soroban_config_metrics_described() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        let output = handle.render();
+
+        let config_metrics = [
+            SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE,
+            SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE,
+            SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE,
+            SOROBAN_CONFIG_TX_MAX_SIZE_BYTE,
+            SOROBAN_CONFIG_TX_MAX_CPU_INSN,
+            SOROBAN_CONFIG_TX_MAX_MEM_BYTE,
+            SOROBAN_CONFIG_TX_MAX_READ_ENTRY,
+            SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE,
+            SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY,
+            SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE,
+            SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE,
+            SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT,
+            SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN,
+            SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE,
+            SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY,
+            SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE,
+            SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY,
+            SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE,
+            SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE,
+            SOROBAN_CONFIG_FEE_WRITE_1KB,
+        ];
+        for name in &config_metrics {
+            assert!(
+                output.contains(&format!("# TYPE {} counter", name)),
+                "missing TYPE counter for soroban config metric {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("# HELP {}", name)),
+                "missing HELP for soroban config metric {}",
                 name
             );
         }

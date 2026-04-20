@@ -1794,6 +1794,42 @@ impl App {
         *self.last_close_stats.write() = result.stats.clone();
         *self.last_close_perf.write() = result.perf.clone();
 
+        // Phase 3: Accumulate cumulative ledger apply counters.
+        {
+            let stats = &result.stats;
+            self.cumulative_apply_success
+                .fetch_add(stats.tx_success_count as u64, Ordering::Relaxed);
+            self.cumulative_apply_failure
+                .fetch_add(stats.tx_failed_count as u64, Ordering::Relaxed);
+
+            // Derive Soroban success/failure from per-tx timings.
+            if let Some(ref perf) = result.perf {
+                let mut soroban_ok = 0u64;
+                let mut soroban_fail = 0u64;
+                for tx in &perf.tx_timings {
+                    if tx.is_soroban {
+                        if tx.success {
+                            soroban_ok += 1;
+                        } else {
+                            soroban_fail += 1;
+                        }
+                    }
+                }
+                self.cumulative_soroban_success
+                    .fetch_add(soroban_ok, Ordering::Relaxed);
+                self.cumulative_soroban_failure
+                    .fetch_add(soroban_fail, Ordering::Relaxed);
+
+                // Soroban parallel phase structure (sticky — updated only when non-zero).
+                if perf.soroban_stage_count > 0 {
+                    self.last_soroban_stage_count
+                        .store(perf.soroban_stage_count as u64, Ordering::Relaxed);
+                    self.last_soroban_max_cluster_count
+                        .store(perf.soroban_max_cluster_count as u64, Ordering::Relaxed);
+                }
+            }
+        }
+
         // Emit LedgerCloseMeta to stream.
         // If a MetaWriter is active (async channel + dedicated thread), use it
         // for non-blocking I/O. Otherwise fall back to the synchronous Mutex path
