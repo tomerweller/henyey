@@ -1461,4 +1461,301 @@ mod tests {
         let b = state.get_account(&fee_source_id).unwrap();
         assert_eq!(b.seq_num.0, 99, "fee source sequence must NOT be advanced");
     }
+
+    // === Fee-bump end-to-end process_fee_seq_num tests (#1828) ===
+
+    /// Build a Soroban fee-bump TransactionFrame with distinct inner/fee sources.
+    fn make_soroban_fee_bump_frame(
+        inner_source: AccountId,
+        fee_source: AccountId,
+        resource_fee: i64,
+        inner_fee: u32,
+        outer_fee: i64,
+    ) -> TransactionFrame {
+        use stellar_xdr::curr::{
+            ContractDataDurability, DecoratedSignature, FeeBumpTransaction,
+            FeeBumpTransactionEnvelope, FeeBumpTransactionExt, FeeBumpTransactionInnerTx, Hash,
+            HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, LedgerKey,
+            LedgerKeyAccount, LedgerKeyContractCode, LedgerKeyContractData, ScAddress, ScSymbol,
+            ScVal, SorobanResources, SorobanResourcesExtV0, SorobanTransactionData,
+            SorobanTransactionDataExt, StringM, VecM,
+        };
+
+        let function_name = ScSymbol(StringM::<32>::try_from("test".to_string()).unwrap());
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Account(AccountId(
+                        PublicKey::PublicKeyTypeEd25519(Uint256([99u8; 32])),
+                    )),
+                    function_name,
+                    args: VecM::default(),
+                }),
+                auth: VecM::default(),
+            }),
+        };
+
+        let footprint = LedgerFootprint {
+            read_only: vec![
+                LedgerKey::Account(LedgerKeyAccount {
+                    account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([4u8; 32]))),
+                }),
+                LedgerKey::ContractData(LedgerKeyContractData {
+                    contract: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+                        Uint256([5u8; 32]),
+                    ))),
+                    key: ScVal::I32(0),
+                    durability: ContractDataDurability::Persistent,
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+            read_write: vec![LedgerKey::ContractCode(LedgerKeyContractCode {
+                hash: Hash([6u8; 32]),
+            })]
+            .try_into()
+            .unwrap(),
+        };
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0u32, 1u32].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint,
+                instructions: 100,
+                disk_read_bytes: 55,
+                write_bytes: 21,
+            },
+            resource_fee,
+        };
+
+        let inner_tx = Transaction {
+            source_account: match inner_source.0 {
+                PublicKey::PublicKeyTypeEd25519(key) => MuxedAccount::Ed25519(key),
+            },
+            fee: inner_fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: stellar_xdr::curr::Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(soroban_data),
+        };
+
+        let inner_envelope = TransactionV1Envelope {
+            tx: inner_tx,
+            signatures: vec![].try_into().unwrap(),
+        };
+
+        let fee_bump_tx = FeeBumpTransaction {
+            fee_source: match fee_source.0 {
+                PublicKey::PublicKeyTypeEd25519(key) => MuxedAccount::Ed25519(key),
+            },
+            fee: outer_fee,
+            inner_tx: FeeBumpTransactionInnerTx::Tx(inner_envelope),
+            ext: FeeBumpTransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: fee_bump_tx,
+            signatures: VecM::<DecoratedSignature, 20>::default(),
+        });
+
+        TransactionFrame::from_owned(envelope)
+    }
+
+    /// End-to-end process_fee_seq_num for a classic fee-bump transaction.
+    ///
+    /// Verifies that fee charging uses resource_operation_count (inner_ops + 1)
+    /// and charges the fee source, not the inner source.
+    #[test]
+    fn test_process_fee_seq_num_fee_bump() {
+        use stellar_xdr::curr::{
+            DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope,
+            FeeBumpTransactionExt, FeeBumpTransactionInnerTx,
+        };
+
+        let mut ctx = make_test_context_with_state(25);
+
+        // Inner source A (seq=5)
+        let inner_source_id = create_test_account_id(10);
+        let inner_account = make_account_entry(inner_source_id.clone(), 10_000_000, 5);
+
+        // Fee source B (seq=99)
+        let fee_source_id = create_test_account_id(20);
+        let fee_account = make_account_entry(fee_source_id.clone(), 10_000_000, 99);
+
+        if let Some(state) = ctx.state_mut() {
+            state.put_account(inner_account);
+            state.put_account(fee_account);
+        }
+
+        // Build classic fee-bump: inner has 1 payment op, outer_fee=1000
+        let inner_tx = Transaction {
+            source_account: match inner_source_id.0.clone() {
+                PublicKey::PublicKeyTypeEd25519(key) => MuxedAccount::Ed25519(key),
+            },
+            fee: 100,
+            seq_num: SequenceNumber(6),
+            cond: Preconditions::None,
+            memo: stellar_xdr::curr::Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: MuxedAccount::Ed25519(Uint256([50u8; 32])),
+                    asset: stellar_xdr::curr::Asset::Native,
+                    amount: 1000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let inner_envelope = TransactionV1Envelope {
+            tx: inner_tx,
+            signatures: vec![].try_into().unwrap(),
+        };
+
+        let fee_bump_tx = FeeBumpTransaction {
+            fee_source: match fee_source_id.0.clone() {
+                PublicKey::PublicKeyTypeEd25519(key) => MuxedAccount::Ed25519(key),
+            },
+            fee: 1000,
+            inner_tx: FeeBumpTransactionInnerTx::Tx(inner_envelope),
+            ext: FeeBumpTransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: fee_bump_tx,
+            signatures: stellar_xdr::curr::VecM::<DecoratedSignature, 20>::default(),
+        });
+
+        let frame = TransactionFrame::from_owned(envelope);
+        assert!(frame.is_fee_bump());
+        assert_eq!(frame.resource_operation_count(), 2);
+
+        // Process fee and seq num
+        let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
+
+        // fee_to_charge = min(declared=1000, base_fee * resource_ops = 100 * 2) = 200
+        assert!(result.should_apply);
+        assert_eq!(
+            result.fee_charged, 200,
+            "fee-bump with 1 inner op should charge base_fee * 2 = 200"
+        );
+        assert_eq!(ctx.fee_pool_delta(), 200);
+
+        // Fee source B: balance reduced by 200
+        let state = ctx.state().unwrap();
+        let b = state.get_account(&fee_source_id).unwrap();
+        assert_eq!(
+            b.balance,
+            10_000_000 - 200,
+            "fee source balance should be deducted"
+        );
+
+        // Inner source A: balance unchanged
+        let a = state.get_account(&inner_source_id).unwrap();
+        assert_eq!(
+            a.balance, 10_000_000,
+            "inner source balance must NOT change"
+        );
+
+        // Sequence numbers unchanged (protocol ≥ 10: seq update is in process_seq_num, not here)
+        assert_eq!(
+            a.seq_num.0, 5,
+            "inner source seq must not change in process_fee_seq_num"
+        );
+        assert_eq!(
+            b.seq_num.0, 99,
+            "fee source seq must not change in process_fee_seq_num"
+        );
+    }
+
+    /// End-to-end process_fee_seq_num for a Soroban fee-bump transaction.
+    ///
+    /// Verifies that fee charging uses the Soroban path:
+    ///   fee_to_charge = resource_fee + min(inclusion_fee, min_inclusion_fee)
+    /// with resource_operation_count = inner_ops + 1 for fee-bumps.
+    #[test]
+    fn test_process_fee_seq_num_soroban_fee_bump() {
+        let mut ctx = make_test_context_with_state(25);
+
+        // Inner source A (seq=10)
+        let inner_source_id = create_test_account_id(30);
+        let inner_account = make_account_entry(inner_source_id.clone(), 10_000_000, 10);
+
+        // Fee source B (seq=50)
+        let fee_source_id = create_test_account_id(40);
+        let fee_account = make_account_entry(fee_source_id.clone(), 10_000_000, 50);
+
+        if let Some(state) = ctx.state_mut() {
+            state.put_account(inner_account);
+            state.put_account(fee_account);
+        }
+
+        // Soroban fee-bump: resource_fee=150, inner_fee=600, outer_fee=900
+        // resource_operation_count = 2 (1 inner op + 1)
+        // inclusion_fee = outer_fee - resource_fee = 900 - 150 = 750
+        // min_inclusion_fee = base_fee * resource_ops = 100 * 2 = 200
+        // fee_to_charge = 150 + min(750, 200) = 350
+        let frame = make_soroban_fee_bump_frame(
+            inner_source_id.clone(),
+            fee_source_id.clone(),
+            150, // resource_fee
+            600, // inner_fee
+            900, // outer_fee
+        );
+        assert!(frame.is_fee_bump());
+        assert!(frame.is_soroban());
+        assert_eq!(frame.resource_operation_count(), 2);
+
+        let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
+
+        assert!(result.should_apply);
+        assert_eq!(
+            result.fee_charged, 350,
+            "Soroban fee-bump: resource_fee(150) + min(inclusion(750), min_inclusion(200)) = 350"
+        );
+        assert_eq!(ctx.fee_pool_delta(), 350);
+
+        // Fee source B: balance reduced by 350
+        let state = ctx.state().unwrap();
+        let b = state.get_account(&fee_source_id).unwrap();
+        assert_eq!(
+            b.balance,
+            10_000_000 - 350,
+            "fee source balance should be deducted"
+        );
+
+        // Inner source A: balance unchanged
+        let a = state.get_account(&inner_source_id).unwrap();
+        assert_eq!(
+            a.balance, 10_000_000,
+            "inner source balance must NOT change"
+        );
+
+        // Sequence numbers unchanged (protocol ≥ 10)
+        assert_eq!(
+            a.seq_num.0, 10,
+            "inner source seq must not change in process_fee_seq_num"
+        );
+        assert_eq!(
+            b.seq_num.0, 50,
+            "fee source seq must not change in process_fee_seq_num"
+        );
+
+        // Refundable fee tracker initialized with resource_fee = 150
+        let tracker = result
+            .tx_result
+            .refundable_fee_tracker()
+            .expect("Soroban tx must have refundable fee tracker");
+        assert_eq!(
+            tracker.max_refundable_fee(),
+            150,
+            "refundable fee tracker should be initialized with resource_fee"
+        );
+    }
 }
