@@ -2516,10 +2516,10 @@ impl Herder {
     /// Quorum health summary for the tracking slot.
     ///
     /// Returns `(agree, missing, disagree, fail_at)` where:
-    /// - `agree` = nodes in Confirming or Externalized state
-    /// - `missing` = nodes in Missing state
-    /// - `disagree` = 0 (not yet detectable)
-    /// - `fail_at` = total - threshold (minimum nodes that can fail)
+    /// - `agree` = nodes in CONFIRMING or EXTERNALIZED state
+    /// - `missing` = nodes in MISSING state
+    /// - `disagree` = 0 (not yet detectable from QuorumInfo)
+    /// - `fail_at` = total - threshold (approximate for nested quorum sets)
     pub fn quorum_health(&self) -> Option<(u64, u64, u64, u64)> {
         let tracking = self.tracking_slot();
         if tracking == 0 {
@@ -2531,12 +2531,13 @@ impl Herder {
         let mut missing = 0u64;
         for node_info in info.nodes.values() {
             match node_info.state.as_str() {
-                "Confirm" | "Externalize" => agree += 1,
-                "Missing" => missing += 1,
+                "CONFIRMING" | "EXTERNALIZED" => agree += 1,
+                "MISSING" => missing += 1,
                 _ => {}
             }
         }
-        // fail_at = how many nodes can fail before quorum is lost
+        // Approximate: for flat quorum sets, total - threshold is exact.
+        // For nested quorum sets this is an upper bound.
         let threshold = self
             .local_quorum_set()
             .map(|qs| qs.threshold as u64)

@@ -2058,7 +2058,6 @@ impl App {
         let duration = self.herder.scp_timing()?;
         Some(crate::app::types::ScpTimingMetrics {
             externalize_duration_secs: Some(duration.as_secs_f64()),
-            nominate_duration_secs: None, // Not yet tracked separately
         })
     }
 }

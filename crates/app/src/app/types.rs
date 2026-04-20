@@ -324,8 +324,6 @@ pub struct QuorumHealthMetrics {
 pub struct ScpTimingMetrics {
     /// Duration from slot creation to externalize (seconds).
     pub externalize_duration_secs: Option<f64>,
-    /// Duration from nomination start to externalize (seconds).
-    pub nominate_duration_secs: Option<f64>,
 }
 
 impl std::fmt::Display for AppInfo {
