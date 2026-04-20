@@ -1045,6 +1045,10 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         } else {
             gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
         }
+    } else {
+        // No timing available (e.g., after catchup cleared it). Reset gauges.
+        gauge!(SCP_TIMING_EXTERNALIZED_SECONDS).set(0.0);
+        gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
     }
 }
 

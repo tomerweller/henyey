@@ -1789,6 +1789,10 @@ impl ScpDriver {
                     externalize_duration,
                     nomination_duration,
                 });
+            } else {
+                // Catchup/fast-forward path: no slot_first_seen recorded.
+                // Clear stale timing so the gauge resets to 0.0.
+                *self.last_externalize_timing.write() = None;
             }
         }
 
@@ -2924,6 +2928,23 @@ mod tests {
 
         assert!(driver.nomination_started_at.read().is_empty());
         assert!(driver.slot_first_seen.read().is_empty());
+    }
+
+    #[test]
+    fn test_nomination_timing_catchup_clears_stale() {
+        let driver = make_test_driver();
+
+        // First: a normal externalization with timing
+        driver.record_slot_activity(100);
+        driver.record_nomination_start(100);
+        driver.record_externalized(100, Value::default());
+        assert!(driver.last_externalize_timing().is_some());
+
+        // Now simulate catchup: record_externalized without record_slot_activity
+        driver.record_externalized(200, Value::default());
+
+        // Timing should be cleared (not stale from slot 100)
+        assert!(driver.last_externalize_timing().is_none());
     }
 
     #[test]
