@@ -133,6 +133,12 @@ pub enum CatchupTarget {
     Ledger(u32),
     /// Catch up to a specific checkpoint number.
     Checkpoint(u32),
+    /// Blocking archive probe: fetch the latest checkpoint from the archive
+    /// via HTTP, and proceed with catchup only if the result is strictly
+    /// ahead of the given ledger. If the archive is at/behind this ledger,
+    /// return an error (no catchup work done). Used by HardResetEscalation
+    /// when the nonblocking cache is stale or cold (see #1862).
+    ProbeAhead(u32),
 }
 
 /// Result of a catchup operation.

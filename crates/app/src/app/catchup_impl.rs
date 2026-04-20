@@ -72,6 +72,22 @@ impl App {
             }
             CatchupTarget::Ledger(seq) => seq,
             CatchupTarget::Checkpoint(checkpoint) => checkpoint * 64,
+            CatchupTarget::ProbeAhead(min_ledger) => {
+                // #1862: Fresh blocking HTTP fetch to discover the latest
+                // archive checkpoint. Only proceeds if strictly ahead of
+                // min_ledger; otherwise errors out gracefully.
+                let checkpoint = self.get_cached_archive_checkpoint_blocking().await?;
+                if checkpoint > min_ledger {
+                    checkpoint
+                } else {
+                    anyhow::bail!(
+                        "Archive checkpoint {} is not ahead of min_ledger {} — \
+                         no catchup target available",
+                        checkpoint,
+                        min_ledger
+                    );
+                }
+            }
         };
 
         progress.set_target(target_ledger);
@@ -1437,30 +1453,40 @@ impl App {
                 )
                 .await
             }
-            Some(latest) => {
+            stale_or_cold => {
+                // #1862: Nonblocking cache is stale or cold — the archive may
+                // have published a new checkpoint that the background refresher
+                // hasn't picked up yet. Spawn an escalation catchup that does a
+                // fresh blocking HTTP fetch inside the spawned task. If the
+                // archive is truly not ahead, the catchup errors out gracefully
+                // and the node returns to its normal recovery cycle.
+                let cache_desc = match stale_or_cold {
+                    Some(v) => format!("stale (latest={})", v),
+                    None => "cold".to_string(),
+                };
                 tracing::warn!(
                     current_ledger,
-                    archive_latest = latest,
-                    "Hard reset: archive at/behind us, requesting SCP state from peers"
+                    archive_cache = %cache_desc,
+                    "Hard reset: archive cache {}, spawning escalation catchup \
+                     with blocking probe (see #1862)",
+                    cache_desc,
                 );
-                // Re-bootstrap consensus pipeline: without fresh EXTERNALIZE
-                // messages, syncing_ledgers stays empty and the node deadlocks
-                // (see #1851).
-                self.request_scp_state_and_record().await;
-                None
-            }
-            None => {
-                tracing::warn!(
-                    current_ledger,
-                    "Hard reset: archive cache cold, requesting SCP state from peers \
-                     (background refresh will warm cache)"
-                );
-                // Expedite archive cache refresh — the node needs a checkpoint
-                // target ASAP for the next recovery cycle.
+                // Expedite background cache refresh.
                 self.archive_checkpoint_cache.set_urgent(true);
-                // Re-bootstrap consensus pipeline (see #1851).
+                let result = self
+                    .spawn_catchup(
+                        CatchupTarget::ProbeAhead(current_ledger),
+                        "HardResetEscalation",
+                        true,
+                        true,
+                    )
+                    .await;
+                // Always re-bootstrap consensus pipeline (see #1851). Safe
+                // after spawn_catchup: message caching is already installed
+                // (consensus.rs:1094), so EXTERNALIZE responses are cached
+                // and replayed after catchup completes.
                 self.request_scp_state_and_record().await;
-                None
+                result
             }
         }
     }
@@ -3459,14 +3485,17 @@ mod tests {
             "archive_behind_until should be None"
         );
 
-        // Verify consensus_stuck_state: recovery_attempts reset, stuck_start preserved.
+        // Verify consensus_stuck_state: with the #1862 fix, the cold-cache
+        // path enters spawn_catchup which clears consensus_stuck_state
+        // (spawn_catchup sets it to None when entering CatchingUp state).
+        // The hard reset itself resets recovery_attempts to 0 (step 6),
+        // then spawn_catchup clears the whole state. This is correct
+        // behavior — the node is attempting a catchup escalation.
         {
             let guard = app.consensus_stuck_state.read().await;
-            let state = guard.as_ref().expect("stuck state should still exist");
-            assert_eq!(state.recovery_attempts, 0, "recovery_attempts should be 0");
             assert!(
-                !state.catchup_triggered,
-                "catchup_triggered should be false"
+                guard.is_none(),
+                "stuck state should be cleared by spawn_catchup entering CatchingUp"
             );
         }
 
@@ -4203,16 +4232,15 @@ mod tests {
             1,
             "HardReset should fire when cooldown is inactive"
         );
+        // With the #1862 fix, the cold-cache path enters spawn_catchup
+        // which clears consensus_stuck_state (sets it to None when entering
+        // CatchingUp state). This is correct — the node is attempting a
+        // catchup escalation.
         {
             let guard = app.consensus_stuck_state.read().await;
-            let state = guard.as_ref().expect("stuck state should still exist");
-            assert_eq!(
-                state.recovery_attempts, 0,
-                "HardReset resets recovery_attempts to 0"
-            );
             assert!(
-                !state.catchup_triggered,
-                "HardReset resets catchup_triggered to false"
+                guard.is_none(),
+                "stuck state should be cleared by spawn_catchup entering CatchingUp"
             );
         }
         assert_eq!(
@@ -4233,10 +4261,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_hard_reset_requests_scp_state_archive_at_or_behind() {
-        // Regression test for #1851: when the archive cache is warm but
-        // the latest checkpoint is at/behind current_ledger, hard reset
-        // must call request_scp_state_and_record() to re-bootstrap the
-        // consensus pipeline.
+        // Regression test for #1851/#1862: when the archive cache is warm but
+        // the latest checkpoint is at/behind current_ledger, hard reset now
+        // attempts spawn_catchup(ProbeAhead) (#1862) and always requests SCP
+        // state afterwards (#1851). spawn_catchup returns None in unit tests
+        // (self_arc not set), so the SCP state fallback fires.
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -4279,23 +4308,24 @@ mod tests {
             )
             .await;
 
-        // Assert: no catchup spawned (returns None).
+        // Assert: spawn_catchup returned None (self_arc not set in unit test).
         assert!(
             result.is_none(),
-            "should not spawn catchup when archive is at/behind"
+            "spawn_catchup returns None in unit test (self_arc not set)"
         );
 
-        // Assert: SCP state was requested (timestamp advanced).
+        // Assert: SCP state was requested (always called after spawn_catchup).
         let after = *app.last_scp_state_request_at.read().await;
         assert!(
             after > before,
             "last_scp_state_request_at should advance after requesting SCP state"
         );
 
-        // Assert: urgent is NOT set (branch discriminator vs cold-cache path).
+        // Assert: urgent IS now set (#1862 — both stale and cold paths set
+        // urgent to expedite background cache refresh).
         assert!(
-            !app.archive_checkpoint_cache.is_urgent(),
-            "archive cache should NOT be set to urgent in at/behind branch"
+            app.archive_checkpoint_cache.is_urgent(),
+            "archive cache should be set to urgent in stale/cold branch (#1862)"
         );
 
         // Assert: hard reset counter incremented.
@@ -4308,9 +4338,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_hard_reset_requests_scp_state_cold_cache() {
-        // Regression test for #1851: when the archive cache is cold (None),
-        // hard reset must call request_scp_state_and_record() AND set the
-        // cache to urgent mode for accelerated background refresh.
+        // Regression test for #1851/#1862: when the archive cache is cold
+        // (None), hard reset now attempts spawn_catchup(ProbeAhead) (#1862)
+        // and always requests SCP state afterwards (#1851). Also sets urgent
+        // for accelerated background refresh.
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -4352,21 +4383,21 @@ mod tests {
             )
             .await;
 
-        // Assert: no catchup spawned (returns None).
+        // Assert: spawn_catchup returned None (self_arc not set in unit test).
         assert!(
             result.is_none(),
-            "should not spawn catchup when cache is cold"
+            "spawn_catchup returns None in unit test (self_arc not set)"
         );
 
-        // Assert: SCP state was requested (timestamp advanced).
+        // Assert: SCP state was requested (always called after spawn_catchup).
         let after = *app.last_scp_state_request_at.read().await;
         assert!(
             after > before,
             "last_scp_state_request_at should advance after requesting SCP state"
         );
 
-        // Assert: urgent mode set (branch discriminator — cold-cache path
-        // sets urgent to accelerate background refresh).
+        // Assert: urgent mode set (stale/cold path sets urgent to expedite
+        // background cache refresh).
         assert!(
             app.archive_checkpoint_cache.is_urgent(),
             "archive cache should be set to urgent in cold-cache branch"
