@@ -57,7 +57,7 @@ Uses the upstream [stellar/quickstart](https://github.com/stellar/docker-stellar
 | Network | Services | What it validates |
 |---------|----------|-------------------|
 | local | core, rpc, horizon | Standalone genesis → ledger close → RPC health → Horizon indexing |
-| testnet | core, rpc, horizon | Catchup from testnet → sync → RPC + Horizon against live data |
+| testnet | core, horizon | Catchup from testnet → sync → Horizon against live data (RPC temporarily disabled, see [#1848](https://github.com/stellar-experimental/henyey/issues/1848)) |
 | pubnet | core, rpc, horizon | Catchup from mainnet → sync → RPC + Horizon against live data |
 
 The quickstart workflow runs on `amd64` only. It uses the `stellar/quickstart:testing` base image with `horizon_skip_protocol_version_check: true` to allow henyey's version string.
