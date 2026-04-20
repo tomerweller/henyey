@@ -231,12 +231,27 @@ pub struct AppInfo {
     pub post_catchup_hard_reset_total: u64,
 }
 
+/// Lightweight metrics-only snapshot for the `/metrics` scrape path.
+///
+/// Unlike [`AppInfo`], this struct contains only `Copy` fields — no Strings,
+/// no PathBuf, no heap allocations. Used by `refresh_gauges()` to avoid
+/// per-scrape allocation churn that contributes to jemalloc fragmentation.
+#[derive(Debug, Clone, Copy)]
+pub struct AppMetricsSnapshot {
+    pub is_validator: bool,
+    pub meta_stream_bytes_total: u64,
+    pub meta_stream_writes_total: u64,
+    pub scp_verify: ScpVerifyMetrics,
+    pub overlay_fetch_channel: OverlayFetchChannelMetrics,
+    pub post_catchup_hard_reset_total: u64,
+}
+
 /// Metrics for the overlay fetch-response channel (issue #1741).
 ///
 /// The fetch channel is unbounded so that SCP fetch-request and fetch-response
 /// messages are never dropped. These gauges expose the queue depth to make
 /// wedge-induced growth observable before it becomes a memory problem.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct OverlayFetchChannelMetrics {
     /// Current depth of the overlay fetch-response channel (event-loop sampled).
     pub depth: i64,
@@ -245,7 +260,7 @@ pub struct OverlayFetchChannelMetrics {
 }
 
 /// Metrics for the SCP signature-verify pipeline (issue #1734 Phase B).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ScpVerifyMetrics {
     /// Pre-filter rejects by reason (cumulative), indexed by [`PreFilterRejectReason`].
     pub prefilter_counters: henyey_herder::scp_verify::PreFilterCounters<u64>,

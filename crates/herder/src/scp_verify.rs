@@ -118,6 +118,8 @@ impl<T: Clone> Clone for PreFilterCounters<T> {
     }
 }
 
+impl<T: Copy> Copy for PreFilterCounters<T> {}
+
 impl<T> PreFilterCounters<T> {
     /// Build from a function that maps each reason to a value.
     pub fn from_fn(mut f: impl FnMut(PreFilterRejectReason) -> T) -> Self {
@@ -283,6 +285,8 @@ impl<T: Clone> Clone for PostVerifyCounters<T> {
         Self(self.0.clone())
     }
 }
+
+impl<T: Copy> Copy for PostVerifyCounters<T> {}
 
 impl<T> PostVerifyCounters<T> {
     /// Build from a function that maps each reason to a value.

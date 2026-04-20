@@ -100,6 +100,14 @@ pub const DRIFT_MEDIAN_SECONDS: &str = "henyey_herder_drift_median_seconds";
 pub const DRIFT_P75_SECONDS: &str = "henyey_herder_drift_p75_seconds";
 pub const DRIFT_SAMPLE_COUNT: &str = "henyey_herder_drift_sample_count";
 
+// jemalloc allocator metrics — scrape-time gauges from AllocatorStats.
+pub const JEMALLOC_ALLOCATED_BYTES: &str = "henyey_jemalloc_allocated_bytes";
+pub const JEMALLOC_ACTIVE_BYTES: &str = "henyey_jemalloc_active_bytes";
+pub const JEMALLOC_RESIDENT_BYTES: &str = "henyey_jemalloc_resident_bytes";
+pub const JEMALLOC_MAPPED_BYTES: &str = "henyey_jemalloc_mapped_bytes";
+pub const JEMALLOC_RETAINED_BYTES: &str = "henyey_jemalloc_retained_bytes";
+pub const JEMALLOC_FRAGMENTATION_PCT: &str = "henyey_jemalloc_fragmentation_pct";
+
 // ── Registration ───────────────────────────────────────────────────────
 
 /// Register HELP/TYPE annotations for all metrics.
@@ -355,6 +363,32 @@ pub fn describe_metrics() {
         DRIFT_SAMPLE_COUNT,
         "Number of samples in the last completed drift window"
     );
+
+    // jemalloc allocator metrics.
+    describe_gauge!(
+        JEMALLOC_ALLOCATED_BYTES,
+        "Bytes allocated by the application (jemalloc stats.allocated)"
+    );
+    describe_gauge!(
+        JEMALLOC_ACTIVE_BYTES,
+        "Bytes in active pages (jemalloc stats.active)"
+    );
+    describe_gauge!(
+        JEMALLOC_RESIDENT_BYTES,
+        "Bytes resident in physical memory (jemalloc stats.resident)"
+    );
+    describe_gauge!(
+        JEMALLOC_MAPPED_BYTES,
+        "Total bytes mapped by the allocator (jemalloc stats.mapped)"
+    );
+    describe_gauge!(
+        JEMALLOC_RETAINED_BYTES,
+        "Bytes retained by the allocator (jemalloc stats.retained)"
+    );
+    describe_gauge!(
+        JEMALLOC_FRAGMENTATION_PCT,
+        "Allocator fragmentation: (resident - allocated) / allocated * 100"
+    );
 }
 
 /// Pre-register all metrics with initial values so that every metric appears
@@ -447,6 +481,14 @@ pub fn register_label_series() {
     gauge!(DRIFT_P75_SECONDS).set(0.0);
     gauge!(DRIFT_SAMPLE_COUNT).set(0.0);
 
+    // jemalloc allocator gauges (zero when jemalloc is not enabled).
+    gauge!(JEMALLOC_ALLOCATED_BYTES).set(0.0);
+    gauge!(JEMALLOC_ACTIVE_BYTES).set(0.0);
+    gauge!(JEMALLOC_RESIDENT_BYTES).set(0.0);
+    gauge!(JEMALLOC_MAPPED_BYTES).set(0.0);
+    gauge!(JEMALLOC_RETAINED_BYTES).set(0.0);
+    gauge!(JEMALLOC_FRAGMENTATION_PCT).set(0.0);
+
     // Labeled counters — all reason labels pre-registered at zero.
     for reason in PreFilterRejectReason::ALL {
         counter!(SCP_PREFILTER_REJECTS_TOTAL, "reason" => reason.label()).absolute(0);
@@ -462,28 +504,27 @@ pub fn register_label_series() {
 ///
 /// Called by the `/metrics` handler immediately before `handle.render()`.
 pub(crate) async fn refresh_gauges(state: &ServerState) {
-    let _app_state = state.app.state().await;
     let uptime = state.start_time.elapsed().as_secs();
     let ledger_seq = state.app.ledger_info().ledger_seq;
-    let peer_count = state.app.peer_snapshots().await.len();
+    let peer_count = state.app.peer_count().await;
     let pending_txs = state.app.pending_transaction_count() as u64;
-    let app_info = state.app.info();
+    let snap = state.app.metrics_snapshot();
 
     // Stellar-compatible gauges.
     gauge!(LEDGER_SEQUENCE).set(ledger_seq as f64);
     gauge!(PEER_COUNT).set(peer_count as f64);
     gauge!(PENDING_TRANSACTIONS).set(pending_txs as f64);
     counter!(UPTIME_SECONDS).absolute(uptime);
-    gauge!(IS_VALIDATOR).set(if app_info.is_validator { 1.0 } else { 0.0 });
+    gauge!(IS_VALIDATOR).set(if snap.is_validator { 1.0 } else { 0.0 });
 
     // Meta stream counters — only set when active (matching current conditional behavior).
-    if app_info.meta_stream_bytes_total > 0 || app_info.meta_stream_writes_total > 0 {
-        counter!(META_STREAM_BYTES_TOTAL).absolute(app_info.meta_stream_bytes_total);
-        counter!(META_STREAM_WRITES_TOTAL).absolute(app_info.meta_stream_writes_total);
+    if snap.meta_stream_bytes_total > 0 || snap.meta_stream_writes_total > 0 {
+        counter!(META_STREAM_BYTES_TOTAL).absolute(snap.meta_stream_bytes_total);
+        counter!(META_STREAM_WRITES_TOTAL).absolute(snap.meta_stream_writes_total);
     }
 
     // SCP verify pipeline — absolute counters.
-    let sv = &app_info.scp_verify;
+    let sv = &snap.scp_verify;
     for (reason, &count) in sv.prefilter_counters.iter() {
         counter!(SCP_PREFILTER_REJECTS_TOTAL, "reason" => reason.label()).absolute(count);
     }
@@ -500,11 +541,11 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     gauge!(SCP_VERIFY_LATENCY_US_COUNT).set(sv.verify_latency_count as f64);
 
     // Overlay fetch channel.
-    gauge!(OVERLAY_FETCH_CHANNEL_DEPTH).set(app_info.overlay_fetch_channel.depth as f64);
-    gauge!(OVERLAY_FETCH_CHANNEL_DEPTH_MAX).set(app_info.overlay_fetch_channel.depth_max as f64);
+    gauge!(OVERLAY_FETCH_CHANNEL_DEPTH).set(snap.overlay_fetch_channel.depth as f64);
+    gauge!(OVERLAY_FETCH_CHANNEL_DEPTH_MAX).set(snap.overlay_fetch_channel.depth_max as f64);
 
     // Catchup.
-    counter!(POST_CATCHUP_HARD_RESET_TOTAL).absolute(app_info.post_catchup_hard_reset_total);
+    counter!(POST_CATCHUP_HARD_RESET_TOTAL).absolute(snap.post_catchup_hard_reset_total);
 
     // SCP/herder counters.
     let (scp_sent, scp_received) = state.app.scp_envelope_counters();
@@ -590,6 +631,19 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         gauge!(DRIFT_MEDIAN_SECONDS).set(0.0);
         gauge!(DRIFT_P75_SECONDS).set(0.0);
         gauge!(DRIFT_SAMPLE_COUNT).set(0.0);
+    }
+
+    // jemalloc allocator stats — always available, zeros when jemalloc is not enabled.
+    let alloc = henyey_ledger::memory_report::AllocatorStats::capture();
+    gauge!(JEMALLOC_ALLOCATED_BYTES).set(alloc.allocated as f64);
+    gauge!(JEMALLOC_ACTIVE_BYTES).set(alloc.active as f64);
+    gauge!(JEMALLOC_RESIDENT_BYTES).set(alloc.resident as f64);
+    gauge!(JEMALLOC_MAPPED_BYTES).set(alloc.mapped as f64);
+    gauge!(JEMALLOC_RETAINED_BYTES).set(alloc.retained as f64);
+    if alloc.allocated > 0 {
+        let frag =
+            (alloc.resident as f64 - alloc.allocated as f64) / alloc.allocated as f64 * 100.0;
+        gauge!(JEMALLOC_FRAGMENTATION_PCT).set(frag);
     }
 }
 
@@ -973,6 +1027,41 @@ mod tests {
                 "ledger metric {} should be pre-registered at 0; output:\n{}",
                 name,
                 output
+            );
+        }
+    }
+
+    #[test]
+    fn test_jemalloc_metrics_present() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        let jemalloc_metrics = [
+            JEMALLOC_ALLOCATED_BYTES,
+            JEMALLOC_ACTIVE_BYTES,
+            JEMALLOC_RESIDENT_BYTES,
+            JEMALLOC_MAPPED_BYTES,
+            JEMALLOC_RETAINED_BYTES,
+            JEMALLOC_FRAGMENTATION_PCT,
+        ];
+        for name in &jemalloc_metrics {
+            assert!(
+                output.contains(&format!("# TYPE {} gauge", name)),
+                "missing TYPE gauge for {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("# HELP {}", name)),
+                "missing HELP for {}",
+                name
+            );
+            // Pre-registered at 0.
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "jemalloc metric {} should be pre-registered at 0",
+                name
             );
         }
     }

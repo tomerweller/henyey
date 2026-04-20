@@ -77,7 +77,7 @@ mod error;
 pub mod execution;
 mod header;
 mod manager;
-pub(crate) mod memory_report;
+pub mod memory_report;
 pub mod offer;
 pub mod offer_store;
 mod prepare_liabilities;

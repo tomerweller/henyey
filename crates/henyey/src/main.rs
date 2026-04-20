@@ -69,6 +69,15 @@ mod verify_execution;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Tune jemalloc for lower fragmentation on long-running processes:
+// - background_thread: purge dirty/muzzy pages asynchronously
+// - dirty_decay_ms=1000: return dirty pages to OS after 1s (default 10s)
+// - muzzy_decay_ms=1000: decommit muzzy pages after 1s (default 10s)
+#[cfg(feature = "jemalloc")]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};

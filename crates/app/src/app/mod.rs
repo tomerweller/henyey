@@ -259,7 +259,7 @@ mod upgrades;
 pub use persist::CatchupFinalizer;
 use types::*;
 pub use types::{
-    AppInfo, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary,
+    AppInfo, AppMetricsSnapshot, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary,
     OverlayFetchChannelMetrics, ScpSlotSnapshot, ScpVerifyMetrics, SelfCheckResult,
     SimulationDebugStats, SurveyPeerReport, SurveyReport,
 };
@@ -1877,6 +1877,46 @@ impl App {
                 }),
                 // Sample live from the verifier handle so the gauge reflects
                 // the current moment instead of the last `pump_scp_intake` tick.
+                verify_input_backlog: self.herder.scp_verifier_handle().queue_len() as u64,
+                verify_output_backlog: self.scp_verify_output_backlog.load(Ordering::Relaxed),
+                verifier_thread_state: self.herder.scp_verifier_handle().state() as u64,
+                verify_latency_us_sum: self.scp_verify_latency_us_sum.load(Ordering::Relaxed),
+                verify_latency_count: self.scp_verify_latency_count.load(Ordering::Relaxed),
+            },
+            overlay_fetch_channel: OverlayFetchChannelMetrics {
+                depth: self.fetch_channel_depth.load(Ordering::Relaxed),
+                depth_max: self.fetch_channel_depth_max.load(Ordering::Relaxed),
+            },
+            post_catchup_hard_reset_total: self
+                .post_catchup_hard_reset_total
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    /// Lightweight metrics snapshot for the `/metrics` scrape path.
+    ///
+    /// Returns only the numeric fields needed by `refresh_gauges()`, avoiding
+    /// the String/PathBuf allocations that [`info()`] performs.
+    pub fn metrics_snapshot(&self) -> AppMetricsSnapshot {
+        let (meta_bytes, meta_writes) = self
+            .meta_stream
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|ms| ms.metrics()))
+            .unwrap_or((0, 0));
+
+        AppMetricsSnapshot {
+            is_validator: self.config.node.is_validator,
+            meta_stream_bytes_total: meta_bytes,
+            meta_stream_writes_total: meta_writes,
+            scp_verify: ScpVerifyMetrics {
+                prefilter_counters: henyey_herder::scp_verify::PreFilterCounters::from_fn(|r| {
+                    self.scp_prefilter_counters[r].load(Ordering::Relaxed)
+                }),
+                post_verify_drops: self.scp_post_verify_drops.load(Ordering::Relaxed),
+                pv_counters: henyey_herder::scp_verify::PostVerifyCounters::from_fn(|r| {
+                    self.scp_pv_counters[r].load(Ordering::Relaxed)
+                }),
                 verify_input_backlog: self.herder.scp_verifier_handle().queue_len() as u64,
                 verify_output_backlog: self.scp_verify_output_backlog.load(Ordering::Relaxed),
                 verifier_thread_state: self.herder.scp_verifier_handle().state() as u64,
