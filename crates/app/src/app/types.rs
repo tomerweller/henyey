@@ -297,6 +297,37 @@ pub struct ScpVerifyMetrics {
     pub verify_latency_count: u64,
 }
 
+/// Overlay connection breakdown by direction and state.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnectionBreakdown {
+    pub inbound_authenticated: u64,
+    pub outbound_authenticated: u64,
+    pub inbound_pending: u64,
+    pub outbound_pending: u64,
+}
+
+/// Quorum health summary for metrics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QuorumHealthMetrics {
+    /// Nodes in Confirming or Externalized state.
+    pub agree: u64,
+    /// Nodes in Missing state.
+    pub missing: u64,
+    /// Nodes disagreeing (placeholder — not yet detectable from QuorumInfo).
+    pub disagree: u64,
+    /// Minimum nodes that can fail before quorum is lost.
+    pub fail_at: u64,
+}
+
+/// SCP timing for the most recently externalized slot.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScpTimingMetrics {
+    /// Duration from slot creation to externalize (seconds).
+    pub externalize_duration_secs: Option<f64>,
+    /// Duration from nomination start to externalize (seconds).
+    pub nominate_duration_secs: Option<f64>,
+}
+
 impl std::fmt::Display for AppInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(

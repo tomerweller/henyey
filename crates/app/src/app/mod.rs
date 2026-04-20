@@ -2025,6 +2025,42 @@ impl App {
         let overlay = self.overlay.read().await;
         overlay.as_ref().map(|o| o.overlay_metrics().snapshot())
     }
+
+    /// Overlay connection breakdown by direction and state.
+    pub async fn overlay_connection_breakdown(
+        &self,
+    ) -> Option<crate::app::types::ConnectionBreakdown> {
+        let overlay = self.overlay.read().await;
+        overlay.as_ref().map(|o| {
+            let stats = o.connection_breakdown();
+            crate::app::types::ConnectionBreakdown {
+                inbound_authenticated: stats.0 as u64,
+                outbound_authenticated: stats.1 as u64,
+                inbound_pending: stats.2 as u64,
+                outbound_pending: stats.3 as u64,
+            }
+        })
+    }
+
+    /// Quorum health summary (None when not tracking).
+    pub fn quorum_health(&self) -> Option<crate::app::types::QuorumHealthMetrics> {
+        let (agree, missing, disagree, fail_at) = self.herder.quorum_health()?;
+        Some(crate::app::types::QuorumHealthMetrics {
+            agree,
+            missing,
+            disagree,
+            fail_at,
+        })
+    }
+
+    /// SCP timing for the most recently externalized slot.
+    pub fn scp_timing(&self) -> Option<crate::app::types::ScpTimingMetrics> {
+        let duration = self.herder.scp_timing()?;
+        Some(crate::app::types::ScpTimingMetrics {
+            externalize_duration_secs: Some(duration.as_secs_f64()),
+            nominate_duration_secs: None, // Not yet tracked separately
+        })
+    }
 }
 
 impl App {

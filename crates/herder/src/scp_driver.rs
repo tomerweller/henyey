@@ -269,6 +269,10 @@ pub struct ScpDriver {
     /// Only written by tests (via `Herder::set_test_clock_seconds`); in
     /// production this atomic is allocated once and read-but-never-written.
     test_clock: Arc<AtomicU64>,
+    /// First time we observed activity for each slot (for timing metrics).
+    slot_first_seen: RwLock<HashMap<SlotIndex, std::time::Instant>>,
+    /// Duration of the most recently externalized slot (first-seen → externalized).
+    last_externalize_duration: RwLock<Option<std::time::Duration>>,
 }
 
 impl ScpDriver {
@@ -296,6 +300,8 @@ impl ScpDriver {
             upgrades: OnceLock::new(),
             tracking_state,
             test_clock: Arc::new(AtomicU64::new(0)),
+            slot_first_seen: RwLock::new(HashMap::new()),
+            last_externalize_duration: RwLock::new(None),
         }
     }
 
@@ -524,6 +530,18 @@ impl ScpDriver {
     /// Get the latest externalized slot.
     pub fn latest_externalized_slot(&self) -> Option<SlotIndex> {
         *tracked_read(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized)
+    }
+
+    /// Record that we first observed activity for a slot.
+    /// Only the first call per slot is recorded; subsequent calls are no-ops.
+    pub fn record_slot_activity(&self, slot: SlotIndex) {
+        let mut map = self.slot_first_seen.write();
+        map.entry(slot).or_insert_with(std::time::Instant::now);
+    }
+
+    /// Duration of the most recently externalized slot (first-seen → externalized).
+    pub fn last_externalize_duration(&self) -> Option<std::time::Duration> {
+        *self.last_externalize_duration.read()
     }
 
     /// Get an externalized slot.
@@ -1714,13 +1732,19 @@ impl ScpDriver {
             }
         }
 
+        let now = std::time::Instant::now();
         let externalized = ExternalizedSlot {
             slot,
             value,
             tx_set_hash,
             close_time,
-            externalized_at: std::time::Instant::now(),
+            externalized_at: now,
         };
+
+        // Compute slot duration from first-seen to externalized.
+        if let Some(first_seen) = self.slot_first_seen.read().get(&slot) {
+            *self.last_externalize_duration.write() = Some(now - *first_seen);
+        }
 
         tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized).insert(slot, externalized);
 
@@ -1728,6 +1752,12 @@ impl ScpDriver {
         let mut latest = tracked_write(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized);
         if latest.map(|l| slot > l).unwrap_or(true) {
             *latest = Some(slot);
+        }
+
+        // Clean up old slot_first_seen entries (keep only recent slots).
+        {
+            let mut map = self.slot_first_seen.write();
+            map.retain(|&s, _| slot.saturating_sub(s) <= 10);
         }
 
         debug!("Externalized slot {} with close time {}", slot, close_time);

@@ -1794,6 +1794,12 @@ impl App {
         *self.last_close_stats.write() = result.stats.clone();
         *self.last_close_perf.write() = result.perf.clone();
 
+        // Record ledger close duration into the histogram (accumulates across closes).
+        if result.stats.close_time_ms > 0 {
+            metrics::histogram!(crate::metrics::LEDGER_CLOSE_DURATION_SECONDS)
+                .record(result.stats.close_time_ms as f64 / 1000.0);
+        }
+
         // Phase 3: Accumulate cumulative ledger apply counters.
         {
             let stats = &result.stats;

@@ -819,6 +819,16 @@ impl OverlayManager {
         &self.metrics
     }
 
+    /// Returns `(inbound_auth, outbound_auth, inbound_pending, outbound_pending)`.
+    pub fn connection_breakdown(&self) -> (usize, usize, usize, usize) {
+        (
+            self.inbound_pool.authenticated_count(),
+            self.outbound_pool.authenticated_count(),
+            self.inbound_pool.pending_count(),
+            self.outbound_pool.pending_count(),
+        )
+    }
+
     /// Get a list of connected peer IDs.
     /// Uses the peer info cache for lock-free access.
     pub fn connected_peers(&self) -> Vec<PeerId> {

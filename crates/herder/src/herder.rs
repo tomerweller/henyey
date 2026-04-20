@@ -1016,6 +1016,8 @@ impl Herder {
             debug!(slot, error = %e, "Invalid SCP envelope signature");
             return EnvelopeState::InvalidSignature;
         }
+        // Record when we first observed activity for this slot (timing metrics).
+        self.scp_driver.record_slot_activity(slot);
         let intake = PipelinedIntake {
             envelope,
             slot,
@@ -1075,6 +1077,8 @@ impl Herder {
                 PostVerifyReason::InvalidSignature,
             );
         }
+        // Record when we first observed activity for this slot (timing metrics).
+        self.scp_driver.record_slot_activity(slot);
         let intake = PipelinedIntake {
             envelope,
             slot,
@@ -1697,6 +1701,9 @@ impl Herder {
 
         let slot = ledger_seq as u64;
         tracing::debug!("Triggering consensus for ledger {}", ledger_seq);
+
+        // Record when we first started processing this slot (for timing metrics).
+        self.scp_driver.record_slot_activity(slot);
 
         let value = self
             .build_nomination_value()
@@ -2504,6 +2511,43 @@ impl Herder {
             pending_envelope_stats: self.pending_envelopes.stats(),
             tx_queue_stats: self.tx_queue.stats(),
         }
+    }
+
+    /// Quorum health summary for the tracking slot.
+    ///
+    /// Returns `(agree, missing, disagree, fail_at)` where:
+    /// - `agree` = nodes in Confirming or Externalized state
+    /// - `missing` = nodes in Missing state
+    /// - `disagree` = 0 (not yet detectable)
+    /// - `fail_at` = total - threshold (minimum nodes that can fail)
+    pub fn quorum_health(&self) -> Option<(u64, u64, u64, u64)> {
+        let tracking = self.tracking_slot();
+        if tracking == 0 {
+            return None;
+        }
+        let info = self.scp.get_quorum_info(tracking)?;
+        let total = info.nodes.len() as u64;
+        let mut agree = 0u64;
+        let mut missing = 0u64;
+        for node_info in info.nodes.values() {
+            match node_info.state.as_str() {
+                "Confirm" | "Externalize" => agree += 1,
+                "Missing" => missing += 1,
+                _ => {}
+            }
+        }
+        // fail_at = how many nodes can fail before quorum is lost
+        let threshold = self
+            .local_quorum_set()
+            .map(|qs| qs.threshold as u64)
+            .unwrap_or(total);
+        let fail_at = total.saturating_sub(threshold);
+        Some((agree, missing, 0, fail_at))
+    }
+
+    /// Duration of the most recently externalized slot.
+    pub fn scp_timing(&self) -> Option<std::time::Duration> {
+        self.scp_driver.last_externalize_duration()
     }
 
     // --- FetchingEnvelopes integration ---
