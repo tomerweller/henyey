@@ -4226,4 +4226,164 @@ mod tests {
             "HardReset clears archive_behind_until"
         );
     }
+
+    // ================================================================
+    // Regression tests for #1851: HardReset SCP state re-bootstrap
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_hard_reset_requests_scp_state_archive_at_or_behind() {
+        // Regression test for #1851: when the archive cache is warm but
+        // the latest checkpoint is at/behind current_ledger, hard reset
+        // must call request_scp_state_and_record() to re-bootstrap the
+        // consensus pipeline.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // Seed archive cache with current_ledger (at, not ahead).
+        app.archive_checkpoint_cache.seed(current_ledger);
+        assert_eq!(
+            app.get_cached_archive_checkpoint_nonblocking(),
+            Some(current_ledger),
+            "precondition: cache should be warm at current_ledger"
+        );
+
+        // Seed minimal stuck state to bypass cooldown.
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger,
+                first_buffered: current_ledger + 1,
+                stuck_start: app.clock.now() - std::time::Duration::from_secs(130),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 5,
+                catchup_triggered: false,
+            });
+        }
+
+        // Record timestamp before the call and sleep to ensure Instant advances.
+        let before = *app.last_scp_state_request_at.read().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        // Execute hard reset.
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindRecoveryExhausted,
+            )
+            .await;
+
+        // Assert: no catchup spawned (returns None).
+        assert!(
+            result.is_none(),
+            "should not spawn catchup when archive is at/behind"
+        );
+
+        // Assert: SCP state was requested (timestamp advanced).
+        let after = *app.last_scp_state_request_at.read().await;
+        assert!(
+            after > before,
+            "last_scp_state_request_at should advance after requesting SCP state"
+        );
+
+        // Assert: urgent is NOT set (branch discriminator vs cold-cache path).
+        assert!(
+            !app.archive_checkpoint_cache.is_urgent(),
+            "archive cache should NOT be set to urgent in at/behind branch"
+        );
+
+        // Assert: hard reset counter incremented.
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "hard reset counter should be 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hard_reset_requests_scp_state_cold_cache() {
+        // Regression test for #1851: when the archive cache is cold (None),
+        // hard reset must call request_scp_state_and_record() AND set the
+        // cache to urgent mode for accelerated background refresh.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // Precondition: cache is cold (no seed).
+        assert_eq!(
+            app.get_cached_archive_checkpoint_nonblocking(),
+            None,
+            "precondition: cache should be cold"
+        );
+
+        // Seed minimal stuck state to bypass cooldown.
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger,
+                first_buffered: current_ledger + 1,
+                stuck_start: app.clock.now() - std::time::Duration::from_secs(130),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 5,
+                catchup_triggered: false,
+            });
+        }
+
+        // Record timestamp before the call and sleep to ensure Instant advances.
+        let before = *app.last_scp_state_request_at.read().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        // Execute hard reset.
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindRecoveryExhausted,
+            )
+            .await;
+
+        // Assert: no catchup spawned (returns None).
+        assert!(
+            result.is_none(),
+            "should not spawn catchup when cache is cold"
+        );
+
+        // Assert: SCP state was requested (timestamp advanced).
+        let after = *app.last_scp_state_request_at.read().await;
+        assert!(
+            after > before,
+            "last_scp_state_request_at should advance after requesting SCP state"
+        );
+
+        // Assert: urgent mode set (branch discriminator — cold-cache path
+        // sets urgent to accelerate background refresh).
+        assert!(
+            app.archive_checkpoint_cache.is_urgent(),
+            "archive cache should be set to urgent in cold-cache branch"
+        );
+
+        // Assert: cold_returns was incremented (proves we went through the
+        // None/cold path in get_cached).
+        assert!(
+            app.archive_checkpoint_cache.cold_returns() >= 1,
+            "cold_returns should be >= 1 after cold-cache hard reset"
+        );
+
+        // Assert: hard reset counter incremented.
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "hard reset counter should be 1"
+        );
+    }
 }
