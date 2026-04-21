@@ -108,6 +108,13 @@ pub(crate) struct RecoveryLogThrottles {
     pub no_txsets_forcing: LogThrottleSecs,
     /// "Recovery escalation blocked: previous fatal catchup failure"
     pub fatal_catchup_blocked: LogThrottleSecs,
+    /// "Recovery exhausted; triggering catchup"
+    pub recovery_exhausted: LogThrottleSecs,
+    /// "Post-catchup livelock detected — hard reset"
+    pub livelock_hard_reset: LogThrottleSecs,
+    /// "Hard reset: spawning catchup …" / "Hard reset: archive cache …"
+    /// (mutually exclusive follow-on branches in the same hard-reset function)
+    pub hard_reset_followon: LogThrottleSecs,
 }
 
 impl RecoveryLogThrottles {
@@ -123,6 +130,9 @@ impl RecoveryLogThrottles {
             permanently_missing: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
             no_txsets_forcing: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
             fatal_catchup_blocked: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            recovery_exhausted: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            livelock_hard_reset: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            hard_reset_followon: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
         }
     }
 
@@ -138,6 +148,9 @@ impl RecoveryLogThrottles {
         self.permanently_missing.reset();
         self.no_txsets_forcing.reset();
         self.fatal_catchup_blocked.reset();
+        self.recovery_exhausted.reset();
+        self.livelock_hard_reset.reset();
+        self.hard_reset_followon.reset();
     }
 }
 
@@ -234,6 +247,9 @@ mod tests {
         assert!(t.permanently_missing.should_log(0));
         assert!(t.no_txsets_forcing.should_log(0));
         assert!(t.fatal_catchup_blocked.should_log(0));
+        assert!(t.recovery_exhausted.should_log(0));
+        assert!(t.livelock_hard_reset.should_log(0));
+        assert!(t.hard_reset_followon.should_log(0));
 
         // All suppressed on immediate retry.
         assert!(!t.far_ahead.should_log(100));
@@ -252,6 +268,9 @@ mod tests {
         assert!(t.permanently_missing.should_log(0));
         assert!(t.no_txsets_forcing.should_log(0));
         assert!(t.fatal_catchup_blocked.should_log(0));
+        assert!(t.recovery_exhausted.should_log(0));
+        assert!(t.livelock_hard_reset.should_log(0));
+        assert!(t.hard_reset_followon.should_log(0));
     }
 
     #[test]

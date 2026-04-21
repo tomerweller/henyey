@@ -1423,20 +1423,41 @@ impl App {
             .fetch_add(1, Ordering::Relaxed)
             + 1;
 
-        tracing::warn!(
-            current_ledger,
-            latest_externalized = latest_ext,
-            gap = current_gap,
-            ?reason,
-            stuck_duration_secs = stuck_duration,
-            prior_recovery_attempts,
-            evicted_syncing_entries,
-            pending_tx_sets_cleared,
-            tx_set_exhausted_before_reset,
-            archive_behind_until_was_armed,
-            total,
-            "Post-catchup livelock detected — hard reset: dropped buffered state"
-        );
+        if self
+            .recovery_throttles
+            .livelock_hard_reset
+            .should_log(now_offset)
+        {
+            tracing::warn!(
+                current_ledger,
+                latest_externalized = latest_ext,
+                gap = current_gap,
+                ?reason,
+                stuck_duration_secs = stuck_duration,
+                prior_recovery_attempts,
+                evicted_syncing_entries,
+                pending_tx_sets_cleared,
+                tx_set_exhausted_before_reset,
+                archive_behind_until_was_armed,
+                total,
+                "Post-catchup livelock detected — hard reset: dropped buffered state"
+            );
+        } else {
+            tracing::debug!(
+                current_ledger,
+                latest_externalized = latest_ext,
+                gap = current_gap,
+                ?reason,
+                stuck_duration_secs = stuck_duration,
+                prior_recovery_attempts,
+                evicted_syncing_entries,
+                pending_tx_sets_cleared,
+                tx_set_exhausted_before_reset,
+                archive_behind_until_was_armed,
+                total,
+                "Post-catchup livelock detected — hard reset: dropped buffered state (repeated)"
+            );
+        }
 
         // 8. Spawn a catchup to the latest archive checkpoint if available.
         // This is the key difference from the original #1822 hard-reset:
@@ -1445,11 +1466,23 @@ impl App {
         // target the latest known checkpoint.
         match self.get_cached_archive_checkpoint_nonblocking() {
             CacheResult::Fresh(latest) | CacheResult::Stale(latest) if latest > current_ledger => {
-                tracing::warn!(
-                    current_ledger,
-                    archive_latest = latest,
-                    "Hard reset: spawning catchup to latest archive checkpoint"
-                );
+                if self
+                    .recovery_throttles
+                    .hard_reset_followon
+                    .should_log(now_offset)
+                {
+                    tracing::warn!(
+                        current_ledger,
+                        archive_latest = latest,
+                        "Hard reset: spawning catchup to latest archive checkpoint"
+                    );
+                } else {
+                    tracing::debug!(
+                        current_ledger,
+                        archive_latest = latest,
+                        "Hard reset: spawning catchup to latest archive checkpoint (repeated)"
+                    );
+                }
                 self.spawn_catchup(
                     CatchupTarget::Ledger(latest),
                     "HardResetEscalation",
@@ -1471,13 +1504,27 @@ impl App {
                     }
                     CacheResult::Cold => "cold".to_string(),
                 };
-                tracing::warn!(
-                    current_ledger,
-                    archive_cache = %cache_desc,
-                    "Hard reset: archive cache {}, spawning escalation catchup \
-                     with blocking probe (see #1862)",
-                    cache_desc,
-                );
+                if self
+                    .recovery_throttles
+                    .hard_reset_followon
+                    .should_log(now_offset)
+                {
+                    tracing::warn!(
+                        current_ledger,
+                        archive_cache = %cache_desc,
+                        "Hard reset: archive cache {}, spawning escalation catchup \
+                         with blocking probe (see #1862)",
+                        cache_desc,
+                    );
+                } else {
+                    tracing::debug!(
+                        current_ledger,
+                        archive_cache = %cache_desc,
+                        "Hard reset: archive cache {}, spawning escalation catchup \
+                         with blocking probe (see #1862) (repeated)",
+                        cache_desc,
+                    );
+                }
                 // Expedite background cache refresh.
                 self.archive_checkpoint_cache.set_urgent(true);
                 let result = self
@@ -1796,15 +1843,32 @@ impl App {
                             let decision = Self::decide_consensus_stuck_action(signals);
                             match decision {
                                 ConsensusStuckAction::TriggerCatchup => {
-                                    tracing::warn!(
-                                        current_ledger,
-                                        first_buffered,
-                                        last_buffered,
-                                        elapsed_secs = elapsed,
-                                        recovery_attempts = effective_attempts,
-                                        recently_caught_up,
-                                        "Recovery exhausted; triggering catchup"
-                                    );
+                                    let now_secs = self.start_instant.elapsed().as_secs();
+                                    if self
+                                        .recovery_throttles
+                                        .recovery_exhausted
+                                        .should_log(now_secs)
+                                    {
+                                        tracing::warn!(
+                                            current_ledger,
+                                            first_buffered,
+                                            last_buffered,
+                                            elapsed_secs = elapsed,
+                                            recovery_attempts = effective_attempts,
+                                            recently_caught_up,
+                                            "Recovery exhausted; triggering catchup"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            current_ledger,
+                                            first_buffered,
+                                            last_buffered,
+                                            elapsed_secs = elapsed,
+                                            recovery_attempts = effective_attempts,
+                                            recently_caught_up,
+                                            "Recovery exhausted; triggering catchup (repeated)"
+                                        );
+                                    }
                                     state.catchup_triggered = true;
                                     if !recently_caught_up {
                                         self.tx_set_all_peers_exhausted
