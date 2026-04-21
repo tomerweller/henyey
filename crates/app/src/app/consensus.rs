@@ -971,9 +971,9 @@ impl App {
         // variable retains documentation value for the read below.
         let _ = backoff_active;
 
-        // Non-blocking read. `None` means cold/stale cache — treat it as
-        // the existing `Err(e)` branch (archive unreachable): arm the
-        // backoff and fall through to the peer-SCP fallback. The
+        // Non-blocking read. `Cold` means cache never populated — fall
+        // through to the peer-SCP fallback. `Fresh`/`Stale` with a value
+        // below `next_cp` means archive is behind — also fall through. The
         // background refresh will warm the cache before the next cycle.
         let archive_latest = if backoff_active {
             tracing::debug!(

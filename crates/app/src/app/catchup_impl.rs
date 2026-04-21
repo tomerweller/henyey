@@ -3408,7 +3408,7 @@ mod tests {
         // config.history.archives — no manual fetcher replacement needed.
         let app = App::new(config).await.unwrap();
 
-        // Cache starts cold (no seed), so get_cached() returns None and
+        // Cache starts cold (no seed), so get_cached() returns Cold and
         // spawns a background refresh via the real HTTP fetcher.
 
         // 3. Assert non-blocking behavior. The 5s timeout is a coarse
@@ -4493,7 +4493,7 @@ mod tests {
         );
 
         // Assert: cold_returns was incremented (proves we went through the
-        // None/cold path in get_cached).
+        // Cold path in get_cached).
         assert!(
             app.archive_checkpoint_cache.cold_returns() >= 1,
             "cold_returns should be >= 1 after cold-cache hard reset"
@@ -4649,24 +4649,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_externalized_catchup_stale_cache_behind_does_not_stamp_completion() {
-        // Regression test for #1863: a stale cache returning Some(behind_value)
+        // Regression test for #1863: a stale cache returning Stale(behind_value)
         // should also NOT stamp last_catchup_completed_at. This is the same
         // behavior as the fresh-cache-behind case — stale values that show
         // "behind" are handled identically.
         let (app, latest_externalized, _dir) = mk_app_for_externalized_catchup_cache_test().await;
 
-        // Seed cache, then let it become stale by advancing the clock.
-        // The cache seed uses a fixed value; what matters is the value
-        // is <= current_ledger (0).
-        app.archive_checkpoint_cache.seed(0);
+        // Use seed_stale so the cache actually returns Stale(0), exercising
+        // the CacheResult::Stale arm in maybe_start_externalized_catchup.
+        // The value 0 is <= current_ledger (0), so the archive-behind branch fires.
+        app.archive_checkpoint_cache.seed_stale(0);
 
-        // Verify the cache returns Fresh(0) (seed() creates a fresh entry;
-        // the test validates the archive-behind behavior regardless of
-        // fresh vs stale status).
+        // Verify the cache returns Stale(0).
         assert_eq!(
             app.get_cached_archive_checkpoint_nonblocking(),
-            CacheResult::Fresh(0),
-            "precondition: cache should return value"
+            CacheResult::Stale(0),
+            "precondition: cache should return stale value"
         );
 
         let result = app

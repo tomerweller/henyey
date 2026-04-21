@@ -4773,7 +4773,7 @@ mod tests {
         );
     }
 
-    /// Cold/stale cache (`None`) must not change `archive_confirmed_behind`.
+    /// Cold cache (`CacheResult::Cold`) must not change `archive_confirmed_behind`.
     #[tokio::test]
     async fn test_archive_confirmed_behind_unchanged_on_cold_cache() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4786,11 +4786,11 @@ mod tests {
         // The flag starts false. A cold cache should not set it.
         assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
 
-        // The `None` branch in trigger_recovery_catchup does NOT touch
+        // The `Cold` branch in trigger_recovery_catchup does NOT touch
         // archive_confirmed_behind. Verify by setting it true and
         // confirming it stays true (cold cache doesn't clear it either).
         app.archive_confirmed_behind.store(true, Ordering::SeqCst);
-        // (Simulating the None branch: no store happens.)
+        // (Simulating the Cold branch: no store happens.)
         assert!(
             app.archive_confirmed_behind.load(Ordering::SeqCst),
             "cold cache must not change archive_confirmed_behind"
