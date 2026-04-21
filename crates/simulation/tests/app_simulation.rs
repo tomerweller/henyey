@@ -229,11 +229,7 @@ async fn test_core3_app_simulation_starts_over_tcp() {
 async fn test_three_nodes_two_running_threshold_two_over_tcp() {
     let mut sim = build_two_running_of_three(SimulationMode::OverTcp).await;
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("manual close two-of-three tcp");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
     sim.stop_all_nodes().await.expect("stop two-of-three tcp");
 }
@@ -242,11 +238,7 @@ async fn test_three_nodes_two_running_threshold_two_over_tcp() {
 async fn test_three_nodes_two_running_threshold_two_over_loopback() {
     let mut sim = build_two_running_of_three(SimulationMode::OverLoopback).await;
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("manual close two-of-three loopback");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
     sim.stop_all_nodes()
         .await
@@ -278,12 +270,7 @@ async fn test_core3_app_simulation_can_attempt_multi_node_close() {
         assert_eq!(app.state().await, AppState::Validating);
     }
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("manual close all nodes");
-
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
     sim.stop_all_nodes().await.expect("stop core3 app nodes");
 }
 
@@ -291,11 +278,7 @@ async fn test_core3_app_simulation_can_attempt_multi_node_close() {
 async fn test_pair_app_simulation_can_close_ledgers_over_tcp() {
     let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("manual close pair");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
     sim.stop_all_nodes().await.expect("stop pair app nodes");
 }
@@ -305,11 +288,7 @@ async fn test_pair_app_simulation_can_close_ledgers_over_loopback() {
     let mut sim =
         build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("manual close pair loopback");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
     sim.stop_all_nodes()
         .await
@@ -371,11 +350,7 @@ async fn test_pair_app_simulation_executes_generated_load_over_loopback() {
 async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
     let mut sim = build_app_backed_topology(Topologies::core(4, SimulationMode::OverTcp), 75).await;
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("manual close core4");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
     sim.stop_all_nodes().await.expect("stop core4 app nodes");
 }
@@ -384,11 +359,7 @@ async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
 async fn test_cycle4_app_simulation_can_close_ledgers_over_tcp() {
     let mut sim = build_app_backed_topology(Topologies::cycle4(SimulationMode::OverTcp), 75).await;
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("manual close cycle4");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
     sim.stop_all_nodes().await.expect("stop cycle4 app nodes");
 }
@@ -398,11 +369,7 @@ async fn test_core3_app_simulation_can_close_ledgers_over_loopback() {
     let mut sim =
         build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("manual close core3 loopback");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
     sim.stop_all_nodes()
         .await
@@ -429,11 +396,7 @@ async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
 async fn test_core3_restart_rejoin_over_tcp() {
     let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 66).await;
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("close ledger 2 tcp");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(45)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(45)).await;
 
     sim.remove_node("node0").await.expect("remove node0 tcp");
     wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(10)).await;
@@ -477,11 +440,7 @@ async fn test_core3_restart_rejoin_over_loopback() {
     let mut sim =
         build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66).await;
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("close ledger 2 loopback");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(45)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(45)).await;
 
     sim.remove_node("node0")
         .await
