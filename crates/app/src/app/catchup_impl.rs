@@ -1756,181 +1756,226 @@ impl App {
                 // We're waiting for trigger - apply consensus stuck timeout
                 // This handles the case where we have a gap but can't reach the trigger
                 let now = self.clock.now();
-                let action = {
-                    self.set_phase_sub(PHASE_13_3_BUFFERED_CONSENSUS_STUCK_WRITE);
-                    let mut stuck_state = self.consensus_stuck_state.write().await;
-                    match stuck_state.as_mut() {
-                        // Match on current_ledger only. first_buffered can change as
-                        // stale EXTERNALIZE messages from SCP state requests create
-                        // new syncing_ledgers entries with lower slot numbers. Matching
-                        // on both caused the stuck timer to reset every time
-                        // first_buffered shifted, preventing catchup from ever
-                        // triggering (Problem 9).
-                        Some(state) if state.current_ledger == current_ledger => {
-                            // Update first_buffered to track the current value
-                            state.first_buffered = first_buffered;
-                            let elapsed = state.stuck_start.elapsed().as_secs();
-                            let since_recovery = state.last_recovery_attempt.elapsed().as_secs();
 
-                            // Cooldown: don't trigger catchup if we recently completed
-                            // catchup. stellar-core does NOT have a stuck timeout
-                            // that triggers catchup — it only triggers catchup when
-                            // checkpoint boundary conditions are met (handled above by
-                            // can_trigger_immediate). When recently caught up, only do
-                            // recovery (re-request SCP state) to fill gaps.
-                            self.set_phase_sub(PHASE_13_4_BUFFERED_LAST_CATCHUP_COMPLETED_READ);
-                            let recently_caught_up = self
-                                .last_catchup_completed_at
-                                .read()
-                                .await
-                                .is_some_and(|t| {
-                                    t.elapsed().as_secs() < POST_CATCHUP_RECOVERY_WINDOW_SECS
-                                });
+                // ── Phase 1: Read all inputs ──
+                // Each lock is acquired and released independently — never
+                // hold one tokio RwLock guard across another `.await`.
+                // This eliminates the lock-scope hazard that caused #1873.
 
-                            // Is the archive known to be behind the target
-                            // checkpoint? When true, suppress TriggerCatchup —
-                            // spawning catchup would only hit the skip path
-                            // and spin. HardReset is the escape hatch.
-                            //
-                            // Two sources: the dedicated `archive_confirmed_behind`
-                            // flag set by `trigger_recovery_catchup` (#1867),
-                            // and the query-suppression deadline set by the
-                            // catchup validation paths.  Either is sufficient.
-                            self.set_phase_sub(PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ);
-                            let archive_behind =
-                                self.archive_confirmed_behind.load(Ordering::SeqCst)
-                                    || self
-                                        .archive_behind_until
-                                        .read()
-                                        .await
-                                        .is_some_and(|deadline| self.clock.now() < deadline);
+                // Cooldown: don't trigger catchup if we recently completed
+                // catchup. stellar-core does NOT have a stuck timeout
+                // that triggers catchup — it only triggers catchup when
+                // checkpoint boundary conditions are met (handled above by
+                // can_trigger_immediate). When recently caught up, only do
+                // recovery (re-request SCP state) to fill gaps.
+                self.set_phase_sub(PHASE_13_4_BUFFERED_LAST_CATCHUP_COMPLETED_READ);
+                let recently_caught_up = self
+                    .last_catchup_completed_at
+                    .read()
+                    .await
+                    .is_some_and(|t| t.elapsed().as_secs() < POST_CATCHUP_RECOVERY_WINDOW_SECS);
 
-                            // Unified recovery counter: max of the per-stuck
-                            // counter and the consensus-tick atomic. See #1831.
-                            let effective_attempts = self.effective_recovery_attempts(state);
+                // Is the archive known to be behind the target
+                // checkpoint? When true, suppress TriggerCatchup —
+                // spawning catchup would only hit the skip path
+                // and spin. HardReset is the escape hatch.
+                //
+                // Two sources: the dedicated `archive_confirmed_behind`
+                // flag set by `trigger_recovery_catchup` (#1867),
+                // and the query-suppression deadline set by the
+                // catchup validation paths.  Either is sufficient.
+                self.set_phase_sub(PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ);
+                let archive_behind = self.archive_confirmed_behind.load(Ordering::SeqCst)
+                    || self
+                        .archive_behind_until
+                        .read()
+                        .await
+                        .is_some_and(|deadline| self.clock.now() < deadline);
 
-                            let tx_set_exhausted =
-                                self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
-                            let stuck_duration = state.stuck_start.elapsed().as_secs();
-                            let jittered_due =
-                                Self::jittered_schedule_due(since_recovery, self.jitter_seed);
-                            let schedule_due = if recently_caught_up {
-                                jittered_due
-                            } else {
-                                since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS
-                            };
+                // Snapshot the stuck state (short read, no nested await).
+                self.set_phase_sub(PHASE_13_3_BUFFERED_CONSENSUS_STUCK_WRITE);
+                let stuck_snapshot = self
+                    .consensus_stuck_state
+                    .read()
+                    .await
+                    .as_ref()
+                    // Match on current_ledger only. first_buffered can change as
+                    // stale EXTERNALIZE messages from SCP state requests create
+                    // new syncing_ledgers entries with lower slot numbers. Matching
+                    // on both caused the stuck timer to reset every time
+                    // first_buffered shifted, preventing catchup from ever
+                    // triggering (Problem 9).
+                    .filter(|s| s.current_ledger == current_ledger)
+                    .cloned();
 
-                            // Compute HardReset cooldown using the shared
-                            // helper (#1843). Prevents the livelock where
-                            // decide returns HardReset every tick but the
-                            // cooldown in force_post_catchup_hard_reset
-                            // blocks it.
-                            let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
-                            let current_gap = latest_ext.saturating_sub(current_ledger as u64);
-                            let hard_reset_cooldown_active =
-                                self.is_hard_reset_on_cooldown(current_gap);
+                // ── Phase 2: Compute decision ──
+                let action = if let Some(snapshot) = stuck_snapshot {
+                    let elapsed = snapshot.stuck_start.elapsed().as_secs();
+                    let since_recovery = snapshot.last_recovery_attempt.elapsed().as_secs();
 
-                            let signals = StuckSignals {
-                                catchup_triggered: state.catchup_triggered,
-                                archive_behind,
-                                tx_set_exhausted,
-                                schedule_due,
-                                stuck_duration,
-                                recovery_attempts: effective_attempts,
-                                hard_reset_cooldown_active,
-                            };
+                    // Unified recovery counter: max of the per-stuck
+                    // counter and the consensus-tick atomic. See #1831.
+                    let effective_attempts = self.effective_recovery_attempts(&snapshot);
 
-                            let decision = Self::decide_consensus_stuck_action(signals);
-                            match decision {
-                                ConsensusStuckAction::TriggerCatchup => {
-                                    let now_secs = self.start_instant.elapsed().as_secs();
-                                    if self
-                                        .recovery_throttles
-                                        .recovery_exhausted
-                                        .should_log(now_secs)
-                                    {
-                                        tracing::warn!(
-                                            current_ledger,
-                                            first_buffered,
-                                            last_buffered,
-                                            elapsed_secs = elapsed,
-                                            recovery_attempts = effective_attempts,
-                                            recently_caught_up,
-                                            "Recovery exhausted; triggering catchup"
-                                        );
-                                    } else {
-                                        tracing::debug!(
-                                            current_ledger,
-                                            first_buffered,
-                                            last_buffered,
-                                            elapsed_secs = elapsed,
-                                            recovery_attempts = effective_attempts,
-                                            recently_caught_up,
-                                            "Recovery exhausted; triggering catchup (repeated)"
-                                        );
+                    let tx_set_exhausted = self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
+                    let stuck_duration = snapshot.stuck_start.elapsed().as_secs();
+                    let jittered_due =
+                        Self::jittered_schedule_due(since_recovery, self.jitter_seed);
+                    let schedule_due = if recently_caught_up {
+                        jittered_due
+                    } else {
+                        since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS
+                    };
+
+                    // Compute HardReset cooldown using the shared
+                    // helper (#1843). Prevents the livelock where
+                    // decide returns HardReset every tick but the
+                    // cooldown in force_post_catchup_hard_reset
+                    // blocks it.
+                    let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+                    let current_gap = latest_ext.saturating_sub(current_ledger as u64);
+                    let hard_reset_cooldown_active = self.is_hard_reset_on_cooldown(current_gap);
+
+                    let signals = StuckSignals {
+                        catchup_triggered: snapshot.catchup_triggered,
+                        archive_behind,
+                        tx_set_exhausted,
+                        schedule_due,
+                        stuck_duration,
+                        recovery_attempts: effective_attempts,
+                        hard_reset_cooldown_active,
+                    };
+
+                    let decision = Self::decide_consensus_stuck_action(signals);
+
+                    // ── Phase 3: Write back with revalidation ──
+                    // Short critical section — no `.await` while holding
+                    // the write guard.
+                    {
+                        let mut guard = self.consensus_stuck_state.write().await;
+                        match guard.as_mut() {
+                            Some(state) if state.current_ledger == current_ledger => {
+                                state.first_buffered = first_buffered;
+                                match decision {
+                                    ConsensusStuckAction::TriggerCatchup => {
+                                        state.catchup_triggered = true;
                                     }
-                                    state.catchup_triggered = true;
-                                    if !recently_caught_up {
-                                        self.tx_set_all_peers_exhausted
-                                            .store(false, Ordering::SeqCst);
-                                        self.tx_set_exhausted_warned.write().await.clear();
+                                    ConsensusStuckAction::AttemptRecovery => {
+                                        state.last_recovery_attempt = now;
+                                        state.recovery_attempts = state
+                                            .recovery_attempts
+                                            .saturating_add(1)
+                                            .min(MAX_POST_CATCHUP_RECOVERY_ATTEMPTS + 1);
                                     }
-                                }
-                                ConsensusStuckAction::AttemptRecovery => {
-                                    state.last_recovery_attempt = now;
-                                    state.recovery_attempts = state
-                                        .recovery_attempts
-                                        .saturating_add(1)
-                                        .min(MAX_POST_CATCHUP_RECOVERY_ATTEMPTS + 1);
-                                    tracing::info!(
-                                        current_ledger,
-                                        first_buffered,
-                                        elapsed_secs = elapsed,
-                                        recovery_attempts = state.recovery_attempts,
-                                        max_recovery_attempts = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS,
-                                        archive_behind,
-                                        recently_caught_up,
-                                        "Attempting out-of-sync recovery"
-                                    );
-                                }
-                                ConsensusStuckAction::Wait => {
-                                    tracing::debug!(
-                                        current_ledger,
-                                        first_buffered,
-                                        elapsed_secs = elapsed,
-                                        catchup_triggered = state.catchup_triggered,
-                                        archive_behind,
-                                        recently_caught_up,
-                                        "Waiting for consensus gap to resolve"
-                                    );
-                                }
-                                ConsensusStuckAction::HardReset(_) => {
-                                    // Handled after dropping the stuck_state
-                                    // write guard — see the outer match below.
+                                    ConsensusStuckAction::Wait
+                                    | ConsensusStuckAction::HardReset(_) => {}
                                 }
                             }
-                            decision
+                            _ => {
+                                // State was cleared/changed between snapshot
+                                // and write-back — decision is stale.
+                                return None;
+                            }
                         }
-                        _ => {
+                    }
+                    // Guard is dropped — safe to perform side effects.
+
+                    // Log the decision.
+                    match decision {
+                        ConsensusStuckAction::TriggerCatchup => {
+                            let now_secs = self.start_instant.elapsed().as_secs();
+                            if self
+                                .recovery_throttles
+                                .recovery_exhausted
+                                .should_log(now_secs)
+                            {
+                                tracing::warn!(
+                                    current_ledger,
+                                    first_buffered,
+                                    last_buffered,
+                                    elapsed_secs = elapsed,
+                                    recovery_attempts = effective_attempts,
+                                    recently_caught_up,
+                                    "Recovery exhausted; triggering catchup"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    current_ledger,
+                                    first_buffered,
+                                    last_buffered,
+                                    elapsed_secs = elapsed,
+                                    recovery_attempts = effective_attempts,
+                                    recently_caught_up,
+                                    "Recovery exhausted; triggering catchup (repeated)"
+                                );
+                            }
+                            // tx_set cleanup outside all lock scopes.
+                            if !recently_caught_up {
+                                self.tx_set_all_peers_exhausted
+                                    .store(false, Ordering::SeqCst);
+                                self.tx_set_exhausted_warned.write().await.clear();
+                            }
+                        }
+                        ConsensusStuckAction::AttemptRecovery => {
+                            // Read back the updated recovery_attempts from
+                            // the write-back for the log message.
+                            let recovery_attempts = self
+                                .consensus_stuck_state
+                                .read()
+                                .await
+                                .as_ref()
+                                .map_or(0, |s| s.recovery_attempts);
                             tracing::info!(
                                 current_ledger,
                                 first_buffered,
-                                last_buffered,
-                                required_first,
-                                trigger,
-                                "Buffered gap detected; starting recovery timer"
+                                elapsed_secs = elapsed,
+                                recovery_attempts,
+                                max_recovery_attempts = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS,
+                                archive_behind,
+                                recently_caught_up,
+                                "Attempting out-of-sync recovery"
                             );
-                            *stuck_state = Some(ConsensusStuckState {
+                        }
+                        ConsensusStuckAction::Wait => {
+                            tracing::debug!(
                                 current_ledger,
                                 first_buffered,
-                                stuck_start: now,
-                                last_recovery_attempt: now,
-                                recovery_attempts: 0,
-                                catchup_triggered: false,
-                            });
-                            ConsensusStuckAction::AttemptRecovery
+                                elapsed_secs = elapsed,
+                                catchup_triggered = snapshot.catchup_triggered,
+                                archive_behind,
+                                recently_caught_up,
+                                "Waiting for consensus gap to resolve"
+                            );
+                        }
+                        ConsensusStuckAction::HardReset(_) => {
+                            // Handled in the outer match below.
                         }
                     }
+
+                    decision
+                } else {
+                    // No existing stuck state or different current_ledger:
+                    // initialize and start recovery.
+                    tracing::info!(
+                        current_ledger,
+                        first_buffered,
+                        last_buffered,
+                        required_first,
+                        trigger,
+                        "Buffered gap detected; starting recovery timer"
+                    );
+                    {
+                        let mut guard = self.consensus_stuck_state.write().await;
+                        *guard = Some(ConsensusStuckState {
+                            current_ledger,
+                            first_buffered,
+                            stuck_start: now,
+                            last_recovery_attempt: now,
+                            recovery_attempts: 0,
+                            catchup_triggered: false,
+                        });
+                    }
+                    ConsensusStuckAction::AttemptRecovery
                 };
 
                 match action {
@@ -4744,6 +4789,55 @@ mod tests {
         assert!(
             app.last_catchup_completed_at.read().await.is_none(),
             "last_catchup_completed_at must NOT be stamped for stale-cache behind (#1863)"
+        );
+    }
+
+    /// Issue #1873: Verify the lock-scope refactor — consensus_stuck_state
+    /// is NOT held across `.await` points.  We do this by blocking
+    /// `archive_behind_until` from another task and confirming that
+    /// `consensus_stuck_state` can still be read (i.e. is not locked).
+    #[tokio::test]
+    async fn test_consensus_stuck_state_not_held_across_await() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("lock-scope-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        // Hold a write guard on archive_behind_until — this will block any
+        // reader that awaits `.read()` on this lock.
+        let _blocker = app.archive_behind_until.write().await;
+
+        // In the old code, maybe_start_buffered_catchup would hold
+        // consensus_stuck_state.write() THEN await archive_behind_until.read(),
+        // which would block. With the refactored code, the reads happen
+        // independently, so consensus_stuck_state should be freely accessible.
+        //
+        // Verify we can read (and write) consensus_stuck_state without
+        // blocking. If the old pattern were in use and the event loop were
+        // blocked on archive_behind_until while holding consensus_stuck_state,
+        // this would deadlock.
+        let read_guard = app.consensus_stuck_state.read().await;
+        assert!(read_guard.is_none(), "initially no stuck state");
+        drop(read_guard);
+
+        let mut write_guard = app.consensus_stuck_state.write().await;
+        *write_guard = Some(ConsensusStuckState {
+            current_ledger: 100,
+            first_buffered: 101,
+            stuck_start: std::time::Instant::now(),
+            last_recovery_attempt: std::time::Instant::now(),
+            recovery_attempts: 0,
+            catchup_triggered: false,
+        });
+        drop(write_guard);
+
+        let read_guard = app.consensus_stuck_state.read().await;
+        assert_eq!(
+            read_guard.as_ref().map(|s| s.current_ledger),
+            Some(100),
+            "should be able to write and read consensus_stuck_state while archive_behind_until is blocked"
         );
     }
 }

@@ -27,8 +27,8 @@ pub(crate) const PHASE_13_1_BUFFERED_SYNCING_LEDGERS_WRITE: u32 = 1;
 /// `syncing_ledgers.read().await` for sequential-tx-set check.
 pub(crate) const PHASE_13_2_BUFFERED_SYNCING_LEDGERS_READ: u32 = 2;
 
-/// `maybe_start_buffered_catchup`: about to acquire
-/// `consensus_stuck_state.write().await` in the stuck-state arm.
+/// `maybe_start_buffered_catchup`: about to snapshot
+/// `consensus_stuck_state.read().await` in the stuck-state arm.
 pub(crate) const PHASE_13_3_BUFFERED_CONSENSUS_STUCK_WRITE: u32 = 3;
 
 /// `maybe_start_buffered_catchup`: about to read
@@ -36,7 +36,7 @@ pub(crate) const PHASE_13_3_BUFFERED_CONSENSUS_STUCK_WRITE: u32 = 3;
 pub(crate) const PHASE_13_4_BUFFERED_LAST_CATCHUP_COMPLETED_READ: u32 = 4;
 
 /// `maybe_start_buffered_catchup`: about to read
-/// `archive_behind_until.read().await` inside the stuck-state arm.
+/// `archive_behind_until.read().await` for archive-behind check.
 pub(crate) const PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ: u32 = 5;
 
 /// `out_of_sync_recovery`: about to acquire
