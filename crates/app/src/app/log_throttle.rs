@@ -115,6 +115,8 @@ pub(crate) struct RecoveryLogThrottles {
     /// "Hard reset: spawning catchup …" / "Hard reset: archive cache …"
     /// (mutually exclusive follow-on branches in the same hard-reset function)
     pub hard_reset_followon: LogThrottleSecs,
+    /// "Externalized catchup: archive cache cold, spawning ProbeAhead escalation"
+    pub externalized_cold_cache: LogThrottleSecs,
 }
 
 impl RecoveryLogThrottles {
@@ -133,6 +135,7 @@ impl RecoveryLogThrottles {
             recovery_exhausted: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
             livelock_hard_reset: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
             hard_reset_followon: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            externalized_cold_cache: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
         }
     }
 
@@ -151,6 +154,7 @@ impl RecoveryLogThrottles {
         self.recovery_exhausted.reset();
         self.livelock_hard_reset.reset();
         self.hard_reset_followon.reset();
+        self.externalized_cold_cache.reset();
     }
 }
 
@@ -250,6 +254,7 @@ mod tests {
         assert!(t.recovery_exhausted.should_log(0));
         assert!(t.livelock_hard_reset.should_log(0));
         assert!(t.hard_reset_followon.should_log(0));
+        assert!(t.externalized_cold_cache.should_log(0));
 
         // All suppressed on immediate retry.
         assert!(!t.far_ahead.should_log(100));
@@ -271,6 +276,7 @@ mod tests {
         assert!(t.recovery_exhausted.should_log(0));
         assert!(t.livelock_hard_reset.should_log(0));
         assert!(t.hard_reset_followon.should_log(0));
+        assert!(t.externalized_cold_cache.should_log(0));
     }
 
     #[test]

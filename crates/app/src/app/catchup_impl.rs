@@ -2548,12 +2548,26 @@ impl App {
                     // ProbeAhead catchup that does a fresh blocking HTTP fetch
                     // inside the spawned task. If the archive is truly not
                     // ahead, the catchup errors out gracefully.
-                    tracing::warn!(
-                        current_ledger,
-                        target_checkpoint,
-                        "Externalized catchup: archive cache cold, \
-                         spawning ProbeAhead escalation (see #1863)",
-                    );
+                    let now_secs = self.start_instant.elapsed().as_secs();
+                    if self
+                        .recovery_throttles
+                        .externalized_cold_cache
+                        .should_log(now_secs)
+                    {
+                        tracing::warn!(
+                            current_ledger,
+                            target_checkpoint,
+                            "Externalized catchup: archive cache cold, \
+                             spawning ProbeAhead escalation (see #1863)",
+                        );
+                    } else {
+                        tracing::debug!(
+                            current_ledger,
+                            target_checkpoint,
+                            "Externalized catchup: archive cache cold, \
+                             spawning ProbeAhead escalation (see #1863) (repeated)",
+                        );
+                    }
                     self.archive_checkpoint_cache.set_urgent(true);
                     return self
                         .spawn_catchup(
