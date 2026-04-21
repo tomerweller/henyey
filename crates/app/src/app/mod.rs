@@ -1675,6 +1675,7 @@ impl App {
             consensus_trigger_failures: self.consensus_trigger_failures.load(Ordering::Relaxed),
             archive_checkpoint_stale_returns: self.archive_checkpoint_cache.stale_returns(),
             archive_checkpoint_cold_returns: self.archive_checkpoint_cache.cold_returns(),
+            archive_checkpoint_fresh_returns: self.archive_checkpoint_cache.fresh_returns(),
             archive_checkpoint_refresh_timeouts: self.archive_checkpoint_cache.refresh_timeouts(),
             archive_checkpoint_refresh_errors: self.archive_checkpoint_cache.refresh_errors(),
             archive_checkpoint_refresh_successes: self.archive_checkpoint_cache.refresh_successes(),
@@ -2012,6 +2013,18 @@ impl App {
                 .read()
                 .as_ref()
                 .map_or(0, |p| p.snapshot_cache.fallback_lookups),
+            // Phase 5 archive cache counters.
+            archive_cache_fresh: self.archive_checkpoint_cache.fresh_returns(),
+            archive_cache_stale: self.archive_checkpoint_cache.stale_returns(),
+            archive_cache_cold: self.archive_checkpoint_cache.cold_returns(),
+            archive_cache_refresh_success: self.archive_checkpoint_cache.refresh_successes(),
+            archive_cache_refresh_error: self.archive_checkpoint_cache.refresh_errors(),
+            archive_cache_refresh_timeout: self.archive_checkpoint_cache.refresh_timeouts(),
+            archive_cache_age_secs: self
+                .archive_checkpoint_cache
+                .last_query_age()
+                .map_or(0.0, |d| d.as_secs_f64()),
+            archive_cache_populated: self.archive_checkpoint_cache.is_populated(),
         }
     }
 

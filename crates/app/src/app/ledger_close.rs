@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// Record the last phase duration from a `PhaseTimer` into a Prometheus histogram.
+/// Must be called immediately after `timer.mark()`.
+fn record_phase_histogram(metric: &'static str, timer: &tracked_lock::PhaseTimer) {
+    if let Some(&(_, duration)) = timer.phases().last() {
+        metrics::histogram!(metric).record(duration.as_secs_f64());
+    }
+}
+
 /// Raw inputs for a ledger-close persist job, captured on the event loop.
 ///
 /// Phase A of #1733: the event loop captures only cheap clones (no XDR/JSON
@@ -1789,6 +1797,7 @@ impl App {
             }
         };
         timer.mark("join_match_ms");
+        record_phase_histogram(crate::metrics::CLOSE_COMPLETE_JOIN_MATCH_SECONDS, &timer);
 
         // Store last-close stats and perf for metrics reporting.
         *self.last_close_stats.write() = result.stats.clone();
@@ -1798,6 +1807,37 @@ impl App {
         if result.stats.close_time_ms > 0 {
             metrics::histogram!(crate::metrics::LEDGER_CLOSE_DURATION_SECONDS)
                 .record(result.stats.close_time_ms as f64 / 1000.0);
+        }
+
+        // Phase 5: Per-phase close-duration histograms (LedgerClosePerf).
+        if let Some(ref perf) = result.perf {
+            let us_to_secs = |us: u64| us as f64 / 1_000_000.0;
+            metrics::histogram!(crate::metrics::CLOSE_BEGIN_SECONDS)
+                .record(us_to_secs(perf.begin_close_us));
+            metrics::histogram!(crate::metrics::CLOSE_TX_EXEC_SECONDS)
+                .record(us_to_secs(perf.tx_exec_us));
+            metrics::histogram!(crate::metrics::CLOSE_CLASSIC_EXEC_SECONDS)
+                .record(us_to_secs(perf.classic_exec_us));
+            metrics::histogram!(crate::metrics::CLOSE_SOROBAN_EXEC_SECONDS)
+                .record(us_to_secs(perf.soroban_exec_us));
+            metrics::histogram!(crate::metrics::CLOSE_COMMIT_SETUP_SECONDS)
+                .record(us_to_secs(perf.commit_setup_us));
+            metrics::histogram!(crate::metrics::CLOSE_BUCKET_LOCK_WAIT_SECONDS)
+                .record(us_to_secs(perf.bucket_lock_wait_us));
+            metrics::histogram!(crate::metrics::CLOSE_EVICTION_SECONDS)
+                .record(us_to_secs(perf.eviction_us));
+            metrics::histogram!(crate::metrics::CLOSE_SOROBAN_STATE_SECONDS)
+                .record(us_to_secs(perf.soroban_state_us));
+            metrics::histogram!(crate::metrics::CLOSE_BUCKET_ADD_SECONDS)
+                .record(us_to_secs(perf.add_batch_us));
+            metrics::histogram!(crate::metrics::CLOSE_HOT_ARCHIVE_SECONDS)
+                .record(us_to_secs(perf.hot_archive_us));
+            metrics::histogram!(crate::metrics::CLOSE_HEADER_SECONDS)
+                .record(us_to_secs(perf.header_us));
+            metrics::histogram!(crate::metrics::CLOSE_COMMIT_SECONDS)
+                .record(us_to_secs(perf.commit_close_us));
+            metrics::histogram!(crate::metrics::CLOSE_META_SECONDS)
+                .record(us_to_secs(perf.meta_us));
         }
 
         // Phase 3: Accumulate cumulative ledger apply counters.
@@ -1882,6 +1922,7 @@ impl App {
             }
         }
         timer.mark("meta_emit_ms");
+        record_phase_histogram(crate::metrics::CLOSE_COMPLETE_META_EMIT_SECONDS, &timer);
 
         // Prepare persist data (CPU work only — XDR serialization, HAS
         // building, SCP envelope collection). The actual I/O (bucket flush,
@@ -1924,6 +1965,10 @@ impl App {
             }
         }
         timer.mark("build_persist_inputs_ms");
+        record_phase_histogram(
+            crate::metrics::CLOSE_COMPLETE_BUILD_PERSIST_INPUTS_SECONDS,
+            &timer,
+        );
 
         // Track non-empty ledger closes for the `ledger.transaction.count` metric.
         if !pending.tx_set.transactions.is_empty() {
@@ -1998,6 +2043,10 @@ impl App {
         // and is what lets us tell the inline window apart from the
         // off-loaded work in the `spawn_blocking` below.
         timer.mark("overlay_bookkeeping_ms");
+        record_phase_histogram(
+            crate::metrics::CLOSE_COMPLETE_OVERLAY_BOOKKEEPING_SECONDS,
+            &timer,
+        );
 
         // === Off-load the two CPU-heavy sub-phases ============================
         //
@@ -2069,6 +2118,10 @@ impl App {
         // arithmetic, `wall_now` / drift computation) runs INSIDE the
         // closure on the blocking-pool thread.
         timer.mark("spawn_blocking_setup_ms");
+        record_phase_histogram(
+            crate::metrics::CLOSE_COMPLETE_SPAWN_BLOCKING_SETUP_SECONDS,
+            &timer,
+        );
 
         let join = tokio::task::spawn_blocking(move || {
             // Test-only synthetic blocking work — lets the regression test
@@ -2266,6 +2319,7 @@ impl App {
             }
         }
         timer.mark("tx_queue_background_wait_ms");
+        record_phase_histogram(crate::metrics::CLOSE_COMPLETE_TX_QUEUE_SECONDS, &timer);
 
         // Update current ledger tracking.
         *self.last_processed_slot.write().await = pending.ledger_seq as u64;
@@ -2326,6 +2380,19 @@ impl App {
             pending.ledger_seq,
         );
         timer.mark("post_close_bookkeeping_ms");
+        record_phase_histogram(
+            crate::metrics::CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS,
+            &timer,
+        );
+
+        // Phase 5: Slot-to-close latency histogram.
+        if let Some(elapsed) = self
+            .herder
+            .slot_first_seen_elapsed(pending.ledger_seq as u64)
+        {
+            metrics::histogram!(crate::metrics::SLOT_TO_CLOSE_LATENCY_SECONDS)
+                .record(elapsed.as_secs_f64());
+        }
 
         // Emit the PhaseTimer WARN (if total ≥ 250 ms). Placed before
         // the finalizer dispatch so the Inline-await persist-handle I/O

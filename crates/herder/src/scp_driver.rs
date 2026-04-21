@@ -577,6 +577,16 @@ impl ScpDriver {
         *self.last_externalize_timing.read()
     }
 
+    /// Elapsed time since the first SCP activity was recorded for `slot`.
+    /// Returns `None` if `record_slot_activity` was never called for this slot
+    /// (e.g., catchup/fast-forward paths).
+    pub fn slot_first_seen_elapsed(&self, slot: SlotIndex) -> Option<std::time::Duration> {
+        self.slot_first_seen
+            .read()
+            .get(&slot)
+            .map(|first_seen| first_seen.elapsed())
+    }
+
     /// Get an externalized slot.
     pub fn get_externalized(&self, slot: SlotIndex) -> Option<ExternalizedSlot> {
         tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized)
@@ -1805,13 +1815,15 @@ impl ScpDriver {
         }
 
         // Clean up old slot_first_seen and nomination_started_at entries (keep only recent slots).
+        // Keep 100 slots to ensure close-complete can still find timestamps during backlog
+        // (EXTERNALIZEs race ahead of close-complete when the node is behind).
         {
             let mut map = self.slot_first_seen.write();
-            map.retain(|&s, _| slot.saturating_sub(s) <= 10);
+            map.retain(|&s, _| slot.saturating_sub(s) <= 100);
         }
         {
             let mut map = self.nomination_started_at.write();
-            map.retain(|&s, _| slot.saturating_sub(s) <= 10);
+            map.retain(|&s, _| slot.saturating_sub(s) <= 100);
         }
 
         debug!("Externalized slot {} with close time {}", slot, close_time);
@@ -2888,7 +2900,7 @@ mod tests {
         driver.record_externalized(200, Value::default());
 
         let map = driver.nomination_started_at.read();
-        assert!(map.is_empty() || map.keys().all(|&s| 200u64.saturating_sub(s) <= 10));
+        assert!(map.is_empty() || map.keys().all(|&s| 200u64.saturating_sub(s) <= 100));
     }
 
     #[test]

@@ -147,6 +147,12 @@ impl PhaseTimer {
         self.phases.len()
     }
 
+    /// Borrow the recorded phases. Each entry is `(name, duration)`
+    /// in the order `mark()` was called. Zero-allocation.
+    pub fn phases(&self) -> &[(&'static str, Duration)] {
+        &self.phases
+    }
+
     /// Finish the timer. If the total wall time since `start` reaches
     /// [`LOCK_SLOW_THRESHOLD`], emit a single structured `WARN` line
     /// with every phase as a field plus `total_ms` and `call`.
@@ -392,9 +398,18 @@ mod tests {
     fn phase_timer_records_all_phases() {
         let mut timer = PhaseTimer::start();
         assert_eq!(timer.phase_count(), 0);
+        assert!(timer.phases().is_empty());
         timer.mark("a");
         assert_eq!(timer.phase_count(), 1);
         timer.mark("b");
         assert_eq!(timer.phase_count(), 2);
+
+        let phases = timer.phases();
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases[0].0, "a");
+        assert_eq!(phases[1].0, "b");
+        // Durations are non-negative (no wall-clock assertions)
+        assert!(phases[0].1 >= Duration::ZERO);
+        assert!(phases[1].1 >= Duration::ZERO);
     }
 }

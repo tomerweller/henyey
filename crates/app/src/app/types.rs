@@ -119,6 +119,7 @@ pub struct SimulationDebugStats {
     // Archive checkpoint cache (issue #1784)
     pub archive_checkpoint_stale_returns: u64,
     pub archive_checkpoint_cold_returns: u64,
+    pub archive_checkpoint_fresh_returns: u64,
     pub archive_checkpoint_refresh_timeouts: u64,
     pub archive_checkpoint_refresh_errors: u64,
     pub archive_checkpoint_refresh_successes: u64,
@@ -264,6 +265,15 @@ pub struct AppMetricsSnapshot {
     pub bucket_cache_hit_ratio: f64,
     pub snapshot_cache_hit_ratio: f64,
     pub snapshot_cache_fallback_lookups: u64,
+    // Phase 5: Archive cache counters.
+    pub archive_cache_fresh: u64,
+    pub archive_cache_stale: u64,
+    pub archive_cache_cold: u64,
+    pub archive_cache_refresh_success: u64,
+    pub archive_cache_refresh_error: u64,
+    pub archive_cache_refresh_timeout: u64,
+    pub archive_cache_age_secs: f64,
+    pub archive_cache_populated: bool,
 }
 
 /// Metrics for the overlay fetch-response channel (issue #1741).

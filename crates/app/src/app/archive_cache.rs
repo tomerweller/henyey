@@ -220,6 +220,7 @@ pub(super) struct ArchiveCheckpointCache {
     urgent: AtomicBool,
     stale_returns: AtomicU64,
     cold_returns: AtomicU64,
+    fresh_returns: AtomicU64,
     refresh_timeouts: AtomicU64,
     refresh_errors: AtomicU64,
     refresh_successes: AtomicU64,
@@ -240,6 +241,7 @@ impl ArchiveCheckpointCache {
             urgent: AtomicBool::new(false),
             stale_returns: AtomicU64::new(0),
             cold_returns: AtomicU64::new(0),
+            fresh_returns: AtomicU64::new(0),
             refresh_timeouts: AtomicU64::new(0),
             refresh_errors: AtomicU64::new(0),
             refresh_successes: AtomicU64::new(0),
@@ -279,7 +281,10 @@ impl ArchiveCheckpointCache {
                 self.stale_returns.fetch_add(1, Ordering::Relaxed);
                 CacheResult::Stale(v)
             }
-            (Some(v), false) => CacheResult::Fresh(v),
+            (Some(v), false) => {
+                self.fresh_returns.fetch_add(1, Ordering::Relaxed);
+                CacheResult::Fresh(v)
+            }
         };
 
         if needs_refresh {
@@ -424,6 +429,10 @@ impl ArchiveCheckpointCache {
         self.cold_returns.load(Ordering::Relaxed)
     }
 
+    pub(super) fn fresh_returns(&self) -> u64 {
+        self.fresh_returns.load(Ordering::Relaxed)
+    }
+
     pub(super) fn refresh_timeouts(&self) -> u64 {
         self.refresh_timeouts.load(Ordering::Relaxed)
     }
@@ -434,6 +443,11 @@ impl ArchiveCheckpointCache {
 
     pub(super) fn refresh_successes(&self) -> u64 {
         self.refresh_successes.load(Ordering::Relaxed)
+    }
+
+    /// Whether the cache has been populated at least once.
+    pub(super) fn is_populated(&self) -> bool {
+        self.value.read().is_some()
     }
 
     #[cfg(test)]
@@ -456,11 +470,14 @@ impl ArchiveCheckpointCache {
         tokio::spawn(async move {
             let fetcher = Arc::clone(&*this.background_fetcher.read());
             let fut = async { fetcher.fetch().await };
+            let refresh_start = Instant::now();
             let outcome =
                 tokio::time::timeout(Duration::from_secs(ARCHIVE_REFRESH_TIMEOUT_SECS), fut).await;
 
             match outcome {
                 Ok(Ok(checkpoint)) => {
+                    metrics::histogram!("henyey_archive_cache_refresh_duration_seconds")
+                        .record(refresh_start.elapsed().as_secs_f64());
                     *this.value.write() = Some(CachedCheckpoint {
                         checkpoint,
                         queried_at: this.clock.now(),
@@ -469,6 +486,8 @@ impl ArchiveCheckpointCache {
                     tracing::debug!(checkpoint, "Archive checkpoint refresh succeeded");
                 }
                 Ok(Err(e)) => {
+                    metrics::histogram!("henyey_archive_cache_refresh_duration_seconds")
+                        .record(refresh_start.elapsed().as_secs_f64());
                     this.refresh_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(
                         error = %e,
@@ -476,6 +495,9 @@ impl ArchiveCheckpointCache {
                     );
                 }
                 Err(_) => {
+                    // Record the full timeout duration — this is the actual stall.
+                    metrics::histogram!("henyey_archive_cache_refresh_duration_seconds")
+                        .record(ARCHIVE_REFRESH_TIMEOUT_SECS as f64);
                     this.refresh_timeouts.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         timeout_secs = ARCHIVE_REFRESH_TIMEOUT_SECS,
@@ -618,6 +640,7 @@ mod tests {
         // Subsequent call returns the fetched value.
         let got = cache.get_cached();
         assert_eq!(got, CacheResult::Fresh(77));
+        assert_eq!(cache.fresh_returns(), 1, "fresh return counter incremented");
     }
 
     /// Concurrent callers on a cold cache spawn exactly one refresh.

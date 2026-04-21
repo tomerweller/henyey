@@ -181,6 +181,52 @@ pub const QUORUM_FAIL_AT: &str = "stellar_quorum_fail_at";
 pub const SCP_TIMING_EXTERNALIZED_SECONDS: &str = "stellar_scp_timing_externalized_seconds";
 pub const SCP_TIMING_NOMINATED_SECONDS: &str = "stellar_scp_timing_nominated_seconds";
 
+// Phase 5 — Per-phase ledger close histograms (LedgerClosePerf).
+pub const CLOSE_BEGIN_SECONDS: &str = "henyey_ledger_close_begin_seconds";
+pub const CLOSE_TX_EXEC_SECONDS: &str = "henyey_ledger_close_tx_exec_seconds";
+pub const CLOSE_CLASSIC_EXEC_SECONDS: &str = "henyey_ledger_close_classic_exec_seconds";
+pub const CLOSE_SOROBAN_EXEC_SECONDS: &str = "henyey_ledger_close_soroban_exec_seconds";
+pub const CLOSE_COMMIT_SETUP_SECONDS: &str = "henyey_ledger_close_commit_setup_seconds";
+pub const CLOSE_BUCKET_LOCK_WAIT_SECONDS: &str = "henyey_ledger_close_bucket_lock_wait_seconds";
+pub const CLOSE_EVICTION_SECONDS: &str = "henyey_ledger_close_eviction_seconds";
+pub const CLOSE_SOROBAN_STATE_SECONDS: &str = "henyey_ledger_close_soroban_state_seconds";
+pub const CLOSE_BUCKET_ADD_SECONDS: &str = "henyey_ledger_close_bucket_add_seconds";
+pub const CLOSE_HOT_ARCHIVE_SECONDS: &str = "henyey_ledger_close_hot_archive_seconds";
+pub const CLOSE_HEADER_SECONDS: &str = "henyey_ledger_close_header_seconds";
+pub const CLOSE_COMMIT_SECONDS: &str = "henyey_ledger_close_commit_seconds";
+pub const CLOSE_META_SECONDS: &str = "henyey_ledger_close_meta_seconds";
+
+// Phase 5 — Event-loop post-close PhaseTimer histograms.
+pub const CLOSE_COMPLETE_JOIN_MATCH_SECONDS: &str = "henyey_close_complete_join_match_seconds";
+pub const CLOSE_COMPLETE_META_EMIT_SECONDS: &str = "henyey_close_complete_meta_emit_seconds";
+pub const CLOSE_COMPLETE_BUILD_PERSIST_INPUTS_SECONDS: &str =
+    "henyey_close_complete_build_persist_inputs_seconds";
+pub const CLOSE_COMPLETE_OVERLAY_BOOKKEEPING_SECONDS: &str =
+    "henyey_close_complete_overlay_bookkeeping_seconds";
+pub const CLOSE_COMPLETE_SPAWN_BLOCKING_SETUP_SECONDS: &str =
+    "henyey_close_complete_spawn_blocking_setup_seconds";
+pub const CLOSE_COMPLETE_TX_QUEUE_SECONDS: &str = "henyey_close_complete_tx_queue_seconds";
+pub const CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS: &str =
+    "henyey_close_complete_post_close_bookkeeping_seconds";
+
+// Phase 5 — Slot-to-close latency histogram.
+pub const SLOT_TO_CLOSE_LATENCY_SECONDS: &str = "henyey_slot_to_close_latency_seconds";
+
+// Phase 5 — Archive cache metrics.
+pub const ARCHIVE_CACHE_FRESH_TOTAL: &str = "henyey_archive_cache_fresh_total";
+pub const ARCHIVE_CACHE_STALE_TOTAL: &str = "henyey_archive_cache_stale_total";
+pub const ARCHIVE_CACHE_COLD_TOTAL: &str = "henyey_archive_cache_cold_total";
+pub const ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL: &str = "henyey_archive_cache_refresh_success_total";
+pub const ARCHIVE_CACHE_REFRESH_ERROR_TOTAL: &str = "henyey_archive_cache_refresh_error_total";
+pub const ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL: &str = "henyey_archive_cache_refresh_timeout_total";
+pub const ARCHIVE_CACHE_REFRESH_DURATION_SECONDS: &str =
+    "henyey_archive_cache_refresh_duration_seconds";
+pub const ARCHIVE_CACHE_AGE_SECONDS: &str = "henyey_archive_cache_age_seconds";
+pub const ARCHIVE_CACHE_POPULATED: &str = "henyey_archive_cache_populated";
+
+// Phase 5 — Recovery stalled tick counter.
+pub const RECOVERY_STALLED_TICK_TOTAL: &str = "henyey_recovery_stalled_tick_total";
+
 // ── Registration ───────────────────────────────────────────────────────
 
 /// Register HELP/TYPE annotations for all metrics.
@@ -643,6 +689,134 @@ pub fn describe_metrics() {
         SCP_TIMING_NOMINATED_SECONDS,
         "Time from first local nomination to externalize (seconds, last slot)"
     );
+
+    // Phase 5: Per-phase close-duration histograms (LedgerClosePerf).
+    describe_histogram!(
+        CLOSE_BEGIN_SECONDS,
+        "Ledger close begin_close phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_TX_EXEC_SECONDS,
+        "Ledger close tx_exec phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_CLASSIC_EXEC_SECONDS,
+        "Ledger close classic_exec sub-phase of tx_exec (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_SOROBAN_EXEC_SECONDS,
+        "Ledger close soroban_exec sub-phase of tx_exec (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_COMMIT_SETUP_SECONDS,
+        "Ledger close commit_setup phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_BUCKET_LOCK_WAIT_SECONDS,
+        "Ledger close bucket_lock_wait phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_EVICTION_SECONDS,
+        "Ledger close eviction phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_SOROBAN_STATE_SECONDS,
+        "Ledger close soroban_state phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_BUCKET_ADD_SECONDS,
+        "Ledger close bucket_add phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_HOT_ARCHIVE_SECONDS,
+        "Ledger close hot_archive phase (seconds)"
+    );
+    describe_histogram!(CLOSE_HEADER_SECONDS, "Ledger close header phase (seconds)");
+    describe_histogram!(
+        CLOSE_COMMIT_SECONDS,
+        "Ledger close commit_close phase (seconds)"
+    );
+    describe_histogram!(CLOSE_META_SECONDS, "Ledger close meta phase (seconds)");
+
+    // Phase 5: Event-loop post-close PhaseTimer histograms.
+    describe_histogram!(
+        CLOSE_COMPLETE_JOIN_MATCH_SECONDS,
+        "Close-complete join_match phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_COMPLETE_META_EMIT_SECONDS,
+        "Close-complete meta_emit phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_COMPLETE_BUILD_PERSIST_INPUTS_SECONDS,
+        "Close-complete build_persist_inputs phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_COMPLETE_OVERLAY_BOOKKEEPING_SECONDS,
+        "Close-complete overlay_bookkeeping phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_COMPLETE_SPAWN_BLOCKING_SETUP_SECONDS,
+        "Close-complete spawn_blocking_setup phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_COMPLETE_TX_QUEUE_SECONDS,
+        "Close-complete tx_queue_background_wait phase (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS,
+        "Close-complete post_close_bookkeeping phase (seconds)"
+    );
+
+    // Phase 5: Slot-to-close latency.
+    describe_histogram!(
+        SLOT_TO_CLOSE_LATENCY_SECONDS,
+        "Wall-clock from first SCP activity to close-complete (seconds)"
+    );
+
+    // Phase 5: Archive cache metrics.
+    describe_counter!(
+        ARCHIVE_CACHE_FRESH_TOTAL,
+        "Archive cache get_cached() Fresh results"
+    );
+    describe_counter!(
+        ARCHIVE_CACHE_STALE_TOTAL,
+        "Archive cache get_cached() Stale results"
+    );
+    describe_counter!(
+        ARCHIVE_CACHE_COLD_TOTAL,
+        "Archive cache get_cached() Cold results"
+    );
+    describe_counter!(
+        ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL,
+        "Archive cache background refresh successes"
+    );
+    describe_counter!(
+        ARCHIVE_CACHE_REFRESH_ERROR_TOTAL,
+        "Archive cache background refresh errors"
+    );
+    describe_counter!(
+        ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL,
+        "Archive cache background refresh timeouts"
+    );
+    describe_histogram!(
+        ARCHIVE_CACHE_REFRESH_DURATION_SECONDS,
+        "Archive cache background refresh duration (seconds, including timeouts)"
+    );
+    describe_gauge!(
+        ARCHIVE_CACHE_AGE_SECONDS,
+        "Age of cached archive checkpoint (seconds, 0 when cold)"
+    );
+    describe_gauge!(
+        ARCHIVE_CACHE_POPULATED,
+        "Whether the archive checkpoint cache has a value (1=populated, 0=cold)"
+    );
+
+    // Phase 5: Recovery stalled tick counter.
+    describe_counter!(
+        RECOVERY_STALLED_TICK_TOTAL,
+        "Recovery stalled ticks by reason"
+    );
 }
 
 /// Pre-register all metrics with initial values so that every metric appears
@@ -810,6 +984,28 @@ pub fn register_label_series() {
     gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
     // Note: histogram (LEDGER_CLOSE_DURATION_SECONDS) is not pre-registered —
     // it is recorded in the ledger close path, not at scrape time.
+
+    // Phase 5: Archive cache counters and gauges.
+    counter!(ARCHIVE_CACHE_FRESH_TOTAL).absolute(0);
+    counter!(ARCHIVE_CACHE_STALE_TOTAL).absolute(0);
+    counter!(ARCHIVE_CACHE_COLD_TOTAL).absolute(0);
+    counter!(ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL).absolute(0);
+    counter!(ARCHIVE_CACHE_REFRESH_ERROR_TOTAL).absolute(0);
+    counter!(ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL).absolute(0);
+    gauge!(ARCHIVE_CACHE_AGE_SECONDS).set(0.0);
+    gauge!(ARCHIVE_CACHE_POPULATED).set(0.0);
+
+    // Phase 5: Recovery stalled tick — pre-register all reason labels at zero.
+    for reason in &[
+        "backoff_active",
+        "forcing_catchup_not_behind",
+        "forcing_catchup_behind",
+    ] {
+        counter!(RECOVERY_STALLED_TICK_TOTAL, "reason" => *reason).absolute(0);
+    }
+    // Note: Phase 5 histograms (CLOSE_*_SECONDS, SLOT_TO_CLOSE_LATENCY_SECONDS,
+    // ARCHIVE_CACHE_REFRESH_DURATION_SECONDS) are not pre-registered — they are
+    // recorded in the ledger close / archive refresh path, not at scrape time.
 }
 
 // ── Scrape-time refresh ────────────────────────────────────────────────
@@ -1064,6 +1260,22 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         gauge!(SCP_TIMING_EXTERNALIZED_SECONDS).set(0.0);
         gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
     }
+
+    // Phase 5: Archive cache absolute counters.
+    counter!(ARCHIVE_CACHE_FRESH_TOTAL).absolute(snap.archive_cache_fresh);
+    counter!(ARCHIVE_CACHE_STALE_TOTAL).absolute(snap.archive_cache_stale);
+    counter!(ARCHIVE_CACHE_COLD_TOTAL).absolute(snap.archive_cache_cold);
+    counter!(ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL).absolute(snap.archive_cache_refresh_success);
+    counter!(ARCHIVE_CACHE_REFRESH_ERROR_TOTAL).absolute(snap.archive_cache_refresh_error);
+    counter!(ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL).absolute(snap.archive_cache_refresh_timeout);
+
+    // Phase 5: Archive cache gauges.
+    gauge!(ARCHIVE_CACHE_AGE_SECONDS).set(snap.archive_cache_age_secs);
+    gauge!(ARCHIVE_CACHE_POPULATED).set(if snap.archive_cache_populated {
+        1.0
+    } else {
+        0.0
+    });
 }
 
 // ── Process health helpers ──────────────────────────────────────────────

@@ -2562,6 +2562,11 @@ impl Herder {
         self.scp_driver.last_externalize_timing()
     }
 
+    /// Elapsed time since first SCP activity for the given slot.
+    pub fn slot_first_seen_elapsed(&self, slot: SlotIndex) -> Option<std::time::Duration> {
+        self.scp_driver.slot_first_seen_elapsed(slot)
+    }
+
     // --- FetchingEnvelopes integration ---
 
     /// Receive a TxSet from a peer.

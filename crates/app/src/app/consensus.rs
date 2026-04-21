@@ -1049,6 +1049,11 @@ impl App {
         };
 
         if backoff_active {
+            metrics::counter!(
+                crate::metrics::RECOVERY_STALLED_TICK_TOTAL,
+                "reason" => "backoff_active"
+            )
+            .increment(1);
             tracing::debug!(
                 current_ledger,
                 latest_externalized,
@@ -1064,6 +1069,11 @@ impl App {
             // The fast-track caller already emits its own WARN before entering
             // this function, so the INFO here is redundant noise at gap=0.
             if !relation.is_behind() {
+                metrics::counter!(
+                    crate::metrics::RECOVERY_STALLED_TICK_TOTAL,
+                    "reason" => "forcing_catchup_not_behind"
+                )
+                .increment(1);
                 tracing::debug!(
                     current_ledger,
                     latest_externalized,
@@ -1074,6 +1084,11 @@ impl App {
                     "Recovery stalled for too long — forcing catchup"
                 );
             } else {
+                metrics::counter!(
+                    crate::metrics::RECOVERY_STALLED_TICK_TOTAL,
+                    "reason" => "forcing_catchup_behind"
+                )
+                .increment(1);
                 tracing::info!(
                     current_ledger,
                     latest_externalized,
