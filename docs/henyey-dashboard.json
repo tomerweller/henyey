@@ -1414,6 +1414,64 @@
       }
     },
     {
+      "id": 56,
+      "type": "timeseries",
+      "title": "Snapshot Cache Fallback Lookups",
+      "description": "Number of SnapshotHandle lookups per ledger that were not served by local caches and had to be dispatched to the fallback (bucket list / Soroban state). Henyey-specific metric.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "000000001"
+      },
+      "targets": [
+        {
+          "expr": "henyey_snapshot_cache_fallback_lookups{job=\"henyey\", instance=~\"$instance\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "Fallback lookups",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "min",
+            "max",
+            "mean",
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
       "id": 20,
       "type": "timeseries",
       "title": "Total Fees",
@@ -1422,7 +1480,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 38
+        "y": 46
       },
       "datasource": {
         "type": "prometheus",
@@ -1479,7 +1537,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 46
+        "y": 54
       },
       "id": 102,
       "panels": []
@@ -1493,7 +1551,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 47
+        "y": 55
       },
       "datasource": {
         "type": "prometheus",
@@ -1591,7 +1649,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 47
+        "y": 55
       },
       "datasource": {
         "type": "prometheus",
@@ -1665,7 +1723,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 55
+        "y": 63
       },
       "datasource": {
         "type": "prometheus",
@@ -1723,7 +1781,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 55
+        "y": 63
       },
       "datasource": {
         "type": "prometheus",
@@ -1781,7 +1839,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 63
+        "y": 71
       },
       "datasource": {
         "type": "prometheus",
@@ -1839,7 +1897,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 63
+        "y": 71
       },
       "datasource": {
         "type": "prometheus",
@@ -1906,7 +1964,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 71
+        "y": 79
       },
       "datasource": {
         "type": "prometheus",
@@ -1973,7 +2031,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 71
+        "y": 79
       },
       "datasource": {
         "type": "prometheus",
@@ -2030,7 +2088,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 79
+        "y": 87
       },
       "id": 103,
       "panels": [
@@ -2383,7 +2441,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 80
+        "y": 88
       },
       "id": 104,
       "panels": [
@@ -2878,7 +2936,7 @@
           }
         },
         {
-          "id": 40,
+          "id": 55,
           "type": "timeseries",
           "title": "Cached TX Sets",
           "description": "Number of transaction sets cached by the herder for consensus rounds.",
@@ -2945,7 +3003,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 81
+        "y": 89
       },
       "id": 105,
       "panels": [
@@ -3352,7 +3410,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 82
+        "y": 90
       },
       "id": 106,
       "panels": [
@@ -3708,7 +3766,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 83
+        "y": 91
       },
       "id": 107,
       "panels": [
@@ -3941,7 +3999,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 84
+        "y": 92
       },
       "id": 108,
       "panels": [

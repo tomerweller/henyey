@@ -39,37 +39,37 @@ Since this is currently a single-node deployment, the instance variable exists f
 - **Thresholds:** <10 = green, <30 = yellow, >=30 = red
 - **Description:** Seconds since the last ledger close. On a healthy mainnet validator this should hover around 5-7s. Sustained values above 30s indicate the node has fallen behind or lost sync.
 
-### Panel 1.3: Ledger Sequence
+### Panel 1.3: Ledger Seq
 - **Type:** stat
 - **Query:** `stellar_ledger_sequence{job="henyey", instance=~"$instance"}`
 - **Unit:** none (plain integer)
 - **Description:** Current ledger number. Useful for cross-referencing with network explorers and other validators.
 
-### Panel 1.4: Herder State
+### Panel 1.4: Herder
 - **Type:** stat
 - **Query:** `stellar_herder_state{job="henyey", instance=~"$instance"}`
 - **Value mapping:** Numeric state codes to human-readable names if known; otherwise display raw value.
 - **Description:** Internal herder state machine position. Indicates whether the node is tracking consensus, catching up, or in another state.
 
-### Panel 1.5: Peer Count
+### Panel 1.5: Peers
 - **Type:** stat
 - **Query:** `stellar_peer_count{job="henyey", instance=~"$instance"}`
 - **Thresholds:** <3 = red, <8 = yellow, >=8 = green
 - **Description:** Total connected peers. Below 3 risks network partition; below 8 is degraded connectivity.
 
-### Panel 1.6: Quorum Fail At
+### Panel 1.6: Fail At
 - **Type:** stat
 - **Query:** `stellar_quorum_fail_at{job="henyey", instance=~"$instance"}`
 - **Thresholds:** 0 = red, 1 = yellow, >=2 = green
 - **Description:** Number of additional quorum nodes that can fail before this validator loses quorum. Zero means quorum loss is imminent. This is the single most critical safety metric.
 
-### Panel 1.7: Quorum Missing
+### Panel 1.7: Missing
 - **Type:** stat
 - **Query:** `stellar_quorum_missing{job="henyey", instance=~"$instance"}`
 - **Thresholds:** 0 = green, >=1 = red
 - **Description:** Number of quorum peers not responding. Any non-zero value warrants investigation.
 
-### Panel 1.8: Is Validator
+### Panel 1.8: Validator
 - **Type:** stat
 - **Query:** `stellar_is_validator{job="henyey", instance=~"$instance"}`
 - **Value mapping:** 1 = "YES" (green), 0 = "NO" (red)
@@ -84,9 +84,9 @@ Since this is currently a single-node deployment, the instance variable exists f
 
 ### Panel 1.10: FD Usage
 - **Type:** stat
-- **Unit:** percent (0-100)
-- **Query:** `henyey_process_open_fds{job="henyey", instance=~"$instance"} / henyey_process_max_fds{job="henyey", instance=~"$instance"} * 100`
-- **Thresholds:** <60 = green, <80 = yellow, >=80 = red
+- **Unit:** percentunit (0-1 range, displayed as percent)
+- **Query:** `henyey_process_open_fds{job="henyey", instance=~"$instance"} / henyey_process_max_fds{job="henyey", instance=~"$instance"}`
+- **Thresholds:** <0.6 = green, <0.8 = yellow, >=0.8 = red
 - **Description:** File descriptor usage as percentage of ulimit. Approaching the limit causes connection failures and crashes.
 
 ---
