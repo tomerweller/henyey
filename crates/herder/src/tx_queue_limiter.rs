@@ -125,7 +125,7 @@ impl TxQueueLimiter {
     }
 
     fn frame_for(&self, tx: &QueuedTransaction) -> TransactionFrame {
-        TransactionFrame::from_owned_with_network(tx.envelope.clone(), self.network_id)
+        TransactionFrame::with_network(tx.envelope.clone(), self.network_id)
     }
 
     fn queue_entry(tx: &QueuedTransaction) -> QueueEntry {
@@ -482,6 +482,7 @@ impl TxQueueLimiter {
 mod tests {
     use super::*;
     use henyey_common::Hash256;
+    use std::sync::Arc;
     use stellar_xdr::curr::{
         DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
         SequenceNumber, Signature, SignatureHint, Transaction, TransactionEnvelope,
@@ -522,7 +523,7 @@ mod tests {
         hash[1] = (fee % 256) as u8;
 
         QueuedTransaction {
-            envelope,
+            envelope: Arc::new(envelope),
             hash: Hash256::from_bytes(hash),
             total_fee: fee,
             inclusion_fee: fee as i64,

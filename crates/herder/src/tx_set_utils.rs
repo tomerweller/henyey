@@ -39,14 +39,17 @@ use crate::tx_queue::{AccountProvider, FeeBalanceProvider};
 #[derive(Debug, Clone)]
 pub struct HashedTx {
     pub(crate) hash: Hash256,
-    pub(crate) envelope: TransactionEnvelope,
+    pub(crate) envelope: Arc<TransactionEnvelope>,
 }
 
 impl HashedTx {
     /// Create a new `HashedTx` by computing the hash from the envelope.
     pub fn new(envelope: TransactionEnvelope) -> Self {
         let hash = Hash256::hash_xdr(&envelope);
-        Self { hash, envelope }
+        Self {
+            hash,
+            envelope: Arc::new(envelope),
+        }
     }
 
     pub fn hash(&self) -> Hash256 {
@@ -58,7 +61,7 @@ impl HashedTx {
     }
 
     pub fn into_envelope(self) -> TransactionEnvelope {
-        self.envelope
+        Arc::unwrap_or_clone(self.envelope)
     }
 }
 
@@ -699,7 +702,7 @@ pub fn get_invalid_tx_list_with_fee_map(
         .iter()
         .map(|tx| HashedTx {
             hash: Hash256::hash_xdr(tx),
-            envelope: tx.clone(),
+            envelope: Arc::new(tx.clone()),
         })
         .collect();
     let invalid_hashed = get_invalid_hashed_core(
@@ -710,7 +713,10 @@ pub fn get_invalid_tx_list_with_fee_map(
         account_provider,
         account_fee_map,
     );
-    invalid_hashed.into_iter().map(|htx| htx.envelope).collect()
+    invalid_hashed
+        .into_iter()
+        .map(|htx| htx.into_envelope())
+        .collect()
 }
 
 /// Invalidation for pre-hashed transactions (queue path).
@@ -785,7 +791,7 @@ fn get_invalid_hashed_core(
     let mut fee_source_cache: HashMap<Hash256, AccountId> = HashMap::new();
 
     for htx in txs {
-        let frame = TransactionFrame::from_owned_with_network(htx.envelope.clone(), ctx.network_id);
+        let frame = TransactionFrame::with_network(htx.envelope.clone(), ctx.network_id);
 
         // Stateless structural + per-op validation (shared with queue admission).
         if check_valid_pre_seq_num_with_config(
@@ -3728,7 +3734,7 @@ mod tests {
             .iter()
             .map(|tx| HashedTx {
                 hash: Hash256::hash_xdr(tx),
-                envelope: tx.clone(),
+                envelope: Arc::new(tx.clone()),
             })
             .collect();
         let invalid_hashed = get_invalid_hashed_tx_list(&hashed_txs, &ctx, &bounds, None, None);
@@ -3784,7 +3790,7 @@ mod tests {
             .iter()
             .map(|tx| HashedTx {
                 hash: Hash256::hash_xdr(tx),
-                envelope: tx.clone(),
+                envelope: Arc::new(tx.clone()),
             })
             .collect();
         let invalid = get_invalid_hashed_tx_list(
@@ -3828,7 +3834,7 @@ mod tests {
         let mut shared_fee_map: HashMap<AccountId, i64> = HashMap::new();
         let hashed1 = vec![HashedTx {
             hash: Hash256::hash_xdr(&env1),
-            envelope: env1.clone(),
+            envelope: Arc::new(env1.clone()),
         }];
         let invalid1 = get_invalid_hashed_tx_list_with_fee_map(
             &hashed1,
@@ -3843,7 +3849,7 @@ mod tests {
         // Phase 2: second tx adds another 4M → total 8M > 6M available.
         let hashed2 = vec![HashedTx {
             hash: Hash256::hash_xdr(&env2),
-            envelope: env2.clone(),
+            envelope: Arc::new(env2.clone()),
         }];
         let invalid2 = get_invalid_hashed_tx_list_with_fee_map(
             &hashed2,
@@ -3867,11 +3873,11 @@ mod tests {
         let hashed_txs = vec![
             HashedTx {
                 hash,
-                envelope: env.clone(),
+                envelope: Arc::new(env.clone()),
             },
             HashedTx {
                 hash,
-                envelope: env.clone(),
+                envelope: Arc::new(env.clone()),
             },
         ];
 

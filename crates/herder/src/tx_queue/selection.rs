@@ -362,7 +362,7 @@ impl TransactionQueue {
             .collect();
         classic_had_not_fitting.resize(lane_count, false);
         while let Some((lane, entry)) = classic_queue.peek_top() {
-            let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+            let frame = henyey_tx::TransactionFrame::with_network(
                 entry.tx.envelope.clone(),
                 self.config.network_id,
             );
@@ -451,7 +451,7 @@ impl TransactionQueue {
             let mut selected = Vec::new();
             let mut lane_left = [queue.lane_limits(GENERIC_LANE)];
             while let Some((lane, entry)) = queue.peek_top() {
-                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                let frame = henyey_tx::TransactionFrame::with_network(
                     entry.tx.envelope.clone(),
                     self.config.network_id,
                 );
@@ -490,8 +490,16 @@ impl TransactionQueue {
         };
 
         let mut transactions = Vec::new();
-        transactions.extend(classic_selected.into_iter().map(|tx| tx.envelope));
-        transactions.extend(soroban_selected.into_iter().map(|tx| tx.envelope));
+        transactions.extend(
+            classic_selected
+                .into_iter()
+                .map(|tx| Arc::unwrap_or_clone(tx.envelope)),
+        );
+        transactions.extend(
+            soroban_selected
+                .into_iter()
+                .map(|tx| Arc::unwrap_or_clone(tx.envelope)),
+        );
 
         SelectedTxs {
             transactions,
@@ -517,7 +525,7 @@ impl TransactionQueue {
 
             let mut seen_soroban = false;
             for tx in txs {
-                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                let frame = henyey_tx::TransactionFrame::with_network(
                     tx.envelope.clone(),
                     self.config.network_id,
                 );
