@@ -1396,8 +1396,7 @@ impl App {
         self.reset_tx_set_tracking().await;
 
         // 5. Reset recovery_attempts_without_progress.
-        self.recovery_attempts_without_progress
-            .store(0, Ordering::SeqCst);
+        self.reset_recovery_attempts(0);
 
         // 6. Reset consensus_stuck_state recovery_attempts (keep stuck_start).
         let (prior_recovery_attempts, stuck_duration) = {

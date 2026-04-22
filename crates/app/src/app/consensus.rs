@@ -195,8 +195,7 @@ impl App {
             // Progress!  Reset the counter.
             self.recovery_baseline_ledger
                 .store(current_ledger as u64, Ordering::SeqCst);
-            self.recovery_attempts_without_progress
-                .store(0, Ordering::SeqCst);
+            self.reset_recovery_attempts(0);
             // Also clear any archive-behind backoff, the confirmed-behind
             // signal (#1867), and urgent cache mode — the node is advancing
             // again, so the next stall (if any) should query fresh.
@@ -327,24 +326,26 @@ impl App {
                 // Fall through to the SCP state request below
             } else {
                 // Step 2: Fast-track — AtTip or Ahead-no-ext with SCP activity.
-                // If we're receiving SCP messages but none result in
-                // externalization, the tx_sets for our slots are gone from
-                // peers' caches (~60s window). Skip straight to catchup.
+                // If we've received SCP messages since the last recovery
+                // reset/re-arm but none result in externalization, the
+                // tx_sets for our slots are gone from peers' caches (~60s
+                // window). Skip straight to catchup.
                 //
-                // Fires at ANY attempt count — the stall evidence
-                // (scp_total > 0) is the gate, not the attempt counter.
-                // This is critical for captive-core following a standalone
-                // validator in quickstart/local mode where the validator
-                // closes ledgers every second.
+                // `scp_since_reset > 0` means SCP traffic arrived since
+                // the last reset — not proof of truly fresh quorum-level
+                // SCP state. In a long stall with no resets, messages from
+                // early in the stall window still qualify.
                 //
-                // Note: scp_total is a lifetime cumulative counter, not proof
-                // of recent activity during the current stall. This is an
-                // existing heuristic preserved from the original code; see
-                // follow-up for adding a recent-activity snapshot.
+                // Fires at ANY attempt count (>= 1) — the stall evidence
+                // is the gate, not the attempt counter. This is critical
+                // for captive-core following a standalone validator in
+                // quickstart/local mode.
                 let scp_total = self.scp_messages_received.load(Ordering::Relaxed);
+                let scp_baseline = self.recovery_baseline_scp_received.load(Ordering::SeqCst);
+                let scp_since_reset = scp_total.saturating_sub(scp_baseline);
                 let at_tip_or_ahead_no_ext = matches!(relation, LedgerRelation::AtTip)
                     || relation.is_ahead_without_externalization(latest_externalized);
-                if attempts >= 1 && scp_total > 0 && at_tip_or_ahead_no_ext {
+                if attempts >= 1 && scp_since_reset > 0 && at_tip_or_ahead_no_ext {
                     let now_secs = self.start_instant.elapsed().as_secs();
                     if self
                         .recovery_throttles
@@ -357,6 +358,8 @@ impl App {
                             gap = relation.behind_gap().unwrap_or(0),
                             attempts,
                             scp_total,
+                            scp_baseline,
+                            scp_since_reset,
                             "Receiving SCP messages but no externalization — \
                              tx_sets evicted from peers, fast-tracking catchup"
                         );
@@ -367,6 +370,8 @@ impl App {
                             gap = relation.behind_gap().unwrap_or(0),
                             attempts,
                             scp_total,
+                            scp_baseline,
+                            scp_since_reset,
                             "Receiving SCP messages but no externalization — \
                              fast-tracking catchup (repeated)"
                         );
@@ -1294,8 +1299,7 @@ impl App {
             }
             self.herder.clear_pending_tx_sets();
             self.reset_tx_set_tracking().await;
-            self.recovery_attempts_without_progress
-                .store(0, Ordering::SeqCst);
+            self.reset_recovery_attempts(0);
         }
 
         result

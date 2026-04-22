@@ -591,6 +591,11 @@ pub struct App {
     /// The ledger sequence at which recovery_attempts_without_progress was
     /// last reset.  Used to detect progress.
     recovery_baseline_ledger: AtomicU64,
+    /// Snapshot of `scp_messages_received` at the last recovery-state reset.
+    /// The fast-track gate compares the current counter against this snapshot
+    /// to determine if SCP messages arrived *since the last recovery reset/re-arm*
+    /// (as opposed to historical traffic from before the stall began).
+    recovery_baseline_scp_received: AtomicU64,
 
     /// Monotonic offset (seconds since `start_instant`) of the last hard reset.
     /// 0 means "never". Used for cooldown enforcement.
@@ -948,6 +953,7 @@ impl App {
             sync_recovery_pending: AtomicBool::new(false),
             recovery_attempts_without_progress: AtomicU64::new(0),
             recovery_baseline_ledger: AtomicU64::new(0),
+            recovery_baseline_scp_received: AtomicU64::new(0),
             last_hard_reset_offset: AtomicU64::new(0),
             last_hard_reset_gap: AtomicU64::new(0),
             post_catchup_hard_reset_total: AtomicU64::new(0),
@@ -1480,6 +1486,26 @@ impl App {
     pub(super) fn escalate_recovery_to_catchup(&self) {
         self.recovery_attempts_without_progress
             .fetch_max(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+    }
+
+    /// Reset (or re-arm) the recovery attempt counter and snapshot the current
+    /// SCP message count. The `seed` parameter sets the initial attempt value:
+    /// - `0` for a full reset (after progress, hard reset, or successful catchup spawn)
+    /// - `1` for a re-arm (after catchup with progress, to re-enter recovery immediately)
+    ///
+    /// The SCP snapshot ensures the fast-track gate only considers SCP traffic
+    /// received *after* this reset/re-arm point.
+    ///
+    /// Store order: SCP baseline first, then attempt counter, so that any
+    /// concurrent reader that observes the new attempt count also sees the
+    /// updated SCP baseline (or a fresher one).
+    pub(super) fn reset_recovery_attempts(&self, seed: u64) {
+        self.recovery_baseline_scp_received.store(
+            self.scp_messages_received.load(Ordering::Relaxed),
+            Ordering::SeqCst,
+        );
+        self.recovery_attempts_without_progress
+            .store(seed, Ordering::SeqCst);
     }
 
     /// Get Soroban network configuration information.
@@ -7122,6 +7148,187 @@ mod tests {
         assert!(
             !app.catchup_in_progress.load(Ordering::SeqCst),
             "catchup_in_progress must not be left set after failed spawn"
+        );
+    }
+
+    /// Regression test for #1898: historical SCP traffic (from before the
+    /// current stall window) must NOT trigger the fast-track gate.
+    ///
+    /// When `recovery_baseline_scp_received == scp_messages_received`, all
+    /// SCP traffic is pre-reset and `scp_since_reset == 0` → no fast-track.
+    #[tokio::test]
+    async fn test_fast_track_skipped_when_scp_traffic_is_historical() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let current_ledger = 0u32;
+
+        // All SCP traffic is historical (pre-reset).
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(10, Ordering::SeqCst);
+
+        // Past the `attempts >= 1` guard.
+        app.recovery_attempts_without_progress
+            .store(1, Ordering::SeqCst);
+        app.recovery_baseline_ledger.store(0, Ordering::SeqCst);
+
+        // Seed archive cache so the fast-track *could* proceed if it fired.
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+        app.archive_checkpoint_cache.seed(next_cp + 64);
+
+        let result = app.out_of_sync_recovery(current_ledger).await;
+
+        // Fast-track must NOT fire — scp_since_reset = 0.
+        // State must remain Initializing (not CatchingUp).
+        assert_eq!(
+            app.state().await,
+            AppState::Initializing,
+            "historical SCP traffic (scp_since_reset=0) must not trigger fast-track"
+        );
+        assert!(
+            result.is_none(),
+            "no catchup should be spawned with only historical SCP traffic"
+        );
+    }
+
+    /// Positive complement to the historical-traffic test: SCP traffic
+    /// *since* the last reset must trigger the fast-track gate.
+    #[tokio::test]
+    async fn test_fast_track_fires_with_scp_traffic_since_reset() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let current_ledger = 0u32;
+
+        // 5 SCP messages since the last reset.
+        app.scp_messages_received.store(15, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(10, Ordering::SeqCst);
+
+        app.recovery_attempts_without_progress
+            .store(1, Ordering::SeqCst);
+        app.recovery_baseline_ledger.store(0, Ordering::SeqCst);
+
+        // Seed archive cache so trigger_recovery_catchup can proceed.
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+        app.archive_checkpoint_cache.seed(next_cp + 64);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        // Fast-track fires → spawn_catchup sets state to CatchingUp.
+        assert_eq!(
+            app.state().await,
+            AppState::CatchingUp,
+            "SCP traffic since reset (scp_since_reset=5) must trigger fast-track"
+        );
+    }
+
+    /// Unit test for `reset_recovery_attempts`: verifies that the helper
+    /// snapshots the SCP baseline and sets the attempt counter correctly
+    /// for both reset (seed=0) and re-arm (seed=1) cases.
+    #[tokio::test]
+    async fn test_reset_recovery_attempts_snapshots_scp_baseline() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Test reset (seed=0).
+        app.scp_messages_received.store(42, Ordering::Relaxed);
+        app.reset_recovery_attempts(0);
+        assert_eq!(
+            app.recovery_baseline_scp_received.load(Ordering::SeqCst),
+            42,
+            "reset must snapshot current SCP count"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            0,
+            "reset must set attempts to 0"
+        );
+
+        // Test re-arm (seed=1).
+        app.scp_messages_received.store(100, Ordering::Relaxed);
+        app.reset_recovery_attempts(1);
+        assert_eq!(
+            app.recovery_baseline_scp_received.load(Ordering::SeqCst),
+            100,
+            "re-arm must snapshot current SCP count"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            1,
+            "re-arm must set attempts to 1"
+        );
+    }
+
+    /// Integration test for the ledger-progress reset path: after the node
+    /// makes progress (ledger advances), the SCP baseline is snapshotted
+    /// so that pre-progress SCP traffic no longer satisfies the fast-track.
+    #[tokio::test]
+    async fn test_fast_track_skipped_after_ledger_progress_resets_baseline() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Initial state: some SCP traffic, baseline=0 (startup default).
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+        app.recovery_attempts_without_progress
+            .store(3, Ordering::SeqCst);
+        app.recovery_baseline_ledger.store(0, Ordering::SeqCst);
+
+        // Call 1: current_ledger=5 > baseline=0 → progress detected.
+        // This triggers reset_recovery_attempts(0), snapshotting SCP baseline to 10.
+        let _ = app.out_of_sync_recovery(5).await;
+
+        // Verify the progress path snapshotted the SCP baseline.
+        assert_eq!(
+            app.recovery_baseline_scp_received.load(Ordering::SeqCst),
+            10,
+            "ledger progress must snapshot SCP baseline"
+        );
+
+        // Seed archive cache for the second call.
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(5 + 1);
+        app.archive_checkpoint_cache.seed(next_cp + 64);
+
+        // Pump attempts past the `>= 1` guard for the second call.
+        // (The first call reset to 0 and then fetch_add'd to 1, so
+        // attempts is now 1. But we need to enter recovery with
+        // attempts >= 1 after the fetch_add, so store 1.)
+        app.recovery_attempts_without_progress
+            .store(1, Ordering::SeqCst);
+
+        // Call 2: current_ledger=5, no further progress, no new SCP traffic.
+        // scp_since_reset = 10 - 10 = 0 → fast-track must NOT fire.
+        let result = app.out_of_sync_recovery(5).await;
+
+        assert_eq!(
+            app.state().await,
+            AppState::Initializing,
+            "after progress reset, no new SCP traffic must not trigger fast-track"
+        );
+        assert!(
+            result.is_none(),
+            "no catchup should be spawned when scp_since_reset=0"
         );
     }
 }

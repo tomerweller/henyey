@@ -385,8 +385,7 @@ impl App {
                             .await;
 
                             if made_progress && pending.re_arm_recovery {
-                                self.recovery_attempts_without_progress
-                                    .store(1, Ordering::SeqCst);
+                                self.reset_recovery_attempts(1);
                                 self.sync_recovery_pending.store(true, Ordering::SeqCst);
                             }
 
