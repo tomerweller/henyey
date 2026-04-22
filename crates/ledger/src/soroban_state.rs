@@ -683,8 +683,12 @@ impl InMemorySorobanState {
     /// If the corresponding data/code entry exists and has no TTL yet, stores
     /// the TTL inline. Otherwise, stores in pending_ttls to be adopted later.
     pub fn create_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) -> Result<()> {
-        // Try to update inline in contract data
-        if let Some(entry) = Arc::make_mut(&mut self.contract_data_entries).get_mut(&key.key_hash) {
+        // Check which map contains the key before taking a mutable reference,
+        // to avoid an unnecessary COW clone on the wrong map.
+        if self.contract_data_entries.contains_key(&key.key_hash) {
+            let entry = Arc::make_mut(&mut self.contract_data_entries)
+                .get_mut(&key.key_hash)
+                .unwrap();
             if entry.ttl_data.is_initialized() {
                 return Err(LedgerError::InvalidEntry(
                     "contract data TTL already initialized".into(),
@@ -695,8 +699,10 @@ impl InMemorySorobanState {
             return Ok(());
         }
 
-        // Try to update inline in contract code
-        if let Some(entry) = Arc::make_mut(&mut self.contract_code_entries).get_mut(&key.key_hash) {
+        if self.contract_code_entries.contains_key(&key.key_hash) {
+            let entry = Arc::make_mut(&mut self.contract_code_entries)
+                .get_mut(&key.key_hash)
+                .unwrap();
             if entry.ttl_data.is_initialized() {
                 return Err(LedgerError::InvalidEntry(
                     "contract code TTL already initialized".into(),
@@ -722,14 +728,22 @@ impl InMemorySorobanState {
     ///
     /// Returns an error if the corresponding data/code entry does not exist.
     pub fn update_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) -> Result<()> {
-        if let Some(entry) = Arc::make_mut(&mut self.contract_data_entries).get_mut(&key.key_hash) {
-            entry.ttl_data = ttl_data;
+        // Check which map contains the key before taking a mutable reference,
+        // to avoid an unnecessary COW clone on the wrong map.
+        if self.contract_data_entries.contains_key(&key.key_hash) {
+            Arc::make_mut(&mut self.contract_data_entries)
+                .get_mut(&key.key_hash)
+                .unwrap()
+                .ttl_data = ttl_data;
             trace!("Updated TTL inline for contract data");
             return Ok(());
         }
 
-        if let Some(entry) = Arc::make_mut(&mut self.contract_code_entries).get_mut(&key.key_hash) {
-            entry.ttl_data = ttl_data;
+        if self.contract_code_entries.contains_key(&key.key_hash) {
+            Arc::make_mut(&mut self.contract_code_entries)
+                .get_mut(&key.key_hash)
+                .unwrap()
+                .ttl_data = ttl_data;
             trace!("Updated TTL inline for contract code");
             return Ok(());
         }
