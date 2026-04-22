@@ -45,9 +45,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use henyey_common::protocol::{
-    protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
-};
+use henyey_common::protocol::{protocol_version_is_before, ProtocolVersion};
 use henyey_common::Hash256;
 use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
 use henyey_tx::soroban::convert::{
@@ -58,8 +56,7 @@ use soroban_env_host25::e2e_invoke::entry_size_for_rent as entry_size_for_rent_p
 use soroban_env_host_p25 as soroban_env_host25;
 use stellar_xdr::curr::{
     ConfigSettingId, ContractCostParams, Hash, LedgerEntry, LedgerEntryData, LedgerKey,
-    LedgerKeyConfigSetting, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTtl, Limits,
-    TtlEntry, WriteXdr,
+    LedgerKeyConfigSetting, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTtl, TtlEntry,
 };
 use tracing::{debug, trace};
 
@@ -158,52 +155,115 @@ fn build_rent_budget(rent_config: Option<&SorobanRentConfig>) -> Budget {
         .unwrap_or_else(|_| Budget::default())
 }
 
+/// Compute the XDR-encoded byte length of a `LedgerEntry` as a `u32`.
+///
+/// Uses `henyey_common::xdr_encoded_len` (a counting writer with zero heap
+/// allocation). Panics if XDR encoding fails or the length exceeds `u32::MAX`
+/// — both conditions indicate a bug, not a recoverable error.
+fn compute_xdr_size(entry: &LedgerEntry) -> u32 {
+    u32::try_from(henyey_common::xdr_encoded_len(entry))
+        .expect("XDR encoded length must fit in u32")
+}
+
 /// A contract data entry with co-located TTL.
+///
+/// All fields are private to enforce the cache invariant: `cached_xdr_size`
+/// always equals the XDR-encoded length of `ledger_entry`. Construction is
+/// only through [`ContractDataMapEntry::new`].
 #[derive(Debug, Clone)]
 pub struct ContractDataMapEntry {
-    /// The contract data ledger entry (immutable).
-    pub ledger_entry: Arc<LedgerEntry>,
-    /// TTL data co-located with the entry.
-    pub ttl_data: TtlData,
+    ledger_entry: Arc<LedgerEntry>,
+    ttl_data: TtlData,
+    cached_xdr_size: u32,
 }
 
 impl ContractDataMapEntry {
-    /// Get the XDR size of this entry.
+    /// Create a new entry, computing and caching the XDR size.
+    pub(crate) fn new(ledger_entry: Arc<LedgerEntry>, ttl_data: TtlData) -> Self {
+        let cached_xdr_size = compute_xdr_size(&ledger_entry);
+        Self {
+            ledger_entry,
+            ttl_data,
+            cached_xdr_size,
+        }
+    }
+
+    /// The contract data ledger entry.
+    pub fn ledger_entry(&self) -> &LedgerEntry {
+        &self.ledger_entry
+    }
+
+    /// TTL data co-located with the entry.
+    pub fn ttl_data(&self) -> TtlData {
+        self.ttl_data
+    }
+
+    /// Cached XDR-encoded byte length (computed once at construction).
     pub fn xdr_size(&self) -> u32 {
-        self.ledger_entry
-            .to_xdr(Limits::none())
-            .map(|v| v.len() as u32)
-            .unwrap_or_else(|e| {
-                tracing::error!("ContractDataMapEntry::xdr_size: failed to serialize: {e}");
-                0
-            })
+        self.cached_xdr_size
     }
 }
 
 /// A contract code entry with co-located TTL and size tracking.
+///
+/// All fields are private to enforce the cache invariant: `cached_xdr_size`
+/// always equals the XDR-encoded length of `ledger_entry`. Construction is
+/// only through [`ContractCodeMapEntry::new`].
 #[derive(Debug, Clone)]
 pub struct ContractCodeMapEntry {
-    /// The contract code ledger entry (immutable).
-    pub ledger_entry: Arc<LedgerEntry>,
-    /// TTL data co-located with the entry.
-    pub ttl_data: TtlData,
+    ledger_entry: Arc<LedgerEntry>,
+    ttl_data: TtlData,
     /// In-memory size of the compiled module (for rent calculations).
-    ///
     /// Protocol 23+ uses this for rent fees, which may differ from XDR size
     /// due to compilation overhead.
-    pub size_bytes: u32,
+    size_bytes: u32,
+    cached_xdr_size: u32,
 }
 
 impl ContractCodeMapEntry {
-    /// Get the XDR size of this entry.
+    /// Create a new entry with a pre-computed XDR size.
+    ///
+    /// The caller computes `xdr_size` via [`compute_xdr_size`] and passes it
+    /// both to `calculate_code_size` and here, avoiding double serialization.
+    fn with_xdr_size(
+        ledger_entry: Arc<LedgerEntry>,
+        ttl_data: TtlData,
+        size_bytes: u32,
+        cached_xdr_size: u32,
+    ) -> Self {
+        Self {
+            ledger_entry,
+            ttl_data,
+            size_bytes,
+            cached_xdr_size,
+        }
+    }
+
+    /// Create a new entry, computing and caching the XDR size.
+    #[cfg(test)]
+    pub(crate) fn new(ledger_entry: Arc<LedgerEntry>, ttl_data: TtlData, size_bytes: u32) -> Self {
+        let cached_xdr_size = compute_xdr_size(&ledger_entry);
+        Self::with_xdr_size(ledger_entry, ttl_data, size_bytes, cached_xdr_size)
+    }
+
+    /// The contract code ledger entry.
+    pub fn ledger_entry(&self) -> &LedgerEntry {
+        &self.ledger_entry
+    }
+
+    /// TTL data co-located with the entry.
+    pub fn ttl_data(&self) -> TtlData {
+        self.ttl_data
+    }
+
+    /// In-memory size of the compiled module (for rent calculations).
+    pub fn size_bytes(&self) -> u32 {
+        self.size_bytes
+    }
+
+    /// Cached XDR-encoded byte length (computed once at construction).
     pub fn xdr_size(&self) -> u32 {
-        self.ledger_entry
-            .to_xdr(Limits::none())
-            .map(|v| v.len() as u32)
-            .unwrap_or_else(|e| {
-                tracing::error!("ContractCodeMapEntry::xdr_size: failed to serialize: {e}");
-                0
-            })
+        self.cached_xdr_size
     }
 }
 
@@ -485,10 +545,7 @@ impl InMemorySorobanState {
         // Check for pending TTL
         let ttl_data = self.pending_ttls.remove(&key_hash).unwrap_or_default();
 
-        let map_entry = ContractDataMapEntry {
-            ledger_entry: Arc::new(entry),
-            ttl_data,
-        };
+        let map_entry = ContractDataMapEntry::new(Arc::new(entry), ttl_data);
 
         self.contract_data_state_size += map_entry.xdr_size() as i64;
         Arc::make_mut(&mut self.contract_data_entries).insert(key_hash, map_entry);
@@ -527,10 +584,7 @@ impl InMemorySorobanState {
 
         // Update size tracking
         let old_size = old_entry.xdr_size();
-        let new_entry = ContractDataMapEntry {
-            ledger_entry: Arc::new(entry),
-            ttl_data: old_entry.ttl_data, // Preserve TTL
-        };
+        let new_entry = ContractDataMapEntry::new(Arc::new(entry), old_entry.ttl_data);
         let new_size = new_entry.xdr_size();
 
         self.contract_data_state_size += (new_size as i64) - (old_size as i64);
@@ -596,14 +650,13 @@ impl InMemorySorobanState {
         // Check for pending TTL
         let ttl_data = self.pending_ttls.remove(&key_hash).unwrap_or_default();
 
-        // Calculate size for rent
-        let size_bytes = self.calculate_code_size(&entry, protocol_version, rent_config);
+        let arc_entry = Arc::new(entry);
+        let xdr_size = compute_xdr_size(&arc_entry);
+        let size_bytes =
+            Self::calculate_code_size(&arc_entry, xdr_size, protocol_version, rent_config);
 
-        let map_entry = ContractCodeMapEntry {
-            ledger_entry: Arc::new(entry),
-            ttl_data,
-            size_bytes,
-        };
+        let map_entry =
+            ContractCodeMapEntry::with_xdr_size(arc_entry, ttl_data, size_bytes, xdr_size);
 
         self.contract_code_state_size += map_entry.size_bytes as i64;
         Arc::make_mut(&mut self.contract_code_entries).insert(key_hash, map_entry);
@@ -639,18 +692,18 @@ impl InMemorySorobanState {
         let key_hash = Self::contract_code_key_hash(&key);
 
         // Calculate new size before taking mutable borrow on the map.
-        let new_size = self.calculate_code_size(&entry, protocol_version, rent_config);
+        let arc_entry = Arc::new(entry);
+        let xdr_size = compute_xdr_size(&arc_entry);
+        let new_size =
+            Self::calculate_code_size(&arc_entry, xdr_size, protocol_version, rent_config);
 
         let map = Arc::make_mut(&mut self.contract_code_entries);
         let old_entry = map
             .remove(&key_hash)
             .ok_or_else(|| LedgerError::InvalidEntry("contract code does not exist".into()))?;
 
-        let new_entry = ContractCodeMapEntry {
-            ledger_entry: Arc::new(entry),
-            ttl_data: old_entry.ttl_data, // Preserve TTL
-            size_bytes: new_size,
-        };
+        let new_entry =
+            ContractCodeMapEntry::with_xdr_size(arc_entry, old_entry.ttl_data, new_size, xdr_size);
 
         // Update size tracking
         self.contract_code_state_size += (new_size as i64) - (old_entry.size_bytes as i64);
@@ -780,19 +833,14 @@ impl InMemorySorobanState {
     }
 
     /// Calculate the in-memory size for a contract code entry.
+    ///
+    /// Accepts a pre-computed XDR size to avoid redundant serialization.
     fn calculate_code_size(
-        &self,
         entry: &LedgerEntry,
+        xdr_size: u32,
         protocol_version: u32,
         rent_config: Option<&SorobanRentConfig>,
     ) -> u32 {
-        let xdr_size = entry
-            .to_xdr(Limits::none())
-            .map(|v| v.len() as u32)
-            .unwrap_or_else(|e| {
-                tracing::error!("calculate_code_size: failed to serialize LedgerEntry: {e}");
-                0
-            });
         if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
             let cost_params = rent_config.map(|rc| (&rc.cpu_cost_params, &rc.mem_cost_params));
             return entry_size_for_rent_by_protocol_with_cost_params(
@@ -969,41 +1017,13 @@ impl InMemorySorobanState {
     ) {
         let mut total_size: i64 = 0;
 
-        // Build the budget once outside the loop for efficiency
-        let budget = build_rent_budget(rent_config);
-
         for entry in Arc::make_mut(&mut self.contract_code_entries).values_mut() {
-            let xdr_size = entry
-                .ledger_entry
-                .to_xdr(Limits::none())
-                .map(|v| v.len() as u32)
-                .unwrap_or_else(|e| {
-                    tracing::error!("recompute_contract_code_sizes: failed to serialize: {e}");
-                    0
-                });
-
-            // Use the same logic as calculate_code_size
-            let new_size = if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
-                match try_convert_ledger_entry_ws_to_p25(&entry.ledger_entry) {
-                    Ok(p25_entry) => {
-                        entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).unwrap_or(xdr_size)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "recompute_contract_code_sizes: {e}, falling back to XDR size"
-                        );
-                        xdr_size
-                    }
-                }
-            } else {
-                let cost_params = rent_config.map(|rc| (&rc.cpu_cost_params, &rc.mem_cost_params));
-                entry_size_for_rent_by_protocol_with_cost_params(
-                    protocol_version,
-                    &entry.ledger_entry,
-                    xdr_size,
-                    cost_params,
-                )
-            };
+            let new_size = Self::calculate_code_size(
+                &entry.ledger_entry,
+                entry.cached_xdr_size,
+                protocol_version,
+                rent_config,
+            );
 
             entry.size_bytes = new_size;
             total_size += new_size as i64;
@@ -1053,7 +1073,7 @@ impl InMemorySorobanState {
     pub fn estimate_contract_data_heap_bytes(&self) -> usize {
         use henyey_common::memory::hashmap_heap_bytes;
         // HashMap<[u8;32], ContractDataMapEntry>
-        // ContractDataMapEntry: Arc<LedgerEntry>(8) + TtlData(8) = 16 inline
+        // ContractDataMapEntry size: see std::mem::size_of (auto-adjusts with struct changes)
         let map_bytes = hashmap_heap_bytes(
             self.contract_data_entries.capacity(),
             32,
@@ -1744,5 +1764,158 @@ mod tests {
         } else {
             panic!("expected ContractData");
         }
+    }
+
+    #[test]
+    fn test_cached_xdr_size_matches_serialization() {
+        use stellar_xdr::curr::{Limits, WriteXdr};
+
+        // Contract data entry
+        let entry = make_contract_data_entry([1u8; 32]);
+        let expected_size = entry.to_xdr(Limits::none()).unwrap().len() as u32;
+        let map_entry = ContractDataMapEntry::new(Arc::new(entry), TtlData::default());
+        assert_eq!(map_entry.xdr_size(), expected_size);
+        assert!(expected_size > 0);
+
+        // Contract code entry
+        let code_entry = make_contract_code_entry([2u8; 32]);
+        let expected_code_size = code_entry.to_xdr(Limits::none()).unwrap().len() as u32;
+        let code_map_entry =
+            ContractCodeMapEntry::new(Arc::new(code_entry), TtlData::default(), 100);
+        assert_eq!(code_map_entry.xdr_size(), expected_code_size);
+        assert!(expected_code_size > 0);
+    }
+
+    #[test]
+    fn test_contract_data_size_tracking_exact_deltas() {
+        use stellar_xdr::curr::{Limits, WriteXdr};
+
+        let mut state = InMemorySorobanState::new();
+
+        // Create entry and verify exact size
+        let entry = make_contract_data_entry([1u8; 32]);
+        let entry_xdr_size = entry.to_xdr(Limits::none()).unwrap().len() as i64;
+        state.create_contract_data(entry).unwrap();
+        assert_eq!(state.contract_data_state_size, entry_xdr_size);
+
+        // Update with a different-sized value (larger)
+        let mut updated_entry = make_contract_data_entry([1u8; 32]);
+        if let LedgerEntryData::ContractData(cd) = &mut updated_entry.data {
+            // Use a much larger value to ensure different XDR size
+            cd.val = ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                vec![0u8; 200].try_into().unwrap(),
+            ));
+        }
+        let updated_xdr_size = updated_entry.to_xdr(Limits::none()).unwrap().len() as i64;
+        state.update_contract_data(updated_entry).unwrap();
+        assert_eq!(state.contract_data_state_size, updated_xdr_size);
+        assert_ne!(
+            entry_xdr_size, updated_xdr_size,
+            "updated entry should have different size"
+        );
+
+        // Delete and verify size returns to 0
+        let key = LedgerKeyContractData {
+            contract: make_contract_address(),
+            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                [1u8; 32].to_vec().try_into().unwrap(),
+            )),
+            durability: ContractDataDurability::Persistent,
+        };
+        state.delete_contract_data(&key).unwrap();
+        assert_eq!(state.contract_data_state_size, 0);
+    }
+
+    #[test]
+    fn test_contract_code_size_tracking_exact_deltas() {
+        let mut state = InMemorySorobanState::new();
+
+        // Create code entry (protocol 25, no rent config = uses XDR size)
+        let entry = make_contract_code_entry([2u8; 32]);
+        state.create_contract_code(entry, 25, None).unwrap();
+
+        let code_size = state.contract_code_state_size;
+        assert!(code_size > 0);
+
+        // Delete and verify returns to 0
+        let key = LedgerKeyContractCode {
+            hash: Hash([2u8; 32]),
+        };
+        state.delete_contract_code(&key).unwrap();
+        assert_eq!(state.contract_code_state_size, 0);
+    }
+
+    #[test]
+    fn test_recompute_contract_code_sizes() {
+        let mut state = InMemorySorobanState::new();
+
+        let entry1 = make_contract_code_entry([1u8; 32]);
+        let entry2 = make_contract_code_entry([2u8; 32]);
+        state.create_contract_code(entry1, 25, None).unwrap();
+        state.create_contract_code(entry2, 25, None).unwrap();
+
+        let size_before = state.contract_code_state_size;
+        assert!(size_before > 0);
+
+        // Recompute with same config — size should remain the same
+        state.recompute_contract_code_sizes(25, None);
+        assert_eq!(state.contract_code_state_size, size_before);
+    }
+
+    #[test]
+    fn test_cached_xdr_size_preserved_on_clone() {
+        let entry = make_contract_data_entry([1u8; 32]);
+        let map_entry = ContractDataMapEntry::new(Arc::new(entry), TtlData::default());
+        let cloned = map_entry.clone();
+        assert_eq!(cloned.xdr_size(), map_entry.xdr_size());
+
+        let code_entry = make_contract_code_entry([2u8; 32]);
+        let code_map_entry =
+            ContractCodeMapEntry::new(Arc::new(code_entry), TtlData::default(), 100);
+        let code_cloned = code_map_entry.clone();
+        assert_eq!(code_cloned.xdr_size(), code_map_entry.xdr_size());
+    }
+
+    #[test]
+    fn test_snapshot_preserves_cached_sizes() {
+        use stellar_xdr::curr::{Limits, WriteXdr};
+
+        let mut state = InMemorySorobanState::new();
+
+        let data1 = make_contract_data_entry([1u8; 32]);
+        let data1_xdr_size = data1.to_xdr(Limits::none()).unwrap().len() as i64;
+        state.create_contract_data(data1.clone()).unwrap();
+
+        let code1 = make_contract_code_entry([3u8; 32]);
+        state.create_contract_code(code1, 25, None).unwrap();
+
+        // Take snapshot
+        let snap = state.snapshot();
+        let snap_data_size = snap.contract_data_state_size();
+        let snap_code_size = snap.contract_code_state_size();
+        assert_eq!(snap_data_size, data1_xdr_size);
+        assert!(snap_code_size > 0);
+
+        // Mutate live state — create new entry
+        let data2 = make_contract_data_entry([2u8; 32]);
+        state.create_contract_data(data2).unwrap();
+        assert!(state.contract_data_state_size > snap_data_size);
+
+        // Snapshot sizes must be unchanged
+        assert_eq!(snap.contract_data_state_size(), snap_data_size);
+        assert_eq!(snap.contract_code_state_size(), snap_code_size);
+
+        // Delete from live
+        let key = LedgerKeyContractData {
+            contract: make_contract_address(),
+            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                [1u8; 32].to_vec().try_into().unwrap(),
+            )),
+            durability: ContractDataDurability::Persistent,
+        };
+        state.delete_contract_data(&key).unwrap();
+
+        // Snapshot still unchanged
+        assert_eq!(snap.contract_data_state_size(), snap_data_size);
     }
 }
