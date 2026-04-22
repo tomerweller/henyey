@@ -344,6 +344,18 @@ fn test_mixed_classic_soroban_txset_deterministic() {
         "tx_set.hash must equal SHA-256 of GeneralizedTransactionSet XDR"
     );
 
+    // Fixed oracle hash — catches deterministic canonical-output drift.
+    // If this fails after a legitimate change (e.g., XDR schema update),
+    // update the expected value to the new canonical hash.
+    let expected_hash = Hash256([
+        79, 184, 196, 148, 41, 150, 225, 148, 161, 119, 138, 207, 17, 90, 93, 143, 159, 185, 254,
+        159, 84, 147, 241, 7, 193, 17, 198, 159, 220, 134, 30, 138,
+    ]);
+    assert_eq!(
+        tx_set1.hash, expected_hash,
+        "canonical hash must match fixed oracle value"
+    );
+
     // --- Wire-path round-trip ---
     let stored = tx_set1.to_xdr_stored_set();
     let round_tripped =
