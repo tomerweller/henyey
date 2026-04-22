@@ -220,16 +220,27 @@ Mainnet closes ~120 ledgers per tick; "≥ 50 failures/tick" ≈ 0.4/ledger.
 | `henyey_jemalloc_fragmentation_pct` | > 50 for two consecutive ticks | WARN | Matches existing log rule; "two ticks" filters warmup |
 | `stellar_ledger_age_current_seconds` | > 30 | SYNC | Backup source for the RPC `age` check |
 | `stellar_herder_state` | != 2 when uptime > 15m | SYNC | 0=bootstrap, 1=catching up, 2=synced |
-| `stellar_quorum_agree` | < 4 | WARN | Quorum agreement nodes too low |
-| `stellar_quorum_missing` / `stellar_quorum_fail_at` | missing > 3 OR fail_at > 0 | WARN | Quorum membership problems |
 | `henyey_scp_verify_input_backlog` | > 100 | WARN | SCP verifier queue growing |
-| `henyey_scp_verifier_thread_state` | != 1 | WARN | Verifier thread not healthy |
+| `henyey_scp_verifier_thread_state` | != 0 | WARN | 0=Running, 1=Stopping, 2=Dead (`crates/app/src/app/types.rs:310-311`); only Running is healthy |
 | `stellar_herder_pending_envelopes` | > 2000 | WARN | Herder backpressure |
 | `henyey_overlay_fetch_channel_depth_max` | > 500 | WARN | Overlay fetch backpressure |
 | `henyey_process_open_fds` / `henyey_process_max_fds` | > 0.85 | WARN | FD exhaustion imminent |
 | `henyey_herder_drift_max_seconds` | > 10 | NONC | Clock/close-time drift |
 
 "Two consecutive ticks": alert fires only if `prev.prom` also breached.
+
+**Intentionally not included** (these were in an earlier draft but removed after first-tick
+validation showed them to be noise, not signal):
+
+- `stellar_quorum_agree` / `stellar_quorum_missing` / `stellar_quorum_fail_at` —
+  these read from `herder.quorum_health()` (`crates/herder/src/herder.rs:2554-2578`),
+  which returns counts for the *tracking slot's* `QuorumInfo`. Between slot
+  externalizations (i.e., most of the time when /metrics is scraped), `agree=0`
+  and `missing=<all quorum nodes>` is legitimate — the slot has already moved
+  on. `fail_at = total - threshold` is a config-derived constant, not a
+  time-varying health signal. A useful threshold here would require a
+  ledger-close-triggered snapshot, not a mid-slot scrape. Revisit when that
+  instrumentation exists.
 
 **C. Histograms — fire on p99 bucket threshold of per-tick-delta**
 
@@ -509,7 +520,7 @@ HEALTH CHECKS:
 
 COUNTERS (delta ≥ threshold): stellar_herder_lost_sync_total ≥1 SYNC; henyey_post_catchup_hard_reset_total ≥1 ACTION; henyey_recovery_stalled_tick_total ≥5 WARN; stellar_ledger_apply_failure_total ≥50 WARN; stellar_herder_pending_too_old_total ≥100 WARN; (stellar_overlay_timeout_idle_total + stellar_overlay_timeout_straggler_total) 5× prior-tick-sum WARN; (stellar_overlay_error_read_total + stellar_overlay_error_write_total) ≥50 WARN; henyey_archive_cache_refresh_error_total ≥1 NONC; henyey_archive_cache_refresh_timeout_total ≥3 NONC; henyey_scp_post_verify_drops_total ≥100 WARN.
 
-GAUGES (absolute threshold on current): stellar_peer_count <8 WARN; henyey_jemalloc_fragmentation_pct >50 on two consecutive ticks WARN; stellar_ledger_age_current_seconds >30 SYNC; stellar_herder_state !=2 when uptime >15m SYNC; stellar_quorum_agree <4 WARN; (stellar_quorum_missing >3 OR stellar_quorum_fail_at >0) WARN; henyey_scp_verify_input_backlog >100 WARN; henyey_scp_verifier_thread_state !=1 WARN; stellar_herder_pending_envelopes >2000 WARN; henyey_overlay_fetch_channel_depth_max >500 WARN; (henyey_process_open_fds / henyey_process_max_fds) >0.85 WARN; henyey_herder_drift_max_seconds >10 NONC.
+GAUGES (absolute threshold on current): stellar_peer_count <8 WARN; henyey_jemalloc_fragmentation_pct >50 on two consecutive ticks WARN; stellar_ledger_age_current_seconds >30 SYNC; stellar_herder_state !=2 when uptime >15m SYNC; henyey_scp_verify_input_backlog >100 WARN; henyey_scp_verifier_thread_state !=0 WARN (0=Running, 1=Stopping, 2=Dead; only Running is healthy); stellar_herder_pending_envelopes >2000 WARN; henyey_overlay_fetch_channel_depth_max >500 WARN; (henyey_process_open_fds / henyey_process_max_fds) >0.85 WARN; henyey_herder_drift_max_seconds >10 NONC. [quorum_agree / quorum_missing / quorum_fail_at intentionally NOT monitored — they snapshot the tracking slot's QuorumInfo and return false-positive noise between externalizations; see skill body.]
 
 HISTOGRAMS (p99 bucket of per-tick delta): for each histogram H, compute bucket_delta[le] = H_bucket_current[le] - H_bucket_prev[le], count_delta = H_count_current - H_count_prev. Skip if count_delta <20. Cumulative bucket delta at upper edge L = sum(bucket_delta[le] for le <= L); smallest L where cumulative ≥ 0.99 * count_delta is the p99 upper bound. Thresholds: henyey_ledger_close_cycle_seconds p99 >5s WARN; henyey_ledger_close_tx_exec_seconds p99 >1s WARN; henyey_ledger_close_soroban_exec_seconds p99 >1s WARN; henyey_ledger_close_commit_seconds p99 >0.5s WARN; henyey_ledger_close_soroban_state_seconds p99 >0.5s WARN; henyey_close_complete_tx_queue_seconds p99 >0.5s WARN. Mean check (sum_delta/count_delta) is cheaper — fire on whichever breaches.
 
