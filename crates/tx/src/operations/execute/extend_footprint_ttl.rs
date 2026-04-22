@@ -8,7 +8,7 @@ use henyey_common::protocol::{
 };
 use stellar_xdr::curr::{
     AccountId, ExtendFootprintTtlOp, ExtendFootprintTtlResult, ExtendFootprintTtlResultCode,
-    OperationResult, OperationResultTr, SorobanTransactionData, WriteXdr,
+    OperationResult, OperationResultTr, SorobanTransactionData,
 };
 
 use crate::state::LedgerStateManager;
@@ -111,11 +111,13 @@ pub(crate) fn execute_extend_footprint_ttl(
             )
         });
 
+        // Compute XDR entry size once for both validation and read-byte tracking.
+        let entry_size = henyey_common::xdr_encoded_len(&entry);
+
         // Validate contract entry size against config limits.
         // Matches stellar-core validateContractLedgerEntry() which rejects
         // CONTRACT_CODE > maxContractSizeBytes and CONTRACT_DATA > maxContractDataEntrySizeBytes.
         if let Some(limits) = config.size_limits {
-            let entry_size = henyey_common::xdr_encoded_len(&entry);
             if !super::validate_contract_ledger_entry(key, entry_size, limits) {
                 return Ok(make_result(
                     ExtendFootprintTtlResultCode::ResourceLimitExceeded,
@@ -134,12 +136,9 @@ pub(crate) fn execute_extend_footprint_ttl(
             context.protocol_version,
             PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
         ) {
-            let entry_size = entry
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .ok()
-                .map(|bytes| bytes.len() as u32)
-                .unwrap_or(0);
-            accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
+            let entry_size_u32 =
+                u32::try_from(entry_size).expect("XDR encoded length must fit in u32");
+            accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size_u32);
             if accumulated_read_bytes > disk_read_bytes_limit {
                 return Ok(make_result(
                     ExtendFootprintTtlResultCode::ResourceLimitExceeded,

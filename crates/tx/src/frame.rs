@@ -660,12 +660,9 @@ impl TransactionFrame {
     ///
     /// Lazily caches the result so repeated calls avoid re-serialization.
     pub fn tx_size_bytes(&self) -> u32 {
-        *self.cached_tx_size.get_or_init(|| {
-            self.envelope
-                .to_xdr(Limits::none())
-                .map(|bytes| bytes.len() as u32)
-                .unwrap_or(0)
-        })
+        *self
+            .cached_tx_size
+            .get_or_init(|| henyey_common::xdr_encoded_len_u32(&*self.envelope))
     }
 
     /// Return the inner transaction envelope size for fee bump, or full envelope size for regular tx.
@@ -675,10 +672,7 @@ impl TransactionFrame {
         match &*self.envelope {
             TransactionEnvelope::TxFeeBump(_) => {
                 let inner = self.inner_envelope().unwrap();
-                TransactionEnvelope::Tx(inner.clone())
-                    .to_xdr(Limits::none())
-                    .map(|bytes| bytes.len() as u32)
-                    .unwrap_or(0)
+                henyey_common::xdr_encoded_len_u32(&TransactionEnvelope::Tx(inner.clone()))
             }
             _ => self.tx_size_bytes(),
         }

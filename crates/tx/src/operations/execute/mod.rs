@@ -42,7 +42,7 @@ use stellar_xdr::curr::{
     Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, LedgerKey, Liabilities,
     Operation, OperationBody, OperationResult, OperationResultTr, RestoreFootprintResult,
     TrustLineEntry, TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext,
-    TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags, WriteXdr,
+    TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -665,16 +665,10 @@ fn rent_snapshot_for_keys(
         let Some(entry) = state.get_entry(key) else {
             continue;
         };
-        let entry_xdr = entry
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap_or_else(|e| {
-                tracing::error!("rent_snapshot_for_keys: failed to serialize LedgerEntry: {e}");
-                Vec::new()
-            });
         let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
             protocol_version,
             &entry,
-            entry_xdr.len() as u32,
+            henyey_common::xdr_encoded_len_u32(&entry),
             cost_params,
         );
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
@@ -710,18 +704,10 @@ fn rent_changes_from_snapshots(
             tracing::debug!(?snapshot.key, "rent_changes_from_snapshots: entry not found, skipping");
             continue;
         };
-        let entry_xdr = entry
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap_or_else(|e| {
-                tracing::error!(
-                    "rent_changes_from_snapshots: failed to serialize LedgerEntry: {e}"
-                );
-                Vec::new()
-            });
         let new_size_bytes = entry_size_for_rent_by_protocol_with_cost_params(
             protocol_version,
             &entry,
-            entry_xdr.len() as u32,
+            henyey_common::xdr_encoded_len_u32(&entry),
             cost_params,
         );
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &snapshot.key);
@@ -1038,18 +1024,10 @@ pub fn execute_operation_with_soroban(
                                     key
                                 )
                             });
-                            let entry_xdr = entry
-                                .to_xdr(stellar_xdr::curr::Limits::none())
-                                .unwrap_or_else(|e| {
-                                    tracing::error!(
-                                        "restore: failed to serialize LedgerEntry: {e}"
-                                    );
-                                    Vec::new()
-                                });
                             let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
                                 context.protocol_version,
                                 &entry,
-                                entry_xdr.len() as u32,
+                                henyey_common::xdr_encoded_len_u32(&entry),
                                 soroban
                                     .config
                                     .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),

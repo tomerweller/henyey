@@ -791,20 +791,16 @@ fn prepare_footprint_entries(
         let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
         if let Some(lu) = live_until {
             let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-            stellar_xdr::curr::TtlEntry {
+            henyey_common::xdr_to_bytes(&stellar_xdr::curr::TtlEntry {
                 key_hash,
                 live_until_ledger_seq: lu,
-            }
-            .to_xdr(Limits::none())
-            .unwrap_or_default()
+            })
         } else if needs_ttl {
             let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-            stellar_xdr::curr::TtlEntry {
+            henyey_common::xdr_to_bytes(&stellar_xdr::curr::TtlEntry {
                 key_hash,
                 live_until_ledger_seq: context.sequence,
-            }
-            .to_xdr(Limits::none())
-            .unwrap_or_default()
+            })
         } else {
             Vec::new()
         }

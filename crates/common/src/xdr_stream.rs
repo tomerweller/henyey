@@ -67,6 +67,14 @@ pub fn xdr_encoded_len(val: &impl WriteXdr) -> usize {
     w.inner.0
 }
 
+/// Compute the XDR-encoded byte length of a value as `u32` without heap allocation.
+///
+/// Wraps [`xdr_encoded_len`] with a checked `u32` conversion. Panics if encoding
+/// fails or the length exceeds `u32::MAX`.
+pub fn xdr_encoded_len_u32(val: &impl WriteXdr) -> u32 {
+    u32::try_from(xdr_encoded_len(val)).expect("XDR encoded length must fit in u32")
+}
+
 #[inline]
 fn encode_frame_header(size: u32) -> [u8; 4] {
     [
@@ -636,5 +644,19 @@ mod tests {
         use stellar_xdr::curr::Hash;
         let hash = Hash([0xABu8; 32]);
         assert_eq!(xdr_encoded_len(&hash), xdr_to_bytes(&hash).len());
+    }
+
+    #[test]
+    fn test_xdr_encoded_len_u32_matches_xdr_to_bytes() {
+        use stellar_xdr::curr::{Hash, TtlEntry};
+        // Simple type
+        let hash = Hash([0xCDu8; 32]);
+        assert_eq!(xdr_encoded_len_u32(&hash), xdr_to_bytes(&hash).len() as u32);
+        // TtlEntry (used in encode_ttl paths)
+        let ttl = TtlEntry {
+            key_hash: hash,
+            live_until_ledger_seq: 1_000_000,
+        };
+        assert_eq!(xdr_encoded_len_u32(&ttl), xdr_to_bytes(&ttl).len() as u32);
     }
 }

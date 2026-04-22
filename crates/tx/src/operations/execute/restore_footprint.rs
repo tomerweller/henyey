@@ -4,9 +4,9 @@
 //! which restores archived Soroban contract data entries.
 
 use stellar_xdr::curr::{
-    AccountId, LedgerEntry, LedgerEntryData, LedgerKey, Limits, OperationResult, OperationResultTr,
+    AccountId, LedgerEntry, LedgerEntryData, LedgerKey, OperationResult, OperationResultTr,
     RestoreFootprintOp, RestoreFootprintResult, RestoreFootprintResultCode, SorobanTransactionData,
-    TtlEntry, WriteXdr,
+    TtlEntry,
 };
 
 use crate::state::LedgerStateManager;
@@ -186,15 +186,10 @@ fn is_persistent_entry(key: &LedgerKey) -> bool {
 
 /// Compute XDR-serialized size of a ledger entry.
 ///
-/// Returns 0 if serialization fails (entry will effectively pass limit checks
-/// with zero cost, matching stellar-core's `xdr_size` which never fails on
-/// well-formed entries).
+/// Panics if serialization fails — in-memory ledger entries must always encode
+/// successfully.
 fn xdr_entry_size(entry: &LedgerEntry) -> u32 {
-    entry
-        .to_xdr(Limits::none())
-        .ok()
-        .map(|bytes| bytes.len() as u32)
-        .unwrap_or(0)
+    henyey_common::xdr_encoded_len_u32(entry)
 }
 
 /// Tracks accumulated read and write bytes against declared resource limits.
