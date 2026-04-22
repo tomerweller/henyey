@@ -179,7 +179,28 @@ Since this is currently a single-node deployment, the instance variable exists f
 - **Y-axis:** count
 - **Description:** Number of SnapshotHandle lookups per ledger that were not served by local caches and had to be dispatched to the fallback (bucket list / Soroban state). **Henyey-specific metric.**
 
-### Panel 2.10: Total Fees
+### Panel 2.10: Close Phase Breakdown
+- **Type:** timeseries (stacked area, full width)
+- **Queries:** One per non-overlapping close phase, using `rate(sum)/rate(count)` to get average duration per close:
+  - `henyey_ledger_close_begin_seconds` — legend: "begin_close"
+  - `henyey_ledger_close_classic_exec_seconds` — legend: "classic_exec"
+  - `henyey_ledger_close_soroban_exec_seconds` — legend: "soroban_exec"
+  - `henyey_ledger_close_commit_setup_seconds` — legend: "commit_setup"
+  - `henyey_ledger_close_bucket_lock_wait_seconds` — legend: "bucket_lock_wait"
+  - `henyey_ledger_close_eviction_seconds` — legend: "eviction"
+  - `henyey_ledger_close_soroban_state_seconds` — legend: "soroban_state"
+  - `henyey_ledger_close_bucket_add_seconds` — legend: "bucket_add"
+  - `henyey_ledger_close_hot_archive_seconds` — legend: "hot_archive"
+  - `henyey_ledger_close_header_seconds` — legend: "header"
+  - `henyey_ledger_close_commit_seconds` — legend: "commit_close"
+  - `henyey_ledger_close_meta_seconds` — legend: "meta"
+- **Y-axis:** seconds
+- **Legend:** right-side table with mean and last
+- **Tooltip sort:** descending
+- **Note:** `tx_exec` is intentionally excluded because it equals `classic_exec + soroban_exec`. All listed phases are non-overlapping leaf phases that sum to approximately the total close duration.
+- **Description:** Stacked composition of ledger close time by phase. Shows where time is spent during each close. Use this to identify bottleneck phases (e.g. bucket_lock_wait indicates contention, commit_close indicates I/O pressure). **Henyey-specific metric.**
+
+### Panel 2.11: Total Fees
 - **Type:** timeseries
 - **Query:** `stellar_ledger_total_fees{job="henyey", instance=~"$instance"}`
 - **Y-axis:** stroops

@@ -1530,6 +1530,162 @@
       }
     },
     {
+      "id": 57,
+      "type": "timeseries",
+      "title": "Close Phase Breakdown",
+      "description": "Average duration of each ledger close phase per close. Stacked to show total composition. classic_exec and soroban_exec are sub-phases of tx_exec; all other phases are sequential. Henyey-specific metric.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 54
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "000000001"
+      },
+      "targets": [
+        {
+          "expr": "rate(henyey_ledger_close_begin_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_begin_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "begin_close",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_classic_exec_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_classic_exec_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "classic_exec",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_soroban_exec_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_soroban_exec_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "soroban_exec",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_commit_setup_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_commit_setup_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "commit_setup",
+          "refId": "D"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_bucket_lock_wait_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_bucket_lock_wait_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "bucket_lock_wait",
+          "refId": "E"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_eviction_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_eviction_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "eviction",
+          "refId": "F"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_soroban_state_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_soroban_state_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "soroban_state",
+          "refId": "G"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_bucket_add_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_bucket_add_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "bucket_add",
+          "refId": "H"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_hot_archive_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_hot_archive_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "hot_archive",
+          "refId": "I"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_header_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_header_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "header",
+          "refId": "J"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_commit_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_commit_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "commit_close",
+          "refId": "K"
+        },
+        {
+          "expr": "rate(henyey_ledger_close_meta_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_meta_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "meta",
+          "refId": "L"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 50,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
       "type": "row",
       "title": "Quorum & Consensus",
       "collapsed": false,
@@ -1537,7 +1693,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 54
+        "y": 62
       },
       "id": 102,
       "panels": []
@@ -1551,7 +1707,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 55
+        "y": 63
       },
       "datasource": {
         "type": "prometheus",
@@ -1649,7 +1805,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 55
+        "y": 63
       },
       "datasource": {
         "type": "prometheus",
@@ -1723,7 +1879,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 63
+        "y": 71
       },
       "datasource": {
         "type": "prometheus",
@@ -1781,7 +1937,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 63
+        "y": 71
       },
       "datasource": {
         "type": "prometheus",
@@ -1839,7 +1995,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 71
+        "y": 79
       },
       "datasource": {
         "type": "prometheus",
@@ -1897,7 +2053,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 71
+        "y": 79
       },
       "datasource": {
         "type": "prometheus",
@@ -1964,7 +2120,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 79
+        "y": 87
       },
       "datasource": {
         "type": "prometheus",
@@ -2031,7 +2187,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 79
+        "y": 87
       },
       "datasource": {
         "type": "prometheus",
@@ -2088,7 +2244,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 87
+        "y": 95
       },
       "id": 103,
       "panels": [
@@ -2441,7 +2597,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 88
+        "y": 96
       },
       "id": 104,
       "panels": [
@@ -3003,7 +3159,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 89
+        "y": 97
       },
       "id": 105,
       "panels": [
@@ -3410,7 +3566,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 90
+        "y": 98
       },
       "id": 106,
       "panels": [
@@ -3766,7 +3922,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 91
+        "y": 99
       },
       "id": 107,
       "panels": [
@@ -3999,7 +4155,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 100
       },
       "id": 108,
       "panels": [
@@ -4244,7 +4400,9 @@
             {
               "id": "reduce",
               "options": {
-                "reducers": ["lastNotNull"],
+                "reducers": [
+                  "lastNotNull"
+                ],
                 "mode": "seriesToRows",
                 "includeTimeField": false
               }
