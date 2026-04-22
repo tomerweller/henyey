@@ -155,6 +155,142 @@ doesn't change when it should — you MUST investigate. Specifically:
   File/comment per the Bug Filing Workflow. Do NOT downgrade it to OK
   just because heard_from_quorum=true and gap=0.
 
+## Metrics Scan
+
+The node exposes 152 Prometheus metrics at `http://localhost:<ADMIN_PORT>/metrics`
+(39 counters, 81 gauges, 32 histograms). Each tick samples `/metrics` and
+evaluates an alert catalog against it. Alerts that fire follow the
+**Bug / CI-Failure Filing Workflow** below — search existing issues, comment
+on a match, else file a new `ready`-labeled issue. Non-critical alerts get a
+`Non-critical:` title prefix; the filing workflow is identical.
+
+### Session state layout
+
+Each tick persists two snapshots and a cooldown map under the session dir:
+
+```
+~/data/<session-id>/metrics/
+  current.prom            # snapshot taken this tick
+  prev.prom               # snapshot from previous tick (rotated from current)
+  anomaly_cooldown.json   # { "<metric-name>": <unix-ts-of-last-file> }
+```
+
+Two snapshots is enough for tick-over-tick deltas on counters and histograms.
+Cooldown is 2 hours per metric: if `now - last_filed < 7200s`, include the
+alert in the status report but skip the file/comment step.
+
+### Restart handling
+
+When the node restarts, histogram/counter values reset. Rule: **if any
+counter's `current` < `prev`, treat this tick's delta as `current` (not
+`current - prev`)**. Also applies to histograms (bucket and count).
+For the first 2 ticks after a detected restart (from check 3 or check 10),
+skip `henyey_jemalloc_fragmentation_pct` gauge checks (post-restart
+warmup lands near 30–45% and settles to ~18% within 10 min) and skip
+counter-started-at-zero alerts.
+
+### Alert catalog — phase 1
+
+Three signal families, each with a specific evaluator. The machine-parseable
+version lives inline in check (12) of the Loop Prompt Template below; this
+table is the human reference.
+
+**A. Counters — fire on delta threshold (delta = current - prev)**
+
+| Metric | Delta threshold | Severity | Rationale |
+|--------|-----------------|----------|-----------|
+| `stellar_herder_lost_sync_total` | ≥ 1 | SYNC | Node fell out of Tracking — always a bug on a steady-state node |
+| `henyey_post_catchup_hard_reset_total` | ≥ 1 | ACTION | Recovery fired |
+| `henyey_recovery_stalled_tick_total` | ≥ 5 | WARN | Recovery loop not progressing |
+| `stellar_ledger_apply_failure_total` | ≥ 50 | WARN | Tx apply failures spiking (mainnet baseline ~0/ledger) |
+| `stellar_herder_pending_too_old_total` | ≥ 100 | WARN | Pending pool rejecting stale envelopes; overlay lag |
+| `stellar_overlay_timeout_idle_total` + `_straggler_total` (sum) | 5× prior-tick sum | WARN | Overlay churn burst |
+| `stellar_overlay_error_read_total` + `_write_total` (sum) | ≥ 50 | WARN | Overlay I/O errors |
+| `henyey_archive_cache_refresh_error_total` | ≥ 1 | NONC | Archive fetch failing |
+| `henyey_archive_cache_refresh_timeout_total` | ≥ 3 | NONC | Archive fetch slow |
+| `henyey_scp_post_verify_drops_total` | ≥ 100 | WARN | Post-verify dropping; investigate reason labels |
+
+Mainnet closes ~120 ledgers per tick; "≥ 50 failures/tick" ≈ 0.4/ledger.
+
+**B. Gauges — fire on absolute threshold**
+
+| Metric | Threshold | Severity | Notes |
+|--------|-----------|----------|-------|
+| `stellar_peer_count` | < 8 | WARN | Validator needs ≥ 8 peers for reliable quorum |
+| `henyey_jemalloc_fragmentation_pct` | > 50 for two consecutive ticks | WARN | Matches existing log rule; "two ticks" filters warmup |
+| `stellar_ledger_age_current_seconds` | > 30 | SYNC | Backup source for the RPC `age` check |
+| `stellar_herder_state` | != 2 when uptime > 15m | SYNC | 0=bootstrap, 1=catching up, 2=synced |
+| `stellar_quorum_agree` | < 4 | WARN | Quorum agreement nodes too low |
+| `stellar_quorum_missing` / `stellar_quorum_fail_at` | missing > 3 OR fail_at > 0 | WARN | Quorum membership problems |
+| `henyey_scp_verify_input_backlog` | > 100 | WARN | SCP verifier queue growing |
+| `henyey_scp_verifier_thread_state` | != 1 | WARN | Verifier thread not healthy |
+| `stellar_herder_pending_envelopes` | > 2000 | WARN | Herder backpressure |
+| `henyey_overlay_fetch_channel_depth_max` | > 500 | WARN | Overlay fetch backpressure |
+| `henyey_process_open_fds` / `henyey_process_max_fds` | > 0.85 | WARN | FD exhaustion imminent |
+| `henyey_herder_drift_max_seconds` | > 10 | NONC | Clock/close-time drift |
+
+"Two consecutive ticks": alert fires only if `prev.prom` also breached.
+
+**C. Histograms — fire on p99 bucket threshold of per-tick-delta**
+
+Per-tick histogram delta algorithm:
+1. For each `<metric>_bucket{le="X"}` compute `bucket_delta[le] = current - prev`.
+2. `count_delta = <metric>_count_current - <metric>_count_prev`.
+3. If `count_delta < 20`: skip (too few samples).
+4. Cumulative bucket delta at upper edge L is `sum(bucket_delta[le] for le <= L)`.
+   Find smallest L where cumulative ≥ `0.99 * count_delta`. That L is the p99 upper bound.
+
+Bucket edges for close-path histograms: `{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 30, +Inf}`
+seconds (verified from live scrape).
+
+| Metric | p99 threshold | Severity | Rationale |
+|--------|---------------|----------|-----------|
+| `henyey_ledger_close_cycle_seconds` | > 5s bucket | WARN | Includes inter-close wait; > 5s = close ran long |
+| `henyey_ledger_close_tx_exec_seconds` | > 1s bucket | WARN | Tx execution regression |
+| `henyey_ledger_close_soroban_exec_seconds` | > 1s bucket | WARN | Soroban execution regression |
+| `henyey_ledger_close_commit_seconds` | > 0.5s bucket | WARN | Commit-phase regression |
+| `henyey_ledger_close_soroban_state_seconds` | > 0.5s bucket | WARN | Loaded-state prep regression |
+| `henyey_close_complete_tx_queue_seconds` | > 0.5s bucket | WARN | Tx-queue bookkeeping regression |
+
+Mean check (`sum_delta / count_delta`) is a cheaper alternative; fire on
+whichever breaches. Coarse bucket-upper-bound avoids false positives from
+histogram bucket granularity.
+
+### Issue body template for metric alerts
+
+```
+## Symptom
+<one-line: metric name, current value, threshold>
+
+## Evidence (L<ledger>, binary <sha>)
+- Current: <metric>=<value>
+- Previous tick: <metric>=<value>
+- Delta: <value>
+- Threshold: <threshold>
+
+## Related metrics
+<sibling gauges/counters that clarify root cause>
+
+## Suspected root cause
+<investigation — grep where the metric is registered, read the hot path>
+
+## Suggested fix
+<file:line citation>
+```
+
+Titles:
+- `Non-critical: metrics: <metric-name> breached threshold (<value> > <threshold>)` for NONC.
+- `metrics: <metric-name> — <short symptom>` for WARN.
+- `metrics: <metric-name> — <short symptom>` for SYNC (and update `sync:` status line).
+
+### Watcher mode
+
+Watcher mode (`--watcher`) exposes `/metrics` on port 11727 but has no
+validator/quorum/SCP state. Run check (12) with a reduced catalog:
+process (`henyey_process_open_fds`, `_max_fds`), jemalloc, overlay
+(`stellar_overlay_*_total`, `henyey_overlay_fetch_channel_depth_max`).
+Skip SCP, quorum, herder_state, and histogram p99 alerts.
+
 ## Bug / CI-Failure Filing Workflow
 
 Use this workflow for both node bugs and CI failures — they route
@@ -283,7 +419,7 @@ process watches for `ready`-labeled issues and handles the fix.
 
 4. **Create directories:**
    ```
-   mkdir -p ~/data/<session-id>/{logs,cache,cargo-target}
+   mkdir -p ~/data/<session-id>/{logs,cache,cargo-target,metrics}
    ```
 
 5. **Build the binary** (henyey crate only, matching the redeploy step in
@@ -367,6 +503,19 @@ HEALTH CHECKS:
 (7) Memory report — run: grep 'Memory report summary' ~/data/<session-id>/logs/monitor.log | tail -1. If grep returns no output, flag WARNING memory-report-missing (log format may have changed). Otherwise extract jemalloc_allocated_mb, jemalloc_resident_mb, fragmentation_pct, heap_components_mb, mmap_mb, unaccounted_mb, unaccounted_sign. If fragmentation_pct > 50, flag HIGH FRAGMENTATION. If unaccounted_mb > 1000 with sign "+", note it (known jemalloc overhead, not a bug — but verify heap_components is stable; if heap_components is growing, investigate).
 (8) RPC health (validator mode only — skip in watcher mode; RPC_PORT=<RPC_PORT>) — run: curl -s -X POST http://localhost:<RPC_PORT> -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'. Verify: response is non-empty, status is "healthy". Check pruning: latestLedger - oldestLedger should be <= retention_window + 250 (allows one full maintenance cycle's worth of new ledgers — maintenance every 900s ≈ 180 ledgers at 5s/ledger, +70 headroom). If gap > retention_window + 500, flag PRUNING STALLED. If RPC is not responding, flag RPC DOWN.
 (9) OBSRVR Radar (validator mode only — skip in watcher mode) — get public key from: curl -s http://localhost:<ADMIN_PORT>/info (extract public_key). Then: curl -s https://radar.withobsrvr.com/api/v1/nodes/<PUBLIC_KEY>. Check: isValidating (if false and node running > 30 min, flag NOT VALIDATING), validating24HoursPercentage (if < 50 and running > 6 hours, flag LOW VALIDATION RATE), lag (if > 500, flag HIGH LAG). If API errors, emit "obsrvr: N/A (api-error)" in the status line instead of omitting the field.
+(12) Metrics scan — scrape /metrics and evaluate alert catalog. (a) Ensure ~/data/<session-id>/metrics exists: mkdir -p ~/data/<session-id>/metrics. (b) Rotate: mv ~/data/<session-id>/metrics/current.prom ~/data/<session-id>/metrics/prev.prom 2>/dev/null || true. (c) Scrape: curl -s http://localhost:<ADMIN_PORT>/metrics > ~/data/<session-id>/metrics/current.prom. (d) Restart detection: for any counter, if current < prev, treat delta as current (node restarted this tick or last tick). If check (3) or (10) restarted the node this tick OR the prior tick, skip jemalloc_fragmentation_pct gauge alert and skip counter-started-at-zero alerts (warmup allowance — 2 ticks).
+
+(e) Evaluate METRIC ALERT CATALOG against current.prom (and deltas vs prev.prom):
+
+COUNTERS (delta ≥ threshold): stellar_herder_lost_sync_total ≥1 SYNC; henyey_post_catchup_hard_reset_total ≥1 ACTION; henyey_recovery_stalled_tick_total ≥5 WARN; stellar_ledger_apply_failure_total ≥50 WARN; stellar_herder_pending_too_old_total ≥100 WARN; (stellar_overlay_timeout_idle_total + stellar_overlay_timeout_straggler_total) 5× prior-tick-sum WARN; (stellar_overlay_error_read_total + stellar_overlay_error_write_total) ≥50 WARN; henyey_archive_cache_refresh_error_total ≥1 NONC; henyey_archive_cache_refresh_timeout_total ≥3 NONC; henyey_scp_post_verify_drops_total ≥100 WARN.
+
+GAUGES (absolute threshold on current): stellar_peer_count <8 WARN; henyey_jemalloc_fragmentation_pct >50 on two consecutive ticks WARN; stellar_ledger_age_current_seconds >30 SYNC; stellar_herder_state !=2 when uptime >15m SYNC; stellar_quorum_agree <4 WARN; (stellar_quorum_missing >3 OR stellar_quorum_fail_at >0) WARN; henyey_scp_verify_input_backlog >100 WARN; henyey_scp_verifier_thread_state !=1 WARN; stellar_herder_pending_envelopes >2000 WARN; henyey_overlay_fetch_channel_depth_max >500 WARN; (henyey_process_open_fds / henyey_process_max_fds) >0.85 WARN; henyey_herder_drift_max_seconds >10 NONC.
+
+HISTOGRAMS (p99 bucket of per-tick delta): for each histogram H, compute bucket_delta[le] = H_bucket_current[le] - H_bucket_prev[le], count_delta = H_count_current - H_count_prev. Skip if count_delta <20. Cumulative bucket delta at upper edge L = sum(bucket_delta[le] for le <= L); smallest L where cumulative ≥ 0.99 * count_delta is the p99 upper bound. Thresholds: henyey_ledger_close_cycle_seconds p99 >5s WARN; henyey_ledger_close_tx_exec_seconds p99 >1s WARN; henyey_ledger_close_soroban_exec_seconds p99 >1s WARN; henyey_ledger_close_commit_seconds p99 >0.5s WARN; henyey_ledger_close_soroban_state_seconds p99 >0.5s WARN; henyey_close_complete_tx_queue_seconds p99 >0.5s WARN. Mean check (sum_delta/count_delta) is cheaper — fire on whichever breaches.
+
+(f) For each firing alert: read ~/data/<session-id>/metrics/anomaly_cooldown.json (create if missing). If last-filed-for-this-metric is within 7200s (2h), include in status report but SKIP file/comment. Otherwise follow BUG FILING WORKFLOW (step 3 below): search `gh issue list --search "metrics: <metric-name>" --state open`, comment on match (with new evidence) and ensure `ready` label, else `gh issue create --label ready` with title `Non-critical: metrics: <metric>` (NONC tier) or `metrics: <metric> — <symptom>` (WARN/SYNC tier) and body including: current/prev values, delta, threshold, ledger, binary sha, related sibling metrics, a file:line citation from `grep -n "<metric_name_without_prefix>" crates/ -r`, and a suggested fix. On fire, update anomaly_cooldown.json with {"<metric>": <now>}. For SYNC-tier alerts, ALSO update the sync: line in the status report (not just metrics:).
+
+(g) Watcher mode (--watcher): run with reduced catalog — only process (open_fds, max_fds), jemalloc, and overlay counters/gauges. Skip SCP, quorum, herder_state, and histogram p99 alerts.
 
 REMOTE SYNC & REDEPLOY:
 (10) Remote sync — first sanity-check the working tree: (pre-a) if git status --porcelain reports any output, ABORT the deploy path for this tick — there are local edits that shouldn't exist (the monitor never edits the checkout). Report: DEPLOY SKIPPED (dirty tree) with the list of dirty paths. Do not run git pull against a dirty tree; do not kill the node. Investigate the dirty tree before the next tick. (a) If clean, run: git fetch origin main. If in detached HEAD state (git symbolic-ref HEAD fails), run git checkout main first. Then compare: git rev-parse HEAD vs git rev-parse origin/main. If they differ (origin/main is ahead): (b) check CI status on origin/main — run: gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'. If any recent run has conclusion "failure", do NOT deploy — route the failure through check 11 (file/comment a `ready`-labeled issue) and wait. (c) If all conclusions are "success" (ignore "" for in-progress and "cancelled"): git pull --rebase, (d) CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release -p henyey, (e) if build succeeds: preserve the log — `mv ~/data/<session-id>/logs/monitor.log ~/data/<session-id>/logs/monitor.log.preredeploy-$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true`; then kill the node (kill <PID>, wait 10s, kill -9 if still alive), restart with the launch command from check (3)(iii) (append redirection), report: DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>, (f) if build fails: report BUILD FAILED, do NOT restart — the old binary is still running. Route the build error through check 11 (file/comment a `ready`-labeled issue). If HEAD == origin/main: no action (already up to date).
@@ -404,6 +553,7 @@ MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   disk:   <used>/<total> (<pct>%) | session+data=<size>
   rpc:    <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
   obsrvr: <validating=<Y/N> val24h=<pct>% lag=<N> | N/A (watcher) | N/A (api-error)>
+  metrics: <clean | N alerts (<metric1>,<metric2>,...) — filed/commented #<N>,#<M> | N alerts, K suppressed by cooldown>
   deploy: <up-to-date | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
   ci:     <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
 Use WARNING for threshold breaches. Use ACTION when a corrective action was taken (restart, deploy, filed a new issue, commented on an existing issue). Use SYNC FAILURE (not WARNING) when the node has exceeded the active sync deadline (15m populated / 4h fresh-start) but is not closing ledgers in real-time — this is a bug that requires immediate investigation AND filing/commenting on a `ready`-labeled issue.
