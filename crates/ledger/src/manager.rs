@@ -2018,9 +2018,14 @@ impl LedgerManager {
     /// The snapshot includes a lookup function for entries not in the cache,
     /// which queries the bucket list for the entry.
     pub fn create_snapshot(&self) -> Result<SnapshotHandle> {
+        let fn_start = std::time::Instant::now();
+
         #[cfg(any(test, feature = "test-utils"))]
         self.snapshot_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // --- Sub-timer: state read + LedgerSnapshot construction ---
+        let t0 = std::time::Instant::now();
         let state = self.state.read();
         // Use an empty entry cache - all lookups go through lookup_fn which handles:
         // - Soroban types (CONTRACT_DATA, CONTRACT_CODE, TTL): O(1) via in-memory soroban_state
@@ -2030,6 +2035,8 @@ impl LedgerManager {
         let entries = HashMap::new();
 
         let snapshot = LedgerSnapshot::new(state.header.clone(), state.header_hash, entries);
+        let ledger_seq = state.header.ledger_seq;
+        let state_read_elapsed = t0.elapsed();
 
         // Create a lookup function that checks in-memory Soroban state first for O(1) access,
         // then falls back to a bucket list snapshot for non-Soroban types or cache misses.
@@ -2046,11 +2053,25 @@ impl LedgerManager {
         // above. Without this, a concurrent commit() could update soroban_state entries
         // before commit_close() publishes the new header, causing the snapshot to mix
         // new Soroban data with the old header.
+        // --- Sub-timer: soroban state snapshot ---
+        let t1 = std::time::Instant::now();
         let soroban_snapshot = Arc::new(self.soroban_state.read().snapshot());
+        let soroban_snapshot_elapsed = t1.elapsed();
+        // --- Sub-timer: bucket list snapshot ---
+        let t2 = std::time::Instant::now();
         let bucket_list_snapshot = Arc::new({
             let bl = self.bucket_list.read();
             henyey_bucket::BucketListSnapshot::new(&bl, state.header.clone())
         });
+        let bucket_list_snapshot_elapsed = t2.elapsed();
+
+        // Drop state read guard — no longer needed after LedgerSnapshot and
+        // BucketListSnapshot construction. Avoids extending the lock hold
+        // through closure building and the debug log below.
+        drop(state);
+
+        // --- Sub-timer: closure building + SnapshotHandle assembly ---
+        let t3 = std::time::Instant::now();
         let soroban_for_lookup = soroban_snapshot.clone();
         let bls_for_lookup = bucket_list_snapshot.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
@@ -2143,6 +2164,19 @@ impl LedgerManager {
         handle.set_batch_lookup(batch_lookup_fn);
         handle.set_offers_by_account_asset(offers_by_account_asset_fn);
         handle.set_pool_share_tls_by_account(pool_share_tls_by_account_fn);
+        let closure_build_elapsed = t3.elapsed();
+
+        tracing::debug!(
+            target: "henyey::snapshot_timing",
+            ledger_seq,
+            state_read_us = state_read_elapsed.as_micros() as u64,
+            soroban_snapshot_us = soroban_snapshot_elapsed.as_micros() as u64,
+            bucket_list_snapshot_us = bucket_list_snapshot_elapsed.as_micros() as u64,
+            closure_build_us = closure_build_elapsed.as_micros() as u64,
+            total_us = fn_start.elapsed().as_micros() as u64,
+            "create_snapshot sub-timings"
+        );
+
         Ok(handle)
     }
 

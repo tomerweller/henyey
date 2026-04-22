@@ -2234,9 +2234,13 @@ impl App {
             metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS)
                 .record(phase2_start.elapsed().as_secs_f64());
 
-            // === Sub-phase 3: snapshot build + Sub-phase 4: invalidation =====
+            // === Sub-phase 3: envelopes fetch + snapshot build + Sub-phase 4: invalidation =====
             let phase3_start = std::time::Instant::now();
             let pending_envs = herder.tx_queue().pending_hashed_envelopes();
+            let fetch_elapsed = phase3_start.elapsed();
+            metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS)
+                .record(fetch_elapsed.as_secs_f64());
+
             let mut invalid_banned = 0usize;
             if !pending_envs.is_empty() {
                 let ctx = TxSetValidationContext {
@@ -2268,7 +2272,10 @@ impl App {
                 // passing `None` providers). We must NOT fall back to
                 // the per-call providers — that would silently
                 // re-introduce the quadratic path.
+                let snapshot_build_start = std::time::Instant::now();
                 let snapshot_result = SnapshotValidationProviders::new(&ledger_manager);
+                metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS)
+                    .record(snapshot_build_start.elapsed().as_secs_f64());
                 metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_SECONDS)
                     .record(phase3_start.elapsed().as_secs_f64());
 
@@ -2300,8 +2307,8 @@ impl App {
                 metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_INVALIDATION_SECONDS)
                     .record(phase4_start.elapsed().as_secs_f64());
             } else {
-                // Queue empty: record the pending_hashed_envelopes() cost
-                // in snapshot, and zero for invalidation.
+                // Queue empty: record envelopes_fetch (already recorded above)
+                // and total. Do NOT record snapshot_build — it wasn't executed.
                 metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_SECONDS)
                     .record(phase3_start.elapsed().as_secs_f64());
                 metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_INVALIDATION_SECONDS)

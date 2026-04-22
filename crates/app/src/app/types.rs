@@ -1029,14 +1029,14 @@ pub(super) struct SnapshotValidationProviders {
 impl SnapshotValidationProviders {
     /// Build one snapshot for the whole validation pass.
     ///
-    /// Returns `Err` if `create_snapshot` fails (e.g., state /
-    /// bucket-list lock poison). Callers must degrade gracefully — see
-    /// the `ledger_close.rs` post-close call site for the expected
-    /// `warn!` + skip-stateful-validation pattern. Callers MUST NOT
-    /// fall back to the per-call [`LedgerAccountProvider`] on this
-    /// error path: re-introducing a quadratic snapshot pattern would
-    /// silently paper over the bug this type was introduced to fix
-    /// (see #1759).
+    /// Returns `Err` if `create_snapshot` fails (currently infallible —
+    /// the `Result` is defensive for future extensibility). Callers must
+    /// degrade gracefully — see the `ledger_close.rs` post-close call
+    /// site for the expected `warn!` + skip-stateful-validation pattern.
+    /// Callers MUST NOT fall back to the per-call
+    /// [`LedgerAccountProvider`] on this error path: re-introducing a
+    /// quadratic snapshot pattern would silently paper over the bug this
+    /// type was introduced to fix (see #1759).
     pub fn new(ledger_manager: &LedgerManager) -> henyey_ledger::Result<Self> {
         Ok(Self {
             inner: henyey_herder::SnapshotProviders::new(ledger_manager.create_snapshot()?),

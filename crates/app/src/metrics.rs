@@ -215,6 +215,10 @@ pub const CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS: &str =
     "henyey_close_tx_queue_ledger_closed_seconds";
 pub const CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS: &str = "henyey_close_tx_queue_shift_update_seconds";
 pub const CLOSE_TX_QUEUE_SNAPSHOT_SECONDS: &str = "henyey_close_tx_queue_snapshot_seconds";
+pub const CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS: &str =
+    "henyey_close_tx_queue_envelopes_fetch_seconds";
+pub const CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS: &str =
+    "henyey_close_tx_queue_snapshot_build_seconds";
 pub const CLOSE_TX_QUEUE_INVALIDATION_SECONDS: &str = "henyey_close_tx_queue_invalidation_seconds";
 
 // Phase 6 — Persist and close-cycle instrumentation.
@@ -795,7 +799,15 @@ pub fn describe_metrics() {
     );
     describe_histogram!(
         CLOSE_TX_QUEUE_SNAPSHOT_SECONDS,
-        "tx_queue spawn_blocking pending_hashed_envelopes + snapshot build (seconds)"
+        "tx_queue spawn_blocking pending_hashed_envelopes + snapshot build total (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS,
+        "tx_queue spawn_blocking pending_hashed_envelopes only (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS,
+        "tx_queue spawn_blocking SnapshotValidationProviders::new only (seconds)"
     );
     describe_histogram!(
         CLOSE_TX_QUEUE_INVALIDATION_SECONDS,
