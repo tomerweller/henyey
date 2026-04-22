@@ -10,6 +10,13 @@ pub(super) fn sort_txs_by_hash(txs: &mut [TransactionEnvelope]) {
     txs.sort_by_cached_key(|tx| Hash256::hash_xdr(tx).0);
 }
 
+/// Sort hashed transactions by their pre-computed hash.
+///
+/// Avoids redundant XDR re-serialization for hash computation.
+pub(super) fn sort_hashed_txs(txs: &mut [crate::tx_set_utils::HashedTx]) {
+    txs.sort_by_key(|htx| htx.hash().0);
+}
+
 /// A set of transactions for a ledger.
 #[derive(Debug, Clone)]
 pub struct TransactionSet {

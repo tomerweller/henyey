@@ -57,7 +57,11 @@ impl TransactionQueue {
     ) -> TransactionSet {
         let SelectedTxs { transactions, .. } =
             self.select_transactions_with_starting_seq(max_ops, None);
-        TransactionSet::new(previous_ledger_hash, transactions)
+        let envelopes: Vec<TransactionEnvelope> = transactions
+            .into_iter()
+            .map(|htx| htx.into_envelope())
+            .collect();
+        TransactionSet::new(previous_ledger_hash, envelopes)
     }
 
     pub fn get_transaction_set_with_starting_seq(
@@ -68,7 +72,11 @@ impl TransactionQueue {
     ) -> TransactionSet {
         let SelectedTxs { transactions, .. } =
             self.select_transactions_with_starting_seq(max_ops, starting_seq);
-        TransactionSet::new(previous_ledger_hash, transactions)
+        let envelopes: Vec<TransactionEnvelope> = transactions
+            .into_iter()
+            .map(|htx| htx.into_envelope())
+            .collect();
+        TransactionSet::new(previous_ledger_hash, envelopes)
     }
 
     /// Build a GeneralizedTransactionSet (protocol 20+) and return it with the correct hash.
@@ -123,17 +131,15 @@ impl TransactionQueue {
             classic_limited,
         } = self.select_transactions_with_starting_seq(max_ops, starting_seq);
         let base_fee = self.validation_context.read().base_fee as i64;
+
+        // Classify into classic/soroban using envelope helpers (no TransactionFrame).
         let mut classic_txs = Vec::new();
         let mut soroban_txs = Vec::new();
-        for tx in &transactions {
-            let frame = henyey_tx::TransactionFrame::from_owned_with_network(
-                tx.clone(),
-                self.config.network_id,
-            );
-            if frame.is_soroban() {
-                soroban_txs.push(tx.clone());
+        for htx in transactions {
+            if crate::tx_set_utils::is_soroban_envelope(htx.envelope()) {
+                soroban_txs.push(htx);
             } else {
-                classic_txs.push(tx.clone());
+                classic_txs.push(htx);
             }
         }
 
@@ -183,9 +189,9 @@ impl TransactionQueue {
                 close_time_offset,
                 close_time_offset,
             );
-            crate::tx_set_utils::trim_invalid_two_phase(
-                &classic_txs,
-                &soroban_txs,
+            crate::tx_set_utils::trim_invalid_two_phase_hashed(
+                classic_txs,
+                soroban_txs,
                 &ctx,
                 &close_time_bounds,
                 fee_ref,
@@ -195,7 +201,7 @@ impl TransactionQueue {
             (classic_txs, soroban_txs)
         };
 
-        sort_txs_by_hash(&mut soroban_txs);
+        sort_hashed_txs(&mut soroban_txs);
 
         let classic_phase = build_classic_phase(
             classic_txs,
@@ -203,7 +209,6 @@ impl TransactionQueue {
             dex_limited,
             base_fee,
             self.config.max_dex_ops.is_some(),
-            self.config.network_id,
         );
 
         // Build Soroban phase first, then compute base fee from survivors.
@@ -491,14 +496,14 @@ impl TransactionQueue {
 
         let mut transactions = Vec::new();
         transactions.extend(
-            classic_selected
-                .into_iter()
-                .map(|tx| Arc::unwrap_or_clone(tx.envelope)),
+            classic_selected.into_iter().map(|tx| {
+                crate::tx_set_utils::HashedTx::from_prehashed(tx.hash, tx.envelope.clone())
+            }),
         );
         transactions.extend(
-            soroban_selected
-                .into_iter()
-                .map(|tx| Arc::unwrap_or_clone(tx.envelope)),
+            soroban_selected.into_iter().map(|tx| {
+                crate::tx_set_utils::HashedTx::from_prehashed(tx.hash, tx.envelope.clone())
+            }),
         );
 
         SelectedTxs {
@@ -525,11 +530,7 @@ impl TransactionQueue {
 
             let mut seen_soroban = false;
             for tx in txs {
-                let frame = henyey_tx::TransactionFrame::with_network(
-                    tx.envelope.clone(),
-                    self.config.network_id,
-                );
-                let is_soroban = frame.is_soroban();
+                let is_soroban = crate::tx_set_utils::is_soroban_envelope(&tx.envelope);
                 if seen_soroban && !is_soroban {
                     break;
                 }
@@ -557,7 +558,7 @@ impl TransactionQueue {
 ///
 /// Returns (phase, base_fee_used) — the base_fee_used is also embedded in the phase.
 fn build_soroban_phase_with_base_fee(
-    soroban_txs: Vec<TransactionEnvelope>,
+    soroban_txs: Vec<crate::tx_set_utils::HashedTx>,
     soroban_limited: bool,
     ledger_base_fee: i64,
     config: &super::TxQueueConfig,
@@ -612,14 +613,20 @@ fn build_soroban_phase_with_base_fee(
         let soroban_base_fee = if soroban_limited {
             soroban_txs
                 .iter()
-                .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
+                .filter_map(|htx| {
+                    envelope_fee_per_op(htx.envelope()).map(|(per_op, _, _)| per_op as i64)
+                })
                 .min()
                 .or(Some(ledger_base_fee))
         } else {
             Some(ledger_base_fee)
         };
 
-        let cluster = DependentTxCluster(soroban_txs.try_into().unwrap_or_default());
+        let envelopes: Vec<TransactionEnvelope> = soroban_txs
+            .into_iter()
+            .map(|htx| htx.into_envelope())
+            .collect();
+        let cluster = DependentTxCluster(envelopes.try_into().unwrap_or_default());
         let stage = ParallelTxExecutionStage(vec![cluster].try_into().unwrap_or_default());
         let phase = TransactionPhase::V1(ParallelTxsComponent {
             base_fee: soroban_base_fee,
@@ -635,7 +642,7 @@ fn build_soroban_phase_with_base_fee(
 /// - If surge-priced (limited) or txs were dropped: use min fee-per-op of survivors
 /// - Otherwise: use ledger base fee
 fn compute_soroban_base_fee(
-    stages: &[Vec<Vec<TransactionEnvelope>>],
+    stages: &[Vec<Vec<crate::tx_set_utils::HashedTx>>],
     soroban_limited: bool,
     had_tx_not_fitting: bool,
     ledger_base_fee: i64,
@@ -649,12 +656,13 @@ fn compute_soroban_base_fee(
     }
 
     if soroban_limited || had_tx_not_fitting {
-        // Compute min fee-per-op from surviving txs
         let min_fee = stages
             .iter()
             .flat_map(|stage| stage.iter())
             .flat_map(|cluster| cluster.iter())
-            .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
+            .filter_map(|htx| {
+                envelope_fee_per_op(htx.envelope()).map(|(per_op, _, _)| per_op as i64)
+            })
             .min();
         min_fee.or(Some(ledger_base_fee))
     } else {
@@ -690,12 +698,11 @@ fn collect_phase_transactions(
 }
 
 fn build_classic_phase(
-    classic_txs: Vec<TransactionEnvelope>,
+    classic_txs: Vec<crate::tx_set_utils::HashedTx>,
     classic_limited: bool,
     dex_limited: bool,
     base_fee: i64,
     has_dex_lane: bool,
-    network_id: NetworkId,
 ) -> stellar_xdr::curr::TransactionPhase {
     use stellar_xdr::curr::{
         TransactionPhase, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
@@ -707,15 +714,15 @@ fn build_classic_phase(
         let mut lowest_lane_fee = vec![i64::MAX; lane_count];
         let mut lane_for_tx = Vec::with_capacity(classic_txs.len());
 
-        for tx in &classic_txs {
-            let frame =
-                henyey_tx::TransactionFrame::from_owned_with_network(tx.clone(), network_id);
-            let lane = if has_dex_lane && frame.has_dex_operations() {
+        for htx in &classic_txs {
+            let lane = if has_dex_lane
+                && crate::tx_set_utils::has_dex_operations_envelope(htx.envelope())
+            {
                 crate::surge_pricing::DEX_LANE
             } else {
                 GENERIC_LANE
             };
-            if let Some((per_op, _, _)) = envelope_fee_per_op(tx) {
+            if let Some((per_op, _, _)) = envelope_fee_per_op(htx.envelope()) {
                 let lane_fee = &mut lowest_lane_fee[lane];
                 let fee = per_op as i64;
                 if fee < *lane_fee {
@@ -742,18 +749,21 @@ fn build_classic_phase(
             }
         }
 
-        let mut components_by_fee: BTreeMap<i64, Vec<TransactionEnvelope>> = BTreeMap::new();
-        for (tx, lane) in classic_txs.into_iter().zip(lane_for_tx) {
+        let mut components_by_fee: BTreeMap<i64, Vec<crate::tx_set_utils::HashedTx>> =
+            BTreeMap::new();
+        for (htx, lane) in classic_txs.into_iter().zip(lane_for_tx) {
             let fee = lane_base_fee[lane];
-            components_by_fee.entry(fee).or_default().push(tx);
+            components_by_fee.entry(fee).or_default().push(htx);
         }
 
         for (fee, mut txs) in components_by_fee {
-            sort_txs_by_hash(&mut txs);
+            sort_hashed_txs(&mut txs);
+            let envelopes: Vec<TransactionEnvelope> =
+                txs.into_iter().map(|htx| htx.into_envelope()).collect();
             classic_components.push(TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
                 TxSetComponentTxsMaybeDiscountedFee {
                     base_fee: Some(fee),
-                    txs: txs.try_into().unwrap_or_default(),
+                    txs: envelopes.try_into().unwrap_or_default(),
                 },
             ));
         }

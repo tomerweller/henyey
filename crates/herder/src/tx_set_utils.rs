@@ -38,8 +38,8 @@ use crate::tx_queue::{AccountProvider, FeeBalanceProvider};
 /// matches `Hash256::hash_xdr(&envelope)`.
 #[derive(Debug, Clone)]
 pub struct HashedTx {
-    pub(crate) hash: Hash256,
-    pub(crate) envelope: Arc<TransactionEnvelope>,
+    hash: Hash256,
+    envelope: Arc<TransactionEnvelope>,
 }
 
 impl HashedTx {
@@ -52,11 +52,28 @@ impl HashedTx {
         }
     }
 
+    /// Create a `HashedTx` from a pre-computed hash and an `Arc`'d envelope.
+    ///
+    /// Avoids redundant hashing when the caller already has the hash
+    /// (e.g. from `QueuedTransaction`).
+    pub fn from_prehashed(hash: Hash256, envelope: Arc<TransactionEnvelope>) -> Self {
+        debug_assert_eq!(
+            hash,
+            Hash256::hash_xdr(&*envelope),
+            "HashedTx::from_prehashed: hash does not match envelope"
+        );
+        Self { hash, envelope }
+    }
+
     pub fn hash(&self) -> Hash256 {
         self.hash
     }
 
     pub fn envelope(&self) -> &TransactionEnvelope {
+        &self.envelope
+    }
+
+    pub fn arc_envelope(&self) -> &Arc<TransactionEnvelope> {
         &self.envelope
     }
 
@@ -698,13 +715,7 @@ pub fn get_invalid_tx_list_with_fee_map(
     account_provider: Option<&dyn AccountProvider>,
     account_fee_map: &mut HashMap<AccountId, i64>,
 ) -> Vec<TransactionEnvelope> {
-    let hashed: Vec<HashedTx> = txs
-        .iter()
-        .map(|tx| HashedTx {
-            hash: Hash256::hash_xdr(tx),
-            envelope: Arc::new(tx.clone()),
-        })
-        .collect();
+    let hashed: Vec<HashedTx> = txs.iter().map(|tx| HashedTx::new(tx.clone())).collect();
     let invalid_hashed = get_invalid_hashed_core(
         &hashed,
         ctx,
@@ -923,6 +934,14 @@ pub fn trim_invalid(
     (valid_txs, invalid_txs)
 }
 
+/// Remove a subset of hashed transactions using pre-computed hashes.
+fn remove_hashed_txs(txs: Vec<HashedTx>, to_remove: &[HashedTx]) -> Vec<HashedTx> {
+    let remove_set: HashSet<Hash256> = to_remove.iter().map(|htx| htx.hash()).collect();
+    txs.into_iter()
+        .filter(|htx| !remove_set.contains(&htx.hash()))
+        .collect()
+}
+
 /// Remove a subset of transactions from a list using hash comparison.
 ///
 /// This is equivalent to the upstream `removeTxs()` helper in `TxSetUtils.cpp`.
@@ -939,6 +958,68 @@ fn remove_txs(
         .filter(|tx| !remove_set.contains(&Hash256::hash_xdr(*tx)))
         .cloned()
         .collect()
+}
+
+/// Trim invalid transactions from two phases (Classic + Soroban), sharing the
+/// fee-source map across phases for Protocol 26+.
+///
+/// Hashed variant: accepts and returns `Vec<HashedTx>`, avoiding redundant
+/// hash computation and deep clones throughout the pipeline.
+///
+/// # Parity
+///
+/// Mirrors `makeTxSetFromTransactions` in stellar-core `TxSetFrame.cpp:836-860`.
+pub(crate) fn trim_invalid_two_phase_hashed(
+    classic_txs: Vec<HashedTx>,
+    soroban_txs: Vec<HashedTx>,
+    ctx: &TxSetValidationContext,
+    close_time_bounds: &CloseTimeBounds,
+    fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+    account_provider: Option<&dyn AccountProvider>,
+) -> (Vec<HashedTx>, Vec<HashedTx>) {
+    use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+
+    let use_cross_phase_fee_map =
+        protocol_version_starts_from(ctx.protocol_version, ProtocolVersion::V26);
+
+    let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
+
+    // Phase 0: Classic
+    let classic_invalid = get_invalid_hashed_tx_list_with_fee_map(
+        &classic_txs,
+        ctx,
+        close_time_bounds,
+        fee_balance_provider,
+        account_provider,
+        &mut account_fee_map,
+    );
+    let valid_classic = if classic_invalid.is_empty() {
+        classic_txs
+    } else {
+        remove_hashed_txs(classic_txs, &classic_invalid)
+    };
+
+    // For pre-V26, clear the fee map between phases (each phase is independent).
+    if !use_cross_phase_fee_map {
+        account_fee_map.clear();
+    }
+
+    // Phase 1: Soroban
+    let soroban_invalid = get_invalid_hashed_tx_list_with_fee_map(
+        &soroban_txs,
+        ctx,
+        close_time_bounds,
+        fee_balance_provider,
+        account_provider,
+        &mut account_fee_map,
+    );
+    let valid_soroban = if soroban_invalid.is_empty() {
+        soroban_txs
+    } else {
+        remove_hashed_txs(soroban_txs, &soroban_invalid)
+    };
+
+    (valid_classic, valid_soroban)
 }
 
 /// Trim invalid transactions from two phases (Classic + Soroban), sharing the
@@ -963,49 +1044,34 @@ pub fn trim_invalid_two_phase(
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
     account_provider: Option<&dyn AccountProvider>,
 ) -> (Vec<TransactionEnvelope>, Vec<TransactionEnvelope>) {
-    use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+    let classic_hashed: Vec<HashedTx> = classic_txs
+        .iter()
+        .map(|tx| HashedTx::new(tx.clone()))
+        .collect();
+    let soroban_hashed: Vec<HashedTx> = soroban_txs
+        .iter()
+        .map(|tx| HashedTx::new(tx.clone()))
+        .collect();
 
-    let use_cross_phase_fee_map =
-        protocol_version_starts_from(ctx.protocol_version, ProtocolVersion::V26);
-
-    let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
-
-    // Phase 0: Classic
-    let classic_invalid = get_invalid_tx_list_with_fee_map(
-        classic_txs,
+    let (valid_classic, valid_soroban) = trim_invalid_two_phase_hashed(
+        classic_hashed,
+        soroban_hashed,
         ctx,
         close_time_bounds,
         fee_balance_provider,
         account_provider,
-        &mut account_fee_map,
     );
-    let valid_classic = if classic_invalid.is_empty() {
-        classic_txs.to_vec()
-    } else {
-        remove_txs(classic_txs, &classic_invalid)
-    };
 
-    // For pre-V26, clear the fee map between phases (each phase is independent).
-    if !use_cross_phase_fee_map {
-        account_fee_map.clear();
-    }
-
-    // Phase 1: Soroban
-    let soroban_invalid = get_invalid_tx_list_with_fee_map(
-        soroban_txs,
-        ctx,
-        close_time_bounds,
-        fee_balance_provider,
-        account_provider,
-        &mut account_fee_map,
-    );
-    let valid_soroban = if soroban_invalid.is_empty() {
-        soroban_txs.to_vec()
-    } else {
-        remove_txs(soroban_txs, &soroban_invalid)
-    };
-
-    (valid_classic, valid_soroban)
+    (
+        valid_classic
+            .into_iter()
+            .map(|htx| htx.into_envelope())
+            .collect(),
+        valid_soroban
+            .into_iter()
+            .map(|htx| htx.into_envelope())
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,14 +1079,8 @@ pub fn trim_invalid_two_phase(
 // ---------------------------------------------------------------------------
 
 /// Check if a transaction envelope is a Soroban transaction.
-fn is_soroban_envelope(env: &TransactionEnvelope) -> bool {
-    let ops = match env {
-        TransactionEnvelope::TxV0(e) => &e.tx.operations,
-        TransactionEnvelope::Tx(e) => &e.tx.operations,
-        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
-        },
-    };
+pub(crate) fn is_soroban_envelope(env: &TransactionEnvelope) -> bool {
+    let ops = envelope_operations(env);
     ops.iter().any(|op| {
         matches!(
             op.body,
@@ -1029,6 +1089,35 @@ fn is_soroban_envelope(env: &TransactionEnvelope) -> bool {
                 | stellar_xdr::curr::OperationBody::RestoreFootprint(_)
         )
     })
+}
+
+/// Check if a transaction envelope contains DEX-related operations.
+///
+/// Mirrors `TransactionFrame::has_dex_operations()` for use without
+/// constructing a full frame.
+pub(crate) fn has_dex_operations_envelope(env: &TransactionEnvelope) -> bool {
+    let ops = envelope_operations(env);
+    ops.iter().any(|op| {
+        matches!(
+            op.body,
+            stellar_xdr::curr::OperationBody::ManageSellOffer(_)
+                | stellar_xdr::curr::OperationBody::ManageBuyOffer(_)
+                | stellar_xdr::curr::OperationBody::CreatePassiveSellOffer(_)
+                | stellar_xdr::curr::OperationBody::PathPaymentStrictSend(_)
+                | stellar_xdr::curr::OperationBody::PathPaymentStrictReceive(_)
+        )
+    })
+}
+
+/// Extract operations from a transaction envelope without constructing a frame.
+fn envelope_operations(env: &TransactionEnvelope) -> &[stellar_xdr::curr::Operation] {
+    match env {
+        TransactionEnvelope::TxV0(e) => &e.tx.operations,
+        TransactionEnvelope::Tx(e) => &e.tx.operations,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
+        },
+    }
 }
 
 /// Extract `SorobanResources` from a transaction envelope (for Soroban TXs).
@@ -3730,13 +3819,7 @@ mod tests {
 
         // Get results from both APIs.
         let invalid_envelopes = get_invalid_tx_list(&txs, &ctx, &bounds, None, None);
-        let hashed_txs: Vec<HashedTx> = txs
-            .iter()
-            .map(|tx| HashedTx {
-                hash: Hash256::hash_xdr(tx),
-                envelope: Arc::new(tx.clone()),
-            })
-            .collect();
+        let hashed_txs: Vec<HashedTx> = txs.iter().map(|tx| HashedTx::new(tx.clone())).collect();
         let invalid_hashed = get_invalid_hashed_tx_list(&hashed_txs, &ctx, &bounds, None, None);
 
         // Same count.
@@ -3787,11 +3870,8 @@ mod tests {
 
         // Test with hashed API.
         let hashed_txs: Vec<HashedTx> = [env1.clone(), env2.clone()]
-            .iter()
-            .map(|tx| HashedTx {
-                hash: Hash256::hash_xdr(tx),
-                envelope: Arc::new(tx.clone()),
-            })
+            .into_iter()
+            .map(HashedTx::new)
             .collect();
         let invalid = get_invalid_hashed_tx_list(
             &hashed_txs,
@@ -3832,10 +3912,7 @@ mod tests {
 
         // Phase 1: first tx consumes 4M.
         let mut shared_fee_map: HashMap<AccountId, i64> = HashMap::new();
-        let hashed1 = vec![HashedTx {
-            hash: Hash256::hash_xdr(&env1),
-            envelope: Arc::new(env1.clone()),
-        }];
+        let hashed1 = vec![HashedTx::new(env1.clone())];
         let invalid1 = get_invalid_hashed_tx_list_with_fee_map(
             &hashed1,
             &ctx,
@@ -3847,10 +3924,7 @@ mod tests {
         assert!(invalid1.is_empty(), "first phase: 4M fee within 6M balance");
 
         // Phase 2: second tx adds another 4M → total 8M > 6M available.
-        let hashed2 = vec![HashedTx {
-            hash: Hash256::hash_xdr(&env2),
-            envelope: Arc::new(env2.clone()),
-        }];
+        let hashed2 = vec![HashedTx::new(env2.clone())];
         let invalid2 = get_invalid_hashed_tx_list_with_fee_map(
             &hashed2,
             &ctx,
@@ -3869,17 +3943,8 @@ mod tests {
     fn test_hashed_invalidation_duplicate_hash_handling() {
         // Verify correct behavior when duplicate envelopes appear in the input.
         let env = make_valid_envelope(100, 1);
-        let hash = Hash256::hash_xdr(&env);
-        let hashed_txs = vec![
-            HashedTx {
-                hash,
-                envelope: Arc::new(env.clone()),
-            },
-            HashedTx {
-                hash,
-                envelope: Arc::new(env.clone()),
-            },
-        ];
+        let htx = HashedTx::new(env.clone());
+        let hashed_txs = vec![htx.clone(), htx];
 
         let ctx = TxSetValidationContext {
             next_ledger_seq: 100,

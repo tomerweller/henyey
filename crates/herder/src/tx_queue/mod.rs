@@ -574,7 +574,7 @@ fn can_replace_by_fee(
 
 #[derive(Debug, Clone)]
 pub(super) struct SelectedTxs {
-    pub(super) transactions: Vec<TransactionEnvelope>,
+    pub(super) transactions: Vec<crate::tx_set_utils::HashedTx>,
     pub(super) soroban_limited: bool,
     pub(super) dex_limited: bool,
     pub(super) classic_limited: bool,
@@ -1253,10 +1253,7 @@ impl TransactionQueue {
         let store = self.store.read();
         store
             .values()
-            .map(|qt| crate::tx_set_utils::HashedTx {
-                hash: qt.hash,
-                envelope: qt.envelope.clone(),
-            })
+            .map(|qt| crate::tx_set_utils::HashedTx::from_prehashed(qt.hash, qt.envelope.clone()))
             .collect()
     }
 
@@ -3690,7 +3687,7 @@ mod tests {
         } = queue.select_transactions(1000);
         assert!(classic_limited);
         assert_eq!(transactions.len(), 1);
-        assert_eq!(envelope_fee(&transactions[0]), 400);
+        assert_eq!(envelope_fee(transactions[0].envelope()), 400);
     }
 
     #[test]
@@ -4541,7 +4538,7 @@ mod tests {
         } = queue.select_transactions(1000);
         assert!(soroban_limited);
         assert_eq!(transactions.len(), 1);
-        assert_eq!(envelope_fee(&transactions[0]), 12000);
+        assert_eq!(envelope_fee(transactions[0].envelope()), 12000);
     }
 
     #[test]
@@ -4567,7 +4564,7 @@ mod tests {
         } = queue.select_transactions(1000);
         assert!(soroban_limited);
         assert_eq!(transactions.len(), 1);
-        assert_eq!(envelope_fee(&transactions[0]), 12000);
+        assert_eq!(envelope_fee(transactions[0].envelope()), 12000);
     }
 
     #[test]
@@ -4588,8 +4585,8 @@ mod tests {
 
         let SelectedTxs { transactions, .. } = queue.select_transactions(1000);
         assert_eq!(transactions.len(), 2);
-        let key_a = account_key(&transactions[0]);
-        let key_b = account_key(&transactions[1]);
+        let key_a = account_key(transactions[0].envelope());
+        let key_b = account_key(transactions[1].envelope());
         assert!(key_a < key_b);
     }
 

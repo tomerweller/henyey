@@ -15,6 +15,7 @@
 //!    with the fewest stages that achieves >= 99.9% of the maximum total
 //!    inclusion fee.
 
+use crate::tx_set_utils::HashedTx;
 use henyey_common::types::Hash256;
 use stellar_xdr::curr::{
     DependentTxCluster, GeneralizedTransactionSet, Hash, LedgerKey, Limits,
@@ -444,18 +445,17 @@ fn soroban_data_from_envelope(
 /// - One reads and the other writes the same key (RO-RW conflict)
 ///
 /// RO-RO does NOT create a conflict.
-fn detect_conflicts(txs: &[TransactionEnvelope]) -> Vec<BitSet> {
+fn detect_conflicts(txs: &[HashedTx]) -> Vec<BitSet> {
     let n = txs.len();
     let mut conflicts: Vec<BitSet> = (0..n).map(|_| BitSet::with_capacity(n)).collect();
 
-    // Build key-to-txs maps: which transactions touch each key as RO or RW.
     let mut ro_key_txs: std::collections::HashMap<Vec<u8>, Vec<usize>> =
         std::collections::HashMap::new();
     let mut rw_key_txs: std::collections::HashMap<Vec<u8>, Vec<usize>> =
         std::collections::HashMap::new();
 
-    for (tx_id, tx) in txs.iter().enumerate() {
-        if let Some(data) = soroban_data_from_envelope(tx) {
+    for (tx_id, htx) in txs.iter().enumerate() {
+        if let Some(data) = soroban_data_from_envelope(htx.envelope()) {
             for key in data.resources.footprint.read_only.iter() {
                 let kb = ledger_key_bytes(key);
                 ro_key_txs.entry(kb).or_default().push(tx_id);
@@ -510,7 +510,7 @@ fn tx_inclusion_fee(tx: &TransactionEnvelope) -> i64 {
 ///
 /// Returns (stages, total_inclusion_fee) where stages[i][j] = cluster j of stage i.
 fn build_with_stage_count(
-    txs: &[TransactionEnvelope],
+    txs: &[HashedTx],
     ledger_max_instructions: i64,
     ledger_max_dependent_tx_clusters: u32,
     stage_count: u32,
@@ -523,7 +523,7 @@ fn build_with_stage_count(
     // full TransactionFrame objects (which would clone each envelope).
     let builder_txs: Vec<BuilderTx> = (0..n)
         .map(|id| {
-            let instructions = soroban_data_from_envelope(&txs[id])
+            let instructions = soroban_data_from_envelope(txs[id].envelope())
                 .map(|d| d.resources.instructions)
                 .unwrap_or(0);
             BuilderTx {
@@ -540,17 +540,15 @@ fn build_with_stage_count(
     // broken by transaction hash (ascending) for determinism.
     let mut sorted_ids: Vec<usize> = (0..n).collect();
     sorted_ids.sort_by(|&a, &b| {
-        let a_fee = tx_inclusion_fee(&txs[a]);
-        let b_fee = tx_inclusion_fee(&txs[b]);
-        let a_ops = (crate::tx_set_utils::envelope_num_ops(&txs[a]) as u32).max(1);
-        let b_ops = (crate::tx_set_utils::envelope_num_ops(&txs[b]) as u32).max(1);
+        let a_fee = tx_inclusion_fee(txs[a].envelope());
+        let b_fee = tx_inclusion_fee(txs[b].envelope());
+        let a_ops = (crate::tx_set_utils::envelope_num_ops(txs[a].envelope()) as u32).max(1);
+        let b_ops = (crate::tx_set_utils::envelope_num_ops(txs[b].envelope()) as u32).max(1);
         // Descending fee rate: compare b vs a
         match crate::tx_queue::fee_rate_cmp(b_fee, b_ops, a_fee, a_ops) {
             std::cmp::Ordering::Equal => {
-                // Ascending hash for determinism
-                let a_hash = Hash256::hash_xdr(&txs[a]);
-                let b_hash = Hash256::hash_xdr(&txs[b]);
-                a_hash.0.cmp(&b_hash.0)
+                // Use precomputed hashes for determinism
+                txs[a].hash().0.cmp(&txs[b].hash().0)
             }
             other => other,
         }
@@ -579,8 +577,8 @@ fn build_with_stage_count(
             }
         }
         if added {
-            // Saturate to prevent wrapping on adversarial fee values.
-            total_inclusion_fee = total_inclusion_fee.saturating_add(tx_inclusion_fee(&txs[tx_id]));
+            total_inclusion_fee =
+                total_inclusion_fee.saturating_add(tx_inclusion_fee(txs[tx_id].envelope()));
         }
         // If not added to any stage, the TX is dropped (doesn't fit).
     }
@@ -635,12 +633,12 @@ const MAX_INCLUSION_FEE_TOLERANCE: f64 = 0.999;
 /// - Whether any transactions were dropped (didn't fit any stage/cluster).
 ///   Matches stellar-core's `hadTxNotFittingLane` feedback.
 pub fn build_parallel_soroban_phase(
-    mut soroban_txs: Vec<TransactionEnvelope>,
+    soroban_txs: Vec<HashedTx>,
     ledger_max_instructions: i64,
     ledger_max_dependent_tx_clusters: u32,
     min_stage_count: u32,
     max_stage_count: u32,
-) -> (Vec<Vec<Vec<TransactionEnvelope>>>, bool) {
+) -> (Vec<Vec<Vec<HashedTx>>>, bool) {
     if soroban_txs.is_empty() {
         return (Vec::new(), false);
     }
@@ -689,8 +687,8 @@ pub fn build_parallel_soroban_phase(
         .sum();
     let had_tx_not_fitting = surviving_count < soroban_txs.len();
 
-    // Convert ID-based stages to envelope-based by moving from the owned Vec.
-    // Use a sentinel (default envelope) for taken slots to avoid Option overhead.
+    // Convert ID-based stages to HashedTx-based by moving from the owned Vec.
+    let mut slots: Vec<Option<HashedTx>> = soroban_txs.into_iter().map(Some).collect();
     let stages = best_ids
         .into_iter()
         .map(|stage| {
@@ -699,7 +697,7 @@ pub fn build_parallel_soroban_phase(
                 .map(|cluster| {
                     cluster
                         .into_iter()
-                        .map(|id| std::mem::take(&mut soroban_txs[id]))
+                        .map(|id| slots[id].take().expect("tx taken twice"))
                         .collect()
                 })
                 .collect()
@@ -716,30 +714,29 @@ pub fn build_parallel_soroban_phase(
 /// 2. Clusters within each stage sorted by first-TX hash (ascending).
 /// 3. Stages sorted by first-TX-of-first-cluster hash (ascending).
 pub fn stages_to_xdr_phase(
-    stages: Vec<Vec<Vec<TransactionEnvelope>>>,
+    stages: Vec<Vec<Vec<HashedTx>>>,
     base_fee: Option<i64>,
 ) -> TransactionPhase {
-    let mut sorted_stages: Vec<Vec<Vec<TransactionEnvelope>>> = stages
+    // Sort using precomputed hashes, then extract envelopes for XDR.
+    let mut sorted_stages: Vec<Vec<Vec<HashedTx>>> = stages
         .into_iter()
         .map(|stage| {
-            let mut sorted_clusters: Vec<Vec<TransactionEnvelope>> = stage
+            let mut sorted_clusters: Vec<Vec<HashedTx>> = stage
                 .into_iter()
                 .map(|mut cluster| {
                     // 1. Sort transactions within each cluster by hash.
-                    // Pre-compute hashes to avoid redundant XDR serialization
-                    // during comparisons (O(N log N) comparisons → O(N) hashes).
-                    cluster.sort_by_cached_key(|tx| Hash256::hash_xdr(tx).0);
+                    cluster.sort_by_key(|htx| htx.hash().0);
                     cluster
                 })
                 .collect();
             // 2. Sort clusters within each stage by first-TX hash
-            sorted_clusters.sort_by_cached_key(|cluster| Hash256::hash_xdr(&cluster[0]).0);
+            sorted_clusters.sort_by_key(|cluster| cluster[0].hash().0);
             sorted_clusters
         })
         .collect();
 
     // 3. Sort stages by first-TX-of-first-cluster hash
-    sorted_stages.sort_by_cached_key(|stage| Hash256::hash_xdr(&stage[0][0]).0);
+    sorted_stages.sort_by_key(|stage| stage[0][0].hash().0);
 
     let execution_stages: Vec<ParallelTxExecutionStage> = sorted_stages
         .into_iter()
@@ -747,7 +744,13 @@ pub fn stages_to_xdr_phase(
             let clusters: Vec<DependentTxCluster> = stage
                 .into_iter()
                 .map(|cluster| {
-                    DependentTxCluster(cluster.try_into().expect("cluster exceeds XDR VecM limit"))
+                    let envelopes: Vec<TransactionEnvelope> =
+                        cluster.into_iter().map(|htx| htx.into_envelope()).collect();
+                    DependentTxCluster(
+                        envelopes
+                            .try_into()
+                            .expect("cluster exceeds XDR VecM limit"),
+                    )
                 })
                 .collect();
             ParallelTxExecutionStage(clusters.try_into().expect("stage exceeds XDR VecM limit"))
@@ -866,6 +869,29 @@ pub fn build_two_phase_tx_set(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+fn to_hashed(txs: Vec<TransactionEnvelope>) -> Vec<HashedTx> {
+    txs.into_iter().map(HashedTx::new).collect()
+}
+
+#[cfg(test)]
+fn to_hashed_slice(txs: &[TransactionEnvelope]) -> Vec<HashedTx> {
+    txs.iter().map(|tx| HashedTx::new(tx.clone())).collect()
+}
+
+#[cfg(test)]
+fn to_hashed_stages(stages: Vec<Vec<Vec<TransactionEnvelope>>>) -> Vec<Vec<Vec<HashedTx>>> {
+    stages
+        .into_iter()
+        .map(|stage| {
+            stage
+                .into_iter()
+                .map(|cluster| to_hashed(cluster))
+                .collect()
+        })
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use stellar_xdr::curr::{
@@ -957,6 +983,8 @@ mod tests {
         })
     }
 
+    // ---- Helpers ----
+
     // ---- BitSet tests ----
 
     #[test]
@@ -1010,7 +1038,7 @@ mod tests {
         let key_b = contract_key(2);
         let tx_a = make_soroban_tx(1, 1, vec![], vec![key_a], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key_b], 1000);
-        let conflicts = detect_conflicts(&[tx_a, tx_b]);
+        let conflicts = detect_conflicts(&to_hashed_slice(&[tx_a, tx_b]));
         assert!(!conflicts[0].get(1));
         assert!(!conflicts[1].get(0));
     }
@@ -1020,7 +1048,7 @@ mod tests {
         let key = contract_key(1);
         let tx_a = make_soroban_tx(1, 1, vec![], vec![key.clone()], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key], 1000);
-        let conflicts = detect_conflicts(&[tx_a, tx_b]);
+        let conflicts = detect_conflicts(&to_hashed_slice(&[tx_a, tx_b]));
         assert!(conflicts[0].get(1));
         assert!(conflicts[1].get(0));
     }
@@ -1030,7 +1058,7 @@ mod tests {
         let key = contract_key(1);
         let tx_a = make_soroban_tx(1, 1, vec![key.clone()], vec![], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key], 1000);
-        let conflicts = detect_conflicts(&[tx_a, tx_b]);
+        let conflicts = detect_conflicts(&to_hashed_slice(&[tx_a, tx_b]));
         assert!(conflicts[0].get(1));
         assert!(conflicts[1].get(0));
     }
@@ -1040,7 +1068,7 @@ mod tests {
         let key = contract_key(1);
         let tx_a = make_soroban_tx(1, 1, vec![key.clone()], vec![], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![key], vec![], 1000);
-        let conflicts = detect_conflicts(&[tx_a, tx_b]);
+        let conflicts = detect_conflicts(&to_hashed_slice(&[tx_a, tx_b]));
         assert!(!conflicts[0].get(1));
         assert!(!conflicts[1].get(0));
     }
@@ -1057,7 +1085,7 @@ mod tests {
         let tx_c = make_soroban_tx(3, 1, vec![], vec![key2], 1000);
 
         let stages = build_parallel_soroban_phase(
-            vec![tx_a, tx_b, tx_c],
+            to_hashed(vec![tx_a, tx_b, tx_c]),
             100_000, // ledger max instructions
             8,       // clusters per stage
             1,
@@ -1081,7 +1109,7 @@ mod tests {
         let tx_a = make_soroban_tx(1, 1, vec![], vec![key1], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key2], 1000);
 
-        let stages = build_parallel_soroban_phase(vec![tx_a, tx_b], 100_000, 8, 1, 1).0;
+        let stages = build_parallel_soroban_phase(to_hashed(vec![tx_a, tx_b]), 100_000, 8, 1, 1).0;
 
         // No conflicts: both TXs fit in the same bin (execution thread)
         assert_eq!(stages.len(), 1);
@@ -1102,7 +1130,7 @@ mod tests {
 
         // With 1 stage and 1 cluster: stage limit = 100k, only 1 TX fits
         let stages = build_parallel_soroban_phase(
-            vec![tx_a.clone(), tx_b.clone()],
+            to_hashed(vec![tx_a.clone(), tx_b.clone()]),
             100_000,
             1, // only 1 cluster per stage
             1,
@@ -1116,7 +1144,7 @@ mod tests {
         // With 2 stages and 1 cluster each: instructions_per_cluster = 100k/2 = 50k
         // Each TX is 60k > 50k, so neither fits. Use higher ledger max instead.
         // ledger_max=120k, 2 stages, 1 cluster each: cluster limit = 60k, stage limit = 60k.
-        let stages = build_parallel_soroban_phase(vec![tx_a, tx_b], 120_000, 1, 2, 2).0;
+        let stages = build_parallel_soroban_phase(to_hashed(vec![tx_a, tx_b]), 120_000, 1, 2, 2).0;
 
         let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 2);
@@ -1131,7 +1159,7 @@ mod tests {
             make_soroban_tx_with_fees(2, 1, vec![], vec![contract_key(2)], 60_000, 800, 0);
 
         let (stages, total_inclusion_fee) = build_with_stage_count(
-            &[tx_low_inclusion.clone(), tx_high_inclusion.clone()],
+            &to_hashed_slice(&[tx_low_inclusion.clone(), tx_high_inclusion.clone()]),
             100_000,
             1,
             1,
@@ -1179,7 +1207,8 @@ mod tests {
 
         // Only room for 1 tx (instruction limit). Per-op rate ordering should
         // pick tx_normal (rate=800) over fee_bump (rate=500).
-        let (stages, _) = build_with_stage_count(&[fee_bump, tx_normal], 100_000, 1, 1);
+        let (stages, _) =
+            build_with_stage_count(&to_hashed_slice(&[fee_bump, tx_normal]), 100_000, 1, 1);
 
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].len(), 1);
@@ -1301,7 +1330,7 @@ mod tests {
 
     #[test]
     fn test_empty_input() {
-        let (stages, had_drop) = build_parallel_soroban_phase(vec![], 100_000, 8, 1, 4);
+        let (stages, had_drop) = build_parallel_soroban_phase(to_hashed(vec![]), 100_000, 8, 1, 4);
         assert!(stages.is_empty());
         assert!(!had_drop);
     }
@@ -1317,7 +1346,7 @@ mod tests {
             })
             .collect();
 
-        let stages = build_parallel_soroban_phase(txs, 1_000_000, 8, 1, 4).0;
+        let stages = build_parallel_soroban_phase(to_hashed(txs), 1_000_000, 8, 1, 4).0;
 
         // Should use 1 stage since all fit
         assert_eq!(stages.len(), 1);
@@ -1330,7 +1359,7 @@ mod tests {
         let key = contract_key(1);
         let tx = make_soroban_tx(1, 1, vec![], vec![key], 1000);
         let stages = vec![vec![vec![tx]]];
-        let phase = stages_to_xdr_phase(stages, Some(100));
+        let phase = stages_to_xdr_phase(to_hashed_stages(stages), Some(100));
 
         match phase {
             TransactionPhase::V1(parallel) => {
@@ -1354,7 +1383,7 @@ mod tests {
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key2], 60_000);
 
         let (stages, had_tx_not_fitting) = build_parallel_soroban_phase(
-            vec![tx_a, tx_b],
+            to_hashed(vec![tx_a, tx_b]),
             100_000,
             1, // 1 cluster per stage
             1,
@@ -1378,7 +1407,7 @@ mod tests {
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key2], 1_000);
 
         let (stages, had_tx_not_fitting) =
-            build_parallel_soroban_phase(vec![tx_a, tx_b], 1_000_000, 8, 1, 1);
+            build_parallel_soroban_phase(to_hashed(vec![tx_a, tx_b]), 1_000_000, 8, 1, 1);
 
         let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 2);
@@ -1612,7 +1641,8 @@ mod tests {
         let tx2 =
             make_fee_bump_soroban_tx(2, 1, vec![], vec![contract_key(2)], 50_000, i64::MAX, 0);
 
-        let (stages, total_inclusion_fee) = build_with_stage_count(&[tx1, tx2], 200_000, 4, 1);
+        let (stages, total_inclusion_fee) =
+            build_with_stage_count(&to_hashed_slice(&[tx1, tx2]), 200_000, 4, 1);
 
         // Both txs should be added (enough instruction budget).
         let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
@@ -1638,7 +1668,7 @@ mod tests {
         // Try stage counts 1..=2. Both should fit all txs and produce
         // saturated fee totals. The builder should prefer fewer stages.
         let (stages, had_not_fitting) =
-            build_parallel_soroban_phase(vec![tx1, tx2], 200_000, 4, 1, 2);
+            build_parallel_soroban_phase(to_hashed(vec![tx1, tx2]), 200_000, 4, 1, 2);
 
         assert!(!had_not_fitting, "all txs should fit");
         assert!(!stages.is_empty(), "should produce at least one stage");
@@ -1663,7 +1693,13 @@ mod tests {
             make_soroban_tx_with_fees(2, 1, vec![], vec![contract_key(2)], 10_000, 1000, 100);
 
         // This should panic because the sort encounters a negative inclusion fee.
-        build_parallel_soroban_phase(vec![negative_fee_tx, normal_tx], 100_000, 8, 1, 1);
+        build_parallel_soroban_phase(
+            to_hashed(vec![negative_fee_tx, normal_tx]),
+            100_000,
+            8,
+            1,
+            1,
+        );
     }
 }
 
@@ -1752,7 +1788,7 @@ mod stages_to_xdr_phase_tests {
         let tx_c = make_soroban_tx(30, 1, vec![], vec![contract_key(30)], 1000);
 
         let stages = vec![vec![vec![tx_c.clone(), tx_a.clone(), tx_b.clone()]]];
-        let phase = stages_to_xdr_phase(stages, Some(100));
+        let phase = stages_to_xdr_phase(to_hashed_stages(stages), Some(100));
 
         match phase {
             TransactionPhase::V1(parallel) => {
@@ -1778,7 +1814,7 @@ mod stages_to_xdr_phase_tests {
         let tx_b = make_soroban_tx(20, 1, vec![], vec![contract_key(20)], 1000);
 
         let stages = vec![vec![vec![tx_b.clone()], vec![tx_a.clone()]]];
-        let phase = stages_to_xdr_phase(stages, Some(100));
+        let phase = stages_to_xdr_phase(to_hashed_stages(stages), Some(100));
 
         match phase {
             TransactionPhase::V1(parallel) => {
@@ -1804,7 +1840,7 @@ mod stages_to_xdr_phase_tests {
 
         // Put stages in reverse order to test sorting
         let stages = vec![vec![vec![tx_b.clone()]], vec![vec![tx_a.clone()]]];
-        let phase = stages_to_xdr_phase(stages, Some(100));
+        let phase = stages_to_xdr_phase(to_hashed_stages(stages), Some(100));
 
         match phase {
             TransactionPhase::V1(parallel) => {
@@ -1832,7 +1868,7 @@ mod stages_to_xdr_phase_tests {
         let tx4 = make_soroban_tx(4, 1, vec![], vec![contract_key(4)], 1000);
 
         let stages = vec![vec![vec![tx1, tx2], vec![tx3]], vec![vec![tx4]]];
-        let phase = stages_to_xdr_phase(stages, Some(200));
+        let phase = stages_to_xdr_phase(to_hashed_stages(stages), Some(200));
 
         match phase {
             TransactionPhase::V1(parallel) => {
@@ -1880,7 +1916,7 @@ mod stages_to_xdr_phase_tests {
     fn test_stages_to_xdr_phase_none_base_fee() {
         let tx = make_soroban_tx(1, 1, vec![], vec![contract_key(1)], 1000);
         let stages = vec![vec![vec![tx]]];
-        let phase = stages_to_xdr_phase(stages, None);
+        let phase = stages_to_xdr_phase(to_hashed_stages(stages), None);
 
         match phase {
             TransactionPhase::V1(parallel) => {
@@ -1898,7 +1934,7 @@ mod stages_to_xdr_phase_tests {
         let tx_c = make_soroban_tx(30, 1, vec![], vec![contract_key(30)], 1000);
 
         let stages = vec![vec![vec![tx_c, tx_a, tx_b]]];
-        let phase1 = stages_to_xdr_phase(stages.clone(), Some(100));
+        let phase1 = stages_to_xdr_phase(to_hashed_stages(stages.clone()), Some(100));
 
         // Extract the TXs back from phase1 and feed them in again
         let extracted_txs = match &phase1 {
@@ -1906,7 +1942,7 @@ mod stages_to_xdr_phase_tests {
             _ => panic!("Expected V1"),
         };
         let stages2 = vec![vec![extracted_txs]];
-        let phase2 = stages_to_xdr_phase(stages2, Some(100));
+        let phase2 = stages_to_xdr_phase(to_hashed_stages(stages2), Some(100));
 
         // Both phases should produce the same XDR
         let xdr1 = phase1.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
@@ -2029,7 +2065,7 @@ mod stellar_core_parity_tests {
 
     /// Verify uniform shape: all stages have same cluster count, all clusters same TX count.
     fn validate_shape(
-        stages: &[Vec<Vec<TransactionEnvelope>>],
+        stages: &[Vec<Vec<HashedTx>>],
         expected_stages: usize,
         expected_clusters_per_stage: usize,
         expected_txs_per_cluster: usize,
@@ -2065,7 +2101,7 @@ mod stellar_core_parity_tests {
     }
 
     /// Compute base fee from builder output. Matches selection.rs:compute_soroban_base_fee logic.
-    fn compute_base_fee(stages: &[Vec<Vec<TransactionEnvelope>>], had_tx_not_fitting: bool) -> i64 {
+    fn compute_base_fee(stages: &[Vec<Vec<HashedTx>>], had_tx_not_fitting: bool) -> i64 {
         if !had_tx_not_fitting {
             return LEDGER_BASE_FEE;
         }
@@ -2073,7 +2109,7 @@ mod stellar_core_parity_tests {
             .iter()
             .flat_map(|s| s.iter())
             .flat_map(|c| c.iter())
-            .map(|tx| crate::tx_set_utils::envelope_inclusion_fee(tx))
+            .map(|tx| crate::tx_set_utils::envelope_inclusion_fee(tx.envelope()))
             .min()
             .unwrap_or(LEDGER_BASE_FEE)
     }
@@ -2114,8 +2150,13 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) =
-                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                to_hashed(txs),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
 
             if variable {
                 // With variable stages: 1 stage, 2 clusters (bin-packed), 4 txs each
@@ -2150,8 +2191,13 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) =
-                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                to_hashed(txs),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
 
             if variable {
                 validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
@@ -2179,8 +2225,13 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) =
-                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                to_hashed(txs),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
 
             if variable {
                 validate_shape(
@@ -2213,8 +2264,13 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) =
-                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                to_hashed(txs),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
 
             if variable {
                 validate_shape(
@@ -2256,8 +2312,13 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) =
-                build_parallel_soroban_phase(txs, ledger_max_instructions, CLUSTER_COUNT, min, max);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                to_hashed(txs),
+                ledger_max_instructions,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
 
             if variable {
                 validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
@@ -2294,8 +2355,13 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) =
-                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                to_hashed(txs),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
 
             if variable {
                 validate_shape(&stages, 1, 1, STAGE_COUNT as usize);
@@ -2323,7 +2389,7 @@ mod stellar_core_parity_tests {
 
             // Chain of conflicts always produces STAGE_COUNT stages regardless of min
             let (stages, _had_drop) = build_parallel_soroban_phase(
-                txs,
+                to_hashed(txs),
                 LEDGER_MAX_INSTRUCTIONS,
                 CLUSTER_COUNT,
                 1,
@@ -2354,8 +2420,13 @@ mod stellar_core_parity_tests {
             }
 
             let (min, max) = stage_range(variable);
-            let (stages, _had_drop) =
-                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
+            let (stages, _had_drop) = build_parallel_soroban_phase(
+                to_hashed(txs),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
 
             if variable {
                 validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
@@ -2386,8 +2457,13 @@ mod stellar_core_parity_tests {
             }
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) =
-                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                to_hashed(txs),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
 
             if variable {
                 validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
@@ -2445,8 +2521,13 @@ mod stellar_core_parity_tests {
             }
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) =
-                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                to_hashed(txs),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
 
             if variable {
                 validate_shape(
@@ -2483,7 +2564,7 @@ mod stellar_core_parity_tests {
 
             // Both variable and fixed produce the same shape here
             let (stages, _had_drop) = build_parallel_soroban_phase(
-                txs,
+                to_hashed(txs),
                 LEDGER_MAX_INSTRUCTIONS,
                 CLUSTER_COUNT,
                 1,
@@ -2522,8 +2603,13 @@ mod stellar_core_parity_tests {
             }
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) =
-                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
+            let (stages, had_drop) = build_parallel_soroban_phase(
+                to_hashed(txs),
+                LEDGER_MAX_INSTRUCTIONS,
+                CLUSTER_COUNT,
+                min,
+                max,
+            );
 
             // Custom shape assertion: one stage has the high-fee TX alone,
             // other stages have CLUSTER_COUNT clusters of small TXs.
@@ -2559,8 +2645,8 @@ mod stellar_core_parity_tests {
 
     /// Extract the RO and RW ledger key sets from a transaction envelope's
     /// Soroban footprint, serialized to bytes for set operations.
-    fn extract_footprint_keys(tx: &TransactionEnvelope) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-        let data = match tx {
+    fn extract_footprint_keys(tx: &HashedTx) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let data = match tx.envelope() {
             TransactionEnvelope::Tx(env) => match &env.tx.ext {
                 TransactionExt::V1(d) => d,
                 _ => return (vec![], vec![]),
@@ -2585,8 +2671,8 @@ mod stellar_core_parity_tests {
     }
 
     /// Extract instruction count from a transaction envelope.
-    fn extract_instructions(tx: &TransactionEnvelope) -> u64 {
-        match tx {
+    fn extract_instructions(tx: &HashedTx) -> u64 {
+        match tx.envelope() {
             TransactionEnvelope::Tx(env) => match &env.tx.ext {
                 TransactionExt::V1(d) => d.resources.instructions as u64,
                 _ => 0,
@@ -2596,7 +2682,7 @@ mod stellar_core_parity_tests {
     }
 
     /// Verify no two clusters within a stage have RW-RW or RO-RW footprint conflicts.
-    fn assert_no_intra_stage_conflicts(stages: &[Vec<Vec<TransactionEnvelope>>], context: &str) {
+    fn assert_no_intra_stage_conflicts(stages: &[Vec<Vec<HashedTx>>], context: &str) {
         use std::collections::HashSet;
 
         for (si, stage) in stages.iter().enumerate() {
@@ -2718,7 +2804,7 @@ mod stellar_core_parity_tests {
                 let ctx = format!("seed={seed}, iter={iter}, mode={mode}");
 
                 let (stages, had_drop) = build_parallel_soroban_phase(
-                    txs.clone(),
+                    to_hashed(txs.clone()),
                     LEDGER_MAX_INSTRUCTIONS,
                     CLUSTER_COUNT,
                     min_stages,
@@ -2775,7 +2861,7 @@ mod stellar_core_parity_tests {
                 for stage in &stages {
                     for cluster in stage {
                         for tx in cluster {
-                            let h = Hash256::hash_xdr(tx).0;
+                            let h = tx.hash().0;
                             assert!(
                                 input_hashes.contains(&h),
                                 "{ctx}: output TX not found in input set"
