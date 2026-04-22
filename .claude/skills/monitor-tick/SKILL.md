@@ -160,13 +160,13 @@ If the API errors out, emit `obsrvr: N/A (api-error)` instead of omitting the fi
 - `stellar_herder_lost_sync_total` ≥1 → SYNC
 - `henyey_post_catchup_hard_reset_total` ≥1 → ACTION
 - `henyey_recovery_stalled_tick_total` ≥5 → WARN
-- `stellar_herder_pending_too_old_total` ≥100 → WARN
 - `(stellar_overlay_timeout_idle_total + stellar_overlay_timeout_straggler_total)` ≥5× prior-tick-sum → WARN
 - `(stellar_overlay_error_read_total + stellar_overlay_error_write_total)` ≥50 → WARN
 - `henyey_archive_cache_refresh_error_total` ≥1 → NONC
 - `henyey_archive_cache_refresh_timeout_total` ≥3 → NONC
 
-`stellar_ledger_apply_failure_total` and `henyey_scp_post_verify_drops_total` are
+`stellar_ledger_apply_failure_total`, `henyey_scp_post_verify_drops_total`, and
+`stellar_herder_pending_too_old_total` are
 **no longer checked as absolute-delta counters** — they are covered by the ratio
 checks below, which are traffic-proportional and self-calibrating.
 
@@ -212,13 +212,15 @@ Mean check (`sum_delta / count_delta`) is a cheaper fallback — fire on whichev
 
 ### Ratio checks — sustained breach detection
 
-Two ratio-based checks replace the former absolute-delta thresholds for
-`stellar_ledger_apply_failure_total` and `henyey_scp_post_verify_drops_total`.
+Three ratio-based checks replace the former absolute-delta thresholds for
+`stellar_ledger_apply_failure_total`, `henyey_scp_post_verify_drops_total`,
+and `stellar_herder_pending_too_old_total`.
 These fire only after **3 consecutive ticks** of threshold breach, avoiding
 transient spikes.
 
-**Required inputs** (all must be present, non-empty, numeric; if any missing
-or invalid, skip ratio checks entirely, empty the ratio snapshot, reset streaks):
+**Required inputs** — global (all must be present, non-empty, numeric; if any
+missing or invalid, skip ratio checks entirely, empty the ratio snapshot,
+reset streaks):
 
 1. `stellar_ledger_age_current_seconds` — sync gating
 2. `stellar_ledger_apply_success_total`
@@ -226,6 +228,13 @@ or invalid, skip ratio checks entirely, empty the ratio snapshot, reset streaks)
 4. `henyey_scp_post_verify_total{reason="accepted"}`
 5. `henyey_scp_post_verify_total{reason="processed_directly"}`
 6. Sum of all 13 `henyey_scp_post_verify_total{reason="..."}` lines (`pv_total_sum`)
+
+**Per-check required inputs** — these are NOT part of the global required set.
+If missing, only the pending check (Check 3) skips; SCP and apply proceed
+normally:
+
+7. `stellar_herder_pending_too_old_total`
+8. `stellar_herder_pending_received_total`
 
 **Post-verify label-set validation:** After extracting the 13
 `henyey_scp_post_verify_total{reason="..."}` lines, validate that the exact set
@@ -235,7 +244,7 @@ of reason labels is: `invalid_sig`, `panic`, `drift_range`, `drift_close_time`,
 missing or unexpected labels appear, treat as missing counters (partial scrape
 or label change).
 
-**Skip conditions** (skip both ratio checks when any is true):
+**Skip conditions** (skip all ratio checks when any is true):
 - `FRESH_START=yes`
 - Heartbeat gap > 5
 - `stellar_ledger_age_current_seconds > 30`
@@ -246,7 +255,7 @@ or label change).
 - Post-verify label set ≠ expected 13 labels
 
 On any skip: **empty** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot`,
-reset both streak counters to 0, report `metrics_ratio: skipped (<reason>)`.
+reset all streak counters to 0, report `metrics_ratio: skipped (<reason>)`.
 
 **Snapshot file:** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot`
 
@@ -263,6 +272,9 @@ pv_processed_directly=<value>
 pv_total_sum=<value>
 apply_breach_streak=<N>
 scp_breach_streak=<N>
+pending_too_old=<value>
+pending_received=<value>
+pending_breach_streak=<N>
 ```
 
 **Process identity:** `start_ticks` = field 22 from `/proc/$PID/stat` (starttime
@@ -311,12 +323,23 @@ fi
 
 pv_total_sum=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="[^"]+"\} ' | awk '{sum+=$2} END {printf "%d", sum}')
 
-# Validate all 6 values present and numeric — STOP if any invalid
+# Validate all 6 global values present and numeric — STOP if any invalid
 for v in "$ledger_age" "$apply_success" "$apply_failure" "$pv_accepted" "$pv_processed" "$pv_total_sum"; do
   if [ -z "$v" ] || ! echo "$v" | grep -qE '^[0-9]+$'; then
     > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
     # report: metrics_ratio: skipped (missing counters)
     # STOP
+  fi
+done
+
+# Per-check inputs for pending (Check 3) — if missing, only Check 3 skips
+pending_too_old=$(echo "$metrics_body" | grep -E '^stellar_herder_pending_too_old_total ' | awk '{printf "%d", $2}')
+pending_received=$(echo "$metrics_body" | grep -E '^stellar_herder_pending_received_total ' | awk '{printf "%d", $2}')
+pending_counters_valid=true
+for v in "$pending_too_old" "$pending_received"; do
+  if [ -z "$v" ] || ! echo "$v" | grep -qE '^[0-9]+$'; then
+    pending_counters_valid=false
+    break
   fi
 done
 ```
@@ -341,13 +364,25 @@ done
   If expected bad-tx traffic (spam wave, known rejections), report as WARNING without filing.
 - **On healthy tick** (ratio ≤ 0.50 with sufficient volume): reset `apply_breach_streak` to 0.
 
+**Check 3: Pending too-old rate**
+- Numerator delta: `delta(pending_too_old)`
+- Denominator delta: `delta(pending_received)`
+- Alert: `(numerator / denominator) > 0.50` (over 50% too old) for 3 consecutive ticks
+- Min denominator delta: 100 (below → `pending: skipped (low volume)`, reset pending streak)
+- **Per-check skip:** If `pending_counters_valid` is false (missing counters), skip this check
+  only — report `pending: skipped (missing counters)`, reset `pending_breach_streak` to 0.
+  SCP and apply checks proceed normally.
+- On breach: increment `pending_breach_streak`. If streak ≥ 3, report as WARNING
+  (overlay lag or stale-envelope flood). Investigate overlay peer health and slot progression.
+- **On healthy tick** (ratio ≤ 0.50 with sufficient volume): reset `pending_breach_streak` to 0.
+
 **Per-check state machine** (each check independently):
 - **Skip** (global skip, low volume, or missing data) → reset that check's streak to 0
 - **Healthy** (ratio within threshold, sufficient volume) → reset streak to 0
 - **Breach** (ratio exceeds threshold, sufficient volume) → increment streak
 
 **Per-check low-volume:** When only one check's denominator delta is below its
-minimum, that check skips (streak resets to 0) and the other proceeds normally.
+minimum, that check skips (streak resets to 0) and the others proceed normally.
 
 **Thresholds are provisional** — tune after 1-2 weeks of production data.
 
@@ -356,19 +391,20 @@ minimum, that check skips (streak resets to 0) and the other proceeds normally.
 
 **Rendering precedence** (determines the `metrics_ratio:` line format):
 
-1. **Global skip** (both checks skipped for the same reason — e.g., not in sync,
+1. **Global skip** (all checks skipped for the same reason — e.g., not in sync,
    fetch failed, recorder not installed, missing counters, label mismatch):
    Use the collapsed form: `metrics_ratio: skipped (<reason>)`
 2. **Collecting baseline** (no previous snapshot exists — first steady-state tick):
    `metrics_ratio: collecting baseline`
 3. **Per-check reporting** (at least one check ran — whether ok, warning, or
-   individually skipped for low volume):
-   Compose: `metrics_ratio: scp <scp_status>, apply <apply_status>`
+   individually skipped for low volume or missing per-check inputs):
+   Compose: `metrics_ratio: scp <scp_status>, apply <apply_status>, pending <pending_status>`
 
 Examples:
-- Both healthy: `metrics_ratio: scp ok (accept=15%), apply ok (fail=8%)`
-- One warning: `metrics_ratio: scp ok (accept=12%), apply WARNING fail=55%>50% (3 ticks) — investigating`
-- One skipped (low volume): `metrics_ratio: scp skipped (low volume), apply ok (fail=5%)`
+- All healthy: `metrics_ratio: scp ok (accept=15%), apply ok (fail=8%), pending ok (too_old=3%)`
+- One warning: `metrics_ratio: scp ok (accept=12%), apply WARNING fail=55%>50% (3 ticks) — investigating, pending ok (too_old=5%)`
+- One skipped (low volume): `metrics_ratio: scp skipped (low volume), apply ok (fail=5%), pending ok (too_old=2%)`
+- Pending skipped (missing counters): `metrics_ratio: scp ok (accept=15%), apply ok (fail=8%), pending skipped (missing counters)`
 - Global skip: `metrics_ratio: skipped (not in sync)`
 - Collecting: `metrics_ratio: collecting baseline`
 
@@ -398,7 +434,7 @@ For each firing alert:
 
 If `$MONITOR_MODE = watcher`, run check (12) with a reduced catalog: only
 process (open_fds, max_fds), jemalloc, and overlay counters/gauges. Skip
-SCP, quorum, herder_state, and histogram p99 alerts.
+SCP, quorum, herder_state, histogram p99 alerts, and ratio checks.
 
 ## Remote sync & redeploy
 
@@ -522,7 +558,7 @@ MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   rpc:     <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
   obsrvr:  <validating=<Y/N> val24h=<pct>% lag=<N> | N/A (watcher) | N/A (api-error)>
   metrics: <clean | N alerts (<metric1>,<metric2>,...) — filed/commented #<N>,#<M> | N alerts, K suppressed by cooldown>
-  metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating> | collecting baseline
+  metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating>, pending <ok (too_old=Z%) | skipped (reason) | WARNING too_old=Z%>50% (N ticks)> | collecting baseline
   deploy:  <up-to-date | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
   ci:      <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
 ```
