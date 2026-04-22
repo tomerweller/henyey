@@ -680,6 +680,41 @@ Guidelines for deferred-work issues:
 Update the completion comment's "What was deferred" section to include the
 newly created issue links (edit the comment or post a follow-up).
 
+### 5c: Clean Up Per-Issue Build Artifacts
+
+Each invocation of this skill accumulates a per-issue `CARGO_TARGET_DIR`
+at `~/data/pdr-$ISSUE/` (25–50 GB per dir for a full henyey workspace
+build), plus optionally `~/data/pdr-$ISSUE-target/` when the caller used
+that alternate naming. Once the fix has landed on `main` and the issue
+is closed, these caches are stale — the next relevant build comes from
+the monitor-loop rebuilding `main`, not from this target. Leaving them
+behind is the dominant disk-pressure driver on the shared `~/data/`
+volume (observed 68 such dirs totalling ~500 GB on 2026-04-22).
+
+Remove the per-issue build targets for the current and original issue
+numbers (they may differ if blocker-ancestor resolution redirected the
+run):
+
+```bash
+for N in "$ISSUE" "$ORIGINAL_ISSUE"; do
+  [ -n "$N" ] || continue
+  rm -rf "$HOME/data/pdr-$N" 2>/dev/null || true
+  rm -rf "$HOME/data/pdr-$N-target" 2>/dev/null || true
+done
+```
+
+**Do not run this cleanup before Step 5.** The target dir is still
+needed across Step 3 (implementation), Step 4 (review-fix re-compiles),
+and any review-round rebuilds that happen if the worktree was recreated
+in 4b. Only remove the target once the completion comment has been
+posted and the skill is truly done.
+
+**Do not clean up if verification failed and the worktree was left
+in place** (see Step 3f's failure clause). In that case the caller or a
+follow-up invocation needs the cached build to resume, so preserve the
+target dir along with the worktree. Check: if `.claude/worktrees/plan-do-review-$ISSUE/`
+still exists, skip the `rm -rf` above.
+
 Print a summary to the terminal:
 
 ```
