@@ -254,18 +254,16 @@ impl App {
         }
 
         // When the node is essentially caught up (small or zero gap), the
-        // recovery strategy depends on whether we have the EXTERNALIZE for the
-        // very next slot (current_ledger + 1).
+        // recovery strategy is a 4-step decision:
         //
-        // Case 1: Next slot's EXTERNALIZE IS available — we're just waiting for
-        //   its tx_set. Don't request SCP state because peers would respond with
-        //   EXTERNALIZE for older slots whose tx_sets are already evicted from
-        //   their caches (~60-72s window), creating unfulfillable requests.
-        //
-        // Case 2: Next slot's EXTERNALIZE is MISSING — we need to ask peers for
-        //   it immediately. Every 5 seconds the gap grows by 1 slot, and peers
-        //   only cache ~12 slots (~60s). Waiting 60s to escalate guarantees the
-        //   EXTERNALIZE is evicted from peers by the time we ask.
+        //   1. next_slot_missing → request SCP state immediately (peers may
+        //      still have it cached).
+        //   2. fast-track → AtTip/Ahead-no-ext with SCP activity means tx_sets
+        //      are evicted from peers' caches; skip straight to catchup. Fires
+        //      at ANY attempt count (the cumulative scp_total > 0 gate is an
+        //      existing heuristic this code preserves).
+        //   3. low attempts → wait for a fresh EXTERNALIZE.
+        //   4. high attempts → request SCP state despite small gap.
         if relation
             .behind_gap()
             .map_or(true, |g| g <= TX_SET_REQUEST_WINDOW)
@@ -300,9 +298,9 @@ impl App {
             }
 
             if next_slot_missing {
-                // The next slot's EXTERNALIZE was missed (network blip, peer
-                // disconnection, etc.). Request SCP state immediately — peers
-                // should still have it cached if we act quickly.
+                // Step 1: The next slot's EXTERNALIZE was missed (network blip,
+                // peer disconnection, etc.). Request SCP state immediately —
+                // peers should still have it cached if we act quickly.
                 let now_secs = self.start_instant.elapsed().as_secs();
                 if self
                     .recovery_throttles
@@ -327,20 +325,23 @@ impl App {
                     );
                 }
                 // Fall through to the SCP state request below
-            } else if attempts < RECOVERY_ESCALATION_SCP_REQUEST {
-                // Fast-track: If we're receiving SCP messages but none result in
-                // externalization, the tx_sets for our slots are gone from peers'
-                // caches (~60s window). Waiting the full 6 escalation cycles is
-                // futile — skip straight to catchup after 1 recovery cycle.
+            } else {
+                // Step 2: Fast-track — AtTip or Ahead-no-ext with SCP activity.
+                // If we're receiving SCP messages but none result in
+                // externalization, the tx_sets for our slots are gone from
+                // peers' caches (~60s window). Skip straight to catchup.
+                //
+                // Fires at ANY attempt count — the stall evidence
+                // (scp_total > 0) is the gate, not the attempt counter.
                 // This is critical for captive-core following a standalone
-                // validator in quickstart/local mode where the validator closes
-                // ledgers every second.
+                // validator in quickstart/local mode where the validator
+                // closes ledgers every second.
+                //
+                // Note: scp_total is a lifetime cumulative counter, not proof
+                // of recent activity during the current stall. This is an
+                // existing heuristic preserved from the original code; see
+                // follow-up for adding a recent-activity snapshot.
                 let scp_total = self.scp_messages_received.load(Ordering::Relaxed);
-                // Fast-track fires for both AtTip and the Ahead-no-externalization
-                // case. In both scenarios, the node has received SCP messages
-                // but cannot externalize: AtTip because tx_sets are evicted from
-                // peers' caches; Ahead (latest_ext=0) because captive-core does
-                // not participate in SCP consensus.
                 let at_tip_or_ahead_no_ext = matches!(relation, LedgerRelation::AtTip)
                     || relation.is_ahead_without_externalization(latest_externalized);
                 if attempts >= 1 && scp_total > 0 && at_tip_or_ahead_no_ext {
@@ -370,7 +371,7 @@ impl App {
                              fast-tracking catchup (repeated)"
                         );
                     }
-                    // Jump directly to catchup instead of waiting 6 cycles
+                    // Jump directly to catchup
                     self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
                     return self
                         .trigger_recovery_catchup(
@@ -382,16 +383,19 @@ impl App {
                         .await;
                 }
 
-                tracing::debug!(
-                    current_ledger,
-                    latest_externalized,
-                    gap = relation.behind_gap().unwrap_or(0),
-                    attempts,
-                    "Essentially caught up — waiting for fresh EXTERNALIZE"
-                );
-                return None;
-            } else {
-                // Escalation: request SCP state despite small gap
+                // Step 3: Low attempts — wait for a fresh EXTERNALIZE.
+                if attempts < RECOVERY_ESCALATION_SCP_REQUEST {
+                    tracing::debug!(
+                        current_ledger,
+                        latest_externalized,
+                        gap = relation.behind_gap().unwrap_or(0),
+                        attempts,
+                        "Essentially caught up — waiting for fresh EXTERNALIZE"
+                    );
+                    return None;
+                }
+
+                // Step 4: High attempts — request SCP state despite small gap.
                 let now_secs = self.start_instant.elapsed().as_secs();
                 if self
                     .recovery_throttles

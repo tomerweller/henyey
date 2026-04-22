@@ -6896,6 +6896,10 @@ mod tests {
     /// When `latest_externalized > 0` but `< current_ledger`, the node is
     /// ahead of SCP but has previously externalized — this is a transient
     /// state that should resolve via SCP state requests, not catchup.
+    ///
+    /// Note: this test still passes after #1897's restructuring because
+    /// `scp_messages_received=0` prevents the fast-track from firing —
+    /// a fresh App with no SCP activity stays in the wait/escalate path.
     #[tokio::test]
     async fn test_recovery_escalation_skipped_at_tip() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -7054,6 +7058,64 @@ mod tests {
             app.state().await,
             AppState::CatchingUp,
             "fast-track path must transition state to CatchingUp"
+        );
+
+        // Verify catchup_in_progress was NOT left stuck on.
+        assert!(
+            !app.catchup_in_progress.load(Ordering::SeqCst),
+            "catchup_in_progress must not be left set after failed spawn"
+        );
+    }
+
+    /// Regression test for #1897: AtTip fast-track must fire even when
+    /// `attempts >= RECOVERY_ESCALATION_SCP_REQUEST`.
+    ///
+    /// Before the fix, the fast-track was nested inside
+    /// `attempts < RECOVERY_ESCALATION_SCP_REQUEST`, making it unreachable
+    /// once the attempt counter crossed 6. The node would loop forever
+    /// requesting SCP state without escalating to catchup.
+    #[tokio::test]
+    async fn test_recovery_at_tip_high_attempts_fast_tracks_catchup() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // AtTip: current_ledger == latest_externalized (both 0 on fresh App).
+        let current_ledger = 0u32;
+        let latest = app.herder.latest_externalized_slot().unwrap_or(0);
+        assert_eq!(
+            current_ledger as u64, latest,
+            "precondition: node must be at tip"
+        );
+
+        // Seed archive cache so trigger_recovery_catchup can proceed.
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+        app.archive_checkpoint_cache.seed(next_cp + 64);
+
+        // SCP messages received > 0 (existing cumulative heuristic for stall
+        // evidence — the node has been receiving SCP traffic but cannot
+        // externalize).
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+
+        // Pump attempts to exactly RECOVERY_ESCALATION_SCP_REQUEST — the
+        // boundary that gated the fast-track before the fix.
+        app.recovery_attempts_without_progress
+            .store(RECOVERY_ESCALATION_SCP_REQUEST, Ordering::SeqCst);
+        app.recovery_baseline_ledger.store(0, Ordering::SeqCst);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        // Assert: fast-track fires → spawn_catchup sets state to CatchingUp.
+        // spawn_catchup fails on test App (no self_arc), but the state
+        // transition is unambiguous proof the fast-track path was taken.
+        assert_eq!(
+            app.state().await,
+            AppState::CatchingUp,
+            "AtTip with high attempts + SCP activity must fast-track to catchup, \
+             not loop requesting SCP state"
         );
 
         // Verify catchup_in_progress was NOT left stuck on.
