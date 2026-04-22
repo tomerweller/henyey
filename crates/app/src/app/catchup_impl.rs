@@ -1931,6 +1931,7 @@ impl App {
                                 elapsed_secs = elapsed,
                                 recovery_attempts,
                                 max_recovery_attempts = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS,
+                                catchup_triggered = snapshot.catchup_triggered,
                                 archive_behind,
                                 recently_caught_up,
                                 "Attempting out-of-sync recovery"
@@ -2037,6 +2038,12 @@ impl App {
 
         // Skip the target validation if we're using CatchupTarget::Current
         if !use_current_target && (target == 0 || target <= current_ledger) {
+            // No valid target — the catchup was NOT started. Clear
+            // catchup_triggered so the stuck-state machine can re-evaluate
+            // on the next tick (including the HardReset path). Without
+            // this clear, a TriggerCatchup decision that fails here leaves
+            // catchup_triggered=true permanently, blocking HardReset (#1890).
+            self.clear_catchup_triggered_on_skip(current_ledger).await;
             return None;
         }
 
@@ -2077,8 +2084,22 @@ impl App {
             CatchupTarget::Ledger(target)
         };
 
-        self.spawn_catchup(catchup_target, "Buffered", true, false)
-            .await
+        let result = self
+            .spawn_catchup(catchup_target, "Buffered", true, false)
+            .await;
+
+        // If spawn_catchup returned None, determine why:
+        // - catchup_in_progress=true → a catchup IS in flight, leave
+        //   catchup_triggered alone.
+        // - catchup_in_progress=false → spawn failed for a transient reason
+        //   (ledger close in progress, self_arc upgrade failure). Clear
+        //   catchup_triggered so the stuck-state machine can re-evaluate
+        //   (including HardReset) on the next tick (#1890).
+        if result.is_none() && !self.catchup_in_progress.load(Ordering::SeqCst) {
+            self.clear_catchup_triggered_on_skip(current_ledger).await;
+        }
+
+        result
     }
 
     /// Check that the target's checkpoint has been published to the archive.
@@ -2168,7 +2189,7 @@ impl App {
                     "Archive checkpoint cache cold; skipping catchup (will retry next tick)"
                 );
                 self.archive_checkpoint_cache.set_urgent(true);
-                self.clear_catchup_triggered_on_skip().await;
+                self.clear_catchup_triggered_on_skip(current_ledger).await;
                 false
             }
         }
@@ -2193,7 +2214,7 @@ impl App {
         let backoff_secs = Self::archive_behind_backoff_secs(current_ledger);
         let deadline = self.clock.now() + Duration::from_secs(backoff_secs);
         *self.archive_behind_until.write().await = Some(deadline);
-        self.clear_catchup_triggered_on_skip().await;
+        self.clear_catchup_triggered_on_skip(current_ledger).await;
     }
 
     /// Compute the appropriate archive-behind backoff duration based on how
@@ -2245,9 +2266,16 @@ impl App {
     /// Arming the 60 s backoff in those cases would force ~5 recovery
     /// ticks to skip the archive check even after the refresh completes
     /// within 2–15 s.
-    async fn clear_catchup_triggered_on_skip(&self) {
+    ///
+    /// State-identity-aware: only clears the flag if the stuck state's
+    /// `current_ledger` matches `expected_ledger`. This prevents a stale
+    /// clear from affecting a newer stuck state that was initialized for
+    /// a different ledger between the decision and the clear (#1890).
+    async fn clear_catchup_triggered_on_skip(&self, expected_ledger: u32) {
         if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
-            state.catchup_triggered = false;
+            if state.current_ledger == expected_ledger {
+                state.catchup_triggered = false;
+            }
         }
     }
 
@@ -2538,7 +2566,7 @@ impl App {
                             archive_latest,
                             "Skipping externalized catchup: archive has no checkpoint ahead of us"
                         );
-                        self.clear_catchup_triggered_on_skip().await;
+                        self.clear_catchup_triggered_on_skip(current_ledger).await;
                         return None;
                     }
                 }
@@ -3154,8 +3182,11 @@ mod tests {
             "precondition: no prior archive-behind backoff"
         );
 
-        // Drive the skip path.
-        let ok = app.validate_target_checkpoint_published(50, target).await;
+        // Drive the skip path. Pass the same current_ledger as the stuck
+        // state so the identity-aware clear matches (#1890).
+        let ok = app
+            .validate_target_checkpoint_published(5_000, target)
+            .await;
         assert!(!ok, "skip path must return false");
 
         // Post-conditions — the core #1753 regression guard:
@@ -4870,5 +4901,114 @@ mod tests {
         // Let the function finish (it will complete now that
         // archive_behind_until is released).
         let _ = tokio::time::timeout(Duration::from_secs(2), func_handle).await;
+    }
+
+    // ================================================================
+    // #1890: Post-catchup archive-behind livelock — catchup_triggered
+    //        stuck at true blocks HardReset escalation
+    // ================================================================
+
+    #[test]
+    fn test_livelock_catchup_triggered_blocks_hard_reset() {
+        // The core livelock: catchup_triggered=true + archive_behind +
+        // recovery_exhausted → only AttemptRecovery, never HardReset.
+        // After clearing catchup_triggered, the same signals → HardReset.
+        let signals = StuckSignals {
+            catchup_triggered: true,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS + 100,
+            recovery_attempts: MAX,
+            hard_reset_cooldown_active: false,
+        };
+
+        // With catchup_triggered=true: stuck in AttemptRecovery (the livelock)
+        let action = App::decide_consensus_stuck_action(signals.clone());
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "catchup_triggered=true must block HardReset"
+        );
+
+        // After clearing catchup_triggered: HardReset now reachable
+        let cleared = StuckSignals {
+            catchup_triggered: false,
+            ..signals
+        };
+        let action = App::decide_consensus_stuck_action(cleared);
+        assert!(
+            matches!(
+                action,
+                ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+            ),
+            "clearing catchup_triggered must unlock HardReset (#1890)"
+        );
+    }
+
+    #[test]
+    fn test_trigger_catchup_bad_target_unlocks_hard_reset() {
+        // Scenario: TriggerCatchup fires (recovery exhausted, archive OK),
+        // sets catchup_triggered=true. compute_target fails (bad target).
+        // Without the fix, catchup_triggered stays true → livelock.
+        // With the fix, it's cleared → next tick with archive_behind hits HardReset.
+        //
+        // Step 1: TriggerCatchup would fire when !catchup_triggered + recovery_exhausted
+        let action = decide(false, MAX, TIMER, false);
+        assert_eq!(action, ConsensusStuckAction::TriggerCatchup);
+
+        // Step 2: After TriggerCatchup sets catchup_triggered=true, if archive
+        // becomes behind, the only way to escalate is through HardReset.
+        // But catchup_triggered=true blocks it:
+        let action = decide(true, MAX, TIMER, true);
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+
+        // Step 3: Our fix clears catchup_triggered when spawn fails.
+        // Now HardReset is reachable:
+        let action = decide(false, MAX, TIMER, true);
+        assert!(matches!(action, ConsensusStuckAction::HardReset(_)));
+    }
+
+    #[tokio::test]
+    async fn test_stale_clear_does_not_affect_newer_state() {
+        // Identity-aware clear: a stale clear (for an older ledger) must
+        // not flip catchup_triggered=false on a newer stuck state.
+        let now = std::time::Instant::now();
+        let state = RwLock::new(Some(ConsensusStuckState {
+            current_ledger: 200,
+            first_buffered: 201,
+            stuck_start: now,
+            last_recovery_attempt: now,
+            recovery_attempts: 0,
+            catchup_triggered: true,
+        }));
+
+        // Stale clear for ledger 100 — must NOT clear
+        {
+            if let Some(s) = state.write().await.as_mut() {
+                if s.current_ledger == 100 {
+                    s.catchup_triggered = false;
+                }
+            }
+            let s = state.read().await;
+            assert!(
+                s.as_ref().unwrap().catchup_triggered,
+                "stale clear must not affect newer state"
+            );
+        }
+
+        // Fresh clear for ledger 200 — must clear
+        {
+            if let Some(s) = state.write().await.as_mut() {
+                if s.current_ledger == 200 {
+                    s.catchup_triggered = false;
+                }
+            }
+            let s = state.read().await;
+            assert!(
+                !s.as_ref().unwrap().catchup_triggered,
+                "fresh clear must flip the flag"
+            );
+        }
     }
 }
