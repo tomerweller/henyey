@@ -2858,13 +2858,11 @@ mod tests {
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
             recovery_attempts: 0,
-            catchup_triggered: false,
         };
 
         assert_eq!(state.current_ledger, 1000);
         assert_eq!(state.first_buffered, 1001);
         assert_eq!(state.recovery_attempts, 0);
-        assert!(!state.catchup_triggered);
     }
 
     #[test]
@@ -3765,7 +3763,6 @@ mod tests {
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
             recovery_attempts: 2,
-            catchup_triggered: false,
         });
 
         // Simulate the cleanup block from the rapid close handler.
@@ -3958,7 +3955,6 @@ mod tests {
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
             recovery_attempts: 0,
-            catchup_triggered: false,
         };
 
         // Same current_ledger, different first_buffered — should still match
@@ -4024,7 +4020,6 @@ mod tests {
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
             recovery_attempts: 1,
-            catchup_triggered: false,
         });
 
         // Record the externalized timestamp before the call.
@@ -4108,7 +4103,6 @@ mod tests {
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
             recovery_attempts: 3,
-            catchup_triggered: false,
         });
 
         // Directly exercise the reset block (same code as in try_apply_buffered_ledgers

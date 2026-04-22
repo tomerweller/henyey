@@ -555,10 +555,20 @@ pub(crate) struct ConsensusStuckState {
     pub last_recovery_attempt: Instant,
     /// Number of recovery attempts made.
     pub recovery_attempts: u32,
-    /// Whether we've already triggered catchup for this stuck state.
-    /// Set to true when catchup is triggered, prevents repeated catchup attempts
-    /// when archive has no newer checkpoint available.
-    pub catchup_triggered: bool,
+}
+
+/// Outcome of `compute_target_and_spawn_buffered_catchup`.
+///
+/// Replaces the prior `Option<PendingCatchup>` return + speculative
+/// `catchup_triggered` write pattern. The caller no longer needs
+/// compensating clears on every failure path (#1892).
+pub(super) enum SpawnOutcome {
+    /// Catchup was spawned successfully.
+    Started(PendingCatchup),
+    /// Catchup was skipped (bad target, archive behind, cold cache, etc.).
+    Skipped,
+    /// A catchup is already in flight (`catchup_in_progress` was true).
+    AlreadyInFlight,
 }
 
 /// Why a hard reset was triggered. Logged at WARN for observability.
@@ -576,7 +586,7 @@ pub(super) enum HardResetReason {
 /// Built once per tick, consumed by `decide_consensus_stuck_action`.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct StuckSignals {
-    pub catchup_triggered: bool,
+    pub catchup_in_progress: bool,
     pub archive_behind: bool,
     pub tx_set_exhausted: bool,
     pub schedule_due: bool,
