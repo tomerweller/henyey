@@ -2243,6 +2243,10 @@ impl App {
 
             let mut invalid_banned = 0usize;
             if !pending_envs.is_empty() {
+                // snapshot_build covers TxSetValidationContext construction +
+                // SnapshotValidationProviders::new() so that envelopes_fetch +
+                // snapshot_build cleanly partitions the total span.
+                let snapshot_build_start = std::time::Instant::now();
                 let ctx = TxSetValidationContext {
                     next_ledger_seq: ledger_seq + 1,
                     close_time: close_time_ctx,
@@ -2272,7 +2276,6 @@ impl App {
                 // passing `None` providers). We must NOT fall back to
                 // the per-call providers — that would silently
                 // re-introduce the quadratic path.
-                let snapshot_build_start = std::time::Instant::now();
                 let snapshot_result = SnapshotValidationProviders::new(&ledger_manager);
                 metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS)
                     .record(snapshot_build_start.elapsed().as_secs_f64());
