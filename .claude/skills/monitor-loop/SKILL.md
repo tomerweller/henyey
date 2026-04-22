@@ -202,19 +202,64 @@ table is the human reference.
 | `stellar_herder_lost_sync_total` | ≥ 1 | SYNC | Node fell out of Tracking — always a bug on a steady-state node |
 | `henyey_post_catchup_hard_reset_total` | ≥ 1 | ACTION | Recovery fired |
 | `henyey_recovery_stalled_tick_total` | ≥ 5 | WARN | Recovery loop not progressing |
-| `stellar_ledger_apply_failure_total` | ≥ 90000 | WARN | Mainnet baseline measured ~8755/tick (~80 fails/ledger) on 2026-04-22; threshold at ~10× baseline |
 | `stellar_herder_pending_too_old_total` | ≥ 100 | WARN | Pending pool rejecting stale envelopes; overlay lag |
 | `stellar_overlay_timeout_idle_total` + `_straggler_total` (sum) | 5× prior-tick sum | WARN | Overlay churn burst |
 | `stellar_overlay_error_read_total` + `_write_total` (sum) | ≥ 50 | WARN | Overlay I/O errors |
 | `henyey_archive_cache_refresh_error_total` | ≥ 1 | NONC | Archive fetch failing |
 | `henyey_archive_cache_refresh_timeout_total` | ≥ 3 | NONC | Archive fetch slow |
-| `henyey_scp_post_verify_drops_total` | ≥ 2000000 | WARN | Mainnet baseline measured ~171971/tick on 2026-04-22 (broad overlay broadcast → TooOld/Invalid at ~318/s); threshold at ~10× baseline |
 
-Mainnet closes ~120 ledgers per tick. Thresholds above for `ledger_apply_failure_total`
-and `scp_post_verify_drops_total` are empirically set at ~10× the 2026-04-22 mainnet
-baseline; they are blunt absolute-delta checks and may false-negative on slow, sustained
-degradation. Follow-up: replace with ratio checks
-(`ledger_apply_failure / (success + failure)` and `scp_post_verify_drops / scp_envelope_receive`).
+**D. Ratio checks — fire on sustained ratio breach (3 consecutive ticks)**
+
+These ratio-based checks replace the earlier absolute-delta thresholds for
+`stellar_ledger_apply_failure_total` and `henyey_scp_post_verify_drops_total`,
+which were fragile (false-negative on slow degradation, baseline drift with
+traffic volume). Ratio checks are traffic-proportional and self-calibrating.
+
+| Check | Numerator | Denominator | Threshold | Min denom delta | Severity | Rationale |
+|-------|-----------|-------------|-----------|-----------------|----------|-----------|
+| SCP post-verify acceptance rate | `delta(henyey_scp_post_verify_total{reason="accepted"})` + `delta(henyey_scp_post_verify_total{reason="processed_directly"})` | `sum delta(henyey_scp_post_verify_total{reason="..."})` across all 13 labels | < 0.05 (less than 5% accepted) for 3 ticks | 500 | WARN (→ Bug Filing) | Baseline acceptance ~10-20%; <5% sustained means almost nothing reaches SCP |
+| Transaction apply failure rate | `delta(stellar_ledger_apply_failure_total)` | `delta(stellar_ledger_apply_failure_total)` + `delta(stellar_ledger_apply_success_total)` | > 0.50 (over 50% fail) for 3 ticks | 200 | WARN (investigate) | Normal bad-tx traffic is <50%; sustained >50% suggests apply-engine bug |
+
+**Ratio check skip conditions** (skip both when any is true):
+- `FRESH_START=yes` (replaying history)
+- Heartbeat gap > 5 (catching up)
+- `stellar_ledger_age_current_seconds > 30` (not in real-time sync — works in both validator and watcher modes)
+- Process uptime < 10 minutes (warmup)
+- `/metrics` fetch fails
+- `/metrics` returns "recorder not installed"
+- Any required counter missing or invalid
+- Post-verify label set ≠ expected 13 labels (`invalid_sig`, `panic`, `drift_range`, `drift_close_time`, `drift_cannot_receive`, `self_message`, `non_quorum`, `buffered`, `duplicate`, `too_far`, `buffer_full`, `processed_directly`, `accepted`)
+
+On any skip: empty the ratio snapshot, reset both breach streak counters to 0.
+
+**Ratio snapshot** persisted at `~/data/<session-id>/metrics/ratio_snapshot`:
+```
+version=1
+pid=<PID>
+start_ticks=<field 22 from /proc/$PID/stat>
+timestamp=<ISO8601>
+apply_success=<value>
+apply_failure=<value>
+pv_accepted=<value>
+pv_processed_directly=<value>
+pv_total_sum=<value>
+apply_breach_streak=<N>
+scp_breach_streak=<N>
+```
+Invalidate on PID/start_ticks change, malformed snapshot, or counter reset (current < previous).
+
+**SCP denominator rationale:** Includes all 13 post-verify outcomes (not just errors). Normal
+outcomes (`duplicate`, `buffered`, `non_quorum`, `self_message`) appear at healthy-state
+proportions. The ratio measures "of everything that went through post-verify, what fraction
+reached SCP?" The 5% threshold is well below the healthy ~10-20% baseline. The older
+`henyey_scp_post_verify_drops_total` counter is NOT used — it counts only
+`EnvelopeState::{TooOld, Invalid, InvalidSignature}`, a subset of non-accepted outcomes.
+
+**Apply-failure policy:** When the alert fires, investigate in the same tick. If evidence points
+to a henyey apply-engine bug, file/comment via Bug Filing Workflow. If expected bad-tx traffic,
+report as WARNING without filing.
+
+**Thresholds are provisional** — tune after 1-2 weeks of production data.
 
 **B. Gauges — fire on absolute threshold**
 

@@ -160,13 +160,15 @@ If the API errors out, emit `obsrvr: N/A (api-error)` instead of omitting the fi
 - `stellar_herder_lost_sync_total` ≥1 → SYNC
 - `henyey_post_catchup_hard_reset_total` ≥1 → ACTION
 - `henyey_recovery_stalled_tick_total` ≥5 → WARN
-- `stellar_ledger_apply_failure_total` ≥90000 → WARN (baselined ~8755/tick 2026-04-22, threshold ~10× baseline)
 - `stellar_herder_pending_too_old_total` ≥100 → WARN
 - `(stellar_overlay_timeout_idle_total + stellar_overlay_timeout_straggler_total)` ≥5× prior-tick-sum → WARN
 - `(stellar_overlay_error_read_total + stellar_overlay_error_write_total)` ≥50 → WARN
 - `henyey_archive_cache_refresh_error_total` ≥1 → NONC
 - `henyey_archive_cache_refresh_timeout_total` ≥3 → NONC
-- `henyey_scp_post_verify_drops_total` ≥2000000 → WARN (baselined ~172k/tick 2026-04-22, threshold ~10× baseline)
+
+`stellar_ledger_apply_failure_total` and `henyey_scp_post_verify_drops_total` are
+**no longer checked as absolute-delta counters** — they are covered by the ratio
+checks below, which are traffic-proportional and self-calibrating.
 
 **GAUGES** (fire on absolute threshold against current snapshot):
 
@@ -207,6 +209,141 @@ Thresholds (all WARN):
 - `henyey_close_complete_tx_queue_seconds` p99 >0.5s
 
 Mean check (`sum_delta / count_delta`) is a cheaper fallback — fire on whichever breaches.
+
+### Ratio checks — sustained breach detection
+
+Two ratio-based checks replace the former absolute-delta thresholds for
+`stellar_ledger_apply_failure_total` and `henyey_scp_post_verify_drops_total`.
+These fire only after **3 consecutive ticks** of threshold breach, avoiding
+transient spikes.
+
+**Required inputs** (all must be present, non-empty, numeric; if any missing
+or invalid, skip ratio checks entirely, empty the ratio snapshot, reset streaks):
+
+1. `stellar_ledger_age_current_seconds` — sync gating
+2. `stellar_ledger_apply_success_total`
+3. `stellar_ledger_apply_failure_total`
+4. `henyey_scp_post_verify_total{reason="accepted"}`
+5. `henyey_scp_post_verify_total{reason="processed_directly"}`
+6. Sum of all 13 `henyey_scp_post_verify_total{reason="..."}` lines (`pv_total_sum`)
+
+**Post-verify label-set validation:** After extracting the 13
+`henyey_scp_post_verify_total{reason="..."}` lines, validate that the exact set
+of reason labels is: `invalid_sig`, `panic`, `drift_range`, `drift_close_time`,
+`drift_cannot_receive`, `self_message`, `non_quorum`, `buffered`, `duplicate`,
+`too_far`, `buffer_full`, `processed_directly`, `accepted`. If any label is
+missing or unexpected labels appear, treat as missing counters (partial scrape
+or label change).
+
+**Skip conditions** (skip both ratio checks when any is true):
+- `FRESH_START=yes`
+- Heartbeat gap > 5
+- `stellar_ledger_age_current_seconds > 30`
+- Process uptime < 10 minutes
+- `/metrics` fetch fails (curl error or empty response)
+- `/metrics` returns "recorder not installed"
+- Any required counter missing or invalid
+- Post-verify label set ≠ expected 13 labels
+
+On any skip: **empty** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot`,
+reset both streak counters to 0, report `metrics_ratio: skipped (<reason>)`.
+
+**Snapshot file:** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot`
+
+Format:
+```
+version=1
+pid=<PID>
+start_ticks=<field 22 from /proc/$PID/stat>
+timestamp=<ISO8601>
+apply_success=<value>
+apply_failure=<value>
+pv_accepted=<value>
+pv_processed_directly=<value>
+pv_total_sum=<value>
+apply_breach_streak=<N>
+scp_breach_streak=<N>
+```
+
+**Process identity:** `start_ticks` = field 22 from `/proc/$PID/stat` (starttime
+in clock ticks since boot). Extract with `awk '{print $22}' /proc/$PID/stat`.
+Locale-independent, catches PID reuse.
+
+**Invalidation:**
+- PID or `start_ticks` changed → discard, write new baseline, reset streaks
+- Snapshot malformed, missing fields, or `version` ≠ `1` → discard
+- Any current counter < previous value → discard (counter reset)
+
+**Metric extraction** — use anchored patterns:
+
+```bash
+metrics_body=$(curl -s http://localhost:$MONITOR_ADMIN_PORT/metrics)
+
+# Bail on fetch failure
+if [ -z "$metrics_body" ]; then
+  > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
+  # report: metrics_ratio: skipped (fetch failed)
+fi
+
+# Bail if recorder not installed
+if echo "$metrics_body" | grep -q 'metrics recorder not installed'; then
+  > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
+  # report: metrics_ratio: skipped (recorder not installed)
+fi
+
+ledger_age=$(echo "$metrics_body" | grep -E '^stellar_ledger_age_current_seconds ' | awk '{printf "%d", $2}')
+apply_success=$(echo "$metrics_body" | grep -E '^stellar_ledger_apply_success_total ' | awk '{printf "%d", $2}')
+apply_failure=$(echo "$metrics_body" | grep -E '^stellar_ledger_apply_failure_total ' | awk '{printf "%d", $2}')
+pv_accepted=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="accepted"\} ' | awk '{printf "%d", $2}')
+pv_processed=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="processed_directly"\} ' | awk '{printf "%d", $2}')
+
+# Validate exact 13-label set
+pv_labels=$(echo "$metrics_body" | grep -oP '^henyey_scp_post_verify_total\{reason="\K[^"]+' | sort)
+expected_labels=$(printf '%s\n' accepted buffer_full buffered drift_cannot_receive drift_close_time drift_range duplicate invalid_sig non_quorum panic processed_directly self_message too_far | sort)
+if [ "$pv_labels" != "$expected_labels" ]; then
+  > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
+  # report: metrics_ratio: skipped (label set mismatch)
+fi
+
+pv_total_sum=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="[^"]+"\} ' | awk '{sum+=$2} END {printf "%d", sum}')
+
+# Validate all 6 values present and numeric
+for v in "$ledger_age" "$apply_success" "$apply_failure" "$pv_accepted" "$pv_processed" "$pv_total_sum"; do
+  if [ -z "$v" ] || ! echo "$v" | grep -qE '^[0-9]+$'; then
+    > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
+    # report: metrics_ratio: skipped (missing counters)
+  fi
+done
+```
+
+**Check 1: SCP post-verify acceptance rate**
+- Numerator delta: `delta(pv_accepted) + delta(pv_processed)`
+- Denominator delta: `delta(pv_total_sum)`
+- Alert: `(numerator / denominator) < 0.05` (less than 5% accepted) for 3 consecutive ticks
+- Min denominator delta: 500 (below → `scp: skipped (low volume)`, reset scp streak)
+- Baseline acceptance on mainnet: ~10-20%. <5% sustained = nearly nothing reaching SCP.
+- On breach: increment `scp_breach_streak`. If streak ≥ 3, route through Bug Filing Workflow
+  (investigate verifier thread, stale envelopes, sync state).
+
+**Check 2: Transaction apply failure rate**
+- Numerator delta: `delta(apply_failure)`
+- Denominator delta: `delta(apply_failure) + delta(apply_success)`
+- Alert: `(numerator / denominator) > 0.50` (over 50% fail) for 3 consecutive ticks
+- Min denominator delta: 200 (below → `apply: skipped (low volume)`, reset apply streak)
+- On breach: increment `apply_breach_streak`. If streak ≥ 3, investigate in same tick.
+  If evidence points to henyey apply-engine bug, file/comment via Bug Filing Workflow.
+  If expected bad-tx traffic (spam wave, known rejections), report as WARNING without filing.
+
+**Per-check low-volume:** When only one check's denominator delta is below its
+minimum, that check skips (streak resets to 0) and the other proceeds normally.
+
+**Thresholds are provisional** — tune after 1-2 weeks of production data.
+
+**Status report:** After computing both ratios, add to the status output:
+```
+  metrics_ratio: <ok (scp_accept=X%, apply_fail=Y%) | skipped (reason) | WARNING scp_accept=X%<5% (N ticks) | WARNING apply_fail=Y%>50% (N ticks) — investigating | collecting baseline>
+```
+When both checks fire: `metrics_ratio: WARNING scp_accept=3%<5% (3 ticks), apply_fail=55%>50% (3 ticks) — investigating`
 
 ### Firing alerts — cooldown + filing
 
@@ -358,6 +495,7 @@ MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   rpc:     <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
   obsrvr:  <validating=<Y/N> val24h=<pct>% lag=<N> | N/A (watcher) | N/A (api-error)>
   metrics: <clean | N alerts (<metric1>,<metric2>,...) — filed/commented #<N>,#<M> | N alerts, K suppressed by cooldown>
+  metrics_ratio: <ok (scp_accept=X%, apply_fail=Y%) | skipped (reason) | WARNING scp_accept=X%<5% (N ticks) | WARNING apply_fail=Y%>50% (N ticks) — investigating | collecting baseline>
   deploy:  <up-to-date | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
   ci:      <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
 ```
