@@ -44,6 +44,42 @@ Determine once at the top of the tick: if `/home/tomer/data/mainnet/mainnet.db`
 does NOT exist, set `FRESH_START=yes` (sync deadline = 4h). Otherwise
 `FRESH_START=no` (sync deadline = 15m). Use this when evaluating check (2).
 
+## Crash-recovery state
+
+If the node's previous run ended with a crash or wedge (SIGKILL), restart
+begins from a stale lcl that can be hours behind mainnet tip; replay will
+legitimately exceed the 15m clean-restart deadline.
+
+Detect crash-recovery once at the top of the tick:
+
+```bash
+# Consider crash-recovery if a .crashed- or .stuck- log rotation is newer
+# than the current process's start time.
+if [ -n "$(pgrep -f 'henyey.*run' | head -1)" ]; then
+  proc_start=$(date -r "/proc/$(pgrep -f 'henyey.*run' | head -1)" +%s 2>/dev/null || echo 0)
+  latest_incident=$(ls -t /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log.crashed-* \
+                       /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log.stuck-* \
+                     2>/dev/null | head -1)
+  if [ -n "$latest_incident" ]; then
+    incident_mtime=$(stat -c %Y "$latest_incident")
+    # If the rotation happened within 60s before the current process started,
+    # this run is a recovery from that incident.
+    if [ "$incident_mtime" -ge "$((proc_start - 60))" ]; then
+      CRASH_RECOVERY=yes
+    fi
+  fi
+fi
+CRASH_RECOVERY=${CRASH_RECOVERY:-no}
+```
+
+When `CRASH_RECOVERY=yes` and `FRESH_START=no`, extend the sync deadline to
+60m and qualify the SYNC FAILURE check with a progress signal: if lcl has
+advanced by ≥ 500 ledgers since the previous tick's tracker, the node is
+replaying, not stuck — report CATCHING UP. Flag SYNC FAILURE only when
+lcl has NOT advanced OR the 60m extended deadline is exceeded.
+
+Clean-restart cases (no crash rotation matched) keep the 15m deadline.
+
 ## Health checks
 
 **(1) Log scan** — `tail -n 500 /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log`.
@@ -62,11 +98,16 @@ ticks so STUCK can be detected by a single invocation:
 - If the ledger has advanced or the file is missing, overwrite
   `/home/tomer/data/$MONITOR_SESSION_ID/last_ledger` with `"<current-ledger>|<now>"`.
 - Check node uptime: `ps -o etime= -p $(pgrep -f 'henyey.*run' | head -1)`.
-  Compare uptime against the deadline from `FRESH_START`.
-- If uptime exceeds the deadline and the node is not yet in real-time sync:
+  Active deadline: **15m** when `FRESH_START=no` and `CRASH_RECOVERY=no`,
+  **60m** when `CRASH_RECOVERY=yes`, **4h** when `FRESH_START=yes`.
+- If uptime exceeds the active deadline and the node is not yet in real-time sync:
   check the latest Heartbeat for the gap between `ledger` and `latest_ext` —
   if gap > 5, or if RPC status is `unhealthy` (i.e. `age` > 30s), or if
   `heard_from_quorum=false`, flag SYNC FAILURE.
+- **Progress carveout (only when `CRASH_RECOVERY=yes`)**: if lcl has advanced
+  by ≥ 500 ledgers since the previous tick's `last_ledger`, the node is
+  actively replaying — report CATCHING UP (no SYNC FAILURE) regardless of
+  uptime. When lcl stops advancing AND uptime exceeds 60m, flag SYNC FAILURE.
 
 **"Real-time sync" means `age < 30s`, NOT just Heartbeat gap=0** — gap is the
 node's local view (`latest_ext - ledger`) and stays at 0 even when the node is
@@ -92,10 +133,24 @@ a large gap is expected — report CATCHING UP instead of SYNC FAILURE.
    ```
 
 **(4) Memory** — `ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1)`, convert to MB.
-If RSS > 12 GB, flag HIGH MEMORY. If RSS > 16 GB or system `available` memory
-(from `free -m`) < 4 GB, restart the node (`kill <PID>`, wait 10s, `kill -9`
-if still alive, then relaunch as in check 3). Use the `available` column — NOT
-`free` — to avoid false positives from reclaimable kernel cache (buff/cache).
+
+- If `RSS > 12 GB`, flag HIGH MEMORY (report-only; no restart).
+- **Restart condition** (restart only if ALL of the following hold):
+  1. `RSS > 16 GB`, AND
+  2. system `available` memory (from `free -m`) `< 8 GB`, AND
+  3. latest two `Memory report summary` entries both show `heap_components_mb`
+     above the earlier snapshot by > 500 MB (i.e. heap is actively growing,
+     not just file cache or transient replay state).
+- Restart procedure: `kill <PID>`, wait 10s, `kill -9` if still alive, then
+  relaunch as in check 3.
+
+Rationale: the old rule (`RSS > 16 GB OR available < 4 GB`) fired on legitimate
+catchup transients (large file_rss from bucket reads, transient unaccounted
+jemalloc state) and restarting during catchup discards replay progress and
+makes recovery worse. The tightened condition gates on (a) memory pressure
+at the system level, AND (b) evidence of a real heap leak, so the safety net
+fires only when needed. Use the `available` column — NOT `free` — to avoid
+false positives from reclaimable kernel cache.
 
 **(5) Disk** — `df -h /home/tomer/data | tail -1`. If usage > 85%, flag LOW DISK.
 Then clean up old rotated log archives (keep 3 most recent per category):
@@ -148,10 +203,15 @@ If the API errors out, emit `obsrvr: N/A (api-error)` instead of omitting the fi
 2. `mv /home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom /home/tomer/data/$MONITOR_SESSION_ID/metrics/prev.prom 2>/dev/null || true`.
 3. `curl -s http://localhost:$MONITOR_ADMIN_PORT/metrics > /home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom`.
 4. Restart detection: for any counter, if `current < prev`, treat delta as
-   `current` (node restarted this tick or last tick). If check (3) or (10)
-   restarted the node this tick OR the prior tick, skip
-   `henyey_jemalloc_fragmentation_pct` gauge alerts and skip
-   counter-started-at-zero alerts (warmup allowance — 2 ticks).
+   `current` (node restarted this tick or last tick). For the first 2 ticks
+   after a detected restart (from check 3 or check 10, or `CRASH_RECOVERY=yes`),
+   skip the following alerts (warmup allowance — overlay handshake + jemalloc
+   arena stabilization + from-zero counters take ~10 minutes to settle):
+   - `henyey_jemalloc_fragmentation_pct > 50` (post-restart fragmentation
+     ramps from ~35-45% and settles to ~18% within 2 ticks)
+   - `stellar_peer_count < 8` (authenticated peer count ramps from 0 → 5 → 10+
+     over the first 10 minutes as overlay handshakes complete)
+   - counter-started-at-zero delta alerts
 
 ### Metric alert catalog
 
@@ -551,7 +611,7 @@ Print a multiline status report:
 ```
 MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   node:    mode=<MODE> session=<session-id> pid=<PID> fresh_start=<yes|no>
-  sync:    <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|4h>) | SYNC FAILURE (gap=N, uptime=Xm — filed/commented #<N>)>
+  sync:    <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|60m|4h>) | SYNC FAILURE (gap=N, uptime=Xm — filed/commented #<N>)>
   mem:     <RSS_MB>MB rss | alloc=<alloc>MB resident=<resident>MB frag=<pct>%
            heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB
   disk:    <used>/<total> (<pct>%) | session+data=<size>
