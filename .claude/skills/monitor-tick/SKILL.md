@@ -265,8 +265,8 @@ checks below, which are traffic-proportional and self-calibrating.
 
 - `stellar_peer_count` <8 → WARN
 - `henyey_jemalloc_fragmentation_pct` >50 on two consecutive ticks → WARN
-- `stellar_ledger_age_current_seconds` >30 → SYNC
-- `stellar_herder_state` !=2 when uptime >15m → SYNC
+- `stellar_ledger_age_current_seconds` >30 when `CRASH_RECOVERY=no` AND `FRESH_START=no` → SYNC (during `CRASH_RECOVERY=yes`, age is legitimately large while replay catches up; the authoritative sync check is (2), with its extended 60m deadline and progress carveout)
+- `stellar_herder_state` !=2 when uptime >15m AND `CRASH_RECOVERY=no` AND `FRESH_START=no` → SYNC (during crash-recovery the node is legitimately in state=1 Catching Up until replay completes)
 - `henyey_scp_verify_input_backlog` >100 → WARN
 - `henyey_scp_verifier_thread_state` !=0 → WARN (0=Running, 1=Stopping, 2=Dead)
 - `stellar_herder_pending_envelopes` >2000 → WARN
