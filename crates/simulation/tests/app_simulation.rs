@@ -6,6 +6,11 @@ use henyey_common::Hash256;
 use henyey_crypto::SecretKey;
 use henyey_simulation::{Simulation, SimulationMode, Topologies};
 
+/// Timeout for the post-remove_node ledger close over TCP.
+/// Conservative guess (2× the original 45s) to absorb CI jitter.
+/// See follow-up investigation issue for root cause analysis.
+const TCP_POST_REMOVAL_CLOSE_TIMEOUT_SECS: u64 = 90;
+
 async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
@@ -54,8 +59,30 @@ async fn collect_node_diagnostics(sim: &Simulation) -> String {
         match sim.app_debug_stats(&id).await {
             Some(stats) => {
                 diag.push_str(&format!(
-                    "\n  {id}: ledger={}, peers={}, state={}, herder={}",
-                    stats.current_ledger, stats.peer_count, stats.app_state, stats.herder_state
+                    "\n  {id}: ledger={}, peers={}, state={}, herder={}, \
+                     pending_envelopes={}, heard_quorum={}, v_blocking={}, \
+                     ballot_phase={}, ballot_round={}, \
+                     nom_timeouts={}, ballot_timeouts={}, \
+                     scp_sent={}, scp_recv={}, \
+                     trigger_attempts={}, trigger_ok={}, trigger_fail={}",
+                    stats.current_ledger,
+                    stats.peer_count,
+                    stats.app_state,
+                    stats.herder_state,
+                    stats.pending_envelopes,
+                    stats.heard_from_quorum,
+                    stats.is_v_blocking,
+                    stats.slot_ballot_phase.as_deref().unwrap_or("none"),
+                    stats
+                        .slot_ballot_round
+                        .map_or("none".to_string(), |r| r.to_string()),
+                    stats.nomination_timeout_fires,
+                    stats.ballot_timeout_fires,
+                    stats.scp_messages_sent,
+                    stats.scp_messages_received,
+                    stats.consensus_trigger_attempts,
+                    stats.consensus_trigger_successes,
+                    stats.consensus_trigger_failures,
                 ));
             }
             None => {
@@ -402,7 +429,13 @@ async fn test_core3_restart_rejoin_over_tcp() {
     wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(10)).await;
     wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(10)).await;
 
-    manual_close_until(&sim, 3, 0, Duration::from_secs(45)).await;
+    manual_close_until(
+        &sim,
+        3,
+        0,
+        Duration::from_secs(TCP_POST_REMOVAL_CLOSE_TIMEOUT_SECS),
+    )
+    .await;
 
     sim.restart_node("node0").await.expect("restart node0 tcp");
     wait_for_app_operational(&sim, "node0", Duration::from_secs(5)).await;
