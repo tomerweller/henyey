@@ -1,16 +1,57 @@
 ---
 name: plan-do-review
 description: Review a proposal issue with adversarial critics, converge on a plan, execute it, and iterate review-fix until clean
-argument-hint: "<issue-number> [--model <model>] [--max-proposal-rounds N] [--max-review-rounds N]"
+argument-hint: "[issue-number] [--model <model>] [--max-proposal-rounds N] [--max-review-rounds N]"
 ---
 
 Parse `$ARGUMENTS`:
-- The first argument is a GitHub issue number. Replace `$ISSUE` with it.
-  Also set `$ORIGINAL_ISSUE` = `$ISSUE` (preserved for redirect comments if
-  blocker-ancestor resolution changes the target).
+- The first positional argument, if present, is a GitHub issue number.
 - `--model <model>`: Model for critic and review agents (default: `"gpt-5.4"`).
 - `--max-proposal-rounds N`: Max proposal↔critic iterations (default: 5).
 - `--max-review-rounds N`: Max implement↔review-fix iterations (default: 3).
+
+**If no issue number was provided, auto-select one:**
+
+Run:
+```bash
+# Priority 1: newest open, unassigned issue labeled "ready",
+# excluding "plan-do-review-loop-failed" and "not-ready".
+gh issue list \
+  --state open \
+  --assignee '' \
+  --search 'sort:created-desc -label:plan-do-review-loop-failed -label:not-ready label:ready' \
+  --json number,title \
+  --limit 1 \
+  --jq '.[0] // empty'
+```
+
+If that returns empty, fall back:
+```bash
+# Priority 2: any eligible issue (no "ready" requirement).
+gh issue list \
+  --state open \
+  --assignee '' \
+  --search 'sort:created-desc -label:plan-do-review-loop-failed -label:not-ready' \
+  --json number,title \
+  --limit 1 \
+  --jq '.[0] // empty'
+```
+
+If still empty, **stop** with a message: "No eligible issues found for auto-selection."
+
+Otherwise, set `$ISSUE` to the selected issue number and announce:
+"Auto-selected issue #$ISSUE: <title>".
+
+Then assign the issue to yourself as a concurrency lock:
+```bash
+gh issue edit $ISSUE --add-assignee "@me"
+```
+
+If assignment fails (e.g., another worker raced), **stop** with a message:
+"Could not assign issue #$ISSUE — it may have been claimed by another worker."
+
+**Set `$ORIGINAL_ISSUE` = `$ISSUE`** (preserved for redirect comments if
+blocker-ancestor resolution changes the target).
 
 # Plan-Do-Review
 
