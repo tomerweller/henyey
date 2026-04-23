@@ -50,26 +50,36 @@ If the node's previous run ended with a crash or wedge (SIGKILL), restart
 begins from a stale lcl that can be hours behind mainnet tip; replay will
 legitimately exceed the 15m clean-restart deadline.
 
-Detect crash-recovery once at the top of the tick:
+Detect crash-recovery once at the top of the tick. The rule: this process
+is in crash-recovery mode if the most recent log rotation in the session's
+`logs/` dir is a `.crashed-*`, `.stuck-*`, or `.frozen-*` (not a planned
+`.preredeploy-*`), AND the current process uptime is under 2 hours (after
+which recovery is considered complete regardless).
+
+Uses `find` (not shell globs) to avoid zsh `NO_NOMATCH` failing the pipeline,
+and anchors to "most recent rotation type" rather than a narrow timing
+window (the old 60s window missed the rebuild-then-restart workflow where
+minutes elapse between log rotation and process start):
 
 ```bash
-# Consider crash-recovery if a .crashed- or .stuck- log rotation is newer
-# than the current process's start time.
-if [ -n "$(pgrep -f 'henyey.*run' | head -1)" ]; then
-  proc_start=$(date -r "/proc/$(pgrep -f 'henyey.*run' | head -1)" +%s 2>/dev/null || echo 0)
-  latest_incident=$(ls -t /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log.crashed-* \
-                       /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log.stuck-* \
-                     2>/dev/null | head -1)
-  if [ -n "$latest_incident" ]; then
-    incident_mtime=$(stat -c %Y "$latest_incident")
-    # If the rotation happened within 60s before the current process started,
-    # this run is a recovery from that incident.
-    if [ "$incident_mtime" -ge "$((proc_start - 60))" ]; then
-      CRASH_RECOVERY=yes
-    fi
+CRASH_RECOVERY=no
+PID=$(pgrep -f 'henyey.*run' | head -1)
+if [ -n "$PID" ]; then
+  uptime_sec=$(ps -o etimes= -p "$PID" 2>/dev/null | tr -d ' ')
+  uptime_sec=${uptime_sec:-0}
+  if [ "$uptime_sec" -lt 7200 ]; then
+    logs_dir="/home/tomer/data/$MONITOR_SESSION_ID/logs"
+    newest_rotation=$(find "$logs_dir" -maxdepth 1 -type f \
+        \( -name 'monitor.log.crashed-*' \
+        -o -name 'monitor.log.stuck-*' \
+        -o -name 'monitor.log.frozen-*' \
+        -o -name 'monitor.log.preredeploy-*' \) \
+      -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    case "$newest_rotation" in
+      *.crashed-*|*.stuck-*|*.frozen-*) CRASH_RECOVERY=yes ;;
+    esac
   fi
 fi
-CRASH_RECOVERY=${CRASH_RECOVERY:-no}
 ```
 
 When `CRASH_RECOVERY=yes` and `FRESH_START=no`, extend the sync deadline to
