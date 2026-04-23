@@ -8,7 +8,8 @@
 //!
 //! | Case | Condition | Action |
 //! |------|-----------|--------|
-//! | 1 | LCL > genesis | Replay from LCL+1 to target (no buckets) |
+//! | 1 | LCL > genesis, gap within replay budget | Replay from LCL+1 to target (no buckets) |
+//! | 1b | LCL > genesis, gap exceeds replay budget | Fall through to checkpoint download |
 //! | 2 | count >= full replay count | Full replay from genesis+1 |
 //! | 3 | count=0 AND target is checkpoint | Buckets only, no replay |
 //! | 4 | target start in first checkpoint | Full replay from genesis+1 |
@@ -225,27 +226,34 @@ impl CatchupRange {
             return Self::replay_only(replay);
         }
 
-        // Case 1: LCL is past genesis — replay from LCL+1, unless the gap is large enough
-        // to justify a fresh checkpoint download.
+        // Case 1: LCL is past genesis — replay from LCL+1 if the gap fits within
+        // the mode's "replay budget"; otherwise fall through to checkpoint download.
         //
-        // For Minimal mode with a LARGE gap (> MINIMAL_BUCKET_DOWNLOAD_THRESHOLD), fall
-        // through to the checkpoint-based logic. Downloading a fresh checkpoint is faster
-        // than replaying thousands of ledgers (e.g., a post-wedge ~4500-ledger recovery).
+        // Each mode defines how many ledgers it is willing to replay before
+        // preferring a fresh checkpoint download:
+        //   - Complete:   unlimited — always replays the full gap.
+        //   - Recent(N):  N — replays up to N ledgers; downloads a checkpoint
+        //                 for anything older.
+        //   - Minimal:    MINIMAL_BUCKET_DOWNLOAD_THRESHOLD — replays small gaps
+        //                 where bucket download overhead exceeds replay cost.
         //
-        // For small gaps, ALWAYS replay from LCL+1. A 4-minute bucket download for a
-        // 93-ledger gap would block the event loop and trigger an infinite catchup loop
-        // (the network advances faster than the bucket download completes). The 1_000
-        // threshold (~83m of mainnet wall-clock) is the crossover where bucket-apply
-        // pays for its download overhead.
+        // NOTE: This is an intentional divergence from stellar-core, which
+        // unconditionally replays from lcl+1 in Case 1 (CatchupRange.cpp:52-57).
+        // We optimize large gaps by downloading a checkpoint + short replay
+        // instead of replaying the entire gap.
         const MINIMAL_BUCKET_DOWNLOAD_THRESHOLD: u32 = 1_000;
         if lcl > GENESIS_LEDGER_SEQ {
-            if mode != CatchupMode::Minimal
-                || full_replay_count <= MINIMAL_BUCKET_DOWNLOAD_THRESHOLD
-            {
+            let should_replay_only = match mode {
+                CatchupMode::Complete => true,
+                CatchupMode::Minimal => full_replay_count <= MINIMAL_BUCKET_DOWNLOAD_THRESHOLD,
+                CatchupMode::Recent(n) => full_replay_count <= n,
+            };
+
+            if should_replay_only {
                 let replay = LedgerRange::new(lcl + 1, full_replay_count);
                 return Self::replay_only(replay);
             }
-            // Fall through: Minimal mode + large gap → use checkpoint download below.
+            // Fall through: gap exceeds replay budget → checkpoint download below.
         }
 
         // Remaining cases: lcl == genesis, OR lcl > genesis with Minimal mode + large gap.
@@ -663,5 +671,123 @@ mod tests {
         assert_eq!(range.bucket_apply_ledger(), 69951);
         assert_eq!(range.replay_first(), 69952);
         assert_eq!(range.replay_count(), 49); // 70000 - 69951 = 49
+    }
+
+    // ── Recent(N) Case 1 regression tests ──────────────────────────────
+    // These tests verify the fix for #1908: Recent(N) with lcl > genesis
+    // now falls through to checkpoint download when the gap exceeds N.
+
+    #[test]
+    fn test_recent_500_large_gap_bucket_applies() {
+        // Recent(500), lcl=100, target=10_000 → gap=9900 > 500.
+        // Should bucket-apply at checkpoint before target_start=9501, replay ~529.
+        let range = CatchupRange::calculate(100, 10_000, CatchupMode::Recent(500));
+        assert!(
+            range.apply_buckets(),
+            "Recent(500) with gap=9900 should bucket-apply, not replay all 9900"
+        );
+        assert!(range.replay_ledgers());
+        // target_start = 10000 - 500 + 1 = 9501
+        // first_in_checkpoint(9501) = 9472
+        // apply_buckets_at = last_before_checkpoint(9501) = 9471
+        assert_eq!(range.bucket_apply_ledger(), 9471);
+        assert_eq!(range.replay_first(), 9472);
+        assert_eq!(range.replay_count(), 529); // 10000 - 9471 = 529
+    }
+
+    #[test]
+    fn test_recent_10000_small_gap_replays() {
+        // Recent(10_000), lcl=100, target=5000 → gap=4900 ≤ 10_000.
+        // Gap within budget → replay from lcl+1.
+        let range = CatchupRange::calculate(100, 5000, CatchupMode::Recent(10_000));
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 101);
+        assert_eq!(range.replay_count(), 4900);
+    }
+
+    #[test]
+    fn test_recent_500_buffered_catchup_replays() {
+        // Recent(500), lcl=61_551_871, target=61_551_964 → gap=93 ≤ 500.
+        // Small gap within budget → replay from lcl+1.
+        let range = CatchupRange::calculate(61_551_871, 61_551_964, CatchupMode::Recent(500));
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 61_551_872);
+        assert_eq!(range.replay_count(), 93);
+    }
+
+    #[test]
+    fn test_recent_boundary_gap_equals_n() {
+        // Recent(100), lcl=100, target=200 → gap=100 = N.
+        // Gap equals budget → replay (budget check is <=).
+        let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(100));
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 101);
+        assert_eq!(range.replay_count(), 100);
+    }
+
+    #[test]
+    fn test_recent_boundary_gap_exceeds_n_by_one() {
+        // Recent(99), lcl=100, target=200 → gap=100 > 99.
+        // Gap exceeds budget by 1 → checkpoint download.
+        let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(99));
+        assert!(
+            range.apply_buckets(),
+            "Recent(99) with gap=100 should fall through to checkpoint download"
+        );
+        assert!(range.replay_ledgers());
+        // target_start = 200 - 99 + 1 = 102
+        // first_in_checkpoint(102) = 65
+        // apply_buckets_at = last_before_checkpoint(102) = 63 (not 64!)
+        assert_eq!(range.bucket_apply_ledger(), 63);
+        assert_eq!(range.replay_first(), 64);
+        assert_eq!(range.replay_count(), 137); // 200 - 63 = 137
+    }
+
+    #[test]
+    fn test_recent_large_gap_checkpoint_target() {
+        // Recent(500), lcl=100, target=10_047 (non-checkpoint) → gap > 500.
+        // Verifies Case 5 path with non-checkpoint target.
+        let range = CatchupRange::calculate(100, 10_047, CatchupMode::Recent(500));
+        assert!(range.apply_buckets());
+        assert!(range.replay_ledgers());
+        // target_start = 10047 - 500 + 1 = 9548
+        // first_in_checkpoint(9548) = 9536
+        // apply_buckets_at = last_before_checkpoint(9548) = 9535
+        assert_eq!(range.bucket_apply_ledger(), 9535);
+        assert_eq!(range.replay_first(), 9536);
+        assert_eq!(range.replay_count(), 512); // 10047 - 9535 = 512
+    }
+
+    #[test]
+    fn test_recent_large_gap_target_start_in_first_checkpoint() {
+        // Recent(150), lcl=2, target=200 → gap=198 > 150.
+        // Falls through Case 1, target_start = 51, first_in_checkpoint(51) = 1 ≤ GENESIS.
+        // lcl > GENESIS → Case 4 returns replay_only(full_replay).
+        let range = CatchupRange::calculate(2, 200, CatchupMode::Recent(150));
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 3);
+        assert_eq!(range.replay_count(), 198);
+    }
+
+    #[test]
+    fn test_recent_0_always_downloads_checkpoint() {
+        // Recent(0), lcl=100, target=200 → gap=100 > 0.
+        // Always falls through since no gap is ≤ 0. Hits Case 5.
+        let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(0));
+        assert!(
+            range.apply_buckets(),
+            "Recent(0) should always download checkpoint, never replay"
+        );
+        assert!(range.replay_ledgers());
+        // count=0, target_start = 201 (saturating_sub(0)+1), but actually
+        // target_start = 200 - 0 + 1 = 201. first_in_checkpoint(201) = 192.
+        // apply_buckets_at = last_before_checkpoint(201) = 191.
+        assert_eq!(range.bucket_apply_ledger(), 191);
+        assert_eq!(range.replay_first(), 192);
+        assert_eq!(range.replay_count(), 9); // 200 - 191 = 9
     }
 }

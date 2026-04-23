@@ -245,6 +245,11 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: Uses `PublishManager`, `PublishQueue`, and structured logs without a scheduler callback layer.
    - **Rationale**: Core file generation is implemented first; operational polish is still pending.
 
+6. **CatchupRange Case 1: replay-budget optimization for Recent(N) and Minimal**
+   - **stellar-core**: Case 1 (`lcl > genesis`) unconditionally replays from `lcl+1` to target regardless of mode or count (`CatchupRange.cpp:52-57`).
+   - **Rust**: Case 1 uses a per-mode "replay budget" to decide whether to replay or download a checkpoint. `Complete` always replays; `Minimal` replays gaps ≤ 1,000; `Recent(N)` replays gaps ≤ N. Larger gaps fall through to checkpoint download (Case 5).
+   - **Rationale**: For large gaps (e.g., 9000-ledger post-wedge recovery with `Recent(500)`), downloading a checkpoint + replaying ~500 ledgers is far faster than replaying all 9000. The final ledger state is identical; only the recovery path differs. This extends the existing Minimal-mode optimization (introduced for startup gaps) to also cover `Recent(N)`. See #1908.
+
 ## Test Coverage
 
 | Area | stellar-core Tests | Rust Tests | Notes |
@@ -255,8 +260,8 @@ Features not yet implemented. These ARE counted against parity %.
 | Archive manager and transport | 4 `TEST_CASE` / 5 `SECTION` | 32 `#[test]` | Rust adds native HTTP and shell-command coverage |
 | Checkpoint builder and queue | 2 `TEST_CASE` / 6 `SECTION` | 25 `#[test]` | Rust covers recovery paths well |
 | Publish workflows | 6 `TEST_CASE` / 18 `SECTION` | 15 `#[test]` | Missing restart, multi-archive, and throttling scenarios |
-| Catchup and replay | 17 `TEST_CASE` / 9 `SECTION` | 44 `#[test]` | Rust has broad unit coverage but lighter end-to-end catchup scenarios |
-| **Total** | **35 `TEST_CASE` / 71 `SECTION`** | **212 `#[test]`** | Upstream still has more scenario-heavy acceptance coverage |
+| Catchup and replay | 17 `TEST_CASE` / 9 `SECTION` | 52 `#[test]` | Rust has broad unit coverage but lighter end-to-end catchup scenarios |
+| **Total** | **35 `TEST_CASE` / 71 `SECTION`** | **220 `#[test]`** | Upstream still has more scenario-heavy acceptance coverage |
 
 ### Test Gaps
 
