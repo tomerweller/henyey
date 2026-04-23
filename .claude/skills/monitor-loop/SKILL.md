@@ -201,7 +201,7 @@ table is the human reference.
 |--------|-----------------|----------|-----------|
 | `stellar_herder_lost_sync_total` | ≥ 1 | SYNC | Node fell out of Tracking — always a bug on a steady-state node |
 | `henyey_post_catchup_hard_reset_total` | ≥ 1 | ACTION | Recovery fired |
-| `henyey_recovery_stalled_tick_total` | ≥ 5 | WARN | Recovery loop not progressing |
+| `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}` | ≥ 1 | WARN | Recovery forced catchup while behind consensus (Form 2 labeled extraction; excludes `backoff_active` and `forcing_catchup_not_behind`) |
 | `stellar_overlay_timeout_idle_total` + `_straggler_total` (sum) | 5× prior-tick sum | WARN | Overlay churn burst |
 | `stellar_overlay_error_read_total` + `_write_total` (sum) | ≥ 50 | WARN | Overlay I/O errors |
 | `henyey_archive_cache_refresh_error_total` | ≥ 1 | NONC | Archive fetch failing |

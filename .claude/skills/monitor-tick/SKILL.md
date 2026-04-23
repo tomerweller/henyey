@@ -257,7 +257,12 @@ against a node that is in real-time sync with age=2s).
 
 - `stellar_herder_lost_sync_total` ≥1 → SYNC
 - `henyey_post_catchup_hard_reset_total` ≥1 → ACTION
-- `henyey_recovery_stalled_tick_total` ≥5 → WARN
+- `delta(henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"})` ≥1 → WARN
+  - **Labeled counter** — uses Form 2 extraction (single labeled series; see §Metric extraction forms).
+  - Only alerts on `forcing_catchup_behind` — the node is behind consensus AND the recovery loop timed out and forced a catchup.
+  - Excludes `backoff_active` (informational, increments routinely on every 10s tick during 60s backoff windows).
+  - Excludes `forcing_catchup_not_behind` (demoted to debug; the fast-track caller emits its own WARN before entering this path, so double-alerting adds noise).
+  - **Alert identity**: use the selector-qualified name `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}` in cooldown keys, issue-search/title keys, and status text.
 - `(stellar_overlay_timeout_idle_total + stellar_overlay_timeout_straggler_total)` ≥5× prior-tick-sum → WARN
 - `(stellar_overlay_error_read_total + stellar_overlay_error_write_total)` ≥50 → WARN
 - `henyey_archive_cache_refresh_error_total` ≥1 → NONC
@@ -307,6 +312,49 @@ Thresholds (all WARN):
 - `henyey_close_complete_tx_queue_seconds` p99 >0.5s
 
 Mean check (`sum_delta / count_delta`) is a cheaper fallback — fire on whichever breaches.
+
+### Metric extraction forms
+
+Counter catalog entries use one of three extraction forms. When adding a new
+counter, check the emission site in `crates/app/src/metrics.rs` to determine
+whether the metric is scalar or labeled, and use the appropriate form.
+
+**Form 1 — Scalar counter** (most counters):
+```bash
+cur=$(grep -E '^<metric_name> ' current.prom | awk '{printf "%d", $2}')
+prev=$(grep -E '^<metric_name> ' prev.prom | awk '{printf "%d", $2}')
+```
+
+**Form 2 — Single labeled series** (extract one specific label value):
+```bash
+cur=$(grep -E '^<metric_name>\{<label>="<value>"\} ' current.prom | awk '{printf "%d", $2}')
+prev=$(grep -E '^<metric_name>\{<label>="<value>"\} ' prev.prom | awk '{printf "%d", $2}')
+```
+
+**Form 3 — Sum of explicit labeled series** (sum specific label values):
+```bash
+cur=$(awk '/^<metric_name>\{<label>="<value1>"\}|^<metric_name>\{<label>="<value2>"\}/ {sum+=$NF} END{printf "%d", sum+0}' current.prom)
+prev=$(awk '/^<metric_name>\{<label>="<value1>"\}|^<metric_name>\{<label>="<value2>"\}/ {sum+=$NF} END{printf "%d", sum+0}' prev.prom)
+```
+
+For all forms, delta handling is identical:
+- Extract `prev` using the same pattern against `prev.prom` (default 0 if absent)
+- If `current < prev`: counter reset (node restarted) → `delta = current`
+- Otherwise: `delta = current - prev`
+
+**Label-presence validation:** For labeled counters, validate that the
+expected label set is present before extracting. This catches silent
+renames or removals that would weaken an alert. If the expected label set
+is missing or mutated, **skip the alert entirely** rather than treating
+missing series as zero. Follow the existing pattern used for
+`henyey_scp_post_verify_total` (lines 406-413):
+```bash
+labels=$(grep -oP '^<metric_name>\{<label>="\K[^"]+' current.prom | sort)
+expected=$(printf '%s\n' <label1> <label2> ... | sort)
+if [ "$labels" != "$expected" ]; then
+  # report: <metric>: skipped (label set mismatch)
+fi
+```
 
 ### Ratio checks — sustained breach detection
 
@@ -440,6 +488,33 @@ for v in "$pending_too_old" "$pending_received"; do
     break
   fi
 done
+
+# Labeled counter: henyey_recovery_stalled_tick_total
+# Validate expected 3-label set — skip alert entirely if mismatch
+recovery_stalled_labels=$(echo "$metrics_body" | grep -oP '^henyey_recovery_stalled_tick_total\{reason="\K[^"]+' | sort)
+recovery_stalled_expected=$(printf '%s\n' backoff_active forcing_catchup_behind forcing_catchup_not_behind | sort)
+recovery_stalled_valid=true
+if [ "$recovery_stalled_labels" != "$recovery_stalled_expected" ]; then
+  recovery_stalled_valid=false
+  # report: recovery_stalled: skipped (label set mismatch: expected {backoff_active, forcing_catchup_behind, forcing_catchup_not_behind}, got {$recovery_stalled_labels})
+fi
+
+# Form 2 extraction — single label: forcing_catchup_behind
+if [ "$recovery_stalled_valid" = true ]; then
+  recovery_stalled_cur=$(echo "$metrics_body" | grep -E '^henyey_recovery_stalled_tick_total\{reason="forcing_catchup_behind"\} ' | awk '{printf "%d", $2}')
+  recovery_stalled_prev=$(grep -E '^henyey_recovery_stalled_tick_total\{reason="forcing_catchup_behind"\} ' \
+    /home/tomer/data/$MONITOR_SESSION_ID/metrics/prev.prom 2>/dev/null | awk '{printf "%d", $2}')
+  recovery_stalled_prev=${recovery_stalled_prev:-0}
+
+  # Per-series counter-reset handling (identical to scalar counters)
+  if [ "$recovery_stalled_cur" -lt "$recovery_stalled_prev" ]; then
+    recovery_stalled_delta=$recovery_stalled_cur
+  else
+    recovery_stalled_delta=$((recovery_stalled_cur - recovery_stalled_prev))
+  fi
+  # Alert if delta ≥ 1 (subject to warmup skip — first 2 ticks after restart)
+  # Alert identity: henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}
+fi
 ```
 
 **Check 1: SCP post-verify acceptance rate**
