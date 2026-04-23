@@ -53,6 +53,17 @@ If assignment fails (e.g., another worker raced), **stop** with a message:
 **Set `$ORIGINAL_ISSUE` = `$ISSUE`** (preserved for redirect comments if
 blocker-ancestor resolution changes the target).
 
+**Set `$AUTO_SELECTED` = `true`** when the issue was auto-selected (no argument
+provided), or `false` when an explicit issue number was given.
+
+**Failure handling for auto-selected issues:** If the skill fails at any point
+and `$AUTO_SELECTED` is `true`, before stopping:
+```bash
+gh issue edit $ISSUE --add-label "plan-do-review-loop-failed" --remove-assignee "$(gh api user -q .login)"
+```
+This labels the issue so it won't be auto-selected again and unassigns it so
+other workers can see it is no longer in progress.
+
 # Plan-Do-Review
 
 Adversarial proposal refinement → full implementation → iterative review-fix.
