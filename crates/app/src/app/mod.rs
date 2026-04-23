@@ -2436,27 +2436,31 @@ impl App {
                             //            the tool to be installed)
                             let hint = format_watchdog_diagnostic_hint(pid);
                             tracing::error!(pid, "{}", hint);
-
-                            // Auto-abort: when the event loop has been frozen
-                            // longer than the configured threshold, terminate
-                            // the process. abort() generates SIGABRT → core
-                            // dump (if ulimit -c allows), providing the exact
-                            // multi-thread stack trace for post-mortem.
-                            if snap.should_abort() {
-                                tracing::error!(
-                                    stale_secs = snap.stale_secs,
-                                    phase = snap.phase,
-                                    phase_sub = snap.phase_sub,
-                                    abort_threshold_secs = snap.abort_threshold_secs,
-                                    "WATCHDOG: Auto-aborting after {}s freeze at phase={}",
-                                    snap.stale_secs,
-                                    snap.phase,
-                                );
-                                std::process::abort();
-                            }
                         }
                         WatchdogTier::Warn => snap.emit_warn(),
                         WatchdogTier::None => {}
+                    }
+
+                    // Auto-abort: independent of the tier check so that
+                    // any configured threshold (even < 30s) is respected.
+                    // Checked after the tier match so diagnostics are
+                    // always emitted before the abort.
+                    if snap.should_abort() {
+                        // If we haven't already emitted error-level
+                        // diagnostics (threshold < 30s), do so now.
+                        if snap.tier() != WatchdogTier::Error {
+                            snap.emit_error();
+                        }
+                        tracing::error!(
+                            stale_secs = snap.stale_secs,
+                            phase = snap.phase,
+                            phase_sub = snap.phase_sub,
+                            abort_threshold_secs = snap.abort_threshold_secs,
+                            "WATCHDOG: Auto-aborting after {}s freeze at phase={}",
+                            snap.stale_secs,
+                            snap.phase,
+                        );
+                        std::process::abort();
                     }
 
                     // SCP verifier health block (issue #1734 Phase B).
@@ -5077,6 +5081,9 @@ mod tests {
     }
 
     /// Test A2: `WatchdogSnapshot::should_abort()` boundary routing.
+    ///
+    /// Verifies that `should_abort()` is independent of `tier()` — even
+    /// thresholds below the 30s Error tier must trigger abort.
     #[test]
     fn watchdog_should_abort_routing() {
         // Disabled (threshold = 0): never abort regardless of stale_secs.
@@ -5105,6 +5112,20 @@ mod tests {
         // Edge: threshold = 1, stale = 0: no abort.
         snap.stale_secs = 0;
         assert!(!snap.should_abort());
+
+        // Threshold below Error tier (< 30s) still triggers abort.
+        // Regression test: previously should_abort was only checked
+        // inside the WatchdogTier::Error arm, so thresholds 1..29
+        // would never fire.
+        snap.abort_threshold_secs = 15;
+        snap.stale_secs = 20;
+        assert_eq!(snap.tier(), super::WatchdogTier::Warn);
+        assert!(snap.should_abort(), "abort must fire even below Error tier");
+
+        snap.abort_threshold_secs = 10;
+        snap.stale_secs = 10;
+        assert_eq!(snap.tier(), super::WatchdogTier::None);
+        assert!(snap.should_abort(), "abort must fire even below Warn tier");
     }
 
     /// Test B: `emit_warn()` emits a WARN event with the correct fields
