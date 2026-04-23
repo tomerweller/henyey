@@ -40,6 +40,14 @@ on:
   pull_request:
   push:
     branches: [main]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'prompts/**'
+      - 'reports/**'
+      - 'ai-summary/**'
+      - '.claude/**'
+      - '.github/skills/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
