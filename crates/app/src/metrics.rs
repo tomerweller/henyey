@@ -1964,52 +1964,187 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_close_cycle_decomposition_histograms_recorded() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-
-        // Phase 5/6 histograms are not pre-registered (see register_label_series
-        // comment at metrics.rs:1087-1089), so we must record at least one sample
-        // before HELP/TYPE lines appear in the rendered output.
-        let decomposition_metrics = [
-            CLOSE_HANDLE_COMPLETE_SECONDS,
-            CLOSE_POST_COMPLETE_SECONDS,
-            CLOSE_DISPATCH_TO_JOIN_SECONDS,
-        ];
-        for name in &decomposition_metrics {
+    /// Assert that each histogram in `metrics` is described (HELP/TYPE) and
+    /// renders bucket/count/sum lines after a synthetic observation.
+    ///
+    /// Phase 5/6 histograms are not pre-registered (see `register_label_series`
+    /// comment at metrics.rs:1087-1089), so we must record at least one sample
+    /// before HELP/TYPE lines appear in the rendered output.
+    fn assert_histograms_described_and_recorded(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        metrics: &[&'static str],
+        category: &str,
+    ) {
+        for name in metrics {
             metrics::histogram!(*name).record(0.025);
         }
 
         let output = handle.render();
 
-        for name in &decomposition_metrics {
+        for name in metrics {
             assert!(
                 output.contains(&format!("# HELP {}", name)),
-                "missing HELP for close-cycle decomposition metric {}",
+                "missing HELP for {} metric {}",
+                category,
                 name
             );
             assert!(
                 output.contains(&format!("# TYPE {} histogram", name)),
-                "missing TYPE histogram for {}",
+                "missing TYPE histogram for {} metric {}",
+                category,
                 name
             );
-            // Verify at least one observation was recorded (bucket, count, sum).
             assert!(
                 output.contains(&format!("{}_bucket{{", name)),
-                "no _bucket line for {} — histogram not recorded",
+                "no _bucket line for {} metric {} — histogram not recorded",
+                category,
                 name
             );
             assert!(
                 output.contains(&format!("{}_count", name)),
-                "no _count line for {} — histogram not recorded",
+                "no _count line for {} metric {} — histogram not recorded",
+                category,
                 name
             );
             assert!(
                 output.contains(&format!("{}_sum", name)),
-                "no _sum line for {} — histogram not recorded",
+                "no _sum line for {} metric {} — histogram not recorded",
+                category,
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_close_cycle_decomposition_histograms_recorded() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+
+        assert_histograms_described_and_recorded(
+            handle,
+            &[
+                CLOSE_HANDLE_COMPLETE_SECONDS,
+                CLOSE_POST_COMPLETE_SECONDS,
+                CLOSE_DISPATCH_TO_JOIN_SECONDS,
+            ],
+            "close-cycle decomposition",
+        );
+    }
+
+    #[test]
+    fn test_ledger_close_duration_histogram_recorded() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+
+        assert_histograms_described_and_recorded(
+            handle,
+            &[LEDGER_CLOSE_DURATION_SECONDS],
+            "ledger close duration",
+        );
+    }
+
+    #[test]
+    fn test_ledger_close_perf_histograms_recorded() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+
+        assert_histograms_described_and_recorded(
+            handle,
+            &[
+                CLOSE_BEGIN_SECONDS,
+                CLOSE_TX_EXEC_SECONDS,
+                CLOSE_CLASSIC_EXEC_SECONDS,
+                CLOSE_SOROBAN_EXEC_SECONDS,
+                CLOSE_COMMIT_SETUP_SECONDS,
+                CLOSE_BUCKET_LOCK_WAIT_SECONDS,
+                CLOSE_EVICTION_SECONDS,
+                CLOSE_SOROBAN_STATE_SECONDS,
+                CLOSE_BUCKET_ADD_SECONDS,
+                CLOSE_HOT_ARCHIVE_SECONDS,
+                CLOSE_HEADER_SECONDS,
+                CLOSE_COMMIT_SECONDS,
+                CLOSE_META_SECONDS,
+            ],
+            "LedgerClosePerf",
+        );
+    }
+
+    #[test]
+    fn test_persist_cycle_histograms_recorded() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+
+        assert_histograms_described_and_recorded(
+            handle,
+            &[
+                PERSIST_DISPATCH_TO_JOIN_SECONDS,
+                PERSIST_LEDGER_CLOSE_SECONDS,
+            ],
+            "persist-cycle",
+        );
+    }
+
+    #[test]
+    fn test_close_complete_phase_histograms_recorded() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+
+        assert_histograms_described_and_recorded(
+            handle,
+            &[
+                CLOSE_COMPLETE_JOIN_MATCH_SECONDS,
+                CLOSE_COMPLETE_META_EMIT_SECONDS,
+                CLOSE_COMPLETE_BUILD_PERSIST_INPUTS_SECONDS,
+                CLOSE_COMPLETE_OVERLAY_BOOKKEEPING_SECONDS,
+                CLOSE_COMPLETE_SPAWN_BLOCKING_SETUP_SECONDS,
+                CLOSE_COMPLETE_TX_QUEUE_SECONDS,
+                CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS,
+            ],
+            "close-complete phase",
+        );
+    }
+
+    #[test]
+    fn test_close_tx_queue_phase_histograms_recorded() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+
+        assert_histograms_described_and_recorded(
+            handle,
+            &[
+                CLOSE_TX_QUEUE_PREP_SECONDS,
+                CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS,
+                CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS,
+                CLOSE_TX_QUEUE_SNAPSHOT_SECONDS,
+                CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS,
+                CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS,
+                CLOSE_TX_QUEUE_INVALIDATION_SECONDS,
+            ],
+            "close tx-queue phase",
+        );
+    }
+
+    #[test]
+    fn test_top_level_close_cycle_histograms_recorded() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+
+        assert_histograms_described_and_recorded(
+            handle,
+            &[CLOSE_CYCLE_SECONDS, SLOT_TO_CLOSE_LATENCY_SECONDS],
+            "top-level close-cycle",
+        );
+    }
+
+    #[test]
+    fn test_archive_cache_histogram_recorded() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+
+        assert_histograms_described_and_recorded(
+            handle,
+            &[ARCHIVE_CACHE_REFRESH_DURATION_SECONDS],
+            "archive cache",
+        );
     }
 }

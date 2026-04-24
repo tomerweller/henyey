@@ -28,6 +28,7 @@ use henyey_history::{DownloadConfig, HistoryArchive};
 use parking_lot::RwLock;
 
 use crate::config::HistoryArchiveEntry;
+use crate::metrics::ARCHIVE_CACHE_REFRESH_DURATION_SECONDS;
 
 /// How long to cache the archive checkpoint before triggering a background
 /// refresh. Matches the previous `ARCHIVE_CHECKPOINT_CACHE_SECS` constant.
@@ -476,7 +477,7 @@ impl ArchiveCheckpointCache {
 
             match outcome {
                 Ok(Ok(checkpoint)) => {
-                    metrics::histogram!("henyey_archive_cache_refresh_duration_seconds")
+                    metrics::histogram!(ARCHIVE_CACHE_REFRESH_DURATION_SECONDS)
                         .record(refresh_start.elapsed().as_secs_f64());
                     *this.value.write() = Some(CachedCheckpoint {
                         checkpoint,
@@ -486,7 +487,7 @@ impl ArchiveCheckpointCache {
                     tracing::debug!(checkpoint, "Archive checkpoint refresh succeeded");
                 }
                 Ok(Err(e)) => {
-                    metrics::histogram!("henyey_archive_cache_refresh_duration_seconds")
+                    metrics::histogram!(ARCHIVE_CACHE_REFRESH_DURATION_SECONDS)
                         .record(refresh_start.elapsed().as_secs_f64());
                     this.refresh_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(
@@ -496,7 +497,7 @@ impl ArchiveCheckpointCache {
                 }
                 Err(_) => {
                     // Record the full timeout duration — this is the actual stall.
-                    metrics::histogram!("henyey_archive_cache_refresh_duration_seconds")
+                    metrics::histogram!(ARCHIVE_CACHE_REFRESH_DURATION_SECONDS)
                         .record(ARCHIVE_REFRESH_TIMEOUT_SECS as f64);
                     this.refresh_timeouts.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
