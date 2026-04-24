@@ -309,7 +309,9 @@ seconds (verified from live scrape).
 
 | Metric | p99 threshold | Severity | Rationale |
 |--------|---------------|----------|-----------|
-| `henyey_close_cycle_seconds` | > 5s bucket | WARN | Includes inter-close wait; > 5s = close ran long |
+| `henyey_close_handle_complete_seconds` | > 0.5s bucket | WARN | Close-complete processing regression (metadata, persist-input prep, finalizer dispatch, overlay, tx queue) |
+| `henyey_close_dispatch_to_join_seconds` | > 5s bucket | WARN | Ledger close spawn_blocking wall-clock + tokio scheduler delay regression |
+| `henyey_close_post_complete_seconds` | > 0.5s bucket | WARN | Post-close lifecycle work regression (persist pipeline, history publish, consensus trigger, SCP/fetch drains) |
 | `henyey_ledger_close_tx_exec_seconds` | > 1s bucket | WARN | Tx execution regression |
 | `henyey_ledger_close_soroban_exec_seconds` | > 1s bucket | WARN | Soroban execution regression |
 | `henyey_ledger_close_commit_seconds` | > 0.5s bucket | WARN | Commit-phase regression |
