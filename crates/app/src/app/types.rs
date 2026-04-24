@@ -259,9 +259,7 @@ pub struct AppMetricsSnapshot {
     // Phase 3: Soroban parallel execution structure (sticky).
     pub soroban_stage_count: u64,
     pub soroban_max_cluster_count: u64,
-    // Phase 3: last-close phase timing (lightweight — no Vec clone).
-    pub soroban_exec_us: u64,
-    pub classic_exec_us: u64,
+    // Phase 3: last-close cache metrics (lightweight — no Vec clone).
     pub bucket_cache_hit_ratio: f64,
     pub snapshot_cache_hit_ratio: f64,
     pub snapshot_cache_fallback_lookups: u64,

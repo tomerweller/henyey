@@ -910,8 +910,8 @@
     {
       "id": 15,
       "type": "timeseries",
-      "title": "Classic vs Soroban Execution",
-      "description": "Breakdown of ledger apply time between classic transaction execution and Soroban smart contract execution. Henyey-specific metric.",
+      "title": "Classic vs Soroban Execution (Rolling Average)",
+      "description": "Rolling average of ledger apply time between classic transaction execution and Soroban smart contract execution, derived from histograms. Henyey-specific metric.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -924,7 +924,7 @@
       },
       "targets": [
         {
-          "expr": "henyey_ledger_classic_exec_us{job=\"henyey\", instance=~\"$instance\"} / 1000",
+          "expr": "rate(henyey_ledger_close_classic_exec_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_classic_exec_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) * 1000 or vector(0)",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"
@@ -933,7 +933,7 @@
           "refId": "A"
         },
         {
-          "expr": "henyey_ledger_soroban_exec_us{job=\"henyey\", instance=~\"$instance\"} / 1000",
+          "expr": "rate(henyey_ledger_close_soroban_exec_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_soroban_exec_seconds_count{job=\"henyey\", instance=~\"$instance\"}[$__rate_interval]) * 1000 or vector(0)",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"
@@ -1278,7 +1278,7 @@
       },
       "targets": [
         {
-          "expr": "henyey_bucket_cache_hit_ratio{job=\"henyey\", instance=~\"$instance\"}",
+          "expr": "henyey_ledger_bucket_cache_hit_ratio{job=\"henyey\", instance=~\"$instance\"}",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"
@@ -1354,7 +1354,7 @@
       },
       "targets": [
         {
-          "expr": "henyey_snapshot_cache_hit_ratio{job=\"henyey\", instance=~\"$instance\"}",
+          "expr": "henyey_ledger_snapshot_cache_hit_ratio{job=\"henyey\", instance=~\"$instance\"}",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"
@@ -1430,7 +1430,7 @@
       },
       "targets": [
         {
-          "expr": "henyey_snapshot_cache_fallback_lookups{job=\"henyey\", instance=~\"$instance\"}",
+          "expr": "henyey_ledger_snapshot_cache_fallback_lookups{job=\"henyey\", instance=~\"$instance\"}",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"

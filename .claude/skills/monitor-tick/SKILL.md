@@ -344,14 +344,14 @@ Skip if `count_delta < 20`. Compute cumulative bucket delta at upper edge L:
 
 Thresholds (all WARN):
 
-- `henyey_close_handle_complete_seconds` p99 >0.5s
-- `henyey_close_dispatch_to_join_seconds` p99 >5s
-- `henyey_close_post_complete_seconds` p99 >0.5s
+- `henyey_ledger_close_handle_complete_seconds` p99 >0.5s
+- `henyey_ledger_close_dispatch_to_join_seconds` p99 >5s
+- `henyey_ledger_close_post_complete_seconds` p99 >0.5s
 - `henyey_ledger_close_tx_exec_seconds` p99 >1s
 - `henyey_ledger_close_soroban_exec_seconds` p99 >1s
 - `henyey_ledger_close_commit_seconds` p99 >0.5s
 - `henyey_ledger_close_soroban_state_seconds` p99 >0.5s
-- `henyey_close_complete_tx_queue_seconds` p99 >0.5s
+- `henyey_ledger_close_complete_tx_queue_seconds` p99 >0.5s
 
 Mean check (`sum_delta / count_delta`) is a cheaper fallback — fire on whichever breaches.
 

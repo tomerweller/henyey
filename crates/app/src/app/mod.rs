@@ -574,7 +574,7 @@ pub struct App {
     is_applying_ledger: AtomicBool,
 
     /// Wall-clock of the last deferred-pipeline close-complete entry.
-    /// Used to compute `henyey_close_cycle_seconds` — the time between
+    /// Used to compute `henyey_ledger_close_cycle_seconds` — the time between
     /// consecutive production close-complete events.
     close_cycle_last_start: parking_lot::Mutex<Option<std::time::Instant>>,
 
@@ -2075,17 +2075,7 @@ impl App {
             cumulative_soroban_failure: self.cumulative_soroban_failure.load(Ordering::Relaxed),
             soroban_stage_count: self.last_soroban_stage_count.load(Ordering::Relaxed),
             soroban_max_cluster_count: self.last_soroban_max_cluster_count.load(Ordering::Relaxed),
-            // Phase 3 last-close phase timing (lightweight snapshot).
-            soroban_exec_us: self
-                .last_close_perf
-                .read()
-                .as_ref()
-                .map_or(0, |p| p.soroban_exec_us),
-            classic_exec_us: self
-                .last_close_perf
-                .read()
-                .as_ref()
-                .map_or(0, |p| p.classic_exec_us),
+            // Phase 3 last-close cache metrics (lightweight snapshot).
             bucket_cache_hit_ratio: self
                 .last_close_perf
                 .read()

@@ -73,7 +73,6 @@ pub const OVERLAY_TIMEOUT_IDLE_TOTAL: &str = "stellar_overlay_timeout_idle_total
 pub const OVERLAY_TIMEOUT_STRAGGLER_TOTAL: &str = "stellar_overlay_timeout_straggler_total";
 
 // Ledger close metrics (Phase 2 — per-ledger snapshot gauges).
-pub const LEDGER_CLOSE_TIME_MS: &str = "stellar_ledger_close_time_ms";
 pub const LEDGER_TX_COUNT: &str = "stellar_ledger_tx_count";
 pub const LEDGER_OP_COUNT: &str = "stellar_ledger_op_count";
 pub const LEDGER_TX_SUCCESS_COUNT: &str = "stellar_ledger_tx_success_count";
@@ -152,11 +151,10 @@ pub const SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE: &str =
 pub const SOROBAN_CONFIG_FEE_WRITE_1KB: &str = "stellar_soroban_config_fee_write_1kb";
 
 // Phase 3 — Henyey-specific observability.
-pub const LEDGER_SOROBAN_EXEC_US: &str = "henyey_ledger_soroban_exec_us";
-pub const LEDGER_CLASSIC_EXEC_US: &str = "henyey_ledger_classic_exec_us";
-pub const LEDGER_BUCKET_CACHE_HIT_RATIO: &str = "henyey_bucket_cache_hit_ratio";
-pub const LEDGER_SNAPSHOT_CACHE_HIT_RATIO: &str = "henyey_snapshot_cache_hit_ratio";
-pub const LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS: &str = "henyey_snapshot_cache_fallback_lookups";
+pub const LEDGER_BUCKET_CACHE_HIT_RATIO: &str = "henyey_ledger_bucket_cache_hit_ratio";
+pub const LEDGER_SNAPSHOT_CACHE_HIT_RATIO: &str = "henyey_ledger_snapshot_cache_hit_ratio";
+pub const LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS: &str =
+    "henyey_ledger_snapshot_cache_fallback_lookups";
 
 // Phase 4 — Ledger close histogram.
 pub const LEDGER_CLOSE_DURATION_SECONDS: &str = "stellar_ledger_close_duration_seconds";
@@ -197,33 +195,36 @@ pub const CLOSE_COMMIT_SECONDS: &str = "henyey_ledger_close_commit_seconds";
 pub const CLOSE_META_SECONDS: &str = "henyey_ledger_close_meta_seconds";
 
 // Phase 5 — Event-loop post-close PhaseTimer histograms.
-pub const CLOSE_COMPLETE_JOIN_MATCH_SECONDS: &str = "henyey_close_complete_join_match_seconds";
-pub const CLOSE_COMPLETE_META_EMIT_SECONDS: &str = "henyey_close_complete_meta_emit_seconds";
+pub const CLOSE_COMPLETE_JOIN_MATCH_SECONDS: &str =
+    "henyey_ledger_close_complete_join_match_seconds";
+pub const CLOSE_COMPLETE_META_EMIT_SECONDS: &str = "henyey_ledger_close_complete_meta_emit_seconds";
 pub const CLOSE_COMPLETE_BUILD_PERSIST_INPUTS_SECONDS: &str =
-    "henyey_close_complete_build_persist_inputs_seconds";
+    "henyey_ledger_close_complete_build_persist_inputs_seconds";
 pub const CLOSE_COMPLETE_OVERLAY_BOOKKEEPING_SECONDS: &str =
-    "henyey_close_complete_overlay_bookkeeping_seconds";
+    "henyey_ledger_close_complete_overlay_bookkeeping_seconds";
 pub const CLOSE_COMPLETE_SPAWN_BLOCKING_SETUP_SECONDS: &str =
-    "henyey_close_complete_spawn_blocking_setup_seconds";
-pub const CLOSE_COMPLETE_TX_QUEUE_SECONDS: &str = "henyey_close_complete_tx_queue_seconds";
+    "henyey_ledger_close_complete_spawn_blocking_setup_seconds";
+pub const CLOSE_COMPLETE_TX_QUEUE_SECONDS: &str = "henyey_ledger_close_complete_tx_queue_seconds";
 pub const CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS: &str =
-    "henyey_close_complete_post_close_bookkeeping_seconds";
+    "henyey_ledger_close_complete_post_close_bookkeeping_seconds";
 
 // Phase 6 — Sub-phase instrumentation inside tx_queue spawn_blocking.
-pub const CLOSE_TX_QUEUE_PREP_SECONDS: &str = "henyey_close_tx_queue_prep_seconds";
+pub const CLOSE_TX_QUEUE_PREP_SECONDS: &str = "henyey_ledger_close_tx_queue_prep_seconds";
 pub const CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS: &str =
-    "henyey_close_tx_queue_ledger_closed_seconds";
-pub const CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS: &str = "henyey_close_tx_queue_shift_update_seconds";
-pub const CLOSE_TX_QUEUE_SNAPSHOT_SECONDS: &str = "henyey_close_tx_queue_snapshot_seconds";
+    "henyey_ledger_close_tx_queue_ledger_closed_seconds";
+pub const CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS: &str =
+    "henyey_ledger_close_tx_queue_shift_update_seconds";
+pub const CLOSE_TX_QUEUE_SNAPSHOT_SECONDS: &str = "henyey_ledger_close_tx_queue_snapshot_seconds";
 pub const CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS: &str =
-    "henyey_close_tx_queue_envelopes_fetch_seconds";
+    "henyey_ledger_close_tx_queue_envelopes_fetch_seconds";
 pub const CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS: &str =
-    "henyey_close_tx_queue_snapshot_build_seconds";
-pub const CLOSE_TX_QUEUE_INVALIDATION_SECONDS: &str = "henyey_close_tx_queue_invalidation_seconds";
+    "henyey_ledger_close_tx_queue_snapshot_build_seconds";
+pub const CLOSE_TX_QUEUE_INVALIDATION_SECONDS: &str =
+    "henyey_ledger_close_tx_queue_invalidation_seconds";
 
 // Phase 6 — Persist and close-cycle instrumentation.
-pub const PERSIST_LEDGER_CLOSE_SECONDS: &str = "henyey_persist_ledger_close_seconds";
-pub const CLOSE_CYCLE_SECONDS: &str = "henyey_close_cycle_seconds";
+pub const PERSIST_LEDGER_CLOSE_SECONDS: &str = "henyey_ledger_persist_close_seconds";
+pub const CLOSE_CYCLE_SECONDS: &str = "henyey_ledger_close_cycle_seconds";
 
 // Close-cycle decomposition metrics (#1909).
 // close_cycle ≈ handle_complete + post_complete + inter_close_wait + dispatch_to_join
@@ -232,13 +233,13 @@ pub const CLOSE_CYCLE_SECONDS: &str = "henyey_close_cycle_seconds";
 // - handle_complete: always recorded (success and failure)
 // - dispatch_to_join: always recorded (measures spawn_blocking latency)
 // - post_complete: only recorded on successful close (guards lifecycle work)
-pub const CLOSE_HANDLE_COMPLETE_SECONDS: &str = "henyey_close_handle_complete_seconds";
-pub const CLOSE_POST_COMPLETE_SECONDS: &str = "henyey_close_post_complete_seconds";
-pub const CLOSE_DISPATCH_TO_JOIN_SECONDS: &str = "henyey_close_dispatch_to_join_seconds";
-pub const PERSIST_DISPATCH_TO_JOIN_SECONDS: &str = "henyey_persist_dispatch_to_join_seconds";
+pub const CLOSE_HANDLE_COMPLETE_SECONDS: &str = "henyey_ledger_close_handle_complete_seconds";
+pub const CLOSE_POST_COMPLETE_SECONDS: &str = "henyey_ledger_close_post_complete_seconds";
+pub const CLOSE_DISPATCH_TO_JOIN_SECONDS: &str = "henyey_ledger_close_dispatch_to_join_seconds";
+pub const PERSIST_DISPATCH_TO_JOIN_SECONDS: &str = "henyey_ledger_persist_dispatch_to_join_seconds";
 
 // Phase 5 — Slot-to-close latency histogram.
-pub const SLOT_TO_CLOSE_LATENCY_SECONDS: &str = "henyey_slot_to_close_latency_seconds";
+pub const SLOT_TO_CLOSE_LATENCY_SECONDS: &str = "henyey_ledger_slot_to_close_latency_seconds";
 
 // Phase 5 — Archive cache metrics.
 pub const ARCHIVE_CACHE_FRESH_TOTAL: &str = "henyey_archive_cache_fresh_total";
@@ -436,10 +437,6 @@ pub fn describe_metrics() {
     );
 
     // Ledger close metrics.
-    describe_gauge!(
-        LEDGER_CLOSE_TIME_MS,
-        "Wall-clock time of the most recent ledger close (milliseconds)"
-    );
     describe_gauge!(LEDGER_TX_COUNT, "Transactions processed in the last close");
     describe_gauge!(LEDGER_OP_COUNT, "Operations executed in the last close");
     describe_gauge!(
@@ -653,14 +650,6 @@ pub fn describe_metrics() {
     );
 
     // Phase 3: Henyey-specific observability.
-    describe_gauge!(
-        LEDGER_SOROBAN_EXEC_US,
-        "Soroban parallel phase execution time in microseconds (last close)"
-    );
-    describe_gauge!(
-        LEDGER_CLASSIC_EXEC_US,
-        "Classic phase execution time in microseconds (last close)"
-    );
     describe_gauge!(
         LEDGER_BUCKET_CACHE_HIT_RATIO,
         "Per-bucket RandomEvictionCache hit ratio (0.0-1.0, Account entries only, last close)"
@@ -977,7 +966,6 @@ pub fn register_label_series() {
     counter!(OVERLAY_TIMEOUT_STRAGGLER_TOTAL).absolute(0);
 
     // Ledger close gauges (Phase 2).
-    gauge!(LEDGER_CLOSE_TIME_MS).set(0.0);
     gauge!(LEDGER_TX_COUNT).set(0.0);
     gauge!(LEDGER_OP_COUNT).set(0.0);
     gauge!(LEDGER_TX_SUCCESS_COUNT).set(0.0);
@@ -1052,8 +1040,6 @@ pub fn register_label_series() {
     gauge!(SOROBAN_CONFIG_FEE_WRITE_1KB).set(0.0);
 
     // Phase 3: Henyey-specific gauges.
-    gauge!(LEDGER_SOROBAN_EXEC_US).set(0.0);
-    gauge!(LEDGER_CLASSIC_EXEC_US).set(0.0);
     gauge!(LEDGER_BUCKET_CACHE_HIT_RATIO).set(0.0);
     gauge!(LEDGER_SNAPSHOT_CACHE_HIT_RATIO).set(0.0);
     gauge!(LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS).set(0.0);
@@ -1198,7 +1184,6 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
 
     // Ledger close stats (Phase 2).
     let lcs = state.app.last_close_stats();
-    gauge!(LEDGER_CLOSE_TIME_MS).set(lcs.close_time_ms as f64);
     gauge!(LEDGER_TX_COUNT).set(lcs.tx_count as f64);
     gauge!(LEDGER_OP_COUNT).set(lcs.op_count as f64);
     gauge!(LEDGER_TX_SUCCESS_COUNT).set(lcs.tx_success_count as f64);
@@ -1300,8 +1285,6 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     }
 
     // Phase 3: Henyey-specific observability.
-    gauge!(LEDGER_SOROBAN_EXEC_US).set(snap.soroban_exec_us as f64);
-    gauge!(LEDGER_CLASSIC_EXEC_US).set(snap.classic_exec_us as f64);
     gauge!(LEDGER_BUCKET_CACHE_HIT_RATIO).set(snap.bucket_cache_hit_ratio);
     gauge!(LEDGER_SNAPSHOT_CACHE_HIT_RATIO).set(snap.snapshot_cache_hit_ratio);
     gauge!(LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS).set(snap.snapshot_cache_fallback_lookups as f64);
@@ -1697,7 +1680,6 @@ mod tests {
 
         // Ledger close gauges.
         let ledger_metrics = [
-            LEDGER_CLOSE_TIME_MS,
             LEDGER_TX_COUNT,
             LEDGER_OP_COUNT,
             LEDGER_TX_SUCCESS_COUNT,
@@ -1792,7 +1774,6 @@ mod tests {
 
         // Before any close, all ledger gauges should be 0.
         let zero_metrics = [
-            LEDGER_CLOSE_TIME_MS,
             LEDGER_TX_COUNT,
             LEDGER_OP_COUNT,
             LEDGER_TX_SUCCESS_COUNT,
@@ -1914,8 +1895,6 @@ mod tests {
         let output = handle.render();
 
         let gauge_metrics = [
-            LEDGER_SOROBAN_EXEC_US,
-            LEDGER_CLASSIC_EXEC_US,
             LEDGER_BUCKET_CACHE_HIT_RATIO,
             LEDGER_SNAPSHOT_CACHE_HIT_RATIO,
             LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS,

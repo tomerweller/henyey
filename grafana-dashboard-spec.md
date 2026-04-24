@@ -125,13 +125,13 @@ Since this is currently a single-node deployment, the instance variable exists f
 - **Legend:** "apply time (ms)"
 - **Description:** Total ledger apply time for the most recent close. This is the CPU-bound portion of the close (excludes consensus/network). Compare with close duration to see how much time is consensus vs execution.
 
-### Panel 2.5: Classic vs Soroban Execution
+### Panel 2.5: Classic vs Soroban Execution (Rolling Average)
 - **Type:** timeseries (stacked area)
 - **Queries:**
-  - `henyey_ledger_classic_exec_us{job="henyey", instance=~"$instance"} / 1000` — legend: "Classic (ms)"
-  - `henyey_ledger_soroban_exec_us{job="henyey", instance=~"$instance"} / 1000` — legend: "Soroban (ms)"
+  - `rate(henyey_ledger_close_classic_exec_seconds_sum{job="henyey", instance=~"$instance"}[$__rate_interval]) / rate(henyey_ledger_close_classic_exec_seconds_count{job="henyey", instance=~"$instance"}[$__rate_interval]) * 1000 or vector(0)` — legend: "Classic (ms)"
+  - `rate(henyey_ledger_close_soroban_exec_seconds_sum{job="henyey", instance=~"$instance"}[$__rate_interval]) / rate(henyey_ledger_close_soroban_exec_seconds_count{job="henyey", instance=~"$instance"}[$__rate_interval]) * 1000 or vector(0)` — legend: "Soroban (ms)"
 - **Y-axis:** milliseconds
-- **Description:** Breakdown of ledger apply time between classic transaction execution and Soroban smart contract execution. Shows the relative cost and how it shifts over time. **Henyey-specific metric — not available in stellar-core.**
+- **Description:** Rolling average of ledger apply time between classic transaction execution and Soroban smart contract execution, derived from histograms. Shows the relative cost and how it shifts over time. **Henyey-specific metric — not available in stellar-core.**
 
 ### Panel 2.6: Transaction & Operation Count
 - **Type:** timeseries
@@ -161,21 +161,21 @@ Since this is currently a single-node deployment, the instance variable exists f
 
 ### Panel 2.9: Bucket Cache Hit Ratio
 - **Type:** timeseries
-- **Query:** `henyey_bucket_cache_hit_ratio{job="henyey", instance=~"$instance"}`
+- **Query:** `henyey_ledger_bucket_cache_hit_ratio{job="henyey", instance=~"$instance"}`
 - **Y-axis:** ratio (0-1), format as percent
 - **Thresholds:** <0.5 = red line
 - **Description:** Per-bucket RandomEvictionCache hit ratio (Account entries only). Low values are expected because the SnapshotHandle prefetch cache absorbs most lookups before they reach the bucket layer. **Henyey-specific metric.**
 
 ### Panel 2.9b: Snapshot Cache Hit Ratio
 - **Type:** timeseries
-- **Query:** `henyey_snapshot_cache_hit_ratio{job="henyey", instance=~"$instance"}`
+- **Query:** `henyey_ledger_snapshot_cache_hit_ratio{job="henyey", instance=~"$instance"}`
 - **Y-axis:** ratio (0-1), format as percent
 - **Thresholds:** <0.5 = red line
 - **Description:** Fraction of SnapshotHandle lookups served from local caches (snapshot + prefetch/read-through) without dispatching to the fallback lookup function. This is the primary cache effectiveness metric. **Henyey-specific metric.**
 
 ### Panel 2.9c: Snapshot Cache Fallback Lookups
 - **Type:** timeseries
-- **Query:** `henyey_snapshot_cache_fallback_lookups{job="henyey", instance=~"$instance"}`
+- **Query:** `henyey_ledger_snapshot_cache_fallback_lookups{job="henyey", instance=~"$instance"}`
 - **Y-axis:** count
 - **Description:** Number of SnapshotHandle lookups per ledger that were not served by local caches and had to be dispatched to the fallback (bucket list / Soroban state). **Henyey-specific metric.**
 
