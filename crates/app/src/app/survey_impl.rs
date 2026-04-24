@@ -897,27 +897,55 @@ impl App {
         const SURVEY_MAX_PEERS: usize = 4;
 
         let now = self.clock.now();
-        let mut scheduler = self.survey_scheduler.write().await;
 
-        if now < scheduler.next_action {
-            return;
-        }
+        // Phase 1: Snapshot scheduler state under a short lock.
+        let action = {
+            let scheduler = self.survey_scheduler.lock().await;
+            if now < scheduler.next_action {
+                SchedulerAction::NotDue
+            } else {
+                match scheduler.phase {
+                    SurveySchedulerPhase::Idle => SchedulerAction::Idle {
+                        last_started: scheduler.last_started,
+                    },
+                    SurveySchedulerPhase::StartSent => SchedulerAction::StartSent {
+                        peers: scheduler.peers.clone(),
+                        nonce: scheduler.nonce,
+                        ledger_num: scheduler.ledger_num,
+                    },
+                    SurveySchedulerPhase::RequestSent => SchedulerAction::RequestSent {
+                        peers: scheduler.peers.clone(),
+                        nonce: scheduler.nonce,
+                        ledger_num: scheduler.ledger_num,
+                    },
+                }
+            }
+        }; // lock dropped
 
-        match scheduler.phase {
-            SurveySchedulerPhase::Idle => {
+        // Phase 2: Perform async work without any lock held.
+        match action {
+            SchedulerAction::NotDue => {}
+
+            SchedulerAction::Idle { last_started } => {
                 if self.survey_data.read().await.survey_is_active()
                     || self.survey_reporting.read().await.running
                 {
+                    let mut scheduler = self.survey_scheduler.lock().await;
+                    debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::Idle);
                     scheduler.next_action = now + SURVEY_INTERVAL;
                     return;
                 }
                 let state = *self.state.read().await;
                 if !matches!(state, AppState::Synced | AppState::Validating) {
+                    let mut scheduler = self.survey_scheduler.lock().await;
+                    debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::Idle);
                     scheduler.next_action = now + SURVEY_INTERVAL;
                     return;
                 }
-                if let Some(last) = scheduler.last_started {
+                if let Some(last) = last_started {
                     if now.duration_since(last) < self.survey_throttle {
+                        let mut scheduler = self.survey_scheduler.lock().await;
+                        debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::Idle);
                         scheduler.next_action = last + self.survey_throttle;
                         return;
                     }
@@ -925,6 +953,8 @@ impl App {
 
                 let peers = {
                     let Some(overlay) = self.overlay().await else {
+                        let mut scheduler = self.survey_scheduler.lock().await;
+                        debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::Idle);
                         scheduler.next_action = now + SURVEY_INTERVAL;
                         return;
                     };
@@ -932,23 +962,30 @@ impl App {
                 };
 
                 if peers.is_empty() {
+                    let mut scheduler = self.survey_scheduler.lock().await;
+                    debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::Idle);
                     scheduler.next_action = now + SURVEY_INTERVAL;
                     return;
                 }
 
                 let ledger_num = self.current_ledger_seq();
                 let nonce = {
-                    let mut nonce = self.survey_nonce.write().await;
-                    let current = *nonce;
-                    *nonce = nonce.wrapping_add(1);
+                    let mut nonce_guard = self.survey_nonce.write().await;
+                    let current = *nonce_guard;
+                    *nonce_guard = nonce_guard.wrapping_add(1);
                     current
                 };
 
                 if !self.send_survey_start(&peers, nonce, ledger_num).await {
+                    let mut scheduler = self.survey_scheduler.lock().await;
+                    debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::Idle);
                     scheduler.next_action = now + SURVEY_INTERVAL;
                     return;
                 }
 
+                // Phase 3: Write back state under short lock.
+                let mut scheduler = self.survey_scheduler.lock().await;
+                debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::Idle);
                 scheduler.phase = SurveySchedulerPhase::StartSent;
                 scheduler.peers = peers;
                 scheduler.nonce = nonce;
@@ -956,25 +993,50 @@ impl App {
                 scheduler.next_action = now + SURVEY_COLLECT_DELAY;
                 scheduler.last_started = Some(now);
             }
-            SurveySchedulerPhase::StartSent => {
-                if !self
-                    .send_survey_requests(&scheduler.peers, scheduler.nonce, scheduler.ledger_num)
-                    .await
-                {
-                    self.survey_secrets.write().await.remove(&scheduler.nonce);
+
+            SchedulerAction::StartSent {
+                peers,
+                nonce,
+                ledger_num,
+            } => {
+                if !self.send_survey_requests(&peers, nonce, ledger_num).await {
+                    // Clean up: remove secrets AND stop local survey collection +
+                    // clear results to prevent survey_is_active() from wedging
+                    // future Idle ticks.
+                    self.survey_secrets.write().await.remove(&nonce);
+                    self.survey_results.write().await.remove(&nonce);
+                    let stop = TimeSlicedSurveyStopCollectingMessage {
+                        surveyor_id: self.local_node_id(),
+                        nonce,
+                        ledger_num,
+                    };
+                    self.stop_local_survey_collecting(&stop).await;
+
+                    let mut scheduler = self.survey_scheduler.lock().await;
+                    debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::StartSent);
                     scheduler.phase = SurveySchedulerPhase::Idle;
                     scheduler.next_action = now + SURVEY_INTERVAL;
                     return;
                 }
+
+                let mut scheduler = self.survey_scheduler.lock().await;
+                debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::StartSent);
                 scheduler.phase = SurveySchedulerPhase::RequestSent;
                 scheduler.next_action = now + SURVEY_RESPONSE_WAIT;
             }
-            SurveySchedulerPhase::RequestSent => {
-                self.send_survey_stop(&scheduler.peers, scheduler.nonce, scheduler.ledger_num)
-                    .await;
-                for peer_id in scheduler.peers.clone() {
-                    let _ = self.survey_topology_timesliced(peer_id, 0, 0).await;
+
+            SchedulerAction::RequestSent {
+                peers,
+                nonce,
+                ledger_num,
+            } => {
+                self.send_survey_stop(&peers, nonce, ledger_num).await;
+                for peer_id in &peers {
+                    let _ = self.survey_topology_timesliced(peer_id.clone(), 0, 0).await;
                 }
+
+                let mut scheduler = self.survey_scheduler.lock().await;
+                debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::RequestSent);
                 scheduler.phase = SurveySchedulerPhase::Idle;
                 scheduler.peers.clear();
                 scheduler.nonce = 0;

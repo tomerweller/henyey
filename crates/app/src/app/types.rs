@@ -929,6 +929,28 @@ impl SurveyScheduler {
     }
 }
 
+/// Action determined by snapshotting `SurveyScheduler` state under a short lock.
+/// The lock is dropped before this enum is consumed, ensuring no lock is held
+/// across `.await` points.
+pub(super) enum SchedulerAction {
+    /// Not yet time to act.
+    NotDue,
+    /// Scheduler is idle — attempt to start a new survey.
+    Idle { last_started: Option<Instant> },
+    /// Survey start was sent — send requests to peers.
+    StartSent {
+        peers: Vec<PeerId>,
+        nonce: u32,
+        ledger_num: u32,
+    },
+    /// Requests were sent — stop the survey and collect topology.
+    RequestSent {
+        peers: Vec<PeerId>,
+        nonce: u32,
+        ledger_num: u32,
+    },
+}
+
 #[derive(Debug)]
 pub(super) struct ScpTimeoutState {
     pub slot: u64,

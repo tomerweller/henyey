@@ -524,7 +524,7 @@ pub struct App {
     scp_latency: RwLock<ScpLatencyTracker>,
 
     /// Survey scheduler state for time-sliced surveys.
-    survey_scheduler: RwLock<SurveyScheduler>,
+    survey_scheduler: TokioMutex<SurveyScheduler>,
     /// Next survey nonce.
     survey_nonce: RwLock<u32>,
     /// Ephemeral survey encryption secrets keyed by nonce.
@@ -943,7 +943,7 @@ impl App {
             archive_behind_until: RwLock::new(None),
             archive_confirmed_behind: AtomicBool::new(false),
             scp_latency: RwLock::new(ScpLatencyTracker::default()),
-            survey_scheduler: RwLock::new(SurveyScheduler::new(now)),
+            survey_scheduler: TokioMutex::new(SurveyScheduler::new(now)),
             survey_nonce: RwLock::new(1),
             survey_secrets: RwLock::new(HashMap::new()),
             survey_results: RwLock::new(HashMap::new()),
@@ -7741,5 +7741,235 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         let _: anyhow::Result<()> = app.db_blocking("test-panic", |_db| panic!("boom")).await;
+    }
+
+    // ---- advance_survey_scheduler tests ----
+
+    /// Helper: create an App for survey scheduler tests.
+    async fn survey_test_app() -> Arc<App> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("survey-test.db"))
+            .build();
+        Arc::new(App::new(config).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_advance_survey_scheduler_not_due() {
+        let app = survey_test_app().await;
+        let now = app.clock.now();
+
+        // Set next_action far in the future so the scheduler should be a no-op.
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.next_action = now + Duration::from_secs(3600);
+        }
+
+        app.advance_survey_scheduler().await;
+
+        // Phase should remain Idle, next_action unchanged.
+        let sched = app.survey_scheduler.lock().await;
+        assert_eq!(sched.phase, SurveySchedulerPhase::Idle);
+        assert!(sched.next_action > now + Duration::from_secs(3599));
+    }
+
+    #[tokio::test]
+    async fn test_advance_survey_scheduler_idle_active_survey() {
+        let app = survey_test_app().await;
+        let now = app.clock.now();
+
+        // Make the scheduler due.
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.next_action = now - Duration::from_secs(1);
+        }
+
+        // Activate survey_data so the Idle path sees survey_is_active() == true.
+        {
+            let mut data = app.survey_data.write().await;
+            let msg = stellar_xdr::curr::TimeSlicedSurveyStartCollectingMessage {
+                surveyor_id: stellar_xdr::curr::NodeId(
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                        [0u8; 32],
+                    )),
+                ),
+                nonce: 99,
+                ledger_num: 1,
+            };
+            let _ = data.start_collecting(
+                &msg,
+                &[],
+                &[],
+                crate::survey::NodeStatsSnapshot {
+                    lost_sync_count: 0,
+                    out_of_sync: false,
+                    added_peers: 0,
+                    dropped_peers: 0,
+                },
+            );
+        }
+
+        app.advance_survey_scheduler().await;
+
+        // Phase stays Idle, next_action bumped by SURVEY_INTERVAL (60s).
+        let sched = app.survey_scheduler.lock().await;
+        assert_eq!(sched.phase, SurveySchedulerPhase::Idle);
+        assert!(sched.next_action >= now + Duration::from_secs(59));
+    }
+
+    #[tokio::test]
+    async fn test_advance_survey_scheduler_idle_reporting_running() {
+        let app = survey_test_app().await;
+        let now = app.clock.now();
+
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.next_action = now - Duration::from_secs(1);
+        }
+        {
+            let mut reporting = app.survey_reporting.write().await;
+            reporting.running = true;
+        }
+
+        app.advance_survey_scheduler().await;
+
+        let sched = app.survey_scheduler.lock().await;
+        assert_eq!(sched.phase, SurveySchedulerPhase::Idle);
+        assert!(sched.next_action >= now + Duration::from_secs(59));
+    }
+
+    #[tokio::test]
+    async fn test_advance_survey_scheduler_idle_wrong_state() {
+        let app = survey_test_app().await;
+        let now = app.clock.now();
+
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.next_action = now - Duration::from_secs(1);
+        }
+        // App starts in Initializing, which is not Synced/Validating.
+        assert_eq!(app.state().await, AppState::Initializing);
+
+        app.advance_survey_scheduler().await;
+
+        let sched = app.survey_scheduler.lock().await;
+        assert_eq!(sched.phase, SurveySchedulerPhase::Idle);
+        assert!(sched.next_action >= now + Duration::from_secs(59));
+    }
+
+    #[tokio::test]
+    async fn test_advance_survey_scheduler_idle_throttled() {
+        let app = survey_test_app().await;
+        let now = app.clock.now();
+
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.next_action = now - Duration::from_secs(1);
+            // Set last_started very recently so the throttle kicks in.
+            sched.last_started = Some(now);
+        }
+        // Set state to Synced so we pass the state check.
+        *app.state.write().await = AppState::Synced;
+
+        app.advance_survey_scheduler().await;
+
+        let sched = app.survey_scheduler.lock().await;
+        assert_eq!(sched.phase, SurveySchedulerPhase::Idle);
+        // next_action should be set to last_started + throttle, not now + INTERVAL.
+        assert!(sched.next_action > now);
+    }
+
+    #[tokio::test]
+    async fn test_advance_survey_scheduler_idle_no_overlay() {
+        let app = survey_test_app().await;
+        let now = app.clock.now();
+
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.next_action = now - Duration::from_secs(1);
+            sched.last_started = None;
+        }
+        *app.state.write().await = AppState::Synced;
+        // No overlay started → overlay() returns None.
+
+        app.advance_survey_scheduler().await;
+
+        let sched = app.survey_scheduler.lock().await;
+        assert_eq!(sched.phase, SurveySchedulerPhase::Idle);
+        assert!(sched.next_action >= now + Duration::from_secs(59));
+    }
+
+    #[tokio::test]
+    async fn test_advance_survey_scheduler_startsent_failure_cleanup() {
+        let app = survey_test_app().await;
+        let now = app.clock.now();
+        let test_nonce = 42u32;
+
+        // Pre-populate scheduler in StartSent phase.
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.phase = SurveySchedulerPhase::StartSent;
+            sched.next_action = now - Duration::from_secs(1);
+            sched.nonce = test_nonce;
+            sched.ledger_num = 100;
+            // Use a dummy peer ID — send_survey_requests will fail because
+            // there's no overlay.
+            sched.peers = vec![henyey_overlay::PeerId::from_bytes([1u8; 32])];
+        }
+
+        // Pre-populate survey_secrets and survey_results so we can verify cleanup.
+        app.survey_secrets
+            .write()
+            .await
+            .insert(test_nonce, [0u8; 32]);
+        app.survey_results
+            .write()
+            .await
+            .insert(test_nonce, HashMap::new());
+
+        app.advance_survey_scheduler().await;
+
+        // Verify cleanup: phase back to Idle, secrets and results removed.
+        let sched = app.survey_scheduler.lock().await;
+        assert_eq!(sched.phase, SurveySchedulerPhase::Idle);
+        assert!(sched.next_action >= now + Duration::from_secs(59));
+
+        assert!(
+            !app.survey_secrets.read().await.contains_key(&test_nonce),
+            "survey_secrets should be cleaned up on StartSent failure"
+        );
+        assert!(
+            !app.survey_results.read().await.contains_key(&test_nonce),
+            "survey_results should be cleaned up on StartSent failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_advance_survey_scheduler_requestsent_to_idle() {
+        let app = survey_test_app().await;
+        let now = app.clock.now();
+        let test_nonce = 77u32;
+
+        // Pre-populate scheduler in RequestSent phase with no overlay.
+        // send_survey_stop will early-return (no overlay), but the phase
+        // transition should still happen.
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.phase = SurveySchedulerPhase::RequestSent;
+            sched.next_action = now - Duration::from_secs(1);
+            sched.nonce = test_nonce;
+            sched.ledger_num = 200;
+            sched.peers = vec![henyey_overlay::PeerId::from_bytes([2u8; 32])];
+        }
+
+        app.advance_survey_scheduler().await;
+
+        // Verify full reset to Idle.
+        let sched = app.survey_scheduler.lock().await;
+        assert_eq!(sched.phase, SurveySchedulerPhase::Idle);
+        assert_eq!(sched.nonce, 0);
+        assert_eq!(sched.ledger_num, 0);
+        assert!(sched.peers.is_empty());
+        assert!(sched.next_action >= now + Duration::from_secs(59));
     }
 }
