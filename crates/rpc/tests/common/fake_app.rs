@@ -4,6 +4,7 @@
 //! See [`FakeRpcApp`] for details and [`FakeRpcAppBuilder`] for customization.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +42,7 @@ pub struct FakeRpcApp {
     shutdown_tx: broadcast::Sender<()>,
     state: AppState,
     submit_result: TxQueueResult,
+    snapshot_ready: AtomicBool,
 }
 
 impl Default for FakeRpcApp {
@@ -119,6 +121,11 @@ impl RpcAppHandle for FakeRpcApp {
     async fn state(&self) -> AppState {
         self.state
     }
+
+    fn is_snapshot_ready(&self) -> bool {
+        self.snapshot_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +148,7 @@ pub struct FakeRpcAppBuilder {
     protocol_version: Option<u32>,
     base_fee: Option<u32>,
     header_snapshot: Option<LedgerHeader>,
+    snapshot_ready: bool,
 }
 
 impl Default for FakeRpcAppBuilder {
@@ -154,6 +162,7 @@ impl Default for FakeRpcAppBuilder {
             protocol_version: None,
             base_fee: None,
             header_snapshot: None,
+            snapshot_ready: true,
         }
     }
 }
@@ -208,6 +217,11 @@ impl FakeRpcAppBuilder {
         self
     }
 
+    pub fn snapshot_ready(mut self, ready: bool) -> Self {
+        self.snapshot_ready = ready;
+        self
+    }
+
     pub fn build(self) -> FakeRpcApp {
         let mut config = AppConfig::testnet();
         config.rpc.enabled = true;
@@ -256,6 +270,7 @@ impl FakeRpcAppBuilder {
             shutdown_tx,
             state: self.state,
             submit_result: self.submit_result,
+            snapshot_ready: AtomicBool::new(self.snapshot_ready),
         }
     }
 }

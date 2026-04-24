@@ -307,6 +307,8 @@ pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
+    ctx.require_snapshot_ready()?;
+
     let format = util::parse_format(&params)?;
 
     let tx_b64 = params

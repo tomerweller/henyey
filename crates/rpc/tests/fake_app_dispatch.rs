@@ -470,3 +470,174 @@ async fn fake_get_latest_ledger_scalar_builder() {
         "response id must equal SHA-256 of headerXdr bytes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot readiness gate tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fake_get_ledger_entries_not_ready() {
+    let app = FakeRpcApp::builder().snapshot_ready(false).build();
+    let h = FakeRpcTestHarness::start(app).await;
+    let id = json!("gle-not-ready");
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLedgerEntries",
+            "params": {"keys": ["AAAAAAAAAAA="]}
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    assert_envelope(&resp, &id);
+    assert_eq!(resp["error"]["code"], json!(-32001));
+    assert_eq!(
+        resp["error"]["message"].as_str().unwrap(),
+        "server is not ready, try again later"
+    );
+}
+
+#[tokio::test]
+async fn fake_simulate_transaction_not_ready() {
+    let app = FakeRpcApp::builder().snapshot_ready(false).build();
+    let h = FakeRpcTestHarness::start(app).await;
+    let id = json!("sim-not-ready");
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "simulateTransaction",
+            "params": {}
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    assert_envelope(&resp, &id);
+    assert_eq!(resp["error"]["code"], json!(-32001));
+    assert_eq!(
+        resp["error"]["message"].as_str().unwrap(),
+        "server is not ready, try again later"
+    );
+}
+
+#[tokio::test]
+async fn fake_simulate_not_ready_beats_invalid_params() {
+    let app = FakeRpcApp::builder().snapshot_ready(false).build();
+    let h = FakeRpcTestHarness::start(app).await;
+    let id = json!("sim-nr-vs-ip");
+    // Send with missing 'transaction' param — would normally be -32602
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "simulateTransaction",
+            "params": {"wrong_field": 42}
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    assert_envelope(&resp, &id);
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32001),
+        "not-ready must take priority over invalid params"
+    );
+}
+
+#[tokio::test]
+async fn fake_get_ledger_entries_not_ready_beats_invalid_params() {
+    let app = FakeRpcApp::builder().snapshot_ready(false).build();
+    let h = FakeRpcTestHarness::start(app).await;
+    let id = json!("gle-nr-vs-ip");
+    // Send with missing 'keys' param — would normally be -32602
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLedgerEntries",
+            "params": {"wrong_field": 42}
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    assert_envelope(&resp, &id);
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32001),
+        "not-ready must take priority over invalid params"
+    );
+}
+
+#[tokio::test]
+async fn fake_non_snapshot_methods_work_while_not_ready() {
+    let app = FakeRpcApp::builder().snapshot_ready(false).build();
+    let h = FakeRpcTestHarness::start(app).await;
+
+    // getHealth should succeed
+    let (status, resp) = h
+        .post_rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "getHealth"}))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        resp.get("result").is_some(),
+        "getHealth must succeed while not ready"
+    );
+
+    // getNetwork should succeed
+    let (status, resp) = h
+        .post_rpc(json!({"jsonrpc": "2.0", "id": 2, "method": "getNetwork"}))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        resp.get("result").is_some(),
+        "getNetwork must succeed while not ready"
+    );
+
+    // getVersionInfo should succeed
+    let (status, resp) = h
+        .post_rpc(json!({"jsonrpc": "2.0", "id": 3, "method": "getVersionInfo"}))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        resp.get("result").is_some(),
+        "getVersionInfo must succeed while not ready"
+    );
+}
+
+/// Defensive fallback: snapshot_ready=true but empty snapshot manager returns
+/// None. The handler must return internal error (-32603), not server-not-ready.
+#[tokio::test]
+async fn fake_get_ledger_entries_defensive_fallback() {
+    use stellar_xdr::curr::{LedgerKey, LedgerKeyAccount, WriteXdr};
+
+    let h = FakeRpcTestHarness::start_default().await;
+    let id = json!("gle-defensive");
+
+    // Build a valid LedgerKey (Account key with zero pubkey)
+    let key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: stellar_xdr::curr::AccountId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                [0u8; 32],
+            )),
+        ),
+    });
+    let key_b64 = BASE64.encode(key.to_xdr(Limits::none()).unwrap());
+
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLedgerEntries",
+            "params": {"keys": [key_b64]}
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    assert_envelope(&resp, &id);
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32603),
+        "ready=true but no snapshot must return internal error, not server-not-ready"
+    );
+}

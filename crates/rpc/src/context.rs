@@ -48,6 +48,16 @@ pub trait RpcAppHandle: Send + Sync + 'static {
     async fn submit_transaction(&self, tx: TransactionEnvelope) -> TxQueueResult;
     /// Current application state (e.g., `Validating`, `Synced`).
     async fn state(&self) -> AppState;
+
+    /// Whether the bucket list snapshot is populated and ready for queries.
+    ///
+    /// Defaults to `true` as a backward-compatibility fallback. In-tree
+    /// implementors that expose snapshot-backed RPC methods should override
+    /// this to check the actual readiness signal (e.g., the `query_is_ready`
+    /// `AtomicBool` in `App`).
+    fn is_snapshot_ready(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait::async_trait]
@@ -82,6 +92,10 @@ impl RpcAppHandle for App {
     async fn state(&self) -> AppState {
         App::state(self).await
     }
+    fn is_snapshot_ready(&self) -> bool {
+        self.query_is_ready()
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// Shared state for all RPC handlers.
@@ -105,6 +119,18 @@ pub struct RpcContext {
 }
 
 impl RpcContext {
+    /// Check that the bucket list snapshot is ready for queries.
+    ///
+    /// Returns `Err(server_not_ready())` if the snapshot has not been
+    /// populated yet (e.g., during boot). Call this at the top of any
+    /// handler that depends on `copy_searchable_live_snapshot()`.
+    pub(crate) fn require_snapshot_ready(&self) -> Result<(), crate::error::JsonRpcError> {
+        if !self.app.is_snapshot_ready() {
+            return Err(crate::error::JsonRpcError::server_not_ready());
+        }
+        Ok(())
+    }
+
     /// Construct an `RpcContext` from the given app, sizing semaphores and
     /// timeout from `app.config().rpc`. The returned `Arc` is the shared
     /// state passed to axum handlers.

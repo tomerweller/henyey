@@ -8,6 +8,8 @@ pub(crate) const INVALID_PARAMS: i32 = -32602;
 pub(crate) const INTERNAL_ERROR: i32 = -32603;
 /// Server is overloaded / too many concurrent requests.
 pub(crate) const SERVER_BUSY: i32 = -32000;
+/// Server is not yet ready (e.g., bucket snapshot not populated during boot).
+pub(crate) const SERVER_NOT_READY: i32 = -32001;
 
 /// JSON-RPC 2.0 error object.
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +51,10 @@ impl JsonRpcError {
 
     pub(crate) fn server_busy(msg: impl Into<String>) -> Self {
         Self::new(SERVER_BUSY, msg)
+    }
+
+    pub(crate) fn server_not_ready() -> Self {
+        Self::new(SERVER_NOT_READY, "server is not ready, try again later")
     }
 
     /// Internal error that logs full details server-side and returns only a
@@ -103,5 +109,15 @@ mod tests {
         assert!(!rpc_err.message.contains("DELETE"));
         assert!(!rpc_err.message.contains("backtrace"));
         assert!(!rpc_err.message.contains("src/db.rs"));
+    }
+
+    /// `server_not_ready()` returns the expected code and message.
+    #[test]
+    fn server_not_ready_code_and_message() {
+        let err = JsonRpcError::server_not_ready();
+        assert_eq!(err.code, SERVER_NOT_READY);
+        assert_eq!(err.code, -32001);
+        assert_eq!(err.message, "server is not ready, try again later");
+        assert!(err.data.is_none());
     }
 }
