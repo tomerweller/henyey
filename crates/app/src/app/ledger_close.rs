@@ -1719,6 +1719,7 @@ impl App {
         let elapsed = close_complete_start.elapsed();
         super::warn_if_slow(elapsed, "handle_close_complete", ledger_seq as u64);
         // Close-cycle decomposition (#1909): envelope metric for handle_close_complete.
+        // Always recorded regardless of close outcome (wraps handle_close_complete_inner).
         metrics::histogram!(crate::metrics::CLOSE_HANDLE_COMPLETE_SECONDS)
             .record(elapsed.as_secs_f64());
         result

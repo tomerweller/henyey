@@ -356,6 +356,7 @@ impl App {
                         }
 
                         // Close-cycle decomposition (#1909): record post-complete duration.
+                        // Only recorded on the success path (inside `if success` branch).
                         metrics::histogram!(crate::metrics::CLOSE_POST_COMPLETE_SECONDS)
                             .record(post_complete_start.elapsed().as_secs_f64());
 

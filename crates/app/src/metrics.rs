@@ -227,6 +227,11 @@ pub const CLOSE_CYCLE_SECONDS: &str = "henyey_close_cycle_seconds";
 
 // Close-cycle decomposition metrics (#1909).
 // close_cycle ≈ handle_complete + post_complete + inter_close_wait + dispatch_to_join
+//
+// Recording semantics:
+// - handle_complete: always recorded (success and failure)
+// - dispatch_to_join: always recorded (measures spawn_blocking latency)
+// - post_complete: only recorded on successful close (guards lifecycle work)
 pub const CLOSE_HANDLE_COMPLETE_SECONDS: &str = "henyey_close_handle_complete_seconds";
 pub const CLOSE_POST_COMPLETE_SECONDS: &str = "henyey_close_post_complete_seconds";
 pub const CLOSE_DISPATCH_TO_JOIN_SECONDS: &str = "henyey_close_dispatch_to_join_seconds";
@@ -1954,6 +1959,55 @@ mod tests {
             assert!(
                 output.contains(&format!("# HELP {}", name)),
                 "missing HELP for soroban config metric {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_close_cycle_decomposition_histograms_recorded() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+
+        // Phase 5/6 histograms are not pre-registered (see register_label_series
+        // comment at metrics.rs:1087-1089), so we must record at least one sample
+        // before HELP/TYPE lines appear in the rendered output.
+        let decomposition_metrics = [
+            CLOSE_HANDLE_COMPLETE_SECONDS,
+            CLOSE_POST_COMPLETE_SECONDS,
+            CLOSE_DISPATCH_TO_JOIN_SECONDS,
+        ];
+        for name in &decomposition_metrics {
+            metrics::histogram!(*name).record(0.025);
+        }
+
+        let output = handle.render();
+
+        for name in &decomposition_metrics {
+            assert!(
+                output.contains(&format!("# HELP {}", name)),
+                "missing HELP for close-cycle decomposition metric {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("# TYPE {} histogram", name)),
+                "missing TYPE histogram for {}",
+                name
+            );
+            // Verify at least one observation was recorded (bucket, count, sum).
+            assert!(
+                output.contains(&format!("{}_bucket{{", name)),
+                "no _bucket line for {} — histogram not recorded",
+                name
+            );
+            assert!(
+                output.contains(&format!("{}_count", name)),
+                "no _count line for {} — histogram not recorded",
+                name
+            );
+            assert!(
+                output.contains(&format!("{}_sum", name)),
+                "no _sum line for {} — histogram not recorded",
                 name
             );
         }
