@@ -67,6 +67,14 @@ impl App {
         // Populate the initial bucket snapshot for the query server.
         self.update_bucket_snapshot();
 
+        // Signal query server readiness — matches stellar-core's
+        // `ApplicationImpl::start()` calling `setReady()` after
+        // `loadLastKnownLedger()`. Release ordering ensures the snapshot
+        // written above is visible to any thread that observes `true`
+        // via Acquire load.
+        self.query_is_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+
         // Wait a short time for initial peer connections, then request SCP state
         self.clock.sleep(Duration::from_millis(500)).await;
         self.request_scp_state_and_record().await;

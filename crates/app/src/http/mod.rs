@@ -107,7 +107,9 @@ pub(crate) fn build_router(state: Arc<ServerState>) -> Router {
 /// - `POST /getledgerentryraw` — Raw ledger entry lookup
 /// - `POST /getledgerentry` — Entry lookup with TTL state classification
 ///
-/// Matches stellar-core's `QueryServer` behavior.
+/// Matches stellar-core's `QueryServer` behavior, including the readiness
+/// gate (`mIsReady`) that returns 404 "Core is booting" before the first
+/// bucket snapshot is populated.
 pub struct QueryServer {
     port: u16,
     address: String,
@@ -121,6 +123,12 @@ impl QueryServer {
     }
 
     /// Build the query server router.
+    ///
+    /// Applies a readiness middleware via `route_layer` (not `layer`) so that
+    /// only matched routes are gated — the fallback 404 handler serves the
+    /// welcome page regardless of readiness, matching stellar-core's behavior
+    /// where `safeRouter` wraps registered handlers but `notFound` is
+    /// independent.
     fn build_router(state: Arc<handlers::query::QueryState>) -> Router {
         Router::new()
             .route(
@@ -131,6 +139,11 @@ impl QueryServer {
                 "/getledgerentry",
                 post(handlers::query::getledgerentry_handler),
             )
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                handlers::query::readiness_check,
+            ))
+            .fallback(handlers::query::not_found_fallback)
             .with_state(state)
     }
 
@@ -138,6 +151,7 @@ impl QueryServer {
     pub async fn start(self) -> anyhow::Result<()> {
         let state = Arc::new(handlers::query::QueryState {
             snapshot_manager: self.app.bucket_snapshot_manager().clone(),
+            is_ready: self.app.query_is_ready().clone(),
         });
 
         let mut shutdown_rx = self.app.subscribe_shutdown();

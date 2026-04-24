@@ -3,14 +3,19 @@
 //! Implements `/getledgerentryraw` and `/getledgerentry` endpoints that query
 //! the bucket list snapshots for ledger entry data. These match stellar-core's
 //! QueryServer endpoints.
+//!
+//! Includes a readiness gate (matching stellar-core's `safeRouter` +
+//! `mIsReady`) and a catch-all 404 fallback (matching `notFound()`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{header, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use henyey_bucket::{
@@ -26,9 +31,61 @@ use crate::http::types::query::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
+/// Body returned by stellar-core when `safeRouter` sees `!mIsReady`.
+const BOOTING_BODY: &str = r#"{"error": "Core is booting, try again later"}"#;
+
+/// Welcome page returned by stellar-core's `QueryServer::notFound()` for
+/// unmatched routes (`QueryServer.cpp:117-124`).
+const NOT_FOUND_BODY: &str = "<b>Welcome to stellar-core!</b>\
+<p>Supported HTTP queries are listed in the \
+<a href=\"https://github.com/stellar/stellar-core/blob/master/docs/software/commands.md#http-commands\">\
+docs</a> as well as in the man pages.</p>\
+<p>Note that this port is for HTTP queries only, not commands.</p>\
+<p>Have fun!</p>";
+
 /// Shared state for the query server.
 pub(crate) struct QueryState {
     pub snapshot_manager: Arc<BucketSnapshotManager>,
+    /// Readiness flag — mirrors stellar-core's `QueryServer::mIsReady`.
+    pub is_ready: Arc<AtomicBool>,
+}
+
+/// Readiness middleware that gates registered query routes.
+///
+/// When `is_ready` is `false`, returns HTTP 404 with the stellar-core
+/// boot message. This matches `safeRouter` returning `false` which
+/// httpthreaded maps to 404 via `add404` (`server.cpp:156-163`).
+///
+/// Applied via `route_layer` so the fallback handler is NOT gated —
+/// matching stellar-core's `notFound()` which is independent of readiness.
+pub(crate) async fn readiness_check(
+    State(state): State<Arc<QueryState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if !state.is_ready.load(Ordering::Acquire) {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html")],
+            BOOTING_BODY,
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Catch-all 404 fallback handler matching stellar-core's
+/// `QueryServer::notFound()`.
+///
+/// Returns the welcome page HTML with `Content-Type: text/html`, matching
+/// the `add404` lambda in httpthreaded's `handle_request`
+/// (`server.cpp:156-163`).
+pub(crate) async fn not_found_fallback() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/html")],
+        NOT_FOUND_BODY,
+    )
 }
 
 /// Parsed form-encoded query request (supports repeated `key=` params).
@@ -152,12 +209,14 @@ pub(crate) async fn getledgerentryraw_handler(
     }
 
     // Get the live bucket list snapshot.
+    // Post-ready, the snapshot should always be available. If it's None,
+    // this is a genuine bug — return 500 (not the boot-window 404).
     let live_bl = match state.snapshot_manager.copy_searchable_live_snapshot() {
         Some(bl) => bl,
         None => {
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Snapshot not available"})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Internal error: snapshot unavailable after initialization"})),
             )
                 .into_response();
         }
@@ -286,17 +345,20 @@ pub(crate) async fn getledgerentry_handler(
     }
 
     // Get both snapshots atomically.
-    let (live_bl, hot_archive_bl) =
-        match state.snapshot_manager.copy_live_and_hot_archive_snapshots() {
-            Some(pair) => pair,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({"error": "Snapshot not available"})),
+    // Post-ready, snapshots should always be available. None is a bug → 500.
+    let (live_bl, hot_archive_bl) = match state
+        .snapshot_manager
+        .copy_live_and_hot_archive_snapshots()
+    {
+        Some(pair) => pair,
+        None => {
+            return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Internal error: snapshot unavailable after initialization"})),
                 )
                     .into_response();
-            }
-        };
+        }
+    };
 
     let ledger_seq = params.ledger_seq.unwrap_or_else(|| live_bl.ledger_seq());
 
@@ -557,7 +619,7 @@ fn load_from_hot_archive(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_form_query_params, percent_decode};
+    use super::*;
 
     #[test]
     fn test_parse_form_query_params_accepts_repeated_key_values() {
@@ -613,5 +675,179 @@ mod tests {
     fn test_percent_decode_base64_padding() {
         assert_eq!(percent_decode("AAA%3D"), "AAA=");
         assert_eq!(percent_decode("AAA%3D%3D"), "AAA==");
+    }
+
+    // ── Router-level readiness and fallback tests ──────────────────────
+
+    use axum::body::Body;
+    use axum::routing::post;
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    /// Build the query server router identical to `QueryServer::build_router`,
+    /// for testing without needing an `App` instance.
+    fn test_router(state: Arc<QueryState>) -> axum::Router {
+        axum::Router::new()
+            .route("/getledgerentryraw", post(getledgerentryraw_handler))
+            .route("/getledgerentry", post(getledgerentry_handler))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                readiness_check,
+            ))
+            .fallback(not_found_fallback)
+            .with_state(state)
+    }
+
+    fn test_state(is_ready: bool) -> Arc<QueryState> {
+        Arc::new(QueryState {
+            snapshot_manager: Arc::new(BucketSnapshotManager::empty(0)),
+            is_ready: Arc::new(AtomicBool::new(is_ready)),
+        })
+    }
+
+    async fn body_string(response: axum::response::Response) -> String {
+        let body = response.into_body();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_pre_ready_known_route_returns_booting_404() {
+        let state = test_state(false);
+        let app = test_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/getledgerentry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+        let body = body_string(response).await;
+        assert_eq!(body, BOOTING_BODY);
+    }
+
+    #[tokio::test]
+    async fn test_pre_ready_getledgerentryraw_returns_booting_404() {
+        let state = test_state(false);
+        let app = test_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/getledgerentryraw")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+        let body = body_string(response).await;
+        assert_eq!(body, BOOTING_BODY);
+    }
+
+    #[tokio::test]
+    async fn test_pre_ready_unknown_route_returns_welcome_page() {
+        // Unknown routes are NOT gated by readiness (matches stellar-core
+        // where notFound() is independent of mIsReady).
+        let state = test_state(false);
+        let app = test_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+        let body = body_string(response).await;
+        assert_eq!(body, NOT_FOUND_BODY);
+    }
+
+    #[tokio::test]
+    async fn test_post_ready_unknown_route_returns_welcome_page() {
+        let state = test_state(true);
+        let app = test_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+        let body = body_string(response).await;
+        assert_eq!(body, NOT_FOUND_BODY);
+    }
+
+    #[tokio::test]
+    async fn test_post_ready_snapshot_none_returns_500() {
+        // After readiness is set but snapshot is somehow None → 500.
+        let state = test_state(true);
+        let app = test_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/getledgerentryraw")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D%3D",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_string(response).await;
+        assert!(body.contains("snapshot unavailable after initialization"));
+    }
+
+    #[tokio::test]
+    async fn test_post_ready_snapshot_none_getledgerentry_returns_500() {
+        let state = test_state(true);
+        let app = test_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/getledgerentry")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D%3D",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_string(response).await;
+        assert!(body.contains("snapshot unavailable after initialization"));
     }
 }

@@ -318,6 +318,13 @@ pub struct App {
     /// Used by the query server to serve `/getledgerentry` and `/getledgerentryraw`.
     bucket_snapshot_manager: Arc<BucketSnapshotManager>,
 
+    /// Readiness gate for the query server, matching stellar-core's
+    /// `QueryServer::mIsReady`. Set to `true` after the first bucket
+    /// snapshot is populated in `App::run()`. The query server middleware
+    /// returns 404 "Core is booting" for all registered routes until this
+    /// flag is set.
+    query_is_ready: Arc<AtomicBool>,
+
     /// Ledger manager for ledger operations.
     ledger_manager: Arc<LedgerManager>,
 
@@ -869,6 +876,7 @@ impl App {
             keypair,
             bucket_manager,
             bucket_snapshot_manager,
+            query_is_ready: Arc::new(AtomicBool::new(false)),
             ledger_manager,
             overlay: RwLock::new(None),
             herder,
@@ -1307,6 +1315,15 @@ impl App {
     /// Get the bucket snapshot manager for concurrent query access.
     pub fn bucket_snapshot_manager(&self) -> &Arc<BucketSnapshotManager> {
         &self.bucket_snapshot_manager
+    }
+
+    /// Get the query server readiness flag.
+    ///
+    /// This flag mirrors stellar-core's `QueryServer::mIsReady`. It starts
+    /// `false` and is set to `true` after the first bucket snapshot is
+    /// populated during startup.
+    pub fn query_is_ready(&self) -> &Arc<AtomicBool> {
+        &self.query_is_ready
     }
 
     /// Update the bucket snapshot manager with fresh snapshots from the
