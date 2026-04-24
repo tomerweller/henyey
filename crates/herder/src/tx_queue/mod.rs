@@ -1992,11 +1992,11 @@ impl TransactionQueue {
 
         // Handle fee-bump replacement if applicable
         if let Some(ref old_tx) = replaced_tx {
-            // Remove the old transaction from store and seen
+            // Remove the old transaction from store
             store.remove(&old_tx.hash, ledger_version);
-            self.seen.write().remove(&old_tx.hash);
 
             // If the old tx has a different fee-source, release the fee from that account
+            // Lock order: account_states → seen (canonical, within store scope).
             let old_fee_source_key = fee_source_key(&old_tx.envelope);
             if old_fee_source_key != new_fee_source_key {
                 let mut account_states = self.account_states.write();
@@ -2010,6 +2010,7 @@ impl TransactionQueue {
                     }
                 }
             }
+            self.seen.write().remove(&old_tx.hash);
         }
 
         // Add to queue
@@ -2082,9 +2083,10 @@ impl TransactionQueue {
             .map(|(h, _)| *h);
         if let Some(hash) = expired_hash {
             let evicted = store.remove(&hash, ledger_version).unwrap();
-            self.seen.write().remove(&hash);
+            // Lock order: account_states → seen (canonical, within store scope).
             let mut account_states = self.account_states.write();
             Self::drop_transaction(&mut account_states, &evicted);
+            self.seen.write().remove(&hash);
             return Ok(());
         }
 
@@ -2093,9 +2095,10 @@ impl TransactionQueue {
             if queued.is_better_than_entry(&min_entry) {
                 let evict_hash = min_entry.hash;
                 let evicted = store.remove(&evict_hash, ledger_version).unwrap();
-                self.seen.write().remove(&evict_hash);
+                // Lock order: account_states → seen (canonical, within store scope).
                 let mut account_states = self.account_states.write();
                 Self::drop_transaction(&mut account_states, &evicted);
+                self.seen.write().remove(&evict_hash);
                 return Ok(());
             }
         }
