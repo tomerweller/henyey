@@ -15,7 +15,9 @@ serde.workspace = true
 hex.workspace = true
 sha2.workspace = true
 toml.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }

@@ -2539,11 +2539,12 @@ impl BucketList {
         if !work_items.is_empty() {
             let bucket_dir = self.bucket_dir.clone();
 
-            let handles: Vec<_> = work_items
+            let handles_with_levels: Vec<_> = work_items
                 .into_iter()
                 .map(|work| {
                     let bucket_dir = bucket_dir.clone();
-                    tokio::task::spawn_blocking(move || {
+                    let level = work.level;
+                    let handle = tokio::task::spawn_blocking(move || {
                         let start = std::time::Instant::now();
                         let level = work.level;
 
@@ -2576,16 +2577,22 @@ impl BucketList {
                         }
 
                         result.map(|bucket| (level, bucket))
-                    })
+                    });
+                    (level, handle)
                 })
                 .collect();
 
-            // Phase 3: Await all and install results
-            let results = futures::future::join_all(handles).await;
-            for join_result in results {
-                let (level, merged) = join_result
-                    .map_err(|e| BucketError::Merge(format!("merge task panicked: {}", e)))??;
-                self.levels[level].next = Some(PendingMerge::InMemory(merged));
+            // Phase 3: Await all and install results.
+            // Tasks are already running in parallel on the blocking pool;
+            // sequential await just processes results in order.
+            for (level, handle) in handles_with_levels {
+                let ctx = format!("restart-merge-level-{level}");
+                let (lvl, merged) = henyey_common::await_blocking_logged(&ctx, handle)
+                    .await
+                    .map_err(|e| {
+                        BucketError::Merge(format!("merge task failed (level {level}): {e}"))
+                    })??;
+                self.levels[lvl].next = Some(PendingMerge::InMemory(merged));
             }
         }
 

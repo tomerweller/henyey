@@ -1563,10 +1563,12 @@ impl App {
 
         // Trigger the herder to close the next ledger
         let herder = std::sync::Arc::clone(&self.herder);
-        tokio::task::spawn_blocking(move || herder.trigger_next_ledger(next_ledger))
-            .await
-            .expect("trigger_next_ledger panicked")
-            .map_err(|e| anyhow::anyhow!("Failed to trigger next ledger: {}", e))?;
+        henyey_common::spawn_blocking_logged("manual-close-trigger", move || {
+            herder.trigger_next_ledger(next_ledger)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed for trigger_next_ledger: {e}"))?
+        .map_err(|e| anyhow::anyhow!("Failed to trigger next ledger: {}", e))?;
 
         Ok(next_ledger)
     }
@@ -1807,7 +1809,7 @@ impl App {
         let bm = self.bucket_manager.clone();
         let db = self.db.clone();
         let sm = self.bucket_snapshot_manager.clone();
-        tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             lm.resolve_pending_bucket_merges();
 
             let mut hashes = lm.all_referenced_bucket_hashes();
@@ -1860,6 +1862,11 @@ impl App {
                     tracing::warn!(error = %e, "Failed to cleanup stale bucket files");
                 }
             }
+        });
+        // Log any panic/cancellation in a detached task — cleanup is
+        // best-effort and the caller doesn't wait for it.
+        tokio::spawn(async move {
+            let _ = henyey_common::await_blocking_logged("stale-bucket-cleanup", handle).await;
         });
     }
 

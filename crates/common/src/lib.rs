@@ -18,6 +18,7 @@
 //! - [`network`] - Network identity derived from network passphrases
 //! - [`protocol`] - Protocol version constants and feature gating utilities
 //! - [`resource`] - Resource accounting for transaction limits and surge pricing
+//! - [`spawn`] - Spawn-blocking helpers with structured error logging
 //! - [`time`] - Time utilities for Unix/Stellar timestamp conversions
 //! - [`tracking`] - Per-call and per-phase timing telemetry primitives
 //! - [`types`] - Core types like [`Hash256`] used throughout the codebase
@@ -58,6 +59,7 @@ pub mod meta;
 pub mod network;
 pub mod protocol;
 pub mod resource;
+pub mod spawn;
 pub mod time;
 pub mod tracking;
 pub mod types;
@@ -72,6 +74,7 @@ pub use meta::*;
 pub use network::NetworkId;
 pub use protocol::*;
 pub use resource::*;
+pub use spawn::{await_blocking_logged, spawn_blocking_logged};
 pub use types::{deterministic_seed, *};
 pub use xdr_stream::{xdr_encoded_len, xdr_encoded_len_u32, xdr_to_bytes};
 

@@ -359,7 +359,9 @@ impl App {
             let bm = self.bucket_manager.clone();
             let db = self.db.clone();
             let sm = self.bucket_snapshot_manager.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            // Log but don't propagate errors — cleanup is best-effort after
+            // catchup has already succeeded.
+            let _ = henyey_common::spawn_blocking_logged("catchup-bucket-cleanup", move || {
                 lm.resolve_pending_bucket_merges();
 
                 let mut hashes = lm.all_referenced_bucket_hashes();
