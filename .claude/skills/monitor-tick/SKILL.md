@@ -218,16 +218,23 @@ Then clean up old rotated log archives (keep 3 most recent per category):
 
 ```bash
 if test -d /home/tomer/data/$MONITOR_SESSION_ID/logs; then
-  for pat in preredeploy crashed stuck; do
-    ls -1r /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log.$pat-* 2>/dev/null \
-      | tail -n +4 | xargs -r rm -f
+  logs_dir=/home/tomer/data/$MONITOR_SESSION_ID/logs
+  for pat in preredeploy crashed stuck frozen; do
+    find "$logs_dir" -maxdepth 1 -type f -name "monitor.log.$pat-*" \
+      -printf '%f\n' 2>/dev/null \
+      | sort -r | tail -n +4 \
+      | while read -r f; do rm -f "$logs_dir/$f"; done
   done
 fi
 ```
 
-The ISO 8601 timestamp suffix sorts lexicographically, so `ls -1r`
-(reverse alphabetical) gives newest-first; `tail -n +4` skips the 3 newest
-and outputs the rest for deletion. Report how many files were removed if any.
+Uses `find -printf` (not shell glob) to avoid zsh `NO_NOMATCH` aborting the
+pipeline when a category has no files — the earlier `ls glob | tail` form
+printed `no matches found` and silently skipped cleanup for the remaining
+categories. The ISO 8601 timestamp suffix sorts lexicographically, so
+`sort -r` gives newest-first; `tail -n +4` skips the 3 newest and emits
+the rest for deletion. Includes `frozen` so wedge-rotations are also
+capped at 3 retained. Report how many files were removed if any.
 
 **(6) Session disk** — `du -sh /home/tomer/data/$MONITOR_SESSION_ID/`
 and `du -sh /home/tomer/data/mainnet/`. If combined > 200 GB, flag SESSION DISK HIGH.
