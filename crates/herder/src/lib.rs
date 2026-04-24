@@ -121,6 +121,7 @@ mod quorum_set_tracker;
 mod quorum_tracker;
 mod scp_driver;
 pub mod scp_verify;
+mod spawn;
 mod state;
 mod surge_pricing;
 pub mod sync_recovery;
@@ -203,6 +204,9 @@ pub use tx_broadcast::{
 
 // Dead node detection
 pub use dead_node_tracker::{DeadNodeTracker, CHECK_FOR_DEAD_NODES_MINUTES};
+
+// Spawn-blocking helpers
+pub use spawn::{await_blocking_logged, spawn_blocking_logged};
 
 /// Result type for Herder operations.
 pub type Result<T> = std::result::Result<T, HerderError>;

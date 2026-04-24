@@ -297,28 +297,6 @@ pub struct Herder {
     >,
 }
 
-/// Spawn a blocking closure and log any JoinError/panic.
-///
-/// Returns `Some(value)` on success, `None` on error. The caller decides
-/// how to handle `None` (e.g. return a default, log extra context fields).
-async fn spawn_blocking_logged<T, F>(context: &str, f: F) -> Option<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(val) => Some(val),
-        Err(e) if e.is_panic() => {
-            error!(error = %e, "{context} panicked in spawn_blocking");
-            None
-        }
-        Err(e) => {
-            error!(error = %e, "spawn_blocking join error for {context}");
-            None
-        }
-    }
-}
-
 impl Herder {
     /// Create a new Herder (observer mode, no secret key).
     pub fn new(config: HerderConfig) -> Self {
@@ -2589,9 +2567,12 @@ impl Herder {
     /// directly.
     pub async fn drain_ready_envelopes_blocking(self: &Arc<Self>, context: &str) -> usize {
         let herder = Arc::clone(self);
-        spawn_blocking_logged(context, move || herder.process_ready_fetching_envelopes())
-            .await
-            .unwrap_or(0)
+        crate::spawn::spawn_blocking_logged(context, move || {
+            herder.process_ready_fetching_envelopes()
+        })
+        .await
+        .ok()
+        .unwrap_or(0)
     }
 
     /// Run [`handle_nomination_timeout`](Self::handle_nomination_timeout) on
@@ -2601,11 +2582,11 @@ impl Herder {
     /// method directly.
     pub async fn handle_nomination_timeout_blocking(self: &Arc<Self>, slot: SlotIndex) {
         let herder = Arc::clone(self);
-        if spawn_blocking_logged("handle_nomination_timeout", move || {
+        if crate::spawn::spawn_blocking_logged("handle_nomination_timeout", move || {
             herder.handle_nomination_timeout(slot);
         })
         .await
-        .is_none()
+        .is_err()
         {
             error!(slot, "nomination timeout failed on spawn_blocking");
         }
