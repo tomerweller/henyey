@@ -81,7 +81,7 @@ Metrics inspired by stellar-core but with different type, unit, or granularity.
 | `LEDGER_APPLY_SOROBAN_FAILURE_TOTAL` | `stellar_ledger_apply_soroban_failure_total` | counter | Cumulative failed Soroban tx applies. |
 | `LEDGER_APPLY_SOROBAN_STAGES` | `stellar_ledger_apply_soroban_stages` | gauge | Parallel execution stage count (last close). |
 | `LEDGER_APPLY_SOROBAN_MAX_CLUSTERS` | `stellar_ledger_apply_soroban_max_clusters` | gauge | Max cluster count across stages (last close). |
-| `SOROBAN_CONFIG_*` | `stellar_soroban_config_*` | gauge | Soroban network configuration parameters (tx limits, ledger limits, fees). 13 metrics total. |
+| `SOROBAN_CONFIG_*` | `stellar_soroban_config_*` | gauge | Soroban network configuration parameters (tx limits, ledger limits, fees). 20 metrics total. |
 
 ## 3. Henyey-Only Metrics
 

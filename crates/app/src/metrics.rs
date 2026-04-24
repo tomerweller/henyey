@@ -1672,6 +1672,29 @@ mod tests {
     }
 
     #[test]
+    fn test_removed_redundant_gauge_metrics_absent() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        // These gauge metrics were removed in #1927 because they duplicate
+        // histogram data. Verify they don't silently reappear.
+        let removed = [
+            "henyey_ledger_soroban_exec_us",
+            "henyey_ledger_classic_exec_us",
+            "stellar_ledger_close_time_ms",
+        ];
+        for name in &removed {
+            assert!(
+                !output.contains(&format!("# HELP {}", name)),
+                "metric {} should not be registered (redundant with histogram)",
+                name
+            );
+        }
+    }
+
+    #[test]
     fn test_phase2_ledger_metrics_present() {
         let handle = ensure_test_recorder();
         describe_metrics();

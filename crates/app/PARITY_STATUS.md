@@ -59,7 +59,9 @@ Corresponds to: `Application.h`, `ApplicationImpl.h`
 | `isStopping()` | shutdown state tracking | Full |
 | `getMetrics()` / `clearMetrics()` | ad-hoc counters plus `App::clear_metrics()` | Partial |
 | `syncOwnMetrics()` / `syncAllMetrics()` | — | None |
-Note: `stellar_ledger_close_time_ms` was removed — its data is captured by the `stellar_ledger_close_duration_seconds` histogram.
+
+> **Note:** `stellar_ledger_close_time_ms` was removed — its data is captured by the `stellar_ledger_close_duration_seconds` histogram.
+
 | subsystem getters (`getLedgerManager`, `getBucketManager`, `getHerder`, `getOverlayManager`, `getDatabase`) | direct `App` accessors and owned fields | Full |
 | `getHistoryArchiveManager()` / `getHistoryManager()` / `getHerderPersistence()` / `getInvariantManager()` / `getPersistentState()` / `getWorkScheduler()` / `getStatusManager()` | distributed across `App` + sibling crates | Partial |
 | `getBannedAccountsPersistor()` | — | None |
