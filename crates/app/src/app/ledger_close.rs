@@ -426,10 +426,13 @@ impl App {
     /// Returns `true` if state was successfully restored, `false` if no persisted
     /// state is available (fresh node or corrupt state).
     pub async fn load_last_known_ledger(&self) -> anyhow::Result<bool> {
-        // Step 1: Read LCL sequence from DB
+        // Step 1: Read LCL sequence from DB (offloaded to blocking pool)
         let lcl_seq = self
-            .db
-            .with_connection(|conn| conn.get_last_closed_ledger())?;
+            .db_blocking("load-lcl-seq", |db| {
+                db.with_connection(|conn| conn.get_last_closed_ledger())
+                    .map_err(Into::into)
+            })
+            .await?;
         let Some(lcl_seq) = lcl_seq else {
             tracing::debug!("No last closed ledger in DB, cannot restore from disk");
             return Ok(false);
@@ -446,10 +449,13 @@ impl App {
         // the current boundary.
         self.restore_checkpoint(lcl_seq);
 
-        // Step 2: Read HAS JSON from DB
+        // Step 2: Read HAS JSON from DB (offloaded to blocking pool)
         let has_json = self
-            .db
-            .with_connection(|conn| conn.get_state(state_keys::HISTORY_ARCHIVE_STATE))?;
+            .db_blocking("load-has-json", |db| {
+                db.with_connection(|conn| conn.get_state(state_keys::HISTORY_ARCHIVE_STATE))
+                    .map_err(Into::into)
+            })
+            .await?;
         let Some(has_json) = has_json else {
             tracing::warn!(lcl_seq, "LCL found but no HAS in DB, cannot restore");
             return Ok(false);
@@ -473,10 +479,12 @@ impl App {
             "Found persisted state, attempting restore from disk"
         );
 
-        // Step 4: Load ledger header from DB
+        // Step 4: Load ledger header from DB (offloaded to blocking pool)
         let header = self
-            .db
-            .get_ledger_header(lcl_seq)?
+            .db_blocking("load-lcl-header", move |db| {
+                db.get_ledger_header(lcl_seq).map_err(Into::into)
+            })
+            .await?
             .ok_or_else(|| anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq))?;
 
         // Compute header hash (we don't store it separately)
@@ -1034,20 +1042,30 @@ impl App {
     pub(super) async fn rebuild_bucket_lists_from_has(
         &self,
     ) -> anyhow::Result<ExistingBucketState> {
-        // Read persisted HAS from DB
-        let has_json = self
-            .db
-            .with_connection(|conn| conn.get_state(state_keys::HISTORY_ARCHIVE_STATE))?;
-        let has_json = has_json.ok_or_else(|| anyhow::anyhow!("No persisted HAS in database"))?;
-        let has = HistoryArchiveState::from_json(&has_json)
-            .map_err(|e| anyhow::anyhow!("Failed to parse persisted HAS: {}", e))?;
+        // Read persisted HAS and LCL header from DB (offloaded to blocking pool).
+        //
+        // This function is called from the catchup task which runs inside
+        // tokio::spawn (catchup_impl.rs). This db_blocking dispatch is a
+        // single spawn_blocking hop — not the nested pattern that caused the
+        // #1713 deadlock (where long-running persist ops held blocking-pool
+        // threads). Short single-row reads release the thread promptly.
+        let (has, header) = self
+            .db_blocking("rebuild-bucket-lists-load-has", |db| {
+                let has_json =
+                    db.with_connection(|conn| conn.get_state(state_keys::HISTORY_ARCHIVE_STATE))?;
+                let has_json =
+                    has_json.ok_or_else(|| anyhow::anyhow!("No persisted HAS in database"))?;
+                let has = HistoryArchiveState::from_json(&has_json)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse persisted HAS: {}", e))?;
+                let lcl_seq = has.current_ledger;
+                let header = db.get_ledger_header(lcl_seq)?.ok_or_else(|| {
+                    anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq)
+                })?;
+                Ok((has, header))
+            })
+            .await?;
 
         let lcl_seq = has.current_ledger;
-
-        let header = self
-            .db
-            .get_ledger_header(lcl_seq)?
-            .ok_or_else(|| anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq))?;
 
         let (bucket_list, hot_archive) = self
             .reconstruct_bucket_lists(&has, &header, lcl_seq)

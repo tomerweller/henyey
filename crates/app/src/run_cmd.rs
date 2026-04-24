@@ -369,11 +369,11 @@ fn print_startup_info(app: &App, options: &RunOptions) {
 async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()> {
     // Check for force-scp flag (standalone single-node bootstrap).
     // When set, skip all catchup and restore the node directly from DB state.
-    let force_scp = app.check_force_scp();
+    let force_scp = app.check_force_scp().await;
     if force_scp {
         tracing::info!("force-scp flag detected, bootstrapping from DB state");
         app.bootstrap_from_db().await?;
-        app.clear_force_scp();
+        app.clear_force_scp().await;
     }
 
     // Attempt to restore node state from persisted DB + on-disk bucket files.

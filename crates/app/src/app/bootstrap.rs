@@ -130,16 +130,21 @@ impl App {
         use henyey_db::queries::LedgerQueries;
         use henyey_ledger::compute_header_hash;
 
-        // Read LCL header from DB
-        let (_lcl_seq, header) = self.db.with_connection(|conn| {
-            let lcl_seq = conn
-                .get_last_closed_ledger()?
-                .ok_or_else(|| henyey_db::DbError::Integrity("No LCL in DB".to_string()))?;
-            let header = conn.load_ledger_header(lcl_seq)?.ok_or_else(|| {
-                henyey_db::DbError::Integrity(format!("No header for LCL {}", lcl_seq))
-            })?;
-            Ok((lcl_seq, header))
-        })?;
+        // Read LCL header from DB (offloaded to blocking pool)
+        let (_lcl_seq, header) = self
+            .db_blocking("bootstrap-load-lcl", |db| {
+                db.with_connection(|conn| {
+                    let lcl_seq = conn
+                        .get_last_closed_ledger()?
+                        .ok_or_else(|| henyey_db::DbError::Integrity("No LCL in DB".to_string()))?;
+                    let header = conn.load_ledger_header(lcl_seq)?.ok_or_else(|| {
+                        henyey_db::DbError::Integrity(format!("No header for LCL {}", lcl_seq))
+                    })?;
+                    Ok((lcl_seq, header))
+                })
+                .map_err(Into::into)
+            })
+            .await?;
 
         let header_hash = compute_header_hash(&header)
             .map_err(|e| anyhow::anyhow!("Failed to compute header hash: {}", e))?;

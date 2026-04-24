@@ -1299,23 +1299,31 @@ impl App {
     ///
     /// Returns `true` if the flag is set, `false` otherwise.
     /// This does NOT clear the flag — call `clear_force_scp` after use.
-    pub fn check_force_scp(&self) -> bool {
-        use henyey_db::queries::StateQueries;
-        use henyey_db::schema::state_keys;
-        self.db
-            .with_connection(|conn| {
+    pub(crate) async fn check_force_scp(&self) -> bool {
+        self.db_blocking("check-force-scp", |db| {
+            db.with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                use henyey_db::schema::state_keys;
                 Ok(conn.get_state(state_keys::FORCE_SCP)?.as_deref() == Some("true"))
             })
-            .unwrap_or(false)
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Clear the force-scp flag in the database.
-    pub fn clear_force_scp(&self) {
-        use henyey_db::queries::StateQueries;
-        use henyey_db::schema::state_keys;
+    pub(crate) async fn clear_force_scp(&self) {
         let _ = self
-            .db
-            .with_connection(|conn| conn.delete_state(state_keys::FORCE_SCP));
+            .db_blocking("clear-force-scp", |db| {
+                db.with_connection(|conn| {
+                    use henyey_db::queries::StateQueries;
+                    use henyey_db::schema::state_keys;
+                    conn.delete_state(state_keys::FORCE_SCP)
+                })
+                .map_err(Into::into)
+            })
+            .await;
     }
 
     /// Get the database.
