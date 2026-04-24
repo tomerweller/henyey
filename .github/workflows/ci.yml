@@ -52,9 +52,45 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - run: cargo test --workspace --all-targets
       # Run herder tests gated behind test-support (SCP stage attribution, split equivalence)
       - run: cargo test -p henyey-herder --features test-support --tests
+
+  doctest:
+    name: Doctest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Pre-test diagnostics
+        run: |
+          echo "::group::Runner health"
+          df -h / /tmp
+          df -ih / /tmp
+          du -sh target/ ~/.cargo/ 2>/dev/null || true
+          free -m
+          cat /proc/meminfo | head -5
+          ulimit -a
+          echo "::endgroup::"
+      - name: Run doctests
+        run: cargo test --workspace --doc -j 1
+      - name: Post-test diagnostics
+        if: always()
+        run: |
+          echo "::group::Runner health"
+          df -h / /tmp
+          df -ih / /tmp
+          du -sh target/ ~/.cargo/ 2>/dev/null || true
+          free -m
+          echo "::endgroup::"
 
   build-release:
     name: Build (release-ci)
