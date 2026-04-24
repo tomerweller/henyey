@@ -4,11 +4,15 @@
 //! descriptions, and scrape-time refresh logic. It wraps the [`metrics`] crate
 //! facade to provide:
 //!
-//! - Centralized metric name constants
+//! - Centralized metric name constants via [`metric_catalog!`]
 //! - One-time HELP/TYPE registration via [`describe_metrics`]
-//! - Pre-registration of labeled counter series at zero via [`register_label_series`]
+//! - Pre-registration of all series at zero via [`register_label_series`]
 //! - Scrape-time gauge refresh via [`refresh_gauges`]
 //! - A once-per-process test helper via [`ensure_test_recorder`]
+//!
+//! Adding a new metric requires a single entry in the [`metric_catalog!`]
+//! invocation below. The macro generates the public constant, description,
+//! pre-registration, and test inventory from that one declaration.
 
 use std::sync::OnceLock;
 
@@ -17,1076 +21,525 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 use crate::http::ServerState;
 
-// ── Metric name constants ──────────────────────────────────────────────
-
-// Stellar-compatible names (backward compatibility with existing dashboards).
-pub const LEDGER_SEQUENCE: &str = "stellar_ledger_sequence";
-pub const PEER_COUNT: &str = "stellar_peer_count";
-pub const PENDING_TRANSACTIONS: &str = "stellar_pending_transactions";
-pub const UPTIME_SECONDS: &str = "stellar_uptime_seconds";
-pub const IS_VALIDATOR: &str = "stellar_is_validator";
-pub const META_STREAM_BYTES_TOTAL: &str = "stellar_meta_stream_bytes_total";
-pub const META_STREAM_WRITES_TOTAL: &str = "stellar_meta_stream_writes_total";
-
-// Henyey-specific metrics.
-pub const SCP_PREFILTER_REJECTS_TOTAL: &str = "henyey_scp_prefilter_rejects_total";
-pub const SCP_POST_VERIFY_DROPS_TOTAL: &str = "henyey_scp_post_verify_drops_total";
-pub const SCP_POST_VERIFY_TOTAL: &str = "henyey_scp_post_verify_total";
-pub const SCP_VERIFY_INPUT_BACKLOG: &str = "henyey_scp_verify_input_backlog";
-pub const SCP_VERIFY_OUTPUT_BACKLOG: &str = "henyey_scp_verify_output_backlog";
-pub const SCP_VERIFIER_THREAD_STATE: &str = "henyey_scp_verifier_thread_state";
-pub const SCP_VERIFY_LATENCY_US_SUM: &str = "henyey_scp_verify_latency_us_sum";
-pub const SCP_VERIFY_LATENCY_US_COUNT: &str = "henyey_scp_verify_latency_us_count";
-pub const OVERLAY_FETCH_CHANNEL_DEPTH: &str = "henyey_overlay_fetch_channel_depth";
-pub const OVERLAY_FETCH_CHANNEL_DEPTH_MAX: &str = "henyey_overlay_fetch_channel_depth_max";
-pub const POST_CATCHUP_HARD_RESET_TOTAL: &str = "henyey_post_catchup_hard_reset_total";
-
-// SCP/herder counters (Phase 1 — expose already-tracked App-level counters).
-pub const SCP_ENVELOPE_EMIT_TOTAL: &str = "stellar_scp_envelope_emit_total";
-pub const SCP_ENVELOPE_RECEIVE_TOTAL: &str = "stellar_scp_envelope_receive_total";
-pub const HERDER_LOST_SYNC_TOTAL: &str = "stellar_herder_lost_sync_total";
-pub const HERDER_STATE: &str = "stellar_herder_state";
-pub const HERDER_PENDING_ENVELOPES: &str = "stellar_herder_pending_envelopes";
-pub const HERDER_CACHED_TX_SETS: &str = "stellar_herder_cached_tx_sets";
-pub const HERDER_PENDING_RECEIVED_TOTAL: &str = "stellar_herder_pending_received_total";
-pub const HERDER_PENDING_DUPLICATES_TOTAL: &str = "stellar_herder_pending_duplicates_total";
-pub const HERDER_PENDING_TOO_OLD_TOTAL: &str = "stellar_herder_pending_too_old_total";
-pub const HERDER_PENDING_EVICTED_TOTAL: &str = "stellar_herder_pending_evicted_total";
-
-// Bucket merge counters (Phase 1 — live MergeCounters from BucketList).
-pub const BUCKET_MERGE_COMPLETED_TOTAL: &str = "stellar_bucket_merge_completed_total";
-pub const BUCKET_MERGE_TIME_US_TOTAL: &str = "stellar_bucket_merge_time_us_total";
-pub const BUCKET_MERGE_NEW_LIVE_TOTAL: &str = "stellar_bucket_merge_new_live_total";
-pub const BUCKET_MERGE_NEW_DEAD_TOTAL: &str = "stellar_bucket_merge_new_dead_total";
-pub const BUCKET_MERGE_NEW_INIT_TOTAL: &str = "stellar_bucket_merge_new_init_total";
-pub const BUCKET_MERGE_NEW_META_TOTAL: &str = "stellar_bucket_merge_new_meta_total";
-pub const BUCKET_MERGE_SHADOWED_TOTAL: &str = "stellar_bucket_merge_shadowed_total";
-pub const BUCKET_MERGE_ANNIHILATED_TOTAL: &str = "stellar_bucket_merge_annihilated_total";
-
-// Overlay counters (Phase 1 — wired to OverlayMetrics in OverlayManager).
-pub const OVERLAY_MESSAGE_READ_TOTAL: &str = "stellar_overlay_message_read_total";
-pub const OVERLAY_MESSAGE_WRITE_TOTAL: &str = "stellar_overlay_message_write_total";
-pub const OVERLAY_MESSAGE_BROADCAST_TOTAL: &str = "stellar_overlay_message_broadcast_total";
-pub const OVERLAY_ERROR_READ_TOTAL: &str = "stellar_overlay_error_read_total";
-pub const OVERLAY_ERROR_WRITE_TOTAL: &str = "stellar_overlay_error_write_total";
-pub const OVERLAY_TIMEOUT_IDLE_TOTAL: &str = "stellar_overlay_timeout_idle_total";
-pub const OVERLAY_TIMEOUT_STRAGGLER_TOTAL: &str = "stellar_overlay_timeout_straggler_total";
-
-// Ledger close metrics (Phase 2 — per-ledger snapshot gauges).
-pub const LEDGER_TX_COUNT: &str = "stellar_ledger_tx_count";
-pub const LEDGER_OP_COUNT: &str = "stellar_ledger_op_count";
-pub const LEDGER_TX_SUCCESS_COUNT: &str = "stellar_ledger_tx_success_count";
-pub const LEDGER_TX_FAILED_COUNT: &str = "stellar_ledger_tx_failed_count";
-pub const LEDGER_TOTAL_FEES: &str = "stellar_ledger_total_fees";
-pub const LEDGER_ENTRIES_CREATED: &str = "stellar_ledger_entries_created";
-pub const LEDGER_ENTRIES_UPDATED: &str = "stellar_ledger_entries_updated";
-pub const LEDGER_ENTRIES_DELETED: &str = "stellar_ledger_entries_deleted";
-pub const LEDGER_APPLY_US: &str = "stellar_ledger_apply_us";
-
-// Herder tx queue metrics (Phase 2 — from TxQueueStats).
-pub const HERDER_TX_QUEUE_ACCOUNTS: &str = "stellar_herder_tx_queue_accounts";
-pub const HERDER_TX_QUEUE_BANNED: &str = "stellar_herder_tx_queue_banned";
-pub const HERDER_TX_QUEUE_SEEN: &str = "stellar_herder_tx_queue_seen";
-
-// Herder pending envelope metrics (Phase 2 — completing the set).
-pub const HERDER_PENDING_ADDED_TOTAL: &str = "stellar_herder_pending_added_total";
-pub const HERDER_PENDING_RELEASED_TOTAL: &str = "stellar_herder_pending_released_total";
-
-// Clock drift metrics (Phase 2 — from CloseTimeDriftTracker).
-pub const DRIFT_MIN_SECONDS: &str = "henyey_herder_drift_min_seconds";
-pub const DRIFT_MAX_SECONDS: &str = "henyey_herder_drift_max_seconds";
-pub const DRIFT_MEDIAN_SECONDS: &str = "henyey_herder_drift_median_seconds";
-pub const DRIFT_P75_SECONDS: &str = "henyey_herder_drift_p75_seconds";
-pub const DRIFT_SAMPLE_COUNT: &str = "henyey_herder_drift_sample_count";
-
-// jemalloc allocator metrics — scrape-time gauges from AllocatorStats.
-pub const JEMALLOC_ALLOCATED_BYTES: &str = "henyey_jemalloc_allocated_bytes";
-pub const JEMALLOC_ACTIVE_BYTES: &str = "henyey_jemalloc_active_bytes";
-pub const JEMALLOC_RESIDENT_BYTES: &str = "henyey_jemalloc_resident_bytes";
-pub const JEMALLOC_MAPPED_BYTES: &str = "henyey_jemalloc_mapped_bytes";
-pub const JEMALLOC_RETAINED_BYTES: &str = "henyey_jemalloc_retained_bytes";
-pub const JEMALLOC_FRAGMENTATION_PCT: &str = "henyey_jemalloc_fragmentation_pct";
-
-// Phase 3 — Ledger apply cumulative counters.
-pub const LEDGER_APPLY_SUCCESS_TOTAL: &str = "stellar_ledger_apply_success_total";
-pub const LEDGER_APPLY_FAILURE_TOTAL: &str = "stellar_ledger_apply_failure_total";
-pub const LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL: &str = "stellar_ledger_apply_soroban_success_total";
-pub const LEDGER_APPLY_SOROBAN_FAILURE_TOTAL: &str = "stellar_ledger_apply_soroban_failure_total";
-pub const LEDGER_APPLY_SOROBAN_MAX_CLUSTERS: &str = "stellar_ledger_apply_soroban_max_clusters";
-pub const LEDGER_APPLY_SOROBAN_STAGES: &str = "stellar_ledger_apply_soroban_stages";
-pub const LEDGER_AGE_CURRENT_SECONDS: &str = "stellar_ledger_age_current_seconds";
-
-// Phase 3 — Soroban network config limits (gauges — snapshot values, not monotonic).
-pub const SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE: &str =
-    "stellar_soroban_config_contract_max_rw_key_byte";
-pub const SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE: &str =
-    "stellar_soroban_config_contract_max_rw_data_byte";
-pub const SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE: &str =
-    "stellar_soroban_config_contract_max_rw_code_byte";
-pub const SOROBAN_CONFIG_TX_MAX_SIZE_BYTE: &str = "stellar_soroban_config_tx_max_size_byte";
-pub const SOROBAN_CONFIG_TX_MAX_CPU_INSN: &str = "stellar_soroban_config_tx_max_cpu_insn";
-pub const SOROBAN_CONFIG_TX_MAX_MEM_BYTE: &str = "stellar_soroban_config_tx_max_mem_byte";
-pub const SOROBAN_CONFIG_TX_MAX_READ_ENTRY: &str = "stellar_soroban_config_tx_max_read_entry";
-pub const SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE: &str =
-    "stellar_soroban_config_tx_max_read_ledger_byte";
-pub const SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY: &str = "stellar_soroban_config_tx_max_write_entry";
-pub const SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE: &str =
-    "stellar_soroban_config_tx_max_write_ledger_byte";
-pub const SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE: &str =
-    "stellar_soroban_config_tx_max_emit_event_byte";
-pub const SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT: &str = "stellar_soroban_config_ledger_max_tx_count";
-pub const SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN: &str = "stellar_soroban_config_ledger_max_cpu_insn";
-pub const SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE: &str =
-    "stellar_soroban_config_ledger_max_txs_size_byte";
-pub const SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY: &str =
-    "stellar_soroban_config_ledger_max_read_entry";
-pub const SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE: &str =
-    "stellar_soroban_config_ledger_max_read_ledger_byte";
-pub const SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY: &str =
-    "stellar_soroban_config_ledger_max_write_entry";
-pub const SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE: &str =
-    "stellar_soroban_config_ledger_max_write_ledger_byte";
-pub const SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE: &str =
-    "stellar_soroban_config_bucket_list_target_size_byte";
-pub const SOROBAN_CONFIG_FEE_WRITE_1KB: &str = "stellar_soroban_config_fee_write_1kb";
-
-// Phase 3 — Henyey-specific observability.
-pub const LEDGER_BUCKET_CACHE_HIT_RATIO: &str = "henyey_ledger_bucket_cache_hit_ratio";
-pub const LEDGER_SNAPSHOT_CACHE_HIT_RATIO: &str = "henyey_ledger_snapshot_cache_hit_ratio";
-pub const LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS: &str =
-    "henyey_ledger_snapshot_cache_fallback_lookups";
-
-// Phase 4 — Ledger close histogram.
-pub const LEDGER_CLOSE_DURATION_SECONDS: &str = "stellar_ledger_close_duration_seconds";
-
-// Phase 4 — Overlay connection breakdown.
-pub const OVERLAY_INBOUND_AUTHENTICATED: &str = "stellar_overlay_inbound_authenticated";
-pub const OVERLAY_OUTBOUND_AUTHENTICATED: &str = "stellar_overlay_outbound_authenticated";
-pub const OVERLAY_INBOUND_PENDING: &str = "stellar_overlay_inbound_pending";
-pub const OVERLAY_OUTBOUND_PENDING: &str = "stellar_overlay_outbound_pending";
-
-// Phase 4 — Process health.
-pub const PROCESS_OPEN_FDS: &str = "henyey_process_open_fds";
-pub const PROCESS_MAX_FDS: &str = "henyey_process_max_fds";
-
-// Phase 4 — Quorum health.
-pub const QUORUM_AGREE: &str = "stellar_quorum_agree";
-pub const QUORUM_MISSING: &str = "stellar_quorum_missing";
-pub const QUORUM_DISAGREE: &str = "stellar_quorum_disagree";
-pub const QUORUM_FAIL_AT: &str = "stellar_quorum_fail_at";
-
-// Phase 4 — SCP timing.
-pub const SCP_TIMING_EXTERNALIZED_SECONDS: &str = "stellar_scp_timing_externalized_seconds";
-pub const SCP_TIMING_NOMINATED_SECONDS: &str = "stellar_scp_timing_nominated_seconds";
-
-// Phase 5 — Per-phase ledger close histograms (LedgerClosePerf).
-pub const CLOSE_BEGIN_SECONDS: &str = "henyey_ledger_close_begin_seconds";
-pub const CLOSE_TX_EXEC_SECONDS: &str = "henyey_ledger_close_tx_exec_seconds";
-pub const CLOSE_CLASSIC_EXEC_SECONDS: &str = "henyey_ledger_close_classic_exec_seconds";
-pub const CLOSE_SOROBAN_EXEC_SECONDS: &str = "henyey_ledger_close_soroban_exec_seconds";
-pub const CLOSE_COMMIT_SETUP_SECONDS: &str = "henyey_ledger_close_commit_setup_seconds";
-pub const CLOSE_BUCKET_LOCK_WAIT_SECONDS: &str = "henyey_ledger_close_bucket_lock_wait_seconds";
-pub const CLOSE_EVICTION_SECONDS: &str = "henyey_ledger_close_eviction_seconds";
-pub const CLOSE_SOROBAN_STATE_SECONDS: &str = "henyey_ledger_close_soroban_state_seconds";
-pub const CLOSE_BUCKET_ADD_SECONDS: &str = "henyey_ledger_close_bucket_add_seconds";
-pub const CLOSE_HOT_ARCHIVE_SECONDS: &str = "henyey_ledger_close_hot_archive_seconds";
-pub const CLOSE_HEADER_SECONDS: &str = "henyey_ledger_close_header_seconds";
-pub const CLOSE_COMMIT_SECONDS: &str = "henyey_ledger_close_commit_seconds";
-pub const CLOSE_META_SECONDS: &str = "henyey_ledger_close_meta_seconds";
-
-// Phase 5 — Event-loop post-close PhaseTimer histograms.
-pub const CLOSE_COMPLETE_JOIN_MATCH_SECONDS: &str =
-    "henyey_ledger_close_complete_join_match_seconds";
-pub const CLOSE_COMPLETE_META_EMIT_SECONDS: &str = "henyey_ledger_close_complete_meta_emit_seconds";
-pub const CLOSE_COMPLETE_BUILD_PERSIST_INPUTS_SECONDS: &str =
-    "henyey_ledger_close_complete_build_persist_inputs_seconds";
-pub const CLOSE_COMPLETE_OVERLAY_BOOKKEEPING_SECONDS: &str =
-    "henyey_ledger_close_complete_overlay_bookkeeping_seconds";
-pub const CLOSE_COMPLETE_SPAWN_BLOCKING_SETUP_SECONDS: &str =
-    "henyey_ledger_close_complete_spawn_blocking_setup_seconds";
-pub const CLOSE_COMPLETE_TX_QUEUE_SECONDS: &str = "henyey_ledger_close_complete_tx_queue_seconds";
-pub const CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS: &str =
-    "henyey_ledger_close_complete_post_close_bookkeeping_seconds";
-
-// Phase 6 — Sub-phase instrumentation inside tx_queue spawn_blocking.
-pub const CLOSE_TX_QUEUE_PREP_SECONDS: &str = "henyey_ledger_close_tx_queue_prep_seconds";
-pub const CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS: &str =
-    "henyey_ledger_close_tx_queue_ledger_closed_seconds";
-pub const CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS: &str =
-    "henyey_ledger_close_tx_queue_shift_update_seconds";
-pub const CLOSE_TX_QUEUE_SNAPSHOT_SECONDS: &str = "henyey_ledger_close_tx_queue_snapshot_seconds";
-pub const CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS: &str =
-    "henyey_ledger_close_tx_queue_envelopes_fetch_seconds";
-pub const CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS: &str =
-    "henyey_ledger_close_tx_queue_snapshot_build_seconds";
-pub const CLOSE_TX_QUEUE_INVALIDATION_SECONDS: &str =
-    "henyey_ledger_close_tx_queue_invalidation_seconds";
-
-// Phase 6 — Persist and close-cycle instrumentation.
-pub const PERSIST_LEDGER_CLOSE_SECONDS: &str = "henyey_ledger_persist_close_seconds";
-pub const CLOSE_CYCLE_SECONDS: &str = "henyey_ledger_close_cycle_seconds";
-
-// Close-cycle decomposition metrics (#1909).
-// close_cycle ≈ handle_complete + post_complete + inter_close_wait + dispatch_to_join
+// ── Declarative metric catalog ─────────────────────────────────────────
 //
-// Recording semantics:
-// - handle_complete: always recorded (success and failure)
-// - dispatch_to_join: always recorded (measures spawn_blocking latency)
-// - post_complete: only recorded on successful close (guards lifecycle work)
-pub const CLOSE_HANDLE_COMPLETE_SECONDS: &str = "henyey_ledger_close_handle_complete_seconds";
-pub const CLOSE_POST_COMPLETE_SECONDS: &str = "henyey_ledger_close_post_complete_seconds";
-pub const CLOSE_DISPATCH_TO_JOIN_SECONDS: &str = "henyey_ledger_close_dispatch_to_join_seconds";
-pub const PERSIST_DISPATCH_TO_JOIN_SECONDS: &str = "henyey_ledger_persist_dispatch_to_join_seconds";
+// The `metric_catalog!` macro accepts metrics grouped by kind. Each entry
+// declares the Rust constant name, Prometheus metric name, and HELP text.
+//
+// Supported kinds:
+//   gauges          — pre-registered at 0 by default
+//   gauges_no_prereg — described only (not pre-registered at startup)
+//   counters        — pre-registered at 0 by default
+//   counters_no_prereg — described only (not pre-registered)
+//   labeled_counters_enum    — pre-registered for each enum label variant
+//   labeled_counters_literal — pre-registered for each literal label value
+//   histograms               — described only (never pre-registered)
 
-// Phase 5 — Slot-to-close latency histogram.
-pub const SLOT_TO_CLOSE_LATENCY_SECONDS: &str = "henyey_ledger_slot_to_close_latency_seconds";
+macro_rules! metric_catalog {
+    (
+        gauges {
+            $( $g_name:ident = $g_prom:expr => $g_help:expr ; )*
+        }
+        gauges_no_prereg {
+            $( $gnp_name:ident = $gnp_prom:expr => $gnp_help:expr ; )*
+        }
+        counters {
+            $( $c_name:ident = $c_prom:expr => $c_help:expr ; )*
+        }
+        counters_no_prereg {
+            $( $cnp_name:ident = $cnp_prom:expr => $cnp_help:expr ; )*
+        }
+        labeled_counters_enum {
+            $( $lce_name:ident = $lce_prom:expr => $lce_help:expr,
+                $lce_key:expr, $lce_enum:ty ; )*
+        }
+        labeled_counters_literal {
+            $( $lcl_name:ident = $lcl_prom:expr => $lcl_help:expr,
+                $lcl_key:expr, [ $( $lcl_val:expr ),+ $(,)? ] ; )*
+        }
+        histograms {
+            $( $h_name:ident = $h_prom:expr => $h_help:expr ; )*
+        }
+    ) => {
+        // ── 1. Public constants ────────────────────────────────────────
+        $( pub const $g_name: &str = $g_prom; )*
+        $( pub const $gnp_name: &str = $gnp_prom; )*
+        $( pub const $c_name: &str = $c_prom; )*
+        $( pub const $cnp_name: &str = $cnp_prom; )*
+        $( pub const $lce_name: &str = $lce_prom; )*
+        $( pub const $lcl_name: &str = $lcl_prom; )*
+        $( pub const $h_name: &str = $h_prom; )*
 
-// Phase 5 — Archive cache metrics.
-pub const ARCHIVE_CACHE_FRESH_TOTAL: &str = "henyey_archive_cache_fresh_total";
-pub const ARCHIVE_CACHE_STALE_TOTAL: &str = "henyey_archive_cache_stale_total";
-pub const ARCHIVE_CACHE_COLD_TOTAL: &str = "henyey_archive_cache_cold_total";
-pub const ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL: &str = "henyey_archive_cache_refresh_success_total";
-pub const ARCHIVE_CACHE_REFRESH_ERROR_TOTAL: &str = "henyey_archive_cache_refresh_error_total";
-pub const ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL: &str = "henyey_archive_cache_refresh_timeout_total";
-pub const ARCHIVE_CACHE_REFRESH_DURATION_SECONDS: &str =
-    "henyey_archive_cache_refresh_duration_seconds";
-pub const ARCHIVE_CACHE_AGE_SECONDS: &str = "henyey_archive_cache_age_seconds";
-pub const ARCHIVE_CACHE_POPULATED: &str = "henyey_archive_cache_populated";
+        // ── 2. describe_metrics() ──────────────────────────────────────
+        /// Register HELP/TYPE annotations for all metrics.
+        ///
+        /// Must be called **after** the global recorder is installed.
+        pub fn describe_metrics() {
+            $( describe_gauge!($g_name, $g_help); )*
+            $( describe_gauge!($gnp_name, $gnp_help); )*
+            $( describe_counter!($c_name, $c_help); )*
+            $( describe_counter!($cnp_name, $cnp_help); )*
+            $( describe_counter!($lce_name, $lce_help); )*
+            $( describe_counter!($lcl_name, $lcl_help); )*
+            $( describe_histogram!($h_name, $h_help); )*
+        }
 
-// Phase 5 — Recovery stalled tick counter.
-pub const RECOVERY_STALLED_TICK_TOTAL: &str = "henyey_recovery_stalled_tick_total";
+        // ── 3. register_label_series() ─────────────────────────────────
+        /// Pre-register all metrics with initial values so that every metric
+        /// appears on the very first scrape with its HELP/TYPE annotations.
+        ///
+        /// Must be called **after** [`describe_metrics`].
+        pub fn register_label_series() {
+            // Gauges — zero-init.
+            $( gauge!($g_name).set(0.0); )*
+            // gauges_no_prereg: intentionally skipped.
+            // Counters — zero-init.
+            $( counter!($c_name).absolute(0); )*
+            // counters_no_prereg: intentionally skipped.
+            // Labeled counters (enum-backed) — iterate ALL variants.
+            $( for v in <$lce_enum>::ALL {
+                counter!($lce_name, $lce_key => v.label()).absolute(0);
+            } )*
+            // Labeled counters (literal-backed).
+            $( for v in &[ $( $lcl_val ),+ ] {
+                counter!($lcl_name, $lcl_key => *v).absolute(0);
+            } )*
+            // Histograms: never pre-registered.
+        }
 
-// Phase 6 — TxSet exhaustion stuck gauge.
-pub const RECOVERY_TX_SET_STUCK_SECONDS: &str = "henyey_recovery_tx_set_stuck_seconds";
-
-// ── Registration ───────────────────────────────────────────────────────
-
-/// Register HELP/TYPE annotations for all metrics.
-///
-/// Must be called **after** the global recorder is installed, otherwise
-/// the descriptions are silently dropped.
-pub fn describe_metrics() {
-    // Stellar-compatible gauges.
-    describe_gauge!(LEDGER_SEQUENCE, "Current ledger sequence number");
-    describe_gauge!(PEER_COUNT, "Number of connected peers");
-    describe_gauge!(PENDING_TRANSACTIONS, "Number of pending transactions");
-    describe_gauge!(UPTIME_SECONDS, "Node uptime in seconds");
-    describe_gauge!(IS_VALIDATOR, "Whether this node is a validator");
-    describe_counter!(
-        META_STREAM_BYTES_TOTAL,
-        "Total bytes written to metadata output stream"
-    );
-    describe_counter!(
-        META_STREAM_WRITES_TOTAL,
-        "Total frames written to metadata output stream"
-    );
-
-    // SCP verify pipeline.
-    describe_counter!(
-        SCP_PREFILTER_REJECTS_TOTAL,
-        "SCP envelopes rejected by the event-loop pre-filter, by reason"
-    );
-    describe_counter!(
-        SCP_POST_VERIFY_DROPS_TOTAL,
-        "Envelopes dropped after verification (aggregate)"
-    );
-    describe_counter!(
-        SCP_POST_VERIFY_TOTAL,
-        "Envelopes processed by post-verify, by reason"
-    );
-    describe_gauge!(
-        SCP_VERIFY_INPUT_BACKLOG,
-        "Current depth of the SCP signature-verify input channel (event-loop sampled)"
-    );
-    describe_gauge!(
-        SCP_VERIFY_OUTPUT_BACKLOG,
-        "Current depth of the verified-envelope output channel (envelopes awaiting the event loop)"
-    );
-    describe_gauge!(
-        SCP_VERIFIER_THREAD_STATE,
-        "Worker thread state (0=Running, 1=Stopping, 2=Dead)"
-    );
-    // SCP verify latency — formerly exposed as a synthetic Prometheus
-    // "summary" (`# TYPE henyey_scp_verify_latency_us summary` with _sum
-    // and _count sub-metrics). The `metrics` crate has no native summary
-    // type, so these are now separate gauges. Consumers computing average
-    // latency as sum/count continue to work unchanged.
-    describe_gauge!(
-        SCP_VERIFY_LATENCY_US_SUM,
-        "Enqueue-to-post-verify latency microseconds (cumulative sum)"
-    );
-    describe_gauge!(
-        SCP_VERIFY_LATENCY_US_COUNT,
-        "Enqueue-to-post-verify latency sample count"
-    );
-
-    // Overlay fetch channel.
-    describe_gauge!(
-        OVERLAY_FETCH_CHANNEL_DEPTH,
-        "Current depth of the overlay fetch-response channel (event-loop sampled)"
-    );
-    describe_gauge!(
-        OVERLAY_FETCH_CHANNEL_DEPTH_MAX,
-        "Monotonic maximum depth of the overlay fetch-response channel since process start"
-    );
-
-    // Catchup.
-    describe_counter!(
-        POST_CATCHUP_HARD_RESET_TOTAL,
-        "Total post-catchup hard resets performed"
-    );
-
-    // SCP/herder counters.
-    describe_counter!(
-        SCP_ENVELOPE_EMIT_TOTAL,
-        "Total SCP envelopes emitted by the local node"
-    );
-    describe_counter!(
-        SCP_ENVELOPE_RECEIVE_TOTAL,
-        "Total SCP envelopes received from peers"
-    );
-    describe_counter!(
-        HERDER_LOST_SYNC_TOTAL,
-        "Total lost-sync events (transitions out of Tracking)"
-    );
-    describe_gauge!(
-        HERDER_STATE,
-        "Herder state (0=Booting, 1=Syncing, 2=Tracking)"
-    );
-    describe_gauge!(
-        HERDER_PENDING_ENVELOPES,
-        "SCP envelopes queued in pending pool"
-    );
-    describe_gauge!(
-        HERDER_CACHED_TX_SETS,
-        "Transaction sets cached for pending SCP slots"
-    );
-    describe_counter!(
-        HERDER_PENDING_RECEIVED_TOTAL,
-        "Total envelopes received by pending pool"
-    );
-    describe_counter!(
-        HERDER_PENDING_DUPLICATES_TOTAL,
-        "Envelopes rejected as duplicates by pending pool"
-    );
-    describe_counter!(
-        HERDER_PENDING_TOO_OLD_TOTAL,
-        "Envelopes rejected as too old by pending pool"
-    );
-    describe_counter!(
-        HERDER_PENDING_EVICTED_TOTAL,
-        "Envelopes evicted from pending pool"
-    );
-
-    // Bucket merge counters.
-    describe_counter!(
-        BUCKET_MERGE_COMPLETED_TOTAL,
-        "Total bucket merges completed"
-    );
-    describe_counter!(
-        BUCKET_MERGE_TIME_US_TOTAL,
-        "Total bucket merge time in microseconds"
-    );
-    describe_counter!(
-        BUCKET_MERGE_NEW_LIVE_TOTAL,
-        "Total new LIVEENTRY entries written during merges"
-    );
-    describe_counter!(
-        BUCKET_MERGE_NEW_DEAD_TOTAL,
-        "Total new DEADENTRY entries written during merges"
-    );
-    describe_counter!(
-        BUCKET_MERGE_NEW_INIT_TOTAL,
-        "Total new INITENTRY entries written during merges"
-    );
-    describe_counter!(
-        BUCKET_MERGE_NEW_META_TOTAL,
-        "Total new METAENTRY entries written during merges"
-    );
-    describe_counter!(
-        BUCKET_MERGE_SHADOWED_TOTAL,
-        "Total entries shadowed during merges"
-    );
-    describe_counter!(
-        BUCKET_MERGE_ANNIHILATED_TOTAL,
-        "Total INIT+DEAD entry pairs annihilated during merges"
-    );
-
-    // Overlay counters.
-    describe_counter!(
-        OVERLAY_MESSAGE_READ_TOTAL,
-        "Total overlay messages read from peers"
-    );
-    describe_counter!(
-        OVERLAY_MESSAGE_WRITE_TOTAL,
-        "Total overlay messages written to peers"
-    );
-    describe_counter!(
-        OVERLAY_MESSAGE_BROADCAST_TOTAL,
-        "Total overlay messages broadcast to all peers"
-    );
-    describe_counter!(OVERLAY_ERROR_READ_TOTAL, "Total overlay read errors");
-    describe_counter!(OVERLAY_ERROR_WRITE_TOTAL, "Total overlay write errors");
-    describe_counter!(
-        OVERLAY_TIMEOUT_IDLE_TOTAL,
-        "Total peers dropped due to idle timeout"
-    );
-    describe_counter!(
-        OVERLAY_TIMEOUT_STRAGGLER_TOTAL,
-        "Total peers dropped due to straggler timeout"
-    );
-
-    // Ledger close metrics.
-    describe_gauge!(LEDGER_TX_COUNT, "Transactions processed in the last close");
-    describe_gauge!(LEDGER_OP_COUNT, "Operations executed in the last close");
-    describe_gauge!(
-        LEDGER_TX_SUCCESS_COUNT,
-        "Successful transactions in the last close"
-    );
-    describe_gauge!(
-        LEDGER_TX_FAILED_COUNT,
-        "Failed transactions in the last close"
-    );
-    describe_gauge!(
-        LEDGER_TOTAL_FEES,
-        "Fees collected in the last close (stroops)"
-    );
-    describe_gauge!(
-        LEDGER_ENTRIES_CREATED,
-        "Ledger entries created in the last close"
-    );
-    describe_gauge!(
-        LEDGER_ENTRIES_UPDATED,
-        "Ledger entries updated in the last close"
-    );
-    describe_gauge!(
-        LEDGER_ENTRIES_DELETED,
-        "Ledger entries deleted in the last close"
-    );
-    describe_gauge!(LEDGER_APPLY_US, "Total ledger close time in microseconds");
-
-    // Herder tx queue metrics.
-    describe_gauge!(
-        HERDER_TX_QUEUE_ACCOUNTS,
-        "Accounts with pending transactions in the queue"
-    );
-    describe_gauge!(
-        HERDER_TX_QUEUE_BANNED,
-        "Currently banned transactions in the queue"
-    );
-    describe_gauge!(
-        HERDER_TX_QUEUE_SEEN,
-        "Deduplicated transaction hashes in the seen set"
-    );
-
-    // Herder pending envelope metrics.
-    describe_counter!(
-        HERDER_PENDING_ADDED_TOTAL,
-        "Envelopes added to the pending pool"
-    );
-    describe_counter!(
-        HERDER_PENDING_RELEASED_TOTAL,
-        "Envelopes released from the pending pool"
-    );
-
-    // Clock drift metrics.
-    describe_gauge!(
-        DRIFT_MIN_SECONDS,
-        "Minimum close time drift in the last completed window (seconds)"
-    );
-    describe_gauge!(
-        DRIFT_MAX_SECONDS,
-        "Maximum close time drift in the last completed window (seconds)"
-    );
-    describe_gauge!(
-        DRIFT_MEDIAN_SECONDS,
-        "Median close time drift in the last completed window (seconds)"
-    );
-    describe_gauge!(
-        DRIFT_P75_SECONDS,
-        "75th percentile close time drift in the last completed window (seconds)"
-    );
-    describe_gauge!(
-        DRIFT_SAMPLE_COUNT,
-        "Number of samples in the last completed drift window"
-    );
-
-    // jemalloc allocator metrics.
-    describe_gauge!(
-        JEMALLOC_ALLOCATED_BYTES,
-        "Bytes allocated by the application (jemalloc stats.allocated)"
-    );
-    describe_gauge!(
-        JEMALLOC_ACTIVE_BYTES,
-        "Bytes in active pages (jemalloc stats.active)"
-    );
-    describe_gauge!(
-        JEMALLOC_RESIDENT_BYTES,
-        "Bytes resident in physical memory (jemalloc stats.resident)"
-    );
-    describe_gauge!(
-        JEMALLOC_MAPPED_BYTES,
-        "Total bytes mapped by the allocator (jemalloc stats.mapped)"
-    );
-    describe_gauge!(
-        JEMALLOC_RETAINED_BYTES,
-        "Bytes retained by the allocator (jemalloc stats.retained)"
-    );
-    describe_gauge!(
-        JEMALLOC_FRAGMENTATION_PCT,
-        "Allocator fragmentation: (resident - allocated) / allocated * 100"
-    );
-
-    // Phase 3: Ledger apply counters.
-    describe_counter!(
-        LEDGER_APPLY_SUCCESS_TOTAL,
-        "Cumulative successful transaction applies"
-    );
-    describe_counter!(
-        LEDGER_APPLY_FAILURE_TOTAL,
-        "Cumulative failed transaction applies"
-    );
-    describe_counter!(
-        LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL,
-        "Cumulative successful Soroban transaction applies"
-    );
-    describe_counter!(
-        LEDGER_APPLY_SOROBAN_FAILURE_TOTAL,
-        "Cumulative failed Soroban transaction applies"
-    );
-    describe_gauge!(
-        LEDGER_APPLY_SOROBAN_MAX_CLUSTERS,
-        "Max dependent tx clusters in the last Soroban ledger close"
-    );
-    describe_gauge!(
-        LEDGER_APPLY_SOROBAN_STAGES,
-        "Number of parallel stages in the last Soroban ledger close"
-    );
-    describe_gauge!(
-        LEDGER_AGE_CURRENT_SECONDS,
-        "Seconds since the last ledger close"
-    );
-
-    // Phase 3: Soroban config limits (gauges — snapshot values that go up/down).
-    describe_gauge!(
-        SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE,
-        "Soroban config: max contract data key size in bytes"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE,
-        "Soroban config: max contract data entry size in bytes"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE,
-        "Soroban config: max contract code size in bytes"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_TX_MAX_SIZE_BYTE,
-        "Soroban config: max transaction size in bytes"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_TX_MAX_CPU_INSN,
-        "Soroban config: max CPU instructions per transaction"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_TX_MAX_MEM_BYTE,
-        "Soroban config: max memory per transaction in bytes"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_TX_MAX_READ_ENTRY,
-        "Soroban config: max read entries per transaction"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE,
-        "Soroban config: max read bytes per transaction"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY,
-        "Soroban config: max write entries per transaction"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE,
-        "Soroban config: max write bytes per transaction"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE,
-        "Soroban config: max event bytes per transaction"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT,
-        "Soroban config: max transactions per ledger"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN,
-        "Soroban config: max CPU instructions per ledger"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE,
-        "Soroban config: max total transaction size per ledger"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY,
-        "Soroban config: max read entries per ledger"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE,
-        "Soroban config: max read bytes per ledger"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY,
-        "Soroban config: max write entries per ledger"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE,
-        "Soroban config: max write bytes per ledger"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE,
-        "Soroban config: bucket list target size in bytes"
-    );
-    describe_gauge!(
-        SOROBAN_CONFIG_FEE_WRITE_1KB,
-        "Soroban config: fee for 1KB write"
-    );
-
-    // Phase 3: Henyey-specific observability.
-    describe_gauge!(
-        LEDGER_BUCKET_CACHE_HIT_RATIO,
-        "Per-bucket RandomEvictionCache hit ratio (0.0-1.0, Account entries only, last close)"
-    );
-    describe_gauge!(
-        LEDGER_SNAPSHOT_CACHE_HIT_RATIO,
-        "SnapshotHandle local cache hit ratio (0.0-1.0, last close)"
-    );
-    describe_gauge!(
-        LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS,
-        "Lookups dispatched to fallback (not served by snapshot local caches, last close)"
-    );
-
-    // Phase 4: Ledger close histogram.
-    describe_histogram!(
-        LEDGER_CLOSE_DURATION_SECONDS,
-        "Ledger close wall-clock duration in seconds"
-    );
-
-    // Phase 4: Overlay connection breakdown.
-    describe_gauge!(
-        OVERLAY_INBOUND_AUTHENTICATED,
-        "Authenticated inbound peer connections"
-    );
-    describe_gauge!(
-        OVERLAY_OUTBOUND_AUTHENTICATED,
-        "Authenticated outbound peer connections"
-    );
-    describe_gauge!(
-        OVERLAY_INBOUND_PENDING,
-        "Pending inbound peer connections (handshaking)"
-    );
-    describe_gauge!(
-        OVERLAY_OUTBOUND_PENDING,
-        "Pending outbound peer connections (handshaking)"
-    );
-
-    // Phase 4: Process health.
-    describe_gauge!(PROCESS_OPEN_FDS, "Open file descriptors");
-    describe_gauge!(PROCESS_MAX_FDS, "Maximum file descriptors (RLIMIT_NOFILE)");
-
-    // Phase 4: Quorum health.
-    describe_gauge!(
-        QUORUM_AGREE,
-        "Quorum set nodes in agreement (confirming/externalized)"
-    );
-    describe_gauge!(QUORUM_MISSING, "Quorum set nodes not responding");
-    describe_gauge!(QUORUM_DISAGREE, "Quorum set nodes disagreeing");
-    describe_gauge!(QUORUM_FAIL_AT, "Nodes that can fail before quorum is lost");
-
-    // Phase 4: SCP timing.
-    describe_gauge!(
-        SCP_TIMING_EXTERNALIZED_SECONDS,
-        "Time from slot creation to externalize (seconds, last slot)"
-    );
-    describe_gauge!(
-        SCP_TIMING_NOMINATED_SECONDS,
-        "Time from first local nomination to externalize (seconds, last slot)"
-    );
-
-    // Phase 5: Per-phase close-duration histograms (LedgerClosePerf).
-    describe_histogram!(
-        CLOSE_BEGIN_SECONDS,
-        "Ledger close begin_close phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_TX_EXEC_SECONDS,
-        "Ledger close tx_exec phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_CLASSIC_EXEC_SECONDS,
-        "Ledger close classic_exec sub-phase of tx_exec (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_SOROBAN_EXEC_SECONDS,
-        "Ledger close soroban_exec sub-phase of tx_exec (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_COMMIT_SETUP_SECONDS,
-        "Ledger close commit_setup phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_BUCKET_LOCK_WAIT_SECONDS,
-        "Ledger close bucket_lock_wait phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_EVICTION_SECONDS,
-        "Ledger close eviction phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_SOROBAN_STATE_SECONDS,
-        "Ledger close soroban_state phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_BUCKET_ADD_SECONDS,
-        "Ledger close bucket_add phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_HOT_ARCHIVE_SECONDS,
-        "Ledger close hot_archive phase (seconds)"
-    );
-    describe_histogram!(CLOSE_HEADER_SECONDS, "Ledger close header phase (seconds)");
-    describe_histogram!(
-        CLOSE_COMMIT_SECONDS,
-        "Ledger close commit_close phase (seconds)"
-    );
-    describe_histogram!(CLOSE_META_SECONDS, "Ledger close meta phase (seconds)");
-
-    // Phase 5: Event-loop post-close PhaseTimer histograms.
-    describe_histogram!(
-        CLOSE_COMPLETE_JOIN_MATCH_SECONDS,
-        "Close-complete join_match phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_COMPLETE_META_EMIT_SECONDS,
-        "Close-complete meta_emit phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_COMPLETE_BUILD_PERSIST_INPUTS_SECONDS,
-        "Close-complete build_persist_inputs phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_COMPLETE_OVERLAY_BOOKKEEPING_SECONDS,
-        "Close-complete overlay_bookkeeping phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_COMPLETE_SPAWN_BLOCKING_SETUP_SECONDS,
-        "Close-complete spawn_blocking_setup phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_COMPLETE_TX_QUEUE_SECONDS,
-        "Close-complete tx_queue_background_wait phase (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS,
-        "Close-complete post_close_bookkeeping phase (seconds)"
-    );
-
-    // Phase 6: Sub-phase instrumentation inside tx_queue spawn_blocking.
-    describe_histogram!(
-        CLOSE_TX_QUEUE_PREP_SECONDS,
-        "tx_queue spawn_blocking closure-local prep (Soroban limits, close-time math) (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS,
-        "tx_queue spawn_blocking herder.ledger_closed + ban failed txs (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS,
-        "tx_queue spawn_blocking validation context update + Soroban limits + shift (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_TX_QUEUE_SNAPSHOT_SECONDS,
-        "tx_queue spawn_blocking pending_hashed_envelopes + snapshot build total (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS,
-        "tx_queue spawn_blocking pending_hashed_envelopes only (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS,
-        "tx_queue spawn_blocking SnapshotValidationProviders::new only (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_TX_QUEUE_INVALIDATION_SECONDS,
-        "tx_queue spawn_blocking get_invalid_hashed_tx_list + ban invalid (seconds)"
-    );
-
-    // Phase 6: Persist and close-cycle instrumentation.
-    describe_histogram!(
-        PERSIST_LEDGER_CLOSE_SECONDS,
-        "PersistJob::LedgerClose wall-clock duration (seconds, excludes scheduling delay)"
-    );
-    describe_histogram!(
-        CLOSE_CYCLE_SECONDS,
-        "Wall-clock between consecutive deferred-pipeline close-complete events (seconds)"
-    );
-
-    // Close-cycle decomposition (#1909).
-    describe_histogram!(
-        CLOSE_HANDLE_COMPLETE_SECONDS,
-        "Wall-clock of handle_close_complete including finalizer dispatch (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_POST_COMPLETE_SECONDS,
-        "Wall-clock of post-close lifecycle work after handle_close_complete (seconds)"
-    );
-    describe_histogram!(
-        CLOSE_DISPATCH_TO_JOIN_SECONDS,
-        "Wall-clock from spawn_blocking dispatch to event-loop join observation (seconds)"
-    );
-    describe_histogram!(
-        PERSIST_DISPATCH_TO_JOIN_SECONDS,
-        "Wall-clock from persist spawn_blocking dispatch to event-loop join observation (seconds)"
-    );
-
-    // Phase 5: Slot-to-close latency.
-    describe_histogram!(
-        SLOT_TO_CLOSE_LATENCY_SECONDS,
-        "Wall-clock from first SCP activity to close-complete (seconds)"
-    );
-
-    // Phase 5: Archive cache metrics.
-    describe_counter!(
-        ARCHIVE_CACHE_FRESH_TOTAL,
-        "Archive cache get_cached() Fresh results"
-    );
-    describe_counter!(
-        ARCHIVE_CACHE_STALE_TOTAL,
-        "Archive cache get_cached() Stale results"
-    );
-    describe_counter!(
-        ARCHIVE_CACHE_COLD_TOTAL,
-        "Archive cache get_cached() Cold results"
-    );
-    describe_counter!(
-        ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL,
-        "Archive cache background refresh successes"
-    );
-    describe_counter!(
-        ARCHIVE_CACHE_REFRESH_ERROR_TOTAL,
-        "Archive cache background refresh errors"
-    );
-    describe_counter!(
-        ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL,
-        "Archive cache background refresh timeouts"
-    );
-    describe_histogram!(
-        ARCHIVE_CACHE_REFRESH_DURATION_SECONDS,
-        "Archive cache background refresh duration (seconds, including timeouts)"
-    );
-    describe_gauge!(
-        ARCHIVE_CACHE_AGE_SECONDS,
-        "Age of cached archive checkpoint (seconds, 0 when cold)"
-    );
-    describe_gauge!(
-        ARCHIVE_CACHE_POPULATED,
-        "Whether the archive checkpoint cache has a value (1=populated, 0=cold)"
-    );
-
-    // Phase 5: Recovery stalled tick counter.
-    describe_counter!(
-        RECOVERY_STALLED_TICK_TOTAL,
-        "Recovery stalled ticks by reason"
-    );
-
-    // Phase 6: TxSet exhaustion stuck gauge.
-    describe_gauge!(
-        RECOVERY_TX_SET_STUCK_SECONDS,
-        "Seconds since all peers exhausted for pending tx_set hashes (0 = not stuck)"
-    );
+        // ── 4. Test arrays ─────────────────────────────────────────────
+        #[cfg(test)]
+        pub(crate) mod catalog_arrays {
+            /// All gauge metric names (including no_preregister).
+            pub const ALL_GAUGE_NAMES: &[&str] = &[
+                $( $g_prom, )*
+                $( $gnp_prom, )*
+            ];
+            /// All counter metric names (including labeled and no_preregister).
+            pub const ALL_COUNTER_NAMES: &[&str] = &[
+                $( $c_prom, )*
+                $( $cnp_prom, )*
+                $( $lce_prom, )*
+                $( $lcl_prom, )*
+            ];
+            /// All histogram metric names.
+            pub const ALL_HISTOGRAM_NAMES: &[&str] = &[
+                $( $h_prom, )*
+            ];
+            /// Gauges that are pre-registered at zero (excludes no_preregister).
+            pub const ALL_PREREGISTERED_GAUGE_NAMES: &[&str] = &[
+                $( $g_prom, )*
+            ];
+            /// Counters that are pre-registered at zero (unlabeled only, excludes no_preregister).
+            pub const ALL_PREREGISTERED_COUNTER_NAMES: &[&str] = &[
+                $( $c_prom, )*
+            ];
+        }
+    };
 }
 
-/// Pre-register all metrics with initial values so that every metric appears
-/// on the very first scrape with its HELP/TYPE annotations.
-///
-/// Must be called **after** [`describe_metrics`].
-pub fn register_label_series() {
-    use henyey_herder::scp_verify::{PostVerifyReason, PreFilterRejectReason};
+// ── Metric catalog ─────────────────────────────────────────────────────
 
-    // Initialize all gauges to zero so they appear in output.
-    gauge!(LEDGER_SEQUENCE).set(0.0);
-    gauge!(PEER_COUNT).set(0.0);
-    gauge!(PENDING_TRANSACTIONS).set(0.0);
-    gauge!(UPTIME_SECONDS).set(0.0);
-    gauge!(IS_VALIDATOR).set(0.0);
-    // Note: meta stream counters are intentionally NOT pre-registered —
-    // they only appear when the meta stream is active (matching current behavior).
+metric_catalog! {
+    gauges {
+        // Stellar-compatible gauges.
+        LEDGER_SEQUENCE = "stellar_ledger_sequence"
+            => "Current ledger sequence number";
+        PEER_COUNT = "stellar_peer_count"
+            => "Number of connected peers";
+        PENDING_TRANSACTIONS = "stellar_pending_transactions"
+            => "Number of pending transactions";
+        UPTIME_SECONDS = "stellar_uptime_seconds"
+            => "Node uptime in seconds";
+        IS_VALIDATOR = "stellar_is_validator"
+            => "Whether this node is a validator";
 
-    // SCP verify pipeline gauges.
-    gauge!(SCP_VERIFY_INPUT_BACKLOG).set(0.0);
-    gauge!(SCP_VERIFY_OUTPUT_BACKLOG).set(0.0);
-    gauge!(SCP_VERIFIER_THREAD_STATE).set(0.0);
-    gauge!(SCP_VERIFY_LATENCY_US_SUM).set(0.0);
-    gauge!(SCP_VERIFY_LATENCY_US_COUNT).set(0.0);
+        // SCP verify pipeline gauges.
+        SCP_VERIFY_INPUT_BACKLOG = "henyey_scp_verify_input_backlog"
+            => "Current depth of the SCP signature-verify input channel (event-loop sampled)";
+        SCP_VERIFY_OUTPUT_BACKLOG = "henyey_scp_verify_output_backlog"
+            => "Current depth of the verified-envelope output channel (envelopes awaiting the event loop)";
+        SCP_VERIFIER_THREAD_STATE = "henyey_scp_verifier_thread_state"
+            => "Worker thread state (0=Running, 1=Stopping, 2=Dead)";
+        // SCP verify latency — formerly exposed as a synthetic Prometheus
+        // "summary". The `metrics` crate has no native summary type, so
+        // these are now separate gauges.
+        SCP_VERIFY_LATENCY_US_SUM = "henyey_scp_verify_latency_us_sum"
+            => "Enqueue-to-post-verify latency microseconds (cumulative sum)";
+        SCP_VERIFY_LATENCY_US_COUNT = "henyey_scp_verify_latency_us_count"
+            => "Enqueue-to-post-verify latency sample count";
 
-    // Overlay fetch channel gauges.
-    gauge!(OVERLAY_FETCH_CHANNEL_DEPTH).set(0.0);
-    gauge!(OVERLAY_FETCH_CHANNEL_DEPTH_MAX).set(0.0);
+        // Overlay fetch channel.
+        OVERLAY_FETCH_CHANNEL_DEPTH = "henyey_overlay_fetch_channel_depth"
+            => "Current depth of the overlay fetch-response channel (event-loop sampled)";
+        OVERLAY_FETCH_CHANNEL_DEPTH_MAX = "henyey_overlay_fetch_channel_depth_max"
+            => "Monotonic maximum depth of the overlay fetch-response channel since process start";
 
-    // Counters.
-    counter!(SCP_POST_VERIFY_DROPS_TOTAL).absolute(0);
-    counter!(POST_CATCHUP_HARD_RESET_TOTAL).absolute(0);
+        // SCP/herder gauges.
+        HERDER_STATE = "stellar_herder_state"
+            => "Herder state (0=Booting, 1=Syncing, 2=Tracking)";
+        HERDER_PENDING_ENVELOPES = "stellar_herder_pending_envelopes"
+            => "SCP envelopes queued in pending pool";
+        HERDER_CACHED_TX_SETS = "stellar_herder_cached_tx_sets"
+            => "Transaction sets cached for pending SCP slots";
 
-    // SCP/herder counters.
-    counter!(SCP_ENVELOPE_EMIT_TOTAL).absolute(0);
-    counter!(SCP_ENVELOPE_RECEIVE_TOTAL).absolute(0);
-    counter!(HERDER_LOST_SYNC_TOTAL).absolute(0);
-    gauge!(HERDER_STATE).set(0.0);
-    gauge!(HERDER_PENDING_ENVELOPES).set(0.0);
-    gauge!(HERDER_CACHED_TX_SETS).set(0.0);
-    counter!(HERDER_PENDING_RECEIVED_TOTAL).absolute(0);
-    counter!(HERDER_PENDING_DUPLICATES_TOTAL).absolute(0);
-    counter!(HERDER_PENDING_TOO_OLD_TOTAL).absolute(0);
-    counter!(HERDER_PENDING_EVICTED_TOTAL).absolute(0);
+        // Ledger close gauges (Phase 2).
+        LEDGER_TX_COUNT = "stellar_ledger_tx_count"
+            => "Transactions processed in the last close";
+        LEDGER_OP_COUNT = "stellar_ledger_op_count"
+            => "Operations executed in the last close";
+        LEDGER_TX_SUCCESS_COUNT = "stellar_ledger_tx_success_count"
+            => "Successful transactions in the last close";
+        LEDGER_TX_FAILED_COUNT = "stellar_ledger_tx_failed_count"
+            => "Failed transactions in the last close";
+        LEDGER_TOTAL_FEES = "stellar_ledger_total_fees"
+            => "Fees collected in the last close (stroops)";
+        LEDGER_ENTRIES_CREATED = "stellar_ledger_entries_created"
+            => "Ledger entries created in the last close";
+        LEDGER_ENTRIES_UPDATED = "stellar_ledger_entries_updated"
+            => "Ledger entries updated in the last close";
+        LEDGER_ENTRIES_DELETED = "stellar_ledger_entries_deleted"
+            => "Ledger entries deleted in the last close";
+        LEDGER_APPLY_US = "stellar_ledger_apply_us"
+            => "Total ledger close time in microseconds";
 
-    // Bucket merge counters.
-    counter!(BUCKET_MERGE_COMPLETED_TOTAL).absolute(0);
-    counter!(BUCKET_MERGE_TIME_US_TOTAL).absolute(0);
-    counter!(BUCKET_MERGE_NEW_LIVE_TOTAL).absolute(0);
-    counter!(BUCKET_MERGE_NEW_DEAD_TOTAL).absolute(0);
-    counter!(BUCKET_MERGE_NEW_INIT_TOTAL).absolute(0);
-    counter!(BUCKET_MERGE_NEW_META_TOTAL).absolute(0);
-    counter!(BUCKET_MERGE_SHADOWED_TOTAL).absolute(0);
-    counter!(BUCKET_MERGE_ANNIHILATED_TOTAL).absolute(0);
+        // Herder tx queue gauges (Phase 2).
+        HERDER_TX_QUEUE_ACCOUNTS = "stellar_herder_tx_queue_accounts"
+            => "Accounts with pending transactions in the queue";
+        HERDER_TX_QUEUE_BANNED = "stellar_herder_tx_queue_banned"
+            => "Currently banned transactions in the queue";
+        HERDER_TX_QUEUE_SEEN = "stellar_herder_tx_queue_seen"
+            => "Deduplicated transaction hashes in the seen set";
 
-    // Overlay counters.
-    counter!(OVERLAY_MESSAGE_READ_TOTAL).absolute(0);
-    counter!(OVERLAY_MESSAGE_WRITE_TOTAL).absolute(0);
-    counter!(OVERLAY_MESSAGE_BROADCAST_TOTAL).absolute(0);
-    counter!(OVERLAY_ERROR_READ_TOTAL).absolute(0);
-    counter!(OVERLAY_ERROR_WRITE_TOTAL).absolute(0);
-    counter!(OVERLAY_TIMEOUT_IDLE_TOTAL).absolute(0);
-    counter!(OVERLAY_TIMEOUT_STRAGGLER_TOTAL).absolute(0);
+        // Clock drift gauges (Phase 2).
+        DRIFT_MIN_SECONDS = "henyey_herder_drift_min_seconds"
+            => "Minimum close time drift in the last completed window (seconds)";
+        DRIFT_MAX_SECONDS = "henyey_herder_drift_max_seconds"
+            => "Maximum close time drift in the last completed window (seconds)";
+        DRIFT_MEDIAN_SECONDS = "henyey_herder_drift_median_seconds"
+            => "Median close time drift in the last completed window (seconds)";
+        DRIFT_P75_SECONDS = "henyey_herder_drift_p75_seconds"
+            => "75th percentile close time drift in the last completed window (seconds)";
+        DRIFT_SAMPLE_COUNT = "henyey_herder_drift_sample_count"
+            => "Number of samples in the last completed drift window";
 
-    // Ledger close gauges (Phase 2).
-    gauge!(LEDGER_TX_COUNT).set(0.0);
-    gauge!(LEDGER_OP_COUNT).set(0.0);
-    gauge!(LEDGER_TX_SUCCESS_COUNT).set(0.0);
-    gauge!(LEDGER_TX_FAILED_COUNT).set(0.0);
-    gauge!(LEDGER_TOTAL_FEES).set(0.0);
-    gauge!(LEDGER_ENTRIES_CREATED).set(0.0);
-    gauge!(LEDGER_ENTRIES_UPDATED).set(0.0);
-    gauge!(LEDGER_ENTRIES_DELETED).set(0.0);
-    gauge!(LEDGER_APPLY_US).set(0.0);
+        // jemalloc allocator gauges.
+        JEMALLOC_ALLOCATED_BYTES = "henyey_jemalloc_allocated_bytes"
+            => "Bytes allocated by the application (jemalloc stats.allocated)";
+        JEMALLOC_ACTIVE_BYTES = "henyey_jemalloc_active_bytes"
+            => "Bytes in active pages (jemalloc stats.active)";
+        JEMALLOC_RESIDENT_BYTES = "henyey_jemalloc_resident_bytes"
+            => "Bytes resident in physical memory (jemalloc stats.resident)";
+        JEMALLOC_MAPPED_BYTES = "henyey_jemalloc_mapped_bytes"
+            => "Total bytes mapped by the allocator (jemalloc stats.mapped)";
+        JEMALLOC_RETAINED_BYTES = "henyey_jemalloc_retained_bytes"
+            => "Bytes retained by the allocator (jemalloc stats.retained)";
+        JEMALLOC_FRAGMENTATION_PCT = "henyey_jemalloc_fragmentation_pct"
+            => "Allocator fragmentation: (resident - allocated) / allocated * 100";
 
-    // Herder tx queue gauges (Phase 2).
-    gauge!(HERDER_TX_QUEUE_ACCOUNTS).set(0.0);
-    gauge!(HERDER_TX_QUEUE_BANNED).set(0.0);
-    gauge!(HERDER_TX_QUEUE_SEEN).set(0.0);
+        // Phase 3: Ledger apply snapshot gauges.
+        LEDGER_APPLY_SOROBAN_MAX_CLUSTERS = "stellar_ledger_apply_soroban_max_clusters"
+            => "Max dependent tx clusters in the last Soroban ledger close";
+        LEDGER_APPLY_SOROBAN_STAGES = "stellar_ledger_apply_soroban_stages"
+            => "Number of parallel stages in the last Soroban ledger close";
+        LEDGER_AGE_CURRENT_SECONDS = "stellar_ledger_age_current_seconds"
+            => "Seconds since the last ledger close";
 
-    // Herder pending envelope counters (Phase 2).
-    counter!(HERDER_PENDING_ADDED_TOTAL).absolute(0);
-    counter!(HERDER_PENDING_RELEASED_TOTAL).absolute(0);
+        // Phase 3: Soroban network config limits.
+        SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE = "stellar_soroban_config_contract_max_rw_key_byte"
+            => "Soroban config: max contract data key size in bytes";
+        SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE = "stellar_soroban_config_contract_max_rw_data_byte"
+            => "Soroban config: max contract data entry size in bytes";
+        SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE = "stellar_soroban_config_contract_max_rw_code_byte"
+            => "Soroban config: max contract code size in bytes";
+        SOROBAN_CONFIG_TX_MAX_SIZE_BYTE = "stellar_soroban_config_tx_max_size_byte"
+            => "Soroban config: max transaction size in bytes";
+        SOROBAN_CONFIG_TX_MAX_CPU_INSN = "stellar_soroban_config_tx_max_cpu_insn"
+            => "Soroban config: max CPU instructions per transaction";
+        SOROBAN_CONFIG_TX_MAX_MEM_BYTE = "stellar_soroban_config_tx_max_mem_byte"
+            => "Soroban config: max memory per transaction in bytes";
+        SOROBAN_CONFIG_TX_MAX_READ_ENTRY = "stellar_soroban_config_tx_max_read_entry"
+            => "Soroban config: max read entries per transaction";
+        SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE = "stellar_soroban_config_tx_max_read_ledger_byte"
+            => "Soroban config: max read bytes per transaction";
+        SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY = "stellar_soroban_config_tx_max_write_entry"
+            => "Soroban config: max write entries per transaction";
+        SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE = "stellar_soroban_config_tx_max_write_ledger_byte"
+            => "Soroban config: max write bytes per transaction";
+        SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE = "stellar_soroban_config_tx_max_emit_event_byte"
+            => "Soroban config: max event bytes per transaction";
+        SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT = "stellar_soroban_config_ledger_max_tx_count"
+            => "Soroban config: max transactions per ledger";
+        SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN = "stellar_soroban_config_ledger_max_cpu_insn"
+            => "Soroban config: max CPU instructions per ledger";
+        SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE = "stellar_soroban_config_ledger_max_txs_size_byte"
+            => "Soroban config: max total transaction size per ledger";
+        SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY = "stellar_soroban_config_ledger_max_read_entry"
+            => "Soroban config: max read entries per ledger";
+        SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE = "stellar_soroban_config_ledger_max_read_ledger_byte"
+            => "Soroban config: max read bytes per ledger";
+        SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY = "stellar_soroban_config_ledger_max_write_entry"
+            => "Soroban config: max write entries per ledger";
+        SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE = "stellar_soroban_config_ledger_max_write_ledger_byte"
+            => "Soroban config: max write bytes per ledger";
+        SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE = "stellar_soroban_config_bucket_list_target_size_byte"
+            => "Soroban config: bucket list target size in bytes";
+        SOROBAN_CONFIG_FEE_WRITE_1KB = "stellar_soroban_config_fee_write_1kb"
+            => "Soroban config: fee for 1KB write";
 
-    // Clock drift gauges (Phase 2).
-    gauge!(DRIFT_MIN_SECONDS).set(0.0);
-    gauge!(DRIFT_MAX_SECONDS).set(0.0);
-    gauge!(DRIFT_MEDIAN_SECONDS).set(0.0);
-    gauge!(DRIFT_P75_SECONDS).set(0.0);
-    gauge!(DRIFT_SAMPLE_COUNT).set(0.0);
+        // Phase 3: Henyey-specific observability.
+        LEDGER_BUCKET_CACHE_HIT_RATIO = "henyey_ledger_bucket_cache_hit_ratio"
+            => "Per-bucket RandomEvictionCache hit ratio (0.0-1.0, Account entries only, last close)";
+        LEDGER_SNAPSHOT_CACHE_HIT_RATIO = "henyey_ledger_snapshot_cache_hit_ratio"
+            => "SnapshotHandle local cache hit ratio (0.0-1.0, last close)";
+        LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS = "henyey_ledger_snapshot_cache_fallback_lookups"
+            => "Lookups dispatched to fallback (not served by snapshot local caches, last close)";
 
-    // jemalloc allocator gauges (zero when jemalloc is not enabled).
-    gauge!(JEMALLOC_ALLOCATED_BYTES).set(0.0);
-    gauge!(JEMALLOC_ACTIVE_BYTES).set(0.0);
-    gauge!(JEMALLOC_RESIDENT_BYTES).set(0.0);
-    gauge!(JEMALLOC_MAPPED_BYTES).set(0.0);
-    gauge!(JEMALLOC_RETAINED_BYTES).set(0.0);
-    gauge!(JEMALLOC_FRAGMENTATION_PCT).set(0.0);
+        // Phase 4: Overlay connection breakdown.
+        OVERLAY_INBOUND_AUTHENTICATED = "stellar_overlay_inbound_authenticated"
+            => "Authenticated inbound peer connections";
+        OVERLAY_OUTBOUND_AUTHENTICATED = "stellar_overlay_outbound_authenticated"
+            => "Authenticated outbound peer connections";
+        OVERLAY_INBOUND_PENDING = "stellar_overlay_inbound_pending"
+            => "Pending inbound peer connections (handshaking)";
+        OVERLAY_OUTBOUND_PENDING = "stellar_overlay_outbound_pending"
+            => "Pending outbound peer connections (handshaking)";
 
-    // Labeled counters — all reason labels pre-registered at zero.
-    for reason in PreFilterRejectReason::ALL {
-        counter!(SCP_PREFILTER_REJECTS_TOTAL, "reason" => reason.label()).absolute(0);
+        // Phase 4: Process health.
+        PROCESS_OPEN_FDS = "henyey_process_open_fds"
+            => "Open file descriptors";
+        PROCESS_MAX_FDS = "henyey_process_max_fds"
+            => "Maximum file descriptors (RLIMIT_NOFILE)";
+
+        // Phase 4: Quorum health.
+        QUORUM_AGREE = "stellar_quorum_agree"
+            => "Quorum set nodes in agreement (confirming/externalized)";
+        QUORUM_MISSING = "stellar_quorum_missing"
+            => "Quorum set nodes not responding";
+        QUORUM_DISAGREE = "stellar_quorum_disagree"
+            => "Quorum set nodes disagreeing";
+        QUORUM_FAIL_AT = "stellar_quorum_fail_at"
+            => "Nodes that can fail before quorum is lost";
+
+        // Phase 4: SCP timing.
+        SCP_TIMING_EXTERNALIZED_SECONDS = "stellar_scp_timing_externalized_seconds"
+            => "Time from slot creation to externalize (seconds, last slot)";
+        SCP_TIMING_NOMINATED_SECONDS = "stellar_scp_timing_nominated_seconds"
+            => "Time from first local nomination to externalize (seconds, last slot)";
+
+        // Phase 5: Archive cache gauges.
+        ARCHIVE_CACHE_AGE_SECONDS = "henyey_archive_cache_age_seconds"
+            => "Age of cached archive checkpoint (seconds, 0 when cold)";
+        ARCHIVE_CACHE_POPULATED = "henyey_archive_cache_populated"
+            => "Whether the archive checkpoint cache has a value (1=populated, 0=cold)";
     }
-    for reason in PostVerifyReason::ALL {
-        counter!(SCP_POST_VERIFY_TOTAL, "reason" => reason.label()).absolute(0);
+
+    gauges_no_prereg {
+        // Phase 6: TxSet exhaustion stuck gauge — set conditionally in refresh_gauges.
+        RECOVERY_TX_SET_STUCK_SECONDS = "henyey_recovery_tx_set_stuck_seconds"
+            => "Seconds since all peers exhausted for pending tx_set hashes (0 = not stuck)";
     }
 
-    // Phase 3: Ledger apply counters.
-    counter!(LEDGER_APPLY_SUCCESS_TOTAL).absolute(0);
-    counter!(LEDGER_APPLY_FAILURE_TOTAL).absolute(0);
-    counter!(LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL).absolute(0);
-    counter!(LEDGER_APPLY_SOROBAN_FAILURE_TOTAL).absolute(0);
-    gauge!(LEDGER_APPLY_SOROBAN_MAX_CLUSTERS).set(0.0);
-    gauge!(LEDGER_APPLY_SOROBAN_STAGES).set(0.0);
-    gauge!(LEDGER_AGE_CURRENT_SECONDS).set(0.0);
+    counters {
+        // SCP verify pipeline.
+        SCP_POST_VERIFY_DROPS_TOTAL = "henyey_scp_post_verify_drops_total"
+            => "Envelopes dropped after verification (aggregate)";
+        POST_CATCHUP_HARD_RESET_TOTAL = "henyey_post_catchup_hard_reset_total"
+            => "Total post-catchup hard resets performed";
 
-    // Phase 3: Soroban config (pre-registered at zero for first-scrape visibility).
-    gauge!(SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_TX_MAX_SIZE_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_TX_MAX_CPU_INSN).set(0.0);
-    gauge!(SOROBAN_CONFIG_TX_MAX_MEM_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_TX_MAX_READ_ENTRY).set(0.0);
-    gauge!(SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY).set(0.0);
-    gauge!(SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT).set(0.0);
-    gauge!(SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN).set(0.0);
-    gauge!(SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY).set(0.0);
-    gauge!(SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY).set(0.0);
-    gauge!(SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE).set(0.0);
-    gauge!(SOROBAN_CONFIG_FEE_WRITE_1KB).set(0.0);
+        // SCP/herder counters.
+        SCP_ENVELOPE_EMIT_TOTAL = "stellar_scp_envelope_emit_total"
+            => "Total SCP envelopes emitted by the local node";
+        SCP_ENVELOPE_RECEIVE_TOTAL = "stellar_scp_envelope_receive_total"
+            => "Total SCP envelopes received from peers";
+        HERDER_LOST_SYNC_TOTAL = "stellar_herder_lost_sync_total"
+            => "Total lost-sync events (transitions out of Tracking)";
+        HERDER_PENDING_RECEIVED_TOTAL = "stellar_herder_pending_received_total"
+            => "Total envelopes received by pending pool";
+        HERDER_PENDING_DUPLICATES_TOTAL = "stellar_herder_pending_duplicates_total"
+            => "Envelopes rejected as duplicates by pending pool";
+        HERDER_PENDING_TOO_OLD_TOTAL = "stellar_herder_pending_too_old_total"
+            => "Envelopes rejected as too old by pending pool";
+        HERDER_PENDING_EVICTED_TOTAL = "stellar_herder_pending_evicted_total"
+            => "Envelopes evicted from pending pool";
 
-    // Phase 3: Henyey-specific gauges.
-    gauge!(LEDGER_BUCKET_CACHE_HIT_RATIO).set(0.0);
-    gauge!(LEDGER_SNAPSHOT_CACHE_HIT_RATIO).set(0.0);
-    gauge!(LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS).set(0.0);
+        // Bucket merge counters.
+        BUCKET_MERGE_COMPLETED_TOTAL = "stellar_bucket_merge_completed_total"
+            => "Total bucket merges completed";
+        BUCKET_MERGE_TIME_US_TOTAL = "stellar_bucket_merge_time_us_total"
+            => "Total bucket merge time in microseconds";
+        BUCKET_MERGE_NEW_LIVE_TOTAL = "stellar_bucket_merge_new_live_total"
+            => "Total new LIVEENTRY entries written during merges";
+        BUCKET_MERGE_NEW_DEAD_TOTAL = "stellar_bucket_merge_new_dead_total"
+            => "Total new DEADENTRY entries written during merges";
+        BUCKET_MERGE_NEW_INIT_TOTAL = "stellar_bucket_merge_new_init_total"
+            => "Total new INITENTRY entries written during merges";
+        BUCKET_MERGE_NEW_META_TOTAL = "stellar_bucket_merge_new_meta_total"
+            => "Total new METAENTRY entries written during merges";
+        BUCKET_MERGE_SHADOWED_TOTAL = "stellar_bucket_merge_shadowed_total"
+            => "Total entries shadowed during merges";
+        BUCKET_MERGE_ANNIHILATED_TOTAL = "stellar_bucket_merge_annihilated_total"
+            => "Total INIT+DEAD entry pairs annihilated during merges";
 
-    // Phase 4: Overlay connection breakdown.
-    gauge!(OVERLAY_INBOUND_AUTHENTICATED).set(0.0);
-    gauge!(OVERLAY_OUTBOUND_AUTHENTICATED).set(0.0);
-    gauge!(OVERLAY_INBOUND_PENDING).set(0.0);
-    gauge!(OVERLAY_OUTBOUND_PENDING).set(0.0);
+        // Overlay counters.
+        OVERLAY_MESSAGE_READ_TOTAL = "stellar_overlay_message_read_total"
+            => "Total overlay messages read from peers";
+        OVERLAY_MESSAGE_WRITE_TOTAL = "stellar_overlay_message_write_total"
+            => "Total overlay messages written to peers";
+        OVERLAY_MESSAGE_BROADCAST_TOTAL = "stellar_overlay_message_broadcast_total"
+            => "Total overlay messages broadcast to all peers";
+        OVERLAY_ERROR_READ_TOTAL = "stellar_overlay_error_read_total"
+            => "Total overlay read errors";
+        OVERLAY_ERROR_WRITE_TOTAL = "stellar_overlay_error_write_total"
+            => "Total overlay write errors";
+        OVERLAY_TIMEOUT_IDLE_TOTAL = "stellar_overlay_timeout_idle_total"
+            => "Total peers dropped due to idle timeout";
+        OVERLAY_TIMEOUT_STRAGGLER_TOTAL = "stellar_overlay_timeout_straggler_total"
+            => "Total peers dropped due to straggler timeout";
 
-    // Phase 4: Process health.
-    gauge!(PROCESS_OPEN_FDS).set(0.0);
-    gauge!(PROCESS_MAX_FDS).set(0.0);
+        // Herder pending envelope counters (Phase 2).
+        HERDER_PENDING_ADDED_TOTAL = "stellar_herder_pending_added_total"
+            => "Envelopes added to the pending pool";
+        HERDER_PENDING_RELEASED_TOTAL = "stellar_herder_pending_released_total"
+            => "Envelopes released from the pending pool";
 
-    // Phase 4: Quorum health.
-    gauge!(QUORUM_AGREE).set(0.0);
-    gauge!(QUORUM_MISSING).set(0.0);
-    gauge!(QUORUM_DISAGREE).set(0.0);
-    gauge!(QUORUM_FAIL_AT).set(0.0);
+        // Phase 3: Ledger apply cumulative counters.
+        LEDGER_APPLY_SUCCESS_TOTAL = "stellar_ledger_apply_success_total"
+            => "Cumulative successful transaction applies";
+        LEDGER_APPLY_FAILURE_TOTAL = "stellar_ledger_apply_failure_total"
+            => "Cumulative failed transaction applies";
+        LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL = "stellar_ledger_apply_soroban_success_total"
+            => "Cumulative successful Soroban transaction applies";
+        LEDGER_APPLY_SOROBAN_FAILURE_TOTAL = "stellar_ledger_apply_soroban_failure_total"
+            => "Cumulative failed Soroban transaction applies";
 
-    // Phase 4: SCP timing.
-    gauge!(SCP_TIMING_EXTERNALIZED_SECONDS).set(0.0);
-    gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
-    // Note: histogram (LEDGER_CLOSE_DURATION_SECONDS) is not pre-registered —
-    // it is recorded in the ledger close path, not at scrape time.
-
-    // Phase 5: Archive cache counters and gauges.
-    counter!(ARCHIVE_CACHE_FRESH_TOTAL).absolute(0);
-    counter!(ARCHIVE_CACHE_STALE_TOTAL).absolute(0);
-    counter!(ARCHIVE_CACHE_COLD_TOTAL).absolute(0);
-    counter!(ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL).absolute(0);
-    counter!(ARCHIVE_CACHE_REFRESH_ERROR_TOTAL).absolute(0);
-    counter!(ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL).absolute(0);
-    gauge!(ARCHIVE_CACHE_AGE_SECONDS).set(0.0);
-    gauge!(ARCHIVE_CACHE_POPULATED).set(0.0);
-
-    // Phase 5: Recovery stalled tick — pre-register all reason labels at zero.
-    for reason in &[
-        "backoff_active",
-        "forcing_catchup_not_behind",
-        "forcing_catchup_behind",
-    ] {
-        counter!(RECOVERY_STALLED_TICK_TOTAL, "reason" => *reason).absolute(0);
+        // Phase 5: Archive cache counters.
+        ARCHIVE_CACHE_FRESH_TOTAL = "henyey_archive_cache_fresh_total"
+            => "Archive cache get_cached() Fresh results";
+        ARCHIVE_CACHE_STALE_TOTAL = "henyey_archive_cache_stale_total"
+            => "Archive cache get_cached() Stale results";
+        ARCHIVE_CACHE_COLD_TOTAL = "henyey_archive_cache_cold_total"
+            => "Archive cache get_cached() Cold results";
+        ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL = "henyey_archive_cache_refresh_success_total"
+            => "Archive cache background refresh successes";
+        ARCHIVE_CACHE_REFRESH_ERROR_TOTAL = "henyey_archive_cache_refresh_error_total"
+            => "Archive cache background refresh errors";
+        ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL = "henyey_archive_cache_refresh_timeout_total"
+            => "Archive cache background refresh timeouts";
     }
-    // Note: Phase 5 histograms (CLOSE_*_SECONDS, SLOT_TO_CLOSE_LATENCY_SECONDS,
-    // ARCHIVE_CACHE_REFRESH_DURATION_SECONDS) are not pre-registered — they are
-    // recorded in the ledger close / archive refresh path, not at scrape time.
+
+    counters_no_prereg {
+        // Meta stream counters — only appear when the meta stream is active.
+        META_STREAM_BYTES_TOTAL = "stellar_meta_stream_bytes_total"
+            => "Total bytes written to metadata output stream";
+        META_STREAM_WRITES_TOTAL = "stellar_meta_stream_writes_total"
+            => "Total frames written to metadata output stream";
+    }
+
+    labeled_counters_enum {
+        SCP_PREFILTER_REJECTS_TOTAL = "henyey_scp_prefilter_rejects_total"
+            => "SCP envelopes rejected by the event-loop pre-filter, by reason",
+            "reason", henyey_herder::scp_verify::PreFilterRejectReason;
+        SCP_POST_VERIFY_TOTAL = "henyey_scp_post_verify_total"
+            => "Envelopes processed by post-verify, by reason",
+            "reason", henyey_herder::scp_verify::PostVerifyReason;
+    }
+
+    labeled_counters_literal {
+        RECOVERY_STALLED_TICK_TOTAL = "henyey_recovery_stalled_tick_total"
+            => "Recovery stalled ticks by reason",
+            "reason", ["backoff_active", "forcing_catchup_not_behind", "forcing_catchup_behind"];
+    }
+
+    histograms {
+        // Phase 4: Ledger close histogram.
+        LEDGER_CLOSE_DURATION_SECONDS = "stellar_ledger_close_duration_seconds"
+            => "Ledger close wall-clock duration in seconds";
+
+        // Phase 5: Per-phase close-duration histograms (LedgerClosePerf).
+        CLOSE_BEGIN_SECONDS = "henyey_ledger_close_begin_seconds"
+            => "Ledger close begin_close phase (seconds)";
+        CLOSE_TX_EXEC_SECONDS = "henyey_ledger_close_tx_exec_seconds"
+            => "Ledger close tx_exec phase (seconds)";
+        CLOSE_CLASSIC_EXEC_SECONDS = "henyey_ledger_close_classic_exec_seconds"
+            => "Ledger close classic_exec sub-phase of tx_exec (seconds)";
+        CLOSE_SOROBAN_EXEC_SECONDS = "henyey_ledger_close_soroban_exec_seconds"
+            => "Ledger close soroban_exec sub-phase of tx_exec (seconds)";
+        CLOSE_COMMIT_SETUP_SECONDS = "henyey_ledger_close_commit_setup_seconds"
+            => "Ledger close commit_setup phase (seconds)";
+        CLOSE_BUCKET_LOCK_WAIT_SECONDS = "henyey_ledger_close_bucket_lock_wait_seconds"
+            => "Ledger close bucket_lock_wait phase (seconds)";
+        CLOSE_EVICTION_SECONDS = "henyey_ledger_close_eviction_seconds"
+            => "Ledger close eviction phase (seconds)";
+        CLOSE_SOROBAN_STATE_SECONDS = "henyey_ledger_close_soroban_state_seconds"
+            => "Ledger close soroban_state phase (seconds)";
+        CLOSE_BUCKET_ADD_SECONDS = "henyey_ledger_close_bucket_add_seconds"
+            => "Ledger close bucket_add phase (seconds)";
+        CLOSE_HOT_ARCHIVE_SECONDS = "henyey_ledger_close_hot_archive_seconds"
+            => "Ledger close hot_archive phase (seconds)";
+        CLOSE_HEADER_SECONDS = "henyey_ledger_close_header_seconds"
+            => "Ledger close header phase (seconds)";
+        CLOSE_COMMIT_SECONDS = "henyey_ledger_close_commit_seconds"
+            => "Ledger close commit_close phase (seconds)";
+        CLOSE_META_SECONDS = "henyey_ledger_close_meta_seconds"
+            => "Ledger close meta phase (seconds)";
+
+        // Phase 5: Event-loop post-close PhaseTimer histograms.
+        CLOSE_COMPLETE_JOIN_MATCH_SECONDS = "henyey_ledger_close_complete_join_match_seconds"
+            => "Close-complete join_match phase (seconds)";
+        CLOSE_COMPLETE_META_EMIT_SECONDS = "henyey_ledger_close_complete_meta_emit_seconds"
+            => "Close-complete meta_emit phase (seconds)";
+        CLOSE_COMPLETE_BUILD_PERSIST_INPUTS_SECONDS = "henyey_ledger_close_complete_build_persist_inputs_seconds"
+            => "Close-complete build_persist_inputs phase (seconds)";
+        CLOSE_COMPLETE_OVERLAY_BOOKKEEPING_SECONDS = "henyey_ledger_close_complete_overlay_bookkeeping_seconds"
+            => "Close-complete overlay_bookkeeping phase (seconds)";
+        CLOSE_COMPLETE_SPAWN_BLOCKING_SETUP_SECONDS = "henyey_ledger_close_complete_spawn_blocking_setup_seconds"
+            => "Close-complete spawn_blocking_setup phase (seconds)";
+        CLOSE_COMPLETE_TX_QUEUE_SECONDS = "henyey_ledger_close_complete_tx_queue_seconds"
+            => "Close-complete tx_queue_background_wait phase (seconds)";
+        CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS = "henyey_ledger_close_complete_post_close_bookkeeping_seconds"
+            => "Close-complete post_close_bookkeeping phase (seconds)";
+
+        // Phase 6: Sub-phase instrumentation inside tx_queue spawn_blocking.
+        CLOSE_TX_QUEUE_PREP_SECONDS = "henyey_ledger_close_tx_queue_prep_seconds"
+            => "tx_queue spawn_blocking closure-local prep (Soroban limits, close-time math) (seconds)";
+        CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS = "henyey_ledger_close_tx_queue_ledger_closed_seconds"
+            => "tx_queue spawn_blocking herder.ledger_closed + ban failed txs (seconds)";
+        CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS = "henyey_ledger_close_tx_queue_shift_update_seconds"
+            => "tx_queue spawn_blocking validation context update + Soroban limits + shift (seconds)";
+        CLOSE_TX_QUEUE_SNAPSHOT_SECONDS = "henyey_ledger_close_tx_queue_snapshot_seconds"
+            => "tx_queue spawn_blocking pending_hashed_envelopes + snapshot build total (seconds)";
+        CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS = "henyey_ledger_close_tx_queue_envelopes_fetch_seconds"
+            => "tx_queue spawn_blocking pending_hashed_envelopes only (seconds)";
+        CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS = "henyey_ledger_close_tx_queue_snapshot_build_seconds"
+            => "tx_queue spawn_blocking SnapshotValidationProviders::new only (seconds)";
+        CLOSE_TX_QUEUE_INVALIDATION_SECONDS = "henyey_ledger_close_tx_queue_invalidation_seconds"
+            => "tx_queue spawn_blocking get_invalid_hashed_tx_list + ban invalid (seconds)";
+
+        // Phase 6: Persist and close-cycle instrumentation.
+        PERSIST_LEDGER_CLOSE_SECONDS = "henyey_ledger_persist_close_seconds"
+            => "PersistJob::LedgerClose wall-clock duration (seconds, excludes scheduling delay)";
+        CLOSE_CYCLE_SECONDS = "henyey_ledger_close_cycle_seconds"
+            => "Wall-clock between consecutive deferred-pipeline close-complete events (seconds)";
+
+        // Close-cycle decomposition (#1909).
+        CLOSE_HANDLE_COMPLETE_SECONDS = "henyey_ledger_close_handle_complete_seconds"
+            => "Wall-clock of handle_close_complete including finalizer dispatch (seconds)";
+        CLOSE_POST_COMPLETE_SECONDS = "henyey_ledger_close_post_complete_seconds"
+            => "Wall-clock of post-close lifecycle work after handle_close_complete (seconds)";
+        CLOSE_DISPATCH_TO_JOIN_SECONDS = "henyey_ledger_close_dispatch_to_join_seconds"
+            => "Wall-clock from spawn_blocking dispatch to event-loop join observation (seconds)";
+        PERSIST_DISPATCH_TO_JOIN_SECONDS = "henyey_ledger_persist_dispatch_to_join_seconds"
+            => "Wall-clock from persist spawn_blocking dispatch to event-loop join observation (seconds)";
+
+        // Phase 5: Slot-to-close latency.
+        SLOT_TO_CLOSE_LATENCY_SECONDS = "henyey_ledger_slot_to_close_latency_seconds"
+            => "Wall-clock from first SCP activity to close-complete (seconds)";
+
+        // Phase 5: Archive cache histogram.
+        ARCHIVE_CACHE_REFRESH_DURATION_SECONDS = "henyey_archive_cache_refresh_duration_seconds"
+            => "Archive cache background refresh duration (seconds, including timeouts)";
+    }
 }
 
 // ── Scrape-time refresh ────────────────────────────────────────────────
@@ -1371,8 +824,6 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
 /// or if `/proc/self/fd` is inaccessible.
 #[cfg(target_os = "linux")]
 fn process_open_fds() -> Option<u64> {
-    // Note: reading /proc/self/fd itself opens an FD, so count may be off by
-    // one, but this is standard practice and the error is negligible.
     std::fs::read_dir("/proc/self/fd")
         .ok()
         .map(|d| d.count() as u64)
@@ -1395,7 +846,6 @@ fn process_max_fds() -> Option<u64> {
     if ret == 0 && rlim.rlim_cur != libc::RLIM_INFINITY {
         Some(rlim.rlim_cur)
     } else if ret == 0 {
-        // RLIM_INFINITY — don't export a misleading number
         None
     } else {
         None
@@ -1428,12 +878,6 @@ pub fn ensure_test_recorder() -> &'static PrometheusHandle {
 /// Install the production metrics recorder.
 ///
 /// Returns the `PrometheusHandle` for use by the `/metrics` endpoint.
-///
-/// This is safe to call from `main()` before constructing `RunOptions`, or
-/// from `run_node()` as a fallback when no handle was provided. If a
-/// recorder is already installed (e.g. by a library consumer), this panics
-/// — callers who need tolerance for that should pre-install and pass the
-/// handle via `RunOptions::prometheus_handle`.
 pub fn install_recorder() -> PrometheusHandle {
     let handle = PrometheusBuilder::new()
         .set_buckets(&[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0])
@@ -1453,143 +897,124 @@ pub fn install_recorder() -> PrometheusHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use catalog_arrays::*;
+    use std::collections::HashSet;
 
     #[test]
-    fn test_describe_metrics_registers_help_lines() {
+    fn test_all_gauges_described_and_typed() {
         let handle = ensure_test_recorder();
         describe_metrics();
         register_label_series();
         let output = handle.render();
 
-        // Verify HELP lines are present for key metrics.
-        assert!(
-            output.contains("# HELP stellar_ledger_sequence"),
-            "missing HELP for ledger_sequence"
-        );
-        assert!(
-            output.contains("# HELP stellar_uptime_seconds"),
-            "missing HELP for uptime_seconds"
-        );
-        assert!(
-            output.contains("# HELP henyey_scp_prefilter_rejects_total"),
-            "missing HELP for prefilter_rejects_total"
-        );
-        assert!(
-            output.contains("# HELP henyey_scp_post_verify_total"),
-            "missing HELP for post_verify_total"
-        );
-        assert!(
-            output.contains("# HELP henyey_post_catchup_hard_reset_total"),
-            "missing HELP for hard_reset_total"
-        );
-
-        // Phase 1: SCP/herder.
-        assert!(
-            output.contains("# HELP stellar_scp_envelope_emit_total"),
-            "missing HELP for scp_envelope_emit_total"
-        );
-        assert!(
-            output.contains("# HELP stellar_herder_state"),
-            "missing HELP for herder_state"
-        );
-        assert!(
-            output.contains("# HELP stellar_herder_pending_envelopes"),
-            "missing HELP for herder_pending_envelopes"
-        );
-
-        // Phase 1: Bucket merge.
-        assert!(
-            output.contains("# HELP stellar_bucket_merge_completed_total"),
-            "missing HELP for bucket_merge_completed_total"
-        );
-        assert!(
-            output.contains("# HELP stellar_bucket_merge_shadowed_total"),
-            "missing HELP for bucket_merge_shadowed_total"
-        );
-
-        // Phase 1: Overlay.
-        assert!(
-            output.contains("# HELP stellar_overlay_message_read_total"),
-            "missing HELP for overlay_message_read_total"
-        );
-        assert!(
-            output.contains("# HELP stellar_overlay_timeout_idle_total"),
-            "missing HELP for overlay_timeout_idle_total"
-        );
+        // Pre-registered gauges have visible HELP/TYPE because they have a value.
+        for name in ALL_PREREGISTERED_GAUGE_NAMES {
+            assert!(
+                output.contains(&format!("# HELP {}", name)),
+                "missing HELP for gauge {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("# TYPE {} gauge", name)),
+                "missing TYPE gauge for {}",
+                name
+            );
+        }
     }
 
     #[test]
-    fn test_type_annotations_present() {
+    fn test_all_counters_described_and_typed() {
         let handle = ensure_test_recorder();
         describe_metrics();
         register_label_series();
         let output = handle.render();
 
-        // Gauges must have TYPE gauge.
-        assert!(
-            output.contains("# TYPE stellar_ledger_sequence gauge"),
-            "missing TYPE gauge for ledger_sequence"
-        );
-        assert!(
-            output.contains("# TYPE stellar_peer_count gauge"),
-            "missing TYPE gauge for peer_count"
-        );
-        assert!(
-            output.contains("# TYPE henyey_scp_verify_latency_us_sum gauge"),
-            "missing TYPE gauge for latency_us_sum"
-        );
-        assert!(
-            output.contains("# TYPE henyey_scp_verify_latency_us_count gauge"),
-            "missing TYPE gauge for latency_us_count"
-        );
+        // Pre-registered counters (unlabeled) have visible HELP/TYPE.
+        for name in ALL_PREREGISTERED_COUNTER_NAMES {
+            assert!(
+                output.contains(&format!("# HELP {}", name)),
+                "missing HELP for counter {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("# TYPE {} counter", name)),
+                "missing TYPE counter for {}",
+                name
+            );
+        }
+    }
 
-        // Counters must have TYPE counter.
-        assert!(
-            output.contains("# TYPE stellar_uptime_seconds gauge"),
-            "missing TYPE gauge for uptime_seconds"
-        );
-        assert!(
-            output.contains("# TYPE henyey_scp_prefilter_rejects_total counter"),
-            "missing TYPE counter for prefilter_rejects_total"
-        );
-        assert!(
-            output.contains("# TYPE henyey_post_catchup_hard_reset_total counter"),
-            "missing TYPE counter for hard_reset_total"
-        );
+    #[test]
+    fn test_preregistered_gauges_at_zero() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
 
-        // Phase 1: SCP/herder types.
-        assert!(
-            output.contains("# TYPE stellar_scp_envelope_emit_total counter"),
-            "missing TYPE counter for scp_envelope_emit_total"
-        );
-        assert!(
-            output.contains("# TYPE stellar_herder_state gauge"),
-            "missing TYPE gauge for herder_state"
-        );
-        assert!(
-            output.contains("# TYPE stellar_herder_pending_received_total counter"),
-            "missing TYPE counter for herder_pending_received_total"
-        );
+        for name in ALL_PREREGISTERED_GAUGE_NAMES {
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "gauge {} should be pre-registered at 0",
+                name
+            );
+        }
+    }
 
-        // Phase 1: Bucket merge types.
-        assert!(
-            output.contains("# TYPE stellar_bucket_merge_completed_total counter"),
-            "missing TYPE counter for bucket_merge_completed_total"
-        );
-        assert!(
-            output.contains("# TYPE stellar_bucket_merge_annihilated_total counter"),
-            "missing TYPE counter for bucket_merge_annihilated_total"
-        );
+    #[test]
+    fn test_preregistered_counters_at_zero() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
 
-        // Phase 1: Overlay types.
-        assert!(
-            output.contains("# TYPE stellar_overlay_message_read_total counter"),
-            "missing TYPE counter for overlay_message_read_total"
-        );
-        assert!(
-            output.contains("# TYPE stellar_overlay_error_write_total counter"),
-            "missing TYPE counter for overlay_error_write_total"
-        );
+        for name in ALL_PREREGISTERED_COUNTER_NAMES {
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "counter {} should be pre-registered at 0",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_histograms_described_and_recorded() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+
+        // Record one sample for each histogram so HELP/TYPE appears.
+        for name in ALL_HISTOGRAM_NAMES {
+            metrics::histogram!(*name).record(0.025);
+        }
+
+        let output = handle.render();
+
+        for name in ALL_HISTOGRAM_NAMES {
+            assert!(
+                output.contains(&format!("# HELP {}", name)),
+                "missing HELP for histogram {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("# TYPE {} histogram", name)),
+                "missing TYPE histogram for {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("{}_bucket{{", name)),
+                "no _bucket line for histogram {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("{}_count", name)),
+                "no _count line for histogram {}",
+                name
+            );
+            assert!(
+                output.contains(&format!("{}_sum", name)),
+                "no _sum line for histogram {}",
+                name
+            );
+        }
     }
 
     #[test]
@@ -1599,7 +1024,7 @@ mod tests {
         register_label_series();
         let output = handle.render();
 
-        // All prefilter reason labels should appear.
+        // PreFilterRejectReason labels.
         use henyey_herder::scp_verify::PreFilterRejectReason;
         for reason in PreFilterRejectReason::ALL {
             let label = format!(
@@ -1608,13 +1033,12 @@ mod tests {
             );
             assert!(
                 output.contains(&label),
-                "missing pre-registered label for reason={}; output:\n{}",
-                reason.label(),
-                output
+                "missing pre-registered label for reason={}",
+                reason.label()
             );
         }
 
-        // All post-verify reason labels should appear.
+        // PostVerifyReason labels.
         use henyey_herder::scp_verify::PostVerifyReason;
         for reason in PostVerifyReason::ALL {
             let label = format!(
@@ -1623,19 +1047,33 @@ mod tests {
             );
             assert!(
                 output.contains(&label),
-                "missing pre-registered label for reason={}; output:\n{}",
-                reason.label(),
-                output
+                "missing pre-registered label for reason={}",
+                reason.label()
+            );
+        }
+
+        // RECOVERY_STALLED_TICK_TOTAL literal labels.
+        for reason in &[
+            "backoff_active",
+            "forcing_catchup_not_behind",
+            "forcing_catchup_behind",
+        ] {
+            let label = format!(
+                "henyey_recovery_stalled_tick_total{{reason=\"{}\"}}",
+                reason
+            );
+            assert!(
+                output.contains(&label),
+                "missing pre-registered label for recovery_stalled reason={}",
+                reason
             );
         }
     }
 
     #[test]
     fn test_recorder_install_is_idempotent() {
-        // Both calls should return the same handle without panicking.
         let h1 = ensure_test_recorder();
         let h2 = ensure_test_recorder();
-        // They should be the same reference (OnceLock returns the same value).
         assert!(std::ptr::eq(h1, h2));
     }
 
@@ -1646,8 +1084,6 @@ mod tests {
         register_label_series();
         let output = handle.render();
 
-        // These overlay metrics were intentionally removed because they lack
-        // production producers. Verify they don't silently reappear.
         let removed = [
             "stellar_overlay_message_drop_total",
             "stellar_overlay_byte_read_total",
@@ -1678,8 +1114,6 @@ mod tests {
         register_label_series();
         let output = handle.render();
 
-        // These gauge metrics were removed in #1927 because they duplicate
-        // histogram data. Verify they don't silently reappear.
         let removed = [
             "henyey_ledger_soroban_exec_us",
             "henyey_ledger_classic_exec_us",
@@ -1695,476 +1129,14 @@ mod tests {
     }
 
     #[test]
-    fn test_phase2_ledger_metrics_present() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
-        let output = handle.render();
-
-        // Ledger close gauges.
-        let ledger_metrics = [
-            LEDGER_TX_COUNT,
-            LEDGER_OP_COUNT,
-            LEDGER_TX_SUCCESS_COUNT,
-            LEDGER_TX_FAILED_COUNT,
-            LEDGER_TOTAL_FEES,
-            LEDGER_ENTRIES_CREATED,
-            LEDGER_ENTRIES_UPDATED,
-            LEDGER_ENTRIES_DELETED,
-            LEDGER_APPLY_US,
-        ];
-        for name in &ledger_metrics {
-            assert!(
-                output.contains(&format!("# TYPE {} gauge", name)),
-                "missing TYPE gauge for {}",
-                name
-            );
-            assert!(
-                output.contains(&format!("# HELP {}", name)),
-                "missing HELP for {}",
-                name
-            );
+    fn test_metric_names_unique() {
+        let mut seen = HashSet::new();
+        let all_names = ALL_GAUGE_NAMES
+            .iter()
+            .chain(ALL_COUNTER_NAMES.iter())
+            .chain(ALL_HISTOGRAM_NAMES.iter());
+        for name in all_names {
+            assert!(seen.insert(name), "duplicate metric name: {}", name);
         }
-    }
-
-    #[test]
-    fn test_phase2_herder_metrics_present() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
-        let output = handle.render();
-
-        // Tx queue gauges.
-        let queue_gauges = [
-            HERDER_TX_QUEUE_ACCOUNTS,
-            HERDER_TX_QUEUE_BANNED,
-            HERDER_TX_QUEUE_SEEN,
-        ];
-        for name in &queue_gauges {
-            assert!(
-                output.contains(&format!("# TYPE {} gauge", name)),
-                "missing TYPE gauge for {}",
-                name
-            );
-        }
-
-        // Pending envelope counters.
-        let pending_counters = [HERDER_PENDING_ADDED_TOTAL, HERDER_PENDING_RELEASED_TOTAL];
-        for name in &pending_counters {
-            assert!(
-                output.contains(&format!("# TYPE {} counter", name)),
-                "missing TYPE counter for {}",
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn test_phase2_drift_metrics_present() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
-        let output = handle.render();
-
-        let drift_metrics = [
-            DRIFT_MIN_SECONDS,
-            DRIFT_MAX_SECONDS,
-            DRIFT_MEDIAN_SECONDS,
-            DRIFT_P75_SECONDS,
-            DRIFT_SAMPLE_COUNT,
-        ];
-        for name in &drift_metrics {
-            assert!(
-                output.contains(&format!("# TYPE {} gauge", name)),
-                "missing TYPE gauge for {}",
-                name
-            );
-            // All drift gauges should be pre-registered at 0.
-            assert!(
-                output.contains(&format!("{} 0", name)),
-                "drift metric {} should be pre-registered at 0",
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn test_phase2_ledger_metrics_pre_registered_at_zero() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
-        let output = handle.render();
-
-        // Before any close, all ledger gauges should be 0.
-        let zero_metrics = [
-            LEDGER_TX_COUNT,
-            LEDGER_OP_COUNT,
-            LEDGER_TX_SUCCESS_COUNT,
-            LEDGER_TX_FAILED_COUNT,
-            LEDGER_TOTAL_FEES,
-            LEDGER_ENTRIES_CREATED,
-            LEDGER_ENTRIES_UPDATED,
-            LEDGER_ENTRIES_DELETED,
-            LEDGER_APPLY_US,
-        ];
-        for name in &zero_metrics {
-            assert!(
-                output.contains(&format!("{} 0", name)),
-                "ledger metric {} should be pre-registered at 0; output:\n{}",
-                name,
-                output
-            );
-        }
-    }
-
-    #[test]
-    fn test_jemalloc_metrics_present() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
-        let output = handle.render();
-
-        let jemalloc_metrics = [
-            JEMALLOC_ALLOCATED_BYTES,
-            JEMALLOC_ACTIVE_BYTES,
-            JEMALLOC_RESIDENT_BYTES,
-            JEMALLOC_MAPPED_BYTES,
-            JEMALLOC_RETAINED_BYTES,
-            JEMALLOC_FRAGMENTATION_PCT,
-        ];
-        for name in &jemalloc_metrics {
-            assert!(
-                output.contains(&format!("# TYPE {} gauge", name)),
-                "missing TYPE gauge for {}",
-                name
-            );
-            assert!(
-                output.contains(&format!("# HELP {}", name)),
-                "missing HELP for {}",
-                name
-            );
-            // Pre-registered at 0.
-            assert!(
-                output.contains(&format!("{} 0", name)),
-                "jemalloc metric {} should be pre-registered at 0",
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn test_phase3_ledger_apply_counters_present() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
-        let output = handle.render();
-
-        // True cumulative counters.
-        let counter_metrics = [
-            LEDGER_APPLY_SUCCESS_TOTAL,
-            LEDGER_APPLY_FAILURE_TOTAL,
-            LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL,
-            LEDGER_APPLY_SOROBAN_FAILURE_TOTAL,
-        ];
-        for name in &counter_metrics {
-            assert!(
-                output.contains(&format!("# TYPE {} counter", name)),
-                "missing TYPE counter for {}",
-                name
-            );
-            assert!(
-                output.contains(&format!("# HELP {}", name)),
-                "missing HELP for {}",
-                name
-            );
-            // Pre-registered at 0.
-            assert!(
-                output.contains(&format!("{} 0", name)),
-                "phase3 counter {} should be pre-registered at 0",
-                name
-            );
-        }
-
-        // Snapshot gauges (not monotonic — fixed from counter to gauge).
-        let gauge_metrics = [
-            LEDGER_APPLY_SOROBAN_MAX_CLUSTERS,
-            LEDGER_APPLY_SOROBAN_STAGES,
-            LEDGER_AGE_CURRENT_SECONDS,
-        ];
-        for name in &gauge_metrics {
-            assert!(
-                output.contains(&format!("# TYPE {} gauge", name)),
-                "missing TYPE gauge for {}",
-                name
-            );
-            assert!(
-                output.contains(&format!("# HELP {}", name)),
-                "missing HELP for {}",
-                name
-            );
-            assert!(
-                output.contains(&format!("{} 0", name)),
-                "phase3 gauge {} should be pre-registered at 0",
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn test_phase3_henyey_specific_gauges_present() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
-        let output = handle.render();
-
-        let gauge_metrics = [
-            LEDGER_BUCKET_CACHE_HIT_RATIO,
-            LEDGER_SNAPSHOT_CACHE_HIT_RATIO,
-            LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS,
-        ];
-        for name in &gauge_metrics {
-            assert!(
-                output.contains(&format!("# TYPE {} gauge", name)),
-                "missing TYPE gauge for {}",
-                name
-            );
-            assert!(
-                output.contains(&format!("# HELP {}", name)),
-                "missing HELP for {}",
-                name
-            );
-            assert!(
-                output.contains(&format!("{} 0", name)),
-                "phase3 gauge {} should be pre-registered at 0",
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn test_phase3_soroban_config_metrics_described() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
-        let output = handle.render();
-
-        let config_metrics = [
-            SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE,
-            SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE,
-            SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE,
-            SOROBAN_CONFIG_TX_MAX_SIZE_BYTE,
-            SOROBAN_CONFIG_TX_MAX_CPU_INSN,
-            SOROBAN_CONFIG_TX_MAX_MEM_BYTE,
-            SOROBAN_CONFIG_TX_MAX_READ_ENTRY,
-            SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE,
-            SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY,
-            SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE,
-            SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE,
-            SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT,
-            SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN,
-            SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE,
-            SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY,
-            SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE,
-            SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY,
-            SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE,
-            SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE,
-            SOROBAN_CONFIG_FEE_WRITE_1KB,
-        ];
-        for name in &config_metrics {
-            assert!(
-                output.contains(&format!("# TYPE {} gauge", name)),
-                "missing TYPE gauge for soroban config metric {}",
-                name
-            );
-            assert!(
-                output.contains(&format!("# HELP {}", name)),
-                "missing HELP for soroban config metric {}",
-                name
-            );
-        }
-    }
-
-    /// Assert that each histogram in `metrics` is described (HELP/TYPE) and
-    /// renders bucket/count/sum lines after a synthetic observation.
-    ///
-    /// Phase 5/6 histograms are not pre-registered (see `register_label_series`
-    /// comment at metrics.rs:1087-1089), so we must record at least one sample
-    /// before HELP/TYPE lines appear in the rendered output.
-    fn assert_histograms_described_and_recorded(
-        handle: &metrics_exporter_prometheus::PrometheusHandle,
-        metrics: &[&'static str],
-        category: &str,
-    ) {
-        for name in metrics {
-            metrics::histogram!(*name).record(0.025);
-        }
-
-        let output = handle.render();
-
-        for name in metrics {
-            assert!(
-                output.contains(&format!("# HELP {}", name)),
-                "missing HELP for {} metric {}",
-                category,
-                name
-            );
-            assert!(
-                output.contains(&format!("# TYPE {} histogram", name)),
-                "missing TYPE histogram for {} metric {}",
-                category,
-                name
-            );
-            assert!(
-                output.contains(&format!("{}_bucket{{", name)),
-                "no _bucket line for {} metric {} — histogram not recorded",
-                category,
-                name
-            );
-            assert!(
-                output.contains(&format!("{}_count", name)),
-                "no _count line for {} metric {} — histogram not recorded",
-                category,
-                name
-            );
-            assert!(
-                output.contains(&format!("{}_sum", name)),
-                "no _sum line for {} metric {} — histogram not recorded",
-                category,
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn test_close_cycle_decomposition_histograms_recorded() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-
-        assert_histograms_described_and_recorded(
-            handle,
-            &[
-                CLOSE_HANDLE_COMPLETE_SECONDS,
-                CLOSE_POST_COMPLETE_SECONDS,
-                CLOSE_DISPATCH_TO_JOIN_SECONDS,
-            ],
-            "close-cycle decomposition",
-        );
-    }
-
-    #[test]
-    fn test_ledger_close_duration_histogram_recorded() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-
-        assert_histograms_described_and_recorded(
-            handle,
-            &[LEDGER_CLOSE_DURATION_SECONDS],
-            "ledger close duration",
-        );
-    }
-
-    #[test]
-    fn test_ledger_close_perf_histograms_recorded() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-
-        assert_histograms_described_and_recorded(
-            handle,
-            &[
-                CLOSE_BEGIN_SECONDS,
-                CLOSE_TX_EXEC_SECONDS,
-                CLOSE_CLASSIC_EXEC_SECONDS,
-                CLOSE_SOROBAN_EXEC_SECONDS,
-                CLOSE_COMMIT_SETUP_SECONDS,
-                CLOSE_BUCKET_LOCK_WAIT_SECONDS,
-                CLOSE_EVICTION_SECONDS,
-                CLOSE_SOROBAN_STATE_SECONDS,
-                CLOSE_BUCKET_ADD_SECONDS,
-                CLOSE_HOT_ARCHIVE_SECONDS,
-                CLOSE_HEADER_SECONDS,
-                CLOSE_COMMIT_SECONDS,
-                CLOSE_META_SECONDS,
-            ],
-            "LedgerClosePerf",
-        );
-    }
-
-    #[test]
-    fn test_persist_cycle_histograms_recorded() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-
-        assert_histograms_described_and_recorded(
-            handle,
-            &[
-                PERSIST_DISPATCH_TO_JOIN_SECONDS,
-                PERSIST_LEDGER_CLOSE_SECONDS,
-            ],
-            "persist-cycle",
-        );
-    }
-
-    #[test]
-    fn test_close_complete_phase_histograms_recorded() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-
-        assert_histograms_described_and_recorded(
-            handle,
-            &[
-                CLOSE_COMPLETE_JOIN_MATCH_SECONDS,
-                CLOSE_COMPLETE_META_EMIT_SECONDS,
-                CLOSE_COMPLETE_BUILD_PERSIST_INPUTS_SECONDS,
-                CLOSE_COMPLETE_OVERLAY_BOOKKEEPING_SECONDS,
-                CLOSE_COMPLETE_SPAWN_BLOCKING_SETUP_SECONDS,
-                CLOSE_COMPLETE_TX_QUEUE_SECONDS,
-                CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS,
-            ],
-            "close-complete phase",
-        );
-    }
-
-    #[test]
-    fn test_close_tx_queue_phase_histograms_recorded() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-
-        assert_histograms_described_and_recorded(
-            handle,
-            &[
-                CLOSE_TX_QUEUE_PREP_SECONDS,
-                CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS,
-                CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS,
-                CLOSE_TX_QUEUE_SNAPSHOT_SECONDS,
-                CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS,
-                CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS,
-                CLOSE_TX_QUEUE_INVALIDATION_SECONDS,
-            ],
-            "close tx-queue phase",
-        );
-    }
-
-    #[test]
-    fn test_top_level_close_cycle_histograms_recorded() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-
-        assert_histograms_described_and_recorded(
-            handle,
-            &[CLOSE_CYCLE_SECONDS, SLOT_TO_CLOSE_LATENCY_SECONDS],
-            "top-level close-cycle",
-        );
-    }
-
-    #[test]
-    fn test_archive_cache_histogram_recorded() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-
-        assert_histograms_described_and_recorded(
-            handle,
-            &[ARCHIVE_CACHE_REFRESH_DURATION_SECONDS],
-            "archive cache",
-        );
     }
 }
