@@ -4158,6 +4158,126 @@ mod tests {
         );
     }
 
+    /// Regression test for #1907: process_scp_envelope must NOT drain the
+    /// ready queue inline when entering the cached-tx-set + missing-quorum-set
+    /// branch. Previously, this path called process_ready_fetching_envelopes()
+    /// after tx_set_available(), which could stall the event loop.
+    ///
+    /// After the fix, envelopes unblocked by tx_set_available() remain in the
+    /// ready queue until the next receive_tx_set() or handle_quorum_set() call
+    /// drains them via spawn_blocking.
+    #[test]
+    fn test_issue_1907_process_scp_envelope_does_not_drain_ready_inline() {
+        use stellar_xdr::curr::Hash as XdrHash;
+
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_secret = SecretKey::from_seed(&[1u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        let unknown_qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![other_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let unknown_qs_hash = hash_quorum_set(&unknown_qs);
+
+        let local_qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(local_qs.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, local_secret);
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, local_qs)
+            .unwrap();
+
+        let tracking = herder.tracking_slot();
+
+        // Cache a tx_set
+        let value = make_valid_value_with_cached_tx_set(&herder, &other_secret);
+
+        // Seed some ready envelopes in FetchingEnvelopes. These simulate
+        // envelopes that became ready via an earlier tx_set_available call.
+        let mut ready_envelopes = Vec::new();
+        for i in 0..5u32 {
+            let ballot = ScpBallot {
+                counter: 100 + i,
+                value: Value(vec![0u8; 1].try_into().unwrap()),
+            };
+            let stmt = ScpStatement {
+                node_id: other_node_id.clone(),
+                slot_index: tracking,
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: XdrHash([0u8; 32]),
+                    ballot,
+                    prepared: None,
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
+            };
+            ready_envelopes.push(ScpEnvelope {
+                statement: stmt,
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            });
+        }
+        herder
+            .fetching_envelopes
+            .test_insert_ready(tracking, ready_envelopes);
+
+        assert_eq!(
+            herder.fetching_envelopes.ready_slots(),
+            vec![tracking],
+            "pre-condition: tracking slot should have ready envelopes"
+        );
+
+        // Now send an envelope that enters the cached-tx-set + missing-quorum-set
+        // branch. This used to drain ready envelopes inline.
+        let statement = ScpStatement {
+            node_id: other_node_id.clone(),
+            slot_index: tracking,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: XdrHash(unknown_qs_hash.0),
+                ballot: ScpBallot { counter: 1, value },
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+        let envelope = sign_statement(&statement, &herder, &other_secret);
+        let result = herder.receive_scp_envelope(envelope);
+        assert_eq!(result, EnvelopeState::Fetching);
+
+        // Key assertion: ready envelopes must NOT have been drained inline.
+        // They should still be in the ready queue, awaiting an explicit
+        // process_ready_fetching_envelopes() call via spawn_blocking.
+        assert!(
+            !herder.fetching_envelopes.ready_slots().is_empty(),
+            "#1907: process_scp_envelope must not drain ready envelopes inline; \
+             they should remain queued for spawn_blocking drain"
+        );
+    }
+
     /// Regression test for #1874: heard_from_quorum must survive purge_slots_below.
     ///
     /// Before the fix, `purge_slots_below` cleared the quorum set cache
