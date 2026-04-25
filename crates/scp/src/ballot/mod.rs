@@ -171,6 +171,13 @@ pub struct BallotProtocol {
     /// In stellar-core, `setConfirmCommit` calls `mSlot.stopNomination()` directly.
     /// In Rust, we set this flag and let the Slot handle it.
     needs_stop_nomination: bool,
+
+    /// Count of ballot protocol timer expirations (used for reporting).
+    ///
+    /// Incremented on each `bump_timeout` call, matching
+    /// `BallotProtocol::ballotProtocolTimerExpired` incrementing `mTimerExpCount`
+    /// (BallotProtocol.cpp:519).
+    timer_exp_count: u32,
 }
 
 impl BallotProtocol {
@@ -192,6 +199,7 @@ impl BallotProtocol {
             last_envelope_emit: None,
             fully_validated: true,
             needs_stop_nomination: false,
+            timer_exp_count: 0,
         }
     }
 
@@ -454,6 +462,78 @@ impl BallotProtocol {
         }
     }
 
+    /// Get the reporting-specific state of a node in the ballot protocol.
+    ///
+    /// Matches `BallotProtocol::getState` (BallotProtocol.cpp:2020-2078).
+    /// Uses timeout thresholds, local-node self-classification, and ballot
+    /// comparison to determine Agree/Delayed/Disagree/Missing/NoInfo.
+    pub(crate) fn get_reporting_state(
+        &self,
+        node_id: &NodeId,
+        local_node_id: &NodeId,
+        self_already_moved_on: bool,
+    ) -> crate::ReportingNodeState {
+        use crate::ReportingNodeState;
+
+        // Always mark self as Agree (BallotProtocol.cpp:2023-2027).
+        if node_id == local_node_id {
+            return ReportingNodeState::Agree;
+        }
+
+        let it = self.latest_envelopes.get(node_id);
+        if it.is_none() {
+            // No envelope from this node.
+            if self.timer_exp_count >= crate::NUM_TIMEOUTS_THRESHOLD_FOR_REPORTING
+                || self_already_moved_on
+            {
+                return ReportingNodeState::Missing;
+            } else {
+                return ReportingNodeState::NoInfo;
+            }
+        }
+
+        let env = it.unwrap();
+        let mut state = ReportingNodeState::Agree;
+
+        if let Some(ref last_emit) = self.last_envelope_emit {
+            let pledges = &env.statement.pledges;
+            let externalized = matches!(pledges, ScpStatementPledges::Externalize(_));
+            let confirmed_commit = matches!(
+                pledges,
+                ScpStatementPledges::Confirm(c) if c.ballot.counter == u32::MAX
+            );
+
+            // Delayed: we externalized + moved on, peer hasn't (BallotProtocol.cpp:2052-2058).
+            if self.phase == BallotPhase::Externalize
+                && (!externalized || !confirmed_commit)
+                && self_already_moved_on
+            {
+                state = ReportingNodeState::Delayed;
+            }
+
+            // Disagree: both in confirm/externalize but incompatible ballots
+            // (BallotProtocol.cpp:2060-2075). Overrides Delayed.
+            let self_accepted_confirm =
+                self.phase == BallotPhase::Confirm || self.phase == BallotPhase::Externalize;
+            let other_accepted_confirm = matches!(
+                pledges,
+                ScpStatementPledges::Confirm(_) | ScpStatementPledges::Externalize(_)
+            );
+
+            if self_accepted_confirm && other_accepted_confirm {
+                let other_working = get_working_ballot(&env.statement);
+                let self_working = get_working_ballot(&last_emit.statement);
+                if let (Some(other_b), Some(self_b)) = (other_working, self_working) {
+                    if !ballot_compatible(&other_b, &self_b) {
+                        state = ReportingNodeState::Disagree;
+                    }
+                }
+            }
+        }
+
+        state
+    }
+
     /// Get JSON-serializable ballot information.
     ///
     /// Returns a BallotInfo struct that can be serialized to JSON
@@ -516,6 +596,7 @@ impl BallotProtocol {
         ctx: &SlotContext<'_, D>,
         composite_candidate: Option<&Value>,
     ) -> bool {
+        self.timer_exp_count = self.timer_exp_count.saturating_add(1);
         // Sync composite candidate from caller before abandoning
         self.composite_candidate = composite_candidate.cloned();
         self.abandon_ballot(0, ctx)
@@ -3823,5 +3904,243 @@ mod tests {
         let env = envelope_with_pledges(node_id.clone(), 42, make_nominate_pledges());
         ballot.latest_envelopes.insert(node_id.clone(), env);
         assert_eq!(ballot.stored_ballot_summary(&node_id), None);
+    }
+
+    // --- Reporting state tests ---
+
+    #[test]
+    fn test_reporting_state_local_node_always_agree() {
+        let ballot = BallotProtocol::new();
+        let local = make_node_id(1);
+        // Local node is always Agree regardless of state.
+        assert_eq!(
+            ballot.get_reporting_state(&local, &local, false),
+            crate::ReportingNodeState::Agree
+        );
+        assert_eq!(
+            ballot.get_reporting_state(&local, &local, true),
+            crate::ReportingNodeState::Agree
+        );
+    }
+
+    #[test]
+    fn test_reporting_state_no_envelope_noinfo_vs_missing() {
+        let ballot = BallotProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+
+        // timer_exp_count=0, selfAlreadyMovedOn=false → NoInfo
+        assert_eq!(
+            ballot.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::NoInfo
+        );
+
+        // selfAlreadyMovedOn=true → Missing even with timer_exp_count=0
+        assert_eq!(
+            ballot.get_reporting_state(&peer, &local, true),
+            crate::ReportingNodeState::Missing
+        );
+    }
+
+    #[test]
+    fn test_reporting_state_timer_threshold_missing() {
+        let mut ballot = BallotProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+
+        // Simulate 2 timer expirations (threshold is 2).
+        ballot.timer_exp_count = 2;
+
+        // No envelope + timer >= threshold → Missing
+        assert_eq!(
+            ballot.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::Missing
+        );
+    }
+
+    #[test]
+    fn test_reporting_state_timer_below_threshold_noinfo() {
+        let mut ballot = BallotProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+
+        ballot.timer_exp_count = 1; // Below threshold of 2
+
+        assert_eq!(
+            ballot.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::NoInfo
+        );
+    }
+
+    #[test]
+    fn test_reporting_state_has_envelope_agree() {
+        let mut ballot = BallotProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+        let qs = make_quorum_set(vec![local.clone(), peer.clone()], 2);
+
+        // Peer has a PREPARE envelope → Agree (default).
+        let env = make_prepare_envelope(
+            peer.clone(),
+            1,
+            &qs,
+            ScpBallot {
+                counter: 1,
+                value: make_value(&[1]),
+            },
+        );
+        ballot.latest_envelopes.insert(peer.clone(), env);
+
+        assert_eq!(
+            ballot.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::Agree
+        );
+    }
+
+    #[test]
+    fn test_reporting_state_delayed() {
+        let mut ballot = BallotProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+        let qs = make_quorum_set(vec![local.clone(), peer.clone()], 2);
+
+        // Local is in Externalize phase and has emitted.
+        ballot.phase = BallotPhase::Externalize;
+        let self_ext = make_externalize_envelope(
+            local.clone(),
+            1,
+            &qs,
+            ScpBallot {
+                counter: 1,
+                value: make_value(&[1]),
+            },
+            1,
+        );
+        ballot.last_envelope_emit = Some(self_ext);
+
+        // Peer is still in PREPARE (hasn't externalized).
+        let peer_env = make_prepare_envelope(
+            peer.clone(),
+            1,
+            &qs,
+            ScpBallot {
+                counter: 1,
+                value: make_value(&[1]),
+            },
+        );
+        ballot.latest_envelopes.insert(peer.clone(), peer_env);
+
+        // selfAlreadyMovedOn = true → Delayed.
+        assert_eq!(
+            ballot.get_reporting_state(&peer, &local, true),
+            crate::ReportingNodeState::Delayed
+        );
+
+        // selfAlreadyMovedOn = false → Agree (not delayed).
+        assert_eq!(
+            ballot.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::Agree
+        );
+    }
+
+    #[test]
+    fn test_reporting_state_disagree() {
+        let mut ballot = BallotProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+        let qs = make_quorum_set(vec![local.clone(), peer.clone()], 2);
+
+        // Local is in Confirm phase with value [1].
+        ballot.phase = BallotPhase::Confirm;
+        let self_env = make_confirm_envelope(
+            local.clone(),
+            1,
+            &qs,
+            ScpBallot {
+                counter: 1,
+                value: make_value(&[1]),
+            },
+        );
+        ballot.last_envelope_emit = Some(self_env);
+
+        // Peer has confirmed an incompatible value [2].
+        let peer_env = make_confirm_envelope(
+            peer.clone(),
+            1,
+            &qs,
+            ScpBallot {
+                counter: 1,
+                value: make_value(&[2]),
+            },
+        );
+        ballot.latest_envelopes.insert(peer.clone(), peer_env);
+
+        // Incompatible confirmed ballots → Disagree.
+        assert_eq!(
+            ballot.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::Disagree
+        );
+    }
+
+    #[test]
+    fn test_reporting_state_disagree_overrides_delayed() {
+        let mut ballot = BallotProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+        let qs = make_quorum_set(vec![local.clone(), peer.clone()], 2);
+
+        // Local externalized value [1].
+        ballot.phase = BallotPhase::Externalize;
+        let self_ext = make_externalize_envelope(
+            local.clone(),
+            1,
+            &qs,
+            ScpBallot {
+                counter: 1,
+                value: make_value(&[1]),
+            },
+            1,
+        );
+        ballot.last_envelope_emit = Some(self_ext);
+
+        // Peer confirmed incompatible value [2].
+        let peer_env = make_confirm_envelope(
+            peer.clone(),
+            1,
+            &qs,
+            ScpBallot {
+                counter: 1,
+                value: make_value(&[2]),
+            },
+        );
+        ballot.latest_envelopes.insert(peer.clone(), peer_env);
+
+        // Even with selfAlreadyMovedOn=true, Disagree overrides Delayed.
+        assert_eq!(
+            ballot.get_reporting_state(&peer, &local, true),
+            crate::ReportingNodeState::Disagree
+        );
+    }
+
+    #[test]
+    fn test_bump_timeout_increments_timer_exp_count() {
+        let node = make_node_id(1);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::with_quorum_set(qs.clone()));
+
+        let mut ballot = BallotProtocol::new();
+        assert_eq!(ballot.timer_exp_count, 0);
+
+        // Set a current ballot so abandon_ballot can work.
+        ballot.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: make_value(&[1]),
+        });
+
+        ballot.bump_timeout(&ctx!(&node, &qs, &driver, 1), None);
+        assert_eq!(ballot.timer_exp_count, 1);
+
+        ballot.bump_timeout(&ctx!(&node, &qs, &driver, 1), None);
+        assert_eq!(ballot.timer_exp_count, 2);
     }
 }

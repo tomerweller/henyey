@@ -647,11 +647,12 @@ fn test_get_missing_nodes() {
     let driver = Arc::new(SimulationDriver::new(node1.clone(), quorum_set.clone()));
     let scp = SCP::new(node1.clone(), true, quorum_set.clone(), driver);
 
-    // All nodes should be missing initially
+    // No slot exists → empty set (matches stellar-core: getSlot(index, false) == null).
     let missing = scp.get_missing_nodes(1);
-    assert!(missing.contains(&node1));
-    assert!(missing.contains(&node2));
-    assert!(missing.contains(&node3));
+    assert!(
+        missing.is_empty(),
+        "nonexistent slot should return empty set"
+    );
 }
 
 #[test]
@@ -1060,9 +1061,9 @@ fn test_nodes_heard_from_tracking() {
     let slot_index = 1u64;
     let value = make_value(&[7, 8, 9]);
 
-    // Initially all nodes are missing
+    // Initially no slot exists → empty set
     let missing_before = scp.get_missing_nodes(slot_index);
-    assert_eq!(missing_before.len(), 3);
+    assert!(missing_before.is_empty(), "nonexistent slot → empty set");
 
     // Receive nomination from node2
     let nom2 = make_nomination_envelope(

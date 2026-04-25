@@ -217,6 +217,71 @@ impl NominationProtocol {
         }
     }
 
+    /// Get the reporting-specific state of a node in the nomination protocol.
+    ///
+    /// Matches `NominationProtocol::getState` (NominationProtocol.cpp:717-775).
+    /// Uses timeout thresholds, local-node self-classification, and accepted-value
+    /// subset comparison to determine Agree/Delayed/Disagree/Missing/NoInfo.
+    pub(crate) fn get_reporting_state(
+        &self,
+        node_id: &NodeId,
+        local_node_id: &NodeId,
+        self_already_moved_on: bool,
+    ) -> crate::ReportingNodeState {
+        use crate::ReportingNodeState;
+
+        // Always mark self as Agree (NominationProtocol.cpp:720-724).
+        if node_id == local_node_id {
+            return ReportingNodeState::Agree;
+        }
+
+        let enough_time = self.timer_exp_count >= crate::NUM_TIMEOUTS_THRESHOLD_FOR_REPORTING
+            || self_already_moved_on;
+
+        let it = self.latest_nominations.get(node_id);
+        if it.is_none() {
+            return if enough_time {
+                ReportingNodeState::Missing
+            } else {
+                ReportingNodeState::NoInfo
+            };
+        }
+
+        // Has nomination envelope from this node.
+        if enough_time {
+            if let Some(ref last_env) = self.last_envelope {
+                let other_env = it.unwrap();
+                // Extract accepted values from both.
+                let other_accepted = match &other_env.statement.pledges {
+                    ScpStatementPledges::Nominate(nom) => &nom.accepted,
+                    _ => return ReportingNodeState::Agree,
+                };
+                let mine_accepted = match &last_env.statement.pledges {
+                    ScpStatementPledges::Nominate(nom) => &nom.accepted,
+                    _ => return ReportingNodeState::Agree,
+                };
+
+                // isSubsetHelper: check if other's accepted ⊆ mine's accepted.
+                // Both vectors are sorted (XDR vectors maintain order).
+                let is_subset = other_accepted.iter().all(|v| mine_accepted.contains(v));
+                let not_equal = other_accepted.len() != mine_accepted.len();
+
+                if is_subset {
+                    if not_equal {
+                        // Strict subset: they haven't accepted everything we have → delayed.
+                        return ReportingNodeState::Delayed;
+                    }
+                    // Equal sets → agree.
+                } else {
+                    // They have values we don't → disagree.
+                    return ReportingNodeState::Disagree;
+                }
+            }
+        }
+
+        ReportingNodeState::Agree
+    }
+
     /// Get JSON-serializable nomination information.
     ///
     /// Returns a NominationInfo struct that can be serialized to JSON
@@ -2369,5 +2434,190 @@ mod tests {
                 nom.votes()
             );
         }
+    }
+
+    // --- Reporting state tests ---
+
+    #[test]
+    fn test_nom_reporting_state_local_node_always_agree() {
+        let nom = NominationProtocol::new();
+        let local = make_node_id(1);
+        assert_eq!(
+            nom.get_reporting_state(&local, &local, false),
+            crate::ReportingNodeState::Agree
+        );
+        assert_eq!(
+            nom.get_reporting_state(&local, &local, true),
+            crate::ReportingNodeState::Agree
+        );
+    }
+
+    #[test]
+    fn test_nom_reporting_state_no_envelope_noinfo_vs_missing() {
+        let nom = NominationProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+
+        // timer_exp_count=0, selfAlreadyMovedOn=false → NoInfo
+        assert_eq!(
+            nom.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::NoInfo
+        );
+
+        // selfAlreadyMovedOn=true → Missing
+        assert_eq!(
+            nom.get_reporting_state(&peer, &local, true),
+            crate::ReportingNodeState::Missing
+        );
+    }
+
+    #[test]
+    fn test_nom_reporting_state_timer_threshold() {
+        let mut nom = NominationProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+
+        nom.timer_exp_count = 2; // At threshold
+        assert_eq!(
+            nom.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::Missing
+        );
+
+        nom.timer_exp_count = 1; // Below threshold
+        assert_eq!(
+            nom.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::NoInfo
+        );
+    }
+
+    #[test]
+    fn test_nom_reporting_state_delayed() {
+        let mut nom = NominationProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+        let qs = make_quorum_set(vec![local.clone(), peer.clone()], 2);
+
+        nom.timer_exp_count = 2;
+
+        // Local has accepted [1, 2].
+        let local_env = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: local.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![make_value(&[1]), make_value(&[2])].try_into().unwrap(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        nom.last_envelope = Some(local_env);
+
+        // Peer has accepted only [1] (strict subset of ours).
+        let peer_env = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: peer.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![make_value(&[1])].try_into().unwrap(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        nom.latest_nominations.insert(peer.clone(), peer_env);
+
+        assert_eq!(
+            nom.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::Delayed
+        );
+    }
+
+    #[test]
+    fn test_nom_reporting_state_disagree() {
+        let mut nom = NominationProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+        let qs = make_quorum_set(vec![local.clone(), peer.clone()], 2);
+
+        nom.timer_exp_count = 2;
+
+        // Local has accepted [1].
+        let local_env = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: local.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![make_value(&[1])].try_into().unwrap(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        nom.last_envelope = Some(local_env);
+
+        // Peer has accepted [2] (not a subset of ours).
+        let peer_env = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: peer.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![make_value(&[2])].try_into().unwrap(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        nom.latest_nominations.insert(peer.clone(), peer_env);
+
+        assert_eq!(
+            nom.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::Disagree
+        );
+    }
+
+    #[test]
+    fn test_nom_reporting_state_equal_sets_agree() {
+        let mut nom = NominationProtocol::new();
+        let local = make_node_id(1);
+        let peer = make_node_id(2);
+        let qs = make_quorum_set(vec![local.clone(), peer.clone()], 2);
+
+        nom.timer_exp_count = 2;
+
+        let val = make_value(&[1]);
+
+        // Both have identical accepted sets.
+        let env = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: local.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![val.clone()].try_into().unwrap(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        nom.last_envelope = Some(env.clone());
+
+        let peer_env = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: peer.clone(),
+                ..env.statement.clone()
+            },
+            ..env.clone()
+        };
+        nom.latest_nominations.insert(peer.clone(), peer_env);
+
+        assert_eq!(
+            nom.get_reporting_state(&peer, &local, false),
+            crate::ReportingNodeState::Agree
+        );
     }
 }

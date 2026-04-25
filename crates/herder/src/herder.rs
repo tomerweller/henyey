@@ -2620,34 +2620,49 @@ impl Herder {
     /// Quorum health summary for the tracking slot.
     ///
     /// Returns `(agree, missing, disagree, fail_at)` where:
-    /// - `agree` = nodes in CONFIRMING or EXTERNALIZED state
-    /// - `missing` = nodes in MISSING state
-    /// - `disagree` = 0 (not yet detectable from QuorumInfo)
+    /// - `agree` = nodes in Agree or Delayed reporting state
+    /// - `missing` = nodes in Missing reporting state
+    /// - `disagree` = nodes in Disagree reporting state
     /// - `fail_at` = total - threshold (approximate for nested quorum sets)
+    ///
+    /// Matches stellar-core `ApplicationImpl.cpp:525-546`:
+    /// - Uses `tracking_slot - 1` first (previous slot has completed envelopes)
+    /// - Falls back to current tracking slot if previous is unavailable
+    /// - Returns None when not tracking (tracking_slot == 0)
     pub fn quorum_health(&self) -> Option<(u64, u64, u64, u64)> {
         let tracking = self.tracking_slot();
+        // When tracking_slot is 0, we're not tracking — equivalent to
+        // stellar-core's HERDER_BOOTING_STATE check.
         if tracking == 0 {
             return None;
         }
-        let info = self.scp.get_quorum_info(tracking)?;
-        let total = info.nodes.len() as u64;
-        let mut agree = 0u64;
-        let mut missing = 0u64;
-        for node_info in info.nodes.values() {
-            match node_info.state.as_str() {
-                "CONFIRMING" | "EXTERNALIZED" => agree += 1,
-                "MISSING" => missing += 1,
-                _ => {}
+
+        // Use previous slot first (ApplicationImpl.cpp:533-536).
+        let summary = if tracking > 1 {
+            let prev = self.scp.get_reporting_summary(tracking - 1);
+            match prev {
+                Some(_) => prev,
+                None => self.scp.get_reporting_summary(tracking),
             }
-        }
+        } else {
+            self.scp.get_reporting_summary(tracking)
+        };
+        let summary = summary?;
+
+        // Delayed counts as agree (node is participating, just behind).
+        let agree = summary.agree + summary.delayed;
+        let missing = summary.missing;
+        let disagree = summary.disagree;
+
         // Approximate: for flat quorum sets, total - threshold is exact.
         // For nested quorum sets this is an upper bound.
+        let total = agree + missing + disagree;
         let threshold = self
             .local_quorum_set()
             .map(|qs| qs.threshold as u64)
             .unwrap_or(total);
         let fail_at = total.saturating_sub(threshold);
-        Some((agree, missing, 0, fail_at))
+        Some((agree, missing, disagree, fail_at))
     }
 
     /// Timing snapshot for the most recently externalized slot.

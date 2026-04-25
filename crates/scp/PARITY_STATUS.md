@@ -54,7 +54,8 @@ Corresponds to: `SCP.h`
 | `getLocalNode()` | Embedded in SCP struct | Full |
 | `getJsonInfo()` | `get_info()`, `get_all_slot_info()` | Partial |
 | `getJsonQuorumInfo()` | `get_quorum_info()`, `get_quorum_info_for_node()` | Partial |
-| `getMissingNodes()` | `get_missing_nodes()` | Partial |
+| `getState()` (reporting) | `get_reporting_state_with_lock()`, `get_reporting_summary()` | Full |
+| `getMissingNodes()` | `get_missing_nodes()` | Full |
 | `purgeSlotsOutsideRange()` | `purge_slots()` | Partial |
 | `isValidator()` | `is_validator()` | Full |
 | `isSlotFullyValidated()` | `is_slot_fully_validated()` | Full |
@@ -108,7 +109,7 @@ Corresponds to: `Slot.h`
 | `gotVBlocking()` | `got_v_blocking()` | Full |
 | `getJsonInfo()` | `get_info()` | Full |
 | `getJsonQuorumInfo()` | `get_quorum_info()` | Partial |
-| `getState()` | `get_node_state()`, `get_all_node_states()` | Partial |
+| `getState()` | `get_node_state()`, `get_all_node_states()`, `get_reporting_state()` | Full |
 | `getCompanionQuorumSetHashFromStatement()` | `get_companion_quorum_set_hash()` | Full |
 | `getStatementValues()` | `get_statement_values()` | Full |
 | `getQuorumSetFromStatement()` | Via driver callback | Full |
@@ -133,7 +134,7 @@ Corresponds to: `BallotProtocol.h`
 | `bumpState(Value, bool)` | `bump()` | Full |
 | `bumpState(Value, uint32)` | `bump_state()` / `bump_to_counter()` | Full |
 | `getJsonInfo()` | `get_info()` | Full |
-| `getState()` | `get_node_state()` | Full |
+| `getState()` | `get_node_state()`, `get_reporting_state()` | Full |
 | `getJsonQuorumInfo()` | Via Slot-level `get_quorum_info()` | Partial |
 | `getCompanionQuorumSetHashFromStatement()` | None | None |
 | `getWorkingBallot()` | `get_working_ballot()` | Full |
@@ -201,7 +202,7 @@ Corresponds to: `NominationProtocol.h`
 | `getLeaders()` | `get_round_leaders()` | Full |
 | `getLatestCompositeCandidate()` | `latest_composite()` | Full |
 | `getJsonInfo()` | `get_info()` | Full |
-| `getState()` | `get_node_state()` | Partial |
+| `getState()` | `get_node_state()`, `get_reporting_state()` | Full |
 | `getLastMessageSend()` | `get_last_message_send()` | Full |
 | `setStateFromEnvelope()` | `set_state_from_envelope()` | Full |
 | `processCurrentState()` | `process_current_state()` | Full |
@@ -379,10 +380,8 @@ Features excluded by design. These are NOT counted against parity %.
 |------------------------|----------|-------|
 | `SCP::getJsonInfo()` | Medium | No aggregate `limit` / `fullKeys` API; Rust reports per-slot structs |
 | `SCP::getJsonQuorumInfo()` | Medium | No upstream-style `summary` / `fullKeys` / latest-slot form |
-| `SCP::getMissingNodes()` | Medium | Rust only reports against the local quorum set for an explicit slot |
 | `SCP::purgeSlotsOutsideRange()` | Medium | Only max-bound purging is exposed |
 | `Slot::recordStatement()` | Low | Historical statements lack timestamp / validated metadata |
-| `Slot::getJsonQuorumInfo()`, `Slot::getState()`, `NominationProtocol::getState()` | Medium | Node-state reporting is simpler than upstream's quorum diagnostics |
 | `BallotProtocol::getJsonQuorumInfo()` | Low | Only slot-level quorum reporting exists |
 | `BallotProtocol::getCompanionQuorumSetHashFromStatement()` | Low | Helper is not exposed as a public Rust API |
 | `SCPDriver::acceptedCommit()` | Low | No callback when a commit is accepted |

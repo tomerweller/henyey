@@ -64,7 +64,8 @@ pub use driver::{SCPDriver, SCPTimerType, ValidationLevel};
 pub use error::ScpError;
 pub use format::{ballot_to_str, envelope_to_str, node_id_to_short_string, value_to_str};
 pub use info::{
-    BallotInfo, BallotValue, CommitBounds, NodeInfo, NominationInfo, QuorumInfo, SlotInfo,
+    BallotInfo, BallotValue, CommitBounds, NodeInfo, NominationInfo, QuorumInfo, ReportingSummary,
+    SlotInfo,
 };
 pub use quorum::{
     find_closest_v_blocking, get_all_nodes, hash_quorum_set, is_quorum, is_quorum_set_sane,
@@ -182,6 +183,37 @@ impl QuorumInfoNodeState {
         matches!(self, QuorumInfoNodeState::Externalized)
     }
 }
+
+/// Reporting-specific node state for Prometheus metrics and quorum health.
+///
+/// Unlike `QuorumInfoNodeState` (per-envelope phase), this enum matches
+/// stellar-core's reporting model with timeout thresholds, local-node
+/// self-classification, and ballot/nomination comparison.
+///
+/// `NoInfo` is a sentinel used internally during multi-slot lookback;
+/// it never escapes `SCP::get_reporting_state()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportingNodeState {
+    /// Not enough information yet (too few timeouts, no envelopes).
+    NoInfo,
+    /// Node agrees with local consensus state.
+    Agree,
+    /// Node is behind but on the same track.
+    Delayed,
+    /// Node has accepted incompatible values.
+    Disagree,
+    /// Node has not sent any messages after sufficient time.
+    Missing,
+}
+
+/// The number of ballot/nomination timeouts before a node with no envelope
+/// is reported as Missing (rather than NoInfo).
+/// Matches `Slot::NUM_TIMEOUTS_THRESHOLD_FOR_REPORTING` in stellar-core (Slot.h:205).
+pub(crate) const NUM_TIMEOUTS_THRESHOLD_FOR_REPORTING: u32 = 2;
+
+/// Number of slots to look back when computing reporting state.
+/// Matches `SCP::NUM_SLOTS_TO_CHECK_FOR_REPORTING` in stellar-core (SCP.h:169).
+pub(crate) const NUM_SLOTS_TO_CHECK_FOR_REPORTING: u64 = 2;
 
 impl EnvelopeState {
     /// Check if the envelope was valid.

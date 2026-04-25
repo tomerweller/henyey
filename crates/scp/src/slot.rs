@@ -838,6 +838,26 @@ impl Slot {
         self.nomination.get_node_state(node_id)
     }
 
+    /// Get the reporting-specific state of a node for this slot.
+    ///
+    /// Matches `Slot::getState` (Slot.cpp:387-395): ballot takes precedence,
+    /// falls back to nomination if ballot returns NoInfo.
+    pub(crate) fn get_reporting_state(
+        &self,
+        node_id: &NodeId,
+        local_node_id: &NodeId,
+        self_already_moved_on: bool,
+    ) -> crate::ReportingNodeState {
+        let b = self
+            .ballot
+            .get_reporting_state(node_id, local_node_id, self_already_moved_on);
+        if b != crate::ReportingNodeState::NoInfo {
+            return b;
+        }
+        self.nomination
+            .get_reporting_state(node_id, local_node_id, self_already_moved_on)
+    }
+
     /// Get states of all nodes in quorum set for this slot.
     ///
     /// Returns a map from node ID to their state in this slot's consensus.

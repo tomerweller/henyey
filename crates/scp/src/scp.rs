@@ -634,27 +634,87 @@ impl<D: SCPDriver> SCP<D> {
 
     /// Get nodes that are missing from consensus for a slot.
     ///
-    /// Returns the set of nodes in our quorum set that we haven't
-    /// heard from for the given slot. This is useful for diagnosing
-    /// why consensus might be stuck.
+    /// Returns the set of nodes in our quorum set that are in MISSING state
+    /// for the given slot, using the reporting-state model with multi-slot lookback.
+    ///
+    /// Matches `SCP::getMissingNodes` (SCP.cpp:260-279): returns empty set if
+    /// the slot doesn't exist (matching `getSlot(index, false)` returning null).
     ///
     /// # Arguments
     /// * `slot_index` - The slot to check
     ///
     /// # Returns
-    /// Set of node IDs that haven't sent messages for this slot.
+    /// Set of node IDs in MISSING reporting state, or empty if slot doesn't exist.
     pub fn get_missing_nodes(&self, slot_index: u64) -> std::collections::HashSet<NodeId> {
-        let all_nodes = crate::quorum::get_all_nodes(&self.local_quorum_set);
         let slots = self.slots.read();
-
-        if let Some(slot) = slots.get(&slot_index) {
-            let heard_from: std::collections::HashSet<NodeId> =
-                slot.ballot().latest_envelopes().keys().cloned().collect();
-
-            all_nodes.difference(&heard_from).cloned().collect()
-        } else {
-            all_nodes
+        // Match stellar-core: getSlot(index, false) returns null → empty set
+        if slots.get(&slot_index).is_none() {
+            return std::collections::HashSet::new();
         }
+        let all_nodes = crate::quorum::get_all_nodes(&self.local_quorum_set);
+        all_nodes
+            .into_iter()
+            .filter(|n| {
+                matches!(
+                    self.get_reporting_state_with_lock(n, slot_index, &slots),
+                    crate::ReportingNodeState::Missing
+                )
+            })
+            .collect()
+    }
+
+    /// Get the reporting-specific state of a node across multiple slots.
+    ///
+    /// Matches `SCP::getState` (SCP.cpp:148-171): checks up to
+    /// `NUM_SLOTS_TO_CHECK_FOR_REPORTING` slots back, returning the first
+    /// non-NoInfo state. Falls back to Missing if all slots return NoInfo.
+    fn get_reporting_state_with_lock(
+        &self,
+        node_id: &NodeId,
+        slot_index: u64,
+        slots: &HashMap<u64, Slot>,
+    ) -> crate::ReportingNodeState {
+        for k in 0..crate::NUM_SLOTS_TO_CHECK_FOR_REPORTING {
+            if slot_index <= k {
+                break;
+            }
+            if let Some(slot) = slots.get(&(slot_index - k)) {
+                let self_already_moved_on = k > 0;
+                let s =
+                    slot.get_reporting_state(node_id, &self.local_node_id, self_already_moved_on);
+                if s != crate::ReportingNodeState::NoInfo {
+                    return s;
+                }
+            }
+        }
+        // No info from any checked slot → Missing.
+        crate::ReportingNodeState::Missing
+    }
+
+    /// Get an aggregated reporting summary for metrics.
+    ///
+    /// Returns counts of Agree/Missing/Disagree/Delayed across all nodes
+    /// in the local quorum set. Returns `None` if the slot doesn't exist
+    /// (matching stellar-core's empty-check in ApplicationImpl.cpp:542).
+    pub fn get_reporting_summary(&self, slot_index: u64) -> Option<crate::ReportingSummary> {
+        let slots = self.slots.read();
+        // Slot must exist — return None if absent.
+        slots.get(&slot_index)?;
+        let all_nodes = crate::quorum::get_all_nodes(&self.local_quorum_set);
+        let mut summary = crate::ReportingSummary::default();
+        for node_id in &all_nodes {
+            match self.get_reporting_state_with_lock(node_id, slot_index, &slots) {
+                crate::ReportingNodeState::Agree => summary.agree += 1,
+                crate::ReportingNodeState::Delayed => summary.delayed += 1,
+                crate::ReportingNodeState::Disagree => summary.disagree += 1,
+                crate::ReportingNodeState::Missing => summary.missing += 1,
+                crate::ReportingNodeState::NoInfo => {
+                    // Should never happen at SCP level — treat as Missing.
+                    summary.missing += 1;
+                }
+            }
+        }
+        Some(summary)
     }
 
     /// Check if a statement is newer than what we have for that node.
@@ -1207,11 +1267,12 @@ mod tests {
         );
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
 
-        // No slot yet - all nodes should be missing
+        // No slot yet — empty set (matches stellar-core: getSlot(index, false) == null → empty).
         let missing = scp.get_missing_nodes(1);
-        assert!(missing.contains(&node_a));
-        assert!(missing.contains(&node_b));
-        assert!(missing.contains(&node_c));
+        assert!(
+            missing.is_empty(),
+            "nonexistent slot should return empty set"
+        );
     }
 
     #[test]
@@ -1267,6 +1328,181 @@ mod tests {
 
         // Should return the highest slot
         assert_eq!(scp.get_highest_known_slot(), Some(8));
+    }
+
+    #[test]
+    fn test_get_missing_nodes_nonexistent_slot() {
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![node_a.clone(), node_b.clone()], 2);
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
+        let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
+
+        // Nonexistent slot → empty set (matches stellar-core getSlot(index, false) returning null).
+        let missing = scp.get_missing_nodes(1);
+        assert!(
+            missing.is_empty(),
+            "get_missing_nodes should return empty set for nonexistent slot"
+        );
+    }
+
+    #[test]
+    fn test_get_reporting_summary_nonexistent_slot() {
+        let node_a = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node_a.clone()], 1);
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
+        let scp = SCP::new(node_a.clone(), true, quorum_set, driver);
+
+        // Nonexistent slot → None.
+        assert!(scp.get_reporting_summary(1).is_none());
+    }
+
+    #[test]
+    fn test_get_reporting_summary_local_node_agree() {
+        let node_a = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node_a.clone()], 1);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .validation_level(ValidationLevel::MaybeValid)
+                .value_hash_mode(ValueHashMode::Fixed(1))
+                .timeout_mode(TimeoutMode::Linear {
+                    base: Duration::from_secs(1),
+                    step: Duration::from_secs(1),
+                })
+                .build(),
+        );
+        let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
+
+        // Force-externalize to create the slot.
+        let value: Value = vec![1].try_into().unwrap();
+        scp.force_externalize(1, value);
+
+        let summary = scp.get_reporting_summary(1).unwrap();
+        // Local node is always Agree.
+        assert_eq!(summary.agree, 1);
+        assert_eq!(summary.missing, 0);
+        assert_eq!(summary.disagree, 0);
+        assert_eq!(summary.delayed, 0);
+    }
+
+    #[test]
+    fn test_get_reporting_summary_with_missing_peer() {
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![node_a.clone(), node_b.clone()], 2);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .validation_level(ValidationLevel::MaybeValid)
+                .value_hash_mode(ValueHashMode::Fixed(1))
+                .timeout_mode(TimeoutMode::Linear {
+                    base: Duration::from_secs(1),
+                    step: Duration::from_secs(1),
+                })
+                .build(),
+        );
+        let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
+
+        // Create the slot with force_externalize.
+        let value: Value = vec![1].try_into().unwrap();
+        scp.force_externalize(1, value);
+
+        // Node B hasn't sent anything but slot has no timer expirations yet.
+        let summary = scp.get_reporting_summary(1).unwrap();
+        // Local = Agree, peer = Missing (single slot, forced externalize means
+        // we already moved past nomination, so NoInfo falls through lookback to Missing).
+        assert_eq!(summary.agree, 1); // local
+        assert_eq!(summary.missing, 1); // peer with no envelopes
+    }
+
+    #[test]
+    fn test_get_missing_nodes_with_envelope() {
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+        let quorum_set = make_quorum_set(vec![node_a.clone(), node_b.clone(), node_c.clone()], 2);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .validation_level(ValidationLevel::MaybeValid)
+                .value_hash_mode(ValueHashMode::Fixed(1))
+                .timeout_mode(TimeoutMode::Linear {
+                    base: Duration::from_secs(1),
+                    step: Duration::from_secs(1),
+                })
+                .build(),
+        );
+        let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
+
+        // Create slot by receiving a prepare envelope from node_b.
+        let ballot = ScpBallot {
+            counter: 1,
+            value: make_value(&[7]),
+        };
+        let env_b = make_prepare_envelope(node_b.clone(), 1, &quorum_set, ballot);
+        scp.receive_envelope(env_b);
+
+        // Now start nomination so the slot exists with some state.
+        let value = make_value(&[1, 2, 3]);
+        let prev = make_value(&[0]);
+        scp.nominate(1, value, &prev);
+
+        let missing = scp.get_missing_nodes(1);
+        // node_a is local (Agree), node_b has an envelope (Agree), node_c is missing.
+        assert!(
+            !missing.contains(&node_a),
+            "local node should not be missing"
+        );
+        assert!(
+            !missing.contains(&node_b),
+            "node with envelope should not be missing"
+        );
+        // node_c may or may not be missing depending on timer_exp_count; with a fresh
+        // slot it returns NoInfo which falls through to Missing at SCP level.
+        assert!(
+            missing.contains(&node_c),
+            "node without any envelope should be missing"
+        );
+    }
+
+    #[test]
+    fn test_multi_slot_lookback() {
+        // Test that get_reporting_summary uses multi-slot lookback.
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![node_a.clone(), node_b.clone()], 2);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .validation_level(ValidationLevel::MaybeValid)
+                .value_hash_mode(ValueHashMode::Fixed(1))
+                .timeout_mode(TimeoutMode::Linear {
+                    base: Duration::from_secs(1),
+                    step: Duration::from_secs(1),
+                })
+                .build(),
+        );
+        let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
+
+        // Slot 1: node_b has an envelope (via force_externalize + direct receive).
+        let ballot = ScpBallot {
+            counter: 1,
+            value: make_value(&[7]),
+        };
+        let env_b = make_prepare_envelope(node_b.clone(), 1, &quorum_set, ballot);
+        scp.receive_envelope(env_b);
+
+        // Now create slot 2 (empty — no envelopes from node_b).
+        let value: Value = vec![1].try_into().unwrap();
+        scp.force_externalize(2, value);
+
+        // When checking slot 2, it should look back to slot 1 for node_b
+        // (selfAlreadyMovedOn=true for the lookback).
+        let summary = scp.get_reporting_summary(2).unwrap();
+        // node_a = local = Agree; node_b should be found in slot 1 lookback
+        assert_eq!(summary.agree, 2, "both nodes should agree via lookback");
+        assert_eq!(summary.missing, 0);
     }
 
     #[test]

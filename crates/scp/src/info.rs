@@ -87,6 +87,21 @@ pub struct CommitBounds {
     pub high: u32,
 }
 
+/// Aggregated reporting summary for Prometheus metrics.
+///
+/// Produced by `SCP::get_reporting_summary()`, consumed by `Herder::quorum_health()`.
+#[derive(Debug, Clone, Default)]
+pub struct ReportingSummary {
+    /// Number of nodes that agree with local consensus.
+    pub agree: u64,
+    /// Number of nodes not heard from.
+    pub missing: u64,
+    /// Number of nodes that accepted incompatible values.
+    pub disagree: u64,
+    /// Number of nodes that are behind but on the same track.
+    pub delayed: u64,
+}
+
 /// JSON-serializable quorum information for a slot.
 ///
 /// This provides a view of quorum state including which nodes
