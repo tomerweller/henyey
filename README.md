@@ -363,7 +363,7 @@ network_passphrase = "Test SDF Network ; September 2015"
 path = "stellar.db"
 
 [overlay]
-listen_port = 11625
+peer_port = 11625
 max_inbound_peers = 64
 max_outbound_peers = 8
 

@@ -118,7 +118,11 @@ get_enabled = true
 put_enabled = false
 
 [overlay]
-peer_port = 8009
+# 11625 is the standard stellar overlay port. Non-standard ports reduce inbound
+# peer discoverability since other validators default to connecting on 11625.
+# If using a non-standard port, ensure your firewall and all preferred_peers
+# entries on other nodes include the correct port.
+peer_port = 11625
 max_inbound_peers = 64
 max_outbound_peers = 8
 target_outbound_peers = 8
