@@ -322,8 +322,8 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `addOutboundConnection()` | (in connector flow) | Full |
 | `removePeer()` | (via peer drop) | Full |
 | `acceptAuthenticatedPeer()` | (in handshake completion) | Full |
-| `isPreferred()` | (via preferred_peers config) | Full |
-| `isPossiblyPreferred()` | `ConnectionPool::try_reserve_with_ip()` | Full |
+| `isPreferred()` | `PreferredPeerSet::is_preferred()` | Full (config hostname + resolved IP matching) |
+| `isPossiblyPreferred()` | `ConnectionPool::try_reserve_with_ip()` | Full (runtime update via `update_preferred_ips()`) |
 | `haveSpaceForConnection()` | `ConnectionPool::can_accept()` | Full |
 | `getInboundPendingPeers()` | N/A | None |
 | `getOutboundPendingPeers()` | N/A | None |
@@ -349,7 +349,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `storeConfigPeers()` | In `start()` — stores known+preferred peers | Full |
 | `purgeDeadPeers()` | In `start()` — `remove_peers_with_many_failures(120)` | Full |
 | `triggerPeerResolution()` | DNS backoff in tick loop | Full |
-| `resolvePeers()` | DNS resolution with exponential backoff | Full |
+| `resolvePeers()` | DNS resolution with exponential backoff; results update both known peers and `PreferredPeerSet` (resolved IPs → inbound pool) | Full |
 | `storePeerList()` | In `start()` and tick loop | Full |
 | `connectToImpl()` | (in connector flow) | Full |
 | `moveToAuthenticated()` | (in handshake completion) | Full |

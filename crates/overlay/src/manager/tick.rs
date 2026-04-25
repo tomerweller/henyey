@@ -4,7 +4,7 @@
 //! peer connection, outbound slot filling, random peer dropping, and peer
 //! advertisement.
 
-use super::{OverlayManager, PeerHandle, SharedPeerState, TickConnectCtx};
+use super::{OverlayManager, PeerHandle, PreferredPeerSet, SharedPeerState, TickConnectCtx};
 use crate::{connection::ConnectionPool, peer::PeerInfo, PeerAddress, PeerId};
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -50,6 +50,8 @@ const EVICTION_SETTLE_DELAY_MS: u64 = 100;
 struct ResolvedPeers {
     /// Successfully resolved known peers (hostname → IP:port).
     known: Vec<PeerAddress>,
+    /// Successfully resolved preferred peers (hostname → IP:port).
+    preferred: Vec<PeerAddress>,
     /// True if any peer in either list failed to resolve.
     errors: bool,
 }
@@ -105,9 +107,10 @@ fn spawn_dns_resolution(
 ) -> JoinHandle<ResolvedPeers> {
     tokio::spawn(async move {
         let (known, known_err) = resolve_peer_list(&known_peers).await;
-        let (_pref, pref_err) = resolve_peer_list(&preferred_peers).await;
+        let (preferred, pref_err) = resolve_peer_list(&preferred_peers).await;
         ResolvedPeers {
             known,
+            preferred,
             errors: known_err || pref_err,
         }
     })
@@ -165,8 +168,9 @@ impl OverlayManager {
     pub(super) fn start_tick_loop(&mut self) {
         let shared = self.shared_state();
         let pool = Arc::clone(&self.outbound_pool);
+        let inbound_pool = Arc::clone(&self.inbound_pool);
         let known_peers = Arc::clone(&self.known_peers);
-        let preferred_peers = self.config.preferred_peers.clone();
+        let preferred_peers_config = self.config.preferred_peers.clone();
         let max_outbound = self.config.max_outbound_peers;
         let config_known_peers = self.config.known_peers.clone();
         let mut shutdown_rx = self.shutdown_tx.lock().as_ref().unwrap().subscribe();
@@ -190,9 +194,15 @@ impl OverlayManager {
             let mut dns_retry_count: u32 = 0;
             let mut dns_next_resolve_at = Instant::now();
 
+            // Current preferred peer set snapshot — starts from config, updated
+            // after each DNS resolution cycle.
+            let mut preferred_set = Arc::new(PreferredPeerSet::from_config(
+                preferred_peers_config.clone(),
+            ));
+
             // Trigger initial DNS resolution.
             let mut dns_resolve_handle: Option<JoinHandle<ResolvedPeers>> = Some(
-                spawn_dns_resolution(config_known_peers.clone(), preferred_peers.clone()),
+                spawn_dns_resolution(config_known_peers.clone(), preferred_peers_config.clone()),
             );
 
             loop {
@@ -213,7 +223,7 @@ impl OverlayManager {
                 Self::maybe_drop_random_peer(
                     &shared.peers,
                     &shared.peer_info_cache,
-                    &preferred_peers,
+                    &preferred_set,
                     max_outbound,
                     tracking,
                     &mut last_out_of_sync_reconnect,
@@ -223,9 +233,12 @@ impl OverlayManager {
                 shared.pending_connections.sweep_stale();
 
                 // G7: Collect completed DNS resolution and schedule next.
+                // Also updates the preferred peer set and inbound pool IPs.
                 Self::maybe_collect_dns_result(
                     &mut dns_resolve_handle,
                     &known_peers,
+                    &mut preferred_set,
+                    &inbound_pool,
                     &mut dns_resolving_with_backoff,
                     &mut dns_retry_count,
                     &mut dns_next_resolve_at,
@@ -235,7 +248,7 @@ impl OverlayManager {
                 if dns_resolve_handle.is_none() && Instant::now() >= dns_next_resolve_at {
                     dns_resolve_handle = Some(spawn_dns_resolution(
                         config_known_peers.clone(),
-                        preferred_peers.clone(),
+                        preferred_peers_config.clone(),
                     ));
                 }
 
@@ -248,7 +261,7 @@ impl OverlayManager {
 
                 // Connect to preferred peers first.
                 let remaining = Self::connect_preferred_peers(
-                    &preferred_peers,
+                    &preferred_set,
                     &mut retry_after,
                     now,
                     available,
@@ -282,11 +295,14 @@ impl OverlayManager {
 
     /// Check if a background DNS resolution has completed and apply results.
     ///
-    /// Merges newly-resolved peers into `known_peers` and computes the next
-    /// resolve delay using backoff logic. Returns the updated DNS state.
+    /// Merges newly-resolved peers into `known_peers`, updates the preferred
+    /// peer set with resolved IPs, and refreshes the inbound pool's preferred
+    /// IPs. Computes the next resolve delay using backoff logic.
     async fn maybe_collect_dns_result(
         dns_resolve_handle: &mut Option<JoinHandle<ResolvedPeers>>,
         known_peers: &RwLock<Vec<PeerAddress>>,
+        preferred_set: &mut Arc<PreferredPeerSet>,
+        inbound_pool: &Arc<ConnectionPool>,
         dns_resolving_with_backoff: &mut bool,
         dns_retry_count: &mut u32,
         dns_next_resolve_at: &mut Instant,
@@ -313,6 +329,14 @@ impl OverlayManager {
                     }
                 }
 
+                // Update preferred peer set with DNS-resolved addresses.
+                let new_set = preferred_set.with_resolved(result.preferred);
+                let new_ips = new_set.resolved_ips().clone();
+                *preferred_set = Arc::new(new_set);
+
+                // Update inbound pool so resolved preferred peers get extra slots.
+                inbound_pool.update_preferred_ips(new_ips);
+
                 let (delay, new_backoff, new_retry) = compute_dns_backoff_delay(
                     *dns_resolving_with_backoff,
                     *dns_retry_count,
@@ -322,8 +346,10 @@ impl OverlayManager {
                 *dns_retry_count = new_retry;
                 *dns_next_resolve_at = Instant::now() + delay;
                 debug!(
-                    "DNS resolution complete (errors={}), next in {:?}",
-                    result.errors, delay
+                    "DNS resolution complete (errors={}, preferred_ips={}), next in {:?}",
+                    result.errors,
+                    preferred_set.resolved_ips().len(),
+                    delay
                 );
             }
             Err(e) => {
@@ -338,7 +364,7 @@ impl OverlayManager {
     /// Evicts youngest non-preferred outbound peer if the pool is full.
     /// Returns how many slots remain after connecting.
     async fn connect_preferred_peers(
-        preferred_peers: &[PeerAddress],
+        preferred_set: &PreferredPeerSet,
         retry_after: &mut HashMap<PeerAddress, Instant>,
         now: Instant,
         mut remaining: usize,
@@ -346,7 +372,9 @@ impl OverlayManager {
         shared: &SharedPeerState,
         ctx: &TickConnectCtx,
     ) -> usize {
-        for addr in preferred_peers {
+        // Shuffle to avoid starvation — stellar-core uses random selection.
+        let entries = preferred_set.shuffled_config_entries(&mut rand::thread_rng());
+        for addr in &entries {
             if remaining == 0 {
                 break;
             }
@@ -365,7 +393,7 @@ impl OverlayManager {
                 let evicted = Self::maybe_evict_for_preferred(
                     &shared.peers,
                     &shared.peer_info_cache,
-                    preferred_peers,
+                    preferred_set,
                 );
                 if evicted {
                     tokio::time::sleep(Duration::from_millis(EVICTION_SETTLE_DELAY_MS)).await;
@@ -469,7 +497,7 @@ impl OverlayManager {
     fn maybe_evict_for_preferred(
         peers: &DashMap<PeerId, PeerHandle>,
         peer_info_cache: &DashMap<PeerId, PeerInfo>,
-        preferred_addrs: &[PeerAddress],
+        preferred_set: &PreferredPeerSet,
     ) -> bool {
         // Find the youngest (most recently connected) non-preferred outbound peer.
         let mut youngest: Option<(PeerId, Instant)> = None;
@@ -478,10 +506,7 @@ impl OverlayManager {
             if !info.direction.we_called_remote() {
                 continue;
             }
-            let is_preferred = preferred_addrs
-                .iter()
-                .any(|pref| Self::peer_info_matches_address(info, pref));
-            if is_preferred {
+            if preferred_set.is_preferred(info) {
                 continue;
             }
             // Track the youngest (most recent connected_at)
@@ -536,7 +561,7 @@ impl OverlayManager {
     pub(super) fn maybe_drop_random_peer(
         peers: &DashMap<PeerId, PeerHandle>,
         peer_info_cache: &DashMap<PeerId, PeerInfo>,
-        preferred_addrs: &[PeerAddress],
+        preferred_set: &PreferredPeerSet,
         max_outbound: usize,
         is_tracking: bool,
         last_out_of_sync_reconnect: &mut Option<Instant>,
@@ -576,10 +601,7 @@ impl OverlayManager {
                     if !info.direction.we_called_remote() {
                         continue;
                     }
-                    let is_preferred = preferred_addrs
-                        .iter()
-                        .any(|pref| Self::peer_info_matches_address(info, pref));
-                    if !is_preferred {
+                    if !preferred_set.is_preferred(info) {
                         candidates.push(entry.key().clone());
                     }
                 }
@@ -680,7 +702,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &[],
+            &PreferredPeerSet::from_config(vec![]),
             8,    // max_outbound = 8 (full)
             true, // tracking = true
             &mut last_reconnect,
@@ -707,7 +729,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &[],
+            &PreferredPeerSet::from_config(vec![]),
             8,
             false, // not tracking
             &mut last_reconnect,
@@ -730,7 +752,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &[],
+            &PreferredPeerSet::from_config(vec![]),
             8,
             false,
             &mut last_reconnect,
@@ -755,7 +777,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &[],
+            &PreferredPeerSet::from_config(vec![]),
             8,
             false,
             &mut last_reconnect,
@@ -779,7 +801,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &[],
+            &PreferredPeerSet::from_config(vec![]),
             8,
             false,
             &mut last_reconnect,
@@ -806,7 +828,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &preferred,
+            &PreferredPeerSet::from_config(preferred.clone()),
             1, // max_outbound = 1 (full)
             false,
             &mut last_reconnect,
@@ -831,7 +853,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &[],
+            &PreferredPeerSet::from_config(vec![]),
             8,
             false,
             &mut last_reconnect,
@@ -853,7 +875,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &[],
+            &PreferredPeerSet::from_config(vec![]),
             8,
             true, // tracking again
             &mut last_reconnect,

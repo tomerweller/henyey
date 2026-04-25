@@ -654,6 +654,14 @@ impl ConnectionPool {
     pub fn authenticated_count(&self) -> usize {
         self.authenticated_count.load(Ordering::Relaxed)
     }
+
+    /// Update the set of preferred IP addresses at runtime.
+    ///
+    /// Called after each DNS resolution cycle to refresh which inbound
+    /// connections qualify for extra preferred slots.
+    pub fn update_preferred_ips(&self, ips: HashSet<IpAddr>) {
+        *self.preferred_ips.write() = ips;
+    }
 }
 
 #[cfg(test)]
@@ -790,5 +798,40 @@ mod tests {
     async fn test_peer_address_connect_format() {
         let addr = PeerAddress::new("127.0.0.1", 11625);
         assert_eq!(addr.to_socket_addr(), "127.0.0.1:11625");
+    }
+
+    #[test]
+    fn test_update_preferred_ips() {
+        let pool = ConnectionPool::with_preferred(2, 2, HashSet::new());
+        assert!(pool.preferred_ips.read().is_empty());
+
+        let mut ips = HashSet::new();
+        ips.insert("10.0.0.1".parse::<IpAddr>().unwrap());
+        ips.insert("10.0.0.2".parse::<IpAddr>().unwrap());
+        pool.update_preferred_ips(ips.clone());
+
+        assert_eq!(*pool.preferred_ips.read(), ips);
+    }
+
+    #[test]
+    fn test_update_preferred_ips_enables_extra_slots() {
+        let mut pool = ConnectionPool::with_preferred(1, 1, HashSet::new());
+        pool.max_pending_extra = 0;
+
+        // Fill base slot
+        assert!(pool.try_reserve());
+
+        // Before update: preferred IP can't get extra slot (not in set)
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(!pool.try_reserve_with_ip(Some(ip)));
+
+        // Update preferred IPs at runtime
+        let mut ips = HashSet::new();
+        ips.insert(ip);
+        pool.update_preferred_ips(ips);
+
+        // Now preferred IP gets the extra slot
+        assert!(pool.try_reserve_with_ip(Some(ip)));
+        assert_eq!(pool.count(), 2);
     }
 }

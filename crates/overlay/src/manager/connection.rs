@@ -148,11 +148,10 @@ impl OverlayManager {
         Self::send_peers_to_inbound_peer(&mut peer, &peer_id, &peer_info, &shared).await;
 
         // Determine if this peer is preferred (by address).
-        // Matches stellar-core isPreferred (OverlayManagerImpl.cpp:1071).
-        let is_preferred = shared
-            .preferred_peers
-            .iter()
-            .any(|pref| Self::peer_info_matches_address(&peer_info, pref));
+        // Uses PreferredPeerSet for both hostname config entries and resolved IPs,
+        // fixing the bug where hostname-based preferred peers were never matched
+        // for inbound connections (which lack original_address).
+        let is_preferred = shared.preferred_peers.is_preferred(&peer_info);
 
         // Try to promote to authenticated.
         // Matches stellar-core acceptAuthenticatedPeer (OverlayManagerImpl.cpp:208).
@@ -242,10 +241,7 @@ impl OverlayManager {
             if info.direction.we_called_remote() {
                 return None;
             }
-            let is_preferred = shared
-                .preferred_peers
-                .iter()
-                .any(|pref| Self::peer_info_matches_address(info, pref));
+            let is_preferred = shared.preferred_peers.is_preferred(info);
             if is_preferred {
                 return None;
             }
