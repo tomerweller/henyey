@@ -221,9 +221,26 @@ been added previously and the issue has since been updated):
 gh issue edit $ISSUE --remove-label "not-ready" 2>/dev/null || true
 ```
 
-Read any files, crates, or stellar-core references mentioned in the issue body
-to build context. You need enough understanding to critique and rewrite the
-proposal intelligently.
+Build context for the issue — but **budget your context aggressively**.
+
+> **Context budget rule.** You must survive the full skill lifecycle:
+> up to 5 proposal↔critic rounds, then implementation, then up to 3
+> review-fix rounds. If you exhaust your context window during
+> exploration, the session will exit before the proposal even converges.
+>
+> - **Prefer `grep`/`glob` over `view`.** Search for specific symbols,
+>   function names, or config keys mentioned in the issue. Do not read
+>   entire files when a 5-line match suffices.
+> - **Prefer `view_range` over full-file reads.** When you need to read
+>   code, read only the relevant function or block (20–50 lines), not
+>   the entire file.
+> - **Stop exploring once you can write a first draft.** Your first
+>   proposal does not need to be perfect — the critic agent has its own
+>   full context window and will verify claims against the codebase.
+>   Trust the critic to catch what you missed; that is the whole point
+>   of the adversarial loop.
+> - **Do not pre-read code "just in case."** Only read code that
+>   directly informs a specific claim in your proposal.
 
 Initialize tracking:
 ```
@@ -359,6 +376,14 @@ Read the agent result. Extract the verdict line.
 **You MUST post the critic response to the issue before processing the
 verdict.** This is not optional — the issue comment trail is the audit log.
 Do not skip this step, even if the verdict is APPROVED.
+
+> **Context hygiene.** The critic's full response can be very large. After
+> posting it to the issue (below), extract only the **verdict** and the
+> **numbered feedback items** into your working state. Do not keep the
+> full critique text in your conversational context — it is preserved in
+> the issue comment for the audit trail. When investigating feedback
+> items, do targeted `grep`/`view_range` lookups rather than re-reading
+> everything the critic referenced.
 
 ```bash
 # Use --body-file (see the CRITICAL note in Step 2a).
@@ -598,6 +623,10 @@ Follow the review-fix skill instructions below exactly. Mode is review
 ### 4b: Process Review Result
 
 Read the agent result. Extract the verdict from the Fix Analysis section.
+
+> **Context hygiene (same as 2b).** After posting the full review to the
+> issue, keep only the verdict and the specific issue list in your working
+> state. The full report is preserved in the issue comment.
 
 **Post the review result to the issue**:
 
