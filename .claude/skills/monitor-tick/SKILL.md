@@ -332,6 +332,9 @@ checks below, which are traffic-proportional and self-calibrating.
 - `henyey_overlay_fetch_channel_depth_max` >500 → WARN
 - `(henyey_process_open_fds / henyey_process_max_fds)` >0.85 → WARN
 - `henyey_herder_drift_max_seconds` >10 → NONC
+- `stellar_scp_timing_externalized_seconds` >3 → WARN (per #1934: healthy stellar-core ~0.35s; >3s leaves <2s headroom against the 5s ledger slot — sustained breach risks falling out of sync). Skip during the 2-tick post-restart warmup since first-slot externalize is naturally elevated.
+- `stellar_scp_timing_nominated_seconds` >2 → WARN (per #1934: healthy ~0.78s; >2s indicates message-propagation lag from low peer count or overlay backpressure). Same warmup carveout.
+- `stellar_overlay_inbound_authenticated` <3 when `uptime >15m` AND `CRASH_RECOVERY=no` AND `FRESH_START=no` → WARN (per #1934: healthy fleet has 50+ inbound; <3 means other validators aren't connecting *to* us, forcing all SCP messages via long relay chains. Aggregate `stellar_peer_count` can still be ≥8 from outbound while inbound starves consensus — this gauge catches that case the aggregate misses).
 
 `quorum_agree` / `quorum_missing` / `quorum_fail_at` are intentionally NOT
 monitored — they snapshot the tracking slot's QuorumInfo and return
