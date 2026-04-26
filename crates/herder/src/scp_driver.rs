@@ -1326,10 +1326,17 @@ impl ScpDriver {
             return values[0].clone();
         }
 
-        // Decode all values
-        let mut decoded: Vec<StellarValue> = values
+        // Decode all values, keeping the raw Value bytes alongside for sorting.
+        // Parity: stellar-core's ValueWrapperPtrSet iterates by raw Value byte
+        // order (WrappedValuePtrComparator, SCPDriver.cpp:36-41). We sort by the
+        // same key to ensure identical tie-breaking.
+        let mut decoded: Vec<(Value, StellarValue)> = values
             .iter()
-            .filter_map(|v| StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none()).ok())
+            .filter_map(|v| {
+                StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none())
+                    .ok()
+                    .map(|sv| (v.clone(), sv))
+            })
             .collect();
 
         if decoded.is_empty() {
@@ -1339,7 +1346,7 @@ impl ScpDriver {
         // Parity: filter out candidates whose tx set is missing from cache.
         // stellar-core crashes (releaseAssert(cTxSet)) if a tx set is missing
         // during combineCandidates — we filter instead to be defensive.
-        decoded.retain(|sv| {
+        decoded.retain(|(_, sv)| {
             let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
             if self.tx_tracker.is_cached(&tx_set_hash) {
                 true
@@ -1358,7 +1365,7 @@ impl ScpDriver {
         // Parity: filter out candidates whose tx set has a different previousLedgerHash
         if let Some(lm) = self.ledger_manager.get() {
             let lcl_hash = lm.current_header_hash();
-            decoded.retain(|sv| {
+            decoded.retain(|(_, sv)| {
                 let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
                 let tx_set = self.tx_tracker.get(&tx_set_hash).unwrap();
                 tx_set.previous_ledger_hash() == lcl_hash
@@ -1371,7 +1378,7 @@ impl ScpDriver {
 
         // Step 1: Compute candidates hash (XOR of all candidate hashes) for tiebreaking
         let mut candidates_hash = [0u8; 32];
-        for sv in &decoded {
+        for (_, sv) in &decoded {
             let val_bytes = henyey_common::xdr_stream::xdr_to_bytes(sv);
             let hash = Hash256::hash(&val_bytes);
             for (i, byte) in candidates_hash.iter_mut().enumerate() {
@@ -1382,7 +1389,7 @@ impl ScpDriver {
         // Step 2: Merge upgrades across all candidates (take max of each upgrade type)
         let mut merged_upgrades: std::collections::BTreeMap<u32, LedgerUpgrade> =
             std::collections::BTreeMap::new();
-        for sv in &decoded {
+        for (_, sv) in &decoded {
             for upgrade_bytes in sv.upgrades.iter() {
                 if let Ok(upgrade) = LedgerUpgrade::from_xdr(
                     upgrade_bytes.0.as_slice(),
@@ -1401,11 +1408,10 @@ impl ScpDriver {
             }
         }
 
-        // Step 3: Sort candidates by XDR bytes for deterministic iteration.
+        // Step 3: Sort candidates by raw Value bytes for deterministic iteration.
         // Parity: stellar-core iterates a ValueWrapperPtrSet (std::set ordered
-        // by Value bytes via WrappedValuePtrComparator). Sorting here ensures
-        // combine_candidates is order-independent regardless of input ordering.
-        decoded.sort();
+        // by raw Value bytes via WrappedValuePtrComparator, SCPDriver.cpp:36-41).
+        decoded.sort_by(|(a_raw, _), (b_raw, _)| a_raw.cmp(b_raw));
 
         // Step 4: Select best candidate using compareTxSets logic.
         // Parity: HerderSCPDriver.cpp:775-797 — manual loop that keeps the
@@ -1414,8 +1420,8 @@ impl ScpDriver {
         // tied element and would be order-dependent.
         let mut best_idx = 0;
         for i in 1..decoded.len() {
-            let best_hash = Hash256::from_bytes(decoded[best_idx].tx_set_hash.0);
-            let cur_hash = Hash256::from_bytes(decoded[i].tx_set_hash.0);
+            let best_hash = Hash256::from_bytes(decoded[best_idx].1.tx_set_hash.0);
+            let cur_hash = Hash256::from_bytes(decoded[i].1.tx_set_hash.0);
             if self.compare_tx_sets(&best_hash, &cur_hash, &candidates_hash)
                 == std::cmp::Ordering::Less
             {
@@ -1424,7 +1430,7 @@ impl ScpDriver {
         }
 
         // Step 5: Compose result
-        let mut result = decoded[best_idx].clone();
+        let mut result = decoded[best_idx].1.clone();
 
         // Replace upgrades with merged set (in order of upgrade type)
         let upgrade_bytes: Vec<stellar_xdr::curr::UpgradeType> = merged_upgrades
