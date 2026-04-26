@@ -27,48 +27,99 @@
 use crate::config::{
     AppConfig, CompatHttpConfig, DatabaseConfig, HistoryArchiveEntry, HistoryConfig, HttpConfig,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
+
+/// Top-level keys that `translate_stellar_core_config` actively translates.
+const SUPPORTED_KEYS: &[&str] = &[
+    "NODE_SEED",
+    "NODE_IS_VALIDATOR",
+    "MANUAL_CLOSE",
+    "NODE_HOME_DOMAIN",
+    "NETWORK_PASSPHRASE",
+    "DATABASE",
+    "BUCKET_DIR_PATH",
+    "HTTP_PORT",
+    "PUBLIC_HTTP_PORT",
+    "HTTP_QUERY_PORT",
+    "QUERY_SNAPSHOT_LEDGERS",
+    "QUERY_THREAD_POOL_SIZE",
+    "PEER_PORT",
+    "KNOWN_PEERS",
+    "PREFERRED_PEERS",
+    "METADATA_OUTPUT_STREAM",
+    "EMIT_SOROBAN_TRANSACTION_META_EXT_V1",
+    "EMIT_LEDGER_CLOSE_META_EXT_V1",
+    "EMIT_CLASSIC_EVENTS",
+    "ENABLE_SOROBAN_DIAGNOSTIC_EVENTS",
+    "ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION",
+    "PREFERRED_UPGRADE_PROTOCOL_VERSION",
+    "ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING",
+    "CATCHUP_COMPLETE",
+    "CATCHUP_RECENT",
+    "AUTOMATIC_MAINTENANCE_PERIOD",
+    "AUTOMATIC_MAINTENANCE_COUNT",
+    "ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING",
+    "GENESIS_TEST_ACCOUNT_COUNT",
+    "RUN_STANDALONE",
+    // Sub-tables (handled structurally)
+    "HISTORY",
+    "VALIDATORS",
+    "QUORUM_SET",
+];
+
+/// Valid stellar-core keys that henyey intentionally does not support.
+/// These are logged at `info` level rather than `warn`.
+const UNSUPPORTED_KNOWN_KEYS: &[&str] = &[
+    "UNSAFE_QUORUM",
+    "FORCE_SCP",
+    "DISABLE_XDR_FSYNC",
+    "FAILURE_SAFETY",
+    "COMMANDS",
+    "EXPERIMENTAL_BUCKETLIST_DB",
+    "EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT",
+    "EXPERIMENTAL_BUCKETLIST_DB_INDEX_CUTOFF",
+    "HOME_DOMAINS",
+    "TARGET_PEER_CONNECTIONS",
+    "MAX_ADDITIONAL_PEER_CONNECTIONS",
+    "MAX_PENDING_CONNECTIONS",
+    "PEER_AUTHENTICATION_TIMEOUT",
+    "PEER_TIMEOUT",
+    "PREFERRED_PEER_KEYS",
+    "PREFERRED_PEERS_ONLY",
+    "MINIMUM_IDLE_PERCENT",
+    "WORKER_THREADS",
+    "MAX_CONCURRENT_SUBPROCESSES",
+    "LOG_FILE_PATH",
+    "BUCKETLIST_DB_MEMORY_FOR_CACHING",
+    "BACKFILL_STELLAR_ASSET_EVENTS",
+];
+
+/// Recognized keys within `[[VALIDATORS]]` entries.
+const VALIDATOR_SUPPORTED_KEYS: &[&str] = &["NAME", "PUBLIC_KEY", "ADDRESS", "HISTORY"];
+const VALIDATOR_UNSUPPORTED_KEYS: &[&str] = &["HOME_DOMAIN", "QUALITY"];
+
+/// Recognized keys within `[QUORUM_SET]`.
+const QUORUM_SET_KEYS: &[&str] = &["THRESHOLD_PERCENT", "VALIDATORS"];
+
+/// Recognized keys within `[HISTORY.*]` entries.
+const HISTORY_ENTRY_KEYS: &[&str] = &["get", "put", "mkdir"];
 
 /// Detect whether a TOML string is in stellar-core format.
 ///
 /// Returns `true` if the top-level table contains at least one key that
-/// matches a known stellar-core uppercase config key.
+/// matches a known stellar-core uppercase config key (supported or
+/// unsupported-but-known).
 pub fn is_stellar_core_format(raw: &toml::Value) -> bool {
     let table = match raw.as_table() {
         Some(t) => t,
         None => return false,
     };
 
-    // Check for well-known stellar-core top-level keys
-    const STELLAR_CORE_KEYS: &[&str] = &[
-        "NETWORK_PASSPHRASE",
-        "HTTP_PORT",
-        "DATABASE",
-        "NODE_SEED",
-        "NODE_IS_VALIDATOR",
-        "METADATA_OUTPUT_STREAM",
-        "UNSAFE_QUORUM",
-        "PEER_PORT",
-        "HTTP_QUERY_PORT",
-        "BUCKET_DIR_PATH",
-        "RUN_STANDALONE",
-        "MANUAL_CLOSE",
-        "ENABLE_SOROBAN_DIAGNOSTIC_EVENTS",
-        "ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION",
-        "EMIT_SOROBAN_TRANSACTION_META_EXT_V1",
-        "EMIT_LEDGER_CLOSE_META_EXT_V1",
-        "EMIT_CLASSIC_EVENTS",
-        "CATCHUP_COMPLETE",
-        "CATCHUP_RECENT",
-        "FORCE_SCP",
-        "KNOWN_PEERS",
-        "PREFERRED_PEERS",
-        "PREFERRED_UPGRADE_PROTOCOL_VERSION",
-    ];
-
-    table
-        .keys()
-        .any(|k| STELLAR_CORE_KEYS.contains(&k.as_str()))
+    table.keys().any(|k| {
+        let key = k.as_str();
+        SUPPORTED_KEYS.contains(&key) || UNSUPPORTED_KNOWN_KEYS.contains(&key)
+    })
 }
 
 /// Translate a stellar-core format TOML config into a henyey `AppConfig`.
@@ -404,7 +455,138 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     // --- Ignored keys (accepted silently for compatibility) ---
     // UNSAFE_QUORUM, FORCE_SCP, DISABLE_XDR_FSYNC, etc.
 
+    warn_unrecognized_keys(table);
+
     Ok(config)
+}
+
+/// Result of classifying config keys as supported, unsupported-known, or unknown.
+#[derive(Debug, Default, PartialEq)]
+struct UnrecognizedKeys {
+    /// Valid stellar-core keys that henyey intentionally skips.
+    unsupported: Vec<String>,
+    /// Keys not in either supported or unsupported lists — likely typos.
+    unknown: Vec<String>,
+    /// Unknown keys found in `[[VALIDATORS]]` sub-tables (index, key).
+    validator_unknown: Vec<(usize, String)>,
+    /// Unknown keys found in `[QUORUM_SET]`.
+    quorum_set_unknown: Vec<String>,
+    /// Unknown keys found in `[HISTORY.*]` entries (archive name, key).
+    history_unknown: Vec<(String, String)>,
+}
+
+impl UnrecognizedKeys {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.unsupported.is_empty()
+            && self.unknown.is_empty()
+            && self.validator_unknown.is_empty()
+            && self.quorum_set_unknown.is_empty()
+            && self.history_unknown.is_empty()
+    }
+}
+
+/// Classify all keys in a stellar-core config table.
+fn classify_keys(table: &toml::map::Map<String, toml::Value>) -> UnrecognizedKeys {
+    let supported: HashSet<&str> = SUPPORTED_KEYS.iter().copied().collect();
+    let unsupported_set: HashSet<&str> = UNSUPPORTED_KNOWN_KEYS.iter().copied().collect();
+
+    let mut result = UnrecognizedKeys::default();
+
+    for key in table.keys() {
+        let k = key.as_str();
+        if supported.contains(k) {
+            // Known and handled.
+        } else if unsupported_set.contains(k) {
+            result.unsupported.push(key.clone());
+        } else {
+            result.unknown.push(key.clone());
+        }
+    }
+
+    // Sub-table: [[VALIDATORS]]
+    let val_supported: HashSet<&str> = VALIDATOR_SUPPORTED_KEYS.iter().copied().collect();
+    let val_unsupported: HashSet<&str> = VALIDATOR_UNSUPPORTED_KEYS.iter().copied().collect();
+    if let Some(validators) = table.get("VALIDATORS").and_then(|v| v.as_array()) {
+        for (i, val) in validators.iter().enumerate() {
+            if let Some(val_table) = val.as_table() {
+                for key in val_table.keys() {
+                    let k = key.as_str();
+                    if !val_supported.contains(k) && !val_unsupported.contains(k) {
+                        result.validator_unknown.push((i, key.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sub-table: [QUORUM_SET]
+    let qs_recognized: HashSet<&str> = QUORUM_SET_KEYS.iter().copied().collect();
+    if let Some(qs_table) = table.get("QUORUM_SET").and_then(|v| v.as_table()) {
+        for key in qs_table.keys() {
+            if !qs_recognized.contains(key.as_str()) {
+                result.quorum_set_unknown.push(key.clone());
+            }
+        }
+    }
+
+    // Sub-table: [HISTORY.*]
+    let hist_recognized: HashSet<&str> = HISTORY_ENTRY_KEYS.iter().copied().collect();
+    if let Some(history_table) = table.get("HISTORY").and_then(|v| v.as_table()) {
+        for (name, entry) in history_table {
+            if let Some(entry_table) = entry.as_table() {
+                for key in entry_table.keys() {
+                    if !hist_recognized.contains(key.as_str()) {
+                        result.history_unknown.push((name.clone(), key.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Warn about unrecognized keys in a stellar-core format config.
+///
+/// Classifies each top-level key as supported, unsupported-but-known, or
+/// unknown, and emits appropriate log messages. Also validates sub-table
+/// keys within `[[VALIDATORS]]`, `[QUORUM_SET]`, and `[HISTORY.*]`.
+fn warn_unrecognized_keys(table: &toml::map::Map<String, toml::Value>) {
+    let classified = classify_keys(table);
+
+    if !classified.unsupported.is_empty() {
+        tracing::info!(
+            keys = %classified.unsupported.join(", "),
+            "Compat config contains valid stellar-core keys not supported by henyey; ignoring"
+        );
+    }
+    if !classified.unknown.is_empty() {
+        tracing::warn!(
+            keys = %classified.unknown.join(", "),
+            "Unknown compat config keys (not recognized by henyey — check for typos)"
+        );
+    }
+    for (i, key) in &classified.validator_unknown {
+        tracing::warn!(
+            key = key.as_str(),
+            index = i,
+            "Unknown key in [[VALIDATORS]] entry (check for typos)"
+        );
+    }
+    for key in &classified.quorum_set_unknown {
+        tracing::warn!(
+            key = key.as_str(),
+            "Unknown key in [QUORUM_SET] (check for typos)"
+        );
+    }
+    for (name, key) in &classified.history_unknown {
+        tracing::warn!(
+            key = key.as_str(),
+            archive = name.as_str(),
+            "Unknown key in [HISTORY.{name}] entry (check for typos)"
+        );
+    }
 }
 
 /// Extract a base URL from a stellar-core curl command template.
@@ -432,43 +614,130 @@ fn extract_url_from_curl_cmd(cmd: &str) -> Option<String> {
 // --- Helper functions for typed value extraction ---
 
 fn get_str(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<String> {
-    table
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    let val = table.get(key)?;
+    match val.as_str() {
+        Some(s) => Some(s.to_string()),
+        None => {
+            tracing::warn!(
+                key,
+                actual_type = val.type_str(),
+                "Compat config key has wrong type (expected string)"
+            );
+            None
+        }
+    }
 }
 
 fn get_bool(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<bool> {
-    table.get(key).and_then(|v| v.as_bool())
+    let val = table.get(key)?;
+    match val.as_bool() {
+        Some(b) => Some(b),
+        None => {
+            tracing::warn!(
+                key,
+                actual_type = val.type_str(),
+                "Compat config key has wrong type (expected boolean)"
+            );
+            None
+        }
+    }
 }
 
 fn get_u16(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u16> {
-    table
-        .get(key)
-        .and_then(|v| v.as_integer())
-        .and_then(|i| u16::try_from(i).ok())
+    let val = table.get(key)?;
+    let i = match val.as_integer() {
+        Some(i) => i,
+        None => {
+            tracing::warn!(
+                key,
+                actual_type = val.type_str(),
+                "Compat config key has wrong type (expected integer)"
+            );
+            return None;
+        }
+    };
+    match u16::try_from(i) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                key,
+                value = i,
+                "Compat config key value overflows u16 range"
+            );
+            None
+        }
+    }
 }
 
 fn get_u32(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u32> {
-    table
-        .get(key)
-        .and_then(|v| v.as_integer())
-        .and_then(|i| u32::try_from(i).ok())
+    let val = table.get(key)?;
+    let i = match val.as_integer() {
+        Some(i) => i,
+        None => {
+            tracing::warn!(
+                key,
+                actual_type = val.type_str(),
+                "Compat config key has wrong type (expected integer)"
+            );
+            return None;
+        }
+    };
+    match u32::try_from(i) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                key,
+                value = i,
+                "Compat config key value overflows u32 range"
+            );
+            None
+        }
+    }
 }
 
 fn get_usize(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<usize> {
-    table
-        .get(key)
-        .and_then(|v| v.as_integer())
-        .and_then(|i| usize::try_from(i).ok())
+    let val = table.get(key)?;
+    let i = match val.as_integer() {
+        Some(i) => i,
+        None => {
+            tracing::warn!(
+                key,
+                actual_type = val.type_str(),
+                "Compat config key has wrong type (expected integer)"
+            );
+            return None;
+        }
+    };
+    match usize::try_from(i) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                key,
+                value = i,
+                "Compat config key value overflows usize range"
+            );
+            None
+        }
+    }
 }
 
 fn get_string_array(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<Vec<String>> {
-    table.get(key).and_then(|v| v.as_array()).map(|arr| {
-        arr.iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect()
-    })
+    let val = table.get(key)?;
+    match val.as_array() {
+        Some(arr) => Some(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+        ),
+        None => {
+            tracing::warn!(
+                key,
+                actual_type = val.type_str(),
+                "Compat config key has wrong type (expected array)"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1270,5 +1539,173 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
             !config.is_networked_validator(),
             "Standalone validator should not be treated as networked"
         );
+    }
+
+    // --- Unknown key detection tests ---
+
+    #[test]
+    fn test_classify_all_supported_keys_no_warnings() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            HTTP_PORT = 11626
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            NODE_IS_VALIDATOR = false
+            "#,
+        )
+        .unwrap();
+        let table = core_toml.as_table().unwrap();
+        let classified = classify_keys(table);
+        assert!(
+            classified.is_empty(),
+            "All supported keys should produce no warnings: {classified:?}"
+        );
+    }
+
+    #[test]
+    fn test_classify_unsupported_known_keys() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            UNSAFE_QUORUM = true
+            FORCE_SCP = true
+            FAILURE_SAFETY = 0
+            "#,
+        )
+        .unwrap();
+        let table = core_toml.as_table().unwrap();
+        let classified = classify_keys(table);
+        assert_eq!(classified.unsupported.len(), 3);
+        assert!(classified
+            .unsupported
+            .contains(&"UNSAFE_QUORUM".to_string()));
+        assert!(classified.unsupported.contains(&"FORCE_SCP".to_string()));
+        assert!(classified
+            .unsupported
+            .contains(&"FAILURE_SAFETY".to_string()));
+        assert!(classified.unknown.is_empty());
+    }
+
+    #[test]
+    fn test_classify_unknown_keys_detected() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            HTPP_PORT = 11626
+            TOTALLY_MADE_UP = true
+            "#,
+        )
+        .unwrap();
+        let table = core_toml.as_table().unwrap();
+        let classified = classify_keys(table);
+        assert_eq!(classified.unknown.len(), 2);
+        assert!(classified.unknown.contains(&"HTPP_PORT".to_string()));
+        assert!(classified.unknown.contains(&"TOTALLY_MADE_UP".to_string()));
+    }
+
+    #[test]
+    fn test_classify_validator_unknown_keys() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            [[VALIDATORS]]
+            NAME = "test"
+            PUBLIC_KEY = "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y"
+            BOGUS_FIELD = "hello"
+            "#,
+        )
+        .unwrap();
+        let table = core_toml.as_table().unwrap();
+        let classified = classify_keys(table);
+        assert!(classified.unknown.is_empty(), "Top-level should be clean");
+        assert_eq!(classified.validator_unknown.len(), 1);
+        assert_eq!(
+            classified.validator_unknown[0],
+            (0, "BOGUS_FIELD".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_quorum_set_unknown_keys() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["$self"]
+            INNER_QUORUM_SETS = []
+            "#,
+        )
+        .unwrap();
+        let table = core_toml.as_table().unwrap();
+        let classified = classify_keys(table);
+        assert_eq!(classified.quorum_set_unknown.len(), 1);
+        assert_eq!(classified.quorum_set_unknown[0], "INNER_QUORUM_SETS");
+    }
+
+    #[test]
+    fn test_classify_history_unknown_keys() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            [HISTORY.sdf1]
+            get = "curl -sf https://example.com/{0} -o {1}"
+            unknown_field = "oops"
+            "#,
+        )
+        .unwrap();
+        let table = core_toml.as_table().unwrap();
+        let classified = classify_keys(table);
+        assert_eq!(classified.history_unknown.len(), 1);
+        assert_eq!(
+            classified.history_unknown[0],
+            ("sdf1".to_string(), "unknown_field".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ssc_config_has_expected_unsupported_keys() {
+        // The SSC fixture contains keys like EXPERIMENTAL_BUCKETLIST_DB,
+        // COMMANDS, etc. — these should be classified as unsupported-known,
+        // not unknown.
+        let fixture = include_str!("compat_http/test_fixtures/ssc_generated_config.cfg");
+        let raw: toml::Value = toml::from_str(fixture).unwrap();
+        let table = raw.as_table().unwrap();
+        let classified = classify_keys(table);
+        // The SSC fixture has EXPERIMENTAL_BUCKETLIST_DB, COMMANDS, etc.
+        assert!(
+            classified.unknown.is_empty(),
+            "SSC fixture should have no truly unknown keys, but found: {:?}",
+            classified.unknown
+        );
+    }
+
+    #[test]
+    fn test_type_mismatch_does_not_error() {
+        // Giving HTTP_PORT a string instead of integer should not crash,
+        // just skip it (with a warning).
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            HTTP_PORT = "not_a_number"
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        // HTTP_PORT was not parsed, so compat_http should use defaults
+        assert!(!config.compat_http.enabled);
+    }
+
+    #[test]
+    fn test_is_stellar_core_format_detects_unsupported_only_configs() {
+        // A config that only has UNSAFE_QUORUM (unsupported-known) should
+        // still be detected as stellar-core format.
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            UNSAFE_QUORUM = true
+            "#,
+        )
+        .unwrap();
+        assert!(is_stellar_core_format(&core_toml));
     }
 }
