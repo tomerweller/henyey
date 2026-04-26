@@ -56,21 +56,14 @@ recovery is considered complete regardless):
 
 1. **Rotation signal**: the most recent log rotation in the session's
    `logs/` dir is a `.crashed-*`, `.stuck-*`, or `.frozen-*` (not a
-   planned `.preredeploy-*`). Uses `find` (not shell globs) to avoid
-   zsh `NO_NOMATCH` failing the pipeline. Anchors to "most recent
-   rotation type" rather than a narrow timing window — the old 60s
-   window missed the rebuild-then-restart workflow where minutes
-   elapse between log rotation and process start.
+   planned `.preredeploy-*`). Use `find` (not shell globs) to avoid
+   zsh `NO_NOMATCH` failing the pipeline.
 
 2. **Active-catchup signal** (fires even when the rotation was
    `.preredeploy-*`): the node is in `Catching Up` state AND uptime
-   exceeds 5 minutes. Normal clean-restart catchup (a few ledgers
-   missed during a build) finishes within 2-3 minutes. If the node is
-   still catching up past 5 minutes, the persisted lcl is more than a
-   few-minutes stale — which is the condition the extended deadline is
-   meant for. This handles the case where a manual planned restart
+   exceeds 5 minutes. Handles the case where a manual planned restart
    (which rotates as `preredeploy-*`) happens AFTER a wedge, leaving
-   the lcl hours stale.
+   the persisted lcl hours stale.
 
 ```bash
 CRASH_RECOVERY=no
@@ -103,15 +96,36 @@ if [ -n "$PID" ]; then
 fi
 ```
 
-When `CRASH_RECOVERY=yes` and `FRESH_START=no`, extend the sync deadline to
-60m and qualify the SYNC FAILURE check with a progress signal: if lcl has
-advanced by ≥ 500 ledgers since the previous tick's tracker, the node is
-replaying, not stuck — report CATCHING UP. Flag SYNC FAILURE only when
-lcl has NOT advanced OR the 60m extended deadline is exceeded.
-
-Clean-restart cases (no crash rotation matched) keep the 15m deadline.
+When `CRASH_RECOVERY=yes` and `FRESH_START=no`, the active sync deadline
+extends to 60m and a progress carveout applies (see check (2)).
 
 ## Health checks
+
+### Common procedures
+
+Several checks share these procedures — define once, reference by name:
+
+**Stop-PID** (graceful kill, fall through to SIGKILL):
+```bash
+kill "$PID"; for i in $(seq 1 10); do sleep 1; kill -0 "$PID" 2>/dev/null || break; done
+kill -0 "$PID" 2>/dev/null && kill -9 "$PID" && sleep 2
+```
+
+**Relaunch** (preserves log via append redirection, clears any stale lockfile):
+```bash
+rm -f /home/tomer/data/mainnet/mainnet.lock
+RUST_LOG=info nohup /home/tomer/data/$MONITOR_SESSION_ID/cargo-target/release/henyey \
+  --mainnet run $MONITOR_RUN_FLAGS -c $MONITOR_CONFIG \
+  >> /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log 2>&1 &
+```
+
+**Rotate-log** (preserve prior session's log under the given suffix):
+```bash
+mv /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log \
+   /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log.<suffix>-$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true
+```
+Suffix per origin: `crashed` (process found dead), `frozen` (wedge per 3b),
+`preredeploy` (planned restart for deploy).
 
 **(1) Log scan** — `tail -n 500 /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log`.
 Scan for hash mismatches ("hash mismatch", "HashMismatch", differing expected/actual
@@ -138,111 +152,65 @@ ticks so STUCK can be detected by a single invocation:
 - Check node uptime: `ps -o etime= -p $(pgrep -f 'henyey.*run' | head -1)`.
   Active deadline: **15m** when `FRESH_START=no` and `CRASH_RECOVERY=no`,
   **60m** when `CRASH_RECOVERY=yes`, **4h** when `FRESH_START=yes`.
-- If uptime exceeds the active deadline and the node is not yet in real-time sync:
-  check the latest Heartbeat for the gap between `ledger` and `latest_ext` —
-  if gap > 5, or if RPC status is `unhealthy` (i.e. `age` > 30s), or if
-  `heard_from_quorum=false`, flag SYNC FAILURE.
+- "Real-time sync" means RPC `age < 30s` — NOT just Heartbeat `gap=0`. Gap is
+  the node's local view (`latest_ext - ledger`) and can stay at 0 even when
+  the node is minutes behind the network. The authoritative wall-clock signal
+  is RPC `age`.
+- If uptime exceeds the active deadline AND the node is not in real-time sync:
+  flag SYNC FAILURE if `gap > 5`, or `age > 30s`, or `heard_from_quorum=false`
+  in the latest Heartbeat. Investigate the catchup path (checkpoint-boundary
+  stalls, hash mismatches, event-loop freezes); do not just wait.
 - **Progress carveout (only when `CRASH_RECOVERY=yes`)**: if lcl has advanced
   by ≥ 500 ledgers since the previous tick's `last_ledger`, the node is
-  actively replaying — report CATCHING UP (no SYNC FAILURE) regardless of
-  uptime. When lcl stops advancing AND uptime exceeds 60m, flag SYNC FAILURE.
+  actively replaying — report CATCHING UP regardless of uptime. Flag SYNC
+  FAILURE only when lcl stops advancing AND uptime exceeds 60m.
+- **Fresh-start carveout (`FRESH_START=yes`, uptime < 4h)**: a large gap is
+  expected during initial bucket apply — report CATCHING UP, not SYNC FAILURE.
 
-**"Real-time sync" means `age < 30s`, NOT just Heartbeat gap=0** — gap is the
-node's local view (`latest_ext - ledger`) and stays at 0 even when the node is
-minutes behind the network if it hasn't received those externalization messages
-yet. The authoritative wall-clock signal is RPC `age`. If `age` is persistently
-> 30s for a non-fresh-start node past the 15m deadline, the node is lagging
-network tip; treat as SYNC FAILURE even with gap=0 and heard_from_quorum=true.
-Do NOT report this as a WARNING and wait. Investigate the catchup path: check
-for checkpoint-boundary stalls ("failed to download header"), hash mismatches,
-or event loop freezes in the log. If `FRESH_START=yes` and uptime is under 4h,
-a large gap is expected — report CATCHING UP instead of SYNC FAILURE.
-
-**(3) Process alive** — `pgrep -af 'henyey.*run'`. If not running, before relaunching:
-
-1. `rm -f /home/tomer/data/mainnet/mainnet.lock` to clear any stale lockfile.
-2. Preserve the prior session's log:
-   `mv /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log.crashed-$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true`
-3. Relaunch with append redirection so interleaving restart pathways don't nuke history:
-   ```
-   RUST_LOG=info nohup /home/tomer/data/$MONITOR_SESSION_ID/cargo-target/release/henyey \
-     --mainnet run $MONITOR_RUN_FLAGS -c $MONITOR_CONFIG \
-     >> /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log 2>&1 &
-   ```
+**(3) Process alive** — `pgrep -af 'henyey.*run'`. If not running:
+Rotate-log with suffix `crashed`, then Relaunch.
 
 **(3b) Wedge detection** — a process can be alive but have a frozen event
 loop (watchdog fires, HTTP hangs, ledger progression stops). Check 3 alone
-misses this because `pgrep` still finds the PID. Detect and remediate:
+misses this because `pgrep` still finds the PID.
 
-1. Is the event loop frozen? `grep 'WATCHDOG: Event loop appears frozen'
-   $LOG | tail -1` — if present AND its timestamp is within the last 120s,
-   the watchdog is currently firing.
-2. Is HTTP hung? `curl -s -m 3 http://localhost:$MONITOR_ADMIN_PORT/info`
-   returns empty body or times out.
+Flag WEDGE when BOTH:
+1. `grep 'WATCHDOG: Event loop appears frozen' $LOG | tail -1` is present
+   with a timestamp within the last 120s.
+2. `curl -s -m 3 http://localhost:$MONITOR_ADMIN_PORT/info` returns empty
+   body or times out.
 
-If BOTH hold, flag WEDGE and execute the kill+relaunch path, rotating the
-log as `.frozen-<ts>` (NOT `.crashed-<ts>`) so the next tick's crash-
-recovery signal 1 matches:
-
-```bash
-PID=$(pgrep -f 'henyey.*run' | head -1)
-kill "$PID"; for i in $(seq 1 10); do sleep 1; kill -0 "$PID" 2>/dev/null || break; done
-kill -0 "$PID" 2>/dev/null && kill -9 "$PID" && sleep 2
-rm -f /home/tomer/data/mainnet/mainnet.lock
-mv /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log \
-   /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log.frozen-$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true
-RUST_LOG=info nohup /home/tomer/data/$MONITOR_SESSION_ID/cargo-target/release/henyey \
-  --mainnet run $MONITOR_RUN_FLAGS -c $MONITOR_CONFIG \
-  >> /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log 2>&1 &
-```
-
-Wedges are a known recurring symptom (see #1904, #1873, #1921). Always
-file a new `urgent`-labeled issue referencing the most recent related one
-(wedge blocks validator operation — meets urgent criteria) —
-recurrence-after-fix → NEW issue, not a comment on a closed one.
+On WEDGE: Stop-PID, Rotate-log with suffix `frozen`, then Relaunch.
+Always file a new `urgent`-labeled issue (wedge blocks validator operation).
+Recurrence-after-fix → NEW issue, not a comment on a closed one. Known prior
+incidents: #1904, #1873, #1921, #1949.
 
 **(4) Memory** — `ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1)`, convert to MB.
 
 - If `RSS > 12 GB`, flag HIGH MEMORY (report-only; no restart).
-- **Restart condition** (restart only if ALL of the following hold):
+- **Restart condition** — restart only if ALL hold (this gates on system
+  pressure AND evidence of a real heap leak, so we don't kill a legit catchup):
   1. `RSS > 16 GB`, AND
-  2. system `available` memory (from `free -m`) `< 8 GB`, AND
+  2. system `available` memory from `free -m` (NOT `free` — that excludes
+     reclaimable kernel cache) `< 8 GB`, AND
   3. latest two `Memory report summary` entries both show `heap_components_mb`
-     above the earlier snapshot by > 500 MB (i.e. heap is actively growing,
-     not just file cache or transient replay state).
-- Restart procedure: `kill <PID>`, wait 10s, `kill -9` if still alive, then
-  relaunch as in check 3.
-
-Rationale: the old rule (`RSS > 16 GB OR available < 4 GB`) fired on legitimate
-catchup transients (large file_rss from bucket reads, transient unaccounted
-jemalloc state) and restarting during catchup discards replay progress and
-makes recovery worse. The tightened condition gates on (a) memory pressure
-at the system level, AND (b) evidence of a real heap leak, so the safety net
-fires only when needed. Use the `available` column — NOT `free` — to avoid
-false positives from reclaimable kernel cache.
+     growing by > 500 MB vs the earlier snapshot.
+- Restart: Stop-PID, Rotate-log suffix `crashed`, Relaunch.
 
 **(5) Disk** — `df -h /home/tomer/data | tail -1`. If usage > 85%, flag LOW DISK.
-Then clean up old rotated log archives (keep 3 most recent per category):
+Then keep the 3 most recent rotated archives per category (the ISO 8601
+timestamp suffix sorts lexicographically, so `sort -r` gives newest-first;
+use `find -printf` not shell glob to survive zsh `NO_NOMATCH`):
 
 ```bash
-if test -d /home/tomer/data/$MONITOR_SESSION_ID/logs; then
-  logs_dir=/home/tomer/data/$MONITOR_SESSION_ID/logs
-  for pat in preredeploy crashed stuck frozen; do
-    find "$logs_dir" -maxdepth 1 -type f -name "monitor.log.$pat-*" \
-      -printf '%f\n' 2>/dev/null \
-      | sort -r | tail -n +4 \
-      | while read -r f; do rm -f "$logs_dir/$f"; done
-  done
-fi
+logs_dir=/home/tomer/data/$MONITOR_SESSION_ID/logs
+[ -d "$logs_dir" ] && for pat in preredeploy crashed stuck frozen; do
+  find "$logs_dir" -maxdepth 1 -type f -name "monitor.log.$pat-*" \
+    -printf '%f\n' 2>/dev/null | sort -r | tail -n +4 \
+    | while read -r f; do rm -f "$logs_dir/$f"; done
+done
 ```
-
-Uses `find -printf` (not shell glob) to avoid zsh `NO_NOMATCH` aborting the
-pipeline when a category has no files — the earlier `ls glob | tail` form
-printed `no matches found` and silently skipped cleanup for the remaining
-categories. The ISO 8601 timestamp suffix sorts lexicographically, so
-`sort -r` gives newest-first; `tail -n +4` skips the 3 newest and emits
-the rest for deletion. Includes `frozen` so wedge-rotations are also
-capped at 3 retained. Report how many files were removed if any.
+Report how many files were removed if any.
 
 **(6) Session disk** — `du -sh /home/tomer/data/$MONITOR_SESSION_ID/`
 and `du -sh /home/tomer/data/mainnet/`. If combined > 200 GB, flag SESSION DISK HIGH.
@@ -288,58 +256,63 @@ against a node that is in real-time sync with age=2s).
 1. `mkdir -p /home/tomer/data/$MONITOR_SESSION_ID/metrics`.
 2. `mv /home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom /home/tomer/data/$MONITOR_SESSION_ID/metrics/prev.prom 2>/dev/null || true`.
 3. `curl -s http://localhost:$MONITOR_ADMIN_PORT/metrics > /home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom`.
-4. Restart detection: for any counter, if `current < prev`, treat delta as
-   `current` (node restarted this tick or last tick). For the first 2 ticks
-   after a detected restart (from check 3 or check 10, or `CRASH_RECOVERY=yes`),
-   skip the following alerts (warmup allowance — overlay handshake + jemalloc
-   arena stabilization + from-zero counters take ~10 minutes to settle):
-   - `henyey_jemalloc_fragmentation_pct > 50` (post-restart fragmentation
-     ramps from ~35-45% and settles to ~18% within 2 ticks)
-   - `stellar_peer_count < 8` (authenticated peer count ramps from 0 → 5 → 10+
-     over the first 10 minutes as overlay handshakes complete)
-   - counter-started-at-zero delta alerts
+4. **Counter reset handling**: for any counter, if `current < prev`, treat
+   `delta = current` (process restarted).
+
+**Post-restart warmup exemptions** — for the first 2 ticks after a detected
+restart (check 3, check 10, or `CRASH_RECOVERY=yes`), skip these alerts.
+Overlay handshake + jemalloc arena stabilization + from-zero counters take
+~10 minutes to settle.
+
+- `henyey_jemalloc_fragmentation_pct > 50` (post-restart frag ramps ~35-45%, settles to ~18%)
+- `stellar_peer_count < 8` (peer count ramps 0 → 10+ over the first 10 min)
+- `stellar_overlay_inbound_authenticated < 3`
+- `stellar_scp_timing_externalized_seconds > 3`
+- `stellar_scp_timing_nominated_seconds > 2`
+- counter-started-at-zero delta alerts (any catalog entry whose `prev` is 0)
 
 ### Metric alert catalog
 
-**COUNTERS** (fire on `delta ≥ threshold`):
+Catalog-wide notes:
+- All entries below are subject to the warmup exemptions above and the cooldown
+  rule in §Firing alerts.
+- "Synced-only gating" = `uptime > 15m AND CRASH_RECOVERY=no AND FRESH_START=no`.
+  These gauges fire only when the node should be in real-time sync; the
+  authoritative sync check is (2). The catchup phases are legitimate
+  non-synced states.
+
+**COUNTERS** (fire on `delta ≥ threshold` per tick):
 
 - `stellar_herder_lost_sync_total` ≥1 → SYNC
 - `henyey_post_catchup_hard_reset_total` ≥1 → ACTION
-- `delta(henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"})` ≥1 → WARN
-  - **Labeled counter** — uses Form 2 extraction (single labeled series; see §Metric extraction forms).
-  - Only alerts on `forcing_catchup_behind` — the node is behind consensus AND the recovery loop timed out and forced a catchup.
-  - Excludes `backoff_active` (informational, increments routinely on every 10s tick during 60s backoff windows).
-  - Excludes `forcing_catchup_not_behind` (demoted to debug; the fast-track caller emits its own WARN before entering this path, so double-alerting adds noise).
-  - **Alert identity**: use the selector-qualified name `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}` in cooldown keys, issue-search/title keys, and status text.
+- `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}` ≥1 → WARN
+  (Form 2 extraction; alert identity = the full selector-qualified name. Other
+  reasons are informational/duplicative — `backoff_active` ticks routinely;
+  `forcing_catchup_not_behind` is debug; the fast-track caller emits its own WARN.)
 - `(stellar_overlay_timeout_idle_total + stellar_overlay_timeout_straggler_total)` ≥5× prior-tick-sum → WARN
 - `(stellar_overlay_error_read_total + stellar_overlay_error_write_total)` ≥50 → WARN
 - `henyey_archive_cache_refresh_error_total` ≥1 → NONC
 - `henyey_archive_cache_refresh_timeout_total` ≥3 → NONC
 
-`stellar_ledger_apply_failure_total`, `henyey_scp_post_verify_drops_total`, and
-`stellar_herder_pending_too_old_total` are
-**no longer checked as absolute-delta counters** — they are covered by the ratio
-checks below, which are traffic-proportional and self-calibrating.
+`stellar_ledger_apply_failure_total`, `henyey_scp_post_verify_drops_total`,
+and `stellar_herder_pending_too_old_total` are covered by the ratio checks
+below (traffic-proportional and self-calibrating); do NOT check absolute deltas.
 
 **GAUGES** (fire on absolute threshold against current snapshot):
 
 - `stellar_peer_count` <8 → WARN
+- `stellar_overlay_inbound_authenticated` <3 → WARN (synced-only gating; healthy fleet has 50+ inbound. Aggregate `peer_count` can be ≥8 from outbound while inbound starves consensus; this catches that case)
+- `stellar_ledger_age_current_seconds` >30 → SYNC (synced-only gating)
+- `stellar_herder_state` !=2 → SYNC (synced-only gating)
 - `henyey_jemalloc_fragmentation_pct` >50 on two consecutive ticks → WARN
-- `stellar_ledger_age_current_seconds` >30 when uptime >15m AND `CRASH_RECOVERY=no` AND `FRESH_START=no` → SYNC (during `CRASH_RECOVERY=yes` age is legitimately large while replay catches up; during clean post-restart bucket-apply / short-gap replay age is also legitimately large until catchup completes. The authoritative sync check is (2), with its deadline and progress carveout — this gauge is a secondary signal gated to the same 15m window as `stellar_herder_state`)
-- `stellar_herder_state` !=2 when uptime >15m AND `CRASH_RECOVERY=no` AND `FRESH_START=no` → SYNC (during crash-recovery the node is legitimately in state=1 Catching Up until replay completes)
-- `henyey_scp_verify_input_backlog` >100 on two consecutive ticks → WARN (single snapshots
-  routinely spike to 100+ during slot externalize bursts and drain to 0 within 1-2 seconds — gate
-  on persistence, matching the `fragmentation_pct` pattern. Verify by sampling /metrics 5 times
-  at 2s intervals before filing; a real backpressure event holds steady, a normal burst returns
-  to 0.)
+- `henyey_scp_verify_input_backlog` >100 on two consecutive ticks → WARN (single snapshots routinely spike to 100+ during slot externalize bursts and drain to 0 within seconds — gate on persistence. Sample /metrics 5x at 2s intervals to verify before filing)
 - `henyey_scp_verifier_thread_state` !=0 → WARN (0=Running, 1=Stopping, 2=Dead)
 - `stellar_herder_pending_envelopes` >2000 → WARN
 - `henyey_overlay_fetch_channel_depth_max` >500 → WARN
 - `(henyey_process_open_fds / henyey_process_max_fds)` >0.85 → WARN
 - `henyey_herder_drift_max_seconds` >10 → NONC
-- `stellar_scp_timing_externalized_seconds` >3 → WARN (per #1934: healthy stellar-core ~0.35s; >3s leaves <2s headroom against the 5s ledger slot — sustained breach risks falling out of sync). Skip during the 2-tick post-restart warmup since first-slot externalize is naturally elevated.
-- `stellar_scp_timing_nominated_seconds` >2 → WARN (per #1934: healthy ~0.78s; >2s indicates message-propagation lag from low peer count or overlay backpressure). Same warmup carveout.
-- `stellar_overlay_inbound_authenticated` <3 when `uptime >15m` AND `CRASH_RECOVERY=no` AND `FRESH_START=no` → WARN (per #1934: healthy fleet has 50+ inbound; <3 means other validators aren't connecting *to* us, forcing all SCP messages via long relay chains. Aggregate `stellar_peer_count` can still be ≥8 from outbound while inbound starves consensus — this gauge catches that case the aggregate misses).
+- `stellar_scp_timing_externalized_seconds` >3 → WARN (per #1934: healthy stellar-core ~0.35s; >3s leaves <2s headroom on the 5s slot)
+- `stellar_scp_timing_nominated_seconds` >2 → WARN (per #1934: healthy ~0.78s; >2s indicates message-propagation lag)
 
 `quorum_agree` / `quorum_missing` / `quorum_fail_at` are intentionally NOT
 monitored — they snapshot the tracking slot's QuorumInfo and return
@@ -546,32 +519,10 @@ for v in "$pending_too_old" "$pending_received"; do
   fi
 done
 
-# Labeled counter: henyey_recovery_stalled_tick_total
-# Validate expected 3-label set — skip alert entirely if mismatch
-recovery_stalled_labels=$(echo "$metrics_body" | grep -oP '^henyey_recovery_stalled_tick_total\{reason="\K[^"]+' | sort)
-recovery_stalled_expected=$(printf '%s\n' backoff_active forcing_catchup_behind forcing_catchup_not_behind | sort)
-recovery_stalled_valid=true
-if [ "$recovery_stalled_labels" != "$recovery_stalled_expected" ]; then
-  recovery_stalled_valid=false
-  # report: recovery_stalled: skipped (label set mismatch: expected {backoff_active, forcing_catchup_behind, forcing_catchup_not_behind}, got {$recovery_stalled_labels})
-fi
-
-# Form 2 extraction — single label: forcing_catchup_behind
-if [ "$recovery_stalled_valid" = true ]; then
-  recovery_stalled_cur=$(echo "$metrics_body" | grep -E '^henyey_recovery_stalled_tick_total\{reason="forcing_catchup_behind"\} ' | awk '{printf "%d", $2}')
-  recovery_stalled_prev=$(grep -E '^henyey_recovery_stalled_tick_total\{reason="forcing_catchup_behind"\} ' \
-    /home/tomer/data/$MONITOR_SESSION_ID/metrics/prev.prom 2>/dev/null | awk '{printf "%d", $2}')
-  recovery_stalled_prev=${recovery_stalled_prev:-0}
-
-  # Per-series counter-reset handling (identical to scalar counters)
-  if [ "$recovery_stalled_cur" -lt "$recovery_stalled_prev" ]; then
-    recovery_stalled_delta=$recovery_stalled_cur
-  else
-    recovery_stalled_delta=$((recovery_stalled_cur - recovery_stalled_prev))
-  fi
-  # Alert if delta ≥ 1 (subject to warmup skip — first 2 ticks after restart)
-  # Alert identity: henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}
-fi
+# henyey_recovery_stalled_tick_total: extract via Form 2 (see §Metric extraction
+# forms). Validate expected 3-label set {backoff_active, forcing_catchup_behind,
+# forcing_catchup_not_behind}; skip the alert entirely on mismatch. Alert when
+# the delta of the forcing_catchup_behind series ≥ 1.
 ```
 
 **Check 1: SCP post-verify acceptance rate**
@@ -697,10 +648,8 @@ If they differ (origin/main is ahead):
    through check (11) and wait.
 3. If all conclusions are `success` (ignore `""` for in-progress and `cancelled`):
    `git pull --rebase`, `CARGO_TARGET_DIR=/home/tomer/data/$MONITOR_SESSION_ID/cargo-target cargo build --release -p henyey`.
-4. If build succeeds: preserve the log, then kill the node (`kill <PID>`,
-   wait 10s, `kill -9` if still alive), restart with the launch command from
-   check (3) (append redirection), report:
-   `DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>`.
+4. If build succeeds: Stop-PID, Rotate-log suffix `preredeploy`, Relaunch.
+   Report: `DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>`.
 5. If build fails: report `BUILD FAILED`, do NOT restart — the old binary is
    still running. Route the build error through check (11).
 
