@@ -24,6 +24,7 @@
 //! - [`ExternalizedSlot`]: Records a slot that has reached consensus
 //! - [`PendingTxSet`]: Tracks transaction sets we need but haven't received yet
 
+use crate::externalize_lag::ExternalizeLagTracker;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -276,6 +277,9 @@ pub struct ScpDriver {
     nomination_started_at: RwLock<HashMap<SlotIndex, std::time::Instant>>,
     /// Timing snapshot for the most recently externalized slot.
     last_externalize_timing: RwLock<Option<ExternalizeTimingSnapshot>>,
+    /// Externalize lag tracker for per-node lag statistics.
+    /// Mirrors stellar-core's `mQSetLag` in `HerderSCPDriver`.
+    externalize_lag: RwLock<ExternalizeLagTracker>,
 }
 
 /// Timing snapshot for the most recently externalized slot.
@@ -319,6 +323,7 @@ impl ScpDriver {
             slot_first_seen: RwLock::new(HashMap::new()),
             nomination_started_at: RwLock::new(HashMap::new()),
             last_externalize_timing: RwLock::new(None),
+            externalize_lag: RwLock::new(ExternalizeLagTracker::new()),
         }
     }
 
@@ -575,6 +580,41 @@ impl ScpDriver {
     /// Full timing snapshot for the most recently externalized slot.
     pub fn last_externalize_timing(&self) -> Option<ExternalizeTimingSnapshot> {
         *self.last_externalize_timing.read()
+    }
+
+    /// Record an SCP externalize event for the local node (self-event).
+    ///
+    /// Sets the first-externalize baseline for this slot.
+    /// Mirrors stellar-core's `recordSCPExternalizeEvent(slotIndex, localNodeID, false)`.
+    pub fn record_self_externalize_event(&self, slot: SlotIndex) {
+        let self_node = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*self.config.node_id.as_bytes()),
+        ));
+        self.externalize_lag.write().record_event(
+            slot,
+            &self_node,
+            true,
+            std::time::Instant::now(),
+        );
+    }
+
+    /// Record an SCP externalize event for a peer node.
+    ///
+    /// Records `now - first_externalize[slot]` as a lag sample.
+    /// Mirrors stellar-core's `recordSCPExternalizeEvent(slotIndex, nodeID, false)`.
+    pub fn record_peer_externalize_event(&self, slot: SlotIndex, node_id: &NodeId) {
+        self.externalize_lag
+            .write()
+            .record_event(slot, node_id, false, std::time::Instant::now());
+    }
+
+    /// Get the summary lag info for the local quorum set.
+    ///
+    /// Returns the average of 75th-percentile lags across quorum set nodes
+    /// with lag > 0. Returns `None` if no nodes have positive lag.
+    pub fn get_qset_lag_info_summary(&self) -> Option<u64> {
+        let qset = self.get_local_quorum_set()?;
+        self.externalize_lag.read().get_lag_info_summary(&qset)
     }
 
     /// Elapsed time since the first SCP activity was recorded for `slot`.
@@ -1912,8 +1952,17 @@ impl ScpDriver {
 
         // Remove oldest
         let to_remove = externalized.len() - keep_count;
+        let mut removed_slots = Vec::with_capacity(to_remove);
         for slot in slots.into_iter().take(to_remove) {
             externalized.remove(&slot);
+            removed_slots.push(slot);
+        }
+        drop(externalized);
+
+        // Clean up lag tracker entries for evicted slots
+        let mut lag = self.externalize_lag.write();
+        for slot in removed_slots {
+            lag.cleanup_slot(slot);
         }
     }
 
@@ -1938,6 +1987,7 @@ impl ScpDriver {
         // heard_from_quorum(). See #1874.
         self.slot_first_seen.write().clear();
         self.nomination_started_at.write().clear();
+        self.externalize_lag.write().clear_slots();
 
         if tx_sizes.cache > 0 || tx_sizes.pending > 0 || externalized_count > 0 {
             tracing::info!(
@@ -1970,6 +2020,11 @@ impl ScpDriver {
         self.nomination_started_at
             .write()
             .retain(|&s, _| s > keep_after_slot);
+        // cleanup_slots_below uses >= (keep slots >= slot), but here we want
+        // to keep slots > keep_after_slot, so pass keep_after_slot + 1.
+        self.externalize_lag
+            .write()
+            .cleanup_slots_below(keep_after_slot + 1);
 
         let kept_pending = self.tx_tracker.pending_count();
         let kept_externalized = tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).len();
@@ -2005,6 +2060,7 @@ impl ScpDriver {
         // Clean up timing maps for old slots
         self.slot_first_seen.write().retain(|&s, _| s >= slot);
         self.nomination_started_at.write().retain(|&s, _| s >= slot);
+        self.externalize_lag.write().cleanup_slots_below(slot);
 
         // Clean up pending tx set requests for old slots
         self.cleanup_old_pending_slots(slot);
@@ -2603,6 +2659,9 @@ impl SCPDriver for HerderScpCallback {
     }
 
     fn value_externalized(&self, slot_index: u64, value: &Value) {
+        // Record first-externalize baseline BEFORE processing.
+        // Mirrors stellar-core line 915: recordSCPExternalizeEvent(self, false)
+        self.driver.record_self_externalize_event(slot_index);
         self.driver.record_externalized(slot_index, value.clone());
     }
 

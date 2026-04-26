@@ -428,6 +428,7 @@ mod tests {
                 missing: 1,
                 delayed: 0,
                 ledger: 42,
+                lag_ms: None,
             },
             transitive: None,
         };

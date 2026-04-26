@@ -108,6 +108,7 @@
 pub mod dead_node_tracker;
 pub mod drift_tracker;
 mod error;
+mod externalize_lag;
 pub(crate) mod fetching_envelopes;
 pub mod flow_control;
 mod herder;

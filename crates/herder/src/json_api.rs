@@ -333,6 +333,10 @@ pub struct InfoQuorumSetSnapshot {
     pub delayed: u64,
     /// Slot index (ledger sequence number).
     pub ledger: u64,
+    /// Externalize lag in ms (average of 75th percentiles, summary mode).
+    /// Always present in JSON — `None` serializes as `null`.
+    /// Matches stellar-core's `ret["qset"]["lag_ms"]` (HerderImpl.cpp:1770-1771).
+    pub lag_ms: Option<u64>,
 }
 
 /// Slot-level quorum info summary.
@@ -578,6 +582,7 @@ mod tests {
                 missing: 1,
                 delayed: 1,
                 ledger: 42,
+                lag_ms: None,
             },
             transitive: None,
         };
@@ -609,6 +614,7 @@ mod tests {
                 missing: 0,
                 delayed: 0,
                 ledger: 100,
+                lag_ms: None,
             },
             transitive: None,
         };
@@ -635,6 +641,7 @@ mod tests {
                 missing: 0,
                 delayed: 0,
                 ledger: 200,
+                lag_ms: None,
             },
             transitive: None,
         };
@@ -665,6 +672,7 @@ mod tests {
                 missing: 0,
                 delayed: 0,
                 ledger: 200,
+                lag_ms: None,
             },
             transitive: Some(TransitiveQuorumJsonInfo {
                 intersection: true,
@@ -703,6 +711,7 @@ mod tests {
                 missing: 0,
                 delayed: 0,
                 ledger: 300,
+                lag_ms: None,
             },
             transitive: Some(TransitiveQuorumJsonInfo {
                 intersection: false,
@@ -744,6 +753,7 @@ mod tests {
                 missing: 0,
                 delayed: 0,
                 ledger: 0,
+                lag_ms: None,
             },
             transitive: None,
         };

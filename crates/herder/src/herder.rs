@@ -1554,11 +1554,24 @@ impl Herder {
             henyey_scp::EnvelopeState::Invalid => {
                 return EnvelopeState::Invalid;
             }
-            henyey_scp::EnvelopeState::Valid => {
-                // Valid but not new
-                return EnvelopeState::Duplicate;
-            }
-            henyey_scp::EnvelopeState::ValidNew => {
+            henyey_scp::EnvelopeState::Valid | henyey_scp::EnvelopeState::ValidNew => {
+                // Record peer externalize lag for EXTERNALIZE envelopes.
+                // Matches stellar-core HerderImpl.cpp:1116-1119 which records
+                // on the unified VALID state (covering both our Valid and ValidNew).
+                if matches!(
+                    envelope.statement.pledges,
+                    ScpStatementPledges::Externalize(_)
+                ) {
+                    self.scp_driver
+                        .record_peer_externalize_event(slot, &envelope.statement.node_id);
+                }
+
+                if result == henyey_scp::EnvelopeState::Valid {
+                    // Valid but not new
+                    return EnvelopeState::Duplicate;
+                }
+
+                // ValidNew path
                 if self.heard_from_quorum(slot) {
                     debug!(slot, "Heard from quorum");
                 }
@@ -2739,6 +2752,9 @@ impl Herder {
             }
         };
 
+        // Get externalize lag summary (HerderImpl.cpp:1770-1771).
+        let lag_ms = self.scp_driver.get_qset_lag_info_summary();
+
         Some(crate::json_api::InfoQuorumSnapshot {
             node,
             qset: crate::json_api::InfoQuorumSetSnapshot {
@@ -2751,6 +2767,7 @@ impl Herder {
                 missing: summary.missing,
                 delayed: summary.delayed,
                 ledger: summary.ledger,
+                lag_ms,
             },
             transitive,
         })
