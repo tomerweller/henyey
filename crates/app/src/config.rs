@@ -2555,25 +2555,47 @@ name = "test"
 
     #[test]
     fn test_shipped_config_files_parse() {
-        // Ensure all configs in configs/ are valid against deny_unknown_fields
-        let configs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        // Ensure all .toml configs (configs/ dir + repo root) are valid
+        // against deny_unknown_fields
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
-            .unwrap()
-            .join("configs");
-        for entry in std::fs::read_dir(&configs_dir).expect("configs/ dir should exist") {
-            let entry = entry.unwrap();
-            let path = entry.path();
+            .unwrap();
+        let configs_dir = repo_root.join("configs");
+
+        // Collect .toml files from configs/ directory
+        let mut toml_files: Vec<std::path::PathBuf> = std::fs::read_dir(&configs_dir)
+            .expect("configs/ dir should exist")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |e| e == "toml"))
+            .collect();
+
+        // Also check root-level .toml configs (excluding Cargo.toml)
+        for entry in std::fs::read_dir(repo_root).expect("repo root should exist") {
+            let path = entry.unwrap().path();
             if path.extension().map_or(true, |e| e != "toml") {
                 continue;
             }
-            let content = std::fs::read_to_string(&path).unwrap();
+            if path.file_name().map_or(false, |n| n == "Cargo.toml") {
+                continue;
+            }
+            toml_files.push(path);
+        }
+
+        assert!(
+            !toml_files.is_empty(),
+            "No .toml config files found to test"
+        );
+
+        for path in &toml_files {
+            let content = std::fs::read_to_string(path).unwrap();
             let result = toml::from_str::<AppConfig>(&content);
             assert!(
                 result.is_ok(),
-                "configs/{} failed to parse: {}",
-                path.file_name().unwrap().to_string_lossy(),
+                "{} failed to parse: {}",
+                path.strip_prefix(repo_root).unwrap_or(path).display(),
                 result.unwrap_err()
             );
         }
