@@ -2905,8 +2905,10 @@ impl Herder {
                             Ok(groups) => groups,
                             Err(_interrupted) => {
                                 debug!("Critical groups computation interrupted");
-                                let mut state = intersection_state.write();
-                                state.clear_checking();
+                                // Do NOT call clear_checking() here: the state
+                                // was already replaced by the new start_checking()
+                                // that triggered the interrupt. Clearing here
+                                // would race with the new analysis.
                                 return;
                             }
                         };
