@@ -336,6 +336,10 @@ pub struct InfoQuorumSetSnapshot {
     /// Externalize lag in ms (average of 75th percentiles, summary mode).
     /// Always present in JSON — `None` serializes as `null`.
     /// Matches stellar-core's `ret["qset"]["lag_ms"]` (HerderImpl.cpp:1770-1771).
+    ///
+    /// Note: Uses a 128-sample FIFO approximation rather than stellar-core's
+    /// `medida::Timer` exponential decay reservoir. See `externalize_lag` module
+    /// docs for details on the approximation tradeoffs.
     pub lag_ms: Option<u64>,
 }
 

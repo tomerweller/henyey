@@ -4,12 +4,21 @@
 //! and when each peer's EXTERNALIZE envelope arrives. This data populates the
 //! `lag_ms` field in the `/info` quorum JSON output.
 //!
-//! Mirrors stellar-core's `mQSetLag` (`UnorderedMap<NodeID, medida::Timer>`)
-//! in `HerderSCPDriver`. stellar-core uses `medida::Timer` with an
-//! `ExponentiallyDecayingReservoir` (~1028 samples). We approximate this with
-//! a fixed ring buffer of the most recent samples per node, which achieves
-//! field-level parity (same JSON field, same 75th-percentile semantic) with a
-//! simpler implementation.
+//! # Approximation Note
+//!
+//! stellar-core uses `medida::Timer` with an `ExponentiallyDecayingReservoir`
+//! (~1028 samples, exponential decay weighting recent samples more heavily).
+//! This implementation uses a fixed 128-sample FIFO ring buffer per node with
+//! equal weighting. This is an **intentional approximation** that achieves:
+//!
+//! - **Field-level parity**: Same JSON field name, same 75th-percentile semantic
+//! - **Behavioral similarity**: Both track per-node externalize lag across slots
+//!
+//! The practical difference: medida gives more weight to recent samples via
+//! exponential decay; our ring buffer gives equal weight to the last 128 samples.
+//! Both converge for steady-state lag. The numeric values may differ slightly
+//! from stellar-core's output for the same traffic pattern, but the diagnostic
+//! utility is equivalent.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
