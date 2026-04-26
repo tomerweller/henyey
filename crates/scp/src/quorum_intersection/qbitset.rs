@@ -48,6 +48,7 @@ impl QBitSet {
     }
 
     /// Whether this quorum set is empty (threshold 0 and no successors).
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.threshold == 0 && self.all_successors.empty()
     }

@@ -554,4 +554,62 @@ mod tests {
             IntersectionResult::Interrupted
         ));
     }
+
+    /// Regression test: missing qsets must NOT reduce thresholds.
+    ///
+    /// A depends on B with threshold 2. B has no qset (dead).
+    /// With correct handling (option #1 from stellar-core), A cannot form a
+    /// quorum because it needs 2 validators but only has itself (B is dead).
+    /// With incorrect threshold reduction, A's threshold would drop to 1
+    /// and {A} would be a quorum, producing a false "intersects" result.
+    #[test]
+    fn test_missing_qset_does_not_reduce_threshold() {
+        let a = make_node_id(1);
+        let b = make_node_id(2);
+
+        let mut map: HashMap<NodeId, Option<ScpQuorumSet>> = HashMap::new();
+        // A's qset: threshold=2, validators=[A, B]
+        map.insert(a.clone(), Some(make_qset(vec![a.clone(), b.clone()], 2)));
+        // B has no qset (dead node)
+        map.insert(b.clone(), None);
+
+        // Neither A nor B can form a quorum: A needs 2 votes but B is dead.
+        // The only possible quorum set {A} doesn't satisfy threshold=2.
+        // So no quorums exist → intersection is trivially satisfied.
+        let result = check_intersection(&map);
+        assert!(
+            matches!(result, IntersectionResult::Intersects),
+            "Expected Intersects (no quorums exist), got {:?}",
+            result
+        );
+    }
+
+    /// Regression test: dead nodes don't make otherwise-healthy networks split.
+    ///
+    /// A, B, C are 2-of-3 with each other plus dead node D. Without D, they
+    /// intersect. D's absence should not change the result (threshold stays 2,
+    /// the dead slot just makes it harder, but the 3 live nodes still satisfy it).
+    #[test]
+    fn test_missing_qset_preserves_intersection() {
+        let a = make_node_id(1);
+        let b = make_node_id(2);
+        let c = make_node_id(3);
+        let d = make_node_id(4);
+
+        let mut map: HashMap<NodeId, Option<ScpQuorumSet>> = HashMap::new();
+        let all = vec![a.clone(), b.clone(), c.clone(), d.clone()];
+        // Each live node has threshold=2, validators=[A,B,C,D]
+        // D is dead → threshold stays 2, but A,B,C can still reach it.
+        map.insert(a.clone(), Some(make_qset(all.clone(), 2)));
+        map.insert(b.clone(), Some(make_qset(all.clone(), 2)));
+        map.insert(c.clone(), Some(make_qset(all.clone(), 2)));
+        map.insert(d.clone(), None);
+
+        let result = check_intersection(&map);
+        assert!(
+            matches!(result, IntersectionResult::Intersects),
+            "Expected Intersects, got {:?}",
+            result
+        );
+    }
 }

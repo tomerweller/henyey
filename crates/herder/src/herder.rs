@@ -2922,7 +2922,9 @@ impl Herder {
                 }
                 henyey_scp::quorum_intersection::IntersectionResult::Interrupted => {
                     debug!("Quorum intersection analysis interrupted (quorum map changed)");
-                    state.clear_checking();
+                    // Do NOT call clear_checking() here: the state was already
+                    // replaced by the new start_checking() that triggered the
+                    // interrupt. Clearing here would race with the new analysis.
                 }
             }
         };

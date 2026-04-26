@@ -41,7 +41,7 @@ pub(crate) struct QuorumIntersectionChecker {
     /// Checker-local PRNG for tie-breaking in pickSplitNode.
     rng: StdRng,
     /// Bounded quorum cache: BitSet → is_quorum.
-    cached_quorums: HashMap<u64, bool>,
+    cached_quorums: HashMap<BitSet, bool>,
     cached_quorums_count: usize,
     /// Reusable buffer for in-degree computation.
     in_degrees: Vec<usize>,
@@ -137,34 +137,27 @@ impl QuorumIntersectionChecker {
 
     /// Convert an ScpQuorumSet into a QBitSet.
     ///
-    /// Nodes not in `pub_key_bit_nums` (dead nodes) are silently skipped,
-    /// and the threshold is reduced accordingly — matching stellar-core's
-    /// `convertSCPQuorumSet` logic.
+    /// Nodes not in `pub_key_bit_nums` (dead nodes) are silently skipped
+    /// but the threshold is NOT reduced. This matches stellar-core's option #1:
+    /// treat missing nodes as dead (not voting), so dependents must reach their
+    /// threshold using only the remaining live nodes. See stellar-core's
+    /// `convertSCPQuorumSet` in QuorumIntersectionCheckerImpl.cpp:537-584.
     fn convert_quorum_set(&self, qset: &ScpQuorumSet) -> QBitSet {
-        let mut threshold = qset.threshold;
+        let threshold = qset.threshold;
         let mut nodes = BitSet::with_capacity(self.bit_num_pub_keys.len());
-        let mut dead_count = 0u32;
 
         for v in qset.validators.iter() {
             if let Some(&bit) = self.pub_key_bit_nums.get(v) {
                 nodes.set(bit);
-            } else {
-                dead_count += 1;
             }
+            // Dead nodes: not assigned a bit, not added to nodes.
+            // Threshold stays unchanged — they must be reached by others.
         }
 
         let mut inner_sets = Vec::new();
         for inner in qset.inner_sets.iter() {
-            let inner_qb = self.convert_quorum_set(inner);
-            if inner_qb.is_empty() {
-                dead_count += 1;
-            } else {
-                inner_sets.push(inner_qb);
-            }
+            inner_sets.push(self.convert_quorum_set(inner));
         }
-
-        // Reduce threshold by dead count (saturating to avoid underflow).
-        threshold = threshold.saturating_sub(dead_count);
 
         QBitSet::new(threshold, nodes, inner_sets)
     }
@@ -294,8 +287,7 @@ impl QuorumIntersectionChecker {
     /// Check if nodes form a quorum (with caching).
     fn is_a_quorum(&mut self, nodes: &BitSet) -> bool {
         // Check cache.
-        let hash = self.hash_bitset(nodes);
-        if let Some(&result) = self.cached_quorums.get(&hash) {
+        if let Some(&result) = self.cached_quorums.get(nodes) {
             return result;
         }
 
@@ -310,18 +302,10 @@ impl QuorumIntersectionChecker {
             self.cached_quorums.clear();
             self.cached_quorums_count = 0;
         }
-        self.cached_quorums.insert(hash, result);
+        self.cached_quorums.insert(nodes.clone(), result);
         self.cached_quorums_count += 1;
 
         result
-    }
-
-    /// Hash a bitset for cache lookup (not cryptographic).
-    fn hash_bitset(&self, bs: &BitSet) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        bs.hash(&mut hasher);
-        hasher.finish()
     }
 
     /// Check if nodes form a minimal quorum (removing any one node breaks it).
