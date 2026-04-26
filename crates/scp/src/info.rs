@@ -141,14 +141,19 @@ pub struct NodeInfo {
 /// Produced by `SCP::get_info_quorum_summary()`, combining
 /// BallotProtocol-level (phase, hash, fail_at), Slot-level (validated),
 /// and SCP-level (agree/disagree/missing/delayed/ledger) information.
+///
+/// When the quorum set is expired (not found by hash), `hash` and `fail_at`
+/// are `None` — matching stellar-core BallotProtocol.cpp:2126-2130 where
+/// only `phase = "expired"` is set and the function returns early without
+/// computing fail_at or emitting hash.
 #[derive(Debug, Clone)]
 pub struct InfoQuorumSummary {
     /// Ballot phase: "PREPARE", "CONFIRM", "EXTERNALIZE", "unknown", or "expired".
     pub phase: String,
-    /// Abbreviated quorum set hash (6 hex chars).
-    pub hash: String,
-    /// Minimum number of nodes whose failure would block quorum.
-    pub fail_at: usize,
+    /// Abbreviated quorum set hash (6 hex chars). None when qset expired.
+    pub hash: Option<String>,
+    /// Minimum number of nodes whose failure would block quorum. None when qset expired.
+    pub fail_at: Option<usize>,
     /// Whether the slot is fully validated (Some for validators, None for watchers).
     pub validated: Option<bool>,
     /// Number of agree nodes.

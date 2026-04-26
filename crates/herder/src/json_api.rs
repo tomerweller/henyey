@@ -305,9 +305,13 @@ pub struct InfoQuorumSetSnapshot {
     /// Ballot phase: "PREPARE", "CONFIRM", "EXTERNALIZE", "unknown", or "expired".
     pub phase: String,
     /// Abbreviated quorum set hash (6 hex chars, matching `hexAbbrev()`).
-    pub hash: String,
+    /// Absent when the quorum set is expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
     /// Minimum number of nodes whose failure would block quorum.
-    pub fail_at: u64,
+    /// Absent when the quorum set is expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_at: Option<u64>,
     /// Whether the slot is fully validated. Present only for validators,
     /// matching `Slot::getJsonQuorumInfo()` (Slot.cpp:401-403).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -559,8 +563,8 @@ mod tests {
             node: "GABCD".to_string(),
             qset: InfoQuorumSetSnapshot {
                 phase: "PREPARE".to_string(),
-                hash: "abcdef".to_string(),
-                fail_at: 2,
+                hash: Some("abcdef".to_string()),
+                fail_at: Some(2),
                 validated: Some(true),
                 agree: 3,
                 disagree: 0,
@@ -589,8 +593,8 @@ mod tests {
             node: "GABCD".to_string(),
             qset: InfoQuorumSetSnapshot {
                 phase: "CONFIRM".to_string(),
-                hash: "123456".to_string(),
-                fail_at: 1,
+                hash: Some("123456".to_string()),
+                fail_at: Some(1),
                 validated: None,
                 agree: 5,
                 disagree: 0,
@@ -614,8 +618,8 @@ mod tests {
             node: "GABCD".to_string(),
             qset: InfoQuorumSetSnapshot {
                 phase: "EXTERNALIZE".to_string(),
-                hash: "aabbcc".to_string(),
-                fail_at: 0,
+                hash: Some("aabbcc".to_string()),
+                fail_at: Some(0),
                 validated: Some(true),
                 agree: 4,
                 disagree: 0,

@@ -2697,11 +2697,15 @@ impl Herder {
         let ledger_seq = self.resolve_quorum_slot(lcl_seq);
 
         // Try previous slot first (ApplicationImpl.cpp:532-536).
+        // Fallback to current slot when previous has no data.
+        // stellar-core checks `quorumInfo.empty() || qset.empty()` — "qset"
+        // is the SCP::getJsonQuorumInfo result. It's empty when the slot
+        // doesn't exist; non-empty even for expired phase (has counts/ledger).
         let summary = if ledger_seq > 1 {
             let prev = self.scp.get_info_quorum_summary(ledger_seq - 1);
-            match &prev {
-                Some(s) if !s.hash.is_empty() => prev,
-                _ => self.scp.get_info_quorum_summary(ledger_seq),
+            match prev {
+                Some(_) => prev,
+                None => self.scp.get_info_quorum_summary(ledger_seq),
             }
         } else {
             self.scp.get_info_quorum_summary(ledger_seq)
@@ -2716,7 +2720,7 @@ impl Herder {
             qset: crate::json_api::InfoQuorumSetSnapshot {
                 phase: summary.phase,
                 hash: summary.hash,
-                fail_at: summary.fail_at as u64,
+                fail_at: summary.fail_at.map(|f| f as u64),
                 validated: summary.validated,
                 agree: summary.agree,
                 disagree: summary.disagree,

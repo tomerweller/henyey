@@ -963,7 +963,7 @@ impl Slot {
             slot_index: self.slot_index,
             local_node: crate::node_id_to_short_string(&self.local_node_id),
             quorum_set_hash: hex::encode(
-                &crate::quorum::hash_quorum_set(&self.local_quorum_set).0[..8],
+                &crate::quorum::hash_quorum_set(&self.local_quorum_set).0[..3],
             ),
             nodes,
             quorum_reached,

@@ -420,8 +420,8 @@ mod tests {
             node: "GABCD".to_string(),
             qset: InfoQuorumSetSnapshot {
                 phase: "PREPARE".to_string(),
-                hash: "abcdef".to_string(),
-                fail_at: 2,
+                hash: Some("abcdef".to_string()),
+                fail_at: Some(2),
                 validated: Some(true),
                 agree: 3,
                 disagree: 0,

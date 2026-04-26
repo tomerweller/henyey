@@ -780,50 +780,44 @@ impl<D: SCPDriver> SCP<D> {
         };
 
         // Look up quorum set by hash via driver.
-        let qset = match self.driver.get_quorum_set_by_hash(&qset_hash) {
-            Some(qs) => qs,
+        // If the qset is expired (not found), we still compute counts/validated/ledger
+        // but omit hash and fail_at — matching BallotProtocol.cpp:2126-2130.
+        let qset = self.driver.get_quorum_set_by_hash(&qset_hash);
+
+        let (phase, hash, fail_at) = match qset {
             None => {
-                // Quorum set expired — matching BallotProtocol.cpp:2126-2130.
-                return Some(crate::info::InfoQuorumSummary {
-                    phase: "expired".to_string(),
-                    hash: hex::encode(&qset_hash.0[..3]),
-                    fail_at: 0,
-                    validated: if self.is_validator {
-                        Some(slot.is_fully_validated())
-                    } else {
-                        None
-                    },
-                    agree: 0,
-                    disagree: 0,
-                    missing: 0,
-                    delayed: 0,
-                    ledger: slot_index,
-                });
+                // Expired qset: only phase is set, no hash or fail_at.
+                ("expired", None, None)
+            }
+            Some(ref qs) => {
+                // Compute compatible nodes — nodes whose working ballot is compatible
+                // with our working ballot (same value).
+                let compatible_nodes: HashSet<NodeId> = latest_envelopes
+                    .iter()
+                    .filter(|(node_id, env)| {
+                        if *node_id == local_id {
+                            return false; // excluded, matching `&id` exclusion
+                        }
+                        if let Some(their_ballot) =
+                            crate::ballot::get_working_ballot(&env.statement)
+                        {
+                            crate::ballot::ballot_compatible(&their_ballot, &working_ballot)
+                        } else {
+                            false
+                        }
+                    })
+                    .map(|(node_id, _)| node_id.clone())
+                    .collect();
+
+                let v_blocking =
+                    crate::quorum::find_closest_v_blocking(qs, &compatible_nodes, Some(local_id));
+                let fail_at = v_blocking.len();
+
+                let hash = hex::encode(&qset_hash.0[..3]);
+
+                (phase, Some(hash), Some(fail_at))
             }
         };
-
-        // Compute compatible nodes — nodes whose working ballot is compatible
-        // with our working ballot (same value).
-        let compatible_nodes: HashSet<NodeId> = latest_envelopes
-            .iter()
-            .filter(|(node_id, env)| {
-                if *node_id == local_id {
-                    return false; // excluded, matching `&id` exclusion
-                }
-                if let Some(their_ballot) = crate::ballot::get_working_ballot(&env.statement) {
-                    crate::ballot::ballot_compatible(&their_ballot, &working_ballot)
-                } else {
-                    false
-                }
-            })
-            .map(|(node_id, _)| node_id.clone())
-            .collect();
-
-        let v_blocking =
-            crate::quorum::find_closest_v_blocking(&qset, &compatible_nodes, Some(local_id));
-        let fail_at = v_blocking.len();
-
-        let hash = hex::encode(&qset_hash.0[..3]);
 
         let validated = if self.is_validator {
             Some(slot.is_fully_validated())
@@ -1765,7 +1759,7 @@ mod tests {
         let summary = scp.get_info_quorum_summary(1).unwrap();
         assert_eq!(summary.phase, "unknown");
         assert_eq!(summary.ledger, 1);
-        assert_eq!(summary.fail_at, 0);
+        assert_eq!(summary.fail_at, Some(0));
         // Validator → validated should be Some
         assert!(summary.validated.is_some());
     }
@@ -1829,7 +1823,16 @@ mod tests {
 
         let summary = scp.get_info_quorum_summary(1).unwrap();
         assert_eq!(summary.phase, "expired");
-        assert_eq!(summary.fail_at, 0);
+        // Expired qset: hash and fail_at should be None
+        assert!(summary.hash.is_none(), "expired qset should have no hash");
+        assert!(
+            summary.fail_at.is_none(),
+            "expired qset should have no fail_at"
+        );
+        // But counts and ledger should still be present
+        assert_eq!(summary.ledger, 1);
+        // Validator → validated should be present
+        assert!(summary.validated.is_some());
     }
 
     #[test]
