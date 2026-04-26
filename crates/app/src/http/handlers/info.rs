@@ -63,6 +63,7 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
     let uptime = state.start_time.elapsed().as_secs();
     let ledger = state.app.ledger_summary();
     let (pending_count, authenticated_count) = state.app.peer_counts().await;
+    let quorum = state.app.quorum_info_for_info();
 
     Json(InfoResponse {
         build: henyey_common::version::build_version_string(&info.version),
@@ -89,6 +90,7 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
             pending_count,
             authenticated_count,
         },
+        quorum,
     })
 }
 

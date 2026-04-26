@@ -264,7 +264,10 @@ pub fn format_node_id(node_id: &NodeId, full_keys: bool) -> String {
 /// # Arguments
 ///
 /// * `hash` - The 32-byte hash
-/// * `full` - If true, return full hex; otherwise abbreviate
+/// * `full` - If true, return full hex; otherwise abbreviate to 6 hex chars
+///
+/// When `full` is false, returns the first 6 hex characters (3 bytes),
+/// matching stellar-core's `hexAbbrev()`.
 ///
 /// # Returns
 ///
@@ -274,8 +277,67 @@ pub fn format_hash(hash: &[u8; 32], full: bool) -> String {
     if full {
         hex
     } else {
-        hex.chars().take(8).collect()
+        // stellar-core's hexAbbrev() takes 3 bytes = 6 hex chars.
+        hex.chars().take(6).collect()
     }
+}
+
+/// Quorum info snapshot for the `/info` endpoint.
+///
+/// Matches stellar-core's `HerderImpl::getJsonQuorumInfo()` output
+/// (HerderImpl.cpp:1754-1777). The `node` field holds the short node
+/// identity and `qset` holds the per-slot quorum info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfoQuorumSnapshot {
+    /// Short node identity (first 5 chars of strkey, matching `toStrKey(id, false)`).
+    pub node: String,
+    /// Per-slot quorum set snapshot.
+    pub qset: InfoQuorumSetSnapshot,
+}
+
+/// Per-slot quorum set info for the `/info` endpoint.
+///
+/// Combines `BallotProtocol::getJsonQuorumInfo()` (phase, hash, fail_at),
+/// `Slot::getJsonQuorumInfo()` (validated), and `SCP::getJsonQuorumInfo()`
+/// (agree, disagree, missing, delayed, ledger) into one struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfoQuorumSetSnapshot {
+    /// Ballot phase: "PREPARE", "CONFIRM", "EXTERNALIZE", "unknown", or "expired".
+    pub phase: String,
+    /// Abbreviated quorum set hash (6 hex chars, matching `hexAbbrev()`).
+    pub hash: String,
+    /// Minimum number of nodes whose failure would block quorum.
+    pub fail_at: u64,
+    /// Whether the slot is fully validated. Present only for validators,
+    /// matching `Slot::getJsonQuorumInfo()` (Slot.cpp:401-403).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validated: Option<bool>,
+    /// Number of nodes that agree with local consensus.
+    pub agree: u64,
+    /// Number of nodes that disagree.
+    pub disagree: u64,
+    /// Number of nodes not heard from.
+    pub missing: u64,
+    /// Number of nodes that are behind but on the same track.
+    pub delayed: u64,
+    /// Slot index (ledger sequence number).
+    pub ledger: u64,
+}
+
+/// Slot-level quorum info summary.
+///
+/// Intermediate result from `Slot::get_quorum_info_summary()`, before
+/// the SCP-level assembly adds agree/disagree/missing/delayed counts.
+#[derive(Debug, Clone)]
+pub struct SlotQuorumInfoSummary {
+    /// Ballot phase: "PREPARE", "CONFIRM", "EXTERNALIZE", "unknown", or "expired".
+    pub phase: String,
+    /// Abbreviated quorum set hash (6 hex chars).
+    pub hash: String,
+    /// Minimum number of nodes whose failure would block quorum.
+    pub fail_at: usize,
+    /// Whether the slot is fully validated (`Some(bool)` for validators, `None` for watchers).
+    pub validated: Option<bool>,
 }
 
 /// Builder for constructing HerderJsonInfo.
@@ -418,8 +480,8 @@ mod tests {
     fn test_format_hash_abbreviated() {
         let hash = [0xABu8; 32];
         let formatted = format_hash(&hash, false);
-        assert_eq!(formatted.len(), 8);
-        assert_eq!(formatted, "abababab");
+        assert_eq!(formatted.len(), 6);
+        assert_eq!(formatted, "ababab");
     }
 
     #[test]
@@ -489,5 +551,89 @@ mod tests {
         assert!(json.contains("\"intersection\":true"));
         assert!(json.contains("\"node_count\":10"));
         assert!(json.contains("GABCD"));
+    }
+
+    #[test]
+    fn test_info_quorum_snapshot_serialization() {
+        let snapshot = InfoQuorumSnapshot {
+            node: "GABCD".to_string(),
+            qset: InfoQuorumSetSnapshot {
+                phase: "PREPARE".to_string(),
+                hash: "abcdef".to_string(),
+                fail_at: 2,
+                validated: Some(true),
+                agree: 3,
+                disagree: 0,
+                missing: 1,
+                delayed: 1,
+                ledger: 42,
+            },
+        };
+
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["node"], "GABCD");
+        assert_eq!(value["qset"]["phase"], "PREPARE");
+        assert_eq!(value["qset"]["hash"], "abcdef");
+        assert_eq!(value["qset"]["fail_at"], 2);
+        assert_eq!(value["qset"]["validated"], true);
+        assert_eq!(value["qset"]["agree"], 3);
+        assert_eq!(value["qset"]["disagree"], 0);
+        assert_eq!(value["qset"]["missing"], 1);
+        assert_eq!(value["qset"]["delayed"], 1);
+        assert_eq!(value["qset"]["ledger"], 42);
+    }
+
+    #[test]
+    fn test_info_quorum_snapshot_validated_absent_for_watcher() {
+        let snapshot = InfoQuorumSnapshot {
+            node: "GABCD".to_string(),
+            qset: InfoQuorumSetSnapshot {
+                phase: "CONFIRM".to_string(),
+                hash: "123456".to_string(),
+                fail_at: 1,
+                validated: None,
+                agree: 5,
+                disagree: 0,
+                missing: 0,
+                delayed: 0,
+                ledger: 100,
+            },
+        };
+
+        let value = serde_json::to_value(&snapshot).unwrap();
+        // validated should be absent (skip_serializing_if = "Option::is_none")
+        assert!(
+            value["qset"].get("validated").is_none(),
+            "validated should be absent for watcher nodes"
+        );
+    }
+
+    #[test]
+    fn test_info_quorum_snapshot_validated_nested_under_qset() {
+        let snapshot = InfoQuorumSnapshot {
+            node: "GABCD".to_string(),
+            qset: InfoQuorumSetSnapshot {
+                phase: "EXTERNALIZE".to_string(),
+                hash: "aabbcc".to_string(),
+                fail_at: 0,
+                validated: Some(true),
+                agree: 4,
+                disagree: 0,
+                missing: 0,
+                delayed: 0,
+                ledger: 200,
+            },
+        };
+
+        let value = serde_json::to_value(&snapshot).unwrap();
+        // validated must be inside qset, not at top level
+        assert!(
+            value.get("validated").is_none(),
+            "validated must not be at top level"
+        );
+        assert!(
+            value["qset"].get("validated").is_some(),
+            "validated must be inside qset"
+        );
     }
 }

@@ -60,6 +60,10 @@ pub(crate) async fn compat_info_handler(
         },
         network: app.config().network.passphrase.clone(),
         status: Vec::new(),
+        quorum: app
+            .quorum_info_for_info()
+            .map(|q| serde_json::to_value(q).unwrap_or_default())
+            .unwrap_or_else(|| serde_json::json!({})),
     };
 
     Json(CompatInfoWrapper { info })
@@ -85,6 +89,9 @@ struct CompatInfoResponse {
     peers: CompatPeerInfo,
     network: String,
     status: Vec<String>,
+    /// Quorum info — always present in stellar-core's output.
+    /// Empty object `{}` when no quorum data is available.
+    quorum: serde_json::Value,
 }
 
 /// Ledger info with stellar-core's camelCase field names.
@@ -147,6 +154,7 @@ mod tests {
                 },
                 network: "Test SDF Network ; September 2015".into(),
                 status: vec!["Catching up: Applying buckets 50.0%".into()],
+                quorum: serde_json::json!({}),
             },
         };
 
@@ -167,6 +175,7 @@ mod tests {
             "peers",
             "network",
             "status",
+            "quorum",
         ];
         for key in &expected_top_keys {
             assert!(info.get(key).is_some(), "missing top-level key: {key}");
@@ -235,6 +244,7 @@ mod tests {
                 },
                 network: "Test SDF Network ; September 2015".into(),
                 status: vec![],
+                quorum: serde_json::json!({}),
             },
         };
 
@@ -269,6 +279,7 @@ mod tests {
                 },
                 network: "Test SDF Network ; September 2015".into(),
                 status: vec![],
+                quorum: serde_json::json!({}),
             },
         };
 
@@ -307,6 +318,7 @@ mod tests {
                 },
                 network: "Test SDF Network ; September 2015".into(),
                 status: vec![],
+                quorum: serde_json::json!({}),
             },
         };
 
@@ -326,6 +338,7 @@ mod tests {
             "peers",
             "network",
             "status",
+            "quorum",
         ]
         .into_iter()
         .collect();
@@ -356,5 +369,108 @@ mod tests {
                 "unexpected ledger key: {key}"
             );
         }
+    }
+
+    /// Verify that `quorum` is always present in compat response (empty object when no data).
+    #[test]
+    fn test_info_response_quorum_always_present() {
+        let wrapper = CompatInfoWrapper {
+            info: CompatInfoResponse {
+                build: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
+                protocol_version: 25,
+                state: "Booting".into(),
+                started_on: "2026-01-15T12:00:00Z".into(),
+                ledger: CompatLedgerInfo {
+                    num: 0,
+                    hash: "0".repeat(64),
+                    close_time: 0,
+                    version: 0,
+                    base_fee: 100,
+                    base_reserve: 100000000,
+                    max_tx_set_size: 1000,
+                    flags: None,
+                    age: 0,
+                },
+                peers: CompatPeerInfo {
+                    pending_count: 0,
+                    authenticated_count: 0,
+                },
+                network: "Test SDF Network ; September 2015".into(),
+                status: vec![],
+                quorum: serde_json::json!({}),
+            },
+        };
+
+        let value = serde_json::to_value(&wrapper).unwrap();
+        let quorum = &value["info"]["quorum"];
+        assert!(quorum.is_object(), "quorum must always be an object");
+        assert!(
+            quorum.as_object().unwrap().is_empty(),
+            "quorum should be empty object when no data"
+        );
+    }
+
+    /// Verify that populated quorum data serializes correctly with `validated`
+    /// nested inside `qset`.
+    #[test]
+    fn test_info_response_quorum_populated() {
+        use henyey_herder::json_api::{InfoQuorumSetSnapshot, InfoQuorumSnapshot};
+
+        let snapshot = InfoQuorumSnapshot {
+            node: "GABCD".to_string(),
+            qset: InfoQuorumSetSnapshot {
+                phase: "PREPARE".to_string(),
+                hash: "abcdef".to_string(),
+                fail_at: 2,
+                validated: Some(true),
+                agree: 3,
+                disagree: 0,
+                missing: 1,
+                delayed: 0,
+                ledger: 42,
+            },
+        };
+
+        let wrapper = CompatInfoWrapper {
+            info: CompatInfoResponse {
+                build: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
+                protocol_version: 25,
+                state: "Synced!".into(),
+                started_on: "2026-01-15T12:00:00Z".into(),
+                ledger: CompatLedgerInfo {
+                    num: 42,
+                    hash: "a".repeat(64),
+                    close_time: 100,
+                    version: 25,
+                    base_fee: 100,
+                    base_reserve: 100000000,
+                    max_tx_set_size: 1000,
+                    flags: None,
+                    age: 0,
+                },
+                peers: CompatPeerInfo {
+                    pending_count: 0,
+                    authenticated_count: 5,
+                },
+                network: "Test SDF Network ; September 2015".into(),
+                status: vec![],
+                quorum: serde_json::to_value(&snapshot).unwrap(),
+            },
+        };
+
+        let value = serde_json::to_value(&wrapper).unwrap();
+        let quorum = &value["info"]["quorum"];
+        assert_eq!(quorum["node"], "GABCD");
+        assert_eq!(quorum["qset"]["phase"], "PREPARE");
+        assert_eq!(quorum["qset"]["hash"], "abcdef");
+        assert_eq!(quorum["qset"]["fail_at"], 2);
+        assert_eq!(quorum["qset"]["agree"], 3);
+        assert_eq!(quorum["qset"]["ledger"], 42);
+        // validated must be inside qset
+        assert!(
+            quorum.get("validated").is_none(),
+            "validated must not be at quorum top level"
+        );
+        assert_eq!(quorum["qset"]["validated"], true);
     }
 }

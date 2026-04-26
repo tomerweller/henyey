@@ -58,14 +58,14 @@ mod slot;
 pub(crate) mod test_utils;
 
 // Re-export main types
-pub use ballot::{get_working_ballot, BallotPhase};
+pub use ballot::{get_companion_quorum_set_hash, get_working_ballot, BallotPhase};
 pub use compare::is_newer_nomination_or_ballot_st;
 pub use driver::{SCPDriver, SCPTimerType, ValidationLevel};
 pub use error::ScpError;
 pub use format::{ballot_to_str, envelope_to_str, node_id_to_short_string, value_to_str};
 pub use info::{
-    BallotInfo, BallotValue, CommitBounds, NodeInfo, NominationInfo, QuorumInfo, ReportingSummary,
-    SlotInfo,
+    BallotInfo, BallotValue, CommitBounds, InfoQuorumSummary, NodeInfo, NominationInfo, QuorumInfo,
+    ReportingSummary, SlotInfo,
 };
 pub use quorum::{
     find_closest_v_blocking, get_all_nodes, hash_quorum_set, is_quorum, is_quorum_set_sane,

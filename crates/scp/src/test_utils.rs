@@ -32,6 +32,9 @@ pub struct MockDriver {
     pub emit_count: AtomicU32,
     /// Counts how many times `ballot_did_hear_from_quorum` was called.
     pub heard_from_quorum: AtomicU32,
+    /// If true, `get_quorum_set_by_hash` returns the configured quorum set
+    /// regardless of the hash. Useful for testing quorum info methods.
+    pub return_qset_by_hash: bool,
 }
 
 /// How `compute_value_hash` should behave.
@@ -59,6 +62,7 @@ pub struct MockDriverBuilder {
     validation_level: ValidationLevel,
     value_hash_mode: ValueHashMode,
     timeout_mode: TimeoutMode,
+    return_qset_by_hash: bool,
 }
 
 impl MockDriverBuilder {
@@ -68,6 +72,7 @@ impl MockDriverBuilder {
             validation_level: ValidationLevel::FullyValidated,
             value_hash_mode: ValueHashMode::SumBytes,
             timeout_mode: TimeoutMode::Fixed(Duration::from_millis(1)),
+            return_qset_by_hash: false,
         }
     }
 
@@ -91,6 +96,11 @@ impl MockDriverBuilder {
         self
     }
 
+    pub fn return_qset_by_hash(mut self) -> Self {
+        self.return_qset_by_hash = true;
+        self
+    }
+
     pub fn build(self) -> MockDriver {
         MockDriver {
             quorum_set: self.quorum_set,
@@ -99,6 +109,7 @@ impl MockDriverBuilder {
             timeout_mode: self.timeout_mode,
             emit_count: AtomicU32::new(0),
             heard_from_quorum: AtomicU32::new(0),
+            return_qset_by_hash: self.return_qset_by_hash,
         }
     }
 }
@@ -148,6 +159,14 @@ impl SCPDriver for MockDriver {
 
     fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
         self.quorum_set.clone()
+    }
+
+    fn get_quorum_set_by_hash(&self, _hash: &henyey_common::Hash256) -> Option<ScpQuorumSet> {
+        if self.return_qset_by_hash {
+            self.quorum_set.clone()
+        } else {
+            None
+        }
     }
 
     fn nominating_value(&self, _slot_index: u64, _value: &Value) {}

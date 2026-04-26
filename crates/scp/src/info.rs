@@ -136,6 +136,33 @@ pub struct NodeInfo {
     pub ballot_counter: Option<u32>,
 }
 
+/// Summary for the `/info` endpoint's quorum section.
+///
+/// Produced by `SCP::get_info_quorum_summary()`, combining
+/// BallotProtocol-level (phase, hash, fail_at), Slot-level (validated),
+/// and SCP-level (agree/disagree/missing/delayed/ledger) information.
+#[derive(Debug, Clone)]
+pub struct InfoQuorumSummary {
+    /// Ballot phase: "PREPARE", "CONFIRM", "EXTERNALIZE", "unknown", or "expired".
+    pub phase: String,
+    /// Abbreviated quorum set hash (6 hex chars).
+    pub hash: String,
+    /// Minimum number of nodes whose failure would block quorum.
+    pub fail_at: usize,
+    /// Whether the slot is fully validated (Some for validators, None for watchers).
+    pub validated: Option<bool>,
+    /// Number of agree nodes.
+    pub agree: u64,
+    /// Number of disagree nodes.
+    pub disagree: u64,
+    /// Number of missing nodes.
+    pub missing: u64,
+    /// Number of delayed nodes.
+    pub delayed: u64,
+    /// Slot index (ledger sequence).
+    pub ledger: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

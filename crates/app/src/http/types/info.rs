@@ -35,6 +35,9 @@ pub struct InfoResponse {
     pub ledger: InfoLedgerSummary,
     /// Peer counts.
     pub peers: InfoPeerSummary,
+    /// Quorum info (absent when no quorum data is available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quorum: Option<henyey_herder::json_api::InfoQuorumSnapshot>,
 }
 
 /// Ledger summary embedded in the /info response.

@@ -2670,6 +2670,63 @@ impl Herder {
         Some((agree, missing, disagree, fail_at))
     }
 
+    /// Determine the slot index to use for quorum info queries.
+    ///
+    /// Mirrors `ApplicationImpl.cpp:527-530`: use `trackingConsensusLedgerIndex()`
+    /// unless state is BOOTING, in which case use LCL seq.
+    pub fn resolve_quorum_slot(&self, lcl_seq: u32) -> u64 {
+        if self.state() != HerderState::Booting {
+            self.tracking_slot()
+        } else {
+            lcl_seq as u64
+        }
+    }
+
+    /// Build the quorum info for the `/info` endpoint.
+    ///
+    /// Mirrors `ApplicationImpl::getJsonInfo()` quorum section
+    /// (ApplicationImpl.cpp:522-545) and `HerderImpl::getJsonQuorumInfo()`
+    /// (HerderImpl.cpp:1754-1777).
+    ///
+    /// Returns `None` if no quorum data is available (both previous and current
+    /// slot are empty or the slot doesn't exist).
+    pub fn quorum_info_for_info(
+        &self,
+        lcl_seq: u32,
+    ) -> Option<crate::json_api::InfoQuorumSnapshot> {
+        let ledger_seq = self.resolve_quorum_slot(lcl_seq);
+
+        // Try previous slot first (ApplicationImpl.cpp:532-536).
+        let summary = if ledger_seq > 1 {
+            let prev = self.scp.get_info_quorum_summary(ledger_seq - 1);
+            match &prev {
+                Some(s) if !s.hash.is_empty() => prev,
+                _ => self.scp.get_info_quorum_summary(ledger_seq),
+            }
+        } else {
+            self.scp.get_info_quorum_summary(ledger_seq)
+        };
+
+        let summary = summary?;
+
+        let node = crate::json_api::format_node_id(self.scp.local_node_id(), false);
+
+        Some(crate::json_api::InfoQuorumSnapshot {
+            node,
+            qset: crate::json_api::InfoQuorumSetSnapshot {
+                phase: summary.phase,
+                hash: summary.hash,
+                fail_at: summary.fail_at as u64,
+                validated: summary.validated,
+                agree: summary.agree,
+                disagree: summary.disagree,
+                missing: summary.missing,
+                delayed: summary.delayed,
+                ledger: summary.ledger,
+            },
+        })
+    }
+
     /// Timing snapshot for the most recently externalized slot.
     pub fn scp_timing(&self) -> Option<crate::scp_driver::ExternalizeTimingSnapshot> {
         self.scp_driver.last_externalize_timing()

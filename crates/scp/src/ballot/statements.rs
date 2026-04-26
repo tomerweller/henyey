@@ -504,6 +504,28 @@ pub fn get_working_ballot(statement: &ScpStatement) -> Option<ScpBallot> {
     }
 }
 
+/// Extract the companion quorum set hash from a ballot statement.
+///
+/// Matches `BallotProtocol::getCompanionQuorumSetHashFromStatement()`
+/// (BallotProtocol.cpp:1572-1590).
+///
+/// Returns the quorum set hash embedded in the statement's pledges, or None
+/// for nomination statements.
+pub fn get_companion_quorum_set_hash(statement: &ScpStatement) -> Option<henyey_common::Hash256> {
+    match &statement.pledges {
+        ScpStatementPledges::Prepare(prep) => {
+            Some(henyey_common::Hash256::from(prep.quorum_set_hash.clone()))
+        }
+        ScpStatementPledges::Confirm(conf) => {
+            Some(henyey_common::Hash256::from(conf.quorum_set_hash.clone()))
+        }
+        ScpStatementPledges::Externalize(ext) => Some(henyey_common::Hash256::from(
+            ext.commit_quorum_set_hash.clone(),
+        )),
+        ScpStatementPledges::Nominate(_) => None,
+    }
+}
+
 /// Return the "worse" of two validation levels.
 ///
 /// Ordering (worst → best):

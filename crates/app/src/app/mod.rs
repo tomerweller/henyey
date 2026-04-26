@@ -2175,6 +2175,12 @@ impl App {
         })
     }
 
+    /// Quorum info for the `/info` endpoint (None when no quorum data available).
+    pub fn quorum_info_for_info(&self) -> Option<henyey_herder::json_api::InfoQuorumSnapshot> {
+        let lcl_seq = self.ledger_summary().num;
+        self.herder.quorum_info_for_info(lcl_seq)
+    }
+
     /// SCP timing for the most recently externalized slot.
     pub fn scp_timing(&self) -> Option<crate::app::types::ScpTimingMetrics> {
         let snapshot = self.herder.scp_timing()?;

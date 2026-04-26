@@ -65,6 +65,7 @@ mod envelope;
 mod state_machine;
 mod statements;
 
+pub use statements::get_companion_quorum_set_hash;
 pub use statements::get_working_ballot;
 pub(crate) use statements::{ballot_compare, ballot_compatible, cmp_opt_ballot};
 
