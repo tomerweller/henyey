@@ -1401,23 +1401,29 @@ impl ScpDriver {
             }
         }
 
-        // Step 3: Select best candidate using compareTxSets logic
-        // Parity: HerderSCPDriver.cpp:614-653 compareTxSets
-        // 1. More operations wins
-        // 2. Higher total fees wins
-        // 3. XOR hash tiebreak with candidates_hash
-        let best_idx = decoded
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                let a_hash = Hash256::from_bytes(a.tx_set_hash.0);
-                let b_hash = Hash256::from_bytes(b.tx_set_hash.0);
-                self.compare_tx_sets(&a_hash, &b_hash, &candidates_hash)
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        // Step 3: Sort candidates by XDR bytes for deterministic iteration.
+        // Parity: stellar-core iterates a ValueWrapperPtrSet (std::set ordered
+        // by Value bytes via WrappedValuePtrComparator). Sorting here ensures
+        // combine_candidates is order-independent regardless of input ordering.
+        decoded.sort();
 
-        // Step 4: Compose result
+        // Step 4: Select best candidate using compareTxSets logic.
+        // Parity: HerderSCPDriver.cpp:775-797 — manual loop that keeps the
+        // first winner on ties (stellar-core: `if (!highestTxSet || compareTxSets(...))`).
+        // We use a keep-first fold instead of max_by, which returns the last
+        // tied element and would be order-dependent.
+        let mut best_idx = 0;
+        for i in 1..decoded.len() {
+            let best_hash = Hash256::from_bytes(decoded[best_idx].tx_set_hash.0);
+            let cur_hash = Hash256::from_bytes(decoded[i].tx_set_hash.0);
+            if self.compare_tx_sets(&best_hash, &cur_hash, &candidates_hash)
+                == std::cmp::Ordering::Less
+            {
+                best_idx = i;
+            }
+        }
+
+        // Step 5: Compose result
         let mut result = decoded[best_idx].clone();
 
         // Replace upgrades with merged set (in order of upgrade type)
@@ -4756,6 +4762,66 @@ mod compare_tx_sets_tests {
             result,
             std::cmp::Ordering::Greater,
             "saturated fees should beat moderate fees"
+        );
+    }
+
+    /// Regression test for #1942: combine_candidates must be order-independent.
+    ///
+    /// When two candidates share the same tx_set but differ only in close_time,
+    /// combine_candidates_impl must return the same result regardless of the
+    /// order candidates are supplied. Before the fix, `max_by` returned the
+    /// last tied element, causing nodes with different insertion orders to
+    /// produce different composites — making SCP ballot convergence impossible.
+    #[test]
+    fn test_combine_candidates_order_independent() {
+        use stellar_xdr::curr::{StellarValue, StellarValueExt, TimePoint, WriteXdr};
+
+        let driver = make_driver();
+
+        // Create a single transaction set (both candidates reference the same tx_set)
+        let tx = make_tx(42, 100, 1);
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![tx]);
+        let tx_set_hash = *tx_set.hash();
+        driver.cache_tx_set(tx_set);
+
+        // Two StellarValues with the same tx_set_hash but different close_times
+        let sv_a = StellarValue {
+            tx_set_hash: Hash(tx_set_hash.as_bytes().clone()),
+            close_time: TimePoint(1000),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let sv_b = StellarValue {
+            tx_set_hash: Hash(tx_set_hash.as_bytes().clone()),
+            close_time: TimePoint(1001),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let val_a = Value(
+            sv_a.to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let val_b = Value(
+            sv_b.to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(
+            val_a, val_b,
+            "candidates must differ (different close_time)"
+        );
+
+        // Call combine_candidates in both orderings
+        let result_ab = driver.combine_candidates_impl(3, &[val_a.clone(), val_b.clone()]);
+        let result_ba = driver.combine_candidates_impl(3, &[val_b.clone(), val_a.clone()]);
+
+        assert_eq!(
+            result_ab, result_ba,
+            "combine_candidates must be order-independent"
         );
     }
 }

@@ -79,7 +79,11 @@ pub struct NominationProtocol {
     ///
     /// These are values where a quorum has accepted them. Once we have
     /// candidates, they are combined into a composite value.
-    candidates: Vec<Value>,
+    ///
+    /// Uses BTreeSet for deterministic iteration order, matching stellar-core's
+    /// ValueWrapperPtrSet (std::set ordered by Value bytes). This ensures
+    /// combine_candidates sees candidates in the same order on all nodes.
+    candidates: BTreeSet<Value>,
 
     /// Whether nomination has been started.
     started: bool,
@@ -127,7 +131,7 @@ impl NominationProtocol {
             round: 0,
             votes: Vec::new(),
             accepted: Vec::new(),
-            candidates: Vec::new(),
+            candidates: BTreeSet::new(),
             started: false,
             stopped: false,
             latest_composite: None,
@@ -537,10 +541,11 @@ impl NominationProtocol {
             return;
         }
 
-        // Combine all candidates
+        // Combine all candidates (collect to Vec for the slice-based API)
+        let candidates_vec: Vec<Value> = self.candidates.iter().cloned().collect();
         if let Some(composite) = ctx
             .driver
-            .combine_candidates(ctx.slot_index, &self.candidates)
+            .combine_candidates(ctx.slot_index, &candidates_vec)
         {
             if self.latest_composite.as_ref() != Some(&composite) {
                 // Notify driver of the updated candidate value
@@ -612,9 +617,7 @@ impl NominationProtocol {
                 continue;
             }
 
-            if self.should_ratify_value(&value, ctx)
-                && Self::insert_unique(&mut self.candidates, value.clone())
-            {
+            if self.should_ratify_value(&value, ctx) && self.candidates.insert(value.clone()) {
                 new_candidates = true;
                 // N12: Stop the nomination timer when candidates are confirmed.
                 ctx.driver
@@ -1053,7 +1056,7 @@ impl NominationProtocol {
     }
 
     /// Get the candidates (confirmed values ready for ballot protocol).
-    pub(crate) fn candidates(&self) -> &[Value] {
+    pub(crate) fn candidates(&self) -> &BTreeSet<Value> {
         &self.candidates
     }
 }
