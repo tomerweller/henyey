@@ -73,7 +73,7 @@
       "datasource": { "type": "prometheus", "uid": "000000001" },
       "targets": [
         {
-          "expr": "stellar_ledger_age_current_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "expr": "stellar_ledger_age_current_seconds{job=\"henyey\", instance=~\"$henyey_instance\"} and stellar_herder_state{job=\"henyey\", instance=~\"$henyey_instance\"} == 2",
           "legendFormat": "Henyey",
           "refId": "A"
         }
@@ -88,7 +88,8 @@
               { "color": "yellow", "value": 10 },
               { "color": "red", "value": 30 }
             ]
-          }
+          },
+          "noValue": "Not synced"
         },
         "overrides": []
       },
@@ -272,12 +273,12 @@
       "datasource": { "type": "prometheus", "uid": "000000001" },
       "targets": [
         {
-          "expr": "stellar_ledger_age_current_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "expr": "stellar_ledger_age_current_seconds{job=\"henyey\", instance=~\"$henyey_instance\"} and stellar_herder_state{job=\"henyey\", instance=~\"$henyey_instance\"} == 2",
           "legendFormat": "Henyey",
           "refId": "A"
         },
         {
-          "expr": "stellar_core_ledger_age{instance=~\"$core_instance\"}",
+          "expr": "stellar_core_ledger_age{instance=~\"$core_instance\"} and stellar_core_synced{instance=~\"$core_instance\"} == 1",
           "legendFormat": "Core ({{instance}})",
           "refId": "B"
         }

@@ -136,7 +136,7 @@
       },
       "targets": [
         {
-          "expr": "stellar_ledger_age_current_seconds{job=\"henyey\", instance=~\"$instance\"}",
+          "expr": "stellar_ledger_age_current_seconds{job=\"henyey\", instance=~\"$instance\"} and stellar_herder_state{job=\"henyey\", instance=~\"$instance\"} == 2",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"
@@ -690,7 +690,7 @@
       },
       "targets": [
         {
-          "expr": "stellar_ledger_age_current_seconds{job=\"henyey\", instance=~\"$instance\"}",
+          "expr": "stellar_ledger_age_current_seconds{job=\"henyey\", instance=~\"$instance\"} and stellar_herder_state{job=\"henyey\", instance=~\"$instance\"} == 2",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"
