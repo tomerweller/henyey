@@ -679,16 +679,25 @@ SCP, quorum, herder_state, histogram p99 alerts, and ratio checks.
 
 If they differ (origin/main is ahead):
 
-1. Check CI status on origin/main: `gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'`.
+1. **Cool-down guard**: if node uptime is `< 30m` AND `CRASH_RECOVERY=no` (i.e.
+   the previous tick deployed cleanly), SKIP DEPLOY this tick. Report:
+   `DEPLOY DEFERRED (cool-down: uptime=<X>m < 30m)`. Rationale: every restart
+   costs ~1-2m of validation downtime + brief peer reconnect. Deploying multiple
+   commits within minutes thrashes the validator without giving each version
+   time to surface issues. The 30m floor was set by operator (#1944). Crash-
+   recovery restarts are exempt because they're not voluntary deploys. Urgent
+   fixes can override by killing the node manually before the next tick — the
+   normal startup path will pick up the latest origin/main.
+2. Check CI status on origin/main: `gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'`.
    If any recent run has conclusion `failure`, do NOT deploy — route the failure
    through check (11) and wait.
-2. If all conclusions are `success` (ignore `""` for in-progress and `cancelled`):
+3. If all conclusions are `success` (ignore `""` for in-progress and `cancelled`):
    `git pull --rebase`, `CARGO_TARGET_DIR=/home/tomer/data/$MONITOR_SESSION_ID/cargo-target cargo build --release -p henyey`.
-3. If build succeeds: preserve the log, then kill the node (`kill <PID>`,
+4. If build succeeds: preserve the log, then kill the node (`kill <PID>`,
    wait 10s, `kill -9` if still alive), restart with the launch command from
    check (3) (append redirection), report:
    `DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>`.
-4. If build fails: report `BUILD FAILED`, do NOT restart — the old binary is
+5. If build fails: report `BUILD FAILED`, do NOT restart — the old binary is
    still running. Route the build error through check (11).
 
 If `HEAD == origin/main`: no action (already up to date).
