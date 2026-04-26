@@ -71,8 +71,10 @@ impl Default for FetchingConfig {
             tx_set_fetcher_config: ItemFetcherConfig::default(),
             quorum_set_fetcher_config: ItemFetcherConfig::default(),
             max_slots: 12,
-            max_tx_set_cache: 256,
-            max_quorum_set_cache: 100,
+            // Parity: stellar-core uses TXSET_CACHE_SIZE = 10000 and
+            // QSET_CACHE_SIZE = 10000 in PendingEnvelopes.cpp.
+            max_tx_set_cache: 10_000,
+            max_quorum_set_cache: 10_000,
         }
     }
 }
@@ -612,16 +614,43 @@ impl FetchingEnvelopes {
     // --- Internal helpers ---
 
     /// Evict a tx set cache entry if the cache is full.
-    /// Removes an arbitrary entry, matching stellar-core's RandomEvictionCache.
+    ///
+    /// Prefers evicting entries NOT referenced by any fetching envelope to avoid
+    /// stranding envelopes that already received the tx-set but are still waiting
+    /// on another dependency (e.g. quorum-set). Falls back to oldest-slot eviction
+    /// when all entries are referenced to preserve the hard memory bound.
     fn evict_tx_set_cache_if_full(&self) {
         if self.tx_set_cache.len() < self.config.max_tx_set_cache {
             return;
         }
 
-        // Evict an arbitrary entry. stellar-core uses RandomEvictionCache
-        // which unconditionally evicts on insert when full — no slot-based
-        // logic. We mirror that: just remove the first entry we find.
-        let to_remove = self.tx_set_cache.iter().next().map(|e| *e.key());
+        // Collect tx-set hashes referenced by currently-fetching envelopes
+        let referenced: HashSet<Hash256> = self
+            .slots
+            .iter()
+            .flat_map(|slot_entry| {
+                slot_entry
+                    .fetching
+                    .values()
+                    .flat_map(|(env, _)| Self::extract_tx_set_hashes(env))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        // Prefer evicting an unreferenced entry
+        let to_remove = self
+            .tx_set_cache
+            .iter()
+            .find(|entry| !referenced.contains(entry.key()))
+            .map(|entry| *entry.key())
+            .or_else(|| {
+                // Fallback: evict the oldest-slot entry to preserve memory bound
+                self.tx_set_cache
+                    .iter()
+                    .min_by_key(|entry| entry.value().0)
+                    .map(|entry| *entry.key())
+            });
+
         if let Some(hash) = to_remove {
             self.tx_set_cache.remove(&hash);
             debug!(
@@ -631,20 +660,44 @@ impl FetchingEnvelopes {
         }
     }
 
-    /// Evict old quorum set cache entries if the cache is full.
-    /// Simply removes a random entry since quorum sets don't have slot info.
+    /// Evict a quorum set cache entry if the cache is full.
+    ///
+    /// Prefers evicting entries NOT referenced by any fetching envelope.
+    /// Falls back to arbitrary eviction to preserve the hard memory bound.
     fn evict_quorum_set_cache_if_full(&self) {
         if self.quorum_set_cache.len() < self.config.max_quorum_set_cache {
             return;
         }
 
-        // Remove any entry
-        let to_remove = self.quorum_set_cache.iter().next().map(|e| *e.key());
+        // Collect quorum-set hashes referenced by currently-fetching envelopes
+        let referenced: HashSet<Hash256> = self
+            .slots
+            .iter()
+            .flat_map(|slot_entry| {
+                slot_entry
+                    .fetching
+                    .values()
+                    .filter_map(|(env, _)| Self::extract_quorum_set_hash(env))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        // Prefer evicting an unreferenced entry
+        let to_remove = self
+            .quorum_set_cache
+            .iter()
+            .find(|entry| !referenced.contains(entry.key()))
+            .map(|entry| *entry.key())
+            .or_else(|| {
+                // Fallback: evict an arbitrary entry to preserve memory bound
+                self.quorum_set_cache.iter().next().map(|e| *e.key())
+            });
+
         if let Some(hash) = to_remove {
             self.quorum_set_cache.remove(&hash);
             debug!(
                 cache_size = self.quorum_set_cache.len(),
-                "Evicted old QuorumSet from cache"
+                "Evicted QuorumSet from cache"
             );
         }
     }
@@ -1560,6 +1613,214 @@ mod tests {
             fetching.ready_count(),
             1,
             "envelope should have moved to ready"
+        );
+    }
+
+    // =========================================================================
+    // Regression: tx-set cache eviction strands fetching envelopes (#1954)
+    // =========================================================================
+
+    /// Helper: create an envelope referencing a specific tx-set hash and quorum-set hash.
+    fn make_envelope_with_deps(
+        slot: SlotIndex,
+        node_seed: u8,
+        tx_set_hash: Hash256,
+        qs_hash: Hash256,
+    ) -> ScpEnvelope {
+        let sv_bytes = make_signed_stellar_value_with_hash(tx_set_hash);
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([node_seed; 32])));
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: Hash(qs_hash.0),
+                    votes: vec![Value(sv_bytes.try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+        }
+    }
+
+    /// Helper: make a sane quorum set for testing.
+    fn make_sane_quorum_set() -> ScpQuorumSet {
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        }
+    }
+
+    /// Regression test for #1954: tx-set eviction must not strand envelopes
+    /// that already received the tx-set but are still waiting on a quorum-set.
+    ///
+    /// Before fix: arbitrary eviction could remove tx-set A from the cache;
+    /// when quorum-set Q arrives, check_dependencies sees A as missing and
+    /// leaves the envelope in fetching forever.
+    #[test]
+    fn test_tx_set_eviction_does_not_strand_fetching_envelopes() {
+        let mut config = FetchingConfig::default();
+        config.max_tx_set_cache = 2;
+        let fetching = FetchingEnvelopes::new(config);
+
+        let tx_hash_a = Hash256::from_bytes([0xAA; 32]);
+        let qs_hash = Hash256::from_bytes([0x01; 32]);
+
+        // 1. Insert envelope needing tx-set A and quorum-set Q
+        let envelope = make_envelope_with_deps(100, 1, tx_hash_a, qs_hash);
+        let result = fetching.recv_envelope(envelope);
+        assert_eq!(result, RecvResult::Fetching);
+        assert_eq!(fetching.fetching_count(), 1);
+
+        // 2. Deliver tx-set A — envelope stays fetching (Q still missing)
+        fetching.recv_tx_set(tx_hash_a, 100, vec![1, 2, 3]);
+        assert!(fetching.has_tx_set(&tx_hash_a));
+        assert_eq!(fetching.fetching_count(), 1, "still waiting on quorum-set");
+
+        // 3. Fill cache to trigger eviction — insert 2 more tx-sets
+        //    (via cache_tx_set which calls evict_tx_set_cache_if_full)
+        let tx_hash_b = Hash256::from_bytes([0xBB; 32]);
+        let tx_hash_c = Hash256::from_bytes([0xCC; 32]);
+        fetching.cache_tx_set(tx_hash_b, 101, vec![4, 5, 6]);
+        fetching.cache_tx_set(tx_hash_c, 102, vec![7, 8, 9]);
+
+        // tx-set A should still be in cache (dependency-aware eviction protects it)
+        assert!(
+            fetching.has_tx_set(&tx_hash_a),
+            "tx-set A should be protected from eviction while an envelope depends on it"
+        );
+
+        // 4. Deliver quorum-set Q — envelope should become ready
+        //    We need to register the quorum-set fetch tracking first by inserting
+        //    directly, since recv_quorum_set checks is_tracking.
+        fetching.cache_quorum_set(qs_hash, make_sane_quorum_set());
+
+        // Manually recheck the fetching envelope
+        let to_check: Vec<ScpEnvelope> = fetching
+            .slots
+            .iter()
+            .flat_map(|slot_entry| {
+                slot_entry
+                    .fetching
+                    .values()
+                    .map(|(env, _)| env.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for env in to_check {
+            fetching.check_and_move_to_ready(env);
+        }
+
+        assert_eq!(
+            fetching.ready_count(),
+            1,
+            "envelope should be ready after receiving both dependencies"
+        );
+        assert_eq!(
+            fetching.fetching_count(),
+            0,
+            "no envelopes should remain in fetching"
+        );
+    }
+
+    /// Regression test for #1954: quorum-set eviction must not strand envelopes.
+    ///
+    /// Mirror of the tx-set test: deliver quorum-set first, evict it via
+    /// cache pressure, then deliver tx-set — envelope should still become ready.
+    #[test]
+    fn test_quorum_set_eviction_does_not_strand_fetching_envelopes() {
+        let mut config = FetchingConfig::default();
+        config.max_quorum_set_cache = 2;
+        let fetching = FetchingEnvelopes::new(config);
+
+        let tx_hash_a = Hash256::from_bytes([0xAA; 32]);
+        let qs_hash = Hash256::from_bytes([0x01; 32]);
+
+        // 1. Insert envelope needing tx-set A and quorum-set Q
+        let envelope = make_envelope_with_deps(100, 1, tx_hash_a, qs_hash);
+        let result = fetching.recv_envelope(envelope);
+        assert_eq!(result, RecvResult::Fetching);
+
+        // 2. Deliver quorum-set Q via direct cache (since recv_quorum_set needs tracking)
+        fetching.cache_quorum_set(qs_hash, make_sane_quorum_set());
+        assert!(fetching.has_quorum_set(&qs_hash));
+        assert_eq!(fetching.fetching_count(), 1, "still waiting on tx-set");
+
+        // 3. Fill quorum-set cache to trigger eviction
+        let qs_hash_b = Hash256::from_bytes([0x02; 32]);
+        let qs_hash_c = Hash256::from_bytes([0x03; 32]);
+        fetching.cache_quorum_set(qs_hash_b, make_sane_quorum_set());
+        fetching.cache_quorum_set(qs_hash_c, make_sane_quorum_set());
+
+        // Q should still be in cache (dependency-aware eviction protects it)
+        assert!(
+            fetching.has_quorum_set(&qs_hash),
+            "quorum-set Q should be protected from eviction while an envelope depends on it"
+        );
+
+        // 4. Deliver tx-set A and recheck
+        fetching.cache_tx_set(tx_hash_a, 100, vec![1, 2, 3]);
+
+        let to_check: Vec<ScpEnvelope> = fetching
+            .slots
+            .iter()
+            .flat_map(|slot_entry| {
+                slot_entry
+                    .fetching
+                    .values()
+                    .map(|(env, _)| env.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for env in to_check {
+            fetching.check_and_move_to_ready(env);
+        }
+
+        assert_eq!(
+            fetching.ready_count(),
+            1,
+            "envelope should be ready after both dependencies"
+        );
+    }
+
+    /// Test that cache size remains bounded even when all entries are referenced
+    /// by fetching envelopes (the fallback eviction path).
+    #[test]
+    fn test_tx_set_cache_bounded_when_all_referenced() {
+        let mut config = FetchingConfig::default();
+        config.max_tx_set_cache = 3;
+        let fetching = FetchingEnvelopes::new(config);
+
+        let qs_hash = Hash256::from_bytes([0x01; 32]);
+
+        // Insert 3 envelopes, each referencing a different tx-set
+        // (all will be fetching because quorum-set Q is missing)
+        for i in 0..3u8 {
+            let tx_hash = Hash256::from_bytes([0x10 + i; 32]);
+            let envelope = make_envelope_with_deps(100 + i as u64, i + 1, tx_hash, qs_hash);
+            let result = fetching.recv_envelope(envelope);
+            assert_eq!(result, RecvResult::Fetching);
+
+            // Deliver each tx-set so it's cached
+            fetching.recv_tx_set(tx_hash, 100 + i as u64, vec![i]);
+        }
+
+        // All 3 tx-sets are cached and all referenced by fetching envelopes
+        assert_eq!(fetching.tx_set_cache_size(), 3);
+        assert_eq!(fetching.fetching_count(), 3);
+
+        // Insert one more tx-set — cache should NOT exceed the limit
+        let extra_hash = Hash256::from_bytes([0xFF; 32]);
+        fetching.cache_tx_set(extra_hash, 200, vec![99]);
+
+        assert!(
+            fetching.tx_set_cache_size() <= 3,
+            "tx_set_cache must not exceed limit, got {}",
+            fetching.tx_set_cache_size()
         );
     }
 }

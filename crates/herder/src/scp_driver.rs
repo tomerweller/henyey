@@ -138,7 +138,7 @@ impl Default for ScpDriverConfig {
     fn default() -> Self {
         Self {
             node_id: PublicKey::from_bytes(&[0u8; 32]).unwrap(),
-            max_tx_set_cache: 256,
+            max_tx_set_cache: 10_000,
             max_time_drift: 60,
             local_quorum_set: None,
         }
