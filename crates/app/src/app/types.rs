@@ -331,7 +331,9 @@ pub struct QuorumHealthMetrics {
     pub missing: u64,
     /// Nodes disagreeing (placeholder — not yet detectable from QuorumInfo).
     pub disagree: u64,
-    /// Minimum nodes that can fail before quorum is lost.
+    /// Minimum nodes that can fail before quorum is lost, computed via
+    /// `find_closest_v_blocking` (excludes self). More precise than
+    /// `total - threshold` for nested quorum sets.
     pub fail_at: u64,
 }
 

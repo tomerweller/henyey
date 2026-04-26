@@ -319,7 +319,7 @@ metric_catalog! {
         QUORUM_DISAGREE = "stellar_quorum_disagree"
             => "Quorum set nodes disagreeing";
         QUORUM_FAIL_AT = "stellar_quorum_fail_at"
-            => "Nodes that can fail before quorum is lost";
+            => "Peers that can fail before quorum is lost (via find_closest_v_blocking, excludes self)";
 
         // Phase 4: SCP timing.
         SCP_TIMING_EXTERNALIZED_SECONDS = "stellar_scp_timing_externalized_seconds"

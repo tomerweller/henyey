@@ -64,7 +64,7 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `QUORUM_AGREE` | `stellar_quorum_agree` | gauge | Nodes agreeing with latest slot |
 | `QUORUM_MISSING` | `stellar_quorum_missing` | gauge | Nodes missing from latest slot |
 | `QUORUM_DISAGREE` | `stellar_quorum_disagree` | gauge | Nodes disagreeing in latest slot |
-| `QUORUM_FAIL_AT` | `stellar_quorum_fail_at` | gauge | Nodes that can fail before quorum loss |
+| `QUORUM_FAIL_AT` | `stellar_quorum_fail_at` | gauge | Peers that can fail before quorum loss (via `find_closest_v_blocking`, excludes self) |
 
 ## 2. Derived / Approximate Equivalents
 

@@ -31,7 +31,7 @@
         "disagree": 0,
         "missing": 0,
         "delayed": 0,
-        "fail_at": 1,
+        "fail_at": 2,
         "hash": "abcdef"
       }
     }

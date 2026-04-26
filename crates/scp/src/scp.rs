@@ -704,8 +704,14 @@ impl<D: SCPDriver> SCP<D> {
         let mut summary = crate::ReportingSummary::default();
         for node_id in &all_nodes {
             match self.get_reporting_state_with_lock(node_id, slot_index, &slots) {
-                crate::ReportingNodeState::Agree => summary.agree += 1,
-                crate::ReportingNodeState::Delayed => summary.delayed += 1,
+                crate::ReportingNodeState::Agree => {
+                    summary.agree += 1;
+                    summary.agreeing_nodes.insert(node_id.clone());
+                }
+                crate::ReportingNodeState::Delayed => {
+                    summary.delayed += 1;
+                    summary.agreeing_nodes.insert(node_id.clone());
+                }
                 crate::ReportingNodeState::Disagree => summary.disagree += 1,
                 crate::ReportingNodeState::Missing => summary.missing += 1,
                 crate::ReportingNodeState::NoInfo => {
@@ -1518,5 +1524,59 @@ mod tests {
         // Should be able to access the driver
         let retrieved = scp.driver();
         assert!(Arc::ptr_eq(&driver, retrieved));
+    }
+
+    #[test]
+    fn test_reporting_summary_agreeing_nodes() {
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+        let quorum_set = make_quorum_set(vec![node_a.clone(), node_b.clone(), node_c.clone()], 2);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .validation_level(ValidationLevel::MaybeValid)
+                .value_hash_mode(ValueHashMode::Fixed(1))
+                .timeout_mode(TimeoutMode::Linear {
+                    base: Duration::from_secs(1),
+                    step: Duration::from_secs(1),
+                })
+                .build(),
+        );
+        let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
+
+        // Force-externalize to create the slot (local = Agree).
+        let value: Value = vec![1].try_into().unwrap();
+        scp.force_externalize(1, value.clone());
+
+        // Inject PREPARE from node_b on slot 0 (will be looked back to from slot 1
+        // when self_already_moved_on=true → Delayed → still in agreeing_nodes).
+        let ballot = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
+        // Slot 0: inject prepare from node_b.
+        let env_b = make_prepare_envelope(node_b.clone(), 0, &quorum_set, ballot);
+        scp.receive_envelope(env_b);
+        // Also externalize slot 0 so the lookback slot exists.
+        scp.force_externalize(0, value);
+
+        let summary = scp.get_reporting_summary(1).unwrap();
+
+        // node_a is local (Agree), node_b via lookback (Agree or Delayed → in agreeing_nodes),
+        // node_c has no envelopes (Missing → not in agreeing_nodes).
+        assert!(
+            summary.agreeing_nodes.contains(&node_a),
+            "local node should be in agreeing_nodes"
+        );
+        assert_eq!(
+            summary.agreeing_nodes.len(),
+            (summary.agree + summary.delayed) as usize,
+            "agreeing_nodes count should match agree + delayed"
+        );
+        assert!(
+            !summary.agreeing_nodes.contains(&node_c),
+            "missing node should not be in agreeing_nodes"
+        );
     }
 }

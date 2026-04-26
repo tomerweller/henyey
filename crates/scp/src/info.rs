@@ -100,6 +100,10 @@ pub struct ReportingSummary {
     pub disagree: u64,
     /// Number of nodes that are behind but on the same track.
     pub delayed: u64,
+    /// Node IDs classified as Agree or Delayed (the "working" set for
+    /// `find_closest_v_blocking`). Populated in the same classification pass
+    /// as the counts above.
+    pub agreeing_nodes: std::collections::HashSet<crate::NodeId>,
 }
 
 /// JSON-serializable quorum information for a slot.

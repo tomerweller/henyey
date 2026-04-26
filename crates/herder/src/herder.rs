@@ -2623,7 +2623,11 @@ impl Herder {
     /// - `agree` = nodes in Agree or Delayed reporting state
     /// - `missing` = nodes in Missing reporting state
     /// - `disagree` = nodes in Disagree reporting state
-    /// - `fail_at` = total - threshold (approximate for nested quorum sets)
+    /// - `fail_at` = minimum number of additional peers (excluding self) whose
+    ///   failure would block quorum, computed via `find_closest_v_blocking`.
+    ///   More precise than `total - threshold` for nested quorum sets, but still
+    ///   approximate: uses reporting-state classification (Agree/Delayed) rather
+    ///   than stellar-core's ballot-compatibility check.
     ///
     /// Matches stellar-core `ApplicationImpl.cpp:525-546`:
     /// - Uses `tracking_slot - 1` first (previous slot has completed envelopes)
@@ -2654,14 +2658,15 @@ impl Herder {
         let missing = summary.missing;
         let disagree = summary.disagree;
 
-        // Approximate: for flat quorum sets, total - threshold is exact.
-        // For nested quorum sets this is an upper bound.
-        let total = agree + missing + disagree;
-        let threshold = self
-            .local_quorum_set()
-            .map(|qs| qs.threshold as u64)
-            .unwrap_or(total);
-        let fail_at = total.saturating_sub(threshold);
+        // Compute fail_at using find_closest_v_blocking for precision with
+        // nested quorum sets. Self-exclusion matches stellar-core's
+        // findClosestVBlocking(&id, ...) semantics: fail_at counts peers
+        // (excluding self) whose failure would block quorum.
+        let qs = self.scp.local_quorum_set();
+        let local_id = self.scp.local_node_id();
+        let v_blocking =
+            henyey_scp::find_closest_v_blocking(qs, &summary.agreeing_nodes, Some(local_id));
+        let fail_at = v_blocking.len() as u64;
         Some((agree, missing, disagree, fail_at))
     }
 
@@ -5974,8 +5979,10 @@ mod quorum_health_tests {
         set_tracking(&herder, 11);
 
         let health = herder.quorum_health();
-        // agree = 1 (local Agree) + 1 (peer Delayed) = 2, threshold=2, fail_at=0
-        assert_eq!(health, Some((2, 0, 0, 0)));
+        // agree = 1 (local Agree) + 1 (peer Delayed) = 2.
+        // find_closest_v_blocking excludes self: left_till_block = 1+2-2 = 1,
+        // peer is agreeing → fail_at = 1 (one peer failure blocks quorum).
+        assert_eq!(health, Some((2, 0, 0, 1)));
     }
 
     // ── Test 6: tracking_slot == 1 edge case ───────────────────────
@@ -5997,7 +6004,7 @@ mod quorum_health_tests {
 
     #[test]
     fn test_quorum_health_fail_at_nonzero() {
-        // 3-node quorum with threshold=2 → fail_at = 3 - 2 = 1.
+        // 3-node quorum with threshold=2 → fail_at = 2 (via find_closest_v_blocking).
         let (herder, keys, _qs) = make_n_node_validator_herder(3, 2);
         let peer1_key = &keys[1];
         let peer2_key = &keys[2];
@@ -6016,7 +6023,173 @@ mod quorum_health_tests {
         set_tracking(&herder, 10);
 
         let health = herder.quorum_health();
-        // 3 nodes all Agree, threshold=2, fail_at = 3 - 2 = 1.
-        assert_eq!(health, Some((3, 0, 0, 1)));
+        // 3 nodes all Agree. find_closest_v_blocking excludes self:
+        // left_till_block = 1+3-2 = 2, both peers agreeing → fail_at = 2.
+        assert_eq!(health, Some((3, 0, 0, 2)));
+    }
+
+    // ── Test 8: nested quorum set precision ────────────────────────
+    //
+    // Demonstrates that find_closest_v_blocking is more precise than
+    // total - threshold for nested quorum sets.
+
+    #[test]
+    fn test_quorum_health_nested_quorum_set_precision() {
+        // Quorum set: threshold=2/3 inner sets, each inner is threshold=2/3 validators.
+        // Old formula: total validators = 9, flat threshold = 2 → fail_at = 9-2 = 7 (wrong).
+        // find_closest_v_blocking correctly considers the nested structure.
+        let n = 10; // local + 9 peers
+        let mut keys = Vec::with_capacity(n);
+        let mut node_ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let seed = [(50 + i as u8); 32];
+            let sk = SecretKey::from_seed(&seed);
+            let pk = sk.public_key();
+            node_ids.push(node_id_from_public_key(&pk));
+            keys.push(sk);
+        }
+
+        // 3 inner sets, each with 3 validators (peers), threshold=2.
+        // Outer threshold=2 (need 2 of 3 inner sets to agree).
+        let inner1 = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![
+                node_ids[1].clone(),
+                node_ids[2].clone(),
+                node_ids[3].clone(),
+            ]
+            .try_into()
+            .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let inner2 = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![
+                node_ids[4].clone(),
+                node_ids[5].clone(),
+                node_ids[6].clone(),
+            ]
+            .try_into()
+            .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let inner3 = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![
+                node_ids[7].clone(),
+                node_ids[8].clone(),
+                node_ids[9].clone(),
+            ]
+            .try_into()
+            .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node_ids[0].clone()].try_into().unwrap(),
+            inner_sets: vec![inner1, inner2, inner3].try_into().unwrap(),
+        };
+
+        let local_pk = keys[0].public_key();
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_pk,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[50u8; 32]));
+
+        for key in &keys[1..] {
+            let peer_node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                *key.public_key().as_bytes(),
+            )));
+            herder.store_quorum_set(&peer_node_id, quorum_set.clone());
+        }
+
+        let value = make_valid_value(&herder, &keys[0]);
+
+        // Slot 9: local externalized + all peers send EXTERNALIZE.
+        herder.scp().force_externalize(9, value.clone());
+        for key in &keys[1..] {
+            let ext = make_envelope(key, 9, externalize_pledges(&value));
+            let r = herder.scp().receive_envelope(ext);
+            assert!(r.is_valid(), "peer EXTERNALIZE rejected: {:?}", r);
+        }
+
+        set_tracking(&herder, 10);
+
+        let health = herder.quorum_health();
+        // All 10 nodes agree. With nested structure:
+        // Outer: threshold=2, 1 validator (local, excluded) + 3 inner sets.
+        // left_till_block = 1 + 1 + 3 - 2 = 3.
+        // Local excluded → skip. Each inner set: all 3 in agreeing → result = [all 3].
+        // All inner sets have non-empty v_blocking results.
+        // After processing: need left_till_block-res.len() inner sets to fill.
+        // The precise fail_at depends on the recursive v-blocking calculation.
+        // Key assertion: fail_at is NOT 9 - 2 = 7 (the old broken formula applied
+        // to the flat threshold — which doesn't even apply to nested sets).
+        let (agree, missing, disagree, fail_at) = health.unwrap();
+        assert_eq!(agree, 10);
+        assert_eq!(missing, 0);
+        assert_eq!(disagree, 0);
+        // find_closest_v_blocking picks the minimum set of agreeing peers whose
+        // failure would v-block. Outer: threshold=2, 1 validator (local, excluded)
+        // + 3 inner sets → left_till_block = 3. All 3 inner sets must be broken.
+        // Each inner (threshold=2, 3 validators) needs 2 failures to v-block.
+        // Total: 3 × 2 = 6.
+        assert_eq!(fail_at, 6, "nested quorum set should give precise fail_at");
+    }
+
+    // ── Test 9: partial agree (some nodes missing) ─────────────────
+
+    #[test]
+    fn test_quorum_health_partial_agree_with_missing() {
+        // 3-node quorum, threshold=2. Only 2 nodes agree, 1 is missing.
+        let (herder, keys, _qs) = make_n_node_validator_herder(3, 2);
+
+        let value = make_valid_value(&herder, &keys[0]);
+
+        // Slot 9: local externalized + only peer1 sends EXTERNALIZE.
+        // Peer2 doesn't send anything → Missing.
+        herder.scp().force_externalize(9, value.clone());
+        let peer1_ext = make_envelope(&keys[1], 9, externalize_pledges(&value));
+        let r = herder.scp().receive_envelope(peer1_ext);
+        assert!(r.is_valid());
+
+        set_tracking(&herder, 10);
+
+        let health = herder.quorum_health();
+        let (agree, missing, _disagree, fail_at) = health.unwrap();
+        assert_eq!(agree, 2); // local + peer1
+        assert_eq!(missing, 1); // peer2
+
+        // find_closest_v_blocking with agreeing_nodes = {local, peer1}, excluded = local.
+        // Only peer1 is in the set (local excluded). left_till_block = 1+3-2 = 2.
+        // peer2 not in nodes → left_till_block -= 1 = 1. peer1 in nodes → res = [peer1].
+        // res.len()=1, left_till_block=1 → no truncation. fail_at = 1.
+        assert_eq!(fail_at, 1, "one more peer failure would block quorum");
+    }
+
+    // ── Test 10: all peers missing → fail_at = 0 ───────────────────
+
+    #[test]
+    fn test_quorum_health_all_peers_missing() {
+        // 3-node quorum, threshold=2. Only local agrees.
+        let (herder, keys, _qs) = make_n_node_validator_herder(3, 2);
+
+        let value = make_valid_value(&herder, &keys[0]);
+        herder.scp().force_externalize(9, value);
+
+        set_tracking(&herder, 10);
+
+        let health = herder.quorum_health();
+        let (agree, missing, _disagree, fail_at) = health.unwrap();
+        assert_eq!(agree, 1); // only local
+        assert_eq!(missing, 2); // both peers
+
+        // Agreeing nodes = {local}, excluded = local → empty set for v-blocking.
+        // Both peers already failing → already v-blocked → fail_at = 0.
+        assert_eq!(fail_at, 0, "already v-blocked with all peers missing");
     }
 }
