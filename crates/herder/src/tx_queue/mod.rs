@@ -2683,7 +2683,13 @@ impl TransactionQueue {
     /// Iterates the maintained `fee_index` BTreeSet in reverse (O(k) where k
     /// is the number of returned txs). Stops when the next transaction's ops
     /// would exceed `ops_budget`. Returns `(hashes, ops_used)`.
-    pub fn broadcast_some(&self, ops_budget: usize) -> (Vec<Hash256>, usize) {
+    /// Return the top transaction hashes by fee priority within an ops budget.
+    ///
+    /// Returns `(hash, op_count)` pairs in descending fee-rate order, stopping
+    /// when the cumulative ops would exceed `ops_budget`. The caller is
+    /// responsible for tracking which hashes were actually broadcast and
+    /// updating carry-over accordingly.
+    pub fn broadcast_some(&self, ops_budget: usize) -> Vec<(Hash256, u32)> {
         let store = self.store.read();
         let mut result = Vec::new();
         let mut ops_remaining = ops_budget;
@@ -2694,11 +2700,10 @@ impl TransactionQueue {
             if ops > ops_remaining {
                 break;
             }
-            result.push(entry.hash);
+            result.push((entry.hash, entry.op_count));
             ops_remaining -= ops;
         }
-        let ops_used = ops_budget - ops_remaining;
-        (result, ops_used)
+        result
     }
 
     /// Return transaction hashes ordered by fee per op (desc) then received time (asc).
@@ -8559,7 +8564,9 @@ mod broadcast_some_tests {
         assert_eq!(queue.try_add(tx_high.clone()), TxQueueResult::Added);
 
         // broadcast_some with unlimited budget should return all in fee-descending order
-        let (hashes, ops_used) = queue.broadcast_some(100);
+        let entries = queue.broadcast_some(100);
+        let hashes: Vec<_> = entries.iter().map(|(h, _)| *h).collect();
+        let ops_used: usize = entries.iter().map(|(_, ops)| (*ops as usize).max(1)).sum();
         assert_eq!(hashes.len(), 3);
         assert_eq!(ops_used, 3);
 
@@ -8593,19 +8600,37 @@ mod broadcast_some_tests {
         queue.try_add(tx3);
 
         // Budget of 3 ops: only 1 tx fits (each has 2 ops), then 1 remaining < 2
-        let (hashes, ops_used) = queue.broadcast_some(3);
-        assert_eq!(hashes.len(), 1);
-        assert_eq!(ops_used, 2);
+        let entries = queue.broadcast_some(3);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(_, ops)| (*ops as usize).max(1))
+                .sum::<usize>(),
+            2
+        );
 
         // Budget of 4 ops: 2 txs fit
-        let (hashes, ops_used) = queue.broadcast_some(4);
-        assert_eq!(hashes.len(), 2);
-        assert_eq!(ops_used, 4);
+        let entries = queue.broadcast_some(4);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(_, ops)| (*ops as usize).max(1))
+                .sum::<usize>(),
+            4
+        );
 
         // Budget of 6 ops: all 3 txs fit
-        let (hashes, ops_used) = queue.broadcast_some(6);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(ops_used, 6);
+        let entries = queue.broadcast_some(6);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(_, ops)| (*ops as usize).max(1))
+                .sum::<usize>(),
+            6
+        );
     }
 
     #[test]
@@ -8613,9 +8638,8 @@ mod broadcast_some_tests {
         let config = TxQueueConfig::default();
         let queue = TransactionQueue::new(config);
 
-        let (hashes, ops_used) = queue.broadcast_some(100);
-        assert!(hashes.is_empty());
-        assert_eq!(ops_used, 0);
+        let entries = queue.broadcast_some(100);
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -8630,9 +8654,8 @@ mod broadcast_some_tests {
         set_source(&mut tx, 1);
         queue.try_add(tx);
 
-        let (hashes, ops_used) = queue.broadcast_some(0);
-        assert!(hashes.is_empty());
-        assert_eq!(ops_used, 0);
+        let entries = queue.broadcast_some(0);
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -8655,9 +8678,8 @@ mod broadcast_some_tests {
         queue.remove_applied(&[(tx1, 300)]);
 
         // Only tx2 should remain
-        let (hashes, ops_used) = queue.broadcast_some(100);
-        assert_eq!(hashes.len(), 1);
-        assert_eq!(ops_used, 1);
-        assert_eq!(hashes[0], Hash256::hash_xdr(&tx2));
+        let entries = queue.broadcast_some(100);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, Hash256::hash_xdr(&tx2));
     }
 }

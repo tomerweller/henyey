@@ -41,9 +41,9 @@ impl App {
 
     pub(super) async fn flush_tx_adverts(&self) {
         let ops_budget = self.compute_flood_ops_budget();
-        let (hashes, ops_used) = self.herder.tx_queue().broadcast_some(ops_budget);
+        let candidates = self.herder.tx_queue().broadcast_some(ops_budget);
 
-        if hashes.is_empty() {
+        if candidates.is_empty() {
             // No txs to flood — preserve carry-over (capped).
             let new_carryover = ops_budget.min(Self::MAX_CARRYOVER_OPS);
             self.broadcast_op_carryover
@@ -51,24 +51,20 @@ impl App {
             return;
         }
 
-        tracing::debug!(
-            count = hashes.len(),
-            ops_used,
-            ops_budget,
-            "Flushing tx adverts (priority-ordered)"
-        );
-
-        // Update carry-over: remaining budget, capped.
-        let remaining = ops_budget.saturating_sub(ops_used);
-        self.broadcast_op_carryover
-            .store(remaining.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
-
         let Some(overlay) = self.overlay().await else {
+            // No overlay — preserve carry-over.
+            let new_carryover = ops_budget.min(Self::MAX_CARRYOVER_OPS);
+            self.broadcast_op_carryover
+                .store(new_carryover, Ordering::Relaxed);
             return;
         };
 
         let snapshots = overlay.peer_snapshots();
         if snapshots.is_empty() {
+            // No peers — preserve carry-over.
+            let new_carryover = ops_budget.min(Self::MAX_CARRYOVER_OPS);
+            self.broadcast_op_carryover
+                .store(new_carryover, Ordering::Relaxed);
             return;
         }
 
@@ -82,32 +78,48 @@ impl App {
         // XDR vector chunk size — cap at 1000 per the protocol limit.
         let max_chunk_size = self.max_advert_size().min(1000);
 
-        let per_peer = {
+        // Phase 1: Determine which hashes are new to at least one peer.
+        // Only count ops for hashes that will actually be advertised.
+        // Parity: stellar-core returns SKIPPED for already-broadcast txs,
+        // which does NOT count against the ops budget.
+        let mut ops_used: usize = 0;
+        let mut per_peer: HashMap<henyey_overlay::PeerId, Vec<Hash256>> = HashMap::new();
+        {
             let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
             adverts_by_peer.retain(|peer, _| peer_set.contains(peer));
 
-            let mut per_peer = Vec::new();
-            for peer_id in peer_ids {
-                let adverts = adverts_by_peer
-                    .entry(peer_id.clone())
-                    .or_insert_with(PeerTxAdverts::new);
-                let mut outgoing = Vec::new();
-                for hash in &hashes {
-                    if adverts.seen_advert(hash) {
-                        continue;
+            for (hash, op_count) in &candidates {
+                let mut new_to_any_peer = false;
+                for peer_id in &peer_ids {
+                    let adverts = adverts_by_peer
+                        .entry(peer_id.clone())
+                        .or_insert_with(PeerTxAdverts::new);
+                    if !adverts.seen_advert(hash) {
+                        new_to_any_peer = true;
+                        per_peer.entry(peer_id.clone()).or_default().push(*hash);
                     }
-                    outgoing.push(*hash);
-                    // Mark as sent so we don't re-advertise next period.
-                    adverts.remember(*hash, ledger_seq);
                 }
-                if !outgoing.is_empty() {
-                    per_peer.push((peer_id, outgoing));
+                if new_to_any_peer {
+                    ops_used += (*op_count as usize).max(1);
                 }
             }
-            per_peer
-        };
+        } // drop write lock before sending
 
-        for (peer_id, hashes) in per_peer {
+        tracing::debug!(
+            candidate_count = candidates.len(),
+            new_adverts = per_peer.values().map(|v| v.len()).sum::<usize>(),
+            ops_used,
+            ops_budget,
+            "Flushing tx adverts (priority-ordered)"
+        );
+
+        // Update carry-over: remaining budget, capped.
+        let remaining = ops_budget.saturating_sub(ops_used);
+        self.broadcast_op_carryover
+            .store(remaining.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
+
+        // Phase 2: Send adverts and mark successfully sent hashes.
+        for (peer_id, hashes) in &per_peer {
             for chunk in hashes.chunks(max_chunk_size) {
                 let tx_hashes = match TxAdvertVector::try_from(
                     chunk
@@ -122,8 +134,20 @@ impl App {
                     }
                 };
                 let advert = FloodAdvert { tx_hashes };
-                if let Err(e) = overlay.try_send_to(&peer_id, StellarMessage::FloodAdvert(advert)) {
-                    tracing::debug!(peer = %peer_id, error = %e, "Failed to send tx advert batch");
+                match overlay.try_send_to(peer_id, StellarMessage::FloodAdvert(advert)) {
+                    Ok(()) => {
+                        // Mark as sent only after successful send.
+                        let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
+                        if let Some(adverts) = adverts_by_peer.get_mut(peer_id) {
+                            for hash in chunk {
+                                adverts.remember(*hash, ledger_seq);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(peer = %peer_id, error = %e, "Failed to send tx advert batch");
+                        // Don't mark — will retry next period.
+                    }
                 }
             }
         }
