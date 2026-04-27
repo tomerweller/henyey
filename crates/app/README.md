@@ -88,30 +88,66 @@ assert!(!config.network.passphrase.is_empty());
 | Module | Description |
 |--------|-------------|
 | `lib.rs` | Crate root, module declarations, and public re-exports for the main app-facing API. |
-| `app/mod.rs` | `App` construction, subsystem wiring, database locking, key setup, bucket/ledger initialization, and shared runtime state. |
-| `app/types.rs` | Public app-facing types plus internal support types for buffering, survey scheduling, latency tracking, and recovery bookkeeping. |
-| `app/lifecycle.rs` | Main event loop, overlay startup, timer scheduling, message dispatch, heartbeat logging, and graceful shutdown. |
-| `app/ledger_close.rs` | Ledger-close persistence, restart recovery from persisted HAS, buffered close sequencing, and contract event extraction. |
+| `app/archive_cache.rs` | Catchup-time archive state cache for checkpoint and bucket metadata. |
+| `app/bootstrap.rs` | Genesis/bootstrap helpers for local and fresh database startup. |
 | `app/catchup_impl.rs` | Catchup orchestration, history archive checkpoint discovery, replay-mode selection, catchup-time message caching, and post-catchup cleanup. |
+| `app/close.rs` | Ledger-close entry points and close-result plumbing. |
+| `app/close_pipeline.rs` | Buffered close pipeline that interleaves ledger application with the event loop. |
 | `app/consensus.rs` | Consensus triggering, out-of-sync recovery, SCP state exchange, quorum-set handling, and timeout management. |
+| `app/ledger_close.rs` | Ledger-close persistence, restart recovery from persisted HAS, buffered close sequencing, and contract event extraction. |
+| `app/lifecycle.rs` | Main event loop, overlay startup, timer scheduling, message dispatch, heartbeat logging, and graceful shutdown. |
+| `app/log_throttle.rs` | Rate-limited logging helpers for repetitive runtime messages. |
+| `app/mod.rs` | `App` construction, subsystem wiring, database locking, key setup, bucket/ledger initialization, and shared runtime state. |
 | `app/peers.rs` | Peer inspection, connect/disconnect/ban helpers, discovery persistence, refresh logic, and ping-based latency measurement. |
+| `app/persist.rs` | Persistent app-state helpers used during restart and ledger close. |
+| `app/phase.rs` | Runtime phase bookkeeping for startup, catchup, and live tracking. |
 | `app/publish.rs` | Validator-side checkpoint publishing, checkpoint artifact assembly, SCP history export, and command-based archive upload support. |
 | `app/survey_impl.rs` | Survey HTTP command implementation, request/response encryption, report aggregation, and automatic survey scheduling logic. |
+| `app/tracked_lock.rs` | Lock tracking helpers for runtime diagnostics. |
 | `app/tx_flooding.rs` | Transaction advert/demand queues, tx-set request rotation, DontHave tracking, and network flood control. |
+| `app/types.rs` | Public app-facing types plus internal support types for buffering, survey scheduling, latency tracking, and recovery bookkeeping. |
+| `app/upgrades.rs` | Ledger-upgrade proposal and settings helpers exposed through app/runtime APIs. |
 | `catchup_cmd.rs` | Public catchup command entry point, target parsing, CLI-oriented progress callbacks, and result formatting. |
-| `config.rs` | Hierarchical TOML config types, defaults for testnet/mainnet, validation rules, env overrides, and builder APIs. |
 | `compat_config.rs` | Translator from stellar-core flat SCREAMING_CASE config files into `AppConfig`. |
-| `run_cmd.rs` | Public node run entry point, mode selection, server spawning, sync waiting, and shutdown signal handling. |
+| `compat_http/mod.rs` | stellar-core-compatible HTTP server and panic-safe router wrapper. |
+| `compat_http/handlers/mod.rs` | Compatibility handler module declarations and shared routing helpers. |
+| `compat_http/handlers/info.rs` | stellar-core-shaped `/info` compatibility response. |
+| `compat_http/handlers/metrics.rs` | Plaintext metrics compatibility output. |
+| `compat_http/handlers/peers.rs` | Compatibility peer inspection and peer-admin endpoints. |
+| `compat_http/handlers/plaintext.rs` | Text response helpers for legacy command endpoints. |
+| `compat_http/handlers/testacc.rs` | Deterministic test-account compatibility endpoint. |
+| `compat_http/handlers/tx.rs` | Compatibility transaction submission endpoint. |
+| `config.rs` | Hierarchical TOML config types, defaults for testnet/mainnet, validation rules, env overrides, and builder APIs. |
+| `http/mod.rs` | Native Axum servers: status/control router and separate query-server router. |
+| `http/helpers.rs` | Shared HTTP parsing helpers for peer IDs, connect params, and ledger upgrade formatting. |
+| `http/handlers/mod.rs` | Native handler module declarations. |
+| `http/handlers/admin.rs` | Native admin endpoints for maintenance, manual close, peer mutation, and self-checks. |
+| `http/handlers/generateload.rs` | Optional load-generation request handling. |
+| `http/handlers/info.rs` | Native node information endpoint. |
+| `http/handlers/metrics.rs` | Metrics export endpoint. |
+| `http/handlers/peers.rs` | Native peer listing and peer-control endpoints. |
+| `http/handlers/query.rs` | Query-server ledger-entry lookup endpoints. |
+| `http/handlers/scp.rs` | SCP and quorum diagnostics endpoints. |
+| `http/handlers/soroban.rs` | Soroban resource and ledger settings endpoints. |
+| `http/handlers/survey.rs` | Survey collection/reporting endpoints. |
+| `http/handlers/tx.rs` | Native transaction submission endpoint. |
+| `http/types/mod.rs` | Native HTTP request/response type module declarations. |
+| `http/types/admin.rs` | Admin endpoint request and response structs. |
+| `http/types/generateload.rs` | Load-generation request and response structs. |
+| `http/types/info.rs` | Node information response structs. |
+| `http/types/peers.rs` | Peer API request and response structs. |
+| `http/types/query.rs` | Query-server request and response structs. |
+| `http/types/scp.rs` | SCP/quorum diagnostic response structs. |
+| `http/types/soroban.rs` | Soroban endpoint response structs. |
+| `http/types/survey.rs` | Survey endpoint request and response structs. |
+| `http/types/tx.rs` | Transaction submission response structs. |
 | `logging.rs` | Tracing initialization, dynamic partition log-level control, and generic/catchup progress trackers. |
 | `maintainer.rs` | Automatic pruning for ledger headers, SCP history, RPC retention tables, and event rows. |
 | `meta_stream.rs` | Main metadata stream output plus rotating debug stream management and gzip segment cleanup. |
+| `meta_writer.rs` | Metadata output writer abstraction and gzip support. |
+| `metrics.rs` | App-level metric registration and snapshots. |
+| `run_cmd.rs` | Public node run entry point, mode selection, server spawning, sync waiting, and shutdown signal handling. |
 | `survey.rs` | Core survey data structures: phase tracking, message limiting, latency histograms, and topology data assembly. |
-| `http/mod.rs` | Native Axum servers: status/control router and separate query-server router. |
-| `http/helpers.rs` | Shared HTTP parsing helpers for peer IDs, connect params, and ledger upgrade formatting. |
-| `http/handlers/` | Native endpoint handlers for admin, info, metrics, peers, query, SCP, Soroban, surveys, tx submission, and optional loadgen. |
-| `http/types/` | Request/response structs for the native HTTP APIs. |
-| `compat_http/mod.rs` | stellar-core-compatible HTTP server and panic-safe router wrapper. |
-| `compat_http/handlers/` | Compatibility handlers for stellar-core JSON/plaintext shapes, including `/info`, `/metrics`, `/peers`, `/tx`, and `/testacc`. |
 
 ## Design Notes
 

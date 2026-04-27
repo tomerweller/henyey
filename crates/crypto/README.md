@@ -18,20 +18,17 @@ survey payload encryption.
 graph TD
     subgraph "henyey-crypto"
         keys[keys.rs<br>PublicKey / SecretKey / Signature]
-        hash[hash.rs<br>SHA-256 / BLAKE2 / HMAC / HKDF / XDR hashing]
-        signer_key[signer_key.rs<br>SignerKey construction]
+        hash[hash.rs<br>SHA-256 / BLAKE2 / HMAC / HKDF]
         signature[signature.rs<br>Cached verify / sign_hash]
         short_hash[short_hash.rs<br>SipHash-2-4]
         curve25519[curve25519.rs<br>ECDH key exchange]
         sealed_box[sealed_box.rs<br>Sealed box encryption]
-        hex_mod[hex.rs<br>Hex encode/decode]
         random[random.rs<br>Secure RNG]
         error[error.rs<br>CryptoError]
     end
 
     signature --> keys
     signature --> hash
-    signer_key --> hash
     sealed_box --> keys
     curve25519 --> hash
     short_hash --> random
@@ -46,6 +43,7 @@ graph TD
 | `Signature` | Ed25519 signature (64 bytes) |
 | `Curve25519Secret` | X25519 secret scalar for ECDH key exchange; zeroized on drop |
 | `Curve25519Public` | X25519 public point for ECDH key exchange |
+| `KeyOrdering` | Selects public-key concatenation order for Stellar overlay shared-key derivation |
 | `Hash256` | 32-byte hash value (re-exported from `henyey-common`) |
 | `Sha256Hasher` | Streaming SHA-256 hasher |
 | `CryptoError` | Error type for all cryptographic operations |
@@ -71,34 +69,36 @@ let restored = PublicKey::from_strkey(&account_id).unwrap();
 assert_eq!(public, restored);
 ```
 
-### Hashing and HMAC
+### Hashing
 
 ```rust
-use henyey_crypto::{sha256, Sha256Hasher, hmac_sha256, hmac_sha256_verify};
+use henyey_crypto::{blake2, sha256, Sha256Hasher};
 
 // Single-shot SHA-256
-let hash = sha256(b"hello world");
+let sha = sha256(b"hello world");
+let digest = blake2(b"hello world");
 
 // Streaming
 let mut hasher = Sha256Hasher::new();
 hasher.update(b"hello ");
 hasher.update(b"world");
-let hash = hasher.finalize();
-
-// HMAC-SHA256
-let key = [0u8; 32];
-let mac = hmac_sha256(&key, b"message");
-assert!(hmac_sha256_verify(&mac, &key, b"message"));
+assert_eq!(sha, hasher.finalize());
+assert_ne!(sha, digest);
 ```
 
-### Sealed box encryption (surveys)
+### Sealed box encryption with Curve25519 keys
 
 ```rust
-use henyey_crypto::{SecretKey, seal_to_public_key, open_from_secret_key};
+use henyey_crypto::{
+    Curve25519Secret, open_from_curve25519_secret_key, seal_to_curve25519_public_key,
+};
 
-let recipient = SecretKey::generate();
-let ciphertext = seal_to_public_key(&recipient.public_key(), b"secret").unwrap();
-let plaintext = open_from_secret_key(&recipient, &ciphertext).unwrap();
+let recipient = Curve25519Secret::random();
+let public = recipient.derive_public();
+let secret_bytes = recipient.to_bytes();
+
+let ciphertext = seal_to_curve25519_public_key(public.as_bytes(), b"secret").unwrap();
+let plaintext = open_from_curve25519_secret_key(&secret_bytes, &ciphertext).unwrap();
 assert_eq!(plaintext, b"secret");
 ```
 
@@ -108,13 +108,11 @@ assert_eq!(plaintext, b"secret");
 |--------|-------------|
 | `lib.rs` | Crate root; module declarations and public re-exports |
 | `keys.rs` | `PublicKey`, `SecretKey`, `Signature` types with Ed25519 operations, XDR conversions, and `account_id_to_strkey` |
-| `hash.rs` | SHA-256, BLAKE2b-256, HMAC-SHA256, HKDF, and XDR hashing (`xdr_sha256`) in single-shot and streaming modes |
+| `hash.rs` | SHA-256, BLAKE2b-256, internal HMAC-SHA256/HKDF helpers, and test-only XDR hashing |
 | `signature.rs` | Process-global cached signature verification helpers, plus `sign_hash` and `verify_hash_from_raw_key` |
-| `signer_key.rs` | Construction and inspection helpers for XDR `SignerKey` variants, including Ed25519, PreAuthTx, HashX, and signed-payload keys |
 | `short_hash.rs` | Process-global SipHash-2-4 for deterministic bucket list ordering |
 | `curve25519.rs` | Curve25519 ECDH key exchange for P2P overlay session key agreement |
 | `sealed_box.rs` | Sealed box encryption/decryption for anonymous survey payloads (Ed25519 and Curve25519 key variants) |
-| `hex.rs` | Hex encoding/decoding utilities (`bin_to_hex`, `hex_abbrev`, `hex_to_bin`, `hex_to_bin_256`, `hex_to_hash256`) |
 | `random.rs` | Cryptographically secure random byte/integer generation via OS RNG |
 | `error.rs` | `CryptoError` enum covering all failure modes |
 
@@ -135,8 +133,9 @@ assert_eq!(plaintext, b"secret");
 - **XDR hashing allocates**: Unlike stellar-core's zero-allocation `XDRHasher`
   CRTP pattern, the Rust implementation serializes XDR to a `Vec<u8>` first.
   This is simpler and sufficient for current workloads.
-- **Constant-time HMAC verification**: `hmac_sha256_verify` delegates to the
-  `hmac` crate's `verify_slice`, which performs constant-time comparison.
+- **Constant-time HMAC verification**: the internal test-only
+  `hmac_sha256_verify` helper delegates to the `hmac` crate's `verify_slice`,
+  which performs constant-time comparison.
 - **StrKey encoding**: Delegated entirely to the `stellar-strkey` crate
   (re-exported as `henyey_crypto::stellar_strkey`), with convenience methods
   on `PublicKey` and `SecretKey` for the common encode/decode operations.
@@ -148,14 +147,14 @@ assert_eq!(plaintext, b"secret");
 | `keys.rs` | `src/crypto/SecretKey.h` / `SecretKey.cpp` |
 | `hash.rs` | `src/crypto/SHA.h` / `SHA.cpp`, `src/crypto/BLAKE2.h` / `BLAKE2.cpp` |
 | `signature.rs` | `src/crypto/SecretKey.h` (signing/verification helpers, `gVerifySigCache`) |
-| `signer_key.rs` | `src/crypto/SignerKey.h` / `SignerKeyUtils.h` |
 | `short_hash.rs` | `src/crypto/ShortHash.h` / `ShortHash.cpp` |
 | `curve25519.rs` | `src/crypto/Curve25519.h` / `Curve25519.cpp` |
 | `sealed_box.rs` | `src/crypto/Curve25519.h` (sealed box functions) |
-| `hex.rs` | `src/crypto/Hex.h` / `Hex.cpp` |
 | `random.rs` | `src/crypto/Random.h` / `Random.cpp` |
 | `error.rs` | (no direct equivalent; C++ uses exceptions) |
 | *(re-export)* `stellar_strkey` | `src/crypto/StrKey.h` / `StrKey.cpp`, `src/crypto/KeyUtils.h` / `KeyUtils.cpp` |
+| *(not implemented)* | `src/crypto/SignerKey.h`, `src/crypto/SignerKeyUtils.h` |
+| *(omitted)* | `src/crypto/Hex.h` / `Hex.cpp` (direct `hex` crate use) |
 
 ## Parity Status
 

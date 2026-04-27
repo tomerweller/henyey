@@ -105,8 +105,10 @@ assert!(status.success());
 | `build.rs` | Injects the git commit hash and UTC build timestamp into compile-time environment variables. |
 | `src/main.rs` | Main CLI entry point plus command handlers for running the node, history tooling, diagnostics, compatibility commands, and benchmarks. |
 | `src/main.rs` (`loadgen_runner`) | Bridges `henyey-app` load-generation hooks to `henyey-simulation::LoadGenerator`. |
+| `src/publish_history.rs` | Implements the history publishing command and command-archive target support. |
 | `src/quorum_intersection.rs` | Loads stellar-core-style JSON quorum descriptions and checks satisfiability plus quorum intersection. |
 | `src/settings_upgrade.rs` | Builds and optionally signs the four Soroban settings-upgrade transactions that mirror stellar-core's upgrade utility. |
+| `src/verify_execution.rs` | Offline execution verifier that restores bucket state and replays ledgers against CDP metadata. |
 | `src/bin/header_compare.rs` | Separate debugging binary that compares local and archived ledger headers and optional transaction result sets. |
 
 ## Design Notes

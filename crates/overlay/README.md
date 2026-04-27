@@ -128,7 +128,10 @@ let overlay = OverlayManager::new_with_connection_factory(config, local_node, fa
 | `flow_control.rs` | Priority outbound queues, message/byte capacity tracking, and `CapacityGuard`. |
 | `item_fetcher.rs` | `ItemFetcher` and `Tracker` state machines for missing tx/quorum set retrieval. |
 | `loopback.rs` | In-process loopback transport for tests and simulations. |
-| `manager.rs` | `OverlayManager`, task orchestration, peer loop, routing, keepalive, and discovery. |
+| `manager/mod.rs` | `OverlayManager` public API, task orchestration, routing, and subscriptions. |
+| `manager/connection.rs` | Dial/listener integration and connection task setup. |
+| `manager/peer_loop.rs` | Per-peer message loop and dispatch into overlay channels. |
+| `manager/tick.rs` | Periodic discovery, keepalive, cleanup, and peer-management ticks. |
 | `message_handlers.rs` | Fetch-protocol dispatcher and local caches for tx sets and quorum sets. |
 | `metrics.rs` | Atomic counters and timers for overlay observability. |
 | `peer.rs` | Authenticated peer lifecycle, handshake ordering, and per-peer stats. |

@@ -4,27 +4,33 @@ Dependency-aware async work scheduler for orchestrating henyey workflows.
 
 ## Overview
 
-`henyey-work` provides the shared scheduling primitives used by higher-level henyey crates to run multi-step async workflows with explicit dependency ordering. It is the Rust counterpart to stellar-core's `src/work/` subsystem, but it models orchestration as a flat DAG of Tokio tasks instead of a parent-child work tree.
+`henyey-work` provides the shared scheduling primitives used by higher-level
+henyey crates to run multi-step async workflows with explicit dependency
+ordering. It maps to the core scheduling concerns in stellar-core's
+`src/work/` subsystem, but models orchestration as a flat DAG of Tokio tasks
+instead of a parent-child `BasicWork` tree.
 
 ## Architecture
 
 ```mermaid
 stateDiagram-v2
     [*] --> Pending
-    Pending --> Running : deps satisfied and slot available
+    Pending --> Running : dependencies succeeded
     Running --> Success
     Running --> Failed
     Running --> Cancelled
-    Running --> Pending : Retry with delay
-    Failed --> Blocked : dependents
-    Cancelled --> Blocked : dependents
-    Blocked --> [*]
+    Running --> Pending : Retry
+    Failed --> Blocked : downstream dependents
+    Cancelled --> Blocked : downstream dependents
     Success --> [*]
     Failed --> [*]
     Cancelled --> [*]
+    Blocked --> [*]
 ```
 
-Each work item starts in `Pending`, runs once all dependencies have succeeded, and reports a `WorkOutcome` back to the scheduler. The scheduler tracks retries, emits optional events, and only re-checks direct dependents when upstream work completes.
+Each work item starts in `Pending`, runs once all dependencies have succeeded,
+and reports a `WorkOutcome` back to the scheduler. The scheduler tracks retry
+budget, cancellation tokens, optional events, and dependency blocking.
 
 ## Key Types
 
@@ -34,9 +40,6 @@ Each work item starts in `Pending`, runs once all dependencies have succeeded, a
 | `WorkScheduler` | DAG scheduler that owns work items, executes ready items, and updates state. |
 | `WorkSchedulerConfig` | Runtime settings for concurrency, default retry delay, and event emission. |
 | `WorkSchedulerMetrics` | Aggregate counts for pending, running, terminal, and retry-related state. |
-| `WorkSnapshot` | Per-item introspection data including dependencies, attempts, and errors. |
-| `WorkSequence` | Helper for appending a linear chain of dependent work items. |
-| `WorkWithCallback` | Wrapper that runs another work item and invokes a completion callback. |
 | `WorkContext` | Execution context containing the work ID, attempt number, and cancellation token. |
 | `WorkOutcome` | Result of one execution attempt: success, retry, failure, or cancellation. |
 | `WorkState` | Scheduler-visible lifecycle state for a registered work item. |
@@ -48,8 +51,6 @@ Each work item starts in `Pending`, runs once all dependencies have succeeded, a
 ### Define and schedule dependent work
 
 ```rust
-use std::time::Duration;
-
 use async_trait::async_trait;
 use henyey_work::{Work, WorkContext, WorkOutcome, WorkScheduler, WorkSchedulerConfig};
 
@@ -66,61 +67,76 @@ impl Work for Download {
     }
 }
 
-let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
-    max_concurrency: 4,
-    retry_delay: Duration::from_secs(1),
-    event_tx: None,
-});
+# async fn example() {
+let mut scheduler = WorkScheduler::new(WorkSchedulerConfig::default());
 
 let download = scheduler.add_work(Box::new(Download), vec![], 0);
 let _verify = scheduler.add_work(Box::new(Download), vec![download], 0);
 
 scheduler.run_until_done().await;
+# }
 ```
 
-### Build a sequential pipeline with `WorkSequence`
+### Retry transient work
 
 ```rust
-use henyey_work::WorkSequence;
+use std::time::Duration;
 
-let mut sequence = WorkSequence::new();
-sequence.push(&mut scheduler, Box::new(fetch_stage), 2);
-sequence.push(&mut scheduler, Box::new(parse_stage), 0);
-sequence.push(&mut scheduler, Box::new(apply_stage), 0);
+use async_trait::async_trait;
+use henyey_work::{Work, WorkContext, WorkOutcome};
 
+struct RetryOnce {
+    attempts: u32,
+}
+
+#[async_trait]
+impl Work for RetryOnce {
+    fn name(&self) -> &str {
+        "retry-once"
+    }
+
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
+        self.attempts += 1;
+        if self.attempts == 1 {
+            WorkOutcome::Retry { delay: Duration::ZERO }
+        } else {
+            WorkOutcome::Success
+        }
+    }
+}
+```
+
+### Inspect state and metrics
+
+```rust
+use henyey_work::{WorkScheduler, WorkSchedulerConfig, WorkState};
+
+# async fn example(mut scheduler: WorkScheduler, id: henyey_work::WorkId) {
 scheduler.run_until_done().await;
-```
 
-### Attach completion callbacks
-
-```rust
-use std::sync::Arc;
-
-use henyey_work::{WorkContext, WorkOutcome, WorkWithCallback};
-
-let callback = Arc::new(|outcome: &WorkOutcome, ctx: &WorkContext| {
-    tracing::info!(work_id = ctx.id, ?outcome, "work finished");
-});
-
-let wrapped = WorkWithCallback::new(Box::new(fetch_stage), callback);
-scheduler.add_work(Box::new(wrapped), vec![], 0);
+let metrics = scheduler.metrics();
+assert_eq!(scheduler.state(id), Some(WorkState::Success));
+tracing::info!(success = metrics.success, total = metrics.total);
+# }
 ```
 
 ## Module Layout
 
 | Module | Description |
 |--------|-------------|
-| `lib.rs` | Crate entry point that wires modules together and re-exports the public API. |
+| `lib.rs` | Crate entry point and public re-exports for the scheduler API. |
 | `types.rs` | Core trait and shared state types such as `Work`, `WorkOutcome`, `WorkState`, and `WorkEvent`. |
-| `scheduler.rs` | Scheduler engine, configuration, metrics, snapshots, retry handling, and cancellation logic. |
-| `sequence.rs` | `WorkSequence` helper for creating ordered dependency chains. |
-| `callback.rs` | `WorkWithCallback` wrapper for post-run hooks. |
+| `scheduler.rs` | Scheduler engine, configuration, metrics, retry handling, cancellation, and event emission. |
 
 ## Design Notes
 
-- Work items are owned by the scheduler and temporarily swapped out with an internal placeholder while Tokio executes them, which preserves mutable state across retries without cloning.
-- Failure propagation is dependency-based: a failed or cancelled item blocks only its downstream dependents, not the entire scheduler.
-- The crate intentionally uses a flat dependency graph rather than stellar-core's hierarchical `Work` tree, which keeps orchestration simpler for current catchup and history flows.
+- Work items are owned by the scheduler and temporarily moved into spawned
+  Tokio tasks, then restored after completion so mutable state survives retries.
+- Failure propagation is dependency-based: a failed or cancelled item blocks
+  only its downstream dependents.
+- The crate intentionally uses a flat dependency graph rather than
+  stellar-core's hierarchical `Work` tree, which keeps current catchup and
+  history workflows simple.
 
 ## stellar-core Mapping
 
@@ -128,11 +144,11 @@ scheduler.add_work(Box::new(wrapped), vec![], 0);
 |------|--------------|
 | `src/types.rs` | `src/work/BasicWork.h`, `src/work/BasicWork.cpp` |
 | `src/scheduler.rs` | `src/work/WorkScheduler.h`, `src/work/WorkScheduler.cpp` |
-| `src/sequence.rs` | `src/work/WorkSequence.h`, `src/work/WorkSequence.cpp` |
-| `src/callback.rs` | `src/work/WorkWithCallback.h`, `src/work/WorkWithCallback.cpp` |
-| Not implemented | `src/work/Work.h` |
+| Not implemented | `src/work/Work.h`, `src/work/Work.cpp` |
+| Not implemented | `src/work/WorkSequence.h`, `src/work/WorkSequence.cpp` |
 | Not implemented | `src/work/BatchWork.h`, `src/work/BatchWork.cpp` |
 | Not implemented | `src/work/ConditionalWork.h`, `src/work/ConditionalWork.cpp` |
+| Not implemented | `src/work/WorkWithCallback.h`, `src/work/WorkWithCallback.cpp` |
 
 ## Parity Status
 

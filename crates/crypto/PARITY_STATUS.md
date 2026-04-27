@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-crypto`
 **Upstream**: `stellar-core/src/crypto/`
-**Overall Parity**: 69%
-**Last Updated**: 2026-04-07
+**Overall Parity**: 59%
+**Last Updated**: 2026-04-26
 
 ## Summary
 
@@ -11,14 +11,14 @@
 |------|--------|-------|
 | SHA-256 Hashing | Partial | Single-shot, streaming (no reset), HMAC, HKDF, XDR hashing |
 | BLAKE2 Hashing | Partial | Single-shot only; no streaming hasher or XDR hashing |
-| Hex Encoding | Full | All four upstream functions implemented (test-only gated) |
+| Hex Encoding | None | Intentionally omitted; call sites use the `hex` crate directly |
 | Random Generation | Full | CSPRNG via OsRng |
 | Curve25519 ECDH | Full | Key exchange, shared key derivation |
 | Sealed Box Encryption | Full | Encrypt/decrypt via crypto_box |
 | Ed25519 Keys & Signatures | Partial | Generate, sign, verify, StrKey; missing isZero, ==, < |
 | StrKey Encoding | Partial | Core encode/decode via `stellar_strkey`; missing size/convert utils |
 | Short Hash (SipHash) | Full | initialize, computeHash, xdrComputeHash, seed |
-| SignerKey Utilities | Full | preAuthTx, hashX, ed25519Payload, getEd25519 (test-only gated) |
+| SignerKey Utilities | None | No crate-local constructors; transaction code builds XDR directly |
 | Signature Verification Cache | Partial | BLAKE2-keyed FIFO cache; missing clear/seed/flush APIs |
 | Key/Logging Utilities | None | toShortString, logKey, random helpers |
 | Error Types | Full | `CryptoError` enum covers all upstream failure modes |
@@ -29,14 +29,14 @@
 |--------------------|-------------|-------|
 | `SHA.h` / `SHA.cpp` | `hash.rs` | SHA-256, HMAC-SHA256, HKDF |
 | `BLAKE2.h` / `BLAKE2.cpp` | `hash.rs` | BLAKE2b-256 single-shot only |
-| `Hex.h` / `Hex.cpp` | `hex.rs` | Hex encoding/decoding (all functions `#[cfg(test)]`) |
+| `Hex.h` / `Hex.cpp` | *(omitted)* | Direct `hex` crate use at call sites |
 | `Random.h` / `Random.cpp` | `random.rs` | CSPRNG |
 | `Curve25519.h` / `Curve25519.cpp` | `curve25519.rs`, `sealed_box.rs` | ECDH and sealed box split across two modules |
 | `SecretKey.h` / `SecretKey.cpp` | `keys.rs`, `signature.rs` | Key types, signing, verification with cache |
 | `StrKey.h` / `StrKey.cpp` | *(re-export)* `stellar_strkey` | StrKey encoding/decoding delegated to external crate |
 | `ShortHash.h` / `ShortHash.cpp` | `short_hash.rs` | SipHash-2-4 |
-| `SignerKey.h` / `SignerKey.cpp` | `signer_key.rs` | KeyFunctions<SignerKey> specialization (all `#[cfg(test)]`) |
-| `SignerKeyUtils.h` / `SignerKeyUtils.cpp` | `signer_key.rs` | SignerKey construction utilities (all `#[cfg(test)]`) |
+| `SignerKey.h` / `SignerKey.cpp` | *(gap)* | No crate-local SignerKey utility module |
+| `SignerKeyUtils.h` / `SignerKeyUtils.cpp` | *(gap)* | No crate-local SignerKey construction helpers |
 | `KeyUtils.h` / `KeyUtils.cpp` | `keys.rs` | Generic key encode/decode via methods on key types |
 | `CryptoError.h` | `error.rs` | Error types |
 | `XDRHasher.h` | `hash.rs` | XDR hashing (different approach) |
@@ -67,18 +67,18 @@ Corresponds to: `SHA.h`, `BLAKE2.h`
 | `BLAKE2::finish()` | -- | None |
 | `xdrBlake2<T>(T)` | -- | None |
 
-### hex.rs (`hex.rs`)
+### Hex utilities (omitted)
 
 Corresponds to: `Hex.h`
 
-All functions are `#[cfg(test)]` — implementations exist but are not compiled into production builds.
+No crate-local hex module exists. Rust call sites use the `hex` crate directly; this is listed under Intentional Omissions and excluded from the parity calculation.
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `binToHex(ByteSlice)` | `bin_to_hex(&[u8])` | Full |
-| `hexAbbrev(ByteSlice)` | `hex_abbrev(&[u8])` | Full |
-| `hexToBin(string)` | `hex_to_bin(&str)` | Full |
-| `hexToBin256(string)` | `hex_to_bin_256(&str)` | Full |
+| `binToHex(ByteSlice)` | `hex::encode(...)` at call sites | None |
+| `hexAbbrev(ByteSlice)` | direct formatting at call sites | None |
+| `hexToBin(string)` | `hex::decode(...)` at call sites | None |
+| `hexToBin256(string)` | `hex::decode(...)` plus length checks at call sites | None |
 
 ### random.rs (`random.rs`)
 
@@ -170,19 +170,19 @@ Corresponds to: `ShortHash.h`
 | `shortHash::computeHash(ByteSlice)` | `compute_hash(&[u8])` (`pub(crate)`) | Full |
 | `shortHash::xdrComputeHash<T>(T)` | `xdr_compute_hash<T: WriteXdr>(T)` | Full |
 
-### signer_key.rs (`signer_key.rs`)
+### SignerKey utilities (not implemented)
 
 Corresponds to: `SignerKeyUtils.h`, `SignerKey.h`
 
-All functions are `#[cfg(test)]` — implementations exist but are not compiled into production builds.
+No crate-local SignerKey utility module exists. Transaction validation code constructs and matches XDR `SignerKey` values directly where needed.
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `SignerKeyUtils::preAuthTxKey(TransactionFrame)` | `pre_auth_tx_key(&Hash256)` | Full |
-| `SignerKeyUtils::preAuthTxKey(FeeBumpTransactionFrame)` | `pre_auth_tx_key(&Hash256)` | Full |
-| `SignerKeyUtils::hashXKey(ByteSlice)` | `hash_x_key(&[u8])` | Full |
-| `SignerKeyUtils::ed25519PayloadKey(uint256, payload)` | `ed25519_payload_key(&[u8; 32], &[u8])` | Full |
-| `KeyFunctions<SignerKey>::getEd25519Value()` | `get_ed25519_from_signer_key(&SignerKey)` | Full |
+| `SignerKeyUtils::preAuthTxKey(TransactionFrame)` | -- | None |
+| `SignerKeyUtils::preAuthTxKey(FeeBumpTransactionFrame)` | -- | None |
+| `SignerKeyUtils::hashXKey(ByteSlice)` | -- | None |
+| `SignerKeyUtils::ed25519PayloadKey(uint256, payload)` | -- | None |
+| `KeyFunctions<SignerKey>::getEd25519Value()` | -- | None |
 
 ### error.rs (`error.rs`)
 
@@ -212,6 +212,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `PubKeyUtils::pseudoRandomForTesting()` | Test-only (`BUILD_TESTS` guard) |
 | `HashUtils::pseudoRandomForTesting()` | Test-only (`BUILD_TESTS` guard) |
 | `PubKeyUtils::enableRustDalekVerify()` | Protocol migration helper; Rust implementation always uses ed25519-dalek |
+| `binToHex()`, `hexAbbrev()`, `hexToBin()`, `hexToBin256()` | Utility formatting/parsing is handled by the Rust `hex` crate directly at call sites |
 
 ## Gaps
 
@@ -235,6 +236,11 @@ Features not yet implemented. These ARE counted against parity %.
 | `HashUtils::random()` | Low | Random hash generation utility |
 | `StrKeyUtils::logKey()` | Low | Logging utility for key inspection |
 | `strKey::getStrKeySize()` | Low | Computes encoded StrKey size from data size |
+| `SignerKeyUtils::preAuthTxKey(TransactionFrame)` | Medium | No crate-local SignerKey helper module |
+| `SignerKeyUtils::preAuthTxKey(FeeBumpTransactionFrame)` | Medium | No crate-local SignerKey helper module |
+| `SignerKeyUtils::hashXKey(ByteSlice)` | Medium | No crate-local SignerKey helper module |
+| `SignerKeyUtils::ed25519PayloadKey(uint256, payload)` | Medium | No crate-local SignerKey helper module |
+| `KeyFunctions<SignerKey>::getEd25519Value()` | Medium | No crate-local SignerKey helper module |
 | `shortHash::getShortHashInitKey()` | Low | Returns current SipHash key (diagnostic) |
 | `KeyUtils::toShortString()` | Low | Short string representation for logging |
 | `KeyUtils::getKeyVersionSize()` | Low | Returns expected payload size for a version byte |
@@ -273,10 +279,10 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: `Sha256Hasher::finalize()` consumes the hasher; create a new instance to hash again
    - **Rationale**: Rust's ownership model makes consuming-finalize more natural; no `BLAKE2` streaming hasher exists yet
 
-7. **`#[cfg(test)]` gating**
+7. **Crate-private and `#[cfg(test)]` helpers**
    - **stellar-core**: All crypto functions are available in both production and test builds
-   - **Rust**: Several modules (`hex.rs`, `signer_key.rs`) and many individual functions (`hmac_sha256_verify`, `hkdf_expand`, `xdr_sha256`, `seal_to_public_key`, `open_from_secret_key`, `initialize`) are compiled only in test builds. Production builds use higher-level wrappers or the `pub(crate)` internal API directly
-   - **Rationale**: Minimizes public API surface; functions only used internally or in tests are not exposed. The implementations exist and pass tests but are not available to downstream crates
+   - **Rust**: Several individual helpers (`hmac_sha256_verify`, `hkdf_expand`, `xdr_sha256`, Ed25519 sealed-box wrappers, `initialize`, random test helpers) are crate-private or compiled only in tests. Production builds use higher-level wrappers or the `pub(crate)` internal API directly
+   - **Rationale**: Minimizes public API surface; functions only used internally or in tests are not exposed to downstream crates
 
 ## Test Coverage
 
@@ -288,10 +294,10 @@ Features not yet implemented. These ARE counted against parity %.
 | Signing / Verification | 5 TEST_CASE (incl. 2 bench, 2 vector suites) | 5 #[test] (keys + signature) | Upstream has much deeper vector coverage |
 | StrKey | 2 TEST_CASE, 5 SECTION | Covered by `stellar_strkey` | Rust relies on external crate's tests |
 | Short Hash | 3 TEST_CASE (incl. 2 bench) | 5 #[test] | Comparable coverage |
-| Hex | Included in CryptoTests | 8 #[test] | Rust has dedicated hex tests |
+| Hex | Included in CryptoTests | 0 #[test] | Intentionally omitted; direct `hex` crate use |
 | Curve25519 / ECDH | -- | 8 #[test] | Upstream tests are in overlay |
 | Random | 1 TEST_CASE | 3 #[test] | Basic non-determinism checks |
-| SignerKey | 1 TEST_CASE, 5 SECTION | 7 #[test] | Good coverage |
+| SignerKey | 1 TEST_CASE, 5 SECTION | 0 #[test] | Helper module not implemented |
 | Sealed Box | -- | 8 #[test] | Upstream tests in overlay |
 | Sig Verification Cache | Included in verify tests | 2 #[test] | Basic cache hit/miss tests |
 
@@ -301,12 +307,13 @@ Features not yet implemented. These ARE counted against parity %.
 - **StrKey edge cases**: Upstream `CryptoTests.cpp` has a large `TEST_CASE("StrKey tests")` block with many edge cases for invalid StrKeys. The Rust tests rely on `stellar_strkey`'s test suite.
 - **Benchmark tests**: Upstream has 6 benchmark `TEST_CASE` entries. The Rust crate has no benchmark tests.
 - **Cache management**: No tests for cache clearing, seeding, or hit/miss counting (APIs not yet implemented).
+- **SignerKey helpers**: No crate-local helpers or tests for upstream `SignerKeyUtils`; transaction validation matches XDR values directly.
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 47 |
-| Gaps (None + Partial) | 21 |
-| Intentional Omissions | 14 |
-| **Parity** | **47 / (47 + 21) = 69%** |
+| Implemented (Full) | 38 |
+| Gaps (None + Partial) | 26 |
+| Intentional Omissions | 18 |
+| **Parity** | **38 / (38 + 26) = 59%** |

@@ -1,6 +1,6 @@
 # henyey
 
-A Rust reimplementation of [Stellar Core](https://github.com/stellar/stellar-core) targeting protocol v25 parity. Supports testnet, mainnet, and local standalone networks. Can serve as a drop-in replacement for stellar-core inside the [stellar/quickstart](https://github.com/stellar/docker-stellar-core-horizon) Docker image. This is an educational experiment and **not** production-grade software.
+A Rust reimplementation of [Stellar Core](https://github.com/stellar/stellar-core) targeting protocol v25 parity. Supports testnet, mainnet, and local standalone networks. Can serve as a drop-in replacement for stellar-core inside the [stellar/quickstart](https://github.com/stellar/quickstart) Docker image. This is an educational experiment and **not** production-grade software.
 
 ## What is Stellar Core?
 
@@ -50,10 +50,10 @@ Supporting crates: `crypto`, `common`, `work`, `historywork`
 
 ## Status
 
-**Work in progress.** Core functionality is implemented and verified against testnet, mainnet, and local standalone networks.
+**Work in progress.** Core functionality is implemented and exercised against testnet, mainnet, and local standalone networks through Docker quickstart CI, verification workflows, and crate-level parity reports.
 
 ### Consensus & Networking
-- SCP consensus participation (validator and observer modes)
+- SCP consensus participation (validator, full-node, and watcher modes)
 - P2P overlay with pull-mode transaction flooding and flow control
 - Quorum intersection checking
 
@@ -74,21 +74,21 @@ Supporting crates: `crypto`, `common`, `work`, `historywork`
 
 ### stellar-core Compatibility
 - Drop-in replacement for stellar-core in [stellar-rpc](https://github.com/stellar/stellar-rpc) (captive core mode)
-- Drop-in replacement inside the [stellar/quickstart](https://github.com/stellar/docker-stellar-core-horizon) Docker image (testnet and local modes)
+- Drop-in replacement inside the [stellar/quickstart](https://github.com/stellar/quickstart) Docker image (testnet and local modes)
 - HTTP API compatible with stellar-core (info, tx submission, ledger queries, upgrades, surveys)
 - LedgerCloseMeta streaming for Horizon and stellar-rpc ingestion
-- CLI compatible with stellar-core subcommands (`new-db`, `run`, `catchup`, `force-scp`, `offline-info`, `version`)
+- CLI compatible with stellar-core subcommands (`new-db`, `new-hist`, `run`, `catchup`, `force-scp`, `offline-info`, `version`, `convert-id`)
 
 ## Requirements
 
 - **Rust**: 1.76+ (2021 edition)
-- **SQLite**: System library (usually pre-installed)
+- **SQLite**: Embedded via bundled `rusqlite` (no system SQLite normally required)
 - **Platform**: Linux, macOS (Windows untested)
 
 ## Build
 
 ```bash
-cargo build --release
+cargo build --release -p henyey
 ```
 
 The binary is at `./target/release/henyey`.
@@ -96,10 +96,17 @@ The binary is at `./target/release/henyey`.
 ## Test
 
 ```bash
-# Unit and integration tests
-cargo test --all
+# Unit and integration tests (CI)
+cargo test --workspace --all-targets
 
-# Lint (required by CI)
+# Doctests (CI)
+cargo test --workspace --doc -j 1
+
+# Herder tests with test-support feature (CI)
+cargo test -p henyey-herder --features test-support --tests
+
+# Format and lint (CI)
+cargo fmt --all -- --check
 cargo clippy --all -- -D warnings
 
 # Run tests for a specific crate
@@ -115,9 +122,9 @@ See [docs/testing.md](docs/testing.md) for the full testing guide including CI p
 
 ## Run
 
-### Observer Mode (Testnet)
+### Full Node Mode (Testnet)
 
-An observer syncs the ledger without participating in consensus:
+A full non-validator catches up from history, maintains ledger state, and tracks consensus without voting:
 
 ```bash
 # Catch up to current ledger
@@ -125,6 +132,12 @@ An observer syncs the ledger without participating in consensus:
 
 # Run and follow the network
 ./target/release/henyey --config configs/testnet.toml run
+```
+
+For observe-only monitoring that skips startup catchup, use watcher mode:
+
+```bash
+./target/release/henyey --config configs/watcher-testnet.toml run --watcher
 ```
 
 ### Validator Mode (Testnet)
@@ -186,11 +199,19 @@ curl -X POST http://localhost:8000 \
   -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
 ```
 
-The native server reads directly from the bucket list (in-memory) and runs Soroban simulation via `soroban-env-host` natively — no captive core subprocess, no CGo bridge, no IPC overhead. See [`crates/rpc/README.md`](crates/rpc/README.md) for details.
+The native server reads from henyey's SQLite database and live bucket snapshots in-process, and runs Soroban simulation via `soroban-env-host` natively — no captive core subprocess, no CGo bridge, no IPC overhead. See [`crates/rpc/README.md`](crates/rpc/README.md) for details.
+
+### RPC Endpoint Paths
+
+| Deployment | Client endpoint | Notes |
+|------------|-----------------|-------|
+| Native henyey RPC | `http://localhost:8000/` | Enabled by `[rpc]`; requests are handled by henyey directly. |
+| Docker quickstart stellar-rpc | `http://localhost:8000/rpc` | stellar-rpc runs in the quickstart container and uses henyey as its core backend. |
+| Captive-core mode | stellar-rpc's configured endpoint | henyey is launched by stellar-rpc; clients do not talk to henyey's native RPC server. |
 
 ## Running with stellar-rpc
 
-Henyey can also serve as a drop-in replacement for stellar-core when used as the backend for [stellar-rpc](https://github.com/stellar/stellar-rpc). No changes to stellar-rpc are required -- henyey automatically detects stellar-core format configuration and translates it internally.
+Henyey can also serve as a drop-in replacement for stellar-core when used as the backend for [stellar-rpc](https://github.com/stellar/stellar-rpc). No changes to stellar-rpc are required -- henyey automatically detects stellar-core format configuration and translates it internally. In this mode, stellar-rpc is the JSON-RPC endpoint; henyey runs as its captive-core-compatible backend.
 
 ### Prerequisites
 
@@ -241,7 +262,7 @@ stellar-rpc launches henyey as a subprocess (in place of stellar-core) and commu
 2. **HTTP commands** (port 11626) -- stellar-rpc polls `/info` for sync status and submits transactions via `/tx`
 3. **HTTP queries** (port 11628) -- stellar-rpc queries ledger entries via `/getledgerentry` for transaction preflight
 
-Henyey detects the stellar-core format config file (TOML with `[[VALIDATORS]]` sections), translates it to its native format, and starts the compatibility HTTP servers automatically. The CLI flags `--conf`, `--console`, `--metadata-output-stream fd:N`, and subcommands `new-db`, `catchup`, `run`, `offline-info`, and `version` are all supported with stellar-core compatible behavior.
+Henyey detects the stellar-core format config file (TOML with `[[VALIDATORS]]` sections), translates it to its native format, and starts the compatibility HTTP servers automatically. The CLI flags `--conf`, `--console`, `--metadata-output-stream fd:N`, and subcommands `new-db`, `new-hist`, `catchup`, `run`, `force-scp`, `offline-info`, `version`, and `convert-id` are supported with stellar-core compatible behavior.
 
 ### Captive Core Config
 
@@ -260,7 +281,7 @@ stellar-rpc injects additional keys (`DATABASE`, `HTTP_PORT`, `NETWORK_PASSPHRAS
 
 ## Running with Docker Quickstart
 
-The [stellar/quickstart](https://github.com/stellar/docker-stellar-core-horizon) Docker image bundles stellar-core, Horizon, and stellar-rpc into a single container. Henyey can replace stellar-core inside this container with no changes to quickstart itself.
+The [stellar/quickstart](https://github.com/stellar/quickstart) Docker image bundles stellar-core, Horizon, and stellar-rpc into a single container. Henyey can replace stellar-core inside this container with no changes to quickstart itself.
 
 ### Quick Start
 
@@ -286,11 +307,11 @@ See [docs/testing.md](docs/testing.md) for the full testing guide including all 
 
 ### Container Architecture
 
-The container runs up to three stellar-core instances simultaneously (testnet mode uses all three; local mode uses the node + RPC captive core):
+Depending on enabled services, the container runs up to three core-compatible processes simultaneously:
 
 | Instance | HTTP Port | Peer Port | Purpose |
 |----------|-----------|-----------|---------|
-| Node (validator/watcher) | 11626 | 11625 | Consensus participant or full watcher |
+| Node (validator/full/watcher) | 11626 | 11625 | Consensus participant, full node, or watcher |
 | Horizon captive core | 11726 | 11725 | Ingestion for Horizon |
 | RPC captive core | 11826 | 11825 | Ingestion for stellar-rpc |
 
@@ -300,12 +321,15 @@ If you need to build the Docker image manually (e.g. for custom base images or c
 
 ```bash
 # 1. Build release binary
-cargo build --release
+cargo build --release -p henyey
 
-# 2. Build overlay image
+# 2. Copy the binary into the Docker build context
+cp -f target/release/henyey henyey-binary
+
+# 3. Build overlay image
 docker build -f Dockerfile.quickstart-local -t henyey-quickstart:local .
 
-# 3. Run
+# 4. Run
 docker run -d --name henyey-quickstart \
   -p 8000:8000 -p 11626:11626 -p 11726:11726 -p 11826:11826 \
   henyey-quickstart:local
@@ -326,13 +350,13 @@ The container creates a standalone network with:
 - 1-second ledger closes
 - Protocol v25 from genesis
 - Friendbot for funding test accounts
-- Horizon (port 8000) and stellar-rpc (port 8000/soroban/rpc)
+- Horizon (port 8000) and stellar-rpc (port 8000 `/rpc` path)
 
 Wait ~15 seconds for startup, then verify:
 
 ```bash
 # RPC health
-curl -s -X POST http://localhost:8000/soroban/rpc \
+curl -s -X POST http://localhost:8000/rpc \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | python3 -m json.tool
 
@@ -353,31 +377,55 @@ Generate a sample config to customize:
 ./target/release/henyey sample-config > my-config.toml
 ```
 
+Native henyey configs use nested `snake_case` TOML sections. stellar-core/captive-core configs use flat `SCREAMING_CASE` keys; henyey auto-translates those only for compatibility use cases such as stellar-rpc and quickstart.
+
 ### Key Configuration Options
 
 ```toml
+[node]
+name = "henyey-testnet"
+is_validator = false
+# Required when is_validator = true:
+# node_seed = "S..."
+
+[node.quorum_set]
+threshold_percent = 67
+validators = [
+    "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y",
+    "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP",
+    "GC2V2EFSXN6SQTWVYA5EPJPBWWIMSD2XQNKUOHGEKB535AQE2I6IXV2Z",
+]
+
 [network]
-network_passphrase = "Test SDF Network ; September 2015"
+passphrase = "Test SDF Network ; September 2015"
+base_fee = 100
+base_reserve = 5000000
+max_protocol_version = 25
 
 [database]
 path = "stellar.db"
+pool_size = 10
+
+[buckets]
+directory = "buckets"
+cache_size = 256
 
 [overlay]
 peer_port = 11625
 max_inbound_peers = 64
 max_outbound_peers = 8
-
-[history]
-# Archive URLs for catchup
-archives = [
-    "https://history.stellar.org/prd/core-testnet/core_testnet_001",
-    "https://history.stellar.org/prd/core-testnet/core_testnet_002",
+target_outbound_peers = 8
+known_peers = [
+    "core-testnet1.stellar.org:11625",
+    "core-testnet2.stellar.org:11625",
+    "core-testnet3.stellar.org:11625",
 ]
 
-[validator]
-# Required for validator mode
-node_seed = "S..."  # Your secret key
-node_is_validator = true
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+get_enabled = true
+put_enabled = false
 
 [events]
 # Classic event emission (off by default)
@@ -392,8 +440,20 @@ retention_window = 2880
 max_healthy_ledger_latency_secs = 30
 max_concurrent_requests = 64
 max_concurrent_simulations = 10
+request_timeout_secs = 30
 rpc_db_concurrency = 8
 bucket_io_concurrency = 8
+
+[compat_http]
+# stellar-core-compatible HTTP API for stellar-rpc/quickstart (off by default)
+enabled = false
+port = 11626
+
+[query]
+# HTTP query server for captive-core ledger-entry lookups (off by default)
+# port = 11628
+snapshot_ledgers = 5
+thread_pool_size = 4
 ```
 
 ## Repository Layout
@@ -429,33 +489,33 @@ henyey/
 |-------|---------|--------|
 | [`henyey`](crates/henyey/README.md) | CLI entrypoint, argument parsing, command dispatch | [56%](crates/henyey/PARITY_STATUS.md) |
 | [`henyey-app`](crates/app/README.md) | Application wiring, lifecycle, HTTP APIs, meta streaming, history publishing | [70%](crates/app/PARITY_STATUS.md) |
-| [`henyey-common`](crates/henyey-common/README.md) | Shared types, config helpers, time utilities | [91%](crates/henyey-common/PARITY_STATUS.md) |
+| [`henyey-common`](crates/common/README.md) | Shared types, config helpers, time utilities | [91%](crates/common/PARITY_STATUS.md) |
 | [`henyey-clock`](crates/clock/README.md) | Injectable clock abstractions for deterministic simulation and runtime timing | [100%](crates/clock/PARITY_STATUS.md) |
-| [`henyey-crypto`](crates/henyey-crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding | [69%](crates/henyey-crypto/PARITY_STATUS.md) |
-| [`henyey-db`](crates/henyey-db/README.md) | SQLite schema, migrations, query layer | [94%](crates/henyey-db/PARITY_STATUS.md) |
+| [`henyey-crypto`](crates/crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding | [59%](crates/crypto/PARITY_STATUS.md) |
+| [`henyey-db`](crates/db/README.md) | SQLite schema, migrations, query layer | [94%](crates/db/PARITY_STATUS.md) |
 
 ### Consensus Layer
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-scp`](crates/henyey-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [95%](crates/henyey-scp/PARITY_STATUS.md) |
-| [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [79%](crates/henyey-herder/PARITY_STATUS.md) |
-| [`henyey-overlay`](crates/henyey-overlay/README.md) | P2P overlay network, peer management, message flooding | [92%](crates/henyey-overlay/PARITY_STATUS.md) |
+| [`henyey-scp`](crates/scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [95%](crates/scp/PARITY_STATUS.md) |
+| [`henyey-herder`](crates/herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [79%](crates/herder/PARITY_STATUS.md) |
+| [`henyey-overlay`](crates/overlay/README.md) | P2P overlay network, peer management, message flooding | [92%](crates/overlay/PARITY_STATUS.md) |
 
 ### Execution Layer
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-ledger`](crates/henyey-ledger/README.md) | Ledger close pipeline, per-operation savepoints, state snapshots, delta tracking | [94%](crates/henyey-ledger/PARITY_STATUS.md) |
-| [`henyey-tx`](crates/henyey-tx/README.md) | Transaction validation and execution (classic + Soroban), savepoint-based rollback | [97%](crates/henyey-tx/PARITY_STATUS.md) |
-| [`henyey-bucket`](crates/henyey-bucket/README.md) | BucketList implementation, merges, on-disk state | [84%](crates/henyey-bucket/PARITY_STATUS.md) |
+| [`henyey-ledger`](crates/ledger/README.md) | Ledger close pipeline, per-operation savepoints, state snapshots, delta tracking | [94%](crates/ledger/PARITY_STATUS.md) |
+| [`henyey-tx`](crates/tx/README.md) | Transaction validation and execution (classic + Soroban), savepoint-based rollback | [97%](crates/tx/PARITY_STATUS.md) |
+| [`henyey-bucket`](crates/bucket/README.md) | BucketList implementation, merges, on-disk state | [84%](crates/bucket/PARITY_STATUS.md) |
 
 ### History & Sync
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-history`](crates/henyey-history/README.md) | History archive I/O, catchup, replay, verification, publishing | [79%](crates/henyey-history/PARITY_STATUS.md) |
-| [`henyey-historywork`](crates/henyey-historywork/README.md) | History work scheduling, publish/catchup task management | [38%](crates/henyey-historywork/PARITY_STATUS.md) |
+| [`henyey-history`](crates/history/README.md) | History archive I/O, catchup, replay, verification, publishing | [79%](crates/history/PARITY_STATUS.md) |
+| [`henyey-historywork`](crates/historywork/README.md) | History work scheduling, publish/catchup task management | [49%](crates/historywork/PARITY_STATUS.md) |
 
 ### RPC
 
@@ -467,7 +527,7 @@ henyey/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-work`](crates/henyey-work/README.md) | Generic DAG-based work scheduler | [25%](crates/henyey-work/PARITY_STATUS.md) |
+| [`henyey-work`](crates/work/README.md) | Generic DAG-based work scheduler | [26%](crates/work/PARITY_STATUS.md) |
 | [`henyey-simulation`](crates/simulation/README.md) | Deterministic multi-node simulation harness and topology/fault scenarios | [85%](crates/simulation/PARITY_STATUS.md) |
 
 ## Design Constraints
@@ -521,7 +581,7 @@ RUST_LOG=henyey_scp=debug,henyey_herder=debug ./target/release/henyey ...
 - Keep behavior deterministic and aligned with stellar-core v25.x
 - Add or update tests when behavior changes
 - Update crate READMEs when modifying subsystem behavior
-- Run `cargo fmt` and `cargo clippy` before committing
+- Run `cargo fmt --all -- --check`, `cargo clippy --all -- -D warnings`, and focused tests for touched crates before committing
 
 ## License
 

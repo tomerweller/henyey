@@ -3,7 +3,7 @@
 **Crate**: `henyey-scp`
 **Upstream**: `stellar-core/src/scp/`
 **Overall Parity**: 95%
-**Last Updated**: 2026-04-07
+**Last Updated**: 2026-04-26
 
 ## Summary
 

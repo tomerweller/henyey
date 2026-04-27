@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-work`
 **Upstream**: `stellar-core/src/work/`
-**Overall Parity**: 25%
-**Last Updated**: 2026-04-07
+**Overall Parity**: 26%
+**Last Updated**: 2026-04-26
 
 ## Summary
 
@@ -238,7 +238,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 18 |
+| Implemented (Full) | 19 |
 | Gaps (None + Partial) | 53 |
 | Intentional Omissions | 12 |
-| **Parity** | **18 / (18 + 53) = 25%** |
+| **Parity** | **19 / (19 + 53) = 26%** |

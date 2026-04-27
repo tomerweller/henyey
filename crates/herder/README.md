@@ -97,31 +97,38 @@ if herder.needs_tx_set(&needed) {
 | Module | Description |
 |--------|-------------|
 | `lib.rs` | Crate exports, top-level traits, and public type aliases. |
+| `dead_node_tracker.rs` | Detects transitive quorum members that stop sending SCP traffic. |
+| `drift_tracker.rs` | Tracks close-time drift against network externalization. |
+| `error.rs` | `HerderError` definitions. |
+| `externalize_lag.rs` | Tracks and summarizes lag between observed and local externalization. |
+| `fetching_envelopes.rs` | Dependency-aware envelope staging while waiting on tx sets or quorum sets. |
+| `flow_control.rs` | Transaction-size and flow-control constants derived from protocol/network limits. |
+| `herder_utils.rs` | Helpers for extracting `StellarValue` and tx-set hashes from SCP statements. |
 | `herder.rs` | Core Herder implementation, state transitions, envelope intake, tx intake, ledger close handling, and cache maintenance. |
 | `scp_driver.rs` | SCP callback bridge, value validation, signing, tx-set cache, externalized-slot tracking, and quorum-set lookup. |
 | `state.rs` | `HerderState` lifecycle enum and transition helpers. |
-| `error.rs` | `HerderError` definitions. |
 | `ledger_close_data.rs` | Serializable ledger-close wrapper and human-readable `StellarValue` formatting. |
-| `herder_utils.rs` | Helpers for extracting `StellarValue` and tx-set hashes from SCP statements. |
 | `json_api.rs` | JSON-serializable diagnostic structures for admin and monitoring endpoints. |
-| `fetching_envelopes.rs` | Dependency-aware envelope staging while waiting on tx sets or quorum sets. |
 | `pending.rs` | Future-slot envelope buffer with deduplication, eviction, and release-by-slot. |
-| `quorum_tracker.rs` | Per-slot quorum-heard tracking plus transitive quorum graph maintenance. |
 | `persistence.rs` | SCP state persistence traits, in-memory/SQLite backends, and restore helpers. |
-| `upgrades.rs` | Upgrade parameter parsing, scheduling, validation, and proposal generation. |
 | `parallel_tx_set_builder.rs` | Parallel Soroban phase construction via conflict clustering and stage packing. |
+| `quorum_intersection_state.rs` | Tracks quorum-intersection background-check state. |
+| `quorum_set_tracker.rs` | Tracks known quorum-set hashes and fetch requirements. |
+| `quorum_tracker.rs` | Per-slot quorum-heard tracking plus transitive quorum graph maintenance. |
+| `scp_verify.rs` | SCP envelope verification helpers and validation cache support. |
+| `spawn.rs` | Small task-spawning helper module. |
 | `surge_pricing.rs` | Lane configuration and fee-priority queue logic for classic, DEX, and Soroban selection. |
+| `sync_recovery.rs` | Tracking heartbeat, stuck-consensus detection, and out-of-sync recovery loop. |
+| `timer_manager.rs` | Async nomination and ballot timeout scheduling. |
+| `tracked_lock.rs` | Lock tracking helpers used by concurrent Herder state. |
+| `tx_broadcast.rs` | Periodic transaction flooding and rebroadcast management. |
 | `tx_queue_limiter.rs` | Resource-aware queue admission and eviction built on top of surge-pricing primitives. |
+| `upgrades.rs` | Upgrade parameter parsing, scheduling, validation, and proposal generation. |
 | `tx_queue/mod.rs` | Main transaction queue, validation, bans, replacement rules, and public queue stats/types. |
 | `tx_queue/selection.rs` | Candidate tx-set selection and generalized tx-set assembly. |
 | `tx_queue/tx_set.rs` | `TransactionSet` wire-format parsing, hash computation, and apply-time validation. |
+| `tx_set_tracker.rs` | Tracks recently seen transaction sets and missing dependencies. |
 | `tx_set_utils.rs` | Helpers for trimming invalid transactions from candidate sets. |
-| `timer_manager.rs` | Async nomination and ballot timeout scheduling. |
-| `sync_recovery.rs` | Tracking heartbeat, stuck-consensus detection, and out-of-sync recovery loop. |
-| `tx_broadcast.rs` | Periodic transaction flooding and rebroadcast management. |
-| `flow_control.rs` | Transaction-size and flow-control constants derived from protocol/network limits. |
-| `drift_tracker.rs` | Close-time drift monitoring against network externalization. |
-| `dead_node_tracker.rs` | Detection of transitive quorum members that stop sending SCP traffic. |
 
 ## Design Notes
 

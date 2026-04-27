@@ -4,7 +4,7 @@ Deterministic simulation and benchmarking harness for henyey nodes.
 
 ## Overview
 
-`henyey-simulation` provides the test-only infrastructure used to model henyey networks, run app-backed multi-node scenarios, generate deterministic classic and Soroban transaction load, and benchmark raw ledger-apply throughput. It sits on top of `henyey-app`, `henyey-overlay`, `henyey-ledger`, and `henyey-tx`, and corresponds to stellar-core's `src/simulation/` subsystem, including `Simulation`, `Topologies`, `LoadGenerator`, `TxGenerator`, and `ApplyLoad`.
+`henyey-simulation` provides the test-only infrastructure used to model henyey networks, run app-backed multi-node scenarios, generate deterministic classic and Soroban transaction load, and benchmark raw ledger-apply throughput. It sits on top of `henyey-app`, `henyey-overlay`, `henyey-ledger`, and `henyey-tx`. The crate has no direct stellar-core source equivalent; it is henyey's native deterministic integration harness.
 
 ## Architecture
 
@@ -114,15 +114,9 @@ assert!(harness.success_rate() >= 0.0);
 
 ## stellar-core Mapping
 
-| Rust | stellar-core |
-|------|--------------|
-| `lib.rs` (`Simulation`) | `src/simulation/Simulation.h`, `src/simulation/Simulation.cpp` |
-| `lib.rs` (`Topologies`) | `src/simulation/Topologies.h`, `src/simulation/Topologies.cpp` |
-| `loadgen.rs` (`LoadGenerator`) | `src/simulation/LoadGenerator.h`, `src/simulation/LoadGenerator.cpp` |
-| `loadgen.rs` (`TxGenerator`) | `src/simulation/TxGenerator.h`, `src/simulation/TxGenerator.cpp` |
-| `loadgen_soroban.rs` | Soroban helper logic in `src/simulation/TxGenerator.cpp` |
-| `applyload.rs` (`ApplyLoad`) | `src/simulation/ApplyLoad.h`, `src/simulation/ApplyLoad.cpp` |
-| `loopback.rs` | Loopback/topology support around upstream simulation networking helpers |
+This crate has no direct stellar-core source equivalent. It is a native henyey
+integration and benchmarking harness, with APIs shaped around henyey's async
+runtime, overlay factories, app lifecycle, and ledger managers.
 
 ## Parity Status
 

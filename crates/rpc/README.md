@@ -4,7 +4,7 @@ Stellar JSON-RPC 2.0 server for henyey nodes.
 
 ## Overview
 
-`henyey-rpc` exposes henyey state over the Soroban RPC surface used by wallets, SDKs, and other network clients. The crate is embedded in the `henyey` binary rather than running as a standalone service: it reads live state from `henyey-app`, historical data from `henyey-db`, bucket snapshots from `henyey-bucket`, and transaction submission results from `henyey-herder`. Upstream, this role is closest to the standalone `stellar-rpc` service rather than a `stellar-core` subsystem.
+`henyey-rpc` exposes henyey state over the Stellar JSON-RPC surface used by wallets, SDKs, and other network clients. The crate is embedded in the `henyey` binary rather than running as a standalone service: it reads live state from `henyey-app`, historical data from `henyey-db`, bucket snapshots from `henyey-bucket`, and transaction submission results from `henyey-herder`. There is no direct stellar-core source equivalent; henyey implements this RPC surface natively instead of using captive-core.
 
 ## Architecture
 
@@ -117,6 +117,10 @@ fn build_simulation_request(tx_b64: &str) -> serde_json::Value {
 | `methods/get_events.rs` | Implements `getEvents`. |
 | `methods/send_transaction.rs` | Implements `sendTransaction`. |
 | `simulate/mod.rs` | Implements `simulateTransaction`, including Soroban preflight and fee estimation. |
+| `simulate/convert.rs` | Converts XDR values between workspace and P25 host types. |
+| `simulate/preflight.rs` | Runs host preflight and extracts Soroban authorization/footprint data. |
+| `simulate/resources.rs` | Estimates CPU, memory, I/O, and resource fees. |
+| `simulate/response.rs` | Builds success and error JSON-RPC simulation responses. |
 | `simulate/snapshot.rs` | Normalizes bucket-list entries and adapts snapshots for soroban-host reads. |
 
 ## Design Notes
@@ -142,7 +146,7 @@ The `request_semaphore` gates async admission (try-acquire, immediate reject). T
 
 ## stellar-core Mapping
 
-This crate has no direct `stellar-core` counterpart. The implemented API surface corresponds to the standalone `stellar-rpc` service, while henyey-specific integrations replace captive-core and ingestion components with direct access to `henyey-app`, `henyey-db`, and bucket snapshots.
+This crate has no direct `stellar-core` counterpart. The implemented API surface is a native Stellar JSON-RPC surface for henyey nodes, while henyey-specific integrations replace captive-core and standalone ingestion components with direct access to `henyey-app`, `henyey-db`, and bucket snapshots.
 
 ## Parity Status
 

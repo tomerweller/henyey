@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-historywork`
 **Upstream**: `stellar-core/src/historywork/`
-**Overall Parity**: 38%
-**Last Updated**: 2026-04-07
+**Overall Parity**: 49%
+**Last Updated**: 2026-04-26
 
 ## Summary
 
@@ -316,11 +316,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 6 |
-| Gaps (None + Partial) | 10 |
+| Implemented (Full) | 24 |
+| Gaps (None + Partial) | 25 |
 | Intentional Omissions | 7 |
-| **Parity** | **6 / (6 + 10) = 38%** |
-
-Full components: GetHistoryArchiveStateWork, DownloadBucketsWork, VerifyBucketWork, BatchDownloadWork, VerifyTxResultsWork, Progress.
-
-Gap components: CheckSingleLedgerHeaderWork, DownloadVerifyTxResultsWork, FetchRecentQsetsWork, PublishWork, PutFilesWork, PutHistoryArchiveStateWork, PutSnapshotFilesWork, ResolveSnapshotWork, WriteSnapshotWork, WriteVerifiedCheckpointHashesWork.
+| **Parity** | **24 / (24 + 25) = 49%** |

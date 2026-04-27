@@ -3,7 +3,7 @@
 **Crate**: `henyey-history`
 **Upstream**: `stellar-core/src/history/`
 **Overall Parity**: 79%
-**Last Updated**: 2026-04-07
+**Last Updated**: 2026-04-26
 
 ## Summary
 
@@ -34,7 +34,7 @@
 | `CheckpointBuilder.h` | `checkpoint_builder.rs` | Crash-safe stream building maps closely |
 | `StateSnapshot.h` | `publish.rs` | PublishManager replaces `StateSnapshot` |
 | `HistoryUtils.h` | `replay.rs` | Gap-tolerant history iteration is inlined into replay logic |
-| `src/catchup/` and `src/historywork/` work classes | `catchup.rs`, `download.rs`, `verify.rs` | Rust crate also absorbs catchup/download orchestration beyond `src/history/` |
+| `src/catchup/` and `src/historywork/` work classes | `catchup/*.rs`, `download.rs`, `verify.rs` | Rust crate also absorbs catchup/download orchestration beyond `src/history/` |
 
 ## Component Mapping
 
@@ -172,7 +172,7 @@ Corresponds to: `StateSnapshot.h`
 | `differingHASFiles()` | -- | None |
 | `takeSnapshotAndPublish()` | `publish_checkpoint()` | Full |
 
-### replay.rs (`replay.rs`)
+### replay modules (`replay/*.rs`, `catchup/replay.rs`)
 
 Corresponds to: `HistoryUtils.h`
 
@@ -254,14 +254,15 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Checkpoint math and paths | 1 `TEST_CASE` / 0 `SECTION` | 22 `#[test]` | Rust covers math and dirty-path helpers thoroughly |
+| Checkpoint math and paths | 1 `TEST_CASE` / 0 `SECTION` | 23 `#[test]` | Rust covers math and dirty-path helpers thoroughly |
 | HAS serialization and bucket state | 2 `TEST_CASE` / 2 `SECTION` | 31 `#[test]` | Strong Rust coverage for parsing, futures, and diffing |
 | Bucket and chain verification | 3 `TEST_CASE` / 31 `SECTION` | 35 `#[test]` | Rust has good unit coverage but fewer archive-failure integration cases |
 | Archive manager and transport | 4 `TEST_CASE` / 5 `SECTION` | 32 `#[test]` | Rust adds native HTTP and shell-command coverage |
 | Checkpoint builder and queue | 2 `TEST_CASE` / 6 `SECTION` | 25 `#[test]` | Rust covers recovery paths well |
 | Publish workflows | 6 `TEST_CASE` / 18 `SECTION` | 15 `#[test]` | Missing restart, multi-archive, and throttling scenarios |
-| Catchup and replay | 17 `TEST_CASE` / 9 `SECTION` | 52 `#[test]` | Rust has broad unit coverage but lighter end-to-end catchup scenarios |
-| **Total** | **35 `TEST_CASE` / 71 `SECTION`** | **220 `#[test]`** | Upstream still has more scenario-heavy acceptance coverage |
+| Catchup and replay | 17 `TEST_CASE` / 9 `SECTION` | 76 `#[test]` | Rust has broad unit coverage but lighter end-to-end catchup scenarios |
+| CDP, compare, and error utilities | No dedicated upstream tests | 8 `#[test]` | Rust-native helpers outside direct history file mapping |
+| **Total** | **37 `TEST_CASE` / 71 `SECTION`** | **245 `#[test]`** | Upstream still has more scenario-heavy acceptance coverage |
 
 ### Test Gaps
 

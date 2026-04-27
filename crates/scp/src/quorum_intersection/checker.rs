@@ -236,7 +236,7 @@ impl QuorumIntersectionChecker {
         if node >= self.graph.len() {
             return false;
         }
-        self.contains_quorum_slice(bs, &self.graph[node])
+        Self::contains_quorum_slice(bs, &self.graph[node])
     }
 
     /// Check if `bs` satisfies the quorum set `qbs`.
@@ -245,7 +245,7 @@ impl QuorumIntersectionChecker {
     /// 1. Count direct node intersections
     /// 2. Overapproximate with all_successors
     /// 3. Selectively test inner sets
-    fn contains_quorum_slice(&self, bs: &BitSet, qbs: &QBitSet) -> bool {
+    fn contains_quorum_slice(bs: &BitSet, qbs: &QBitSet) -> bool {
         // Phase 1: direct nodes.
         let intersecting = bs.intersection_count(&qbs.nodes);
         if intersecting >= qbs.threshold as usize {
@@ -269,7 +269,7 @@ impl QuorumIntersectionChecker {
         let mut fail_limit = qbs.inner_sets.len() - inner_threshold + 1;
 
         for inner in &qbs.inner_sets {
-            if self.contains_quorum_slice(bs, inner) {
+            if Self::contains_quorum_slice(bs, inner) {
                 remaining_needed -= 1;
                 if remaining_needed == 0 {
                     return true;

@@ -120,18 +120,27 @@ println!("ledger {} closed at {}", header.ledger_seq, header.scp_value.close_tim
 | `lib.rs` | Crate root, re-exports, archive-manager types, and shared result structs. |
 | `archive.rs` | Read-side history archive client plus testnet/mainnet archive constants. |
 | `archive_state.rs` | HAS parsing, validation helpers, bucket diffing, and FutureBucket state extraction. |
-| `catchup.rs` | Main catchup pipeline, checkpoint downloads, bucket restore, replay, and persistence. |
+| `catchup/mod.rs` | Main catchup manager, options, retry loop, and checkpoint-data orchestration. |
+| `catchup/buckets.rs` | Bucket restore and bucket-list adoption during catchup. |
+| `catchup/download.rs` | Checkpoint/HAS/bucket download helpers used by catchup. |
+| `catchup/persist.rs` | Persistence for ledger history, transaction data, SCP history, and bucket snapshots. |
+| `catchup/replay.rs` | Catchup replay loop and application of downloaded ledgers. |
 | `catchup_range.rs` | Catchup planning logic matching stellar-core's five-case range calculation. |
 | `cdp.rs` | SEP-0054 data-lake readers, cache layer, and `LedgerCloseMeta` extraction helpers. |
 | `checkpoint.rs` | Checkpoint arithmetic and ledger-range helpers. |
 | `checkpoint_builder.rs` | Crash-safe checkpoint file construction and startup recovery of dirty files. |
+| `compare.rs` | Checkpoint comparison utilities for local vs reference archive output. |
 | `download.rs` | HTTP retry policy, gzip decompression, and record-marked XDR parsing. |
 | `error.rs` | `HistoryError` plus fatal/transient catchup classification. |
 | `paths.rs` | Archive path generation, checkpoint frequency control, and dirty-path helpers. |
 | `publish.rs` | HAS construction and local archive publishing for checkpoint material. |
 | `publish_queue.rs` | Persistent queue and backpressure constants for history publication. |
 | `remote_archive.rs` | Shell-command archive adapter for put/get/mkdir style publishing. |
-| `replay.rs` | Metadata replay, execution replay, eviction handling, and replay result types. |
+| `replay/mod.rs` | Replay module root and shared replay result/config types. |
+| `replay/diff.rs` | Replay diff formatting for expected vs actual results. |
+| `replay/execution.rs` | Execution-based ledger replay using transaction re-execution. |
+| `replay/metadata.rs` | Metadata-based ledger replay from archived `TransactionMeta`. |
+| `test_utils.rs` | Feature-gated in-process archive fixtures for integration tests. |
 | `verify.rs` | Header-chain, bucket, tx-set, SCP-history, and HAS verification routines. |
 
 ## Design Notes
@@ -150,7 +159,7 @@ println!("ledger {} closed at {}", header.ledger_seq, header.scp_value.close_tim
 | `lib.rs` (`HistoryArchiveManager`, `ArchiveEntry`) | `src/history/HistoryArchiveManager.cpp` |
 | `archive.rs` | `src/history/HistoryArchive.cpp` |
 | `archive_state.rs` | `src/history/HistoryArchive.cpp` (HAS serialization and bucket-state logic) |
-| `catchup.rs` | `src/catchup/CatchupWork.cpp`, `DownloadApplyTxsWork.cpp` |
+| `catchup/mod.rs`, `catchup/*.rs` | `src/catchup/CatchupWork.cpp`, `DownloadApplyTxsWork.cpp` |
 | `catchup_range.rs` | `src/catchup/CatchupRange.cpp`, `CatchupConfiguration.cpp` |
 | `checkpoint.rs` | `src/history/HistoryManager.h`, `src/history/HistoryUtils.cpp` |
 | `checkpoint_builder.rs` | `src/history/CheckpointBuilder.cpp` |
@@ -159,7 +168,7 @@ println!("ledger {} closed at {}", header.ledger_seq, header.scp_value.close_tim
 | `publish.rs` | `src/history/StateSnapshot.cpp`, parts of `HistoryManagerImpl.cpp` |
 | `publish_queue.rs` | `src/history/HistoryManagerImpl.cpp` publish-queue behavior |
 | `remote_archive.rs` | `src/history/HistoryArchive.cpp`, `src/historywork/GetRemoteFileWork.cpp`, `PutRemoteFileWork.cpp` |
-| `replay.rs` | `src/catchup/ApplyCheckpointWork.cpp`, `ApplyLedgerWork.cpp` |
+| `replay/mod.rs`, `replay/*.rs` | `src/catchup/ApplyCheckpointWork.cpp`, `ApplyLedgerWork.cpp` |
 | `verify.rs` | `src/historywork/VerifyBucketWork.cpp`, `VerifyLedgerChainWork.cpp`, `CheckSingleLedgerHeaderWork.cpp` |
 | `cdp.rs` | No direct upstream equivalent; Rust-native SEP-0054 integration |
 

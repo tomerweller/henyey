@@ -132,11 +132,17 @@ let quorum_info = scp.get_quorum_info(ledger_seq);
 | `ballot/statements.rs` | Ballot statement ordering, sanity checks, quorum-set resolution, and federated accept/ratify helpers. |
 | `quorum.rs` | Quorum-slice, quorum, v-blocking, normalization, hashing, and singleton quorum-set utilities. |
 | `quorum_config.rs` | Rust-side quorum configuration parsing, validation, known validator presets, and strkey conversion. |
+| `quorum_intersection/mod.rs` | Public quorum-intersection API and re-exports. |
+| `quorum_intersection/checker.rs` | Quorum intersection checker and counterexample discovery. |
+| `quorum_intersection/bit_set.rs` | Compact bit-set helpers for quorum graph algorithms. |
+| `quorum_intersection/qbitset.rs` | Quorum-node bit-set representation used by enumeration. |
+| `quorum_intersection/tarjan.rs` | Strongly connected component decomposition. |
 | `driver.rs` | `SCPDriver` trait plus shared node-weight and timeout helper logic. |
 | `compare.rs` | Cross-statement ordering helpers used to compare nomination and ballot progress. |
 | `format.rs` | Human-readable formatting for nodes, ballots, envelopes, and values. |
 | `info.rs` | Serde-friendly diagnostic structs used by `get_info()` and `get_quorum_info()`. |
 | `error.rs` | Crate-level error definitions. |
+| `test_utils.rs` | Crate-local test scaffolding for drivers, values, and quorum sets. |
 
 ## Design Notes
 

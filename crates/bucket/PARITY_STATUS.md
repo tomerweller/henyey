@@ -3,7 +3,7 @@
 **Crate**: `henyey-bucket`
 **Upstream**: `stellar-core/src/bucket/`
 **Overall Parity**: 84%
-**Last Updated**: 2026-04-07
+**Last Updated**: 2026-04-26
 
 ## Summary
 
