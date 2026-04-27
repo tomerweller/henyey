@@ -229,10 +229,16 @@ not a bug — but verify `heap_components` is stable; if it is growing, investig
 **(8) RPC health** (validator mode only — skip in watcher mode) —
 `curl -s -X POST http://localhost:$MONITOR_RPC_PORT -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'`.
 Verify response is non-empty and `status` is `healthy`. Check pruning:
-`latestLedger - oldestLedger` should be ≤ `retention_window + 250` (allows
-one full maintenance cycle's worth of new ledgers — maintenance every 900s ≈
-180 ledgers at 5s/ledger, +70 headroom). If gap > `retention_window + 500`,
-flag PRUNING STALLED. If RPC is not responding, flag RPC DOWN.
+`latestLedger - oldestLedger` should be bounded.
+- Baseline (data only) is `retention_window` ledgers, plus a maintenance-cycle
+  buffer (maintenance every 900s ≈ 180 ledgers at 5s/ledger).
+- Since `57821bcf`/`25797e2e` (Apr 27), ledger headers and tx history are
+  also held back from pruning to satisfy publishing. The new equilibrium is
+  ~3× retention_window (~1050 for retention=360).
+- If `gap > 3 × retention_window + 500` (~1580 for retention=360), flag
+  PRUNING STALLED — that's "headers/tx-history protection plus an extra
+  maintenance cycle's slack" exceeded, indicating real pruning failure.
+- If RPC is not responding, flag RPC DOWN.
 
 **(9) OBSRVR Radar** (validator mode only — skip in watcher mode) — get
 public key from `curl -s http://localhost:$MONITOR_ADMIN_PORT/info`
