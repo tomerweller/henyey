@@ -260,7 +260,7 @@ pub use persist::CatchupFinalizer;
 use types::*;
 pub use types::{
     AppInfo, AppMetricsSnapshot, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary,
-    OverlayFetchChannelMetrics, ScpSlotSnapshot, ScpVerifyMetrics, SelfCheckResult,
+    OverlayFetchChannelMetrics, RestoreResult, ScpSlotSnapshot, ScpVerifyMetrics, SelfCheckResult,
     SimulationDebugStats, SurveyPeerReport, SurveyReport,
 };
 

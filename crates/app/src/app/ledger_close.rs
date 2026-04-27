@@ -423,9 +423,16 @@ impl App {
     /// On success, the ledger manager is initialized with the bucket list
     /// reconstructed from disk, avoiding a full catchup from history archives.
     ///
-    /// Returns `true` if state was successfully restored, `false` if no persisted
-    /// state is available (fresh node or corrupt state).
-    pub async fn load_last_known_ledger(&self) -> anyhow::Result<bool> {
+    /// # Returns
+    ///
+    /// - `Ok(RestoreResult::Restored)` — state was successfully restored from disk.
+    /// - `Ok(RestoreResult::NoState)` — no persisted state exists (fresh node,
+    ///   no LCL in DB). The caller should proceed to catchup or genesis bootstrap.
+    /// - `Err(...)` — persisted state is corrupt or inconsistent (e.g., LCL exists
+    ///   but HAS is missing, LCL/HAS mismatch, missing bucket files). The caller
+    ///   **must not** continue — this matches stellar-core's fatal throw in
+    ///   `loadLastKnownLedger`.
+    pub async fn load_last_known_ledger(&self) -> anyhow::Result<RestoreResult> {
         // Step 1: Read LCL sequence from DB (offloaded to blocking pool)
         let lcl_seq = self
             .db_blocking("load-lcl-seq", |db| {
@@ -435,11 +442,13 @@ impl App {
             .await?;
         let Some(lcl_seq) = lcl_seq else {
             tracing::debug!("No last closed ledger in DB, cannot restore from disk");
-            return Ok(false);
+            return Ok(RestoreResult::NoState);
         };
         if lcl_seq == 0 {
-            tracing::debug!("LCL is 0, cannot restore from disk");
-            return Ok(false);
+            // Genesis is persisted as ledger seq 1; a DB value of 0 is anomalous.
+            anyhow::bail!(
+                "Invalid database state: last closed ledger is 0 (expected >= 1 or absent)"
+            );
         }
 
         // Step 1b: Restore checkpoint state (crash recovery).
@@ -457,20 +466,21 @@ impl App {
             })
             .await?;
         let Some(has_json) = has_json else {
-            tracing::warn!(lcl_seq, "LCL found but no HAS in DB, cannot restore");
-            return Ok(false);
+            anyhow::bail!(
+                "Invalid database state: LCL exists at seq {} but no history archive state in DB",
+                lcl_seq
+            );
         };
         let has = HistoryArchiveState::from_json(&has_json)
             .map_err(|e| anyhow::anyhow!("Failed to parse persisted HAS: {}", e))?;
 
         // Step 3: Verify consistency between LCL and HAS
         if has.current_ledger != lcl_seq {
-            tracing::warn!(
+            anyhow::bail!(
+                "Invalid database state: LCL seq {} does not agree with HAS current_ledger {}",
                 lcl_seq,
-                has_ledger = has.current_ledger,
-                "LCL and HAS disagree on current ledger, cannot restore"
+                has.current_ledger
             );
-            return Ok(false);
         }
 
         tracing::info!(
@@ -741,7 +751,7 @@ impl App {
         // admission rejects invalid Soroban txs from the very first moment.
         self.seed_validation_context();
 
-        Ok(true)
+        Ok(RestoreResult::Restored)
     }
 
     /// Seed the herder's ValidationContext from the current ledger state.
@@ -2740,5 +2750,125 @@ mod extract_contract_events_tests {
         let expected_toid = (42u64 << 32) | (0u64 << 12) | 0u64;
         let expected_id = format!("{:019}-{:010}", expected_toid, 0);
         assert_eq!(events[0].id, expected_id);
+    }
+}
+
+#[cfg(test)]
+mod restore_result_tests {
+    use super::*;
+
+    /// Helper: create a minimal App for load_last_known_ledger tests.
+    async fn test_app() -> (Arc<App>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("test.db");
+        let bucket_dir = dir.path().join("buckets");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .bucket_directory(&bucket_dir)
+            .build();
+        let app = App::new(config).await.unwrap();
+        let app = Arc::new(app);
+        app.set_self_arc().await;
+        (app, dir)
+    }
+
+    #[tokio::test]
+    async fn test_no_lcl_returns_no_state() {
+        let (app, _dir) = test_app().await;
+        // Fresh DB has no LCL — should return NoState.
+        let result = app.load_last_known_ledger().await.unwrap();
+        assert_eq!(result, RestoreResult::NoState);
+    }
+
+    #[tokio::test]
+    async fn test_lcl_zero_returns_err() {
+        let (app, _dir) = test_app().await;
+        // Set LCL to 0 (anomalous — genesis is seq 1).
+        app.db_blocking("test-set-lcl", |db| {
+            db.with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                conn.set_last_closed_ledger(0)
+            })
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+        let result = app.load_last_known_ledger().await;
+        assert!(result.is_err(), "lcl_seq == 0 should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("last closed ledger is 0"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lcl_exists_but_no_has_returns_err() {
+        let (app, _dir) = test_app().await;
+        // Set LCL but no HAS — inconsistent state.
+        app.db_blocking("test-set-lcl", |db| {
+            db.with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                conn.set_last_closed_ledger(100)
+            })
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+        let result = app.load_last_known_ledger().await;
+        assert!(result.is_err(), "LCL without HAS should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no history archive state"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lcl_has_mismatch_returns_err() {
+        let (app, _dir) = test_app().await;
+        // Set LCL=100 but HAS says current_ledger=50.
+        app.db_blocking("test-set-lcl-has", |db| {
+            db.with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                conn.set_last_closed_ledger(100)?;
+                // Minimal HAS JSON with current_ledger=50.
+                let has_json = r#"{"version":1,"currentLedger":50,"currentBuckets":[]}"#;
+                conn.set_state(
+                    henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE,
+                    has_json,
+                )
+            })
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+        let result = app.load_last_known_ledger().await;
+        assert!(result.is_err(), "LCL/HAS mismatch should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("does not agree"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_malformed_has_json_returns_err() {
+        let (app, _dir) = test_app().await;
+        app.db_blocking("test-set-lcl-has", |db| {
+            db.with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                conn.set_last_closed_ledger(100)?;
+                conn.set_state(
+                    henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE,
+                    "not valid json",
+                )
+            })
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+        let result = app.load_last_known_ledger().await;
+        assert!(result.is_err(), "malformed HAS JSON should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Failed to parse"), "unexpected error: {msg}");
     }
 }

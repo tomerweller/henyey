@@ -64,6 +64,23 @@ impl std::fmt::Display for AppState {
     }
 }
 
+// ── Restore result ─────────────────────────────────────────────────────
+
+/// Result of attempting to restore node state from persisted DB and on-disk
+/// bucket files via [`App::load_last_known_ledger`](super::App::load_last_known_ledger).
+///
+/// Corruption and inconsistent state are represented as `Err`, not as a
+/// variant here, so callers cannot accidentally continue after encountering
+/// corrupt persisted state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreResult {
+    /// State was successfully restored from disk.
+    Restored,
+    /// No persisted state exists (fresh node, no LCL in DB). The caller
+    /// should proceed to catchup or genesis bootstrap.
+    NoState,
+}
+
 // ── Public API types ───────────────────────────────────────────────────
 
 /// Report of survey topology data collected from a single peer.

@@ -42,7 +42,7 @@ use serde::Serialize;
 use tokio::signal;
 use tokio::sync::broadcast;
 
-use crate::app::{App, AppState, CatchupTarget};
+use crate::app::{App, AppState, CatchupTarget, RestoreResult};
 use crate::compat_http::CompatServer;
 use crate::config::AppConfig;
 use crate::http::{QueryServer, StatusServer};
@@ -380,7 +380,7 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
     // This avoids a full catchup when the node restarts with intact state.
     if !force_scp && !options.force_catchup {
         match app.load_last_known_ledger().await {
-            Ok(true) => {
+            Ok(RestoreResult::Restored) => {
                 let info = app.ledger_info();
                 tracing::info!(
                     lcl_seq = info.ledger_seq,
@@ -388,11 +388,13 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
                 );
                 app.set_state(AppState::Synced).await;
             }
-            Ok(false) => {
+            Ok(RestoreResult::NoState) => {
                 tracing::debug!("No persisted state available, will check catchup");
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to restore from disk, will check catchup");
+                // Corruption or inconsistent DB state — abort startup.
+                // Matches stellar-core's fatal throw in loadLastKnownLedger.
+                return Err(e.context("load_last_known_ledger failed — persisted state is corrupt"));
             }
         }
     }

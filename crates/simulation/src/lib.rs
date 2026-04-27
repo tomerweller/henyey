@@ -901,22 +901,23 @@ impl Simulation {
         // App::run() will read the restored ledger via get_current_ledger()
         // and set state via restore_operational_state().
         match app.load_last_known_ledger().await {
-            Ok(true) => {
+            Ok(henyey_app::RestoreResult::Restored) => {
                 let info = app.ledger_info();
                 tracing::info!(
                     lcl_seq = info.ledger_seq,
                     "Restored restarted node from disk"
                 );
             }
-            Ok(false) => {
+            Ok(henyey_app::RestoreResult::NoState) => {
                 tracing::warn!(
                     "No persisted state for restarted node, falling back to genesis bootstrap"
                 );
                 app.bootstrap_from_db().await?;
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to restore restarted node from disk, falling back to genesis bootstrap");
-                app.bootstrap_from_db().await?;
+                return Err(
+                    e.context("Failed to restore restarted node — persisted state is corrupt")
+                );
             }
         }
 
