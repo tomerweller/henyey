@@ -2904,4 +2904,168 @@ mod restore_result_tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Failed to parse"), "unexpected error: {msg}");
     }
+
+    /// Helper: create a test App with custom validator/archive settings.
+    async fn test_app_with_publish_config(
+        is_validator: bool,
+        writable_archive: bool,
+    ) -> (Arc<App>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("test.db");
+        let bucket_dir = dir.path().join("buckets");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let mut builder = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .bucket_directory(&bucket_dir)
+            .validator(is_validator);
+        if is_validator {
+            builder = builder.node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA");
+        }
+        let mut config = builder.build();
+        if writable_archive {
+            config
+                .history
+                .archives
+                .push(crate::config::HistoryArchiveEntry {
+                    name: "test-archive".to_string(),
+                    url: "file:///tmp/test-archive".to_string(),
+                    get_enabled: true,
+                    put_enabled: true,
+                    put: Some("cp {0} {1}".to_string()),
+                    mkdir: None,
+                });
+        }
+        let app = App::new(config).await.unwrap();
+        let app = Arc::new(app);
+        app.set_self_arc().await;
+        (app, dir)
+    }
+
+    /// Regression test for #1989: startup drain clears stale publish queue
+    /// entries when the node is NOT a validator (even with writable archives).
+    #[tokio::test]
+    async fn test_startup_drain_clears_queue_when_not_validator() {
+        // Non-validator with writable archives — can_publish should be false.
+        let (app, _dir) = test_app_with_publish_config(false, true).await;
+
+        // Seed DB with LCL and stale publish queue entries.
+        app.db_blocking("seed-db", |db| {
+            db.with_connection(|conn| {
+                use henyey_db::queries::{PublishQueueQueries, StateQueries};
+                conn.set_last_closed_ledger(256)?;
+                conn.enqueue_publish(
+                    64,
+                    r#"{"version":1,"currentLedger":64,"currentBuckets":[]}"#,
+                )?;
+                conn.enqueue_publish(
+                    128,
+                    r#"{"version":1,"currentLedger":128,"currentBuckets":[]}"#,
+                )?;
+                conn.enqueue_publish(
+                    192,
+                    r#"{"version":1,"currentLedger":192,"currentBuckets":[]}"#,
+                )?;
+                Ok::<_, henyey_db::DbError>(())
+            })
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+
+        // Verify entries exist before drain.
+        let count_before = app
+            .db_blocking("check-queue-before", |db| {
+                Ok::<_, anyhow::Error>(db.load_publish_queue(None)?.len())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            count_before, 3,
+            "publish queue should have 3 entries before drain"
+        );
+
+        // load_last_known_ledger triggers the startup drain. It will fail
+        // later (no HAS in DB) but the drain happens before that.
+        let _ = app.load_last_known_ledger().await;
+
+        // Verify queue was drained.
+        let count_after = app
+            .db_blocking("check-queue-after", |db| {
+                Ok::<_, anyhow::Error>(db.load_publish_queue(None)?.len())
+            })
+            .await
+            .unwrap();
+        assert_eq!(count_after, 0, "publish queue should be empty after drain");
+    }
+
+    /// Regression test for #1989: startup drain clears stale publish queue
+    /// entries when the node is a validator but has no writable archives.
+    #[tokio::test]
+    async fn test_startup_drain_clears_queue_when_no_writable_archives() {
+        // Validator with NO writable archives — can_publish should be false.
+        let (app, _dir) = test_app_with_publish_config(true, false).await;
+
+        // Seed DB with stale entries.
+        app.db_blocking("seed-db", |db| {
+            db.with_connection(|conn| {
+                use henyey_db::queries::{PublishQueueQueries, StateQueries};
+                conn.set_last_closed_ledger(128)?;
+                conn.enqueue_publish(
+                    64,
+                    r#"{"version":1,"currentLedger":64,"currentBuckets":[]}"#,
+                )?;
+                Ok::<_, henyey_db::DbError>(())
+            })
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+
+        let _ = app.load_last_known_ledger().await;
+
+        let count = app
+            .db_blocking("check-queue", |db| {
+                Ok::<_, anyhow::Error>(db.load_publish_queue(None)?.len())
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "publish queue should be drained");
+    }
+
+    /// Verify that startup does NOT drain the publish queue when the node
+    /// IS a validator WITH writable archives (can_publish = true).
+    #[tokio::test]
+    async fn test_startup_preserves_queue_when_can_publish() {
+        // Validator with writable archives — can_publish should be true.
+        let (app, _dir) = test_app_with_publish_config(true, true).await;
+
+        // Seed DB with entries that should be preserved.
+        app.db_blocking("seed-db", |db| {
+            db.with_connection(|conn| {
+                use henyey_db::queries::{PublishQueueQueries, StateQueries};
+                conn.set_last_closed_ledger(128)?;
+                conn.enqueue_publish(
+                    64,
+                    r#"{"version":1,"currentLedger":64,"currentBuckets":[]}"#,
+                )?;
+                Ok::<_, henyey_db::DbError>(())
+            })
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+
+        let _ = app.load_last_known_ledger().await;
+
+        let count = app
+            .db_blocking("check-queue", |db| {
+                Ok::<_, anyhow::Error>(db.load_publish_queue(None)?.len())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "publish queue should be preserved when can_publish is true"
+        );
+    }
 }
