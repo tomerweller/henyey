@@ -58,6 +58,7 @@ pub async fn handle(
     // Query events and batch-load close times in a single blocking DB call.
     // On pruning race (require_close_times fails), fall back to batch_close_times
     // and skip events with missing headers rather than returning a 500.
+    let event_load_budget = ctx.app.config().rpc.max_event_load_bytes;
     let (events, close_time_cache) = util::blocking_db(ctx, move |db| {
         db.with_connection(|conn| {
             use henyey_db::{EventQueries, LedgerQueries};
@@ -69,6 +70,7 @@ pub async fn handle(
                 topics: &topic_filters,
                 cursor: cursor_owned.as_deref(),
                 limit,
+                max_total_bytes: event_load_budget,
             })?;
             let seqs: Vec<u32> = events
                 .iter()

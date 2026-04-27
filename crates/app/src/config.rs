@@ -1116,6 +1116,14 @@ pub struct RpcConfig {
     /// size so pagination can make forward progress.  Defaults to 10 MiB.
     #[serde(default = "default_max_tx_load_bytes")]
     pub max_tx_load_bytes: usize,
+
+    /// Maximum cumulative stored bytes (`event_xdr + topic1..4`) to load
+    /// from the database per `getEvents` request.  Acts as a DB load
+    /// budget — the first event is always returned regardless of its
+    /// size so pagination can make forward progress.  Measures the
+    /// base64-encoded TEXT length as stored in SQLite.  Defaults to 10 MiB.
+    #[serde(default = "default_max_event_load_bytes")]
+    pub max_event_load_bytes: usize,
 }
 
 impl Default for RpcConfig {
@@ -1132,6 +1140,7 @@ impl Default for RpcConfig {
             bucket_io_concurrency: default_bucket_io_concurrency(),
             max_ledger_meta_load_bytes: default_max_ledger_meta_load_bytes(),
             max_tx_load_bytes: default_max_tx_load_bytes(),
+            max_event_load_bytes: default_max_event_load_bytes(),
         }
     }
 }
@@ -1195,6 +1204,10 @@ fn default_max_ledger_meta_load_bytes() -> usize {
 }
 
 fn default_max_tx_load_bytes() -> usize {
+    10 * 1024 * 1024 // 10 MiB
+}
+
+fn default_max_event_load_bytes() -> usize {
     10 * 1024 * 1024 // 10 MiB
 }
 

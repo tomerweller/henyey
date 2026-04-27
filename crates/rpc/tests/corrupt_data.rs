@@ -1318,3 +1318,188 @@ async fn get_transactions_budget_oversized_first_row() {
         "cursor must be present for forward progress"
     );
 }
+
+// ---------------------------------------------------------------------------
+// getEvents budget truncation and pagination tests
+// ---------------------------------------------------------------------------
+
+/// Boot a [`FakeRpcTestHarness`] with a custom `max_event_load_bytes` budget.
+async fn setup_fake_rpc_with_event_budget(budget: usize) -> FakeRpcTestHarness {
+    let app = FakeRpcApp::builder()
+        .ledger_seq(10)
+        .max_event_load_bytes(budget)
+        .build();
+    let h = FakeRpcTestHarness::start(app).await;
+    seed_ledger_header(h.app.database(), 2, 1_700_000_002);
+    seed_ledger_header(h.app.database(), 10, 1_700_000_010);
+    h
+}
+
+/// Seed N events at a given ledger, each with a known-size XDR payload.
+/// Returns the per-row stored byte count (event_xdr length + topic lengths).
+fn seed_events_with_budget(h: &FakeRpcTestHarness, ledger_seq: u32, count: u32) -> usize {
+    let valid_xdr = valid_event_xdr_b64();
+    let topic_b64 = {
+        let topic_val = ScVal::U32(99);
+        let bytes = topic_val.to_xdr(Limits::none()).unwrap();
+        BASE64.encode(&bytes)
+    };
+    // row_bytes = len(event_xdr) + len(topic1)
+    let row_bytes = valid_xdr.len() + topic_b64.len();
+
+    for i in 0..count {
+        let event = EventRecord {
+            id: format!("{:019}-{:010}", (ledger_seq as u64) << 32, i),
+            ledger_seq,
+            tx_index: i,
+            op_index: 0,
+            tx_hash: format!("tx_budget_{ledger_seq}_{i:04}"),
+            contract_id: None,
+            event_type: ContractEventType::Contract,
+            topics: vec![topic_b64.clone()],
+            event_xdr: valid_xdr.clone(),
+            in_successful_contract_call: true,
+        };
+        h.app
+            .database()
+            .with_connection(|conn| conn.store_events(&[event]))
+            .unwrap();
+    }
+    row_bytes
+}
+
+/// Verify getEvents respects byte budget and truncates results.
+#[tokio::test]
+async fn get_events_budget_truncation() {
+    // First, discover per-row size
+    let h = setup_fake_rpc_with_event_budget(1).await;
+    let row_bytes = seed_events_with_budget(&h, 2, 5);
+
+    // Recreate with budget that fits 2 rows but not 3
+    let budget = row_bytes * 2 + row_bytes / 2;
+    let h = setup_fake_rpc_with_event_budget(budget).await;
+    let row_bytes2 = seed_events_with_budget(&h, 2, 5);
+    assert_eq!(row_bytes, row_bytes2);
+
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "budget-events-trunc",
+            "method": "getEvents",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 10 }
+            }
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let events = result["events"].as_array().expect("events array");
+    assert_eq!(
+        events.len(),
+        2,
+        "expected budget to truncate to 2 events, got {}",
+        events.len()
+    );
+    let cursor = result["cursor"].as_str().expect("cursor");
+    assert!(!cursor.is_empty());
+}
+
+/// Verify first event is always returned even with 1-byte budget.
+#[tokio::test]
+async fn get_events_budget_first_row_always_returned() {
+    let h = setup_fake_rpc_with_event_budget(1).await;
+    seed_events_with_budget(&h, 2, 3);
+
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "budget-events-first",
+            "method": "getEvents",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 10 }
+            }
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let events = result["events"].as_array().expect("events array");
+    assert_eq!(
+        events.len(),
+        1,
+        "with 1-byte budget, first event must still be returned"
+    );
+    let cursor = result["cursor"].as_str().expect("cursor");
+    assert!(
+        !cursor.is_empty(),
+        "cursor must be present for forward progress"
+    );
+}
+
+/// Verify pagination resumes correctly after budget truncation.
+#[tokio::test]
+async fn get_events_budget_pagination() {
+    let h = setup_fake_rpc_with_event_budget(1).await;
+    let row_bytes = seed_events_with_budget(&h, 2, 3);
+
+    // Budget fits exactly 1 row
+    let h = setup_fake_rpc_with_event_budget(row_bytes).await;
+    seed_events_with_budget(&h, 2, 3);
+
+    // First page — should get 1 event
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "budget-events-page1",
+            "method": "getEvents",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 10 }
+            }
+        }))
+        .await;
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let events = result["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1, "page 1 should have 1 event");
+    let cursor = result["cursor"].as_str().expect("cursor").to_string();
+
+    // Second page — use the cursor
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "budget-events-page2",
+            "method": "getEvents",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 10, "cursor": cursor }
+            }
+        }))
+        .await;
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let events = result["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1, "page 2 should have 1 event");
+    let cursor2 = result["cursor"].as_str().expect("cursor").to_string();
+    assert_ne!(cursor, cursor2, "cursor should advance");
+
+    // Third page
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "budget-events-page3",
+            "method": "getEvents",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 10, "cursor": cursor2 }
+            }
+        }))
+        .await;
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let events = result["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1, "page 3 should have 1 event");
+}

@@ -152,6 +152,7 @@ Paginated endpoints that load variable-size blobs (`getLedgers`, `getTransaction
 |----------|-------------|---------|----------|
 | `getLedgers` | `max_ledger_meta_load_bytes` | 10 MiB | Raw `LedgerCloseMeta` XDR |
 | `getTransactions` | `max_tx_load_bytes` | 10 MiB | `txbody + txresult + txmeta` |
+| `getEvents` | `max_event_load_bytes` | 10 MiB | `event_xdr + topic1..4` (base64 TEXT) |
 
 The first row is always returned regardless of its size so that cursor-based pagination can always make forward progress.
 
