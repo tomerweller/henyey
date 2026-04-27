@@ -815,7 +815,19 @@ rm -f "$tmpfile"
 
 If the completion summary includes deferred items (from the "What was deferred"
 section, reviewer recommendations, or remaining concerns noted during
-implementation), create a GitHub issue for **each** deferred item:
+implementation), create a GitHub issue for **each** deferred item.
+
+**Classify each deferred item** to determine its priority label:
+
+| Category | Priority label | Examples |
+|---|---|---|
+| Correctness bugs | `urgent` | Wrong result, data corruption, logic error, missing validation that causes incorrect behavior |
+| Security issues | `high` | Unauthenticated access, input injection, credential exposure, DoS vectors |
+| Performance issues | `medium` | Unnecessary allocations, O(n²) where O(n) suffices, missing caching, redundant I/O |
+| Everything else | `low` | Refactors, testing gaps, documentation, code cleanup, naming improvements |
+
+Apply the highest applicable category — e.g., a performance issue that also
+causes incorrect results is `urgent` (correctness), not `medium`.
 
 ```bash
 gh issue create \
@@ -835,8 +847,12 @@ gh issue create \
 ## References
 - Parent issue: #$ISSUE
 - Implementation commit(s): <commit hashes>" \
-  --label "follow-up"
+  --label "follow-up" \
+  --label "<priority>"
 ```
+
+where `<priority>` is one of `urgent`, `high`, `medium`, or `low` based on the
+classification above.
 
 Guidelines for deferred-work issues:
 - One issue per distinct work item — do not bundle unrelated items.
@@ -845,8 +861,8 @@ Guidelines for deferred-work issues:
 - Include enough context that someone unfamiliar with the parent issue can
   understand and execute the work.
 - Reference the parent issue and implementation commits.
-- Add relevant labels beyond `follow-up` (e.g., `testing`, `refactor`,
-  crate-specific labels).
+- Add relevant labels beyond `follow-up` and the priority label (e.g.,
+  `testing`, `refactor`, crate-specific labels).
 - If a deferred item is trivial or speculative, skip it — only file issues for
   work that genuinely should be done.
 - **State dependencies explicitly.** If a deferred issue depends on another
