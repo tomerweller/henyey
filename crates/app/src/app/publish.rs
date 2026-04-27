@@ -606,7 +606,10 @@ mod tests {
     #[test]
     fn app_runtime_does_not_reconstruct_bucket_manager_from_config() {
         let app_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app");
-        let constructor = ["BucketManager::", "with_cache_size"].concat();
+        let constructors = [
+            ["BucketManager::", "with_cache_size"].concat(),
+            ["BucketManager::", "new"].concat(),
+        ];
         let config_bucket_dir = ["config.buckets", ".directory"].concat();
         let mut offenders = Vec::new();
         let mut stack = vec![app_dir];
@@ -623,11 +626,18 @@ mod tests {
                 }
 
                 let source = std::fs::read_to_string(&path).unwrap();
-                if path.file_name().and_then(|name| name.to_str()) == Some("mod.rs") {
+                if path.file_name().and_then(|name| name.to_str()) == Some("mod.rs")
+                    && source.matches(&constructors[0]).count() == 1
+                    && !source.contains(&constructors[1])
+                {
                     continue;
                 }
-                if source.contains(&constructor) && source.contains(&config_bucket_dir) {
-                    offenders.push(path);
+                if constructors
+                    .iter()
+                    .any(|constructor| source.contains(constructor))
+                    && source.contains(&config_bucket_dir)
+                {
+                    offenders.push(path.clone());
                 }
             }
         }
