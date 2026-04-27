@@ -431,10 +431,10 @@ mod tests {
         assert_eq!(node_ids.len(), MAX_PENDING_NODE_IDS);
     }
 
-    /// Regression test for issue #1953: QuorumSetTracker seeded with an
-    /// unnormalized local quorum set must still be findable by the
-    /// *normalized* hash (because SCP::new normalizes and emits that hash
-    /// in statements).
+    /// Regression test for issue #1953: verifies that Herder::build's
+    /// normalization step makes the canonical hash usable for by-hash
+    /// lookup. We simulate the full flow: start with an unnormalized qset,
+    /// normalize it (as Herder::build does), then seed the tracker.
     #[test]
     fn test_unnormalized_local_qset_lookup_by_normalized_hash() {
         use henyey_scp::normalize_quorum_set;
@@ -449,19 +449,20 @@ mod tests {
             inner_sets: VecM::default(),
         };
 
-        // Compute the normalized hash (what SCP::new would produce).
+        // The unnormalized hash differs from the normalized hash.
+        let unnormalized_hash = hash_quorum_set(&unnormalized);
         let mut normalized = unnormalized.clone();
         normalize_quorum_set(&mut normalized);
         let normalized_hash = hash_quorum_set(&normalized);
+        assert_ne!(
+            unnormalized_hash, normalized_hash,
+            "precondition: unnormalized and normalized hashes must differ"
+        );
 
-        // Construct the tracker with the unnormalized qset as-is.
-        // In production, Herder::build normalizes before constructing the
-        // tracker, but this test verifies the contract: even if someone
-        // constructs with unnormalized input, the normalized hash should
-        // work for lookup after normalization at the Herder layer.
+        // Simulate the Herder::build flow: normalize first, then seed tracker.
         let tracker = QuorumSetTracker::new(node_key(0), Some(normalized.clone()));
 
-        // Lookup by normalized hash must succeed.
+        // Lookup by the canonical (normalized) hash must succeed.
         assert!(
             tracker.has_hash(&normalized_hash),
             "tracker seeded with normalized qset must be findable by canonical hash"
@@ -469,5 +470,12 @@ mod tests {
         let retrieved = tracker.get_by_hash(&normalized_hash);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().threshold, 2);
+
+        // Lookup by the old unnormalized hash must NOT succeed — the tracker
+        // only knows the canonical form.
+        assert!(
+            !tracker.has_hash(&unnormalized_hash),
+            "tracker must not be indexed under the unnormalized hash"
+        );
     }
 }

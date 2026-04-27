@@ -597,7 +597,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 ## Parity Notes
 
-- **Local quorum set normalization in `Herder::build`** (issue #1953): `Herder::build` now normalizes `config.local_quorum_set` before distributing it to `SCP::new`, `ScpDriverConfig`, `FetchingEnvelopes`, `QuorumSetTracker`, and `SlotQuorumTracker`. This matches stellar-core's `LocalNode::LocalNode` which calls `normalizeQSet` on the local quorum set before computing `mQSetHash`. The app config path (`config_to_quorum_set`) already normalized, so this is defense-in-depth for direct API callers.
+- **Local quorum set normalization in `Herder::build`** (issue #1953): `Herder::build` now normalizes `config.local_quorum_set` before distributing it to `SCP::new`, `ScpDriverConfig`, `FetchingEnvelopes`, `QuorumSetTracker`, and `SlotQuorumTracker`. This matches stellar-core's `LocalNode::LocalNode` which calls `normalizeQSet` on the local quorum set before computing `mQSetHash`. The app config path (`QuorumSetConfig::to_xdr` in `crates/app/src/config.rs`) already normalized, so this is defense-in-depth for direct API callers.
 - **Remaining parity debt**: `set_local_quorum_set` does not normalize (matching upstream `LocalNode::updateQuorumSet`), but henyey only applies it to new slots while stellar-core's shared `LocalNode` reference affects all slots retroactively.
 
 ## Parity Calculation

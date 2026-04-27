@@ -3825,6 +3825,117 @@ mod tests {
     }
 
     // =========================================================================
+    // Issue #1953 — Herder end-to-end normalization regression
+    // =========================================================================
+
+    /// End-to-end regression test for issue #1953: construct a Herder with
+    /// deliberately reverse-sorted validators in the quorum set and verify
+    /// that (a) SCP stores the normalized form, (b) the quorum-set tracker
+    /// indexes it by the canonical hash, and (c) emitted SCP statements use
+    /// the canonical hash.
+    #[test]
+    fn test_herder_normalizes_reverse_sorted_quorum_set_end_to_end() {
+        let seed = [9u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let local_node_id = node_id_from_public_key(&public);
+
+        // Second node.
+        let other_secret = SecretKey::from_seed(&[10u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        // Deliberately reverse-sort the validators — local second, other first
+        // (or whichever order is NOT canonical).  We just swap them and verify
+        // the hash differs from the sorted version.
+        let unsorted_qs = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![other_node_id.clone(), local_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let unsorted_hash = hash_quorum_set(&unsorted_qs);
+
+        let mut sorted_qs = unsorted_qs.clone();
+        henyey_scp::normalize_quorum_set(&mut sorted_qs);
+        let sorted_hash = hash_quorum_set(&sorted_qs);
+
+        // Precondition: the two orderings produce different hashes.
+        // (If they happen to be already sorted, swap them so they differ.)
+        let quorum_set = if unsorted_hash == sorted_hash {
+            // Already canonical — reverse explicitly.
+            ScpQuorumSet {
+                threshold: 2,
+                validators: vec![local_node_id.clone(), other_node_id.clone()]
+                    .try_into()
+                    .unwrap(),
+                inner_sets: vec![].try_into().unwrap(),
+            }
+        } else {
+            unsorted_qs
+        };
+        let pre_normalize_hash = hash_quorum_set(&quorum_set);
+        let mut canonical = quorum_set.clone();
+        henyey_scp::normalize_quorum_set(&mut canonical);
+        let canonical_hash = hash_quorum_set(&canonical);
+        assert_ne!(
+            pre_normalize_hash, canonical_hash,
+            "precondition: quorum set must not already be in canonical order"
+        );
+
+        // Build the Herder with the non-canonical quorum set.
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(config, secret);
+
+        // (a) SCP must store the normalized form.
+        let scp_stored = herder.scp().local_quorum_set();
+        let stored_hash = hash_quorum_set(scp_stored);
+        assert_eq!(
+            stored_hash, canonical_hash,
+            "SCP must store the canonically-normalized quorum set"
+        );
+
+        // (b) The tracker must be able to look up by the canonical hash.
+        let canonical_hash256 = henyey_common::Hash256(canonical_hash.0);
+        let from_tracker = herder.scp_driver.get_quorum_set_by_hash(&canonical_hash256);
+        assert!(
+            from_tracker.is_some(),
+            "quorum set tracker must index the local qset under the canonical hash"
+        );
+
+        // (c) Emit a nomination and verify the quorum_set_hash in the
+        //     statement matches the canonical hash.
+        let signing_secret = SecretKey::from_seed(&[9u8; 32]);
+        let value = make_valid_value_with_cached_tx_set(&herder, &signing_secret);
+        let prev_value = value.clone();
+        assert!(herder.scp().nominate(1, value, &prev_value));
+
+        let envelopes = herder.scp().get_latest_messages_send(1);
+        assert!(
+            !envelopes.is_empty(),
+            "SCP should have emitted at least one envelope"
+        );
+        for env in &envelopes {
+            let env_qs_hash = match &env.statement.pledges {
+                ScpStatementPledges::Nominate(nom) => &nom.quorum_set_hash,
+                ScpStatementPledges::Prepare(p) => &p.quorum_set_hash,
+                ScpStatementPledges::Confirm(c) => &c.quorum_set_hash,
+                ScpStatementPledges::Externalize(e) => &e.commit_quorum_set_hash,
+            };
+            assert_eq!(
+                env_qs_hash.0, canonical_hash.0,
+                "emitted SCP statement must use the canonical quorum-set hash"
+            );
+        }
+    }
+
+    // =========================================================================
     // Phase 6 H1 parity tests — close-time validation in Herder
     // =========================================================================
 
