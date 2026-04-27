@@ -241,6 +241,25 @@ impl DiskBucket {
         Ok(Arc::new(mmap))
     }
 
+    /// Compute SHA-256 hash of a file's content using sequential buffered I/O.
+    ///
+    /// Uses a separate file read (not mmap) to get optimal sequential access
+    /// patterns for the kernel's readahead logic.
+    fn compute_file_hash(path: &Path) -> Result<Hash256> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 256 * 1024];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(Hash256::from(<[u8; 32]>::from(hasher.finalize())))
+    }
+
     /// Ensure the index is initialized.
     ///
     /// The index is always built eagerly during construction, so this simply
@@ -357,6 +376,18 @@ impl DiskBucket {
         prebuilt_index: LiveBucketIndex,
     ) -> Result<Self> {
         let path = path.as_ref();
+
+        // Verify the bucket file's content hash matches the expected hash.
+        // The prebuilt path trusts the persisted index for the hash value,
+        // so we must independently verify by hashing the file content.
+        // Use a sequential file read (not the mmap which uses MADV_RANDOM).
+        let actual_hash = Self::compute_file_hash(path)?;
+        if actual_hash != hash {
+            return Err(BucketError::HashMismatch {
+                expected: hash.to_hex(),
+                actual: actual_hash.to_hex(),
+            });
+        }
 
         let index = OnceLock::new();
         index

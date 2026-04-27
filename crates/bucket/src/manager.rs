@@ -606,17 +606,18 @@ impl BucketManager {
             return Ok(());
         }
         let bucket_path = self.bucket_path(hash);
-        crate::index_persistence::save_disk_index(index, &bucket_path)
+        crate::index_persistence::save_disk_index(index, &bucket_path, hash)
     }
 
     /// Try to load a persisted disk index for a bucket.
     ///
     /// Returns `None` if persistence is disabled, the file doesn't exist,
-    /// or the stored version/page-size doesn't match.
+    /// or any integrity check fails (version, page size, bucket hash,
+    /// file size, or data checksum).
     ///
     /// # Arguments
     ///
-    /// * `hash` - The bucket hash
+    /// * `hash` - The bucket hash (also used for integrity verification)
     /// * `expected_page_size` - Expected page size for validation
     pub fn try_load_index_for_bucket(
         &self,
@@ -627,7 +628,7 @@ impl BucketManager {
             return Ok(None);
         }
         let bucket_path = self.bucket_path(hash);
-        crate::index_persistence::load_disk_index(&bucket_path, expected_page_size)
+        crate::index_persistence::load_disk_index(&bucket_path, expected_page_size, hash)
     }
 
     /// Add a bucket to the cache.
@@ -2415,5 +2416,75 @@ mod tests {
             }
             other => panic!("Expected HashMismatch, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_prebuilt_path_rejects_corrupted_bucket() {
+        use crate::index::{DiskIndex, DEFAULT_PAGE_SIZE};
+
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            BucketManager::with_persist_index(temp_dir.path().to_path_buf(), true).unwrap();
+
+        // Create a bucket with enough entries to be above DISK_BACKED_THRESHOLD
+        // For the test, we'll create a real bucket and persist its index, then corrupt it.
+        let entries: Vec<BucketEntry> = (0..100u8)
+            .map(|i| BucketEntry::Liveentry(make_account_entry([i; 32], i as i64 * 100)))
+            .collect();
+        let bucket = manager.create_bucket(entries.clone()).unwrap();
+        let hash = bucket.hash();
+        let bucket_path = manager.bucket_path(&hash);
+
+        // Build and save a disk index
+        let indexed_entries: Vec<(crate::entry::BucketEntry, u64)> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| (e, i as u64 * 100))
+            .collect();
+        let bloom_seed = [0u8; 16];
+        let index =
+            DiskIndex::from_entries(indexed_entries.into_iter(), bloom_seed, DEFAULT_PAGE_SIZE);
+        manager.save_index_for_bucket(&hash, &index).unwrap();
+
+        // Verify the index was persisted
+        let loaded = manager
+            .try_load_index_for_bucket(&hash, DEFAULT_PAGE_SIZE)
+            .unwrap();
+        assert!(loaded.is_some(), "Index should be persisted");
+
+        // Corrupt the bucket file (overwrite first bytes)
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&bucket_path)
+                .unwrap();
+            file.write_all(b"CORRUPTED DATA HERE").unwrap();
+        }
+
+        // Clear the cache so load_bucket must re-read from disk
+        manager.clear_cache();
+
+        // Create a fresh manager to ensure no cached state
+        let manager2 =
+            BucketManager::with_persist_index(temp_dir.path().to_path_buf(), true).unwrap();
+
+        // Try to load — the index will fail Layer 2 (bucket hash changed due to
+        // corruption → file size check may pass but hash check fails), or if
+        // by chance Layer 2 passes, Layer 1 (from_prebuilt hash verification)
+        // catches it. Either way, we should get an error or a rebuild that
+        // computes the correct hash and detects the mismatch.
+        let result = manager2.load_bucket(&hash);
+
+        // The bucket file was corrupted, so the hash won't match.
+        // It may error at the index-loading stage (Layer 2 rejects because
+        // the index was built for the original hash) and then the full
+        // streaming rebuild computes a different hash → HashMismatch.
+        // Or the persisted index passes (if bucket_path still has correct
+        // name) and from_prebuilt catches it (Layer 1).
+        assert!(
+            result.is_err(),
+            "load_bucket should fail for corrupted bucket file"
+        );
     }
 }

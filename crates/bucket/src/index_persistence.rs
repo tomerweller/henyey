@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use henyey_common::Hash256;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use stellar_xdr::curr::{LedgerEntryType, LedgerKey, Limits, PoolId, ReadXdr, WriteXdr};
 use xorf::BinaryFuse16;
 
@@ -48,17 +49,22 @@ use crate::BucketError;
 /// Version 2: Added bloom filter and asset-to-pool-id map persistence.
 /// Version 3: Page size changed from entry-count to byte-offset semantics.
 /// Version 4: Added entry_type_sizes to counters.
-pub const BUCKET_INDEX_VERSION: u32 = 4;
+/// Version 5: Added bucket_hash, bucket_file_size, and data_checksum for integrity.
+pub const BUCKET_INDEX_VERSION: u32 = 5;
 
 // ============================================================================
 // Serializable Types
 // ============================================================================
 
-/// Header for index files, used for version checking.
+/// Header for index files, used for version and integrity checking.
 #[derive(Serialize, Deserialize, Debug)]
 struct IndexHeader {
     version: u32,
     page_size: u64,
+    /// SHA-256 hash of the bucket file this index was built from.
+    bucket_hash: [u8; 32],
+    /// Size in bytes of the bucket file this index was built from.
+    bucket_file_size: u64,
 }
 
 /// Serializable version of RangeEntry.
@@ -264,9 +270,16 @@ pub fn index_path_for_bucket(bucket_path: &Path) -> PathBuf {
 /// # Returns
 ///
 /// `Ok(())` on success, `Err` on I/O or serialization failure.
-pub fn save_disk_index(index: &DiskIndex, bucket_path: &Path) -> Result<(), BucketError> {
+pub fn save_disk_index(
+    index: &DiskIndex,
+    bucket_path: &Path,
+    bucket_hash: &Hash256,
+) -> Result<(), BucketError> {
     let index_path = index_path_for_bucket(bucket_path);
     let tmp_path = index_path.with_extension("index.tmp");
+
+    // Derive bucket file size from the actual file
+    let bucket_file_size = std::fs::metadata(bucket_path)?.len();
 
     // Serialize index data
     let pages: Result<Vec<_>, _> = index
@@ -312,9 +325,19 @@ pub fn save_disk_index(index: &DiskIndex, bucket_path: &Path) -> Result<(), Buck
     let header = IndexHeader {
         version: BUCKET_INDEX_VERSION,
         page_size: index.page_size(),
+        bucket_hash: *bucket_hash.as_bytes(),
+        bucket_file_size,
     };
 
-    // Write to temp file
+    // Serialize data to bytes first so we can compute a checksum (Layer 3)
+    let data_bytes = bincode::serialize(&data)
+        .map_err(|e| BucketError::Serialization(format!("Failed to serialize data: {}", e)))?;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&data_bytes);
+    let data_checksum: [u8; 32] = hasher.finalize().into();
+
+    // Write to temp file: header + checksum + data
     {
         let file = File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
@@ -322,8 +345,10 @@ pub fn save_disk_index(index: &DiskIndex, bucket_path: &Path) -> Result<(), Buck
         bincode::serialize_into(&mut writer, &header).map_err(|e| {
             BucketError::Serialization(format!("Failed to serialize header: {}", e))
         })?;
-        bincode::serialize_into(&mut writer, &data)
-            .map_err(|e| BucketError::Serialization(format!("Failed to serialize data: {}", e)))?;
+        bincode::serialize_into(&mut writer, &data_checksum).map_err(|e| {
+            BucketError::Serialization(format!("Failed to serialize checksum: {}", e))
+        })?;
+        writer.write_all(&data_bytes)?;
 
         writer.flush()?;
     }
@@ -352,12 +377,15 @@ pub fn save_disk_index(index: &DiskIndex, bucket_path: &Path) -> Result<(), Buck
 /// - Index file doesn't exist
 /// - Version mismatch
 /// - PageSize mismatch
+/// - Bucket hash or file size mismatch (stale/mispaired index)
+/// - Data checksum mismatch (corrupted index data)
 /// - Deserialization error
 ///
 /// # Arguments
 ///
 /// * `bucket_path` - Path to the bucket file
 /// * `expected_page_size` - Expected page size (triggers rebuild if different)
+/// * `expected_hash` - Expected SHA-256 hash of the bucket file
 ///
 /// # Returns
 ///
@@ -365,6 +393,7 @@ pub fn save_disk_index(index: &DiskIndex, bucket_path: &Path) -> Result<(), Buck
 pub fn load_disk_index(
     bucket_path: &Path,
     expected_page_size: u64,
+    expected_hash: &Hash256,
 ) -> Result<Option<DiskIndex>, BucketError> {
     let index_path = index_path_for_bucket(bucket_path);
 
@@ -417,8 +446,64 @@ pub fn load_disk_index(
         return Ok(None);
     }
 
-    // Load data
-    let data: IndexData = match bincode::deserialize_from(&mut reader) {
+    // Bucket hash check (Layer 2: detect stale/mispaired indexes)
+    if header.bucket_hash != *expected_hash.as_bytes() {
+        tracing::info!(
+            path = %index_path.display(),
+            stored_hash = %Hash256::from(header.bucket_hash).to_hex(),
+            expected_hash = %expected_hash.to_hex(),
+            "Index bucket hash mismatch, will rebuild"
+        );
+        let _ = std::fs::remove_file(&index_path);
+        return Ok(None);
+    }
+
+    // Bucket file size check (Layer 2: detect truncated/replaced files)
+    let actual_file_size = std::fs::metadata(bucket_path)?.len();
+    if header.bucket_file_size != actual_file_size {
+        tracing::info!(
+            path = %index_path.display(),
+            stored_size = header.bucket_file_size,
+            actual_size = actual_file_size,
+            "Index bucket file size mismatch, will rebuild"
+        );
+        let _ = std::fs::remove_file(&index_path);
+        return Ok(None);
+    }
+
+    // Read data checksum (Layer 3)
+    let stored_checksum: [u8; 32] = match bincode::deserialize_from(&mut reader) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                path = %index_path.display(),
+                error = %e,
+                "Failed to read data checksum, will rebuild"
+            );
+            let _ = std::fs::remove_file(&index_path);
+            return Ok(None);
+        }
+    };
+
+    // Read remaining data bytes for checksum verification
+    let mut data_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut data_bytes)?;
+
+    // Verify data checksum (Layer 3: detect corrupted index data)
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&data_bytes);
+    let computed_checksum: [u8; 32] = hasher.finalize().into();
+    if stored_checksum != computed_checksum {
+        tracing::warn!(
+            path = %index_path.display(),
+            "Index data checksum mismatch, will rebuild"
+        );
+        let _ = std::fs::remove_file(&index_path);
+        return Ok(None);
+    }
+
+    // Deserialize the verified data
+    let data: IndexData = match bincode::deserialize(&data_bytes) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(
@@ -517,6 +602,13 @@ mod tests {
     use stellar_xdr::curr::*;
     use tempfile::tempdir;
 
+    /// Create a dummy bucket file for testing and return its SHA-256 hash.
+    fn create_dummy_bucket_file(bucket_path: &Path) -> Hash256 {
+        let data = b"dummy bucket data for index persistence tests";
+        std::fs::write(bucket_path, data).unwrap();
+        Hash256::hash(data)
+    }
+
     fn make_account_key(byte: u8) -> LedgerKey {
         LedgerKey::Account(LedgerKeyAccount {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32]))),
@@ -567,7 +659,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let bucket_path = temp_dir.path().join("bucket-test.xdr");
 
-        let result = load_disk_index(&bucket_path, DEFAULT_PAGE_SIZE).unwrap();
+        let result = load_disk_index(&bucket_path, DEFAULT_PAGE_SIZE, &Hash256::ZERO).unwrap();
         assert!(result.is_none());
     }
 
@@ -618,6 +710,7 @@ mod tests {
 
         let temp_dir = tempdir().unwrap();
         let bucket_path = temp_dir.path().join("bucket-test.xdr");
+        let bucket_hash = create_dummy_bucket_file(&bucket_path);
 
         // Create a DiskIndex with entries
         let entries: Vec<(BucketEntry, u64)> = (0..100u8)
@@ -634,14 +727,14 @@ mod tests {
         let original = DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size);
 
         // Save the index
-        save_disk_index(&original, &bucket_path).unwrap();
+        save_disk_index(&original, &bucket_path, &bucket_hash).unwrap();
 
         // Verify index file was created
         let index_path = index_path_for_bucket(&bucket_path);
         assert!(index_path.exists());
 
         // Load the index back
-        let loaded = load_disk_index(&bucket_path, page_size)
+        let loaded = load_disk_index(&bucket_path, page_size, &bucket_hash)
             .unwrap()
             .expect("Index should load successfully");
 
@@ -730,6 +823,7 @@ mod tests {
 
         let temp_dir = tempdir().unwrap();
         let bucket_path = temp_dir.path().join("bucket-test.xdr");
+        let bucket_hash = create_dummy_bucket_file(&bucket_path);
 
         // Create and save with page_size = 10
         let entries: Vec<(BucketEntry, u64)> = (0..50u8)
@@ -742,10 +836,10 @@ mod tests {
             .collect();
 
         let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10);
-        save_disk_index(&index, &bucket_path).unwrap();
+        save_disk_index(&index, &bucket_path, &bucket_hash).unwrap();
 
         // Try to load with different page_size = 20
-        let result = load_disk_index(&bucket_path, 20).unwrap();
+        let result = load_disk_index(&bucket_path, 20, &bucket_hash).unwrap();
         assert!(
             result.is_none(),
             "Should return None for page size mismatch"
@@ -842,6 +936,7 @@ mod tests {
     fn test_save_load_with_bloom_filter() {
         let temp_dir = tempdir().unwrap();
         let bucket_path = temp_dir.path().join("bucket-bloom.xdr");
+        let bucket_hash = create_dummy_bucket_file(&bucket_path);
 
         let bloom_seed = [7u8; 16];
         let page_size = 10u64;
@@ -851,10 +946,10 @@ mod tests {
         assert!(original.bloom_filter().is_some());
 
         // Save
-        save_disk_index(&original, &bucket_path).unwrap();
+        save_disk_index(&original, &bucket_path, &bucket_hash).unwrap();
 
         // Load
-        let loaded = load_disk_index(&bucket_path, page_size)
+        let loaded = load_disk_index(&bucket_path, page_size, &bucket_hash)
             .unwrap()
             .expect("Should load successfully");
 
@@ -881,6 +976,7 @@ mod tests {
 
         let temp_dir = tempdir().unwrap();
         let bucket_path = temp_dir.path().join("bucket-pool.xdr");
+        let bucket_hash = create_dummy_bucket_file(&bucket_path);
 
         // Build a DiskIndex that includes liquidity pool entries
         // We'll use from_entries with pool entries to populate the map
@@ -948,10 +1044,10 @@ mod tests {
         assert_eq!(pools_native[0], pool_id);
 
         // Save
-        save_disk_index(&original, &bucket_path).unwrap();
+        save_disk_index(&original, &bucket_path, &bucket_hash).unwrap();
 
         // Load
-        let loaded = load_disk_index(&bucket_path, page_size)
+        let loaded = load_disk_index(&bucket_path, page_size, &bucket_hash)
             .unwrap()
             .expect("Should load successfully");
 
@@ -969,34 +1065,106 @@ mod tests {
     fn test_version_2_rejects_version_1() {
         let temp_dir = tempdir().unwrap();
         let bucket_path = temp_dir.path().join("bucket-v1.xdr");
+        let bucket_hash = create_dummy_bucket_file(&bucket_path);
         let index_path = index_path_for_bucket(&bucket_path);
 
-        // Manually write an index file with version 1
-        let header = IndexHeader {
-            version: 1,
-            page_size: 10,
-        };
-
+        // Manually write an index file with an old version header.
+        // The old format lacks bucket_hash/bucket_file_size fields, so
+        // deserialization of the full header will fail gracefully.
         {
             let file = File::create(&index_path).unwrap();
             let mut writer = BufWriter::new(file);
-            bincode::serialize_into(&mut writer, &header).unwrap();
+            // Write just version + page_size (old format)
+            bincode::serialize_into(&mut writer, &1u32).unwrap(); // version
+            bincode::serialize_into(&mut writer, &10u64).unwrap(); // page_size
             writer.flush().unwrap();
         }
 
         assert!(index_path.exists());
 
-        // Try to load — should return None due to version mismatch
-        let result = load_disk_index(&bucket_path, 10).unwrap();
+        // Try to load — should return None due to header deserialization failure
+        // (old format lacks bucket_hash and bucket_file_size fields)
+        let result = load_disk_index(&bucket_path, 10, &bucket_hash).unwrap();
+        assert!(result.is_none(), "Old format index should be rejected");
+    }
+
+    #[test]
+    fn test_load_rejects_wrong_bucket_hash() {
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-hash.xdr");
+        let bucket_hash = create_dummy_bucket_file(&bucket_path);
+
+        let page_size = 10u64;
+        let original = make_disk_index(20, [0u8; 16], page_size);
+        save_disk_index(&original, &bucket_path, &bucket_hash).unwrap();
+
+        // Load with a different expected hash — should be rejected
+        let wrong_hash = Hash256::hash(b"wrong data");
+        let result = load_disk_index(&bucket_path, page_size, &wrong_hash).unwrap();
         assert!(
             result.is_none(),
-            "Version 1 index should be rejected by version 2 loader"
+            "Should reject index with wrong bucket hash"
         );
 
-        // Old file should be cleaned up
+        // Index file should be deleted
+        let index_path = index_path_for_bucket(&bucket_path);
         assert!(
             !index_path.exists(),
-            "Outdated index file should be deleted"
+            "Mismatched hash index should be deleted"
         );
+    }
+
+    #[test]
+    fn test_load_rejects_wrong_file_size() {
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-size.xdr");
+        let bucket_hash = create_dummy_bucket_file(&bucket_path);
+
+        let page_size = 10u64;
+        let original = make_disk_index(20, [0u8; 16], page_size);
+        save_disk_index(&original, &bucket_path, &bucket_hash).unwrap();
+
+        // Change the bucket file size (append data)
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&bucket_path)
+                .unwrap();
+            f.write_all(b"extra data").unwrap();
+        }
+
+        // Load should reject because file size changed
+        let result = load_disk_index(&bucket_path, page_size, &bucket_hash).unwrap();
+        assert!(
+            result.is_none(),
+            "Should reject index with changed file size"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_corrupted_data() {
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-corrupt.xdr");
+        let bucket_hash = create_dummy_bucket_file(&bucket_path);
+
+        let page_size = 10u64;
+        let original = make_disk_index(20, [0u8; 16], page_size);
+        save_disk_index(&original, &bucket_path, &bucket_hash).unwrap();
+
+        // Corrupt the index file data section (flip bits after header + checksum)
+        let index_path = index_path_for_bucket(&bucket_path);
+        let mut bytes = std::fs::read(&index_path).unwrap();
+        // Corrupt bytes near the end of the file (in the data section)
+        let len = bytes.len();
+        if len > 10 {
+            bytes[len - 5] ^= 0xFF;
+            bytes[len - 3] ^= 0xFF;
+        }
+        std::fs::write(&index_path, &bytes).unwrap();
+
+        // Load should reject because data checksum doesn't match
+        let result = load_disk_index(&bucket_path, page_size, &bucket_hash).unwrap();
+        assert!(result.is_none(), "Should reject index with corrupted data");
     }
 }
