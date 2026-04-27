@@ -656,15 +656,30 @@ fn build_validator_weight_config(
             return Ok(None);
         };
 
-        // Resolve quality: inline QUALITY takes precedence over HOME_DOMAINS map
-        let quality = if let Some(qs) = quality_str {
-            ValidatorQuality::from_str(qs)
-                .ok_or_else(|| anyhow::anyhow!("Validator '{}': unknown QUALITY '{}'", name, qs))?
-        } else if let Some(q) = domain_quality_map.get(domain) {
-            *q
-        } else {
-            // No quality data available — can't build weight config
-            return Ok(None);
+        // Resolve quality: stellar-core rejects double-definition (inline
+        // QUALITY when HOME_DOMAINS already provides it for this domain).
+        let quality = match (quality_str, domain_quality_map.get(domain)) {
+            (Some(_qs), Some(_)) => {
+                anyhow::bail!(
+                    "Validator '{}': quality already defined in home domain '{}'",
+                    name,
+                    domain
+                );
+            }
+            (Some(qs), None) => ValidatorQuality::from_str(qs)
+                .ok_or_else(|| anyhow::anyhow!("Validator '{}': unknown QUALITY '{}'", name, qs))?,
+            (None, Some(q)) => *q,
+            (None, None) => {
+                if domain_quality_map.is_empty() {
+                    // No HOME_DOMAINS at all — can't build weight config
+                    return Ok(None);
+                }
+                anyhow::bail!(
+                    "Validator '{}': missing quality (no inline QUALITY and home domain '{}' not in HOME_DOMAINS)",
+                    name,
+                    domain
+                );
+            }
         };
 
         let node_id = parse_node_id(pubkey)?;
@@ -1896,5 +1911,147 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
         )
         .unwrap();
         assert!(is_stellar_core_format(&core_toml));
+    }
+
+    #[test]
+    fn test_parse_home_domains_valid() {
+        let toml_str = r#"
+            [[HOME_DOMAINS]]
+            HOME_DOMAIN = "example.com"
+            QUALITY = "HIGH"
+
+            [[HOME_DOMAINS]]
+            HOME_DOMAIN = "other.org"
+            QUALITY = "MEDIUM"
+        "#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let table = raw.as_table().unwrap();
+        let map = parse_home_domains(table).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["example.com"], ValidatorQuality::High);
+        assert_eq!(map["other.org"], ValidatorQuality::Medium);
+    }
+
+    #[test]
+    fn test_parse_home_domains_duplicate_rejected() {
+        let toml_str = r#"
+            [[HOME_DOMAINS]]
+            HOME_DOMAIN = "example.com"
+            QUALITY = "HIGH"
+
+            [[HOME_DOMAINS]]
+            HOME_DOMAIN = "example.com"
+            QUALITY = "MEDIUM"
+        "#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let table = raw.as_table().unwrap();
+        assert!(parse_home_domains(table).is_err());
+    }
+
+    #[test]
+    fn test_parse_home_domains_invalid_quality_rejected() {
+        let toml_str = r#"
+            [[HOME_DOMAINS]]
+            HOME_DOMAIN = "example.com"
+            QUALITY = "SUPER"
+        "#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let table = raw.as_table().unwrap();
+        assert!(parse_home_domains(table).is_err());
+    }
+
+    #[test]
+    fn test_parse_home_domains_case_sensitive() {
+        // stellar-core uses exact match — lowercase should be rejected
+        let toml_str = r#"
+            [[HOME_DOMAINS]]
+            HOME_DOMAIN = "example.com"
+            QUALITY = "high"
+        "#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let table = raw.as_table().unwrap();
+        assert!(parse_home_domains(table).is_err());
+    }
+
+    #[test]
+    fn test_parse_home_domains_empty() {
+        let raw: toml::Value = toml::from_str("").unwrap();
+        let table = raw.as_table().unwrap();
+        let map = parse_home_domains(table).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_build_validator_weight_config_basic() {
+        let mut config = AppConfig::testnet();
+        config.node.node_seed = None; // No self-entry
+
+        let entries = vec![(
+            "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y".to_string(),
+            "sdf_testnet_1".to_string(),
+            Some("testnet.stellar.org".to_string()),
+            None, // quality from HOME_DOMAINS
+        )];
+        let mut domain_map = HashMap::new();
+        domain_map.insert("testnet.stellar.org".to_string(), ValidatorQuality::High);
+
+        let result = build_validator_weight_config(&config, &entries, &domain_map).unwrap();
+        assert!(result.is_some());
+        let vwc = result.unwrap();
+        assert_eq!(vwc.quality_weights[&ValidatorQuality::High], u64::MAX);
+    }
+
+    #[test]
+    fn test_build_validator_weight_config_double_definition_rejected() {
+        let mut config = AppConfig::testnet();
+        config.node.node_seed = None;
+
+        let entries = vec![(
+            "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y".to_string(),
+            "sdf_testnet_1".to_string(),
+            Some("testnet.stellar.org".to_string()),
+            Some("MEDIUM".to_string()), // inline QUALITY
+        )];
+        let mut domain_map = HashMap::new();
+        domain_map.insert("testnet.stellar.org".to_string(), ValidatorQuality::High);
+
+        // Double-definition: inline QUALITY + HOME_DOMAINS should error
+        assert!(build_validator_weight_config(&config, &entries, &domain_map).is_err());
+    }
+
+    #[test]
+    fn test_build_validator_weight_config_no_home_domains_returns_none() {
+        let mut config = AppConfig::testnet();
+        config.node.node_seed = None;
+
+        let entries = vec![(
+            "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y".to_string(),
+            "sdf_testnet_1".to_string(),
+            Some("testnet.stellar.org".to_string()),
+            None, // no inline quality
+        )];
+        let domain_map = HashMap::new(); // empty HOME_DOMAINS
+
+        // No quality data at all — should return None gracefully
+        let result = build_validator_weight_config(&config, &entries, &domain_map).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_build_validator_weight_config_missing_domain_with_home_domains_errors() {
+        let mut config = AppConfig::testnet();
+        config.node.node_seed = None;
+
+        let entries = vec![(
+            "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y".to_string(),
+            "sdf_testnet_1".to_string(),
+            Some("unknown.org".to_string()),
+            None,
+        )];
+        let mut domain_map = HashMap::new();
+        domain_map.insert("testnet.stellar.org".to_string(), ValidatorQuality::High);
+
+        // HOME_DOMAINS exists but validator's domain isn't in it → error
+        assert!(build_validator_weight_config(&config, &entries, &domain_map).is_err());
     }
 }

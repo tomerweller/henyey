@@ -137,12 +137,12 @@ pub enum ValidatorQuality {
 }
 
 impl ValidatorQuality {
-    /// Parse a quality string (case-insensitive) matching stellar-core's
-    /// `Config::parseQuality`.
+    /// Parse a quality string matching stellar-core's `Config::parseQuality`.
+    /// Exact match only: "LOW", "MEDIUM", "HIGH", "CRITICAL".
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
+        match s {
             "LOW" => Some(Self::Low),
-            "MEDIUM" | "MED" => Some(Self::Medium),
+            "MEDIUM" => Some(Self::Medium),
             "HIGH" => Some(Self::High),
             "CRITICAL" => Some(Self::Critical),
             _ => None,
@@ -205,6 +205,9 @@ impl ValidatorWeightConfig {
             HashMap::new();
 
         for (node_id, entry) in validators {
+            if validator_entries.contains_key(node_id) {
+                return Err(format!("Duplicate validator entry for node {:?}", node_id));
+            }
             validator_entries.insert(node_id.clone(), entry.clone());
             *home_domain_sizes
                 .entry(entry.home_domain.clone())
@@ -5418,15 +5421,7 @@ mod validator_weight_config_tests {
             Some(ValidatorQuality::High)
         );
         assert_eq!(
-            ValidatorQuality::from_str("high"),
-            Some(ValidatorQuality::High)
-        );
-        assert_eq!(
             ValidatorQuality::from_str("MEDIUM"),
-            Some(ValidatorQuality::Medium)
-        );
-        assert_eq!(
-            ValidatorQuality::from_str("MED"),
             Some(ValidatorQuality::Medium)
         );
         assert_eq!(
@@ -5437,6 +5432,25 @@ mod validator_weight_config_tests {
             ValidatorQuality::from_str("CRITICAL"),
             Some(ValidatorQuality::Critical)
         );
+        // Exact match only — case-insensitive and abbreviations are rejected
+        assert_eq!(ValidatorQuality::from_str("high"), None);
+        assert_eq!(ValidatorQuality::from_str("MED"), None);
         assert_eq!(ValidatorQuality::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn test_duplicate_validator_rejected() {
+        let n1 = make_node_id(1);
+        let validators = vec![
+            (
+                n1.clone(),
+                entry("v1", "example.com", ValidatorQuality::High),
+            ),
+            (
+                n1.clone(),
+                entry("v1_dup", "example.com", ValidatorQuality::High),
+            ),
+        ];
+        assert!(ValidatorWeightConfig::new(&validators).is_err());
     }
 }
