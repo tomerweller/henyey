@@ -161,41 +161,121 @@ impl LedgerStateManager {
         Ok(())
     }
 
+    /// Validate that a sponsored entry can be removed without violating
+    /// sponsorship invariants. Does NOT mutate any state.
+    ///
+    /// Mirrors stellar-core's `canRemoveEntryWithSponsorship`
+    /// (SponsorshipUtils.cpp:558-584): validates that the sponsor's
+    /// `num_sponsoring` is sufficient, and (for subentries) that the
+    /// sponsored account's `num_sponsored` and `num_sub_entries` are
+    /// sufficient. Corrupt state is an internal error, not a user-facing
+    /// operation result.
+    ///
+    /// `sponsored` is `None` for claimable balances (they have no owner
+    /// subentry relationship) and `Some` for all other entry types.
+    pub fn validate_can_remove_sponsorship(
+        &mut self,
+        key: &LedgerKey,
+        sponsored: Option<&AccountId>,
+        multiplier: i64,
+    ) -> Result<()> {
+        if multiplier < 0 {
+            return Err(TxError::Internal(
+                "negative sponsorship multiplier".to_string(),
+            ));
+        }
+        let Some(sponsor) = self.entry_sponsor(key) else {
+            return Ok(());
+        };
+        // Lazily load the sponsor account so we can read its counts.
+        self.ensure_account_loaded(&sponsor)?;
+        let (num_sponsoring, _) =
+            self.sponsorship_counts_for_account(&sponsor)
+                .ok_or_else(|| {
+                    TxError::Internal(format!("sponsor account missing for entry {:?}", key))
+                })?;
+        if num_sponsoring < multiplier {
+            return Err(TxError::Internal(format!(
+                "invalid sponsoring account state: num_sponsoring {} < multiplier {}",
+                num_sponsoring, multiplier
+            )));
+        }
+        if let Some(sponsored_id) = sponsored {
+            self.ensure_account_loaded(sponsored_id)?;
+            let account = self.get_account(sponsored_id).ok_or_else(|| {
+                TxError::Internal(format!("sponsored account missing for entry {:?}", key))
+            })?;
+            let (_, num_sponsored) = sponsorship_counts(account);
+            if num_sponsored < multiplier {
+                return Err(TxError::Internal(format!(
+                    "invalid sponsored account state: num_sponsored {} < multiplier {}",
+                    num_sponsored, multiplier
+                )));
+            }
+            // For non-account entries, also check num_sub_entries.
+            // Account entries (account-merge) don't require this check —
+            // stellar-core skips the subentry check when le.data.type() == ACCOUNT.
+            if !matches!(key, LedgerKey::Account(_)) {
+                if (account.num_sub_entries as i64) < multiplier {
+                    return Err(TxError::Internal(format!(
+                        "invalid sponsored account state: num_sub_entries {} < multiplier {}",
+                        account.num_sub_entries, multiplier
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Remove sponsorship for a ledger entry and update account counts.
+    ///
+    /// Validates sponsorship invariants before mutating any state.
     pub fn remove_entry_sponsorship_and_update_counts(
         &mut self,
         key: &LedgerKey,
         sponsored: &AccountId,
         multiplier: i64,
     ) -> Result<Option<AccountId>> {
-        let Some(sponsor) = self.remove_entry_sponsor(key) else {
+        if self.entry_sponsor(key).is_none() {
             return Ok(None);
-        };
+        }
         if multiplier < 0 {
             return Err(TxError::Internal(
                 "negative sponsorship multiplier".to_string(),
             ));
         }
+        // Validate before any mutation.
+        self.validate_can_remove_sponsorship(key, Some(sponsored), multiplier)?;
+        let sponsor = self
+            .remove_entry_sponsor(key)
+            .expect("sponsor verified present");
         self.update_num_sponsoring(&sponsor, -multiplier)?;
         self.update_num_sponsored(sponsored, -multiplier)?;
         Ok(Some(sponsor))
     }
 
     /// Remove sponsorship for a ledger entry with optional sponsored account.
+    ///
+    /// Validates sponsorship invariants before mutating any state.
     pub fn remove_entry_sponsorship_with_sponsor_counts(
         &mut self,
         key: &LedgerKey,
         sponsored: Option<&AccountId>,
         multiplier: i64,
     ) -> Result<Option<AccountId>> {
-        let Some(sponsor) = self.remove_entry_sponsor(key) else {
+        if self.entry_sponsor(key).is_none() {
             return Ok(None);
-        };
+        }
         if multiplier < 0 {
             return Err(TxError::Internal(
                 "negative sponsorship multiplier".to_string(),
             ));
         }
+        // Validate before any mutation.
+        self.validate_can_remove_sponsorship(key, sponsored, multiplier)?;
+        let sponsor = self
+            .remove_entry_sponsor(key)
+            .expect("sponsor verified present");
         self.update_num_sponsoring(&sponsor, -multiplier)?;
         if let Some(sponsored) = sponsored {
             self.update_num_sponsored(sponsored, -multiplier)?;
@@ -917,5 +997,69 @@ mod tests {
             result.is_err(),
             "error must propagate through remove_one_time_signers_from_all_sources"
         );
+    }
+
+    // ========================================================================
+    // validate_can_remove_sponsorship tests (issue #2005)
+    // ========================================================================
+
+    #[test]
+    fn test_validate_can_remove_sponsorship_no_sponsor() {
+        // Entry with no sponsor should pass validation (nothing to check).
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut hash = [0u8; 32];
+        hash[0] = 99;
+        let key = LedgerKey::ClaimableBalance(stellar_xdr::curr::LedgerKeyClaimableBalance {
+            balance_id: stellar_xdr::curr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
+                stellar_xdr::curr::Hash(hash),
+            ),
+        });
+        // No sponsor set for this key
+        let result = state.validate_can_remove_sponsorship(&key, None, 1);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_can_remove_sponsorship_subentry_underflow() {
+        // Sponsored trustline entry where the sponsored account has
+        // num_sub_entries = 0 — should fail validation.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let owner_id = create_test_account_id(0);
+        let sponsor_id = create_test_account_id(1);
+
+        // Owner has num_sub_entries = 0 but num_sponsored = 1
+        let owner = create_test_account_with_sponsorship(
+            owner_id.clone(),
+            100_000_000,
+            0, // num_sub_entries = 0 — corrupt for a subentry
+            1,
+            0,
+        );
+        state.create_account(owner);
+
+        // Sponsor has num_sponsoring = 1
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            1,
+        ));
+
+        // Use a trustline key (a subentry type that requires num_sub_entries check)
+        let key = LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+            account_id: owner_id.clone(),
+            asset: stellar_xdr::curr::TrustLineAsset::Native,
+        });
+        state.set_entry_sponsor(key.clone(), sponsor_id.clone());
+
+        let result = state.validate_can_remove_sponsorship(&key, Some(&owner_id), 1);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TxError::Internal(msg) => {
+                assert!(msg.contains("num_sub_entries"));
+            }
+            other => panic!("expected Internal error, got {:?}", other),
+        }
     }
 }

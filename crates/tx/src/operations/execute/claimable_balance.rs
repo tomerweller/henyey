@@ -349,6 +349,13 @@ pub(crate) fn execute_claim_claimable_balance(
         balance_id: entry.balance_id.clone(),
     });
     let sponsor = state.entry_sponsor(&ledger_key);
+
+    // Validate sponsorship counts before any mutation (delete or count update).
+    // Claimable balances have no sponsored owner — pass None.
+    if sponsor.is_some() {
+        state.validate_can_remove_sponsorship(&ledger_key, None, sponsorship_multiplier)?;
+    }
+
     // Delete the claimable balance entry
     state.delete_claimable_balance(&op.balance_id);
     if let Some(sponsor) = sponsor {
@@ -2426,5 +2433,170 @@ mod tests {
             )) => {} // OK
             other => panic!("expected CreateClaimableBalance::Success, got {:?}", other),
         }
+    }
+
+    /// Helper: create an account with V2 sponsorship extensions.
+    fn create_account_with_sponsorship(
+        account_id: AccountId,
+        balance: i64,
+        num_sponsoring: u32,
+        num_sponsored: u32,
+    ) -> AccountEntry {
+        AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                    num_sponsored,
+                    num_sponsoring,
+                    signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                    ext: AccountEntryExtensionV2Ext::V0,
+                }),
+            }),
+        }
+    }
+
+    /// Helper: create a claimable balance entry and insert it as sponsored.
+    fn setup_sponsored_claimable_balance(
+        state: &mut LedgerStateManager,
+        balance_id: ClaimableBalanceId,
+        claimant: &AccountId,
+        sponsor: &AccountId,
+        amount: i64,
+    ) {
+        let entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: claimant.clone(),
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset: Asset::Native,
+            amount,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(entry);
+        let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance { balance_id });
+        state.set_entry_sponsor(ledger_key, sponsor.clone());
+    }
+
+    fn test_balance_id(n: u8) -> ClaimableBalanceId {
+        let mut hash = [0u8; 32];
+        hash[0] = n;
+        ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash(hash))
+    }
+
+    #[test]
+    fn test_claim_sponsored_claimable_balance_validates_before_delete() {
+        // Set up a sponsored claimable balance where the sponsor has
+        // num_sponsoring = 0 (corrupt state). The claim should fail with
+        // Internal error, and the claimable balance should still exist.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let claimant_id = create_test_account_id(0);
+        let sponsor_id = create_test_account_id(1);
+        let balance_id = test_balance_id(1);
+
+        // Claimant with enough balance
+        state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+        // Sponsor with num_sponsoring = 0 (corrupt — should be >= 1)
+        state.create_account(create_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0, // num_sponsoring: corrupt, should be >= 1
+            0,
+        ));
+
+        setup_sponsored_claimable_balance(
+            &mut state,
+            balance_id.clone(),
+            &claimant_id,
+            &sponsor_id,
+            10_000_000,
+        );
+
+        let op = ClaimClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        };
+
+        let result = execute_claim_claimable_balance(&op, &claimant_id, &mut state, &context);
+
+        // Should be an Internal error, not a success or user-facing error
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TxError::Internal(msg) => {
+                assert!(
+                    msg.contains("invalid sponsoring account state"),
+                    "unexpected error: {}",
+                    msg
+                );
+            }
+            other => panic!("expected TxError::Internal, got {:?}", other),
+        }
+
+        // Claimable balance should still exist (not deleted)
+        assert!(state.get_claimable_balance(&balance_id).is_some());
+    }
+
+    #[test]
+    fn test_claim_sponsored_claimable_balance_success() {
+        // Happy path: sponsor has sufficient num_sponsoring, claim succeeds,
+        // balance is deleted, sponsor count decremented.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let claimant_id = create_test_account_id(0);
+        let sponsor_id = create_test_account_id(1);
+        let balance_id = test_balance_id(2);
+
+        state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+        state.create_account(create_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            1, // num_sponsoring: enough for 1 claimant
+            0,
+        ));
+
+        setup_sponsored_claimable_balance(
+            &mut state,
+            balance_id.clone(),
+            &claimant_id,
+            &sponsor_id,
+            10_000_000,
+        );
+
+        let op = ClaimClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        };
+
+        let result =
+            execute_claim_claimable_balance(&op, &claimant_id, &mut state, &context).unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(r)) => {
+                assert!(matches!(r, ClaimClaimableBalanceResult::Success));
+            }
+            other => panic!("expected Success, got {:?}", other),
+        }
+
+        // Balance should be deleted
+        assert!(state.get_claimable_balance(&balance_id).is_none());
+
+        // Sponsor's num_sponsoring should be decremented to 0
+        let (num_sponsoring, _) = state.sponsorship_counts_for_account(&sponsor_id).unwrap();
+        assert_eq!(num_sponsoring, 0);
     }
 }

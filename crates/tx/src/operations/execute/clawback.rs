@@ -168,6 +168,13 @@ pub(crate) fn execute_clawback_claimable_balance(
         balance_id: entry.balance_id.clone(),
     });
     let sponsor = state.entry_sponsor(&ledger_key);
+
+    // Validate sponsorship counts before any mutation (delete or count update).
+    // Claimable balances have no sponsored owner — pass None.
+    if sponsor.is_some() {
+        state.validate_can_remove_sponsorship(&ledger_key, None, sponsorship_multiplier)?;
+    }
+
     // Delete the claimable balance (clawed back entirely)
     state.delete_claimable_balance(&op.balance_id);
     if let Some(sponsor) = sponsor {
@@ -212,6 +219,7 @@ fn make_clawback_cb_result(code: ClawbackClaimableBalanceResultCode) -> Operatio
 mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
+    use crate::TxError;
     use stellar_xdr::curr::*;
 
     const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
@@ -1298,5 +1306,175 @@ mod tests {
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    /// Helper: create an account with V2 sponsorship extensions.
+    fn create_account_with_sponsorship(
+        account_id: AccountId,
+        balance: i64,
+        flags: u32,
+        num_sponsoring: u32,
+        num_sponsored: u32,
+    ) -> AccountEntry {
+        AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                    num_sponsored,
+                    num_sponsoring,
+                    signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                    ext: AccountEntryExtensionV2Ext::V0,
+                }),
+            }),
+        }
+    }
+
+    fn test_balance_id(n: u8) -> ClaimableBalanceId {
+        let mut hash = [0u8; 32];
+        hash[0] = n;
+        ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash(hash))
+    }
+
+    #[test]
+    fn test_clawback_cb_sponsored_validates_before_delete() {
+        // Sponsor has num_sponsoring = 0 (corrupt). Clawback should fail
+        // with Internal error and NOT delete the claimable balance.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        let claimant_id = create_test_account_id(1);
+        let sponsor_id = create_test_account_id(2);
+        let balance_id = test_balance_id(1);
+
+        let asset = create_asset(&issuer_id);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(claimant_id.clone(), 10_000_000, 0));
+        // Sponsor with corrupt state: num_sponsoring = 0
+        state.create_account(create_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0, // num_sponsoring: corrupt
+            0,
+        ));
+
+        // Create claimable balance with clawback enabled
+        let cb_entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: claimant_id.clone(),
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset,
+            amount: 1000,
+            ext: ClaimableBalanceEntryExt::V1(ClaimableBalanceEntryExtensionV1 {
+                ext: ClaimableBalanceEntryExtensionV1Ext::V0,
+                flags: ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32,
+            }),
+        };
+        state.create_claimable_balance(cb_entry);
+        let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: balance_id.clone(),
+        });
+        state.set_entry_sponsor(ledger_key, sponsor_id.clone());
+
+        let op = ClawbackClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        };
+        let result = execute_clawback_claimable_balance(&op, &issuer_id, &mut state, &context);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TxError::Internal(msg) => {
+                assert!(
+                    msg.contains("invalid sponsoring account state"),
+                    "unexpected error: {}",
+                    msg
+                );
+            }
+            other => panic!("expected TxError::Internal, got {:?}", other),
+        }
+
+        // Claimable balance should still exist
+        assert!(state.get_claimable_balance(&balance_id).is_some());
+    }
+
+    #[test]
+    fn test_clawback_cb_sponsored_success() {
+        // Happy path: sponsor has sufficient num_sponsoring.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        let claimant_id = create_test_account_id(1);
+        let sponsor_id = create_test_account_id(2);
+        let balance_id = test_balance_id(2);
+
+        let asset = create_asset(&issuer_id);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(claimant_id.clone(), 10_000_000, 0));
+        state.create_account(create_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            1, // num_sponsoring: enough for 1 claimant
+            0,
+        ));
+
+        let cb_entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: claimant_id.clone(),
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset,
+            amount: 1000,
+            ext: ClaimableBalanceEntryExt::V1(ClaimableBalanceEntryExtensionV1 {
+                ext: ClaimableBalanceEntryExtensionV1Ext::V0,
+                flags: ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32,
+            }),
+        };
+        state.create_claimable_balance(cb_entry);
+        let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: balance_id.clone(),
+        });
+        state.set_entry_sponsor(ledger_key, sponsor_id.clone());
+
+        let op = ClawbackClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        };
+        let result =
+            execute_clawback_claimable_balance(&op, &issuer_id, &mut state, &context).unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClawbackClaimableBalance(r)) => {
+                assert!(matches!(r, ClawbackClaimableBalanceResult::Success));
+            }
+            other => panic!("expected Success, got {:?}", other),
+        }
+
+        // Balance should be deleted
+        assert!(state.get_claimable_balance(&balance_id).is_none());
+
+        // Sponsor's num_sponsoring should be decremented to 0
+        let (num_sponsoring, _) = state.sponsorship_counts_for_account(&sponsor_id).unwrap();
+        assert_eq!(num_sponsoring, 0);
     }
 }

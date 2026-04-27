@@ -699,7 +699,10 @@ mod tests {
         let owner_id = create_test_account_id(2);
 
         state.create_account(create_test_account(sponsor_id.clone(), 100_000_000));
-        state.create_account(create_test_account(owner_id.clone(), 100_000_000));
+        // Owner needs num_sub_entries = 1 for the data entry sub-entry.
+        let mut owner = create_test_account(owner_id.clone(), 100_000_000);
+        owner.num_sub_entries = 1;
+        state.create_account(owner);
 
         let data_entry = create_data_entry(&owner_id, "test");
         state.create_data(data_entry);
