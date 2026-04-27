@@ -20,7 +20,7 @@
 | TxQueueLimiter | Partial | Missing visitTopTxs with custom limits |
 | TxSetFrame / ApplicableTxSetFrame | Partial | No ApplicableTxSetFrame abstraction |
 | SurgePricingUtils | Full | All lane configs and priority queue; `erase()` guard matches `releaseAssert(res <= mLaneCurrentCount[lane])` |
-| Upgrades / ConfigUpgradeSetFrame | Partial | Missing ConfigUpgradeSetFrame entirely |
+| Upgrades / ConfigUpgradeSetFrame | Partial | `isConsistentWith`, `encodeAsString`, `toJson` not implemented; proposal gating via `ConfigUpgradeContext` is now at parity |
 | QuorumIntersectionChecker | Full | SCC decomposition + MinQuorumEnumerator with interrupt support |
 | ParallelTxSetBuilder | Full | Implemented in parallel_tx_set_builder.rs |
 | FilteredEntries | None | Not implemented (trivial) |
@@ -400,7 +400,7 @@ Corresponds to: `Upgrades.h`
 | `Upgrades()` constructor | `Upgrades::new()` | Full |
 | `setParameters()` | `set_parameters()` | Full |
 | `getParameters()` | `parameters()` | Full |
-| `createUpgradesFor()` | `create_upgrades_for()` | Full |
+| `createUpgradesFor()` | `create_upgrades_for()` | Full | Now gates config upgrades via `ConfigUpgradeContext` (parity with `makeFromKey + isValidForApply + upgradeNeeded` in stellar-core) |
 | `applyTo()` | _(not implemented)_ | None |
 | `toString(LedgerUpgrade)` | `upgrade_to_string()` | Full |
 | `isValidForApply()` | `is_valid_for_apply()` | Full |
@@ -409,14 +409,14 @@ Corresponds to: `Upgrades.h`
 | `removeUpgrades()` | `remove_upgrades()` | Full |
 | `dropAll()` | _(not implemented)_ | None |
 | `dropSupportUpgradeHistory()` | _(not implemented)_ | None |
-| `ConfigUpgradeSetFrame::makeFromKey()` | _(not implemented)_ | None |
-| `ConfigUpgradeSetFrame::getLedgerKey()` | _(not implemented)_ | None |
-| `ConfigUpgradeSetFrame::toXDR()` | _(not implemented)_ | None |
-| `ConfigUpgradeSetFrame::getKey()` | _(not implemented)_ | None |
-| `ConfigUpgradeSetFrame::upgradeNeeded()` | _(not implemented)_ | None |
-| `ConfigUpgradeSetFrame::applyTo()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::makeFromKey()` | `ConfigUpgradeSetFrame::make_from_key()` (henyey-ledger) | Full |
+| `ConfigUpgradeSetFrame::getLedgerKey()` | `ConfigUpgradeSetFrame::get_ledger_key()` (henyey-ledger) | Full |
+| `ConfigUpgradeSetFrame::toXDR()` | `ConfigUpgradeSetFrame::to_xdr()` (henyey-ledger) | Full |
+| `ConfigUpgradeSetFrame::getKey()` | _(not needed — key stored externally)_ | N/A |
+| `ConfigUpgradeSetFrame::upgradeNeeded()` | `ConfigUpgradeSetFrame::upgrade_needed()` (henyey-ledger) | Full | Added in #1952 |
+| `ConfigUpgradeSetFrame::applyTo()` | `ConfigUpgradeSetFrame::apply_to()` (henyey-ledger) | Full |
 | `ConfigUpgradeSetFrame::isConsistentWith()` | _(not implemented)_ | None |
-| `ConfigUpgradeSetFrame::isValidForApply()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::isValidForApply()` | `ConfigUpgradeSetFrame::is_valid_for_apply()` (henyey-ledger) | Full |
 | `ConfigUpgradeSetFrame::encodeAsString()` | _(not implemented)_ | None |
 | `ConfigUpgradeSetFrame::toJson()` | _(not implemented)_ | None |
 

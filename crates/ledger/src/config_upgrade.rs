@@ -294,6 +294,55 @@ impl ConfigUpgradeSetFrame {
         ConfigUpgradeValidity::Valid
     }
 
+    /// Check if any entry in this upgrade set differs from the current ledger state.
+    ///
+    /// Returns `Ok(true)` if at least one `updated_entry` differs from the
+    /// corresponding CONFIG_SETTING in the ledger. Returns `Ok(false)` if all
+    /// entries match (no-op upgrade). Returns `Err` if a config setting cannot
+    /// be loaded (broken ledger state).
+    ///
+    /// Uses the ledger snapshot's protocol version (`ltx.header().ledger_version`),
+    /// not the frame's stored `self.ledger_version`. stellar-core uses
+    /// `ls.getLedgerHeader().current().ledgerVersion` for this check — the
+    /// *current* ledger version, not the post-upgrade version. The frame's
+    /// `self.ledger_version` is set to the post-upgrade protocol for apply-time
+    /// correctness (#1088), but `upgrade_needed` should use the snapshot's version.
+    ///
+    /// Parity: stellar-core `ConfigUpgradeSetFrame::upgradeNeeded`
+    /// (Upgrades.cpp:1413-1432)
+    pub fn upgrade_needed(&self, ltx: &CloseLedgerState) -> crate::Result<bool> {
+        use henyey_common::protocol::SOROBAN_PROTOCOL_VERSION;
+
+        let protocol_version = ltx.header().ledger_version;
+        if protocol_version_is_before(protocol_version, SOROBAN_PROTOCOL_VERSION) {
+            return Ok(false);
+        }
+        for updated_entry in self.config_upgrade_set.updated_entry.iter() {
+            let setting_id = updated_entry.discriminant();
+            let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                config_setting_id: setting_id,
+            });
+            let entry = ltx.get_entry(&key)?.ok_or_else(|| {
+                LedgerError::Internal(format!(
+                    "missing CONFIG_SETTING {setting_id:?} in ledger (required after Soroban)"
+                ))
+            })?;
+            let current = match &entry.data {
+                LedgerEntryData::ConfigSetting(cs) => cs,
+                other => {
+                    return Err(LedgerError::Internal(format!(
+                        "CONFIG_SETTING key {setting_id:?} has wrong entry type {:?}",
+                        std::mem::discriminant(other),
+                    )));
+                }
+            };
+            if current != updated_entry {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Apply the configuration upgrades to the ledger.
     ///
     /// Updates all CONFIG_SETTING entries in the upgrade set. Also handles
@@ -1652,6 +1701,190 @@ mod tests {
             err_msg.contains("not found during upgrade"),
             "Error should mention missing config setting, got: {}",
             err_msg
+        );
+    }
+
+    #[test]
+    fn test_upgrade_needed_all_match() {
+        use crate::close_state::CloseLedgerState;
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+
+        let compute_setting =
+            ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+                ledger_max_instructions: 100_000_000,
+                tx_max_instructions: 10_000_000,
+                fee_rate_per_instructions_increment: 100,
+                tx_memory_limit: 50_000_000,
+            });
+
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![compute_setting.clone()].try_into().unwrap(),
+        };
+
+        let frame = ConfigUpgradeSetFrame {
+            config_upgrade_set: upgrade_set,
+            valid_xdr: true,
+            ledger_version: 25,
+        };
+
+        // Build a snapshot where the current setting matches exactly.
+        let current_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ConfigSetting(compute_setting),
+            ext: LedgerEntryExt::V0,
+        };
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(move |key: &LedgerKey| {
+            if matches!(key, LedgerKey::ConfigSetting(_)) {
+                Ok(Some(current_entry.clone()))
+            } else {
+                Ok(None)
+            }
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 101,
+            ..Default::default()
+        };
+        let ltx = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        assert_eq!(frame.upgrade_needed(&ltx).unwrap(), false);
+    }
+
+    #[test]
+    fn test_upgrade_needed_one_differs() {
+        use crate::close_state::CloseLedgerState;
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+
+        let proposed = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+            ledger_max_instructions: 200_000_000, // different
+            tx_max_instructions: 10_000_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 50_000_000,
+        });
+
+        let current = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+            ledger_max_instructions: 100_000_000,
+            tx_max_instructions: 10_000_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 50_000_000,
+        });
+
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![proposed].try_into().unwrap(),
+        };
+
+        let frame = ConfigUpgradeSetFrame {
+            config_upgrade_set: upgrade_set,
+            valid_xdr: true,
+            ledger_version: 25,
+        };
+
+        let current_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ConfigSetting(current),
+            ext: LedgerEntryExt::V0,
+        };
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(move |key: &LedgerKey| {
+            if matches!(key, LedgerKey::ConfigSetting(_)) {
+                Ok(Some(current_entry.clone()))
+            } else {
+                Ok(None)
+            }
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 101,
+            ..Default::default()
+        };
+        let ltx = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        assert_eq!(frame.upgrade_needed(&ltx).unwrap(), true);
+    }
+
+    #[test]
+    fn test_upgrade_needed_pre_soroban() {
+        use crate::close_state::CloseLedgerState;
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![ConfigSettingEntry::ContractComputeV0(
+                ConfigSettingContractComputeV0 {
+                    ledger_max_instructions: 100_000_000,
+                    tx_max_instructions: 10_000_000,
+                    fee_rate_per_instructions_increment: 100,
+                    tx_memory_limit: 50_000_000,
+                },
+            )]
+            .try_into()
+            .unwrap(),
+        };
+
+        let frame = ConfigUpgradeSetFrame {
+            config_upgrade_set: upgrade_set,
+            valid_xdr: true,
+            ledger_version: 19,
+        };
+
+        let empty_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| Ok(None));
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), empty_lookup);
+        // Ledger version 19 — before Soroban
+        let header = LedgerHeader {
+            ledger_version: 19,
+            ledger_seq: 101,
+            ..Default::default()
+        };
+        let ltx = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        assert_eq!(frame.upgrade_needed(&ltx).unwrap(), false);
+    }
+
+    #[test]
+    fn test_upgrade_needed_missing_entry_returns_error() {
+        use crate::close_state::CloseLedgerState;
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![ConfigSettingEntry::ContractComputeV0(
+                ConfigSettingContractComputeV0 {
+                    ledger_max_instructions: 100_000_000,
+                    tx_max_instructions: 10_000_000,
+                    fee_rate_per_instructions_increment: 100,
+                    tx_memory_limit: 50_000_000,
+                },
+            )]
+            .try_into()
+            .unwrap(),
+        };
+
+        let frame = ConfigUpgradeSetFrame {
+            config_upgrade_set: upgrade_set,
+            valid_xdr: true,
+            ledger_version: 25,
+        };
+
+        // Empty snapshot — the config setting doesn't exist.
+        let empty_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| Ok(None));
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), empty_lookup);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 101,
+            ..Default::default()
+        };
+        let ltx = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let result = frame.upgrade_needed(&ltx);
+        assert!(result.is_err(), "Missing config setting should return Err");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("missing CONFIG_SETTING"),
+            "Error message should mention missing setting, got: {}",
+            err_msg,
         );
     }
 }

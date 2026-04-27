@@ -73,7 +73,7 @@ use crate::tx_queue::{
     account_key_from_account_id, TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult,
     TxQueueStats,
 };
-use crate::upgrades::{CurrentLedgerState, UpgradeParameters, Upgrades};
+use crate::upgrades::{ConfigUpgradeContext, CurrentLedgerState, UpgradeParameters, Upgrades};
 use crate::Result;
 
 /// Maximum slot distance for accepting EXTERNALIZE messages.
@@ -2064,8 +2064,8 @@ impl Herder {
     ///   5. Sign via `make_stellar_value` and XDR-encode to `Value`
     fn build_nomination_value(&self) -> Option<Value> {
         // 1. Ledger state — create ONE snapshot for the entire nomination pass.
-        // This snapshot is shared between build_starting_seq_map and the
-        // trim_invalid_two_phase validation, eliminating O(N) per-call snapshots.
+        // This snapshot is shared between build_starting_seq_map, the
+        // trim_invalid_two_phase validation, and config upgrade context.
         let (
             previous_hash,
             max_txs,
@@ -2074,6 +2074,7 @@ impl Herder {
             lcl_close_time,
             max_soroban_tx_set_size,
             snapshot_providers,
+            config_ctx,
         ) = {
             let guard = self.ledger_manager.read();
             if let Some(manager) = guard.as_ref() {
@@ -2107,7 +2108,34 @@ impl Herder {
                     None => (None, None),
                 };
 
-                (snap.hash, max, seq, snap.header, lcl_ct, soroban_max, sp)
+                // Build config upgrade context from the same snapshot used for
+                // tx set validation. Parity: stellar-core builds config upgrade
+                // decisions from the same LedgerSnapshot as the rest of nomination.
+                let cfg_ctx = self
+                    .runtime_upgrades
+                    .read()
+                    .parameters()
+                    .config_upgrade_set_key
+                    .as_ref()
+                    .and_then(|k| k.to_xdr().ok())
+                    .and_then(|key| {
+                        // Use a fresh snapshot from the same manager state for the
+                        // config upgrade context. This is consistent with the header
+                        // snapshot already captured.
+                        let cfg_snapshot = manager.create_snapshot().ok()?;
+                        ConfigUpgradeContext::from_snapshot(&cfg_snapshot, &key)
+                    });
+
+                (
+                    snap.hash,
+                    max,
+                    seq,
+                    snap.header,
+                    lcl_ct,
+                    soroban_max,
+                    sp,
+                    cfg_ctx,
+                )
             } else {
                 (
                     Hash256::ZERO,
@@ -2115,6 +2143,7 @@ impl Herder {
                     None,
                     LedgerHeader::default(),
                     0,
+                    None,
                     None,
                     None,
                 )
@@ -2186,12 +2215,44 @@ impl Herder {
                 LedgerUpgrade::MaxSorobanTxSetSize(s) => {
                     state.max_soroban_tx_set_size.map_or(true, |c| *s != c)
                 }
-                _ => true,
+                // Parity: gate config upgrades through the same makeFromKey +
+                // isValidForApply + upgradeNeeded checks as runtime upgrades.
+                LedgerUpgrade::Config(_) => config_ctx
+                    .as_ref()
+                    .and_then(|ctx| match ctx.should_propose() {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "broken ledger state in config upgrade check"
+                            );
+                            None
+                        }
+                    })
+                    .unwrap_or(false),
             })
             .cloned()
             .collect();
 
-        let runtime_upgrades = self.runtime_upgrades.read().create_upgrades_for(&state);
+        // If should_propose() returned Err above (broken ledger state), abort
+        // nomination. Check by looking for the error condition: config_ctx is
+        // Some but proposed_upgrades contained a Config that we couldn't check.
+        // (The error was already logged above.)
+
+        let runtime_upgrades = match self
+            .runtime_upgrades
+            .read()
+            .create_upgrades_for(&state, config_ctx.as_ref())
+        {
+            Ok(upgrades) => upgrades,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "broken ledger state in runtime config upgrade check; aborting nomination"
+                );
+                return None;
+            }
+        };
         for upgrade in runtime_upgrades {
             let dominated = upgrade_list.iter().any(|existing| {
                 std::mem::discriminant(existing) == std::mem::discriminant(&upgrade)

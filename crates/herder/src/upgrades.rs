@@ -38,14 +38,63 @@
 //! ```
 
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+use henyey_ledger::config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
+use henyey_ledger::{CloseLedgerState, LedgerError, SnapshotHandle};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use stellar_xdr::curr::{ConfigUpgradeSetKey, LedgerUpgrade, ReadXdr, UpgradeType};
 
 /// Default expiration time for pending upgrades (15 minutes, matching stellar-core
 /// Upgrades::DEFAULT_UPGRADE_EXPIRATION_MINUTES).
 pub const DEFAULT_UPGRADE_EXPIRATION_MINUTES: u64 = 15;
+
+/// Context for validating config upgrades at proposal time.
+///
+/// Bundles a loaded `ConfigUpgradeSetFrame` with the `CloseLedgerState` from
+/// the same snapshot, ensuring consistency. Centralizes the
+/// `makeFromKey + isValidForApply + upgradeNeeded` parity contract.
+///
+/// Parity: stellar-core `Upgrades::createUpgradesFor` (Upgrades.cpp:330-340)
+pub struct ConfigUpgradeContext {
+    pub frame: Arc<ConfigUpgradeSetFrame>,
+    pub ltx: CloseLedgerState,
+}
+
+impl ConfigUpgradeContext {
+    /// Build from a pre-existing snapshot.
+    ///
+    /// Returns `None` if the key doesn't exist in the ledger, the TTL has
+    /// expired, the XDR is invalid, or the entry has wrong durability. These
+    /// are not errors — the upgrade set simply isn't available for proposal.
+    pub fn from_snapshot(snapshot: &SnapshotHandle, key: &ConfigUpgradeSetKey) -> Option<Self> {
+        let closing_ledger_seq = snapshot.ledger_seq() + 1;
+        let protocol_version = snapshot.header().ledger_version;
+        let ltx = CloseLedgerState::begin(
+            snapshot.clone(),
+            snapshot.header().clone(),
+            *snapshot.snapshot().header_hash(),
+            closing_ledger_seq,
+        );
+        let frame =
+            ConfigUpgradeSetFrame::make_from_key(&ltx, key, closing_ledger_seq, protocol_version)?;
+        Some(Self { frame, ltx })
+    }
+
+    /// Check whether the config upgrade should be proposed.
+    ///
+    /// Returns `Ok(true)` if the upgrade is valid and at least one setting
+    /// differs from current ledger state. Returns `Ok(false)` if invalid or
+    /// all settings match (no-op). Returns `Err` on broken ledger state
+    /// (missing CONFIG_SETTING after Soroban).
+    pub fn should_propose(&self) -> Result<bool, LedgerError> {
+        if self.frame.is_valid_for_apply() != ConfigUpgradeValidity::Valid {
+            return Ok(false);
+        }
+        self.frame.upgrade_needed(&self.ltx)
+    }
+}
 
 /// Upgrade validity result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,7 +434,18 @@ impl Upgrades {
     ///
     /// Returns a list of LedgerUpgrade XDR objects for parameters that
     /// differ from the current values and should be upgraded.
-    pub fn create_upgrades_for(&self, state: &CurrentLedgerState) -> Vec<LedgerUpgrade> {
+    ///
+    /// For config upgrades, `config_ctx` provides ledger-backed validation
+    /// (existence, validity, and no-op suppression). If `None`, config
+    /// upgrades are silently skipped. If `Some` and the upgrade set is
+    /// valid + needed, `LedgerUpgrade::Config` is emitted.
+    ///
+    /// Parity: stellar-core `Upgrades::createUpgradesFor` (Upgrades.cpp:278-342)
+    pub fn create_upgrades_for(
+        &self,
+        state: &CurrentLedgerState,
+        config_ctx: Option<&ConfigUpgradeContext>,
+    ) -> Result<Vec<LedgerUpgrade>, LedgerError> {
         let close_time = state.close_time;
         let current_version = state.protocol_version;
         let current_base_fee = state.base_fee;
@@ -396,7 +456,7 @@ impl Upgrades {
         let mut result = Vec::new();
 
         if !self.time_for_upgrade(close_time) {
-            return result;
+            return Ok(result);
         }
 
         if let Some(version) = self.params.protocol_version {
@@ -439,17 +499,19 @@ impl Upgrades {
             }
         }
 
-        // Parity: config upgrade proposal. In upstream, this validates via
-        // ConfigUpgradeSetFrame::makeFromKey() against ledger state. Here we
-        // emit the upgrade if the key is configured, and validation happens
-        // when the upgrade is applied.
+        // Parity: config upgrade proposal gated on makeFromKey + isValidForApply
+        // + upgradeNeeded, matching stellar-core Upgrades.cpp:330-340.
         if let Some(ref key_json) = self.params.config_upgrade_set_key {
             if let Ok(key) = key_json.to_xdr() {
-                result.push(LedgerUpgrade::Config(key));
+                if let Some(ctx) = config_ctx {
+                    if ctx.should_propose()? {
+                        result.push(LedgerUpgrade::Config(key));
+                    }
+                }
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Remove upgrades that have been applied.
@@ -737,39 +799,54 @@ mod tests {
         let upgrades = Upgrades::new(params);
 
         // Before upgrade time
-        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-            close_time: 999,
-            protocol_version: 23,
-            base_fee: 100,
-            max_tx_set_size: 1000,
-            base_reserve: 10000000,
-            flags: 0,
-            max_soroban_tx_set_size: None,
-        });
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 999,
+                    protocol_version: 23,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 10000000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                None,
+            )
+            .unwrap();
         assert!(proposals.is_empty());
 
         // At upgrade time, with differences
-        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-            close_time: 1000,
-            protocol_version: 23,
-            base_fee: 100,
-            max_tx_set_size: 1000,
-            base_reserve: 10000000,
-            flags: 0,
-            max_soroban_tx_set_size: None,
-        });
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 23,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 10000000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                None,
+            )
+            .unwrap();
         assert_eq!(proposals.len(), 3);
 
         // At upgrade time, with no differences
-        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-            close_time: 1000,
-            protocol_version: 24,
-            base_fee: 200,
-            max_tx_set_size: 500,
-            base_reserve: 10000000,
-            flags: 0,
-            max_soroban_tx_set_size: None,
-        });
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 24,
+                    base_fee: 200,
+                    max_tx_set_size: 500,
+                    base_reserve: 10000000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                None,
+            )
+            .unwrap();
         assert!(proposals.is_empty());
     }
 
@@ -975,7 +1052,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_create_upgrades_for_config_upgrade() {
+    fn test_create_upgrades_for_config_skips_without_context() {
         use base64::{engine::general_purpose::STANDARD, Engine};
 
         let contract_id = [1u8; 32];
@@ -989,24 +1066,27 @@ mod tests {
 
         let upgrades = Upgrades::new(params);
 
-        // At upgrade time, should emit a Config upgrade
-        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-            close_time: 1000,
-            protocol_version: 24,
-            base_fee: 100,
-            max_tx_set_size: 1000,
-            base_reserve: 10000000,
-            flags: 0,
-            max_soroban_tx_set_size: None,
-        });
-        assert_eq!(proposals.len(), 1);
-        match &proposals[0] {
-            LedgerUpgrade::Config(key) => {
-                assert_eq!(key.contract_id.0 .0, contract_id);
-                assert_eq!(key.content_hash.0, content_hash);
-            }
-            other => panic!("Expected Config upgrade, got {:?}", other),
-        }
+        // Without config context, config upgrade should NOT be emitted even
+        // though a key is configured. This is the fix for #1952.
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 24,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 10000000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert!(
+            proposals.is_empty(),
+            "Config upgrade should not be emitted without context, got {:?}",
+            proposals,
+        );
     }
 
     #[test]
@@ -1023,20 +1103,24 @@ mod tests {
 
         let upgrades = Upgrades::new(params);
 
-        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-            close_time: 1000,
-            protocol_version: 24,
-            base_fee: 100,
-            max_tx_set_size: 1000,
-            base_reserve: 10000000,
-            flags: 0,
-            max_soroban_tx_set_size: None,
-        });
-        // Should have: Version, BaseFee, Config = 3 upgrades
-        assert_eq!(proposals.len(), 3);
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 24,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 10000000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                None,
+            )
+            .unwrap();
+        // Without config context, only scalar upgrades are emitted (Version, BaseFee)
+        assert_eq!(proposals.len(), 2);
         assert!(matches!(proposals[0], LedgerUpgrade::Version(25)));
         assert!(matches!(proposals[1], LedgerUpgrade::BaseFee(200)));
-        assert!(matches!(proposals[2], LedgerUpgrade::Config(_)));
     }
 
     #[test]
@@ -1049,15 +1133,20 @@ mod tests {
         });
 
         let upgrades = Upgrades::new(params);
-        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-            close_time: 1000,
-            protocol_version: 24,
-            base_fee: 100,
-            max_tx_set_size: 1000,
-            base_reserve: 10000000,
-            flags: 0,
-            max_soroban_tx_set_size: None,
-        });
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 24,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 10000000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                None,
+            )
+            .unwrap();
         assert!(
             proposals.is_empty(),
             "Bad config key should produce no upgrade"
@@ -1077,15 +1166,20 @@ mod tests {
         let upgrades = Upgrades::new(params);
 
         // Before upgrade time, should emit nothing
-        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-            close_time: 1000,
-            protocol_version: 24,
-            base_fee: 100,
-            max_tx_set_size: 1000,
-            base_reserve: 10000000,
-            flags: 0,
-            max_soroban_tx_set_size: None,
-        });
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 24,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 10000000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                None,
+            )
+            .unwrap();
         assert!(proposals.is_empty());
     }
 
@@ -1107,15 +1201,20 @@ mod tests {
         let upgrades = Upgrades::new(params);
 
         // Current value matches proposed: should be filtered out
-        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-            close_time: 1000,
-            protocol_version: 24,
-            base_fee: 100,
-            max_tx_set_size: 1000,
-            base_reserve: 10000000,
-            flags: 0,
-            max_soroban_tx_set_size: Some(200),
-        });
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 24,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 10000000,
+                    flags: 0,
+                    max_soroban_tx_set_size: Some(200),
+                },
+                None,
+            )
+            .unwrap();
         assert!(
             proposals.is_empty(),
             "Upgrade to same value should be filtered, got {:?}",
@@ -1123,15 +1222,20 @@ mod tests {
         );
 
         // Current value differs from proposed: should emit the upgrade
-        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-            close_time: 1000,
-            protocol_version: 24,
-            base_fee: 100,
-            max_tx_set_size: 1000,
-            base_reserve: 10000000,
-            flags: 0,
-            max_soroban_tx_set_size: Some(100),
-        });
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 24,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 10000000,
+                    flags: 0,
+                    max_soroban_tx_set_size: Some(100),
+                },
+                None,
+            )
+            .unwrap();
         assert_eq!(proposals.len(), 1);
         assert!(matches!(
             proposals[0],
@@ -1139,15 +1243,20 @@ mod tests {
         ));
 
         // Current value is None (Soroban not yet available): should still emit
-        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-            close_time: 1000,
-            protocol_version: 24,
-            base_fee: 100,
-            max_tx_set_size: 1000,
-            base_reserve: 10000000,
-            flags: 0,
-            max_soroban_tx_set_size: None,
-        });
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 24,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 10000000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                None,
+            )
+            .unwrap();
         assert!(
             proposals.is_empty(),
             "Without current Soroban config, upgrade should not be proposed"
@@ -1185,6 +1294,218 @@ mod tests {
         assert!(
             !result,
             "Config upgrade with mismatched key should be rejected by nomination validation"
+        );
+    }
+
+    // ========================================================================
+    // ConfigUpgradeContext integration tests (#1952)
+    // ========================================================================
+
+    /// Helper: build a `ConfigUpgradeContext` from a `ConfigUpgradeSet` and
+    /// matching current CONFIG_SETTING entries. Returns `(ctx, key)` where
+    /// `key` is the `ConfigUpgradeSetKey` suitable for `UpgradeParameters`.
+    fn build_config_upgrade_context(
+        upgrade_set: &stellar_xdr::curr::ConfigUpgradeSet,
+        current_settings: &[stellar_xdr::curr::ConfigSettingEntry],
+        protocol_version: u32,
+        ledger_seq: u32,
+    ) -> (ConfigUpgradeContext, ConfigUpgradeSetKey) {
+        use henyey_common::Hash256;
+        use henyey_ledger::{SnapshotBuilder, SnapshotHandle};
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::*;
+
+        // Compute the content hash from the XDR-encoded upgrade set.
+        let upgrade_xdr = upgrade_set.to_xdr(Limits::none()).unwrap();
+        let content_hash_bytes: [u8; 32] = Sha256::digest(&upgrade_xdr).into();
+
+        let contract_id = Hash([1u8; 32]);
+        let key = ConfigUpgradeSetKey {
+            contract_id: ContractId(contract_id.clone()),
+            content_hash: Hash(content_hash_bytes),
+        };
+
+        // Build the ledger key for the CONTRACT_DATA entry.
+        let data_key = ConfigUpgradeSetFrame::get_ledger_key(&key);
+
+        // TTL key: hash of the data key's XDR.
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash(Hash256::hash_xdr(&data_key).0),
+        });
+
+        // CONTRACT_DATA entry: SCV_BYTES containing the XDR-encoded upgrade set.
+        let data_entry = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: stellar_xdr::curr::ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(contract_id.clone())),
+                key: ScVal::Bytes(content_hash_bytes.to_vec().try_into().unwrap()),
+                durability: ContractDataDurability::Temporary,
+                val: ScVal::Bytes(upgrade_xdr.try_into().unwrap()),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // TTL entry: live_until_ledger_seq far in the future.
+        let ttl_entry = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: Hash(Hash256::hash_xdr(&data_key).0),
+                live_until_ledger_seq: ledger_seq + 10000,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Build snapshot with CONTRACT_DATA + TTL + CONFIG_SETTING entries.
+        let header = LedgerHeader {
+            ledger_version: protocol_version,
+            ledger_seq,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 1000,
+            total_coins: 100_000_000_000_000_000,
+            ..Default::default()
+        };
+
+        let mut builder = SnapshotBuilder::new(ledger_seq)
+            .with_header(header, Hash256::ZERO)
+            .add_entry(data_key, data_entry)
+            .add_entry(ttl_key, ttl_entry);
+
+        for setting in current_settings {
+            let setting_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                config_setting_id: setting.discriminant(),
+            });
+            let setting_entry = LedgerEntry {
+                last_modified_ledger_seq: ledger_seq,
+                data: LedgerEntryData::ConfigSetting(setting.clone()),
+                ext: LedgerEntryExt::V0,
+            };
+            builder = builder.add_entry(setting_key, setting_entry);
+        }
+
+        let snapshot = builder.build().unwrap();
+        let handle = SnapshotHandle::new(snapshot);
+
+        let ctx = ConfigUpgradeContext::from_snapshot(&handle, &key)
+            .expect("from_snapshot should succeed with valid entries");
+
+        (ctx, key)
+    }
+
+    #[test]
+    fn test_create_upgrades_for_config_with_context_needed() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use stellar_xdr::curr::*;
+
+        let proposed = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+            ledger_max_instructions: 200_000_000, // differs
+            tx_max_instructions: 10_000_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 50_000_000,
+        });
+
+        let current = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+            ledger_max_instructions: 100_000_000,
+            tx_max_instructions: 10_000_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 50_000_000,
+        });
+
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![proposed].try_into().unwrap(),
+        };
+
+        let (ctx, key) = build_config_upgrade_context(&upgrade_set, &[current], 25, 100);
+
+        // Verify should_propose returns true (upgrade is needed).
+        assert!(ctx.should_propose().unwrap());
+
+        let mut params = UpgradeParameters::new(1000);
+        params.config_upgrade_set_key = Some(ConfigUpgradeSetKeyJson {
+            contract_id: STANDARD.encode(key.contract_id.0 .0),
+            content_hash: STANDARD.encode(key.content_hash.0),
+        });
+
+        let upgrades = Upgrades::new(params);
+
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 25,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 5_000_000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                Some(&ctx),
+            )
+            .unwrap();
+
+        assert_eq!(
+            proposals.len(),
+            1,
+            "Expected config upgrade, got {:?}",
+            proposals
+        );
+        assert!(
+            matches!(&proposals[0], LedgerUpgrade::Config(_)),
+            "Expected Config upgrade, got {:?}",
+            proposals[0],
+        );
+    }
+
+    #[test]
+    fn test_create_upgrades_for_config_with_context_not_needed() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use stellar_xdr::curr::*;
+
+        // Proposed and current are identical — upgrade not needed.
+        let setting = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+            ledger_max_instructions: 100_000_000,
+            tx_max_instructions: 10_000_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 50_000_000,
+        });
+
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![setting.clone()].try_into().unwrap(),
+        };
+
+        let (ctx, key) = build_config_upgrade_context(&upgrade_set, &[setting], 25, 100);
+
+        // should_propose returns false — all settings match.
+        assert!(!ctx.should_propose().unwrap());
+
+        let mut params = UpgradeParameters::new(1000);
+        params.config_upgrade_set_key = Some(ConfigUpgradeSetKeyJson {
+            contract_id: STANDARD.encode(key.contract_id.0 .0),
+            content_hash: STANDARD.encode(key.content_hash.0),
+        });
+
+        let upgrades = Upgrades::new(params);
+
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 25,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 5_000_000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                Some(&ctx),
+            )
+            .unwrap();
+
+        assert!(
+            proposals.is_empty(),
+            "Config upgrade with matching settings should be suppressed, got {:?}",
+            proposals,
         );
     }
 }
