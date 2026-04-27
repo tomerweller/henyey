@@ -721,6 +721,35 @@ Only act on failures from the last 2 hours (compare `createdAt` with
 
 Applies to node bugs, metric alerts, and CI failures.
 
+### Body delivery — use `--body-file`, not heredocs
+
+When the issue body contains code blocks, **always write the body to a temp
+file and pass `--body-file <path>`** rather than `--body "$(cat <<'EOF' ... EOF)"`.
+
+Reason: heredocs nested inside double-quoted shell expressions tempt the agent
+to backslash-escape backticks (`` \` ``), which GitHub renders literally — every
+code fence breaks. There is no GitHub-side workaround once filed; the issue
+must be re-edited via `gh issue edit <N> --body-file <path>`.
+
+Pattern:
+
+```bash
+cat > /tmp/issue-body.md <<'EOF'
+## Symptom
+...
+```rust
+some code
+```
+...
+EOF
+gh issue create --title "..." --body-file /tmp/issue-body.md
+# or for amendments:
+gh issue edit <N> --body-file /tmp/issue-body.md
+```
+
+The single-quoted `'EOF'` makes the heredoc literal — no escaping needed for
+backticks, dollar signs, etc. inside the body.
+
 ### Label policy
 
 When creating or commenting on issues:
