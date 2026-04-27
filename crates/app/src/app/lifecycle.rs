@@ -1187,7 +1187,8 @@ impl App {
                         if let Some(hash) = tx_hash {
                             self.record_tx_pull_latency(hash, &msg.from_peer).await;
                         }
-                        self.enqueue_tx_advert(&tx_env).await;
+                        // No explicit advert enqueue — flush_tx_adverts() reads
+                        // the herder queue in priority order each flood period.
                     }
                     henyey_herder::TxQueueResult::Duplicate => {
                         if let Some(hash) = tx_hash {

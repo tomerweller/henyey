@@ -16,28 +16,57 @@ impl App {
         (base + (peer_offset % peers_len)) % peers_len
     }
 
-    pub(super) async fn enqueue_tx_advert(&self, tx_env: &stellar_xdr::curr::TransactionEnvelope) {
-        let hash = Hash256::hash_xdr(tx_env);
-
-        self.tx_advert_queue.write().await.insert(hash);
+    /// Compute the per-period ops budget for transaction flooding.
+    ///
+    /// Matches stellar-core's `getMaxResourcesToFloodThisPeriod` for classic txs:
+    /// `ceil(flood_op_rate_per_ledger * max_tx_set_ops * flood_period_ms / ledger_close_ms)`
+    /// plus carry-over from the previous period.
+    fn compute_flood_ops_budget(&self) -> usize {
+        let ledger_close_ms = (self.herder.ledger_close_time() as u64).saturating_mul(1000);
+        let ledger_close_ms = ledger_close_ms.max(1) as f64;
+        let ops_to_flood =
+            self.config.overlay.flood_op_rate_per_ledger * self.herder.max_tx_set_size() as f64;
+        let base_budget = (ops_to_flood * self.config.overlay.flood_advert_period_ms as f64
+            / ledger_close_ms)
+            .ceil()
+            .max(1.0) as usize;
+        let carryover = self.broadcast_op_carryover.load(Ordering::Relaxed);
+        base_budget + carryover
     }
 
-    pub(super) async fn flush_tx_adverts(&self) {
-        let hashes = {
-            let mut queue = self.tx_advert_queue.write().await;
-            if queue.is_empty() {
-                return;
-            }
-            queue.drain()
-        };
+    /// Maximum carry-over ops between flood periods.
+    /// Matches stellar-core's cap at MAX_OPS_PER_TX + 1 to allow one worst-case
+    /// fee-bump transaction in carry-over.
+    const MAX_CARRYOVER_OPS: usize = 101; // MAX_OPS_PER_TX (100) + 1
 
-        tracing::debug!(count = hashes.len(), "Flushing tx adverts");
+    pub(super) async fn flush_tx_adverts(&self) {
+        let ops_budget = self.compute_flood_ops_budget();
+        let (hashes, ops_used) = self.herder.tx_queue().broadcast_some(ops_budget);
+
+        if hashes.is_empty() {
+            // No txs to flood — preserve carry-over (capped).
+            let new_carryover = ops_budget.min(Self::MAX_CARRYOVER_OPS);
+            self.broadcast_op_carryover
+                .store(new_carryover, Ordering::Relaxed);
+            return;
+        }
+
+        tracing::debug!(
+            count = hashes.len(),
+            ops_used,
+            ops_budget,
+            "Flushing tx adverts (priority-ordered)"
+        );
+
+        // Update carry-over: remaining budget, capped.
+        let remaining = ops_budget.saturating_sub(ops_used);
+        self.broadcast_op_carryover
+            .store(remaining.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
 
         let Some(overlay) = self.overlay().await else {
             return;
         };
 
-        let max_advert_size = self.max_advert_size();
         let snapshots = overlay.peer_snapshots();
         if snapshots.is_empty() {
             return;
@@ -48,6 +77,10 @@ impl App {
             .map(|snapshot| snapshot.info.peer_id.clone())
             .collect::<Vec<_>>();
         let peer_set: HashSet<_> = peer_ids.iter().cloned().collect();
+        let ledger_seq = self.herder.tracking_slot().saturating_sub(1) as u32;
+
+        // XDR vector chunk size — cap at 1000 per the protocol limit.
+        let max_chunk_size = self.max_advert_size().min(1000);
 
         let per_peer = {
             let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
@@ -64,6 +97,8 @@ impl App {
                         continue;
                     }
                     outgoing.push(*hash);
+                    // Mark as sent so we don't re-advertise next period.
+                    adverts.remember(*hash, ledger_seq);
                 }
                 if !outgoing.is_empty() {
                     per_peer.push((peer_id, outgoing));
@@ -73,7 +108,7 @@ impl App {
         };
 
         for (peer_id, hashes) in per_peer {
-            for chunk in hashes.chunks(max_advert_size) {
+            for chunk in hashes.chunks(max_chunk_size) {
                 let tx_hashes = match TxAdvertVector::try_from(
                     chunk
                         .iter()

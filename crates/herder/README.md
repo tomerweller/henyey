@@ -24,7 +24,6 @@ graph TD
     Driver --> SCP[SCP engine]
     Herder --> Timers[TimerManager]
     Herder --> Recovery[SyncRecoveryManager]
-    Herder --> Broadcast[TxBroadcastManager]
 ```
 
 ## Key Types
@@ -121,10 +120,9 @@ if herder.needs_tx_set(&needed) {
 | `sync_recovery.rs` | Tracking heartbeat, stuck-consensus detection, and out-of-sync recovery loop. |
 | `timer_manager.rs` | Async nomination and ballot timeout scheduling. |
 | `tracked_lock.rs` | Lock tracking helpers used by concurrent Herder state. |
-| `tx_broadcast.rs` | Periodic transaction flooding and rebroadcast management. |
+| `tx_queue/mod.rs` | Main transaction queue, validation, bans, replacement rules, `broadcast_some()` priority flooding, and public queue stats/types. |
 | `tx_queue_limiter.rs` | Resource-aware queue admission and eviction built on top of surge-pricing primitives. |
 | `upgrades.rs` | Upgrade parameter parsing, scheduling, validation, and proposal generation. |
-| `tx_queue/mod.rs` | Main transaction queue, validation, bans, replacement rules, and public queue stats/types. |
 | `tx_queue/selection.rs` | Candidate tx-set selection and generalized tx-set assembly. |
 | `tx_queue/tx_set.rs` | `TransactionSet` wire-format parsing, hash computation, and apply-time validation. |
 | `tx_set_tracker.rs` | Tracks recently seen transaction sets and missing dependencies. |
@@ -146,7 +144,7 @@ if herder.needs_tx_set(&needed) {
 | `pending.rs`, `fetching_envelopes.rs` | `src/herder/PendingEnvelopes.h`, `src/herder/PendingEnvelopes.cpp` |
 | `quorum_tracker.rs` | `src/herder/QuorumTracker.h`, `src/herder/QuorumTracker.cpp` |
 | `persistence.rs` | `src/herder/HerderPersistence.h`, `src/herder/HerderPersistenceImpl.h`, `src/herder/HerderPersistenceImpl.cpp` |
-| `tx_queue/mod.rs`, `tx_broadcast.rs` | `src/herder/TransactionQueue.h`, `src/herder/TransactionQueue.cpp` |
+| `tx_queue/mod.rs` | `src/herder/TransactionQueue.h`, `src/herder/TransactionQueue.cpp` |
 | `tx_queue/tx_set.rs` | `src/herder/TxSetFrame.h`, `src/herder/TxSetFrame.cpp` |
 | `tx_set_utils.rs` | `src/herder/TxSetUtils.h`, `src/herder/TxSetUtils.cpp` |
 | `tx_queue_limiter.rs` | `src/herder/TxQueueLimiter.h`, `src/herder/TxQueueLimiter.cpp` |

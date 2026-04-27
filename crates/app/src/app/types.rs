@@ -624,45 +624,8 @@ pub(super) enum ConsensusStuckAction {
     HardReset(HardResetReason),
 }
 
-/// Ordered, deduplicated queue of pending transaction hashes to advertise.
-///
-/// Combines insertion-order tracking (`queue`) with O(1) deduplication (`seen`)
-/// in a single type, replacing the prior separate `tx_advert_queue` + `tx_advert_set`
-/// fields that could drift out of sync.
-#[derive(Debug)]
-pub(super) struct TxAdvertQueue {
-    queue: Vec<Hash256>,
-    seen: HashSet<Hash256>,
-}
-
-impl TxAdvertQueue {
-    pub fn new() -> Self {
-        Self {
-            queue: Vec::new(),
-            seen: HashSet::new(),
-        }
-    }
-
-    /// Enqueue a hash if not already present. Returns true if inserted.
-    pub fn insert(&mut self, hash: Hash256) -> bool {
-        if self.seen.insert(hash) {
-            self.queue.push(hash);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Drain all hashes, resetting both the queue and the dedup set.
-    pub fn drain(&mut self) -> Vec<Hash256> {
-        self.seen.clear();
-        std::mem::take(&mut self.queue)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-}
+// (TxAdvertQueue removed — flooding now reads from herder's TransactionQueue
+// in priority order via broadcast_some(). See tx_flooding.rs.)
 
 #[derive(Debug)]
 pub(super) struct PeerTxAdverts {

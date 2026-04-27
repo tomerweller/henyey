@@ -42,7 +42,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -462,8 +462,9 @@ pub struct App {
     /// Time-sliced survey data manager.
     survey_data: RwLock<SurveyDataManager>,
 
-    /// Pending transaction hashes to advertise (ordered + deduplicated).
-    tx_advert_queue: RwLock<TxAdvertQueue>,
+    /// Carry-over ops budget from the previous flood period. Capped at
+    /// MAX_OPS_PER_TX + 1 to prevent unbounded accumulation from missed ticks.
+    broadcast_op_carryover: AtomicUsize,
 
     /// Per-peer advert tracking and queues for demand scheduling.
     tx_adverts_by_peer: RwLock<HashMap<henyey_overlay::PeerId, PeerTxAdverts>>,
@@ -931,7 +932,7 @@ impl App {
                 max_inbound_peers,
                 max_outbound_peers,
             )),
-            tx_advert_queue: RwLock::new(TxAdvertQueue::new()),
+            broadcast_op_carryover: AtomicUsize::new(0),
             tx_adverts_by_peer: RwLock::new(HashMap::new()),
             tx_demand_history: RwLock::new(HashMap::new()),
             tx_pending_demands: RwLock::new(VecDeque::new()),
@@ -1700,11 +1701,8 @@ impl App {
         }
 
         let result = self.herder.receive_transaction(tx.clone());
-        // Flood the transaction to peers so validators can include it.
-        // Without this, transactions submitted via HTTP /tx stay local.
-        if matches!(result, henyey_herder::TxQueueResult::Added) {
-            self.enqueue_tx_advert(&tx).await;
-        }
+        // No explicit advert enqueue needed — flush_tx_adverts() reads
+        // the herder's queue in priority order each flood period.
         result
     }
 

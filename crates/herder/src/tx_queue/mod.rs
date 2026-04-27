@@ -2677,6 +2677,30 @@ impl TransactionQueue {
         out
     }
 
+    /// Return transaction hashes in surge-pricing priority order (highest
+    /// inclusion-fee rate first), limited by an operations budget.
+    ///
+    /// Iterates the maintained `fee_index` BTreeSet in reverse (O(k) where k
+    /// is the number of returned txs). Stops when the next transaction's ops
+    /// would exceed `ops_budget`. Returns `(hashes, ops_used)`.
+    pub fn broadcast_some(&self, ops_budget: usize) -> (Vec<Hash256>, usize) {
+        let store = self.store.read();
+        let mut result = Vec::new();
+        let mut ops_remaining = ops_budget;
+        // fee_index is sorted ascending by FeeEntry::Ord (inclusion_fee/op_count
+        // cross-multiply comparison); iterate in reverse for highest-fee-first.
+        for entry in store.fee_index.iter().rev() {
+            let ops = (entry.op_count as usize).max(1);
+            if ops > ops_remaining {
+                break;
+            }
+            result.push(entry.hash);
+            ops_remaining -= ops;
+        }
+        let ops_used = ops_budget - ops_remaining;
+        (result, ops_used)
+    }
+
     /// Return transaction hashes ordered by fee per op (desc) then received time (asc).
     pub fn ordered_hashes_by_fee(&self, limit: usize) -> Vec<Hash256> {
         let store = self.store.read();
@@ -8466,5 +8490,174 @@ mod inclusion_fee_i64_tests {
             .try_into()
             .unwrap(),
         })
+    }
+}
+
+#[cfg(test)]
+mod broadcast_some_tests {
+    use super::*;
+    use stellar_xdr::curr::*;
+
+    fn make_test_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let operations: Vec<Operation> = (0..ops)
+            .map(|_| Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
+                    starting_balance: 1000000000,
+                }),
+            })
+            .collect();
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    fn set_source(envelope: &mut TransactionEnvelope, seed: u8) {
+        match envelope {
+            TransactionEnvelope::Tx(ref mut env) => {
+                env.tx.source_account = MuxedAccount::Ed25519(Uint256([seed; 32]));
+            }
+            _ => panic!("Expected Tx variant"),
+        }
+    }
+
+    #[test]
+    fn test_broadcast_some_priority_order() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add 3 txs with different fees from different accounts
+        let mut tx_low = make_test_envelope(100, 1);
+        set_source(&mut tx_low, 1);
+        let mut tx_mid = make_test_envelope(200, 1);
+        set_source(&mut tx_mid, 2);
+        let mut tx_high = make_test_envelope(300, 1);
+        set_source(&mut tx_high, 3);
+
+        assert_eq!(queue.try_add(tx_low.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_mid.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_high.clone()), TxQueueResult::Added);
+
+        // broadcast_some with unlimited budget should return all in fee-descending order
+        let (hashes, ops_used) = queue.broadcast_some(100);
+        assert_eq!(hashes.len(), 3);
+        assert_eq!(ops_used, 3);
+
+        // Verify highest-fee tx is first
+        let hash_high = Hash256::hash_xdr(&tx_high);
+        let hash_mid = Hash256::hash_xdr(&tx_mid);
+        let hash_low = Hash256::hash_xdr(&tx_low);
+        assert_eq!(hashes[0], hash_high);
+        assert_eq!(hashes[1], hash_mid);
+        assert_eq!(hashes[2], hash_low);
+    }
+
+    #[test]
+    fn test_broadcast_some_ops_budget_cap() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add 3 txs each with 2 ops (fees must be >= 100/op to pass min_fee_per_op)
+        let mut tx1 = make_test_envelope(600, 2);
+        set_source(&mut tx1, 1);
+        let mut tx2 = make_test_envelope(400, 2);
+        set_source(&mut tx2, 2);
+        let mut tx3 = make_test_envelope(200, 2);
+        set_source(&mut tx3, 3);
+
+        queue.try_add(tx1);
+        queue.try_add(tx2);
+        queue.try_add(tx3);
+
+        // Budget of 3 ops: only 1 tx fits (each has 2 ops), then 1 remaining < 2
+        let (hashes, ops_used) = queue.broadcast_some(3);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(ops_used, 2);
+
+        // Budget of 4 ops: 2 txs fit
+        let (hashes, ops_used) = queue.broadcast_some(4);
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(ops_used, 4);
+
+        // Budget of 6 ops: all 3 txs fit
+        let (hashes, ops_used) = queue.broadcast_some(6);
+        assert_eq!(hashes.len(), 3);
+        assert_eq!(ops_used, 6);
+    }
+
+    #[test]
+    fn test_broadcast_some_empty_queue() {
+        let config = TxQueueConfig::default();
+        let queue = TransactionQueue::new(config);
+
+        let (hashes, ops_used) = queue.broadcast_some(100);
+        assert!(hashes.is_empty());
+        assert_eq!(ops_used, 0);
+    }
+
+    #[test]
+    fn test_broadcast_some_zero_budget() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx = make_test_envelope(100, 1);
+        set_source(&mut tx, 1);
+        queue.try_add(tx);
+
+        let (hashes, ops_used) = queue.broadcast_some(0);
+        assert!(hashes.is_empty());
+        assert_eq!(ops_used, 0);
+    }
+
+    #[test]
+    fn test_broadcast_some_after_remove_applied() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx1 = make_test_envelope(300, 1);
+        set_source(&mut tx1, 1);
+        let mut tx2 = make_test_envelope(200, 1);
+        set_source(&mut tx2, 2);
+
+        queue.try_add(tx1.clone());
+        queue.try_add(tx2.clone());
+
+        // Remove tx1 as applied
+        queue.remove_applied(&[(tx1, 300)]);
+
+        // Only tx2 should remain
+        let (hashes, ops_used) = queue.broadcast_some(100);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(ops_used, 1);
+        assert_eq!(hashes[0], Hash256::hash_xdr(&tx2));
     }
 }

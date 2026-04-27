@@ -130,7 +130,8 @@ mod surge_pricing;
 pub mod sync_recovery;
 pub(crate) mod timer_manager;
 mod tracked_lock;
-pub(crate) mod tx_broadcast;
+// tx_broadcast module removed — flood scheduling is now handled by
+// TransactionQueue::broadcast_some() + the app-layer flood timer.
 mod tx_queue;
 mod tx_queue_limiter;
 mod tx_set_tracker;
@@ -200,11 +201,7 @@ pub use sync_recovery::{
     OUT_OF_SYNC_RECOVERY_INTERVAL,
 };
 
-// Transaction broadcast
-pub use tx_broadcast::{
-    BroadcastCommand, TxBroadcastCallback, TxBroadcastHandle, TxBroadcastManager, TxBroadcastStats,
-    DEFAULT_FLOOD_PERIOD_MS,
-};
+// (TxBroadcastManager removed — see TransactionQueue::broadcast_some)
 
 // Dead node detection
 pub use dead_node_tracker::{DeadNodeTracker, CHECK_FOR_DEAD_NODES_MINUTES};
