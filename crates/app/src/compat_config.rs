@@ -650,10 +650,17 @@ fn build_validator_weight_config(
     let mut entries: Vec<(NodeId, ValidatorEntryInfo)> = Vec::new();
 
     for (pubkey, name, home_domain, quality_str) in validator_entries {
-        // Resolve home domain
+        // Resolve home domain — when HOME_DOMAINS is present, all validators
+        // must have HOME_DOMAIN (matching stellar-core Config.cpp:719-745).
         let Some(domain) = home_domain.as_deref() else {
-            // No home domain data — can't build weight config
-            return Ok(None);
+            if domain_quality_map.is_empty() {
+                // No HOME_DOMAINS at all — feature not in use
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "Validator '{}': missing HOME_DOMAIN (required when HOME_DOMAINS is present)",
+                name
+            );
         };
 
         // Resolve quality: stellar-core rejects double-definition (inline
@@ -699,19 +706,23 @@ fn build_validator_weight_config(
     if let Some(ref seed_str) = config.node.node_seed {
         let node_home_domain = config.node.home_domain.as_deref().unwrap_or("");
         if node_home_domain.is_empty() {
-            // NODE_HOME_DOMAIN is required when building validator weight config
-            tracing::debug!("NODE_HOME_DOMAIN not set, skipping ValidatorWeightConfig");
-            return Ok(None);
+            if domain_quality_map.is_empty() {
+                // No HOME_DOMAINS at all — feature not in use
+                return Ok(None);
+            }
+            anyhow::bail!("NODE_HOME_DOMAIN is required when HOME_DOMAINS is present");
         }
 
         let quality = if let Some(q) = domain_quality_map.get(node_home_domain) {
             *q
-        } else {
-            tracing::debug!(
-                domain = node_home_domain,
-                "NODE_HOME_DOMAIN not found in HOME_DOMAINS, skipping ValidatorWeightConfig"
-            );
+        } else if domain_quality_map.is_empty() {
+            // No HOME_DOMAINS — feature not in use
             return Ok(None);
+        } else {
+            anyhow::bail!(
+                "NODE_HOME_DOMAIN '{}' not found in HOME_DOMAINS",
+                node_home_domain
+            );
         };
 
         let secret = henyey_crypto::SecretKey::from_strkey(seed_str)
@@ -733,10 +744,7 @@ fn build_validator_weight_config(
 
     match ValidatorWeightConfig::new(&entries) {
         Ok(vwc) => Ok(Some(vwc)),
-        Err(e) => {
-            tracing::warn!(error = %e, "Could not build ValidatorWeightConfig, using base weights");
-            Ok(None)
-        }
+        Err(e) => anyhow::bail!("Invalid ValidatorWeightConfig: {}", e),
     }
 }
 
