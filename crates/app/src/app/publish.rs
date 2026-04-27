@@ -24,14 +24,7 @@ impl App {
         }
 
         // Check for writable archives with put commands
-        let has_writable = self
-            .config
-            .history
-            .archives
-            .iter()
-            .any(|a| a.put_enabled && a.put.is_some());
-
-        if !has_writable {
+        if !self.config.history.publish_enabled() {
             tracing::debug!(
                 total_archives = self.config.history.archives.len(),
                 "publish: no writable command archives found"

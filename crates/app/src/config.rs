@@ -788,6 +788,19 @@ pub struct HistoryConfig {
     pub archives: Vec<HistoryArchiveEntry>,
 }
 
+impl HistoryConfig {
+    /// Whether any archive is configured for command-based writing.
+    ///
+    /// When false, checkpoint publishing cannot happen: entries should not be
+    /// enqueued to the publish queue and the publish queue should not pin
+    /// maintenance retention thresholds.
+    pub fn publish_enabled(&self) -> bool {
+        self.archives
+            .iter()
+            .any(|a| a.put_enabled && a.put.is_some())
+    }
+}
+
 /// A single history archive entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2885,5 +2898,57 @@ name = "test"
             .database_path("/data/stellar/node.db")
             .build();
         assert_eq!(config.buckets.directory, PathBuf::from("/custom/buckets"));
+    }
+
+    #[test]
+    fn test_publish_enabled_with_no_archives() {
+        let config = HistoryConfig { archives: vec![] };
+        assert!(!config.publish_enabled());
+    }
+
+    #[test]
+    fn test_publish_enabled_with_readonly_archives() {
+        let config = HistoryConfig {
+            archives: vec![HistoryArchiveEntry {
+                name: "sdf1".to_string(),
+                url: "https://history.stellar.org/prd/core-live/core_live_001".to_string(),
+                get_enabled: true,
+                put_enabled: false,
+                put: None,
+                mkdir: None,
+            }],
+        };
+        assert!(!config.publish_enabled());
+    }
+
+    #[test]
+    fn test_publish_enabled_with_writable_archive() {
+        let config = HistoryConfig {
+            archives: vec![HistoryArchiveEntry {
+                name: "local".to_string(),
+                url: "file:///tmp/archive".to_string(),
+                get_enabled: true,
+                put_enabled: true,
+                put: Some("cp {0} {1}".to_string()),
+                mkdir: Some("mkdir -p {0}".to_string()),
+            }],
+        };
+        assert!(config.publish_enabled());
+    }
+
+    #[test]
+    fn test_publish_enabled_put_enabled_but_no_put_command() {
+        // put_enabled=true but no put command → not publishable
+        let config = HistoryConfig {
+            archives: vec![HistoryArchiveEntry {
+                name: "broken".to_string(),
+                url: "file:///tmp/archive".to_string(),
+                get_enabled: true,
+                put_enabled: true,
+                put: None,
+                mkdir: None,
+            }],
+        };
+        assert!(!config.publish_enabled());
     }
 }

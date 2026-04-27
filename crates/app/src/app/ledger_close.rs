@@ -30,7 +30,9 @@ struct LedgerPersistInputs {
     /// JSON serialization happens later on the blocking thread.
     has: HistoryArchiveState,
     bucket_list_levels: Option<Vec<(Hash256, Hash256)>>,
-    is_validator: bool,
+    /// Whether checkpoint publishing is enabled (validator with writable archives).
+    /// Controls whether checkpoints are enqueued to the publish queue.
+    publish_enabled: bool,
 }
 
 impl LedgerPersistInputs {
@@ -77,7 +79,7 @@ impl LedgerPersistInputs {
                 if let Some(ref levels) = self.bucket_list_levels {
                     conn.store_bucket_list(self.header.ledger_seq, levels)?;
                 }
-                if self.is_validator {
+                if self.publish_enabled {
                     conn.enqueue_publish(self.header.ledger_seq, &has_json)?;
                 }
             }
@@ -297,7 +299,7 @@ impl App {
             scp_quorum_sets,
             has,
             bucket_list_levels,
-            is_validator: self.is_validator,
+            publish_enabled: self.is_validator && self.config.history.publish_enabled(),
         })
     }
 
@@ -449,6 +451,37 @@ impl App {
             anyhow::bail!(
                 "Invalid database state: last closed ledger is 0 (expected >= 1 or absent)"
             );
+        }
+
+        // Drain stale publish queue entries when publishing is disabled.
+        // This must happen before restore_checkpoint and bucket verification,
+        // which read the publish queue. Without writable archives, queue entries
+        // can never be published and would pin retention thresholds (#1989).
+        if !self.config.history.publish_enabled() {
+            match self
+                .db_blocking("drain-stale-publish-queue", |db| {
+                    let stale = db.load_publish_queue(None)?;
+                    if !stale.is_empty() {
+                        tracing::info!(
+                            count = stale.len(),
+                            "Clearing publish queue: no writable archives configured"
+                        );
+                        for seq in &stale {
+                            db.remove_publish(*seq)?;
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(stale.len())
+                })
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to drain stale publish queue (non-fatal)"
+                    );
+                }
+            }
         }
 
         // Step 1b: Restore checkpoint state (crash recovery).
@@ -851,7 +884,27 @@ impl App {
     /// This is a best-effort operation — errors are logged but do not prevent
     /// startup, since checkpoint publishing is independent of ledger state.
     fn restore_checkpoint(&self, lcl: u32) {
-        // Guard: only run if publishing is enabled (at least one writable archive).
+        // Always remove stale publish queue entries above LCL — they represent
+        // impossible future checkpoints regardless of archive configuration.
+        match self.db.remove_publish_above_lcl(lcl) {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(
+                    lcl,
+                    removed,
+                    "Removed stale publish queue entries above LCL"
+                );
+            }
+            Ok(_) => {} // nothing removed
+            Err(e) => {
+                tracing::warn!(
+                    lcl,
+                    error = %e,
+                    "Failed to clean stale publish queue entries (non-fatal)"
+                );
+            }
+        }
+
+        // Guard: remaining restore logic only for configs with writable+readable archives.
         let publish_enabled = self
             .config
             .history
@@ -889,29 +942,6 @@ impl App {
                 "Checkpoint cleanup failed (non-fatal)"
             );
             return;
-        }
-
-        // Phase 1b: Remove stale publish queue entries above LCL.
-        //
-        // This mirrors stellar-core's `restoreCheckpoint()` which iterates
-        // `.checkpoint.dirty` files and removes entries above LCL. Since
-        // henyey uses a SQLite-backed publish queue, this is a simple DELETE.
-        match self.db.remove_publish_above_lcl(lcl) {
-            Ok(removed) if removed > 0 => {
-                tracing::info!(
-                    lcl,
-                    removed,
-                    "Removed stale publish queue entries above LCL"
-                );
-            }
-            Ok(_) => {} // nothing removed
-            Err(e) => {
-                tracing::warn!(
-                    lcl,
-                    error = %e,
-                    "Failed to clean stale publish queue entries (non-fatal)"
-                );
-            }
         }
 
         // Phase 2: If LCL is at a checkpoint boundary, finalize recovered

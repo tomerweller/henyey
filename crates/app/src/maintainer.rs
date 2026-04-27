@@ -812,4 +812,79 @@ mod tests {
             Some(801)
         );
     }
+
+    #[test]
+    fn test_headers_pruned_at_rpc_lmin_when_publish_disabled() {
+        // Regression test for #1989: when publishing is disabled (no writable
+        // archives), callers pass min_queued=None. Headers should be pruned at
+        // rpc_lmin, not pinned by stale publish queue entries.
+        //
+        // Scenario: lcl=1000, min_queued=None (publish disabled), retention=200
+        //   publish_safe_lmin = 1000 - 64 = 936  (qmin defaults to lcl)
+        //   rpc_lmin = 800
+        //   publish_and_rpc_lmin = min(936, 800) = 800
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_ledger_headers(&db, &(790..=810).collect::<Vec<_>>());
+        assert_eq!(count_rows(&db, "ledgerheaders"), 21);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: Some(200),
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            // min_queued=None simulates disabled publishing
+            move || (1000, None),
+        );
+
+        maintainer.perform_maintenance();
+
+        // Headers at ledgerseq <= 800 pruned (790..=800 = 11 rows deleted)
+        // Headers at ledgerseq > 800 remain (801..=810 = 10 rows)
+        assert_eq!(count_rows(&db_clone, "ledgerheaders"), 10);
+        assert_eq!(
+            min_ledger(&db_clone, "ledgerheaders", "ledgerseq"),
+            Some(801)
+        );
+    }
+
+    #[test]
+    fn test_tx_history_pruned_at_rpc_lmin_when_publish_disabled() {
+        // Regression test for #1989: tx history should also be pruned when
+        // publishing is disabled, not pinned by stale queue entries.
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_tx_history(&db, &(790..=810).collect::<Vec<_>>());
+        insert_events(&db, &(790..=810).collect::<Vec<_>>());
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: Some(200),
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (1000, None),
+        );
+
+        maintainer.perform_maintenance();
+
+        // tx history pruned at publish_and_rpc_lmin = min(936, 800) = 800
+        assert_eq!(count_rows(&db_clone, "txhistory"), 10);
+        assert_eq!(min_ledger(&db_clone, "txhistory", "ledgerseq"), Some(801));
+        assert_eq!(count_rows(&db_clone, "txresults"), 10);
+        assert_eq!(min_ledger(&db_clone, "txresults", "ledgerseq"), Some(801));
+
+        // Events also pruned at rpc_lmin = 800
+        assert_eq!(count_rows(&db_clone, "events"), 10);
+        assert_eq!(min_ledger(&db_clone, "events", "ledgerseq"), Some(801));
+    }
 }

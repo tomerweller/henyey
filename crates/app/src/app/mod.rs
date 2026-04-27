@@ -1869,12 +1869,16 @@ impl App {
     pub fn perform_maintenance(&self, count: u32) {
         let lcl = self.ledger_info().ledger_seq;
 
-        // Get minimum queued publish checkpoint if available
-        let min_queued = self
-            .db
-            .load_publish_queue(Some(1))
-            .ok()
-            .and_then(|queue| queue.first().copied());
+        // Only consult the publish queue for retention when publishing is
+        // possible (#1989).
+        let min_queued = if self.config.history.publish_enabled() {
+            self.db
+                .load_publish_queue(Some(1))
+                .ok()
+                .and_then(|queue| queue.first().copied())
+        } else {
+            None
+        };
 
         let rpc_retention_window = if self.config.rpc.enabled {
             Some(self.config.rpc.retention_window)
@@ -2293,13 +2297,20 @@ impl App {
 
         // Provide ledger bounds via Arc<App>.
         let app = Arc::clone(self);
+        let publish_enabled = self.config.history.publish_enabled();
         let get_ledger_bounds = move || -> (u32, Option<u32>) {
             let lcl = app.ledger_info().ledger_seq;
-            let min_queued = app
-                .database()
-                .load_publish_queue(Some(1))
-                .ok()
-                .and_then(|queue| queue.first().copied());
+            // Only consult the publish queue for retention when publishing is
+            // possible.  Without writable archives the queue cannot drain and
+            // stale entries would pin the prune threshold indefinitely (#1989).
+            let min_queued = if publish_enabled {
+                app.database()
+                    .load_publish_queue(Some(1))
+                    .ok()
+                    .and_then(|queue| queue.first().copied())
+            } else {
+                None
+            };
             (lcl, min_queued)
         };
 
