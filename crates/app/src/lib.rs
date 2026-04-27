@@ -69,7 +69,7 @@ pub mod survey;
 
 pub use app::{
     App, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary, RestoreResult,
-    SimulationDebugStats, SurveyReport,
+    ScpSlotDebugStats, SimulationDebugStats, SurveyReport,
 };
 pub use catchup_cmd::{run_catchup, CatchupMode, CatchupOptions};
 pub use config::{AppConfig, BuildMetadata, MaintenanceAppConfig};

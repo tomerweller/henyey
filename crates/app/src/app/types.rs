@@ -111,6 +111,33 @@ pub struct SurveyReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ScpSlotDebugStats {
+    pub slot_index: u64,
+    pub is_externalized: bool,
+    pub is_nominating: bool,
+    pub scp_heard_from_quorum: bool,
+    pub ballot_phase: String,
+    pub nomination_round: u32,
+    pub ballot_round: Option<u32>,
+    pub fully_validated: Option<bool>,
+}
+
+impl From<henyey_scp::SlotState> for ScpSlotDebugStats {
+    fn from(state: henyey_scp::SlotState) -> Self {
+        Self {
+            slot_index: state.slot_index,
+            is_externalized: state.is_externalized,
+            is_nominating: state.is_nominating,
+            scp_heard_from_quorum: state.heard_from_quorum,
+            ballot_phase: format!("{:?}", state.ballot_phase),
+            nomination_round: state.nomination_round,
+            ballot_round: state.ballot_round,
+            fully_validated: state.fully_validated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SimulationDebugStats {
     pub app_state: String,
     pub herder_state: String,
@@ -122,10 +149,7 @@ pub struct SimulationDebugStats {
     pub cached_tx_sets: usize,
     pub heard_from_quorum: bool,
     pub is_v_blocking: bool,
-    pub slot_is_nominating: Option<bool>,
-    pub slot_is_externalized: Option<bool>,
-    pub slot_ballot_phase: Option<String>,
-    pub slot_ballot_round: Option<u32>,
+    pub slot: Option<ScpSlotDebugStats>,
     pub nomination_timeout_fires: u64,
     pub ballot_timeout_fires: u64,
     pub scp_messages_sent: u64,
@@ -403,13 +427,7 @@ impl std::fmt::Display for AppInfo {
 
 #[derive(Debug, Clone)]
 pub struct ScpSlotSnapshot {
-    pub slot_index: u64,
-    pub is_externalized: bool,
-    pub is_nominating: bool,
-    pub fully_validated: Option<bool>,
-    pub ballot_phase: String,
-    pub nomination_round: u32,
-    pub ballot_round: Option<u32>,
+    pub slot: ScpSlotDebugStats,
     pub envelope_count: usize,
 }
 
@@ -1252,6 +1270,31 @@ impl QueryInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scp_slot_debug_stats_projects_every_slot_state_field() {
+        let slot_state = henyey_scp::SlotState {
+            slot_index: 42,
+            is_externalized: true,
+            is_nominating: false,
+            heard_from_quorum: true,
+            ballot_phase: henyey_scp::BallotPhase::Confirm,
+            nomination_round: 7,
+            ballot_round: Some(3),
+            fully_validated: Some(false),
+        };
+
+        let stats = ScpSlotDebugStats::from(slot_state);
+
+        assert_eq!(stats.slot_index, 42);
+        assert!(stats.is_externalized);
+        assert!(!stats.is_nominating);
+        assert!(stats.scp_heard_from_quorum);
+        assert_eq!(stats.ballot_phase, "Confirm");
+        assert_eq!(stats.nomination_round, 7);
+        assert_eq!(stats.ballot_round, Some(3));
+        assert_eq!(stats.fully_validated, Some(false));
+    }
 
     #[test]
     fn test_query_info_allows_within_limit() {

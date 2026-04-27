@@ -58,10 +58,12 @@ async fn collect_node_diagnostics(sim: &Simulation) -> String {
     for id in sim.app_node_ids() {
         match sim.app_debug_stats(&id).await {
             Some(stats) => {
+                let slot = stats.slot.as_ref();
                 diag.push_str(&format!(
                     "\n  {id}: ledger={}, peers={}, state={}, herder={}, \
                      pending_envelopes={}, heard_quorum={}, v_blocking={}, \
-                     ballot_phase={}, ballot_round={}, \
+                     slot_externalized={}, slot_nominating={}, slot_scp_heard_quorum={}, \
+                     ballot_phase={}, nomination_round={}, ballot_round={}, fully_validated={}, \
                      nom_timeouts={}, ballot_timeouts={}, \
                      scp_sent={}, scp_recv={}, \
                      trigger_attempts={}, trigger_ok={}, trigger_fail={}",
@@ -72,10 +74,15 @@ async fn collect_node_diagnostics(sim: &Simulation) -> String {
                     stats.pending_envelopes,
                     stats.heard_from_quorum,
                     stats.is_v_blocking,
-                    stats.slot_ballot_phase.as_deref().unwrap_or("none"),
-                    stats
-                        .slot_ballot_round
+                    slot.map_or("none".to_string(), |s| s.is_externalized.to_string()),
+                    slot.map_or("none".to_string(), |s| s.is_nominating.to_string()),
+                    slot.map_or("none".to_string(), |s| s.scp_heard_from_quorum.to_string()),
+                    slot.map_or("none", |s| s.ballot_phase.as_str()),
+                    slot.map_or("none".to_string(), |s| s.nomination_round.to_string()),
+                    slot.and_then(|s| s.ballot_round)
                         .map_or("none".to_string(), |r| r.to_string()),
+                    slot.and_then(|s| s.fully_validated)
+                        .map_or("none".to_string(), |v| v.to_string()),
                     stats.nomination_timeout_fires,
                     stats.ballot_timeout_fires,
                     stats.scp_messages_sent,

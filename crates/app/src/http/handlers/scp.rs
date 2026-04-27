@@ -29,14 +29,15 @@ pub(crate) async fn scp_handler(
 
 impl From<crate::app::ScpSlotSnapshot> for ScpSlotInfo {
     fn from(snapshot: crate::app::ScpSlotSnapshot) -> Self {
+        let slot = snapshot.slot;
         Self {
-            slot_index: snapshot.slot_index,
-            is_externalized: snapshot.is_externalized,
-            is_nominating: snapshot.is_nominating,
-            fully_validated: snapshot.fully_validated,
-            ballot_phase: snapshot.ballot_phase,
-            nomination_round: snapshot.nomination_round,
-            ballot_round: snapshot.ballot_round,
+            slot_index: slot.slot_index,
+            is_externalized: slot.is_externalized,
+            is_nominating: slot.is_nominating,
+            fully_validated: slot.fully_validated,
+            ballot_phase: slot.ballot_phase,
+            nomination_round: slot.nomination_round,
+            ballot_round: slot.ballot_round,
             envelope_count: snapshot.envelope_count,
         }
     }

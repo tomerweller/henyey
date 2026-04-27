@@ -260,8 +260,8 @@ pub use persist::CatchupFinalizer;
 use types::*;
 pub use types::{
     AppInfo, AppMetricsSnapshot, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary,
-    OverlayFetchChannelMetrics, RestoreResult, ScpSlotSnapshot, ScpVerifyMetrics, SelfCheckResult,
-    SimulationDebugStats, SurveyPeerReport, SurveyReport,
+    OverlayFetchChannelMetrics, RestoreResult, ScpSlotDebugStats, ScpSlotSnapshot,
+    ScpVerifyMetrics, SelfCheckResult, SimulationDebugStats, SurveyPeerReport, SurveyReport,
 };
 
 /// The main application struct coordinating all Stellar Core subsystems.
@@ -1816,10 +1816,7 @@ impl App {
             cached_tx_sets: herder_stats.cached_tx_sets,
             heard_from_quorum: self.herder.heard_from_quorum(quorum_slot),
             is_v_blocking: self.herder.is_v_blocking(quorum_slot),
-            slot_is_nominating: slot_state.as_ref().map(|s| s.is_nominating),
-            slot_is_externalized: slot_state.as_ref().map(|s| s.is_externalized),
-            slot_ballot_phase: slot_state.as_ref().map(|s| format!("{:?}", s.ballot_phase)),
-            slot_ballot_round: slot_state.as_ref().and_then(|s| s.ballot_round),
+            slot: slot_state.map(Into::into),
             nomination_timeout_fires: self.nomination_timeout_fires.load(Ordering::Relaxed),
             ballot_timeout_fires: self.ballot_timeout_fires.load(Ordering::Relaxed),
             scp_messages_sent: self.scp_messages_sent.load(Ordering::Relaxed),
@@ -1971,13 +1968,7 @@ impl App {
             if let Some(state) = scp.get_slot_state(slot) {
                 let envelopes = self.herder.get_scp_envelopes(slot);
                 snapshots.push(ScpSlotSnapshot {
-                    slot_index: state.slot_index,
-                    is_externalized: state.is_externalized,
-                    is_nominating: state.is_nominating,
-                    fully_validated: state.fully_validated,
-                    ballot_phase: format!("{:?}", state.ballot_phase),
-                    nomination_round: state.nomination_round,
-                    ballot_round: state.ballot_round,
+                    slot: state.into(),
                     envelope_count: envelopes.len(),
                 });
             }
