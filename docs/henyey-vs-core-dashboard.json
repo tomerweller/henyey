@@ -786,6 +786,58 @@
       }
     },
     {
+      "id": 800,
+      "type": "timeseries",
+      "title": "SCP First-to-Self Externalize Lag",
+      "description": "Time from first observed EXTERNALIZE (any node) to self-externalize. Apples-to-apples between henyey and stellar-core (both measure propagation-lag, ~0.3-0.5s healthy). See #1975 — the 'SCP Externalize Time' panel above compares different metrics (henyey slot-cycle vs core propagation-lag) and overstates the henyey-vs-core gap.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_scp_timing_first_to_self_externalize_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(stellar_core_scp_timing_first_to_self_externalize_lag_sum{instance=~\"$core_instance\"}[$__rate_interval]) / rate(stellar_core_scp_timing_first_to_self_externalize_lag_count{instance=~\"$core_instance\"}[$__rate_interval])",
+          "legendFormat": "Core avg",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
       "id": 23,
       "type": "timeseries",
       "title": "SCP Nominate Time",

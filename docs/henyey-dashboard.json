@@ -2045,10 +2045,68 @@
       }
     },
     {
+      "id": 109,
+      "type": "timeseries",
+      "title": "SCP First-to-Self Externalize Lag",
+      "description": "Time from the first EXTERNALIZE message observed (any node) to self-externalize. Apples-to-apples comparable to stellar-core's `scp.timing.first-to-self-externalize-lag` (~0.3-0.5s healthy). Distinct from `stellar_scp_timing_externalized_seconds`, which is the full slot-cycle time (~5s on mainnet). See #1975.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 79
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "000000001"
+      },
+      "targets": [
+        {
+          "expr": "stellar_scp_timing_first_to_self_externalize_seconds{job=\"henyey\", instance=~\"$instance\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "First-to-self lag",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "min",
+            "max",
+            "mean",
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
       "id": 26,
       "type": "timeseries",
-      "title": "Externalize vs Nominate",
-      "description": "Both timings overlaid to visualize the nomination-to-externalization gap.",
+      "title": "Externalize / Nominate / First-to-Self",
+      "description": "Three SCP timing series overlaid: full slot-cycle (Externalize), from-nominate (Nominate), and propagation-lag (First-to-self). First-to-self is the metric directly comparable to stellar-core's scp.timing.first-to-self-externalize-lag.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -2077,6 +2135,15 @@
           },
           "legendFormat": "Nominate",
           "refId": "B"
+        },
+        {
+          "expr": "stellar_scp_timing_first_to_self_externalize_seconds{job=\"henyey\", instance=~\"$instance\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "First-to-self",
+          "refId": "C"
         }
       ],
       "fieldConfig": {
