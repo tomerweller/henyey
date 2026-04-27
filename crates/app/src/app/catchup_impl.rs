@@ -370,27 +370,7 @@ impl App {
                 hashes.extend(sm.all_referenced_hashes());
 
                 // Add DB HAS and publish queue references
-                match db.with_connection(|conn| {
-                    use henyey_db::queries::publish_queue::PublishQueueQueries;
-                    use henyey_db::queries::StateQueries;
-                    let mut extra_hashes = Vec::new();
-
-                    if let Some(has_json) =
-                        conn.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)?
-                    {
-                        if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
-                            extra_hashes.extend(has.all_bucket_hashes());
-                        }
-                    }
-
-                    for has_json in conn.load_all_publish_has()? {
-                        if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
-                            extra_hashes.extend(has.all_bucket_hashes());
-                        }
-                    }
-
-                    Ok(extra_hashes)
-                }) {
+                match super::collect_db_referenced_bucket_hashes(&db) {
                     Ok(extra) => hashes.extend(extra),
                     Err(e) => {
                         tracing::warn!(

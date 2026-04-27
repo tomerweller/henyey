@@ -511,14 +511,24 @@ impl App {
                 }
             }
         }
+
+        // Step 5a: Also verify buckets referenced by the publish queue,
+        // mirroring stellar-core's getMissingBucketsReferencedByPublishQueue().
+        let publish_queue_hashes = self
+            .db_blocking("load-publish-queue-bucket-hashes", |db| {
+                collect_publish_queue_bucket_hashes(db)
+            })
+            .await?;
+        essential_hashes.extend(publish_queue_hashes);
+
         let missing = self.bucket_manager.verify_buckets_exist(&essential_hashes);
         if !missing.is_empty() {
-            tracing::warn!(
-                missing_count = missing.len(),
-                first_missing = %missing[0].to_hex(),
-                "Missing essential bucket files on disk, cannot restore"
+            anyhow::bail!(
+                "{} bucket(s) are missing from bucket directory (first: {}). \
+                 Bucket directory is corrupt.",
+                missing.len(),
+                missing[0].to_hex(),
             );
-            return Ok(false);
         }
 
         // Step 5b: Check which pending merge outputs are available.

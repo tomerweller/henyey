@@ -698,6 +698,65 @@ pub struct App {
     event_loop_phase_sub: Arc<AtomicU32>,
 }
 
+/// Collect all bucket hashes referenced by DB-stored state: the authoritative
+/// HAS and all publish-queue HAS entries. Used by bucket GC cleanup to avoid
+/// deleting files still needed by the current state or pending publishes.
+///
+/// Parse failures are propagated as errors (not silently skipped), matching
+/// stellar-core's treatment of invalid queued state as corruption.
+fn collect_db_referenced_bucket_hashes(db: &henyey_db::Database) -> anyhow::Result<Vec<Hash256>> {
+    db.with_connection(|conn| {
+        use henyey_db::queries::publish_queue::PublishQueueQueries;
+        use henyey_db::queries::StateQueries;
+
+        let mut hashes = Vec::new();
+
+        // Stored authoritative HAS
+        if let Some(has_json) = conn.get_state(state_keys::HISTORY_ARCHIVE_STATE)? {
+            let has = henyey_history::HistoryArchiveState::from_json(&has_json).map_err(|e| {
+                henyey_db::DbError::Integrity(format!("Failed to parse authoritative HAS: {e}"))
+            })?;
+            hashes.extend(has.all_bucket_hashes());
+        }
+
+        // Publish queue HAS entries
+        for has_json in conn.load_all_publish_has()? {
+            let has = henyey_history::HistoryArchiveState::from_json(&has_json).map_err(|e| {
+                henyey_db::DbError::Integrity(format!("Failed to parse publish-queue HAS: {e}"))
+            })?;
+            hashes.extend(has.all_bucket_hashes());
+        }
+
+        Ok(hashes)
+    })
+    .map_err(Into::into)
+}
+
+/// Collect bucket hashes referenced only by publish-queue HAS entries.
+///
+/// Used during startup to verify that all buckets needed by pending publishes
+/// exist on disk, mirroring stellar-core's
+/// `getMissingBucketsReferencedByPublishQueue()`.
+fn collect_publish_queue_bucket_hashes(db: &henyey_db::Database) -> anyhow::Result<Vec<Hash256>> {
+    db.with_connection(|conn| {
+        use henyey_db::queries::publish_queue::PublishQueueQueries;
+
+        let mut hashes = Vec::new();
+        for has_json in conn.load_all_publish_has()? {
+            let has = henyey_history::HistoryArchiveState::from_json(&has_json).map_err(|e| {
+                henyey_db::DbError::Integrity(format!("Failed to parse publish-queue HAS: {e}"))
+            })?;
+            for h in has.all_bucket_hashes() {
+                if !h.is_zero() {
+                    hashes.push(h);
+                }
+            }
+        }
+        Ok(hashes)
+    })
+    .map_err(Into::into)
+}
+
 impl App {
     /// Create a new application instance.
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
@@ -1864,27 +1923,7 @@ impl App {
             // Add bucket hashes from the DB-stored HAS and publish queue.
             // If DB access fails, skip cleanup entirely to avoid deleting
             // still-referenced bucket files (fail-closed).
-            match db.with_connection(|conn| {
-                use henyey_db::queries::publish_queue::PublishQueueQueries;
-                use henyey_db::queries::StateQueries;
-                let mut extra_hashes = Vec::new();
-
-                // Stored authoritative HAS
-                if let Some(has_json) = conn.get_state(state_keys::HISTORY_ARCHIVE_STATE)? {
-                    if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
-                        extra_hashes.extend(has.all_bucket_hashes());
-                    }
-                }
-
-                // Publish queue HAS entries
-                for has_json in conn.load_all_publish_has()? {
-                    if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
-                        extra_hashes.extend(has.all_bucket_hashes());
-                    }
-                }
-
-                Ok(extra_hashes)
-            }) {
+            match collect_db_referenced_bucket_hashes(&db) {
                 Ok(extra) => hashes.extend(extra),
                 Err(e) => {
                     tracing::warn!(
@@ -7984,5 +8023,125 @@ mod tests {
         assert_eq!(sched.ledger_num, 0);
         assert!(sched.peers.is_empty());
         assert!(sched.next_action >= now + Duration::from_secs(59));
+    }
+
+    /// Build a minimal HAS JSON with one bucket level containing the given
+    /// curr/snap hex hashes.
+    fn make_has_json(ledger: u32, curr_hex: &str, snap_hex: &str) -> String {
+        serde_json::json!({
+            "version": 2,
+            "currentLedger": ledger,
+            "currentBuckets": [{
+                "curr": curr_hex,
+                "snap": snap_hex,
+                "next": { "state": 0 }
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_collect_publish_queue_bucket_hashes_returns_hashes() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let hash_a = "aa".repeat(32); // 64 hex chars = 32 bytes
+        let hash_b = "bb".repeat(32);
+        let has_json = make_has_json(128, &hash_a, &hash_b);
+
+        db.with_connection(|conn| {
+            use henyey_db::queries::publish_queue::PublishQueueQueries;
+            conn.enqueue_publish(128, &has_json)
+        })
+        .unwrap();
+
+        let hashes = collect_publish_queue_bucket_hashes(&db).unwrap();
+        let hex_set: std::collections::HashSet<String> =
+            hashes.iter().map(|h| h.to_hex()).collect();
+        assert!(hex_set.contains(&hash_a), "expected hash_a in result");
+        assert!(hex_set.contains(&hash_b), "expected hash_b in result");
+    }
+
+    #[test]
+    fn test_collect_publish_queue_bucket_hashes_empty_queue() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let hashes = collect_publish_queue_bucket_hashes(&db).unwrap();
+        assert!(hashes.is_empty());
+    }
+
+    #[test]
+    fn test_collect_publish_queue_bucket_hashes_rejects_malformed_json() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        // Insert malformed JSON directly (bypasses normal enqueue path)
+        db.with_connection(|conn| {
+            use henyey_db::queries::publish_queue::PublishQueueQueries;
+            conn.enqueue_publish(128, "not valid json")
+        })
+        .unwrap();
+
+        let result = collect_publish_queue_bucket_hashes(&db);
+        assert!(result.is_err(), "malformed HAS JSON should cause an error");
+    }
+
+    #[test]
+    fn test_collect_db_referenced_bucket_hashes_includes_authoritative_has() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let hash_a = "cc".repeat(32);
+        let hash_b = "dd".repeat(32);
+        let has_json = make_has_json(64, &hash_a, &hash_b);
+
+        db.with_connection(|conn| {
+            use henyey_db::queries::StateQueries;
+            conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)
+        })
+        .unwrap();
+
+        let hashes = collect_db_referenced_bucket_hashes(&db).unwrap();
+        let hex_set: std::collections::HashSet<String> =
+            hashes.iter().map(|h| h.to_hex()).collect();
+        assert!(hex_set.contains(&hash_a));
+        assert!(hex_set.contains(&hash_b));
+    }
+
+    #[test]
+    fn test_collect_db_referenced_bucket_hashes_includes_publish_queue() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let auth_curr = "aa".repeat(32);
+        let auth_snap = "bb".repeat(32);
+        let pq_curr = "cc".repeat(32);
+        let pq_snap = "dd".repeat(32);
+
+        let auth_has = make_has_json(64, &auth_curr, &auth_snap);
+        let pq_has = make_has_json(128, &pq_curr, &pq_snap);
+
+        db.with_connection(|conn| {
+            use henyey_db::queries::publish_queue::PublishQueueQueries;
+            use henyey_db::queries::StateQueries;
+            conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &auth_has)?;
+            conn.enqueue_publish(128, &pq_has)
+        })
+        .unwrap();
+
+        let hashes = collect_db_referenced_bucket_hashes(&db).unwrap();
+        let hex_set: std::collections::HashSet<String> =
+            hashes.iter().map(|h| h.to_hex()).collect();
+        assert!(hex_set.contains(&auth_curr), "authoritative curr");
+        assert!(hex_set.contains(&auth_snap), "authoritative snap");
+        assert!(hex_set.contains(&pq_curr), "publish queue curr");
+        assert!(hex_set.contains(&pq_snap), "publish queue snap");
+    }
+
+    #[test]
+    fn test_collect_db_referenced_bucket_hashes_rejects_malformed_authoritative_has() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        db.with_connection(|conn| {
+            use henyey_db::queries::StateQueries;
+            conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, "broken json")
+        })
+        .unwrap();
+
+        let result = collect_db_referenced_bucket_hashes(&db);
+        assert!(
+            result.is_err(),
+            "malformed authoritative HAS should cause an error"
+        );
     }
 }
