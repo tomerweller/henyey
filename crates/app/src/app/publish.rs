@@ -603,6 +603,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn app_runtime_does_not_reconstruct_bucket_manager_from_config() {
+        let app_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app");
+        let constructor = ["BucketManager::", "with_cache_size"].concat();
+        let config_bucket_dir = ["config.buckets", ".directory"].concat();
+        let mut offenders = Vec::new();
+        let mut stack = vec![app_dir];
+
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+
+                let source = std::fs::read_to_string(&path).unwrap();
+                if path.file_name().and_then(|name| name.to_str()) == Some("mod.rs") {
+                    continue;
+                }
+                if source.contains(&constructor) && source.contains(&config_bucket_dir) {
+                    offenders.push(path);
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "app runtime must use App::bucket_manager after construction; offenders: {offenders:?}"
+        );
+    }
+
     #[tokio::test]
     async fn custom_bucket_directory_survives_genesis_publish_and_restore() {
         let dir = tempfile::tempdir().expect("temp dir");
