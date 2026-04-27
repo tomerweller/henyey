@@ -9,6 +9,7 @@ use stellar_xdr::curr::{
     TtlEntry,
 };
 
+use crate::soroban::ttl::restore_ttl_target;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
@@ -80,9 +81,7 @@ pub(crate) fn execute_restore_footprint(
     // Per stellar-core RestoreFootprintOpFrame.cpp line 115-116:
     //   restoredLiveUntilLedger = ledgerSeq + archivalSettings.minPersistentTTL - 1
     let current_ledger = context.sequence;
-    let new_ttl = current_ledger
-        .saturating_add(resources.min_persistent_entry_ttl)
-        .saturating_sub(1);
+    let new_ttl = restore_ttl_target(current_ledger, resources.min_persistent_entry_ttl);
 
     // Resource limit tracking (stellar-core: RestoreFootprintApplyHelper::apply)
     let soroban_data = resources.soroban_data.unwrap(); // safe: checked above
@@ -866,6 +865,64 @@ mod tests {
             }
             other => panic!("Unexpected result type: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_restore_footprint_hot_archive_wrapped_restore_ttl_at_sequence_overflow() {
+        let ledger_seq = u32::MAX - 5;
+        let mut state = LedgerStateManager::new(5_000_000, ledger_seq);
+        let context = LedgerContext::testnet(ledger_seq, 1000);
+        let source = create_test_account_id(0);
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let hash = Hash([52u8; 32]);
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
+        let entry = make_contract_code_entry(hash);
+
+        let hot_restores = vec![HotArchiveRestoreEntry {
+            key: key.clone(),
+            entry,
+        }];
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key.clone()].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 10_000,
+                write_bytes: 10_000,
+            },
+            resource_fee: 0,
+        };
+
+        let expected_ttl = crate::soroban::ttl::restore_ttl_target(ledger_seq, 10);
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: 10,
+                hot_archive_restores: &hot_restores,
+                ttl_key_cache: None,
+                size_limits: None,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::Success);
+
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        let ttl = state.get_ttl(&key_hash).expect("ttl created");
+        assert_eq!(
+            ttl.live_until_ledger_seq, expected_ttl,
+            "#1951 wrapping parity"
+        );
     }
 
     /// Test hot archive entry restoration with sufficient resource limits.

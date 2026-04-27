@@ -88,6 +88,7 @@ mod error;
 mod host;
 pub mod protocol;
 mod storage;
+pub mod ttl;
 
 pub use budget::{
     FeeConfiguration, RentFeeConfiguration, ResourceLimits, SorobanBudget, SorobanConfig,
@@ -97,6 +98,7 @@ pub use host::{
     SorobanExecutionResult, StorageChange, StorageChangeKind,
 };
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};
+pub use ttl::{extend_ttl_target, restore_ttl_target};
 
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{

@@ -230,7 +230,8 @@ pub(super) fn simulate_extend_ttl_op(
     use soroban_host::fees::LedgerEntryRentChange;
 
     let budget = soroban_host::budget::Budget::default();
-    let new_live_until = ledger_info.sequence_number.saturating_add(extend_to);
+    let new_live_until =
+        henyey_tx::soroban::ttl::extend_ttl_target(ledger_info.sequence_number, extend_to);
 
     let mut rent_changes = Vec::with_capacity(keys.len());
     let mut extended_keys = Vec::with_capacity(keys.len());

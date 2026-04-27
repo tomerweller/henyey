@@ -406,6 +406,7 @@ All 24 classic operations are fully implemented:
 
 | stellar-core Component | Rust Module | Status |
 |------------------------|-------------|--------|
+| TTL target ledger sequences (`uint32_t` wrap on overflow) | `soroban/ttl.rs` (extend/restore/host + RPC extend sim) | Full |
 | Protocol-versioned hosts | `soroban/protocol/p24.rs`, `p25.rs` | Full |
 | Protocol 26 host | `soroban/host.rs` (p26 dispatch) | Full |
 | `e2e_invoke` API | `soroban/host.rs` | Full |

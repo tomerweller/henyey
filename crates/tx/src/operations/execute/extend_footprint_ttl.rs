@@ -11,6 +11,7 @@ use stellar_xdr::curr::{
     OperationResult, OperationResultTr, SorobanTransactionData,
 };
 
+use crate::soroban::ttl::extend_ttl_target;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
@@ -69,7 +70,7 @@ pub(crate) fn execute_extend_footprint_ttl(
     // Calculate the target TTL ledger sequence
     // stellar-core: newLiveUntilLedgerSeq = getLedgerSeq() + mOpFrame.mExtendFootprintTTLOp.extendTo
     let current_ledger = context.sequence;
-    let new_live_until = current_ledger.saturating_add(op.extend_to);
+    let new_live_until = extend_ttl_target(current_ledger, op.extend_to);
     let disk_read_bytes_limit = soroban_data.resources.disk_read_bytes;
     let mut accumulated_read_bytes: u32 = 0;
 
@@ -1123,6 +1124,84 @@ mod tests {
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    /// Near `u32::MAX`, TTL targets wrap like C++ `uint32_t`. When the wrapped target is
+    /// below the entry's current live-until, stellar-core skips the extend (successful no-op).
+    #[test]
+    fn test_extend_footprint_ttl_sequence_overflow_wrap_skips_extend() {
+        let ledger_seq = u32::MAX - 5;
+        let mut state = LedgerStateManager::new(5_000_000, ledger_seq);
+        let context = LedgerContext::testnet(ledger_seq, 1000);
+        let source = create_test_account_id(0);
+
+        let contract_hash = Hash([88u8; 32]);
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: contract_hash.clone(),
+        });
+
+        let code_entry = ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash: contract_hash.clone(),
+            code: vec![0u8; 100].try_into().unwrap(),
+        };
+        state.create_contract_code(code_entry);
+
+        let key_hash = crate::soroban::compute_key_hash(&contract_key);
+        let initial_live_until = u32::MAX - 4;
+        state.create_ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: initial_live_until,
+        });
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 10,
+        };
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![contract_key].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 10_000,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
+        );
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::Success),
+                    "Expected Success for no-op extend near sequence overflow"
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        let ttl_after = state.get_ttl(&key_hash).expect("ttl exists");
+        assert_eq!(
+            ttl_after.live_until_ledger_seq, initial_live_until,
+            "wrapped extend target is below live_until — must not extend (#1951)"
+        );
     }
 
     /// Regression test: live TTL exists but data entry is missing → must panic.

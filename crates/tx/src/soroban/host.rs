@@ -853,8 +853,10 @@ fn prepare_footprint_entries(
                 };
 
                 if is_actually_archived {
-                    let restored_live_until =
-                        Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
+                    let restored_live_until = Some(super::ttl::restore_ttl_target(
+                        context.sequence,
+                        soroban_config.min_persistent_entry_ttl,
+                    ));
                     tracing::debug!(
                         idx = idx,
                         key_type = ?std::mem::discriminant(key),
