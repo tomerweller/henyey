@@ -447,10 +447,10 @@ impl BucketManager {
 
     /// Load a live bucket from disk for merge restart, verifying its hash.
     ///
-    /// Unlike [`load_bucket`], this always loads disk-backed (streaming I/O),
-    /// does NOT use or populate the bucket cache, and does NOT build an index.
-    /// This is appropriate for merge-restart inputs which are consumed once
-    /// by the merge and then discarded.
+    /// Unlike [`load_bucket`], this always loads disk-backed (streaming I/O)
+    /// and does NOT use or populate the bucket cache. This is appropriate for
+    /// merge-restart inputs which are consumed once by the merge and then
+    /// discarded.
     pub fn load_bucket_for_merge(&self, hash: &Hash256) -> Result<Bucket> {
         if hash.is_zero() {
             return Ok(Bucket::empty());
@@ -474,8 +474,8 @@ impl BucketManager {
 
     /// Load a hot archive bucket from disk for merge restart, verifying its hash.
     ///
-    /// Same semantics as [`load_bucket_for_merge`] — disk-backed, no cache,
-    /// no index. Appropriate for hot archive merge-restart inputs.
+    /// Same semantics as [`load_bucket_for_merge`] — disk-backed, no cache.
+    /// Appropriate for hot archive merge-restart inputs.
     pub fn load_hot_archive_bucket_for_merge(
         &self,
         hash: &Hash256,

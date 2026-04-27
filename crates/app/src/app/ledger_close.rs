@@ -637,6 +637,26 @@ impl App {
                 })
                 .collect();
 
+            // Downgrade hot-archive state-1 outputs whose files are missing,
+            // matching the live-bucket downgrade above.
+            let mut hot_next_states = hot_next_states;
+            for state in &mut hot_next_states {
+                if state.state == 1 {
+                    if let Some(ref output_hash) = state.output {
+                        if !output_hash.is_zero() && !self.bucket_manager.bucket_exists(output_hash)
+                        {
+                            tracing::info!(
+                                output = %output_hash.to_hex(),
+                                "Hot archive pending merge output not on disk, \
+                                 discarding merge state"
+                            );
+                            state.state = 0;
+                            state.output = None;
+                        }
+                    }
+                }
+            }
+
             let bucket_manager = self.bucket_manager.clone();
             let load_hot =
                 |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
@@ -650,9 +670,10 @@ impl App {
             .map_err(|e| anyhow::anyhow!("Failed to restore hot archive: {}", e))?;
 
             let bucket_manager = self.bucket_manager.clone();
-            let load_hot_for_merge = move |hash: &Hash256| -> henyey_bucket::Result<
-                henyey_bucket::HotArchiveBucket,
-            > { bucket_manager.load_hot_archive_bucket(hash) };
+            let load_hot_for_merge =
+                move |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
+                    bucket_manager.load_hot_archive_bucket_for_merge(hash)
+                };
             let hot_next_states_ref = hot_next_states.clone();
             hot_bl
                 .restart_merges_from_has(
@@ -988,6 +1009,26 @@ impl App {
                     bucket_manager.load_hot_archive_bucket(hash)
                 };
 
+            // Downgrade hot-archive state-1 outputs whose files are missing,
+            // matching the live-bucket downgrade above.
+            let mut hot_next_states = hot_next_states;
+            for state in &mut hot_next_states {
+                if state.state == 1 {
+                    if let Some(ref output_hash) = state.output {
+                        if !output_hash.is_zero() && !self.bucket_manager.bucket_exists(output_hash)
+                        {
+                            tracing::info!(
+                                output = %output_hash.to_hex(),
+                                "reconstruct_bucket_lists: hot archive pending merge output \
+                                 not on disk, discarding merge state"
+                            );
+                            state.state = 0;
+                            state.output = None;
+                        }
+                    }
+                }
+            }
+
             let mut hot_bl = HotArchiveBucketList::restore_from_has_parallel(
                 &hot_hash_pairs,
                 &hot_next_states,
@@ -1001,7 +1042,7 @@ impl App {
                 let load_hot_for_merge = move |hash: &Hash256| -> henyey_bucket::Result<
                     henyey_bucket::HotArchiveBucket,
                 > {
-                    bucket_manager.load_hot_archive_bucket(hash)
+                    bucket_manager.load_hot_archive_bucket_for_merge(hash)
                 };
                 hot_bl
                     .restart_merges_from_has(

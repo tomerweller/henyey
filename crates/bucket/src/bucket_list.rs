@@ -778,13 +778,23 @@ impl BucketLevel {
                         if path.exists() {
                             match Bucket::from_xdr_file_disk_backed(&path) {
                                 Ok(bucket) => {
-                                    tracing::debug!(
-                                        level = self.level,
-                                        output_hash = %output_hash,
-                                        "Reusing cached merge result from merge map"
-                                    );
-                                    self.next = Some(PendingMerge::InMemory(bucket));
-                                    return Ok(());
+                                    if bucket.hash() != output_hash {
+                                        tracing::warn!(
+                                            level = self.level,
+                                            expected = %output_hash,
+                                            actual = %bucket.hash(),
+                                            "Merge-map cached result hash mismatch, \
+                                             falling through to new merge"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            level = self.level,
+                                            output_hash = %output_hash,
+                                            "Reusing cached merge result from merge map"
+                                        );
+                                        self.next = Some(PendingMerge::InMemory(bucket));
+                                        return Ok(());
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
