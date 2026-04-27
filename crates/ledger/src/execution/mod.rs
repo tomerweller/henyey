@@ -1987,12 +1987,11 @@ impl TransactionExecutor {
                     stellar_xdr::curr::Uint256(outer_hash.0),
                 );
                 self.state
-                    .remove_account_signer(&fee_source_id, &signer_key);
+                    .remove_account_signer(&fee_source_id, &signer_key)
+                    .map_err(|e| LedgerError::Internal(format!("signer removal error: {}", e)))?;
                 self.state.flush_modified_entries();
 
                 // Always capture the STATE/UPDATED pair. In stellar-core,
-                // removeOneTimeSignerKeyFromFeeSource() runs in its own LedgerTxn
-                // and pushes to txChangesBefore regardless of fee mode.
                 let fee_source_after = self
                     .state
                     .get_entry(&fee_source_key)
@@ -2059,7 +2058,7 @@ impl TransactionExecutor {
             outer_hash
         };
         let (signer_changes, signer_created, signer_updated, signer_deleted, signer_removal_us) =
-            self.remove_one_time_signers_phase(&frame, &inner_source_id, &signer_removal_hash);
+            self.remove_one_time_signers_phase(&frame, &inner_source_id, &signer_removal_hash)?;
 
         let (seq_changes, seq_created, seq_updated, seq_deleted, seq_bump_us) =
             self.bump_sequence_phase(&frame, &inner_source_id);
@@ -2396,28 +2395,29 @@ impl TransactionExecutor {
     /// Remove one-time (PreAuthTx) signers from all source accounts.
     ///
     /// Returns (signer_changes, signer_created, signer_updated, signer_deleted, duration_us).
+    #[allow(clippy::type_complexity)]
     fn remove_one_time_signers_phase(
         &mut self,
         frame: &TransactionFrame,
         inner_source_id: &AccountId,
         outer_hash: &Hash256,
-    ) -> (
+    ) -> Result<(
         LedgerEntryChanges,
         Vec<LedgerEntry>,
         Vec<LedgerEntry>,
         Vec<LedgerKey>,
         u64,
-    ) {
+    )> {
         let signer_removal_start = std::time::Instant::now();
         if self.protocol_version == 7 {
             let us = signer_removal_start.elapsed().as_micros() as u64;
-            return (
+            return Ok((
                 empty_entry_changes(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 us,
-            );
+            ));
         }
 
         let mut source_accounts = Vec::new();
@@ -2441,11 +2441,13 @@ impl TransactionExecutor {
             }
         }
 
-        self.state.remove_one_time_signers_from_all_sources(
-            outer_hash,
-            &source_accounts,
-            self.protocol_version,
-        );
+        self.state
+            .remove_one_time_signers_from_all_sources(
+                outer_hash,
+                &source_accounts,
+                self.protocol_version,
+            )
+            .map_err(|e| LedgerError::Internal(format!("signer removal error: {}", e)))?;
         self.state.flush_modified_entries();
         let delta_after_signers = delta_snapshot(&self.state);
         let delta_slice = delta_slice_between(
@@ -2464,13 +2466,13 @@ impl TransactionExecutor {
             &signer_state_overrides,
         );
         let us = signer_removal_start.elapsed().as_micros() as u64;
-        (
+        Ok((
             signer_changes,
             signer_created,
             signer_updated,
             signer_deleted,
             us,
-        )
+        ))
     }
 
     /// Bump the transaction source account's sequence number and capture delta changes.
@@ -2571,7 +2573,8 @@ impl TransactionExecutor {
                     stellar_xdr::curr::Uint256(outer_hash.0),
                 );
                 self.state
-                    .remove_account_signer(&fee_source_id, &signer_key);
+                    .remove_account_signer(&fee_source_id, &signer_key)
+                    .map_err(|e| LedgerError::Internal(format!("signer removal error: {}", e)))?;
                 self.state.flush_modified_entries();
 
                 let fee_source_after = self
@@ -2640,11 +2643,13 @@ impl TransactionExecutor {
         source_accounts.sort_by(|a, b| a.0.cmp(&b.0));
         source_accounts.dedup_by(|a, b| a.0 == b.0);
 
-        self.state.remove_one_time_signers_from_all_sources(
-            &signer_removal_hash,
-            &source_accounts,
-            self.protocol_version,
-        );
+        self.state
+            .remove_one_time_signers_from_all_sources(
+                &signer_removal_hash,
+                &source_accounts,
+                self.protocol_version,
+            )
+            .map_err(|e| LedgerError::Internal(format!("signer removal error: {}", e)))?;
 
         // Flush all inner mutations (seq bump + signer removal) and capture delta.
         self.state.flush_modified_entries();

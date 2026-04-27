@@ -270,10 +270,10 @@ impl LedgerStateManager {
         tx_hash: &henyey_common::Hash256,
         source_accounts: &[AccountId],
         protocol_version: u32,
-    ) {
+    ) -> Result<()> {
         // Protocol 7 bypass (matches stellar-core behavior)
         if protocol_version == 7 {
-            return;
+            return Ok(());
         }
 
         // Create the pre-auth TX signer key from the transaction hash
@@ -282,82 +282,58 @@ impl LedgerStateManager {
 
         // Remove from each source account
         for account_id in source_accounts {
-            self.remove_account_signer(account_id, &signer_key);
+            self.remove_account_signer(account_id, &signer_key)?;
         }
+        Ok(())
     }
 
     /// Remove a specific signer from an account.
     ///
-    /// This handles the removal of any signer type and properly updates:
-    /// - The signers vector
-    /// - The num_sub_entries count
-    /// - The sponsorship tracking (if the signer was sponsored)
+    /// Uses a validate-then-mutate pattern to ensure atomicity: all fallible
+    /// checks (signer lookup, descriptor validation, sponsor account existence,
+    /// count preconditions) happen before any state mutations. This matches
+    /// stellar-core's `canRemoveSignerWith[out]Sponsorship` + `removeSignerWith[out]Sponsorship`
+    /// two-phase approach (`SponsorshipUtils.cpp:623-740`).
     ///
     /// # Returns
     ///
-    /// `true` if the signer was found and removed, `false` otherwise.
+    /// `Ok(true)` if the signer was found and removed, `Ok(false)` if the
+    /// signer was not found (or account doesn't exist), `Err` if the signer
+    /// exists but removal would leave inconsistent state (missing sponsor,
+    /// corrupt counts, descriptor mismatch).
     pub fn remove_account_signer(
         &mut self,
         account_id: &AccountId,
         signer_key: &stellar_xdr::curr::SignerKey,
-    ) -> bool {
-        // Get mutable access to the account
-        let Some(account) = self.get_account_mut(account_id) else {
-            return false; // Account may have been removed (e.g., by merge)
+    ) -> Result<bool> {
+        // ── Phase 1: Validate (fallible, no observable mutations) ────────
+
+        let Some(account) = self.get_account(account_id) else {
+            return Ok(false); // Account may have been removed (e.g., by merge)
         };
 
         // Find the signer index
         let signer_idx = account.signers.iter().position(|s| &s.key == signer_key);
-
         let Some(idx) = signer_idx else {
-            return false; // Signer not found
+            return Ok(false); // Signer not found
         };
 
-        // Remove the signer from the vec
-        let mut new_signers: Vec<stellar_xdr::curr::Signer> = account.signers.to_vec();
-        new_signers.remove(idx);
-        account.signers = new_signers.try_into().unwrap_or_default();
-
-        henyey_common::checked_types::dec_sub_entries(account, 1);
-
-        // Handle sponsorship cleanup if applicable
-        // The signer sponsorship is stored in the account's extension
-        self.remove_signer_sponsorship(account_id, idx);
-
-        true
-    }
-
-    /// Remove sponsorship tracking for a signer at the given index.
-    ///
-    /// When a signer is sponsored, the sponsoring account's ID is stored in
-    /// the account's `signer_sponsoring_i_ds` vector (in AccountEntryExtensionV2).
-    /// Removing a signer requires cleaning up this sponsorship relationship
-    /// and updating the sponsor's `num_sponsoring` count.
-    fn remove_signer_sponsorship(&mut self, account_id: &AccountId, signer_index: usize) {
-        let Some(account) = self.get_account(account_id) else {
-            return;
-        };
-
-        // Read ext v2 status and sponsor in one pass. The signer has already
-        // been removed from account.signers by the caller, so we expect
-        // ids.len() == signers.len() + 1 when vectors are properly aligned.
+        // Read ext v2 sponsorship metadata (immutable read — no mutations).
+        // The signer is still present, so descriptors.len() should equal
+        // signers.len() (one descriptor per signer, including the master key).
         let (has_ext_v2, sponsor_id) = match &account.ext {
             AccountEntryExt::V1(v1) => match &v1.ext {
                 AccountEntryExtensionV1Ext::V2(v2) => {
-                    let expected_len = account.signers.len() + 1;
-                    if v2.signer_sponsoring_i_ds.len() != expected_len {
-                        tracing::error!(
-                            "signer_sponsoring_i_ds length mismatch: \
-                             expected {} (signers {} + 1), got {}",
-                            expected_len,
-                            account.signers.len(),
+                    // Validate descriptor slot is in bounds — matches stellar-core's
+                    // `.at(n)` which throws out_of_range when n >= size().
+                    if idx >= v2.signer_sponsoring_i_ds.len() {
+                        return Err(TxError::Internal(format!(
+                            "signer descriptor out of bounds: index {} >= descriptors len {}",
+                            idx,
                             v2.signer_sponsoring_i_ds.len()
-                        );
+                        )));
                     }
-                    let sponsor = v2
-                        .signer_sponsoring_i_ds
-                        .get(signer_index)
-                        .and_then(|d| d.0.clone());
+                    let sponsor = v2.signer_sponsoring_i_ds[idx].0.clone();
                     (true, sponsor)
                 }
                 AccountEntryExtensionV1Ext::V0 => (false, None),
@@ -365,39 +341,113 @@ impl LedgerStateManager {
             AccountEntryExt::V0 => (false, None),
         };
 
-        // Update sponsorship counts only when there was an actual sponsor
-        if let Some(sponsor) = sponsor_id {
-            if let Err(e) = self.update_num_sponsoring(&sponsor, -1) {
-                tracing::warn!(
-                    "Failed to update num_sponsoring during signer removal: {}",
-                    e
-                );
+        // Validate sponsorship preconditions if the signer is sponsored.
+        // Matches stellar-core's `canRemoveSignerWithSponsorship`
+        // (SponsorshipUtils.cpp:633-652).
+        if let Some(ref sponsor) = sponsor_id {
+            // Pre-load sponsor account (idempotent lazy load from bucket list)
+            self.ensure_account_loaded(sponsor)?;
+
+            // Validate sponsor account exists
+            let sponsor_account = self.get_account(sponsor).ok_or_else(|| {
+                TxError::Internal("sponsor account missing during signer removal".to_string())
+            })?;
+
+            // Validate sponsor's num_sponsoring >= 1
+            let sponsor_num_sponsoring = match &sponsor_account.ext {
+                AccountEntryExt::V1(v1) => match &v1.ext {
+                    AccountEntryExtensionV1Ext::V2(v2) => v2.num_sponsoring,
+                    AccountEntryExtensionV1Ext::V0 => 0,
+                },
+                AccountEntryExt::V0 => 0,
+            };
+            if sponsor_num_sponsoring < 1 {
+                return Err(TxError::Internal(
+                    "invalid sponsoring account state: num_sponsoring < 1".to_string(),
+                ));
             }
-            if let Err(e) = self.update_num_sponsored(account_id, -1) {
-                tracing::warn!(
-                    "Failed to update num_sponsored during signer removal: {}",
-                    e
-                );
+
+            // Re-read the sponsored account (immutable borrow after ensure_account_loaded)
+            let account = self.get_account(account_id).ok_or_else(|| {
+                TxError::Internal("sponsored account disappeared during validation".to_string())
+            })?;
+
+            // Validate sponsored account's num_sub_entries >= 1 and num_sponsored >= 1
+            if account.num_sub_entries < 1 {
+                return Err(TxError::Internal(
+                    "invalid sponsored account state: num_sub_entries < 1".to_string(),
+                ));
+            }
+            let sponsored_num_sponsored = match &account.ext {
+                AccountEntryExt::V1(v1) => match &v1.ext {
+                    AccountEntryExtensionV1Ext::V2(v2) => v2.num_sponsored,
+                    AccountEntryExtensionV1Ext::V0 => 0,
+                },
+                AccountEntryExt::V0 => 0,
+            };
+            if sponsored_num_sponsored < 1 {
+                return Err(TxError::Internal(
+                    "invalid sponsored account state: num_sponsored < 1".to_string(),
+                ));
+            }
+        } else {
+            // Unsponsored signer: validate num_sub_entries >= 1
+            // Matches stellar-core's `canRemoveSignerWithoutSponsorship`
+            // (SponsorshipUtils.cpp:623-630).
+            let account = self.get_account(account_id).ok_or_else(|| {
+                TxError::Internal("account disappeared during validation".to_string())
+            })?;
+            if account.num_sub_entries < 1 {
+                return Err(TxError::Internal(
+                    "invalid account state: num_sub_entries < 1".to_string(),
+                ));
             }
         }
 
-        // Always remove the descriptor slot when ext v2 exists, regardless
-        // of whether the signer was sponsored. This matches stellar-core's
+        // ── Phase 2: Mutate (infallible — all preconditions verified) ────
+
+        // Update sponsorship counts if sponsored.
+        // Direct field writes — preconditions guarantee no underflow.
+        if let Some(ref sponsor) = sponsor_id {
+            // Decrement sponsor's num_sponsoring
+            if let Some(sponsor_account) = self.get_account_mut(sponsor) {
+                let ext = ensure_account_ext_v2(sponsor_account);
+                ext.num_sponsoring -= 1;
+            }
+
+            // Decrement account's num_sponsored
+            if let Some(account) = self.get_account_mut(account_id) {
+                let ext = ensure_account_ext_v2(account);
+                ext.num_sponsored -= 1;
+            }
+        }
+
+        // Remove the descriptor slot when ext v2 exists, regardless of
+        // whether the signer was sponsored. Matches stellar-core's
         // removeSignerWithoutSponsorship which unconditionally erases the
         // signerSponsoringIDs entry.
         if has_ext_v2 {
             if let Some(account) = self.get_account_mut(account_id) {
                 if let AccountEntryExt::V1(v1) = &mut account.ext {
                     if let AccountEntryExtensionV1Ext::V2(v2) = &mut v1.ext {
-                        if signer_index < v2.signer_sponsoring_i_ds.len() {
-                            let mut ids: Vec<_> = v2.signer_sponsoring_i_ds.to_vec();
-                            ids.remove(signer_index);
-                            v2.signer_sponsoring_i_ds = ids.try_into().unwrap_or_default();
-                        }
+                        let mut ids: Vec<_> = v2.signer_sponsoring_i_ds.to_vec();
+                        ids.remove(idx);
+                        v2.signer_sponsoring_i_ds = ids.try_into().unwrap_or_default();
                     }
                 }
             }
         }
+
+        // Remove the signer from the signers vec
+        if let Some(account) = self.get_account_mut(account_id) {
+            let mut new_signers: Vec<stellar_xdr::curr::Signer> = account.signers.to_vec();
+            new_signers.remove(idx);
+            account.signers = new_signers.try_into().unwrap_or_default();
+
+            henyey_common::checked_types::dec_sub_entries(account, 1);
+        }
+
+        Ok(true)
     }
 }
 
@@ -504,7 +554,9 @@ mod tests {
         );
         state.create_account(account);
 
-        let removed = state.remove_account_signer(&account_id, &signer.key);
+        let removed = state
+            .remove_account_signer(&account_id, &signer.key)
+            .unwrap();
         assert!(removed);
 
         let account = state.get_account(&account_id).unwrap();
@@ -546,7 +598,9 @@ mod tests {
         );
         state.create_account(sponsor);
 
-        let removed = state.remove_account_signer(&account_id, &signer.key);
+        let removed = state
+            .remove_account_signer(&account_id, &signer.key)
+            .unwrap();
         assert!(removed);
 
         let account = state.get_account(&account_id).unwrap();
@@ -588,7 +642,9 @@ mod tests {
         state.create_account(sponsor);
 
         // Remove the leading unsponsored signer
-        let removed = state.remove_account_signer(&account_id, &signer_a.key);
+        let removed = state
+            .remove_account_signer(&account_id, &signer_a.key)
+            .unwrap();
         assert!(removed);
 
         let account = state.get_account(&account_id).unwrap();
@@ -637,7 +693,9 @@ mod tests {
         );
         state.create_account(account);
 
-        state.remove_one_time_signers_from_all_sources(&tx_hash, &[account_id.clone()], 25);
+        state
+            .remove_one_time_signers_from_all_sources(&tx_hash, &[account_id.clone()], 25)
+            .unwrap();
 
         let account = state.get_account(&account_id).unwrap();
         assert_eq!(account.signers.len(), 0);
@@ -670,8 +728,11 @@ mod tests {
         );
         state.create_account(account);
 
-        // Must not panic
-        let removed = state.remove_account_signer(&account_id, &signer.key);
+        // Must not error — extra trailing descriptors are tolerated
+        // (only out-of-bounds access is a hard error)
+        let removed = state
+            .remove_account_signer(&account_id, &signer.key)
+            .unwrap();
         assert!(removed);
 
         let account = state.get_account(&account_id).unwrap();
@@ -679,5 +740,215 @@ mod tests {
         let v2 = get_ext_v2(account);
         // Best-effort: removed the descriptor at index 0, one stale slot remains
         assert_eq!(v2.signer_sponsoring_i_ds.len(), 1);
+    }
+
+    // ========================================================================
+    // Hard-error regression tests (issue #1976)
+    // ========================================================================
+
+    /// Removing a sponsored signer when sponsor account is missing must error,
+    /// and leave state completely unchanged (atomicity).
+    #[test]
+    fn test_remove_sponsored_signer_missing_sponsor_errors() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(60);
+        let sponsor_id = create_test_account_id(61);
+
+        let signer = make_signer(3, 1);
+        let account = create_account_with_signers_and_descriptors(
+            account_id.clone(),
+            vec![signer.clone()],
+            vec![SponsorshipDescriptor(Some(sponsor_id.clone()))],
+            1, // num_sub_entries
+            1, // num_sponsored
+            0,
+        );
+        state.create_account(account);
+        // Intentionally do NOT create the sponsor account
+
+        let result = state.remove_account_signer(&account_id, &signer.key);
+        assert!(
+            result.is_err(),
+            "must error when sponsor account is missing"
+        );
+
+        // Verify atomicity: nothing changed
+        let account = state.get_account(&account_id).unwrap();
+        assert_eq!(
+            account.signers.len(),
+            1,
+            "signer must not be removed on error"
+        );
+        assert_eq!(
+            account.num_sub_entries, 1,
+            "num_sub_entries must not change on error"
+        );
+        let v2 = get_ext_v2(account);
+        assert_eq!(
+            v2.num_sponsored, 1,
+            "num_sponsored must not change on error"
+        );
+        assert_eq!(
+            v2.signer_sponsoring_i_ds.len(),
+            1,
+            "descriptors must not change on error"
+        );
+    }
+
+    /// Descriptor out-of-bounds (signer_index >= descriptors.len()) must error.
+    #[test]
+    fn test_remove_signer_descriptor_out_of_bounds_errors() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(70);
+
+        let signer = make_signer(4, 1);
+        // Create account with ext v2 but EMPTY descriptor list — mismatch
+        let account = create_account_with_signers_and_descriptors(
+            account_id.clone(),
+            vec![signer.clone()],
+            vec![], // no descriptors — index 0 is out of bounds
+            1,
+            0,
+            0,
+        );
+        state.create_account(account);
+
+        let result = state.remove_account_signer(&account_id, &signer.key);
+        assert!(
+            result.is_err(),
+            "must error when descriptor index is out of bounds"
+        );
+
+        // Verify atomicity: nothing changed
+        let account = state.get_account(&account_id).unwrap();
+        assert_eq!(
+            account.signers.len(),
+            1,
+            "signer must not be removed on error"
+        );
+        assert_eq!(account.num_sub_entries, 1);
+    }
+
+    /// Zero num_sponsoring on sponsor when removing a sponsored signer must error.
+    #[test]
+    fn test_remove_sponsored_signer_zero_num_sponsoring_errors() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(80);
+        let sponsor_id = create_test_account_id(81);
+
+        let signer = make_signer(5, 1);
+        let account = create_account_with_signers_and_descriptors(
+            account_id.clone(),
+            vec![signer.clone()],
+            vec![SponsorshipDescriptor(Some(sponsor_id.clone()))],
+            1, // num_sub_entries
+            1, // num_sponsored
+            0,
+        );
+        state.create_account(account);
+
+        // Sponsor account exists but with num_sponsoring = 0 (corrupted state)
+        let sponsor = create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            0, // num_sponsoring = 0 — corrupt
+        );
+        state.create_account(sponsor);
+
+        let result = state.remove_account_signer(&account_id, &signer.key);
+        assert!(
+            result.is_err(),
+            "must error when sponsor num_sponsoring < 1"
+        );
+
+        // Verify atomicity: nothing changed
+        let account = state.get_account(&account_id).unwrap();
+        assert_eq!(account.signers.len(), 1);
+        assert_eq!(account.num_sub_entries, 1);
+        let v2 = get_ext_v2(account);
+        assert_eq!(v2.num_sponsored, 1);
+
+        let sponsor = state.get_account(&sponsor_id).unwrap();
+        let sv2 = get_ext_v2(sponsor);
+        assert_eq!(
+            sv2.num_sponsoring, 0,
+            "sponsor num_sponsoring must not change"
+        );
+    }
+
+    /// Zero num_sponsored on account when removing a sponsored signer must error.
+    #[test]
+    fn test_remove_sponsored_signer_zero_num_sponsored_errors() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(90);
+        let sponsor_id = create_test_account_id(91);
+
+        let signer = make_signer(6, 1);
+        let account = create_account_with_signers_and_descriptors(
+            account_id.clone(),
+            vec![signer.clone()],
+            vec![SponsorshipDescriptor(Some(sponsor_id.clone()))],
+            1, // num_sub_entries
+            0, // num_sponsored = 0 — corrupt
+            0,
+        );
+        state.create_account(account);
+
+        let sponsor = create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            1, // num_sponsoring = 1
+        );
+        state.create_account(sponsor);
+
+        let result = state.remove_account_signer(&account_id, &signer.key);
+        assert!(result.is_err(), "must error when account num_sponsored < 1");
+
+        // Verify atomicity: nothing changed
+        let account = state.get_account(&account_id).unwrap();
+        assert_eq!(account.signers.len(), 1);
+        let sponsor = state.get_account(&sponsor_id).unwrap();
+        let sv2 = get_ext_v2(sponsor);
+        assert_eq!(
+            sv2.num_sponsoring, 1,
+            "sponsor must not be decremented on error"
+        );
+    }
+
+    /// Error propagation through remove_one_time_signers_from_all_sources.
+    #[test]
+    fn test_remove_one_time_signers_propagates_error() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(100);
+        let sponsor_id = create_test_account_id(101);
+
+        let tx_hash = henyey_common::Hash256([0xCC; 32]);
+        let preauth_key = SignerKey::PreAuthTx(Uint256(tx_hash.0));
+        let signer = Signer {
+            key: preauth_key,
+            weight: 1,
+        };
+
+        let account = create_account_with_signers_and_descriptors(
+            account_id.clone(),
+            vec![signer],
+            vec![SponsorshipDescriptor(Some(sponsor_id.clone()))],
+            1, // num_sub_entries
+            1, // num_sponsored
+            0,
+        );
+        state.create_account(account);
+        // No sponsor account → error must propagate through the production entry point
+
+        let result =
+            state.remove_one_time_signers_from_all_sources(&tx_hash, &[account_id.clone()], 25);
+        assert!(
+            result.is_err(),
+            "error must propagate through remove_one_time_signers_from_all_sources"
+        );
     }
 }

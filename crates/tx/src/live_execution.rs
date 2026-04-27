@@ -617,7 +617,7 @@ pub fn remove_one_time_signers(
         .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
 
     for account_id in source_accounts {
-        state.remove_one_time_signers_from_all_sources(tx_hash, &[account_id], protocol_version);
+        state.remove_one_time_signers_from_all_sources(tx_hash, &[account_id], protocol_version)?;
     }
 
     Ok(())
@@ -683,23 +683,22 @@ pub fn apply_transaction(
     // For regular txs, a single pass with the tx hash covers everything.
     if frame.is_fee_bump() {
         // Fee-source signer removal with outer hash
-        if let Ok(outer_hash) = frame.hash(ctx.network_id()) {
-            let fee_source_id = frame.fee_source_account_id();
-            let protocol_version = ctx.protocol_version();
-            if let Some(state) = ctx.state_mut() {
-                state.remove_one_time_signers_from_all_sources(
-                    &outer_hash,
-                    &[fee_source_id],
-                    protocol_version,
-                );
-            }
+        let outer_hash = frame.hash(ctx.network_id())?;
+        let fee_source_id = frame.fee_source_account_id();
+        let protocol_version = ctx.protocol_version();
+        if let Some(state) = ctx.state_mut() {
+            state.remove_one_time_signers_from_all_sources(
+                &outer_hash,
+                &[fee_source_id],
+                protocol_version,
+            )?;
         }
         // Inner source signer removal with inner hash
-        if let Ok(inner_hash) = frame.inner_hash(ctx.network_id()) {
-            let _ = remove_one_time_signers(frame, ctx, &inner_hash);
-        }
-    } else if let Ok(hash) = frame.hash(ctx.network_id()) {
-        let _ = remove_one_time_signers(frame, ctx, &hash);
+        let inner_hash = frame.inner_hash(ctx.network_id())?;
+        remove_one_time_signers(frame, ctx, &inner_hash)?;
+    } else {
+        let hash = frame.hash(ctx.network_id())?;
+        remove_one_time_signers(frame, ctx, &hash)?;
     }
 
     Ok(tx_result)
