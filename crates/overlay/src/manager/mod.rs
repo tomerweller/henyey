@@ -52,7 +52,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stellar_xdr::curr::{
@@ -371,6 +371,9 @@ pub(super) struct SharedPeerState {
     pub(super) fetch_channel_depth_max: Arc<AtomicI64>,
     /// Shared overlay metrics counters.
     pub(super) metrics: Arc<OverlayMetrics>,
+    /// Per-peer query rate-limit window in whole seconds, updated by the app
+    /// layer after each ledger close. See `OverlayManager::set_query_rate_limit_window`.
+    pub(super) query_rate_limit_window_secs: Arc<AtomicU64>,
 }
 
 impl SharedPeerState {
@@ -583,6 +586,13 @@ pub struct OverlayManager {
     /// Overlay metrics counters. Shared with peer loops and exposed via
     /// `/metrics` as `stellar_overlay_*` gauges and counters.
     pub(super) metrics: Arc<OverlayMetrics>,
+    /// Per-peer query rate-limit window in whole seconds.
+    ///
+    /// stellar-core computes this as `expectedLedgerCloseTime * MAX_SLOTS_TO_REMEMBER`
+    /// (Peer.cpp:1426-1429), truncated to seconds. The app layer updates this
+    /// via [`set_query_rate_limit_window`] after each ledger close; peer tasks
+    /// read it through `SharedPeerState`.
+    pub(super) query_rate_limit_window_secs: Arc<AtomicU64>,
 }
 
 impl OverlayManager {
@@ -688,6 +698,7 @@ impl OverlayManager {
             fetch_channel_depth,
             fetch_channel_depth_max,
             metrics: Arc::new(OverlayMetrics::new()),
+            query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
         })
     }
 
@@ -719,6 +730,7 @@ impl OverlayManager {
             fetch_channel_depth: Arc::clone(&self.fetch_channel_depth),
             fetch_channel_depth_max: Arc::clone(&self.fetch_channel_depth_max),
             metrics: Arc::clone(&self.metrics),
+            query_rate_limit_window_secs: Arc::clone(&self.query_rate_limit_window_secs),
         }
     }
 
@@ -1167,6 +1179,17 @@ impl OverlayManager {
         self.is_tracking.store(tracking, Ordering::Relaxed);
     }
 
+    /// Update the per-peer query rate-limit window.
+    ///
+    /// The app layer should call this after each ledger close with the
+    /// result of `query_rate_limit_window(herder.ledger_close_duration())`.
+    /// Parity: stellar-core recomputes this per-call in `Peer::process()`
+    /// from `expectedLedgerCloseTime * MAX_SLOTS_TO_REMEMBER`.
+    pub fn set_query_rate_limit_window(&self, window: Duration) {
+        self.query_rate_limit_window_secs
+            .store(window.as_secs(), Ordering::Relaxed);
+    }
+
     /// Returns whether the node is currently tracking consensus.
     pub fn is_tracking(&self) -> bool {
         self.is_tracking.load(Ordering::Relaxed)
@@ -1499,6 +1522,37 @@ mod tests {
         assert_eq!(stats.outbound_peers, 0);
     }
 
+    #[test]
+    fn test_set_query_rate_limit_window_propagates_to_shared_state() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        // Default should be 60s (5s * 12).
+        let shared = manager.shared_state();
+        assert_eq!(
+            shared.query_rate_limit_window_secs.load(Ordering::Relaxed),
+            60
+        );
+
+        // Update via setter and verify SharedPeerState sees the new value.
+        manager.set_query_rate_limit_window(Duration::from_secs(54));
+        let shared2 = manager.shared_state();
+        assert_eq!(
+            shared2.query_rate_limit_window_secs.load(Ordering::Relaxed),
+            54
+        );
+
+        // The previously-cloned SharedPeerState should also see the update
+        // (same Arc).
+        assert_eq!(
+            shared.query_rate_limit_window_secs.load(Ordering::Relaxed),
+            54
+        );
+    }
+
     #[tokio::test]
     async fn test_subscribe_fetch_responses_returns_receiver_once() {
         let config = OverlayConfig::default();
@@ -1740,6 +1794,7 @@ mod tests {
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
             metrics: Arc::new(OverlayMetrics::new()),
+            query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
         }
     }
 
@@ -2249,6 +2304,7 @@ mod tests {
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
             metrics: Arc::new(OverlayMetrics::new()),
+            query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
         };
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
@@ -2330,6 +2386,7 @@ mod tests {
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
             metrics: Arc::new(OverlayMetrics::new()),
+            query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
         };
         (shared, broadcast_rx, fetch_rx)
     }

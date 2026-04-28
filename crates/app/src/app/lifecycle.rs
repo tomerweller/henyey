@@ -1157,6 +1157,14 @@ impl App {
             }
         }
 
+        // Set the initial per-peer query rate-limit window from the current
+        // ledger close duration before the overlay starts accepting messages.
+        // Parity: stellar-core's Peer::process() reads the dynamic close time
+        // on every call (Peer.cpp:1426-1429).
+        overlay.set_query_rate_limit_window(query_rate_limit_window(
+            self.herder.ledger_close_duration(),
+        ));
+
         overlay.start().await?;
 
         let peer_count = overlay.peer_count();

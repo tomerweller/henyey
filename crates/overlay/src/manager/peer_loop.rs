@@ -703,20 +703,20 @@ impl OverlayManager {
         }
 
         // Per-peer query rate limit (parity: Peer.cpp:1423-1438).
-        // stellar-core's window = expectedLedgerCloseTime * MAX_SLOTS_TO_REMEMBER.
+        // stellar-core's window = expectedLedgerCloseTime * MAX_SLOTS_TO_REMEMBER,
+        // recomputed dynamically. The app layer updates the atomic after each
+        // ledger close via OverlayManager::set_query_rate_limit_window().
         {
-            const EXPECTED_LEDGER_CLOSE_SECS: u64 = 5;
-            const MAX_SLOTS_TO_REMEMBER: u64 = 12;
-            const QUERY_WINDOW: Duration =
-                Duration::from_secs(EXPECTED_LEDGER_CLOSE_SECS * MAX_SLOTS_TO_REMEMBER);
+            let window_secs = state.query_rate_limit_window_secs.load(Ordering::Relaxed);
+            let query_window = Duration::from_secs(window_secs);
             let allowed = match message {
                 StellarMessage::GetTxSet(_) => {
-                    ctx.query_limiter.tx_set.check_and_increment(QUERY_WINDOW)
+                    ctx.query_limiter.tx_set.check_and_increment(query_window)
                 }
                 StellarMessage::GetScpQuorumset(_) => ctx
                     .query_limiter
                     .quorum_set
-                    .check_and_increment(QUERY_WINDOW),
+                    .check_and_increment(query_window),
                 _ => true,
             };
             if !allowed {
