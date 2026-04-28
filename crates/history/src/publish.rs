@@ -443,11 +443,16 @@ impl PublishManager {
         })();
 
         match result {
-            Ok(()) => {
-                durable_rename(&tmp_path, &final_path)?;
-                debug!("Wrote {} {} to {:?}", items.len(), label, final_path);
-                Ok(())
-            }
+            Ok(()) => match durable_rename(&tmp_path, &final_path) {
+                Ok(()) => {
+                    debug!("Wrote {} {} to {:?}", items.len(), label, final_path);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    Err(e.into())
+                }
+            },
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp_path);
                 Err(e)
@@ -516,11 +521,16 @@ impl PublishManager {
         })();
 
         match result {
-            Ok(()) => {
-                durable_rename(&tmp_path, path)?;
-                debug!("Wrote bucket to {:?}", path);
-                Ok(())
-            }
+            Ok(()) => match durable_rename(&tmp_path, path) {
+                Ok(()) => {
+                    debug!("Wrote bucket to {:?}", path);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    Err(e.into())
+                }
+            },
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp_path);
                 Err(e)
@@ -551,11 +561,16 @@ impl PublishManager {
         })();
 
         match result {
-            Ok(()) => {
-                durable_rename(&tmp_path, path)?;
-                debug!("Wrote HAS to {:?}", path);
-                Ok(())
-            }
+            Ok(()) => match durable_rename(&tmp_path, path) {
+                Ok(()) => {
+                    debug!("Wrote HAS to {:?}", path);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    Err(e.into())
+                }
+            },
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp_path);
                 Err(e)
@@ -1314,5 +1329,68 @@ mod tests {
             content.is_empty(),
             "empty items should produce empty decompressed content"
         );
+    }
+
+    #[test]
+    fn test_write_bucket_from_entries_atomic() {
+        let temp = TempDir::new().unwrap();
+        let config = PublishConfig {
+            local_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let manager = PublishManager::new(config);
+
+        let bucket = henyey_bucket::Bucket::empty();
+        let bucket_path = temp.path().join("bucket/00/00/00/bucket-empty.xdr.gz");
+
+        manager
+            .write_bucket_from_entries(&bucket_path, &bucket)
+            .unwrap();
+
+        // Final file exists
+        assert!(bucket_path.exists());
+
+        // No temp files remain
+        let parent = bucket_path.parent().unwrap();
+        let tmp_files: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            tmp_files.is_empty(),
+            "no .tmp files should remain after successful write"
+        );
+
+        // File is valid gzip
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let file = std::fs::File::open(&bucket_path).unwrap();
+        let mut decoder = GzDecoder::new(file);
+        let mut content = Vec::new();
+        decoder.read_to_end(&mut content).unwrap();
+    }
+
+    #[test]
+    fn test_write_bucket_from_entries_skips_existing() {
+        let temp = TempDir::new().unwrap();
+        let config = PublishConfig {
+            local_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let manager = PublishManager::new(config);
+
+        let bucket_path = temp.path().join("bucket/00/00/00/bucket-existing.xdr.gz");
+        std::fs::create_dir_all(bucket_path.parent().unwrap()).unwrap();
+        std::fs::write(&bucket_path, b"pre-existing content").unwrap();
+
+        let bucket = henyey_bucket::Bucket::empty();
+        manager
+            .write_bucket_from_entries(&bucket_path, &bucket)
+            .unwrap();
+
+        // File was NOT overwritten
+        let content = std::fs::read(&bucket_path).unwrap();
+        assert_eq!(content, b"pre-existing content");
     }
 }
