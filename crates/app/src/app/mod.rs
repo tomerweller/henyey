@@ -1519,16 +1519,16 @@ impl App {
         }
     }
 
-    pub fn target_ledger_close_time(&self) -> u32 {
-        self.herder.ledger_close_time()
+    pub fn target_ledger_close_duration(&self) -> Duration {
+        self.herder.ledger_close_duration()
     }
 
-    /// Expected time of the next ledger close.
+    /// Expected Unix timestamp (seconds) of the next ledger close.
     ///
-    /// Returns `tracking_consensus_close_time + ledger_close_time` (seconds).
+    /// Returns `tracking_consensus_close_time + ledger_close_duration.as_secs()`.
     /// Used by simulation to predict when the next close should occur.
-    pub fn expected_ledger_close_time(&self) -> u64 {
-        self.herder.tracking_consensus_close_time() + self.herder.ledger_close_time() as u64
+    pub fn expected_next_ledger_close_unix_secs(&self) -> u64 {
+        self.herder.tracking_consensus_close_time() + self.herder.ledger_close_duration().as_secs()
     }
 
     pub async fn peer_count(&self) -> usize {

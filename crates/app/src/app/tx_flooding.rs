@@ -88,7 +88,7 @@ impl App {
             self.config.overlay.flood_op_rate_per_ledger,
             self.herder.max_tx_set_size(),
             self.config.overlay.flood_advert_period_ms,
-            self.herder.ledger_close_time_ms(),
+            self.herder.ledger_close_duration().as_millis() as u64,
         );
         let carryover = self.broadcast_op_carryover.load(Ordering::Relaxed);
         add_flood_carryover(base_budget, carryover)
@@ -107,7 +107,7 @@ impl App {
             self.config.overlay.flood_op_rate_per_ledger,
             effective_dex_ops,
             self.config.overlay.flood_advert_period_ms,
-            self.herder.ledger_close_time_ms(),
+            self.herder.ledger_close_duration().as_millis() as u64,
         );
         let carryover = self.broadcast_dex_op_carryover.load(Ordering::Relaxed);
         Some(add_flood_carryover(base, carryover))
@@ -286,7 +286,7 @@ impl App {
             self.config.overlay.flood_op_rate_per_ledger,
             self.herder.max_tx_set_size(),
             self.config.overlay.flood_advert_period_ms,
-            self.herder.ledger_close_time_ms(),
+            self.herder.ledger_close_duration().as_millis() as u64,
         );
         per_period.clamp(1, TX_ADVERT_VECTOR_MAX_SIZE)
     }
@@ -296,7 +296,7 @@ impl App {
             self.config.overlay.flood_op_rate_per_ledger,
             self.herder.max_queue_size_ops(),
             self.config.overlay.flood_demand_period_ms,
-            self.herder.ledger_close_time_ms(),
+            self.herder.ledger_close_duration().as_millis() as u64,
         );
         per_period.clamp(1, TX_DEMAND_VECTOR_MAX_SIZE)
     }

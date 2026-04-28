@@ -819,7 +819,7 @@ impl App {
             header.base_fee,
             header.base_reserve,
             ledger_flags,
-            self.herder.ledger_close_time_ms(),
+            self.herder.ledger_close_duration().as_millis() as u64,
         );
 
         // Seed Soroban per-tx limits and dynamic resource limits from network config.
@@ -2283,7 +2283,7 @@ impl App {
             // latency; `upper_bound_offset` is denominated in whole
             // seconds and feeds no hash, so the semantics are preserved.
             const EXPECTED_CLOSE_TIME_MULT: u64 = 2;
-            let expected_close_secs = herder.ledger_close_time() as u64;
+            let expected_close_secs = herder.ledger_close_duration().as_secs();
             let wall_now = clock
                 .system_now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2323,7 +2323,7 @@ impl App {
                 base_fee,
                 base_reserve,
                 ledger_flags,
-                herder.ledger_close_time_ms(),
+                herder.ledger_close_duration().as_millis() as u64,
             );
             if let Some(q) = queue_limit {
                 herder.tx_queue().update_soroban_resource_limits(q);

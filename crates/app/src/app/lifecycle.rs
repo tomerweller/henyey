@@ -12,8 +12,8 @@ const MAX_SLOTS_TO_REMEMBER: u64 = 12;
 /// then truncates to whole seconds with `duration_cast<std::chrono::seconds>`.
 /// We replicate that exact sequence: multiply in ms first, then integer-divide
 /// by 1000 to truncate.
-pub(crate) fn query_rate_limit_window(close_time_ms: u64) -> Duration {
-    let total_ms = close_time_ms * MAX_SLOTS_TO_REMEMBER;
+pub(crate) fn query_rate_limit_window(close_duration: Duration) -> Duration {
+    let total_ms = close_duration.as_millis() as u64 * MAX_SLOTS_TO_REMEMBER;
     Duration::from_secs(total_ms / 1000)
 }
 
@@ -1617,7 +1617,7 @@ impl App {
 
     /// Compute the standard per-peer rate-limit window.
     fn rate_limit_window(&self) -> Duration {
-        query_rate_limit_window(self.herder.ledger_close_time_ms())
+        query_rate_limit_window(self.herder.ledger_close_duration())
     }
 
     /// Check per-peer rate limit. Returns true if the request is allowed.
@@ -2168,7 +2168,7 @@ mod rate_limit_tests {
     fn test_query_rate_limit_window_4500ms() {
         // Bug case: premature truncation gave 4s * 12 = 48s.
         // Correct: 4500 * 12 = 54000ms / 1000 = 54s.
-        let window = query_rate_limit_window(4500);
+        let window = query_rate_limit_window(Duration::from_millis(4500));
         assert_eq!(window, Duration::from_secs(54));
         assert_eq!(window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER, 270);
     }
@@ -2176,7 +2176,7 @@ mod rate_limit_tests {
     #[test]
     fn test_query_rate_limit_window_4300ms() {
         // Non-round: 4300 * 12 = 51600ms / 1000 = 51s (truncation after multiply).
-        let window = query_rate_limit_window(4300);
+        let window = query_rate_limit_window(Duration::from_millis(4300));
         assert_eq!(window, Duration::from_secs(51));
         assert_eq!(window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER, 255);
     }
@@ -2185,7 +2185,7 @@ mod rate_limit_tests {
     fn test_query_rate_limit_window_4999ms() {
         // Boundary: 4999 * 12 = 59988ms / 1000 = 59s.
         // Proves truncation happens after multiplication, not before.
-        let window = query_rate_limit_window(4999);
+        let window = query_rate_limit_window(Duration::from_millis(4999));
         assert_eq!(window, Duration::from_secs(59));
         assert_eq!(window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER, 295);
     }
@@ -2193,7 +2193,7 @@ mod rate_limit_tests {
     #[test]
     fn test_query_rate_limit_window_5000ms() {
         // Standard/fallback: 5000 * 12 = 60000ms / 1000 = 60s.
-        let window = query_rate_limit_window(5000);
+        let window = query_rate_limit_window(Duration::from_secs(5));
         assert_eq!(window, Duration::from_secs(60));
         assert_eq!(window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER, 300);
     }

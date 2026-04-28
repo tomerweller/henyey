@@ -55,6 +55,7 @@ use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use stellar_xdr::curr::{
     AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId, ExtensionPoint,
     GeneralizedTransactionSet, Hash, LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaExtV1,
@@ -2487,17 +2488,17 @@ impl LedgerManager {
     ///
     /// Both the header and soroban_network_info are read under a single state
     /// lock to avoid races during ledger close.
-    pub fn expected_ledger_close_time_ms(&self) -> u64 {
+    pub fn expected_ledger_close_duration(&self) -> Duration {
         let state = self.state.read();
         if protocol_version_starts_from(state.header.ledger_version, ProtocolVersion::V23) {
             if let Some(ref info) = state.soroban_network_info {
                 if info.ledger_target_close_time_ms > 0 {
-                    return info.ledger_target_close_time_ms as u64;
+                    return Duration::from_millis(info.ledger_target_close_time_ms as u64);
                 }
             }
         }
         // Pre-v23 fallback: TARGET_LEDGER_CLOSE_TIME_BEFORE_PROTOCOL_VERSION_23_MS
-        5000
+        Duration::from_secs(5)
     }
 
     /// Compute `SorobanNetworkInfo` from the current bucket-list state.

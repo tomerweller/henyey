@@ -455,14 +455,14 @@ impl Simulation {
         Ok(())
     }
 
-    /// Get the expected next ledger close time for an app node.
+    /// Get the expected Unix timestamp (seconds) of the next ledger close for a node.
     ///
-    /// Returns `tracking_consensus_close_time + ledger_close_time`.
+    /// Returns `tracking_consensus_close_time + ledger_close_duration.as_secs()`.
     /// Matches stellar-core's expected close time calculation used in
     /// various `crankUntil` calls.
-    pub fn expected_ledger_close_time(&self, node_id: &str) -> Option<u64> {
+    pub fn expected_next_ledger_close_unix_secs(&self, node_id: &str) -> Option<u64> {
         let app = self.running_apps.get(node_id)?;
-        Some(app.app.expected_ledger_close_time())
+        Some(app.app.expected_next_ledger_close_unix_secs())
     }
 
     /// Check whether Soroban upgrade setup has completed.

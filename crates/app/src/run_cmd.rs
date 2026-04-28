@@ -501,7 +501,7 @@ async fn check_needs_catchup(app: &App, options: &RunOptions) -> anyhow::Result<
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let target_close_time = app.target_ledger_close_time() as u64;
+    let target_close_time = app.target_ledger_close_duration().as_secs();
     let max_age_seconds = target_close_time.saturating_mul(options.max_ledger_age as u64);
     Ok(is_ledger_too_old(close_time, now, max_age_seconds))
 }
