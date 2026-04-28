@@ -50,7 +50,7 @@ use crate::{
     paths, verify, HistoryError, Result,
 };
 use henyey_bucket::{BucketList, PendingMergeState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
-use henyey_common::fs_utils::{durable_rename, temp_path};
+use henyey_common::fs_utils::{atomic_write_bytes, atomic_write_with};
 use henyey_common::Hash256;
 use std::path::{Path, PathBuf};
 use stellar_xdr::curr::{
@@ -408,38 +408,19 @@ impl PublishManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = temp_path(&final_path);
-        let result = (|| -> Result<()> {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
-            let mut encoder = GzEncoder::new(file, Compression::default());
+        atomic_write_with(&final_path, |file| {
+            let mut encoder = GzEncoder::new(&mut *file, Compression::default());
 
             for item in items {
                 write_record_marked_xdr(&mut encoder, item)?;
             }
 
-            encoder.finish()?.sync_all()?;
+            encoder.finish()?;
             Ok(())
-        })();
+        })?;
 
-        match result {
-            Ok(()) => match durable_rename(&tmp_path, &final_path) {
-                Ok(()) => {
-                    debug!("Wrote {} {} to {:?}", items.len(), label, final_path);
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    Err(e.into())
-                }
-            },
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                Err(e)
-            }
-        }
+        debug!("Wrote {} {} to {:?}", items.len(), label, final_path);
+        Ok(())
     }
 
     /// Write a bucket to the history archive as a gzip-compressed file.
@@ -466,13 +447,8 @@ impl PublishManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = temp_path(path);
-        let result = (|| -> Result<()> {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
-            let mut encoder = GzEncoder::new(file, Compression::default());
+        atomic_write_with(path, |file| {
+            let mut encoder = GzEncoder::new(&mut *file, Compression::default());
 
             if let Some(backing_path) = bucket.backing_file_path() {
                 // Fast path: gzip-compress the existing .bucket.xdr file directly.
@@ -490,40 +466,25 @@ impl PublishManager {
                 // Fallback: serialize entries with RFC 5531 record marks
                 for entry_result in bucket
                     .iter()
-                    .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
                 {
-                    let entry = entry_result
-                        .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
+                    let entry = entry_result.map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    })?;
                     write_record_marked_xdr(&mut encoder, &entry)?;
                 }
             }
 
-            encoder.finish()?.sync_all()?;
+            encoder.finish()?;
             Ok(())
-        })();
+        })?;
 
-        match result {
-            Ok(()) => match durable_rename(&tmp_path, path) {
-                Ok(()) => {
-                    debug!("Wrote bucket to {:?}", path);
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    Err(e.into())
-                }
-            },
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                Err(e)
-            }
-        }
+        debug!("Wrote bucket to {:?}", path);
+        Ok(())
     }
 
     /// Write a History Archive State file.
     fn write_has(&self, path: &Path, has: &HistoryArchiveState) -> Result<()> {
-        use std::io::Write;
-
         let json = serde_json::to_string_pretty(has)
             .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
 
@@ -531,33 +492,10 @@ impl PublishManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = temp_path(path);
-        let result = (|| -> Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        })();
+        atomic_write_bytes(path, json.as_bytes())?;
 
-        match result {
-            Ok(()) => match durable_rename(&tmp_path, path) {
-                Ok(()) => {
-                    debug!("Wrote HAS to {:?}", path);
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    Err(e.into())
-                }
-            },
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                Err(e)
-            }
-        }
+        debug!("Wrote HAS to {:?}", path);
+        Ok(())
     }
 
     /// Create a History Archive State from checkpoint data.
@@ -1212,6 +1150,7 @@ mod tests {
 
     #[test]
     fn test_temp_path_uniqueness() {
+        use henyey_common::fs_utils::temp_path;
         let base = Path::new("/tmp/bucket-abc123.xdr.gz");
         let p1 = temp_path(base);
         let p2 = temp_path(base);

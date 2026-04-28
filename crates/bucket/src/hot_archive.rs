@@ -481,16 +481,17 @@ impl HotArchiveBucket {
         match &self.storage {
             HotArchiveStorage::InMemory { .. } => {
                 let bytes = self.to_xdr_bytes()?;
-                let mut file = std::fs::File::create(&path)?;
-                use std::io::Write;
-                file.write_all(&bytes)?;
-                file.sync_all()?;
+                henyey_common::fs_utils::atomic_write_bytes(&path, &bytes)?;
             }
             HotArchiveStorage::DiskBacked {
                 path: source_path, ..
             } => {
                 if source_path != &path {
-                    std::fs::copy(source_path, &path)?;
+                    henyey_common::fs_utils::atomic_write_with(&path, |file| {
+                        let mut src = std::fs::File::open(source_path)?;
+                        std::io::copy(&mut src, file)?;
+                        Ok(())
+                    })?;
                 }
             }
         }

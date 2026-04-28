@@ -676,9 +676,7 @@ mod tests {
         .unwrap();
         write_root_has(tmp.path(), &has).unwrap();
 
-        let root_path = tmp
-            .path()
-            .join(henyey_history::paths::root_has_path());
+        let root_path = tmp.path().join(henyey_history::paths::root_has_path());
         assert!(root_path.exists(), "root HAS file should be written");
 
         // Verify it's valid JSON matching the original HAS

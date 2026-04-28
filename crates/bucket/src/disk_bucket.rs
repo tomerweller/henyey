@@ -391,16 +391,10 @@ impl DiskBucket {
         save_path: impl AsRef<Path>,
         bloom_seed: HashSeed,
     ) -> Result<Self> {
-        use std::io::Write;
-
         let save_path = save_path.as_ref();
 
-        // Save to disk first
-        {
-            let mut file = File::create(save_path)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-        }
+        // Save to disk atomically first
+        henyey_common::fs_utils::atomic_write_bytes(save_path, bytes)?;
 
         // Build index by streaming the saved file. If validation fails, remove
         // the just-written file so malformed caller-provided bytes are not left

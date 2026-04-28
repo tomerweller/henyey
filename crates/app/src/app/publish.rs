@@ -236,8 +236,7 @@ impl App {
                         use flate2::Compression;
                         use std::io::{Read, Write};
                         henyey_common::fs_utils::atomic_write_with(&dest, |file| {
-                            let mut encoder =
-                                GzEncoder::new(&mut *file, Compression::default());
+                            let mut encoder = GzEncoder::new(&mut *file, Compression::default());
                             let mut src_file = std::fs::File::open(&src)?;
                             let mut buf = [0u8; 64 * 1024];
                             loop {
@@ -856,7 +855,11 @@ mod tests {
         assert!(bytes.len() > 4);
 
         let mark = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
-        assert_ne!(mark & 0x8000_0000, 0, "high bit must be set for record mark");
+        assert_ne!(
+            mark & 0x8000_0000,
+            0,
+            "high bit must be set for record mark"
+        );
 
         // No temp files
         assert_eq!(

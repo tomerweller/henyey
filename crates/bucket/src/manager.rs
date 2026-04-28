@@ -762,13 +762,10 @@ impl BucketManager {
         // Save raw XDR bytes to disk if not already there
         let path = self.bucket_path(&hash);
         if !path.exists() {
-            use std::io::Write;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(xdr_bytes)?;
-            file.sync_all()?;
+            henyey_common::fs_utils::atomic_write_bytes(&path, xdr_bytes)?;
         }
 
         // Load via threshold-aware path (DiskBacked for large, InMemory for small)

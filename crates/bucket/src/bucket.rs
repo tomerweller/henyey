@@ -31,7 +31,6 @@
 //! fresh for each operation to avoid contention.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -569,24 +568,17 @@ impl Bucket {
             BucketStorage::InMemory { entries, .. } => {
                 // Serialize entries to uncompressed XDR with record marks
                 let uncompressed = Self::serialize_entries(entries)?;
-
-                // Write directly (no compression).
-                // IMPORTANT: if the write or sync fails (e.g. disk full), we must
-                // remove the file we just created.  A zero-byte or truncated file
-                // at the canonical path would corrupt any future merge that
-                // produces the same content hash and tries to reuse the file.
-                let mut file = std::fs::File::create(&path)?;
-                let write_result = file.write_all(&uncompressed).and_then(|_| file.sync_all());
-                if let Err(e) = write_result {
-                    let _ = std::fs::remove_file(&path);
-                    return Err(BucketError::Io(e));
-                }
+                henyey_common::fs_utils::atomic_write_bytes(&path, &uncompressed)?;
             }
             BucketStorage::DiskBacked { disk_bucket } => {
                 // For disk-backed buckets, the file is already uncompressed XDR
                 let source = disk_bucket.file_path();
                 if source != path {
-                    std::fs::copy(source, &path)?;
+                    henyey_common::fs_utils::atomic_write_with(&path, |file| {
+                        let mut src = std::fs::File::open(source)?;
+                        std::io::copy(&mut src, file)?;
+                        Ok(())
+                    })?;
                 }
             }
         }
@@ -611,6 +603,7 @@ impl Bucket {
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
+        use std::io::Write;
 
         let path = path.as_ref().to_path_buf();
 
