@@ -17,7 +17,7 @@
 | PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache; release-up-to drain now matches `processSCPQueueUpToIndex`; intra-slot LIFO ordering now matches `pop()` |
 | QuorumTracker | Full | expand, rebuild, closest validators |
 | TransactionQueue | Partial | Missing arb damping; fee release and drop now implemented |
-| TxQueueLimiter | Partial | Missing visitTopTxs with custom limits |
+| TxQueueLimiter | Partial | `visitTopTxs` custom limits implemented; missing total flood resource tracking |
 | TxSetFrame / ApplicableTxSetFrame | Partial | No ApplicableTxSetFrame abstraction |
 | SurgePricingUtils | Full | All lane configs and priority queue; `erase()` guard matches `releaseAssert(res <= mLaneCurrentCount[lane])` |
 | Upgrades / ConfigUpgradeSetFrame | Partial | `isConsistentWith`, `encodeAsString`, `toJson` not implemented; proposal gating via `ConfigUpgradeContext` is now at parity |
@@ -326,7 +326,7 @@ Corresponds to: `TxQueueLimiter.h`
 | `canAddTx()` | `can_add_tx()` | Full |
 | `resetEvictionState()` | `reset_eviction_state()` | Full |
 | `reset()` | `reset()` | Full |
-| `visitTopTxs()` | `visit_top_txs()` | Partial |
+| `visitTopTxs()` | `visit_top_txs()` | Full |
 | `getTotalResourcesToFlood()` | _(not implemented)_ | None |
 | `resetBestFeeTxs()` | `reset_best_fee_txs()` | Full |
 | `markTxForFlood()` | `mark_tx_for_flood()` | Full |
@@ -499,7 +499,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `TxSetXDRFrame::makeFromHistoryTransactions()` | Low | History tx set construction |
 | `TxSetXDRFrame::encodedSize()` | Low | Wire size calculation |
 | `TxSetUtils::sortParallelTxsInHashOrder()` | Low | Parallel stage sorting |
-| `visitTopTxs()` with custom limits | Low | TxQueueLimiter custom limits |
 | `maxScaledLedgerResources()` | Low | Removed during simplification; re-add if needed |
 | `getTotalResourcesToFlood()` | Low | Flood resource tracking |
 | `stateChanged()` | Low | SCP state change callback |

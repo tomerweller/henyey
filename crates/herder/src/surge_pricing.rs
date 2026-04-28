@@ -212,6 +212,58 @@ impl SurgePricingLaneConfig for OpsOnlyLaneConfig {
     }
 }
 
+/// Operation-only lane configuration for flood traversal.
+///
+/// Flood budgets are expressed in operations, regardless of the queue admission
+/// limits currently configured for classic bytes or Soroban resources.
+pub(crate) struct FloodLaneConfig {
+    lane_limits: Vec<Resource>,
+    has_dex_lane: bool,
+}
+
+impl FloodLaneConfig {
+    pub(crate) fn new(has_dex_lane: bool) -> Self {
+        let mut lane_limits = vec![Resource::new(vec![i64::MAX])];
+        if has_dex_lane {
+            lane_limits.push(Resource::new(vec![i64::MAX]));
+        }
+        Self {
+            lane_limits,
+            has_dex_lane,
+        }
+    }
+}
+
+impl SurgePricingLaneConfig for FloodLaneConfig {
+    fn get_lane(&self, env: &TransactionEnvelope) -> usize {
+        if self.has_dex_lane && has_dex_operations_envelope(env) {
+            DEX_LANE
+        } else {
+            GENERIC_LANE
+        }
+    }
+
+    fn lane_limits(&self) -> &[Resource] {
+        &self.lane_limits
+    }
+
+    fn tx_resources(&self, env: &TransactionEnvelope, _ledger_version: u32) -> Resource {
+        let ops = i64::try_from(envelope_operation_count(env))
+            .expect("flood operation count exceeds i64::MAX")
+            .max(1);
+        Resource::new(vec![ops])
+    }
+
+    fn update_generic_lane_limit(&mut self, limit: Resource) {
+        assert_eq!(
+            limit.size(),
+            self.lane_limits[GENERIC_LANE].size(),
+            "flood generic lane limit dimension mismatch"
+        );
+        self.lane_limits[GENERIC_LANE] = limit;
+    }
+}
+
 /// Exclusion context for `can_fit_with_eviction`.
 ///
 /// When checking whether a candidate tx fits in a persistent eviction queue,
@@ -493,8 +545,27 @@ impl SurgePricingPriorityQueue {
         allow_gaps: bool,
         ledger_version: u32,
         mut visitor: impl FnMut(&QueuedTransaction) -> VisitTxResult,
+        custom_limits: Option<&[Resource]>,
     ) -> PopResult {
-        let mut lane_left_until_limit = self.lane_limits.clone();
+        let mut lane_left_until_limit = if let Some(limits) = custom_limits {
+            assert_eq!(
+                limits.len(),
+                self.lane_limits.len(),
+                "custom flood limits lane count must match queue lane count"
+            );
+            for (lane, (custom, configured)) in
+                limits.iter().zip(self.lane_limits.iter()).enumerate()
+            {
+                assert_eq!(
+                    custom.size(),
+                    configured.size(),
+                    "custom flood limit dimension mismatch for lane {lane}"
+                );
+            }
+            limits.to_vec()
+        } else {
+            self.lane_limits.clone()
+        };
         let mut lane_active = vec![true; self.lane_limits.len()];
 
         loop {

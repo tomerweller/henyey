@@ -16,8 +16,8 @@
 use henyey_common::Resource;
 
 use crate::surge_pricing::{
-    DexLimitingLaneConfig, QueueEntry, SorobanGenericLaneConfig, SurgePricingLaneConfig,
-    SurgePricingPriorityQueue, VisitTxResult, GENERIC_LANE,
+    DexLimitingLaneConfig, FloodLaneConfig, QueueEntry, SorobanGenericLaneConfig,
+    SurgePricingLaneConfig, SurgePricingPriorityQueue, VisitTxResult, GENERIC_LANE,
 };
 use crate::tx_queue::{fee_rate_cmp, QueuedTransaction};
 
@@ -154,6 +154,26 @@ impl TxQueueLimiter {
             txs: None,
             lane_config: None,
             txs_to_flood: None,
+            lane_evicted_inclusion_fee: Vec::new(),
+        }
+    }
+
+    /// Create a temporary operation-only limiter for flood traversal.
+    ///
+    /// The internal flood queue is initialized immediately because
+    /// `visit_top_txs` destructively drains it. Callers that need
+    /// non-destructive behavior should build a fresh limiter per traversal.
+    pub(crate) fn new_flood(has_dex_lane: bool, seed: u64) -> Self {
+        Self {
+            max_resources: Resource::new(vec![i64::MAX]),
+            is_soroban: false,
+            max_dex_operations: None,
+            txs: None,
+            lane_config: None,
+            txs_to_flood: Some(SurgePricingPriorityQueue::new(
+                Box::new(FloodLaneConfig::new(has_dex_lane)),
+                seed,
+            )),
             lane_evicted_inclusion_fee: Vec::new(),
         }
     }
@@ -430,22 +450,28 @@ impl TxQueueLimiter {
 
     /// Mark a transaction for flooding.
     pub fn mark_tx_for_flood(&mut self, tx: &QueuedTransaction, ledger_version: u32) {
-        if let Some(ref mut flood) = self.txs_to_flood {
-            flood.add(tx.clone(), ledger_version);
-        }
+        let flood = self
+            .txs_to_flood
+            .as_mut()
+            .expect("mark_tx_for_flood requires an initialized flood queue");
+        flood.add(tx.clone(), ledger_version);
     }
 
     /// Visit transactions in priority order for flooding.
+    ///
+    /// This destructively drains the limiter's internal flood queue. Use a
+    /// fresh flood limiter for non-destructive transaction-queue reads.
     pub fn visit_top_txs<F>(
         &mut self,
         mut visitor: F,
         lane_resources_left: &mut Vec<Resource>,
         ledger_version: u32,
+        custom_limits: Option<&[Resource]>,
     ) where
         F: FnMut(&QueuedTransaction) -> VisitTxResult,
     {
         if let Some(ref mut flood) = self.txs_to_flood {
-            let result = flood.pop_top_txs(false, ledger_version, |tx| visitor(tx));
+            let result = flood.pop_top_txs(false, ledger_version, |tx| visitor(tx), custom_limits);
             *lane_resources_left = result.lane_left_until_limit;
         }
     }
@@ -562,6 +588,73 @@ mod tests {
 
         // Should be able to add with eviction
         assert!(can_add);
+    }
+
+    #[test]
+    #[should_panic(expected = "mark_tx_for_flood requires an initialized flood queue")]
+    fn test_mark_tx_for_flood_requires_initialized_queue() {
+        let max_resources = Resource::new(vec![10]);
+        let mut limiter = TxQueueLimiter::new(1, max_resources, false, None);
+        let tx = make_test_tx(100, 1, 1);
+
+        limiter.mark_tx_for_flood(&tx, 25);
+    }
+
+    #[test]
+    fn test_flood_limiter_visits_marked_transactions() {
+        let mut limiter = TxQueueLimiter::new_flood(false, 0);
+        let tx = make_test_tx(100, 1, 1);
+        let limits = vec![Resource::new(vec![1])];
+        let mut remaining = Vec::new();
+        let mut visited = Vec::new();
+
+        limiter.mark_tx_for_flood(&tx, 25);
+        limiter.visit_top_txs(
+            |tx| {
+                visited.push(tx.hash);
+                VisitTxResult::Processed
+            },
+            &mut remaining,
+            25,
+            Some(&limits),
+        );
+
+        assert_eq!(visited, vec![tx.hash]);
+        assert_eq!(remaining, vec![Resource::new(vec![0])]);
+    }
+
+    #[test]
+    #[should_panic(expected = "custom flood limits lane count must match queue lane count")]
+    fn test_visit_top_txs_rejects_custom_limit_lane_mismatch() {
+        let mut limiter = TxQueueLimiter::new_flood(true, 0);
+        let tx = make_test_tx(100, 1, 1);
+        let limits = vec![Resource::new(vec![1])];
+        let mut remaining = Vec::new();
+
+        limiter.mark_tx_for_flood(&tx, 25);
+        limiter.visit_top_txs(
+            |_| VisitTxResult::Processed,
+            &mut remaining,
+            25,
+            Some(&limits),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "custom flood limit dimension mismatch for lane 0")]
+    fn test_visit_top_txs_rejects_custom_limit_dimension_mismatch() {
+        let mut limiter = TxQueueLimiter::new_flood(false, 0);
+        let tx = make_test_tx(100, 1, 1);
+        let limits = vec![Resource::new(vec![1, 1])];
+        let mut remaining = Vec::new();
+
+        limiter.mark_tx_for_flood(&tx, 25);
+        limiter.visit_top_txs(
+            |_| VisitTxResult::Processed,
+            &mut remaining,
+            25,
+            Some(&limits),
+        );
     }
 
     #[test]

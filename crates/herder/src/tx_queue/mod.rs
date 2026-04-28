@@ -62,8 +62,10 @@ use stellar_xdr::curr::{
 use crate::error::HerderError;
 use crate::surge_pricing::{
     DexLimitingLaneConfig, EvictionExclusion, OpsOnlyLaneConfig, QueueEntry,
-    SorobanGenericLaneConfig, SurgePricingLaneConfig, SurgePricingPriorityQueue, GENERIC_LANE,
+    SorobanGenericLaneConfig, SurgePricingLaneConfig, SurgePricingPriorityQueue, VisitTxResult,
+    GENERIC_LANE,
 };
+use crate::tx_queue_limiter::TxQueueLimiter;
 use crate::Result;
 use henyey_tx::envelope_sequence_number;
 use rand::Rng;
@@ -2692,72 +2694,62 @@ impl TransactionQueue {
 
     /// Visit queued transactions in fee-descending order with lane-aware budgeting.
     ///
-    /// Mirrors stellar-core's `popTopTxs(allowGaps=false)` budget semantics but
-    /// operates as a **read-only scan** — the queue is not mutated. Candidates are
-    /// snapshotted from `fee_index` while holding a read lock, then the lock is
-    /// released before invoking the visitor.
+    /// Mirrors stellar-core's `popTopTxs(allowGaps=false)` budget semantics via a
+    /// fresh, operation-only flood limiter. The limiter traversal is destructive,
+    /// but it drains only the temporary limiter, not the transaction queue.
     ///
-    /// Budget-fit checks happen **before** invoking the visitor:
-    /// - A DEX tx that exceeds `dex_ops_remaining` deactivates the DEX lane
-    ///   (non-DEX candidates continue).
-    /// - Any tx that exceeds `ops_remaining` stops traversal entirely.
-    /// - `budget.ops_remaining` and `budget.dex_ops_remaining` are decremented
-    ///   only for [`BroadcastVisitResult::Processed`] candidates.
+    /// Budget-fit checks happen before invoking the visitor. Remaining budget is
+    /// decremented only for [`BroadcastVisitResult::Processed`] candidates.
     pub fn broadcast_with_visitor<F>(&self, budget: &mut BroadcastBudget, mut visitor: F)
     where
         F: FnMut(&BroadcastCandidate) -> BroadcastVisitResult,
     {
-        // Snapshot candidates from fee_index while holding the read lock.
-        let candidates: Vec<BroadcastCandidate> = {
+        let ops_budget =
+            i64::try_from(budget.ops_remaining).expect("broadcast ops budget exceeds i64::MAX");
+        let dex_ops_budget = budget.dex_ops_remaining.map(|budget| {
+            i64::try_from(budget).expect("broadcast DEX ops budget exceeds i64::MAX")
+        });
+
+        let mut custom_limits = vec![Resource::new(vec![ops_budget])];
+        if let Some(dex_budget) = dex_ops_budget {
+            custom_limits.push(Resource::new(vec![dex_budget]));
+        }
+
+        let ledger_version = self.validation_context.read().protocol_version;
+        let mut limiter = TxQueueLimiter::new_flood(custom_limits.len() > 1, 0);
+        {
             let store = self.store.read();
-            store
-                .fee_index
-                .iter()
-                .rev()
-                .map(|entry| BroadcastCandidate {
-                    hash: entry.hash,
-                    op_count: entry.op_count,
-                    is_dex: entry.is_dex,
-                })
-                .collect()
-        };
-        // Lock released — visitor may acquire other locks without ordering issues.
-
-        let mut dex_lane_active = true;
-
-        for candidate in &candidates {
-            let ops = (candidate.op_count as usize).max(1);
-
-            if candidate.is_dex && budget.dex_ops_remaining.is_some() {
-                if !dex_lane_active {
-                    continue;
-                }
-                if let Some(dex_rem) = budget.dex_ops_remaining {
-                    if ops > dex_rem {
-                        // Drop entire DEX lane — matches popTopTxs lane_active[lane] = false
-                        dex_lane_active = false;
-                        continue;
-                    }
-                }
-                if ops > budget.ops_remaining {
-                    break;
-                }
-                // Candidate fits both budgets — invoke visitor.
-                if visitor(&candidate) == BroadcastVisitResult::Processed {
-                    budget.ops_remaining -= ops;
-                    if let Some(ref mut dex_rem) = budget.dex_ops_remaining {
-                        *dex_rem -= ops;
-                    }
-                }
-            } else {
-                // Non-DEX tx, or DEX with no configured limit: generic budget only
-                if ops > budget.ops_remaining {
-                    break;
-                }
-                if visitor(&candidate) == BroadcastVisitResult::Processed {
-                    budget.ops_remaining -= ops;
-                }
+            for tx in store.values() {
+                limiter.mark_tx_for_flood(tx, ledger_version);
             }
+        }
+
+        let mut lane_resources_left = Vec::new();
+        limiter.visit_top_txs(
+            |tx| {
+                let candidate = BroadcastCandidate {
+                    hash: tx.hash,
+                    op_count: tx.op_count,
+                    is_dex: tx.is_dex,
+                };
+                visitor(&candidate).into()
+            },
+            &mut lane_resources_left,
+            ledger_version,
+            Some(&custom_limits),
+        );
+
+        budget.ops_remaining = lane_resources_left
+            .first()
+            .and_then(|resource| resource.try_get_val(ResourceType::Operations))
+            .and_then(|ops| usize::try_from(ops).ok())
+            .unwrap_or(0);
+        if let Some(dex_remaining) = &mut budget.dex_ops_remaining {
+            *dex_remaining = lane_resources_left
+                .get(1)
+                .and_then(|resource| resource.try_get_val(ResourceType::Operations))
+                .and_then(|ops| usize::try_from(ops).ok())
+                .unwrap_or(0);
         }
     }
 
@@ -2825,6 +2817,15 @@ pub enum BroadcastVisitResult {
     /// The candidate was skipped (e.g., all peers already have it).
     /// Budget is NOT consumed.
     Skipped,
+}
+
+impl From<BroadcastVisitResult> for VisitTxResult {
+    fn from(value: BroadcastVisitResult) -> Self {
+        match value {
+            BroadcastVisitResult::Processed => VisitTxResult::Processed,
+            BroadcastVisitResult::Skipped => VisitTxResult::Skipped,
+        }
+    }
 }
 
 /// Mutable budget state for [`TransactionQueue::broadcast_with_visitor`].
@@ -8914,7 +8915,91 @@ mod broadcast_visitor_tests {
     }
 
     #[test]
+    fn test_broadcast_visitor_dex_budget_independent_of_queue_dex_config() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            max_queue_dex_ops: None,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex1 = make_dex_envelope(300, 1);
+        set_source(&mut dex1, 1);
+        let mut dex2 = make_dex_envelope(200, 1);
+        set_source(&mut dex2, 2);
+        let mut non_dex = make_test_envelope(100, 1);
+        set_source(&mut non_dex, 3);
+
+        assert_eq!(queue.try_add(dex1.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex2), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex.clone()), TxQueueResult::Added);
+
+        let (entries, _) = visit_all_processed(&queue, 100, Some(1));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&dex1));
+        assert_eq!(entries[1].hash, Hash256::hash_xdr(&non_dex));
+    }
+
+    #[test]
+    fn test_broadcast_visitor_uses_ops_flood_limits_with_queue_byte_config() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            max_queue_classic_bytes: Some(1_000_000),
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx1 = make_test_envelope(300, 1);
+        set_source(&mut tx1, 1);
+        let mut tx2 = make_test_envelope(200, 1);
+        set_source(&mut tx2, 2);
+
+        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2.clone()), TxQueueResult::Added);
+
+        let (entries, budget) = visit_all_processed(&queue, 1, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&tx1));
+        assert_eq!(budget.ops_remaining, 0);
+    }
+
+    #[test]
+    fn test_broadcast_visitor_equal_fee_order_matches_fee_index() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx1 = make_test_envelope(100, 1);
+        set_source(&mut tx1, 1);
+        let mut tx2 = make_test_envelope(100, 1);
+        set_source(&mut tx2, 2);
+        let mut tx3 = make_test_envelope(100, 1);
+        set_source(&mut tx3, 3);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx3), TxQueueResult::Added);
+
+        let expected: Vec<_> = {
+            let store = queue.store.read();
+            store
+                .fee_index
+                .iter()
+                .rev()
+                .map(|entry| entry.hash)
+                .collect()
+        };
+        let (entries, _) = visit_all_processed(&queue, 100, None);
+        let actual: Vec<_> = entries.iter().map(|candidate| candidate.hash).collect();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_broadcast_visitor_dex_lane_drop() {
+        // When top DEX tx exceeds DEX budget, ALL DEX txs are dropped
         let config = TxQueueConfig {
             max_size: 10,
             ..Default::default()
