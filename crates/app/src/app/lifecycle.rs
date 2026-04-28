@@ -1127,7 +1127,9 @@ impl App {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             while let Some(event) = peer_event_rx.blocking_recv() {
-                update_peer_record(&db, event);
+                if let Err(err) = update_peer_record(&db, event) {
+                    tracing::warn!(?err, "Failed to update peer record");
+                }
             }
         });
 

@@ -102,12 +102,15 @@ impl App {
     /// would block the entire main event loop.
     pub(super) async fn maintain_peers(&self) {
         let max_failures = self.config.overlay.peer_max_failures;
-        let _ = self
+        if let Err(e) = self
             .db_blocking("remove-failed-peers", move |db| {
                 db.remove_peers_with_failures(max_failures)?;
                 Ok(())
             })
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to remove failed peers");
+        }
 
         // Phase 1: Acquire lock briefly to check peer count and collect candidates.
         let (_peer_count, _target_outbound, candidates) = {
@@ -361,47 +364,51 @@ impl App {
     pub(super) async fn store_config_peers(&self) {
         let known_peers = self.config.overlay.known_peers.clone();
         let preferred_peers = self.config.overlay.preferred_peers.clone();
-        let _ = self
+        if let Err(e) = self
             .db_blocking("store-config-peers", move |db| {
                 let now = current_epoch_seconds();
                 for addr in &known_peers {
                     if let Some(peer) = App::parse_peer_address(addr) {
                         let record =
                             henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Outbound);
-                        let _ = db.store_peer(&peer.host, peer.port, record);
+                        db.store_peer(&peer.host, peer.port, record)?;
                     }
                 }
                 for addr in &preferred_peers {
                     if let Some(peer) = App::parse_peer_address(addr) {
                         let record =
                             henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Preferred);
-                        let _ = db.store_peer(&peer.host, peer.port, record);
+                        db.store_peer(&peer.host, peer.port, record)?;
                     }
                 }
                 Ok(())
             })
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to store config peers");
+        }
     }
 
     async fn persist_peers(&self, peers: &[PeerAddress]) {
         let peers = peers.to_vec();
-        let _ = self
+        if let Err(e) = self
             .db_blocking("persist-peers", move |db| {
                 let now = current_epoch_seconds();
                 for peer in &peers {
-                    let existing = db.load_peer(&peer.host, peer.port).ok().flatten();
+                    let existing = db.load_peer(&peer.host, peer.port)?;
                     if existing.is_some() {
                         continue;
                     }
                     let record =
                         henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Outbound);
-                    if let Err(err) = db.store_peer(&peer.host, peer.port, record) {
-                        tracing::debug!(peer = %peer, error = %err, "Failed to persist peer");
-                    }
+                    db.store_peer(&peer.host, peer.port, record)?;
                 }
                 Ok(())
             })
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to persist peers");
+        }
     }
 
     async fn filter_discovered_peers(&self, peers: Vec<PeerAddress>) -> Vec<PeerAddress> {
@@ -416,8 +423,8 @@ impl App {
             let now = current_epoch_seconds();
             let mut filtered = Vec::new();
             for peer in public_peers {
-                let record = db.load_peer(&peer.host, peer.port).ok().flatten();
-                if let Some(record) = record {
+                let record = db.load_peer(&peer.host, peer.port)?;
+                if let Some(ref record) = record {
                     if record.num_failures >= max_failures {
                         continue;
                     }
@@ -430,6 +437,7 @@ impl App {
             Ok(filtered)
         })
         .await
+        .inspect_err(|e| tracing::warn!(error = %e, "Failed to filter discovered peers from DB"))
         .unwrap_or_default()
     }
 
@@ -482,7 +490,7 @@ impl App {
                 for addr in &preferred_peers_config {
                     if let Some(peer) = App::parse_peer_address(addr) {
                         // upsert_peer_type inline
-                        let existing = db.load_peer(&peer.host, peer.port).ok().flatten();
+                        let existing = db.load_peer(&peer.host, peer.port)?;
                         let record = match existing {
                             Some(existing) => henyey_db::queries::PeerRecord::new(
                                 existing.next_attempt,
@@ -495,7 +503,7 @@ impl App {
                                 StoredPeerType::Preferred,
                             ),
                         };
-                        let _ = db.store_peer(&peer.host, peer.port, record);
+                        db.store_peer(&peer.host, peer.port, record)?;
                         peers.push(peer);
                     }
                 }
@@ -508,10 +516,9 @@ impl App {
                         StoredPeerType::Outbound,
                     )),
                 };
-                if let Ok(persisted) = db.query_random_peers(1000, &outbound_filter) {
-                    for (host, port, _) in persisted {
-                        peers.push(PeerAddress::new(host, port));
-                    }
+                let persisted = db.query_random_peers(1000, &outbound_filter)?;
+                for (host, port, _) in persisted {
+                    peers.push(PeerAddress::new(host, port));
                 }
 
                 // Filter discovered peers (inline)
@@ -522,7 +529,7 @@ impl App {
                         filtered_peers.push(peer);
                         continue;
                     }
-                    let record = db.load_peer(&peer.host, peer.port).ok().flatten();
+                    let record = db.load_peer(&peer.host, peer.port)?;
                     if let Some(ref record) = record {
                         if record.num_failures >= max_failures {
                             continue;
@@ -553,10 +560,9 @@ impl App {
                     )),
                     ..Default::default()
                 };
-                if let Ok(persisted) = db.query_random_peers(1000, &adv_outbound_filter) {
-                    for (host, port, _) in persisted {
-                        advertised_outbound.push(PeerAddress::new(host, port));
-                    }
+                let persisted = db.query_random_peers(1000, &adv_outbound_filter)?;
+                for (host, port, _) in persisted {
+                    advertised_outbound.push(PeerAddress::new(host, port));
                 }
 
                 // Build advertised inbound
@@ -568,10 +574,9 @@ impl App {
                     )),
                     ..Default::default()
                 };
-                if let Ok(persisted) = db.query_random_peers(1000, &adv_inbound_filter) {
-                    for (host, port, _) in persisted {
-                        advertised_inbound.push(PeerAddress::new(host, port));
-                    }
+                let persisted = db.query_random_peers(1000, &adv_inbound_filter)?;
+                for (host, port, _) in persisted {
+                    advertised_inbound.push(PeerAddress::new(host, port));
                 }
 
                 Ok(DbResult {

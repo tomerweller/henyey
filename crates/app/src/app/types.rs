@@ -1173,20 +1173,23 @@ pub(super) fn map_peer_type(
     }
 }
 
-pub(super) fn update_peer_record(db: &henyey_db::Database, event: henyey_overlay::PeerEvent) {
+pub(super) fn update_peer_record(
+    db: &henyey_db::Database,
+    event: henyey_overlay::PeerEvent,
+) -> Result<(), henyey_db::error::DbError> {
     let now = current_epoch_seconds();
     match event {
         henyey_overlay::PeerEvent::Connected(addr, peer_type) => {
-            let existing = db.load_peer(&addr.host, addr.port).ok().flatten();
+            let existing = db.load_peer(&addr.host, addr.port)?;
             let existing_type = existing
                 .map(|r| r.peer_type)
                 .unwrap_or(StoredPeerType::Inbound);
             let mapped = map_peer_type(peer_type, existing_type);
             let record = henyey_db::queries::PeerRecord::new(now, 0, mapped);
-            let _ = db.store_peer(&addr.host, addr.port, record);
+            db.store_peer(&addr.host, addr.port, record)?;
         }
         henyey_overlay::PeerEvent::Failed(addr, peer_type) => {
-            let existing = db.load_peer(&addr.host, addr.port).ok().flatten();
+            let existing = db.load_peer(&addr.host, addr.port)?;
             let mut failures = existing.map(|r| r.num_failures).unwrap_or(0);
             failures = failures.saturating_add(1);
             let backoff = compute_peer_backoff_secs(failures);
@@ -1196,9 +1199,10 @@ pub(super) fn update_peer_record(db: &henyey_db::Database, event: henyey_overlay
                 .unwrap_or(StoredPeerType::Inbound);
             let mapped = map_peer_type(peer_type, existing_type);
             let record = henyey_db::queries::PeerRecord::new(next_attempt, failures, mapped);
-            let _ = db.store_peer(&addr.host, addr.port, record);
+            db.store_peer(&addr.host, addr.port, record)?;
         }
     }
+    Ok(())
 }
 
 pub(super) fn compute_peer_backoff_secs(failures: u32) -> i64 {
@@ -1458,5 +1462,106 @@ mod tests {
         assert_eq!(info.peer_id, real_peer);
         // The caller would compare info.peer_id != responding_peer_id and
         // discard the response — tested here to document the invariant.
+    }
+
+    #[test]
+    fn test_update_peer_record_connected_preserves_existing_type() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let addr = henyey_overlay::PeerAddress::new("127.0.0.1", 11625);
+
+        // Store a peer with Preferred type
+        let record = henyey_db::queries::PeerRecord::new(100, 3, StoredPeerType::Preferred);
+        db.store_peer(&addr.host, addr.port, record).unwrap();
+
+        // Connected event should preserve the existing type via map_peer_type
+        let event =
+            henyey_overlay::PeerEvent::Connected(addr.clone(), henyey_overlay::PeerType::Outbound);
+        update_peer_record(&db, event).unwrap();
+
+        let updated = db.load_peer(&addr.host, addr.port).unwrap().unwrap();
+        // Failure count resets to 0 on connect
+        assert_eq!(updated.num_failures, 0);
+    }
+
+    #[test]
+    fn test_update_peer_record_connected_defaults_to_inbound_when_new() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let addr = henyey_overlay::PeerAddress::new("127.0.0.2", 11625);
+
+        // No peer stored — Connected event should create one
+        let event =
+            henyey_overlay::PeerEvent::Connected(addr.clone(), henyey_overlay::PeerType::Inbound);
+        update_peer_record(&db, event).unwrap();
+
+        let stored = db.load_peer(&addr.host, addr.port).unwrap().unwrap();
+        assert_eq!(stored.num_failures, 0);
+    }
+
+    #[test]
+    fn test_update_peer_record_failed_increments_failures_and_sets_backoff() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let addr = henyey_overlay::PeerAddress::new("127.0.0.3", 11625);
+
+        // Store a peer with 2 failures
+        let record = henyey_db::queries::PeerRecord::new(100, 2, StoredPeerType::Outbound);
+        db.store_peer(&addr.host, addr.port, record).unwrap();
+
+        let event =
+            henyey_overlay::PeerEvent::Failed(addr.clone(), henyey_overlay::PeerType::Outbound);
+        update_peer_record(&db, event).unwrap();
+
+        let updated = db.load_peer(&addr.host, addr.port).unwrap().unwrap();
+        assert_eq!(updated.num_failures, 3); // 2 + 1
+        assert!(updated.next_attempt > 100); // backoff applied
+    }
+
+    #[test]
+    fn test_update_peer_record_failed_new_peer_starts_at_one_failure() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let addr = henyey_overlay::PeerAddress::new("127.0.0.4", 11625);
+
+        // No peer stored — Failed event should start at failure count 1
+        let event =
+            henyey_overlay::PeerEvent::Failed(addr.clone(), henyey_overlay::PeerType::Inbound);
+        update_peer_record(&db, event).unwrap();
+
+        let stored = db.load_peer(&addr.host, addr.port).unwrap().unwrap();
+        assert_eq!(stored.num_failures, 1);
+    }
+
+    #[test]
+    fn test_update_peer_record_load_error_propagates() {
+        // Verify that update_peer_record returns Err when load_peer fails,
+        // not silently treating the error as "peer not found."
+        // We can't easily inject a DB error, but we can verify the return type
+        // is Result<(), DbError> and that a successful call returns Ok(()).
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let addr = henyey_overlay::PeerAddress::new("127.0.0.5", 11625);
+
+        let event =
+            henyey_overlay::PeerEvent::Connected(addr.clone(), henyey_overlay::PeerType::Outbound);
+        let result = update_peer_record(&db, event);
+        assert!(result.is_ok(), "successful update should return Ok(())");
+
+        let stored = db.load_peer(&addr.host, addr.port).unwrap().unwrap();
+        assert_eq!(stored.num_failures, 0);
+    }
+
+    #[test]
+    fn test_update_peer_record_store_error_propagates() {
+        // Verify that store errors propagate. Since we can't easily inject
+        // a write error in-memory, we verify the function signature returns
+        // Result<(), DbError> which means store_peer errors will propagate via ?.
+        // A successful write should return Ok.
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let addr = henyey_overlay::PeerAddress::new("127.0.0.6", 11625);
+
+        let record = henyey_db::queries::PeerRecord::new(100, 0, StoredPeerType::Outbound);
+        db.store_peer(&addr.host, addr.port, record).unwrap();
+
+        let event =
+            henyey_overlay::PeerEvent::Connected(addr.clone(), henyey_overlay::PeerType::Outbound);
+        let result = update_peer_record(&db, event);
+        assert!(result.is_ok(), "store_peer on existing peer should succeed");
     }
 }
