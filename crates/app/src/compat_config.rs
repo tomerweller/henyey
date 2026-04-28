@@ -72,6 +72,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "FLOOD_ARB_TX_BASE_ALLOWANCE",
     "FLOOD_ARB_TX_DAMPING_FACTOR",
     "FLOOD_TX_PERIOD_MS",
+    "FLOOD_ADVERT_PERIOD_MS",
 ];
 
 /// Valid stellar-core keys that henyey intentionally does not support.
@@ -268,6 +269,17 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         } else {
             tracing::warn!(
                 key = "FLOOD_TX_PERIOD_MS",
+                value = v,
+                "Compat config key value must be >= 1"
+            );
+        }
+    }
+    if let Some(v) = get_i64(table, "FLOOD_ADVERT_PERIOD_MS") {
+        if v >= 1 {
+            config.overlay.flood_advert_period_ms = v as u64;
+        } else {
+            tracing::warn!(
+                key = "FLOOD_ADVERT_PERIOD_MS",
                 value = v,
                 "Compat config key value must be >= 1"
             );
@@ -2187,5 +2199,43 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
         let config = translate_stellar_core_config(&raw).unwrap();
         // Default should be 200 (matching stellar-core FLOOD_TX_PERIOD_MS)
         assert_eq!(config.overlay.flood_tx_period_ms, 200);
+    }
+
+    #[test]
+    fn test_flood_tx_period_ms_invalid_preserves_default() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOOD_TX_PERIOD_MS=0
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        // Invalid value (0) should be ignored, keeping the default 200.
+        assert_eq!(config.overlay.flood_tx_period_ms, 200);
+    }
+
+    #[test]
+    fn test_flood_advert_period_ms_parsed() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOOD_ADVERT_PERIOD_MS=50
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert_eq!(config.overlay.flood_advert_period_ms, 50);
+    }
+
+    #[test]
+    fn test_flood_advert_period_ms_invalid_preserves_default() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOOD_ADVERT_PERIOD_MS=-1
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        // Invalid value should be ignored, keeping the default 100.
+        assert_eq!(config.overlay.flood_advert_period_ms, 100);
     }
 }
