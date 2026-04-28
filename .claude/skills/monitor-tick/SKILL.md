@@ -67,7 +67,7 @@ recovery is considered complete regardless):
 
 ```bash
 CRASH_RECOVERY=no
-PID=$(pgrep -f 'henyey.*run' | head -1)
+PID=$(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)
 if [ -n "$PID" ]; then
   uptime_sec=$(ps -o etimes= -p "$PID" 2>/dev/null | tr -d ' ')
   uptime_sec=${uptime_sec:-0}
@@ -149,7 +149,7 @@ ticks so STUCK can be detected by a single invocation:
   timestamp is more than 600s old, flag STUCK.
 - If the ledger has advanced or the file is missing, overwrite
   `/home/tomer/data/$MONITOR_SESSION_ID/last_ledger` with `"<current-ledger>|<now>"`.
-- Check node uptime: `ps -o etime= -p $(pgrep -f 'henyey.*run' | head -1)`.
+- Check node uptime: `ps -o etime= -p $(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)`.
   Active deadline: **15m** when `FRESH_START=no` and `CRASH_RECOVERY=no`,
   **60m** when `CRASH_RECOVERY=yes`, **4h** when `FRESH_START=yes`.
 - "Real-time sync" means RPC `age < 30s` — NOT just Heartbeat `gap=0`. Gap is
@@ -167,7 +167,7 @@ ticks so STUCK can be detected by a single invocation:
 - **Fresh-start carveout (`FRESH_START=yes`, uptime < 4h)**: a large gap is
   expected during initial bucket apply — report CATCHING UP, not SYNC FAILURE.
 
-**(3) Process alive** — `pgrep -af 'henyey.*run'`. If not running:
+**(3) Process alive** — find by `comm` not `pgrep -f`: `for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done`. The earlier `pgrep -f 'henyey.*run'` form is unsafe in environments with parallel `claude --print` agent processes whose prompt args contain "henyey" — they false-match, yielding wrong PIDs for kill/restart. If not running:
 Rotate-log with suffix `crashed`, then Relaunch.
 
 **(3b) Wedge detection** — a process can be alive but have a frozen event
@@ -185,7 +185,7 @@ Always file a new `urgent`-labeled issue (wedge blocks validator operation).
 Recurrence-after-fix → NEW issue, not a comment on a closed one. Known prior
 incidents: #1904, #1873, #1921, #1949.
 
-**(4) Memory** — `ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1)`, convert to MB.
+**(4) Memory** — `ps -o rss= -p $(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)`, convert to MB.
 
 - If `RSS > 12 GB`, flag HIGH MEMORY (report-only; no restart).
 - **Restart condition** — restart only if ALL hold (this gates on system
