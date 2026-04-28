@@ -385,16 +385,20 @@ impl CatchupManager {
     ///
     /// This is used by `differing_bucket_hashes()` to compute the differential
     /// bucket download set — only downloading buckets that differ between the
-    /// remote HAS and local state. Returns `None` if no local HAS exists (fresh node).
-    pub(super) fn load_local_has(&self) -> Option<HistoryArchiveState> {
-        self.db
-            .with_connection(|conn| {
-                use henyey_db::queries::StateQueries;
-                conn.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)
-            })
-            .ok()
-            .flatten()
-            .and_then(|json| HistoryArchiveState::from_json(&json).ok())
+    /// remote HAS and local state.
+    ///
+    /// Returns `Ok(None)` if no local HAS has been persisted (fresh node).
+    /// Returns `Err` if the DB read fails or the stored JSON is corrupt.
+    pub(super) fn load_local_has(&self) -> Result<Option<HistoryArchiveState>> {
+        let json_opt = self.db.with_connection(|conn| {
+            use henyey_db::queries::StateQueries;
+            conn.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)
+        })?;
+
+        match json_opt {
+            None => Ok(None),
+            Some(json) => Ok(Some(HistoryArchiveState::from_json(&json)?)),
+        }
     }
 
     /// Compute the bucket hashes to download from a remote HAS.
@@ -408,8 +412,8 @@ impl CatchupManager {
     pub(super) fn compute_bucket_download_set(
         &self,
         remote_has: &HistoryArchiveState,
-    ) -> Vec<Hash256> {
-        match self.load_local_has() {
+    ) -> Result<Vec<Hash256>> {
+        match self.load_local_has()? {
             Some(local_has) => {
                 let hashes = remote_has.all_differing_bucket_hashes(&local_has);
                 info!(
@@ -419,11 +423,11 @@ impl CatchupManager {
                     remote_has.unique_bucket_hashes().len(),
                     local_has.unique_bucket_hashes().len(),
                 );
-                hashes
+                Ok(hashes)
             }
             None => {
-                info!("No local HAS found, downloading all unique buckets");
-                remote_has.unique_bucket_hashes()
+                info!("No local HAS in database (fresh node), downloading all unique buckets");
+                Ok(remote_has.unique_bucket_hashes())
             }
         }
     }
@@ -464,5 +468,67 @@ impl CatchupManager {
             "failed to download header for ledger {} from any archive",
             ledger_seq
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use henyey_bucket::BucketManager;
+    use henyey_db::{queries::StateQueries, Database};
+
+    fn make_test_catchup_manager() -> CatchupManager {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let tmp_dir = tempfile::tempdir().expect("temp dir");
+        let bucket_manager = BucketManager::new(tmp_dir.keep()).expect("bucket manager");
+        let archive = crate::HistoryArchive::new("https://example.com").expect("archive");
+        super::super::CatchupManager::new(vec![archive], bucket_manager, db)
+    }
+
+    #[test]
+    fn test_load_local_has_absent() {
+        let mgr = make_test_catchup_manager();
+        let result = mgr.load_local_has();
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        assert!(result.unwrap().is_none(), "expected None for fresh DB");
+    }
+
+    #[test]
+    fn test_load_local_has_valid() {
+        let mgr = make_test_catchup_manager();
+        let has_json = r#"{"version":2,"currentLedger":100,"currentBuckets":[]}"#;
+        mgr.db
+            .with_connection(|conn| {
+                conn.set_state(
+                    henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE,
+                    has_json,
+                )
+            })
+            .expect("set_state");
+        let result = mgr.load_local_has();
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        let has = result.unwrap().expect("expected Some");
+        assert_eq!(has.current_ledger(), 100);
+    }
+
+    #[test]
+    fn test_load_local_has_corrupt_json() {
+        let mgr = make_test_catchup_manager();
+        mgr.db
+            .with_connection(|conn| {
+                conn.set_state(
+                    henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE,
+                    "this is not valid json {{{",
+                )
+            })
+            .expect("set_state");
+        let result = mgr.load_local_has();
+        assert!(result.is_err(), "expected Err for corrupt JSON");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, HistoryError::Json(_)),
+            "expected HistoryError::Json, got: {:?}",
+            err,
+        );
     }
 }

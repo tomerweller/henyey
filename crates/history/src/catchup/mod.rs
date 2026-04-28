@@ -563,7 +563,7 @@ impl CatchupManager {
             2,
             "Downloading bucket files",
         );
-        let bucket_hashes = self.compute_bucket_download_set(&has);
+        let bucket_hashes = self.compute_bucket_download_set(&has)?;
         let buckets_total = bucket_hashes.len() as u32;
         self.progress.buckets_total = buckets_total;
         let buckets = self.download_buckets(&bucket_hashes).await?;
@@ -658,7 +658,7 @@ impl CatchupManager {
                 2,
                 "Downloading bucket files",
             );
-            let bucket_hashes = self.compute_bucket_download_set(&has);
+            let bucket_hashes = self.compute_bucket_download_set(&has)?;
             self.progress.buckets_total = bucket_hashes.len() as u32;
             let buckets = self.download_buckets(&bucket_hashes).await?;
 
