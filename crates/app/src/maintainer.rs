@@ -56,10 +56,10 @@ pub struct MaintenanceConfig {
     /// Whether maintenance is enabled.
     pub enabled: bool,
     /// RPC retention window in ledgers. When set, the maintainer will also clean
-    /// up `events`, `ledger_close_meta`, `txhistory`, `txsets`, and `txresults`
-    /// tables. RPC-only tables (events, close meta) are pruned at the RPC window;
-    /// publish+RPC tables (tx history) use the more conservative of the publish-safe
-    /// and RPC thresholds.
+    /// up RPC-only tables (`events`, `ledger_close_meta`). Transaction history
+    /// tables (`txhistory`, `txsets`, `txresults`) and ledger headers are always
+    /// pruned at the publish-safe threshold; when RPC is also configured, they
+    /// use the more conservative of the publish-safe and RPC thresholds.
     pub rpc_retention_window: Option<u32>,
 }
 
@@ -280,14 +280,15 @@ impl Maintainer {
 
 /// Core maintenance logic shared between `App::perform_maintenance` and `Maintainer`.
 ///
-/// Deletes old SCP history, ledger headers, and (if `rpc_retention_window` is set)
-/// RPC-specific tables (events, ledger close meta, tx history).
+/// Deletes old data from the database to prevent unbounded growth.
 ///
-/// Tables are pruned based on their data class:
+/// Tables are pruned based on their retention class:
 /// - **Publish-only** (SCP history): pruned at `publish_safe_lmin` (stellar-core parity).
-/// - **Publish + RPC** (headers, tx history/sets/results): pruned at the more
-///   conservative of `publish_safe_lmin` and `rpc_lmin` to satisfy both consumers.
-/// - **RPC-only** (events, close meta): pruned at `rpc_lmin`.
+/// - **Publish + RPC** (headers, tx history/sets/results): always pruned at the
+///   more conservative of `publish_safe_lmin` and `rpc_lmin`. These tables serve
+///   both checkpoint publishing (`txsets`, `txresults`, headers) and RPC queries
+///   (`txhistory`, headers), so we keep data needed by both consumers.
+/// - **RPC-only** (events, close meta): pruned at `rpc_lmin` only when RPC is configured.
 pub fn run_maintenance(
     db: &henyey_db::Database,
     lcl: u32,
@@ -321,30 +322,31 @@ pub fn run_maintenance(
         "Running maintenance"
     );
 
-    // Delete old SCP history (publish-safe threshold, publish-only).
+    // --- Publish-only tables ---
     if let Err(e) = db.delete_old_scp_entries(publish_safe_lmin, count) {
         warn!(error = %e, "Failed to delete old SCP entries");
     }
 
-    // Delete old ledger headers (publish + RPC threshold).
+    // --- Publish + RPC tables ---
+    // These tables serve both checkpoint publishing (txsets, txresults, headers)
+    // and RPC queries (txhistory, headers). Always pruned at the more conservative
+    // of publish_safe_lmin and rpc_lmin so neither consumer loses required data.
     if let Err(e) = db.delete_old_ledger_headers(publish_and_rpc_lmin, count) {
         warn!(error = %e, "Failed to delete old ledger headers");
     }
 
-    // Clean up RPC tables when RPC retention is configured.
+    if let Err(e) = db.delete_old_tx_history(publish_and_rpc_lmin, count) {
+        warn!(error = %e, "Failed to delete old tx history");
+    }
+
+    // --- RPC-only tables (only when RPC retention is configured) ---
     if let Some(rpc_lmin) = rpc_lmin {
-        // RPC-only tables: events and close meta.
         if let Err(e) = db.delete_old_events(rpc_lmin, count) {
             warn!(error = %e, "Failed to delete old events");
         }
 
         if let Err(e) = db.delete_old_ledger_close_meta(rpc_lmin, count) {
             warn!(error = %e, "Failed to delete old ledger close meta");
-        }
-
-        // Tx history/sets/results are needed by both publish and RPC.
-        if let Err(e) = db.delete_old_tx_history(publish_and_rpc_lmin, count) {
-            warn!(error = %e, "Failed to delete old tx history");
         }
     }
 }
@@ -488,6 +490,13 @@ mod tests {
                     &format!(
                         "INSERT INTO txhistory (txid, ledgerseq, txindex, txbody, txresult, txmeta) \
                          VALUES ('tx{seq}', {seq}, 0, X'00', X'00', X'00')"
+                    ),
+                    [],
+                )?;
+                conn.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO txsets (ledgerseq, data) \
+                         VALUES ({seq}, X'00')"
                     ),
                     [],
                 )?;
@@ -770,6 +779,8 @@ mod tests {
         // All tx history preserved: publish_and_rpc_lmin = 63, all rows > 63
         assert_eq!(count_rows(&db_clone, "txhistory"), 21);
         assert_eq!(min_ledger(&db_clone, "txhistory", "ledgerseq"), Some(790));
+        assert_eq!(count_rows(&db_clone, "txsets"), 21);
+        assert_eq!(min_ledger(&db_clone, "txsets", "ledgerseq"), Some(790));
         assert_eq!(count_rows(&db_clone, "txresults"), 21);
         assert_eq!(min_ledger(&db_clone, "txresults", "ledgerseq"), Some(790));
 
@@ -880,11 +891,94 @@ mod tests {
         // tx history pruned at publish_and_rpc_lmin = min(936, 800) = 800
         assert_eq!(count_rows(&db_clone, "txhistory"), 10);
         assert_eq!(min_ledger(&db_clone, "txhistory", "ledgerseq"), Some(801));
+        assert_eq!(count_rows(&db_clone, "txsets"), 10);
+        assert_eq!(min_ledger(&db_clone, "txsets", "ledgerseq"), Some(801));
         assert_eq!(count_rows(&db_clone, "txresults"), 10);
         assert_eq!(min_ledger(&db_clone, "txresults", "ledgerseq"), Some(801));
 
         // Events also pruned at rpc_lmin = 800
         assert_eq!(count_rows(&db_clone, "events"), 10);
         assert_eq!(min_ledger(&db_clone, "events", "ledgerseq"), Some(801));
+    }
+
+    #[test]
+    fn test_tx_history_pruned_without_rpc() {
+        // Regression test for #2003: without RPC, tx history tables must still
+        // be pruned at publish_safe_lmin. Previously, delete_old_tx_history was
+        // gated inside the `if let Some(rpc_lmin)` block, so non-RPC nodes
+        // never pruned txhistory/txsets/txresults.
+        //
+        // Scenario: lcl=1000, min_queued=1000, checkpoint_freq=64, no RPC
+        //   publish_safe_lmin = 1000 - 64 = 936
+        //   publish_and_rpc_lmin = 936 (no RPC to lower it)
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_tx_history(&db, &(930..=940).collect::<Vec<_>>());
+        assert_eq!(count_rows(&db, "txhistory"), 11);
+        assert_eq!(count_rows(&db, "txsets"), 11);
+        assert_eq!(count_rows(&db, "txresults"), 11);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: None,
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (1000, Some(1000)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // Rows at ledgerseq <= 936 should be deleted (930..=936 = 7 rows)
+        // Rows at ledgerseq > 936 should remain (937..=940 = 4 rows)
+        assert_eq!(count_rows(&db_clone, "txhistory"), 4);
+        assert_eq!(min_ledger(&db_clone, "txhistory", "ledgerseq"), Some(937));
+        assert_eq!(count_rows(&db_clone, "txsets"), 4);
+        assert_eq!(min_ledger(&db_clone, "txsets", "ledgerseq"), Some(937));
+        assert_eq!(count_rows(&db_clone, "txresults"), 4);
+        assert_eq!(min_ledger(&db_clone, "txresults", "ledgerseq"), Some(937));
+    }
+
+    #[test]
+    fn test_tx_history_preserved_for_publish_queue_without_rpc() {
+        // Regression test for #2003: without RPC, when the publish queue has
+        // pending checkpoints, tx history must be preserved for publishing.
+        //
+        // Scenario: lcl=1000, min_queued=127 (pending checkpoint), no RPC
+        //   publish_safe_lmin = 127 - 64 = 63
+        //   → tx history at 790..810 all preserved (all > 63)
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_tx_history(&db, &(790..=810).collect::<Vec<_>>());
+        assert_eq!(count_rows(&db, "txhistory"), 21);
+        assert_eq!(count_rows(&db, "txsets"), 21);
+        assert_eq!(count_rows(&db, "txresults"), 21);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: None,
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (1000, Some(127)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // All rows preserved: publish_safe_lmin = 63, all rows > 63
+        assert_eq!(count_rows(&db_clone, "txhistory"), 21);
+        assert_eq!(min_ledger(&db_clone, "txhistory", "ledgerseq"), Some(790));
+        assert_eq!(count_rows(&db_clone, "txsets"), 21);
+        assert_eq!(min_ledger(&db_clone, "txsets", "ledgerseq"), Some(790));
+        assert_eq!(count_rows(&db_clone, "txresults"), 21);
+        assert_eq!(min_ledger(&db_clone, "txresults", "ledgerseq"), Some(790));
     }
 }
