@@ -235,18 +235,21 @@ impl App {
                         use flate2::write::GzEncoder;
                         use flate2::Compression;
                         use std::io::{Read, Write};
-                        let file = std::fs::File::create(&dest)?;
-                        let mut encoder = GzEncoder::new(file, Compression::default());
-                        let mut src_file = std::fs::File::open(&src)?;
-                        let mut buf = [0u8; 64 * 1024];
-                        loop {
-                            let n = src_file.read(&mut buf)?;
-                            if n == 0 {
-                                break;
+                        henyey_common::fs_utils::atomic_write_with(&dest, |file| {
+                            let mut encoder =
+                                GzEncoder::new(&mut *file, Compression::default());
+                            let mut src_file = std::fs::File::open(&src)?;
+                            let mut buf = [0u8; 64 * 1024];
+                            loop {
+                                let n = src_file.read(&mut buf)?;
+                                if n == 0 {
+                                    break;
+                                }
+                                encoder.write_all(&buf[..n])?;
                             }
-                            encoder.write_all(&buf[..n])?;
-                        }
-                        encoder.finish()?;
+                            encoder.finish()?;
+                            Ok(())
+                        })?;
                         tracing::debug!(hash = %hash.to_hex(), "Published hot archive bucket");
                     } else {
                         anyhow::bail!(
@@ -267,7 +270,7 @@ impl App {
         if let Some(parent) = root_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&root_path, &has_json)?;
+        henyey_common::fs_utils::atomic_write_bytes(&root_path, has_json.as_bytes())?;
 
         // Upload to each command-based archive
         for archive in archives {
@@ -363,13 +366,14 @@ fn write_scp_history_file(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::File::create(&path)?;
-    let mut encoder = GzEncoder::new(file, Compression::default());
-
-    for entry in entries {
-        henyey_history::write_record_marked_xdr(&mut encoder, entry)?;
-    }
-    encoder.finish()?;
+    henyey_common::fs_utils::atomic_write_with(&path, |file| {
+        let mut encoder = GzEncoder::new(&mut *file, Compression::default());
+        for entry in entries {
+            henyey_history::write_record_marked_xdr(&mut encoder, entry)?;
+        }
+        encoder.finish()?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -822,5 +826,47 @@ mod tests {
             custom_bucket_dir.as_path()
         );
         assert_eq!(canonical_bucket_file_count(&derived_bucket_dir), 0);
+    }
+
+    #[test]
+    fn test_write_scp_history_file_valid_gzip_no_temp_files() {
+        use flate2::read::GzDecoder;
+        use henyey_history::paths::checkpoint_path;
+        use std::io::Read;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let entry = stellar_xdr::curr::ScpHistoryEntry::V0(stellar_xdr::curr::ScpHistoryEntryV0 {
+            quorum_sets: stellar_xdr::curr::VecM::default(),
+            ledger_messages: stellar_xdr::curr::LedgerScpMessages {
+                ledger_seq: 63,
+                messages: stellar_xdr::curr::VecM::default(),
+            },
+        });
+
+        write_scp_history_file(tmp.path(), 63, std::slice::from_ref(&entry)).unwrap();
+
+        // Verify the file is valid gzip with correct XDR record marks
+        let path = tmp.path().join(checkpoint_path("scp", 63, "xdr.gz"));
+        assert!(path.exists());
+        let file = std::fs::File::open(&path).unwrap();
+        let mut decoder = GzDecoder::new(file);
+        let mut bytes = Vec::new();
+        decoder.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.len() > 4);
+
+        let mark = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        assert_ne!(mark & 0x8000_0000, 0, "high bit must be set for record mark");
+
+        // No temp files
+        assert_eq!(
+            files_matching(tmp.path(), |p| p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".tmp.")),
+            0,
+            "no temp files should remain"
+        );
     }
 }

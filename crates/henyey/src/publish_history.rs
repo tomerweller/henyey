@@ -434,7 +434,7 @@ fn write_root_has(
     use henyey_history::paths::root_has_path;
     let root_path = dir.join(root_has_path());
     super::create_parent_dir(&root_path)?;
-    std::fs::write(&root_path, has.to_json()?)?;
+    henyey_common::fs_utils::atomic_write_bytes(&root_path, has.to_json()?.as_bytes())?;
     Ok(())
 }
 
@@ -454,18 +454,21 @@ fn write_scp_history_file(
 
     let path = base_dir.join(checkpoint_path("scp", checkpoint, "xdr.gz"));
     super::create_parent_dir(&path)?;
-    let file = std::fs::File::create(&path)?;
-    let mut encoder = GzEncoder::new(file, Compression::default());
-
-    for entry in entries {
-        let xdr = entry.to_xdr(Limits::none())?;
-        /// XDR record mark: high bit indicates last/only fragment.
-        const XDR_RECORD_MARK: u32 = 0x8000_0000;
-        let marked_len = (xdr.len() as u32) | XDR_RECORD_MARK;
-        encoder.write_all(&marked_len.to_be_bytes())?;
-        encoder.write_all(&xdr)?;
-    }
-    encoder.finish()?;
+    henyey_common::fs_utils::atomic_write_with(&path, |file| {
+        let mut encoder = GzEncoder::new(&mut *file, Compression::default());
+        for entry in entries {
+            let xdr = entry
+                .to_xdr(Limits::none())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            /// XDR record mark: high bit indicates last/only fragment.
+            const XDR_RECORD_MARK: u32 = 0x8000_0000;
+            let marked_len = (xdr.len() as u32) | XDR_RECORD_MARK;
+            encoder.write_all(&marked_len.to_be_bytes())?;
+            encoder.write_all(&xdr)?;
+        }
+        encoder.finish()?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -613,5 +616,102 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn test_write_scp_history_file_no_temp_files_remain() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let entry = stellar_xdr::curr::ScpHistoryEntry::V0(stellar_xdr::curr::ScpHistoryEntryV0 {
+            quorum_sets: stellar_xdr::curr::VecM::default(),
+            ledger_messages: stellar_xdr::curr::LedgerScpMessages {
+                ledger_seq: 63,
+                messages: stellar_xdr::curr::VecM::default(),
+            },
+        });
+
+        write_scp_history_file(tmp.path(), 63, std::slice::from_ref(&entry)).unwrap();
+
+        // No .tmp files should remain anywhere in the output tree
+        fn has_tmp_files(dir: &std::path::Path) -> bool {
+            if !dir.exists() {
+                return false;
+            }
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    if has_tmp_files(&path) {
+                        return true;
+                    }
+                } else if path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        assert!(
+            !has_tmp_files(tmp.path()),
+            "temp files should be cleaned up after atomic write"
+        );
+    }
+
+    #[test]
+    fn test_write_root_has_produces_valid_json_no_temp_files() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let has = henyey_history::publish::build_history_archive_state(
+            0,
+            &henyey_bucket::BucketList::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        write_root_has(tmp.path(), &has).unwrap();
+
+        let root_path = tmp
+            .path()
+            .join(henyey_history::paths::root_has_path());
+        assert!(root_path.exists(), "root HAS file should be written");
+
+        // Verify it's valid JSON matching the original HAS
+        let content = std::fs::read_to_string(&root_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.is_object());
+
+        // No temp files in the tree
+        fn has_tmp_files(dir: &std::path::Path) -> bool {
+            if !dir.exists() {
+                return false;
+            }
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    if has_tmp_files(&path) {
+                        return true;
+                    }
+                } else if path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        assert!(
+            !has_tmp_files(tmp.path()),
+            "temp files should be cleaned up after atomic write"
+        );
     }
 }
