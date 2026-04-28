@@ -789,13 +789,13 @@
       "id": 23,
       "type": "timeseries",
       "title": "SCP Nominate Time",
-      "description": "Time to nominate a value. Henyey: gauge (last slot). Core: summary rate(sum)/rate(count).",
+      "description": "Time spent in the nomination phase (nomination_start → ballot_start). Both sides averaged over $__rate_interval for an apples-to-apples comparison.",
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 39 },
       "datasource": { "type": "prometheus", "uid": "000000001" },
       "targets": [
         {
-          "expr": "stellar_scp_timing_nominated_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
-          "legendFormat": "Henyey",
+          "expr": "avg_over_time(stellar_scp_timing_nominated_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+          "legendFormat": "Henyey avg",
           "refId": "A"
         },
         {
