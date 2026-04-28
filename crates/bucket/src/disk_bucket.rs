@@ -869,6 +869,7 @@ impl Iterator for DiskBucketOffsetIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::BucketError;
     use stellar_xdr::curr::*;
     use tempfile::tempdir;
 
@@ -1198,6 +1199,33 @@ mod tests {
 
             let entry = bucket.get(&key).unwrap();
             assert!(entry.is_some(), "Entry {} should be found", i);
+        }
+    }
+
+    #[test]
+    fn test_from_prebuilt_rejects_hash_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bucket");
+
+        let bytes = make_test_bucket_bytes();
+        let bucket = DiskBucket::from_xdr_bytes(&bytes, &path).unwrap();
+
+        let real_hash = bucket.hash();
+        let wrong_hash = Hash256::hash(b"wrong");
+        assert_ne!(wrong_hash, real_hash, "Test requires distinct hashes");
+
+        let index = bucket.live_index().clone();
+        let entry_count = bucket.len();
+
+        let result = DiskBucket::from_prebuilt(&path, wrong_hash, entry_count, index);
+
+        match result {
+            Err(BucketError::HashMismatch { expected, actual }) => {
+                assert_eq!(expected, wrong_hash.to_hex());
+                assert_eq!(actual, real_hash.to_hex());
+            }
+            Err(other) => panic!("Expected HashMismatch, got: {:?}", other),
+            Ok(_) => panic!("Expected error, got Ok"),
         }
     }
 }

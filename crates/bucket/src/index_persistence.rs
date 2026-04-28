@@ -1140,6 +1140,13 @@ mod tests {
             result.is_none(),
             "Should reject index with changed file size"
         );
+
+        // Index file should be deleted
+        let index_path = index_path_for_bucket(&bucket_path);
+        assert!(
+            !index_path.exists(),
+            "Mismatched file-size index should be deleted"
+        );
     }
 
     #[test]
@@ -1166,5 +1173,12 @@ mod tests {
         // Load should reject because data checksum doesn't match
         let result = load_disk_index(&bucket_path, page_size, &bucket_hash).unwrap();
         assert!(result.is_none(), "Should reject index with corrupted data");
+
+        // Index file should be deleted
+        let index_path = index_path_for_bucket(&bucket_path);
+        assert!(
+            !index_path.exists(),
+            "Corrupted index file should be deleted"
+        );
     }
 }
