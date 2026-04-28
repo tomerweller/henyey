@@ -1092,11 +1092,16 @@ impl App {
         overlay_config.is_validator = self.is_validator; // Watchers filter non-essential messages
         overlay_config.network_passphrase = self.config.network.passphrase.clone();
 
-        if let Ok(persisted) = self.load_persisted_peers().await {
-            for addr in persisted {
-                if !overlay_config.known_peers.contains(&addr) {
-                    overlay_config.known_peers.push(addr);
+        match self.load_persisted_peers().await {
+            Ok(persisted) => {
+                for addr in persisted {
+                    if !overlay_config.known_peers.contains(&addr) {
+                        overlay_config.known_peers.push(addr);
+                    }
                 }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load persisted peers");
             }
         }
 
