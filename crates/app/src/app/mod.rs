@@ -1877,10 +1877,17 @@ impl App {
         // possible (validator with writable archives) (#1989).
         let can_publish = self.is_validator && self.config.history.publish_enabled();
         let min_queued = if can_publish {
-            self.db
-                .load_publish_queue(Some(1))
-                .ok()
-                .and_then(|queue| queue.first().copied())
+            match self.db.load_publish_queue(Some(1)) {
+                Ok(queue) => queue.first().copied(),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to read publish queue for maintenance; \
+                         pruning will use LCL as fallback"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -2304,10 +2311,17 @@ impl App {
             // queue cannot drain and stale entries would pin the prune threshold
             // indefinitely (#1989).
             let min_queued = if can_publish {
-                app.database()
-                    .load_publish_queue(Some(1))
-                    .ok()
-                    .and_then(|queue| queue.first().copied())
+                match app.database().load_publish_queue(Some(1)) {
+                    Ok(queue) => queue.first().copied(),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to read publish queue for maintenance; \
+                             pruning will use LCL as fallback"
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             };
