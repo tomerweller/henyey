@@ -80,6 +80,7 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use stellar_xdr::curr::WriteXdr;
 
@@ -543,6 +544,26 @@ enum Commands {
     /// Print sample configuration
     SampleConfig,
 
+    /// Validate a configuration file
+    ///
+    /// Parses the given TOML file as an AppConfig (with deny_unknown_fields for
+    /// native format), supporting both henyey-native and stellar-core compat
+    /// formats. Optionally runs semantic validation. Exit code 0 on success,
+    /// non-zero on parse or validation error.
+    ///
+    /// Environment overrides (RS_STELLAR_CORE_*) are applied, matching runtime
+    /// behavior. Stellar-core compat format does not enforce deny_unknown_fields
+    /// (unknown keys are warned/ignored by the translator).
+    #[command(name = "check-config")]
+    CheckConfig {
+        /// Path to the TOML configuration file to check
+        path: PathBuf,
+
+        /// Also run semantic validation (e.g., node_seed format, archive presence)
+        #[arg(long)]
+        validate: bool,
+    },
+
     /// Send a command to a running stellar-core node
     ///
     /// Makes an HTTP GET request to the local node's command interface.
@@ -846,6 +867,11 @@ async fn main() -> anyhow::Result<()> {
                 add_resource_fee: *add_resource_fee,
             });
         }
+        Commands::CheckConfig { path, validate } => {
+            // Init logging so validate() warnings and compat-detection info are visible.
+            init_logging(&cli)?;
+            return cmd_check_config(path, *validate);
+        }
         _ => {}
     }
 
@@ -1007,7 +1033,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::OfflineInfo => cmd_offline_info(config),
 
         // Handled by early return above; included for exhaustive match.
-        Commands::Version | Commands::ConvertId { .. } | Commands::GetSettingsUpgradeTxs { .. } => {
+        Commands::Version
+        | Commands::ConvertId { .. }
+        | Commands::GetSettingsUpgradeTxs { .. }
+        | Commands::CheckConfig { .. } => {
             unreachable!()
         }
 
@@ -2772,6 +2801,24 @@ fn cmd_sample_config() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate a configuration file.
+///
+/// Parses the file using `load_config_file` (which handles stellar-core compat
+/// format detection and env overrides), then optionally runs semantic validation.
+fn cmd_check_config(path: &std::path::Path, validate: bool) -> anyhow::Result<()> {
+    let config = load_config_file(path)
+        .with_context(|| format!("Failed to load config: {}", path.display()))?;
+
+    if validate {
+        config
+            .validate()
+            .with_context(|| format!("Config validation failed: {}", path.display()))?;
+    }
+
+    println!("OK: {}", path.display());
+    Ok(())
+}
+
 /// Prints information about bucket files.
 ///
 /// If given a directory, lists all bucket files with their sizes.
@@ -3652,5 +3699,138 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    // =========================================================================
+    // check-config Tests
+    // =========================================================================
+
+    #[test]
+    fn test_cli_check_config_parse() {
+        let cli = Cli::parse_from(["rs-stellar-core", "check-config", "/tmp/foo.toml"]);
+        match cli.command {
+            Commands::CheckConfig { path, validate } => {
+                assert_eq!(path, PathBuf::from("/tmp/foo.toml"));
+                assert!(!validate);
+            }
+            _ => panic!("Expected CheckConfig"),
+        }
+    }
+
+    #[test]
+    fn test_cli_check_config_parse_with_validate() {
+        let cli = Cli::parse_from([
+            "rs-stellar-core",
+            "check-config",
+            "--validate",
+            "/tmp/foo.toml",
+        ]);
+        match cli.command {
+            Commands::CheckConfig { path, validate } => {
+                assert_eq!(path, PathBuf::from("/tmp/foo.toml"));
+                assert!(validate);
+            }
+            _ => panic!("Expected CheckConfig"),
+        }
+    }
+
+    #[test]
+    fn test_check_config_shipped_config_parses() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let config_path = repo_root.join("configs/validator-testnet.toml");
+        assert!(
+            config_path.exists(),
+            "configs/validator-testnet.toml should exist"
+        );
+        cmd_check_config(&config_path, false).expect("shipped config should parse");
+    }
+
+    #[test]
+    fn test_check_config_unknown_field_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(
+            &path,
+            r#"
+[node]
+bogus_field_that_does_not_exist = true
+"#,
+        )
+        .unwrap();
+
+        let err = cmd_check_config(&path, false).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("unknown field"),
+            "Expected 'unknown field' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_check_config_validate_pass() {
+        // Minimal watcher config that passes both parse and validate.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watcher.toml");
+        std::fs::write(
+            &path,
+            r#"
+[node]
+is_validator = false
+
+[node.quorum_set]
+threshold_percent = 67
+validators = [
+    "GDKXE2OZMJIPOSLNA6N6F2BVCI3O6CDCQ2HO3SIBB4LE5AWI5AYM24",
+]
+
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+"#,
+        )
+        .unwrap();
+
+        cmd_check_config(&path, true).expect("valid watcher config should pass validation");
+    }
+
+    #[test]
+    fn test_check_config_validate_fail_empty_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-archives.toml");
+        std::fs::write(
+            &path,
+            r#"
+[node]
+is_validator = false
+
+[node.quorum_set]
+threshold_percent = 67
+validators = [
+    "GDKXE2OZMJIPOSLNA6N6F2BVCI3O6CDCQ2HO3SIBB4LE5AWI5AYM24",
+]
+
+[network]
+passphrase = "Test SDF Network ; September 2015"
+"#,
+        )
+        .unwrap();
+
+        // Parse-only should succeed (no semantic validation).
+        cmd_check_config(&path, false).expect("parse-only should succeed");
+
+        // Validate should fail — no history archives.
+        let err = cmd_check_config(&path, true).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("history archive"),
+            "Expected archive-related error, got: {msg}"
+        );
     }
 }
