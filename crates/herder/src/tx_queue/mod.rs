@@ -1317,13 +1317,25 @@ impl TransactionQueue {
 
     /// Return the effective Soroban resource limits for queue admission.
     /// Prefers the dynamic value (updated each ledger close) over the static config.
-    fn effective_queue_soroban_resources(&self) -> Option<Resource> {
+    pub(crate) fn effective_queue_soroban_resources(&self) -> Option<Resource> {
         let dynamic = self.dynamic_queue_soroban_resources.read();
         if dynamic.is_some() {
             dynamic.clone()
         } else {
             self.config.max_queue_soroban_resources.clone()
         }
+    }
+
+    /// Return the effective Soroban queue tx-count limit for flood demand sizing.
+    ///
+    /// Matches stellar-core `SorobanTransactionQueue::getMaxQueueSizeOps()`:
+    /// returns the `Operations` slot of the pool-scaled Soroban resource limits,
+    /// or `0` when no Soroban limits are configured.
+    pub fn max_queue_size_soroban_ops(&self) -> usize {
+        self.effective_queue_soroban_resources()
+            .and_then(|r| r.try_get_val(ResourceType::Operations))
+            .map(|ops| usize::try_from(ops.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0)
     }
 
     /// Test-only: skip fee balance validation in try_add.

@@ -714,6 +714,15 @@ impl Herder {
         self.config.max_pending_transactions
     }
 
+    /// Maximum Soroban queue capacity in tx-count (pool-scaled).
+    ///
+    /// Matches stellar-core `HerderImpl::getMaxQueueSizeSorobanOps()`:
+    /// delegates to the Soroban transaction queue's `getMaxQueueSizeOps()`,
+    /// which returns 0 when no Soroban limits are configured.
+    pub fn max_queue_size_soroban_ops(&self) -> usize {
+        self.tx_queue.max_queue_size_soroban_ops()
+    }
+
     /// Return the set of node IDs from the local quorum set (if configured).
     pub fn local_quorum_nodes(&self) -> std::collections::HashSet<stellar_xdr::curr::NodeId> {
         fn collect_nodes(
@@ -7094,5 +7103,31 @@ mod dynamic_close_time_tests {
         };
         let herder = Herder::new(config);
         assert_eq!(herder.ledger_close_duration(), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn test_max_queue_size_soroban_ops_defaults_to_zero() {
+        let herder = Herder::new(HerderConfig::default());
+        assert_eq!(herder.max_queue_size_soroban_ops(), 0);
+    }
+
+    #[test]
+    fn test_max_queue_size_soroban_ops_reads_static_config() {
+        let mut config = HerderConfig::default();
+        config.tx_queue_config.max_queue_soroban_resources =
+            Some(henyey_common::Resource::new(vec![
+                7, 200, 300, 400, 500, 600, 700,
+            ]));
+        let herder = Herder::new(config);
+        assert_eq!(herder.max_queue_size_soroban_ops(), 7);
+    }
+
+    #[test]
+    fn test_max_queue_size_soroban_ops_prefers_dynamic() {
+        let herder = Herder::new(HerderConfig::default());
+        herder.tx_queue().update_soroban_resource_limits(
+            henyey_common::Resource::soroban_ledger_limits(17, 1, 1, 1, 1, 1, 1),
+        );
+        assert_eq!(herder.max_queue_size_soroban_ops(), 17);
     }
 }

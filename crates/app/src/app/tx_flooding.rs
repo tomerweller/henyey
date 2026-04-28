@@ -1,16 +1,18 @@
 //! Transaction flooding: advertising, pulling, and broadcasting transactions across peers.
 
 use super::*;
+use henyey_common::protocol::soroban_supported;
 
 const TX_ADVERT_VECTOR_MAX_SIZE: usize = 1000;
 const TX_DEMAND_VECTOR_MAX_SIZE: usize = 1000;
 const MAX_FLOOD_RESOURCE: usize = u32::MAX as usize;
 
-fn classic_ops_to_flood_per_ledger(rate: f64, ops_limit: usize) -> i64 {
-    let product = rate * ops_limit as f64;
+/// Truncate `rate * limit` to i64, matching stellar-core's `getOpsFloodLedger`.
+fn ops_to_flood_per_ledger(rate: f64, limit: usize) -> i64 {
+    let product = rate * limit as f64;
     assert!(
         product.is_finite() && product >= 0.0 && product < i64::MAX as f64,
-        "classic flood rate product must be representable as int64"
+        "flood rate product must be representable as int64"
     );
     product as i64
 }
@@ -45,8 +47,29 @@ fn classic_flood_budget(
     period_ms: u64,
     ledger_close_ms: u64,
 ) -> usize {
-    let per_ledger = classic_ops_to_flood_per_ledger(rate, ops_limit);
+    let per_ledger = ops_to_flood_per_ledger(rate, ops_limit);
     rounded_up_flood_budget(per_ledger as u128, period_ms, ledger_close_ms)
+}
+
+/// Compute the combined classic+Soroban flood budget.
+///
+/// Matches stellar-core: sum `getOpsFloodLedger` for classic and Soroban
+/// as i64 first (one per-ledger total), then a single `bigDivideOrThrow`
+/// with ROUND_UP for the period fraction, then clamp externally.
+fn combined_flood_budget(
+    classic_rate: f64,
+    classic_limit: usize,
+    soroban_rate: f64,
+    soroban_limit: usize,
+    period_ms: u64,
+    ledger_close_ms: u64,
+) -> usize {
+    let classic = ops_to_flood_per_ledger(classic_rate, classic_limit);
+    let soroban = ops_to_flood_per_ledger(soroban_rate, soroban_limit);
+    let total = classic
+        .checked_add(soroban)
+        .expect("combined flood per-ledger limit must fit stellar-core int64");
+    rounded_up_flood_budget(total as u128, period_ms, ledger_close_ms)
 }
 
 fn dex_flood_budget(rate: f64, ops_limit: u32, period_ms: u64, ledger_close_ms: u64) -> usize {
@@ -266,9 +289,25 @@ impl App {
     }
 
     fn max_advert_size(&self) -> usize {
-        let per_period = classic_flood_budget(
+        // stellar-core: TxAdverts::getMaxAdvertSize()
+        // Sum classic + Soroban ops-to-flood-per-ledger, then one round-up division.
+        let soroban_limit = if soroban_supported(
+            self.ledger_manager()
+                .header_snapshot()
+                .header
+                .ledger_version,
+        ) {
+            self.soroban_network_info()
+                .map(|info| info.ledger_max_tx_count as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let per_period = combined_flood_budget(
             self.config.overlay.flood_op_rate_per_ledger,
             self.herder.max_tx_set_size(),
+            self.config.overlay.flood_soroban_rate_per_ledger,
+            soroban_limit,
             self.config.overlay.flood_advert_period_ms,
             self.herder.ledger_close_duration().as_millis() as u64,
         );
@@ -276,9 +315,13 @@ impl App {
     }
 
     fn max_demand_size(&self) -> usize {
-        let per_period = classic_flood_budget(
+        // stellar-core: TxDemandsManager::getMaxDemandSize()
+        // Sum classic queue ops + Soroban queue ops, then one round-up division.
+        let per_period = combined_flood_budget(
             self.config.overlay.flood_op_rate_per_ledger,
             self.herder.max_queue_size_ops(),
+            self.config.overlay.flood_soroban_rate_per_ledger,
+            self.herder.max_queue_size_soroban_ops(),
             self.config.overlay.flood_demand_period_ms,
             self.herder.ledger_close_duration().as_millis() as u64,
         );
@@ -1353,15 +1396,38 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "classic flood rate product must be representable as int64")]
+    #[should_panic(expected = "flood rate product must be representable as int64")]
     fn test_classic_flood_budget_rejects_non_finite_rate() {
         let _ = classic_flood_budget(f64::NAN, 100, 200, 5000);
     }
 
     #[test]
-    #[should_panic(expected = "classic flood rate product must be representable as int64")]
+    #[should_panic(expected = "flood rate product must be representable as int64")]
     fn test_classic_flood_budget_rejects_too_large_product() {
         let _ = classic_flood_budget(i64::MAX as f64, 1, 200, 5000);
+    }
+
+    #[test]
+    fn test_combined_flood_budget_adds_soroban_before_division() {
+        // classic: 0.1 * 10 = 1, soroban: 0.1 * 10 = 1, total = 2
+        // 2 * 1 / 2 = 1 (exact)
+        assert_eq!(combined_flood_budget(0.1, 10, 0.1, 10, 1, 2), 1);
+    }
+
+    #[test]
+    fn test_combined_flood_budget_matches_classic_when_soroban_zero() {
+        assert_eq!(
+            combined_flood_budget(0.51, 10, 0.9, 0, 3, 10),
+            classic_flood_budget(0.51, 10, 3, 10)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "combined flood per-ledger limit must fit stellar-core int64")]
+    fn test_combined_flood_budget_rejects_overflow() {
+        // Each term fits i64, but their sum overflows.
+        let half = (i64::MAX / 2 + 1) as f64;
+        let _ = combined_flood_budget(half, 1, half, 1, 200, 5000);
     }
 
     #[test]
