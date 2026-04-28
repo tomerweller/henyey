@@ -247,7 +247,16 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         config.overlay.preferred_peers = peers;
     }
     if let Some(v) = get_i64(table, "FLOOD_ARB_TX_BASE_ALLOWANCE") {
-        config.overlay.flood_arb_tx_base_allowance = v as i32;
+        match i32::try_from(v) {
+            Ok(i) => config.overlay.flood_arb_tx_base_allowance = i,
+            Err(_) => {
+                tracing::warn!(
+                    key = "FLOOD_ARB_TX_BASE_ALLOWANCE",
+                    value = v,
+                    "Compat config key value overflows i32 range"
+                );
+            }
+        }
     }
     if let Some(v) = get_f64(table, "FLOOD_ARB_TX_DAMPING_FACTOR") {
         config.overlay.flood_arb_tx_damping_factor = v;
@@ -2103,5 +2112,44 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
 
         // HOME_DOMAINS exists but validator's domain isn't in it → error
         assert!(build_validator_weight_config(&config, &entries, &domain_map).is_err());
+    }
+
+    #[test]
+    fn test_flood_arb_tx_base_allowance_parsed() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOOD_ARB_TX_BASE_ALLOWANCE=10
+FLOOD_ARB_TX_DAMPING_FACTOR=0.5
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert_eq!(config.overlay.flood_arb_tx_base_allowance, 10);
+        assert!((config.overlay.flood_arb_tx_damping_factor - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_flood_arb_tx_base_allowance_disabled() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOOD_ARB_TX_BASE_ALLOWANCE=-1
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert_eq!(config.overlay.flood_arb_tx_base_allowance, -1);
+    }
+
+    #[test]
+    fn test_flood_arb_tx_base_allowance_overflow_ignored() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOOD_ARB_TX_BASE_ALLOWANCE=4294967295
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        // Value overflows i32 — should be ignored, keeping the default.
+        assert_eq!(config.overlay.flood_arb_tx_base_allowance, 5);
     }
 }

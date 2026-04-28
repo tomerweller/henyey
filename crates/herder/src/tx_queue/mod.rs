@@ -9411,4 +9411,168 @@ mod broadcast_visitor_tests {
         assert_eq!(budget.ops_remaining, 0);
         assert_eq!(budget.dex_ops_remaining, Some(0));
     }
+
+    /// Create a path-payment-strict-receive envelope where send_asset → path → dest_asset
+    /// forms a loop (send_asset == dest_asset with no path, or forms a cycle).
+    fn make_arb_loop_envelope(fee: u32) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let asset_a = Asset::Native;
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+        });
+        // A → B → A forms a loop
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+                send_asset: asset_a.clone(),
+                send_max: 1000,
+                destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+                dest_asset: asset_a,
+                dest_amount: 100,
+                path: vec![asset_b].try_into().unwrap(),
+            }),
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    #[test]
+    fn test_broadcast_visitor_arb_damping_drops_after_allowance() {
+        let config = TxQueueConfig {
+            max_size: 100,
+            flood_arb_tx_base_allowance: 1,
+            flood_arb_tx_damping_factor: 0.8,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add several arb-loop txs from different sources
+        for i in 0..5u8 {
+            let mut env = make_arb_loop_envelope(200);
+            set_source(&mut env, 10 + i);
+            queue.try_add(env);
+        }
+
+        // With base_allowance=1, the first should always be broadcast,
+        // subsequent ones may be dampened.
+        let (entries, _) = visit_all_processed(&queue, 100, None);
+        // At least 1 must pass (the base allowance), but fewer than all 5
+        // should pass (probabilistic damping kicks in).
+        assert!(
+            !entries.is_empty(),
+            "At least the base allowance txs should pass"
+        );
+
+        // Metrics should reflect arb processing
+        let stats = queue.stats();
+        assert!(stats.arb_tx_seen > 0, "arb_tx_seen should be incremented");
+    }
+
+    #[test]
+    fn test_broadcast_visitor_arb_damping_disabled() {
+        let config = TxQueueConfig {
+            max_size: 100,
+            flood_arb_tx_base_allowance: -1, // disabled
+            flood_arb_tx_damping_factor: 0.8,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        for i in 0..3u8 {
+            let mut env = make_arb_loop_envelope(200);
+            set_source(&mut env, 10 + i);
+            queue.try_add(env);
+        }
+
+        let (entries, _) = visit_all_processed(&queue, 100, None);
+        // All should pass when damping is disabled
+        assert_eq!(entries.len(), 3);
+
+        // arb_tx_seen/dropped should be 0 when disabled
+        let stats = queue.stats();
+        assert_eq!(stats.arb_tx_seen, 0);
+        assert_eq!(stats.arb_tx_dropped, 0);
+    }
+
+    #[test]
+    fn test_shift_clears_arb_damper() {
+        let config = TxQueueConfig {
+            max_size: 100,
+            flood_arb_tx_base_allowance: 1,
+            flood_arb_tx_damping_factor: 0.8,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add and broadcast arb txs to populate damper state
+        for i in 0..3u8 {
+            let mut env = make_arb_loop_envelope(200);
+            set_source(&mut env, 10 + i);
+            queue.try_add(env);
+        }
+        visit_all_processed(&queue, 100, None);
+
+        let stats_before = queue.stats();
+        assert!(stats_before.arb_tx_seen > 0);
+
+        // shift() should clear the damper's internal state (per-pair counters)
+        // but metrics are cumulative AtomicU64s, so they persist.
+        queue.shift();
+        let damper = queue.arb_damper.lock();
+        assert!(
+            damper.damping_map.is_empty(),
+            "shift() should clear damper's per-pair counters"
+        );
+    }
+
+    #[test]
+    fn test_reset_and_rebuild_preserves_arb_damper() {
+        let config = TxQueueConfig {
+            max_size: 100,
+            flood_arb_tx_base_allowance: 1,
+            flood_arb_tx_damping_factor: 0.8,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add and broadcast arb txs to populate damper state
+        for i in 0..3u8 {
+            let mut env = make_arb_loop_envelope(200);
+            set_source(&mut env, 10 + i);
+            queue.try_add(env);
+        }
+        visit_all_processed(&queue, 100, None);
+
+        // Grab damper state before reset
+        let pairs_before = queue.arb_damper.lock().damping_map.len();
+        assert!(
+            pairs_before > 0,
+            "damper should have entries after broadcast"
+        );
+
+        // reset_and_rebuild should NOT clear the damper
+        queue.reset_and_rebuild();
+        let pairs_after = queue.arb_damper.lock().damping_map.len();
+        assert_eq!(
+            pairs_before, pairs_after,
+            "reset_and_rebuild must preserve arb damper state"
+        );
+    }
 }

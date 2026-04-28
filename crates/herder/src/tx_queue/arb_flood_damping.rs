@@ -240,7 +240,7 @@ pub enum ArbBroadcastResult {
 /// Beyond that, each additional broadcast is allowed with geometrically
 /// decreasing probability controlled by `damping_factor`.
 pub struct ArbitrageFloodDamper {
-    damping_map: HashMap<AssetPair, u32>,
+    pub(crate) damping_map: HashMap<AssetPair, u32>,
     base_allowance: i32,
     damping_factor: f64,
     rng: StdRng,
