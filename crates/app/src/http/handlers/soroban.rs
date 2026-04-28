@@ -9,8 +9,8 @@ use axum::{
 };
 
 use super::super::types::{
-    SorobanInfoParams, SorobanInfoResponse, SorobanLedgerLimits, SorobanStateArchival,
-    SorobanTxLimits,
+    SorobanInfoParams, SorobanInfoResponse, SorobanLedgerLimits, SorobanScpSettings,
+    SorobanStateArchival, SorobanTxLimits,
 };
 use super::super::ServerState;
 
@@ -75,6 +75,22 @@ pub(crate) async fn sorobaninfo_handler(
                     bucketlist_size_window_sample_size: info.bucketlist_size_window_sample_size,
                     eviction_scan_size: info.eviction_scan_size,
                     starting_eviction_scan_level: info.starting_eviction_scan_level,
+                },
+                max_dependent_tx_clusters: if protocol_version >= 23 {
+                    Some(info.ledger_max_dependent_tx_clusters)
+                } else {
+                    None
+                },
+                scp: if protocol_version >= 23 {
+                    Some(SorobanScpSettings {
+                        ledger_close_time_ms: info.ledger_target_close_time_ms,
+                        nomination_timeout_ms: info.nomination_timeout_initial_ms,
+                        nomination_timeout_inc_ms: info.nomination_timeout_increment_ms,
+                        ballot_timeout_ms: info.ballot_timeout_initial_ms,
+                        ballot_timeout_inc_ms: info.ballot_timeout_increment_ms,
+                    })
+                } else {
+                    None
                 },
             };
             (

@@ -25,6 +25,22 @@ pub struct SorobanInfoResponse {
     pub fee_contract_events_size_1kb: i64,
     pub fee_transaction_size_1kb: i64,
     pub state_archival: SorobanStateArchival,
+    /// Protocol 23+: maximum dependent TX clusters per parallel stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_dependent_tx_clusters: Option<u32>,
+    /// Protocol 23+: SCP timing settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scp: Option<SorobanScpSettings>,
+}
+
+/// SCP timing settings (protocol 23+), matching stellar-core's JSON field names.
+#[derive(Serialize)]
+pub struct SorobanScpSettings {
+    pub ledger_close_time_ms: u32,
+    pub nomination_timeout_ms: u32,
+    pub nomination_timeout_inc_ms: u32,
+    pub ballot_timeout_ms: u32,
+    pub ballot_timeout_inc_ms: u32,
 }
 
 /// Soroban per-transaction resource limits.

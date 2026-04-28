@@ -36,8 +36,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7042,7 +7042,10 @@ mod dynamic_close_time_tests {
         let mut info = SorobanNetworkInfo::default();
         info.ledger_target_close_time_ms = 4000;
         lm.set_soroban_network_info_for_test(info);
-        assert_eq!(lm.expected_ledger_close_duration(), Duration::from_millis(4000));
+        assert_eq!(
+            lm.expected_ledger_close_duration(),
+            Duration::from_millis(4000)
+        );
     }
 
     #[test]
@@ -7053,7 +7056,10 @@ mod dynamic_close_time_tests {
         let mut info = SorobanNetworkInfo::default();
         info.ledger_target_close_time_ms = 4500;
         lm.set_soroban_network_info_for_test(info);
-        assert_eq!(lm.expected_ledger_close_duration(), Duration::from_millis(4500));
+        assert_eq!(
+            lm.expected_ledger_close_duration(),
+            Duration::from_millis(4500)
+        );
     }
 
     #[test]

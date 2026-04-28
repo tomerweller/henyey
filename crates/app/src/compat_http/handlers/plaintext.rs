@@ -340,19 +340,40 @@ pub(crate) async fn compat_sorobaninfo_handler(
     State(state): State<Arc<CompatServerState>>,
 ) -> impl IntoResponse {
     match state.app.soroban_network_info() {
-        Some(info) => Json(serde_json::json!({
-            "info": {
-                "ledger_max_instructions": info.ledger_max_instructions,
-                "tx_max_instructions": info.tx_max_instructions,
-                "tx_memory_limit": info.tx_memory_limit,
-                "ledger_max_read_ledger_entries": info.ledger_max_read_ledger_entries,
-                "ledger_max_read_bytes": info.ledger_max_read_bytes,
-                "ledger_max_write_ledger_entries": info.ledger_max_write_ledger_entries,
-                "ledger_max_write_bytes": info.ledger_max_write_bytes,
-                "ledger_max_tx_count": info.ledger_max_tx_count,
-                "tx_max_size_bytes": info.tx_max_size_bytes,
+        Some(info) => {
+            let protocol_version = state.app.ledger_info().protocol_version;
+            let mut resp = serde_json::json!({
+                "info": {
+                    "ledger_max_instructions": info.ledger_max_instructions,
+                    "tx_max_instructions": info.tx_max_instructions,
+                    "tx_memory_limit": info.tx_memory_limit,
+                    "ledger_max_read_ledger_entries": info.ledger_max_read_ledger_entries,
+                    "ledger_max_read_bytes": info.ledger_max_read_bytes,
+                    "ledger_max_write_ledger_entries": info.ledger_max_write_ledger_entries,
+                    "ledger_max_write_bytes": info.ledger_max_write_bytes,
+                    "ledger_max_tx_count": info.ledger_max_tx_count,
+                    "tx_max_size_bytes": info.tx_max_size_bytes,
+                }
+            });
+            if protocol_version >= 23 {
+                let obj = resp["info"].as_object_mut().unwrap();
+                obj.insert(
+                    "max_dependent_tx_clusters".into(),
+                    info.ledger_max_dependent_tx_clusters.into(),
+                );
+                obj.insert(
+                    "scp".into(),
+                    serde_json::json!({
+                        "ledger_close_time_ms": info.ledger_target_close_time_ms,
+                        "nomination_timeout_ms": info.nomination_timeout_initial_ms,
+                        "nomination_timeout_inc_ms": info.nomination_timeout_increment_ms,
+                        "ballot_timeout_ms": info.ballot_timeout_initial_ms,
+                        "ballot_timeout_inc_ms": info.ballot_timeout_increment_ms,
+                    }),
+                );
             }
-        })),
+            Json(resp)
+        }
         None => Json(serde_json::json!({"info": "Soroban not available"})),
     }
 }
