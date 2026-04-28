@@ -50,12 +50,31 @@ use crate::{
     paths, verify, HistoryError, Result,
 };
 use henyey_bucket::{BucketList, PendingMergeState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
+use henyey_common::fs_utils::durable_rename;
 use henyey_common::Hash256;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use stellar_xdr::curr::{
     LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
 use tracing::{debug, info};
+
+/// Monotonic counter for generating unique temp file names.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a unique temp file path in the same directory as `final_path`.
+///
+/// Uses PID + atomic counter to guarantee uniqueness across threads and
+/// process restarts. The temp file should be created with `OpenOptions::new().write(true).create_new(true)`
+/// to detect stale collisions.
+fn temp_path(final_path: &Path) -> PathBuf {
+    final_path.with_file_name(format!(
+        "{}.tmp.{}.{}",
+        final_path.file_name().unwrap().to_string_lossy(),
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ))
+}
 
 /// Buffer size for gzip-compressing bucket files (64 KiB).
 const GZIP_COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -401,16 +420,39 @@ impl PublishManager {
         use flate2::write::GzEncoder;
         use flate2::Compression;
 
-        let file = std::fs::File::create(path.with_extension("xdr.gz"))?;
-        let mut encoder = GzEncoder::new(file, Compression::default());
+        let final_path = path.with_extension("xdr.gz");
 
-        for item in items {
-            write_record_marked_xdr(&mut encoder, item)?;
+        if let Some(parent) = final_path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
 
-        encoder.finish()?;
-        debug!("Wrote {} {} to {:?}", items.len(), label, path);
-        Ok(())
+        let tmp_path = temp_path(&final_path);
+        let result = (|| -> Result<()> {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            let mut encoder = GzEncoder::new(file, Compression::default());
+
+            for item in items {
+                write_record_marked_xdr(&mut encoder, item)?;
+            }
+
+            encoder.finish()?.sync_all()?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                durable_rename(&tmp_path, &final_path)?;
+                debug!("Wrote {} {} to {:?}", items.len(), label, final_path);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                Err(e)
+            }
+        }
     }
 
     /// Write a bucket to the history archive as a gzip-compressed file.
@@ -437,45 +479,88 @@ impl PublishManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        let file = std::fs::File::create(path)?;
-        let mut encoder = GzEncoder::new(file, Compression::default());
+        let tmp_path = temp_path(path);
+        let result = (|| -> Result<()> {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            let mut encoder = GzEncoder::new(file, Compression::default());
 
-        if let Some(backing_path) = bucket.backing_file_path() {
-            // Fast path: gzip-compress the existing .bucket.xdr file directly.
-            // This preserves the exact record-marked format.
-            let mut src = std::fs::File::open(backing_path)?;
-            let mut buf = [0u8; GZIP_COPY_BUFFER_SIZE];
-            loop {
-                let n = src.read(&mut buf)?;
-                if n == 0 {
-                    break;
+            if let Some(backing_path) = bucket.backing_file_path() {
+                // Fast path: gzip-compress the existing .bucket.xdr file directly.
+                // This preserves the exact record-marked format.
+                let mut src = std::fs::File::open(backing_path)?;
+                let mut buf = [0u8; GZIP_COPY_BUFFER_SIZE];
+                loop {
+                    let n = src.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    encoder.write_all(&buf[..n])?;
                 }
-                encoder.write_all(&buf[..n])?;
+            } else {
+                // Fallback: serialize entries with RFC 5531 record marks
+                for entry_result in bucket
+                    .iter()
+                    .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?
+                {
+                    let entry = entry_result
+                        .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
+                    write_record_marked_xdr(&mut encoder, &entry)?;
+                }
             }
-        } else {
-            // Fallback: serialize entries with RFC 5531 record marks
-            for entry_result in bucket
-                .iter()
-                .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?
-            {
-                let entry =
-                    entry_result.map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
-                write_record_marked_xdr(&mut encoder, &entry)?;
+
+            encoder.finish()?.sync_all()?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                durable_rename(&tmp_path, path)?;
+                debug!("Wrote bucket to {:?}", path);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                Err(e)
             }
         }
-
-        encoder.finish()?;
-        debug!("Wrote bucket to {:?}", path);
-        Ok(())
     }
 
     /// Write a History Archive State file.
     fn write_has(&self, path: &Path, has: &HistoryArchiveState) -> Result<()> {
+        use std::io::Write;
+
         let json = serde_json::to_string_pretty(has)
             .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
-        std::fs::write(path, json)?;
-        debug!("Wrote HAS to {:?}", path);
-        Ok(())
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let tmp_path = temp_path(path);
+        let result = (|| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                durable_rename(&tmp_path, path)?;
+                debug!("Wrote HAS to {:?}", path);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                Err(e)
+            }
+        }
     }
 
     /// Create a History Archive State from checkpoint data.
@@ -1126,5 +1211,108 @@ mod tests {
                 header_hash.to_hex(),
             );
         }
+    }
+
+    #[test]
+    fn test_temp_path_uniqueness() {
+        let base = Path::new("/tmp/bucket-abc123.xdr.gz");
+        let p1 = temp_path(base);
+        let p2 = temp_path(base);
+        assert_ne!(p1, p2, "temp_path must produce unique names");
+        // Same directory as the original
+        assert_eq!(p1.parent(), base.parent());
+        assert_eq!(p2.parent(), base.parent());
+        // Contains .tmp. marker
+        let name1 = p1.file_name().unwrap().to_string_lossy();
+        assert!(name1.contains(".tmp."), "temp name should contain .tmp.");
+        assert!(name1.starts_with("bucket-abc123.xdr.gz.tmp."));
+    }
+
+    #[test]
+    fn test_write_has_atomic() {
+        let temp = TempDir::new().unwrap();
+        let config = PublishConfig {
+            local_path: temp.path().to_path_buf(),
+            network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+            ..Default::default()
+        };
+        let manager = PublishManager::new(config);
+
+        let has = HistoryArchiveState {
+            version: 1,
+            server: None,
+            current_ledger: 64,
+            network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+            current_buckets: vec![],
+            hot_archive_buckets: None,
+        };
+
+        let has_path = temp.path().join("history/00/00/00/history-00000040.json");
+        manager.write_has(&has_path, &has).unwrap();
+
+        // Final file exists
+        assert!(has_path.exists());
+
+        // No temp files remain
+        let parent = has_path.parent().unwrap();
+        let tmp_files: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            tmp_files.is_empty(),
+            "no .tmp files should remain after successful write"
+        );
+
+        // Content is valid JSON
+        let content = std::fs::read_to_string(&has_path).unwrap();
+        let _: serde_json::Value = serde_json::from_str(&content).unwrap();
+    }
+
+    #[test]
+    fn test_write_xdr_gz_atomic() {
+        use stellar_xdr::curr::LedgerHeaderHistoryEntry;
+
+        let temp = TempDir::new().unwrap();
+        let config = PublishConfig {
+            local_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let manager = PublishManager::new(config);
+
+        let base_path = temp.path().join("ledger/00/00/00/ledger-00000040");
+        let final_path = base_path.with_extension("xdr.gz");
+
+        // Write empty items (valid but trivial)
+        let items: Vec<LedgerHeaderHistoryEntry> = vec![];
+        manager.write_xdr_gz(&base_path, &items, "headers").unwrap();
+
+        // Final file exists
+        assert!(final_path.exists());
+
+        // No temp files remain in the directory
+        let parent = final_path.parent().unwrap();
+        let tmp_files: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            tmp_files.is_empty(),
+            "no .tmp files should remain after successful write"
+        );
+
+        // File is valid gzip
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let file = std::fs::File::open(&final_path).unwrap();
+        let mut decoder = GzDecoder::new(file);
+        let mut content = Vec::new();
+        decoder.read_to_end(&mut content).unwrap();
+        assert!(
+            content.is_empty(),
+            "empty items should produce empty decompressed content"
+        );
     }
 }
