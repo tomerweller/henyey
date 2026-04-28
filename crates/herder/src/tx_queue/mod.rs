@@ -46,6 +46,7 @@ use parking_lot::RwLock;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use henyey_common::{
@@ -305,9 +306,9 @@ pub struct ValidationContext {
     pub base_reserve: u32,
     /// Ledger header flags (e.g. LP disable flags). 0 if pre-v1 extension.
     pub ledger_flags: u32,
-    /// Expected ledger close time in milliseconds.
+    /// Expected ledger close time.
     /// Updated each ledger close from the dynamic network config.
-    pub expected_close_time_ms: u64,
+    pub expected_close_time: Duration,
     /// Soroban per-transaction resource limits (if available).
     pub soroban_limits: Option<SorobanTxLimits>,
     /// Max contract WASM size (from Soroban config, if available).
@@ -345,7 +346,7 @@ impl Default for ValidationContext {
             base_fee: 100,
             base_reserve: DEFAULT_BASE_RESERVE,
             ledger_flags: 0,
-            expected_close_time_ms: 5000,
+            expected_close_time: Duration::from_secs(5),
             soroban_limits: None,
             max_contract_size_bytes: None,
         }
@@ -1202,7 +1203,7 @@ impl TransactionQueue {
     pub fn with_depths(config: TxQueueConfig, ban_depth: u32, pending_depth: u32) -> Self {
         let ctx = ValidationContext {
             base_fee: config.min_fee_per_op,
-            expected_close_time_ms: config.expected_ledger_close_secs * 1000,
+            expected_close_time: Duration::from_secs(config.expected_ledger_close_secs),
             ..Default::default()
         };
 
@@ -1398,7 +1399,7 @@ impl TransactionQueue {
         base_fee: u32,
         base_reserve: u32,
         ledger_flags: u32,
-        expected_close_time_ms: u64,
+        expected_close_time: Duration,
     ) {
         let mut ctx = self.validation_context.write();
         ctx.ledger_seq = ledger_seq;
@@ -1407,7 +1408,7 @@ impl TransactionQueue {
         ctx.base_fee = base_fee;
         ctx.base_reserve = base_reserve;
         ctx.ledger_flags = ledger_flags;
-        ctx.expected_close_time_ms = expected_close_time_ms;
+        ctx.expected_close_time = expected_close_time;
     }
 
     /// Set the Soroban per-transaction resource limits in the validation context.
@@ -1493,7 +1494,8 @@ impl TransactionQueue {
                 .as_secs();
             let drift = now.saturating_sub(ctx.close_time);
             let upper_offset =
-                (ctx.expected_close_time_ms / 1000) * EXPECTED_CLOSE_TIME_MULT + drift;
+            // .as_secs() floors to whole seconds — matches stellar-core's duration_cast<seconds>
+                ctx.expected_close_time.as_secs() * EXPECTED_CLOSE_TIME_MULT + drift;
             let upper_close_time = ctx.close_time.saturating_add(upper_offset);
             let upper_ctx = LedgerContext::new(
                 ctx.ledger_seq,
@@ -3833,7 +3835,15 @@ mod tests {
     fn test_queue_rejects_below_current_base_fee() {
         let queue = TransactionQueue::with_defaults();
 
-        queue.update_validation_context(1, 0, 25, 500, 5_000_000, 0, 5000);
+        queue.update_validation_context(
+            1,
+            0,
+            25,
+            500,
+            5_000_000,
+            0,
+            std::time::Duration::from_secs(5),
+        );
 
         let low_fee = make_test_envelope(200, 1);
         let high_fee = make_test_envelope(600, 1);
@@ -5539,7 +5549,15 @@ mod tests {
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
-        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0, 5000);
+        queue.update_validation_context(
+            100,
+            lcl_close_time,
+            21,
+            100,
+            5_000_000,
+            0,
+            std::time::Duration::from_secs(5),
+        );
 
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
         let operations: Vec<Operation> = vec![Operation {
@@ -5598,7 +5616,15 @@ mod tests {
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
-        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0, 5000);
+        queue.update_validation_context(
+            100,
+            lcl_close_time,
+            21,
+            100,
+            5_000_000,
+            0,
+            std::time::Duration::from_secs(5),
+        );
 
         // max_time is before lcl_close_time — already expired.
         let max_time = lcl_close_time - 1;
@@ -5644,7 +5670,7 @@ mod tests {
         );
     }
 
-    /// Verify that the tx queue uses expected_close_time_ms from
+    /// Verify that the tx queue uses expected_close_time from
     /// ValidationContext (not the static config) for upper-bound validation.
     #[test]
     fn test_queue_uses_dynamic_expected_close_time() {
@@ -5669,8 +5695,16 @@ mod tests {
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
-        // Set dynamic close time to 4000ms (4s) via ValidationContext
-        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0, 4000);
+        // Set dynamic close time to 4s via ValidationContext
+        queue.update_validation_context(
+            100,
+            lcl_close_time,
+            21,
+            100,
+            5_000_000,
+            0,
+            std::time::Duration::from_millis(4000),
+        );
 
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
         let operations: Vec<Operation> = vec![Operation {
@@ -7605,7 +7639,15 @@ mod resource_limit_parity_tests {
         };
         let queue = TransactionQueue::new(config);
         queue.update_soroban_selection_limits(soroban_limit);
-        queue.update_validation_context(0, 0, PROTOCOL_VERSION, 100, 5_000_000, 0, 5000);
+        queue.update_validation_context(
+            0,
+            0,
+            PROTOCOL_VERSION,
+            100,
+            5_000_000,
+            0,
+            std::time::Duration::from_secs(5),
+        );
         #[cfg(test)]
         queue.set_skip_fee_balance_check(true);
         queue
