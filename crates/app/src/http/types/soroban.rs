@@ -81,3 +81,131 @@ pub struct SorobanStateArchival {
     pub eviction_scan_size: i64,
     pub starting_eviction_scan_level: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_response(
+        scp: Option<SorobanScpSettings>,
+        clusters: Option<u32>,
+    ) -> SorobanInfoResponse {
+        SorobanInfoResponse {
+            max_contract_size: 0,
+            max_contract_data_key_size: 0,
+            max_contract_data_entry_size: 0,
+            tx: SorobanTxLimits {
+                max_instructions: 0,
+                memory_limit: 0,
+                max_read_ledger_entries: 0,
+                max_read_bytes: 0,
+                max_write_ledger_entries: 0,
+                max_write_bytes: 0,
+                max_contract_events_size_bytes: 0,
+                max_size_bytes: 0,
+            },
+            ledger: SorobanLedgerLimits {
+                max_instructions: 0,
+                max_read_ledger_entries: 0,
+                max_read_bytes: 0,
+                max_write_ledger_entries: 0,
+                max_write_bytes: 0,
+                max_tx_size_bytes: 0,
+                max_tx_count: 0,
+            },
+            fee_rate_per_instructions_increment: 0,
+            fee_read_ledger_entry: 0,
+            fee_write_ledger_entry: 0,
+            fee_read_1kb: 0,
+            fee_write_1kb: 0,
+            fee_historical_1kb: 0,
+            fee_contract_events_size_1kb: 0,
+            fee_transaction_size_1kb: 0,
+            state_archival: SorobanStateArchival {
+                max_entry_ttl: 0,
+                min_temporary_ttl: 0,
+                min_persistent_ttl: 0,
+                persistent_rent_rate_denominator: 0,
+                temp_rent_rate_denominator: 0,
+                max_entries_to_archive: 0,
+                bucketlist_size_window_sample_size: 0,
+                eviction_scan_size: 0,
+                starting_eviction_scan_level: 0,
+            },
+            max_dependent_tx_clusters: clusters,
+            scp,
+        }
+    }
+
+    #[test]
+    fn test_sorobaninfo_pre_protocol_23_omits_scp_fields() {
+        let response = default_response(None, None);
+        let json = serde_json::to_value(&response).unwrap();
+
+        assert!(
+            json.get("scp").is_none(),
+            "scp should be absent for pre-protocol 23"
+        );
+        assert!(
+            json.get("max_dependent_tx_clusters").is_none(),
+            "max_dependent_tx_clusters should be absent for pre-protocol 23"
+        );
+    }
+
+    #[test]
+    fn test_sorobaninfo_protocol_23_includes_scp_fields() {
+        let response = default_response(
+            Some(SorobanScpSettings {
+                ledger_close_time_ms: 5000,
+                nomination_timeout_ms: 1000,
+                nomination_timeout_inc_ms: 500,
+                ballot_timeout_ms: 1000,
+                ballot_timeout_inc_ms: 1000,
+            }),
+            Some(8),
+        );
+        let json = serde_json::to_value(&response).unwrap();
+
+        assert_eq!(json["max_dependent_tx_clusters"], 8);
+
+        let scp = &json["scp"];
+        assert_eq!(scp["ledger_close_time_ms"], 5000);
+        assert_eq!(scp["nomination_timeout_ms"], 1000);
+        assert_eq!(scp["nomination_timeout_inc_ms"], 500);
+        assert_eq!(scp["ballot_timeout_ms"], 1000);
+        assert_eq!(scp["ballot_timeout_inc_ms"], 1000);
+    }
+
+    #[test]
+    fn test_sorobaninfo_scp_field_names_match_stellar_core() {
+        let response = default_response(
+            Some(SorobanScpSettings {
+                ledger_close_time_ms: 1,
+                nomination_timeout_ms: 2,
+                nomination_timeout_inc_ms: 3,
+                ballot_timeout_ms: 4,
+                ballot_timeout_inc_ms: 5,
+            }),
+            Some(6),
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        let scp = json["scp"].as_object().unwrap();
+
+        // Verify exact field names match stellar-core's CommandHandler.cpp:1034-1044.
+        let expected_keys = [
+            "ledger_close_time_ms",
+            "nomination_timeout_ms",
+            "nomination_timeout_inc_ms",
+            "ballot_timeout_ms",
+            "ballot_timeout_inc_ms",
+        ];
+        for key in &expected_keys {
+            assert!(scp.contains_key(*key), "missing expected SCP field: {key}");
+        }
+        assert_eq!(
+            scp.len(),
+            expected_keys.len(),
+            "unexpected extra SCP fields"
+        );
+    }
+}
