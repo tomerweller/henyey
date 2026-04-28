@@ -163,31 +163,15 @@ impl App {
             ops_remaining: ops_budget,
             dex_ops_remaining: dex_ops_budget,
         };
-        let mut per_peer: HashMap<henyey_overlay::PeerId, Vec<Hash256>> = HashMap::new();
-        {
+        let per_peer = {
             let adverts_by_peer = self.tx_adverts_by_peer.read().await;
-            self.herder
-                .tx_queue()
-                .broadcast_with_visitor(&mut budget, |candidate| {
-                    let mut new_to_any_peer = false;
-                    for peer_id in &peer_ids {
-                        if let Some(adverts) = adverts_by_peer.get(peer_id) {
-                            if !adverts.seen_advert(&candidate.hash) {
-                                new_to_any_peer = true;
-                                per_peer
-                                    .entry(peer_id.clone())
-                                    .or_default()
-                                    .push(candidate.hash);
-                            }
-                        }
-                    }
-                    if new_to_any_peer {
-                        BroadcastVisitResult::Processed
-                    } else {
-                        BroadcastVisitResult::Skipped
-                    }
-                });
-        }
+            collect_adverts_for_peers(
+                self.herder.tx_queue(),
+                &mut budget,
+                &peer_ids,
+                &adverts_by_peer,
+            )
+        };
 
         let ops_used = ops_budget.saturating_sub(budget.ops_remaining);
         let dex_ops_used = dex_ops_budget
@@ -1290,6 +1274,52 @@ impl App {
     }
 }
 
+/// Traverse the queue's broadcast candidates and collect per-peer advert lists.
+///
+/// For each candidate, checks which peers haven't seen it yet. If at least one
+/// peer needs it, returns [`BroadcastVisitResult::Processed`] (budget consumed);
+/// if all peers already know it, returns [`BroadcastVisitResult::Skipped`]
+/// (budget-neutral).
+///
+/// # Precondition
+///
+/// Every entry in `peer_ids` must have a corresponding entry in `adverts_by_peer`.
+/// Phase 0 of [`App::flush_tx_adverts`] establishes this invariant before calling
+/// this function.
+fn collect_adverts_for_peers(
+    queue: &henyey_herder::TransactionQueue,
+    budget: &mut BroadcastBudget,
+    peer_ids: &[henyey_overlay::PeerId],
+    adverts_by_peer: &HashMap<henyey_overlay::PeerId, PeerTxAdverts>,
+) -> HashMap<henyey_overlay::PeerId, Vec<Hash256>> {
+    debug_assert!(
+        peer_ids.iter().all(|pid| adverts_by_peer.contains_key(pid)),
+        "collect_adverts_for_peers: every peer_id must have an entry in adverts_by_peer"
+    );
+
+    let mut per_peer: HashMap<henyey_overlay::PeerId, Vec<Hash256>> = HashMap::new();
+    queue.broadcast_with_visitor(budget, |candidate| {
+        let mut new_to_any_peer = false;
+        for peer_id in peer_ids {
+            if let Some(adverts) = adverts_by_peer.get(peer_id) {
+                if !adverts.seen_advert(&candidate.hash) {
+                    new_to_any_peer = true;
+                    per_peer
+                        .entry(peer_id.clone())
+                        .or_default()
+                        .push(candidate.hash);
+                }
+            }
+        }
+        if new_to_any_peer {
+            BroadcastVisitResult::Processed
+        } else {
+            BroadcastVisitResult::Skipped
+        }
+    });
+    per_peer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,5 +1403,259 @@ mod tests {
     #[should_panic(expected = "flood budget must fit stellar-core uint32 resource")]
     fn test_flood_carryover_rejects_final_resource_overflow() {
         let _ = add_flood_carryover(u32::MAX as usize, 1);
+    }
+
+    // ── Test helpers for collect_adverts_for_peers ────────────────────────
+
+    use henyey_herder::{TransactionQueue, TxQueueConfig, TxQueueResult};
+    use stellar_xdr::curr::{
+        AccountId, AlphaNum4, Asset, AssetCode4, DecoratedSignature, ManageSellOfferOp, Memo,
+        MuxedAccount, Operation, OperationBody, Preconditions, Price, PublicKey, SequenceNumber,
+        Signature, SignatureHint, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionV1Envelope, Uint256,
+    };
+
+    fn test_queue_config() -> TxQueueConfig {
+        TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: false,
+            ..Default::default()
+        }
+    }
+
+    fn make_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let operations: Vec<Operation> = (0..ops)
+            .map(|_| Operation {
+                source_account: None,
+                body: OperationBody::BumpSequence(stellar_xdr::curr::BumpSequenceOp {
+                    bump_to: SequenceNumber(0),
+                }),
+            })
+            .collect();
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    fn set_source(envelope: &mut TransactionEnvelope, seed: u8) {
+        match envelope {
+            TransactionEnvelope::Tx(ref mut env) => {
+                env.tx.source_account = MuxedAccount::Ed25519(Uint256([seed; 32]));
+            }
+            _ => panic!("Expected Tx variant"),
+        }
+    }
+
+    fn make_dex_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let operations: Vec<Operation> = (0..ops)
+            .map(|_| Operation {
+                source_account: None,
+                body: OperationBody::ManageSellOffer(ManageSellOfferOp {
+                    selling: Asset::Native,
+                    buying: Asset::CreditAlphanum4(AlphaNum4 {
+                        asset_code: AssetCode4(*b"USD\0"),
+                        issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+                    }),
+                    amount: 100,
+                    price: Price { n: 1, d: 1 },
+                    offer_id: 0,
+                }),
+            })
+            .collect();
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    fn make_peer_id(seed: u8) -> henyey_overlay::PeerId {
+        henyey_overlay::PeerId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
+    }
+
+    // ── collect_adverts_for_peers tests ──────────────────────────────────
+
+    #[test]
+    fn test_flush_adverts_budget_neutral_when_all_peers_seen() {
+        let queue = TransactionQueue::new(test_queue_config());
+        let mut env = make_envelope(100, 1);
+        set_source(&mut env, 1);
+        let hash = Hash256::hash_xdr(&env);
+        assert_eq!(queue.try_add(env), TxQueueResult::Added);
+
+        let peer_a = make_peer_id(10);
+        let peer_b = make_peer_id(20);
+        let peer_ids = vec![peer_a.clone(), peer_b.clone()];
+
+        let mut adverts: HashMap<henyey_overlay::PeerId, PeerTxAdverts> = HashMap::new();
+        let mut pa = PeerTxAdverts::new();
+        pa.remember(hash, 1);
+        adverts.insert(peer_a, pa);
+        let mut pb = PeerTxAdverts::new();
+        pb.remember(hash, 1);
+        adverts.insert(peer_b, pb);
+
+        let mut budget = BroadcastBudget {
+            ops_remaining: 10,
+            dex_ops_remaining: None,
+        };
+
+        let per_peer = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
+
+        assert!(per_peer.is_empty(), "no peer should receive a known tx");
+        assert_eq!(
+            budget.ops_remaining, 10,
+            "budget must be unchanged (skip is budget-neutral)"
+        );
+    }
+
+    #[test]
+    fn test_flush_adverts_routes_to_correct_peers() {
+        let queue = TransactionQueue::new(test_queue_config());
+
+        let mut tx_high = make_envelope(200, 1); // fee-per-op = 200
+        set_source(&mut tx_high, 1);
+        let hash_high = Hash256::hash_xdr(&tx_high);
+        assert_eq!(queue.try_add(tx_high), TxQueueResult::Added);
+
+        let mut tx_low = make_envelope(100, 1); // fee-per-op = 100
+        set_source(&mut tx_low, 2);
+        let hash_low = Hash256::hash_xdr(&tx_low);
+        assert_eq!(queue.try_add(tx_low), TxQueueResult::Added);
+
+        let peer_a = make_peer_id(10);
+        let peer_b = make_peer_id(20);
+        let peer_ids = vec![peer_a.clone(), peer_b.clone()];
+
+        let mut adverts: HashMap<henyey_overlay::PeerId, PeerTxAdverts> = HashMap::new();
+        // Peer A has already seen the high-fee tx.
+        let mut pa = PeerTxAdverts::new();
+        pa.remember(hash_high, 1);
+        adverts.insert(peer_a.clone(), pa);
+        // Peer B has not seen either tx.
+        adverts.insert(peer_b.clone(), PeerTxAdverts::new());
+
+        let mut budget = BroadcastBudget {
+            ops_remaining: 10,
+            dex_ops_remaining: None,
+        };
+
+        let per_peer = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
+
+        // Peer A should only get the low-fee tx (already seen the high-fee one).
+        let a_hashes = per_peer.get(&peer_a).expect("peer_a should have adverts");
+        assert_eq!(a_hashes, &[hash_low]);
+
+        // Peer B should get both in fee-per-op descending order.
+        let b_hashes = per_peer.get(&peer_b).expect("peer_b should have adverts");
+        assert_eq!(b_hashes, &[hash_high, hash_low]);
+
+        // Both txs were Processed (each is new to at least one peer).
+        assert_eq!(budget.ops_remaining, 8, "2 ops consumed (1 per tx)");
+    }
+
+    #[test]
+    fn test_flush_adverts_carry_over_reflects_only_processed() {
+        let queue = TransactionQueue::new(test_queue_config());
+
+        let mut tx_known = make_envelope(200, 1); // higher fee, visited first
+        set_source(&mut tx_known, 1);
+        let hash_known = Hash256::hash_xdr(&tx_known);
+        assert_eq!(queue.try_add(tx_known), TxQueueResult::Added);
+
+        let mut tx_new = make_envelope(100, 1); // lower fee, visited second
+        set_source(&mut tx_new, 2);
+        assert_eq!(queue.try_add(tx_new), TxQueueResult::Added);
+
+        let peer = make_peer_id(10);
+        let peer_ids = vec![peer.clone()];
+
+        let mut adverts: HashMap<henyey_overlay::PeerId, PeerTxAdverts> = HashMap::new();
+        let mut pa = PeerTxAdverts::new();
+        pa.remember(hash_known, 1); // peer already knows tx_known
+        adverts.insert(peer, pa);
+
+        let mut budget = BroadcastBudget {
+            ops_remaining: 10,
+            dex_ops_remaining: None,
+        };
+
+        let _per_peer = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
+
+        // tx_known was Skipped (budget-neutral), tx_new was Processed (1 op consumed).
+        assert_eq!(budget.ops_remaining, 9, "only tx_new should consume budget");
+    }
+
+    #[test]
+    fn test_flush_adverts_dex_skip_is_budget_neutral() {
+        let queue = TransactionQueue::new(test_queue_config());
+
+        let mut dex_env = make_dex_envelope(100, 1);
+        set_source(&mut dex_env, 1);
+        let hash = Hash256::hash_xdr(&dex_env);
+        assert_eq!(queue.try_add(dex_env), TxQueueResult::Added);
+
+        let peer = make_peer_id(10);
+        let peer_ids = vec![peer.clone()];
+
+        let mut adverts: HashMap<henyey_overlay::PeerId, PeerTxAdverts> = HashMap::new();
+        let mut pa = PeerTxAdverts::new();
+        pa.remember(hash, 1);
+        adverts.insert(peer, pa);
+
+        let mut budget = BroadcastBudget {
+            ops_remaining: 10,
+            dex_ops_remaining: Some(5),
+        };
+
+        let per_peer = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
+
+        assert!(per_peer.is_empty(), "known DEX tx should not be advertised");
+        assert_eq!(budget.ops_remaining, 10, "generic budget untouched");
+        assert_eq!(budget.dex_ops_remaining, Some(5), "DEX budget untouched");
+    }
+
+    #[test]
+    #[should_panic(expected = "every peer_id must have an entry in adverts_by_peer")]
+    fn test_flush_adverts_panics_on_missing_peer() {
+        let queue = TransactionQueue::new(test_queue_config());
+        let peer = make_peer_id(10);
+        let peer_ids = vec![peer];
+        let adverts: HashMap<henyey_overlay::PeerId, PeerTxAdverts> = HashMap::new();
+        let mut budget = BroadcastBudget {
+            ops_remaining: 10,
+            dex_ops_remaining: None,
+        };
+        let _ = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
     }
 }
