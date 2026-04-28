@@ -50,31 +50,13 @@ use crate::{
     paths, verify, HistoryError, Result,
 };
 use henyey_bucket::{BucketList, PendingMergeState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
-use henyey_common::fs_utils::durable_rename;
+use henyey_common::fs_utils::{durable_rename, temp_path};
 use henyey_common::Hash256;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use stellar_xdr::curr::{
     LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
 use tracing::{debug, info};
-
-/// Monotonic counter for generating unique temp file names.
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Generate a unique temp file path in the same directory as `final_path`.
-///
-/// Uses PID + atomic counter to guarantee uniqueness across threads and
-/// process restarts. The temp file should be created with `OpenOptions::new().write(true).create_new(true)`
-/// to detect stale collisions.
-fn temp_path(final_path: &Path) -> PathBuf {
-    final_path.with_file_name(format!(
-        "{}.tmp.{}.{}",
-        final_path.file_name().unwrap().to_string_lossy(),
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ))
-}
 
 /// Buffer size for gzip-compressing bucket files (64 KiB).
 const GZIP_COPY_BUFFER_SIZE: usize = 64 * 1024;

@@ -5,6 +5,7 @@ use crate::{
     Result,
 };
 use henyey_bucket::canonical_bucket_filename;
+use henyey_common::fs_utils::atomic_write_bytes;
 use henyey_common::Hash256;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -227,8 +228,8 @@ impl CatchupManager {
                                     );
                                     continue;
                                 }
-                                // Save to disk
-                                if let Err(e) = std::fs::write(&bucket_path, &data) {
+                                // Save to disk atomically
+                                if let Err(e) = atomic_write_bytes(&bucket_path, &data) {
                                     warn!("Failed to save bucket {} to disk: {}", hash, e);
                                     continue;
                                 }

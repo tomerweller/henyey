@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 
 use henyey_bucket::canonical_bucket_filename;
+use henyey_common::fs_utils::atomic_write_bytes;
 use henyey_common::Hash256;
 use henyey_history::{archive::HistoryArchive, archive_state::HistoryArchiveState, verify};
 use henyey_ledger::TransactionSetVariant;
@@ -112,7 +113,7 @@ async fn download_and_save_bucket(
     verify::verify_bucket_hash(&data, hash)
         .map_err(|err| format!("bucket {hash} hash mismatch: {err}"))?;
 
-    std::fs::write(bucket_path, &data)
+    atomic_write_bytes(bucket_path, &data)
         .map_err(|e| format!("failed to save bucket {hash} to disk: {e}"))?;
 
     Ok(())

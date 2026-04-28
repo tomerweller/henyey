@@ -4,6 +4,7 @@ use crate::{archive_state::HistoryArchiveState, HistoryError, Result};
 use henyey_bucket::{
     canonical_bucket_filename, Bucket, BucketList, HasNextState, HotArchiveBucketList,
 };
+use henyey_common::fs_utils::atomic_write_bytes;
 use henyey_common::Hash256;
 use std::collections::HashMap;
 
@@ -217,7 +218,7 @@ impl CatchupManager {
             // Save XDR data to disk first, then build the disk-backed bucket by
             // streaming through the file. This avoids holding the full file in memory
             // while also building the index — critical for multi-GB buckets on mainnet.
-            std::fs::write(&bucket_path, &xdr_data).map_err(|e| {
+            atomic_write_bytes(&bucket_path, &xdr_data).map_err(|e| {
                 henyey_bucket::BucketError::NotFound(format!(
                     "failed to write bucket to disk: {}",
                     e
@@ -358,8 +359,8 @@ impl CatchupManager {
                         let mut preloaded = preloaded_buckets.lock().unwrap();
                         preloaded.remove(hash)
                     } {
-                        // Save preloaded data to disk, then load via streaming
-                        std::fs::write(&bucket_path, &data).map_err(|e| {
+                        // Save preloaded data to disk atomically, then load via streaming
+                        atomic_write_bytes(&bucket_path, &data).map_err(|e| {
                             henyey_bucket::BucketError::NotFound(format!(
                                 "failed to write hot archive bucket to disk: {}",
                                 e
@@ -381,9 +382,9 @@ impl CatchupManager {
                         ))?)
                     };
 
-                    // If we downloaded data, save it to disk first
+                    // If we downloaded data, save it to disk atomically
                     if let Some(downloaded_data) = xdr_data {
-                        std::fs::write(&bucket_path, &downloaded_data).map_err(|e| {
+                        atomic_write_bytes(&bucket_path, &downloaded_data).map_err(|e| {
                             henyey_bucket::BucketError::NotFound(format!(
                                 "failed to write hot archive bucket to disk: {}",
                                 e
