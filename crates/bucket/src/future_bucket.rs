@@ -1260,8 +1260,7 @@ mod tests {
 
         // Loader returns a bucket with a different hash
         let wrong_entry = make_account_entry([2u8; 32], 200);
-        let wrong_bucket =
-            Bucket::from_entries(vec![BucketEntry::Liveentry(wrong_entry)]).unwrap();
+        let wrong_bucket = Bucket::from_entries(vec![BucketEntry::Liveentry(wrong_entry)]).unwrap();
         assert_ne!(wrong_bucket.hash(), expected_hash);
 
         let result = fb.make_live(

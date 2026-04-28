@@ -469,13 +469,12 @@ impl Work for DownloadScpHistoryWork {
 
 /// Returns non-empty, non-zero bucket hashes from a History Archive State.
 ///
-/// Filters out the zero hash and the hash of the empty bucket, which are
-/// sentinel values that should not be downloaded.
+/// Filters out sentinel hashes (zero hash and empty-file hash), which
+/// don't require files on disk and should not be downloaded.
 pub(crate) fn content_bucket_hashes(has: &HistoryArchiveState) -> Vec<Hash256> {
-    let empty_bucket_hash = Hash256::empty_hash();
     has.unique_bucket_hashes()
         .into_iter()
-        .filter(|h| !h.is_zero() && h != empty_bucket_hash)
+        .filter(|h| !h.is_empty_bucket_sentinel())
         .collect()
 }
 

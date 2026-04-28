@@ -168,13 +168,12 @@ impl CatchupManager {
         use futures::stream::{self, StreamExt};
 
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
-        let empty_bucket_hash = Hash256::empty_hash();
 
-        // Filter out zero/empty hashes and already-downloaded buckets
+        // Filter out sentinel hashes and already-downloaded buckets
         let to_download: Vec<_> = hashes
             .iter()
             .filter(|hash| {
-                if hash.is_zero() || *hash == empty_bucket_hash {
+                if hash.is_empty_bucket_sentinel() {
                     return false;
                 }
                 let bucket_path = bucket_dir.join(canonical_bucket_filename(&hash));

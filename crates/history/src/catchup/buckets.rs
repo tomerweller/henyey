@@ -156,18 +156,11 @@ impl CatchupManager {
         let archives = self.archives.clone();
         let bucket_dir = bucket_dir.to_path_buf();
 
-        let empty_bucket_hash = Hash256::empty_hash();
-
         // Helper to load a bucket - downloads on-demand, saves to disk, and caches
         let load_bucket = |hash: &Hash256| -> henyey_bucket::Result<Bucket> {
-            // Zero hash means empty bucket
-            if hash.is_zero() {
-                return Ok(Bucket::empty());
-            }
-            // SHA-256 of empty bytes — a bucket file with no entries.
-            // Bucket::from_entries(vec![]) produces a bucket with this exact hash.
-            if *hash == *empty_bucket_hash {
-                return Bucket::from_entries(vec![]);
+            // Sentinel hashes (zero and empty-file) don't need files on disk.
+            if let Some(bucket) = Bucket::for_sentinel_hash(hash) {
+                return Ok(bucket);
             }
 
             // Check cache first

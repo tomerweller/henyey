@@ -73,6 +73,14 @@ impl Hash256 {
         EMPTY.get_or_init(|| Hash256::hash(&[]))
     }
 
+    /// Returns true if this hash represents an empty/absent live bucket sentinel.
+    ///
+    /// Both the zero hash and SHA-256("") are used as sentinels for empty buckets
+    /// in the bucket list. Neither sentinel requires a file on disk.
+    pub fn is_empty_bucket_sentinel(&self) -> bool {
+        self.is_zero() || *self == *Self::empty_hash()
+    }
+
     /// Compute the SHA-256 hash of arbitrary data.
     ///
     /// # Examples
@@ -420,5 +428,18 @@ mod tests {
         use stellar_xdr::curr::Hash;
         let value = Hash([1u8; 32]);
         assert_eq!(Hash256::hash_xdr(&value), Hash256::hash_xdr(&value));
+    }
+
+    #[test]
+    fn test_is_empty_bucket_sentinel() {
+        // Zero hash is a sentinel
+        assert!(Hash256::ZERO.is_empty_bucket_sentinel());
+
+        // SHA-256 of empty bytes is a sentinel
+        assert!(Hash256::empty_hash().is_empty_bucket_sentinel());
+
+        // An arbitrary non-sentinel hash
+        let arbitrary = Hash256::hash(b"not a sentinel");
+        assert!(!arbitrary.is_empty_bucket_sentinel());
     }
 }

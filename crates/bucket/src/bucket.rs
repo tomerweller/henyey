@@ -160,6 +160,26 @@ impl Bucket {
         }
     }
 
+    /// Materialize a bucket for a sentinel hash, preserving the hash identity.
+    ///
+    /// - Zero hash → [`Bucket::empty()`] (hash = ZERO)
+    /// - [`Hash256::empty_hash()`] → empty-entries bucket (hash = empty_hash)
+    ///
+    /// Returns `None` if the hash is not a recognized sentinel.
+    ///
+    /// This is a live-bucket compatibility shim; in protocol 24+ real empty
+    /// merges produce metadata-bearing buckets, so `empty_hash()` is
+    /// legacy/synthetic.
+    pub fn for_sentinel_hash(hash: &Hash256) -> Option<Self> {
+        if hash.is_zero() {
+            Some(Self::empty())
+        } else if *hash == *Hash256::empty_hash() {
+            Some(Self::from_entries(vec![]).expect("empty entries cannot fail"))
+        } else {
+            None
+        }
+    }
+
     /// Create a bucket from a list of entries.
     ///
     /// The entries will be sorted by key using [`compare_entries`]. This is the
@@ -1151,6 +1171,29 @@ mod tests {
         assert!(bucket.is_empty());
         assert_eq!(bucket.len(), 0);
         assert_eq!(bucket.hash(), Hash256::ZERO);
+    }
+
+    #[test]
+    fn test_for_sentinel_hash_zero() {
+        let bucket = Bucket::for_sentinel_hash(&Hash256::ZERO).unwrap();
+        assert!(bucket.is_empty());
+        assert_eq!(bucket.hash(), Hash256::ZERO);
+    }
+
+    #[test]
+    fn test_for_sentinel_hash_empty_hash() {
+        let empty_hash = Hash256::empty_hash();
+        let bucket = Bucket::for_sentinel_hash(empty_hash).unwrap();
+        assert!(bucket.is_empty());
+        // The hash must match empty_hash, not ZERO — this is the key invariant.
+        assert_eq!(bucket.hash(), *empty_hash);
+        assert_ne!(bucket.hash(), Hash256::ZERO);
+    }
+
+    #[test]
+    fn test_for_sentinel_hash_non_sentinel() {
+        let arbitrary = Hash256::hash(b"not a sentinel");
+        assert!(Bucket::for_sentinel_hash(&arbitrary).is_none());
     }
 
     #[test]

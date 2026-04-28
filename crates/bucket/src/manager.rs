@@ -320,9 +320,9 @@ impl BucketManager {
     /// buckets (only the index is in memory); smaller files are loaded entirely
     /// into memory for faster access.
     pub fn load_bucket(&self, hash: &Hash256) -> Result<Arc<Bucket>> {
-        // Check if it's the empty bucket
-        if hash.is_zero() {
-            return Ok(Arc::new(Bucket::empty()));
+        // Check if it's an empty bucket sentinel (zero hash or empty-file hash)
+        if let Some(bucket) = Bucket::for_sentinel_hash(hash) {
+            return Ok(Arc::new(bucket));
         }
 
         // Check cache first
@@ -452,8 +452,8 @@ impl BucketManager {
     /// merge-restart inputs which are consumed once by the merge and then
     /// discarded.
     pub fn load_bucket_for_merge(&self, hash: &Hash256) -> Result<Bucket> {
-        if hash.is_zero() {
-            return Ok(Bucket::empty());
+        if let Some(bucket) = Bucket::for_sentinel_hash(hash) {
+            return Ok(bucket);
         }
 
         let xdr_path = self.bucket_path(hash);
@@ -502,8 +502,8 @@ impl BucketManager {
 
     /// Check if a bucket exists (in cache or on disk).
     pub fn bucket_exists(&self, hash: &Hash256) -> bool {
-        if hash.is_zero() {
-            return true; // Empty bucket always "exists"
+        if hash.is_empty_bucket_sentinel() {
+            return true; // Sentinel hashes always "exist" (no file needed)
         }
 
         // Check cache
@@ -828,7 +828,7 @@ impl BucketManager {
         let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
 
         for hash in bucket_hashes {
-            if hash.is_zero() {
+            if hash.is_empty_bucket_sentinel() {
                 continue;
             }
 
@@ -930,7 +930,7 @@ impl BucketManager {
         // bucket_hashes should be in order: level 10 snap, level 10 curr, ..., level 0 snap, level 0 curr
         // We iterate in that order so newest entries win
         for hash in bucket_hashes {
-            if hash.is_zero() {
+            if hash.is_empty_bucket_sentinel() {
                 continue;
             }
 
@@ -1098,7 +1098,7 @@ impl BucketManager {
     pub fn verify_buckets_exist(&self, bucket_hashes: &[Hash256]) -> Vec<Hash256> {
         bucket_hashes
             .iter()
-            .filter(|hash| !hash.is_zero() && !self.bucket_exists(hash))
+            .filter(|hash| !hash.is_empty_bucket_sentinel() && !self.bucket_exists(hash))
             .copied()
             .collect()
     }
@@ -1135,7 +1135,7 @@ impl BucketManager {
 
         // Verify live buckets
         for expected_hash in live_hashes {
-            if expected_hash.is_zero() {
+            if expected_hash.is_empty_bucket_sentinel() {
                 continue;
             }
 
@@ -1227,11 +1227,9 @@ impl BucketManager {
         let mut mismatches = Vec::new();
 
         for expected_hash in bucket_hashes {
-            if expected_hash.is_zero() {
+            if expected_hash.is_empty_bucket_sentinel() {
                 continue;
             }
-
-            // Only check canonical .bucket.xdr path
             let xdr_path = self.bucket_path(expected_hash);
             if !xdr_path.exists() {
                 return Err(BucketError::NotFound(format!(
@@ -1283,7 +1281,7 @@ impl BucketManager {
         let mut fetched = 0;
 
         for hash in bucket_hashes {
-            if hash.is_zero() {
+            if hash.is_empty_bucket_sentinel() {
                 continue;
             }
 
@@ -2486,5 +2484,30 @@ mod tests {
             result.is_err(),
             "load_bucket should fail for corrupted bucket file"
         );
+    }
+
+    #[test]
+    fn test_load_bucket_empty_hash_returns_matching_hash() {
+        let (_temp_dir, manager) = create_manager();
+        let empty_hash = Hash256::empty_hash();
+        let bucket = manager.load_bucket(empty_hash).unwrap();
+        assert_eq!(bucket.hash(), *empty_hash);
+        assert!(bucket.is_empty());
+    }
+
+    #[test]
+    fn test_load_bucket_for_merge_empty_hash_returns_matching_hash() {
+        let (_temp_dir, manager) = create_manager();
+        let empty_hash = Hash256::empty_hash();
+        let bucket = manager.load_bucket_for_merge(empty_hash).unwrap();
+        assert_eq!(bucket.hash(), *empty_hash);
+        assert!(bucket.is_empty());
+    }
+
+    #[test]
+    fn test_bucket_exists_empty_hash() {
+        let (_temp_dir, manager) = create_manager();
+        assert!(manager.bucket_exists(Hash256::empty_hash()));
+        assert!(manager.bucket_exists(&Hash256::ZERO));
     }
 }
