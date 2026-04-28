@@ -41,6 +41,21 @@ pub const DEFAULT_MAINTENANCE_PERIOD: Duration = Duration::from_secs(4 * 60 * 60
 /// Default number of entries to delete per maintenance cycle.
 pub const DEFAULT_MAINTENANCE_COUNT: u32 = 50000;
 
+/// Maximum checkpoint-distance for publish queue entries before eviction.
+///
+/// Entries more than this many checkpoint intervals behind the LCL are
+/// permanently abandoned — they will never be published. This prevents
+/// unbounded retention from persistently failing archive publishing.
+///
+/// 30 checkpoints × 64 ledgers × ~5s ≈ ~2.7 hours of checkpoint distance.
+/// This is intentionally larger than `PUBLISH_QUEUE_MAX_SIZE` (16) used
+/// during catchup, since normal operation may have legitimate publishing
+/// backlogs (e.g., slow archive uploads).
+///
+/// **Parity divergence**: stellar-core does not evict stale publish queue
+/// entries. See `crates/app/PARITY_STATUS.md`.
+pub const MAX_PUBLISH_QUEUE_CHECKPOINT_DISTANCE: u32 = 30;
+
 /// Checkpoint frequency — delegates to the runtime-configurable value.
 pub fn checkpoint_frequency() -> u32 {
     henyey_history::checkpoint_frequency()
@@ -282,6 +297,13 @@ impl Maintainer {
 ///
 /// Deletes old data from the database to prevent unbounded growth.
 ///
+/// When `min_queued` is `Some`, publish queue staleness eviction runs first:
+/// entries whose checkpoint-distance from the LCL exceeds
+/// [`MAX_PUBLISH_QUEUE_CHECKPOINT_DISTANCE`] are permanently removed, and
+/// `min_queued` is re-read from the (now-trimmed) queue. This prevents
+/// persistently failing archive publishing from pinning the pruning
+/// threshold indefinitely.
+///
 /// Tables are pruned based on their retention class:
 /// - **Publish-only** (SCP history): pruned at `publish_safe_lmin` (stellar-core parity).
 /// - **Publish + RPC** (headers, tx history/sets/results): always pruned at the
@@ -296,6 +318,42 @@ pub fn run_maintenance(
     rpc_retention_window: Option<u32>,
     count: u32,
 ) {
+    // Evict stale publish queue entries when publishing is enabled.
+    // Fail closed: on any DB error, keep the original min_queued to avoid
+    // over-pruning.
+    let min_queued = if let Some(orig_min) = min_queued {
+        let max_lag = MAX_PUBLISH_QUEUE_CHECKPOINT_DISTANCE * checkpoint_frequency();
+        let staleness_threshold = lcl.saturating_sub(max_lag);
+        if staleness_threshold > 0 && orig_min < staleness_threshold {
+            match db.remove_publish_entries_below(staleness_threshold) {
+                Ok(removed) if removed > 0 => {
+                    warn!(
+                        removed,
+                        staleness_threshold,
+                        lcl,
+                        original_oldest = orig_min,
+                        "Permanently abandoned stale publish queue entries. \
+                         These checkpoints will NOT be published. \
+                         Check archive connectivity and credentials."
+                    );
+                    // Re-read queue after eviction
+                    db.load_publish_queue(Some(1))
+                        .ok()
+                        .and_then(|q| q.first().copied())
+                }
+                Ok(_) => min_queued,
+                Err(e) => {
+                    warn!(error = %e, "Failed to evict stale publish queue entries");
+                    min_queued
+                }
+            }
+        } else {
+            min_queued
+        }
+    } else {
+        None
+    };
+
     let qmin = min_queued.unwrap_or(lcl).min(lcl);
 
     // Publish-safe threshold: keeps data needed for queued checkpoint publishing.
@@ -980,5 +1038,200 @@ mod tests {
         assert_eq!(min_ledger(&db_clone, "txsets", "ledgerseq"), Some(790));
         assert_eq!(count_rows(&db_clone, "txresults"), 21);
         assert_eq!(min_ledger(&db_clone, "txresults", "ledgerseq"), Some(790));
+    }
+
+    // -----------------------------------------------------------------------
+    // Publish queue staleness eviction tests (#2004)
+    // -----------------------------------------------------------------------
+
+    /// Insert synthetic publish queue entries.
+    fn insert_publish_queue_entries(db: &henyey_db::Database, ledger_seqs: &[u32]) {
+        db.with_connection(|conn| {
+            use henyey_db::queries::publish_queue::PublishQueueQueries;
+            for &seq in ledger_seqs {
+                let has_json = format!(r#"{{"version":2,"currentLedger":{seq}}}"#);
+                conn.enqueue_publish(seq, &has_json)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Count publish queue entries.
+    fn publish_queue_count(db: &henyey_db::Database) -> u32 {
+        db.with_connection(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM publishqueue", [], |r| {
+                r.get::<_, u32>(0)
+            })
+            .map_err(Into::into)
+        })
+        .unwrap()
+    }
+
+    /// Get minimum ledger in publish queue.
+    fn publish_queue_min(db: &henyey_db::Database) -> Option<u32> {
+        db.with_connection(|conn| {
+            conn.query_row("SELECT MIN(ledgerseq) FROM publishqueue", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .map(|v| v.map(|v| v as u32))
+            .map_err(Into::into)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_stale_entries_evicted() {
+        // Scenario: publish queue has a very old entry (ledger 63) and the
+        // LCL is 10000. The staleness threshold is:
+        //   10000 - (30 * 64) = 10000 - 1920 = 8080
+        // Entry at 63 is < 8080, so it should be evicted.
+        // After eviction, publish_safe_lmin should advance.
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Insert a very old entry and a recent one
+        insert_publish_queue_entries(&db, &[63, 9919]);
+        assert_eq!(publish_queue_count(&db), 2);
+
+        // Insert headers to observe pruning behavior
+        insert_ledger_headers(&db, &(8000..=8100).collect::<Vec<_>>());
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: None,
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            // min_queued=63 initially (oldest entry)
+            move || (10000, Some(63)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // Old entry (63) should be evicted
+        assert_eq!(publish_queue_count(&db_clone), 1);
+        assert_eq!(publish_queue_min(&db_clone), Some(9919));
+
+        // publish_safe_lmin should be computed from the fresh min (9919):
+        //   9919 - 64 = 9855
+        // Headers at 8000..=8100 are all < 9855, so all should be pruned
+        assert_eq!(count_rows(&db_clone, "ledgerheaders"), 0);
+    }
+
+    #[test]
+    fn test_no_eviction_within_window() {
+        // All entries are within the 30-checkpoint window. None should be evicted.
+        // LCL=10000, staleness_threshold = 10000 - 1920 = 8080
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Entries at 8127 and 9919 are both > 8080
+        insert_publish_queue_entries(&db, &[8127, 9919]);
+        assert_eq!(publish_queue_count(&db), 2);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: None,
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (10000, Some(8127)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // No entries evicted
+        assert_eq!(publish_queue_count(&db_clone), 2);
+    }
+
+    #[test]
+    fn test_mixed_stale_fresh_entries() {
+        // Mix of stale and fresh entries. Only stale ones evicted.
+        // LCL=10000, threshold = 8080
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_publish_queue_entries(&db, &[63, 127, 191, 8127, 8191, 9919]);
+        assert_eq!(publish_queue_count(&db), 6);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: None,
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (10000, Some(63)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // 63, 127, 191 evicted (all < 8080). 8127, 8191, 9919 remain.
+        assert_eq!(publish_queue_count(&db_clone), 3);
+        assert_eq!(publish_queue_min(&db_clone), Some(8127));
+    }
+
+    #[test]
+    fn test_eviction_threshold_underflow() {
+        // LCL is small (< max_lag). Threshold saturates at 0, no eviction.
+        // max_lag = 30 * 64 = 1920. LCL=500 → threshold = 0
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_publish_queue_entries(&db, &[63, 127]);
+        assert_eq!(publish_queue_count(&db), 2);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: None,
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (500, Some(63)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // No eviction: threshold = 0
+        assert_eq!(publish_queue_count(&db_clone), 2);
+    }
+
+    #[test]
+    fn test_publish_disabled_no_eviction() {
+        // min_queued = None (publishing disabled). No eviction should occur.
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_publish_queue_entries(&db, &[63, 127]);
+        assert_eq!(publish_queue_count(&db), 2);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: None,
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (10000, None),
+        );
+
+        maintainer.perform_maintenance();
+
+        // No eviction: publishing disabled
+        assert_eq!(publish_queue_count(&db_clone), 2);
     }
 }

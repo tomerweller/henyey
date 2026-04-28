@@ -57,6 +57,19 @@ pub trait PublishQueueQueries {
     /// Used by bucket cleanup to determine which bucket files are still
     /// referenced by pending publish queue entries.
     fn load_all_publish_has(&self) -> Result<Vec<String>, DbError>;
+
+    /// Removes all queued checkpoint ledgers below the given threshold.
+    ///
+    /// This permanently abandons those checkpoints — they will never be
+    /// published. Used by the maintainer to evict stale entries that are
+    /// too far behind the current ledger, preventing unbounded retention
+    /// from persistently failing archive publishing.
+    ///
+    /// The boundary is strict `<`: the entry at exactly `threshold` is
+    /// preserved.
+    ///
+    /// Returns the number of entries removed.
+    fn remove_publish_entries_below(&self, threshold: u32) -> Result<u64, DbError>;
 }
 
 impl PublishQueueQueries for Connection {
@@ -122,6 +135,14 @@ impl PublishQueueQueries for Connection {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DbError::from)
     }
+
+    fn remove_publish_entries_below(&self, threshold: u32) -> Result<u64, DbError> {
+        let count = self.execute(
+            "DELETE FROM publishqueue WHERE ledgerseq < ?1",
+            params![threshold as i64],
+        )?;
+        Ok(count as u64)
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +187,58 @@ mod tests {
 
         let stored = conn.load_publish_has(63).unwrap().unwrap();
         assert_eq!(stored, first_has);
+    }
+
+    #[test]
+    fn test_remove_publish_entries_below_basic() {
+        let conn = setup_db();
+        let has = r#"{"version":2}"#;
+
+        conn.enqueue_publish(63, has).unwrap();
+        conn.enqueue_publish(127, has).unwrap();
+        conn.enqueue_publish(191, has).unwrap();
+
+        let removed = conn.remove_publish_entries_below(128).unwrap();
+        assert_eq!(removed, 2); // 63 and 127 removed
+
+        let remaining = conn.load_publish_queue(None).unwrap();
+        assert_eq!(remaining, vec![191]);
+    }
+
+    #[test]
+    fn test_remove_publish_entries_below_exact_boundary() {
+        let conn = setup_db();
+        let has = r#"{"version":2}"#;
+
+        conn.enqueue_publish(63, has).unwrap();
+        conn.enqueue_publish(127, has).unwrap();
+
+        // Strict <: entry at exactly 127 is preserved
+        let removed = conn.remove_publish_entries_below(127).unwrap();
+        assert_eq!(removed, 1);
+
+        let remaining = conn.load_publish_queue(None).unwrap();
+        assert_eq!(remaining, vec![127]);
+    }
+
+    #[test]
+    fn test_remove_publish_entries_below_empty_queue() {
+        let conn = setup_db();
+        let removed = conn.remove_publish_entries_below(1000).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_remove_publish_entries_below_returns_count() {
+        let conn = setup_db();
+        let has = r#"{"version":2}"#;
+
+        for seq in (63..=63 + 64 * 9).step_by(64) {
+            conn.enqueue_publish(seq, has).unwrap();
+        }
+
+        // 10 entries: 63, 127, 191, 255, 319, 383, 447, 511, 575, 639
+        let removed = conn.remove_publish_entries_below(400).unwrap();
+        assert_eq!(removed, 6); // 63, 127, 191, 255, 319, 383
     }
 }

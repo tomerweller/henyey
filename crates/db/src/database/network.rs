@@ -73,6 +73,18 @@ impl Database {
         })
     }
 
+    /// Removes all queued checkpoint ledgers below the given threshold.
+    ///
+    /// This permanently abandons those checkpoints — they will never be
+    /// published. The boundary is strict `<`: the entry at exactly
+    /// `threshold` is preserved. Returns the number of entries removed.
+    pub fn remove_publish_entries_below(&self, threshold: u32) -> Result<u64> {
+        self.with_connection(|conn| {
+            use queries::PublishQueueQueries;
+            conn.remove_publish_entries_below(threshold)
+        })
+    }
+
     /// Adds a node ID to the ban list.
     ///
     /// Banned nodes are excluded from consensus and peer connections.

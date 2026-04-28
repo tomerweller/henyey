@@ -15,7 +15,7 @@
 | Catchup and restart recovery | Full | Archive catchup, replay, restart restore, publish flow wired |
 | Persistent state integration | Partial | Critical state persisted through `henyey-db`; some SCP helper APIs absent |
 | Transaction flooding | Partial | Pull-mode advert/demand scheduling; classic flood budgets use stellar-core truncate-then-round integer arithmetic; Soroban advert/demand capacity and distinct `FLOOD_TX_PERIOD_MS` remain gaps |
-| Background maintenance | Full | Periodic pruning and RPC-retention cleanup implemented |
+| Background maintenance | Full | Periodic pruning and RPC-retention cleanup implemented; **divergence**: stale publish queue entries are evicted after `MAX_PUBLISH_QUEUE_CHECKPOINT_DISTANCE` (30) intervals to prevent unbounded retention from failing archives — stellar-core does not evict (#2004) |
 | Survey and network diagnostics | Partial | Time-sliced surveys implemented; `Diagnostics::bucketStats()` absent |
 | Metadata streaming | Full | Main stream, debug rotation, gzip segments supported |
 | Logging and runtime controls | Partial | Dynamic log levels work; compat `/ll` behavior is incomplete |
