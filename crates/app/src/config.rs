@@ -802,7 +802,7 @@ impl HistoryConfig {
 }
 
 /// A single history archive entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryArchiveEntry {
     /// Name of this archive.
@@ -2776,6 +2776,32 @@ name = "test"
         haystack.matches(needle).count()
     }
 
+    /// Substitute `__PLACEHOLDER__` markers in the raw test-history-publish
+    /// template with valid dummy values and return the rendered string.
+    fn render_history_publish_fixture(raw: &str) -> String {
+        let test_seed = henyey_crypto::SecretKey::from_seed(&[42u8; 32]).to_strkey();
+        let mut rendered = raw
+            .replace("__NODE_SEED__", &test_seed)
+            .replace("__DB_PATH__", "/tmp/adv&dir|path/validator.db")
+            .replace("__BUCKET_DIR__", "/tmp/adv&dir|path/buckets")
+            .replace("__HISTORY_DIR__", "/tmp/adv&dir|path/history");
+
+        // Replace the peer_port line (mirrors the shell script's anchored sed).
+        rendered = rendered
+            .lines()
+            .map(|line| {
+                if line.starts_with("peer_port") && line.contains("# __PEER_PORT__") {
+                    "peer_port = 31415".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        rendered
+    }
+
     #[test]
     fn test_history_publish_fixture_renders_and_parses() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2836,32 +2862,8 @@ name = "test"
             "__BUCKET_DIR__ should appear exactly once"
         );
 
-        // Phase 2: Render with adversarial values.
-        // Use & and | (sed metacharacters) but not \ (TOML escape char).
-        let test_seed = henyey_crypto::SecretKey::from_seed(&[42u8; 32]).to_strkey();
-        let test_db_path = "/tmp/adv&dir|path/validator.db";
-        let test_bucket_dir = "/tmp/adv&dir|path/buckets";
-        let test_history_dir = "/tmp/adv&dir|path/history";
-        let test_peer_port: u16 = 31415;
-
-        let mut rendered = raw
-            .replace("__NODE_SEED__", &test_seed)
-            .replace("__DB_PATH__", test_db_path)
-            .replace("__BUCKET_DIR__", test_bucket_dir)
-            .replace("__HISTORY_DIR__", test_history_dir);
-
-        // Replace the peer_port line (mirrors the shell script's anchored sed).
-        rendered = rendered
-            .lines()
-            .map(|line| {
-                if line.starts_with("peer_port") && line.contains("# __PEER_PORT__") {
-                    format!("peer_port = {test_peer_port}")
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Phase 2: Render with adversarial values via shared helper.
+        let rendered = render_history_publish_fixture(&raw);
 
         // Phase 3: Assert no placeholder markers remain.
         assert!(
@@ -2878,6 +2880,7 @@ name = "test"
             .unwrap_or_else(|e| panic!("rendered config failed semantic validation: {e}"));
 
         // Phase 5: Assert substituted values via exact equality.
+        let test_seed = henyey_crypto::SecretKey::from_seed(&[42u8; 32]).to_strkey();
         assert_eq!(
             config.node.node_seed.as_deref(),
             Some(test_seed.as_str()),
@@ -2885,21 +2888,19 @@ name = "test"
         );
         assert_eq!(
             config.database.path,
-            std::path::PathBuf::from(test_db_path),
+            std::path::PathBuf::from("/tmp/adv&dir|path/validator.db"),
             "database.path mismatch"
         );
         assert_eq!(
             config.buckets.directory,
-            std::path::PathBuf::from(test_bucket_dir),
+            std::path::PathBuf::from("/tmp/adv&dir|path/buckets"),
             "buckets.directory mismatch"
         );
-        assert_eq!(
-            config.overlay.peer_port, test_peer_port,
-            "peer_port mismatch"
-        );
+        assert_eq!(config.overlay.peer_port, 31415_u16, "peer_port mismatch");
 
         // Verify the "local" archive entry has the adversarial history path
         // in all three use-sites: url, put, mkdir.
+        let test_history_dir = "/tmp/adv&dir|path/history";
         let local_archive = config
             .history
             .archives
@@ -2920,6 +2921,80 @@ name = "test"
             local_archive.mkdir.as_deref(),
             Some(format!("mkdir -p {test_history_dir}/{{0}}").as_str()),
             "local archive mkdir command mismatch"
+        );
+    }
+
+    /// Asserts that the shared sections between `configs/test-history-publish.toml`
+    /// and `configs/validator-testnet.toml` are semantically identical after parsing.
+    ///
+    /// Shared sections enforced: quorum_set, network passphrase, remote history
+    /// archives (all fields), and overlay known_peers. If a new shared section is
+    /// added to the fixture, extend this test to cover it.
+    #[test]
+    fn test_history_publish_shared_sections_match_validator_testnet() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+
+        // Load the validator-testnet config (parse only, no validate — node_seed is omitted).
+        let validator_raw =
+            std::fs::read_to_string(repo_root.join("configs/validator-testnet.toml"))
+                .expect("configs/validator-testnet.toml should exist");
+        let validator: AppConfig = toml::from_str(&validator_raw)
+            .expect("configs/validator-testnet.toml should parse as AppConfig");
+
+        // Load and render the test-history-publish fixture.
+        let fixture_raw =
+            std::fs::read_to_string(repo_root.join("configs/test-history-publish.toml"))
+                .expect("configs/test-history-publish.toml should exist");
+        let fixture: AppConfig = toml::from_str(&render_history_publish_fixture(&fixture_raw))
+            .expect("rendered test-history-publish.toml should parse as AppConfig");
+
+        // --- Quorum set ---
+        assert_eq!(
+            fixture.node.quorum_set.threshold_percent, validator.node.quorum_set.threshold_percent,
+            "quorum_set.threshold_percent drift"
+        );
+        // Order-sensitive: config files should list validators in the same order.
+        assert_eq!(
+            fixture.node.quorum_set.validators, validator.node.quorum_set.validators,
+            "quorum_set.validators drift"
+        );
+
+        // --- Network passphrase ---
+        assert_eq!(
+            fixture.network.passphrase, validator.network.passphrase,
+            "network.passphrase drift"
+        );
+
+        // --- Remote history archives (all fields) ---
+        // Filter out the "local" archive (test-specific) from the fixture.
+        let fixture_remote: Vec<&HistoryArchiveEntry> = fixture
+            .history
+            .archives
+            .iter()
+            .filter(|a| a.name != "local")
+            .collect();
+        let validator_remote: Vec<&HistoryArchiveEntry> =
+            validator.history.archives.iter().collect();
+        assert_eq!(
+            fixture_remote.len(),
+            validator_remote.len(),
+            "remote archive count drift: fixture has {}, validator has {}",
+            fixture_remote.len(),
+            validator_remote.len()
+        );
+        for (f, v) in fixture_remote.iter().zip(validator_remote.iter()) {
+            assert_eq!(f, v, "history archive '{}' drift", f.name);
+        }
+
+        // --- Overlay known_peers ---
+        // Order-sensitive: config files should list peers in the same order.
+        assert_eq!(
+            fixture.overlay.known_peers, validator.overlay.known_peers,
+            "overlay.known_peers drift"
         );
     }
 

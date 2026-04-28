@@ -5,7 +5,7 @@
 # deny_unknown_fields — covered by
 # crates/app/src/config.rs::test_shipped_config_files_parse.
 # Quorum keys, archive URLs, and known_peers mirror configs/validator-testnet.toml;
-# update both files together.
+# enforced by test_history_publish_shared_sections_match_validator_testnet in config.rs.
 
 [node]
 name = "henyey-publish-test"
