@@ -41,6 +41,7 @@ fn rounded_up_flood_budget(per_ledger: u128, period_ms: u64, ledger_close_ms: u6
     usize::try_from(quotient).expect("flood budget does not fit usize")
 }
 
+#[cfg(test)]
 fn classic_flood_budget(
     rate: f64,
     ops_limit: usize,
@@ -102,17 +103,56 @@ impl App {
         (base + (peer_offset % peers_len)) % peers_len
     }
 
+    /// Returns `ledger_max_tx_count` from Soroban network config as a scalar
+    /// flood-budget limit, or 0 when Soroban is not supported on the current
+    /// protocol version or when network info is not yet available.
+    fn soroban_flood_tx_limit(&self) -> usize {
+        if soroban_supported(
+            self.ledger_manager()
+                .header_snapshot()
+                .header
+                .ledger_version,
+        ) {
+            self.soroban_network_info()
+                .map(|info| info.ledger_max_tx_count as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Compute the combined classic+Soroban ops flood budget for one period.
+    ///
+    /// Wraps [`combined_flood_budget`] with the overlay config's flood rates
+    /// and the current ledger close duration. Callers supply capacity limits
+    /// (ledger-max or queue-max) and the period for their specific use case.
+    fn combined_ops_flood_budget(
+        &self,
+        classic_limit: usize,
+        soroban_limit: usize,
+        period_ms: u64,
+    ) -> usize {
+        combined_flood_budget(
+            self.config.overlay.flood_op_rate_per_ledger,
+            classic_limit,
+            self.config.overlay.flood_soroban_rate_per_ledger,
+            soroban_limit,
+            period_ms,
+            self.herder.ledger_close_duration().as_millis() as u64,
+        )
+    }
+
     /// Compute the per-period ops budget for transaction flooding.
     ///
-    /// Matches stellar-core's truncate-then-round-up integer arithmetic for
-    /// classic tx flooding, using `flood_tx_period_ms` to match stellar-core's
-    /// `FLOOD_TX_PERIOD_MS` in `ClassicTransactionQueue::getFloodPeriod()`.
+    /// Computes the combined classic + Soroban broadcast budget using
+    /// `flood_tx_period_ms`. In stellar-core, classic and Soroban queues
+    /// have separate broadcast budgets; henyey's unified queue requires
+    /// a combined budget here.
     fn compute_flood_ops_budget(&self) -> usize {
-        let base_budget = classic_flood_budget(
-            self.config.overlay.flood_op_rate_per_ledger,
+        let base_budget = self.combined_ops_flood_budget(
             self.herder.max_tx_set_size(),
+            self.soroban_flood_tx_limit(),
             self.config.overlay.flood_tx_period_ms,
-            self.herder.ledger_close_duration().as_millis() as u64,
         );
         let carryover = self.broadcast_op_carryover.load(Ordering::Relaxed);
         add_flood_carryover(base_budget, carryover)
@@ -294,40 +334,21 @@ impl App {
 
     fn max_advert_size(&self) -> usize {
         // stellar-core: TxAdverts::getMaxAdvertSize()
-        // Sum classic + Soroban ops-to-flood-per-ledger, then one round-up division.
-        let soroban_limit = if soroban_supported(
-            self.ledger_manager()
-                .header_snapshot()
-                .header
-                .ledger_version,
-        ) {
-            self.soroban_network_info()
-                .map(|info| info.ledger_max_tx_count as usize)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let per_period = combined_flood_budget(
-            self.config.overlay.flood_op_rate_per_ledger,
+        let per_period = self.combined_ops_flood_budget(
             self.herder.max_tx_set_size(),
-            self.config.overlay.flood_soroban_rate_per_ledger,
-            soroban_limit,
+            self.soroban_flood_tx_limit(),
             self.config.overlay.flood_advert_period_ms,
-            self.herder.ledger_close_duration().as_millis() as u64,
         );
         per_period.clamp(1, TX_ADVERT_VECTOR_MAX_SIZE)
     }
 
     fn max_demand_size(&self) -> usize {
         // stellar-core: TxDemandsManager::getMaxDemandSize()
-        // Sum classic queue ops + Soroban queue ops, then one round-up division.
-        let per_period = combined_flood_budget(
-            self.config.overlay.flood_op_rate_per_ledger,
+        // Uses queue-capacity limits (not ledger-max) per stellar-core.
+        let per_period = self.combined_ops_flood_budget(
             self.herder.max_queue_size_ops(),
-            self.config.overlay.flood_soroban_rate_per_ledger,
             self.herder.max_queue_size_soroban_ops(),
             self.config.overlay.flood_demand_period_ms,
-            self.herder.ledger_close_duration().as_millis() as u64,
         );
         per_period.clamp(1, TX_DEMAND_VECTOR_MAX_SIZE)
     }
@@ -1423,6 +1444,19 @@ mod tests {
         assert_eq!(
             combined_flood_budget(0.51, 10, 0.9, 0, 3, 10),
             classic_flood_budget(0.51, 10, 3, 10)
+        );
+    }
+
+    #[test]
+    fn test_combined_flood_budget_soroban_increases_budget() {
+        // With Soroban limit > 0, the combined budget must be strictly larger
+        // than classic-only. This is the regression test for the bug where
+        // compute_flood_ops_budget used classic_flood_budget only.
+        let classic_only = classic_flood_budget(0.5, 100, 200, 5000);
+        let combined = combined_flood_budget(0.5, 100, 0.9, 50, 200, 5000);
+        assert!(
+            combined > classic_only,
+            "combined budget ({combined}) must exceed classic-only ({classic_only})"
         );
     }
 
