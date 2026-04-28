@@ -29,10 +29,49 @@ const MAX_ERROR_MESSAGE_LEN: usize = 100;
 /// Matches stellar-core's `QUERY_RESPONSE_MULTIPLIER` (Peer.cpp:136).
 const QUERY_RESPONSE_MULTIPLIER: u32 = 5;
 
+/// Fixed max rate for GetScpState queries per window, matching stellar-core's
+/// `GET_SCP_STATE_MAX_RATE` (Peer.cpp:61).
+const GET_SCP_STATE_MAX_RATE: u32 = 10;
+
+/// Rate-limited query message types.
+///
+/// Parity: stellar-core Peer.cpp uses separate `QueryInfo` instances for
+/// GetTxSet, GetScpQuorumset, and GetScpState, each checked via
+/// `Peer::process()` (Peer.cpp:1423-1438).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryKind {
+    TxSet,
+    ScpQuorumSet,
+    ScpState,
+}
+
+impl QueryKind {
+    /// Classify a message as a rate-limited query, if applicable.
+    fn classify(message: &StellarMessage) -> Option<Self> {
+        match message {
+            StellarMessage::GetTxSet(_) => Some(Self::TxSet),
+            StellarMessage::GetScpQuorumset(_) => Some(Self::ScpQuorumSet),
+            StellarMessage::GetScpState(_) => Some(Self::ScpState),
+            _ => None,
+        }
+    }
+
+    /// Per-kind max queries per window. `None` uses the default
+    /// (`window_secs * QUERY_RESPONSE_MULTIPLIER`).
+    fn max_queries_per_window(self) -> Option<u32> {
+        match self {
+            Self::ScpState => Some(GET_SCP_STATE_MAX_RATE),
+            _ => None,
+        }
+    }
+}
+
 /// Per-query-type sliding-window rate limiter.
 ///
-/// Parity: stellar-core (Peer.cpp:1423-1438) limits GetTxSet and
-/// GetScpQuorumSet queries per peer with a time-windowed counter.
+/// Parity: stellar-core (Peer.cpp:1423-1438) limits GetTxSet, GetScpQuorumSet,
+/// and GetScpState queries per peer with a time-windowed counter. GetScpState
+/// uses a fixed max of 10 per window (`GET_SCP_STATE_MAX_RATE`); the other two
+/// use `window_secs * QUERY_RESPONSE_MULTIPLIER`.
 struct QueryInfo {
     last_reset: Instant,
     count: u32,
@@ -47,13 +86,18 @@ impl QueryInfo {
     }
 
     /// Returns true if the query is allowed under the rate limit.
-    fn check_and_increment(&mut self, window: Duration) -> bool {
-        let max_queries = window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER;
+    ///
+    /// When `max_queries` is `None`, defaults to
+    /// `window_secs * QUERY_RESPONSE_MULTIPLIER`. Mirrors stellar-core's
+    /// `Peer::process(QueryInfo&, optional<uint32_t>)`.
+    fn check_and_increment(&mut self, window: Duration, max_queries: Option<u32>) -> bool {
+        let max =
+            max_queries.unwrap_or_else(|| window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER);
         if self.last_reset.elapsed() >= window {
             self.last_reset = Instant::now();
             self.count = 0;
         }
-        if self.count >= max_queries {
+        if self.count >= max {
             return false;
         }
         self.count += 1;
@@ -61,10 +105,14 @@ impl QueryInfo {
     }
 }
 
-/// Per-peer query rate limiters for GetTxSet and GetScpQuorumSet.
+/// Per-peer query rate limiters for GetTxSet, GetScpQuorumSet, and GetScpState.
+///
+/// Parity: stellar-core Peer.cpp:1423-1438 (`process()`), Peer.cpp:1686
+/// (GetScpState with fixed max=10).
 struct QueryRateLimiter {
     tx_set: QueryInfo,
     quorum_set: QueryInfo,
+    scp_state: QueryInfo,
 }
 
 impl QueryRateLimiter {
@@ -72,7 +120,23 @@ impl QueryRateLimiter {
         Self {
             tx_set: QueryInfo::new(),
             quorum_set: QueryInfo::new(),
+            scp_state: QueryInfo::new(),
         }
+    }
+
+    /// Returns `true` if the message is allowed. Non-query messages always pass.
+    fn check(&mut self, message: &StellarMessage, window: Duration) -> bool {
+        let kind = match QueryKind::classify(message) {
+            Some(k) => k,
+            None => return true,
+        };
+        let max = kind.max_queries_per_window();
+        let info = match kind {
+            QueryKind::TxSet => &mut self.tx_set,
+            QueryKind::ScpQuorumSet => &mut self.quorum_set,
+            QueryKind::ScpState => &mut self.scp_state,
+        };
+        info.check_and_increment(window, max)
     }
 }
 
@@ -702,24 +766,14 @@ impl OverlayManager {
             return Some(false);
         }
 
-        // Per-peer query rate limit (parity: Peer.cpp:1423-1438).
+        // Per-peer query rate limit (parity: Peer.cpp:1423-1438, 1686).
         // stellar-core's window = expectedLedgerCloseTime * MAX_SLOTS_TO_REMEMBER,
         // recomputed dynamically. The app layer updates the atomic after each
         // ledger close via OverlayManager::set_query_rate_limit_window().
         {
             let window_secs = state.query_rate_limit_window_secs.load(Ordering::Relaxed);
             let query_window = Duration::from_secs(window_secs);
-            let allowed = match message {
-                StellarMessage::GetTxSet(_) => {
-                    ctx.query_limiter.tx_set.check_and_increment(query_window)
-                }
-                StellarMessage::GetScpQuorumset(_) => ctx
-                    .query_limiter
-                    .quorum_set
-                    .check_and_increment(query_window),
-                _ => true,
-            };
-            if !allowed {
+            if !ctx.query_limiter.check(message, query_window) {
                 debug!(
                     "Dropping {} from {}: query rate limit exceeded",
                     msg_type, peer_id
@@ -1554,10 +1608,10 @@ mod tests {
     // which requires real TCP streams. This is an **integration test candidate**.
     // The config default (2s for unauth, 30s for auth) is tested in lib.rs tests.
 
-    /// Regression test: QueryInfo sliding-window rate limiter.
+    /// Regression test: QueryInfo sliding-window rate limiter with default max.
     /// Parity: stellar-core Peer.cpp:1423-1438 (QUERY_RESPONSE_MULTIPLIER=5).
     #[test]
-    fn test_query_rate_limiter() {
+    fn test_query_rate_limiter_default_max() {
         let window = Duration::from_secs(10);
         let max_queries = window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER; // 50
 
@@ -1566,15 +1620,123 @@ mod tests {
         // All queries within limit should be allowed
         for _ in 0..max_queries {
             assert!(
-                info.check_and_increment(window),
+                info.check_and_increment(window, None),
                 "query within limit should be allowed"
             );
         }
 
         // Next query should be rejected
         assert!(
-            !info.check_and_increment(window),
+            !info.check_and_increment(window, None),
             "query exceeding limit should be rejected"
+        );
+    }
+
+    /// Test QueryInfo with custom max override (used for GetScpState).
+    /// Parity: stellar-core Peer.cpp:1686 (GET_SCP_STATE_MAX_RATE=10).
+    #[test]
+    fn test_query_rate_limiter_custom_max() {
+        let window = Duration::from_secs(10);
+        let custom_max = Some(GET_SCP_STATE_MAX_RATE); // 10
+
+        let mut info = QueryInfo::new();
+
+        for _ in 0..GET_SCP_STATE_MAX_RATE {
+            assert!(
+                info.check_and_increment(window, custom_max),
+                "query within custom limit should be allowed"
+            );
+        }
+
+        assert!(
+            !info.check_and_increment(window, custom_max),
+            "query exceeding custom limit should be rejected"
+        );
+    }
+
+    /// Test QueryRateLimiter::check with GetScpState messages — exactly 10
+    /// allowed per window. Parity: stellar-core Peer.cpp:1686.
+    #[test]
+    fn test_query_rate_limiter_scp_state_cap() {
+        let window = Duration::from_secs(10);
+        let mut limiter = QueryRateLimiter::new();
+        let msg = StellarMessage::GetScpState(0);
+
+        for i in 0..GET_SCP_STATE_MAX_RATE {
+            assert!(
+                limiter.check(&msg, window),
+                "GetScpState #{} should be allowed",
+                i + 1
+            );
+        }
+
+        assert!(
+            !limiter.check(&msg, window),
+            "GetScpState #{} should be rejected (exceeds max=10)",
+            GET_SCP_STATE_MAX_RATE + 1
+        );
+    }
+
+    /// Test that the sliding window resets after expiry.
+    #[test]
+    fn test_query_rate_limiter_window_reset() {
+        let window = Duration::from_millis(1);
+        let mut info = QueryInfo::new();
+
+        // Exhaust the limit. With 1ms window, default max = 0 (0 * 5),
+        // so use custom max.
+        let custom_max = Some(2u32);
+        assert!(info.check_and_increment(window, custom_max));
+        assert!(info.check_and_increment(window, custom_max));
+        assert!(!info.check_and_increment(window, custom_max));
+
+        // Wait for window to expire
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Should be allowed again after reset
+        assert!(
+            info.check_and_increment(window, custom_max),
+            "query should be allowed after window reset"
+        );
+    }
+
+    /// Test QueryKind::classify returns correct variants.
+    #[test]
+    fn test_query_kind_classify() {
+        use stellar_xdr::curr::*;
+
+        // Rate-limited query types
+        assert_eq!(
+            QueryKind::classify(&StellarMessage::GetTxSet(Uint256([0; 32]))),
+            Some(QueryKind::TxSet)
+        );
+        assert_eq!(
+            QueryKind::classify(&StellarMessage::GetScpQuorumset(Uint256([0; 32]))),
+            Some(QueryKind::ScpQuorumSet)
+        );
+        assert_eq!(
+            QueryKind::classify(&StellarMessage::GetScpState(0)),
+            Some(QueryKind::ScpState)
+        );
+
+        // Non-query messages should return None
+        assert_eq!(
+            QueryKind::classify(&StellarMessage::Hello(Hello {
+                ledger_version: 0,
+                overlay_version: 0,
+                overlay_min_version: 0,
+                network_id: Hash([0; 32]),
+                version_str: "".try_into().unwrap(),
+                listening_port: 0,
+                peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+                cert: AuthCert {
+                    pubkey: Curve25519Public { key: [0; 32] },
+                    expiration: 0,
+                    sig: Signature::default(),
+                },
+                nonce: Uint256([0; 32]),
+            })),
+            None
         );
     }
 

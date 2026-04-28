@@ -65,7 +65,8 @@ message handler entry points, cross-referenced with Henyey's implementation stat
 
 | Guard | stellar-core Location | Henyey Location | Status | Issue |
 |-------|----------------------|-----------------|--------|-------|
-| Sliding-window query rate limit | `Peer.cpp:1423-1438` (`process()`) | `peer_loop.rs` (`QueryRateLimiter`) | PRESENT | |
+| Sliding-window query rate limit (GetTxSet, GetScpQuorumSet) | `Peer.cpp:1423-1438` (`process()`) | `peer_loop.rs` (`QueryRateLimiter::check`) | PRESENT | |
+| GetScpState fixed max=10 per window | `Peer.cpp:1682-1693` (`recvGetSCPState`, `GET_SCP_STATE_MAX_RATE=10`) | `peer_loop.rs` (`QueryRateLimiter::check` via `QueryKind::ScpState`) | PRESENT | |
 
 ## Timeouts
 

@@ -203,7 +203,7 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `getIOTimeout()` | Idle/straggler timeout in `run_peer_loop()` | Full |
 | `beginMessageProcessing()` | `FlowControl::begin_message_processing()` | Full |
 | `endMessageProcessing()` | `FlowControl::end_message_processing()` | Full |
-| `process()` (query throttle) | `route_received_message()` query rate limiter | Full |
+| `process()` (query throttle) | `QueryRateLimiter::check()` via `QueryKind` enum (GetTxSet, GetScpQuorumSet, GetScpState with fixed max=10) | Full |
 | `canRead()` | `FlowControl::can_read()` | Full |
 | `retryAdvert()` | `TxAdverts::retry_incoming_advert()` | Full |
 | `hasAdvert()` | `TxAdverts::has_adverts()` | Full |
