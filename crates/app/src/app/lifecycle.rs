@@ -2278,11 +2278,15 @@ mod max_tx_size_tests {
     use henyey_herder::flow_control::{compute_max_tx_size, MAX_CLASSIC_TX_SIZE_BYTES};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// Simulate the pure logic of `update_max_tx_size_bytes` without needing
-    /// a full `App` instance. The method is:
+    /// Mirrors the pure logic of `App::update_max_tx_size_bytes` without
+    /// needing a full `App` instance. The real method is three lines:
     ///   new_max = compute_max_tx_size(protocol_version, soroban_tx_max)
-    ///   old_max = atomic.swap(new_max)
+    ///   old_max = self.max_tx_size_bytes.swap(new_max)
     ///   return new_max.saturating_sub(old_max)
+    ///
+    /// The real `refresh_max_tx_size_bytes` (async wrapper) and its call-site
+    /// wiring (startup, catchup, ledger close) are covered indirectly by the
+    /// existing ledger close integration tests which now go through the helper.
     fn update(atomic: &AtomicU32, protocol_version: u32, soroban_tx_max: Option<u32>) -> u32 {
         let new_max = compute_max_tx_size(protocol_version, soroban_tx_max);
         let old_max = atomic.swap(new_max, Ordering::Relaxed);
