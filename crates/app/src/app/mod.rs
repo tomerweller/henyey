@@ -1202,6 +1202,8 @@ impl App {
                     .ledger_close_time
                     .unwrap_or(if config.testing.accelerate_time { 1 } else { 5 })
                     as u64,
+                flood_arb_tx_base_allowance: config.overlay.flood_arb_tx_base_allowance,
+                flood_arb_tx_damping_factor: config.overlay.flood_arb_tx_damping_factor,
                 ..Default::default()
             },
             local_quorum_set,

@@ -69,6 +69,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "QUORUM_SET",
     "HOME_DOMAINS",
     "FORCE_OLD_STYLE_LEADER_ELECTION",
+    "FLOOD_ARB_TX_BASE_ALLOWANCE",
+    "FLOOD_ARB_TX_DAMPING_FACTOR",
 ];
 
 /// Valid stellar-core keys that henyey intentionally does not support.
@@ -243,6 +245,12 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
     if let Some(peers) = get_string_array(table, "PREFERRED_PEERS") {
         config.overlay.preferred_peers = peers;
+    }
+    if let Some(v) = get_i64(table, "FLOOD_ARB_TX_BASE_ALLOWANCE") {
+        config.overlay.flood_arb_tx_base_allowance = v as i32;
+    }
+    if let Some(v) = get_f64(table, "FLOOD_ARB_TX_DAMPING_FACTOR") {
+        config.overlay.flood_arb_tx_damping_factor = v;
     }
 
     // --- Metadata ---
@@ -927,6 +935,40 @@ fn get_usize(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u
                 key,
                 value = i,
                 "Compat config key value overflows usize range"
+            );
+            None
+        }
+    }
+}
+
+fn get_i64(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<i64> {
+    let val = table.get(key)?;
+    match val.as_integer() {
+        Some(i) => Some(i),
+        None => {
+            tracing::warn!(
+                key,
+                actual_type = val.type_str(),
+                "Compat config key has wrong type (expected integer)"
+            );
+            None
+        }
+    }
+}
+
+fn get_f64(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<f64> {
+    let val = table.get(key)?;
+    match val.as_float() {
+        Some(f) => Some(f),
+        None => {
+            // Try integer as float
+            if let Some(i) = val.as_integer() {
+                return Some(i as f64);
+            }
+            tracing::warn!(
+                key,
+                actual_type = val.type_str(),
+                "Compat config key has wrong type (expected float)"
             );
             None
         }

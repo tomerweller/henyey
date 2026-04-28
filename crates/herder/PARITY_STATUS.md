@@ -16,7 +16,7 @@
 | LedgerCloseData | Full | All accessors and XDR round-trip |
 | PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache; release-up-to drain now matches `processSCPQueueUpToIndex`; intra-slot LIFO ordering now matches `pop()` |
 | QuorumTracker | Full | expand, rebuild, closest validators |
-| TransactionQueue | Partial | Missing arb damping; fee release and drop now implemented |
+| TransactionQueue | Partial | Arb flood damping implemented; missing ban-on-damping, dedicated flood queue |
 | TxQueueLimiter | Partial | `visitTopTxs` custom limits implemented; missing total flood resource tracking |
 | TxSetFrame / ApplicableTxSetFrame | Partial | No ApplicableTxSetFrame abstraction |
 | SurgePricingUtils | Full | All lane configs and priority queue; `erase()` guard matches `releaseAssert(res <= mLaneCurrentCount[lane])` |
@@ -108,7 +108,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `setupTriggerNextLedger()` | _(not implemented)_ | None |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
-| `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget and budget-neutral skipped txs; missing arb damping, ban-on-damping, dedicated flood queue, mark-on-attempt |
+| `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, and arb flood damping; missing ban-on-damping, dedicated flood queue, mark-on-attempt |
 | `processSCPQueue()` | pending envelope release | Full |
 | `updateTransactionQueue()` | handled in `ledger_closed()` | Full |
 | `maybeSetupSorobanQueue()` | Integrated via lane-based `TransactionQueue` | Full |
@@ -306,11 +306,11 @@ Corresponds to: `TransactionQueue.h`
 | `dropTransaction()` | `drop_transaction()` | Full |
 | `isFiltered()` | `is_filtered()` | Full |
 | `broadcastTx()` | _(removed — replaced by `broadcast_with_visitor()`)_ | N/A |
-| `broadcastSome()` | `TransactionQueue::broadcast_with_visitor()` | Partial — priority-ordered with ops budget, DEX-lane limits, budget-neutral skipped txs; missing arb damping, ban-on-damping |
+| `broadcastSome()` | `TransactionQueue::broadcast_with_visitor()` | Partial — priority-ordered with ops budget, DEX-lane limits, budget-neutral skipped txs, arb flood damping; missing ban-on-damping |
 | `SorobanTransactionQueue::resetAndRebuild()` | `reset_and_rebuild()` in `tx_queue.rs` | Full |
 | `SorobanTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
 | `ClassicTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
-| `ClassicTransactionQueue::allowTxBroadcast()` | _(not implemented)_ | None |
+| `ClassicTransactionQueue::allowTxBroadcast()` | `ArbitrageFloodDamper::allow_tx_broadcast()` | Full |
 
 ### TxQueueLimiter (`tx_queue_limiter.rs`)
 
@@ -467,8 +467,6 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `findAllAssetPairsInvolvedInPaymentLoops()` | Low | Arbitrage flood damping; flooding optimization only, does not affect consensus correctness |
-| `allowTxBroadcast()` arb damping | Low | Classic queue arbitrage filtering; flooding optimization only |
 | `ApplicableTxSetFrame` abstraction | Low | Validation done inline in `tx_set.rs`; functionally equivalent |
 | `TxSetPhaseFrame` | Medium | Phase-level abstraction for parallel support |
 | `TxSetUtils::buildAccountTxQueues()` | Low | Account-based tx ordering |

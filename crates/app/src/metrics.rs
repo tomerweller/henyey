@@ -210,6 +210,10 @@ metric_catalog! {
             => "Currently banned transactions in the queue";
         HERDER_TX_QUEUE_SEEN = "stellar_herder_tx_queue_seen"
             => "Deduplicated transaction hashes in the seen set";
+        HERDER_ARB_TX_SEEN = "stellar_herder_arb_tx_seen_total"
+            => "Total arbitrage (looping path-payment) transactions evaluated for broadcast";
+        HERDER_ARB_TX_DROPPED = "stellar_herder_arb_tx_dropped_total"
+            => "Total arbitrage transactions dropped by flood damping";
 
         // Clock drift gauges (Phase 2).
         DRIFT_MIN_SECONDS = "henyey_herder_drift_min_seconds"
@@ -658,6 +662,8 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     gauge!(HERDER_TX_QUEUE_ACCOUNTS).set(tq.account_count as f64);
     gauge!(HERDER_TX_QUEUE_BANNED).set(tq.banned_count as f64);
     gauge!(HERDER_TX_QUEUE_SEEN).set(tq.seen_count as f64);
+    counter!(HERDER_ARB_TX_SEEN).absolute(tq.arb_tx_seen);
+    counter!(HERDER_ARB_TX_DROPPED).absolute(tq.arb_tx_dropped);
 
     // Herder pending envelope stats — added + released (Phase 2).
     counter!(HERDER_PENDING_ADDED_TOTAL).absolute(pstats.added);

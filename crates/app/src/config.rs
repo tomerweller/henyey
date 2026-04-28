@@ -904,6 +904,18 @@ pub struct OverlayConfig {
     /// Maximum peer failures allowed before pruning.
     #[serde(default = "default_peer_max_failures")]
     pub peer_max_failures: u32,
+
+    /// Arbitrage flood damping: number of unconditional broadcasts per asset
+    /// pair per ledger. Set to `-1` to disable. Default `5`.
+    /// Matches stellar-core `FLOOD_ARB_TX_BASE_ALLOWANCE`.
+    #[serde(default = "default_flood_arb_tx_base_allowance")]
+    pub flood_arb_tx_base_allowance: i32,
+
+    /// Arbitrage flood damping: probability parameter for geometric distribution.
+    /// Must be in `(0.0, 1.0]`. Default `0.8`.
+    /// Matches stellar-core `FLOOD_ARB_TX_DAMPING_FACTOR`.
+    #[serde(default = "default_flood_arb_tx_damping_factor")]
+    pub flood_arb_tx_damping_factor: f64,
 }
 
 impl Default for OverlayConfig {
@@ -923,12 +935,22 @@ impl Default for OverlayConfig {
             flood_advert_period_ms: default_flood_advert_period_ms(),
             flood_demand_backoff_delay_ms: default_flood_demand_backoff_delay_ms(),
             peer_max_failures: default_peer_max_failures(),
+            flood_arb_tx_base_allowance: default_flood_arb_tx_base_allowance(),
+            flood_arb_tx_damping_factor: default_flood_arb_tx_damping_factor(),
         }
     }
 }
 
 fn default_peer_max_failures() -> u32 {
     120
+}
+
+fn default_flood_arb_tx_base_allowance() -> i32 {
+    5
+}
+
+fn default_flood_arb_tx_damping_factor() -> f64 {
+    0.8
 }
 
 /// Logging configuration.
@@ -1615,6 +1637,15 @@ impl AppConfig {
         }
         if self.overlay.flood_demand_backoff_delay_ms == 0 {
             anyhow::bail!("flood_demand_backoff_delay_ms must be > 0");
+        }
+        if self.overlay.flood_arb_tx_base_allowance < -1 {
+            anyhow::bail!("flood_arb_tx_base_allowance must be >= -1");
+        }
+        if !self.overlay.flood_arb_tx_damping_factor.is_finite()
+            || self.overlay.flood_arb_tx_damping_factor <= 0.0
+            || self.overlay.flood_arb_tx_damping_factor > 1.0
+        {
+            anyhow::bail!("flood_arb_tx_damping_factor must be in (0.0, 1.0]");
         }
         if self.overlay.auto_survey {
             anyhow::bail!("auto_survey is not supported; surveys are manual only");

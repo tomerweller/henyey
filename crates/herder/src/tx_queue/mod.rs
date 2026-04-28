@@ -70,6 +70,7 @@ use crate::Result;
 use henyey_tx::envelope_sequence_number;
 use rand::Rng;
 
+pub mod arb_flood_damping;
 mod selection;
 mod tx_set;
 
@@ -246,6 +247,14 @@ pub struct TxQueueConfig {
     /// Expected ledger close time in seconds (used for upper bound close time offset).
     /// Matches stellar-core's `EXPECTED_LEDGER_CLOSE_TIME` config.
     pub expected_ledger_close_secs: u64,
+    /// Arbitrage flood damping: number of unconditional broadcasts per asset
+    /// pair per ledger. Set to `-1` to disable damping. Default `5`.
+    /// Matches stellar-core `FLOOD_ARB_TX_BASE_ALLOWANCE`.
+    pub flood_arb_tx_base_allowance: i32,
+    /// Arbitrage flood damping: probability parameter for the geometric
+    /// distribution used beyond the base allowance. Must be in `(0.0, 1.0]`.
+    /// Default `0.8`. Matches stellar-core `FLOOD_ARB_TX_DAMPING_FACTOR`.
+    pub flood_arb_tx_damping_factor: f64,
 }
 
 impl Default for TxQueueConfig {
@@ -272,6 +281,8 @@ impl Default for TxQueueConfig {
             soroban_phase_min_stage_count: 1,
             soroban_phase_max_stage_count: 4,
             expected_ledger_close_secs: 5,
+            flood_arb_tx_base_allowance: 5,
+            flood_arb_tx_damping_factor: 0.8,
         }
     }
 }
@@ -1109,7 +1120,7 @@ impl EvictionThresholds {
 ///
 /// When acquiring multiple write locks, always acquire in this order:
 ///
-///   `store → account_states → banned_transactions → seen`
+///   `store → account_states → banned_transactions → seen → arb_damper`
 ///
 /// `validation_context` is excluded: it is only read-locked in
 /// multi-lock contexts. If a future change needs `.write()` while
@@ -1158,6 +1169,13 @@ pub struct TransactionQueue {
     /// Dynamic Soroban resource limits for tx-set selection (1x ledger max).
     /// Separate from queue-admission limits which use POOL_LEDGER_MULTIPLIER (2x).
     dynamic_selection_soroban_resources: RwLock<Option<Resource>>,
+    /// Arbitrage flood damper. Acquired after `store` lock in `broadcast_with_visitor`
+    /// and `shift()`. Cleared by `shift()`, preserved by `reset_and_rebuild()`.
+    arb_damper: parking_lot::Mutex<arb_flood_damping::ArbitrageFloodDamper>,
+    /// Counter: arb txs seen during broadcast (has payment loops).
+    arb_tx_seen: std::sync::atomic::AtomicU64,
+    /// Counter: arb txs dampened during broadcast (not broadcast).
+    arb_tx_dropped: std::sync::atomic::AtomicU64,
 }
 
 /// Default ban depth (number of ledgers transactions stay banned).
@@ -1194,6 +1212,11 @@ impl TransactionQueue {
             banned.push_back(HashSet::new());
         }
 
+        let arb_damper = arb_flood_damping::ArbitrageFloodDamper::new(
+            config.flood_arb_tx_base_allowance,
+            config.flood_arb_tx_damping_factor,
+        );
+
         Self {
             store: RwLock::new(QueueStore::new()),
             config,
@@ -1209,6 +1232,9 @@ impl TransactionQueue {
             skip_fee_balance_check: std::sync::atomic::AtomicBool::new(false),
             dynamic_queue_soroban_resources: RwLock::new(None),
             dynamic_selection_soroban_resources: RwLock::new(None),
+            arb_damper: parking_lot::Mutex::new(arb_damper),
+            arb_tx_seen: std::sync::atomic::AtomicU64::new(0),
+            arb_tx_dropped: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2607,6 +2633,10 @@ impl TransactionQueue {
             }
         }
 
+        // Clear arbitrage flood damping state for the new ledger.
+        // Parity: stellar-core clears mArbitrageFloodDamping in shift().
+        self.arb_damper.lock().clear();
+
         ShiftResult {
             unbanned_count,
             evicted_due_to_age,
@@ -2733,6 +2763,25 @@ impl TransactionQueue {
         let mut lane_resources_left = Vec::new();
         if let Err(e) = limiter.visit_top_txs(
             |tx| {
+                // Arbitrage flood damping: check before visitor.
+                // Mirrors stellar-core broadcastTx → allowTxBroadcast.
+                let ops = henyey_tx::envelope_utils::envelope_operations(&tx.envelope);
+                let arb_result = self.arb_damper.lock().allow_tx_broadcast(ops);
+                match arb_result {
+                    arb_flood_damping::ArbBroadcastResult::Dampened => {
+                        self.arb_tx_seen
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.arb_tx_dropped
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return VisitTxResult::Skipped;
+                    }
+                    arb_flood_damping::ArbBroadcastResult::Allowed => {
+                        self.arb_tx_seen
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    arb_flood_damping::ArbBroadcastResult::NotArb => {}
+                }
+
                 let candidate = BroadcastCandidate {
                     hash: tx.hash,
                     op_count: tx.op_count,
@@ -2801,7 +2850,22 @@ impl TransactionQueue {
             account_count: accounts.len(),
             banned_count: self.banned_count(),
             seen_count: seen.len(),
+            arb_tx_seen: self.arb_tx_seen.load(std::sync::atomic::Ordering::Relaxed),
+            arb_tx_dropped: self
+                .arb_tx_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// Get the number of arb txs seen during broadcast (for metrics export).
+    pub fn arb_tx_seen_count(&self) -> u64 {
+        self.arb_tx_seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get the number of arb txs dampened during broadcast (for metrics export).
+    pub fn arb_tx_dropped_count(&self) -> u64 {
+        self.arb_tx_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -2864,6 +2928,10 @@ pub struct TxQueueStats {
     pub banned_count: usize,
     /// Number of seen (deduplicated) transaction hashes.
     pub seen_count: usize,
+    /// Total arbitrage transactions evaluated for broadcast (monotonic).
+    pub arb_tx_seen: u64,
+    /// Total arbitrage transactions dropped by damping (monotonic).
+    pub arb_tx_dropped: u64,
 }
 
 fn extra_signers_satisfied(
