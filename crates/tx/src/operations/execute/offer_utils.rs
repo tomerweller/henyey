@@ -15,7 +15,7 @@ use super::offer_exchange::{
 };
 use super::{
     account_liabilities, apply_balance_delta, apply_liabilities_delta, can_buy_at_most,
-    dec_sub_entries, is_authorized_to_maintain_liabilities, issuer_for_asset, map_exchange_error,
+    is_authorized_to_maintain_liabilities, issuer_for_asset, map_exchange_error,
     trustline_liabilities,
 };
 use crate::state::LedgerStateManager;
@@ -82,66 +82,29 @@ pub(super) fn can_sell_at_most(
     Ok(available.max(0))
 }
 
-/// Delete an offer and handle sponsorship/sub-entry cleanup.
+/// Delete an offer and handle sponsorship / sub-entry cleanup.
 ///
-/// Uses a validate-then-mutate pattern matching stellar-core's
-/// `removeEntryWithPossibleSponsorship` (SponsorshipUtils.cpp:809-847):
+/// Thin wrapper over `LedgerStateManager::remove_sponsored_subentry` that
+/// also performs the offer-specific entry deletion. Centralizes the
+/// validate-then-mutate sponsorship pattern so all five offer-deletion
+/// callers (manage_offer, path_payment, trust_flags pool-share path,
+/// cross_offer_v10) share the same atomic bookkeeping path.
 ///
-/// Phase 1 — Validate: ensure accounts exist, counts won't underflow.
-/// Phase 2 — Mutate: delete offer, update sponsorship counts, decrement sub-entries.
-///
-/// Data integrity violations (missing accounts, insufficient counts) return
-/// `TxError::Internal`, matching stellar-core's `std::runtime_error` behavior.
+/// Mirrors stellar-core's `removeEntryWithPossibleSponsorship` (which
+/// runs sub-entry decrement first, then sponsorship-count updates) and
+/// then deletes the offer entry. Data integrity violations during Phase
+/// 1 return `TxError::Internal`; Phase 2 cannot fail.
 pub(super) fn delete_offer_with_sponsorship(
     seller: &AccountId,
     offer_id: i64,
     state: &mut LedgerStateManager,
 ) -> Result<()> {
-    use crate::error::TxError;
-
     let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
         seller_id: seller.clone(),
         offer_id,
     });
-
-    // Phase 1: Validate — no state mutations
-    let sponsor = state.entry_sponsor(&ledger_key);
-    if let Some(ref sponsor) = sponsor {
-        state.ensure_account_loaded(sponsor)?;
-        let (num_sponsoring, _) = state
-            .sponsorship_counts_for_account(sponsor)
-            .ok_or_else(|| TxError::Internal("sponsor account missing".into()))?;
-        if num_sponsoring < 1 {
-            return Err(TxError::Internal("insufficient numSponsoring".into()));
-        }
-        state.ensure_account_loaded(seller)?;
-        let (_, num_sponsored) = state
-            .sponsorship_counts_for_account(seller)
-            .ok_or_else(|| TxError::Internal("sponsored account missing".into()))?;
-        if num_sponsored < 1 {
-            return Err(TxError::Internal("insufficient numSponsored".into()));
-        }
-    }
-    state.ensure_account_loaded(seller)?;
-    let seller_account = state
-        .get_account(seller)
-        .ok_or_else(|| TxError::Internal(format!("seller account missing for offer {offer_id}")))?;
-    if seller_account.num_sub_entries < 1 {
-        return Err(TxError::Internal(format!(
-            "seller num_sub_entries is 0 for offer {offer_id}"
-        )));
-    }
-
-    // Phase 2: Mutate — all preconditions verified
+    state.remove_sponsored_subentry(&ledger_key, seller, 1)?;
     state.delete_offer(seller, offer_id);
-    if let Some(sponsor) = sponsor {
-        state.update_num_sponsoring(&sponsor, -1)?;
-        state.update_num_sponsored(seller, -1)?;
-    }
-    let account = state
-        .get_account_mut(seller)
-        .expect("seller account validated above");
-    dec_sub_entries(account, 1);
     Ok(())
 }
 

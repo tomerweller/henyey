@@ -9,7 +9,7 @@ use stellar_xdr::curr::{
 };
 
 use super::{
-    account_balance_after_liabilities, dec_sub_entries, ensure_trustline_ext_v2, inc_sub_entries,
+    account_balance_after_liabilities, ensure_trustline_ext_v2, inc_sub_entries,
     is_authorized_to_maintain_liabilities, require_source_account, trustline_liabilities,
     ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
@@ -152,23 +152,17 @@ fn remove_trustline(
         decrement_pool_use_counts(state, source, params)?;
     }
 
-    {
-        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
-            account_id: source.clone(),
-            asset: tl_asset.clone(),
-        });
-        if state.entry_sponsor(&ledger_key).is_some() {
-            state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, multiplier)?;
-        }
-    }
-
-    // Decrease sub-entries BEFORE deleting trustline.
-    // stellar-core records account STATE/UPDATED before trustline STATE/REMOVED.
-    if let Some(account) = state.get_account_mut(source) {
-        // stellar-core: panics on underflow (invalid account state)
-        dec_sub_entries(account, multiplier as u32);
-    }
+    let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: source.clone(),
+        asset: tl_asset.clone(),
+    });
+    // Atomic validate-then-mutate: clears sponsorship metadata, decrements
+    // num_sponsoring/num_sponsored (if sponsored), and decrements
+    // num_sub_entries on the source account. Mirrors stellar-core's
+    // `removeEntryWithPossibleSponsorship` (SponsorshipUtils.cpp:808-847).
+    state.remove_sponsored_subentry(&ledger_key, source, multiplier)?;
     // Flush ALL account changes before recording trustline deletion.
+    // stellar-core records account STATE/UPDATED before trustline STATE/REMOVED.
     state.flush_all_accounts();
     state.delete_trustline_by_trustline_asset(source, tl_asset);
     Ok(None)

@@ -348,19 +348,15 @@ pub(crate) fn execute_claim_claimable_balance(
     let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
         balance_id: entry.balance_id.clone(),
     });
-    let sponsor = state.entry_sponsor(&ledger_key);
 
-    // Validate sponsorship counts before any mutation (delete or count update).
-    // Claimable balances have no sponsored owner — pass None.
-    if sponsor.is_some() {
-        state.validate_can_remove_sponsorship(&ledger_key, None, sponsorship_multiplier)?;
-    }
+    // Atomic validate-then-mutate for the sponsor's num_sponsoring.
+    // Mirrors stellar-core's `removeEntryWithPossibleSponsorship`
+    // (SponsorshipUtils.cpp:808-847): no-op if unsponsored, otherwise
+    // validates num_sponsoring and decrements via direct field write.
+    state.remove_sponsored_claimable_balance(&ledger_key, sponsorship_multiplier)?;
 
-    // Delete the claimable balance entry
+    // Delete the claimable balance entry.
     state.delete_claimable_balance(&op.balance_id);
-    if let Some(sponsor) = sponsor {
-        state.update_num_sponsoring(&sponsor, -sponsorship_multiplier)?;
-    }
 
     Ok(make_claim_result(ClaimClaimableBalanceResultCode::Success))
 }

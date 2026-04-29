@@ -14,10 +14,9 @@ use stellar_xdr::curr::{
 };
 
 use super::{
-    add_pool_reserve, add_pool_shares, dec_sub_entries, ensure_account_liabilities,
-    ensure_trustline_liabilities, is_authorized_to_maintain_liabilities, issuer_for_asset,
-    TxIdentity, AUTHORIZED_FLAG, AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG,
-    TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+    add_pool_reserve, add_pool_shares, ensure_account_liabilities, ensure_trustline_liabilities,
+    is_authorized_to_maintain_liabilities, issuer_for_asset, TxIdentity, AUTHORIZED_FLAG,
+    AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -544,21 +543,15 @@ fn redeem_pool_share_trustlines(
             .entry_sponsor(&tl_ledger_key)
             .unwrap_or_else(|| account_id.clone());
 
-        // Delete the pool share trustline: release reserves and remove
-        // Pool share trustlines have multiplier 2
+        // Delete the pool share trustline: release reserves and remove.
+        // Pool share trustlines have multiplier 2.
+        // Atomic validate-then-mutate: clears sponsorship metadata,
+        // decrements num_sponsoring/num_sponsored (if sponsored), and
+        // decrements num_sub_entries by `multiplier` on the source account.
+        // Mirrors stellar-core's `removeEntryWithPossibleSponsorship`
+        // (SponsorshipUtils.cpp:808-847).
         let multiplier: i64 = 2;
-        if state.entry_sponsor(&tl_ledger_key).is_some() {
-            state.remove_entry_sponsorship_and_update_counts(
-                &tl_ledger_key,
-                account_id,
-                multiplier,
-            )?;
-        }
-
-        // Decrease sub-entries BEFORE deleting trustline
-        if let Some(account) = state.get_account_mut(account_id) {
-            dec_sub_entries(account, multiplier as u32);
-        }
+        state.remove_sponsored_subentry(&tl_ledger_key, account_id, multiplier)?;
 
         state.delete_trustline_by_trustline_asset(account_id, &tl_asset);
 
