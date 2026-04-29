@@ -339,9 +339,9 @@ impl CatchupManager {
 
             let load_hot_archive_bucket =
                 |hash: &Hash256| -> henyey_bucket::Result<HotArchiveBucket> {
-                    // Zero hash means empty bucket
-                    if hash.is_zero() {
-                        return Ok(HotArchiveBucket::empty());
+                    // Short-circuit sentinel hashes (zero hash → empty bucket)
+                    if let Some(bucket) = HotArchiveBucket::for_sentinel_hash(hash) {
+                        return Ok(bucket);
                     }
 
                     // Check cache first (same hash can appear at multiple levels)

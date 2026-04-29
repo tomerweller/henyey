@@ -415,9 +415,9 @@ impl BucketManager {
         &self,
         hash: &Hash256,
     ) -> Result<crate::hot_archive::HotArchiveBucket> {
-        // Check if it's the empty bucket
-        if hash.is_zero() {
-            return Ok(crate::hot_archive::HotArchiveBucket::empty());
+        // Short-circuit sentinel hashes (zero hash → empty bucket)
+        if let Some(bucket) = crate::hot_archive::HotArchiveBucket::for_sentinel_hash(hash) {
+            return Ok(bucket);
         }
 
         // Load from canonical .bucket.xdr path
@@ -480,8 +480,8 @@ impl BucketManager {
         &self,
         hash: &Hash256,
     ) -> Result<crate::hot_archive::HotArchiveBucket> {
-        if hash.is_zero() {
-            return Ok(crate::hot_archive::HotArchiveBucket::empty());
+        if let Some(bucket) = crate::hot_archive::HotArchiveBucket::for_sentinel_hash(hash) {
+            return Ok(bucket);
         }
 
         let xdr_path = self.bucket_path(hash);
@@ -2347,6 +2347,15 @@ mod tests {
         let result = manager
             .load_hot_archive_bucket_for_merge(&Hash256::ZERO)
             .unwrap();
+        assert!(result.hash().is_zero());
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_load_hot_archive_bucket_returns_empty_for_zero_hash() {
+        let (_temp_dir, manager) = create_manager();
+
+        let result = manager.load_hot_archive_bucket(&Hash256::ZERO).unwrap();
         assert!(result.hash().is_zero());
         assert_eq!(result.len(), 0);
     }

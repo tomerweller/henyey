@@ -113,6 +113,19 @@ impl HotArchiveBucket {
         }
     }
 
+    /// Return the canonical empty bucket for a recognized sentinel hash.
+    ///
+    /// Hot archive buckets recognize only the zero hash as a sentinel
+    /// (there is no `empty_hash()` equivalent for hot archive). Returns
+    /// `None` if the hash is not a recognized sentinel.
+    pub fn for_sentinel_hash(hash: &Hash256) -> Option<Self> {
+        if hash.is_zero() {
+            Some(Self::empty())
+        } else {
+            None
+        }
+    }
+
     /// Create a hot archive bucket from entries.
     ///
     /// **Important**: The entries MUST be pre-sorted in stellar-core order
@@ -802,6 +815,33 @@ where
     Ok(bucket)
 }
 
+/// Load a hot archive bucket by hash, short-circuiting recognized sentinel hashes.
+///
+/// Returns the canonical empty bucket for zero-hash sentinels; otherwise calls
+/// [`load_hot_and_verify`]. Mirrors [`load_or_sentinel`](super::bucket_list)
+/// for live buckets.
+fn load_hot_or_sentinel<F>(hash: &Hash256, load_bucket: &mut F) -> Result<HotArchiveBucket>
+where
+    F: FnMut(&Hash256) -> Result<HotArchiveBucket>,
+{
+    if let Some(b) = HotArchiveBucket::for_sentinel_hash(hash) {
+        return Ok(b);
+    }
+    load_hot_and_verify(hash, load_bucket)
+}
+
+/// Shared-closure variant of [`load_hot_or_sentinel`] for use under
+/// `std::thread::scope`.
+fn load_hot_or_sentinel_shared<F>(hash: &Hash256, load_bucket: &F) -> Result<HotArchiveBucket>
+where
+    F: Fn(&Hash256) -> Result<HotArchiveBucket>,
+{
+    if let Some(b) = HotArchiveBucket::for_sentinel_hash(hash) {
+        return Ok(b);
+    }
+    load_hot_and_verify_shared(hash, load_bucket)
+}
+
 impl HotArchiveBucketList {
     /// Number of levels in the hot archive bucket list.
     pub const NUM_LEVELS: usize = HOT_ARCHIVE_BUCKET_LIST_LEVELS;
@@ -1221,17 +1261,9 @@ impl HotArchiveBucketList {
                 .enumerate()
                 .map(|(i, ((curr_hash, snap_hash), state))| {
                     s.spawn(move || -> Result<HotArchiveBucketLevel> {
-                        let curr = if curr_hash.is_zero() {
-                            HotArchiveBucket::empty()
-                        } else {
-                            load_hot_and_verify_shared(curr_hash, load_bucket)?
-                        };
+                        let curr = load_hot_or_sentinel_shared(curr_hash, load_bucket)?;
 
-                        let snap = if snap_hash.is_zero() {
-                            HotArchiveBucket::empty()
-                        } else {
-                            load_hot_and_verify_shared(snap_hash, load_bucket)?
-                        };
+                        let snap = load_hot_or_sentinel_shared(snap_hash, load_bucket)?;
 
                         let next = if state.state == HAS_NEXT_STATE_OUTPUT {
                             if let Some(ref output_hash) = state.output {
@@ -1313,17 +1345,9 @@ impl HotArchiveBucketList {
         let mut levels = Vec::with_capacity(HOT_ARCHIVE_BUCKET_LIST_LEVELS);
 
         for (i, (curr_hash, snap_hash)) in hashes.iter().enumerate() {
-            let curr = if curr_hash.is_zero() {
-                HotArchiveBucket::empty()
-            } else {
-                load_hot_and_verify(curr_hash, &mut load_bucket)?
-            };
+            let curr = load_hot_or_sentinel(curr_hash, &mut load_bucket)?;
 
-            let snap = if snap_hash.is_zero() {
-                HotArchiveBucket::empty()
-            } else {
-                load_hot_and_verify(snap_hash, &mut load_bucket)?
-            };
+            let snap = load_hot_or_sentinel(snap_hash, &mut load_bucket)?;
 
             // Check if there's a completed merge (state == HAS_NEXT_STATE_OUTPUT) for this level
             let state = &next_states[i];
@@ -1415,17 +1439,9 @@ impl HotArchiveBucketList {
                     (&state.input_curr, &state.input_snap)
                 {
                     // Load the input buckets from the stored hashes
-                    let input_curr = if curr_hash.is_zero() {
-                        HotArchiveBucket::empty()
-                    } else {
-                        load_hot_and_verify(curr_hash, &mut load_bucket)?
-                    };
+                    let input_curr = load_hot_or_sentinel(curr_hash, &mut load_bucket)?;
 
-                    let input_snap = if snap_hash.is_zero() {
-                        HotArchiveBucket::empty()
-                    } else {
-                        load_hot_and_verify(snap_hash, &mut load_bucket)?
-                    };
+                    let input_snap = load_hot_or_sentinel(snap_hash, &mut load_bucket)?;
 
                     tracing::info!(
                         level = i,
@@ -2487,6 +2503,74 @@ mod tests {
                 assert_eq!(actual, wrong_hash.to_hex());
             }
             other => panic!("Expected HashMismatch, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_for_sentinel_hash_zero() {
+        let bucket = HotArchiveBucket::for_sentinel_hash(&Hash256::ZERO).unwrap();
+        assert!(bucket.is_empty());
+        assert!(bucket.hash().is_zero());
+    }
+
+    #[test]
+    fn test_for_sentinel_hash_non_sentinel() {
+        let arbitrary = Hash256::from_bytes([0xAB; 32]);
+        assert!(HotArchiveBucket::for_sentinel_hash(&arbitrary).is_none());
+    }
+
+    #[test]
+    fn test_load_hot_or_sentinel_short_circuits_zero_hash() {
+        // A loader that errors on any call — proves the sentinel check
+        // short-circuits before reaching the loader.
+        let mut loader = |_: &Hash256| -> Result<HotArchiveBucket> {
+            Err(BucketError::NotFound("should not be called".into()))
+        };
+        let bucket = load_hot_or_sentinel(&Hash256::ZERO, &mut loader).unwrap();
+        assert!(bucket.is_empty());
+        assert!(bucket.hash().is_zero());
+    }
+
+    #[test]
+    fn test_load_hot_or_sentinel_shared_short_circuits_zero_hash() {
+        let loader = |_: &Hash256| -> Result<HotArchiveBucket> {
+            Err(BucketError::NotFound("should not be called".into()))
+        };
+        let bucket = load_hot_or_sentinel_shared(&Hash256::ZERO, &loader).unwrap();
+        assert!(bucket.is_empty());
+        assert!(bucket.hash().is_zero());
+    }
+
+    #[test]
+    fn test_load_hot_or_sentinel_delegates_non_sentinel() {
+        let real_bucket = HotArchiveBucket::empty();
+        let real_hash = Hash256::from_bytes([0x42; 32]);
+        // This loader returns a bucket whose hash won't match — just testing
+        // that the loader IS called for non-sentinel hashes.
+        let mut loader = |_: &Hash256| -> Result<HotArchiveBucket> { Ok(real_bucket.clone()) };
+        let result = load_hot_or_sentinel(&real_hash, &mut loader);
+        // Should fail with HashMismatch because the loader returns empty (hash=zero)
+        // but we asked for a non-zero hash.
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+    }
+
+    #[test]
+    fn test_restore_from_has_handles_zero_hash_sentinel() {
+        use crate::bucket_list::HasNextState;
+
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+
+        // Loader that errors on any call — proves sentinel handling works
+        let loader = |_: &Hash256| -> Result<HotArchiveBucket> {
+            Err(BucketError::NotFound("should not be called".into()))
+        };
+
+        let bl = HotArchiveBucketList::restore_from_has(&hashes, &next_states, loader).unwrap();
+
+        for level in bl.levels() {
+            assert!(level.curr.hash().is_zero());
+            assert!(level.snap.hash().is_zero());
         }
     }
 }
