@@ -2573,4 +2573,25 @@ mod tests {
             assert!(level.snap.hash().is_zero());
         }
     }
+
+    #[test]
+    fn test_restore_from_has_parallel_handles_zero_hash_sentinel() {
+        use crate::bucket_list::HasNextState;
+
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+
+        // Loader that errors on any call — proves parallel sentinel handling works
+        let loader = |_: &Hash256| -> Result<HotArchiveBucket> {
+            Err(BucketError::NotFound("should not be called".into()))
+        };
+
+        let bl =
+            HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+
+        for level in bl.levels() {
+            assert!(level.curr.hash().is_zero());
+            assert!(level.snap.hash().is_zero());
+        }
+    }
 }
