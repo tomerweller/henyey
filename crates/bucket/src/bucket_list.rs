@@ -1157,6 +1157,35 @@ where
     Ok(bucket)
 }
 
+/// Load a bucket by hash, short-circuiting recognized empty-bucket sentinels.
+///
+/// Returns the canonical sentinel bucket (zero-hash empty or `empty_hash()`-hash
+/// empty) when applicable; otherwise calls [`load_and_verify`]. Use this in
+/// restore and merge-restart paths where the loader closure may not itself be
+/// sentinel-aware. This mirrors `BucketManager::load_bucket`, which short-circuits
+/// the same sentinels via `Bucket::for_sentinel_hash`.
+fn load_or_sentinel<F>(hash: &Hash256, load_bucket: &mut F) -> Result<Bucket>
+where
+    F: FnMut(&Hash256) -> Result<Bucket>,
+{
+    if let Some(b) = Bucket::for_sentinel_hash(hash) {
+        return Ok(b);
+    }
+    load_and_verify(hash, load_bucket)
+}
+
+/// Shared-closure variant of [`load_or_sentinel`] for use under
+/// `std::thread::scope`.
+fn load_or_sentinel_shared<F>(hash: &Hash256, load_bucket: &F) -> Result<Bucket>
+where
+    F: Fn(&Hash256) -> Result<Bucket>,
+{
+    if let Some(b) = Bucket::for_sentinel_hash(hash) {
+        return Ok(b);
+    }
+    load_and_verify_shared(hash, load_bucket)
+}
+
 impl BucketList {
     /// Number of levels in the BucketList.
     pub const NUM_LEVELS: usize = BUCKET_LIST_LEVELS;
@@ -2296,17 +2325,8 @@ impl BucketList {
                     s.spawn(move || -> Result<(usize, Bucket, Bucket)> {
                         let level_start = std::time::Instant::now();
 
-                        let curr = if curr_hash.is_zero() {
-                            Bucket::empty()
-                        } else {
-                            load_and_verify_shared(curr_hash, load_bucket)?
-                        };
-
-                        let snap = if snap_hash.is_zero() {
-                            Bucket::empty()
-                        } else {
-                            load_and_verify_shared(snap_hash, load_bucket)?
-                        };
+                        let curr = load_or_sentinel_shared(curr_hash, load_bucket)?;
+                        let snap = load_or_sentinel_shared(snap_hash, load_bucket)?;
 
                         tracing::info!(
                             level = i,
@@ -2430,17 +2450,8 @@ impl BucketList {
 
         for (i, (curr_hash, snap_hash)) in hashes.iter().enumerate() {
             let level_start = std::time::Instant::now();
-            let curr = if curr_hash.is_zero() {
-                Bucket::empty()
-            } else {
-                load_and_verify(curr_hash, &mut load_bucket)?
-            };
-
-            let snap = if snap_hash.is_zero() {
-                Bucket::empty()
-            } else {
-                load_and_verify(snap_hash, &mut load_bucket)?
-            };
+            let curr = load_or_sentinel(curr_hash, &mut load_bucket)?;
+            let snap = load_or_sentinel(snap_hash, &mut load_bucket)?;
 
             tracing::info!(
                 level = i,
@@ -2454,6 +2465,15 @@ impl BucketList {
             let state = &next_states[i];
             let next: Option<PendingMerge> = if state.state == HAS_NEXT_STATE_OUTPUT {
                 if let Some(ref output_hash) = state.output {
+                    // `is_zero` here means "no merge result recorded" — the
+                    // FutureBucket state was effectively cleared. This is
+                    // distinct from an `empty_hash()` output, which represents
+                    // a real (empty-content) completed merge that should still
+                    // be loaded as a `PendingMerge::InMemory`. The underlying
+                    // loader (`BucketManager::load_bucket` via
+                    // `Bucket::for_sentinel_hash`) already handles
+                    // `empty_hash()` correctly, so we don't need the sentinel
+                    // helper here.
                     if !output_hash.is_zero() {
                         tracing::debug!(
                             level = i,
@@ -2566,17 +2586,8 @@ impl BucketList {
                 if let (Some(ref curr_hash), Some(ref snap_hash)) =
                     (&state.input_curr, &state.input_snap)
                 {
-                    let input_curr = if curr_hash.is_zero() {
-                        Bucket::empty()
-                    } else {
-                        load_and_verify(curr_hash, &mut load_bucket)?
-                    };
-
-                    let input_snap = if snap_hash.is_zero() {
-                        Bucket::empty()
-                    } else {
-                        load_and_verify(snap_hash, &mut load_bucket)?
-                    };
+                    let input_curr = load_or_sentinel(curr_hash, &mut load_bucket)?;
+                    let input_snap = load_or_sentinel(snap_hash, &mut load_bucket)?;
 
                     tracing::info!(
                         level = i,
@@ -4408,6 +4419,67 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_from_has_parallel_handles_empty_hash_sentinel() {
+        // A HAS that references a level via `empty_hash()` must be handled by
+        // the sentinel short-circuit, not routed to the loader. We pass a
+        // `make_loader(vec![])` which errors on any non-sentinel hash, so a
+        // successful restore proves the short-circuit fired before the
+        // loader was called.
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (*Hash256::empty_hash(), Hash256::ZERO);
+
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+
+        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, make_loader(vec![]))
+            .unwrap();
+
+        assert_eq!(bl.levels()[0].curr.hash(), *Hash256::empty_hash());
+        assert_eq!(bl.levels()[0].curr.len(), 0);
+        assert_eq!(bl.levels()[0].snap.hash(), Hash256::ZERO);
+    }
+
+    #[test]
+    fn test_restore_from_has_handles_empty_hash_sentinel() {
+        // Sequential variant of the above — the same scenario via
+        // `restore_from_has` instead of `restore_from_has_parallel`.
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (*Hash256::empty_hash(), Hash256::ZERO);
+
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+
+        let bl = BucketList::restore_from_has(&hashes, &next_states, make_loader(vec![])).unwrap();
+
+        assert_eq!(bl.levels()[0].curr.hash(), *Hash256::empty_hash());
+        assert_eq!(bl.levels()[0].curr.len(), 0);
+        assert_eq!(bl.levels()[0].snap.hash(), Hash256::ZERO);
+    }
+
+    #[test]
+    fn test_restore_from_has_parallel_mixed_sentinels() {
+        // Both `Hash256::ZERO` and `*Hash256::empty_hash()` must be
+        // short-circuited in the same restore call. We place each sentinel
+        // at distinct slots across two levels (and swap which side is which
+        // between levels) to exercise both branches of `for_sentinel_hash`
+        // for both curr and snap positions.
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (*Hash256::empty_hash(), Hash256::ZERO);
+        hashes[1] = (Hash256::ZERO, *Hash256::empty_hash());
+
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+
+        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, make_loader(vec![]))
+            .unwrap();
+
+        assert_eq!(bl.levels()[0].curr.hash(), *Hash256::empty_hash());
+        assert_eq!(bl.levels()[0].curr.len(), 0);
+        assert_eq!(bl.levels()[0].snap.hash(), Hash256::ZERO);
+
+        assert_eq!(bl.levels()[1].curr.hash(), Hash256::ZERO);
+        assert_eq!(bl.levels()[1].snap.hash(), *Hash256::empty_hash());
+        assert_eq!(bl.levels()[1].snap.len(), 0);
+    }
+
+    #[test]
     fn test_perform_merge_replaces_corrupt_existing_permanent_file() {
         use tempfile::TempDir;
 
@@ -4859,5 +4931,28 @@ mod tests {
             err_msg.contains("Expected 11 next states, got 12"),
             "{err_msg}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_restart_merges_from_has_handles_empty_hash_sentinel() {
+        // A HAS_NEXT_STATE_INPUTS entry that references inputs via the
+        // empty-bucket sentinels (one ZERO, one `empty_hash()`) must be
+        // handled by `load_or_sentinel` and never reach the loader. We pass
+        // `make_loader(vec![])`, which errors on any non-sentinel hash, so a
+        // successful restart proves both sentinel branches fired before the
+        // loader was called.
+        let mut bl = BucketList::new();
+        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_INPUTS,
+            input_curr: Some(*Hash256::empty_hash()),
+            input_snap: Some(Hash256::ZERO),
+            output: None,
+        };
+
+        let result = bl
+            .restart_merges_from_has(1, TEST_PROTOCOL, &next_states, make_loader(vec![]), false)
+            .await;
+        assert!(result.is_ok(), "restart should succeed: {:?}", result.err());
     }
 }
