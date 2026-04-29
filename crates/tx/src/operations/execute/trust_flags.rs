@@ -553,6 +553,15 @@ fn redeem_pool_share_trustlines(
         let multiplier: i64 = 2;
         state.remove_sponsored_subentry(&tl_ledger_key, account_id, multiplier)?;
 
+        // NOTE: Do NOT call flush_all_accounts() here. Unlike change_trust.rs
+        // (which deletes a single trustline), this loop processes N pool-share
+        // trustlines. Flushing per-iteration would emit N Account UPDATED
+        // entries for the same trustor key, whereas stellar-core's
+        // removeOffersAndPoolShareTrustLines accumulates all changes in one
+        // LedgerTxn and commits once (TransactionUtils.cpp:1774), producing at
+        // most one change per unique LedgerKey. Account modifications are
+        // deferred and coalesced by flush_modified_entries() after the
+        // operation returns (apply.rs:439).
         state.delete_trustline_by_trustline_asset(account_id, &tl_asset);
 
         // Load pool data for withdrawal calculation
@@ -3758,6 +3767,254 @@ mod tests {
         assert_eq!(
             account.num_sub_entries, 1,
             "num_sub_entries should be decremented by 3 (trustline remains)"
+        );
+    }
+
+    /// Regression test for #2049: verify that pool-share trustline deletion
+    /// during SetTrustLineFlags deauthorization produces at most one Account
+    /// UPDATED entry per unique account key in the delta.
+    ///
+    /// This exercises the path in `redeem_pool_share_trustlines` with two
+    /// pool-share trustlines sharing the same trustor. The invariant is:
+    /// flush_all_accounts() must NOT be called inside the loop (unlike the
+    /// single-trustline path in change_trust.rs), because doing so would
+    /// produce duplicate Account UPDATED entries for the same key — violating
+    /// stellar-core's at-most-one-change-per-key-per-operation guarantee.
+    #[test]
+    fn test_pool_share_deauth_one_account_updated_per_key() {
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::{Limits, WriteXdr};
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        let trustor_id = create_test_account_id(1);
+
+        // Issuer needs RequiredFlag + RevocableFlag to deauthorize
+        let issuer_flags = AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32;
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            issuer_flags,
+        ));
+
+        // Trustor needs enough balance for reserves and enough sub-entries.
+        // Pool-share trustlines have multiplier 2, so 2 pool-share TLs = 4 sub-entries.
+        // Plus 3 asset trustlines = 7 sub-entries total.
+        let mut trustor_acc = create_test_account(trustor_id.clone(), 100_000_000, 0);
+        trustor_acc.num_sub_entries = 7;
+        state.create_account(trustor_acc);
+
+        // Create 3 assets: USDC (to be deauthorized), EUR, and GBP
+        let usdc_asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+        let eur_issuer = create_test_account_id(2);
+        state.create_account(create_test_account(eur_issuer.clone(), 100_000_000, 0));
+        let eur_asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: eur_issuer.clone(),
+        });
+        let gbp_issuer = create_test_account_id(3);
+        state.create_account(create_test_account(gbp_issuer.clone(), 100_000_000, 0));
+        let gbp_asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"GBP\0"),
+            issuer: gbp_issuer.clone(),
+        });
+
+        // Create asset trustlines for trustor (authorized)
+        for (asset, flag) in [
+            (&usdc_asset, AUTHORIZED_FLAG),
+            (&eur_asset, AUTHORIZED_FLAG),
+            (&gbp_asset, AUTHORIZED_FLAG),
+        ] {
+            let tl_asset = match asset {
+                Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a.clone()),
+                _ => unreachable!(),
+            };
+            state.create_trustline(create_test_trustline(
+                trustor_id.clone(),
+                tl_asset,
+                0,
+                1_000_000,
+                flag,
+            ));
+        }
+
+        // Set liquidityPoolUseCount=1 on the asset trustlines involved in pools
+        fn set_pool_use_count(state: &mut LedgerStateManager, acct: &AccountId, asset: &Asset) {
+            if let Some(tl) = state.get_trustline_mut(acct, asset) {
+                super::ensure_trustline_ext_v2(tl).liquidity_pool_use_count = 1;
+            }
+        }
+        set_pool_use_count(&mut state, &trustor_id, &usdc_asset);
+        set_pool_use_count(&mut state, &trustor_id, &eur_asset);
+        set_pool_use_count(&mut state, &trustor_id, &gbp_asset);
+
+        // Helper to compute pool ID from params
+        fn compute_pool_id(params: &LiquidityPoolParameters) -> PoolId {
+            let xdr = params.to_xdr(Limits::none()).expect("pool params xdr");
+            let mut hasher = Sha256::new();
+            hasher.update(&xdr);
+            PoolId(Hash(hasher.finalize().into()))
+        }
+
+        // Pool 1: USDC/EUR  (uses usdc_asset)
+        let params1 = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+            LiquidityPoolConstantProductParameters {
+                asset_a: eur_asset.clone(),
+                asset_b: usdc_asset.clone(),
+                fee: LIQUIDITY_POOL_FEE_V18,
+            },
+        );
+        let pool_id_1 = compute_pool_id(&params1);
+
+        // Pool 2: USDC/GBP  (uses usdc_asset)
+        let params2 = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+            LiquidityPoolConstantProductParameters {
+                asset_a: gbp_asset.clone(),
+                asset_b: usdc_asset.clone(),
+                fee: LIQUIDITY_POOL_FEE_V18,
+            },
+        );
+        let pool_id_2 = compute_pool_id(&params2);
+
+        // Create liquidity pools
+        let LiquidityPoolParameters::LiquidityPoolConstantProduct(ref cp_params1) = params1;
+        state.create_liquidity_pool(LiquidityPoolEntry {
+            liquidity_pool_id: pool_id_1.clone(),
+            body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                LiquidityPoolEntryConstantProduct {
+                    params: cp_params1.clone(),
+                    reserve_a: 1000,
+                    reserve_b: 1000,
+                    total_pool_shares: 1000,
+                    pool_shares_trust_line_count: 1,
+                },
+            ),
+        });
+
+        let LiquidityPoolParameters::LiquidityPoolConstantProduct(ref cp_params2) = params2;
+        state.create_liquidity_pool(LiquidityPoolEntry {
+            liquidity_pool_id: pool_id_2.clone(),
+            body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                LiquidityPoolEntryConstantProduct {
+                    params: cp_params2.clone(),
+                    reserve_a: 1000,
+                    reserve_b: 1000,
+                    total_pool_shares: 1000,
+                    pool_shares_trust_line_count: 1,
+                },
+            ),
+        });
+
+        // Create pool-share trustlines with zero balance (simplifies the test
+        // by skipping claimable balance creation)
+        state.create_trustline(create_test_trustline(
+            trustor_id.clone(),
+            TrustLineAsset::PoolShare(pool_id_1.clone()),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            trustor_id.clone(),
+            TrustLineAsset::PoolShare(pool_id_2.clone()),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Record how many delta entries exist before the operation
+        let pre_op_change_count = state.delta().change_order().len();
+
+        // Enable op snapshots (as the real execution framework does)
+        state.begin_op_snapshot();
+
+        // Execute SetTrustLineFlags to deauthorize USDC trustline
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset: usdc_asset.clone(),
+            clear_flags: AUTHORIZED_FLAG,
+            set_flags: 0,
+        };
+
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .expect("execute should not error");
+
+        match &result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Success),
+                    "expected success, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Simulate the post-operation flush that the framework does (apply.rs:439)
+        state.flush_modified_entries();
+        state.end_op_snapshot();
+
+        // Inspect the delta entries produced by the operation
+        let change_order = state.delta().change_order();
+        let op_changes = &change_order[pre_op_change_count..];
+
+        // Count Account UPDATED entries per unique account key
+        let mut account_updated_keys: Vec<AccountId> = Vec::new();
+        for change_ref in op_changes {
+            if let crate::apply::ChangeRef::Updated(idx) = change_ref {
+                let post_state = &state.delta().updated_entries()[*idx];
+                if let LedgerEntryData::Account(acc) = &post_state.data {
+                    account_updated_keys.push(acc.account_id.clone());
+                }
+            }
+        }
+
+        // Verify: at most one Account UPDATED per unique account key
+        let total = account_updated_keys.len();
+        account_updated_keys.dedup();
+        let unique_count = account_updated_keys.len();
+        assert_eq!(
+            total, unique_count,
+            "Expected at most one Account UPDATED per unique key, but found duplicates"
+        );
+
+        // Verify trustor account was updated (sub-entries decremented)
+        assert!(
+            account_updated_keys.iter().any(|k| k == &trustor_id),
+            "trustor account should have an UPDATED entry"
+        );
+
+        // Verify both pool-share trustlines were deleted
+        let deleted_count = op_changes
+            .iter()
+            .filter(|cr| matches!(cr, crate::apply::ChangeRef::Deleted(_)))
+            .count();
+        assert!(
+            deleted_count >= 2,
+            "expected at least 2 deleted entries (pool-share trustlines), got {}",
+            deleted_count
+        );
+
+        // Verify trustor's num_sub_entries was decremented by 4 (2 pool-share TLs × multiplier 2)
+        let trustor = state.get_account(&trustor_id).unwrap();
+        assert_eq!(
+            trustor.num_sub_entries, 3,
+            "num_sub_entries should be 7 - 4 = 3 (3 asset trustlines remain)"
         );
     }
 }
