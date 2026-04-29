@@ -46,11 +46,12 @@
 use crate::{
     archive_state::{HASBucketLevel, HASBucketNext, HistoryArchiveState},
     checkpoint::is_checkpoint_ledger,
-    checkpoint_builder::write_record_marked_xdr,
     paths, verify, HistoryError, Result,
 };
 use henyey_bucket::{BucketList, PendingMergeState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
-use henyey_common::fs_utils::{atomic_write_bytes, atomic_write_with};
+use henyey_common::fs_utils::{
+    atomic_gzip_xdr_write_iter, atomic_gzip_xdr_write_slice, atomic_write_bytes, atomic_write_with,
+};
 use henyey_common::Hash256;
 use std::path::{Path, PathBuf};
 use stellar_xdr::curr::{
@@ -399,25 +400,13 @@ impl PublishManager {
     /// 4-byte big-endian length with the high bit set ("last fragment" flag).
     /// This matches stellar-core's `XDROutputFileStream::writeOne`.
     fn write_xdr_gz<T: WriteXdr>(&self, path: &Path, items: &[T], label: &str) -> Result<()> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-
         let final_path = path.with_extension("xdr.gz");
 
         if let Some(parent) = final_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        atomic_write_with(&final_path, |file| {
-            let mut encoder = GzEncoder::new(&mut *file, Compression::default());
-
-            for item in items {
-                write_record_marked_xdr(&mut encoder, item)?;
-            }
-
-            encoder.finish()?;
-            Ok(())
-        })?;
+        atomic_gzip_xdr_write_slice(&final_path, items)?;
 
         debug!("Wrote {} {} to {:?}", items.len(), label, final_path);
         Ok(())
@@ -428,12 +417,8 @@ impl PublishManager {
     /// If the bucket has a backing file on disk (`.bucket.xdr`), we gzip-compress
     /// it directly — this preserves the exact record-marked format and avoids
     /// re-serialization. For in-memory-only buckets, we serialize entries with
-    /// RFC 5531 record marks.
+    /// RFC 5531 record marks via `atomic_gzip_xdr_write_iter`.
     fn write_bucket_from_entries(&self, path: &Path, bucket: &henyey_bucket::Bucket) -> Result<()> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use std::io::{Read, Write};
-
         // The path already includes the full filename with .xdr.gz extension
         // (from paths::bucket_path).
         if path.exists() {
@@ -447,12 +432,16 @@ impl PublishManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        atomic_write_with(path, |file| {
-            let mut encoder = GzEncoder::new(&mut *file, Compression::default());
-
-            if let Some(backing_path) = bucket.backing_file_path() {
-                // Fast path: gzip-compress the existing .bucket.xdr file directly.
-                // This preserves the exact record-marked format.
+        if let Some(backing_path) = bucket.backing_file_path() {
+            // Disk-backed branch — out of scope for issue #2047.
+            // Streams the backing .bucket.xdr file through gzip via a 64KB
+            // read loop. A follow-up may evaluate using `atomic_gzip_copy`
+            // here.
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use std::io::{Read, Write};
+            atomic_write_with(path, |file| {
+                let mut encoder = GzEncoder::new(&mut *file, Compression::default());
                 let mut src = std::fs::File::open(backing_path)?;
                 let mut buf = [0u8; GZIP_COPY_BUFFER_SIZE];
                 loop {
@@ -462,22 +451,20 @@ impl PublishManager {
                     }
                     encoder.write_all(&buf[..n])?;
                 }
-            } else {
-                // Fallback: serialize entries with RFC 5531 record marks
-                for entry_result in bucket
-                    .iter()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-                {
-                    let entry = entry_result.map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                    })?;
-                    write_record_marked_xdr(&mut encoder, &entry)?;
-                }
-            }
-
-            encoder.finish()?;
-            Ok(())
-        })?;
+                encoder.finish()?;
+                Ok(())
+            })?;
+        } else {
+            // In-memory branch — serialize entries via the shared helper.
+            // BucketIter yields `Result<BucketEntry, BucketError>`; the
+            // helper maps per-item errors through `io::Error`. The outer
+            // `bucket.iter()?` (which can fail when opening a disk-backed
+            // iterator) keeps its existing error mapping.
+            let iter = bucket
+                .iter()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            atomic_gzip_xdr_write_iter(path, iter)?;
+        }
 
         debug!("Wrote bucket to {:?}", path);
         Ok(())

@@ -446,29 +446,11 @@ fn write_scp_history_file(
     checkpoint: u32,
     entries: &[stellar_xdr::curr::ScpHistoryEntry],
 ) -> anyhow::Result<()> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
     use henyey_history::paths::checkpoint_path;
-    use std::io::Write;
-    use stellar_xdr::curr::{Limits, WriteXdr};
 
     let path = base_dir.join(checkpoint_path("scp", checkpoint, "xdr.gz"));
     super::create_parent_dir(&path)?;
-    henyey_common::fs_utils::atomic_write_with(&path, |file| {
-        let mut encoder = GzEncoder::new(&mut *file, Compression::default());
-        for entry in entries {
-            let xdr = entry
-                .to_xdr(Limits::none())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            /// XDR record mark: high bit indicates last/only fragment.
-            const XDR_RECORD_MARK: u32 = 0x8000_0000;
-            let marked_len = (xdr.len() as u32) | XDR_RECORD_MARK;
-            encoder.write_all(&marked_len.to_be_bytes())?;
-            encoder.write_all(&xdr)?;
-        }
-        encoder.finish()?;
-        Ok(())
-    })?;
+    henyey_common::fs_utils::atomic_gzip_xdr_write_slice(&path, entries)?;
     Ok(())
 }
 
