@@ -1026,7 +1026,6 @@ pub(super) struct SurveyScheduler {
     pub next_action: Instant,
     pub peers: Vec<PeerId>,
     pub nonce: u32,
-    pub ledger_num: u32,
     pub last_started: Option<Instant>,
 }
 
@@ -1037,7 +1036,6 @@ impl SurveyScheduler {
             next_action: now + Duration::from_secs(60),
             peers: Vec::new(),
             nonce: 0,
-            ledger_num: 0,
             last_started: None,
         }
     }
@@ -1052,17 +1050,9 @@ pub(super) enum SchedulerAction {
     /// Scheduler is idle — attempt to start a new survey.
     Idle { last_started: Option<Instant> },
     /// Survey start was sent — send requests to peers.
-    StartSent {
-        peers: Vec<PeerId>,
-        nonce: u32,
-        ledger_num: u32,
-    },
+    StartSent { peers: Vec<PeerId>, nonce: u32 },
     /// Requests were sent — stop the survey and collect topology.
-    RequestSent {
-        peers: Vec<PeerId>,
-        nonce: u32,
-        ledger_num: u32,
-    },
+    RequestSent { peers: Vec<PeerId>, nonce: u32 },
 }
 
 #[derive(Debug)]

@@ -458,10 +458,35 @@ impl SurveyDataManager {
         dropped_peers_total: u64,
         lost_sync_count_total: u64,
     ) -> bool {
+        self.stop_collecting_by_identity(
+            msg.nonce,
+            &msg.surveyor_id,
+            inbound_peers,
+            outbound_peers,
+            added_peers_total,
+            dropped_peers_total,
+            lost_sync_count_total,
+        )
+    }
+
+    /// Stop collecting by nonce and surveyor identity directly, without
+    /// requiring the full network message struct. Used by local cleanup paths
+    /// where constructing a wire message is unnecessary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stop_collecting_by_identity(
+        &mut self,
+        nonce: u32,
+        surveyor_id: &stellar_xdr::curr::NodeId,
+        inbound_peers: &[PeerSnapshot],
+        outbound_peers: &[PeerSnapshot],
+        added_peers_total: u64,
+        dropped_peers_total: u64,
+        lost_sync_count_total: u64,
+    ) -> bool {
         if self.phase != SurveyPhase::Collecting {
             return false;
         }
-        if self.nonce != Some(msg.nonce) || self.surveyor_id.as_ref() != Some(&msg.surveyor_id) {
+        if self.nonce != Some(nonce) || self.surveyor_id.as_ref() != Some(surveyor_id) {
             return false;
         }
 
@@ -756,5 +781,99 @@ impl SurveyDataManager {
         self.final_node = None;
         self.final_inbound.clear();
         self.final_outbound.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{NodeId, PublicKey, Uint256};
+
+    fn test_node_id() -> NodeId {
+        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])))
+    }
+
+    fn test_start_msg(nonce: u32) -> TimeSlicedSurveyStartCollectingMessage {
+        TimeSlicedSurveyStartCollectingMessage {
+            surveyor_id: test_node_id(),
+            nonce,
+            ledger_num: 100,
+        }
+    }
+
+    #[test]
+    fn test_stop_collecting_by_identity_transitions_phase() {
+        let mut mgr = SurveyDataManager::new(false, 10, 10);
+        let nonce = 42u32;
+        let surveyor_id = test_node_id();
+        let node_stats = NodeStatsSnapshot {
+            lost_sync_count: 0,
+            out_of_sync: false,
+            added_peers: 0,
+            dropped_peers: 0,
+        };
+
+        // Start collecting first.
+        let start_msg = test_start_msg(nonce);
+        let started = mgr.start_collecting(&start_msg, &[], &[], node_stats.clone());
+        assert!(started);
+        assert_eq!(mgr.phase(), SurveyPhase::Collecting);
+
+        // Stop collecting by identity.
+        let stopped = mgr.stop_collecting_by_identity(nonce, &surveyor_id, &[], &[], 0, 0, 0);
+        assert!(stopped);
+        assert_eq!(mgr.phase(), SurveyPhase::Reporting);
+    }
+
+    #[test]
+    fn test_stop_collecting_by_identity_rejects_wrong_nonce() {
+        let mut mgr = SurveyDataManager::new(false, 10, 10);
+        let nonce = 42u32;
+        let surveyor_id = test_node_id();
+        let node_stats = NodeStatsSnapshot {
+            lost_sync_count: 0,
+            out_of_sync: false,
+            added_peers: 0,
+            dropped_peers: 0,
+        };
+
+        let start_msg = test_start_msg(nonce);
+        mgr.start_collecting(&start_msg, &[], &[], node_stats);
+
+        // Wrong nonce — should not transition.
+        let stopped = mgr.stop_collecting_by_identity(99, &surveyor_id, &[], &[], 0, 0, 0);
+        assert!(!stopped);
+        assert_eq!(mgr.phase(), SurveyPhase::Collecting);
+    }
+
+    #[test]
+    fn test_stop_collecting_by_identity_rejects_wrong_surveyor() {
+        let mut mgr = SurveyDataManager::new(false, 10, 10);
+        let nonce = 42u32;
+        let node_stats = NodeStatsSnapshot {
+            lost_sync_count: 0,
+            out_of_sync: false,
+            added_peers: 0,
+            dropped_peers: 0,
+        };
+
+        let start_msg = test_start_msg(nonce);
+        mgr.start_collecting(&start_msg, &[], &[], node_stats);
+
+        let wrong_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32])));
+        let stopped = mgr.stop_collecting_by_identity(nonce, &wrong_id, &[], &[], 0, 0, 0);
+        assert!(!stopped);
+        assert_eq!(mgr.phase(), SurveyPhase::Collecting);
+    }
+
+    #[test]
+    fn test_stop_collecting_by_identity_rejects_inactive_phase() {
+        let mut mgr = SurveyDataManager::new(false, 10, 10);
+        let surveyor_id = test_node_id();
+
+        // Not in collecting phase — should fail.
+        let stopped = mgr.stop_collecting_by_identity(42, &surveyor_id, &[], &[], 0, 0, 0);
+        assert!(!stopped);
+        assert_eq!(mgr.phase(), SurveyPhase::Inactive);
     }
 }

@@ -73,17 +73,15 @@ impl App {
     }
 
     pub async fn start_survey_collecting(&self, nonce: u32) -> anyhow::Result<()> {
-        let ledger_num = self.survey_local_ledger().await;
-        self.broadcast_survey_start(nonce, ledger_num).await
+        self.broadcast_survey_start(nonce).await
     }
 
     pub async fn stop_survey_collecting(&self) -> Result<(), SurveyStopError> {
-        let ledger_num = self.survey_local_ledger().await;
         let nonce = { self.survey_data.read().await.nonce() };
         let Some(nonce) = nonce else {
             return Err(SurveyStopError::NoActiveSurvey);
         };
-        self.broadcast_survey_stop(nonce, ledger_num).await;
+        self.broadcast_survey_stop(nonce).await;
         Ok(())
     }
 
@@ -215,7 +213,6 @@ impl App {
             return;
         }
 
-        let ledger_num = self.survey_local_ledger().await;
         let mut requests_sent = 0usize;
         let mut to_send = Vec::new();
 
@@ -238,13 +235,7 @@ impl App {
 
         for (peer_id, inbound_index, outbound_index) in to_send {
             let ok = self
-                .send_survey_request(
-                    peer_id.clone(),
-                    nonce,
-                    ledger_num,
-                    inbound_index,
-                    outbound_index,
-                )
+                .send_survey_request(peer_id.clone(), nonce, inbound_index, outbound_index)
                 .await;
             if !ok {
                 tracing::debug!(peer = %peer_id, "Survey request failed to send");
@@ -256,11 +247,11 @@ impl App {
         &self,
         peer_id: henyey_overlay::PeerId,
         nonce: u32,
-        ledger_num: u32,
         inbound_index: u32,
         outbound_index: u32,
     ) -> bool {
         let local_node_id = self.local_node_id();
+        let ledger_num = self.survey_local_ledger().await;
         let secret = self.ensure_survey_secret(nonce).await;
         let public = CurvePublicKey::from(&secret);
         let encryption_key = Curve25519Public {
@@ -319,7 +310,8 @@ impl App {
             .is_ok()
     }
 
-    async fn broadcast_survey_start(&self, nonce: u32, ledger_num: u32) -> anyhow::Result<()> {
+    async fn broadcast_survey_start(&self, nonce: u32) -> anyhow::Result<()> {
+        let ledger_num = self.survey_local_ledger().await;
         let start = TimeSlicedSurveyStartCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
@@ -345,7 +337,8 @@ impl App {
         Ok(())
     }
 
-    async fn broadcast_survey_stop(&self, nonce: u32, ledger_num: u32) {
+    async fn broadcast_survey_stop(&self, nonce: u32) {
+        let ledger_num = self.survey_local_ledger().await;
         let stop = TimeSlicedSurveyStopCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
@@ -912,12 +905,10 @@ impl App {
                     SurveySchedulerPhase::StartSent => SchedulerAction::StartSent {
                         peers: scheduler.peers.clone(),
                         nonce: scheduler.nonce,
-                        ledger_num: scheduler.ledger_num,
                     },
                     SurveySchedulerPhase::RequestSent => SchedulerAction::RequestSent {
                         peers: scheduler.peers.clone(),
                         nonce: scheduler.nonce,
-                        ledger_num: scheduler.ledger_num,
                     },
                 }
             }
@@ -969,7 +960,6 @@ impl App {
                     return;
                 }
 
-                let ledger_num = self.survey_local_ledger().await;
                 let nonce = {
                     let mut nonce_guard = self.survey_nonce.write().await;
                     let current = *nonce_guard;
@@ -977,7 +967,7 @@ impl App {
                     current
                 };
 
-                if !self.send_survey_start(&peers, nonce, ledger_num).await {
+                if !self.send_survey_start(&peers, nonce).await {
                     let mut scheduler = self.survey_scheduler.lock().await;
                     debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::Idle);
                     scheduler.next_action = now + SURVEY_INTERVAL;
@@ -990,28 +980,18 @@ impl App {
                 scheduler.phase = SurveySchedulerPhase::StartSent;
                 scheduler.peers = peers;
                 scheduler.nonce = nonce;
-                scheduler.ledger_num = ledger_num;
                 scheduler.next_action = now + SURVEY_COLLECT_DELAY;
                 scheduler.last_started = Some(now);
             }
 
-            SchedulerAction::StartSent {
-                peers,
-                nonce,
-                ledger_num,
-            } => {
-                if !self.send_survey_requests(&peers, nonce, ledger_num).await {
+            SchedulerAction::StartSent { peers, nonce } => {
+                if !self.send_survey_requests(&peers, nonce).await {
                     // Clean up: remove secrets AND stop local survey collection +
                     // clear results to prevent survey_is_active() from wedging
                     // future Idle ticks.
                     self.survey_secrets.write().await.remove(&nonce);
                     self.survey_results.write().await.remove(&nonce);
-                    let stop = TimeSlicedSurveyStopCollectingMessage {
-                        surveyor_id: self.local_node_id(),
-                        nonce,
-                        ledger_num,
-                    };
-                    self.stop_local_survey_collecting(&stop).await;
+                    self.stop_local_survey_collecting_by_nonce(nonce).await;
 
                     let mut scheduler = self.survey_scheduler.lock().await;
                     debug_assert_eq!(scheduler.phase, SurveySchedulerPhase::StartSent);
@@ -1026,12 +1006,8 @@ impl App {
                 scheduler.next_action = now + SURVEY_RESPONSE_WAIT;
             }
 
-            SchedulerAction::RequestSent {
-                peers,
-                nonce,
-                ledger_num,
-            } => {
-                self.send_survey_stop(&peers, nonce, ledger_num).await;
+            SchedulerAction::RequestSent { peers, nonce } => {
+                self.send_survey_stop(&peers, nonce).await;
                 for peer_id in &peers {
                     let _ = self.survey_topology_timesliced(peer_id.clone(), 0, 0).await;
                 }
@@ -1041,7 +1017,6 @@ impl App {
                 scheduler.phase = SurveySchedulerPhase::Idle;
                 scheduler.peers.clear();
                 scheduler.nonce = 0;
-                scheduler.ledger_num = 0;
                 scheduler.next_action = now + SURVEY_INTERVAL;
             }
         }
@@ -1070,12 +1045,8 @@ impl App {
         limiter.clear_old_ledgers(last_closed);
     }
 
-    async fn send_survey_start(
-        &self,
-        peers: &[henyey_overlay::PeerId],
-        nonce: u32,
-        ledger_num: u32,
-    ) -> bool {
+    async fn send_survey_start(&self, peers: &[henyey_overlay::PeerId], nonce: u32) -> bool {
+        let ledger_num = self.survey_local_ledger().await;
         let start = TimeSlicedSurveyStartCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
@@ -1113,12 +1084,7 @@ impl App {
         sent
     }
 
-    async fn send_survey_requests(
-        &self,
-        peers: &[henyey_overlay::PeerId],
-        nonce: u32,
-        ledger_num: u32,
-    ) -> bool {
+    async fn send_survey_requests(&self, peers: &[henyey_overlay::PeerId], nonce: u32) -> bool {
         let local_node_id = self.local_node_id();
         let secret = self.ensure_survey_secret(nonce).await;
         let public = CurvePublicKey::from(&secret);
@@ -1128,6 +1094,9 @@ impl App {
 
         let mut ok = true;
         for peer in peers {
+            // Read ledger fresh per-peer, matching stellar-core's
+            // populateSurveyRequestMessage which reads per-request.
+            let ledger_num = self.survey_local_ledger().await;
             let request = SurveyRequestMessage {
                 surveyor_peer_id: local_node_id.clone(),
                 surveyed_peer_id: stellar_xdr::curr::NodeId(peer.0.clone()),
@@ -1171,12 +1140,8 @@ impl App {
         ok
     }
 
-    async fn send_survey_stop(
-        &self,
-        peers: &[henyey_overlay::PeerId],
-        nonce: u32,
-        ledger_num: u32,
-    ) {
+    async fn send_survey_stop(&self, peers: &[henyey_overlay::PeerId], nonce: u32) {
+        let ledger_num = self.survey_local_ledger().await;
         let stop = TimeSlicedSurveyStopCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
@@ -1273,5 +1238,38 @@ impl App {
         let mut survey_data = self.survey_data.write().await;
         let _ =
             survey_data.stop_collecting(message, &inbound, &outbound, added, dropped, lost_sync);
+    }
+
+    /// Stop local survey collecting by nonce, without requiring a network
+    /// message struct. Used by the scheduler error path where constructing a
+    /// full wire message is unnecessary. If overlay is unavailable, still
+    /// transitions SurveyDataManager phase with empty peer data to prevent
+    /// wedging.
+    async fn stop_local_survey_collecting_by_nonce(&self, nonce: u32) {
+        let surveyor_id = self.local_node_id();
+
+        let (inbound, outbound, added, dropped, lost_sync) =
+            if let Some(overlay) = self.overlay().await {
+                let snapshots = overlay.peer_snapshots();
+                let added = overlay.added_authenticated_peers();
+                let dropped = overlay.dropped_authenticated_peers();
+                let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
+                let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
+                (inbound, outbound, added, dropped, lost_sync)
+            } else {
+                // No overlay — use empty peer data to still transition phase.
+                (vec![], vec![], 0, 0, 0)
+            };
+
+        let mut survey_data = self.survey_data.write().await;
+        let _ = survey_data.stop_collecting_by_identity(
+            nonce,
+            &surveyor_id,
+            &inbound,
+            &outbound,
+            added,
+            dropped,
+            lost_sync,
+        );
     }
 }

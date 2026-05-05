@@ -8807,7 +8807,6 @@ mod tests {
             sched.phase = SurveySchedulerPhase::StartSent;
             sched.next_action = now - Duration::from_secs(1);
             sched.nonce = test_nonce;
-            sched.ledger_num = 100;
             // Use a dummy peer ID — send_survey_requests will fail because
             // there's no overlay.
             sched.peers = vec![henyey_overlay::PeerId::from_bytes([1u8; 32])];
@@ -8854,7 +8853,6 @@ mod tests {
             sched.phase = SurveySchedulerPhase::RequestSent;
             sched.next_action = now - Duration::from_secs(1);
             sched.nonce = test_nonce;
-            sched.ledger_num = 200;
             sched.peers = vec![henyey_overlay::PeerId::from_bytes([2u8; 32])];
         }
 
@@ -8864,7 +8862,6 @@ mod tests {
         let sched = app.survey_scheduler.lock().await;
         assert_eq!(sched.phase, SurveySchedulerPhase::Idle);
         assert_eq!(sched.nonce, 0);
-        assert_eq!(sched.ledger_num, 0);
         assert!(sched.peers.is_empty());
         assert!(sched.next_action >= now + Duration::from_secs(59));
     }
