@@ -4420,6 +4420,81 @@ mod tests {
         assert_eq!(result_sv.upgrades.len(), 2);
     }
 
+    /// Regression: extract_valid_value_impl must strip upgrades that are valid for
+    /// apply but invalid for nomination when the driver has configured upgrades.
+    /// This exercises the `is_valid_for_nomination` branch at scp_driver.rs:1637-1644
+    /// through the extract path, which was previously uncovered.
+    /// Parity: stellar-core HerderSCPDriver.cpp:416-444 strips via
+    /// mUpgrades.isValid(upgrade, true, ...) which calls isValidForNomination.
+    #[test]
+    fn test_extract_valid_value_strips_nomination_invalid_upgrade() {
+        use crate::upgrades::{UpgradeParameters, Upgrades};
+
+        let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
+
+        // Configure upgrades: base_fee=200, upgrade_time=0 so timing check
+        // passes (lcl_close_time=0 >= upgrade_time=0) and only value-mismatch
+        // causes nomination rejection.
+        let params = UpgradeParameters {
+            upgrade_time: 0,
+            base_fee: Some(200),
+            ..UpgradeParameters::default()
+        };
+        driver.set_upgrades(Arc::new(RwLock::new(Upgrades::new(params))));
+
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
+        let tx_set_hash = *tx_set.hash();
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // BaseFee(200): matches configured value → valid for nomination
+        let valid_fee = LedgerUpgrade::BaseFee(200)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        // BaseFee(500): does NOT match configured value → invalid for nomination
+        // (but valid for apply since 500 != 0)
+        let invalid_fee = LedgerUpgrade::BaseFee(500)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let upgrades = vec![
+            UpgradeType(valid_fee.try_into().unwrap()),
+            UpgradeType(invalid_fee.try_into().unwrap()),
+        ];
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(now),
+            upgrades: upgrades.try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let value = encode_sv(&stellar_value);
+
+        let result = driver.extract_valid_value_impl(1, &value);
+        assert!(result.is_some(), "Overall value should be valid");
+
+        // Only the nomination-valid upgrade (BaseFee(200)) should remain
+        let result_sv =
+            StellarValue::from_xdr(&result.unwrap(), Limits::none()).expect("decode result");
+        assert_eq!(
+            result_sv.upgrades.len(),
+            1,
+            "Should strip nomination-invalid upgrade, keeping only the valid one"
+        );
+        let kept_upgrade =
+            LedgerUpgrade::from_xdr(result_sv.upgrades[0].0.as_slice(), Limits::none())
+                .expect("decode upgrade");
+        assert_eq!(
+            kept_upgrade,
+            LedgerUpgrade::BaseFee(200),
+            "The nomination-valid upgrade (BaseFee(200)) must be preserved"
+        );
+    }
+
     #[test]
     fn test_validate_value_still_rejects_out_of_order_upgrades() {
         // Regression: validate_value_impl (via check_upgrade_ordering) still
