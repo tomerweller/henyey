@@ -9735,17 +9735,12 @@ mod quorum_health_tests {
             "heard_from_quorum must work on a new slot after cache churn"
         );
 
-        // Assert all 30 remote validators' qsets are individually retrievable.
-        for (i, nid) in node_ids.iter().enumerate().skip(1) {
-            assert!(
-                herder.scp_driver.get_quorum_set(nid).is_some(),
-                "validator {} (key seed {}) qset evicted despite interleaved access",
-                i,
-                10 + i
-            );
-        }
-
-        // Verify quorum_tracker.rebuild() still works under cache pressure.
+        // Verify quorum_tracker.rebuild() works under cache pressure.
+        // This is placed BEFORE individual get_quorum_set() probes so that
+        // rebuild() is the first per-node cache access after churn completes
+        // (aside from the heard_from_quorum call above, which is realistic —
+        // production also checks quorum before rebuild triggers).
+        //
         // rebuild() traverses from the local node through the quorum set,
         // calling scp_driver.get_quorum_set() for each member — all of which
         // go through the bounded cache. If active validators were evicted,
@@ -9763,10 +9758,10 @@ mod quorum_health_tests {
                 "rebuild must recover all 31 quorum members under cache pressure"
             );
 
-            // Stronger assertion: all 30 remote validators must have their
-            // quorum_set populated (not just be present as unexpanded entries).
-            // If the cache had evicted their qsets, rebuild() would insert them
-            // as tracked nodes but leave quorum_set = None.
+            // All 30 remote validators must have their quorum_set populated
+            // (not just be present as unexpanded entries). If the cache had
+            // evicted their qsets, rebuild() would insert them as tracked
+            // nodes but leave quorum_set = None.
             let qmap = tracker.quorum_map();
             for (i, nid) in node_ids.iter().enumerate().skip(1) {
                 let info = qmap
@@ -9780,6 +9775,16 @@ mod quorum_health_tests {
                     10 + i
                 );
             }
+        }
+
+        // Also assert individual lookups are still available after rebuild.
+        for (i, nid) in node_ids.iter().enumerate().skip(1) {
+            assert!(
+                herder.scp_driver.get_quorum_set(nid).is_some(),
+                "validator {} (key seed {}) qset evicted despite interleaved access",
+                i,
+                10 + i
+            );
         }
     }
 }
