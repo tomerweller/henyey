@@ -1701,4 +1701,82 @@ mod tests {
         assert!(info.build_timestamp.is_none());
         assert!(info.public_key.is_empty());
     }
+
+    // --- TxAdvertHistory / PeerTxAdverts tests ---
+
+    #[test]
+    fn test_advert_history_remember_and_seen() {
+        let mut history = TxAdvertHistory::new(100);
+        let hash = make_hash(1);
+
+        assert!(!history.seen(&hash));
+        history.remember(hash, 10);
+        assert!(history.seen(&hash));
+    }
+
+    #[test]
+    fn test_advert_history_clear_below_prunes_old_entries() {
+        let mut history = TxAdvertHistory::new(100);
+        let hash_at_9 = make_hash(1);
+        let hash_at_10 = make_hash(2);
+        let hash_at_11 = make_hash(3);
+
+        // Stamp adverts at different ledger sequences
+        history.remember(hash_at_9, 9);
+        history.remember(hash_at_10, 10);
+        history.remember(hash_at_11, 11);
+
+        // clear_below(10) should remove entries stamped < 10
+        history.clear_below(10);
+
+        assert!(
+            !history.seen(&hash_at_9),
+            "entry at ledger 9 should be pruned"
+        );
+        assert!(
+            history.seen(&hash_at_10),
+            "entry at ledger 10 should be retained"
+        );
+        assert!(
+            history.seen(&hash_at_11),
+            "entry at ledger 11 should be retained"
+        );
+    }
+
+    #[test]
+    fn test_advert_history_stamped_at_correct_ledger_affects_pruning() {
+        // Regression test: adverts must be stamped at the last-externalized
+        // ledger (N), not next-consensus (N+1). If stamped at N+1, they would
+        // survive one extra clear_below cycle, creating a parity divergence.
+        let mut history = TxAdvertHistory::new(100);
+        let hash = make_hash(42);
+
+        // Simulate correct stamping: advert arrives during consensus for
+        // ledger 10, so last-externalized = 10.
+        let last_externalized = 10u32;
+        history.remember(hash, last_externalized);
+
+        // After ledger 11 closes, clear_below(11) should prune the entry.
+        history.clear_below(last_externalized + 1);
+        assert!(
+            !history.seen(&hash),
+            "advert stamped at N should be pruned when clear_below(N+1) is called"
+        );
+    }
+
+    #[test]
+    fn test_peer_tx_adverts_queue_incoming_stamps_history() {
+        let mut adverts = PeerTxAdverts::new();
+        let hash_bytes = [7u8; 32];
+        let hashes = vec![stellar_xdr::curr::Hash(hash_bytes)];
+
+        adverts.queue_incoming(&hashes, 15, 100);
+
+        let hash256 = Hash256(hash_bytes);
+        assert!(adverts.seen_advert(&hash256));
+
+        // Verify it's pruned at the correct boundary
+        adverts.history.clear_below(16);
+        assert!(!adverts.seen_advert(&hash256));
+    }
 }

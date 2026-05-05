@@ -635,7 +635,7 @@ impl App {
             count = advert.tx_hashes.0.len(),
             "Received FloodAdvert"
         );
-        let ledger_seq = self.herder.tracking_slot().min(u32::MAX as u64) as u32;
+        let ledger_seq = self.herder.tracking_consensus_ledger_index() as u32;
         let max_ops = self.max_advert_queue_size();
         let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
         let entry = adverts_by_peer

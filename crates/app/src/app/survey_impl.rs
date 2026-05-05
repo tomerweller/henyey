@@ -755,7 +755,7 @@ impl App {
     }
 
     async fn survey_local_ledger(&self) -> u32 {
-        let tracking = self.herder.tracking_slot() as u32;
+        let tracking = self.herder.tracking_consensus_ledger_index() as u32;
         if tracking == 0 {
             self.current_ledger_seq()
         } else {
@@ -964,7 +964,7 @@ impl App {
                     return;
                 }
 
-                let ledger_num = self.current_ledger_seq();
+                let ledger_num = self.survey_local_ledger().await;
                 let nonce = {
                     let mut nonce_guard = self.survey_nonce.write().await;
                     let current = *nonce_guard;
