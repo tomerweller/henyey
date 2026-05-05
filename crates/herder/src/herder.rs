@@ -1490,6 +1490,24 @@ impl Herder {
                         PostVerifyReason::PendingAddBufferFull,
                     );
                 }
+                PendingResult::PerSlotFull => {
+                    let last_warned = self.pending_envelopes.last_per_slot_full_warn_slot();
+                    if slot != last_warned {
+                        self.pending_envelopes
+                            .set_last_per_slot_full_warn_slot(slot);
+                        tracing::warn!(
+                            slot,
+                            current_slot,
+                            pending_slot,
+                            per_slot_count = self.pending_envelopes.pending_count(slot),
+                            "Per-slot safety cap reached (possible compromised validator or watcher flood)"
+                        );
+                    }
+                    return (
+                        EnvelopeState::Invalid,
+                        PostVerifyReason::PendingAddPerSlotFull,
+                    );
+                }
             }
         }
 

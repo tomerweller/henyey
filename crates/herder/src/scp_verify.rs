@@ -224,13 +224,14 @@ pub enum PostVerifyReason {
     PendingAddTooFar = 9,
     PendingAddBufferFull = 10,
     PendingAddProcessedDirectly = 11,
-    Accepted = 12,
+    PendingAddPerSlotFull = 12,
+    Accepted = 13,
 }
 
 impl PostVerifyReason {
     /// All variants in discriminant order. This is the single source of truth
     /// for iteration, counter allocation, and Prometheus label generation.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::InvalidSignature,
         Self::PanicVerdict,
         Self::GateDriftRange,
@@ -243,6 +244,7 @@ impl PostVerifyReason {
         Self::PendingAddTooFar,
         Self::PendingAddBufferFull,
         Self::PendingAddProcessedDirectly,
+        Self::PendingAddPerSlotFull,
         Self::Accepted,
     ];
 
@@ -261,6 +263,7 @@ impl PostVerifyReason {
             Self::PendingAddTooFar => "too_far",
             Self::PendingAddBufferFull => "buffer_full",
             Self::PendingAddProcessedDirectly => "processed_directly",
+            Self::PendingAddPerSlotFull => "per_slot_full",
             Self::Accepted => "accepted",
         }
     }

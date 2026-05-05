@@ -253,10 +253,15 @@ Corresponds to: `PendingEnvelopes.h`
 | `getCostPerValidator()` | _(not implemented)_ | None |
 
 **Parity notes (pending.rs):**
-- **No per-slot envelope count cap** (matches stellar-core). Removed the
-  henyey-specific `max_per_slot` field in #1899 — stellar-core's
-  `PendingEnvelopes` uses an unbounded `std::map<uint64, SlotEnvelopes>`
-  with no per-slot limit. Cleanup is slot-based, not per-envelope.
+- **Per-slot safety cap (intentional henyey-specific divergence).** henyey adds
+  `MAX_ENVELOPES_PER_SLOT = 5000` as a defense-in-depth bound not present in
+  stellar-core. stellar-core's per-slot collections are implicitly bounded by
+  quorum membership filtering and single-threaded processing. The henyey cap is
+  set 3.3× above the theoretical honest maximum (~1500 from 50 quorum nodes ×
+  30 messages/node) and should never trigger during normal consensus. It exists
+  to prevent memory exhaustion from compromised validator keys or quorum-less
+  watcher flood attacks. The old `max_per_slot = 100` (removed in #1899) was
+  routinely hit in normal operation; this cap is 50× higher (added in #2408).
 - **Slot-count gating** correctly skips the `max_slots` check when appending
   to an existing slot (fixed in #1899).
 - **`purge_slots_below(min_slot)`** mirrors the lower-bound cleanup of

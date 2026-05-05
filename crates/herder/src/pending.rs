@@ -22,9 +22,14 @@
 //!
 //! stellar-core's `PendingEnvelopes` does NOT impose per-slot envelope count
 //! limits. Cleanup is done by `stopAllOutsideRange(min, max, slotToKeep)`,
-//! which removes entire slots outside the active window. Henyey matches this:
-//! no per-slot cap, slot-count gating only for new slots, and
-//! `purge_slots_below` for lifecycle cleanup.
+//! which removes entire slots outside the active window.
+//!
+//! Henyey adds a defense-in-depth safety cap ([`MAX_ENVELOPES_PER_SLOT`] =
+//! 5000) that bounds per-slot growth. This cap is set well above the
+//! theoretical honest maximum (~1500 from 50 quorum nodes × 30 messages) and
+//! should never trigger during normal SCP consensus. It exists to prevent
+//! memory exhaustion if a quorum member's key is compromised or a quorum-less
+//! watcher is flooded. See the constant's doc comment for full derivation.
 
 use dashmap::DashMap;
 use henyey_common::Hash256;
@@ -34,6 +39,24 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::ScpEnvelope;
+
+/// Per-slot envelope safety cap. Henyey-specific defense-in-depth.
+///
+/// Boundary: the 5000th envelope is accepted; the 5001st is rejected with
+/// [`PendingResult::PerSlotFull`].
+///
+/// Derivation: Stellar mainnet transitive quorum ~50 nodes. Worst-case honest
+/// messages per node per slot: ~30 (multiple NOMINATE rounds + PREPARE +
+/// CONFIRM + EXTERNALIZE). Theoretical honest max: 1500. Cap provides 3.3×
+/// margin. Cannot be reached without a compromised quorum member key or a
+/// quorum-less watcher under flood attack.
+///
+/// This is NOT the same as the cap removed in #1899. That cap was 100 —
+/// routinely hit during normal 30-validator nomination rounds. This cap of
+/// 5000 is 50× higher and requires adversarial conditions to trigger.
+///
+/// Not present in stellar-core. See `PARITY_STATUS.md`.
+pub(crate) const MAX_ENVELOPES_PER_SLOT: usize = 5000;
 
 /// Configuration for pending envelope management.
 ///
@@ -59,12 +82,21 @@ use stellar_xdr::curr::ScpEnvelope;
 /// henyey-specific and caused issue #1899: during heavy-TX bursts the
 /// per-slot cap filled up and critical CONFIRM/EXTERNALIZE votes were
 /// dropped, stalling the node. It has been removed to match stellar-core.
+///
+/// However, henyey now adds a high safety cap ([`MAX_ENVELOPES_PER_SLOT`])
+/// as defense-in-depth against memory exhaustion from compromised validators
+/// or flood attacks on quorum-less watchers. This cap is 50× above the old
+/// one and cannot be reached during honest SCP consensus.
 #[derive(Debug, Clone)]
 pub struct PendingConfig {
     /// Maximum number of slots to buffer.
     pub max_slots: usize,
     /// Maximum age of pending envelopes before eviction.
     pub max_age: Duration,
+    /// Per-slot envelope safety cap (defense-in-depth, henyey-specific).
+    /// Defaults to [`MAX_ENVELOPES_PER_SLOT`]. Tests may override with a
+    /// lower value for easier verification.
+    pub(crate) max_envelopes_per_slot: usize,
 }
 
 impl Default for PendingConfig {
@@ -77,6 +109,7 @@ impl Default for PendingConfig {
             // the type level.
             max_slots: crate::sync_recovery::LEDGER_VALIDITY_BRACKET as usize,
             max_age: Duration::from_secs(300),
+            max_envelopes_per_slot: MAX_ENVELOPES_PER_SLOT,
         }
     }
 }
@@ -119,8 +152,11 @@ pub enum PendingResult {
     Duplicate,
     /// Slot is too old.
     SlotTooOld,
-    /// Buffer is full.
+    /// Buffer is full (slot-count limit).
     BufferFull,
+    /// Per-slot safety cap reached (defense-in-depth, henyey-specific).
+    /// The slot already has [`MAX_ENVELOPES_PER_SLOT`] buffered envelopes.
+    PerSlotFull,
 }
 
 /// Manages pending SCP envelopes for future slots.
@@ -140,6 +176,8 @@ pub struct PendingEnvelopes {
     stats: RwLock<PendingStats>,
     /// Last slot for which a BufferFull warning was emitted (rate-limiting).
     last_buffer_full_warn_slot: AtomicU64,
+    /// Last slot for which a PerSlotFull warning was emitted (rate-limiting).
+    last_per_slot_full_warn_slot: AtomicU64,
 }
 
 /// Statistics about pending envelope management.
@@ -159,6 +197,8 @@ pub struct PendingStats {
     pub evicted: u64,
     /// Total BufferFull rejections (slot-count limit).
     pub buffer_full: u64,
+    /// Per-slot safety cap rejections (defense-in-depth).
+    pub per_slot_full: u64,
     /// High-water mark: largest envelope count observed in any single slot.
     pub max_envelopes_per_slot: u64,
 }
@@ -173,6 +213,7 @@ impl PendingEnvelopes {
             current_slot: RwLock::new(0),
             stats: RwLock::new(PendingStats::default()),
             last_buffer_full_warn_slot: AtomicU64::new(0),
+            last_per_slot_full_warn_slot: AtomicU64::new(0),
         }
     }
 
@@ -217,10 +258,32 @@ impl PendingEnvelopes {
             return PendingResult::Duplicate;
         }
 
-        // Existing slot — just append, no slot-count check needed.
-        // This avoids false BufferFull when max_slots slots exist but
-        // the target slot is already one of them.
+        // Existing slot — inline-evict expired, check per-slot cap, then append.
         if let Some(mut existing) = self.slots.get_mut(&slot) {
+            // Inline eviction: remove expired entries from this specific slot
+            // before checking cap. Prevents stale entries from consuming budget.
+            let max_age = self.config.max_age;
+            let expired_hashes: Vec<Hash256> = existing
+                .iter()
+                .filter(|e| e.is_expired(max_age))
+                .map(|e| e.hash)
+                .collect();
+            if !expired_hashes.is_empty() {
+                existing.retain(|e| !e.is_expired(max_age));
+                for h in &expired_hashes {
+                    self.seen_hashes.remove(h);
+                }
+                self.stats.write().evicted += expired_hashes.len() as u64;
+            }
+
+            // Per-slot safety cap (defense-in-depth).
+            if self.config.max_envelopes_per_slot > 0
+                && existing.len() >= self.config.max_envelopes_per_slot
+            {
+                self.stats.write().per_slot_full += 1;
+                return PendingResult::PerSlotFull;
+            }
+
             self.seen_hashes.insert(pending.hash, ());
             existing.push(pending);
             let count = existing.len() as u64;
@@ -445,6 +508,17 @@ impl PendingEnvelopes {
         self.last_buffer_full_warn_slot
             .store(slot, Ordering::Relaxed);
     }
+
+    /// Returns the last slot for which a PerSlotFull warning was logged.
+    pub fn last_per_slot_full_warn_slot(&self) -> u64 {
+        self.last_per_slot_full_warn_slot.load(Ordering::Relaxed)
+    }
+
+    /// Set the last slot for which a PerSlotFull warning was logged.
+    pub fn set_last_per_slot_full_warn_slot(&self, slot: u64) {
+        self.last_per_slot_full_warn_slot
+            .store(slot, Ordering::Relaxed);
+    }
 }
 
 impl Default for PendingEnvelopes {
@@ -649,7 +723,10 @@ mod tests {
     }
 
     /// Regression for #1899, Test A: 200+ envelopes with distinct node IDs
-    /// in one slot should all be accepted (no per-slot cap).
+    /// in one slot should all be accepted. The safety cap is 5000, far above
+    /// the 201 tested here. The old `max_per_slot = 100` was removed in #1899;
+    /// the new safety cap (`MAX_ENVELOPES_PER_SLOT = 5000`) added in #2408 is
+    /// high enough to never trigger during honest SCP operation.
     #[test]
     fn test_issue_1899_no_per_slot_cap() {
         let pending = PendingEnvelopes::with_defaults();
@@ -941,6 +1018,207 @@ mod tests {
             slot_101,
             vec![6, 5, 4],
             "Slot 101 must be LIFO: last-added envelope first"
+        );
+    }
+
+    // --- Per-slot safety cap tests (issue #2408) ---
+
+    /// Helper: create a PendingEnvelopes with a low per-slot cap for testing.
+    fn pending_with_per_slot_cap(cap: usize) -> PendingEnvelopes {
+        PendingEnvelopes::new(PendingConfig {
+            max_envelopes_per_slot: cap,
+            ..Default::default()
+        })
+    }
+
+    /// The per-slot safety cap is enforced: after `cap` envelopes, the next
+    /// returns `PerSlotFull`.
+    #[test]
+    fn test_per_slot_safety_cap_enforced() {
+        let pending = pending_with_per_slot_cap(3);
+        pending.set_current_slot(100);
+
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 1)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 2)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 3)),
+            PendingResult::Added
+        );
+        // 4th envelope hits the cap
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 4)),
+            PendingResult::PerSlotFull,
+            "4th envelope should be rejected by per-slot safety cap of 3"
+        );
+    }
+
+    /// PerSlotFull must not poison seen_hashes — the rejected envelope can
+    /// be re-added after the slot is purged and recreated.
+    #[test]
+    fn test_per_slot_full_does_not_poison_seen_hashes() {
+        let pending = pending_with_per_slot_cap(2);
+        pending.set_current_slot(100);
+
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 1)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 2)),
+            PendingResult::Added
+        );
+
+        // This envelope is rejected by cap
+        let env3 = make_test_envelope_with_node(101, 3);
+        assert_eq!(pending.add(101, env3.clone()), PendingResult::PerSlotFull);
+
+        // Purge slot 101
+        pending.purge_slots_below(102);
+        pending.set_current_slot(100);
+
+        // Re-add — should succeed (hash was not inserted into seen_hashes)
+        assert_eq!(
+            pending.add(101, env3),
+            PendingResult::Added,
+            "Envelope rejected by PerSlotFull must not be permanently stuck in seen_hashes"
+        );
+    }
+
+    /// PerSlotFull on slot A does not affect slot B.
+    #[test]
+    fn test_per_slot_full_does_not_affect_other_slots() {
+        let pending = pending_with_per_slot_cap(2);
+        pending.set_current_slot(100);
+
+        // Fill slot 101 to cap
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 1)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 2)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 3)),
+            PendingResult::PerSlotFull
+        );
+
+        // Slot 102 should still accept
+        assert_eq!(
+            pending.add(102, make_test_envelope_with_node(102, 4)),
+            PendingResult::Added,
+            "PerSlotFull on slot 101 must not affect slot 102"
+        );
+    }
+
+    /// Inline eviction frees space before cap check: expired entries are
+    /// removed, allowing new envelopes below the cap.
+    #[test]
+    fn test_per_slot_full_inline_eviction_frees_space() {
+        let config = PendingConfig {
+            max_envelopes_per_slot: 2,
+            max_age: Duration::from_millis(1), // very short expiry
+            ..Default::default()
+        };
+        let pending = PendingEnvelopes::new(config);
+        pending.set_current_slot(100);
+
+        // Add 2 envelopes (fills to cap)
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 1)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 2)),
+            PendingResult::Added
+        );
+
+        // Wait for them to expire
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Next add should succeed because inline eviction removes expired entries
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 3)),
+            PendingResult::Added,
+            "Inline eviction should free space below cap"
+        );
+
+        // Only the new envelope remains
+        assert_eq!(pending.pending_count(101), 1);
+    }
+
+    /// The per_slot_full stats counter increments on each rejection.
+    #[test]
+    fn test_per_slot_full_stats_counter() {
+        let pending = pending_with_per_slot_cap(1);
+        pending.set_current_slot(100);
+
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 1)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 2)),
+            PendingResult::PerSlotFull
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 3)),
+            PendingResult::PerSlotFull
+        );
+
+        let stats = pending.stats();
+        assert_eq!(stats.per_slot_full, 2, "Two per-slot-full rejections");
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.received, 3);
+    }
+
+    /// At cap, a duplicate envelope still returns Duplicate (not PerSlotFull).
+    /// Dedup check precedes cap check in the flow.
+    #[test]
+    fn test_per_slot_full_duplicate_detected_at_cap() {
+        let pending = pending_with_per_slot_cap(2);
+        pending.set_current_slot(100);
+
+        let env1 = make_test_envelope_with_node(101, 1);
+        assert_eq!(pending.add(101, env1.clone()), PendingResult::Added);
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 2)),
+            PendingResult::Added
+        );
+
+        // Slot is at cap. Sending a duplicate should return Duplicate, not PerSlotFull.
+        assert_eq!(
+            pending.add(101, env1),
+            PendingResult::Duplicate,
+            "Duplicate detection must work even at per-slot cap"
+        );
+    }
+
+    /// The last_per_slot_full_warn_slot atomic is separate from
+    /// last_buffer_full_warn_slot.
+    #[test]
+    fn test_per_slot_full_separate_warn_tracking() {
+        let pending = pending_with_per_slot_cap(1);
+        pending.set_current_slot(100);
+
+        // Set buffer-full warn to slot 200
+        pending.set_last_buffer_full_warn_slot(200);
+
+        // Per-slot-full warn should be independent
+        assert_eq!(pending.last_per_slot_full_warn_slot(), 0);
+        pending.set_last_per_slot_full_warn_slot(300);
+        assert_eq!(pending.last_per_slot_full_warn_slot(), 300);
+        assert_eq!(
+            pending.last_buffer_full_warn_slot(),
+            200,
+            "Buffer-full warn slot must not be affected"
         );
     }
 }
