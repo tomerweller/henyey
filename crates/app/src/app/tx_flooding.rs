@@ -2052,4 +2052,95 @@ mod tests {
             "no extra messages should be sent"
         );
     }
+
+    // ── handle_flood_advert caller-level regression test ─────────────────
+
+    /// Regression test for issue #2418: handle_flood_advert must stamp adverts
+    /// at tracking_consensus_ledger_index (last externalized), NOT tracking_slot
+    /// (next consensus). This exercises the full caller path through App, not
+    /// just the lower-level TxAdvertHistory data structure.
+    ///
+    /// Parity: stellar-core/src/overlay/Peer.cpp:2088-2090 uses
+    /// trackingConsensusLedgerIndex() for inbound advert stamping.
+    #[tokio::test]
+    async fn test_handle_flood_advert_stamps_at_tracking_consensus_ledger_index() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("test.db"))
+            .build();
+        let app = crate::app::App::new(config).await.unwrap();
+
+        // Bootstrap herder at ledger 5:
+        //   tracking_slot() = 6 (next consensus)
+        //   tracking_consensus_ledger_index() = 5 (last externalized)
+        app.herder.bootstrap(5);
+        assert_eq!(
+            app.herder.tracking_slot(),
+            6,
+            "precondition: tracking_slot should be 6"
+        );
+        assert_eq!(
+            app.herder.tracking_consensus_ledger_index(),
+            5,
+            "precondition: tracking_consensus_ledger_index should be 5"
+        );
+
+        // Create a peer and a single-hash advert.
+        let peer_id = make_peer_id(99);
+        let hash_bytes = [0x42u8; 32];
+        let advert = FloodAdvert {
+            tx_hashes: TxAdvertVector(
+                vec![stellar_xdr::curr::Hash(hash_bytes)]
+                    .try_into()
+                    .unwrap(),
+            ),
+        };
+        let hash256 = Hash256(hash_bytes);
+
+        // Act: call handle_flood_advert at the App boundary.
+        app.handle_flood_advert(&peer_id, advert).await;
+
+        // Assert: advert was recorded.
+        {
+            let adverts_by_peer = app.tx_adverts_by_peer.read().await;
+            let entry = adverts_by_peer
+                .get(&peer_id)
+                .expect("peer entry must exist");
+            assert!(
+                entry.seen_advert(&hash256),
+                "advert hash must be recorded after handle_flood_advert"
+            );
+        } // read lock dropped
+
+        // Prove stamp == 5 (two-step):
+        // Step 1: clear_below(5) retains entries with seq >= 5.
+        // Since stamp is 5, it must survive.
+        app.clear_tx_advert_history(5).await;
+        {
+            let adverts_by_peer = app.tx_adverts_by_peer.read().await;
+            let entry = adverts_by_peer
+                .get(&peer_id)
+                .expect("peer entry must exist");
+            assert!(
+                entry.seen_advert(&hash256),
+                "advert stamped at 5 must survive clear_below(5) — 5 >= 5"
+            );
+        } // read lock dropped
+
+        // Step 2: clear_below(6) removes entries with seq < 6.
+        // Since stamp is 5, it must be pruned.
+        app.clear_tx_advert_history(6).await;
+        {
+            let adverts_by_peer = app.tx_adverts_by_peer.read().await;
+            let entry = adverts_by_peer
+                .get(&peer_id)
+                .expect("peer entry must exist");
+            assert!(
+                !entry.seen_advert(&hash256),
+                "advert stamped at 5 must be pruned by clear_below(6) — 5 < 6. \
+                 If this fails, handle_flood_advert is using tracking_slot (6) \
+                 instead of tracking_consensus_ledger_index (5)."
+            );
+        }
+    }
 }
