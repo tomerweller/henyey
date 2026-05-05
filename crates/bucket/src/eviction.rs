@@ -187,15 +187,57 @@ impl EvictionIteratorExt for EvictionIterator {
 #[derive(Debug)]
 pub struct EvictionCandidate {
     /// The data entry being evicted (newest version from bucket list).
-    pub entry: LedgerEntry,
-    /// The data entry's key.
-    pub data_key: LedgerKey,
-    /// The corresponding TTL key.
-    pub ttl_key: LedgerKey,
-    /// Whether this is a temporary entry (vs persistent).
-    pub is_temporary: bool,
+    entry: LedgerEntry,
     /// The EvictionIterator position AFTER this entry (resume point).
-    pub position: EvictionIterator,
+    position: EvictionIterator,
+}
+
+impl EvictionCandidate {
+    /// Create an EvictionCandidate.
+    ///
+    /// # Panics
+    /// Panics if the entry is not a Soroban entry with a derivable TTL key.
+    /// This constructor is `pub(crate)` — only the eviction scan path calls
+    /// it, and that path filters to Soroban entries before reaching here.
+    /// The panic is defense-in-depth against internal misuse.
+    pub(crate) fn new(entry: LedgerEntry, position: EvictionIterator) -> Self {
+        let data_key = henyey_common::entry_to_key(&entry);
+        assert!(
+            get_ttl_key(&data_key).is_some(),
+            "EvictionCandidate entry must be a Soroban entry with a derivable TTL key"
+        );
+        Self { entry, position }
+    }
+
+    /// The data entry being evicted.
+    pub fn entry(&self) -> &LedgerEntry {
+        &self.entry
+    }
+
+    /// The data entry's key (derived from entry).
+    pub fn data_key(&self) -> LedgerKey {
+        henyey_common::entry_to_key(&self.entry)
+    }
+
+    /// The corresponding TTL key (derived from entry via SHA-256 hash).
+    pub fn ttl_key(&self) -> LedgerKey {
+        get_ttl_key(&self.data_key()).unwrap()
+    }
+
+    /// Whether this is a temporary entry (vs persistent).
+    pub fn is_temporary(&self) -> bool {
+        is_temporary_entry(&self.entry)
+    }
+
+    /// The EvictionIterator position AFTER this entry (resume point).
+    pub fn position(&self) -> &EvictionIterator {
+        &self.position
+    }
+
+    /// Consume self, returning the owned entry and position.
+    pub(crate) fn into_parts(self) -> (LedgerEntry, EvictionIterator) {
+        (self.entry, self.position)
+    }
 }
 
 /// Result of the scan phase of eviction for a single ledger.
@@ -270,8 +312,7 @@ impl EvictionResult {
     ) -> ResolvedEviction {
         let scan_end_iterator = self.end_iterator;
 
-        // Phase 1: Filter out entries with modified TTLs, and check for
-        // modified live entries (internal consistency check).
+        // Single-pass resolution: filter + collect in one loop.
         //
         // Parity: stellar-core's `resolveBackgroundEvictionScan` uses a
         // single `modifiedKeys` set containing ALL keys touched in the
@@ -279,33 +320,8 @@ impl EvictionResult {
         //   - If TTL key is in modifiedKeys → filter out (don't evict).
         //   - Else if data key is in modifiedKeys → log internal bug
         //     (a data-key write without a TTL update should not happen).
-        let filtered: Vec<_> = self
-            .candidates
-            .into_iter()
-            .filter(|c| {
-                if modified_keys.contains(&c.ttl_key) {
-                    // TTL was modified this ledger — skip eviction.
-                    return false;
-                }
-
-                // Parity: stellar-core checks if the live entry key was
-                // modified while the TTL was not. This should never happen
-                // in a correct system (a restore or write would also touch
-                // the TTL). Log it as an internal bug.
-                if modified_keys.contains(&c.data_key) {
-                    tracing::error!(
-                        key = ?c.data_key,
-                        "Eviction attempted on modified live entry — this is an internal bug"
-                    );
-                }
-
-                true
-            })
-            .collect();
-
-        // Phase 2: Apply max_entries limit and collect results.
         //
-        // Parity: stellar-core builds two separate vectors:
+        // stellar-core builds two separate vectors:
         //   - deletedKeys: temp data keys + ALL TTL keys (both temp and persistent)
         //   - archivedEntries: full LedgerEntry for persistent entries
         // We mirror this separation in deleted_keys + archived_entries.
@@ -314,25 +330,47 @@ impl EvictionResult {
         let mut last_evicted_position = None;
         let mut remaining = max_entries_to_archive;
 
-        for candidate in filtered {
+        for candidate in self.candidates {
+            let data_key = candidate.data_key();
+            let ttl_key = candidate.ttl_key();
+
+            if modified_keys.contains(&ttl_key) {
+                // TTL was modified this ledger — skip eviction.
+                continue;
+            }
+
+            // Parity: stellar-core checks if the live entry key was
+            // modified while the TTL was not. This should never happen
+            // in a correct system (a restore or write would also touch
+            // the TTL). Log it as an internal bug.
+            if modified_keys.contains(&data_key) {
+                tracing::error!(
+                    key = ?data_key,
+                    "Eviction attempted on modified live entry — this is an internal bug"
+                );
+            }
+
             if remaining == 0 {
                 break;
             }
 
-            if candidate.is_temporary {
-                deleted_keys.push(candidate.data_key);
+            let is_temporary = candidate.is_temporary();
+            let (entry, position) = candidate.into_parts();
+
+            if is_temporary {
+                deleted_keys.push(data_key);
             } else {
                 // Persistent entries go to hot archive
-                archived_entries.push(candidate.entry);
+                archived_entries.push(entry);
             }
             // TTL key is always added to deleted_keys for both types
-            deleted_keys.push(candidate.ttl_key);
+            deleted_keys.push(ttl_key);
 
-            last_evicted_position = Some(candidate.position);
+            last_evicted_position = Some(position);
             remaining -= 1;
         }
 
-        // Phase 3: Set iterator position
+        // Set iterator position.
         // stellar-core logic from resolveBackgroundEvictionScan:
         //   newEvictionIterator is initialized to endOfRegionIterator
         //   Each eviction updates it to the evicted entry's position
@@ -595,17 +633,14 @@ pub(crate) fn scan_bucket_region(
                 live_entry.clone()
             };
 
-            candidates.push(EvictionCandidate {
-                entry: entry_for_candidate,
-                data_key: key,
-                ttl_key,
-                is_temporary: is_temp,
-                position: EvictionIterator {
+            candidates.push(EvictionCandidate::new(
+                entry_for_candidate,
+                EvictionIterator {
                     bucket_list_level: iter.bucket_list_level,
                     is_curr_bucket: iter.is_curr_bucket,
                     bucket_file_offset: start_offset + bytes_used,
                 },
-            });
+            ));
         }
 
         if bytes_used >= max_bytes {
@@ -959,23 +994,10 @@ mod tests {
 
     use stellar_xdr::curr::{
         ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash, LedgerEntry,
-        LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyContractData, LedgerKeyTtl, ScAddress,
-        ScVal,
+        LedgerEntryData, LedgerEntryExt, ScAddress, ScVal,
     };
 
     fn make_contract_data_candidate(key_bytes: [u8; 32], is_temporary: bool) -> EvictionCandidate {
-        let data_key = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(Hash(key_bytes))),
-            key: ScVal::Void,
-            durability: if is_temporary {
-                ContractDataDurability::Temporary
-            } else {
-                ContractDataDurability::Persistent
-            },
-        });
-        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: Hash(key_bytes),
-        });
         let entry = LedgerEntry {
             last_modified_ledger_seq: 100,
             data: LedgerEntryData::ContractData(ContractDataEntry {
@@ -991,19 +1013,13 @@ mod tests {
             }),
             ext: LedgerEntryExt::V0,
         };
-        EvictionCandidate {
-            entry,
-            data_key,
-            ttl_key,
-            is_temporary,
-            position: EvictionIterator::with_default_level(),
-        }
+        EvictionCandidate::new(entry, EvictionIterator::with_default_level())
     }
 
     #[test]
     fn test_resolve_filters_modified_ttl_keys() {
         let candidate = make_contract_data_candidate([1u8; 32], true);
-        let ttl_key = candidate.ttl_key.clone();
+        let ttl_key = candidate.ttl_key();
 
         let result = EvictionResult {
             candidates: vec![candidate],
@@ -1049,7 +1065,7 @@ mod tests {
         // the candidate should still be kept (not filtered), but an error
         // should be logged. This test verifies the candidate is NOT removed.
         let candidate = make_contract_data_candidate([1u8; 32], true);
-        let data_key = candidate.data_key.clone();
+        let data_key = candidate.data_key();
 
         let result = EvictionResult {
             candidates: vec![candidate],
@@ -1077,8 +1093,8 @@ mod tests {
         // When BOTH the TTL key and data key are in modified_keys,
         // the TTL check fires first and filters out the candidate.
         let candidate = make_contract_data_candidate([1u8; 32], true);
-        let data_key = candidate.data_key.clone();
-        let ttl_key = candidate.ttl_key.clone();
+        let data_key = candidate.data_key();
+        let ttl_key = candidate.ttl_key();
 
         let result = EvictionResult {
             candidates: vec![candidate],
@@ -1168,14 +1184,14 @@ mod tests {
         let temp3 = make_contract_data_candidate([3u8; 32], true);
         let persistent4 = make_contract_data_candidate([4u8; 32], false);
 
-        let temp1_data = temp1.data_key.clone();
-        let temp1_ttl = temp1.ttl_key.clone();
-        let persistent2_data = persistent2.data_key.clone();
-        let persistent2_ttl = persistent2.ttl_key.clone();
-        let temp3_data = temp3.data_key.clone();
-        let temp3_ttl = temp3.ttl_key.clone();
-        let persistent4_data = persistent4.data_key.clone();
-        let persistent4_ttl = persistent4.ttl_key.clone();
+        let temp1_data = temp1.data_key();
+        let temp1_ttl = temp1.ttl_key();
+        let persistent2_data = persistent2.data_key();
+        let persistent2_ttl = persistent2.ttl_key();
+        let temp3_data = temp3.data_key();
+        let temp3_ttl = temp3.ttl_key();
+        let persistent4_data = persistent4.data_key();
+        let persistent4_ttl = persistent4.ttl_key();
 
         let result = EvictionResult {
             candidates: vec![temp1, persistent2, temp3, persistent4],
@@ -1217,10 +1233,10 @@ mod tests {
         let persistent2 = make_contract_data_candidate([2u8; 32], false);
         let temp3 = make_contract_data_candidate([3u8; 32], true);
 
-        let temp1_data = temp1.data_key.clone();
-        let temp1_ttl = temp1.ttl_key.clone();
-        let persistent2_data = persistent2.data_key.clone();
-        let persistent2_ttl = persistent2.ttl_key.clone();
+        let temp1_data = temp1.data_key();
+        let temp1_ttl = temp1.ttl_key();
+        let persistent2_data = persistent2.data_key();
+        let persistent2_ttl = persistent2.ttl_key();
 
         let result = EvictionResult {
             candidates: vec![temp1, persistent2, temp3],
@@ -1250,10 +1266,10 @@ mod tests {
         let p1 = make_contract_data_candidate([1u8; 32], false);
         let p2 = make_contract_data_candidate([2u8; 32], false);
 
-        let p1_data = p1.data_key.clone();
-        let p1_ttl = p1.ttl_key.clone();
-        let p2_data = p2.data_key.clone();
-        let p2_ttl = p2.ttl_key.clone();
+        let p1_data = p1.data_key();
+        let p1_ttl = p1.ttl_key();
+        let p2_data = p2.data_key();
+        let p2_ttl = p2.ttl_key();
 
         let result = EvictionResult {
             candidates: vec![p1, p2],
@@ -1272,5 +1288,156 @@ mod tests {
             evicted, expected,
             "persistent-only: TTL keys first in scan order, then data keys in scan order"
         );
+    }
+
+    // --- EvictionCandidate constructor tests ---
+
+    #[test]
+    fn test_eviction_candidate_constructor_derives_correctly() {
+        let candidate = make_contract_data_candidate([42u8; 32], true);
+        // data_key derived from entry
+        assert_eq!(
+            candidate.data_key(),
+            henyey_common::entry_to_key(candidate.entry())
+        );
+        // ttl_key derived from data_key
+        assert_eq!(
+            candidate.ttl_key(),
+            get_ttl_key(&candidate.data_key()).unwrap()
+        );
+        // is_temporary derived from entry
+        assert!(candidate.is_temporary());
+        assert_eq!(
+            candidate.is_temporary(),
+            is_temporary_entry(candidate.entry())
+        );
+    }
+
+    #[test]
+    fn test_eviction_candidate_persistent() {
+        let candidate = make_contract_data_candidate([7u8; 32], false);
+        assert!(!candidate.is_temporary());
+        assert_eq!(
+            candidate.is_temporary(),
+            is_temporary_entry(candidate.entry())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Soroban entry")]
+    fn test_eviction_candidate_rejects_non_soroban_entry() {
+        use stellar_xdr::curr::{AccountEntry, AccountId, PublicKey, Thresholds, Uint256};
+        let non_soroban_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+                balance: 100,
+                seq_num: stellar_xdr::curr::SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: stellar_xdr::curr::String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: stellar_xdr::curr::VecM::default(),
+                ext: stellar_xdr::curr::AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        // Should panic — non-Soroban entries cannot be eviction candidates
+        EvictionCandidate::new(non_soroban_entry, EvictionIterator::with_default_level());
+    }
+
+    // --- resolve() iterator edge case tests ---
+
+    #[test]
+    fn test_resolve_max_entries_zero_uses_scan_end() {
+        let candidate = make_contract_data_candidate([1u8; 32], true);
+
+        let scan_end = EvictionIterator {
+            bucket_list_level: 3,
+            is_curr_bucket: false,
+            bucket_file_offset: 9999,
+        };
+
+        let result = EvictionResult {
+            candidates: vec![candidate],
+            end_iterator: scan_end.clone(),
+            bytes_scanned: 1000,
+            scan_complete: true,
+        };
+
+        let modified = std::collections::HashSet::new();
+        // max_entries_to_archive = 0 means no eviction, use scan end
+        let resolved = result.resolve(0, &modified);
+        assert!(resolved.deleted_keys.is_empty());
+        assert!(resolved.archived_entries.is_empty());
+        assert_eq!(resolved.end_iterator, scan_end);
+    }
+
+    #[test]
+    fn test_resolve_all_filtered_uses_scan_end() {
+        let c1 = make_contract_data_candidate([1u8; 32], true);
+        let c2 = make_contract_data_candidate([2u8; 32], true);
+        let ttl1 = c1.ttl_key();
+        let ttl2 = c2.ttl_key();
+
+        let scan_end = EvictionIterator {
+            bucket_list_level: 2,
+            is_curr_bucket: true,
+            bucket_file_offset: 5000,
+        };
+
+        let result = EvictionResult {
+            candidates: vec![c1, c2],
+            end_iterator: scan_end.clone(),
+            bytes_scanned: 2000,
+            scan_complete: true,
+        };
+
+        // All TTL keys are modified — all candidates filtered out
+        let mut modified = std::collections::HashSet::new();
+        modified.insert(ttl1);
+        modified.insert(ttl2);
+
+        let resolved = result.resolve(10, &modified);
+        assert!(resolved.deleted_keys.is_empty());
+        assert!(resolved.archived_entries.is_empty());
+        // When all are filtered (remaining > 0), use scan end iterator
+        assert_eq!(resolved.end_iterator, scan_end);
+    }
+
+    #[test]
+    fn test_resolve_filtered_before_limit_uses_last_evicted_position() {
+        // Candidates: [filtered, kept, kept] with max_entries=2
+        // The filtered candidate should be skipped, and the limit should apply
+        // to the unfiltered ones.
+        let c1 = make_contract_data_candidate([1u8; 32], true);
+        let c2 = make_contract_data_candidate([2u8; 32], true);
+        let c3 = make_contract_data_candidate([3u8; 32], true);
+        let ttl1 = c1.ttl_key();
+
+        let scan_end = EvictionIterator {
+            bucket_list_level: 1,
+            is_curr_bucket: true,
+            bucket_file_offset: 8000,
+        };
+
+        let result = EvictionResult {
+            candidates: vec![c1, c2, c3],
+            end_iterator: scan_end.clone(),
+            bytes_scanned: 3000,
+            scan_complete: true,
+        };
+
+        // Only c1's TTL is modified — c1 filtered, c2 and c3 are evicted
+        let mut modified = std::collections::HashSet::new();
+        modified.insert(ttl1);
+
+        let resolved = result.resolve(2, &modified);
+        // c2 and c3 evicted: 2 data_keys + 2 ttl_keys = 4
+        assert_eq!(resolved.deleted_keys.len(), 4);
+        // With max_entries=2, exactly 2 evicted, remaining=0 → use last position
+        // (not scan_end, because we hit the limit)
+        assert_ne!(resolved.end_iterator, scan_end);
     }
 }

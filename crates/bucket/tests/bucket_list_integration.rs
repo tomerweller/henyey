@@ -1098,22 +1098,26 @@ async fn test_snapshot_eviction_scan_matches_bucket_list() {
         .enumerate()
     {
         assert_eq!(
-            bl_c.data_key, snap_c.data_key,
+            bl_c.data_key(),
+            snap_c.data_key(),
             "Candidate {} data_key mismatch",
             i
         );
         assert_eq!(
-            bl_c.ttl_key, snap_c.ttl_key,
+            bl_c.ttl_key(),
+            snap_c.ttl_key(),
             "Candidate {} ttl_key mismatch",
             i
         );
         assert_eq!(
-            bl_c.is_temporary, snap_c.is_temporary,
+            bl_c.is_temporary(),
+            snap_c.is_temporary(),
             "Candidate {} is_temporary mismatch",
             i
         );
         assert_eq!(
-            bl_c.position, snap_c.position,
+            bl_c.position(),
+            snap_c.position(),
             "Candidate {} position mismatch",
             i
         );
@@ -1208,7 +1212,7 @@ async fn test_snapshot_eviction_scan_on_background_thread() {
     // Verify all candidates are persistent contract code entries
     for candidate in &result.candidates {
         assert!(
-            !candidate.is_temporary,
+            !candidate.is_temporary(),
             "Contract code entries are persistent"
         );
     }
@@ -1414,8 +1418,16 @@ async fn test_snapshot_eviction_scan_temporary_entries() {
         "Should find all 5 expired entries"
     );
 
-    let temp_count = result.candidates.iter().filter(|c| c.is_temporary).count();
-    let persistent_count = result.candidates.iter().filter(|c| !c.is_temporary).count();
+    let temp_count = result
+        .candidates
+        .iter()
+        .filter(|c| c.is_temporary())
+        .count();
+    let persistent_count = result
+        .candidates
+        .iter()
+        .filter(|c| !c.is_temporary())
+        .count();
 
     assert_eq!(temp_count, 3, "Should have 3 temporary candidates");
     assert_eq!(persistent_count, 2, "Should have 2 persistent candidates");
