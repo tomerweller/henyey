@@ -42,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=53
+TAP_PLAN=63
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -127,6 +127,16 @@ check_skill_structure() {
   # monitor-tick must NOT contain old inline crash detection (replaced by detect_crash_state)
   if grep -q 'recent_crashed=\$(find' "$tick_file"; then
     echo "WARNING: monitor-tick/SKILL.md still contains old inline crash detection (find-based)" >&2
+    drift=true
+  fi
+  # monitor-tick must call detect_soft_fail_blocked (3c soft-fail trigger)
+  if ! grep -q 'detect_soft_fail_blocked' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not call detect_soft_fail_blocked" >&2
+    drift=true
+  fi
+  # monitor-tick must call has_fatal_wipe_evidence (3c crash evidence)
+  if ! grep -q 'has_fatal_wipe_evidence' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not call has_fatal_wipe_evidence" >&2
     drift=true
   fi
 
@@ -947,6 +957,203 @@ run_tests() {
   else
     tap_not_ok "check-12b-semantics: metric label from TOML in both specs" \
       "Expected '$metric_label' in both Check 12b section and monitor-loop table"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # detect_soft_fail_blocked and has_fatal_wipe_evidence tests (T54-T63)
+  # Source: scripts/lib/monitor-decisions.sh — (3c) soft-fail state-wipe trigger
+  # ════════════════════════════════════════════════════════════════════════════
+
+  local NOW_SF=1700000000  # fixed reference for soft-fail tests
+  local PROC_START_SF=$((NOW_SF - 900))  # process started 15 min ago
+
+  # ── Test 54: 20 WARN blocked messages spanning 600s → yes ──────────────────
+  local sf54="$TEST_ROOT/t54"
+  mkdir -p "$sf54"
+  local sf54_log="$sf54/monitor.log"
+  : > "$sf54_log"
+  # Messages end at NOW_SF - 30 (within 90s), spanning 600s total
+  for i in $(seq 0 19); do
+    local ts_epoch=$((NOW_SF - 30 - (19 - i) * 30))
+    local ts=$(date -u -d "@$ts_epoch" "+%Y-%m-%dT%H:%M:%S.000000Z" 2>/dev/null)
+    printf '%s  WARN henyey_app::app::consensus: Recovery escalation blocked: previous fatal state failure — manual intervention required\n' "$ts" >> "$sf54_log"
+  done
+  detect_soft_fail_blocked "$sf54_log" "$PROC_START_SF" "$NOW_SF"
+  if [[ "$SOFT_FAIL_BLOCKED" == "yes" && "$SOFT_FAIL_BLOCKED_DURATION_SEC" -ge 570 ]]; then
+    tap_ok "soft-fail-detect: 20 messages spanning 600s → yes (duration=$SOFT_FAIL_BLOCKED_DURATION_SEC)"
+  else
+    tap_not_ok "soft-fail-detect: 20 messages spanning 600s → yes" \
+      "BLOCKED=$SOFT_FAIL_BLOCKED DURATION=$SOFT_FAIL_BLOCKED_DURATION_SEC"
+  fi
+
+  # ── Test 55: 5 messages spanning 120s → no (duration < 300s) ───────────────
+  local sf55="$TEST_ROOT/t55"
+  mkdir -p "$sf55"
+  local sf55_log="$sf55/monitor.log"
+  : > "$sf55_log"
+  for i in $(seq 0 4); do
+    local ts_epoch=$((NOW_SF - 120 + i * 30))
+    local ts=$(date -u -d "@$ts_epoch" "+%Y-%m-%dT%H:%M:%S.000000Z" 2>/dev/null)
+    printf '%s  WARN henyey_app::app::consensus: Recovery escalation blocked: previous fatal state failure — manual intervention required\n' "$ts" >> "$sf55_log"
+  done
+  detect_soft_fail_blocked "$sf55_log" "$PROC_START_SF" "$NOW_SF"
+  if [[ "$SOFT_FAIL_BLOCKED" == "no" ]]; then
+    tap_ok "soft-fail-detect: 5 messages spanning 120s → no"
+  else
+    tap_not_ok "soft-fail-detect: 5 messages spanning 120s → no" \
+      "BLOCKED=$SOFT_FAIL_BLOCKED DURATION=$SOFT_FAIL_BLOCKED_DURATION_SEC"
+  fi
+
+  # ── Test 56: 20 messages, most recent 120s ago → no (stale) ────────────────
+  local sf56="$TEST_ROOT/t56"
+  mkdir -p "$sf56"
+  local sf56_log="$sf56/monitor.log"
+  : > "$sf56_log"
+  for i in $(seq 0 19); do
+    local ts_epoch=$((NOW_SF - 700 + i * 30))
+    local ts=$(date -u -d "@$ts_epoch" "+%Y-%m-%dT%H:%M:%S.000000Z" 2>/dev/null)
+    printf '%s  WARN henyey_app::app::consensus: Recovery escalation blocked: previous fatal state failure — manual intervention required\n' "$ts" >> "$sf56_log"
+  done
+  detect_soft_fail_blocked "$sf56_log" "$PROC_START_SF" "$NOW_SF"
+  if [[ "$SOFT_FAIL_BLOCKED" == "no" ]]; then
+    tap_ok "soft-fail-detect: 20 messages most recent 120s ago → no (stale)"
+  else
+    tap_not_ok "soft-fail-detect: 20 messages most recent 120s ago → no (stale)" \
+      "BLOCKED=$SOFT_FAIL_BLOCKED DURATION=$SOFT_FAIL_BLOCKED_DURATION_SEC"
+  fi
+
+  # ── Test 57: Empty/missing log file → no ───────────────────────────────────
+  detect_soft_fail_blocked "$TEST_ROOT/t57/nonexistent.log" "$PROC_START_SF" "$NOW_SF"
+  if [[ "$SOFT_FAIL_BLOCKED" == "no" && "$SOFT_FAIL_BLOCKED_DURATION_SEC" -eq 0 ]]; then
+    tap_ok "soft-fail-detect: missing log file → no"
+  else
+    tap_not_ok "soft-fail-detect: missing log file → no" \
+      "BLOCKED=$SOFT_FAIL_BLOCKED DURATION=$SOFT_FAIL_BLOCKED_DURATION_SEC"
+  fi
+
+  # ── Test 58: One blocked message → no (duration=0) ─────────────────────────
+  local sf58="$TEST_ROOT/t58"
+  mkdir -p "$sf58"
+  local sf58_log="$sf58/monitor.log"
+  local ts58=$(date -u -d "@$((NOW_SF - 30))" "+%Y-%m-%dT%H:%M:%S.000000Z" 2>/dev/null)
+  printf '%s  WARN henyey_app::app::consensus: Recovery escalation blocked: previous fatal state failure — manual intervention required\n' "$ts58" > "$sf58_log"
+  detect_soft_fail_blocked "$sf58_log" "$PROC_START_SF" "$NOW_SF"
+  if [[ "$SOFT_FAIL_BLOCKED" == "no" ]]; then
+    tap_ok "soft-fail-detect: one message → no (duration=0)"
+  else
+    tap_not_ok "soft-fail-detect: one message → no (duration=0)" \
+      "BLOCKED=$SOFT_FAIL_BLOCKED DURATION=$SOFT_FAIL_BLOCKED_DURATION_SEC"
+  fi
+
+  # ── Test 59: All timestamps < PROC_START → no (stale from prior PID) ───────
+  local sf59="$TEST_ROOT/t59"
+  mkdir -p "$sf59"
+  local sf59_log="$sf59/monitor.log"
+  : > "$sf59_log"
+  local late_start=$((NOW_SF - 60))  # process started 60s ago
+  for i in $(seq 0 19); do
+    local ts_epoch=$((NOW_SF - 700 + i * 30))  # all before late_start
+    local ts=$(date -u -d "@$ts_epoch" "+%Y-%m-%dT%H:%M:%S.000000Z" 2>/dev/null)
+    printf '%s  WARN henyey_app::app::consensus: Recovery escalation blocked: previous fatal state failure — manual intervention required\n' "$ts" >> "$sf59_log"
+  done
+  detect_soft_fail_blocked "$sf59_log" "$late_start" "$NOW_SF"
+  if [[ "$SOFT_FAIL_BLOCKED" == "no" ]]; then
+    tap_ok "soft-fail-detect: all timestamps before PROC_START → no"
+  else
+    tap_not_ok "soft-fail-detect: all timestamps before PROC_START → no" \
+      "BLOCKED=$SOFT_FAIL_BLOCKED DURATION=$SOFT_FAIL_BLOCKED_DURATION_SEC"
+  fi
+
+  # ── Test 60: Mixed text+JSON WARN lines → yes ─────────────────────────────
+  local sf60="$TEST_ROOT/t60"
+  mkdir -p "$sf60"
+  local sf60_log="$sf60/monitor.log"
+  : > "$sf60_log"
+  # Messages end at NOW_SF - 30 (within 90s), spanning 540s total (10 msgs * 60s)
+  for i in $(seq 0 9); do
+    local ts_epoch=$((NOW_SF - 30 - (9 - i) * 60))
+    local ts=$(date -u -d "@$ts_epoch" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
+    if (( i % 2 == 0 )); then
+      printf '%s  WARN henyey_app::app::consensus: Recovery escalation blocked: previous fatal state failure — manual intervention required\n' "$ts" >> "$sf60_log"
+    else
+      printf '{"timestamp":"%s","level":"WARN","target":"henyey_app::app::consensus","message":"Recovery escalation blocked: previous fatal state failure — manual intervention required"}\n' "$ts" >> "$sf60_log"
+    fi
+  done
+  detect_soft_fail_blocked "$sf60_log" "$PROC_START_SF" "$NOW_SF"
+  if [[ "$SOFT_FAIL_BLOCKED" == "yes" && "$SOFT_FAIL_BLOCKED_DURATION_SEC" -ge 500 ]]; then
+    tap_ok "soft-fail-detect: mixed text+JSON → yes (duration=$SOFT_FAIL_BLOCKED_DURATION_SEC)"
+  else
+    tap_not_ok "soft-fail-detect: mixed text+JSON → yes" \
+      "BLOCKED=$SOFT_FAIL_BLOCKED DURATION=$SOFT_FAIL_BLOCKED_DURATION_SEC"
+  fi
+
+  # ── Test 61: Mixed WARN + DEBUG lines (only WARN counted) ──────────────────
+  local sf61="$TEST_ROOT/t61"
+  mkdir -p "$sf61"
+  local sf61_log="$sf61/monitor.log"
+  : > "$sf61_log"
+  # Add many DEBUG lines (should be ignored)
+  for i in $(seq 0 19); do
+    local ts_epoch=$((PROC_START_SF + 30 + i * 30))
+    local ts=$(date -u -d "@$ts_epoch" "+%Y-%m-%dT%H:%M:%S.000000Z" 2>/dev/null)
+    printf '%s DEBUG henyey_app::app::consensus: Recovery escalation blocked: previous fatal state failure (repeated)\n' "$ts" >> "$sf61_log"
+  done
+  # Add only 2 WARN lines (duration < 300s)
+  local ts61a=$(date -u -d "@$((NOW_SF - 60))" "+%Y-%m-%dT%H:%M:%S.000000Z" 2>/dev/null)
+  local ts61b=$(date -u -d "@$((NOW_SF - 30))" "+%Y-%m-%dT%H:%M:%S.000000Z" 2>/dev/null)
+  printf '%s  WARN henyey_app::app::consensus: Recovery escalation blocked: previous fatal state failure — manual intervention required\n' "$ts61a" >> "$sf61_log"
+  printf '%s  WARN henyey_app::app::consensus: Recovery escalation blocked: previous fatal state failure — manual intervention required\n' "$ts61b" >> "$sf61_log"
+  detect_soft_fail_blocked "$sf61_log" "$PROC_START_SF" "$NOW_SF"
+  if [[ "$SOFT_FAIL_BLOCKED" == "no" ]]; then
+    tap_ok "soft-fail-detect: WARN+DEBUG mix, only WARN counted → no (duration=30)"
+  else
+    tap_not_ok "soft-fail-detect: WARN+DEBUG mix, only WARN counted → no" \
+      "BLOCKED=$SOFT_FAIL_BLOCKED DURATION=$SOFT_FAIL_BLOCKED_DURATION_SEC"
+  fi
+
+  # ── Test 62: has_fatal_wipe_evidence — crashed + active + missing ──────────
+  local sf62="$TEST_ROOT/t62"
+  mkdir -p "$sf62/logs"
+  # crashed file WITH signal
+  printf '2026-05-04T14:04:09Z ERROR lifecycle: FATAL: unrecoverable fatal_wipe_required=true\n' \
+    > "$sf62/logs/monitor.log.crashed-20260504T140409Z"
+  local sf62_active="$sf62/logs/monitor.log"
+  printf '2026-05-04T14:05:00Z INFO heartbeat=true\n' > "$sf62_active"
+  has_fatal_wipe_evidence "$sf62/logs" "$sf62_active"
+  local r62a="$FATAL_WIPE_EVIDENCE"
+  local s62a="$FATAL_WIPE_SOURCE"
+
+  # active log WITH signal (no crashed)
+  local sf62b="$TEST_ROOT/t62b"
+  mkdir -p "$sf62b/logs"
+  local sf62b_active="$sf62b/logs/monitor.log"
+  printf '2026-05-04T14:04:09Z ERROR lifecycle: FATAL: fatal_wipe_required=true\n' > "$sf62b_active"
+  has_fatal_wipe_evidence "$sf62b/logs" "$sf62b_active"
+  local r62b="$FATAL_WIPE_EVIDENCE"
+  local s62b="$FATAL_WIPE_SOURCE"
+
+  # neither
+  local sf62c="$TEST_ROOT/t62c"
+  mkdir -p "$sf62c/logs"
+  printf '2026-05-04T14:05:00Z INFO normal operation\n' > "$sf62c/logs/monitor.log"
+  has_fatal_wipe_evidence "$sf62c/logs" "$sf62c/logs/monitor.log"
+  local r62c="$FATAL_WIPE_EVIDENCE"
+
+  if [[ "$r62a" == "yes" && "$s62a" == crashed:* && "$r62b" == "yes" && "$s62b" == "active" && "$r62c" == "no" ]]; then
+    tap_ok "fatal-wipe-evidence: crashed=yes active=yes neither=no"
+  else
+    tap_not_ok "fatal-wipe-evidence: crashed/active/neither" \
+      "crashed: $r62a ($s62a), active: $r62b ($s62b), neither: $r62c"
+  fi
+
+  # ── Test 63: Consistency — SKILL.md references both functions ──────────────
+  local tick_file_ref="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  if grep -q 'detect_soft_fail_blocked' "$tick_file_ref" \
+     && grep -q 'has_fatal_wipe_evidence' "$tick_file_ref"; then
+    tap_ok "consistency: SKILL.md references detect_soft_fail_blocked and has_fatal_wipe_evidence"
+  else
+    tap_not_ok "consistency: SKILL.md references detect_soft_fail_blocked and has_fatal_wipe_evidence" \
+      "One or both functions not referenced in monitor-tick/SKILL.md"
   fi
 }
 

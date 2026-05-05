@@ -272,6 +272,159 @@ detect_crash_state() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# has_fatal_wipe_evidence LOGS_DIR LOG_FILE
+#
+# Checks for fatal_wipe_required=true in crashed rotations OR the active log.
+# Unlike detect_crash_state() which is windowed to 30 min, this has no time
+# limit — it answers "has this session EVER had a fatal corruption signal?"
+#
+# Arguments:
+#   LOGS_DIR - Directory containing monitor.log.crashed-* files
+#   LOG_FILE - Path to active monitor.log
+#
+# Sets globals:
+#   FATAL_WIPE_EVIDENCE - "yes" | "no"
+#   FATAL_WIPE_SOURCE   - "crashed:<filename>" | "active" | ""
+#
+# Detection pattern (same as detect_crash_state):
+#   'fatal_wipe_required\s*[=:]\s*true|"fatal_wipe_required"\s*:\s*true|State wipe required before restart'
+#
+# Logic:
+#   1. Check crashed files (bounded by check (5) retention: max 3 per category)
+#   2. If no crashed match, check active log
+#
+# Returns: always 0
+# ─────────────────────────────────────────────────────────────────────────────
+has_fatal_wipe_evidence() {
+  local logs_dir="$1"
+  local log_file="$2"
+  local pattern='fatal_wipe_required\s*[=:]\s*true|"fatal_wipe_required"\s*:\s*true|State wipe required before restart'
+
+  FATAL_WIPE_EVIDENCE="no"
+  FATAL_WIPE_SOURCE=""
+
+  # Check crashed rotations
+  if [[ -d "$logs_dir" ]]; then
+    local f
+    for f in "$logs_dir"/monitor.log.crashed-*; do
+      [[ -f "$f" ]] || continue
+      if grep -qE "$pattern" "$f" 2>/dev/null; then
+        FATAL_WIPE_EVIDENCE="yes"
+        FATAL_WIPE_SOURCE="crashed:$(basename "$f")"
+        return 0
+      fi
+    done
+  fi
+
+  # Check active log (handles first-occurrence: current PID emitted the signal)
+  if [[ -f "$log_file" ]] && grep -qE "$pattern" "$log_file" 2>/dev/null; then
+    FATAL_WIPE_EVIDENCE="yes"
+    FATAL_WIPE_SOURCE="active"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# detect_soft_fail_blocked LOG_FILE PROC_START_EPOCH [NOW_EPOCH]
+#
+# Detects a running process stuck in the fatal-state-blocked loop.
+#
+# Arguments:
+#   LOG_FILE         - Path to active monitor.log
+#   PROC_START_EPOCH - Process start time (epoch seconds). Lines with timestamps
+#                      before this are ignored (stale from prior run).
+#   NOW_EPOCH        - Optional: current epoch (default: $(date +%s))
+#
+# Sets globals:
+#   SOFT_FAIL_BLOCKED             - "yes" | "no"
+#   SOFT_FAIL_BLOCKED_DURATION_SEC - Seconds between first and most-recent blocked
+#                                    message within current PID lifetime (0 when no)
+#
+# Detection contract:
+#   Matches ONLY the WARN-level "Recovery escalation blocked: previous fatal
+#   state failure" message from consensus.rs:1174 (throttled every 30s).
+#   Excludes DEBUG-level "(repeated)" variant at consensus.rs:1179-1180.
+#
+#   Pattern matches lines containing WARN level AND the blocked message:
+#     Text: "2024-01-15T10:30:00.123456Z  WARN ... Recovery escalation blocked: previous fatal state failure"
+#     JSON: {"timestamp":"...","level":"WARN",...,"message":"Recovery escalation blocked: previous fatal state failure..."}
+#
+# Logic:
+#   1. tail -n 2000 LOG_FILE | grep (WARN + blocked pattern)
+#   2. Extract ISO 8601 timestamps; skip unparseable
+#   3. Convert to epoch; filter < PROC_START_EPOCH
+#   4. Duration = max_epoch - min_epoch
+#   5. yes when duration >= 300 AND max_epoch >= (NOW_EPOCH - 90)
+#
+# Edge cases:
+#   - Missing/empty LOG_FILE: no, duration=0
+#   - One matching line: no (duration=0 < 300)
+#   - All timestamps < PROC_START_EPOCH: no
+#   - Timestamp parse failure: skip silently
+#   - Mixed text+JSON: both handled
+#
+# Returns: always 0
+# ─────────────────────────────────────────────────────────────────────────────
+detect_soft_fail_blocked() {
+  local log_file="$1"
+  local proc_start_epoch="$2"
+  local now_epoch="${3:-$(date +%s)}"
+
+  SOFT_FAIL_BLOCKED="no"
+  SOFT_FAIL_BLOCKED_DURATION_SEC=0
+
+  [[ -f "$log_file" ]] || return 0
+
+  # Grep for WARN-level blocked messages (both text and JSON formats)
+  local matched_lines
+  matched_lines=$(tail -n 2000 "$log_file" 2>/dev/null \
+    | grep -E '( WARN .+|"level"\s*:\s*"WARN".+)Recovery escalation blocked: previous fatal state failure' \
+    2>/dev/null) || return 0
+
+  [[ -z "$matched_lines" ]] && return 0
+
+  # Extract and filter timestamps
+  local min_epoch="" max_epoch=""
+  local line ts epoch
+
+  while IFS= read -r line; do
+    # Try text format: first field is ISO timestamp (starts with "20")
+    ts=$(printf '%s' "$line" | awk '{print $1}')
+    if [[ "$ts" != 20* ]]; then
+      # Try JSON format: extract "timestamp":"..." value
+      ts=$(printf '%s' "$line" | grep -oP '"timestamp"\s*:\s*"\K[^"]+' 2>/dev/null)
+    fi
+    [[ -z "$ts" ]] && continue
+
+    # Convert to epoch; skip on failure
+    epoch=$(date -d "$ts" +%s 2>/dev/null) || continue
+    [[ -z "$epoch" ]] && continue
+
+    # Filter: discard timestamps before process start
+    [[ "$epoch" -lt "$proc_start_epoch" ]] && continue
+
+    # Track min and max
+    if [[ -z "$min_epoch" ]] || [[ "$epoch" -lt "$min_epoch" ]]; then
+      min_epoch="$epoch"
+    fi
+    if [[ -z "$max_epoch" ]] || [[ "$epoch" -gt "$max_epoch" ]]; then
+      max_epoch="$epoch"
+    fi
+  done <<< "$matched_lines"
+
+  # Need at least two distinct timestamps
+  [[ -z "$min_epoch" || -z "$max_epoch" ]] && return 0
+
+  local duration=$((max_epoch - min_epoch))
+  SOFT_FAIL_BLOCKED_DURATION_SEC="$duration"
+
+  # Fire when: sustained >= 5 min AND most recent within 90s
+  local staleness=$((now_epoch - max_epoch))
+  if [[ "$duration" -ge 300 ]] && [[ "$staleness" -le 90 ]]; then
+    SOFT_FAIL_BLOCKED="yes"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # grep_heartbeat_lines LOG_FILE [TAIL_COUNT]
 #
 # Prints heartbeat event lines from LOG_FILE.

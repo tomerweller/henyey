@@ -361,6 +361,68 @@ File a new `urgent` GH issue documenting the wipe with the count of crashed rota
 
 The trigger is self-rate-limiting: after a wipe, the new `.crashed-*` rotations stop accumulating (the symptom is gone), so the 3-in-30-min window can't fire again until something else goes wrong.
 
+**(3c) Soft-fail state-wipe trigger** — defense-in-depth for the case where
+`trigger_fatal_shutdown()` signals exit but the process fails to terminate,
+leaving it alive with `fatal_state_failure=true`, blocking all recovery, and
+making no ledger progress. This complements (3a) which only fires post-mortem.
+Evaluate (3c) BEFORE (3b) when the process IS alive. If (3c) fires, skip (3b)
+— a wipe supersedes a plain restart.
+
+```bash
+logs_dir=/home/tomer/data/$MONITOR_SESSION_ID/logs
+log_file="$logs_dir/monitor.log"
+
+# PID (same comm-based detection as check (3); skip (3c) if empty)
+PID=$(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)
+[ -z "$PID" ] && : # skip — dead-process path (3a) handles this
+
+# Process start time from /proc/$PID/stat mtime
+PROC_START_EPOCH=$(stat -c %Y /proc/$PID/stat 2>/dev/null || echo 0)
+
+# Uses shared functions from scripts/lib/monitor-decisions.sh
+has_fatal_wipe_evidence "$logs_dir" "$log_file"
+detect_soft_fail_blocked "$log_file" "$PROC_START_EPOCH"
+```
+
+Trigger the wipe when ALL hold:
+1. `SOFT_FAIL_BLOCKED == "yes"` (WARN-level "Recovery escalation blocked" messages sustained for >= 5 min within current PID lifetime, most recent within 90s of now)
+2. `FATAL_WIPE_EVIDENCE == "yes"` (`fatal_wipe_required=true` signal found in any crashed rotation OR the active log — no time window, confirms persistent state corruption)
+3. `FRESH_START == "no"` (not a fresh sync)
+4. **No ledger progress since previous tick** — `last_ledger` unchanged (stash previous tick's value before check (2) overwrites; compare against current ledger)
+
+When triggered:
+
+```bash
+# 1. Stop the alive-but-stuck process
+kill "$PID" && sleep 5
+kill -0 "$PID" 2>/dev/null && kill -9 "$PID" && sleep 2
+
+# 2. Rotate log (preserve evidence, consistent suffix with 3a)
+mv "$log_file" "${log_file}.crashed-$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
+
+# 3. Wipe corrupt persisted state (same artifacts as 3a)
+rm -f /home/tomer/data/mainnet/mainnet.db \
+      /home/tomer/data/mainnet/mainnet.db-shm \
+      /home/tomer/data/mainnet/mainnet.db-wal \
+      /home/tomer/data/mainnet/mainnet.lock
+rm -rf /home/tomer/data/mainnet/buckets
+
+# 4. Reset progression tracker
+rm -f /home/tomer/data/$MONITOR_SESSION_ID/last_ledger
+```
+
+Then Relaunch. The next tick will see `FRESH_START=yes` (mainnet.db absent).
+
+File a new `urgent` GH issue documenting the soft-fail wipe with: blocked
+duration (`SOFT_FAIL_BLOCKED_DURATION_SEC`), evidence source
+(`FATAL_WIPE_SOURCE`), and cumulative downtime. Use title pattern:
+`"Soft-fail state wipe: fatal_state_failure stuck for {N}m"`. Always a new
+issue (no dedup — each wipe is a distinct incident). Known prior incidents: #2363.
+
+Self-limiting: after wipe, `FRESH_START=yes` blocks condition (3); new process
+has no `fatal_state_failure` so condition (1) fails; log rotation removes old
+blocked messages from active log.
+
 **(3b) Wedge detection** — a process can be alive but have a frozen event
 loop (watchdog fires, HTTP hangs, ledger progression stops). Check 3 alone
 misses this because `pgrep` still finds the PID.
