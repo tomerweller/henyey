@@ -1994,6 +1994,7 @@ impl App {
         let current_ledger = self.ledger_info().ledger_seq;
         let quorum_slot = herder_stats
             .tracking_slot
+            .get()
             .max(current_ledger as u64 + 1)
             .max(1);
         let slot_state = self.herder.get_slot_state(quorum_slot);
@@ -3691,7 +3692,7 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         // Verify quorum tracking methods are callable
-        let slot = app.herder.tracking_slot();
+        let slot = app.herder.tracking_slot().get();
         let _heard = app.herder.heard_from_quorum(slot);
         let _blocking = app.herder.is_v_blocking(slot);
     }

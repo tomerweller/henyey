@@ -205,6 +205,76 @@ impl ClosingGate {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Newtype wrappers for tracking slot values
+// ---------------------------------------------------------------------------
+
+/// The next consensus slot — the slot SCP is currently working on.
+/// Equal to last_externalized + 1.
+///
+/// A value of `0` means no slot has been externalized yet (uninitialized
+/// tracking state). Real ledgers start at genesis = 1. Use `is_boot()` to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+pub struct NextConsensusSlot(u64);
+
+/// The last externalized ledger index — the most recent ledger that
+/// completed consensus.
+///
+/// A value of `0` means no ledger has been externalized yet (uninitialized
+/// tracking / boot / syncing state). Real Stellar ledgers start at genesis = 1,
+/// so `0` is never a valid ledger number. Use `is_boot()` to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+pub struct LastExternalizedLedger(u64);
+
+impl NextConsensusSlot {
+    pub fn new(slot: u64) -> Self {
+        Self(slot)
+    }
+
+    /// Extract the raw u64 value for SCP operations and comparisons.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    /// True when tracking is uninitialized (no slot externalized yet).
+    pub fn is_boot(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl LastExternalizedLedger {
+    pub fn new(ledger: u64) -> Self {
+        Self(ledger)
+    }
+
+    /// Extract the raw u64 value.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Convert to u32, panicking if out of range.
+    pub fn as_u32(self) -> u32 {
+        u32::try_from(self.0).expect("ledger index exceeds u32::MAX")
+    }
+
+    /// True when tracking is uninitialized (no ledger externalized yet).
+    pub fn is_boot(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::fmt::Display for NextConsensusSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::fmt::Display for LastExternalizedLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Configuration for the Herder.
 ///
 /// Controls the Herder's behavior including validator mode, queue limits,
@@ -708,8 +778,10 @@ impl Herder {
     /// This is the slot SCP is currently working on or will work on next.
     /// For the *last externalized* ledger, use
     /// [`tracking_consensus_ledger_index()`](Self::tracking_consensus_ledger_index).
-    pub fn tracking_slot(&self) -> u64 {
-        tracked_read(LOCK_TRACKING_STATE, &self.tracking_state).consensus_index
+    pub fn tracking_slot(&self) -> NextConsensusSlot {
+        NextConsensusSlot::new(
+            tracked_read(LOCK_TRACKING_STATE, &self.tracking_state).consensus_index,
+        )
     }
 
     /// Returns the tracking consensus ledger index — the last ledger that was
@@ -728,8 +800,8 @@ impl Herder {
     /// In henyey, `tracking_slot()` stores the *next* consensus index
     /// (externalized + 1), so this helper subtracts 1 to produce the
     /// last-externalized value.
-    pub fn tracking_consensus_ledger_index(&self) -> u64 {
-        self.tracking_slot().saturating_sub(1)
+    pub fn tracking_consensus_ledger_index(&self) -> LastExternalizedLedger {
+        LastExternalizedLedger::new(self.tracking_slot().get().saturating_sub(1))
     }
 
     /// Get the tracking consensus close time.
@@ -742,7 +814,7 @@ impl Herder {
     /// Matches stellar-core `HerderImpl::nextConsensusLedgerIndex()`.
     ///
     /// Equivalent to [`tracking_slot`](Self::tracking_slot); both read the same field.
-    pub fn next_consensus_ledger_index(&self) -> u64 {
+    pub fn next_consensus_ledger_index(&self) -> NextConsensusSlot {
         self.tracking_slot()
     }
 
@@ -750,7 +822,7 @@ impl Herder {
     ///
     /// 0=unknown, 1=prepare, 2=confirm, 3=externalize.
     pub fn tracking_slot_ballot_phase(&self) -> u8 {
-        self.scp.get_slot_ballot_phase(self.tracking_slot())
+        self.scp.get_slot_ballot_phase(self.tracking_slot().get())
     }
 
     /// Get a snapshot of the SCP event counters for the metrics scrape path.
@@ -773,7 +845,7 @@ impl Herder {
     /// - ledger 64..127 → checkpoint starts at 64
     /// - ledger 128..191 → checkpoint starts at 128
     pub fn get_most_recent_checkpoint_seq(&self) -> u64 {
-        let tracking_consensus_index = self.tracking_consensus_ledger_index();
+        let tracking_consensus_index = self.tracking_consensus_ledger_index().get();
         let freq = self.config.checkpoint_frequency;
         // checkpointContainingLedger: ((ledger / freq + 1) * freq) - 1
         let last = ((tracking_consensus_index / freq) + 1) * freq - 1;
@@ -792,7 +864,7 @@ impl Herder {
     /// Messages for slots below this value can be safely dropped from queues.
     /// Matches upstream `HerderImpl::getMinLedgerSeqToRemember()`.
     pub fn get_min_ledger_seq_to_remember(&self) -> u64 {
-        let current_slot = self.tracking_consensus_ledger_index();
+        let current_slot = self.tracking_consensus_ledger_index().get();
         if current_slot > MAX_SLOTS_TO_REMEMBER {
             current_slot - MAX_SLOTS_TO_REMEMBER + 1
         } else {
@@ -1094,7 +1166,7 @@ impl Herder {
         // stellar-core uses trackingConsensusLedgerIndex() which is the LCL seq (= next_consensus - 1)
         let state = self.state();
         if state != HerderState::Booting {
-            let tracking_index = self.tracking_consensus_ledger_index();
+            let tracking_index = self.tracking_consensus_ledger_index().get();
             if env_ledger_index >= tracking_index && tracking_index > last_close_index {
                 last_close_index = tracking_index;
                 last_close_time = self.tracking_consensus_close_time();
@@ -1298,7 +1370,7 @@ impl Herder {
         use crate::scp_verify::{PipelinedIntake, PreFilter, PreFilterRejectReason};
         let state = self.state();
         let slot = envelope.statement.slot_index;
-        let current_slot = self.tracking_slot();
+        let current_slot = self.tracking_slot().get();
 
         if !state.can_receive_scp() {
             debug!(
@@ -1321,11 +1393,11 @@ impl Herder {
         let mut max_ledger_seq: u64 = u64::MAX;
 
         if state.is_tracking() {
-            max_ledger_seq = self.next_consensus_ledger_index() + LEDGER_VALIDITY_BRACKET;
+            max_ledger_seq = self.next_consensus_ledger_index().get() + LEDGER_VALIDITY_BRACKET;
         } else {
-            let tracking_consensus_index = self.tracking_consensus_ledger_index();
+            let tracking_consensus_index = self.tracking_consensus_ledger_index().get();
             let enforce_recent = tracking_consensus_index <= GENESIS_LEDGER_SEQ
-                && slot != self.next_consensus_ledger_index();
+                && slot != self.next_consensus_ledger_index().get();
             if !self.check_envelope_close_time(envelope, enforce_recent) && slot != checkpoint {
                 debug!(
                     slot,
@@ -1434,7 +1506,7 @@ impl Herder {
             }
         }
 
-        let current_slot = self.tracking_slot();
+        let current_slot = self.tracking_slot().get();
 
         // Parity: skip self-messages (HerderImpl.cpp:885-891)
         let local_node_id = node_id_from_public_key(&self.config.node_public_key);
@@ -1566,8 +1638,7 @@ impl Herder {
             RecvResult::Ready => {
                 // Deps satisfied, envelope broadcast by FetchingEnvelopes.
                 // Route based on slot eligibility.
-                if slot <= self.tracking_slot() {
-                    // Current/past slot: process through SCP inline.
+                if slot <= self.tracking_slot().get() {
                     debug!(slot, "Envelope ready, processing through SCP");
                     let scp_result = self.process_scp_envelope_with_tx_set(envelope_clone);
                     // Pop the duplicate from ready queue to prevent later
@@ -1582,7 +1653,7 @@ impl Herder {
                     // process_ready_fetching_envelopes() is called.
                     debug!(
                         slot,
-                        tracking = self.tracking_slot(),
+                        tracking = self.tracking_slot().get(),
                         "Future-slot envelope ready, deferring SCP processing"
                     );
                     EnvelopeState::Pending
@@ -1610,7 +1681,7 @@ impl Herder {
                 // and will be processed when the slot advances.
                 //
                 // See #1796 and the SCP/herder PARITY_STATUS.md sections.
-                if is_externalize && slot <= self.tracking_slot() {
+                if is_externalize && slot <= self.tracking_slot().get() {
                     debug!(
                         slot,
                         "EXTERNALIZE with missing deps, processing through SCP immediately"
@@ -1620,7 +1691,7 @@ impl Herder {
                     if is_externalize {
                         debug!(
                             slot,
-                            tracking = self.tracking_slot(),
+                            tracking = self.tracking_slot().get(),
                             "Future-slot EXTERNALIZE waiting for deps in FetchingEnvelopes"
                         );
                     } else {
@@ -2202,7 +2273,7 @@ impl Herder {
             None
         };
         let max_slot = if self.is_tracking() {
-            Some(self.next_consensus_ledger_index() + LEDGER_VALIDITY_BRACKET)
+            Some(self.next_consensus_ledger_index().get() + LEDGER_VALIDITY_BRACKET)
         } else {
             None
         };
@@ -3106,7 +3177,7 @@ impl Herder {
     /// This is called after receiving a tx set to feed any buffered envelopes
     /// to SCP now that their dependencies are satisfied.
     pub fn process_ready_fetching_envelopes(&self) -> usize {
-        let tracking_slot = self.tracking_slot();
+        let tracking_slot = self.tracking_slot().get();
         let is_tracking = self.state().is_tracking();
         let mut processed = 0;
 
@@ -3257,7 +3328,7 @@ impl Herder {
     /// - Falls back to current tracking slot if previous is unavailable
     /// - Returns None when not tracking (tracking_slot == 0)
     pub fn quorum_health(&self) -> Option<(u64, u64, u64, u64, u64)> {
-        let tracking = self.tracking_slot();
+        let tracking = self.tracking_slot().get();
         // When tracking_slot is 0, we're not tracking — equivalent to
         // stellar-core's HERDER_BOOTING_STATE check.
         if tracking == 0 {
@@ -3300,7 +3371,7 @@ impl Herder {
     /// unless state is BOOTING, in which case use LCL seq.
     pub fn resolve_quorum_slot(&self, lcl_seq: u32) -> u64 {
         if self.state() != HerderState::Booting {
-            self.tracking_consensus_ledger_index()
+            self.tracking_consensus_ledger_index().get()
         } else {
             lcl_seq as u64
         }
@@ -3712,7 +3783,7 @@ pub struct HerderStats {
     /// Current state.
     pub state: HerderState,
     /// Current tracking slot.
-    pub tracking_slot: u64,
+    pub tracking_slot: NextConsensusSlot,
     /// Number of pending transactions.
     pub pending_transactions: usize,
     /// Number of pending SCP envelopes.
@@ -3914,7 +3985,7 @@ mod tests {
 
         herder.bootstrap(100);
         assert_eq!(herder.state(), HerderState::Tracking);
-        assert_eq!(herder.tracking_slot(), 101);
+        assert_eq!(herder.tracking_slot().get(), 101);
         assert!(herder.is_tracking());
     }
 
@@ -3955,7 +4026,7 @@ mod tests {
 
         let stats = herder.stats();
         assert_eq!(stats.state, HerderState::Tracking);
-        assert_eq!(stats.tracking_slot, 51);
+        assert_eq!(stats.tracking_slot.get(), 51);
         assert_eq!(stats.pending_transactions, 0);
         assert!(!stats.is_validator);
     }
@@ -4000,7 +4071,7 @@ mod tests {
             .expand(&local_node_id, quorum_set)
             .unwrap();
 
-        let tracking = herder.tracking_slot(); // 101
+        let tracking = herder.tracking_slot().get(); // 101
 
         // Create a signed EXTERNALIZE from the unknown node
         let envelope = make_signed_externalize_from(tracking, &herder, &unknown_secret);
@@ -4014,7 +4085,7 @@ mod tests {
             "Non-quorum node envelope should be rejected by quorum membership check"
         );
         assert_eq!(
-            herder.tracking_slot(),
+            herder.tracking_slot().get(),
             tracking,
             "tracking slot should NOT advance — unknown node not in quorum"
         );
@@ -4028,7 +4099,7 @@ mod tests {
         herder.start_syncing();
         herder.bootstrap(100);
 
-        let tracking = herder.tracking_slot(); // 101
+        let tracking = herder.tracking_slot().get(); // 101
 
         // Create a signed envelope FROM the local node
         let value = make_valid_value_with_cached_tx_set(&herder, &secret);
@@ -4098,7 +4169,7 @@ mod tests {
             .expand(&other_node_id, quorum_set)
             .unwrap();
 
-        let tracking = herder.tracking_slot(); // 101
+        let tracking = herder.tracking_slot().get(); // 101
 
         // An EXTERNALIZE for a future slot within the pending buffer distance
         let future_slot = tracking + 5;
@@ -4108,7 +4179,7 @@ mod tests {
         // Should be buffered in FetchingEnvelopes (not immediately processed)
         assert_eq!(result, EnvelopeState::Fetching);
         // Tracking slot should NOT have advanced (envelope is buffered)
-        assert_eq!(herder.tracking_slot(), tracking);
+        assert_eq!(herder.tracking_slot().get(), tracking);
     }
 
     /// Regression for issue #1807.
@@ -4161,7 +4232,7 @@ mod tests {
             .expand(&other_node_id, quorum_set)
             .unwrap();
 
-        let tracking = herder.tracking_slot(); // 101
+        let tracking = herder.tracking_slot().get(); // 101
 
         // Primary is 48 slots ahead — this matches the post-catchup Quickstart
         // scenario where captive-core just bootstrapped at `tracking_slot=N`
@@ -4178,7 +4249,7 @@ mod tests {
             result
         );
         // Tracking slot must not advance on buffering alone.
-        assert_eq!(herder.tracking_slot(), tracking);
+        assert_eq!(herder.tracking_slot().get(), tracking);
     }
 
     #[test]
@@ -4219,7 +4290,7 @@ mod tests {
             .expand(&other_node_id, quorum_set)
             .unwrap();
 
-        let tracking = herder.tracking_slot(); // 101
+        let tracking = herder.tracking_slot().get(); // 101
 
         // Create a properly signed EXTERNALIZE for the current tracking slot
         let envelope = make_signed_externalize_from(tracking, &herder, &other_secret);
@@ -4228,7 +4299,7 @@ mod tests {
         // Should be accepted and cause externalization through SCP
         assert_eq!(result, EnvelopeState::Valid);
         // Tracking slot should have advanced
-        assert_eq!(herder.tracking_slot(), tracking + 1);
+        assert_eq!(herder.tracking_slot().get(), tracking + 1);
     }
 
     #[test]
@@ -4272,7 +4343,7 @@ mod tests {
         herder.set_state(HerderState::Syncing);
         assert_eq!(herder.state(), HerderState::Syncing);
 
-        let tracking = herder.tracking_slot(); // 101
+        let tracking = herder.tracking_slot().get(); // 101
 
         // Process an EXTERNALIZE — should transition back to Tracking
         let envelope = make_signed_externalize_from(tracking, &herder, &other_secret);
@@ -4620,18 +4691,56 @@ mod tests {
         let herder = make_test_herder();
 
         // Default tracking_slot is 0 → saturating_sub(1) = 0
-        assert_eq!(herder.tracking_slot(), 0);
-        assert_eq!(herder.tracking_consensus_ledger_index(), 0);
+        assert_eq!(herder.tracking_slot().get(), 0);
+        assert_eq!(herder.tracking_consensus_ledger_index().get(), 0);
 
         // Bootstrap to slot 1 (tracking_slot = 2, i.e., externalized + 1)
         herder.bootstrap(1);
-        assert_eq!(herder.tracking_slot(), 2);
-        assert_eq!(herder.tracking_consensus_ledger_index(), 1);
+        assert_eq!(herder.tracking_slot().get(), 2);
+        assert_eq!(herder.tracking_consensus_ledger_index().get(), 1);
 
         // Bootstrap to slot 100 (tracking_slot = 101)
         herder.bootstrap(100);
-        assert_eq!(herder.tracking_slot(), 101);
-        assert_eq!(herder.tracking_consensus_ledger_index(), 100);
+        assert_eq!(herder.tracking_slot().get(), 101);
+        assert_eq!(herder.tracking_consensus_ledger_index().get(), 100);
+    }
+
+    #[test]
+    fn test_newtype_api() {
+        // NextConsensusSlot
+        let slot = NextConsensusSlot::new(101);
+        assert_eq!(slot.get(), 101);
+        assert!(!slot.is_boot());
+        assert_eq!(format!("{}", slot), "101");
+
+        let boot_slot = NextConsensusSlot::new(0);
+        assert!(boot_slot.is_boot());
+
+        // LastExternalizedLedger
+        let ledger = LastExternalizedLedger::new(100);
+        assert_eq!(ledger.get(), 100);
+        assert_eq!(ledger.as_u32(), 100);
+        assert!(!ledger.is_boot());
+        assert_eq!(format!("{}", ledger), "100");
+
+        let boot_ledger = LastExternalizedLedger::new(0);
+        assert!(boot_ledger.is_boot());
+
+        // Ordering
+        assert!(NextConsensusSlot::new(5) > NextConsensusSlot::new(3));
+        assert!(LastExternalizedLedger::new(10) < LastExternalizedLedger::new(20));
+    }
+
+    #[test]
+    fn test_newtype_serialization() {
+        // Verify Serialize produces a bare number (not a wrapped object)
+        let slot = NextConsensusSlot::new(42);
+        let json = serde_json::to_value(slot).unwrap();
+        assert_eq!(json, serde_json::json!(42));
+
+        let ledger = LastExternalizedLedger::new(99);
+        let json = serde_json::to_value(ledger).unwrap();
+        assert_eq!(json, serde_json::json!(99));
     }
 
     #[test]
@@ -5396,7 +5505,7 @@ mod tests {
             .expand(&other_node_id, quorum_set)
             .unwrap();
 
-        let tracking = herder.tracking_slot(); // 101
+        let tracking = herder.tracking_slot().get(); // 101
 
         // Track emitted envelopes to verify SCP participation
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5424,7 +5533,7 @@ mod tests {
             "herder should record externalized slot"
         );
         assert_eq!(
-            herder.tracking_slot(),
+            herder.tracking_slot().get(),
             tracking + 1,
             "tracking slot should advance after externalization"
         );
@@ -5565,7 +5674,7 @@ mod tests {
             .expand(&other_node_id, local_qs)
             .unwrap();
 
-        let tracking = herder.tracking_slot(); // 101
+        let tracking = herder.tracking_slot().get(); // 101
 
         // Cache a tx_set in scp_driver so the fast path triggers
         let value = make_valid_value_with_cached_tx_set(&herder, &other_secret);
@@ -5656,7 +5765,7 @@ mod tests {
             .expand(&other_node_id, local_qs)
             .unwrap();
 
-        let tracking = herder.tracking_slot();
+        let tracking = herder.tracking_slot().get();
 
         // Cache a tx_set
         let value = make_valid_value_with_cached_tx_set(&herder, &other_secret);
@@ -6465,7 +6574,7 @@ mod tests {
             .scp_driver
             .store_quorum_set(&other_node_id, quorum_set);
 
-        let tracking = herder.tracking_slot(); // 101
+        let tracking = herder.tracking_slot().get(); // 101
 
         // Step 1: Send an unsolicited tx set (not tracked by the tracker).
         let tx_set = TransactionSet::new(Hash256::from_bytes([0xEE; 32]), Vec::new());
@@ -9361,7 +9470,7 @@ mod quorum_health_tests {
     #[test]
     fn test_quorum_health_returns_none_when_not_tracking() {
         let herder = Herder::new(HerderConfig::default(), make_default_lm());
-        assert_eq!(herder.tracking_slot(), 0);
+        assert_eq!(herder.tracking_slot().get(), 0);
         assert!(herder.quorum_health().is_none());
     }
 
@@ -10504,7 +10613,7 @@ mod previous_value_tests {
             "slot 101 must be externalized by SCP"
         );
         assert_eq!(
-            herder.tracking_slot(),
+            herder.tracking_slot().get(),
             102,
             "tracking must advance to 102 after externalizing 101"
         );
@@ -10536,7 +10645,7 @@ mod previous_value_tests {
 
         // -- Verify tracking state did NOT regress ----------------------------
         assert_eq!(
-            herder.tracking_slot(),
+            herder.tracking_slot().get(),
             102,
             "tracking must NOT regress after retrograde externalization"
         );
@@ -10617,7 +10726,7 @@ mod required_lm_behavioral_tests {
 
         assert_eq!(herder.state(), HerderState::Tracking);
         // tracking_slot = ledger_seq + 1
-        assert_eq!(herder.tracking_slot(), 43);
+        assert_eq!(herder.tracking_slot().get(), 43);
         // consensus_close_time should match the LM header's close_time (500)
         let ts = herder.tracking_state.read();
         assert_eq!(ts.consensus_close_time, 500);

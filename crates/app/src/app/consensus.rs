@@ -112,7 +112,7 @@ impl App {
             return;
         }
 
-        let tracking_slot = self.herder.tracking_slot();
+        let tracking_slot = self.herder.tracking_slot().get();
 
         // Check if we should start a new round
         if self.herder.is_tracking() {
@@ -1089,7 +1089,7 @@ impl App {
             return;
         }
         let current_ledger = self.current_ledger_seq() as u64;
-        let slot = self.herder.tracking_slot().max(current_ledger + 1);
+        let slot = self.herder.tracking_slot().get().max(current_ledger + 1);
         let now = self.clock.now();
 
         // Phase 1: decide which timeouts fired, clear them, drop guard.

@@ -133,7 +133,7 @@ impl SyncRecoveryCallback for App {
     fn get_v_blocking_slots(&self) -> Vec<henyey_scp::SlotIndex> {
         // Return slots where we've received v-blocking messages
         // For now, return the tracking slot range
-        let tracking = self.herder.tracking_slot();
+        let tracking = self.herder.tracking_slot().get();
         if tracking > 0 {
             vec![tracking]
         } else {

@@ -2344,7 +2344,7 @@ impl App {
                         target: "henyey::envelope_path",
                         ledger_seq = result.ledger_seq,
                         latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0),
-                        tracking_slot = self.herder.tracking_slot(),
+                        tracking_slot = self.herder.tracking_slot().get(),
                         last_processed_slot = last_processed_slot_snapshot,
                         herder_state = ?herder_state_snapshot,
                         "{} catchup complete",

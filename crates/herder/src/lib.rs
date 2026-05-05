@@ -146,8 +146,8 @@ pub mod upgrades;
 pub use error::HerderError;
 pub use fetching_envelopes::{FetchingConfig, FetchingEnvelopes, FetchingStats, RecvResult};
 pub use herder::{
-    EnvelopeState, Herder, HerderConfig, HerderStats, LedgerCloseInfo, TimeoutOutcome,
-    TriggerOutcome,
+    EnvelopeState, Herder, HerderConfig, HerderStats, LastExternalizedLedger, LedgerCloseInfo,
+    NextConsensusSlot, TimeoutOutcome, TriggerOutcome,
 };
 pub use metrics::{ScpMetrics, ScpMetricsSnapshot};
 pub use pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
@@ -362,6 +362,6 @@ mod tests {
 
         herder.bootstrap(100);
         assert_eq!(herder.state(), HerderState::Tracking);
-        assert_eq!(herder.tracking_slot(), 101);
+        assert_eq!(herder.tracking_slot().get(), 101);
     }
 }

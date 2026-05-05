@@ -59,7 +59,7 @@ assert_eq!(herder.state(), HerderState::Syncing);
 
 herder.bootstrap(1024);
 assert_eq!(herder.state(), HerderState::Tracking);
-assert_eq!(herder.tracking_slot(), 1025);
+assert_eq!(herder.tracking_slot().get(), 1025);
 ```
 
 ```rust,ignore

@@ -1044,7 +1044,7 @@ impl App {
                 // Heartbeat for debugging
                 _ = heartbeat_interval.tick() => {
                     self.set_phase(16); // 16 = heartbeat
-                    let tracking_slot = self.herder.tracking_slot();
+                    let tracking_slot = self.herder.tracking_slot().get();
                     let ledger = self.current_ledger_seq();
                     let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
                     let peers = self.overlay().await.map(|o| o.peer_count()).unwrap_or(0);
@@ -1620,7 +1620,7 @@ impl App {
 
         tracing::debug!(
             state = ?stats.state,
-            tracking_slot = stats.tracking_slot,
+            tracking_slot = stats.tracking_slot.get(),
             pending_txs = stats.pending_transactions,
             ledger,
             peers = peer_count,
@@ -2079,7 +2079,7 @@ impl App {
         self.scp_scheduled.complete(&ve.intake.envelope);
 
         let slot = ve.intake.slot;
-        let tracking = self.herder.tracking_slot();
+        let tracking = self.herder.tracking_slot().get();
         let is_externalize = ve.intake.is_externalize;
         // Extract the FloodGate message hash (if set by pump_scp_intake) before
         // the VerifiedEnvelope is consumed by herder.process_verified().

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use henyey_common::Hash256;
-use henyey_herder::{AccountProvider, FeeBalanceProvider, Herder};
+use henyey_herder::{AccountProvider, FeeBalanceProvider, Herder, NextConsensusSlot};
 use henyey_ledger::{HeaderSnapshot, LedgerManager};
 use henyey_overlay::{PeerId, ScpQueueCallback};
 use stellar_xdr::curr::{Hash, LedgerUpgrade, ReadXdr, TopologyResponseBodyV2, UpgradeType};
@@ -163,7 +163,7 @@ pub struct SimulationDebugStats {
     pub app_state: String,
     pub herder_state: String,
     pub current_ledger: u32,
-    pub tracking_slot: u64,
+    pub tracking_slot: NextConsensusSlot,
     pub latest_externalized_slot: Option<u64>,
     pub peer_count: usize,
     pub pending_envelopes: usize,

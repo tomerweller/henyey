@@ -217,8 +217,7 @@ impl App {
             .map(|snapshot| snapshot.info.peer_id.clone())
             .collect();
         let peer_set: HashSet<_> = peer_ids.iter().cloned().collect();
-        let ledger_seq = u32::try_from(self.herder.tracking_consensus_ledger_index())
-            .expect("ledger index exceeds u32::MAX");
+        let ledger_seq = self.herder.tracking_consensus_ledger_index().as_u32();
 
         // XDR vector chunk size — cap at 1000 per the protocol limit.
         let max_chunk_size = self.max_advert_size().min(1000);
@@ -636,8 +635,7 @@ impl App {
             count = advert.tx_hashes.0.len(),
             "Received FloodAdvert"
         );
-        let ledger_seq = u32::try_from(self.herder.tracking_consensus_ledger_index())
-            .expect("ledger index exceeds u32::MAX");
+        let ledger_seq = self.herder.tracking_consensus_ledger_index().as_u32();
         let max_ops = self.max_advert_queue_size();
         let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
         let entry = adverts_by_peer
@@ -2075,12 +2073,12 @@ mod tests {
         //   tracking_consensus_ledger_index() = 5 (last externalized)
         app.herder.bootstrap(5);
         assert_eq!(
-            app.herder.tracking_slot(),
+            app.herder.tracking_slot().get(),
             6,
             "precondition: tracking_slot should be 6"
         );
         assert_eq!(
-            app.herder.tracking_consensus_ledger_index(),
+            app.herder.tracking_consensus_ledger_index().get(),
             5,
             "precondition: tracking_consensus_ledger_index should be 5"
         );
