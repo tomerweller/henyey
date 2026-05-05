@@ -131,16 +131,15 @@ impl App {
             match app.publish_single_checkpoint(checkpoint, &command_archives) {
                 Ok(()) => {
                     let elapsed = publish_started.elapsed();
-                    metrics::counter!(crate::metrics::HISTORY_PUBLISH_SUCCESS_TOTAL).increment(1);
-                    metrics::histogram!(crate::metrics::HISTORY_PUBLISH_TIME_SECONDS)
-                        .record(elapsed.as_secs_f64());
+                    crate::metrics::HISTORY_PUBLISH_SUCCESS_TOTAL.increment(1);
+                    crate::metrics::HISTORY_PUBLISH_TIME_SECONDS.record(elapsed.as_secs_f64());
                     if let Err(e) = app.db.remove_publish(checkpoint) {
                         tracing::warn!(checkpoint, error = %e, "Failed to dequeue published checkpoint");
                     }
                     tracing::info!(checkpoint, "Checkpoint published successfully");
                 }
                 Err(e) => {
-                    metrics::counter!(crate::metrics::HISTORY_PUBLISH_FAILURE_TOTAL).increment(1);
+                    crate::metrics::HISTORY_PUBLISH_FAILURE_TOTAL.increment(1);
                     tracing::warn!(checkpoint, error = %e, "Failed to publish checkpoint");
                 }
             }

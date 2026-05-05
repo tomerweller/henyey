@@ -21,6 +21,144 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 use crate::http::ServerState;
 
+// ── Typed metric wrappers ──────────────────────────────────────────────
+//
+// These newtypes make it a compile-time error to emit a counter metric
+// through a gauge API or vice versa. Each wrapper exposes only the methods
+// appropriate for its Prometheus type.
+
+/// A gauge metric — supports `set`, `increment`, `decrement`.
+#[derive(Clone, Copy, Debug)]
+pub struct GaugeMetric(pub &'static str);
+
+/// A counter metric — supports `absolute` and `increment`.
+#[derive(Clone, Copy, Debug)]
+pub struct CounterMetric(pub &'static str);
+
+/// A histogram metric — supports `record`.
+#[derive(Clone, Copy, Debug)]
+pub struct HistogramMetric(pub &'static str);
+
+/// A labeled counter metric with a fixed label key.
+/// Supports `absolute(label_value, n)` and `increment(label_value, n)`.
+#[derive(Clone, Copy, Debug)]
+pub struct LabeledCounterMetric {
+    pub name: &'static str,
+    pub key: &'static str,
+}
+
+impl GaugeMetric {
+    pub fn set(&self, value: f64) {
+        gauge!(self.0).set(value);
+    }
+    pub fn increment(&self, value: f64) {
+        gauge!(self.0).increment(value);
+    }
+    pub fn decrement(&self, value: f64) {
+        gauge!(self.0).decrement(value);
+    }
+    pub const fn name(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl CounterMetric {
+    pub fn absolute(&self, value: u64) {
+        counter!(self.0).absolute(value);
+    }
+    pub fn increment(&self, value: u64) {
+        counter!(self.0).increment(value);
+    }
+    pub const fn name(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl HistogramMetric {
+    pub fn record(&self, value: f64) {
+        metrics::histogram!(self.0).record(value);
+    }
+    pub const fn name(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl LabeledCounterMetric {
+    pub fn absolute(&self, label_value: &str, value: u64) {
+        counter!(self.name, self.key => label_value.to_owned()).absolute(value);
+    }
+    pub fn increment(&self, label_value: &str, value: u64) {
+        counter!(self.name, self.key => label_value.to_owned()).increment(value);
+    }
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+// Trait impls for ergonomic string access.
+impl AsRef<str> for GaugeMetric {
+    fn as_ref(&self) -> &str {
+        self.0
+    }
+}
+impl AsRef<str> for CounterMetric {
+    fn as_ref(&self) -> &str {
+        self.0
+    }
+}
+impl AsRef<str> for HistogramMetric {
+    fn as_ref(&self) -> &str {
+        self.0
+    }
+}
+impl AsRef<str> for LabeledCounterMetric {
+    fn as_ref(&self) -> &str {
+        self.name
+    }
+}
+
+impl PartialEq<&str> for GaugeMetric {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+impl PartialEq<&str> for CounterMetric {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+impl PartialEq<&str> for HistogramMetric {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+impl PartialEq<&str> for LabeledCounterMetric {
+    fn eq(&self, other: &&str) -> bool {
+        self.name == *other
+    }
+}
+
+impl std::fmt::Display for GaugeMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::fmt::Display for CounterMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::fmt::Display for HistogramMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::fmt::Display for LabeledCounterMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name)
+    }
+}
+
 // ── Declarative metric catalog ─────────────────────────────────────────
 //
 // The `metric_catalog!` macro accepts metrics grouped by kind. Each entry
@@ -61,27 +199,27 @@ macro_rules! metric_catalog {
             $( $h_name:ident = $h_prom:expr => $h_help:expr ; )*
         }
     ) => {
-        // ── 1. Public constants ────────────────────────────────────────
-        $( pub const $g_name: &str = $g_prom; )*
-        $( pub const $gnp_name: &str = $gnp_prom; )*
-        $( pub const $c_name: &str = $c_prom; )*
-        $( pub const $cnp_name: &str = $cnp_prom; )*
-        $( pub const $lce_name: &str = $lce_prom; )*
-        $( pub const $lcl_name: &str = $lcl_prom; )*
-        $( pub const $h_name: &str = $h_prom; )*
+        // ── 1. Public typed constants ──────────────────────────────────
+        $( pub const $g_name: GaugeMetric = GaugeMetric($g_prom); )*
+        $( pub const $gnp_name: GaugeMetric = GaugeMetric($gnp_prom); )*
+        $( pub const $c_name: CounterMetric = CounterMetric($c_prom); )*
+        $( pub const $cnp_name: CounterMetric = CounterMetric($cnp_prom); )*
+        $( pub const $lce_name: LabeledCounterMetric = LabeledCounterMetric { name: $lce_prom, key: $lce_key }; )*
+        $( pub const $lcl_name: LabeledCounterMetric = LabeledCounterMetric { name: $lcl_prom, key: $lcl_key }; )*
+        $( pub const $h_name: HistogramMetric = HistogramMetric($h_prom); )*
 
         // ── 2. describe_metrics() ──────────────────────────────────────
         /// Register HELP/TYPE annotations for all metrics.
         ///
         /// Must be called **after** the global recorder is installed.
         pub fn describe_metrics() {
-            $( describe_gauge!($g_name, $g_help); )*
-            $( describe_gauge!($gnp_name, $gnp_help); )*
-            $( describe_counter!($c_name, $c_help); )*
-            $( describe_counter!($cnp_name, $cnp_help); )*
-            $( describe_counter!($lce_name, $lce_help); )*
-            $( describe_counter!($lcl_name, $lcl_help); )*
-            $( describe_histogram!($h_name, $h_help); )*
+            $( describe_gauge!($g_prom, $g_help); )*
+            $( describe_gauge!($gnp_prom, $gnp_help); )*
+            $( describe_counter!($c_prom, $c_help); )*
+            $( describe_counter!($cnp_prom, $cnp_help); )*
+            $( describe_counter!($lce_prom, $lce_help); )*
+            $( describe_counter!($lcl_prom, $lcl_help); )*
+            $( describe_histogram!($h_prom, $h_help); )*
         }
 
         // ── 3. register_label_series() ─────────────────────────────────
@@ -91,18 +229,18 @@ macro_rules! metric_catalog {
         /// Must be called **after** [`describe_metrics`].
         pub fn register_label_series() {
             // Gauges — zero-init.
-            $( gauge!($g_name).set(0.0); )*
+            $( gauge!($g_prom).set(0.0); )*
             // gauges_no_prereg: intentionally skipped.
             // Counters — zero-init.
-            $( counter!($c_name).absolute(0); )*
+            $( counter!($c_prom).absolute(0); )*
             // counters_no_prereg: intentionally skipped.
             // Labeled counters (enum-backed) — iterate ALL variants.
             $( for v in <$lce_enum>::ALL {
-                counter!($lce_name, $lce_key => v.label()).absolute(0);
+                counter!($lce_prom, $lce_key => v.label()).absolute(0);
             } )*
             // Labeled counters (literal-backed).
             $( for v in &[ $( $lcl_val ),+ ] {
-                counter!($lcl_name, $lcl_key => *v).absolute(0);
+                counter!($lcl_prom, $lcl_key => *v).absolute(0);
             } )*
             // Histograms: never pre-registered.
         }
@@ -609,7 +747,8 @@ metric_catalog! {
     labeled_counters_literal {
         RECOVERY_STALLED_TICK_TOTAL = "henyey_recovery_stalled_tick_total"
             => "Recovery stalled ticks by reason",
-            "reason", ["backoff_active", "forcing_catchup_not_behind", "forcing_catchup_behind"];
+            "reason", ["backoff_active", "forcing_catchup_not_behind", "forcing_catchup_behind",
+                       "at_tip_no_scp_hard_reset", "archive_behind_peer_ahead_hard_reset"];
     }
 
     histograms {
@@ -734,51 +873,51 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     let snap = state.app.metrics_snapshot();
 
     // Stellar-compatible gauges.
-    gauge!(LEDGER_SEQUENCE).set(ledger_seq as f64);
-    gauge!(PEER_COUNT).set(peer_count as f64);
-    gauge!(PENDING_TRANSACTIONS).set(pending_txs as f64);
-    gauge!(UPTIME_SECONDS).set(uptime as f64);
-    gauge!(IS_VALIDATOR).set(if snap.is_validator { 1.0 } else { 0.0 });
+    LEDGER_SEQUENCE.set(ledger_seq as f64);
+    PEER_COUNT.set(peer_count as f64);
+    PENDING_TRANSACTIONS.set(pending_txs as f64);
+    UPTIME_SECONDS.set(uptime as f64);
+    IS_VALIDATOR.set(if snap.is_validator { 1.0 } else { 0.0 });
 
     // Stage B: Memory queued ledgers.
-    gauge!(LEDGER_MEMORY_QUEUED_LEDGERS).set(queued_ledgers as f64);
+    LEDGER_MEMORY_QUEUED_LEDGERS.set(queued_ledgers as f64);
 
     // Meta stream counters — only set when active (matching current conditional behavior).
     if snap.meta_stream_bytes_total > 0 || snap.meta_stream_writes_total > 0 {
-        counter!(META_STREAM_BYTES_TOTAL).absolute(snap.meta_stream_bytes_total);
-        counter!(META_STREAM_WRITES_TOTAL).absolute(snap.meta_stream_writes_total);
+        META_STREAM_BYTES_TOTAL.absolute(snap.meta_stream_bytes_total);
+        META_STREAM_WRITES_TOTAL.absolute(snap.meta_stream_writes_total);
     }
 
     // SCP verify pipeline — absolute counters.
     let sv = &snap.scp_verify;
     for (reason, &count) in sv.prefilter_counters.iter() {
-        counter!(SCP_PREFILTER_REJECTS_TOTAL, "reason" => reason.label()).absolute(count);
+        SCP_PREFILTER_REJECTS_TOTAL.absolute(reason.label(), count);
     }
-    counter!(SCP_POST_VERIFY_DROPS_TOTAL).absolute(sv.post_verify_drops);
+    SCP_POST_VERIFY_DROPS_TOTAL.absolute(sv.post_verify_drops);
     for (reason, &count) in sv.pv_counters.iter() {
-        counter!(SCP_POST_VERIFY_TOTAL, "reason" => reason.label()).absolute(count);
+        SCP_POST_VERIFY_TOTAL.absolute(reason.label(), count);
     }
 
     // SCP verify pipeline — gauges.
-    gauge!(SCP_VERIFY_INPUT_BACKLOG).set(sv.verify_input_backlog as f64);
-    gauge!(SCP_VERIFY_OUTPUT_BACKLOG).set(sv.verify_output_backlog as f64);
-    gauge!(SCP_VERIFIER_THREAD_STATE).set(sv.verifier_thread_state as f64);
-    gauge!(SCP_VERIFY_LATENCY_US_SUM).set(sv.verify_latency_us_sum as f64);
-    gauge!(SCP_VERIFY_LATENCY_US_COUNT).set(sv.verify_latency_count as f64);
-    counter!(SCP_SCHEDULED_DEDUP_TOTAL).absolute(sv.scheduled_dedup_count);
+    SCP_VERIFY_INPUT_BACKLOG.set(sv.verify_input_backlog as f64);
+    SCP_VERIFY_OUTPUT_BACKLOG.set(sv.verify_output_backlog as f64);
+    SCP_VERIFIER_THREAD_STATE.set(sv.verifier_thread_state as f64);
+    SCP_VERIFY_LATENCY_US_SUM.set(sv.verify_latency_us_sum as f64);
+    SCP_VERIFY_LATENCY_US_COUNT.set(sv.verify_latency_count as f64);
+    SCP_SCHEDULED_DEDUP_TOTAL.absolute(sv.scheduled_dedup_count);
 
     // Overlay fetch channel.
-    gauge!(OVERLAY_FETCH_CHANNEL_DEPTH).set(snap.overlay_fetch_channel.depth as f64);
-    gauge!(OVERLAY_FETCH_CHANNEL_DEPTH_MAX).set(snap.overlay_fetch_channel.depth_max as f64);
+    OVERLAY_FETCH_CHANNEL_DEPTH.set(snap.overlay_fetch_channel.depth as f64);
+    OVERLAY_FETCH_CHANNEL_DEPTH_MAX.set(snap.overlay_fetch_channel.depth_max as f64);
 
     // Catchup.
-    counter!(POST_CATCHUP_HARD_RESET_TOTAL).absolute(snap.post_catchup_hard_reset_total);
+    POST_CATCHUP_HARD_RESET_TOTAL.absolute(snap.post_catchup_hard_reset_total);
 
     // SCP/herder counters.
     let (scp_sent, scp_received) = state.app.scp_envelope_counters();
-    counter!(SCP_ENVELOPE_EMIT_TOTAL).absolute(scp_sent);
-    counter!(SCP_ENVELOPE_RECEIVE_TOTAL).absolute(scp_received);
-    counter!(HERDER_LOST_SYNC_TOTAL).absolute(state.app.lost_sync_count());
+    SCP_ENVELOPE_EMIT_TOTAL.absolute(scp_sent);
+    SCP_ENVELOPE_RECEIVE_TOTAL.absolute(scp_received);
+    HERDER_LOST_SYNC_TOTAL.absolute(state.app.lost_sync_count());
 
     let herder = state.app.herder_stats();
     let herder_state_val = match herder.state {
@@ -786,141 +925,140 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         henyey_herder::HerderState::Syncing => 1.0,
         henyey_herder::HerderState::Tracking => 2.0,
     };
-    gauge!(HERDER_STATE).set(herder_state_val);
-    gauge!(HERDER_PENDING_ENVELOPES).set(herder.pending_envelopes as f64);
-    gauge!(HERDER_CACHED_TX_SETS).set(herder.cached_tx_sets as f64);
+    HERDER_STATE.set(herder_state_val);
+    HERDER_PENDING_ENVELOPES.set(herder.pending_envelopes as f64);
+    HERDER_CACHED_TX_SETS.set(herder.cached_tx_sets as f64);
 
     let pstats = &herder.pending_envelope_stats;
-    counter!(HERDER_PENDING_RECEIVED_TOTAL).absolute(pstats.received);
-    counter!(HERDER_PENDING_DUPLICATES_TOTAL).absolute(pstats.duplicates);
-    counter!(HERDER_PENDING_TOO_OLD_TOTAL).absolute(pstats.too_old);
-    counter!(HERDER_PENDING_EVICTED_TOTAL).absolute(pstats.evicted);
+    HERDER_PENDING_RECEIVED_TOTAL.absolute(pstats.received);
+    HERDER_PENDING_DUPLICATES_TOTAL.absolute(pstats.duplicates);
+    HERDER_PENDING_TOO_OLD_TOTAL.absolute(pstats.too_old);
+    HERDER_PENDING_EVICTED_TOTAL.absolute(pstats.evicted);
 
     // Bucket merge counters.
     let mc = state.app.merge_counters_snapshot();
-    counter!(BUCKET_MERGE_COMPLETED_TOTAL).absolute(mc.merges_completed);
-    counter!(BUCKET_MERGE_TIME_US_TOTAL).absolute(mc.merge_time_us);
-    counter!(BUCKET_MERGE_NEW_LIVE_TOTAL).absolute(mc.new_live_entries);
-    counter!(BUCKET_MERGE_NEW_DEAD_TOTAL).absolute(mc.new_dead_entries);
-    counter!(BUCKET_MERGE_NEW_INIT_TOTAL).absolute(mc.new_init_entries);
-    counter!(BUCKET_MERGE_NEW_META_TOTAL).absolute(mc.new_meta_entries);
-    counter!(BUCKET_MERGE_SHADOWED_TOTAL).absolute(mc.old_entries_shadowed);
-    counter!(BUCKET_MERGE_ANNIHILATED_TOTAL).absolute(mc.entries_annihilated);
+    BUCKET_MERGE_COMPLETED_TOTAL.absolute(mc.merges_completed);
+    BUCKET_MERGE_TIME_US_TOTAL.absolute(mc.merge_time_us);
+    BUCKET_MERGE_NEW_LIVE_TOTAL.absolute(mc.new_live_entries);
+    BUCKET_MERGE_NEW_DEAD_TOTAL.absolute(mc.new_dead_entries);
+    BUCKET_MERGE_NEW_INIT_TOTAL.absolute(mc.new_init_entries);
+    BUCKET_MERGE_NEW_META_TOTAL.absolute(mc.new_meta_entries);
+    BUCKET_MERGE_SHADOWED_TOTAL.absolute(mc.old_entries_shadowed);
+    BUCKET_MERGE_ANNIHILATED_TOTAL.absolute(mc.entries_annihilated);
 
     // Overlay counters (if overlay is running).
     if let Some(ov) = state.app.overlay_metrics_snapshot().await {
-        counter!(OVERLAY_MESSAGE_READ_TOTAL).absolute(ov.messages_read);
-        counter!(OVERLAY_MESSAGE_WRITE_TOTAL).absolute(ov.messages_written);
-        counter!(OVERLAY_MESSAGE_BROADCAST_TOTAL).absolute(ov.messages_broadcast);
-        counter!(OVERLAY_ERROR_READ_TOTAL).absolute(ov.errors_read);
-        counter!(OVERLAY_ERROR_WRITE_TOTAL).absolute(ov.errors_write);
-        counter!(OVERLAY_TIMEOUT_IDLE_TOTAL).absolute(ov.timeouts_idle);
-        counter!(OVERLAY_TIMEOUT_STRAGGLER_TOTAL).absolute(ov.timeouts_straggler);
+        OVERLAY_MESSAGE_READ_TOTAL.absolute(ov.messages_read);
+        OVERLAY_MESSAGE_WRITE_TOTAL.absolute(ov.messages_written);
+        OVERLAY_MESSAGE_BROADCAST_TOTAL.absolute(ov.messages_broadcast);
+        OVERLAY_ERROR_READ_TOTAL.absolute(ov.errors_read);
+        OVERLAY_ERROR_WRITE_TOTAL.absolute(ov.errors_write);
+        OVERLAY_TIMEOUT_IDLE_TOTAL.absolute(ov.timeouts_idle);
+        OVERLAY_TIMEOUT_STRAGGLER_TOTAL.absolute(ov.timeouts_straggler);
 
         // Stage F.1: byte / async I/O counters (issue #2236).
-        counter!(OVERLAY_BYTE_READ_TOTAL).absolute(ov.bytes_read);
-        counter!(OVERLAY_BYTE_WRITE_TOTAL).absolute(ov.bytes_written);
-        counter!(OVERLAY_ASYNC_READ_TOTAL).absolute(ov.async_read);
-        counter!(OVERLAY_ASYNC_WRITE_TOTAL).absolute(ov.async_write);
+        OVERLAY_BYTE_READ_TOTAL.absolute(ov.bytes_read);
+        OVERLAY_BYTE_WRITE_TOTAL.absolute(ov.bytes_written);
+        OVERLAY_ASYNC_READ_TOTAL.absolute(ov.async_read);
+        OVERLAY_ASYNC_WRITE_TOTAL.absolute(ov.async_write);
 
         // Stage F.1: connection lifecycle counters (issue #2236).
-        counter!(OVERLAY_INBOUND_ATTEMPT_TOTAL).absolute(ov.inbound_attempt);
-        counter!(OVERLAY_INBOUND_ESTABLISH_TOTAL).absolute(ov.inbound_establish);
-        counter!(OVERLAY_INBOUND_DROP_TOTAL).absolute(ov.inbound_drop);
-        counter!(OVERLAY_INBOUND_REJECT_TOTAL).absolute(ov.inbound_reject);
-        counter!(OVERLAY_OUTBOUND_ATTEMPT_TOTAL).absolute(ov.outbound_attempt);
-        counter!(OVERLAY_OUTBOUND_ESTABLISH_TOTAL).absolute(ov.outbound_establish);
-        counter!(OVERLAY_OUTBOUND_DROP_TOTAL).absolute(ov.outbound_drop);
-        counter!(OVERLAY_OUTBOUND_REJECT_TOTAL).absolute(ov.outbound_reject);
+        OVERLAY_INBOUND_ATTEMPT_TOTAL.absolute(ov.inbound_attempt);
+        OVERLAY_INBOUND_ESTABLISH_TOTAL.absolute(ov.inbound_establish);
+        OVERLAY_INBOUND_DROP_TOTAL.absolute(ov.inbound_drop);
+        OVERLAY_INBOUND_REJECT_TOTAL.absolute(ov.inbound_reject);
+        OVERLAY_OUTBOUND_ATTEMPT_TOTAL.absolute(ov.outbound_attempt);
+        OVERLAY_OUTBOUND_ESTABLISH_TOTAL.absolute(ov.outbound_establish);
+        OVERLAY_OUTBOUND_DROP_TOTAL.absolute(ov.outbound_drop);
+        OVERLAY_OUTBOUND_REJECT_TOTAL.absolute(ov.outbound_reject);
 
         // Stage F.2: flood / fetch / item-fetcher counters (issue #2244).
-        counter!(OVERLAY_FLOOD_BROADCAST_TOTAL).absolute(ov.flood_broadcast);
-        counter!(OVERLAY_FLOOD_DUPLICATE_RECV_TOTAL).absolute(ov.flood_duplicate_recv);
-        counter!(OVERLAY_FLOOD_UNIQUE_RECV_TOTAL).absolute(ov.flood_unique_recv);
-        counter!(OVERLAY_FETCH_DUPLICATE_RECV_TOTAL).absolute(ov.fetch_duplicate_recv);
-        counter!(OVERLAY_FETCH_UNIQUE_RECV_TOTAL).absolute(ov.fetch_unique_recv);
-        counter!(OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL).absolute(ov.item_fetcher_next_peer);
-        gauge!(OVERLAY_MEMORY_FLOOD_KNOWN).set(ov.flood_known_count as f64);
+        OVERLAY_FLOOD_BROADCAST_TOTAL.absolute(ov.flood_broadcast);
+        OVERLAY_FLOOD_DUPLICATE_RECV_TOTAL.absolute(ov.flood_duplicate_recv);
+        OVERLAY_FLOOD_UNIQUE_RECV_TOTAL.absolute(ov.flood_unique_recv);
+        OVERLAY_FETCH_DUPLICATE_RECV_TOTAL.absolute(ov.fetch_duplicate_recv);
+        OVERLAY_FETCH_UNIQUE_RECV_TOTAL.absolute(ov.fetch_unique_recv);
+        OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL.absolute(ov.item_fetcher_next_peer);
+        OVERLAY_MEMORY_FLOOD_KNOWN.set(ov.flood_known_count as f64);
 
         // Stage F.3: per-message-type send counter (issue #2245).
         for kind in henyey_overlay::OverlayMessageKind::ALL {
-            counter!(OVERLAY_SEND_TOTAL, "type" => kind.label())
-                .absolute(ov.send_by_type[kind as usize]);
+            OVERLAY_SEND_TOTAL.absolute(kind.label(), ov.send_by_type[kind as usize]);
         }
     } else {
         // Ensure gauge is zeroed if overlay stops.
-        gauge!(OVERLAY_MEMORY_FLOOD_KNOWN).set(0.0);
+        OVERLAY_MEMORY_FLOOD_KNOWN.set(0.0);
     }
 
     // Ledger close stats (Phase 2).
     let lcs = state.app.last_close_stats();
-    gauge!(LEDGER_TX_COUNT).set(lcs.tx_count as f64);
-    gauge!(LEDGER_OP_COUNT).set(lcs.op_count as f64);
-    gauge!(LEDGER_TX_SUCCESS_COUNT).set(lcs.tx_success_count as f64);
-    gauge!(LEDGER_TX_FAILED_COUNT).set(lcs.tx_failed_count as f64);
-    gauge!(LEDGER_TOTAL_FEES).set(lcs.total_fees as f64);
-    gauge!(LEDGER_ENTRIES_CREATED).set(lcs.entries_created as f64);
-    gauge!(LEDGER_ENTRIES_UPDATED).set(lcs.entries_updated as f64);
-    gauge!(LEDGER_ENTRIES_DELETED).set(lcs.entries_deleted as f64);
+    LEDGER_TX_COUNT.set(lcs.tx_count as f64);
+    LEDGER_OP_COUNT.set(lcs.op_count as f64);
+    LEDGER_TX_SUCCESS_COUNT.set(lcs.tx_success_count as f64);
+    LEDGER_TX_FAILED_COUNT.set(lcs.tx_failed_count as f64);
+    LEDGER_TOTAL_FEES.set(lcs.total_fees as f64);
+    LEDGER_ENTRIES_CREATED.set(lcs.entries_created as f64);
+    LEDGER_ENTRIES_UPDATED.set(lcs.entries_updated as f64);
+    LEDGER_ENTRIES_DELETED.set(lcs.entries_deleted as f64);
 
     // Ledger apply timing (Phase 2).
     if let Some(perf) = state.app.last_close_perf() {
-        gauge!(LEDGER_APPLY_US).set(perf.total_us as f64);
+        LEDGER_APPLY_US.set(perf.total_us as f64);
     }
 
     // Herder tx queue stats (Phase 2).
     let tq = &herder.tx_queue_stats;
-    gauge!(HERDER_TX_QUEUE_ACCOUNTS).set(tq.account_count as f64);
-    gauge!(HERDER_TX_QUEUE_BANNED).set(tq.banned_count as f64);
-    gauge!(HERDER_TX_QUEUE_SEEN).set(tq.seen_count as f64);
-    counter!(HERDER_ARB_TX_SEEN).absolute(tq.arb_tx_seen);
-    counter!(HERDER_ARB_TX_DROPPED).absolute(tq.arb_tx_dropped);
+    HERDER_TX_QUEUE_ACCOUNTS.set(tq.account_count as f64);
+    HERDER_TX_QUEUE_BANNED.set(tq.banned_count as f64);
+    HERDER_TX_QUEUE_SEEN.set(tq.seen_count as f64);
+    HERDER_ARB_TX_SEEN.absolute(tq.arb_tx_seen);
+    HERDER_ARB_TX_DROPPED.absolute(tq.arb_tx_dropped);
 
     // Herder pending-tx age gauges (Stage D).
-    gauge!(HERDER_PENDING_TXS_AGE0).set(tq.pending_txs_age[0] as f64);
-    gauge!(HERDER_PENDING_TXS_AGE1).set(tq.pending_txs_age[1] as f64);
-    gauge!(HERDER_PENDING_TXS_AGE2).set(tq.pending_txs_age[2] as f64);
-    gauge!(HERDER_PENDING_TXS_AGE3).set(tq.pending_txs_age[3] as f64);
+    HERDER_PENDING_TXS_AGE0.set(tq.pending_txs_age[0] as f64);
+    HERDER_PENDING_TXS_AGE1.set(tq.pending_txs_age[1] as f64);
+    HERDER_PENDING_TXS_AGE2.set(tq.pending_txs_age[2] as f64);
+    HERDER_PENDING_TXS_AGE3.set(tq.pending_txs_age[3] as f64);
 
     // Herder pending envelope stats — added + released (Phase 2).
-    counter!(HERDER_PENDING_ADDED_TOTAL).absolute(pstats.added);
-    counter!(HERDER_PENDING_RELEASED_TOTAL).absolute(pstats.released);
+    HERDER_PENDING_ADDED_TOTAL.absolute(pstats.added);
+    HERDER_PENDING_RELEASED_TOTAL.absolute(pstats.released);
 
     // Clock drift (Phase 2) — always write, zeros when no completed window.
     if let Some(ds) = state.app.drift_stats() {
-        gauge!(DRIFT_MIN_SECONDS).set(ds.min as f64);
-        gauge!(DRIFT_MAX_SECONDS).set(ds.max as f64);
-        gauge!(DRIFT_MEDIAN_SECONDS).set(ds.median as f64);
-        gauge!(DRIFT_P75_SECONDS).set(ds.p75 as f64);
-        gauge!(DRIFT_SAMPLE_COUNT).set(ds.sample_count as f64);
+        DRIFT_MIN_SECONDS.set(ds.min as f64);
+        DRIFT_MAX_SECONDS.set(ds.max as f64);
+        DRIFT_MEDIAN_SECONDS.set(ds.median as f64);
+        DRIFT_P75_SECONDS.set(ds.p75 as f64);
+        DRIFT_SAMPLE_COUNT.set(ds.sample_count as f64);
     } else {
-        gauge!(DRIFT_MIN_SECONDS).set(0.0);
-        gauge!(DRIFT_MAX_SECONDS).set(0.0);
-        gauge!(DRIFT_MEDIAN_SECONDS).set(0.0);
-        gauge!(DRIFT_P75_SECONDS).set(0.0);
-        gauge!(DRIFT_SAMPLE_COUNT).set(0.0);
+        DRIFT_MIN_SECONDS.set(0.0);
+        DRIFT_MAX_SECONDS.set(0.0);
+        DRIFT_MEDIAN_SECONDS.set(0.0);
+        DRIFT_P75_SECONDS.set(0.0);
+        DRIFT_SAMPLE_COUNT.set(0.0);
     }
 
     // jemalloc allocator stats — always available, zeros when jemalloc is not enabled.
     let alloc = henyey_ledger::memory_report::AllocatorStats::capture();
-    gauge!(JEMALLOC_ALLOCATED_BYTES).set(alloc.allocated as f64);
-    gauge!(JEMALLOC_ACTIVE_BYTES).set(alloc.active as f64);
-    gauge!(JEMALLOC_RESIDENT_BYTES).set(alloc.resident as f64);
-    gauge!(JEMALLOC_MAPPED_BYTES).set(alloc.mapped as f64);
-    gauge!(JEMALLOC_RETAINED_BYTES).set(alloc.retained as f64);
+    JEMALLOC_ALLOCATED_BYTES.set(alloc.allocated as f64);
+    JEMALLOC_ACTIVE_BYTES.set(alloc.active as f64);
+    JEMALLOC_RESIDENT_BYTES.set(alloc.resident as f64);
+    JEMALLOC_MAPPED_BYTES.set(alloc.mapped as f64);
+    JEMALLOC_RETAINED_BYTES.set(alloc.retained as f64);
     if alloc.allocated > 0 {
         let frag =
             (alloc.resident as f64 - alloc.allocated as f64) / alloc.allocated as f64 * 100.0;
-        gauge!(JEMALLOC_FRAGMENTATION_PCT).set(frag);
+        JEMALLOC_FRAGMENTATION_PCT.set(frag);
     }
 
     // Phase 3: Ledger apply cumulative counters.
-    counter!(LEDGER_APPLY_SUCCESS_TOTAL).absolute(snap.cumulative_apply_success);
-    counter!(LEDGER_APPLY_FAILURE_TOTAL).absolute(snap.cumulative_apply_failure);
-    counter!(LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL).absolute(snap.cumulative_soroban_success);
-    counter!(LEDGER_APPLY_SOROBAN_FAILURE_TOTAL).absolute(snap.cumulative_soroban_failure);
-    gauge!(LEDGER_APPLY_SOROBAN_MAX_CLUSTERS).set(snap.soroban_max_cluster_count as f64);
-    gauge!(LEDGER_APPLY_SOROBAN_STAGES).set(snap.soroban_stage_count as f64);
+    LEDGER_APPLY_SUCCESS_TOTAL.absolute(snap.cumulative_apply_success);
+    LEDGER_APPLY_FAILURE_TOTAL.absolute(snap.cumulative_apply_failure);
+    LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL.absolute(snap.cumulative_soroban_success);
+    LEDGER_APPLY_SOROBAN_FAILURE_TOTAL.absolute(snap.cumulative_soroban_failure);
+    LEDGER_APPLY_SOROBAN_MAX_CLUSTERS.set(snap.soroban_max_cluster_count as f64);
+    LEDGER_APPLY_SOROBAN_STAGES.set(snap.soroban_stage_count as f64);
 
     // Phase 3: Ledger age from header close_time.
     let ledger_info = state.app.ledger_info();
@@ -930,117 +1068,112 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
             .unwrap_or_default()
             .as_secs();
         let age = now.saturating_sub(ledger_info.close_time);
-        gauge!(LEDGER_AGE_CURRENT_SECONDS).set(age as f64);
+        LEDGER_AGE_CURRENT_SECONDS.set(age as f64);
     }
 
     // Stage A (10334 dashboard): Health Summary & Version gauges.
-    gauge!(STARTED_ON).set(state.started_on_epoch);
-    gauge!(LEDGER_VERSION).set(ledger_info.protocol_version as f64);
-    gauge!(PROTOCOL_VERSION).set(state.app.config().network.max_protocol_version as f64);
+    STARTED_ON.set(state.started_on_epoch);
+    LEDGER_VERSION.set(ledger_info.protocol_version as f64);
+    PROTOCOL_VERSION.set(state.app.config().network.max_protocol_version as f64);
 
     // Phase 3: Soroban config limits (gauges — snapshot values).
     if let Some(info) = state.app.soroban_network_info() {
-        gauge!(SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE).set(info.max_contract_data_key_size as f64);
-        gauge!(SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE)
-            .set(info.max_contract_data_entry_size as f64);
-        gauge!(SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE).set(info.max_contract_size as f64);
-        gauge!(SOROBAN_CONFIG_TX_MAX_SIZE_BYTE).set(info.tx_max_size_bytes as f64);
-        gauge!(SOROBAN_CONFIG_TX_MAX_CPU_INSN).set(info.tx_max_instructions.max(0) as f64);
-        gauge!(SOROBAN_CONFIG_TX_MAX_MEM_BYTE).set(info.tx_memory_limit as f64);
-        gauge!(SOROBAN_CONFIG_TX_MAX_READ_ENTRY).set(info.tx_max_read_ledger_entries as f64);
-        gauge!(SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE).set(info.tx_max_read_bytes as f64);
-        gauge!(SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY).set(info.tx_max_write_ledger_entries as f64);
-        gauge!(SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE).set(info.tx_max_write_bytes as f64);
-        gauge!(SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE)
-            .set(info.tx_max_contract_events_size_bytes as f64);
-        gauge!(SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT).set(info.ledger_max_tx_count as f64);
-        gauge!(SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN).set(info.ledger_max_instructions.max(0) as f64);
-        gauge!(SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE).set(info.ledger_max_tx_size_bytes as f64);
-        gauge!(SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY)
-            .set(info.ledger_max_read_ledger_entries as f64);
-        gauge!(SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE).set(info.ledger_max_read_bytes as f64);
-        gauge!(SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY)
-            .set(info.ledger_max_write_ledger_entries as f64);
-        gauge!(SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE).set(info.ledger_max_write_bytes as f64);
-        gauge!(SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE)
-            .set(info.state_target_size_bytes.max(0) as f64);
-        gauge!(SOROBAN_CONFIG_FEE_WRITE_1KB).set(info.fee_write_1kb.max(0) as f64);
+        SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE.set(info.max_contract_data_key_size as f64);
+        SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE.set(info.max_contract_data_entry_size as f64);
+        SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE.set(info.max_contract_size as f64);
+        SOROBAN_CONFIG_TX_MAX_SIZE_BYTE.set(info.tx_max_size_bytes as f64);
+        SOROBAN_CONFIG_TX_MAX_CPU_INSN.set(info.tx_max_instructions.max(0) as f64);
+        SOROBAN_CONFIG_TX_MAX_MEM_BYTE.set(info.tx_memory_limit as f64);
+        SOROBAN_CONFIG_TX_MAX_READ_ENTRY.set(info.tx_max_read_ledger_entries as f64);
+        SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE.set(info.tx_max_read_bytes as f64);
+        SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY.set(info.tx_max_write_ledger_entries as f64);
+        SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE.set(info.tx_max_write_bytes as f64);
+        SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE.set(info.tx_max_contract_events_size_bytes as f64);
+        SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT.set(info.ledger_max_tx_count as f64);
+        SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN.set(info.ledger_max_instructions.max(0) as f64);
+        SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE.set(info.ledger_max_tx_size_bytes as f64);
+        SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY.set(info.ledger_max_read_ledger_entries as f64);
+        SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE.set(info.ledger_max_read_bytes as f64);
+        SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY.set(info.ledger_max_write_ledger_entries as f64);
+        SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE.set(info.ledger_max_write_bytes as f64);
+        SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE.set(info.state_target_size_bytes.max(0) as f64);
+        SOROBAN_CONFIG_FEE_WRITE_1KB.set(info.fee_write_1kb.max(0) as f64);
     }
 
     // Phase 3: Henyey-specific observability.
-    gauge!(LEDGER_BUCKET_CACHE_HIT_RATIO).set(snap.bucket_cache_hit_ratio);
-    gauge!(LEDGER_SNAPSHOT_CACHE_HIT_RATIO).set(snap.snapshot_cache_hit_ratio);
-    gauge!(LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS).set(snap.snapshot_cache_fallback_lookups as f64);
+    LEDGER_BUCKET_CACHE_HIT_RATIO.set(snap.bucket_cache_hit_ratio);
+    LEDGER_SNAPSHOT_CACHE_HIT_RATIO.set(snap.snapshot_cache_hit_ratio);
+    LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS.set(snap.snapshot_cache_fallback_lookups as f64);
 
     // Phase 4: Overlay connection breakdown.
     if let Some(breakdown) = state.app.overlay_connection_breakdown().await {
-        gauge!(OVERLAY_INBOUND_AUTHENTICATED).set(breakdown.inbound_authenticated as f64);
-        gauge!(OVERLAY_OUTBOUND_AUTHENTICATED).set(breakdown.outbound_authenticated as f64);
-        gauge!(OVERLAY_INBOUND_PENDING).set(breakdown.inbound_pending as f64);
-        gauge!(OVERLAY_OUTBOUND_PENDING).set(breakdown.outbound_pending as f64);
+        OVERLAY_INBOUND_AUTHENTICATED.set(breakdown.inbound_authenticated as f64);
+        OVERLAY_OUTBOUND_AUTHENTICATED.set(breakdown.outbound_authenticated as f64);
+        OVERLAY_INBOUND_PENDING.set(breakdown.inbound_pending as f64);
+        OVERLAY_OUTBOUND_PENDING.set(breakdown.outbound_pending as f64);
     } else {
-        gauge!(OVERLAY_INBOUND_AUTHENTICATED).set(0.0);
-        gauge!(OVERLAY_OUTBOUND_AUTHENTICATED).set(0.0);
-        gauge!(OVERLAY_INBOUND_PENDING).set(0.0);
-        gauge!(OVERLAY_OUTBOUND_PENDING).set(0.0);
+        OVERLAY_INBOUND_AUTHENTICATED.set(0.0);
+        OVERLAY_OUTBOUND_AUTHENTICATED.set(0.0);
+        OVERLAY_INBOUND_PENDING.set(0.0);
+        OVERLAY_OUTBOUND_PENDING.set(0.0);
     }
 
     // Phase 4: Process health (Linux-only).
     if let Some(fds) = process_open_fds() {
-        gauge!(PROCESS_OPEN_FDS).set(fds as f64);
+        PROCESS_OPEN_FDS.set(fds as f64);
     }
     if let Some(max) = process_max_fds() {
-        gauge!(PROCESS_MAX_FDS).set(max as f64);
+        PROCESS_MAX_FDS.set(max as f64);
     }
 
     // Phase 4: Quorum health.
     if let Some(qh) = state.app.quorum_health() {
-        gauge!(QUORUM_AGREE).set(qh.agree as f64);
-        gauge!(QUORUM_MISSING).set(qh.missing as f64);
-        gauge!(QUORUM_DISAGREE).set(qh.disagree as f64);
-        gauge!(QUORUM_FAIL_AT).set(qh.fail_at as f64);
-        gauge!(QUORUM_DELAYED).set(qh.delayed as f64);
+        QUORUM_AGREE.set(qh.agree as f64);
+        QUORUM_MISSING.set(qh.missing as f64);
+        QUORUM_DISAGREE.set(qh.disagree as f64);
+        QUORUM_FAIL_AT.set(qh.fail_at as f64);
+        QUORUM_DELAYED.set(qh.delayed as f64);
     } else {
-        gauge!(QUORUM_AGREE).set(0.0);
-        gauge!(QUORUM_MISSING).set(0.0);
-        gauge!(QUORUM_DISAGREE).set(0.0);
-        gauge!(QUORUM_FAIL_AT).set(0.0);
-        gauge!(QUORUM_DELAYED).set(0.0);
+        QUORUM_AGREE.set(0.0);
+        QUORUM_MISSING.set(0.0);
+        QUORUM_DISAGREE.set(0.0);
+        QUORUM_FAIL_AT.set(0.0);
+        QUORUM_DELAYED.set(0.0);
     }
 
     // Phase 4: SCP timing.
     if let Some(timing) = state.app.scp_timing() {
         if let Some(ext_secs) = timing.externalize_duration_secs {
-            gauge!(SCP_TIMING_EXTERNALIZED_SECONDS).set(ext_secs);
+            SCP_TIMING_EXTERNALIZED_SECONDS.set(ext_secs);
         }
         if let Some(nom_secs) = timing.nomination_duration_secs {
-            gauge!(SCP_TIMING_NOMINATED_SECONDS).set(nom_secs);
+            SCP_TIMING_NOMINATED_SECONDS.set(nom_secs);
         } else {
-            gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
+            SCP_TIMING_NOMINATED_SECONDS.set(0.0);
         }
         if let Some(lag_secs) = timing.first_to_self_externalize_secs {
-            gauge!(SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS).set(lag_secs);
+            SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS.set(lag_secs);
         } else {
-            gauge!(SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS).set(0.0);
+            SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS.set(0.0);
         }
     } else {
         // No timing available (e.g., after catchup cleared it). Reset gauges.
-        gauge!(SCP_TIMING_EXTERNALIZED_SECONDS).set(0.0);
-        gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
-        gauge!(SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS).set(0.0);
+        SCP_TIMING_EXTERNALIZED_SECONDS.set(0.0);
+        SCP_TIMING_NOMINATED_SECONDS.set(0.0);
+        SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS.set(0.0);
     }
 
     // Phase 5: Archive cache absolute counters.
-    counter!(ARCHIVE_CACHE_FRESH_TOTAL).absolute(snap.archive_cache_fresh);
-    counter!(ARCHIVE_CACHE_STALE_TOTAL).absolute(snap.archive_cache_stale);
-    counter!(ARCHIVE_CACHE_COLD_TOTAL).absolute(snap.archive_cache_cold);
-    counter!(ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL).absolute(snap.archive_cache_refresh_success);
-    counter!(ARCHIVE_CACHE_REFRESH_ERROR_TOTAL).absolute(snap.archive_cache_refresh_error);
-    counter!(ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL).absolute(snap.archive_cache_refresh_timeout);
+    ARCHIVE_CACHE_FRESH_TOTAL.absolute(snap.archive_cache_fresh);
+    ARCHIVE_CACHE_STALE_TOTAL.absolute(snap.archive_cache_stale);
+    ARCHIVE_CACHE_COLD_TOTAL.absolute(snap.archive_cache_cold);
+    ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL.absolute(snap.archive_cache_refresh_success);
+    ARCHIVE_CACHE_REFRESH_ERROR_TOTAL.absolute(snap.archive_cache_refresh_error);
+    ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL.absolute(snap.archive_cache_refresh_timeout);
 
     // Phase 5: Archive cache gauges.
-    gauge!(ARCHIVE_CACHE_AGE_SECONDS).set(snap.archive_cache_age_secs);
-    gauge!(ARCHIVE_CACHE_POPULATED).set(if snap.archive_cache_populated {
+    ARCHIVE_CACHE_AGE_SECONDS.set(snap.archive_cache_age_secs);
+    ARCHIVE_CACHE_POPULATED.set(if snap.archive_cache_populated {
         1.0
     } else {
         0.0
@@ -1050,27 +1183,25 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     let exhausted_since = state.app.tx_set_exhausted_since_offset();
     if exhausted_since > 0 {
         let stuck_secs = uptime.saturating_sub(exhausted_since);
-        gauge!(RECOVERY_TX_SET_STUCK_SECONDS).set(stuck_secs as f64);
+        RECOVERY_TX_SET_STUCK_SECONDS.set(stuck_secs as f64);
     } else {
-        gauge!(RECOVERY_TX_SET_STUCK_SECONDS).set(0.0);
+        RECOVERY_TX_SET_STUCK_SECONDS.set(0.0);
     }
 
     // Stage C: SCP metrics (issue #2233).
-    gauge!(SCP_PHASE).set(snap.scp_phase as f64);
-    gauge!(SCP_MEMORY_CUMULATIVE_STATEMENTS).set(snap.scp_cumulative_statements as f64);
-    counter!(SCP_TIMEOUT_NOMINATE_TOTAL).absolute(snap.nomination_timeout_fires);
-    counter!(SCP_TIMEOUT_PREPARE_TOTAL).absolute(snap.ballot_timeout_fires);
-    counter!(CONSENSUS_TRIGGER_SKIPPED_APPLYING_TOTAL)
-        .absolute(snap.consensus_trigger_skipped_applying);
-    counter!(CONSENSUS_TRIGGER_SKIPPED_STALE_TOTAL).absolute(snap.consensus_trigger_skipped_stale);
-    counter!(NOMINATION_TIMEOUT_SKIPPED_STALE_TOTAL)
-        .absolute(snap.nomination_timeout_skipped_stale);
-    counter!(SCP_ENVELOPE_VALIDSIG_TOTAL).absolute(snap.scp.envelope_validsig_total);
-    counter!(SCP_ENVELOPE_INVALIDSIG_TOTAL).absolute(snap.scp.envelope_invalidsig_total);
-    counter!(SCP_ENVELOPE_SIGN_TOTAL).absolute(snap.scp.envelope_sign_total);
-    counter!(SCP_VALUE_VALID_TOTAL).absolute(snap.scp.value_valid_total);
-    counter!(SCP_VALUE_INVALID_TOTAL).absolute(snap.scp.value_invalid_total);
-    counter!(SCP_NOMINATION_COMBINECANDIDATES_TOTAL).absolute(snap.scp.combine_candidates_total);
+    SCP_PHASE.set(snap.scp_phase as f64);
+    SCP_MEMORY_CUMULATIVE_STATEMENTS.set(snap.scp_cumulative_statements as f64);
+    SCP_TIMEOUT_NOMINATE_TOTAL.absolute(snap.nomination_timeout_fires);
+    SCP_TIMEOUT_PREPARE_TOTAL.absolute(snap.ballot_timeout_fires);
+    CONSENSUS_TRIGGER_SKIPPED_APPLYING_TOTAL.absolute(snap.consensus_trigger_skipped_applying);
+    CONSENSUS_TRIGGER_SKIPPED_STALE_TOTAL.absolute(snap.consensus_trigger_skipped_stale);
+    NOMINATION_TIMEOUT_SKIPPED_STALE_TOTAL.absolute(snap.nomination_timeout_skipped_stale);
+    SCP_ENVELOPE_VALIDSIG_TOTAL.absolute(snap.scp.envelope_validsig_total);
+    SCP_ENVELOPE_INVALIDSIG_TOTAL.absolute(snap.scp.envelope_invalidsig_total);
+    SCP_ENVELOPE_SIGN_TOTAL.absolute(snap.scp.envelope_sign_total);
+    SCP_VALUE_VALID_TOTAL.absolute(snap.scp.value_valid_total);
+    SCP_VALUE_INVALID_TOTAL.absolute(snap.scp.value_invalid_total);
+    SCP_NOMINATION_COMBINECANDIDATES_TOTAL.absolute(snap.scp.combine_candidates_total);
 }
 
 // ── Process health helpers ──────────────────────────────────────────────
@@ -1759,7 +1890,7 @@ mod tests {
         let handle = recorder.handle();
 
         metrics::with_local_recorder(&recorder, || {
-            metrics::histogram!(HISTORY_PUBLISH_TIME_SECONDS).record(42.0);
+            HISTORY_PUBLISH_TIME_SECONDS.record(42.0);
         });
 
         let output = handle.render();
@@ -1792,9 +1923,9 @@ mod tests {
             describe_metrics();
             register_label_series();
             // Simulate runtime emission (as refresh_gauges does).
-            counter!(SCP_SCHEDULED_DEDUP_TOTAL).absolute(42);
-            counter!(HERDER_ARB_TX_SEEN).absolute(100);
-            counter!(HERDER_ARB_TX_DROPPED).absolute(50);
+            SCP_SCHEDULED_DEDUP_TOTAL.absolute(42);
+            HERDER_ARB_TX_SEEN.absolute(100);
+            HERDER_ARB_TX_DROPPED.absolute(50);
         });
         let output = handle.render();
 
@@ -1822,215 +1953,9 @@ mod tests {
         }
     }
 
-    /// Guard test: every `counter!()` target used in `refresh_gauges` must be
-    /// declared in the `counters {}` catalog block (appears in ALL_COUNTER_NAMES),
-    /// and every `gauge!()` target must be in the `gauges {}` block
-    /// (ALL_GAUGE_NAMES). Catches the class of bug from #2350 at compile/test
-    /// time rather than requiring a live scrape.
-    #[test]
-    fn test_refresh_gauges_type_consistency() {
-        let counter_set: HashSet<&str> = ALL_COUNTER_NAMES.iter().copied().collect();
-        let gauge_set: HashSet<&str> = ALL_GAUGE_NAMES.iter().copied().collect();
-
-        // All counter!() targets in refresh_gauges (exhaustive as of this commit).
-        // Includes both unlabeled counters and labeled counters emitted with
-        // counter!(NAME, "key" => value).
-        let refresh_counter_targets: &[&str] = &[
-            META_STREAM_BYTES_TOTAL,
-            META_STREAM_WRITES_TOTAL,
-            SCP_PREFILTER_REJECTS_TOTAL,
-            SCP_POST_VERIFY_DROPS_TOTAL,
-            SCP_POST_VERIFY_TOTAL,
-            POST_CATCHUP_HARD_RESET_TOTAL,
-            SCP_SCHEDULED_DEDUP_TOTAL,
-            SCP_ENVELOPE_EMIT_TOTAL,
-            SCP_ENVELOPE_RECEIVE_TOTAL,
-            HERDER_LOST_SYNC_TOTAL,
-            HERDER_PENDING_RECEIVED_TOTAL,
-            HERDER_PENDING_DUPLICATES_TOTAL,
-            HERDER_PENDING_TOO_OLD_TOTAL,
-            HERDER_PENDING_EVICTED_TOTAL,
-            HERDER_ARB_TX_SEEN,
-            HERDER_ARB_TX_DROPPED,
-            HERDER_PENDING_ADDED_TOTAL,
-            HERDER_PENDING_RELEASED_TOTAL,
-            BUCKET_MERGE_COMPLETED_TOTAL,
-            BUCKET_MERGE_TIME_US_TOTAL,
-            BUCKET_MERGE_NEW_LIVE_TOTAL,
-            BUCKET_MERGE_NEW_DEAD_TOTAL,
-            BUCKET_MERGE_NEW_INIT_TOTAL,
-            BUCKET_MERGE_NEW_META_TOTAL,
-            BUCKET_MERGE_SHADOWED_TOTAL,
-            BUCKET_MERGE_ANNIHILATED_TOTAL,
-            OVERLAY_MESSAGE_READ_TOTAL,
-            OVERLAY_MESSAGE_WRITE_TOTAL,
-            OVERLAY_MESSAGE_BROADCAST_TOTAL,
-            OVERLAY_ERROR_READ_TOTAL,
-            OVERLAY_ERROR_WRITE_TOTAL,
-            OVERLAY_TIMEOUT_IDLE_TOTAL,
-            OVERLAY_TIMEOUT_STRAGGLER_TOTAL,
-            OVERLAY_BYTE_READ_TOTAL,
-            OVERLAY_BYTE_WRITE_TOTAL,
-            OVERLAY_ASYNC_READ_TOTAL,
-            OVERLAY_ASYNC_WRITE_TOTAL,
-            OVERLAY_INBOUND_ATTEMPT_TOTAL,
-            OVERLAY_INBOUND_ESTABLISH_TOTAL,
-            OVERLAY_INBOUND_DROP_TOTAL,
-            OVERLAY_INBOUND_REJECT_TOTAL,
-            OVERLAY_OUTBOUND_ATTEMPT_TOTAL,
-            OVERLAY_OUTBOUND_ESTABLISH_TOTAL,
-            OVERLAY_OUTBOUND_DROP_TOTAL,
-            OVERLAY_OUTBOUND_REJECT_TOTAL,
-            OVERLAY_FLOOD_BROADCAST_TOTAL,
-            OVERLAY_FLOOD_DUPLICATE_RECV_TOTAL,
-            OVERLAY_FLOOD_UNIQUE_RECV_TOTAL,
-            OVERLAY_FETCH_DUPLICATE_RECV_TOTAL,
-            OVERLAY_FETCH_UNIQUE_RECV_TOTAL,
-            OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL,
-            OVERLAY_SEND_TOTAL,
-            LEDGER_APPLY_SUCCESS_TOTAL,
-            LEDGER_APPLY_FAILURE_TOTAL,
-            LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL,
-            LEDGER_APPLY_SOROBAN_FAILURE_TOTAL,
-            ARCHIVE_CACHE_FRESH_TOTAL,
-            ARCHIVE_CACHE_STALE_TOTAL,
-            ARCHIVE_CACHE_COLD_TOTAL,
-            ARCHIVE_CACHE_REFRESH_SUCCESS_TOTAL,
-            ARCHIVE_CACHE_REFRESH_ERROR_TOTAL,
-            ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL,
-            SCP_TIMEOUT_NOMINATE_TOTAL,
-            SCP_TIMEOUT_PREPARE_TOTAL,
-            CONSENSUS_TRIGGER_SKIPPED_APPLYING_TOTAL,
-            CONSENSUS_TRIGGER_SKIPPED_STALE_TOTAL,
-            NOMINATION_TIMEOUT_SKIPPED_STALE_TOTAL,
-            SCP_ENVELOPE_VALIDSIG_TOTAL,
-            SCP_ENVELOPE_INVALIDSIG_TOTAL,
-            SCP_ENVELOPE_SIGN_TOTAL,
-            SCP_VALUE_VALID_TOTAL,
-            SCP_VALUE_INVALID_TOTAL,
-            SCP_NOMINATION_COMBINECANDIDATES_TOTAL,
-        ];
-
-        for name in refresh_counter_targets {
-            assert!(
-                counter_set.contains(name),
-                "counter!({name}) used in refresh_gauges but `{name}` is NOT in \
-                 the counters {{}} catalog block. Move it from gauges {{}} to counters {{}}."
-            );
-            assert!(
-                !gauge_set.contains(name),
-                "counter!({name}) used in refresh_gauges but `{name}` is ALSO in \
-                 the gauges {{}} catalog block — this causes duplicate # TYPE lines."
-            );
-        }
-
-        // All gauge!() targets in refresh_gauges (exhaustive as of this commit).
-        let refresh_gauge_targets: &[&str] = &[
-            LEDGER_SEQUENCE,
-            PEER_COUNT,
-            PENDING_TRANSACTIONS,
-            UPTIME_SECONDS,
-            IS_VALIDATOR,
-            LEDGER_MEMORY_QUEUED_LEDGERS,
-            SCP_VERIFY_INPUT_BACKLOG,
-            SCP_VERIFY_OUTPUT_BACKLOG,
-            SCP_VERIFIER_THREAD_STATE,
-            SCP_VERIFY_LATENCY_US_SUM,
-            SCP_VERIFY_LATENCY_US_COUNT,
-            OVERLAY_FETCH_CHANNEL_DEPTH,
-            OVERLAY_FETCH_CHANNEL_DEPTH_MAX,
-            HERDER_STATE,
-            HERDER_PENDING_ENVELOPES,
-            HERDER_CACHED_TX_SETS,
-            HERDER_TX_QUEUE_ACCOUNTS,
-            HERDER_TX_QUEUE_BANNED,
-            HERDER_TX_QUEUE_SEEN,
-            HERDER_PENDING_TXS_AGE0,
-            HERDER_PENDING_TXS_AGE1,
-            HERDER_PENDING_TXS_AGE2,
-            HERDER_PENDING_TXS_AGE3,
-            DRIFT_MIN_SECONDS,
-            DRIFT_MAX_SECONDS,
-            DRIFT_MEDIAN_SECONDS,
-            DRIFT_P75_SECONDS,
-            DRIFT_SAMPLE_COUNT,
-            JEMALLOC_ALLOCATED_BYTES,
-            JEMALLOC_ACTIVE_BYTES,
-            JEMALLOC_RESIDENT_BYTES,
-            JEMALLOC_MAPPED_BYTES,
-            JEMALLOC_RETAINED_BYTES,
-            JEMALLOC_FRAGMENTATION_PCT,
-            LEDGER_TX_COUNT,
-            LEDGER_OP_COUNT,
-            LEDGER_TX_SUCCESS_COUNT,
-            LEDGER_TX_FAILED_COUNT,
-            LEDGER_TOTAL_FEES,
-            LEDGER_ENTRIES_CREATED,
-            LEDGER_ENTRIES_UPDATED,
-            LEDGER_ENTRIES_DELETED,
-            LEDGER_APPLY_US,
-            OVERLAY_MEMORY_FLOOD_KNOWN,
-            LEDGER_APPLY_SOROBAN_MAX_CLUSTERS,
-            LEDGER_APPLY_SOROBAN_STAGES,
-            LEDGER_AGE_CURRENT_SECONDS,
-            STARTED_ON,
-            LEDGER_VERSION,
-            PROTOCOL_VERSION,
-            SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE,
-            SOROBAN_CONFIG_CONTRACT_MAX_RW_DATA_BYTE,
-            SOROBAN_CONFIG_CONTRACT_MAX_RW_CODE_BYTE,
-            SOROBAN_CONFIG_TX_MAX_SIZE_BYTE,
-            SOROBAN_CONFIG_TX_MAX_CPU_INSN,
-            SOROBAN_CONFIG_TX_MAX_MEM_BYTE,
-            SOROBAN_CONFIG_TX_MAX_READ_ENTRY,
-            SOROBAN_CONFIG_TX_MAX_READ_LEDGER_BYTE,
-            SOROBAN_CONFIG_TX_MAX_WRITE_ENTRY,
-            SOROBAN_CONFIG_TX_MAX_WRITE_LEDGER_BYTE,
-            SOROBAN_CONFIG_TX_MAX_EMIT_EVENT_BYTE,
-            SOROBAN_CONFIG_LEDGER_MAX_TX_COUNT,
-            SOROBAN_CONFIG_LEDGER_MAX_CPU_INSN,
-            SOROBAN_CONFIG_LEDGER_MAX_TXS_SIZE_BYTE,
-            SOROBAN_CONFIG_LEDGER_MAX_READ_ENTRY,
-            SOROBAN_CONFIG_LEDGER_MAX_READ_LEDGER_BYTE,
-            SOROBAN_CONFIG_LEDGER_MAX_WRITE_ENTRY,
-            SOROBAN_CONFIG_LEDGER_MAX_WRITE_LEDGER_BYTE,
-            SOROBAN_CONFIG_BUCKET_LIST_TARGET_SIZE_BYTE,
-            SOROBAN_CONFIG_FEE_WRITE_1KB,
-            LEDGER_BUCKET_CACHE_HIT_RATIO,
-            LEDGER_SNAPSHOT_CACHE_HIT_RATIO,
-            LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS,
-            OVERLAY_INBOUND_AUTHENTICATED,
-            OVERLAY_OUTBOUND_AUTHENTICATED,
-            OVERLAY_INBOUND_PENDING,
-            OVERLAY_OUTBOUND_PENDING,
-            PROCESS_OPEN_FDS,
-            PROCESS_MAX_FDS,
-            QUORUM_AGREE,
-            QUORUM_MISSING,
-            QUORUM_DISAGREE,
-            QUORUM_FAIL_AT,
-            QUORUM_DELAYED,
-            SCP_TIMING_EXTERNALIZED_SECONDS,
-            SCP_TIMING_NOMINATED_SECONDS,
-            SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS,
-            ARCHIVE_CACHE_AGE_SECONDS,
-            ARCHIVE_CACHE_POPULATED,
-            RECOVERY_TX_SET_STUCK_SECONDS,
-            SCP_PHASE,
-            SCP_MEMORY_CUMULATIVE_STATEMENTS,
-        ];
-
-        for name in refresh_gauge_targets {
-            assert!(
-                gauge_set.contains(name),
-                "gauge!({name}) used in refresh_gauges but `{name}` is NOT in \
-                 the gauges {{}} catalog block. Move it from counters {{}} to gauges {{}}."
-            );
-            assert!(
-                !counter_set.contains(name),
-                "gauge!({name}) used in refresh_gauges but `{name}` is ALSO in \
-                 the counters {{}} catalog block — this causes duplicate # TYPE lines."
-            );
-        }
-    }
+    // NOTE: The former `test_refresh_gauges_type_consistency` test has been
+    // removed. It manually verified that counter constants were only used with
+    // counter!() and gauge constants only with gauge!(). That invariant is now
+    // enforced at compile time by the typed wrapper structs (GaugeMetric,
+    // CounterMetric, HistogramMetric) — a type mismatch is a compile error.
 }

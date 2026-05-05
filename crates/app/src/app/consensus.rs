@@ -491,11 +491,8 @@ impl App {
                         "Recovery stuck: AtTip, no SCP progress, archive behind \
                          — escalating to hard reset (time-based)"
                     );
-                    metrics::counter!(
-                        crate::metrics::RECOVERY_STALLED_TICK_TOTAL,
-                        "reason" => "at_tip_no_scp_hard_reset"
-                    )
-                    .increment(1);
+                    crate::metrics::RECOVERY_STALLED_TICK_TOTAL
+                        .increment("at_tip_no_scp_hard_reset", 1);
                     self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
                     // If the inner cooldown blocks, fall through to
                     // the SCP state request rather than returning idle.
@@ -1197,11 +1194,7 @@ impl App {
         };
 
         if backoff_active {
-            metrics::counter!(
-                crate::metrics::RECOVERY_STALLED_TICK_TOTAL,
-                "reason" => "backoff_active"
-            )
-            .increment(1);
+            crate::metrics::RECOVERY_STALLED_TICK_TOTAL.increment("backoff_active", 1);
             tracing::debug!(
                 current_ledger,
                 latest_externalized,
@@ -1217,11 +1210,8 @@ impl App {
             // The fast-track caller already emits its own WARN before entering
             // this function, so the INFO here is redundant noise at gap=0.
             if !relation.is_behind() {
-                metrics::counter!(
-                    crate::metrics::RECOVERY_STALLED_TICK_TOTAL,
-                    "reason" => "forcing_catchup_not_behind"
-                )
-                .increment(1);
+                crate::metrics::RECOVERY_STALLED_TICK_TOTAL
+                    .increment("forcing_catchup_not_behind", 1);
                 tracing::debug!(
                     current_ledger,
                     latest_externalized,
@@ -1232,11 +1222,7 @@ impl App {
                     "Recovery stalled for too long — forcing catchup"
                 );
             } else {
-                metrics::counter!(
-                    crate::metrics::RECOVERY_STALLED_TICK_TOTAL,
-                    "reason" => "forcing_catchup_behind"
-                )
-                .increment(1);
+                crate::metrics::RECOVERY_STALLED_TICK_TOTAL.increment("forcing_catchup_behind", 1);
                 tracing::info!(
                     current_ledger,
                     latest_externalized,
@@ -1370,11 +1356,8 @@ impl App {
                         "Recovery stuck: archive confirmed behind, peers verified ahead \
                          — escalating to hard reset"
                     );
-                    metrics::counter!(
-                        crate::metrics::RECOVERY_STALLED_TICK_TOTAL,
-                        "reason" => "archive_behind_peer_ahead_hard_reset"
-                    )
-                    .increment(1);
+                    crate::metrics::RECOVERY_STALLED_TICK_TOTAL
+                        .increment("archive_behind_peer_ahead_hard_reset", 1);
                     // If the inner cooldown blocks, fall through to the
                     // peer-SCP fallback rather than returning an idle None
                     // (the inner cooldown uses a different gap metric).

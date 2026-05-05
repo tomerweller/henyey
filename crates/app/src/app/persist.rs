@@ -292,7 +292,7 @@ impl PersistJob {
                     }
                 }
 
-                metrics::histogram!(crate::metrics::PERSIST_LEDGER_CLOSE_SECONDS)
+                crate::metrics::PERSIST_LEDGER_CLOSE_SECONDS
                     .record(persist_start.elapsed().as_secs_f64());
             }
         }

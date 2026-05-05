@@ -4,9 +4,12 @@ use super::*;
 
 /// Record the last phase duration from a `PhaseTimer` into a Prometheus histogram.
 /// Must be called immediately after `timer.mark()`.
-fn record_phase_histogram(metric: &'static str, timer: &tracked_lock::PhaseTimer) {
+fn record_phase_histogram(
+    metric: crate::metrics::HistogramMetric,
+    timer: &tracked_lock::PhaseTimer,
+) {
     if let Some(&(_, duration)) = timer.phases().last() {
-        metrics::histogram!(metric).record(duration.as_secs_f64());
+        metric.record(duration.as_secs_f64());
     }
 }
 
@@ -1955,8 +1958,7 @@ impl App {
         super::warn_if_slow(elapsed, "handle_close_complete", ledger_seq as u64);
         // Close-cycle decomposition (#1909): envelope metric for handle_close_complete.
         // Always recorded regardless of close outcome (wraps handle_close_complete_inner).
-        metrics::histogram!(crate::metrics::CLOSE_HANDLE_COMPLETE_SECONDS)
-            .record(elapsed.as_secs_f64());
+        crate::metrics::CLOSE_HANDLE_COMPLETE_SECONDS.record(elapsed.as_secs_f64());
         result
     }
 
@@ -2035,39 +2037,27 @@ impl App {
 
         // Record ledger close duration into the histogram (accumulates across closes).
         if result.stats.close_time_ms > 0 {
-            metrics::histogram!(crate::metrics::LEDGER_CLOSE_DURATION_SECONDS)
+            crate::metrics::LEDGER_CLOSE_DURATION_SECONDS
                 .record(result.stats.close_time_ms as f64 / 1000.0);
         }
 
         // Phase 5: Per-phase close-duration histograms (LedgerClosePerf).
         if let Some(ref perf) = result.perf {
             let us_to_secs = |us: u64| us as f64 / 1_000_000.0;
-            metrics::histogram!(crate::metrics::CLOSE_BEGIN_SECONDS)
-                .record(us_to_secs(perf.begin_close_us));
-            metrics::histogram!(crate::metrics::CLOSE_TX_EXEC_SECONDS)
-                .record(us_to_secs(perf.tx_exec_us));
-            metrics::histogram!(crate::metrics::CLOSE_CLASSIC_EXEC_SECONDS)
-                .record(us_to_secs(perf.classic_exec_us));
-            metrics::histogram!(crate::metrics::CLOSE_SOROBAN_EXEC_SECONDS)
-                .record(us_to_secs(perf.soroban_exec_us));
-            metrics::histogram!(crate::metrics::CLOSE_COMMIT_SETUP_SECONDS)
-                .record(us_to_secs(perf.commit_setup_us));
-            metrics::histogram!(crate::metrics::CLOSE_BUCKET_LOCK_WAIT_SECONDS)
+            crate::metrics::CLOSE_BEGIN_SECONDS.record(us_to_secs(perf.begin_close_us));
+            crate::metrics::CLOSE_TX_EXEC_SECONDS.record(us_to_secs(perf.tx_exec_us));
+            crate::metrics::CLOSE_CLASSIC_EXEC_SECONDS.record(us_to_secs(perf.classic_exec_us));
+            crate::metrics::CLOSE_SOROBAN_EXEC_SECONDS.record(us_to_secs(perf.soroban_exec_us));
+            crate::metrics::CLOSE_COMMIT_SETUP_SECONDS.record(us_to_secs(perf.commit_setup_us));
+            crate::metrics::CLOSE_BUCKET_LOCK_WAIT_SECONDS
                 .record(us_to_secs(perf.bucket_lock_wait_us));
-            metrics::histogram!(crate::metrics::CLOSE_EVICTION_SECONDS)
-                .record(us_to_secs(perf.eviction_us));
-            metrics::histogram!(crate::metrics::CLOSE_SOROBAN_STATE_SECONDS)
-                .record(us_to_secs(perf.soroban_state_us));
-            metrics::histogram!(crate::metrics::CLOSE_BUCKET_ADD_SECONDS)
-                .record(us_to_secs(perf.add_batch_us));
-            metrics::histogram!(crate::metrics::CLOSE_HOT_ARCHIVE_SECONDS)
-                .record(us_to_secs(perf.hot_archive_us));
-            metrics::histogram!(crate::metrics::CLOSE_HEADER_SECONDS)
-                .record(us_to_secs(perf.header_us));
-            metrics::histogram!(crate::metrics::CLOSE_COMMIT_SECONDS)
-                .record(us_to_secs(perf.commit_close_us));
-            metrics::histogram!(crate::metrics::CLOSE_META_SECONDS)
-                .record(us_to_secs(perf.meta_us));
+            crate::metrics::CLOSE_EVICTION_SECONDS.record(us_to_secs(perf.eviction_us));
+            crate::metrics::CLOSE_SOROBAN_STATE_SECONDS.record(us_to_secs(perf.soroban_state_us));
+            crate::metrics::CLOSE_BUCKET_ADD_SECONDS.record(us_to_secs(perf.add_batch_us));
+            crate::metrics::CLOSE_HOT_ARCHIVE_SECONDS.record(us_to_secs(perf.hot_archive_us));
+            crate::metrics::CLOSE_HEADER_SECONDS.record(us_to_secs(perf.header_us));
+            crate::metrics::CLOSE_COMMIT_SECONDS.record(us_to_secs(perf.commit_close_us));
+            crate::metrics::CLOSE_META_SECONDS.record(us_to_secs(perf.meta_us));
         }
 
         // Phase 3: Accumulate cumulative ledger apply counters.
@@ -2422,8 +2412,7 @@ impl App {
             let upper_bound_offset =
                 expected_close_secs * EXPECTED_CLOSE_TIME_MULT + close_time_drift;
 
-            metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_PREP_SECONDS)
-                .record(prep_start.elapsed().as_secs_f64());
+            crate::metrics::CLOSE_TX_QUEUE_PREP_SECONDS.record(prep_start.elapsed().as_secs_f64());
 
             // === Sub-phase 1: herder.ledger_closed + ban failed txs ==========
             let phase1_start = std::time::Instant::now();
@@ -2440,7 +2429,7 @@ impl App {
                 );
                 herder.tx_queue().ban(&failed_hashes_for_ban);
             }
-            metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS)
+            crate::metrics::CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS
                 .record(phase1_start.elapsed().as_secs_f64());
 
             // === Sub-phase 2: validation context update + shift ==============
@@ -2462,14 +2451,14 @@ impl App {
             }
 
             let shift_result = herder.tx_queue().shift();
-            metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS)
+            crate::metrics::CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS
                 .record(phase2_start.elapsed().as_secs_f64());
 
             // === Sub-phase 3: envelopes fetch + snapshot build + Sub-phase 4: invalidation =====
             let phase3_start = std::time::Instant::now();
             let pending_envs = herder.tx_queue().pending_hashed_envelopes();
             let fetch_elapsed = phase3_start.elapsed();
-            metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS)
+            crate::metrics::CLOSE_TX_QUEUE_ENVELOPES_FETCH_SECONDS
                 .record(fetch_elapsed.as_secs_f64());
 
             let mut invalid_banned = 0usize;
@@ -2508,9 +2497,9 @@ impl App {
                 // the per-call providers — that would silently
                 // re-introduce the quadratic path.
                 let snapshot_result = SnapshotValidationProviders::new(&ledger_manager);
-                metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS)
+                crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_BUILD_SECONDS
                     .record(snapshot_build_start.elapsed().as_secs_f64());
-                metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_SECONDS)
+                crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_SECONDS
                     .record(phase3_start.elapsed().as_secs_f64());
 
                 let phase4_start = std::time::Instant::now();
@@ -2538,15 +2527,14 @@ impl App {
                     invalid_banned = invalid_hashes.len();
                     herder.tx_queue().ban(&invalid_hashes);
                 }
-                metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_INVALIDATION_SECONDS)
+                crate::metrics::CLOSE_TX_QUEUE_INVALIDATION_SECONDS
                     .record(phase4_start.elapsed().as_secs_f64());
             } else {
                 // Queue empty: record envelopes_fetch (already recorded above)
                 // and total. Do NOT record snapshot_build — it wasn't executed.
-                metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_SECONDS)
+                crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_SECONDS
                     .record(phase3_start.elapsed().as_secs_f64());
-                metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_INVALIDATION_SECONDS)
-                    .record(0.0);
+                crate::metrics::CLOSE_TX_QUEUE_INVALIDATION_SECONDS.record(0.0);
             }
 
             (shift_result, invalid_banned)
@@ -2673,8 +2661,7 @@ impl App {
             .herder
             .slot_first_seen_elapsed(pending.ledger_seq as u64)
         {
-            metrics::histogram!(crate::metrics::SLOT_TO_CLOSE_LATENCY_SECONDS)
-                .record(elapsed.as_secs_f64());
+            crate::metrics::SLOT_TO_CLOSE_LATENCY_SECONDS.record(elapsed.as_secs_f64());
         }
 
         // Emit the PhaseTimer WARN (if total ≥ 250 ms). Placed before

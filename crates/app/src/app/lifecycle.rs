@@ -409,7 +409,7 @@ impl App {
                     {
                         let mut last_start = self.close_cycle_last_start.lock();
                         if let Some(prev) = *last_start {
-                            metrics::histogram!(crate::metrics::CLOSE_CYCLE_SECONDS)
+                            crate::metrics::CLOSE_CYCLE_SECONDS
                                 .record(prev.elapsed().as_secs_f64());
                         }
                         *last_start = Some(std::time::Instant::now());
@@ -417,7 +417,7 @@ impl App {
                     tracing::debug!(select_iteration, "BRANCH: pending_close completed");
                     let pending = close_pipeline.take_close();
                     // Close-cycle decomposition (#1909): dispatch-to-join latency.
-                    metrics::histogram!(crate::metrics::CLOSE_DISPATCH_TO_JOIN_SECONDS)
+                    crate::metrics::CLOSE_DISPATCH_TO_JOIN_SECONDS
                         .record(pending.dispatch_time.elapsed().as_secs_f64());
                     let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
                     let success = self
@@ -507,7 +507,7 @@ impl App {
 
                         // Close-cycle decomposition (#1909): record post-complete duration.
                         // Only recorded on the success path (inside `if success` branch).
-                        metrics::histogram!(crate::metrics::CLOSE_POST_COMPLETE_SECONDS)
+                        crate::metrics::CLOSE_POST_COMPLETE_SECONDS
                             .record(post_complete_start.elapsed().as_secs_f64());
 
                         // Don't start the next close here — wait for
@@ -523,7 +523,7 @@ impl App {
                         super::close_pipeline::PipelineEvent::PersistComplete(persist_result) => {
                     let persist = close_pipeline.take_persist();
                     // Persist-cycle decomposition (#1916): dispatch-to-join latency.
-                    metrics::histogram!(crate::metrics::PERSIST_DISPATCH_TO_JOIN_SECONDS)
+                    crate::metrics::PERSIST_DISPATCH_TO_JOIN_SECONDS
                         .record(persist.dispatch_time.elapsed().as_secs_f64());
                     if let Err(e) = persist_result {
                         tracing::error!(
