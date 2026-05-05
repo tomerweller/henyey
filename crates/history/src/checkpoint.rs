@@ -175,6 +175,53 @@ pub fn checkpoint_start(seq: u32) -> u32 {
 /// Alias for [`checkpoint_start`] to match stellar-core HistoryManager naming.
 pub use checkpoint_start as first_ledger_in_checkpoint_containing;
 
+/// Check if a ledger sequence is a checkpoint start (the first ledger in its checkpoint).
+///
+/// Returns true for ledger 1 (start of the first checkpoint) and for each multiple
+/// of `checkpoint_frequency()` (start of subsequent checkpoints).
+///
+/// # Examples
+///
+/// ```
+/// use henyey_history::checkpoint::is_checkpoint_start;
+///
+/// assert!(is_checkpoint_start(1));
+/// assert!(!is_checkpoint_start(2));
+/// assert!(!is_checkpoint_start(63));
+/// assert!(is_checkpoint_start(64));
+/// assert!(!is_checkpoint_start(65));
+/// assert!(is_checkpoint_start(128));
+/// ```
+#[inline]
+pub fn is_checkpoint_start(seq: u32) -> bool {
+    seq == checkpoint_start(seq)
+}
+
+/// Get the first ledger in the checkpoint *after* the one containing `seq`.
+///
+/// For the first checkpoint (seq < freq), this returns `freq` (e.g. 64).
+/// For subsequent checkpoints, it returns `checkpoint_containing(seq) + 1`.
+///
+/// Matches stellar-core's `firstLedgerAfterCheckpointContaining()`.
+///
+/// # Examples
+///
+/// ```
+/// use henyey_history::checkpoint::first_ledger_after_checkpoint_containing;
+///
+/// assert_eq!(first_ledger_after_checkpoint_containing(1), 64);
+/// assert_eq!(first_ledger_after_checkpoint_containing(32), 64);
+/// assert_eq!(first_ledger_after_checkpoint_containing(63), 64);
+/// assert_eq!(first_ledger_after_checkpoint_containing(64), 128);
+/// assert_eq!(first_ledger_after_checkpoint_containing(100), 128);
+/// assert_eq!(first_ledger_after_checkpoint_containing(127), 128);
+/// assert_eq!(first_ledger_after_checkpoint_containing(128), 192);
+/// ```
+#[inline]
+pub fn first_ledger_after_checkpoint_containing(seq: u32) -> u32 {
+    checkpoint_containing(seq) + 1
+}
+
 /// Get the ledger immediately before the checkpoint containing `seq`.
 ///
 /// Returns `None` if `seq` is in the first checkpoint (ledgers 1-63).
@@ -257,22 +304,20 @@ pub fn checkpoint_range(checkpoint_ledger_seq: u32) -> (u32, u32) {
 ///
 /// # Panics
 ///
-/// Panics if `first_ledger_of_buffered_checkpoint` is not a checkpoint start
-/// (i.e., not a multiple of the checkpoint frequency).
+/// Panics if `first_ledger_of_buffered_checkpoint` is not a checkpoint start.
 ///
 /// # Examples
 ///
 /// ```
 /// use henyey_history::checkpoint::ledger_to_trigger_catchup;
 ///
-/// assert_eq!(ledger_to_trigger_catchup(0), 1);
+/// assert_eq!(ledger_to_trigger_catchup(1), 2);
 /// assert_eq!(ledger_to_trigger_catchup(64), 65);
 /// assert_eq!(ledger_to_trigger_catchup(128), 129);
 /// ```
 pub fn ledger_to_trigger_catchup(first_ledger_of_buffered_checkpoint: u32) -> u32 {
-    assert_eq!(
-        first_ledger_of_buffered_checkpoint % checkpoint_frequency(),
-        0,
+    assert!(
+        is_checkpoint_start(first_ledger_of_buffered_checkpoint),
         "not a checkpoint start: {}",
         first_ledger_of_buffered_checkpoint
     );
@@ -415,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_ledger_to_trigger_catchup_first_checkpoint() {
-        assert_eq!(ledger_to_trigger_catchup(0), 1);
+        assert_eq!(ledger_to_trigger_catchup(1), 2);
     }
 
     #[test]
@@ -429,5 +474,35 @@ mod tests {
     #[should_panic(expected = "not a checkpoint start")]
     fn test_ledger_to_trigger_catchup_panics_on_non_start() {
         ledger_to_trigger_catchup(63); // 63 is not a checkpoint start
+    }
+
+    #[test]
+    #[should_panic(expected = "not a checkpoint start")]
+    fn test_ledger_to_trigger_catchup_panics_on_zero() {
+        ledger_to_trigger_catchup(0); // 0 is not a valid checkpoint start
+    }
+
+    #[test]
+    fn test_is_checkpoint_start() {
+        assert!(is_checkpoint_start(1));
+        assert!(!is_checkpoint_start(0));
+        assert!(!is_checkpoint_start(2));
+        assert!(!is_checkpoint_start(32));
+        assert!(!is_checkpoint_start(63));
+        assert!(is_checkpoint_start(64));
+        assert!(!is_checkpoint_start(65));
+        assert!(is_checkpoint_start(128));
+        assert!(is_checkpoint_start(192));
+    }
+
+    #[test]
+    fn test_first_ledger_after_checkpoint_containing() {
+        assert_eq!(first_ledger_after_checkpoint_containing(1), 64);
+        assert_eq!(first_ledger_after_checkpoint_containing(32), 64);
+        assert_eq!(first_ledger_after_checkpoint_containing(63), 64);
+        assert_eq!(first_ledger_after_checkpoint_containing(64), 128);
+        assert_eq!(first_ledger_after_checkpoint_containing(100), 128);
+        assert_eq!(first_ledger_after_checkpoint_containing(127), 128);
+        assert_eq!(first_ledger_after_checkpoint_containing(128), 192);
     }
 }

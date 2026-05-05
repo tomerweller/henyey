@@ -143,11 +143,11 @@ pub use cdp::{
     CachedCdpDataLake, CdpDataLake,
 };
 pub use checkpoint::{
-    checkpoint_containing, checkpoint_frequency, checkpoint_ledger,
-    first_ledger_in_checkpoint_containing, is_checkpoint_ledger,
-    last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at,
-    ledger_to_trigger_catchup, set_checkpoint_frequency, size_of_checkpoint_containing,
-    ACCELERATED_CHECKPOINT_FREQUENCY, DEFAULT_CHECKPOINT_FREQUENCY,
+    checkpoint_containing, checkpoint_frequency, checkpoint_ledger, checkpoint_start,
+    first_ledger_after_checkpoint_containing, first_ledger_in_checkpoint_containing,
+    is_checkpoint_ledger, is_checkpoint_start, last_ledger_before_checkpoint_containing,
+    latest_checkpoint_before_or_at, ledger_to_trigger_catchup, set_checkpoint_frequency,
+    size_of_checkpoint_containing, ACCELERATED_CHECKPOINT_FREQUENCY, DEFAULT_CHECKPOINT_FREQUENCY,
 };
 pub use checkpoint_builder::write_record_marked_xdr;
 pub use compare::{compare_checkpoint, Category, CheckpointComparison, Mismatch};

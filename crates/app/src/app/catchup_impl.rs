@@ -1693,7 +1693,7 @@ impl App {
             current_ledger,
             first_buffered,
             last_buffered,
-            is_checkpoint_boundary = Self::is_first_ledger_in_checkpoint(first_buffered),
+            is_checkpoint_boundary = is_checkpoint_start(first_buffered),
             gap = first_buffered.saturating_sub(current_ledger),
             "maybe_start_buffered_catchup: evaluating"
         );
@@ -1735,24 +1735,23 @@ impl App {
         // First buffered is checkpoint boundary AND we have multiple buffered ledgers.
         // This matches stellar-core: catchup to first_buffered - 1.
         let can_trigger_immediate =
-            Self::is_first_ledger_in_checkpoint(first_buffered) && first_buffered < last_buffered;
+            is_checkpoint_start(first_buffered) && first_buffered < last_buffered;
 
         tracing::debug!(
             can_trigger_immediate,
             first_buffered,
             last_buffered,
-            is_checkpoint = Self::is_first_ledger_in_checkpoint(first_buffered),
+            is_checkpoint = is_checkpoint_start(first_buffered),
             "maybe_start_buffered_catchup: can_trigger_immediate decision"
         );
 
         // If we can't trigger immediate catchup, check if we should wait for trigger
         // or if we're stuck and need timeout-based catchup
         if !can_trigger_immediate {
-            let (required_first, trigger) = if Self::is_first_ledger_in_checkpoint(first_buffered) {
+            let (required_first, trigger) = if is_checkpoint_start(first_buffered) {
                 (first_buffered, first_buffered.saturating_add(1))
             } else {
-                let required_first = Self::first_ledger_in_checkpoint(first_buffered)
-                    .saturating_add(checkpoint_frequency());
+                let required_first = first_ledger_after_checkpoint_containing(first_buffered);
                 (required_first, required_first.saturating_add(1))
             };
 
@@ -2652,10 +2651,10 @@ impl App {
             return if target == 0 { None } else { Some(target) };
         }
 
-        let required_first = if Self::is_first_ledger_in_checkpoint(first_buffered) {
+        let required_first = if is_checkpoint_start(first_buffered) {
             first_buffered
         } else {
-            Self::first_ledger_in_checkpoint(first_buffered).saturating_add(checkpoint_frequency())
+            first_ledger_after_checkpoint_containing(first_buffered)
         };
         let trigger = required_first.saturating_add(1);
         if last_buffered < trigger {
@@ -2681,22 +2680,14 @@ impl App {
         // We need to catch up to a point that lets us make progress.
         // The best target is just before first_buffered, so we can then apply the buffered ledgers.
 
-        // Find the checkpoint that contains first_buffered
-        let first_buffered_checkpoint_start = Self::first_ledger_in_checkpoint(first_buffered);
-
-        // Target should be the last ledger of the checkpoint BEFORE the one containing first_buffered
-        // This is checkpoint_start - 1
-        let target = if first_buffered_checkpoint_start > 0 {
-            first_buffered_checkpoint_start.saturating_sub(1)
-        } else {
-            // first_buffered is in the first checkpoint, target first_buffered - 1
-            first_buffered.saturating_sub(1)
-        };
+        // Target the last ledger before the checkpoint containing first_buffered.
+        // For the first checkpoint (ledgers 1..freq-1), there is no prior checkpoint,
+        // so this returns None and we fall through to the direct_target path.
+        let target = last_ledger_before_checkpoint_containing(first_buffered).unwrap_or(0);
 
         // If target is not better than current_ledger, try targeting last_buffered's checkpoint
         if target <= current_ledger {
-            let last_checkpoint_start = Self::first_ledger_in_checkpoint(last_buffered);
-            let alt_target = last_checkpoint_start.saturating_sub(1);
+            let alt_target = last_ledger_before_checkpoint_containing(last_buffered).unwrap_or(0);
 
             if alt_target > current_ledger {
                 return Some(alt_target);
@@ -2707,6 +2698,7 @@ impl App {
             // first_buffered - 1 directly. This produces a Case 1 replay that
             // bridges the gap (e.g., replay 1 ledger from 922751 to 922752),
             // then the buffer starting at 922753 can drain.
+            // Also handles the first-checkpoint case where no prior checkpoint exists.
             let direct_target = first_buffered.saturating_sub(1);
             if direct_target > current_ledger {
                 return Some(direct_target);

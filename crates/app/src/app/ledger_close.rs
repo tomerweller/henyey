@@ -1539,15 +1539,6 @@ impl App {
         self.maybe_start_buffered_catchup().await
     }
 
-    pub(super) fn first_ledger_in_checkpoint(ledger: u32) -> u32 {
-        let freq = checkpoint_frequency();
-        (ledger / freq) * freq
-    }
-
-    pub(super) fn is_first_ledger_in_checkpoint(ledger: u32) -> bool {
-        ledger % checkpoint_frequency() == 0
-    }
-
     pub(super) fn trim_syncing_ledgers(
         buffer: &mut BTreeMap<u32, henyey_herder::LedgerCloseInfo>,
         current_ledger: u32,
@@ -1574,14 +1565,14 @@ impl App {
         let last_buffered = *buffer.keys().next_back().expect("checked non-empty above");
         let gap = first_buffered.saturating_sub(current_ledger);
         if gap >= checkpoint_frequency() {
-            let trim_before = if Self::is_first_ledger_in_checkpoint(last_buffered) {
-                if last_buffered == 0 {
+            let trim_before = if is_checkpoint_start(last_buffered) {
+                if last_buffered <= 1 {
                     return;
                 }
                 let prev = last_buffered - 1;
-                Self::first_ledger_in_checkpoint(prev)
+                checkpoint_start(prev)
             } else {
-                Self::first_ledger_in_checkpoint(last_buffered)
+                checkpoint_start(last_buffered)
             };
             buffer.retain(|seq, _| *seq >= trim_before);
         }

@@ -71,10 +71,11 @@ use henyey_herder::{
     HerderStats, TxQueueConfig, TxSetValidationContext,
 };
 use henyey_history::{
-    build_history_archive_state, checkpoint_containing, checkpoint_frequency, is_checkpoint_ledger,
-    latest_checkpoint_before_or_at, CatchupManager, CatchupMode,
-    CatchupResult as HistoryCatchupResult, CheckpointData, ExistingBucketState, HistoryArchive,
-    HistoryArchiveState, GENESIS_LEDGER_SEQ,
+    build_history_archive_state, checkpoint_containing, checkpoint_frequency, checkpoint_start,
+    first_ledger_after_checkpoint_containing, is_checkpoint_ledger, is_checkpoint_start,
+    last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at, CatchupManager,
+    CatchupMode, CatchupResult as HistoryCatchupResult, CheckpointData, ExistingBucketState,
+    HistoryArchive, HistoryArchiveState, GENESIS_LEDGER_SEQ,
 };
 use henyey_historywork::{
     build_checkpoint_data, get_progress, HistoryWorkBuilder, HistoryWorkState,
@@ -3222,6 +3223,32 @@ mod tests {
     }
 
     #[test]
+    fn test_buffered_catchup_target_first_checkpoint() {
+        // first_buffered=32 is in the first checkpoint (not a checkpoint start).
+        // next checkpoint start = first_ledger_after_checkpoint_containing(32) = 64
+        // required_first = 64, trigger = 65, target = 63
+        let target = App::buffered_catchup_target(0, 32, 65);
+        assert_eq!(target, Some(63));
+
+        // Not enough buffered: last_buffered < trigger (65)
+        let target = App::buffered_catchup_target(0, 32, 64);
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn test_buffered_catchup_target_at_checkpoint_start() {
+        // first_buffered=64 is a checkpoint start.
+        // required_first = 64, trigger = 65, target = 63
+        let target = App::buffered_catchup_target(0, 64, 65);
+        assert_eq!(target, Some(63));
+
+        // first_buffered=1 is a checkpoint start (first checkpoint).
+        // required_first = 1, trigger = 2, target = 0 → None
+        let target = App::buffered_catchup_target(0, 1, 2);
+        assert_eq!(target, None);
+    }
+
+    #[test]
     fn test_tx_set_start_index_rotation() {
         let mut bytes = [0u8; 32];
         bytes[0] = 1;
@@ -3267,16 +3294,19 @@ mod tests {
         assert!(target.is_none());
 
         // Test case 6: very early ledger (first checkpoint)
-        // first_buffered=50 is in checkpoint starting at 0
-        // Since checkpoint_start is 0, target = first_buffered - 1 = 49
+        // first_buffered=50 is in the first checkpoint (starts at 1).
+        // last_ledger_before_checkpoint_containing(50) = None → target=0.
+        // Falls through to direct_target = first_buffered - 1 = 49.
         // 49 > current_ledger (10), so return Some(49)
         let target = App::compute_catchup_target_for_timeout(60, 50, 10);
         assert_eq!(target, Some(49));
 
         // Test case 7: edge case with very small ledgers
-        let target = App::compute_catchup_target_for_timeout(5, 3, 0);
-        // first_buffered=3, checkpoint start=0, target=first_buffered-1=2
+        // first_buffered=3, in first checkpoint (starts at 1).
+        // last_ledger_before_checkpoint_containing(3) = None → target=0.
+        // Falls through to direct_target = 3 - 1 = 2.
         // 2 > current_ledger(0), so return Some(2)
+        let target = App::compute_catchup_target_for_timeout(5, 3, 0);
         assert_eq!(target, Some(2));
 
         // Test case 8: tiny gap at checkpoint boundary (the stuck-after-catchup bug)
@@ -4530,6 +4560,87 @@ mod tests {
         assert!(buffer.contains_key(&106));
         assert!(buffer.contains_key(&110));
         assert_eq!(buffer.len(), 5);
+    }
+
+    #[test]
+    fn test_trim_syncing_ledgers_early_checkpoint() {
+        // When buffer straddles the first/second checkpoint boundary with a large gap,
+        // verify correct trimming. last_buffered=100 is NOT a checkpoint start,
+        // so trim_before = checkpoint_start(100) = 64. Entries below 64 are trimmed.
+        let mut buffer = BTreeMap::new();
+        let make_entry = |slot: u32| henyey_herder::LedgerCloseInfo {
+            slot: slot as u64,
+            tx_set_hash: Hash256::ZERO,
+            tx_set: None,
+            close_time: 1,
+            upgrades: Vec::new(),
+            stellar_value_ext: StellarValueExt::Basic,
+        };
+
+        // current_ledger=0, buffer at 50..=100. Gap = 50 - 0 = 50 < freq (64).
+        // Actually, we need gap >= freq, so use current_ledger such that gap >= 64.
+        // With entries at 65..=100, current_ledger=0, gap = 65 >= 64.
+        // But entries 65..100 are all >= 64, so nothing to trim there.
+        // Use entries spanning the boundary: 50..=100, current_ledger far below.
+        // gap = first_buffered - current_ledger = 50 - (-15) — no, current_ledger is u32.
+        // Let's do: entries at 50..=100. We need gap = 50 - current >= 64.
+        // That's impossible since first_buffered=50 and we need current_ledger < 50-64 < 0.
+        // Instead: entries from 65..=130 with current_ledger=0 (gap=65 >= 64).
+        // last_buffered=130, NOT checkpoint start, trim_before = checkpoint_start(130) = 128.
+        // Entries 65..127 trimmed, 128..130 kept.
+        let current_ledger = 0u32;
+        for slot in 65..=130 {
+            buffer.insert(slot, make_entry(slot));
+        }
+
+        App::trim_syncing_ledgers(&mut buffer, current_ledger);
+
+        // trim_before = checkpoint_start(130) = 128
+        assert!(
+            !buffer.contains_key(&65),
+            "entry below checkpoint boundary should be trimmed"
+        );
+        assert!(
+            !buffer.contains_key(&127),
+            "entry just below checkpoint boundary should be trimmed"
+        );
+        assert!(
+            buffer.contains_key(&128),
+            "entry at checkpoint boundary should be retained"
+        );
+        assert!(buffer.contains_key(&130), "last entry should be retained");
+        assert_eq!(buffer.len(), 3); // 128, 129, 130
+    }
+
+    #[test]
+    fn test_trim_syncing_ledgers_last_buffered_at_checkpoint_start() {
+        // When last_buffered IS a checkpoint start (e.g. 128), we look at prev=127
+        // and trim_before = checkpoint_start(127) = 64.
+        let mut buffer = BTreeMap::new();
+        let make_entry = |slot: u32| henyey_herder::LedgerCloseInfo {
+            slot: slot as u64,
+            tx_set_hash: Hash256::ZERO,
+            tx_set: None,
+            close_time: 1,
+            upgrades: Vec::new(),
+            stellar_value_ext: StellarValueExt::Basic,
+        };
+
+        let current_ledger = 0u32;
+        for slot in 65..=128 {
+            buffer.insert(slot, make_entry(slot));
+        }
+
+        App::trim_syncing_ledgers(&mut buffer, current_ledger);
+
+        // last_buffered=128 is checkpoint start, prev=127, trim_before=checkpoint_start(127)=64
+        // All entries >= 64 retained (65..128 are all >= 64)
+        assert!(
+            buffer.contains_key(&65),
+            "entry at/above trim boundary should be retained"
+        );
+        assert!(buffer.contains_key(&128), "last entry should be retained");
+        assert_eq!(buffer.len(), 64); // 65..=128
     }
 
     #[test]
