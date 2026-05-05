@@ -9744,6 +9744,24 @@ mod quorum_health_tests {
                 10 + i
             );
         }
+
+        // Verify quorum_tracker.rebuild() still works under cache pressure.
+        // rebuild() traverses from the local node through the quorum set,
+        // calling scp_driver.get_quorum_set() for each member — all of which
+        // go through the bounded cache. If active validators were evicted,
+        // rebuild() would leave those nodes unexpanded.
+        {
+            let mut tracker = herder.quorum_tracker.write();
+            tracker
+                .rebuild(|id| herder.scp_driver.get_quorum_set(id))
+                .expect("quorum_tracker.rebuild() must succeed under cache pressure");
+            // All 31 nodes (local + 30 remote) should be tracked after rebuild.
+            assert_eq!(
+                tracker.tracked_node_count(),
+                31,
+                "rebuild must recover all 31 quorum members under cache pressure"
+            );
+        }
     }
 }
 
