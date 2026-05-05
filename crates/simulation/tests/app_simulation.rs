@@ -161,12 +161,12 @@ async fn build_app_backed_topology(
 ) -> Simulation {
     sim.populate_app_nodes_from_existing(threshold_percent);
     sim.start_all_nodes().await;
-    sim.stabilize_app_tcp_connectivity(min_peers, Duration::from_secs(30))
+    sim.stabilize_app_tcp_connectivity(min_peers, Duration::from_secs(45))
         .await
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|err| {
             panic!(
                 "build_app_backed_topology: TCP connectivity did not stabilize \
-             within 30s (min_peers={min_peers}). Nodes may not have completed handshakes.",
+                 within 45s (min_peers={min_peers}): {err}",
             )
         });
     sim
@@ -820,10 +820,16 @@ async fn test_stabilize_app_tcp_connectivity_returns_error_on_timeout() {
         .stabilize_app_tcp_connectivity(100, Duration::from_millis(500))
         .await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("did not stabilize"));
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("did not stabilize"),
+        "expected 'did not stabilize' in error: {err_msg}"
+    );
+    // Verify per-node diagnostics are propagated
+    assert!(
+        err_msg.contains("not all apps reached"),
+        "expected per-node detail in error: {err_msg}"
+    );
     sim.stop_all_nodes().await.ok();
 }
 

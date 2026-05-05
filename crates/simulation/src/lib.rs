@@ -586,9 +586,17 @@ impl Simulation {
             let remaining = deadline.duration_since(tokio::time::Instant::now());
             tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
         }
-        anyhow::bail!(
-            "stabilize_app_tcp_connectivity: connectivity did not stabilize within {timeout:?}"
-        )
+        // Final probe with zero timeout to get per-node peer counts for diagnostics.
+        match self
+            .wait_for_app_connectivity(min_peers, Duration::from_millis(0))
+            .await
+        {
+            Err(detail) => anyhow::bail!(
+                "stabilize_app_tcp_connectivity: connectivity did not stabilize \
+                 within {timeout:?}: {detail}"
+            ),
+            Ok(()) => Ok(()),
+        }
     }
 
     pub fn have_all_app_nodes_externalized(&self, ledger_seq: u32, max_spread: u32) -> bool {
@@ -1044,16 +1052,12 @@ impl Simulation {
 
     fn known_peers_for(&self, node_id: &str, port_map: &HashMap<String, u16>) -> Vec<PeerAddress> {
         self.loopback
-            .links()
+            .neighbors(node_id)
             .into_iter()
-            .filter_map(|(a, b)| {
-                if a == node_id && a < b {
-                    port_map
-                        .get(&b)
-                        .map(|port| PeerAddress::new("127.0.0.1", *port))
-                } else {
-                    None
-                }
+            .filter_map(|neighbor| {
+                port_map
+                    .get(&neighbor)
+                    .map(|port| PeerAddress::new("127.0.0.1", *port))
             })
             .collect()
     }
