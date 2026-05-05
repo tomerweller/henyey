@@ -7541,6 +7541,65 @@ mod scp_pipeline_tests {
         assert_eq!(reason, PostVerifyReason::GateDriftRange);
     }
 
+    /// #2408: process_verified returns (Invalid, PendingAddPerSlotFull) when
+    /// the per-slot cap is hit. This exercises the herder-level match arm
+    /// end-to-end rather than just the PendingEnvelopes unit tests.
+    #[test]
+    fn test_process_verified_per_slot_full() {
+        use crate::pending::PendingConfig;
+        let config = HerderConfig {
+            pending_config: PendingConfig {
+                max_envelopes_per_slot: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let herder = Herder::new(config, make_default_lm());
+        herder.start_syncing();
+        herder.pending_envelopes.set_current_slot(95);
+
+        let slot = 100u64; // future slot → goes through pending_envelopes.add()
+
+        // Fill 3 envelopes (the cap). Use signed envelopes so close-time
+        // gate passes.
+        for seed_byte in 0..3u8 {
+            let secret = SecretKey::from_seed(&[seed_byte + 10; 32]);
+            let env = make_signed_test_envelope_outer(slot, &herder, &secret);
+            let intake = PipelinedIntake {
+                envelope: env,
+                slot,
+                is_externalize: false,
+                peer_id: None,
+                enqueue_at: std::time::Instant::now(),
+                flood_msg_hash: None,
+            };
+            let (state, reason) = herder.process_verified(VerifiedEnvelope {
+                intake,
+                verdict: Verdict::Ok,
+            });
+            assert_eq!(state, EnvelopeState::Pending);
+            assert_eq!(reason, PostVerifyReason::PendingAddBuffered);
+        }
+
+        // 4th envelope exceeds the cap → PerSlotFull path.
+        let secret = SecretKey::from_seed(&[99; 32]);
+        let env = make_signed_test_envelope_outer(slot, &herder, &secret);
+        let intake = PipelinedIntake {
+            envelope: env,
+            slot,
+            is_externalize: false,
+            peer_id: None,
+            enqueue_at: std::time::Instant::now(),
+            flood_msg_hash: None,
+        };
+        let (state, reason) = herder.process_verified(VerifiedEnvelope {
+            intake,
+            verdict: Verdict::Ok,
+        });
+        assert_eq!(state, EnvelopeState::Invalid);
+        assert_eq!(reason, PostVerifyReason::PendingAddPerSlotFull);
+    }
+
     // -------- scp_verify::worker tests --------
 
     #[test]
