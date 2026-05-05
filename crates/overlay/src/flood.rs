@@ -270,18 +270,23 @@ impl FloodGate {
     /// Drains the eviction queue until the map is at or below 75% capacity.
     ///
     /// Uses generation tokens to safely skip ghost entries and re-inserted
-    /// entries whose original queue slot is stale.
+    /// entries whose original queue slot is stale. The generation check and
+    /// removal are atomic (via `remove_if`) to prevent a concurrent
+    /// forget+reinsert from having its new entry incorrectly evicted.
     fn evict_to_target(&self, queue: &mut VecDeque<(Hash256, u64)>) {
         let target = self.max_entries * 3 / 4;
         let mut evicted = 0u64;
         while self.seen.len() > target {
             match queue.pop_front() {
                 Some((hash, gen)) => {
-                    // Only evict if generation matches (entry hasn't been
-                    // forgotten and re-inserted with a new generation).
-                    let should_remove = self.seen.get(&hash).map_or(false, |e| e.generation == gen);
-                    if should_remove {
-                        self.seen.remove(&hash);
+                    // Atomic check-and-remove: only evicts if the entry's
+                    // generation matches the queued generation. If a concurrent
+                    // forget+reinsert changed the generation, this is a no-op.
+                    if self
+                        .seen
+                        .remove_if(&hash, |_, entry| entry.generation == gen)
+                        .is_some()
+                    {
                         evicted += 1;
                     }
                 }
@@ -1138,6 +1143,67 @@ mod tests {
             gate.seen.len() <= 1000 + num_threads,
             "seen.len() = {} exceeds expected bound",
             gate.seen.len()
+        );
+    }
+
+    /// Regression test: concurrent forget+reinsert must not lose entries to
+    /// stale eviction. Before the `remove_if` fix, a non-atomic get+remove
+    /// could evict a freshly re-inserted entry.
+    #[test]
+    fn test_flood_gate_concurrent_forget_reinsert_during_eviction() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Small capacity to force frequent evictions.
+        let gate = Arc::new(FloodGate::with_limits(Duration::from_secs(300), 100));
+        let num_threads = 4;
+        let iterations = 200;
+
+        // Pre-fill to capacity with unique entries.
+        for i in 0u16..100 {
+            let mut h = [0u8; 32];
+            h[0..2].copy_from_slice(&i.to_le_bytes());
+            gate.record_seen(Hash256(h), None, 1);
+        }
+
+        // Concurrently: some threads insert new entries (triggering eviction),
+        // while other threads forget + reinsert a "hot" hash repeatedly.
+        let hot_hash = Hash256([0xAA; 32]);
+        gate.record_seen(hot_hash, None, 1);
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|t| {
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || {
+                    if t % 2 == 0 {
+                        // Inserter thread — pushes new entries to trigger eviction.
+                        for i in 0..iterations {
+                            let mut h = [0u8; 32];
+                            h[0] = 0xFF;
+                            h[1] = t as u8;
+                            h[2..4].copy_from_slice(&(i as u16).to_le_bytes());
+                            gate.record_seen(Hash256(h), None, 1);
+                        }
+                    } else {
+                        // Forget+reinsert thread — rapidly cycles the hot hash.
+                        for _ in 0..iterations {
+                            gate.forget(&hot_hash);
+                            gate.record_seen(hot_hash, None, 1);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The hot hash must still be present — forget+reinsert should never
+        // lose an entry to a stale eviction.
+        assert!(
+            gate.seen.contains_key(&hot_hash),
+            "hot_hash was incorrectly evicted by stale queue entry"
         );
     }
 }
