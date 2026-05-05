@@ -1217,8 +1217,13 @@ impl OverlayManager {
     ///
     /// Mirrors stellar-core's `OverlayManagerImpl::forgetFloodedMsg`
     /// (OverlayManagerImpl.cpp:1264-1268). Called from the app layer when
-    /// an SCP envelope is discarded after `record_inbound_relay` already
-    /// recorded the message hash.
+    /// a flood-tracked message is discarded after `record_inbound_relay`
+    /// already recorded the message hash. Two call sites:
+    ///
+    /// - **SCP envelopes**: rejected after verification (pre-filter or
+    ///   post-verify discard).
+    /// - **Transactions**: rejected by the tx queue (any result that is not
+    ///   Added or Duplicate — parity with OverlayManagerImpl.cpp:1231-1236).
     pub fn forget_flooded_msg(&self, message_hash: &henyey_common::Hash256) {
         self.flood_gate.forget(message_hash);
     }

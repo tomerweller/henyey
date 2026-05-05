@@ -313,7 +313,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `broadcastMessage()` | (via broadcast channel + flood gate) | Full |
 | `recvFloodedMsgID()` | `FloodGate::record_inbound_relay()` / `record_local_broadcast()` | Full |
 | `recvTransaction()` | (via broadcast channel + flood gate) | Full |
-| `forgetFloodedMsg()` | Handled within `clear_below()` at ledger close | Full |
+| `forgetFloodedMsg()` | `forget_flooded_msg()` — called on SCP discard and tx rejection; also cleared via `clear_below()` at ledger close | Full |
 | `recvTxDemand()` | Handled in app crate (`App::handle_flood_demand`) | Full (moved to app layer) |
 | `getRandomAuthenticatedPeers()` | (shuffled peer list) | Full |
 | `getRandomInboundAuthenticatedPeers()` | N/A | None |

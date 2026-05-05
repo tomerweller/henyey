@@ -82,6 +82,35 @@ pub(crate) fn query_rate_limit_window(close_duration: Duration) -> Duration {
     henyey_overlay::query_policy::query_rate_limit_window(close_duration)
 }
 
+/// Whether a transaction queue result requires removal of the FloodGate record,
+/// allowing re-delivery to be treated as new.
+///
+/// Mirrors stellar-core: OverlayManagerImpl.cpp:1231-1236 — `forgetFloodedMsg`
+/// is called when the add result is NOT `ADD_STATUS_PENDING` or `ADD_STATUS_DUPLICATE`.
+fn should_forget_tx_flood_record(result: &henyey_herder::TxQueueResult) -> bool {
+    use henyey_herder::TxQueueResult;
+    match result {
+        // Parity: ADD_STATUS_PENDING — keep flood record for relay accounting
+        TxQueueResult::Added => false,
+        // Parity: ADD_STATUS_DUPLICATE — keep flood record for relay accounting
+        TxQueueResult::Duplicate => false,
+        // All rejections: forget so redelivery is treated as new.
+        //
+        // TryAgainLater is henyey-specific (herder.rs:1894-1907 — the node
+        // hasn't reached Tracking state yet). stellar-core does not gate on
+        // tracking state, so this variant has no upstream analog. We still
+        // forget because: (a) the tx was not accepted, (b) the peer should
+        // be able to re-send once the node is tracking, and (c) keeping the
+        // record provides no relay value since the tx won't be broadcast.
+        TxQueueResult::QueueFull
+        | TxQueueResult::FeeTooLow
+        | TxQueueResult::Invalid(_)
+        | TxQueueResult::Banned
+        | TxQueueResult::Filtered
+        | TxQueueResult::TryAgainLater => true,
+    }
+}
+
 /// Whether a post-verify SCP outcome requires removal of the corresponding
 /// FloodGate record, allowing re-delivery to be treated as new.
 ///
@@ -1390,21 +1419,27 @@ impl App {
             }
 
             StellarMessage::Transaction(tx_env) => {
-                let tx_hash = Some(Hash256::hash_xdr(&tx_env));
-                match self.herder.receive_transaction(tx_env.clone()) {
+                let tx_hash = Hash256::hash_xdr(&tx_env);
+                let flood_msg_hash = henyey_overlay::compute_message_hash(
+                    &StellarMessage::Transaction(tx_env.clone()),
+                );
+                let result = self.herder.receive_transaction(tx_env);
+                // Parity: OverlayManagerImpl.cpp:1231-1236 — forgetFloodedMsg
+                // for any result that is not PENDING or DUPLICATE.
+                if should_forget_tx_flood_record(&result) {
+                    if let Some(overlay) = self.overlay().await {
+                        overlay.forget_flooded_msg(&flood_msg_hash);
+                    }
+                }
+                match result {
                     henyey_herder::TxQueueResult::Added => {
                         tracing::debug!(peer = %msg.from_peer, "Transaction added to queue");
-                        if let Some(hash) = tx_hash {
-                            self.record_tx_pull_latency(hash, &msg.from_peer).await;
-                        }
+                        self.record_tx_pull_latency(tx_hash, &msg.from_peer).await;
                         // No explicit advert enqueue — flush_tx_adverts() reads
                         // the herder queue in priority order each flood period.
                     }
                     henyey_herder::TxQueueResult::Duplicate => {
-                        if let Some(hash) = tx_hash {
-                            self.record_tx_pull_latency(hash, &msg.from_peer).await;
-                        }
-                        // Expected, ignore
+                        self.record_tx_pull_latency(tx_hash, &msg.from_peer).await;
                     }
                     henyey_herder::TxQueueResult::QueueFull => {
                         // Aggregate count emitted per ledger close in Herder::ledger_closed()
@@ -3244,5 +3279,54 @@ mod heartbeat_field_tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tx_flood_forget_tests {
+    use super::should_forget_tx_flood_record;
+    use henyey_herder::TxQueueResult;
+
+    #[test]
+    fn test_added_does_not_forget() {
+        assert!(!should_forget_tx_flood_record(&TxQueueResult::Added));
+    }
+
+    #[test]
+    fn test_duplicate_does_not_forget() {
+        assert!(!should_forget_tx_flood_record(&TxQueueResult::Duplicate));
+    }
+
+    #[test]
+    fn test_queue_full_forgets() {
+        assert!(should_forget_tx_flood_record(&TxQueueResult::QueueFull));
+    }
+
+    #[test]
+    fn test_fee_too_low_forgets() {
+        assert!(should_forget_tx_flood_record(&TxQueueResult::FeeTooLow));
+    }
+
+    #[test]
+    fn test_invalid_forgets() {
+        assert!(should_forget_tx_flood_record(&TxQueueResult::Invalid(None)));
+        assert!(should_forget_tx_flood_record(&TxQueueResult::Invalid(
+            Some(henyey_tx::TxResultCode::TxBadAuth,)
+        )));
+    }
+
+    #[test]
+    fn test_banned_forgets() {
+        assert!(should_forget_tx_flood_record(&TxQueueResult::Banned));
+    }
+
+    #[test]
+    fn test_filtered_forgets() {
+        assert!(should_forget_tx_flood_record(&TxQueueResult::Filtered));
+    }
+
+    #[test]
+    fn test_try_again_later_forgets() {
+        assert!(should_forget_tx_flood_record(&TxQueueResult::TryAgainLater));
     }
 }
