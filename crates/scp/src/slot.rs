@@ -233,6 +233,12 @@ impl Slot {
         self.set_fully_validated(validated);
     }
 
+    /// Test-only: directly set the `got_v_blocking` flag.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_set_got_v_blocking(&mut self, v_blocking: bool) {
+        self.got_v_blocking = v_blocking;
+    }
+
     /// Restore `fully_validated` and emit any deferred ballot/nomination envelopes.
     ///
     /// Called by the herder after all deferred validation conditions for this

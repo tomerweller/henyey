@@ -957,7 +957,7 @@ impl Herder {
     /// the highest v-blocking slot.
     ///
     /// Returns the slot we purged below, or None if no purging was done.
-    pub fn out_of_sync_recovery(&self, lcl: u64) -> Option<u64> {
+    pub fn out_of_sync_recovery(&self) -> Option<u64> {
         // Don't call this when tracking normally
         if self.state() == HerderState::Tracking {
             return None;
@@ -984,9 +984,8 @@ impl Herder {
         if let Some(purge_slot) = purge_slot {
             info!(purge_slot, "Out-of-sync recovery: purging slots below");
 
-            // Calculate slot_to_keep (for checkpoint preservation, keep last checkpoint)
-            let freq = self.config.checkpoint_frequency;
-            let last_checkpoint = (lcl / freq) * freq;
+            // Parity: stellar-core eraseOutsideRange uses getMostRecentCheckpointSeq()
+            let last_checkpoint = self.get_most_recent_checkpoint_seq();
 
             self.fetching_envelopes
                 .erase_outside_range(Some(purge_slot), None, last_checkpoint);
@@ -11155,5 +11154,164 @@ mod fetching_envelopes_routing_tests {
         // current_slot = 101 - 1 = 100, 100 > 12 → 100 - 12 + 1 = 89
         herder.bootstrap(100);
         assert_eq!(herder.get_min_ledger_seq_to_remember(), 89);
+    }
+
+    /// Regression test for #2417: `out_of_sync_recovery()` must preserve checkpoint
+    /// slot 1 for early ledgers (tracking_slot in 1..63 range).
+    ///
+    /// Before the fix, the code computed `(lcl / freq) * freq` which yielded 0
+    /// for early ledgers, failing to preserve checkpoint slot 1.
+    #[test]
+    fn test_out_of_sync_recovery_preserves_checkpoint_early_ledgers() {
+        let herder = make_test_herder();
+
+        // Bootstrap to ledger 49 → tracking_slot = 50, then transition to Syncing
+        // so out_of_sync_recovery can fire (it requires state != Tracking).
+        herder.bootstrap(49);
+        {
+            let mut ts = herder.tracking_state.write();
+            // Keep consensus_index = 50 but clear tracking flag
+            ts.is_tracking = false;
+        }
+        *herder.state.write() = HerderState::Syncing;
+
+        // Verify checkpoint computation: tracking_slot=50, tracking_consensus_index=49
+        // checkpoint containing 49: ((49/64+1)*64)-1 = 63, size=63 (49<64), first = 63-62 = 1
+        assert_eq!(herder.get_most_recent_checkpoint_seq(), 1);
+
+        // Set up >100 v-blocking SCP slots to trigger purge.
+        // The recovery scans descending and counts v-blocking slots;
+        // after 100, it purges below that point.
+        // Create slots 200..=301 (102 slots) all with v-blocking.
+        for slot in 200..=301 {
+            herder.scp.test_set_slot_v_blocking(slot);
+        }
+
+        // Insert fetching_envelopes for slot 1 (checkpoint) and slot 5 (should be kept
+        // because purge_slot will be 201, and erase_outside_range only erases below min_slot
+        // EXCEPT slot_to_keep).
+        herder
+            .fetching_envelopes
+            .test_insert_ready(1, vec![make_fetching_test_envelope(1, 1)]);
+        herder
+            .fetching_envelopes
+            .test_insert_ready(5, vec![make_fetching_test_envelope(5, 1)]);
+        herder
+            .fetching_envelopes
+            .test_insert_ready(250, vec![make_fetching_test_envelope(250, 1)]);
+
+        // Act: trigger out-of-sync recovery
+        let result = herder.out_of_sync_recovery();
+
+        // The purge_slot should be 202 (100 v-blocking slots from 301 down to 202;
+        // the 100th decrement brings max_slots_ahead to 0 at slot 202).
+        assert_eq!(result, Some(202));
+
+        // Slot 1 should be PRESERVED as the checkpoint keep_slot.
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&1),
+            "slot 1 must be preserved as checkpoint keep_slot (#2417)"
+        );
+
+        // Slot 5 is below purge_slot (202) and not the checkpoint — it gets erased.
+        assert!(
+            !herder.fetching_envelopes.slots.contains_key(&5),
+            "slot 5 should be erased (below purge_slot 202, not checkpoint)"
+        );
+
+        // Slot 250 is above purge_slot — preserved (erase_outside_range only has min_slot).
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&250),
+            "slot 250 should be preserved (above purge_slot)"
+        );
+    }
+
+    /// Regression test for #2417: `out_of_sync_recovery()` with tracking_slot=0
+    /// (default/unbootstrapped) still preserves checkpoint 1 via saturating math.
+    #[test]
+    fn test_out_of_sync_recovery_preserves_checkpoint_at_tracking_slot_zero() {
+        let herder = make_test_herder();
+
+        // Default state: tracking_slot = 0, state = Booting.
+        // Transition to Syncing so the function doesn't return early.
+        herder.set_state(HerderState::Syncing);
+
+        // get_most_recent_checkpoint_seq with tracking_slot=0:
+        // saturating_sub(1) = 0, ((0/64+1)*64)-1 = 63, size=63 (0<64), first=1
+        assert_eq!(herder.get_most_recent_checkpoint_seq(), 1);
+
+        // Set up >100 v-blocking SCP slots
+        for slot in 500..=601 {
+            herder.scp.test_set_slot_v_blocking(slot);
+        }
+
+        // Insert slot 1 in fetching_envelopes
+        herder
+            .fetching_envelopes
+            .test_insert_ready(1, vec![make_fetching_test_envelope(1, 1)]);
+
+        let result = herder.out_of_sync_recovery();
+        assert_eq!(result, Some(502));
+
+        // Slot 1 preserved as checkpoint keep_slot even with tracking_slot=0
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&1),
+            "slot 1 must be preserved even with tracking_slot=0 (#2417)"
+        );
+    }
+
+    /// Regression test for #2417: after crossing first checkpoint boundary,
+    /// out_of_sync_recovery preserves slot 64 (not slot 1).
+    #[test]
+    fn test_out_of_sync_recovery_preserves_checkpoint_after_boundary() {
+        let herder = make_test_herder();
+
+        // Bootstrap to ledger 65 → tracking_slot = 66
+        herder.bootstrap(65);
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = false;
+        }
+        *herder.state.write() = HerderState::Syncing;
+
+        // checkpoint containing 65: ((65/64+1)*64)-1 = 127, size=64, first=64
+        assert_eq!(herder.get_most_recent_checkpoint_seq(), 64);
+
+        // Set up >100 v-blocking SCP slots
+        for slot in 300..=401 {
+            herder.scp.test_set_slot_v_blocking(slot);
+        }
+
+        // Insert slots
+        herder
+            .fetching_envelopes
+            .test_insert_ready(1, vec![make_fetching_test_envelope(1, 1)]);
+        herder
+            .fetching_envelopes
+            .test_insert_ready(64, vec![make_fetching_test_envelope(64, 1)]);
+        herder
+            .fetching_envelopes
+            .test_insert_ready(50, vec![make_fetching_test_envelope(50, 1)]);
+
+        let result = herder.out_of_sync_recovery();
+        assert_eq!(result, Some(302));
+
+        // Slot 64 preserved as checkpoint keep_slot
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&64),
+            "slot 64 must be preserved as checkpoint keep_slot"
+        );
+
+        // Slot 1 is below purge_slot and NOT the checkpoint — erased
+        assert!(
+            !herder.fetching_envelopes.slots.contains_key(&1),
+            "slot 1 should be erased (not checkpoint when past boundary)"
+        );
+
+        // Slot 50 is below purge_slot and NOT the checkpoint — erased
+        assert!(
+            !herder.fetching_envelopes.slots.contains_key(&50),
+            "slot 50 should be erased"
+        );
     }
 }

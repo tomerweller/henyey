@@ -1139,7 +1139,7 @@ impl App {
                     // When we have v-blocking slots that are >100 ahead of older slots,
                     // purge the old slots to free memory and allow recovery.
                     if !self.herder.state().can_receive_scp() || !heard_from_quorum {
-                        if let Some(purge_slot) = self.herder.out_of_sync_recovery(ledger as u64) {
+                        if let Some(purge_slot) = self.herder.out_of_sync_recovery() {
                             tracing::info!(
                                 purge_slot,
                                 ledger,

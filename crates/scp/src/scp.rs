@@ -401,6 +401,14 @@ impl<D: SCPDriver> SCP<D> {
         slot.test_set_fully_validated(false);
     }
 
+    /// Test-only: create a slot and set its `got_v_blocking` flag.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_set_slot_v_blocking(&self, slot_index: u64) {
+        let mut slots = self.slots.write();
+        let slot = self.get_or_create_slot(&mut slots, slot_index);
+        slot.test_set_got_v_blocking(true);
+    }
+
     /// Get all envelopes for a specific slot.
     pub fn get_slot_envelopes(&self, slot_index: u64) -> Vec<ScpEnvelope> {
         let slots = self.slots.read();
