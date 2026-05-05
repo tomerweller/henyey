@@ -3250,6 +3250,48 @@ mod tests {
     }
 
     #[test]
+    fn test_buffered_catchup_target_first_buffered_one() {
+        // Tests first_buffered=1 with a large buffer spanning past the first checkpoint.
+        // Assumes default checkpoint_frequency=64.
+        //
+        // first_buffered=1, current_ledger=0:
+        // Early return guard: first_buffered(1) <= current_ledger(0) + 1 → 1 <= 1 → true → None
+        // This confirms: at genesis with the immediate next ledger buffered, no catchup
+        // is triggered regardless of how many additional ledgers are buffered.
+        let target = App::buffered_catchup_target(0, 1, 65);
+        assert_eq!(target, None);
+
+        // Same scenario with last_buffered spanning multiple checkpoints.
+        let target = App::buffered_catchup_target(0, 1, 200);
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn test_compute_catchup_target_for_timeout_first_buffered_one() {
+        // Tests compute_catchup_target_for_timeout with first_buffered=1 (genesis).
+        // Assumes default checkpoint_frequency=64.
+        // The key boundary is last_buffered=64 (first ledger of second checkpoint)
+        // vs last_buffered=63 (last ledger of first checkpoint).
+
+        // Case A (boundary positive): last_buffered=64 spans into second checkpoint.
+        // last_ledger_before_checkpoint_containing(1) = None → target=0
+        // target(0) <= current(0) → falls through to alt_target
+        // last_ledger_before_checkpoint_containing(64) = Some(63) (second checkpoint starts at 64)
+        // alt_target(63) > current(0) → returns Some(63)
+        let target = App::compute_catchup_target_for_timeout(64, 1, 0);
+        assert_eq!(target, Some(63));
+
+        // Case B (boundary negative): last_buffered=63, all in first checkpoint.
+        // last_ledger_before_checkpoint_containing(1) = None → target=0
+        // target(0) <= current(0) → falls through to alt_target
+        // last_ledger_before_checkpoint_containing(63) = None (63 is in first checkpoint)
+        // alt_target=0 <= current(0) → falls through to direct_target
+        // direct_target = first_buffered - 1 = 0, 0 > 0 → false → None
+        let target = App::compute_catchup_target_for_timeout(63, 1, 0);
+        assert_eq!(target, None);
+    }
+
+    #[test]
     fn test_tx_set_start_index_rotation() {
         let mut bytes = [0u8; 32];
         bytes[0] = 1;
