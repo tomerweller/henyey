@@ -9542,4 +9542,30 @@ mod tests {
             "no reset → max_verified_scp_slot preserved"
         );
     }
+
+    // ---- survey_local_ledger parity tests ----
+
+    #[tokio::test]
+    async fn test_survey_local_ledger_returns_last_externalized() {
+        let app = survey_test_app().await;
+        // Bootstrap at ledger 5 → tracking_slot = 6, tracking_consensus_ledger_index = 5
+        app.herder.bootstrap(5);
+        let result = app.survey_local_ledger().await;
+        assert_eq!(
+            result, 5,
+            "survey_local_ledger must return last externalized (5), not next consensus (6)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_survey_local_ledger_fallback_when_not_tracking() {
+        let app = survey_test_app().await;
+        // No bootstrap → tracking_slot = 0, tracking_consensus_ledger_index = 0
+        let lcl = app.current_ledger_seq();
+        let result = app.survey_local_ledger().await;
+        assert_eq!(
+            result, lcl,
+            "survey_local_ledger must fall back to current_ledger_seq when not tracking"
+        );
+    }
 }

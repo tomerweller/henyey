@@ -754,12 +754,17 @@ impl App {
         ))
     }
 
-    async fn survey_local_ledger(&self) -> u32 {
-        let tracking = self.herder.tracking_consensus_ledger_index() as u32;
+    pub(crate) async fn survey_local_ledger(&self) -> u32 {
+        let tracking = self.herder.tracking_consensus_ledger_index();
         if tracking == 0 {
+            // Not yet tracking (boot/syncing state). Stellar-core asserts
+            // non-boot in trackingConsensusLedgerIndex(); henyey gracefully
+            // falls back to LCL. Outgoing survey entrypoints are gated by
+            // app state, so this fallback primarily serves incoming message
+            // validation during catchup.
             self.current_ledger_seq()
         } else {
-            tracking
+            u32::try_from(tracking).expect("ledger index exceeds u32::MAX")
         }
     }
 
