@@ -9749,18 +9749,37 @@ mod quorum_health_tests {
         // rebuild() traverses from the local node through the quorum set,
         // calling scp_driver.get_quorum_set() for each member — all of which
         // go through the bounded cache. If active validators were evicted,
-        // rebuild() would leave those nodes unexpanded.
+        // rebuild() would leave those nodes unexpanded (quorum_set = None).
         {
             let mut tracker = herder.quorum_tracker.write();
             tracker
                 .rebuild(|id| herder.scp_driver.get_quorum_set(id))
                 .expect("quorum_tracker.rebuild() must succeed under cache pressure");
-            // All 31 nodes (local + 30 remote) should be tracked after rebuild.
+
+            // All 31 nodes should be tracked.
             assert_eq!(
                 tracker.tracked_node_count(),
                 31,
                 "rebuild must recover all 31 quorum members under cache pressure"
             );
+
+            // Stronger assertion: all 30 remote validators must have their
+            // quorum_set populated (not just be present as unexpanded entries).
+            // If the cache had evicted their qsets, rebuild() would insert them
+            // as tracked nodes but leave quorum_set = None.
+            let qmap = tracker.quorum_map();
+            for (i, nid) in node_ids.iter().enumerate().skip(1) {
+                let info = qmap
+                    .get(nid)
+                    .unwrap_or_else(|| panic!("validator {} missing from quorum_map", i));
+                assert!(
+                    info.quorum_set.is_some(),
+                    "validator {} (seed {}) has quorum_set=None after rebuild — \
+                     cache eviction prevented rebuild from resolving its qset",
+                    i,
+                    10 + i
+                );
+            }
         }
     }
 }
