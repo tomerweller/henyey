@@ -317,7 +317,7 @@ pub(super) fn collect_soroban_restored_entries(
     // emissions for read-only auto-restores.
     if let Some(meta) = soroban_meta {
         for ha_restore in &meta.hot_archive_restores {
-            hot_archive.insert(ha_restore.key.clone());
+            hot_archive.insert(ha_restore.key().clone());
         }
     }
     let ha_before = hot_archive.len();
@@ -361,8 +361,9 @@ pub(super) fn collect_soroban_restored_entries(
     // via hot_archive_entries_with_originals() post-processing at meta.rs.
     if let Some(meta) = soroban_meta {
         for ha_restore in &meta.hot_archive_restores {
-            if hot_archive_for_meta.contains(&ha_restore.key) {
-                restored.insert_hot_archive_entry(ha_restore.key.clone(), ha_restore.entry.clone());
+            if hot_archive_for_meta.contains(ha_restore.key()) {
+                restored
+                    .insert_hot_archive_entry(ha_restore.key().clone(), ha_restore.entry().clone());
             }
         }
     }

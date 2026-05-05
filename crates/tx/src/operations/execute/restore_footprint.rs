@@ -99,12 +99,12 @@ pub(crate) fn execute_restore_footprint(
     // SECURITY: hot_archive_restores populated by ledger execution layer from local hot archive, not external tx input
     for restore in resources.hot_archive_restores {
         tracing::debug!(
-            ?restore.key,
+            key = ?restore.key(),
             new_ttl,
             "RestoreFootprint: restoring entry from hot archive to state"
         );
 
-        let entry_size = xdr_entry_size(&restore.entry);
+        let entry_size = xdr_entry_size(restore.entry());
 
         // stellar-core ordering: read_bytes → validate_contract → write_bytes
         if accumulator.add_read(entry_size).is_err() {
@@ -113,7 +113,7 @@ pub(crate) fn execute_restore_footprint(
             ));
         }
         if !super::validate_contract_ledger_entry(
-            &restore.key,
+            restore.key(),
             entry_size as usize,
             &resources.size_limits,
         ) {
@@ -128,7 +128,7 @@ pub(crate) fn execute_restore_footprint(
         }
 
         // Add the entry to state based on type
-        match &restore.entry.data {
+        match &restore.entry().data {
             LedgerEntryData::ContractCode(code) => {
                 state.create_contract_code(code.clone());
             }
@@ -138,7 +138,7 @@ pub(crate) fn execute_restore_footprint(
             _ => {
                 // Hot archive should only contain ContractCode and ContractData
                 tracing::warn!(
-                    ?restore.key,
+                    key = ?restore.key(),
                     "RestoreFootprint: unexpected entry type in hot archive"
                 );
             }
@@ -146,7 +146,7 @@ pub(crate) fn execute_restore_footprint(
 
         // Create the TTL entry for the restored entry
         let key_hash =
-            crate::soroban::get_or_compute_key_hash(resources.ttl_key_cache, &restore.key);
+            crate::soroban::get_or_compute_key_hash(resources.ttl_key_cache, restore.key());
         let ttl_entry = TtlEntry {
             key_hash,
             live_until_ledger_seq: new_ttl,
@@ -164,7 +164,11 @@ pub(crate) fn execute_restore_footprint(
     };
     for key in footprint.read_write.iter() {
         // Skip entries that were restored from hot archive - they're already handled
-        if resources.hot_archive_restores.iter().any(|r| &r.key == key) {
+        if resources
+            .hot_archive_restores
+            .iter()
+            .any(|r| r.key() == key)
+        {
             continue;
         }
 
@@ -878,10 +882,7 @@ mod tests {
         let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         let entry = make_contract_code_entry(hash);
 
-        let hot_restores = vec![HotArchiveRestore {
-            key: key.clone(),
-            entry,
-        }];
+        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry)];
 
         let soroban_data = SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,
@@ -936,10 +937,7 @@ mod tests {
         let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         let entry = make_contract_code_entry(hash);
 
-        let hot_restores = vec![HotArchiveRestore {
-            key: key.clone(),
-            entry,
-        }];
+        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry)];
 
         let soroban_data = SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,
@@ -985,10 +983,7 @@ mod tests {
         let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         let entry = make_contract_code_entry(hash);
 
-        let hot_restores = vec![HotArchiveRestore {
-            key: key.clone(),
-            entry,
-        }];
+        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry)];
 
         // disk_read_bytes = 0 means any entry exceeds it
         let soroban_data = SorobanTransactionData {
@@ -1039,10 +1034,7 @@ mod tests {
         let hot_entry = make_contract_code_entry(hot_hash);
         let hot_entry_size = hot_entry.to_xdr(Limits::none()).unwrap().len() as u32;
 
-        let hot_restores = vec![HotArchiveRestore {
-            key: hot_key.clone(),
-            entry: hot_entry,
-        }];
+        let hot_restores = vec![HotArchiveRestore::new(hot_key.clone(), hot_entry)];
 
         // Live entry with expired TTL
         let live_hash = Hash([61u8; 32]);
@@ -1221,10 +1213,7 @@ mod tests {
             "entry XDR size ({entry_xdr_size}) must exceed restrictive limit (100)"
         );
 
-        let hot_restores = vec![HotArchiveRestore {
-            key: key.clone(),
-            entry: entry.clone(),
-        }];
+        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry.clone())];
 
         let soroban_data = SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,
@@ -1320,10 +1309,7 @@ mod tests {
             "entry XDR size ({entry_xdr_size}) must exceed restrictive limit (100)"
         );
 
-        let hot_restores = vec![HotArchiveRestore {
-            key: key.clone(),
-            entry: entry.clone(),
-        }];
+        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry.clone())];
 
         let soroban_data = SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,
@@ -1637,10 +1623,7 @@ mod tests {
         let entry = make_contract_code_entry_with_size(hash, 100);
         let entry_xdr_size = entry.to_xdr(Limits::none()).unwrap().len() as u32;
 
-        let hot_restores = vec![HotArchiveRestore {
-            key: key.clone(),
-            entry,
-        }];
+        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry)];
 
         let soroban_data = SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,

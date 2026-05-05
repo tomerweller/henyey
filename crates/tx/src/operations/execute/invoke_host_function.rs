@@ -549,10 +549,7 @@ fn execute_contract_invocation(
                         .read_write
                         .get(*idx as usize)?;
                     let entry = guarded.get(key).ok()??;
-                    Some(HotArchiveRestore {
-                        key: key.clone(),
-                        entry,
-                    })
+                    Some(HotArchiveRestore::new(key.clone(), entry))
                 })
                 .collect(),
             _ => Vec::new(),

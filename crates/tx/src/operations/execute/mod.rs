@@ -547,12 +547,52 @@ impl SorobanOperationMeta {
 }
 
 /// Entry restored from the hot archive.
+///
+/// This type enforces structural pairing invariants at construction time:
+/// - The key must be a persistent Soroban key (ContractCode or persistent ContractData)
+/// - The entry must correspond to the key
+///
+/// Note: This type enforces only structural pairing, not eviction/restore semantics
+/// (whether the entry was actually evicted is contextual to the hot archive state).
 #[derive(Debug, Clone)]
 pub struct HotArchiveRestore {
-    /// The key of the restored entry.
-    pub key: stellar_xdr::curr::LedgerKey,
+    key: stellar_xdr::curr::LedgerKey,
+    entry: stellar_xdr::curr::LedgerEntry,
+}
+
+impl HotArchiveRestore {
+    /// Create a new validated `HotArchiveRestore`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any structural invariant is violated:
+    /// - `key` is not a persistent Soroban key (ContractCode or persistent ContractData)
+    /// - `entry` does not correspond to `key`
+    pub fn new(key: stellar_xdr::curr::LedgerKey, entry: stellar_xdr::curr::LedgerEntry) -> Self {
+        assert!(
+            henyey_common::is_persistent_key(&key),
+            "HotArchiveRestore::new: key must be a persistent Soroban key, got: {:?}",
+            key
+        );
+
+        assert_eq!(
+            henyey_common::entry_to_key(&entry),
+            key,
+            "HotArchiveRestore::new: entry does not correspond to key"
+        );
+
+        Self { key, entry }
+    }
+
+    /// The ledger key of the restored entry (ContractCode or persistent ContractData).
+    pub fn key(&self) -> &stellar_xdr::curr::LedgerKey {
+        &self.key
+    }
+
     /// The restored entry value.
-    pub entry: stellar_xdr::curr::LedgerEntry,
+    pub fn entry(&self) -> &stellar_xdr::curr::LedgerEntry {
+        &self.entry
+    }
 }
 
 pub struct OperationExecutionResult {
@@ -1141,10 +1181,8 @@ pub fn execute_operation_with_soroban(
                                     old_live_until: 0, // Hot archive entries: old_live_until = 0
                                 });
                                 // Track this entry for RESTORED metadata emission
-                                hot_archive_restores.push(HotArchiveRestore {
-                                    key: key.clone(),
-                                    entry: entry.clone(),
-                                });
+                                hot_archive_restores
+                                    .push(HotArchiveRestore::new(key.clone(), entry.clone()));
                             }
                         }
                     }
@@ -1442,7 +1480,52 @@ mod tests {
     // === HotArchiveRestore tests ===
 
     #[test]
-    fn test_hot_archive_restore_struct() {
+    fn test_hot_archive_restore_new_valid_contract_code() {
+        let hash = Hash([42u8; 32]);
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash,
+                code: vec![1, 2, 3].try_into().unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let restore = HotArchiveRestore::new(key.clone(), entry);
+        assert_eq!(restore.key(), &key);
+        assert_eq!(restore.entry().last_modified_ledger_seq, 100);
+    }
+
+    #[test]
+    fn test_hot_archive_restore_new_valid_persistent_contract_data() {
+        let contract_id = ContractId(Hash([7u8; 32]));
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(contract_id.clone()),
+            key: ScVal::Void,
+            durability: ContractDataDurability::Persistent,
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 200,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(contract_id),
+                key: ScVal::Void,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let restore = HotArchiveRestore::new(key.clone(), entry);
+        assert_eq!(restore.key(), &key);
+        assert_eq!(restore.entry().last_modified_ledger_seq, 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "key must be a persistent Soroban key")]
+    fn test_hot_archive_restore_new_non_soroban_key() {
         let key = LedgerKey::Account(LedgerKeyAccount {
             account_id: create_test_account_id(0),
         });
@@ -1455,26 +1538,67 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let restore = HotArchiveRestore {
-            key: key.clone(),
-            entry: entry.clone(),
+        HotArchiveRestore::new(key, entry);
+    }
+
+    #[test]
+    #[should_panic(expected = "key must be a persistent Soroban key")]
+    fn test_hot_archive_restore_new_temporary_contract_data() {
+        let contract_id = ContractId(Hash([7u8; 32]));
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(contract_id.clone()),
+            key: ScVal::Void,
+            durability: ContractDataDurability::Temporary,
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(contract_id),
+                key: ScVal::Void,
+                durability: ContractDataDurability::Temporary,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
         };
 
-        assert_eq!(restore.entry.last_modified_ledger_seq, 100);
+        HotArchiveRestore::new(key, entry);
+    }
+
+    #[test]
+    #[should_panic(expected = "entry does not correspond to key")]
+    fn test_hot_archive_restore_new_mismatched_key_entry() {
+        let hash1 = Hash([1u8; 32]);
+        let hash2 = Hash([2u8; 32]);
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash1 });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash: hash2,
+                code: vec![1, 2, 3].try_into().unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        HotArchiveRestore::new(key, entry);
     }
 
     #[test]
     fn test_hot_archive_restore_debug() {
-        let key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: create_test_account_id(0),
-        });
+        let hash = Hash([99u8; 32]);
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         let entry = LedgerEntry {
             last_modified_ledger_seq: 50,
-            data: LedgerEntryData::Account(create_test_account(create_test_account_id(0), 500_000)),
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash,
+                code: vec![].try_into().unwrap(),
+            }),
             ext: LedgerEntryExt::V0,
         };
 
-        let restore = HotArchiveRestore { key, entry };
+        let restore = HotArchiveRestore::new(key, entry);
         let debug_str = format!("{:?}", restore);
         assert!(debug_str.contains("HotArchiveRestore"));
     }
