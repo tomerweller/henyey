@@ -120,13 +120,9 @@ impl App {
     /// flood-budget limit, or 0 when Soroban is not supported on the current
     /// protocol version or when network info is not yet available.
     fn soroban_flood_tx_limit(&self) -> usize {
-        if soroban_supported(
-            self.ledger_manager()
-                .header_snapshot()
-                .header
-                .ledger_version,
-        ) {
-            self.soroban_network_info()
+        let snap = self.ledger_manager().header_snapshot();
+        if soroban_supported(snap.header.ledger_version) {
+            snap.soroban_network_info
                 .map(|info| info.ledger_max_tx_count as usize)
                 .unwrap_or(0)
         } else {

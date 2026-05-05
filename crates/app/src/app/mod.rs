@@ -1797,6 +1797,15 @@ impl App {
     ///
     /// Returns the Soroban-related configuration settings from the current ledger
     /// state, or `None` if not available (pre-protocol 20 or not initialized).
+    ///
+    /// # Prefer `header_snapshot()` when pairing with protocol version
+    ///
+    /// If you need both the protocol version and Soroban info together (e.g., to
+    /// gate on `soroban_supported(version)` before reading config), use
+    /// `self.ledger_manager().header_snapshot()` instead. That captures both
+    /// atomically under a single lock and avoids TOCTOU races with
+    /// `commit_close()`. This standalone method is safe only when no header
+    /// field is read in the same logical operation.
     pub fn soroban_network_info(&self) -> Option<SorobanNetworkInfo> {
         self.ledger_manager.soroban_network_info()
     }

@@ -1919,10 +1919,9 @@ impl App {
     /// Mirrors upstream `HerderImpl::maybeHandleUpgrade()` max-tx-size
     /// tracking plus the startup initialization in `HerderImpl::start()`.
     pub(crate) async fn refresh_max_tx_size_bytes(&self) {
-        let protocol_version = self.ledger_manager.current_header().ledger_version;
-        let soroban_tx_max = self
-            .soroban_network_info()
-            .map(|info| info.tx_max_size_bytes);
+        let snap = self.ledger_manager.header_snapshot();
+        let protocol_version = snap.header.ledger_version;
+        let soroban_tx_max = snap.soroban_network_info.map(|info| info.tx_max_size_bytes);
         let increase = self.update_max_tx_size_bytes(protocol_version, soroban_tx_max);
         if increase > 0 {
             if let Some(overlay) = self.overlay().await {
