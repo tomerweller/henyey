@@ -10850,4 +10850,100 @@ mod fetching_envelopes_routing_tests {
         assert_eq!(processed, 2, "should drain both past and current slots");
         assert!(herder.fetching_envelopes.ready_slots().is_empty());
     }
+
+    /// Regression test for #2414: `ledger_closed()` prunes fetching_envelopes
+    /// slots above `next_consensus_ledger_index + LEDGER_VALIDITY_BRACKET`
+    /// when the herder is tracking.
+    ///
+    /// Also verifies lower-bound pruning (slots below the closed slot) and
+    /// the slot_to_keep exemption.
+    #[test]
+    fn test_ledger_closed_prunes_slots_above_validity_bracket() {
+        let herder = make_test_herder();
+        herder.bootstrap(100); // tracking_slot = 101
+
+        // Simulate advance_tracking_slot(101) having already run:
+        // consensus_index = 102, so next_consensus_ledger_index() = 102.
+        // Upper bound = 102 + LEDGER_VALIDITY_BRACKET = 202.
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = 102;
+        }
+
+        let bracket = crate::sync_recovery::LEDGER_VALIDITY_BRACKET;
+
+        // Insert envelopes for slots within the bracket (103..=202).
+        // These are above tracking_slot (102) so process_ready won't drain them.
+        for slot in 103..=(102 + bracket) {
+            herder
+                .fetching_envelopes
+                .test_insert_ready(slot, vec![make_fetching_test_envelope(slot, 1)]);
+        }
+
+        // Insert envelopes beyond the bracket (203..=210) — should be pruned.
+        for slot in (102 + bracket + 1)..=(102 + bracket + 8) {
+            herder
+                .fetching_envelopes
+                .test_insert_ready(slot, vec![make_fetching_test_envelope(slot, 1)]);
+        }
+
+        // Insert a stale slot below min_slot (slot=101 is the min passed to
+        // erase_outside_range). Slot 50 should be removed.
+        herder
+            .fetching_envelopes
+            .test_insert_ready(50, vec![make_fetching_test_envelope(50, 1)]);
+
+        // Insert slot_to_keep = 101 - 2 = 99. This slot is below min_slot but
+        // exempted by the slot_to_keep parameter.
+        herder
+            .fetching_envelopes
+            .test_insert_ready(99, vec![make_fetching_test_envelope(99, 1)]);
+
+        // Verify pre-conditions: all slots present
+        assert!(herder.fetching_envelopes.slots.contains_key(&50));
+        assert!(herder.fetching_envelopes.slots.contains_key(&99));
+        assert!(herder.fetching_envelopes.slots.contains_key(&103));
+        assert!(herder.fetching_envelopes.slots.contains_key(&202));
+        assert!(herder.fetching_envelopes.slots.contains_key(&203));
+        assert!(herder.fetching_envelopes.slots.contains_key(&210));
+
+        // Act: call ledger_closed which triggers the pruning
+        herder.ledger_closed(101, &[], &[], 0);
+
+        // Assert upper-bound pruning: slots above 202 are gone
+        for slot in 203..=210 {
+            assert!(
+                !herder.fetching_envelopes.slots.contains_key(&slot),
+                "slot {} should have been pruned (above upper bound 202)",
+                slot
+            );
+        }
+
+        // Assert lower-bound pruning: slot 50 is gone (below min_slot=101)
+        assert!(
+            !herder.fetching_envelopes.slots.contains_key(&50),
+            "slot 50 should have been pruned (below min_slot 101)"
+        );
+
+        // Assert slot_to_keep exemption: slot 99 survives
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&99),
+            "slot 99 should be preserved (slot_to_keep = 101 - 2 = 99)"
+        );
+
+        // Assert within-bracket slots are preserved
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&103),
+            "slot 103 should be preserved (within bracket, above tracking)"
+        );
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&150),
+            "slot 150 should be preserved (within bracket)"
+        );
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&202),
+            "slot 202 should be preserved (boundary: 102 + 100 = 202)"
+        );
+    }
 }

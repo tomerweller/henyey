@@ -88,7 +88,7 @@ impl Default for FetchingConfig {
 /// waiting for that data become ready for processing.
 pub struct FetchingEnvelopes {
     /// Per-slot envelope state.
-    slots: DashMap<SlotIndex, SlotEnvelopes>,
+    pub(crate) slots: DashMap<SlotIndex, SlotEnvelopes>,
     /// TxSet fetcher.
     tx_set_fetcher: ItemFetcher,
     /// QuorumSet fetcher.
