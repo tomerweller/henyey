@@ -3300,7 +3300,7 @@ impl Herder {
     /// unless state is BOOTING, in which case use LCL seq.
     pub fn resolve_quorum_slot(&self, lcl_seq: u32) -> u64 {
         if self.state() != HerderState::Booting {
-            self.tracking_slot()
+            self.tracking_consensus_ledger_index()
         } else {
             lcl_seq as u64
         }
@@ -4632,6 +4632,22 @@ mod tests {
         herder.bootstrap(100);
         assert_eq!(herder.tracking_slot(), 101);
         assert_eq!(herder.tracking_consensus_ledger_index(), 100);
+    }
+
+    #[test]
+    fn test_resolve_quorum_slot_uses_tracking_consensus_ledger_index() {
+        let herder = make_test_herder();
+
+        // In Booting state, should use LCL seq directly
+        assert_eq!(herder.state(), HerderState::Booting);
+        assert_eq!(herder.resolve_quorum_slot(50), 50);
+
+        // After bootstrap, should use tracking_consensus_ledger_index (not tracking_slot)
+        herder.bootstrap(100);
+        assert_eq!(herder.state(), HerderState::Tracking);
+        // tracking_slot = 101, tracking_consensus_ledger_index = 100
+        assert_eq!(herder.resolve_quorum_slot(99), 100);
+        assert_eq!(herder.resolve_quorum_slot(0), 100);
     }
 
     #[test]

@@ -73,7 +73,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `recvSCPEnvelope()` | `receive_scp_envelope()` | Full |
 | `isTracking()` | `is_tracking()` | Full |
 | `sendSCPStateToPeer()` | `get_scp_state()` | Full |
-| `trackingConsensusLedgerIndex()` | `tracking_slot()` | Full |
+| `trackingConsensusLedgerIndex()` | `tracking_consensus_ledger_index()` | Full |
 | `getMaxClassicTxSize()` | via `flow_control` module | Full |
 | `getMaxTxSize()` | via `flow_control` module | Full |
 | `getFlowControlExtraBuffer()` | `FLOW_CONTROL_BYTES_EXTRA_BUFFER` | Full |
