@@ -1274,7 +1274,7 @@ impl UpgradeContext {
         closing_ledger_seq: u32,
         protocol_version: u32,
         soroban_state: &crate::soroban_state::SharedSorobanState,
-    ) -> Result<ConfigUpgradeResult, LedgerError> {
+    ) -> ConfigUpgradeResult {
         use stellar_xdr::curr::{Limits, WriteXdr};
 
         let mut state_archival_changed = false;
@@ -1291,13 +1291,22 @@ impl UpgradeContext {
                 &key,
                 closing_ledger_seq,
                 protocol_version,
-            )? {
-                Some(f) => f,
-                None => {
-                    return Err(LedgerError::UpgradeError(format!(
-                        "Failed to retrieve valid config upgrade set for {:?}",
-                        key.contract_id
-                    )));
+            ) {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    tracing::error!(
+                        contract_id = ?key.contract_id,
+                        "Failed to retrieve valid config upgrade set — skipping"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        contract_id = ?key.contract_id,
+                        error = %e,
+                        "Exception loading config upgrade set — skipping"
+                    );
+                    continue;
                 }
             };
 
@@ -1305,22 +1314,23 @@ impl UpgradeContext {
             match frame.is_valid_for_apply() {
                 ConfigUpgradeValidity::Valid => {}
                 ConfigUpgradeValidity::XdrInvalid | ConfigUpgradeValidity::Invalid => {
-                    return Err(LedgerError::UpgradeError(format!(
-                        "Config upgrade set is no longer valid for {:?}",
-                        key.contract_id
-                    )));
+                    tracing::error!(
+                        contract_id = ?key.contract_id,
+                        "Config upgrade set is no longer valid — skipping"
+                    );
+                    continue;
                 }
             }
 
-            // Capture all mutations via capture_entry_changes (mirrors stellar-core's
-            // child LedgerTxn + getChanges() pattern). This automatically includes
-            // config setting updates, frozen keys delta, window resize, and
-            // state size recomputation.
-            let ((archival, memory_cost), entry_changes) = ltx.capture_entry_changes(|ltx| {
+            // Each ConfigUpgradeSet is independently transactional: on failure,
+            // mutations are rolled back and this upgrade is skipped. Prior
+            // successful config upgrades are preserved.
+            // Parity: stellar-core gives each LedgerUpgrade its own child LedgerTxn.
+            match ltx.transactional(|ltx| {
                 let (archival, memory_cost) = frame.apply_to(ltx)?;
 
                 // Parity: Upgrades.cpp:1468-1472 — state size recompute runs inside
-                // the config upgrade's child LedgerTxn scope when memory cost changes.
+                // the config upgrade's transactional scope when memory cost changes.
                 if memory_cost && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
                     crate::manager::handle_upgrade_affecting_soroban_state_size(
                         ltx,
@@ -1330,36 +1340,62 @@ impl UpgradeContext {
                     )?;
                 }
                 Ok((archival, memory_cost))
-            })?;
+            }) {
+                Ok(((archival, memory_cost), entry_changes)) => {
+                    state_archival_changed |= archival;
+                    memory_cost_params_changed |= memory_cost;
 
-            state_archival_changed |= archival;
-            memory_cost_params_changed |= memory_cost;
+                    let key_bytes = key
+                        .to_xdr(Limits::none())
+                        .expect("ConfigUpgradeSetKey XDR serialization must not fail");
+                    per_upgrade_changes.insert(key_bytes, entry_changes);
 
-            // Store changes keyed by serialized ConfigUpgradeSetKey for later matching
-            let key_bytes = key
-                .to_xdr(Limits::none())
-                .expect("ConfigUpgradeSetKey XDR serialization must not fail");
-            per_upgrade_changes.insert(key_bytes, entry_changes);
-
-            tracing::info!(
-                contract_id = ?key.contract_id,
-                "Applied config upgrade"
-            );
+                    tracing::info!(
+                        contract_id = ?key.contract_id,
+                        "Applied config upgrade"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        contract_id = ?key.contract_id,
+                        error = %e,
+                        "Exception during config upgrade — rolling back and skipping"
+                    );
+                    // Mutations already rolled back by transactional()
+                    continue;
+                }
+            }
         }
 
-        Ok(ConfigUpgradeResult {
+        ConfigUpgradeResult {
             state_archival_changed,
             memory_cost_params_changed,
             per_upgrade_changes,
-        })
+        }
     }
 
     /// Apply upgrades to a header, returning the modified values.
     pub fn apply_to_header(&self, header: &mut LedgerHeader) {
+        self.apply_to_header_filtered(header, true, true);
+    }
+
+    /// Apply upgrades to a header, gated by per-upgrade success flags.
+    ///
+    /// Header-only upgrades (BaseFee, MaxTxSetSize, Flags) are always applied.
+    /// Version and BaseReserve also have delta-side effects: if those failed,
+    /// skip the header mutation to maintain consistency.
+    pub fn apply_to_header_filtered(
+        &self,
+        header: &mut LedgerHeader,
+        version_succeeded: bool,
+        reserve_succeeded: bool,
+    ) {
         for upgrade in &self.upgrades {
             match upgrade {
                 LedgerUpgrade::Version(v) => {
-                    header.ledger_version = *v;
+                    if version_succeeded {
+                        header.ledger_version = *v;
+                    }
                 }
                 LedgerUpgrade::BaseFee(fee) => {
                     header.base_fee = *fee;
@@ -1368,7 +1404,9 @@ impl UpgradeContext {
                     header.max_tx_set_size = *size;
                 }
                 LedgerUpgrade::BaseReserve(reserve) => {
-                    header.base_reserve = *reserve;
+                    if reserve_succeeded {
+                        header.base_reserve = *reserve;
+                    }
                 }
                 LedgerUpgrade::Flags(flags) => {
                     // Set flags in the header extension v1 (matching upstream setLedgerHeaderFlag)

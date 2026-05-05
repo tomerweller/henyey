@@ -642,8 +642,9 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     );
 
     // Parity: stellar-core throws in applyTo (Upgrades.cpp:373) when the
-    // config upgrade set cannot be loaded. After AUDIT-023 fix,
-    // apply_config_upgrades returns an error instead of silently skipping.
+    // config upgrade set cannot be loaded. With transactional per-config
+    // independence, missing/invalid upgrades are logged and skipped rather
+    // than aborting the entire batch. The result will have empty per_upgrade_changes.
     let mut ctx = UpgradeContext::new(25);
     ctx.add_upgrade(LedgerUpgrade::Config(bogus_key));
 
@@ -651,16 +652,12 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     let soroban_state = henyey_ledger::SharedSorobanState::new();
     let result = ctx.apply_config_upgrades(&mut ltx, 1, 25, &soroban_state);
 
+    // With per-config independence, a missing key is logged and skipped.
+    // The result has no per-upgrade changes for the bogus key.
     assert!(
-        result.is_err(),
-        "apply_config_upgrades must error on nonexistent config upgrade key \
-         (parity: stellar-core throws in Upgrades::applyTo)"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("Failed to retrieve valid config upgrade set"),
-        "Error message should indicate the config upgrade set was not found, got: {}",
-        err
+        result.per_upgrade_changes.is_empty(),
+        "apply_config_upgrades must skip nonexistent config upgrade key \
+         (parity: stellar-core's child LedgerTxn aborts on exception)"
     );
 }
 

@@ -239,7 +239,8 @@ impl CloseLedgerState {
     /// Run `f` inside a checkpoint scope and return both its result and the
     /// [`LedgerEntryChanges`] produced by mutations inside the closure.
     ///
-    /// This is the **recommended API** for capturing per-upgrade entry changes.
+    /// This is the **recommended API** for capturing per-upgrade entry changes
+    /// when errors propagate upward (aborting the entire ledger close).
     /// It ensures that `change_checkpoint()` and `entry_changes_since()` are
     /// always paired correctly, preventing the class of bug where mutations
     /// happen after the changes have already been extracted (see #2268).
@@ -250,7 +251,9 @@ impl CloseLedgerState {
     /// **Not transactional.** If `f` returns `Err`, partial mutations made by
     /// the closure remain in the delta — the helper only controls whether the
     /// `LedgerEntryChanges` diff is returned. It does NOT roll back mutations.
-    /// A future child-delta commit/abort mechanism would address this gap.
+    /// Use [`transactional`](Self::transactional) for scopes that catch errors
+    /// and continue processing.
+    #[allow(dead_code)]
     pub(crate) fn capture_entry_changes<F, T>(&mut self, f: F) -> Result<(T, LedgerEntryChanges)>
     where
         F: FnOnce(&mut Self) -> Result<T>,
@@ -260,12 +263,35 @@ impl CloseLedgerState {
         Ok((result, self.entry_changes_since(cp)))
     }
 
+    /// Execute `f` in a transactional scope: on `Ok`, commit and return changes;
+    /// on `Err`, roll back all delta mutations and propagate the error.
+    ///
+    /// This mirrors stellar-core's child `LedgerTxn` semantics where the
+    /// destructor aborts all mutations on exception.
+    ///
+    /// Use this instead of [`capture_entry_changes`](Self::capture_entry_changes)
+    /// when the caller catches errors and continues processing (e.g., per-upgrade
+    /// error handling that logs and skips failed upgrades).
+    pub(crate) fn transactional<F, T>(&mut self, f: F) -> Result<(T, LedgerEntryChanges)>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        let cp = self.change_checkpoint();
+        match f(self) {
+            Ok(result) => Ok((result, self.entry_changes_since(cp))),
+            Err(e) => {
+                self.current.rollback_to(cp);
+                Err(e)
+            }
+        }
+    }
+
     /// Capture the current delta state as a checkpoint.
     ///
-    /// **Escape hatch** — prefer [`capture_entry_changes`] for new code.
-    /// This low-level method exists for potential future borrow-conflict cases
-    /// that cannot use the closure form. Currently has no active callers
-    /// (the version-upgrade path was migrated in #2354).
+    /// **Escape hatch** — prefer [`transactional`](Self::transactional) for new code.
+    /// This low-level method is needed when `&mut self` borrow conflicts prevent
+    /// using the closure form (e.g., the version-upgrade path in `manager.rs`
+    /// where `&mut self` on the enclosing struct conflicts with `&mut self.ltx`).
     ///
     /// Delegates to [`LedgerDelta::checkpoint`]. See [`ChangeCheckpoint`]
     /// for the usage contract.
@@ -275,13 +301,24 @@ impl CloseLedgerState {
 
     /// Extract all entry changes made since the given checkpoint.
     ///
-    /// **Escape hatch** — prefer [`capture_entry_changes`] for new code.
-    /// See [`change_checkpoint`] for when this low-level API is appropriate.
-    /// Currently has no active callers.
+    /// **Escape hatch** — prefer [`transactional`](Self::transactional) for new code.
+    /// See [`change_checkpoint`](Self::change_checkpoint) for when this low-level
+    /// API is appropriate.
     ///
     /// Delegates to [`LedgerDelta::changes_since`].
     pub(crate) fn entry_changes_since(&self, cp: ChangeCheckpoint) -> LedgerEntryChanges {
         self.current.changes_since(cp)
+    }
+
+    /// Roll back the delta to a prior checkpoint state.
+    ///
+    /// **Escape hatch** — prefer [`transactional`](Self::transactional) for new code.
+    /// This is needed where `&mut self` borrow conflicts prevent the closure form.
+    ///
+    /// Restores all delta state (entries, ordering, fee pool, total coins) to
+    /// the values captured at checkpoint time.
+    pub(crate) fn rollback_to_checkpoint(&mut self, cp: ChangeCheckpoint) {
+        self.current.rollback_to(cp);
     }
 
     // ------------------------------------------------------------------
@@ -983,5 +1020,110 @@ mod tests {
             "Earlier changes must be captured even when a later operation fails"
         );
         assert!(matches!(&changes.0[0], LedgerEntryChange::Created(_)));
+    }
+
+    #[test]
+    fn test_transactional_success_commits_changes() {
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let key = make_account_key(1);
+
+        // transactional on success: changes committed and returned.
+        let (val, changes) = state
+            .transactional(|s| {
+                let entry = make_test_account_entry(1, 1000, 101);
+                s.record_create(entry)?;
+                Ok(42u64)
+            })
+            .unwrap();
+
+        assert_eq!(val, 42);
+        assert_eq!(changes.0.len(), 1);
+        // The entry persists in the delta.
+        assert!(state.get_entry(&key).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_transactional_error_rolls_back() {
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let key = make_account_key(1);
+
+        // transactional on error: mutations rolled back.
+        let result = state.transactional(|s| -> Result<()> {
+            let entry = make_test_account_entry(1, 1000, 101);
+            s.record_create(entry)?;
+            Err(crate::error::LedgerError::Internal("deliberate error".into()).into())
+        });
+        assert!(result.is_err());
+
+        // The entry must NOT be present in the delta — rolled back.
+        let entry = state.get_entry(&key).unwrap();
+        assert!(entry.is_none(), "Entry must be rolled back on Err");
+    }
+
+    #[test]
+    fn test_transactional_rolls_back_fee_pool_and_coins() {
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Mutate fee_pool_delta and total_coins_delta before the transactional scope.
+        state.record_fee_pool_delta(500);
+
+        let result = state.transactional(|s| -> Result<()> {
+            s.record_fee_pool_delta(100);
+            Err(crate::error::LedgerError::Internal("deliberate error".into()).into())
+        });
+        assert!(result.is_err());
+
+        // fee_pool_delta should be restored to pre-transactional value.
+        assert_eq!(state.fee_pool_delta(), 500);
+    }
+
+    #[test]
+    fn test_rollback_to_checkpoint_escape_hatch() {
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let key = make_account_key(1);
+
+        // Take a checkpoint, make mutations, then rollback.
+        let cp = state.change_checkpoint();
+        let entry = make_test_account_entry(1, 1000, 101);
+        state.record_create(entry).unwrap();
+
+        // Entry is present before rollback.
+        assert!(state.get_entry(&key).unwrap().is_some());
+
+        state.rollback_to_checkpoint(cp);
+
+        // Entry gone after rollback.
+        assert!(state.get_entry(&key).unwrap().is_none());
     }
 }

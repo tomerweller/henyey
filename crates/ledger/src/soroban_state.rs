@@ -1039,6 +1039,27 @@ impl InMemorySorobanState {
         );
     }
 
+    /// Compute what the contract code state size WOULD be after recomputation,
+    /// without mutating any state. Used by compute-then-commit patterns to
+    /// determine the new total before committing delta changes.
+    pub fn compute_recomputed_code_size(
+        &self,
+        protocol_version: u32,
+        rent_config: Option<&SorobanRentConfig>,
+    ) -> i64 {
+        let mut total_size: i64 = 0;
+        for entry in self.contract_code_entries.values() {
+            let new_size = Self::calculate_code_size(
+                &entry.ledger_entry,
+                entry.cached_xdr_size,
+                protocol_version,
+                rent_config,
+            );
+            total_size += new_size as i64;
+        }
+        total_size
+    }
+
     /// Clear all state.
     pub fn clear(&mut self) {
         Arc::make_mut(&mut self.contract_data_entries).clear();

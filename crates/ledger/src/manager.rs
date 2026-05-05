@@ -1033,30 +1033,21 @@ pub(crate) fn handle_upgrade_affecting_soroban_state_size(
         None => return Ok(()), // Pre-Soroban: no config entries yet
     };
 
-    // Recompute contract code sizes with new cost params.
-    {
-        let mut state = soroban_state.write();
-        let code_size_before = state.contract_code_state_size();
-        let data_size_before = state.contract_data_state_size();
-        let code_count = state.contract_code_count();
-        let data_count = state.contract_data_count();
-        state.recompute_contract_code_sizes(protocol_version, Some(&rent_config));
-        tracing::info!(
-            ledger_seq,
-            code_size_before,
-            code_size_after = state.contract_code_state_size(),
-            data_size = data_size_before,
-            code_count,
-            data_count,
-            total_size = state.total_size(),
-            "Recomputed contract code sizes (upgrade-affecting state size)"
-        );
-    }
+    // Phase 1: Compute the new total size WITHOUT mutating the cache.
+    // This ensures that if the delta update (Phase 2) fails, the cache remains
+    // consistent with the rolled-back delta.
+    let new_total_size = {
+        let state = soroban_state.read();
+        state.compute_recomputed_code_size(protocol_version, Some(&rent_config))
+    };
 
-    // Update all window entries with the new total size.
+    // Phase 2: Update all window entries in the delta with the new total size.
     // Parity: NetworkConfig.cpp:2165 updateRecomputedSorobanStateSize
     if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
-        let new_size = soroban_state.read().total_size();
+        let new_size = {
+            let state = soroban_state.read();
+            state.contract_data_state_size() as u64 + new_total_size as u64
+        };
         let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
         });
@@ -1094,6 +1085,26 @@ pub(crate) fn handle_upgrade_affecting_soroban_state_size(
                 "Updated all state size window entries (upgrade-affecting state size)"
             );
         }
+    }
+
+    // Phase 3: Commit cache mutation only after all delta updates succeeded.
+    {
+        let mut state = soroban_state.write();
+        let code_size_before = state.contract_code_state_size();
+        let data_size_before = state.contract_data_state_size();
+        let code_count = state.contract_code_count();
+        let data_count = state.contract_data_count();
+        state.recompute_contract_code_sizes(protocol_version, Some(&rent_config));
+        tracing::info!(
+            ledger_seq,
+            code_size_before,
+            code_size_after = state.contract_code_state_size(),
+            data_size = data_size_before,
+            code_count,
+            data_count,
+            total_size = state.total_size(),
+            "Recomputed contract code sizes (upgrade-affecting state size)"
+        );
     }
 
     Ok(())
@@ -4339,7 +4350,7 @@ impl LedgerCloseContext<'_> {
         &mut self,
         prev_version: u32,
         protocol_version: u32,
-    ) -> Result<(bool, bool, Vec<UpgradeEntryMeta>)> {
+    ) -> Result<(bool, bool, Vec<UpgradeEntryMeta>, bool, bool)> {
         use stellar_xdr::curr::{LedgerEntryChanges, LedgerUpgrade, Limits, WriteXdr};
 
         // Parity: Upgrades.cpp:1229-1242 applyVersionUpgrade
@@ -4354,13 +4365,12 @@ impl LedgerCloseContext<'_> {
         let mut version_upgrade_succeeded = prev_version == protocol_version;
 
         // Capture changes from version upgrade side effects (cost types, state
-        // size window, etc.) using capture_entry_changes. All context is pre-bound
-        // to local variables to avoid disjoint-field-capture reliance.
+        // size window, etc.) using transactional(). On error, mutations are
+        // rolled back and the version upgrade is skipped.
         //
         // Parity: stellar-core LedgerManagerImpl.cpp:1666-1685 wraps each
-        // upgrade in a per-upgrade try/catch that logs errors and continues.
-        // capture_entry_changes is non-transactional: on Err, partial mutations
-        // remain in the delta (matching the existing behavior).
+        // upgrade in a per-upgrade child LedgerTxn; on exception, the
+        // destructor aborts all mutations.
         let version_changes = if prev_version != protocol_version {
             let ledger_seq = self.close_data.ledger_seq;
             let network_id = self.manager.network_id();
@@ -4373,7 +4383,7 @@ impl LedgerCloseContext<'_> {
                 .total_size();
             let soroban_state = &self.manager.soroban_state;
 
-            match self.ltx.capture_entry_changes(|ltx| {
+            match self.ltx.transactional(|ltx| {
                 let memory_cost_changed = apply_version_upgrade_side_effects(
                     ltx,
                     ledger_seq,
@@ -4384,22 +4394,18 @@ impl LedgerCloseContext<'_> {
                     protocol_version,
                 )?;
                 // Parity: Upgrades.cpp:1252-1256 — state size recompute runs
-                // inside the version upgrade scope.
+                // inside the version upgrade's transactional scope. If it fails,
+                // the entire upgrade is rolled back (matching stellar-core's
+                // child LedgerTxn abort semantics).
                 if protocol_version_starts_from(protocol_version, ProtocolVersion::V23)
                     && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
                 {
-                    if let Err(e) = handle_upgrade_affecting_soroban_state_size(
+                    handle_upgrade_affecting_soroban_state_size(
                         ltx,
                         protocol_version,
                         ledger_seq,
                         soroban_state,
-                    ) {
-                        tracing::error!(
-                            protocol_version,
-                            error = %e,
-                            "Exception during version upgrade state size recompute — skipping"
-                        );
-                    }
+                    )?;
                 }
                 Ok(memory_cost_changed)
             }) {
@@ -4412,7 +4418,7 @@ impl LedgerCloseContext<'_> {
                         prev_version,
                         protocol_version,
                         error = %e,
-                        "Exception during version upgrade side effects — skipping"
+                        "Exception during version upgrade — rolling back and skipping"
                     );
                     LedgerEntryChanges(VecM::default())
                 }
@@ -4437,7 +4443,7 @@ impl LedgerCloseContext<'_> {
             if protocol_version_starts_from(protocol_version, ProtocolVersion::V10)
                 && did_reserve_increase
             {
-                match self.ltx.capture_entry_changes(|ltx| {
+                match self.ltx.transactional(|ltx| {
                     crate::prepare_liabilities::prepare_liabilities(
                         ltx,
                         protocol_version,
@@ -4450,7 +4456,7 @@ impl LedgerCloseContext<'_> {
                         tracing::error!(
                             new_reserve,
                             error = %e,
-                            "Exception during reserve upgrade (prepareLiabilities) — skipping"
+                            "Exception during reserve upgrade (prepareLiabilities) — rolling back and skipping"
                         );
                         reserve_upgrade_succeeded = false;
                         LedgerEntryChanges(VecM::default())
@@ -4467,46 +4473,39 @@ impl LedgerCloseContext<'_> {
         // In stellar-core, config upgrades are applied to the LedgerTxn before
         // getAllEntries() and addBatch(), so the upgraded ConfigSetting entries are included
         // in the bucket list update. We must do the same here.
+        //
+        // Each config upgrade is independently transactional: if one fails, its
+        // mutations are rolled back while prior successful upgrades are preserved.
         let mut config_state_archival_changed = false;
         let mut config_memory_cost_params_changed = false;
         let mut per_config_changes: HashMap<Vec<u8>, LedgerEntryChanges> = HashMap::new();
-        let mut config_upgrade_succeeded = true;
         let delta_count_before_upgrades = self.ltx.num_changes();
         if self.upgrade_ctx.has_config_upgrades() {
-            match self.upgrade_ctx.apply_config_upgrades(
+            let result = self.upgrade_ctx.apply_config_upgrades(
                 &mut self.ltx,
                 self.close_data.ledger_seq,
                 protocol_version,
                 &self.manager.soroban_state,
-            ) {
-                Ok(result) => {
-                    config_state_archival_changed = result.state_archival_changed;
-                    config_memory_cost_params_changed = result.memory_cost_params_changed;
-                    per_config_changes = result.per_upgrade_changes;
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        delta_before = delta_count_before_upgrades,
-                        delta_after = self.ltx.num_changes(),
-                        archival_changed = config_state_archival_changed,
-                        memory_cost_changed = config_memory_cost_params_changed,
-                        "Delta entry count after config upgrades"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        error = %e,
-                        "Exception during config upgrade — skipping"
-                    );
-                    config_upgrade_succeeded = false;
-                }
-            }
+            );
+            config_state_archival_changed = result.state_archival_changed;
+            config_memory_cost_params_changed = result.memory_cost_params_changed;
+            per_config_changes = result.per_upgrade_changes;
+            tracing::info!(
+                ledger_seq = self.close_data.ledger_seq,
+                delta_before = delta_count_before_upgrades,
+                delta_after = self.ltx.num_changes(),
+                archival_changed = config_state_archival_changed,
+                memory_cost_changed = config_memory_cost_params_changed,
+                "Delta entry count after config upgrades"
+            );
         }
 
         // Apply MaxSorobanTxSetSize upgrade through CloseLedgerState (modifies CONFIG_SETTING entry).
         // Parity: Upgrades.cpp upgradeMaxSorobanTxSetSize()
+        // Wrapped in checkpoint/rollback for transactional consistency (hardening).
         let mut max_soroban_upgrade_succeeded = true;
         let max_soroban_changes = if self.upgrade_ctx.max_soroban_tx_set_size_upgrade().is_some() {
+            let cp = self.ltx.change_checkpoint();
             match self
                 .upgrade_ctx
                 .apply_max_soroban_tx_set_size(&mut self.ltx, self.close_data.ledger_seq)
@@ -4515,8 +4514,9 @@ impl LedgerCloseContext<'_> {
                 Err(e) => {
                     tracing::error!(
                         error = %e,
-                        "Exception during MaxSorobanTxSetSize upgrade — skipping"
+                        "Exception during MaxSorobanTxSetSize upgrade — rolling back and skipping"
                     );
+                    self.ltx.rollback_to_checkpoint(cp);
                     max_soroban_upgrade_succeeded = false;
                     LedgerEntryChanges(VecM::default())
                 }
@@ -4533,16 +4533,16 @@ impl LedgerCloseContext<'_> {
             let (succeeded, changes) = match &upgrade {
                 LedgerUpgrade::Version(_) => (version_upgrade_succeeded, version_changes.clone()),
                 LedgerUpgrade::Config(key) => {
-                    if config_upgrade_succeeded {
-                        let key_bytes = key
-                            .to_xdr(Limits::none())
-                            .expect("XDR encoding of ConfigSettingId must not fail");
-                        let changes = per_config_changes
-                            .remove(&key_bytes)
-                            .unwrap_or_else(|| LedgerEntryChanges(VecM::default()));
-                        (true, changes)
-                    } else {
-                        (false, LedgerEntryChanges(VecM::default()))
+                    // Per-config independence: a config upgrade succeeded if its
+                    // changes are present in per_config_changes (it was committed
+                    // by the transactional scope). Failed configs were rolled back
+                    // and have no entry here.
+                    let key_bytes = key
+                        .to_xdr(Limits::none())
+                        .expect("XDR encoding of ConfigSettingId must not fail");
+                    match per_config_changes.remove(&key_bytes) {
+                        Some(changes) => (true, changes),
+                        None => (false, LedgerEntryChanges(VecM::default())),
                     }
                 }
                 LedgerUpgrade::MaxSorobanTxSetSize(_) => {
@@ -4568,6 +4568,8 @@ impl LedgerCloseContext<'_> {
             config_state_archival_changed,
             config_memory_cost_params_changed,
             upgrades_meta,
+            version_upgrade_succeeded,
+            reserve_upgrade_succeeded,
         ))
     }
 
@@ -4581,6 +4583,8 @@ impl LedgerCloseContext<'_> {
         tx_result_hash: Hash256,
         config_state_archival_changed: bool,
         config_memory_cost_params_changed: bool,
+        version_upgrade_succeeded: bool,
+        reserve_upgrade_succeeded: bool,
     ) -> Result<(LedgerHeader, Hash256)> {
         // Log all inputs to create_next_header for debugging header mismatch
         let total_coins = self.prev_header.total_coins + self.ltx.total_coins_delta();
@@ -4623,8 +4627,18 @@ impl LedgerCloseContext<'_> {
             },
         );
 
-        // Apply upgrades to header fields (e.g., ledger_version, base_fee)
-        self.upgrade_ctx.apply_to_header(&mut new_header);
+        // Apply upgrades to header fields, gated by success.
+        // Header-only upgrades (BaseFee, MaxTxSetSize, Flags) always succeed.
+        // Version and BaseReserve also modify the delta; apply to header only if
+        // the delta side succeeded. Parity: in stellar-core, a failed upgrade
+        // (which cannot happen in practice since upgrades are validated before
+        // SCP nomination) would abort the child LedgerTxn, leaving the header
+        // unchanged.
+        self.upgrade_ctx.apply_to_header_filtered(
+            &mut new_header,
+            version_upgrade_succeeded,
+            reserve_upgrade_succeeded,
+        );
 
         // Log config upgrade effects (upgrades were already applied to the delta
         // before bucket list add_batch, matching stellar-core ordering)
@@ -4763,8 +4777,13 @@ impl LedgerCloseContext<'_> {
             "Protocol version for commit"
         );
 
-        let (config_state_archival_changed, config_memory_cost_params_changed, upgrades_meta) =
-            self.apply_upgrades_to_delta(prev_version, protocol_version)?;
+        let (
+            config_state_archival_changed,
+            config_memory_cost_params_changed,
+            upgrades_meta,
+            version_upgrade_succeeded,
+            reserve_upgrade_succeeded,
+        ) = self.apply_upgrades_to_delta(prev_version, protocol_version)?;
 
         // Reload soroban_fee_write_1kb from post-upgrade config state.
         // The value cached at apply_transactions() time reflects pre-upgrade config;
@@ -5454,6 +5473,8 @@ impl LedgerCloseContext<'_> {
             tx_result_hash,
             config_state_archival_changed,
             config_memory_cost_params_changed,
+            version_upgrade_succeeded,
+            reserve_upgrade_succeeded,
         )?;
         let header_us = header_start.elapsed().as_micros() as u64;
 
@@ -8177,7 +8198,7 @@ mod tests {
 
         // build_and_hash_header should use upgrade_ctx.upgrades, not close_data.upgrades.
         let (header, _hash) = ctx
-            .build_and_hash_header(Hash256::ZERO, Hash256::ZERO, false, false)
+            .build_and_hash_header(Hash256::ZERO, Hash256::ZERO, false, false, true, true)
             .expect("build_and_hash_header should succeed");
 
         // Verify scp_value.upgrades is populated (not empty).

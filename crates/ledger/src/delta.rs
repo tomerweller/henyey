@@ -36,10 +36,18 @@
 
 use crate::{LedgerError, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use stellar_xdr::curr::{
     AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerKey,
     LedgerKeyAccount, VecM,
 };
+
+/// Global counter for unique delta identity assignment.
+static DELTA_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_delta_id() -> u64 {
+    DELTA_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 /// For TTL entries, take the max `live_until_ledger_seq`.
 /// For all other entries, take the incoming value (last-writer-wins).
@@ -187,6 +195,12 @@ pub(crate) struct ChangeCheckpoint {
     /// Keys in insertion order at checkpoint time, for deterministic
     /// iteration over keys that disappeared from the delta after checkpoint.
     key_order: Vec<LedgerKey>,
+    /// Snapshot of fee pool delta at checkpoint time.
+    fee_pool_delta: i64,
+    /// Snapshot of total coins delta at checkpoint time.
+    total_coins_delta: i64,
+    /// Identity of the delta that created this checkpoint.
+    delta_id: u64,
 }
 
 /// Accumulator for all ledger entry changes during a single ledger close.
@@ -216,7 +230,7 @@ pub(crate) struct ChangeCheckpoint {
 ///
 /// Changes are tracked in insertion order to ensure deterministic iteration.
 /// This is critical for producing consistent bucket list updates across nodes.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LedgerDelta {
     /// The ledger sequence this delta applies to.
     ledger_seq: u32,
@@ -238,6 +252,24 @@ pub struct LedgerDelta {
     ///
     /// Typically zero, but can change due to inflation or fee burns.
     total_coins_delta: i64,
+
+    /// Unique identity for this delta instance. Used to validate checkpoints.
+    id: u64,
+}
+
+impl Clone for LedgerDelta {
+    fn clone(&self) -> Self {
+        Self {
+            ledger_seq: self.ledger_seq,
+            changes: self.changes.clone(),
+            change_order: self.change_order.clone(),
+            fee_pool_delta: self.fee_pool_delta,
+            total_coins_delta: self.total_coins_delta,
+            // Clones get a fresh identity so checkpoints from the original
+            // cannot be accidentally applied to a clone (or vice versa).
+            id: next_delta_id(),
+        }
+    }
 }
 
 impl LedgerDelta {
@@ -249,6 +281,7 @@ impl LedgerDelta {
             change_order: Vec::new(),
             fee_pool_delta: 0,
             total_coins_delta: 0,
+            id: next_delta_id(),
         }
     }
 
@@ -612,7 +645,33 @@ impl LedgerDelta {
         ChangeCheckpoint {
             entries: self.changes.clone(),
             key_order: self.change_order.clone(),
+            fee_pool_delta: self.fee_pool_delta,
+            total_coins_delta: self.total_coins_delta,
+            delta_id: self.id,
         }
+    }
+
+    /// Roll back the delta to a prior checkpoint state.
+    ///
+    /// Restores entries, key ordering, fee pool delta, and total coins delta
+    /// to exactly the state captured at checkpoint time. All mutations made
+    /// since the checkpoint are discarded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the checkpoint was created by a different `LedgerDelta` instance.
+    /// This is a programmer error — checkpoints must only be used on the delta
+    /// that created them.
+    pub(crate) fn rollback_to(&mut self, cp: ChangeCheckpoint) {
+        assert_eq!(
+            cp.delta_id, self.id,
+            "BUG: checkpoint from delta {} applied to delta {} — mismatched checkpoint",
+            cp.delta_id, self.id
+        );
+        self.changes = cp.entries;
+        self.change_order = cp.key_order;
+        self.fee_pool_delta = cp.fee_pool_delta;
+        self.total_coins_delta = cp.total_coins_delta;
     }
 
     /// Extract all entry changes made since the given checkpoint.
@@ -2644,5 +2703,62 @@ mod tests {
         // Only entry3 should appear (entry1 and entry2 unchanged)
         assert_eq!(changes.0.len(), 1);
         assert!(matches!(&changes.0[0], LedgerEntryChange::Created(e) if *e == entry3));
+    }
+
+    #[test]
+    fn test_rollback_to_restores_entries() {
+        let mut delta = LedgerDelta::new(1);
+        let entry1 = create_test_account(1);
+        delta.record_create(entry1).unwrap();
+
+        // Take checkpoint after first entry.
+        let cp = delta.checkpoint();
+        assert_eq!(delta.num_changes(), 1);
+
+        // Create a second entry.
+        let entry2 = create_test_account(2);
+        delta.record_create(entry2).unwrap();
+        assert_eq!(delta.num_changes(), 2);
+
+        // Rollback to checkpoint: second entry should be gone.
+        delta.rollback_to(cp);
+        assert_eq!(delta.num_changes(), 1);
+    }
+
+    #[test]
+    fn test_rollback_to_restores_fee_pool_and_coins() {
+        let mut delta = LedgerDelta::new(1);
+        delta.record_fee_pool_delta(100);
+        delta.record_total_coins_delta(200);
+
+        let cp = delta.checkpoint();
+
+        delta.record_fee_pool_delta(50);
+        delta.record_total_coins_delta(75);
+        assert_eq!(delta.fee_pool_delta(), 150);
+        assert_eq!(delta.total_coins_delta(), 275);
+
+        delta.rollback_to(cp);
+        assert_eq!(delta.fee_pool_delta(), 100);
+        assert_eq!(delta.total_coins_delta(), 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "mismatched checkpoint")]
+    fn test_rollback_to_panics_on_wrong_delta() {
+        let mut delta_a = LedgerDelta::new(1);
+        let delta_b = LedgerDelta::new(2);
+
+        // Take checkpoint from delta_b, try to roll back delta_a.
+        let cp = delta_b.checkpoint();
+        delta_a.rollback_to(cp);
+    }
+
+    #[test]
+    fn test_clone_gets_new_id() {
+        let delta = LedgerDelta::new(1);
+        let cloned = delta.clone();
+        // Cloned delta must have a different id (fresh identity).
+        assert_ne!(delta.id, cloned.id);
     }
 }
