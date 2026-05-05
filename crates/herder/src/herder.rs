@@ -442,6 +442,8 @@ impl Herder {
 
         let scp_metrics = Arc::new(crate::metrics::ScpMetrics::new());
 
+        let runtime_upgrades = Arc::new(RwLock::new(Upgrades::default()));
+
         let scp_driver = Arc::new(if let Some(ref sk) = secret_key {
             ScpDriver::with_secret_key(
                 scp_driver_config,
@@ -450,6 +452,7 @@ impl Herder {
                 Arc::clone(&ledger_manager),
                 Arc::clone(&tracking_state),
                 Arc::clone(&scp_metrics),
+                Arc::clone(&runtime_upgrades),
             )
         } else {
             ScpDriver::new(
@@ -458,6 +461,7 @@ impl Herder {
                 Arc::clone(&ledger_manager),
                 Arc::clone(&tracking_state),
                 Arc::clone(&scp_metrics),
+                Arc::clone(&runtime_upgrades),
             )
         });
 
@@ -528,9 +532,6 @@ impl Herder {
                 "Quorum tracker initialized"
             );
         }
-
-        let runtime_upgrades = Arc::new(RwLock::new(Upgrades::default()));
-        scp_driver.set_upgrades(Arc::clone(&runtime_upgrades));
 
         // Spawn the dedicated SCP signature-verification worker thread.
         // The worker is a core component of the event-loop pipeline

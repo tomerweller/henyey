@@ -460,8 +460,8 @@ pub struct ScpDriver {
     /// Ledger manager for network configuration lookups.
     ledger_manager: Arc<LedgerManager>,
     /// Upgrade parameters for nomination validation.
-    /// Set via `set_upgrades` when the Herder initializes.
-    upgrades: OnceLock<Arc<RwLock<Upgrades>>>,
+    /// Always present — shared with Herder via `Arc`.
+    upgrades: Arc<RwLock<Upgrades>>,
     /// Shared tracking consensus state (owned by Herder, read by ScpDriver).
     tracking_state: Arc<RwLock<SharedTrackingState>>,
     /// Optional wall-clock override for `check_close_time`. When zero, the
@@ -559,6 +559,7 @@ impl ScpDriver {
         ledger_manager: Arc<LedgerManager>,
         tracking_state: Arc<RwLock<SharedTrackingState>>,
         scp_metrics: Arc<crate::metrics::ScpMetrics>,
+        upgrades: Arc<RwLock<Upgrades>>,
     ) -> Self {
         let local_quorum_set = config.local_quorum_set.clone();
         let local_node_key = *config.node_id.as_bytes();
@@ -575,7 +576,7 @@ impl ScpDriver {
             envelope_sender: OnceLock::new(),
             network_id,
             ledger_manager,
-            upgrades: OnceLock::new(),
+            upgrades,
             tracking_state,
             test_clock: Arc::new(AtomicU64::new(0)),
             slot_timing: RwLock::new(HashMap::new()),
@@ -618,6 +619,7 @@ impl ScpDriver {
         ledger_manager: Arc<LedgerManager>,
         tracking_state: Arc<RwLock<SharedTrackingState>>,
         scp_metrics: Arc<crate::metrics::ScpMetrics>,
+        upgrades: Arc<RwLock<Upgrades>>,
     ) -> Self {
         let mut driver = Self::new(
             config,
@@ -625,6 +627,7 @@ impl ScpDriver {
             ledger_manager,
             tracking_state,
             scp_metrics,
+            upgrades,
         );
         driver.secret_key = Some(secret_key);
         driver
@@ -636,11 +639,6 @@ impl ScpDriver {
         F: Fn(ScpEnvelope) + Send + Sync + 'static,
     {
         let _ = self.envelope_sender.set(Box::new(sender));
-    }
-
-    /// Provide upgrade parameters access for nomination validation.
-    pub fn set_upgrades(&self, upgrades: Arc<RwLock<Upgrades>>) {
-        let _ = self.upgrades.set(upgrades);
     }
 
     /// Clear the tx set validity cache (call on ledger close).
@@ -1620,9 +1618,6 @@ impl ScpDriver {
     /// Used by both `extract_valid_value_impl` (filter mode — skip invalid) and
     /// `check_upgrades_valid` (reject mode — fail on first invalid). Callers supply
     /// `current_version` and `lcl_close_time` from their own `current_header()` snapshot.
-    ///
-    /// When `nomination` is true and `self.upgrades` is unset (`None`), the nomination
-    /// check defaults to permissive (upgrade passes).
     fn is_upgrade_valid(
         &self,
         upgrade: &LedgerUpgrade,
@@ -1633,15 +1628,13 @@ impl ScpDriver {
         if !Self::is_valid_upgrade_for_apply(upgrade, current_version, &self.ledger_manager) {
             return false;
         }
-        if nomination {
-            if let Some(upgrades_arc) = self.upgrades.get() {
-                if !upgrades_arc
-                    .read()
-                    .is_valid_for_nomination(upgrade, lcl_close_time)
-                {
-                    return false;
-                }
-            }
+        if nomination
+            && !self
+                .upgrades
+                .read()
+                .is_valid_for_nomination(upgrade, lcl_close_time)
+        {
+            return false;
         }
         true
     }
@@ -2591,6 +2584,10 @@ mod cache_tests {
         Arc::new(RwLock::new(SharedTrackingState::default()))
     }
 
+    fn make_default_upgrades() -> Arc<RwLock<Upgrades>> {
+        Arc::new(RwLock::new(Upgrades::default()))
+    }
+
     fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
         use stellar_xdr::curr::{
@@ -2652,6 +2649,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
         let first = make_tx_set(1);
         let second = make_tx_set(2);
@@ -2671,6 +2669,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
         let tx_set = make_tx_set(3);
         let slot = 12u64;
@@ -2694,6 +2693,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
         let tx_set = make_tx_set(4);
         let bad_hash = Hash256::from_bytes([9; 32]);
@@ -2716,6 +2716,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
         let tx_set_a = make_tx_set(5);
         let tx_set_b = make_tx_set(6);
@@ -2738,6 +2739,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
         let tx_set = make_tx_set(7);
         driver.request_tx_set(*tx_set.hash(), 20);
@@ -2771,6 +2773,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
 
         // Create a test node_id for the request
@@ -2810,6 +2813,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
 
         // Externalize some slots (manually insert into the map for testing)
@@ -2846,6 +2850,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
 
         // Externalize some slots with gaps
@@ -2881,6 +2886,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
 
         // Add pending tx_sets for various slots
@@ -2933,6 +2939,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
         let tx_set_a = make_tx_set(10);
         let tx_set_b = make_tx_set(11);
@@ -2956,6 +2963,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
         assert!(driver.get_pending_tx_sets().is_empty());
 
@@ -2972,6 +2980,7 @@ mod cache_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
         let tx_set = make_tx_set(20);
 
@@ -3056,6 +3065,7 @@ mod cache_tests {
             make_default_lm(),
             tracking,
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
 
         let now = std::time::SystemTime::now()
@@ -3348,15 +3358,12 @@ impl SCPDriver for HerderScpCallback {
     /// Parity: get the nomination timeout limit for upgrade stripping.
     /// In stellar-core: mUpgrades.getParameters().mNominationTimeoutLimit
     fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
-        if let Some(upgrades_arc) = self.driver.upgrades.get() {
-            upgrades_arc
-                .read()
-                .parameters()
-                .nomination_timeout_limit
-                .unwrap_or(u32::MAX)
-        } else {
-            u32::MAX
-        }
+        self.driver
+            .upgrades
+            .read()
+            .parameters()
+            .nomination_timeout_limit
+            .unwrap_or(u32::MAX)
     }
 }
 
@@ -3422,6 +3429,10 @@ mod tests {
         make_test_driver_with_lm(make_default_lm())
     }
 
+    fn make_default_upgrades() -> Arc<RwLock<Upgrades>> {
+        Arc::new(RwLock::new(Upgrades::default()))
+    }
+
     fn make_test_driver_with_lm(lm: Arc<henyey_ledger::LedgerManager>) -> ScpDriver {
         let config = ScpDriverConfig::default();
         ScpDriver::new(
@@ -3430,6 +3441,7 @@ mod tests {
             lm,
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         )
     }
 
@@ -3471,6 +3483,7 @@ mod tests {
             lm,
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         );
         (driver, secret_key)
     }
@@ -4289,7 +4302,23 @@ mod tests {
     #[test]
     fn test_extract_valid_value_strips_invalid_upgrades() {
         // Parity: extractValidValue strips truly invalid upgrades (e.g., BaseFee(0))
-        let driver = make_test_driver();
+        use crate::upgrades::{UpgradeParameters, Upgrades};
+
+        // Configure upgrades to accept Version(25) for nomination
+        let params = UpgradeParameters {
+            upgrade_time: 0,
+            protocol_version: Some(25),
+            ..UpgradeParameters::default()
+        };
+        let upgrades = Arc::new(RwLock::new(Upgrades::new(params)));
+        let driver = ScpDriver::new(
+            ScpDriverConfig::default(),
+            Hash256::ZERO,
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            upgrades,
+        );
         let lcl_hash = driver.ledger_manager.current_header_hash();
 
         let tx_set = TransactionSet::new(lcl_hash, vec![]);
@@ -4334,7 +4363,24 @@ mod tests {
     fn test_extract_valid_value_keeps_out_of_order_valid_upgrades() {
         // Parity: extractValidValue does NOT enforce ordering (HerderSCPDriver.cpp:434-444).
         // Out-of-order but individually-valid upgrades are all kept.
-        let driver = make_test_driver();
+        use crate::upgrades::{UpgradeParameters, Upgrades};
+
+        // Configure upgrades to accept both BaseFee(200) and Version(25) for nomination
+        let params = UpgradeParameters {
+            upgrade_time: 0,
+            protocol_version: Some(25),
+            base_fee: Some(200),
+            ..UpgradeParameters::default()
+        };
+        let upgrades = Arc::new(RwLock::new(Upgrades::new(params)));
+        let driver = ScpDriver::new(
+            ScpDriverConfig::default(),
+            Hash256::ZERO,
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            upgrades,
+        );
         let lcl_hash = driver.ledger_manager.current_header_hash();
 
         let tx_set = TransactionSet::new(lcl_hash, vec![]);
@@ -4379,7 +4425,23 @@ mod tests {
     fn test_extract_valid_value_keeps_duplicate_type_upgrades() {
         // Parity: extractValidValue keeps duplicate-type upgrades that are individually valid.
         // stellar-core's isValid in extract path doesn't reject duplicates.
-        let driver = make_test_driver();
+        use crate::upgrades::{UpgradeParameters, Upgrades};
+
+        // Configure upgrades to accept BaseFee(200) for nomination
+        let params = UpgradeParameters {
+            upgrade_time: 0,
+            base_fee: Some(200),
+            ..UpgradeParameters::default()
+        };
+        let upgrades = Arc::new(RwLock::new(Upgrades::new(params)));
+        let driver = ScpDriver::new(
+            ScpDriverConfig::default(),
+            Hash256::ZERO,
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            upgrades,
+        );
         let lcl_hash = driver.ledger_manager.current_header_hash();
 
         let tx_set = TransactionSet::new(lcl_hash, vec![]);
@@ -4391,11 +4453,11 @@ mod tests {
             .unwrap_or_default()
             .as_secs();
 
-        // Two BaseFee upgrades — same type, both valid (non-zero)
+        // Two BaseFee upgrades — same type and value, both valid for nomination
         let fee1 = LedgerUpgrade::BaseFee(200)
             .to_xdr(Limits::none())
             .expect("xdr");
-        let fee2 = LedgerUpgrade::BaseFee(300)
+        let fee2 = LedgerUpgrade::BaseFee(200)
             .to_xdr(Limits::none())
             .expect("xdr");
         let upgrades = vec![
@@ -4430,9 +4492,6 @@ mod tests {
     fn test_extract_valid_value_strips_nomination_invalid_upgrade() {
         use crate::upgrades::{UpgradeParameters, Upgrades};
 
-        let driver = make_test_driver();
-        let lcl_hash = driver.ledger_manager.current_header_hash();
-
         // Configure upgrades: base_fee=200, upgrade_time=0 so timing check
         // passes (lcl_close_time=0 >= upgrade_time=0) and only value-mismatch
         // causes nomination rejection.
@@ -4441,7 +4500,16 @@ mod tests {
             base_fee: Some(200),
             ..UpgradeParameters::default()
         };
-        driver.set_upgrades(Arc::new(RwLock::new(Upgrades::new(params))));
+        let upgrades = Arc::new(RwLock::new(Upgrades::new(params)));
+        let driver = ScpDriver::new(
+            ScpDriverConfig::default(),
+            Hash256::ZERO,
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            upgrades,
+        );
+        let lcl_hash = driver.ledger_manager.current_header_hash();
 
         let tx_set = TransactionSet::new(lcl_hash, vec![]);
         let tx_set_hash = *tx_set.hash();
@@ -4492,6 +4560,34 @@ mod tests {
             kept_upgrade,
             LedgerUpgrade::BaseFee(200),
             "The nomination-valid upgrade (BaseFee(200)) must be preserved"
+        );
+    }
+
+    /// Regression test for #2413: with default (empty) upgrades, nomination
+    /// validation must reject all concrete upgrades (fail-closed). Previously,
+    /// an unset OnceLock would skip validation entirely (fail-open).
+    #[test]
+    fn test_default_upgrades_rejects_nominations() {
+        use stellar_xdr::curr::LedgerUpgrade;
+
+        let driver = make_test_driver();
+
+        // With default Upgrades (no params configured), any concrete upgrade
+        // must be rejected during nomination validation.
+        let upgrade = LedgerUpgrade::BaseFee(200);
+        let current_version = 21;
+        let lcl_close_time = 1000;
+
+        // nomination=true → must consult Upgrades → default rejects
+        assert!(
+            !driver.is_upgrade_valid(&upgrade, current_version, lcl_close_time, true),
+            "Default upgrades must reject nomination validation (fail-closed)"
+        );
+
+        // nomination=false → only checks apply-validity (passes for valid upgrade type)
+        assert!(
+            driver.is_upgrade_valid(&upgrade, current_version, lcl_close_time, false),
+            "Apply-only validation should pass for a valid upgrade type"
         );
     }
 
@@ -5256,8 +5352,6 @@ mod tests {
     fn test_audit_008_check_upgrades_valid_nomination_flag() {
         use crate::upgrades::{UpgradeParameters, Upgrades};
 
-        let (driver, _secret_key) = make_test_driver_with_key();
-
         // Configure upgrades: only base_fee=200 at time 1000
         let params = UpgradeParameters {
             upgrade_time: 1000,
@@ -5265,7 +5359,22 @@ mod tests {
             ..UpgradeParameters::default()
         };
         let upgrades = Arc::new(RwLock::new(Upgrades::new(params)));
-        driver.set_upgrades(upgrades);
+
+        let secret_key = SecretKey::generate();
+        let public_key = secret_key.public_key();
+        let config = ScpDriverConfig {
+            node_id: public_key,
+            ..ScpDriverConfig::default()
+        };
+        let driver = ScpDriver::with_secret_key(
+            config,
+            Hash256::ZERO,
+            secret_key,
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            upgrades,
+        );
 
         // Create a StellarValue with a base_fee=500 upgrade (wrong value)
         let wrong_upgrade = LedgerUpgrade::BaseFee(500);
@@ -6376,6 +6485,10 @@ mod compare_tx_sets_tests {
         Arc::new(RwLock::new(SharedTrackingState::default()))
     }
 
+    fn make_default_upgrades() -> Arc<RwLock<Upgrades>> {
+        Arc::new(RwLock::new(Upgrades::default()))
+    }
+
     fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
         use stellar_xdr::curr::{
@@ -6431,6 +6544,7 @@ mod compare_tx_sets_tests {
             make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
         )
     }
 
@@ -6827,8 +6941,6 @@ mod compare_tx_sets_tests {
         use crate::upgrades::{UpgradeParameters, Upgrades};
         use std::sync::Arc;
 
-        let driver = make_driver();
-
         // Set up Upgrades with a specific timeout limit
         let mut params = UpgradeParameters::default();
         params.nomination_timeout_limit = Some(300);
@@ -6836,7 +6948,15 @@ mod compare_tx_sets_tests {
             UpgradeParameters::default(),
         )));
         upgrades.write().set_parameters(params, 26).unwrap();
-        driver.set_upgrades(upgrades);
+
+        let driver = ScpDriver::new(
+            make_config(),
+            Hash256::ZERO,
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            upgrades,
+        );
 
         let callback = super::HerderScpCallback::new(Arc::new(driver));
         assert_eq!(
