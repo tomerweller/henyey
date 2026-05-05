@@ -26,11 +26,11 @@
 //! **Not transactional**: on `Err`, partial mutations remain in the delta.
 //! Only the `LedgerEntryChanges` diff return is suppressed.
 //!
-//! For borrow-conflict cases that cannot use the closure form, the low-level
-//! `change_checkpoint()` + `entry_changes_since()` pair is available as a
-//! `pub(crate)` escape hatch. The checkpoint/diff logic is encapsulated in
-//! [`LedgerDelta`] (see [`crate::delta::ChangeCheckpoint`]); `CloseLedgerState`
-//! delegates to it.
+//! The low-level `change_checkpoint()` + `entry_changes_since()` pair remains
+//! available as a `pub(crate)` escape hatch for any future borrow-conflict
+//! cases that cannot use the closure form. Currently there are no active users
+//! of this escape hatch — the version-upgrade path in `manager.rs` was migrated
+//! to use `capture_entry_changes` with free functions (see #2354).
 
 use crate::delta::{ChangeCheckpoint, DeltaCategorization, LedgerDelta};
 use crate::snapshot::SnapshotHandle;
@@ -263,10 +263,9 @@ impl CloseLedgerState {
     /// Capture the current delta state as a checkpoint.
     ///
     /// **Escape hatch** — prefer [`capture_entry_changes`] for new code.
-    /// This low-level method is only needed when borrow conflicts prevent
-    /// using the closure form (e.g., `apply_upgrades` version-upgrade path
-    /// in `manager.rs` where `&mut self` on the enclosing struct conflicts
-    /// with `&mut self.ltx` in the closure).
+    /// This low-level method exists for potential future borrow-conflict cases
+    /// that cannot use the closure form. Currently has no active callers
+    /// (the version-upgrade path was migrated in #2354).
     ///
     /// Delegates to [`LedgerDelta::checkpoint`]. See [`ChangeCheckpoint`]
     /// for the usage contract.
@@ -278,6 +277,7 @@ impl CloseLedgerState {
     ///
     /// **Escape hatch** — prefer [`capture_entry_changes`] for new code.
     /// See [`change_checkpoint`] for when this low-level API is appropriate.
+    /// Currently has no active callers.
     ///
     /// Delegates to [`LedgerDelta::changes_since`].
     pub(crate) fn entry_changes_since(&self, cp: ChangeCheckpoint) -> LedgerEntryChanges {

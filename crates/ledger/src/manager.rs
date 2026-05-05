@@ -2916,12 +2916,897 @@ struct LedgerCloseContext<'a> {
     soroban_max_cluster_count: usize,
 }
 
-impl LedgerCloseContext<'_> {
-    /// Load an entry through the CloseLedgerState read path (current delta → snapshot).
-    fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
-        self.ltx.get_entry(key)
+// ---------------------------------------------------------------------------
+// Version-upgrade free functions
+//
+// These are module-private free functions that implement protocol version
+// upgrade side effects. They accept explicit parameters rather than &mut self
+// on LedgerCloseContext, enabling use with capture_entry_changes (which
+// requires passing &mut CloseLedgerState via closure).
+// ---------------------------------------------------------------------------
+
+/// Create the initial Soroban configuration entries for protocol v20.
+/// Apply version upgrade side effects (create config entries, cost types, etc.).
+///
+/// Returns whether memory cost params were changed. Extracted as a helper
+/// so that the caller can wrap it in an error boundary matching stellar-core's
+/// per-upgrade try/catch (LedgerManagerImpl.cpp:1666-1690).
+fn apply_version_upgrade_side_effects(
+    ltx: &mut CloseLedgerState,
+    ledger_seq: u32,
+    network_id: &NetworkId,
+    base_reserve: u32,
+    initial_bucket_list_size: u64,
+    prev_version: u32,
+    protocol_version: u32,
+) -> Result<bool> {
+    let mut memory_cost_changed = false;
+
+    // Parity: Upgrades.cpp:1189-1212
+    if needs_upgrade_to_version(ProtocolVersion::V20, prev_version, protocol_version) {
+        create_ledger_entries_for_v20(ltx, ledger_seq, initial_bucket_list_size)?;
+        memory_cost_changed = true;
     }
 
+    // Parity: Upgrades.cpp:1213-1217
+    if needs_upgrade_to_version(ProtocolVersion::V21, prev_version, protocol_version) {
+        create_cost_types_for_v21(ltx, ledger_seq)?;
+        memory_cost_changed = true;
+    }
+
+    // Parity: Upgrades.cpp:1219-1223
+    if needs_upgrade_to_version(ProtocolVersion::V22, prev_version, protocol_version) {
+        create_cost_types_for_v22(ltx, ledger_seq)?;
+        memory_cost_changed = true;
+    }
+
+    // Parity: Upgrades.cpp:1225-1229
+    if needs_upgrade_to_version(ProtocolVersion::V23, prev_version, protocol_version) {
+        create_and_update_ledger_entries_for_v23(ltx, ledger_seq)?;
+        memory_cost_changed = true;
+    }
+
+    // Parity: Upgrades.cpp:1229-1233
+    if needs_upgrade_to_version(ProtocolVersion::V25, prev_version, protocol_version) {
+        create_cost_types_for_v25(ltx, ledger_seq)?;
+        memory_cost_changed = true;
+    }
+
+    // Parity: NetworkConfig.cpp updateCostTypesForV26 + createLedgerEntriesForV26
+    if needs_upgrade_to_version(ProtocolVersion::V26, prev_version, protocol_version) {
+        update_cost_types_for_v26(ltx, ledger_seq)?;
+        create_ledger_entries_for_v26(ltx, ledger_seq)?;
+        memory_cost_changed = true;
+    }
+
+    // Parity: Upgrades.cpp:1189-1193
+    // needUpgradeToVersion(V_10, prev, new) → prepareLiabilities
+    // NOTE: Henyey supports protocol 24+ only, so prev_version < 10
+    // should never be true in production. Included for completeness.
+    if needs_upgrade_to_version(ProtocolVersion::V10, prev_version, protocol_version) {
+        crate::prepare_liabilities::prepare_liabilities(
+            ltx,
+            protocol_version,
+            base_reserve,
+            ledger_seq,
+        )?;
+    }
+
+    // Parity: Upgrades.cpp:1244-1251
+    // prevVersion==V_23 && newVersion==V_24 && gIsProductionNetwork
+    if prev_version == 23 && protocol_version == 24 && network_id.is_mainnet() {
+        ltx.record_fee_pool_delta(31_879_035);
+        tracing::info!("Applied V24 mainnet fee pool correction: +31879035 stroops");
+    }
+
+    Ok(memory_cost_changed)
+}
+
+///
+/// Parity: NetworkConfig.cpp:1388-1430 `createLedgerEntriesForV20`
+/// Creates 14 CONFIG_SETTING ledger entries with initial values for Soroban.
+/// This is called when the network upgrades from pre-Soroban (< v20) to v20+.
+fn create_ledger_entries_for_v20(
+    ltx: &mut CloseLedgerState,
+    ledger_seq: u32,
+    initial_bucket_list_size: u64,
+) -> Result<()> {
+    use stellar_xdr::curr::{
+        ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
+        ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
+        ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
+        ContractCostParams, StateArchivalSettings,
+    };
+
+    let make_entry = |config: ConfigSettingEntry| -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ConfigSetting(config),
+            ext: LedgerEntryExt::V0,
+        }
+    };
+
+    // 1. CONFIG_SETTING_CONTRACT_MAX_SIZE_BYTES
+    // Parity: NetworkConfig.cpp:44-58 initialMaxContractSizeEntry
+    // MinimumSorobanNetworkConfig::MAX_CONTRACT_SIZE = 2000
+    ltx.record_create(make_entry(ConfigSettingEntry::ContractMaxSizeBytes(2_000)))?;
+
+    // 2. CONFIG_SETTING_CONTRACT_DATA_KEY_SIZE_BYTES
+    // Parity: NetworkConfig.cpp:60-74 initialMaxContractDataKeySizeEntry
+    // MinimumSorobanNetworkConfig::MAX_CONTRACT_DATA_KEY_SIZE_BYTES = 200
+    ltx.record_create(make_entry(ConfigSettingEntry::ContractDataKeySizeBytes(
+        200,
+    )))?;
+
+    // 3. CONFIG_SETTING_CONTRACT_DATA_ENTRY_SIZE_BYTES
+    // Parity: NetworkConfig.cpp:76-90 initialMaxContractDataEntrySizeEntry
+    // MinimumSorobanNetworkConfig::MAX_CONTRACT_DATA_ENTRY_SIZE_BYTES = 2000
+    ltx.record_create(make_entry(ConfigSettingEntry::ContractDataEntrySizeBytes(
+        2_000,
+    )))?;
+
+    // 4. CONFIG_SETTING_CONTRACT_COMPUTE_V0
+    // Parity: NetworkConfig.cpp:92-116 initialContractComputeSettingsEntry
+    ltx.record_create(make_entry(ConfigSettingEntry::ContractComputeV0(
+        ConfigSettingContractComputeV0 {
+            // TX_MAX_INSTRUCTIONS = MinimumSorobanNetworkConfig::TX_MAX_INSTRUCTIONS = 2_500_000
+            ledger_max_instructions: 2_500_000, // LEDGER_MAX_INSTRUCTIONS = TX_MAX_INSTRUCTIONS
+            tx_max_instructions: 2_500_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 2_000_000, // MEMORY_LIMIT = MinimumSorobanNetworkConfig::MEMORY_LIMIT
+        },
+    )))?;
+
+    // 5. CONFIG_SETTING_CONTRACT_LEDGER_COST_V0
+    // Parity: NetworkConfig.cpp:118-175 initialContractLedgerAccessSettingsEntry
+    ltx.record_create(make_entry(ConfigSettingEntry::ContractLedgerCostV0(
+        ConfigSettingContractLedgerCostV0 {
+            ledger_max_disk_read_entries: 3, // LEDGER_MAX_READ_LEDGER_ENTRIES = TX_MAX
+            ledger_max_disk_read_bytes: 3_200, // LEDGER_MAX_READ_BYTES = TX_MAX
+            ledger_max_write_ledger_entries: 2, // TX_MAX_WRITE_LEDGER_ENTRIES
+            ledger_max_write_bytes: 3_200,   // TX_MAX_WRITE_BYTES
+            tx_max_disk_read_entries: 3,
+            tx_max_disk_read_bytes: 3_200,
+            tx_max_write_ledger_entries: 2,
+            tx_max_write_bytes: 3_200,
+            fee_disk_read_ledger_entry: 5_000,
+            fee_write_ledger_entry: 20_000,
+            fee_disk_read1_kb: 1_000,
+            soroban_state_target_size_bytes: 30 * 1024 * 1024 * 1024_i64, // 30 GB
+            rent_fee1_kb_soroban_state_size_low: 1_000,
+            rent_fee1_kb_soroban_state_size_high: 10_000,
+            soroban_state_rent_fee_growth_factor: 1,
+        },
+    )))?;
+
+    // 6. CONFIG_SETTING_CONTRACT_HISTORICAL_DATA_V0
+    // Parity: NetworkConfig.cpp:177-186 initialContractHistoricalDataSettingsEntry
+    ltx.record_create(make_entry(ConfigSettingEntry::ContractHistoricalDataV0(
+        ConfigSettingContractHistoricalDataV0 {
+            fee_historical1_kb: 100,
+        },
+    )))?;
+
+    // 7. CONFIG_SETTING_CONTRACT_EVENTS_V0
+    // Parity: NetworkConfig.cpp:188-205 initialContractEventsSettingsEntry
+    ltx.record_create(make_entry(ConfigSettingEntry::ContractEventsV0(
+        ConfigSettingContractEventsV0 {
+            tx_max_contract_events_size_bytes: 200, // MinimumSorobanNetworkConfig
+            fee_contract_events1_kb: 200,
+        },
+    )))?;
+
+    // 8. CONFIG_SETTING_CONTRACT_BANDWIDTH_V0
+    // Parity: NetworkConfig.cpp:207-227 initialContractBandwidthSettingsEntry
+    ltx.record_create(make_entry(ConfigSettingEntry::ContractBandwidthV0(
+        ConfigSettingContractBandwidthV0 {
+            ledger_max_txs_size_bytes: 10_000, // TX_MAX_SIZE_BYTES = LEDGER_MAX
+            tx_max_size_bytes: 10_000,
+            fee_tx_size1_kb: 2_000,
+        },
+    )))?;
+
+    // 9. CONFIG_SETTING_CONTRACT_EXECUTION_LANES
+    // Parity: NetworkConfig.cpp:229-243 initialContractExecutionLanesSettingsEntry
+    ltx.record_create(make_entry(ConfigSettingEntry::ContractExecutionLanes(
+        ConfigSettingContractExecutionLanesV0 {
+            ledger_max_tx_count: 1,
+        },
+    )))?;
+
+    // 10. CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS
+    // Parity: NetworkConfig.cpp:246-338 initialCpuCostParamsEntryForV20
+    let cpu_params = initial_cpu_cost_params_for_v20();
+    ltx.record_create(make_entry(
+        ConfigSettingEntry::ContractCostParamsCpuInstructions(ContractCostParams(
+            cpu_params.try_into().map_err(|_| {
+                LedgerError::Internal("Failed to create V20 CPU cost params".to_string())
+            })?,
+        )),
+    ))?;
+
+    // 11. CONFIG_SETTING_CONTRACT_COST_PARAMS_MEMORY_BYTES
+    // Parity: NetworkConfig.cpp:688-776 initialMemCostParamsEntryForV20
+    let mem_params = initial_mem_cost_params_for_v20();
+    ltx.record_create(make_entry(
+        ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
+            mem_params.try_into().map_err(|_| {
+                LedgerError::Internal("Failed to create V20 memory cost params".to_string())
+            })?,
+        )),
+    ))?;
+
+    // 12. CONFIG_SETTING_STATE_ARCHIVAL
+    // Parity: NetworkConfig.cpp:632-685 initialStateArchivalSettings
+    ltx.record_create(make_entry(ConfigSettingEntry::StateArchival(
+        StateArchivalSettings {
+            max_entry_ttl: 1_054_080,  // MAXIMUM_ENTRY_LIFETIME (61 days)
+            min_persistent_ttl: 4_096, // Live until level 6
+            min_temporary_ttl: 16,
+            persistent_rent_rate_denominator: 252_480,
+            temp_rent_rate_denominator: 2_524_800,
+            max_entries_to_archive: 100,
+            live_soroban_state_size_window_sample_size: 30,
+            live_soroban_state_size_window_sample_period: 64,
+            eviction_scan_size: 100_000, // 100 kb
+            starting_eviction_scan_level: 6,
+        },
+    )))?;
+
+    // 13. CONFIG_SETTING_LIVE_SOROBAN_STATE_SIZE_WINDOW
+    // Parity: NetworkConfig.cpp:1110-1126 initialliveSorobanStateSizeWindow
+    // Populates 30-entry window with copies of current bucket list size.
+    let bl_size = initial_bucket_list_size;
+    let window: Vec<u64> = vec![bl_size; 30]; // BUCKET_LIST_SIZE_WINDOW_SAMPLE_SIZE = 30
+    ltx.record_create(make_entry(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+        window
+            .try_into()
+            .map_err(|_| LedgerError::Internal("Failed to create state size window".to_string()))?,
+    )))?;
+
+    // 14. CONFIG_SETTING_EVICTION_ITERATOR
+    // Parity: NetworkConfig.cpp:1128-1139 initialEvictionIterator
+    ltx.record_create(make_entry(ConfigSettingEntry::EvictionIterator(
+        EvictionIterator {
+            bucket_list_level: 6, // STARTING_EVICTION_SCAN_LEVEL
+            is_curr_bucket: true,
+            bucket_file_offset: 0,
+        },
+    )))?;
+
+    tracing::info!(
+        ledger_seq = ledger_seq,
+        "Applied createLedgerEntriesForV20: created 14 CONFIG_SETTING entries"
+    );
+
+    Ok(())
+}
+
+/// Build the initial V20 CPU cost parameter table (23 entries: indices 0..=22).
+///
+/// Parity: NetworkConfig.cpp:246-338 `initialCpuCostParamsEntryForV20`
+fn initial_cpu_cost_params_for_v20() -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
+    use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
+    let e = |const_term: i64, linear_term: i64| ContractCostParamEntry {
+        ext: ExtensionPoint::V0,
+        const_term,
+        linear_term,
+    };
+    // Indices 0..=22 (ChaCha20DrawBytes)
+    vec![
+        e(4, 0),          // 0: WasmInsnExec
+        e(434, 16),       // 1: MemAlloc
+        e(42, 16),        // 2: MemCpy
+        e(44, 16),        // 3: MemCmp
+        e(310, 0),        // 4: DispatchHostFunction
+        e(61, 0),         // 5: VisitObject
+        e(230, 29),       // 6: ValSer
+        e(59052, 4001),   // 7: ValDeser
+        e(3738, 7012),    // 8: ComputeSha256Hash
+        e(40253, 0),      // 9: ComputeEd25519PubKey
+        e(377524, 4068),  // 10: VerifyEd25519Sig
+        e(451626, 45405), // 11: VmInstantiation
+        e(451626, 45405), // 12: VmCachedInstantiation
+        e(1948, 0),       // 13: InvokeVmFunction
+        e(3766, 5969),    // 14: ComputeKeccak256Hash
+        e(710, 0),        // 15: DecodeEcdsaCurve256Sig
+        e(2315295, 0),    // 16: RecoverEcdsaSecp256k1Key
+        e(4404, 0),       // 17: Int256AddSub
+        e(4947, 0),       // 18: Int256Mul
+        e(4911, 0),       // 19: Int256Div
+        e(4286, 0),       // 20: Int256Pow
+        e(913, 0),        // 21: Int256Shift
+        e(1058, 501),     // 22: ChaCha20DrawBytes
+    ]
+}
+
+/// Build the initial V20 memory cost parameter table (23 entries: indices 0..=22).
+///
+/// Parity: NetworkConfig.cpp:688-776 `initialMemCostParamsEntryForV20`
+fn initial_mem_cost_params_for_v20() -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
+    use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
+    let e = |const_term: i64, linear_term: i64| ContractCostParamEntry {
+        ext: ExtensionPoint::V0,
+        const_term,
+        linear_term,
+    };
+    // Indices 0..=22 (ChaCha20DrawBytes)
+    vec![
+        e(0, 0),         // 0: WasmInsnExec
+        e(16, 128),      // 1: MemAlloc
+        e(0, 0),         // 2: MemCpy
+        e(0, 0),         // 3: MemCmp
+        e(0, 0),         // 4: DispatchHostFunction
+        e(0, 0),         // 5: VisitObject
+        e(242, 384),     // 6: ValSer
+        e(0, 384),       // 7: ValDeser
+        e(0, 0),         // 8: ComputeSha256Hash
+        e(0, 0),         // 9: ComputeEd25519PubKey
+        e(0, 0),         // 10: VerifyEd25519Sig
+        e(130065, 5064), // 11: VmInstantiation
+        e(130065, 5064), // 12: VmCachedInstantiation
+        e(14, 0),        // 13: InvokeVmFunction
+        e(0, 0),         // 14: ComputeKeccak256Hash
+        e(0, 0),         // 15: DecodeEcdsaCurve256Sig
+        e(181, 0),       // 16: RecoverEcdsaSecp256k1Key
+        e(99, 0),        // 17: Int256AddSub
+        e(99, 0),        // 18: Int256Mul
+        e(99, 0),        // 19: Int256Div
+        e(99, 0),        // 20: Int256Pow
+        e(99, 0),        // 21: Int256Shift
+        e(0, 0),         // 22: ChaCha20DrawBytes
+    ]
+}
+
+/// Shared helper: load, resize, update, and persist CPU and memory cost param entries.
+///
+/// Each update triple `(index, const_term, linear_term)` sets the corresponding
+/// `ContractCostParamEntry` at the given index. Indices beyond the current
+/// length are filled with zero entries during the resize.
+fn resize_and_update_cost_params(
+    ltx: &mut CloseLedgerState,
+    ledger_seq: u32,
+    new_size: usize,
+    cpu_updates: &[(usize, i64, i64)],
+    mem_updates: &[(usize, i64, i64)],
+) -> Result<()> {
+    use stellar_xdr::curr::{ContractCostParamEntry, ContractCostParams};
+
+    let make_entry = |const_term: i64, linear_term: i64| ContractCostParamEntry {
+        ext: ExtensionPoint::V0,
+        const_term,
+        linear_term,
+    };
+
+    // Helper closure: load, resize, update, and persist one cost param config setting.
+    let mut update_params = |setting_id: ConfigSettingId,
+                             updates: &[(usize, i64, i64)],
+                             wrap: fn(ContractCostParams) -> ConfigSettingEntry,
+                             label: &str|
+     -> Result<()> {
+        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: setting_id,
+        });
+        let entry = ltx
+            .get_entry(&key)?
+            .ok_or_else(|| LedgerError::Internal(format!("{label} entry not found")))?;
+
+        let mut params = if let LedgerEntryData::ConfigSetting(ref cs) = entry.data {
+            match cs {
+                ConfigSettingEntry::ContractCostParamsCpuInstructions(p)
+                | ConfigSettingEntry::ContractCostParamsMemoryBytes(p) => p.0.to_vec(),
+                _ => {
+                    return Err(LedgerError::Internal(format!(
+                        "Unexpected entry type for {label}"
+                    )));
+                }
+            }
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "Unexpected entry type for {label}"
+            )));
+        };
+
+        params.resize(new_size, make_entry(0, 0));
+        for &(idx, c, l) in updates {
+            params[idx] = make_entry(c, l);
+        }
+
+        let new_entry = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ConfigSetting(wrap(ContractCostParams(
+                params
+                    .try_into()
+                    .map_err(|_| LedgerError::Internal(format!("Failed to convert {label}")))?,
+            ))),
+            ext: LedgerEntryExt::V0,
+        };
+        ltx.record_update(entry, new_entry)?;
+        Ok(())
+    };
+
+    update_params(
+        ConfigSettingId::ContractCostParamsCpuInstructions,
+        cpu_updates,
+        ConfigSettingEntry::ContractCostParamsCpuInstructions,
+        "ContractCostParamsCpuInstructions",
+    )?;
+
+    update_params(
+        ConfigSettingId::ContractCostParamsMemoryBytes,
+        mem_updates,
+        ConfigSettingEntry::ContractCostParamsMemoryBytes,
+        "ContractCostParamsMemoryBytes",
+    )?;
+
+    Ok(())
+}
+
+/// Apply version upgrade side effects for protocol 21.
+///
+/// Parity: NetworkConfig.cpp:1432-1439 `createCostTypesForV21`
+/// Resizes CPU and memory cost params to include ParseWasm/InstantiateWasm types
+/// and ECDSA-secp256r1 verification.
+fn create_cost_types_for_v21(ltx: &mut CloseLedgerState, ledger_seq: u32) -> Result<()> {
+    const NEW_SIZE: usize = 45; // V21 last cost type: VerifyEcdsaSecp256r1Sig = 44
+
+    // CPU params: Parity: NetworkConfig.cpp:340-441 updateCpuCostParamsEntryForV21
+    let cpu_updates: &[(usize, i64, i64)] = &[
+        (12, 41142, 634),   // VmCachedInstantiation (updated)
+        (23, 73077, 25410), // ParseWasmInstructions
+        (24, 0, 540752),    // ParseWasmFunctions
+        (25, 0, 176363),    // ParseWasmGlobals
+        (26, 0, 29989),     // ParseWasmTableEntries
+        (27, 0, 1061449),   // ParseWasmTypes
+        (28, 0, 237336),    // ParseWasmDataSegments
+        (29, 0, 328476),    // ParseWasmElemSegments
+        (30, 0, 701845),    // ParseWasmImports
+        (31, 0, 429383),    // ParseWasmExports
+        (32, 0, 28),        // ParseWasmDataSegmentBytes
+        (33, 43030, 0),     // InstantiateWasmInstructions
+        (34, 0, 7556),      // InstantiateWasmFunctions
+        (35, 0, 10711),     // InstantiateWasmGlobals
+        (36, 0, 3300),      // InstantiateWasmTableEntries
+        (37, 0, 0),         // InstantiateWasmTypes
+        (38, 0, 23038),     // InstantiateWasmDataSegments
+        (39, 0, 42488),     // InstantiateWasmElemSegments
+        (40, 0, 828974),    // InstantiateWasmImports
+        (41, 0, 297100),    // InstantiateWasmExports
+        (42, 0, 14),        // InstantiateWasmDataSegmentBytes
+        (43, 1882, 0),      // Sec1DecodePointUncompressed
+        (44, 3000906, 0),   // VerifyEcdsaSecp256r1Sig
+    ];
+
+    // Memory params: Parity: NetworkConfig.cpp:778-880 updateMemCostParamsEntryForV21
+    let mem_updates: &[(usize, i64, i64)] = &[
+        (12, 69472, 1217), // VmCachedInstantiation (updated)
+        (23, 17564, 6457), // ParseWasmInstructions
+        (24, 0, 47464),    // ParseWasmFunctions
+        (25, 0, 13420),    // ParseWasmGlobals
+        (26, 0, 6285),     // ParseWasmTableEntries
+        (27, 0, 64670),    // ParseWasmTypes
+        (28, 0, 29074),    // ParseWasmDataSegments
+        (29, 0, 48095),    // ParseWasmElemSegments
+        (30, 0, 103229),   // ParseWasmImports
+        (31, 0, 36394),    // ParseWasmExports
+        (32, 0, 257),      // ParseWasmDataSegmentBytes
+        (33, 70704, 0),    // InstantiateWasmInstructions
+        (34, 0, 14613),    // InstantiateWasmFunctions
+        (35, 0, 6833),     // InstantiateWasmGlobals
+        (36, 0, 1025),     // InstantiateWasmTableEntries
+        (37, 0, 0),        // InstantiateWasmTypes
+        (38, 0, 129632),   // InstantiateWasmDataSegments
+        (39, 0, 13665),    // InstantiateWasmElemSegments
+        (40, 0, 97637),    // InstantiateWasmImports
+        (41, 0, 9176),     // InstantiateWasmExports
+        (42, 0, 126),      // InstantiateWasmDataSegmentBytes
+        (43, 0, 0),        // Sec1DecodePointUncompressed
+        (44, 0, 0),        // VerifyEcdsaSecp256r1Sig
+    ];
+
+    resize_and_update_cost_params(ltx, ledger_seq, NEW_SIZE, cpu_updates, mem_updates)?;
+
+    tracing::info!(
+        ledger_seq = ledger_seq,
+        new_size = NEW_SIZE,
+        "Applied createCostTypesForV21: resized cost params with ParseWasm/InstantiateWasm entries"
+    );
+
+    Ok(())
+}
+
+/// Apply version upgrade side effects for protocol 22.
+///
+/// Parity: NetworkConfig.cpp:1441-1448 `createCostTypesForV22`
+/// Resizes CPU and memory cost params to include BLS12-381 curve types.
+fn create_cost_types_for_v22(ltx: &mut CloseLedgerState, ledger_seq: u32) -> Result<()> {
+    const NEW_SIZE: usize = 70; // V22 last cost type: Bls12381FrInv = 69
+
+    // CPU params: Parity: NetworkConfig.cpp:443-553 updateCpuCostParamsEntryForV22
+    let cpu_updates: &[(usize, i64, i64)] = &[
+        (45, 661, 0),              // Bls12381EncodeFp
+        (46, 985, 0),              // Bls12381DecodeFp
+        (47, 1934, 0),             // Bls12381G1CheckPointOnCurve
+        (48, 730510, 0),           // Bls12381G1CheckPointInSubgroup
+        (49, 5921, 0),             // Bls12381G2CheckPointOnCurve
+        (50, 1057822, 0),          // Bls12381G2CheckPointInSubgroup
+        (51, 92642, 0),            // Bls12381G1ProjectiveToAffine
+        (52, 100742, 0),           // Bls12381G2ProjectiveToAffine
+        (53, 7689, 0),             // Bls12381G1Add
+        (54, 2458985, 0),          // Bls12381G1Mul
+        (55, 2426722, 96397671),   // Bls12381G1Msm
+        (56, 1541554, 0),          // Bls12381MapFpToG1
+        (57, 3211191, 6713),       // Bls12381HashToG1
+        (58, 25207, 0),            // Bls12381G2Add
+        (59, 7873219, 0),          // Bls12381G2Mul
+        (60, 8035968, 309667335),  // Bls12381G2Msm
+        (61, 2420202, 0),          // Bls12381MapFp2ToG2
+        (62, 7050564, 6797),       // Bls12381HashToG2
+        (63, 10558948, 632860943), // Bls12381Pairing
+        (64, 1994, 0),             // Bls12381FrFromU256
+        (65, 1155, 0),             // Bls12381FrToU256
+        (66, 74, 0),               // Bls12381FrAddSub
+        (67, 332, 0),              // Bls12381FrMul
+        (68, 691, 74558),          // Bls12381FrPow
+        (69, 35421, 0),            // Bls12381FrInv
+    ];
+
+    // Memory params: Parity: NetworkConfig.cpp:882-990 updateMemCostParamsEntryForV22
+    let mem_updates: &[(usize, i64, i64)] = &[
+        (45, 0, 0),           // Bls12381EncodeFp
+        (46, 0, 0),           // Bls12381DecodeFp
+        (47, 0, 0),           // Bls12381G1CheckPointOnCurve
+        (48, 0, 0),           // Bls12381G1CheckPointInSubgroup
+        (49, 0, 0),           // Bls12381G2CheckPointOnCurve
+        (50, 0, 0),           // Bls12381G2CheckPointInSubgroup
+        (51, 0, 0),           // Bls12381G1ProjectiveToAffine
+        (52, 0, 0),           // Bls12381G2ProjectiveToAffine
+        (53, 0, 0),           // Bls12381G1Add
+        (54, 0, 0),           // Bls12381G1Mul
+        (55, 109494, 354667), // Bls12381G1Msm
+        (56, 5552, 0),        // Bls12381MapFpToG1
+        (57, 9424, 0),        // Bls12381HashToG1
+        (58, 0, 0),           // Bls12381G2Add
+        (59, 0, 0),           // Bls12381G2Mul
+        (60, 219654, 354667), // Bls12381G2Msm
+        (61, 3344, 0),        // Bls12381MapFp2ToG2
+        (62, 6816, 0),        // Bls12381HashToG2
+        (63, 2204, 9340474),  // Bls12381Pairing
+        (64, 0, 0),           // Bls12381FrFromU256
+        (65, 248, 0),         // Bls12381FrToU256
+        (66, 0, 0),           // Bls12381FrAddSub
+        (67, 0, 0),           // Bls12381FrMul
+        (68, 0, 128),         // Bls12381FrPow
+        (69, 0, 0),           // Bls12381FrInv
+    ];
+
+    resize_and_update_cost_params(ltx, ledger_seq, NEW_SIZE, cpu_updates, mem_updates)?;
+
+    tracing::info!(
+        ledger_seq = ledger_seq,
+        new_size = NEW_SIZE,
+        "Applied createCostTypesForV22: resized cost params with BLS12-381 entries"
+    );
+
+    Ok(())
+}
+
+/// Apply version upgrade side effects for protocol 23.
+///
+/// Parity: NetworkConfig.cpp:1459-1484 `createAndUpdateLedgerEntriesForV23`
+/// Creates 3 new CONFIG_SETTING entries (parallel compute, SCP timing,
+/// ledger cost extension) and updates rent cost parameters.
+fn create_and_update_ledger_entries_for_v23(
+    ltx: &mut CloseLedgerState,
+    ledger_seq: u32,
+) -> Result<()> {
+    use stellar_xdr::curr::{
+        ConfigSettingContractLedgerCostExtV0, ConfigSettingContractParallelComputeV0,
+        ConfigSettingScpTiming,
+    };
+
+    // 1. CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0
+    // Parity: NetworkConfig.cpp:1069-1076 initialParallelComputeEntry
+    ltx.record_create(LedgerEntry {
+        last_modified_ledger_seq: ledger_seq,
+        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractParallelComputeV0(
+            ConfigSettingContractParallelComputeV0 {
+                ledger_max_dependent_tx_clusters: 1, // LEDGER_MAX_DEPENDENT_TX_CLUSTERS
+            },
+        )),
+        ext: LedgerEntryExt::V0,
+    })?;
+
+    // 2. CONFIG_SETTING_SCP_TIMING
+    // Parity: NetworkConfig.cpp:1092-1108 initialScpTimingEntry
+    ltx.record_create(LedgerEntry {
+        last_modified_ledger_seq: ledger_seq,
+        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ScpTiming(
+            ConfigSettingScpTiming {
+                ledger_target_close_time_milliseconds: 5000,
+                nomination_timeout_initial_milliseconds: 1000,
+                nomination_timeout_increment_milliseconds: 1000,
+                ballot_timeout_initial_milliseconds: 1000,
+                ballot_timeout_increment_milliseconds: 1000,
+            },
+        )),
+        ext: LedgerEntryExt::V0,
+    })?;
+
+    // 3. CONFIG_SETTING_CONTRACT_LEDGER_COST_EXT_V0
+    // Parity: NetworkConfig.cpp:1078-1090 initialLedgerCostExtEntry
+    // Reads txMaxDiskReadEntries from the existing V0 cost setting.
+    let cost_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::ContractLedgerCostV0,
+    });
+    let cost_entry = ltx.get_entry(&cost_key)?.ok_or_else(|| {
+        LedgerError::Internal(
+            "CONFIG_SETTING_CONTRACT_LEDGER_COST_V0 not found (required for V23 upgrade)"
+                .to_string(),
+        )
+    })?;
+    let tx_max_disk_read_entries = if let LedgerEntryData::ConfigSetting(
+        ConfigSettingEntry::ContractLedgerCostV0(ref settings),
+    ) = cost_entry.data
+    {
+        settings.tx_max_disk_read_entries
+    } else {
+        return Err(LedgerError::Internal(
+            "Unexpected entry type for ContractLedgerCost".to_string(),
+        ));
+    };
+
+    ltx.record_create(LedgerEntry {
+        last_modified_ledger_seq: ledger_seq,
+        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostExtV0(
+            ConfigSettingContractLedgerCostExtV0 {
+                tx_max_footprint_entries: tx_max_disk_read_entries,
+                fee_write1_kb: 3_500, // FEE_LEDGER_WRITE_1KB
+            },
+        )),
+        ext: LedgerEntryExt::V0,
+    })?;
+
+    // 4. Update rent cost parameters
+    // Parity: NetworkConfig.cpp:1142-1171 updateRentCostParamsForV23
+    update_rent_cost_params_for_v23(ltx, ledger_seq)?;
+
+    tracing::info!(
+        ledger_seq = ledger_seq,
+        "Applied createAndUpdateLedgerEntriesForV23: 3 new entries + rent param update"
+    );
+
+    Ok(())
+}
+
+/// Update rent cost parameters for the V23 protocol upgrade.
+///
+/// Parity: NetworkConfig.cpp:1142-1171 `updateRentCostParamsForV23`
+/// Updates ContractLedgerCost and StateArchival settings with new rent parameters.
+fn update_rent_cost_params_for_v23(ltx: &mut CloseLedgerState, ledger_seq: u32) -> Result<()> {
+    // Update CONFIG_SETTING_CONTRACT_LEDGER_COST_V0
+    let cost_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::ContractLedgerCostV0,
+    });
+    let cost_entry = ltx
+        .get_entry(&cost_key)?
+        .ok_or_else(|| LedgerError::Internal("ContractLedgerCostV0 entry not found".to_string()))?;
+
+    if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostV0(ref settings)) =
+        cost_entry.data
+    {
+        let mut new_settings = settings.clone();
+        // Protcol23UpgradedConfig values (note: typo matches stellar-core)
+        new_settings.soroban_state_target_size_bytes = 3_000_000_000; // 3 GB
+        new_settings.rent_fee1_kb_soroban_state_size_low = -17_000;
+        new_settings.rent_fee1_kb_soroban_state_size_high = 10_000;
+
+        let new_entry = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostV0(
+                new_settings,
+            )),
+            ext: LedgerEntryExt::V0,
+        };
+        ltx.record_update(cost_entry, new_entry)?;
+    } else {
+        return Err(LedgerError::Internal(
+            "Unexpected entry type for ContractLedgerCostV0".to_string(),
+        ));
+    }
+
+    // Update CONFIG_SETTING_STATE_ARCHIVAL
+    let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::StateArchival,
+    });
+    let archival_entry = ltx
+        .get_entry(&archival_key)?
+        .ok_or_else(|| LedgerError::Internal("StateArchival entry not found".to_string()))?;
+
+    if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(ref settings)) =
+        archival_entry.data
+    {
+        let mut new_settings = settings.clone();
+        new_settings.persistent_rent_rate_denominator = 1_215;
+        new_settings.temp_rent_rate_denominator = 2_430;
+
+        let new_entry = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(new_settings)),
+            ext: LedgerEntryExt::V0,
+        };
+        ltx.record_update(archival_entry, new_entry)?;
+    } else {
+        return Err(LedgerError::Internal(
+            "Unexpected entry type for StateArchival".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Apply version upgrade side effects for protocol 25.
+///
+/// Parity: NetworkConfig.cpp:1450-1457 `createCostTypesForV25`
+/// Resizes the CPU and memory cost param entries to include BN254 curve
+/// cost types and populates their values.
+fn create_cost_types_for_v25(ltx: &mut CloseLedgerState, ledger_seq: u32) -> Result<()> {
+    // BN254 cost type indices (from ContractCostType enum)
+    const BN254_ENCODE_FP: usize = 70;
+    const BN254_DECODE_FP: usize = 71;
+    const BN254_G1_CHECK_POINT_ON_CURVE: usize = 72;
+    const BN254_G2_CHECK_POINT_ON_CURVE: usize = 73;
+    const BN254_G2_CHECK_POINT_IN_SUBGROUP: usize = 74;
+    const BN254_G1_PROJECTIVE_TO_AFFINE: usize = 75;
+    const BN254_G1_ADD: usize = 76;
+    const BN254_G1_MUL: usize = 77;
+    const BN254_PAIRING: usize = 78;
+    const BN254_FR_FROM_U256: usize = 79;
+    const BN254_FR_TO_U256: usize = 80;
+    const BN254_FR_ADD_SUB: usize = 81;
+    const BN254_FR_MUL: usize = 82;
+    const BN254_FR_POW: usize = 83;
+    const BN254_FR_INV: usize = 84;
+    const NEW_SIZE: usize = BN254_FR_INV + 1; // 85
+
+    // CPU params: from NetworkConfig.cpp:556-629
+    let cpu_updates: &[(usize, i64, i64)] = &[
+        (BN254_ENCODE_FP, 344, 0),
+        (BN254_DECODE_FP, 476, 0),
+        (BN254_G1_CHECK_POINT_ON_CURVE, 904, 0),
+        (BN254_G2_CHECK_POINT_ON_CURVE, 2811, 0),
+        (BN254_G2_CHECK_POINT_IN_SUBGROUP, 2937755, 0),
+        (BN254_G1_PROJECTIVE_TO_AFFINE, 61, 0),
+        (BN254_G1_ADD, 3623, 0),
+        (BN254_G1_MUL, 1150435, 0),
+        (BN254_PAIRING, 5263916, 392472814),
+        (BN254_FR_FROM_U256, 2052, 0),
+        (BN254_FR_TO_U256, 1133, 0),
+        (BN254_FR_ADD_SUB, 74, 0),
+        (BN254_FR_MUL, 332, 0),
+        (BN254_FR_POW, 755, 68930),
+        (BN254_FR_INV, 33151, 0),
+    ];
+
+    // Memory params: from NetworkConfig.cpp:993-1067
+    let mem_updates: &[(usize, i64, i64)] = &[
+        (BN254_ENCODE_FP, 0, 0),
+        (BN254_DECODE_FP, 0, 0),
+        (BN254_G1_CHECK_POINT_ON_CURVE, 0, 0),
+        (BN254_G2_CHECK_POINT_ON_CURVE, 0, 0),
+        (BN254_G2_CHECK_POINT_IN_SUBGROUP, 0, 0),
+        (BN254_G1_PROJECTIVE_TO_AFFINE, 0, 0),
+        (BN254_G1_ADD, 0, 0),
+        (BN254_G1_MUL, 0, 0),
+        (BN254_PAIRING, 1821, 6232546),
+        (BN254_FR_FROM_U256, 0, 0),
+        (BN254_FR_TO_U256, 312, 0),
+        (BN254_FR_ADD_SUB, 0, 0),
+        (BN254_FR_MUL, 0, 0),
+        (BN254_FR_POW, 0, 0),
+        (BN254_FR_INV, 0, 0),
+    ];
+
+    resize_and_update_cost_params(ltx, ledger_seq, NEW_SIZE, cpu_updates, mem_updates)?;
+
+    tracing::info!(
+        ledger_seq = ledger_seq,
+        new_size = NEW_SIZE,
+        "Applied createCostTypesForV25: resized cost params with BN254 entries"
+    );
+
+    Ok(())
+}
+
+/// Update cost type parameters for Protocol 26.
+///
+/// Parity: NetworkConfig.cpp updateCpuCostParamsEntryForV26 + updateMemCostParamsEntryForV26
+/// Resizes cost params from 85 → 86 entries (adds Bn254G1Msm at index 85)
+/// and updates BLS12-381 and BN254 cost type values.
+fn update_cost_types_for_v26(ltx: &mut CloseLedgerState, ledger_seq: u32) -> Result<()> {
+    // Cost type indices (from ContractCostType enum)
+    const BLS12381_G1_MSM: usize = 55;
+    const BLS12381_MAP_FP_TO_G1: usize = 56;
+    const BLS12381_HASH_TO_G1: usize = 57;
+    const BLS12381_G2_MSM: usize = 60;
+    const BLS12381_MAP_FP2_TO_G2: usize = 61;
+    const BLS12381_HASH_TO_G2: usize = 62;
+    const BN254_G2_CHECK_POINT_IN_SUBGROUP: usize = 74;
+    const BN254_G1_MSM: usize = 85;
+    const NEW_SIZE: usize = BN254_G1_MSM + 1; // 86
+
+    // CPU params: from NetworkConfig.cpp:635-694
+    let cpu_updates: &[(usize, i64, i64)] = &[
+        (BLS12381_G1_MSM, 2347584, 94135478),
+        (BLS12381_MAP_FP_TO_G1, 1020885, 0),
+        (BLS12381_HASH_TO_G1, 2638451, 6803),
+        (BLS12381_G2_MSM, 7663880, 298580871),
+        (BLS12381_MAP_FP2_TO_G2, 1856539, 0),
+        (BLS12381_HASH_TO_G2, 6315452, 7232),
+        (BN254_G2_CHECK_POINT_IN_SUBGROUP, 1706052, 0),
+        (BN254_G1_MSM, 1185193, 41568084),
+    ];
+
+    // Memory params: from NetworkConfig.cpp:1135-1190
+    let mem_updates: &[(usize, i64, i64)] = &[
+        (BLS12381_G1_MSM, 109494, 266603),
+        (BLS12381_MAP_FP_TO_G1, 2776, 0),
+        (BLS12381_HASH_TO_G1, 5896, 0),
+        (BLS12381_G2_MSM, 219654, 266603),
+        (BLS12381_MAP_FP2_TO_G2, 1672, 0),
+        (BLS12381_HASH_TO_G2, 3960, 0),
+        (BN254_G1_MSM, 73061, 229779),
+    ];
+
+    resize_and_update_cost_params(ltx, ledger_seq, NEW_SIZE, cpu_updates, mem_updates)?;
+
+    tracing::info!(
+        ledger_seq = ledger_seq,
+        new_size = NEW_SIZE,
+        "Applied updateCostTypesForV26: updated BLS12-381/BN254 cost params and added Bn254G1Msm"
+    );
+
+    Ok(())
+}
+
+/// Create initial CONFIG_SETTING entries for Protocol 26 (CAP-77 frozen ledger keys).
+///
+/// Parity: NetworkConfig.cpp createLedgerEntriesForV26
+/// Creates 2 CONFIG_SETTING entries with empty frozen key and bypass tx sets.
+fn create_ledger_entries_for_v26(ltx: &mut CloseLedgerState, ledger_seq: u32) -> Result<()> {
+    use stellar_xdr::curr::{FreezeBypassTxs, FrozenLedgerKeys, VecM};
+
+    let make_entry = |config: ConfigSettingEntry| -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ConfigSetting(config),
+            ext: LedgerEntryExt::V0,
+        }
+    };
+
+    // CONFIG_SETTING_FROZEN_LEDGER_KEYS (empty)
+    ltx.record_create(make_entry(ConfigSettingEntry::FrozenLedgerKeys(
+        FrozenLedgerKeys {
+            keys: VecM::default(),
+        },
+    )))?;
+
+    // CONFIG_SETTING_FREEZE_BYPASS_TXS (empty)
+    ltx.record_create(make_entry(ConfigSettingEntry::FreezeBypassTxs(
+        FreezeBypassTxs {
+            tx_hashes: VecM::default(),
+        },
+    )))?;
+
+    tracing::info!(
+        ledger_seq,
+        "Applied createLedgerEntriesForV26: created 2 CONFIG_SETTING entries for frozen keys"
+    );
+
+    Ok(())
+}
+
+impl LedgerCloseContext<'_> {
     /// Load StateArchivalSettings through the CloseLedgerState read path.
     ///
     /// Parity: In stellar-core, the eviction scan runs after config upgrades are applied to the
@@ -2941,901 +3826,48 @@ impl LedgerCloseContext<'_> {
         }
     }
 
-    /// Create the initial Soroban configuration entries for protocol v20.
-    /// Apply version upgrade side effects (create config entries, cost types, etc.).
-    ///
-    /// Returns whether memory cost params were changed. Extracted as a helper
-    /// so that the caller can wrap it in an error boundary matching stellar-core's
-    /// per-upgrade try/catch (LedgerManagerImpl.cpp:1666-1690).
-    fn apply_version_upgrade_side_effects(
-        &mut self,
-        prev_version: u32,
-        protocol_version: u32,
-    ) -> Result<bool> {
-        let mut memory_cost_changed = false;
+    // -----------------------------------------------------------------------
+    // Thin method wrappers for version-upgrade free functions (test compat)
+    //
+    // These wrappers preserve the original method API so that unit tests in
+    // this module can continue calling ctx.create_cost_types_for_v25() etc.
+    // Production code uses the free functions directly via capture_entry_changes.
+    // -----------------------------------------------------------------------
 
-        // Parity: Upgrades.cpp:1189-1212
-        if needs_upgrade_to_version(ProtocolVersion::V20, prev_version, protocol_version) {
-            self.create_ledger_entries_for_v20()?;
-            memory_cost_changed = true;
-        }
-
-        // Parity: Upgrades.cpp:1213-1217
-        if needs_upgrade_to_version(ProtocolVersion::V21, prev_version, protocol_version) {
-            self.create_cost_types_for_v21()?;
-            memory_cost_changed = true;
-        }
-
-        // Parity: Upgrades.cpp:1219-1223
-        if needs_upgrade_to_version(ProtocolVersion::V22, prev_version, protocol_version) {
-            self.create_cost_types_for_v22()?;
-            memory_cost_changed = true;
-        }
-
-        // Parity: Upgrades.cpp:1225-1229
-        if needs_upgrade_to_version(ProtocolVersion::V23, prev_version, protocol_version) {
-            self.create_and_update_ledger_entries_for_v23()?;
-            memory_cost_changed = true;
-        }
-
-        // Parity: Upgrades.cpp:1229-1233
-        if needs_upgrade_to_version(ProtocolVersion::V25, prev_version, protocol_version) {
-            self.create_cost_types_for_v25()?;
-            memory_cost_changed = true;
-        }
-
-        // Parity: NetworkConfig.cpp updateCostTypesForV26 + createLedgerEntriesForV26
-        if needs_upgrade_to_version(ProtocolVersion::V26, prev_version, protocol_version) {
-            self.update_cost_types_for_v26()?;
-            self.create_ledger_entries_for_v26()?;
-            memory_cost_changed = true;
-        }
-
-        // Parity: Upgrades.cpp:1189-1193
-        // needUpgradeToVersion(V_10, prev, new) → prepareLiabilities
-        // NOTE: Henyey supports protocol 24+ only, so prev_version < 10
-        // should never be true in production. Included for completeness.
-        if needs_upgrade_to_version(ProtocolVersion::V10, prev_version, protocol_version) {
-            crate::prepare_liabilities::prepare_liabilities(
-                &mut self.ltx,
-                protocol_version,
-                self.prev_header.base_reserve,
-                self.close_data.ledger_seq,
-            )?;
-        }
-
-        // Parity: Upgrades.cpp:1244-1251
-        // prevVersion==V_23 && newVersion==V_24 && gIsProductionNetwork
-        if prev_version == 23 && protocol_version == 24 && self.manager.network_id().is_mainnet() {
-            self.ltx.record_fee_pool_delta(31_879_035);
-            tracing::info!("Applied V24 mainnet fee pool correction: +31879035 stroops");
-        }
-
-        Ok(memory_cost_changed)
-    }
-
-    ///
-    /// Parity: NetworkConfig.cpp:1388-1430 `createLedgerEntriesForV20`
-    /// Creates 14 CONFIG_SETTING ledger entries with initial values for Soroban.
-    /// This is called when the network upgrades from pre-Soroban (< v20) to v20+.
+    #[cfg(test)]
     fn create_ledger_entries_for_v20(&mut self) -> Result<()> {
-        use stellar_xdr::curr::{
-            ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
-            ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
-            ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
-            ContractCostParams, StateArchivalSettings,
-        };
-
-        let ledger_seq = self.close_data.ledger_seq;
-        let make_entry = |config: ConfigSettingEntry| -> LedgerEntry {
-            LedgerEntry {
-                last_modified_ledger_seq: ledger_seq,
-                data: LedgerEntryData::ConfigSetting(config),
-                ext: LedgerEntryExt::V0,
-            }
-        };
-
-        // 1. CONFIG_SETTING_CONTRACT_MAX_SIZE_BYTES
-        // Parity: NetworkConfig.cpp:44-58 initialMaxContractSizeEntry
-        // MinimumSorobanNetworkConfig::MAX_CONTRACT_SIZE = 2000
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::ContractMaxSizeBytes(2_000)))?;
-
-        // 2. CONFIG_SETTING_CONTRACT_DATA_KEY_SIZE_BYTES
-        // Parity: NetworkConfig.cpp:60-74 initialMaxContractDataKeySizeEntry
-        // MinimumSorobanNetworkConfig::MAX_CONTRACT_DATA_KEY_SIZE_BYTES = 200
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::ContractDataKeySizeBytes(
-                200,
-            )))?;
-
-        // 3. CONFIG_SETTING_CONTRACT_DATA_ENTRY_SIZE_BYTES
-        // Parity: NetworkConfig.cpp:76-90 initialMaxContractDataEntrySizeEntry
-        // MinimumSorobanNetworkConfig::MAX_CONTRACT_DATA_ENTRY_SIZE_BYTES = 2000
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::ContractDataEntrySizeBytes(
-                2_000,
-            )))?;
-
-        // 4. CONFIG_SETTING_CONTRACT_COMPUTE_V0
-        // Parity: NetworkConfig.cpp:92-116 initialContractComputeSettingsEntry
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::ContractComputeV0(
-                ConfigSettingContractComputeV0 {
-                    // TX_MAX_INSTRUCTIONS = MinimumSorobanNetworkConfig::TX_MAX_INSTRUCTIONS = 2_500_000
-                    ledger_max_instructions: 2_500_000, // LEDGER_MAX_INSTRUCTIONS = TX_MAX_INSTRUCTIONS
-                    tx_max_instructions: 2_500_000,
-                    fee_rate_per_instructions_increment: 100,
-                    tx_memory_limit: 2_000_000, // MEMORY_LIMIT = MinimumSorobanNetworkConfig::MEMORY_LIMIT
-                },
-            )))?;
-
-        // 5. CONFIG_SETTING_CONTRACT_LEDGER_COST_V0
-        // Parity: NetworkConfig.cpp:118-175 initialContractLedgerAccessSettingsEntry
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::ContractLedgerCostV0(
-                ConfigSettingContractLedgerCostV0 {
-                    ledger_max_disk_read_entries: 3, // LEDGER_MAX_READ_LEDGER_ENTRIES = TX_MAX
-                    ledger_max_disk_read_bytes: 3_200, // LEDGER_MAX_READ_BYTES = TX_MAX
-                    ledger_max_write_ledger_entries: 2, // TX_MAX_WRITE_LEDGER_ENTRIES
-                    ledger_max_write_bytes: 3_200,   // TX_MAX_WRITE_BYTES
-                    tx_max_disk_read_entries: 3,
-                    tx_max_disk_read_bytes: 3_200,
-                    tx_max_write_ledger_entries: 2,
-                    tx_max_write_bytes: 3_200,
-                    fee_disk_read_ledger_entry: 5_000,
-                    fee_write_ledger_entry: 20_000,
-                    fee_disk_read1_kb: 1_000,
-                    soroban_state_target_size_bytes: 30 * 1024 * 1024 * 1024_i64, // 30 GB
-                    rent_fee1_kb_soroban_state_size_low: 1_000,
-                    rent_fee1_kb_soroban_state_size_high: 10_000,
-                    soroban_state_rent_fee_growth_factor: 1,
-                },
-            )))?;
-
-        // 6. CONFIG_SETTING_CONTRACT_HISTORICAL_DATA_V0
-        // Parity: NetworkConfig.cpp:177-186 initialContractHistoricalDataSettingsEntry
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::ContractHistoricalDataV0(
-                ConfigSettingContractHistoricalDataV0 {
-                    fee_historical1_kb: 100,
-                },
-            )))?;
-
-        // 7. CONFIG_SETTING_CONTRACT_EVENTS_V0
-        // Parity: NetworkConfig.cpp:188-205 initialContractEventsSettingsEntry
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::ContractEventsV0(
-                ConfigSettingContractEventsV0 {
-                    tx_max_contract_events_size_bytes: 200, // MinimumSorobanNetworkConfig
-                    fee_contract_events1_kb: 200,
-                },
-            )))?;
-
-        // 8. CONFIG_SETTING_CONTRACT_BANDWIDTH_V0
-        // Parity: NetworkConfig.cpp:207-227 initialContractBandwidthSettingsEntry
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::ContractBandwidthV0(
-                ConfigSettingContractBandwidthV0 {
-                    ledger_max_txs_size_bytes: 10_000, // TX_MAX_SIZE_BYTES = LEDGER_MAX
-                    tx_max_size_bytes: 10_000,
-                    fee_tx_size1_kb: 2_000,
-                },
-            )))?;
-
-        // 9. CONFIG_SETTING_CONTRACT_EXECUTION_LANES
-        // Parity: NetworkConfig.cpp:229-243 initialContractExecutionLanesSettingsEntry
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::ContractExecutionLanes(
-                ConfigSettingContractExecutionLanesV0 {
-                    ledger_max_tx_count: 1,
-                },
-            )))?;
-
-        // 10. CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS
-        // Parity: NetworkConfig.cpp:246-338 initialCpuCostParamsEntryForV20
-        let cpu_params = Self::initial_cpu_cost_params_for_v20();
-        self.ltx.record_create(make_entry(
-            ConfigSettingEntry::ContractCostParamsCpuInstructions(ContractCostParams(
-                cpu_params.try_into().map_err(|_| {
-                    LedgerError::Internal("Failed to create V20 CPU cost params".to_string())
-                })?,
-            )),
-        ))?;
-
-        // 11. CONFIG_SETTING_CONTRACT_COST_PARAMS_MEMORY_BYTES
-        // Parity: NetworkConfig.cpp:688-776 initialMemCostParamsEntryForV20
-        let mem_params = Self::initial_mem_cost_params_for_v20();
-        self.ltx.record_create(make_entry(
-            ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
-                mem_params.try_into().map_err(|_| {
-                    LedgerError::Internal("Failed to create V20 memory cost params".to_string())
-                })?,
-            )),
-        ))?;
-
-        // 12. CONFIG_SETTING_STATE_ARCHIVAL
-        // Parity: NetworkConfig.cpp:632-685 initialStateArchivalSettings
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::StateArchival(
-                StateArchivalSettings {
-                    max_entry_ttl: 1_054_080,  // MAXIMUM_ENTRY_LIFETIME (61 days)
-                    min_persistent_ttl: 4_096, // Live until level 6
-                    min_temporary_ttl: 16,
-                    persistent_rent_rate_denominator: 252_480,
-                    temp_rent_rate_denominator: 2_524_800,
-                    max_entries_to_archive: 100,
-                    live_soroban_state_size_window_sample_size: 30,
-                    live_soroban_state_size_window_sample_period: 64,
-                    eviction_scan_size: 100_000, // 100 kb
-                    starting_eviction_scan_level: 6,
-                },
-            )))?;
-
-        // 13. CONFIG_SETTING_LIVE_SOROBAN_STATE_SIZE_WINDOW
-        // Parity: NetworkConfig.cpp:1110-1126 initialliveSorobanStateSizeWindow
-        // Populates 30-entry window with copies of current bucket list size.
         let bl_size = self
             .manager
             .bucket_list
             .read()
             .sum_bucket_entry_counters()
             .total_size();
-        let window: Vec<u64> = vec![bl_size; 30]; // BUCKET_LIST_SIZE_WINDOW_SAMPLE_SIZE = 30
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::LiveSorobanStateSizeWindow(
-                window.try_into().map_err(|_| {
-                    LedgerError::Internal("Failed to create state size window".to_string())
-                })?,
-            )))?;
-
-        // 14. CONFIG_SETTING_EVICTION_ITERATOR
-        // Parity: NetworkConfig.cpp:1128-1139 initialEvictionIterator
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::EvictionIterator(
-                EvictionIterator {
-                    bucket_list_level: 6, // STARTING_EVICTION_SCAN_LEVEL
-                    is_curr_bucket: true,
-                    bucket_file_offset: 0,
-                },
-            )))?;
-
-        tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
-            "Applied createLedgerEntriesForV20: created 14 CONFIG_SETTING entries"
-        );
-
-        Ok(())
+        create_ledger_entries_for_v20(&mut self.ltx, self.close_data.ledger_seq, bl_size)
     }
 
-    /// Build the initial V20 CPU cost parameter table (23 entries: indices 0..=22).
-    ///
-    /// Parity: NetworkConfig.cpp:246-338 `initialCpuCostParamsEntryForV20`
-    fn initial_cpu_cost_params_for_v20() -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
-        use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
-        let e = |const_term: i64, linear_term: i64| ContractCostParamEntry {
-            ext: ExtensionPoint::V0,
-            const_term,
-            linear_term,
-        };
-        // Indices 0..=22 (ChaCha20DrawBytes)
-        vec![
-            e(4, 0),          // 0: WasmInsnExec
-            e(434, 16),       // 1: MemAlloc
-            e(42, 16),        // 2: MemCpy
-            e(44, 16),        // 3: MemCmp
-            e(310, 0),        // 4: DispatchHostFunction
-            e(61, 0),         // 5: VisitObject
-            e(230, 29),       // 6: ValSer
-            e(59052, 4001),   // 7: ValDeser
-            e(3738, 7012),    // 8: ComputeSha256Hash
-            e(40253, 0),      // 9: ComputeEd25519PubKey
-            e(377524, 4068),  // 10: VerifyEd25519Sig
-            e(451626, 45405), // 11: VmInstantiation
-            e(451626, 45405), // 12: VmCachedInstantiation
-            e(1948, 0),       // 13: InvokeVmFunction
-            e(3766, 5969),    // 14: ComputeKeccak256Hash
-            e(710, 0),        // 15: DecodeEcdsaCurve256Sig
-            e(2315295, 0),    // 16: RecoverEcdsaSecp256k1Key
-            e(4404, 0),       // 17: Int256AddSub
-            e(4947, 0),       // 18: Int256Mul
-            e(4911, 0),       // 19: Int256Div
-            e(4286, 0),       // 20: Int256Pow
-            e(913, 0),        // 21: Int256Shift
-            e(1058, 501),     // 22: ChaCha20DrawBytes
-        ]
-    }
-
-    /// Build the initial V20 memory cost parameter table (23 entries: indices 0..=22).
-    ///
-    /// Parity: NetworkConfig.cpp:688-776 `initialMemCostParamsEntryForV20`
-    fn initial_mem_cost_params_for_v20() -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
-        use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
-        let e = |const_term: i64, linear_term: i64| ContractCostParamEntry {
-            ext: ExtensionPoint::V0,
-            const_term,
-            linear_term,
-        };
-        // Indices 0..=22 (ChaCha20DrawBytes)
-        vec![
-            e(0, 0),         // 0: WasmInsnExec
-            e(16, 128),      // 1: MemAlloc
-            e(0, 0),         // 2: MemCpy
-            e(0, 0),         // 3: MemCmp
-            e(0, 0),         // 4: DispatchHostFunction
-            e(0, 0),         // 5: VisitObject
-            e(242, 384),     // 6: ValSer
-            e(0, 384),       // 7: ValDeser
-            e(0, 0),         // 8: ComputeSha256Hash
-            e(0, 0),         // 9: ComputeEd25519PubKey
-            e(0, 0),         // 10: VerifyEd25519Sig
-            e(130065, 5064), // 11: VmInstantiation
-            e(130065, 5064), // 12: VmCachedInstantiation
-            e(14, 0),        // 13: InvokeVmFunction
-            e(0, 0),         // 14: ComputeKeccak256Hash
-            e(0, 0),         // 15: DecodeEcdsaCurve256Sig
-            e(181, 0),       // 16: RecoverEcdsaSecp256k1Key
-            e(99, 0),        // 17: Int256AddSub
-            e(99, 0),        // 18: Int256Mul
-            e(99, 0),        // 19: Int256Div
-            e(99, 0),        // 20: Int256Pow
-            e(99, 0),        // 21: Int256Shift
-            e(0, 0),         // 22: ChaCha20DrawBytes
-        ]
-    }
-
-    /// Shared helper: load, resize, update, and persist CPU and memory cost param entries.
-    ///
-    /// Each update triple `(index, const_term, linear_term)` sets the corresponding
-    /// `ContractCostParamEntry` at the given index. Indices beyond the current
-    /// length are filled with zero entries during the resize.
-    fn resize_and_update_cost_params(
-        &mut self,
-        new_size: usize,
-        cpu_updates: &[(usize, i64, i64)],
-        mem_updates: &[(usize, i64, i64)],
-    ) -> Result<()> {
-        use stellar_xdr::curr::{ContractCostParamEntry, ContractCostParams};
-
-        let make_entry = |const_term: i64, linear_term: i64| ContractCostParamEntry {
-            ext: ExtensionPoint::V0,
-            const_term,
-            linear_term,
-        };
-
-        // Helper closure: load, resize, update, and persist one cost param config setting.
-        let mut update_params = |setting_id: ConfigSettingId,
-                                 updates: &[(usize, i64, i64)],
-                                 wrap: fn(ContractCostParams) -> ConfigSettingEntry,
-                                 label: &str|
-         -> Result<()> {
-            let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-                config_setting_id: setting_id,
-            });
-            let entry = self
-                .load_entry(&key)?
-                .ok_or_else(|| LedgerError::Internal(format!("{label} entry not found")))?;
-
-            let mut params = if let LedgerEntryData::ConfigSetting(ref cs) = entry.data {
-                match cs {
-                    ConfigSettingEntry::ContractCostParamsCpuInstructions(p)
-                    | ConfigSettingEntry::ContractCostParamsMemoryBytes(p) => p.0.to_vec(),
-                    _ => {
-                        return Err(LedgerError::Internal(format!(
-                            "Unexpected entry type for {label}"
-                        )));
-                    }
-                }
-            } else {
-                return Err(LedgerError::Internal(format!(
-                    "Unexpected entry type for {label}"
-                )));
-            };
-
-            params.resize(new_size, make_entry(0, 0));
-            for &(idx, c, l) in updates {
-                params[idx] = make_entry(c, l);
-            }
-
-            let new_entry = LedgerEntry {
-                last_modified_ledger_seq: self.close_data.ledger_seq,
-                data: LedgerEntryData::ConfigSetting(wrap(ContractCostParams(
-                    params
-                        .try_into()
-                        .map_err(|_| LedgerError::Internal(format!("Failed to convert {label}")))?,
-                ))),
-                ext: LedgerEntryExt::V0,
-            };
-            self.ltx.record_update(entry, new_entry)?;
-            Ok(())
-        };
-
-        update_params(
-            ConfigSettingId::ContractCostParamsCpuInstructions,
-            cpu_updates,
-            ConfigSettingEntry::ContractCostParamsCpuInstructions,
-            "ContractCostParamsCpuInstructions",
-        )?;
-
-        update_params(
-            ConfigSettingId::ContractCostParamsMemoryBytes,
-            mem_updates,
-            ConfigSettingEntry::ContractCostParamsMemoryBytes,
-            "ContractCostParamsMemoryBytes",
-        )?;
-
-        Ok(())
-    }
-
-    /// Apply version upgrade side effects for protocol 21.
-    ///
-    /// Parity: NetworkConfig.cpp:1432-1439 `createCostTypesForV21`
-    /// Resizes CPU and memory cost params to include ParseWasm/InstantiateWasm types
-    /// and ECDSA-secp256r1 verification.
+    #[cfg(test)]
     fn create_cost_types_for_v21(&mut self) -> Result<()> {
-        const NEW_SIZE: usize = 45; // V21 last cost type: VerifyEcdsaSecp256r1Sig = 44
-
-        // CPU params: Parity: NetworkConfig.cpp:340-441 updateCpuCostParamsEntryForV21
-        let cpu_updates: &[(usize, i64, i64)] = &[
-            (12, 41142, 634),   // VmCachedInstantiation (updated)
-            (23, 73077, 25410), // ParseWasmInstructions
-            (24, 0, 540752),    // ParseWasmFunctions
-            (25, 0, 176363),    // ParseWasmGlobals
-            (26, 0, 29989),     // ParseWasmTableEntries
-            (27, 0, 1061449),   // ParseWasmTypes
-            (28, 0, 237336),    // ParseWasmDataSegments
-            (29, 0, 328476),    // ParseWasmElemSegments
-            (30, 0, 701845),    // ParseWasmImports
-            (31, 0, 429383),    // ParseWasmExports
-            (32, 0, 28),        // ParseWasmDataSegmentBytes
-            (33, 43030, 0),     // InstantiateWasmInstructions
-            (34, 0, 7556),      // InstantiateWasmFunctions
-            (35, 0, 10711),     // InstantiateWasmGlobals
-            (36, 0, 3300),      // InstantiateWasmTableEntries
-            (37, 0, 0),         // InstantiateWasmTypes
-            (38, 0, 23038),     // InstantiateWasmDataSegments
-            (39, 0, 42488),     // InstantiateWasmElemSegments
-            (40, 0, 828974),    // InstantiateWasmImports
-            (41, 0, 297100),    // InstantiateWasmExports
-            (42, 0, 14),        // InstantiateWasmDataSegmentBytes
-            (43, 1882, 0),      // Sec1DecodePointUncompressed
-            (44, 3000906, 0),   // VerifyEcdsaSecp256r1Sig
-        ];
-
-        // Memory params: Parity: NetworkConfig.cpp:778-880 updateMemCostParamsEntryForV21
-        let mem_updates: &[(usize, i64, i64)] = &[
-            (12, 69472, 1217), // VmCachedInstantiation (updated)
-            (23, 17564, 6457), // ParseWasmInstructions
-            (24, 0, 47464),    // ParseWasmFunctions
-            (25, 0, 13420),    // ParseWasmGlobals
-            (26, 0, 6285),     // ParseWasmTableEntries
-            (27, 0, 64670),    // ParseWasmTypes
-            (28, 0, 29074),    // ParseWasmDataSegments
-            (29, 0, 48095),    // ParseWasmElemSegments
-            (30, 0, 103229),   // ParseWasmImports
-            (31, 0, 36394),    // ParseWasmExports
-            (32, 0, 257),      // ParseWasmDataSegmentBytes
-            (33, 70704, 0),    // InstantiateWasmInstructions
-            (34, 0, 14613),    // InstantiateWasmFunctions
-            (35, 0, 6833),     // InstantiateWasmGlobals
-            (36, 0, 1025),     // InstantiateWasmTableEntries
-            (37, 0, 0),        // InstantiateWasmTypes
-            (38, 0, 129632),   // InstantiateWasmDataSegments
-            (39, 0, 13665),    // InstantiateWasmElemSegments
-            (40, 0, 97637),    // InstantiateWasmImports
-            (41, 0, 9176),     // InstantiateWasmExports
-            (42, 0, 126),      // InstantiateWasmDataSegmentBytes
-            (43, 0, 0),        // Sec1DecodePointUncompressed
-            (44, 0, 0),        // VerifyEcdsaSecp256r1Sig
-        ];
-
-        self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
-
-        tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
-            new_size = NEW_SIZE,
-            "Applied createCostTypesForV21: resized cost params with ParseWasm/InstantiateWasm entries"
-        );
-
-        Ok(())
+        create_cost_types_for_v21(&mut self.ltx, self.close_data.ledger_seq)
     }
 
-    /// Apply version upgrade side effects for protocol 22.
-    ///
-    /// Parity: NetworkConfig.cpp:1441-1448 `createCostTypesForV22`
-    /// Resizes CPU and memory cost params to include BLS12-381 curve types.
+    #[cfg(test)]
     fn create_cost_types_for_v22(&mut self) -> Result<()> {
-        const NEW_SIZE: usize = 70; // V22 last cost type: Bls12381FrInv = 69
-
-        // CPU params: Parity: NetworkConfig.cpp:443-553 updateCpuCostParamsEntryForV22
-        let cpu_updates: &[(usize, i64, i64)] = &[
-            (45, 661, 0),              // Bls12381EncodeFp
-            (46, 985, 0),              // Bls12381DecodeFp
-            (47, 1934, 0),             // Bls12381G1CheckPointOnCurve
-            (48, 730510, 0),           // Bls12381G1CheckPointInSubgroup
-            (49, 5921, 0),             // Bls12381G2CheckPointOnCurve
-            (50, 1057822, 0),          // Bls12381G2CheckPointInSubgroup
-            (51, 92642, 0),            // Bls12381G1ProjectiveToAffine
-            (52, 100742, 0),           // Bls12381G2ProjectiveToAffine
-            (53, 7689, 0),             // Bls12381G1Add
-            (54, 2458985, 0),          // Bls12381G1Mul
-            (55, 2426722, 96397671),   // Bls12381G1Msm
-            (56, 1541554, 0),          // Bls12381MapFpToG1
-            (57, 3211191, 6713),       // Bls12381HashToG1
-            (58, 25207, 0),            // Bls12381G2Add
-            (59, 7873219, 0),          // Bls12381G2Mul
-            (60, 8035968, 309667335),  // Bls12381G2Msm
-            (61, 2420202, 0),          // Bls12381MapFp2ToG2
-            (62, 7050564, 6797),       // Bls12381HashToG2
-            (63, 10558948, 632860943), // Bls12381Pairing
-            (64, 1994, 0),             // Bls12381FrFromU256
-            (65, 1155, 0),             // Bls12381FrToU256
-            (66, 74, 0),               // Bls12381FrAddSub
-            (67, 332, 0),              // Bls12381FrMul
-            (68, 691, 74558),          // Bls12381FrPow
-            (69, 35421, 0),            // Bls12381FrInv
-        ];
-
-        // Memory params: Parity: NetworkConfig.cpp:882-990 updateMemCostParamsEntryForV22
-        let mem_updates: &[(usize, i64, i64)] = &[
-            (45, 0, 0),           // Bls12381EncodeFp
-            (46, 0, 0),           // Bls12381DecodeFp
-            (47, 0, 0),           // Bls12381G1CheckPointOnCurve
-            (48, 0, 0),           // Bls12381G1CheckPointInSubgroup
-            (49, 0, 0),           // Bls12381G2CheckPointOnCurve
-            (50, 0, 0),           // Bls12381G2CheckPointInSubgroup
-            (51, 0, 0),           // Bls12381G1ProjectiveToAffine
-            (52, 0, 0),           // Bls12381G2ProjectiveToAffine
-            (53, 0, 0),           // Bls12381G1Add
-            (54, 0, 0),           // Bls12381G1Mul
-            (55, 109494, 354667), // Bls12381G1Msm
-            (56, 5552, 0),        // Bls12381MapFpToG1
-            (57, 9424, 0),        // Bls12381HashToG1
-            (58, 0, 0),           // Bls12381G2Add
-            (59, 0, 0),           // Bls12381G2Mul
-            (60, 219654, 354667), // Bls12381G2Msm
-            (61, 3344, 0),        // Bls12381MapFp2ToG2
-            (62, 6816, 0),        // Bls12381HashToG2
-            (63, 2204, 9340474),  // Bls12381Pairing
-            (64, 0, 0),           // Bls12381FrFromU256
-            (65, 248, 0),         // Bls12381FrToU256
-            (66, 0, 0),           // Bls12381FrAddSub
-            (67, 0, 0),           // Bls12381FrMul
-            (68, 0, 128),         // Bls12381FrPow
-            (69, 0, 0),           // Bls12381FrInv
-        ];
-
-        self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
-
-        tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
-            new_size = NEW_SIZE,
-            "Applied createCostTypesForV22: resized cost params with BLS12-381 entries"
-        );
-
-        Ok(())
+        create_cost_types_for_v22(&mut self.ltx, self.close_data.ledger_seq)
     }
 
-    /// Apply version upgrade side effects for protocol 23.
-    ///
-    /// Parity: NetworkConfig.cpp:1459-1484 `createAndUpdateLedgerEntriesForV23`
-    /// Creates 3 new CONFIG_SETTING entries (parallel compute, SCP timing,
-    /// ledger cost extension) and updates rent cost parameters.
+    #[cfg(test)]
     fn create_and_update_ledger_entries_for_v23(&mut self) -> Result<()> {
-        use stellar_xdr::curr::{
-            ConfigSettingContractLedgerCostExtV0, ConfigSettingContractParallelComputeV0,
-            ConfigSettingScpTiming,
-        };
-
-        let ledger_seq = self.close_data.ledger_seq;
-
-        // 1. CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0
-        // Parity: NetworkConfig.cpp:1069-1076 initialParallelComputeEntry
-        self.ltx.record_create(LedgerEntry {
-            last_modified_ledger_seq: ledger_seq,
-            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractParallelComputeV0(
-                ConfigSettingContractParallelComputeV0 {
-                    ledger_max_dependent_tx_clusters: 1, // LEDGER_MAX_DEPENDENT_TX_CLUSTERS
-                },
-            )),
-            ext: LedgerEntryExt::V0,
-        })?;
-
-        // 2. CONFIG_SETTING_SCP_TIMING
-        // Parity: NetworkConfig.cpp:1092-1108 initialScpTimingEntry
-        self.ltx.record_create(LedgerEntry {
-            last_modified_ledger_seq: ledger_seq,
-            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ScpTiming(
-                ConfigSettingScpTiming {
-                    ledger_target_close_time_milliseconds: 5000,
-                    nomination_timeout_initial_milliseconds: 1000,
-                    nomination_timeout_increment_milliseconds: 1000,
-                    ballot_timeout_initial_milliseconds: 1000,
-                    ballot_timeout_increment_milliseconds: 1000,
-                },
-            )),
-            ext: LedgerEntryExt::V0,
-        })?;
-
-        // 3. CONFIG_SETTING_CONTRACT_LEDGER_COST_EXT_V0
-        // Parity: NetworkConfig.cpp:1078-1090 initialLedgerCostExtEntry
-        // Reads txMaxDiskReadEntries from the existing V0 cost setting.
-        let cost_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractLedgerCostV0,
-        });
-        let cost_entry = self.load_entry(&cost_key)?.ok_or_else(|| {
-            LedgerError::Internal(
-                "CONFIG_SETTING_CONTRACT_LEDGER_COST_V0 not found (required for V23 upgrade)"
-                    .to_string(),
-            )
-        })?;
-        let tx_max_disk_read_entries = if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractLedgerCostV0(ref settings),
-        ) = cost_entry.data
-        {
-            settings.tx_max_disk_read_entries
-        } else {
-            return Err(LedgerError::Internal(
-                "Unexpected entry type for ContractLedgerCost".to_string(),
-            ));
-        };
-
-        self.ltx.record_create(LedgerEntry {
-            last_modified_ledger_seq: ledger_seq,
-            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostExtV0(
-                ConfigSettingContractLedgerCostExtV0 {
-                    tx_max_footprint_entries: tx_max_disk_read_entries,
-                    fee_write1_kb: 3_500, // FEE_LEDGER_WRITE_1KB
-                },
-            )),
-            ext: LedgerEntryExt::V0,
-        })?;
-
-        // 4. Update rent cost parameters
-        // Parity: NetworkConfig.cpp:1142-1171 updateRentCostParamsForV23
-        self.update_rent_cost_params_for_v23()?;
-
-        tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
-            "Applied createAndUpdateLedgerEntriesForV23: 3 new entries + rent param update"
-        );
-
-        Ok(())
+        create_and_update_ledger_entries_for_v23(&mut self.ltx, self.close_data.ledger_seq)
     }
 
-    /// Update rent cost parameters for the V23 protocol upgrade.
-    ///
-    /// Parity: NetworkConfig.cpp:1142-1171 `updateRentCostParamsForV23`
-    /// Updates ContractLedgerCost and StateArchival settings with new rent parameters.
-    fn update_rent_cost_params_for_v23(&mut self) -> Result<()> {
-        let ledger_seq = self.close_data.ledger_seq;
-
-        // Update CONFIG_SETTING_CONTRACT_LEDGER_COST_V0
-        let cost_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractLedgerCostV0,
-        });
-        let cost_entry = self.load_entry(&cost_key)?.ok_or_else(|| {
-            LedgerError::Internal("ContractLedgerCostV0 entry not found".to_string())
-        })?;
-
-        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostV0(
-            ref settings,
-        )) = cost_entry.data
-        {
-            let mut new_settings = settings.clone();
-            // Protcol23UpgradedConfig values (note: typo matches stellar-core)
-            new_settings.soroban_state_target_size_bytes = 3_000_000_000; // 3 GB
-            new_settings.rent_fee1_kb_soroban_state_size_low = -17_000;
-            new_settings.rent_fee1_kb_soroban_state_size_high = 10_000;
-
-            let new_entry = LedgerEntry {
-                last_modified_ledger_seq: ledger_seq,
-                data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostV0(
-                    new_settings,
-                )),
-                ext: LedgerEntryExt::V0,
-            };
-            self.ltx.record_update(cost_entry, new_entry)?;
-        } else {
-            return Err(LedgerError::Internal(
-                "Unexpected entry type for ContractLedgerCostV0".to_string(),
-            ));
-        }
-
-        // Update CONFIG_SETTING_STATE_ARCHIVAL
-        let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::StateArchival,
-        });
-        let archival_entry = self
-            .load_entry(&archival_key)?
-            .ok_or_else(|| LedgerError::Internal("StateArchival entry not found".to_string()))?;
-
-        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(ref settings)) =
-            archival_entry.data
-        {
-            let mut new_settings = settings.clone();
-            new_settings.persistent_rent_rate_denominator = 1_215;
-            new_settings.temp_rent_rate_denominator = 2_430;
-
-            let new_entry = LedgerEntry {
-                last_modified_ledger_seq: ledger_seq,
-                data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(
-                    new_settings,
-                )),
-                ext: LedgerEntryExt::V0,
-            };
-            self.ltx.record_update(archival_entry, new_entry)?;
-        } else {
-            return Err(LedgerError::Internal(
-                "Unexpected entry type for StateArchival".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Apply version upgrade side effects for protocol 25.
-    ///
-    /// Parity: NetworkConfig.cpp:1450-1457 `createCostTypesForV25`
-    /// Resizes the CPU and memory cost param entries to include BN254 curve
-    /// cost types and populates their values.
+    #[cfg(test)]
     fn create_cost_types_for_v25(&mut self) -> Result<()> {
-        // BN254 cost type indices (from ContractCostType enum)
-        const BN254_ENCODE_FP: usize = 70;
-        const BN254_DECODE_FP: usize = 71;
-        const BN254_G1_CHECK_POINT_ON_CURVE: usize = 72;
-        const BN254_G2_CHECK_POINT_ON_CURVE: usize = 73;
-        const BN254_G2_CHECK_POINT_IN_SUBGROUP: usize = 74;
-        const BN254_G1_PROJECTIVE_TO_AFFINE: usize = 75;
-        const BN254_G1_ADD: usize = 76;
-        const BN254_G1_MUL: usize = 77;
-        const BN254_PAIRING: usize = 78;
-        const BN254_FR_FROM_U256: usize = 79;
-        const BN254_FR_TO_U256: usize = 80;
-        const BN254_FR_ADD_SUB: usize = 81;
-        const BN254_FR_MUL: usize = 82;
-        const BN254_FR_POW: usize = 83;
-        const BN254_FR_INV: usize = 84;
-        const NEW_SIZE: usize = BN254_FR_INV + 1; // 85
-
-        // CPU params: from NetworkConfig.cpp:556-629
-        let cpu_updates: &[(usize, i64, i64)] = &[
-            (BN254_ENCODE_FP, 344, 0),
-            (BN254_DECODE_FP, 476, 0),
-            (BN254_G1_CHECK_POINT_ON_CURVE, 904, 0),
-            (BN254_G2_CHECK_POINT_ON_CURVE, 2811, 0),
-            (BN254_G2_CHECK_POINT_IN_SUBGROUP, 2937755, 0),
-            (BN254_G1_PROJECTIVE_TO_AFFINE, 61, 0),
-            (BN254_G1_ADD, 3623, 0),
-            (BN254_G1_MUL, 1150435, 0),
-            (BN254_PAIRING, 5263916, 392472814),
-            (BN254_FR_FROM_U256, 2052, 0),
-            (BN254_FR_TO_U256, 1133, 0),
-            (BN254_FR_ADD_SUB, 74, 0),
-            (BN254_FR_MUL, 332, 0),
-            (BN254_FR_POW, 755, 68930),
-            (BN254_FR_INV, 33151, 0),
-        ];
-
-        // Memory params: from NetworkConfig.cpp:993-1067
-        let mem_updates: &[(usize, i64, i64)] = &[
-            (BN254_ENCODE_FP, 0, 0),
-            (BN254_DECODE_FP, 0, 0),
-            (BN254_G1_CHECK_POINT_ON_CURVE, 0, 0),
-            (BN254_G2_CHECK_POINT_ON_CURVE, 0, 0),
-            (BN254_G2_CHECK_POINT_IN_SUBGROUP, 0, 0),
-            (BN254_G1_PROJECTIVE_TO_AFFINE, 0, 0),
-            (BN254_G1_ADD, 0, 0),
-            (BN254_G1_MUL, 0, 0),
-            (BN254_PAIRING, 1821, 6232546),
-            (BN254_FR_FROM_U256, 0, 0),
-            (BN254_FR_TO_U256, 312, 0),
-            (BN254_FR_ADD_SUB, 0, 0),
-            (BN254_FR_MUL, 0, 0),
-            (BN254_FR_POW, 0, 0),
-            (BN254_FR_INV, 0, 0),
-        ];
-
-        self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
-
-        tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
-            new_size = NEW_SIZE,
-            "Applied createCostTypesForV25: resized cost params with BN254 entries"
-        );
-
-        Ok(())
+        create_cost_types_for_v25(&mut self.ltx, self.close_data.ledger_seq)
     }
 
-    /// Update cost type parameters for Protocol 26.
-    ///
-    /// Parity: NetworkConfig.cpp updateCpuCostParamsEntryForV26 + updateMemCostParamsEntryForV26
-    /// Resizes cost params from 85 → 86 entries (adds Bn254G1Msm at index 85)
-    /// and updates BLS12-381 and BN254 cost type values.
+    #[cfg(test)]
     fn update_cost_types_for_v26(&mut self) -> Result<()> {
-        // Cost type indices (from ContractCostType enum)
-        const BLS12381_G1_MSM: usize = 55;
-        const BLS12381_MAP_FP_TO_G1: usize = 56;
-        const BLS12381_HASH_TO_G1: usize = 57;
-        const BLS12381_G2_MSM: usize = 60;
-        const BLS12381_MAP_FP2_TO_G2: usize = 61;
-        const BLS12381_HASH_TO_G2: usize = 62;
-        const BN254_G2_CHECK_POINT_IN_SUBGROUP: usize = 74;
-        const BN254_G1_MSM: usize = 85;
-        const NEW_SIZE: usize = BN254_G1_MSM + 1; // 86
-
-        // CPU params: from NetworkConfig.cpp:635-694
-        let cpu_updates: &[(usize, i64, i64)] = &[
-            (BLS12381_G1_MSM, 2347584, 94135478),
-            (BLS12381_MAP_FP_TO_G1, 1020885, 0),
-            (BLS12381_HASH_TO_G1, 2638451, 6803),
-            (BLS12381_G2_MSM, 7663880, 298580871),
-            (BLS12381_MAP_FP2_TO_G2, 1856539, 0),
-            (BLS12381_HASH_TO_G2, 6315452, 7232),
-            (BN254_G2_CHECK_POINT_IN_SUBGROUP, 1706052, 0),
-            (BN254_G1_MSM, 1185193, 41568084),
-        ];
-
-        // Memory params: from NetworkConfig.cpp:1135-1190
-        let mem_updates: &[(usize, i64, i64)] = &[
-            (BLS12381_G1_MSM, 109494, 266603),
-            (BLS12381_MAP_FP_TO_G1, 2776, 0),
-            (BLS12381_HASH_TO_G1, 5896, 0),
-            (BLS12381_G2_MSM, 219654, 266603),
-            (BLS12381_MAP_FP2_TO_G2, 1672, 0),
-            (BLS12381_HASH_TO_G2, 3960, 0),
-            (BN254_G1_MSM, 73061, 229779),
-        ];
-
-        self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
-
-        tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
-            new_size = NEW_SIZE,
-            "Applied updateCostTypesForV26: updated BLS12-381/BN254 cost params and added Bn254G1Msm"
-        );
-
-        Ok(())
-    }
-
-    /// Create initial CONFIG_SETTING entries for Protocol 26 (CAP-77 frozen ledger keys).
-    ///
-    /// Parity: NetworkConfig.cpp createLedgerEntriesForV26
-    /// Creates 2 CONFIG_SETTING entries with empty frozen key and bypass tx sets.
-    fn create_ledger_entries_for_v26(&mut self) -> Result<()> {
-        use stellar_xdr::curr::{FreezeBypassTxs, FrozenLedgerKeys, VecM};
-
-        let ledger_seq = self.close_data.ledger_seq;
-        let make_entry = |config: ConfigSettingEntry| -> LedgerEntry {
-            LedgerEntry {
-                last_modified_ledger_seq: ledger_seq,
-                data: LedgerEntryData::ConfigSetting(config),
-                ext: LedgerEntryExt::V0,
-            }
-        };
-
-        // CONFIG_SETTING_FROZEN_LEDGER_KEYS (empty)
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::FrozenLedgerKeys(
-                FrozenLedgerKeys {
-                    keys: VecM::default(),
-                },
-            )))?;
-
-        // CONFIG_SETTING_FREEZE_BYPASS_TXS (empty)
-        self.ltx
-            .record_create(make_entry(ConfigSettingEntry::FreezeBypassTxs(
-                FreezeBypassTxs {
-                    tx_hashes: VecM::default(),
-                },
-            )))?;
-
-        tracing::info!(
-            ledger_seq,
-            "Applied createLedgerEntriesForV26: created 2 CONFIG_SETTING entries for frozen keys"
-        );
-
-        Ok(())
+        update_cost_types_for_v26(&mut self.ltx, self.close_data.ledger_seq)
     }
 
     /// Apply transactions from the transaction set.
@@ -4321,38 +4353,59 @@ impl LedgerCloseContext<'_> {
         // the ledger close.
         let mut version_upgrade_succeeded = prev_version == protocol_version;
 
-        // Capture changes from version upgrade side effects (cost types for V25).
-        //
-        // Uses the raw change_checkpoint/entry_changes_since escape hatch
-        // because apply_version_upgrade_side_effects takes &mut self (the
-        // enclosing struct), which conflicts with the &mut self.ltx borrow
-        // that capture_entry_changes requires. See CloseLedgerState docs.
+        // Capture changes from version upgrade side effects (cost types, state
+        // size window, etc.) using capture_entry_changes. All context is pre-bound
+        // to local variables to avoid disjoint-field-capture reliance.
         //
         // Parity: stellar-core LedgerManagerImpl.cpp:1666-1685 wraps each
         // upgrade in a per-upgrade try/catch that logs errors and continues.
+        // capture_entry_changes is non-transactional: on Err, partial mutations
+        // remain in the delta (matching the existing behavior).
         let version_changes = if prev_version != protocol_version {
-            let cp = self.ltx.change_checkpoint();
-            match self.apply_version_upgrade_side_effects(prev_version, protocol_version) {
-                Ok(_memory_cost_changed) => {
-                    version_upgrade_succeeded = true;
-                    // Parity: Upgrades.cpp:1252-1256 — state size recompute runs
-                    // inside the version upgrade's child LedgerTxn scope.
-                    if protocol_version_starts_from(protocol_version, ProtocolVersion::V23)
-                        && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
-                    {
-                        if let Err(e) = handle_upgrade_affecting_soroban_state_size(
-                            &mut self.ltx,
+            let ledger_seq = self.close_data.ledger_seq;
+            let network_id = self.manager.network_id();
+            let base_reserve = self.prev_header.base_reserve;
+            let bl_size = self
+                .manager
+                .bucket_list
+                .read()
+                .sum_bucket_entry_counters()
+                .total_size();
+            let soroban_state = &self.manager.soroban_state;
+
+            match self.ltx.capture_entry_changes(|ltx| {
+                let memory_cost_changed = apply_version_upgrade_side_effects(
+                    ltx,
+                    ledger_seq,
+                    network_id,
+                    base_reserve,
+                    bl_size,
+                    prev_version,
+                    protocol_version,
+                )?;
+                // Parity: Upgrades.cpp:1252-1256 — state size recompute runs
+                // inside the version upgrade scope.
+                if protocol_version_starts_from(protocol_version, ProtocolVersion::V23)
+                    && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
+                {
+                    if let Err(e) = handle_upgrade_affecting_soroban_state_size(
+                        ltx,
+                        protocol_version,
+                        ledger_seq,
+                        soroban_state,
+                    ) {
+                        tracing::error!(
                             protocol_version,
-                            self.close_data.ledger_seq,
-                            &self.manager.soroban_state,
-                        ) {
-                            tracing::error!(
-                                protocol_version,
-                                error = %e,
-                                "Exception during version upgrade state size recompute — skipping"
-                            );
-                        }
+                            error = %e,
+                            "Exception during version upgrade state size recompute — skipping"
+                        );
                     }
+                }
+                Ok(memory_cost_changed)
+            }) {
+                Ok((_memory_cost_changed, changes)) => {
+                    version_upgrade_succeeded = true;
+                    changes
                 }
                 Err(e) => {
                     tracing::error!(
@@ -4361,10 +4414,9 @@ impl LedgerCloseContext<'_> {
                         error = %e,
                         "Exception during version upgrade side effects — skipping"
                     );
+                    LedgerEntryChanges(VecM::default())
                 }
             }
-            // Extract changes made during version upgrade side effects
-            self.ltx.entry_changes_since(cp)
         } else {
             LedgerEntryChanges(VecM::default())
         };
@@ -8053,7 +8105,7 @@ mod tests {
     #[test]
     fn test_v20_cpu_cost_params_values_match_stellar_core() {
         // Parity: NetworkConfig.cpp:246-338 initialCpuCostParamsEntryForV20
-        let cpu_params = LedgerCloseContext::initial_cpu_cost_params_for_v20();
+        let cpu_params = initial_cpu_cost_params_for_v20();
         assert_eq!(cpu_params.len(), 23);
 
         // Spot-check key values against stellar-core
@@ -8072,7 +8124,7 @@ mod tests {
     #[test]
     fn test_v20_mem_cost_params_values_match_stellar_core() {
         // Parity: NetworkConfig.cpp:688-776 initialMemCostParamsEntryForV20
-        let mem_params = LedgerCloseContext::initial_mem_cost_params_for_v20();
+        let mem_params = initial_mem_cost_params_for_v20();
         assert_eq!(mem_params.len(), 23);
 
         // Spot-check key values
