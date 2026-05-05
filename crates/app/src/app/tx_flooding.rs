@@ -217,7 +217,7 @@ impl App {
             .map(|snapshot| snapshot.info.peer_id.clone())
             .collect();
         let peer_set: HashSet<_> = peer_ids.iter().cloned().collect();
-        let ledger_seq = self.herder.tracking_slot().saturating_sub(1) as u32;
+        let ledger_seq = self.herder.tracking_consensus_ledger_index() as u32;
 
         // XDR vector chunk size — cap at 1000 per the protocol limit.
         let max_chunk_size = self.max_advert_size().min(1000);

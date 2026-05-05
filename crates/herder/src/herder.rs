@@ -703,9 +703,33 @@ impl Herder {
         }
     }
 
-    /// Get the current tracking slot.
+    /// Returns the next consensus ledger index (externalized + 1).
+    ///
+    /// This is the slot SCP is currently working on or will work on next.
+    /// For the *last externalized* ledger, use
+    /// [`tracking_consensus_ledger_index()`](Self::tracking_consensus_ledger_index).
     pub fn tracking_slot(&self) -> u64 {
         tracked_read(LOCK_TRACKING_STATE, &self.tracking_state).consensus_index
+    }
+
+    /// Returns the tracking consensus ledger index — the last ledger that was
+    /// externalized by SCP.
+    ///
+    /// Analogous to stellar-core's `HerderImpl::trackingConsensusLedgerIndex()`
+    /// (HerderImpl.cpp:165), which returns `mTrackingSCP.mConsensusIndex`.
+    ///
+    /// **Intentional divergences from stellar-core:**
+    /// - Returns 0 when no slot has been externalized (`tracking_slot() == 0`).
+    ///   Stellar-core asserts `state != BOOTING` — henyey callers handle boot
+    ///   gracefully via the 0 sentinel.
+    /// - Does NOT assert `<= UINT32_MAX`. Henyey uses u64 throughout; callers
+    ///   that need u32 must cast explicitly.
+    ///
+    /// In henyey, `tracking_slot()` stores the *next* consensus index
+    /// (externalized + 1), so this helper subtracts 1 to produce the
+    /// last-externalized value.
+    pub fn tracking_consensus_ledger_index(&self) -> u64 {
+        self.tracking_slot().saturating_sub(1)
     }
 
     /// Get the tracking consensus close time.
@@ -749,7 +773,7 @@ impl Herder {
     /// - ledger 64..127 → checkpoint starts at 64
     /// - ledger 128..191 → checkpoint starts at 128
     pub fn get_most_recent_checkpoint_seq(&self) -> u64 {
-        let tracking_consensus_index = self.tracking_slot().saturating_sub(1);
+        let tracking_consensus_index = self.tracking_consensus_ledger_index();
         let freq = self.config.checkpoint_frequency;
         // checkpointContainingLedger: ((ledger / freq + 1) * freq) - 1
         let last = ((tracking_consensus_index / freq) + 1) * freq - 1;
@@ -768,10 +792,7 @@ impl Herder {
     /// Messages for slots below this value can be safely dropped from queues.
     /// Matches upstream `HerderImpl::getMinLedgerSeqToRemember()`.
     pub fn get_min_ledger_seq_to_remember(&self) -> u64 {
-        // tracking_slot() == next_consensus_ledger_index (externalized + 1).
-        // stellar-core's getMinLedgerSeqToRemember uses trackingConsensusLedgerIndex
-        // (= externalized). Subtract 1 to align, same as get_most_recent_checkpoint_seq().
-        let current_slot = self.tracking_slot().saturating_sub(1);
+        let current_slot = self.tracking_consensus_ledger_index();
         if current_slot > MAX_SLOTS_TO_REMEMBER {
             current_slot - MAX_SLOTS_TO_REMEMBER + 1
         } else {
@@ -1074,7 +1095,7 @@ impl Herder {
         // stellar-core uses trackingConsensusLedgerIndex() which is the LCL seq (= next_consensus - 1)
         let state = self.state();
         if state != HerderState::Booting {
-            let tracking_index = self.tracking_slot().saturating_sub(1);
+            let tracking_index = self.tracking_consensus_ledger_index();
             if env_ledger_index >= tracking_index && tracking_index > last_close_index {
                 last_close_index = tracking_index;
                 last_close_time = self.tracking_consensus_close_time();
@@ -1303,7 +1324,7 @@ impl Herder {
         if state.is_tracking() {
             max_ledger_seq = self.next_consensus_ledger_index() + LEDGER_VALIDITY_BRACKET;
         } else {
-            let tracking_consensus_index = current_slot.saturating_sub(1);
+            let tracking_consensus_index = self.tracking_consensus_ledger_index();
             let enforce_recent = tracking_consensus_index <= GENESIS_LEDGER_SEQ
                 && slot != self.next_consensus_ledger_index();
             if !self.check_envelope_close_time(envelope, enforce_recent) && slot != checkpoint {
@@ -4593,6 +4614,25 @@ mod tests {
             },
             signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
         }
+    }
+
+    #[test]
+    fn test_tracking_consensus_ledger_index() {
+        let herder = make_test_herder();
+
+        // Default tracking_slot is 0 → saturating_sub(1) = 0
+        assert_eq!(herder.tracking_slot(), 0);
+        assert_eq!(herder.tracking_consensus_ledger_index(), 0);
+
+        // Bootstrap to slot 1 (tracking_slot = 2, i.e., externalized + 1)
+        herder.bootstrap(1);
+        assert_eq!(herder.tracking_slot(), 2);
+        assert_eq!(herder.tracking_consensus_ledger_index(), 1);
+
+        // Bootstrap to slot 100 (tracking_slot = 101)
+        herder.bootstrap(100);
+        assert_eq!(herder.tracking_slot(), 101);
+        assert_eq!(herder.tracking_consensus_ledger_index(), 100);
     }
 
     #[test]
