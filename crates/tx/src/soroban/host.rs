@@ -452,11 +452,13 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                         let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
                         let ttl_entry = self.state.get_entry(&ttl_key);
 
-                        ttl_entry.map(|te| super::protocol::LiveBucketListRestore {
-                            key: key.as_ref().clone(),
-                            entry: entry.as_ref().clone(),
-                            ttl_key,
-                            ttl_entry: te,
+                        ttl_entry.map(|te| {
+                            super::protocol::LiveBucketListRestore::new(
+                                key.as_ref().clone(),
+                                entry.as_ref().clone(),
+                                ttl_key,
+                                te,
+                            )
                         })
                     } else {
                         None

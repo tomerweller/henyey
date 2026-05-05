@@ -176,74 +176,51 @@ impl RestoredEntries {
     ///
     /// Validates all pairing invariants before mutating the map. If any
     /// assertion fails, the map remains unchanged (no partial insert).
+    /// Inserts a validated `LiveBucketListRestore` pair.
+    ///
+    /// The structural pairing invariants (key type, TTL key derivation, entry correspondence)
+    /// are guaranteed by `LiveBucketListRestore::new()`. This method only checks map-state
+    /// conflicts: hot-archive overlap and duplicate insertion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either key conflicts with hot-archive entries or is already present.
     pub(super) fn insert_live_bl_pair(
         &mut self,
         restore: &henyey_tx::soroban::protocol::LiveBucketListRestore,
     ) {
-        use stellar_xdr::curr::LedgerEntryData;
-
-        // 1. data_key must NOT be a TTL key
-        assert!(
-            !matches!(restore.key, LedgerKey::Ttl(_)),
-            "insert_live_bl_pair: data_key must not be a TTL key: {:?}",
-            restore.key
-        );
-        // 2. ttl_key must BE a TTL key
-        assert!(
-            matches!(restore.ttl_key, LedgerKey::Ttl(_)),
-            "insert_live_bl_pair: ttl_key must be a TTL key: {:?}",
-            restore.ttl_key
-        );
-        // 3. ttl_key must correspond to data_key (SHA-256 hash)
-        assert_eq!(
-            henyey_bucket::get_ttl_key(&restore.key),
-            Some(restore.ttl_key.clone()),
-            "insert_live_bl_pair: ttl_key does not match get_ttl_key(data_key)"
-        );
-        // 4. ttl_entry must actually be a TTL entry
-        assert!(
-            matches!(restore.ttl_entry.data, LedgerEntryData::Ttl(_)),
-            "insert_live_bl_pair: ttl_entry is not a TTL entry: {:?}",
-            restore.ttl_entry.data
-        );
-        // 5. ttl_entry's key_hash must match ttl_key
-        assert_eq!(
-            henyey_common::entry_to_key(&restore.ttl_entry),
-            restore.ttl_key,
-            "insert_live_bl_pair: ttl_entry does not correspond to ttl_key"
-        );
-        // 6. Neither key may conflict with hot-archive entries
+        // Neither key may conflict with hot-archive entries
         assert!(
             !matches!(
-                self.entries.get(&restore.key),
+                self.entries.get(restore.key()),
                 Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl)
             ),
             "insert_live_bl_pair: data_key already restored from hot archive: {:?}",
-            restore.key
+            restore.key()
         );
         assert!(
             !matches!(
-                self.entries.get(&restore.ttl_key),
+                self.entries.get(restore.ttl_key()),
                 Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl)
             ),
             "insert_live_bl_pair: ttl_key already restored from hot archive: {:?}",
-            restore.ttl_key
+            restore.ttl_key()
         );
-        // 7. Neither key may already exist (reject duplicates)
+        // Neither key may already exist (reject duplicates)
         assert!(
-            !self.entries.contains_key(&restore.key),
+            !self.entries.contains_key(restore.key()),
             "insert_live_bl_pair: duplicate data_key insertion: {:?}",
-            restore.key
+            restore.key()
         );
         assert!(
-            !self.entries.contains_key(&restore.ttl_key),
+            !self.entries.contains_key(restore.ttl_key()),
             "insert_live_bl_pair: duplicate ttl_key insertion: {:?}",
-            restore.ttl_key
+            restore.ttl_key()
         );
 
         // --- Mutation (only after all checks pass) ---
-        self.insert_live_bl_inner(restore.key.clone(), restore.entry.clone());
-        self.insert_live_bl_inner(restore.ttl_key.clone(), restore.ttl_entry.clone());
+        self.insert_live_bl_inner(restore.key().clone(), restore.entry().clone());
+        self.insert_live_bl_inner(restore.ttl_key().clone(), restore.ttl_entry().clone());
     }
 
     /// Test-only: insert a single live-BL entry without pair enforcement.
@@ -1418,19 +1395,18 @@ mod tests {
             LedgerKey::Ttl(t) => t.key_hash.clone(),
             _ => unreachable!(),
         };
-        henyey_tx::soroban::protocol::LiveBucketListRestore {
-            key: data_key,
-            entry: make_entry(1),
-            ttl_key,
-            ttl_entry: stellar_xdr::curr::LedgerEntry {
-                last_modified_ledger_seq: 1,
-                data: LedgerEntryData::Ttl(TtlEntry {
-                    key_hash: ttl_key_hash,
-                    live_until_ledger_seq: 1000,
-                }),
-                ext: LedgerEntryExt::V0,
-            },
-        }
+        let entry = make_entry(1);
+        let ttl_entry = stellar_xdr::curr::LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: ttl_key_hash,
+                live_until_ledger_seq: 1000,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        henyey_tx::soroban::protocol::LiveBucketListRestore::new(
+            data_key, entry, ttl_key, ttl_entry,
+        )
     }
 
     #[test]
@@ -1440,70 +1416,9 @@ mod tests {
 
         r.insert_live_bl_pair(&restore);
 
-        assert!(r.is_live_bl_restored(&restore.key));
-        assert!(r.is_live_bl_restored(&restore.ttl_key));
+        assert!(r.is_live_bl_restored(restore.key()));
+        assert!(r.is_live_bl_restored(restore.ttl_key()));
         assert_eq!(r.live_bl_len(), 2);
-    }
-
-    #[test]
-    #[should_panic(expected = "data_key must not be a TTL key")]
-    fn test_insert_live_bl_pair_panics_data_key_is_ttl() {
-        let mut r = RestoredEntries::new();
-        let mut restore = make_live_bl_restore();
-        // Swap: put a TTL key as the data_key
-        restore.key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: Hash([99u8; 32]),
-        });
-        r.insert_live_bl_pair(&restore);
-    }
-
-    #[test]
-    #[should_panic(expected = "ttl_key must be a TTL key")]
-    fn test_insert_live_bl_pair_panics_ttl_key_not_ttl() {
-        let mut r = RestoredEntries::new();
-        let mut restore = make_live_bl_restore();
-        // Put a non-TTL key as ttl_key
-        restore.ttl_key = make_contract_data_key();
-        r.insert_live_bl_pair(&restore);
-    }
-
-    #[test]
-    #[should_panic(expected = "ttl_key does not match get_ttl_key(data_key)")]
-    fn test_insert_live_bl_pair_panics_key_hash_mismatch() {
-        let mut r = RestoredEntries::new();
-        let mut restore = make_live_bl_restore();
-        // Use a TTL key that doesn't correspond to the data_key
-        restore.ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: Hash([77u8; 32]),
-        });
-        r.insert_live_bl_pair(&restore);
-    }
-
-    #[test]
-    #[should_panic(expected = "ttl_entry is not a TTL entry")]
-    fn test_insert_live_bl_pair_panics_ttl_entry_not_ttl_data() {
-        let mut r = RestoredEntries::new();
-        let mut restore = make_live_bl_restore();
-        // Put a non-TTL entry as ttl_entry
-        restore.ttl_entry = make_entry(1);
-        r.insert_live_bl_pair(&restore);
-    }
-
-    #[test]
-    #[should_panic(expected = "ttl_entry does not correspond to ttl_key")]
-    fn test_insert_live_bl_pair_panics_ttl_entry_key_mismatch() {
-        let mut r = RestoredEntries::new();
-        let mut restore = make_live_bl_restore();
-        // ttl_entry has a different key_hash than ttl_key
-        restore.ttl_entry = stellar_xdr::curr::LedgerEntry {
-            last_modified_ledger_seq: 1,
-            data: LedgerEntryData::Ttl(TtlEntry {
-                key_hash: Hash([88u8; 32]), // wrong hash
-                live_until_ledger_seq: 1000,
-            }),
-            ext: LedgerEntryExt::V0,
-        };
-        r.insert_live_bl_pair(&restore);
     }
 
     #[test]
@@ -1522,7 +1437,7 @@ mod tests {
         let mut r = RestoredEntries::new();
         let restore = make_live_bl_restore();
         // Insert just the ttl_key first via test-only method
-        r.insert_live_bl(restore.ttl_key.clone(), restore.ttl_entry.clone());
+        r.insert_live_bl(restore.ttl_key().clone(), restore.ttl_entry().clone());
         // Now try to insert the pair — ttl_key duplicate
         r.insert_live_bl_pair(&restore);
     }
@@ -1533,7 +1448,7 @@ mod tests {
         let mut r = RestoredEntries::new();
         let restore = make_live_bl_restore();
         // Put data_key in hot archive first
-        r.insert_hot_archive_entry(restore.key.clone(), restore.entry.clone());
+        r.insert_hot_archive_entry(restore.key().clone(), restore.entry().clone());
         r.insert_live_bl_pair(&restore);
     }
 
@@ -1543,7 +1458,7 @@ mod tests {
         let mut r = RestoredEntries::new();
         let restore = make_live_bl_restore();
         // Put ttl_key in hot archive first
-        r.insert_hot_archive_ttl(restore.ttl_key.clone());
+        r.insert_hot_archive_ttl(restore.ttl_key().clone());
         r.insert_live_bl_pair(&restore);
     }
 
@@ -1555,7 +1470,7 @@ mod tests {
         // We wrap the RestoredEntries in AssertUnwindSafe so we can inspect it after.
         let mut r = RestoredEntries::new();
         // Pre-insert the ttl_key to trigger duplicate check on the second half
-        r.insert_live_bl(restore.ttl_key.clone(), restore.ttl_entry.clone());
+        r.insert_live_bl(restore.ttl_key().clone(), restore.ttl_entry().clone());
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // This should panic at the "duplicate ttl_key" assertion,
@@ -1566,7 +1481,7 @@ mod tests {
         assert!(result.is_err(), "should have panicked on duplicate ttl_key");
         // data_key must NOT have been inserted (atomicity guarantee)
         assert!(
-            !r.is_live_bl_restored(&restore.key),
+            !r.is_live_bl_restored(restore.key()),
             "data_key was partially inserted despite ttl_key conflict"
         );
     }

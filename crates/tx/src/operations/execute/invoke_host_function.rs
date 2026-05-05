@@ -816,7 +816,7 @@ fn extract_hot_archive_restored_keys(
     // Collect keys that are live BL restores (these should NOT be treated as hot archive restores)
     let live_bl_restore_keys: HashSet<LedgerKey> = live_bucket_list_restores
         .iter()
-        .map(|r| r.key.clone())
+        .map(|r| r.key().clone())
         .collect();
 
     // Get the corresponding keys from the read_write footprint, excluding live BL restores.
