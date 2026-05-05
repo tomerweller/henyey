@@ -42,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=63
+TAP_PLAN=65
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -1154,6 +1154,61 @@ run_tests() {
   else
     tap_not_ok "consistency: SKILL.md references detect_soft_fail_blocked and has_fatal_wipe_evidence" \
       "One or both functions not referenced in monitor-tick/SKILL.md"
+  fi
+
+  # ── Test 64: Tick history capture uses quoted heredoc + datetime.now ────────
+  # Structural assertion scoped to the fenced code block in "Tick history capture".
+  local tick_hist_block
+  tick_hist_block=$(sed -n '/^### Tick history capture/,/^##/{/^```bash/,/^```/p}' \
+    "$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md")
+  local t64_pass=true
+  if ! echo "$tick_hist_block" | grep -q "<<'PY'"; then
+    t64_pass=false
+  fi
+  if echo "$tick_hist_block" | grep -q '$(date'; then
+    t64_pass=false
+  fi
+  if ! echo "$tick_hist_block" | grep -q 'datetime.now(timezone.utc)'; then
+    t64_pass=false
+  fi
+  if [[ "$t64_pass" == true ]]; then
+    tap_ok "tick-history: quoted heredoc, no inline \$(date), uses datetime.now"
+  else
+    tap_not_ok "tick-history: quoted heredoc, no inline \$(date), uses datetime.now" \
+      "Tick history capture block must use <<'PY', no \$(date, and datetime.now(timezone.utc)"
+  fi
+
+  # ── Test 65: Tick history ts behavioral check ──────────────────────────────
+  # Run the actual pattern and verify ts is valid JSON, ISO 8601 UTC, within 60s.
+  local t65_result
+  t65_result=$(python3 - <<'PY'
+import json
+from datetime import datetime, timezone
+ts_val = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+obj = {"ts": ts_val}
+print(json.dumps(obj))
+PY
+  )
+  local t65_ok
+  t65_ok=$(python3 -c "
+import json, sys
+from datetime import datetime, timezone
+try:
+    obj = json.loads('''$t65_result''')
+    ts = datetime.strptime(obj['ts'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    skew = abs((now - ts).total_seconds())
+    assert obj['ts'].endswith('Z'), 'ts must end with Z'
+    assert skew <= 60, f'ts skew {skew}s exceeds 60s'
+    print('ok')
+except Exception as e:
+    print(f'fail: {e}')
+" 2>&1)
+  if [[ "$t65_ok" == "ok" ]]; then
+    tap_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew"
+  else
+    tap_not_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew" \
+      "$t65_ok"
   fi
 }
 

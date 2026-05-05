@@ -1386,11 +1386,13 @@ single JSON line to `/home/tomer/data/$MONITOR_SESSION_ID/tick-history.jsonl`
 so `/daily-summary` can aggregate the last 24h of ticks:
 
 ```bash
+# ts is computed inside the Python block — do NOT use shell expansion for timestamps.
 HIST=/home/tomer/data/$MONITOR_SESSION_ID/tick-history.jsonl
-python3 - <<PY >> "$HIST"
+python3 - <<'PY' >> "$HIST"
 import json
+from datetime import datetime, timezone
 print(json.dumps({
-  "ts":           "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "ts":           datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
   "status":       "<OK|WARNING|ACTION|OFFLINE>",
   "ledger":       <current-ledger-int>,
   "build":        "<short-sha>",
@@ -1402,6 +1404,11 @@ print(json.dumps({
 }))
 PY
 ```
+
+> **`ts` contract:** The `ts` field records the wall-clock UTC time captured
+> immediately before emitting the JSON line. Format: `YYYY-MM-DDTHH:MM:SSZ`
+> (ISO 8601, always UTC). Acceptable skew: ≤ 60 seconds from real wall-clock
+> time. Any drift > 60 s indicates a bug in the capture mechanism.
 
 `watch` carries multi-tick non-incident concerns the daily summary should
 surface — examples: `pruning_gap=2451`, `frag_pct=18`, `disk_pct=72`,
