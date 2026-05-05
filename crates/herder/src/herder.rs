@@ -9621,6 +9621,130 @@ mod quorum_health_tests {
         // Both peers already failing → already v-blocked → fail_at = 0.
         assert_eq!(fail_at, 0, "already v-blocked with all peers missing");
     }
+
+    /// Integration test for AUDIT-259 follow-up (#2410): quorum tracking
+    /// survives cache churn through the full quorum-check read path.
+    ///
+    /// Exercises: `heard_from_quorum()` → `SlotQuorumTracker::has_quorum()`
+    /// → `ScpDriver::get_quorum_set()` → `QuorumSetTracker::get_by_node()`
+    /// → `RandomEvictionCache::get()` under eviction pressure from >10,000
+    /// non-quorum entries.
+    ///
+    /// Distinct from the unit test at `quorum_set_tracker.rs:626-688` which
+    /// tests the cache directly. This test validates that periodic
+    /// `heard_from_quorum()` calls (the real-world access pattern) keep
+    /// active validators' entries hot throughout sustained churn.
+    #[test]
+    fn test_quorum_tracking_survives_cache_churn() {
+        // Setup: 31-node quorum (1 local + 30 remote), threshold=21 (67%).
+        let (herder, keys, _quorum_set) = make_n_node_validator_herder(31, 21);
+
+        // Build node IDs for all 31 validators.
+        let node_ids: Vec<NodeId> = keys
+            .iter()
+            .map(|k| {
+                NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                    *k.public_key().as_bytes(),
+                )))
+            })
+            .collect();
+
+        // Record SCP envelopes from all 31 nodes for slot 100.
+        let slot = 100u64;
+        {
+            let mut tracker = herder.slot_quorum_tracker.write();
+            for nid in &node_ids {
+                tracker.record_envelope(slot, nid.clone());
+            }
+        }
+
+        // Baseline: quorum must be satisfied.
+        assert!(
+            herder.heard_from_quorum(slot),
+            "baseline: heard_from_quorum must be true before churn"
+        );
+
+        // Flood the cache with 10,500 distinct non-quorum entries.
+        // Each `heard_from_quorum()` call refreshes all 30 remote validators'
+        // access generation in both by_node and by_hash caches.
+        //
+        // Cache stress:
+        //   by_node: 30 active remote entries + 10,500 churn = 10,530 total
+        //            → 530 evictions from the 10,000-capacity cache.
+        //            (Local node is pinned; short-circuits in get_by_node.)
+        //   by_hash: 1 shared validator qset + 10,500 unique churn qsets = 10,501
+        //            → 501 evictions.
+        //
+        // Using scp_driver.store_quorum_set() directly is a test-only shortcut
+        // to create cache pressure without triggering quorum_tracker.rebuild()
+        // for each non-quorum node. This is safe because churn nodes never
+        // participate in quorum evaluation (not in slot_quorum_tracker, not
+        // referenced by any quorum set).
+        for i in 0u32..10_500 {
+            if i > 0 && i % 500 == 0 {
+                // Interleaved quorum check — refreshes active validators' access
+                // generation AND asserts the read path works under pressure.
+                assert!(
+                    herder.heard_from_quorum(slot),
+                    "heard_from_quorum failed during churn at iteration {}",
+                    i
+                );
+            }
+
+            // Generate a unique churn node ID (indices 1000..11500, avoiding
+            // collision with validator seeds 10..=40).
+            let churn_key = {
+                let mut key = [0u8; 32];
+                let idx = i + 1000;
+                key[..4].copy_from_slice(&idx.to_le_bytes());
+                key
+            };
+            let churn_node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                Uint256(churn_key),
+            ));
+
+            // Each churn node gets a sane single-node qset (threshold=1,
+            // validators=[self]). Unique validator field → unique hash.
+            let churn_qset = ScpQuorumSet {
+                threshold: 1,
+                validators: vec![churn_node_id.clone()].try_into().unwrap(),
+                inner_sets: vec![].try_into().unwrap(),
+            };
+
+            herder
+                .scp_driver
+                .store_quorum_set(&churn_node_id, churn_qset);
+        }
+
+        // Final interleaved check after the last batch.
+        assert!(
+            herder.heard_from_quorum(slot),
+            "heard_from_quorum failed after all churn completed"
+        );
+
+        // Assert on a new slot: record envelopes for slot 101, verify quorum.
+        let new_slot = 101u64;
+        {
+            let mut tracker = herder.slot_quorum_tracker.write();
+            for nid in &node_ids {
+                tracker.record_envelope(new_slot, nid.clone());
+            }
+        }
+        assert!(
+            herder.heard_from_quorum(new_slot),
+            "heard_from_quorum must work on a new slot after cache churn"
+        );
+
+        // Assert all 30 remote validators' qsets are individually retrievable.
+        for (i, nid) in node_ids.iter().enumerate().skip(1) {
+            assert!(
+                herder.scp_driver.get_quorum_set(nid).is_some(),
+                "validator {} (key seed {}) qset evicted despite interleaved access",
+                i,
+                10 + i
+            );
+        }
+    }
 }
 
 // ── Regression tests for quorum intersection self-deadlock (#1949) ──────
