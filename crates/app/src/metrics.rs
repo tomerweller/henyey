@@ -84,11 +84,11 @@ impl HistogramMetric {
 }
 
 impl LabeledCounterMetric {
-    pub fn absolute(&self, label_value: &str, value: u64) {
-        counter!(self.name, self.key => label_value.to_owned()).absolute(value);
+    pub fn absolute(&self, label_value: &'static str, value: u64) {
+        counter!(self.name, self.key => label_value).absolute(value);
     }
-    pub fn increment(&self, label_value: &str, value: u64) {
-        counter!(self.name, self.key => label_value.to_owned()).increment(value);
+    pub fn increment(&self, label_value: &'static str, value: u64) {
+        counter!(self.name, self.key => label_value).increment(value);
     }
     pub const fn name(&self) -> &'static str {
         self.name

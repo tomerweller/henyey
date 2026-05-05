@@ -594,7 +594,7 @@ impl App {
         }
 
         // Stage B: Record catchup duration after all fallible work completes.
-        metrics::histogram!("stellar_ledger_catchup_duration_seconds")
+        crate::metrics::LEDGER_CATCHUP_DURATION_SECONDS
             .record(catchup_timer.elapsed().as_secs_f64());
 
         // Only clear the full-reset flag after catchup succeeds. If any error
