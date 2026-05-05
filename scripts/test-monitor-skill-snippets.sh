@@ -1179,22 +1179,62 @@ run_tests() {
   fi
 
   # ── Test 65: Tick history ts behavioral check ──────────────────────────────
-  # Run the actual pattern and verify ts is valid JSON, ISO 8601 UTC, within 60s.
-  local t65_result
-  t65_result=$(python3 - <<'PY'
-import json
-from datetime import datetime, timezone
-ts_val = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-obj = {"ts": ts_val}
-print(json.dumps(obj))
-PY
-  )
-  local t65_ok
-  t65_ok=$(python3 -c "
-import json, sys
+  # Execute the actual SKILL.md tick-history code block with substituted
+  # placeholders and verify ts is valid JSON, ISO 8601 UTC, within 60s.
+
+  # Reuse tick_hist_block from Test 64 (already extracted above).
+  # Guard: ensure extraction succeeded and contains expected markers.
+  local t65_snippet_ok=true
+  if [[ -z "$tick_hist_block" ]]; then
+    t65_snippet_ok=false
+  elif ! printf '%s' "$tick_hist_block" | grep -q "<<'PY'"; then
+    t65_snippet_ok=false
+  elif ! printf '%s' "$tick_hist_block" | grep -q 'datetime.now(timezone.utc)'; then
+    t65_snippet_ok=false
+  elif ! printf '%s' "$tick_hist_block" | grep -q 'json.dumps'; then
+    t65_snippet_ok=false
+  fi
+
+  if [[ "$t65_snippet_ok" != true ]]; then
+    tap_not_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew" \
+      "Code block extraction failed or missing expected markers"
+  else
+    # Strip fence lines, comment line, HIST= line, and >> "$HIST" redirect
+    local t65_exec
+    t65_exec=$(printf '%s' "$tick_hist_block" \
+      | sed '/^```/d' \
+      | sed '/^# ts is computed/d' \
+      | sed '/^HIST=/d' \
+      | sed 's/ >> "\$HIST"//')
+
+    # Substitute placeholders with exact literal values from SKILL.md
+    t65_exec=$(printf '%s' "$t65_exec" \
+      | sed 's/"<OK|WARNING|ACTION|OFFLINE>"/"OK"/' \
+      | sed 's/<current-ledger-int>/12345/' \
+      | sed 's/"<short-sha>"/"abc1234"/' \
+      | sed 's/<0 or 1>/0/' \
+      | sed 's/\[<list of metric names that breached>\]/[]/' \
+      | sed 's/\[<list of action keywords: restart, deploy, filed-#N, session-wiped-recovery, session-wiped-process-alive, session-wiped-rebuild-failed, mainnet-data-wiped>\]/[]/' \
+      | sed 's/"<clean | fixed-inline | filed-#N>"/"clean"/' \
+      | sed 's/\["<key>=<value>", \.\.\.\]/[]/')
+
+    # Execute via bash on stdin — capture exit code gracefully
+    local t65_result t65_exit
+    t65_result=$(printf '%s' "$t65_exec" | bash 2>&1) && t65_exit=0 || t65_exit=$?
+
+    if [[ $t65_exit -ne 0 ]]; then
+      tap_not_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew" \
+        "Snippet execution failed (exit $t65_exit): $t65_result"
+    else
+      # Validate via Python — pass result through env var to avoid quoting issues
+      local t65_ok
+      t65_ok=$(T65_RESULT="$t65_result" python3 -c "
+import json, os, sys
 from datetime import datetime, timezone
 try:
-    obj = json.loads('''$t65_result''')
+    raw = os.environ['T65_RESULT']
+    obj = json.loads(raw)
+    assert 'ts' in obj, 'missing ts field'
     ts = datetime.strptime(obj['ts'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
     skew = abs((now - ts).total_seconds())
@@ -1204,11 +1244,14 @@ try:
 except Exception as e:
     print(f'fail: {e}')
 " 2>&1)
-  if [[ "$t65_ok" == "ok" ]]; then
-    tap_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew"
-  else
-    tap_not_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew" \
-      "$t65_ok"
+
+      if [[ "$t65_ok" == "ok" ]]; then
+        tap_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew"
+      else
+        tap_not_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew" \
+          "$t65_ok"
+      fi
+    fi
   fi
 }
 
