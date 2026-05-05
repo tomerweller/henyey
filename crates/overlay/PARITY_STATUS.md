@@ -12,7 +12,7 @@
 | Authentication (PeerAuth, Hmac) | Full | HKDF key derivation, HMAC-SHA256 MAC |
 | Peer Connection (Peer, TCPPeer) | Partial | Core handshake and I/O complete; rejected outbound peers may still receive SEND_MORE_EXTENDED/GET_SCP_STATE before ERR_LOAD; admin JSON absent |
 | OverlayManager | Partial | Core peer lifecycle present; preferred-peer eviction happens at authenticated admission; some peer-list and stats accessors absent |
-| Floodgate | Full | Message deduplication, ledger-based cleanup |
+| Floodgate | Full | Message deduplication, ledger-based cleanup, capacity-bounded (henyey-specific) |
 | FlowControl | Full | Capacity tracking, throttling, SCP-aware trimming, CapacityGuard RAII |
 | ItemFetcher / Tracker | Full | Fetch lifecycle, retry, envelope tracking |
 | BanManager | Full | In-memory + SQLite persistence, auto-ban escalation, time-limited bans |
@@ -72,13 +72,18 @@ Corresponds to: `Floodgate.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `Floodgate()` | `FloodGate::new()` / `with_ttl()` | Full |
-| `clearBelow()` | `clear_below()` | Full (+ henyey-specific TTL expiry) |
+| `Floodgate()` | `FloodGate::new()` / `with_ttl()` / `with_limits()` | Full |
+| `clearBelow()` | `clear_below()` | Full (+ henyey-specific TTL expiry + queue compaction) |
 | `addRecord()` | `record_inbound_relay()` / `record_local_broadcast()` | Full |
 | `broadcast()` | `get_forward_peers()` + external send | Full |
 | `getPeersKnows()` | `get_forward_peers()` | Full |
 | `forgetRecord()` | `forget()` | Full |
 | `shutdown()` | `clear()` | Full |
+| (no equivalent) | FIFO eviction at capacity (`evict_to_target()`) | Henyey-specific DoS protection |
+
+**Henyey-specific divergences:**
+- **Capacity bound**: The `seen` map is bounded at 1M entries (configurable via `with_limits()`). When the cap is reached, oldest entries are evicted via a FIFO queue with generation tokens. stellar-core has no equivalent bound. This prevents OOM under adversarial traffic but may cause redundant re-forwarding of evicted messages under extreme load. Not consensus-affecting.
+- **TTL expiry in clear_below**: Entries older than the TTL are removed during `clear_below()`, regardless of ledger sequence. stellar-core's `clearBelow()` is purely ledger-based.
 
 ### FlowControl (`flow_control.rs`)
 

@@ -22,8 +22,8 @@
 
 use dashmap::DashMap;
 use henyey_common::Hash256;
-use parking_lot::RwLock;
-use std::collections::HashSet;
+use parking_lot::{Mutex, RwLock};
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::StellarMessage;
@@ -56,11 +56,16 @@ enum RelayRecord {
 /// during ledger-boundary cleanup.
 const DEFAULT_TTL_SECS: u64 = 300;
 
-/// Threshold for warning about large flood gate size.
+/// Hard cap for the flood seen map (entry count, not memory).
 ///
-/// If the map exceeds this many entries between ledger closes, a one-shot
-/// warning is logged to alert operators.
-const LARGE_MAP_WARN_THRESHOLD: usize = 500_000;
+/// Bounds the number of tracked message hashes. Under normal mainnet
+/// traffic (~1000 unique msgs/sec), the map holds ~5000 entries per
+/// ledger close cycle. This cap exists to prevent OOM under adversarial
+/// conditions (Sybil flooding with unique hashes).
+///
+/// Henyey-specific. stellar-core has no equivalent bound — its Floodgate
+/// relies solely on `clearBelow()`.
+const DEFAULT_MAX_SEEN_ENTRIES: usize = 1_000_000;
 
 /// Default global rate limit (messages per second).
 ///
@@ -77,15 +82,18 @@ struct SeenEntry {
     ledger_seq: u32,
     /// Set of peers that have sent us this message.
     peers: HashSet<PeerId>,
+    /// Generation token for FIFO eviction queue consistency.
+    generation: u64,
 }
 
 impl SeenEntry {
-    /// Creates a new entry with the current timestamp and ledger sequence.
-    fn new(ledger_seq: u32) -> Self {
+    /// Creates a new entry with the current timestamp, ledger sequence, and generation.
+    fn new(ledger_seq: u32, generation: u64) -> Self {
         Self {
             first_seen: Instant::now(),
             ledger_seq,
             peers: HashSet::new(),
+            generation,
         }
     }
 
@@ -130,39 +138,64 @@ impl SeenEntry {
 pub struct FloodGate {
     /// Map of message hash to tracking entry.
     seen: DashMap<Hash256, SeenEntry>,
+    /// FIFO eviction queue storing (hash, generation) pairs.
+    /// May contain ghost entries (removed from `seen` by clear_below/forget).
+    eviction_queue: Mutex<VecDeque<(Hash256, u64)>>,
+    /// Monotonic counter for generation tokens.
+    next_generation: AtomicU64,
+    /// Hard capacity bound (entry count).
+    max_entries: usize,
     /// Time-to-live for message entries (used by `clear_below`).
     ttl: Duration,
     /// Counter: total messages processed.
     messages_seen: AtomicU64,
     /// Counter: duplicate messages observed.
     messages_duplicate: AtomicU64,
+    /// Counter: total entries evicted due to capacity overflow.
+    evictions_total: AtomicU64,
     /// Maximum messages per second.
     rate_limit: u64,
     /// Start of current rate-limiting window.
     rate_window_start: RwLock<Instant>,
     /// Messages counted in current window.
     rate_window_count: AtomicU64,
-    /// Whether the large-map warning has already been emitted.
-    large_map_warned: AtomicBool,
+    /// Whether an eviction warning has been emitted since last reset.
+    eviction_warned: AtomicBool,
 }
 
 impl FloodGate {
-    /// Creates a new flood gate with default settings (5 minute TTL).
+    /// Creates a new flood gate with default settings (5 minute TTL, 1M entry cap).
     pub fn new() -> Self {
-        Self::with_ttl(Duration::from_secs(DEFAULT_TTL_SECS))
+        Self::with_limits(
+            Duration::from_secs(DEFAULT_TTL_SECS),
+            DEFAULT_MAX_SEEN_ENTRIES,
+        )
     }
 
-    /// Creates a new flood gate with a custom TTL.
+    /// Creates a new flood gate with a custom TTL and default capacity.
     pub fn with_ttl(ttl: Duration) -> Self {
+        Self::with_limits(ttl, DEFAULT_MAX_SEEN_ENTRIES)
+    }
+
+    /// Creates a new flood gate with custom TTL and capacity.
+    ///
+    /// # Panics
+    /// Panics if `max_entries == 0`.
+    pub fn with_limits(ttl: Duration, max_entries: usize) -> Self {
+        assert!(max_entries > 0, "FloodGate max_entries must be > 0");
         Self {
             seen: DashMap::new(),
+            eviction_queue: Mutex::new(VecDeque::new()),
+            next_generation: AtomicU64::new(0),
+            max_entries,
             ttl,
             messages_seen: AtomicU64::new(0),
             messages_duplicate: AtomicU64::new(0),
+            evictions_total: AtomicU64::new(0),
             rate_limit: DEFAULT_RATE_LIMIT_PER_SEC,
             rate_window_start: RwLock::new(Instant::now()),
             rate_window_count: AtomicU64::new(0),
-            large_map_warned: AtomicBool::new(false),
+            eviction_warned: AtomicBool::new(false),
         }
     }
 
@@ -197,21 +230,19 @@ impl FloodGate {
             return RelayRecord::Repeated;
         }
 
-        // New message
-        let mut entry = SeenEntry::new(ledger_seq);
+        // New message — assign generation and insert
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let mut entry = SeenEntry::new(ledger_seq, generation);
         if let Some(peer) = from_peer {
             entry.add_peer(peer);
         }
         self.seen.insert(message_hash, entry);
 
-        // One-shot warning if the map grows unexpectedly large between ledger closes
-        let len = self.seen.len();
-        if len > LARGE_MAP_WARN_THRESHOLD && !self.large_map_warned.swap(true, Ordering::Relaxed) {
-            warn!(
-                entries = len,
-                "FloodGate map exceeds {} entries; cleanup happens at ledger close",
-                LARGE_MAP_WARN_THRESHOLD
-            );
+        // Enqueue for FIFO eviction and check capacity
+        let mut queue = self.eviction_queue.lock();
+        queue.push_back((message_hash, generation));
+        if self.seen.len() > self.max_entries {
+            self.evict_to_target(&mut queue);
         }
 
         trace!("New message: {}", message_hash);
@@ -234,6 +265,40 @@ impl FloodGate {
 
         let count = self.rate_window_count.fetch_add(1, Ordering::Relaxed) + 1;
         count <= self.rate_limit
+    }
+
+    /// Drains the eviction queue until the map is at or below 75% capacity.
+    ///
+    /// Uses generation tokens to safely skip ghost entries and re-inserted
+    /// entries whose original queue slot is stale.
+    fn evict_to_target(&self, queue: &mut VecDeque<(Hash256, u64)>) {
+        let target = self.max_entries * 3 / 4;
+        let mut evicted = 0u64;
+        while self.seen.len() > target {
+            match queue.pop_front() {
+                Some((hash, gen)) => {
+                    // Only evict if generation matches (entry hasn't been
+                    // forgotten and re-inserted with a new generation).
+                    let should_remove = self.seen.get(&hash).map_or(false, |e| e.generation == gen);
+                    if should_remove {
+                        self.seen.remove(&hash);
+                        evicted += 1;
+                    }
+                }
+                None => break, // queue exhausted
+            }
+        }
+        if evicted > 0 {
+            self.evictions_total.fetch_add(evicted, Ordering::Relaxed);
+            if !self.eviction_warned.swap(true, Ordering::Relaxed) {
+                warn!(
+                    evicted,
+                    seen = self.seen.len(),
+                    max = self.max_entries,
+                    "FloodGate capacity overflow — evicted oldest entries"
+                );
+            }
+        }
     }
 
     /// Record a locally-originated message for relay accounting (self-broadcast).
@@ -324,6 +389,7 @@ impl FloodGate {
             seen_count: self.seen.len(),
             total_messages: self.messages_seen.load(Ordering::Relaxed),
             duplicate_messages: self.messages_duplicate.load(Ordering::Relaxed),
+            evictions_total: self.evictions_total.load(Ordering::Relaxed),
         }
     }
 
@@ -347,8 +413,18 @@ impl FloodGate {
             );
         }
 
-        // Reset the large-map warning so it can fire again if growth recurs
-        self.large_map_warned.store(false, Ordering::Relaxed);
+        // Reset eviction warning if map dropped well below capacity
+        if self.seen.len() < self.max_entries / 2 {
+            self.eviction_warned.store(false, Ordering::Relaxed);
+        }
+
+        // Queue compaction: if ghost buildup exceeds 2x capacity, clear the queue.
+        // Entries currently in the map become "untracked" until their next
+        // clear_below cycle. New inserts going forward are properly tracked.
+        let mut queue = self.eviction_queue.lock();
+        if queue.len() > self.max_entries * 2 {
+            queue.clear();
+        }
     }
 
     /// Clears all entries from the flood gate.
@@ -357,7 +433,9 @@ impl FloodGate {
     /// flooded again.
     pub fn clear(&self) {
         self.seen.clear();
-        self.large_map_warned.store(false, Ordering::Relaxed);
+        let mut queue = self.eviction_queue.lock();
+        queue.clear();
+        self.eviction_warned.store(false, Ordering::Relaxed);
     }
 }
 
@@ -376,6 +454,8 @@ pub struct FloodGateStats {
     pub total_messages: u64,
     /// Number of duplicate messages observed (relay accounting only).
     pub duplicate_messages: u64,
+    /// Total entries evicted due to capacity overflow.
+    pub evictions_total: u64,
 }
 
 impl FloodGateStats {
@@ -797,5 +877,267 @@ mod tests {
         let all_peers = vec![peer1.clone(), peer2.clone(), peer3.clone()];
         let forward = gate.get_forward_peers(&hash, &all_peers);
         assert_eq!(forward, vec![peer3]);
+    }
+
+    // --- Capacity eviction tests ---
+
+    #[test]
+    fn test_flood_gate_eviction_at_capacity() {
+        let gate = FloodGate::with_limits(Duration::from_secs(300), 100);
+
+        // Fill to capacity
+        for i in 0..100u8 {
+            let _ = gate.record_seen(make_hash(i), None, 1);
+        }
+        assert_eq!(gate.seen.len(), 100);
+
+        // One more triggers eviction to 75% target
+        let _ = gate.record_seen(make_hash(200), None, 1);
+        assert!(gate.seen.len() <= 75);
+        assert!(gate.stats().evictions_total > 0);
+    }
+
+    #[test]
+    fn test_flood_gate_fifo_order() {
+        let gate = FloodGate::with_limits(Duration::from_secs(300), 4);
+
+        let ha = make_hash(1);
+        let hb = make_hash(2);
+        let hc = make_hash(3);
+        let hd = make_hash(4);
+
+        let _ = gate.record_seen(ha, None, 1);
+        let _ = gate.record_seen(hb, None, 1);
+        let _ = gate.record_seen(hc, None, 1);
+        let _ = gate.record_seen(hd, None, 1);
+
+        // Insert one more — triggers eviction. A (oldest) should be evicted.
+        let he = make_hash(5);
+        let _ = gate.record_seen(he, None, 1);
+
+        // Target is 75% of 4 = 3. So we evict until <= 3.
+        // After inserting 5th, we had 5 entries, evict oldest until <= 3.
+        assert!(!gate.has_seen(&ha)); // A evicted (oldest)
+        assert!(!gate.has_seen(&hb)); // B evicted
+        assert!(gate.has_seen(&he)); // E (newest) survives
+    }
+
+    #[test]
+    fn test_flood_gate_ghost_entries_skipped() {
+        let gate = FloodGate::with_limits(Duration::from_secs(300), 10);
+
+        // Insert entries at ledger 1 and ledger 2
+        for i in 0..5u8 {
+            let _ = gate.record_seen(make_hash(i), None, 1);
+        }
+        for i in 10..15u8 {
+            let _ = gate.record_seen(make_hash(i), None, 2);
+        }
+        assert_eq!(gate.seen.len(), 10);
+
+        // clear_below(2) removes ledger-1 entries → creates ghosts in queue
+        gate.clear_below(2);
+        assert_eq!(gate.seen.len(), 5);
+
+        // Now fill up to trigger eviction. The 5 ghost entries should be skipped.
+        for i in 20..30u8 {
+            let _ = gate.record_seen(make_hash(i), None, 2);
+        }
+        // Should have triggered eviction; verify we're at or below cap
+        assert!(gate.seen.len() <= 10);
+    }
+
+    #[test]
+    fn test_flood_gate_forget_creates_ghost() {
+        let gate = FloodGate::with_limits(Duration::from_secs(300), 4);
+
+        let ha = make_hash(1);
+        let hb = make_hash(2);
+        let hc = make_hash(3);
+        let hd = make_hash(4);
+
+        let _ = gate.record_seen(ha, None, 1);
+        let _ = gate.record_seen(hb, None, 1);
+        let _ = gate.record_seen(hc, None, 1);
+        let _ = gate.record_seen(hd, None, 1);
+
+        // Forget B — creates a ghost in the queue
+        gate.forget(&hb);
+        assert_eq!(gate.seen.len(), 3);
+
+        // Insert two more to trigger eviction
+        let he = make_hash(5);
+        let hf = make_hash(6);
+        let _ = gate.record_seen(he, None, 1);
+        // Now seen has 4 entries (A, C, D, E), at capacity
+        let _ = gate.record_seen(hf, None, 1);
+        // Now 5 entries, eviction triggered. Queue: [A, B(ghost), C, D, E, F]
+        // Eviction pops A (evicted), B (ghost, skipped), C (evicted) → target is 3
+        assert!(!gate.has_seen(&ha));
+        assert!(gate.has_seen(&hf)); // newest survives
+    }
+
+    #[test]
+    fn test_flood_gate_generation_prevents_stale_eviction() {
+        let gate = FloodGate::with_limits(Duration::from_secs(300), 4);
+
+        let ha = make_hash(1);
+        let hb = make_hash(2);
+        let hc = make_hash(3);
+        let hd = make_hash(4);
+
+        let _ = gate.record_seen(ha, None, 1);
+        let _ = gate.record_seen(hb, None, 1);
+        let _ = gate.record_seen(hc, None, 1);
+        let _ = gate.record_seen(hd, None, 1);
+
+        // Forget A, then re-insert A (new generation)
+        gate.forget(&ha);
+        let _ = gate.record_seen(ha, None, 2);
+        // Queue: [(A,gen0), (B,gen1), (C,gen2), (D,gen3), (A,gen4)]
+        // Map has: A(gen4), B(gen1), C(gen2), D(gen3) = 4 entries
+
+        // Insert one more to trigger eviction
+        let he = make_hash(5);
+        let _ = gate.record_seen(he, None, 2);
+        // 5 entries > cap of 4. Eviction pops (A,gen0) → map has A(gen4), mismatch → skip!
+        // Then pops (B,gen1) → matches → evict. Then (C,gen2) → matches → evict.
+        // Target is 3 (75% of 4).
+        // A should survive because its generation was updated.
+        assert!(gate.has_seen(&ha)); // Re-inserted A survives!
+        assert!(gate.has_seen(&he)); // Newest survives
+    }
+
+    #[test]
+    fn test_flood_gate_clear_resets_queue() {
+        let gate = FloodGate::with_limits(Duration::from_secs(300), 100);
+
+        for i in 0..50u8 {
+            let _ = gate.record_seen(make_hash(i), None, 1);
+        }
+        assert_eq!(gate.seen.len(), 50);
+
+        gate.clear();
+        assert_eq!(gate.seen.len(), 0);
+        let queue = gate.eviction_queue.lock();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_flood_gate_queue_compaction() {
+        // Cap of 5, so compaction triggers when queue > 10
+        let gate = FloodGate::with_limits(Duration::from_secs(300), 5);
+
+        // Insert 5 entries at ledger 1
+        for i in 0..5u8 {
+            let _ = gate.record_seen(make_hash(i), None, 1);
+        }
+        // Queue has 5 entries
+
+        // Clear them all by ledger (creates 5 ghosts)
+        gate.clear_below(2);
+        assert_eq!(gate.seen.len(), 0);
+        // Queue still has 5 ghost entries (below 2*5=10, no compaction yet)
+
+        // Insert 5 more at ledger 2
+        for i in 10..15u8 {
+            let _ = gate.record_seen(make_hash(i), None, 2);
+        }
+        // Queue: 5 ghosts + 5 live = 10 entries
+
+        // Clear again
+        gate.clear_below(3);
+        // Now queue has 10 ghosts (still 10, not > 10, so no compaction)
+
+        // Insert 1 more to push queue over 10 (compaction threshold is > 2*5=10)
+        let _ = gate.record_seen(make_hash(20), None, 3);
+        // Queue has 11 entries. clear_below didn't compact because len was exactly 10.
+        // But on next clear_below it should compact if > 10.
+
+        // Force clear_below to trigger compaction check
+        gate.clear_below(3);
+        let queue = gate.eviction_queue.lock();
+        // After compaction (queue.len() was 11 > 10), queue should be cleared
+        assert!(queue.len() <= 1); // only the one live entry or empty after clear
+    }
+
+    #[test]
+    fn test_flood_gate_eviction_stats() {
+        let gate = FloodGate::with_limits(Duration::from_secs(300), 10);
+
+        // Fill to capacity
+        for i in 0..10u8 {
+            let _ = gate.record_seen(make_hash(i), None, 1);
+        }
+        assert_eq!(gate.stats().evictions_total, 0);
+
+        // Trigger eviction
+        let _ = gate.record_seen(make_hash(100), None, 1);
+        assert!(gate.stats().evictions_total > 0);
+    }
+
+    #[test]
+    fn test_flood_gate_no_eviction_below_cap() {
+        let gate = FloodGate::with_limits(Duration::from_secs(300), 100);
+
+        for i in 0..50u8 {
+            let _ = gate.record_seen(make_hash(i), None, 1);
+        }
+        assert_eq!(gate.seen.len(), 50);
+        assert_eq!(gate.stats().evictions_total, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "FloodGate max_entries must be > 0")]
+    fn test_flood_gate_with_limits_panics_on_zero() {
+        FloodGate::with_limits(Duration::from_secs(300), 0);
+    }
+
+    #[test]
+    fn test_flood_gate_eviction_warn_resets() {
+        let gate = FloodGate::with_limits(Duration::from_secs(300), 10);
+
+        // Fill and trigger eviction → sets eviction_warned
+        for i in 0..11u8 {
+            let _ = gate.record_seen(make_hash(i), None, 1);
+        }
+        assert!(gate.eviction_warned.load(Ordering::Relaxed));
+
+        // clear_below that brings map below 50% should reset the warning
+        gate.clear_below(u32::MAX); // removes everything (ledger < MAX)
+        assert!(!gate.eviction_warned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_flood_gate_concurrent_bounded() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let gate = Arc::new(FloodGate::with_limits(Duration::from_secs(300), 1000));
+        let num_threads = 8;
+        let inserts_per_thread = 500;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|t| {
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || {
+                    for i in 0..inserts_per_thread {
+                        let hash = Hash256([(t * 100 + i) as u8; 32]);
+                        let _ = gate.record_seen(hash, None, 1);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // After all threads complete, map should be at or below cap + bounded overshoot
+        assert!(
+            gate.seen.len() <= 1000 + num_threads,
+            "seen.len() = {} exceeds expected bound",
+            gate.seen.len()
+        );
     }
 }
