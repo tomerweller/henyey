@@ -5181,4 +5181,50 @@ mod tests {
         let hashes: Vec<_> = state.referenced_hashes().collect();
         assert_eq!(hashes, vec![&h1, &h2]);
     }
+
+    #[test]
+    fn test_restore_from_has_zero_hash_output_treated_as_clear() {
+        // Passing Output(Hash256::ZERO) directly to restore_from_has should
+        // NOT attempt to load a bucket — it's treated as clear (no next).
+        let entry = make_account_entry([1u8; 32], 100);
+        let bucket = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry)]).unwrap();
+        let hc = bucket.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (hc, Hash256::ZERO);
+
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        // Explicitly pass zero-hash output (should be treated as clear)
+        next_states[0] = Some(PendingMergeState::Output(Hash256::ZERO));
+
+        let loader = make_loader(vec![bucket]);
+        let bl = BucketList::restore_from_has(&hashes, &next_states, loader).unwrap();
+
+        // Level 0 should have NO pending merge (zero-hash output is skipped)
+        assert!(
+            bl.levels()[0].next.is_none(),
+            "zero-hash output should be treated as clear, not loaded as pending merge"
+        );
+    }
+
+    #[test]
+    fn test_restore_from_has_parallel_zero_hash_output_treated_as_clear() {
+        let entry = make_account_entry([1u8; 32], 100);
+        let bucket = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry)]).unwrap();
+        let hc = bucket.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (hc, Hash256::ZERO);
+
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[0] = Some(PendingMergeState::Output(Hash256::ZERO));
+
+        let loader = make_loader(vec![bucket]);
+        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+
+        assert!(
+            bl.levels()[0].next.is_none(),
+            "zero-hash output should be treated as clear in parallel restore"
+        );
+    }
 }
