@@ -2153,7 +2153,9 @@ impl App {
                     }
                 }
             }
-            tracing::info!(
+            // Debug-level envelope path attribution for verify-rejected envelopes.
+            // Demoted from info! per #2341; enable with RUST_LOG=henyey::envelope_path=debug.
+            tracing::debug!(
                 target: "henyey::envelope_path",
                 slot,
                 node_id = ?node_id,
@@ -2212,7 +2214,7 @@ impl App {
         }
 
         // Track highest verified SCP slot from peers for recovery stall detection.
-        // Only fires for Verdict::Ok envelopes (verify-rejected return at line 1995).
+        // Only fires for Verdict::Ok envelopes (verify-rejected early return above).
         // Excludes self-messages (own SCP output reflected back).
         if !matches!(
             reason,
@@ -2223,12 +2225,17 @@ impl App {
                 .fetch_max(slot, Ordering::Relaxed);
         }
 
-        // Structured attribution log for Issue #1806 investigation. Emits
-        // the envelope outcome and the PostVerifyReason so a single grep of
-        // `target=henyey::envelope_path` across the shard log reveals which
-        // gate (self-message, non-quorum, pending-buffer state, close-time
-        // drift, signature failure, or accepted) fires for each envelope.
-        tracing::info!(
+        // Envelope path attribution log (Issue #1806, demoted to debug per #2341).
+        // Enable with RUST_LOG=henyey::envelope_path=debug to see per-envelope
+        // outcomes. Fields:
+        //   reason (PostVerifyReason): which post-verify gate the envelope hit.
+        //     `Accepted` = passed all gates, entered downstream intake.
+        //   result (EnvelopeState): outcome after downstream processing
+        //     (Valid, Invalid, TooOld, Fetching, etc.).
+        // So `result=Invalid reason=Accepted` means the envelope passed all
+        // pre/post-verify gates but was rejected during downstream processing
+        // (e.g., stale ballot in SCP, discarded during fetch intake).
+        tracing::debug!(
             target: "henyey::envelope_path",
             slot,
             node_id = ?sender_node_id,
