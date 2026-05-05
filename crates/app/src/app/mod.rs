@@ -4717,6 +4717,39 @@ mod tests {
     }
 
     #[test]
+    fn test_trim_boundary_for_last_buffered() {
+        // Direct unit tests for the trim-boundary computation helper.
+        // These can distinguish correct (checkpoint_start) from broken (returns 0) behavior.
+
+        // last_buffered=64: checkpoint start, prev=63, checkpoint_start(63)=1
+        assert_eq!(App::trim_boundary_for_last_buffered(64), Some(1));
+
+        // last_buffered=128: checkpoint start, prev=127, checkpoint_start(127)=64
+        assert_eq!(App::trim_boundary_for_last_buffered(128), Some(64));
+
+        // last_buffered=192: checkpoint start, prev=191, checkpoint_start(191)=128
+        assert_eq!(App::trim_boundary_for_last_buffered(192), Some(128));
+
+        // last_buffered=130: NOT checkpoint start, checkpoint_start(130)=128
+        assert_eq!(App::trim_boundary_for_last_buffered(130), Some(128));
+
+        // last_buffered=100: NOT checkpoint start, checkpoint_start(100)=64
+        assert_eq!(App::trim_boundary_for_last_buffered(100), Some(64));
+
+        // last_buffered=63: NOT checkpoint start (63 != checkpoint_start(63)=1),
+        // checkpoint_start(63)=1
+        assert_eq!(App::trim_boundary_for_last_buffered(63), Some(1));
+
+        // last_buffered=1: checkpoint start (1 == checkpoint_start(1)=1),
+        // and last_buffered <= 1, so returns None (no trimming)
+        assert_eq!(App::trim_boundary_for_last_buffered(1), None);
+
+        // last_buffered=0: checkpoint_start(0) = 1, 0 != 1 so NOT checkpoint start,
+        // checkpoint_start(0) = 1
+        assert_eq!(App::trim_boundary_for_last_buffered(0), Some(1));
+    }
+
+    #[test]
     fn test_consensus_stuck_state_matches_on_current_ledger_only() {
         // Verify that ConsensusStuckState matches when current_ledger is the
         // same but first_buffered changes. This is critical for Problem 9:

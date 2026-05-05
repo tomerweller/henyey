@@ -1565,14 +1565,9 @@ impl App {
         let last_buffered = *buffer.keys().next_back().expect("checked non-empty above");
         let gap = first_buffered.saturating_sub(current_ledger);
         if gap >= checkpoint_frequency() {
-            let trim_before = if is_checkpoint_start(last_buffered) {
-                if last_buffered <= 1 {
-                    return;
-                }
-                let prev = last_buffered - 1;
-                checkpoint_start(prev)
-            } else {
-                checkpoint_start(last_buffered)
+            let trim_before = match Self::trim_boundary_for_last_buffered(last_buffered) {
+                Some(b) => b,
+                None => return,
             };
             buffer.retain(|seq, _| *seq >= trim_before);
         }
@@ -1593,6 +1588,24 @@ impl App {
                 buffer_size = buffer.len(),
                 "Trimmed syncing_ledgers buffer to max size"
             );
+        }
+    }
+
+    /// Compute the trim boundary for the given `last_buffered` slot.
+    ///
+    /// Returns `None` if no trimming should occur (last_buffered <= 1 and is a
+    /// checkpoint start). Otherwise returns `Some(trim_before)` — entries below
+    /// this value should be removed.
+    pub(super) fn trim_boundary_for_last_buffered(last_buffered: u32) -> Option<u32> {
+        if is_checkpoint_start(last_buffered) {
+            if last_buffered <= 1 {
+                None
+            } else {
+                let prev = last_buffered - 1;
+                Some(checkpoint_start(prev))
+            }
+        } else {
+            Some(checkpoint_start(last_buffered))
         }
     }
 
