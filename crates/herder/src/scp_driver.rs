@@ -1602,12 +1602,20 @@ impl ScpDriver {
 
         // If upgrades changed, update the value
         if valid_upgrades.len() != stellar_value.upgrades.len() {
-            stellar_value.upgrades = valid_upgrades.try_into().unwrap_or_default();
+            stellar_value.upgrades = valid_upgrades
+                .try_into()
+                .expect("valid_upgrades is subset of input which is already bounded");
             // Re-encode
             stellar_value
                 .to_xdr(stellar_xdr::curr::Limits::none())
                 .ok()
-                .map(|bytes| Value(bytes.try_into().unwrap_or_default()))
+                .map(|bytes| {
+                    Value(
+                        bytes
+                            .try_into()
+                            .expect("BUG: just-encoded StellarValue must fit in Value"),
+                    )
+                })
         } else {
             Some(value.clone())
         }
@@ -1770,18 +1778,16 @@ impl ScpDriver {
         // Parity: stellar-core's ValueWrapperPtrSet iterates by raw Value byte
         // order (WrappedValuePtrComparator, SCPDriver.cpp:36-41). We sort by the
         // same key to ensure identical tie-breaking.
+        // Parity: stellar-core throws on decode failure in combineCandidates
+        // (HerderSCPDriver.cpp:682-688). We panic to match fail-loud behavior.
         let decoded: Vec<(Value, StellarValue)> = values
             .iter()
-            .filter_map(|v| {
-                StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none())
-                    .ok()
-                    .map(|sv| (v.clone(), sv))
+            .map(|v| {
+                let sv = StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none())
+                    .expect("BUG: cannot parse candidate value in combineCandidates");
+                (v.clone(), sv)
             })
             .collect();
-
-        if decoded.is_empty() {
-            return values[0].clone();
-        }
 
         // Resolve tx sets upfront in a single atomic lookup per candidate.
         // Parity deviation: stellar-core releaseAssert(cTxSet) on missing tx sets
@@ -1836,20 +1842,22 @@ impl ScpDriver {
             std::collections::BTreeMap::new();
         for c in &all_candidates {
             for upgrade_bytes in c.sv.upgrades.iter() {
-                if let Ok(upgrade) = LedgerUpgrade::from_xdr(
+                // Parity: stellar-core throws on upgrade parse failure in
+                // combineCandidates (HerderSCPDriver.cpp:694-704).
+                let upgrade = LedgerUpgrade::from_xdr(
                     upgrade_bytes.0.as_slice(),
                     stellar_xdr::curr::Limits::none(),
-                ) {
-                    let order = Self::upgrade_type_order(&upgrade);
-                    merged_upgrades
-                        .entry(order)
-                        .and_modify(|existing| {
-                            if Self::compare_upgrades(&upgrade, existing) {
-                                *existing = upgrade.clone();
-                            }
-                        })
-                        .or_insert(upgrade);
-                }
+                )
+                .expect("BUG: cannot parse upgrade in validated candidate");
+                let order = Self::upgrade_type_order(&upgrade);
+                merged_upgrades
+                    .entry(order)
+                    .and_modify(|existing| {
+                        if Self::compare_upgrades(&upgrade, existing) {
+                            *existing = upgrade.clone();
+                        }
+                    })
+                    .or_insert(upgrade);
             }
         }
 
@@ -1899,21 +1907,34 @@ impl ScpDriver {
         // Phase 5: Compose result from selected candidate + merged upgrades.
         let mut result = selectable_candidates[best_idx].sv.clone();
 
+        // Parity: stellar-core uses xdr_to_opaque (throws on failure) at
+        // HerderSCPDriver.cpp:810 and does not bound-check the upgrade count
+        // (would crash on XDR serialization if >6).
         let upgrade_bytes: Vec<stellar_xdr::curr::UpgradeType> = merged_upgrades
             .values()
-            .filter_map(|upgrade| {
-                upgrade
+            .map(|upgrade| {
+                let bytes = upgrade
                     .to_xdr(stellar_xdr::curr::Limits::none())
-                    .ok()
-                    .and_then(|bytes| stellar_xdr::curr::UpgradeType(bytes.try_into().ok()?).into())
+                    .expect("BUG: failed to re-encode LedgerUpgrade");
+                stellar_xdr::curr::UpgradeType(
+                    bytes
+                        .try_into()
+                        .expect("BUG: encoded upgrade exceeds UpgradeType byte limit"),
+                )
             })
             .collect();
-        result.upgrades = upgrade_bytes.try_into().unwrap_or_default();
+        result.upgrades = upgrade_bytes
+            .try_into()
+            .expect("BUG: merged upgrades exceed XDR max of 6");
 
-        result
+        let xdr_bytes = result
             .to_xdr(stellar_xdr::curr::Limits::none())
-            .map(|bytes| Value(bytes.try_into().unwrap_or_default()))
-            .unwrap_or_default()
+            .expect("BUG: failed to encode combined StellarValue");
+        Value(
+            xdr_bytes
+                .try_into()
+                .expect("BUG: encoded StellarValue exceeds Value byte limit"),
+        )
     }
 
     /// Compare two upgrades of the same type, returning true if `new` > `existing`.
@@ -3512,7 +3533,9 @@ mod tests {
         StellarValue {
             tx_set_hash,
             close_time,
-            upgrades: upgrades.try_into().unwrap_or_default(),
+            upgrades: upgrades
+                .try_into()
+                .expect("test: upgrades must fit in VecM<UpgradeType, 6>"),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
                 node_id,
                 signature: stellar_xdr::curr::Signature(
@@ -3969,11 +3992,32 @@ mod tests {
 
     #[test]
     fn test_combine_single_value() {
+        // A single valid candidate should be returned (possibly re-encoded)
         let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
 
-        let value = Value(vec![1, 2, 3].try_into().unwrap());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
+        let hash = *tx_set.hash();
+        driver.cache_tx_set(tx_set);
+
+        let sv = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(hash.0),
+            close_time: TimePoint(now),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let value = encode_sv(&sv);
         let result = driver.combine_candidates_impl(1, std::slice::from_ref(&value));
-        assert_eq!(result, value);
+
+        // Single valid candidate: result should decode to same StellarValue
+        let result_sv = StellarValue::from_xdr(&result, Limits::none()).expect("decode");
+        assert_eq!(result_sv.tx_set_hash, sv.tx_set_hash);
+        assert_eq!(result_sv.close_time, sv.close_time);
     }
 
     #[test]
@@ -6465,6 +6509,214 @@ mod tests {
         // With protocol 0 LedgerManager, should be permissive (accepted)
         let result = driver.check_and_cache_tx_set_valid(&tx_set, Hash256::ZERO, 0);
         assert!(result, "Pre-v20 LedgerManager should be permissive");
+    }
+
+    #[test]
+    fn test_combine_candidates_merges_6_upgrade_types() {
+        // Verify that 6 distinct upgrade types from multiple candidates merge correctly
+        let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
+        let hash = *tx_set.hash();
+        driver.cache_tx_set(tx_set);
+
+        // Candidate 1: VERSION, BASE_FEE, MAX_TX_SET_SIZE
+        let u1 = LedgerUpgrade::Version(25).to_xdr(Limits::none()).unwrap();
+        let u2 = LedgerUpgrade::BaseFee(200).to_xdr(Limits::none()).unwrap();
+        let u3 = LedgerUpgrade::MaxTxSetSize(1000)
+            .to_xdr(Limits::none())
+            .unwrap();
+        let sv1 = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(hash.0),
+            close_time: TimePoint(now),
+            upgrades: vec![
+                UpgradeType(u1.try_into().unwrap()),
+                UpgradeType(u2.try_into().unwrap()),
+                UpgradeType(u3.try_into().unwrap()),
+            ]
+            .try_into()
+            .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        // Candidate 2: BASE_RESERVE, FLAGS, CONFIG
+        let u4 = LedgerUpgrade::BaseReserve(5_000_000)
+            .to_xdr(Limits::none())
+            .unwrap();
+        let u5 = LedgerUpgrade::Flags(1).to_xdr(Limits::none()).unwrap();
+        let u6 = LedgerUpgrade::Config(stellar_xdr::curr::ConfigUpgradeSetKey {
+            contract_id: stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash([0u8; 32])),
+            content_hash: stellar_xdr::curr::Hash([1u8; 32]),
+        })
+        .to_xdr(Limits::none())
+        .unwrap();
+        let sv2 = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(hash.0),
+            close_time: TimePoint(now),
+            upgrades: vec![
+                UpgradeType(u4.try_into().unwrap()),
+                UpgradeType(u5.try_into().unwrap()),
+                UpgradeType(u6.try_into().unwrap()),
+            ]
+            .try_into()
+            .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let v1 = encode_sv(&sv1);
+        let v2 = encode_sv(&sv2);
+
+        let result = driver.combine_candidates_impl(1, &[v1, v2]);
+        let result_sv = StellarValue::from_xdr(&result, Limits::none()).expect("decode");
+
+        // All 6 distinct upgrade types should be merged
+        assert_eq!(result_sv.upgrades.len(), 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "BUG: merged upgrades exceed XDR max of 6")]
+    fn test_combine_candidates_panics_on_7_upgrade_types() {
+        // When merged upgrades produce 7 distinct types, the function should panic
+        // instead of silently dropping all upgrades.
+        let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
+        let hash = *tx_set.hash();
+        driver.cache_tx_set(tx_set);
+
+        // Candidate 1: VERSION, BASE_FEE, MAX_TX_SET_SIZE, BASE_RESERVE
+        let u1 = LedgerUpgrade::Version(25).to_xdr(Limits::none()).unwrap();
+        let u2 = LedgerUpgrade::BaseFee(200).to_xdr(Limits::none()).unwrap();
+        let u3 = LedgerUpgrade::MaxTxSetSize(1000)
+            .to_xdr(Limits::none())
+            .unwrap();
+        let u4 = LedgerUpgrade::BaseReserve(5_000_000)
+            .to_xdr(Limits::none())
+            .unwrap();
+        let sv1 = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(hash.0),
+            close_time: TimePoint(now),
+            upgrades: vec![
+                UpgradeType(u1.try_into().unwrap()),
+                UpgradeType(u2.try_into().unwrap()),
+                UpgradeType(u3.try_into().unwrap()),
+                UpgradeType(u4.try_into().unwrap()),
+            ]
+            .try_into()
+            .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        // Candidate 2: FLAGS, CONFIG, MAX_SOROBAN_TX_SET_SIZE (3 more = 7 total)
+        let u5 = LedgerUpgrade::Flags(1).to_xdr(Limits::none()).unwrap();
+        let u6 = LedgerUpgrade::Config(stellar_xdr::curr::ConfigUpgradeSetKey {
+            contract_id: stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash([0u8; 32])),
+            content_hash: stellar_xdr::curr::Hash([1u8; 32]),
+        })
+        .to_xdr(Limits::none())
+        .unwrap();
+        let u7 = LedgerUpgrade::MaxSorobanTxSetSize(500)
+            .to_xdr(Limits::none())
+            .unwrap();
+        let sv2 = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(hash.0),
+            close_time: TimePoint(now),
+            upgrades: vec![
+                UpgradeType(u5.try_into().unwrap()),
+                UpgradeType(u6.try_into().unwrap()),
+                UpgradeType(u7.try_into().unwrap()),
+            ]
+            .try_into()
+            .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let v1 = encode_sv(&sv1);
+        let v2 = encode_sv(&sv2);
+
+        // This should panic
+        let _ = driver.combine_candidates_impl(1, &[v1, v2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BUG: cannot parse candidate value in combineCandidates")]
+    fn test_combine_candidates_panics_on_malformed_candidate() {
+        // Parity: stellar-core throws on malformed candidate values
+        let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
+        let hash = *tx_set.hash();
+        driver.cache_tx_set(tx_set);
+
+        // One valid candidate
+        let sv = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(hash.0),
+            close_time: TimePoint(now),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let valid = encode_sv(&sv);
+
+        // One malformed candidate (garbage bytes)
+        let malformed = Value(vec![0xFF, 0xFE, 0xFD, 0xFC].try_into().unwrap());
+
+        // This should panic
+        let _ = driver.combine_candidates_impl(1, &[valid, malformed]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BUG: cannot parse upgrade in validated candidate")]
+    fn test_combine_candidates_panics_on_malformed_upgrade() {
+        // Parity: stellar-core throws on malformed upgrade XDR in combineCandidates
+        let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
+        let hash = *tx_set.hash();
+        driver.cache_tx_set(tx_set);
+
+        // Candidate with a valid upgrade and a malformed upgrade
+        let valid_upgrade = LedgerUpgrade::Version(25).to_xdr(Limits::none()).unwrap();
+        let malformed_bytes: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
+        let sv = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(hash.0),
+            close_time: TimePoint(now),
+            upgrades: vec![
+                UpgradeType(valid_upgrade.try_into().unwrap()),
+                UpgradeType(malformed_bytes.try_into().unwrap()),
+            ]
+            .try_into()
+            .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let v = encode_sv(&sv);
+
+        // This should panic on the malformed upgrade
+        let _ = driver.combine_candidates_impl(1, &[v]);
     }
 }
 

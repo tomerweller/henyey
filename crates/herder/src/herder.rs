@@ -2687,10 +2687,26 @@ impl Herder {
             LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
         });
 
+        // Parity: stellar-core logs and skips individual upgrades whose encoded
+        // size exceeds UpgradeType::max_size() (HerderImpl.cpp:1572-1587).
+        // The XDR encode itself should never fail for a valid LedgerUpgrade.
         let upgrades: Vec<UpgradeType> = upgrade_list
             .iter()
-            .filter_map(|upgrade| upgrade.to_xdr(Limits::none()).ok())
-            .filter_map(|bytes| bytes.try_into().ok().map(UpgradeType))
+            .filter_map(|upgrade| {
+                let bytes = upgrade
+                    .to_xdr(Limits::none())
+                    .expect("BUG: failed to encode LedgerUpgrade to XDR");
+                match bytes.try_into() {
+                    Ok(b) => Some(UpgradeType(b)),
+                    Err(_) => {
+                        error!(
+                            upgrade_type = ?std::mem::discriminant(upgrade),
+                            "upgrade blob exceeds UpgradeType max size — skipping"
+                        );
+                        None
+                    }
+                }
+            })
             .collect();
 
         // 5. Sign & encode
@@ -2872,7 +2888,9 @@ impl Herder {
         Ok(StellarValue {
             tx_set_hash: xdr_tx_set_hash,
             close_time: xdr_close_time,
-            upgrades: upgrades.try_into().unwrap_or_default(),
+            upgrades: upgrades
+                .try_into()
+                .expect("BUG: upgrades exceed XDR max of 6"),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
                 node_id,
                 signature: XdrSignature(sig.0.to_vec().try_into().unwrap_or_default()),
