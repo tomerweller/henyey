@@ -768,7 +768,10 @@ impl Herder {
     /// Messages for slots below this value can be safely dropped from queues.
     /// Matches upstream `HerderImpl::getMinLedgerSeqToRemember()`.
     pub fn get_min_ledger_seq_to_remember(&self) -> u64 {
-        let current_slot = self.tracking_slot();
+        // tracking_slot() == next_consensus_ledger_index (externalized + 1).
+        // stellar-core's getMinLedgerSeqToRemember uses trackingConsensusLedgerIndex
+        // (= externalized). Subtract 1 to align, same as get_most_recent_checkpoint_seq().
+        let current_slot = self.tracking_slot().saturating_sub(1);
         if current_slot > MAX_SLOTS_TO_REMEMBER {
             current_slot - MAX_SLOTS_TO_REMEMBER + 1
         } else {
@@ -1325,11 +1328,7 @@ impl Herder {
         // for already-moved-on slots and the node can still relay finalization
         // messages (see HerderSCPDriver.cpp:244-253 and
         // crates/herder/src/scp_driver.rs:1055-1063).
-        let min_ledger_seq = if current_slot > MAX_SLOTS_TO_REMEMBER {
-            current_slot - MAX_SLOTS_TO_REMEMBER + 1
-        } else {
-            1
-        };
+        let min_ledger_seq = self.get_min_ledger_seq_to_remember();
 
         if (slot > max_ledger_seq || slot < min_ledger_seq) && slot != checkpoint {
             debug!(
@@ -2172,20 +2171,24 @@ impl Herder {
         self.scp_driver
             .purge_deferred_slots(slot.saturating_sub(10));
 
-        // Clean up old fetching envelopes and cached tx sets (keep a small buffer)
-        // Keep the current slot and 2 slots back for any late envelopes
-        let keep_slot = slot.saturating_sub(2);
-        // Parity: stellar-core HerderImpl.cpp:267-278 in newSlotExternalized
-        // computes maxSlotToRemember = nextConsensusLedgerIndex() + LEDGER_VALIDITY_BRACKET
-        // when tracking. This reactively prunes slots that were once valid but
-        // are now too far ahead.
+        // Clean up old fetching envelopes and cached tx sets.
+        // Parity: stellar-core HerderImpl.cpp:260-278 (newSlotExternalized)
+        // + HerderImpl.cpp:1312-1318 (eraseOutsideRange computes slotToKeep
+        // from getMostRecentCheckpointSeq).
+        let min_ledger_seq = self.get_min_ledger_seq_to_remember();
+        let min_slot = if min_ledger_seq > GENESIS_LEDGER_SEQ {
+            Some(min_ledger_seq)
+        } else {
+            None
+        };
         let max_slot = if self.is_tracking() {
             Some(self.next_consensus_ledger_index() + LEDGER_VALIDITY_BRACKET)
         } else {
             None
         };
+        let keep_slot = self.get_most_recent_checkpoint_seq();
         self.fetching_envelopes
-            .erase_outside_range(Some(slot), max_slot, keep_slot);
+            .erase_outside_range(min_slot, max_slot, keep_slot);
 
         // Clean up old data
         self.cleanup();
@@ -7473,7 +7476,7 @@ mod scp_pipeline_tests {
         // is current (so pre_filter's close-time gate passes), but by the
         // time process_verified runs, the herder has advanced its current
         // slot so far that the envelope's slot falls below `min_ledger_seq`
-        // (tracking_slot=10000 → min_ledger_seq=9989)
+        // (tracking_slot=10000 → min_ledger_seq=9988)
         // — the Range gate must now reject it as `EnvelopeState::TooOld`.
         let herder = make_test_herder();
         herder.start_syncing();
@@ -7484,7 +7487,7 @@ mod scp_pipeline_tests {
 
         let secret = SecretKey::from_seed(&[7u8; 32]);
         // Build a Nominate envelope with a fresh, signed StellarValue so
-        // close-time passes; slot=100 is far below min_ledger_seq (=9989).
+        // close-time passes; slot=100 is far below min_ledger_seq (=9988).
         let env = make_signed_test_envelope_outer(100, &herder, &secret);
         let intake = PipelinedIntake {
             envelope: env,
@@ -7807,7 +7810,7 @@ mod scp_pipeline_tests {
     /// Pre-fix this returned `Reject(Range)` because of the `lcl + 1` clamp.
     #[test]
     fn test_pre_filter_accepts_recent_post_lcl_envelope() {
-        // tracking=100, lcl=99, min_ledger_seq=89. Slot 95 is post-LCL but
+        // tracking=100, lcl=99, min_ledger_seq=88. Slot 95 is post-LCL but
         // within the retained window.
         let herder = herder_with_lcl_and_tracking(99, 100);
         let secret = SecretKey::from_seed(&[1u8; 32]);
@@ -7828,7 +7831,7 @@ mod scp_pipeline_tests {
     #[test]
     fn test_pre_filter_accepts_envelope_when_lcl_equals_tracking() {
         // tracking=100, lcl=100. Pre-fix this rejected slot 95 (and any other
-        // non-checkpoint slot in 89..=100).
+        // non-checkpoint slot in 88..=100).
         let herder = herder_with_lcl_and_tracking(100, 100);
         let secret = SecretKey::from_seed(&[2u8; 32]);
         let env = make_signed_test_envelope_outer(95, &herder, &secret);
@@ -7844,12 +7847,12 @@ mod scp_pipeline_tests {
     /// Lower-edge boundary: slot exactly at `min_ledger_seq` is accepted.
     #[test]
     fn test_pre_filter_accepts_at_min_ledger_seq() {
-        // tracking=100, min_ledger_seq=89.
+        // tracking=100, min_ledger_seq=88.
         let herder = herder_with_lcl_and_tracking(99, 100);
         let secret = SecretKey::from_seed(&[3u8; 32]);
-        let env = make_signed_test_envelope_outer(89, &herder, &secret);
+        let env = make_signed_test_envelope_outer(88, &herder, &secret);
         match herder.pre_filter_scp_envelope(&env) {
-            PreFilter::Accept(intake) => assert_eq!(intake.slot, 89),
+            PreFilter::Accept(intake) => assert_eq!(intake.slot, 88),
             PreFilter::Reject(r) => panic!(
                 "slot at min_ledger_seq must be accepted, got Reject({:?})",
                 r
@@ -7861,10 +7864,10 @@ mod scp_pipeline_tests {
     /// retained-window check is preserved; we only removed the LCL clamp).
     #[test]
     fn test_pre_filter_rejects_below_min_ledger_seq() {
-        // tracking=100, min_ledger_seq=89. Slot 88 is below; should reject.
+        // tracking=100, min_ledger_seq=88. Slot 87 is below; should reject.
         let herder = herder_with_lcl_and_tracking(99, 100);
         let secret = SecretKey::from_seed(&[4u8; 32]);
-        let env = make_signed_test_envelope_outer(88, &herder, &secret);
+        let env = make_signed_test_envelope_outer(87, &herder, &secret);
         match herder.pre_filter_scp_envelope(&env) {
             PreFilter::Reject(PreFilterRejectReason::Range) => {}
             other => panic!(
@@ -7880,7 +7883,7 @@ mod scp_pipeline_tests {
     #[test]
     fn test_pre_filter_checkpoint_exception_below_min_ledger_seq() {
         // tracking=101 → most_recent_checkpoint_seq = 64 (with default
-        // checkpoint_frequency=64). min_ledger_seq = 90. Slot 64 is below 90
+        // checkpoint_frequency=64). min_ledger_seq = 89. Slot 64 is below 89
         // but equals checkpoint, so the `slot != checkpoint` exception fires.
         let herder = herder_with_lcl_and_tracking(99, 101);
         assert_eq!(herder.get_most_recent_checkpoint_seq(), 64);
@@ -10851,12 +10854,14 @@ mod fetching_envelopes_routing_tests {
         assert!(herder.fetching_envelopes.ready_slots().is_empty());
     }
 
-    /// Regression test for #2414: `ledger_closed()` prunes fetching_envelopes
-    /// slots above `next_consensus_ledger_index + LEDGER_VALIDITY_BRACKET`
-    /// when the herder is tracking.
+    /// Regression test for #2414/#2415: `ledger_closed()` prunes fetching_envelopes
+    /// using `get_min_ledger_seq_to_remember()` and `get_most_recent_checkpoint_seq()`
+    /// for parity with stellar-core's `newSlotExternalized` + `eraseOutsideRange`.
     ///
-    /// Also verifies lower-bound pruning (slots below the closed slot) and
-    /// the slot_to_keep exemption.
+    /// With consensus_index=102 (tracking_slot=102, tracking=true):
+    /// - min_slot = get_min_ledger_seq_to_remember() = (101 - 12 + 1) = 90 (> genesis, so Some(90))
+    /// - keep_slot = get_most_recent_checkpoint_seq() = 64 (first ledger in checkpoint containing 101)
+    /// - max_slot = next_consensus_ledger_index() + LEDGER_VALIDITY_BRACKET = 102 + 100 = 202
     #[test]
     fn test_ledger_closed_prunes_slots_above_validity_bracket() {
         let herder = make_test_herder();
@@ -10864,7 +10869,7 @@ mod fetching_envelopes_routing_tests {
 
         // Simulate advance_tracking_slot(101) having already run:
         // consensus_index = 102, so next_consensus_ledger_index() = 102.
-        // Upper bound = 102 + LEDGER_VALIDITY_BRACKET = 202.
+        // min_slot = Some(90), keep_slot = 64, max_slot = Some(202).
         {
             let mut ts = herder.tracking_state.write();
             ts.is_tracking = true;
@@ -10874,7 +10879,6 @@ mod fetching_envelopes_routing_tests {
         let bracket = crate::sync_recovery::LEDGER_VALIDITY_BRACKET;
 
         // Insert envelopes for slots within the bracket (103..=202).
-        // These are above tracking_slot (102) so process_ready won't drain them.
         for slot in 103..=(102 + bracket) {
             herder
                 .fetching_envelopes
@@ -10888,21 +10892,25 @@ mod fetching_envelopes_routing_tests {
                 .test_insert_ready(slot, vec![make_fetching_test_envelope(slot, 1)]);
         }
 
-        // Insert a stale slot below min_slot (slot=101 is the min passed to
-        // erase_outside_range). Slot 50 should be removed.
+        // Insert a stale slot well below min_slot (50 < 90, and 50 != 64).
         herder
             .fetching_envelopes
             .test_insert_ready(50, vec![make_fetching_test_envelope(50, 1)]);
 
-        // Insert slot_to_keep = 101 - 2 = 99. This slot is below min_slot but
-        // exempted by the slot_to_keep parameter.
+        // Insert checkpoint slot (64) — below min_slot but preserved as keep_slot.
         herder
             .fetching_envelopes
-            .test_insert_ready(99, vec![make_fetching_test_envelope(99, 1)]);
+            .test_insert_ready(64, vec![make_fetching_test_envelope(64, 1)]);
+
+        // Insert a slot within the retention window (91 >= min_slot=90).
+        herder
+            .fetching_envelopes
+            .test_insert_ready(91, vec![make_fetching_test_envelope(91, 1)]);
 
         // Verify pre-conditions: all slots present
         assert!(herder.fetching_envelopes.slots.contains_key(&50));
-        assert!(herder.fetching_envelopes.slots.contains_key(&99));
+        assert!(herder.fetching_envelopes.slots.contains_key(&64));
+        assert!(herder.fetching_envelopes.slots.contains_key(&91));
         assert!(herder.fetching_envelopes.slots.contains_key(&103));
         assert!(herder.fetching_envelopes.slots.contains_key(&202));
         assert!(herder.fetching_envelopes.slots.contains_key(&203));
@@ -10920,19 +10928,23 @@ mod fetching_envelopes_routing_tests {
             );
         }
 
-        // Assert lower-bound pruning: slot 50 is gone (below min_slot=101)
+        // Assert lower-bound pruning: slot 50 is gone (below min_slot=90, not checkpoint)
         assert!(
             !herder.fetching_envelopes.slots.contains_key(&50),
-            "slot 50 should have been pruned (below min_slot 101)"
+            "slot 50 should have been pruned (below min_slot 90, not checkpoint slot)"
         );
 
-        // Assert slot_to_keep exemption: slot 99 survives
+        // Assert checkpoint keep_slot exemption: slot 64 survives despite being below min
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&99),
-            "slot 99 should be preserved (slot_to_keep = 101 - 2 = 99)"
+            herder.fetching_envelopes.slots.contains_key(&64),
+            "slot 64 should be preserved (keep_slot = checkpoint = 64)"
         );
 
-        // Assert within-bracket slots are preserved
+        // Assert within-retention-window slots are preserved
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&91),
+            "slot 91 should be preserved (>= min_slot 90)"
+        );
         assert!(
             herder.fetching_envelopes.slots.contains_key(&103),
             "slot 103 should be preserved (within bracket, above tracking)"
@@ -10945,5 +10957,163 @@ mod fetching_envelopes_routing_tests {
             herder.fetching_envelopes.slots.contains_key(&202),
             "slot 202 should be preserved (boundary: 102 + 100 = 202)"
         );
+    }
+
+    /// Regression test for #2415: `ledger_closed()` at genesis/early ledgers
+    /// does NOT purge any slots (min_slot = None when min_ledger_seq <= 1).
+    #[test]
+    fn test_ledger_closed_no_lower_purge_at_genesis() {
+        let herder = make_test_herder();
+        // Bootstrap to slot 1 (tracking_slot = 2)
+        herder.bootstrap(1);
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = 2;
+        }
+
+        // get_min_ledger_seq_to_remember: (2-1) = 1, 1 <= 12, so returns 1.
+        // Genesis guard: 1 <= GENESIS_LEDGER_SEQ, so min_slot = None.
+        // No lower-bound purge should happen.
+        herder
+            .fetching_envelopes
+            .test_insert_ready(1, vec![make_fetching_test_envelope(1, 1)]);
+
+        herder.ledger_closed(1, &[], &[], 0);
+
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&1),
+            "slot 1 should be preserved (no lower purge at genesis)"
+        );
+    }
+
+    /// Regression test for #2415: First purge happens at ledger 13
+    /// (tracking_slot=14, min_ledger_seq = (13 - 12 + 1) = 2).
+    #[test]
+    fn test_ledger_closed_first_purge_at_ledger_13() {
+        let herder = make_test_herder();
+        herder.bootstrap(13);
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = 14;
+        }
+
+        // min_ledger_seq = (14-1) - 12 + 1 = 2. min_slot = Some(2).
+        // keep_slot = get_most_recent_checkpoint_seq():
+        //   tracking_consensus_index = 13, checkpoint = ((13/64+1)*64)-1 = 63,
+        //   size = 63 (13 < 64), first = 63-62 = 1. keep_slot = 1.
+        herder
+            .fetching_envelopes
+            .test_insert_ready(1, vec![make_fetching_test_envelope(1, 1)]);
+        herder
+            .fetching_envelopes
+            .test_insert_ready(2, vec![make_fetching_test_envelope(2, 1)]);
+        herder
+            .fetching_envelopes
+            .test_insert_ready(10, vec![make_fetching_test_envelope(10, 1)]);
+
+        herder.ledger_closed(13, &[], &[], 0);
+
+        // Slot 1 is below min_slot (2) but is checkpoint keep_slot — preserved.
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&1),
+            "slot 1 preserved as checkpoint keep_slot"
+        );
+        // Slot 2 is exactly at min_slot — preserved.
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&2),
+            "slot 2 preserved (>= min_slot)"
+        );
+        // Slot 10 is within range — preserved.
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&10),
+            "slot 10 preserved (within range)"
+        );
+    }
+
+    /// Regression test for #2415: Checkpoint boundary at ledger 65.
+    /// After the first checkpoint completes (ledger 63), ledger 64 starts
+    /// a new checkpoint. At ledger 65, checkpoint = 64, preserved as keep_slot.
+    #[test]
+    fn test_ledger_closed_checkpoint_preserved_at_boundary() {
+        let herder = make_test_herder();
+        herder.bootstrap(65);
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = 66;
+        }
+
+        // min_ledger_seq = (66-1) - 12 + 1 = 54. min_slot = Some(54).
+        // keep_slot = get_most_recent_checkpoint_seq():
+        //   tracking_consensus_index = 65, ((65/64+1)*64)-1 = 127,
+        //   size = 64 (65 >= 64), first = 127-63 = 64. keep_slot = 64.
+        herder
+            .fetching_envelopes
+            .test_insert_ready(50, vec![make_fetching_test_envelope(50, 1)]);
+        herder
+            .fetching_envelopes
+            .test_insert_ready(53, vec![make_fetching_test_envelope(53, 1)]);
+        herder
+            .fetching_envelopes
+            .test_insert_ready(54, vec![make_fetching_test_envelope(54, 1)]);
+        herder
+            .fetching_envelopes
+            .test_insert_ready(64, vec![make_fetching_test_envelope(64, 1)]);
+
+        herder.ledger_closed(65, &[], &[], 0);
+
+        // Slot 50 < min_slot (54) and != keep_slot (64) — pruned.
+        assert!(
+            !herder.fetching_envelopes.slots.contains_key(&50),
+            "slot 50 should be pruned (below min_slot 54, not checkpoint)"
+        );
+        // Slot 53 < min_slot (54) and != keep_slot (64) — pruned.
+        assert!(
+            !herder.fetching_envelopes.slots.contains_key(&53),
+            "slot 53 should be pruned (below min_slot 54, not checkpoint)"
+        );
+        // Slot 54 is exactly at min_slot — preserved.
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&54),
+            "slot 54 preserved (== min_slot)"
+        );
+        // Slot 64 is checkpoint keep_slot — preserved.
+        assert!(
+            herder.fetching_envelopes.slots.contains_key(&64),
+            "slot 64 preserved (checkpoint keep_slot and within range)"
+        );
+    }
+
+    /// Regression test for #2415: `get_min_ledger_seq_to_remember()` off-by-one fix.
+    /// Verifies the function uses tracking_slot().saturating_sub(1) to align
+    /// with stellar-core's `trackingConsensusLedgerIndex()`.
+    #[test]
+    fn test_get_min_ledger_seq_to_remember_parity() {
+        let herder = make_test_herder();
+
+        // tracking_slot = 0 (default) → saturating_sub(1) = 0 → returns 1
+        assert_eq!(herder.get_min_ledger_seq_to_remember(), 1);
+
+        // Bootstrap to slot 1: tracking_slot = 2
+        // current_slot = 2 - 1 = 1, 1 <= 12 → returns 1
+        herder.bootstrap(1);
+        assert_eq!(herder.get_min_ledger_seq_to_remember(), 1);
+
+        // Bootstrap to slot 12: tracking_slot = 13
+        // current_slot = 13 - 1 = 12, 12 <= 12 → returns 1
+        herder.bootstrap(12);
+        assert_eq!(herder.get_min_ledger_seq_to_remember(), 1);
+
+        // Bootstrap to slot 13: tracking_slot = 14
+        // current_slot = 14 - 1 = 13, 13 > 12 → 13 - 12 + 1 = 2
+        herder.bootstrap(13);
+        assert_eq!(herder.get_min_ledger_seq_to_remember(), 2);
+
+        // Bootstrap to slot 100: tracking_slot = 101
+        // current_slot = 101 - 1 = 100, 100 > 12 → 100 - 12 + 1 = 89
+        herder.bootstrap(100);
+        assert_eq!(herder.get_min_ledger_seq_to_remember(), 89);
     }
 }
