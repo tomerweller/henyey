@@ -64,8 +64,6 @@ pub struct FetchingConfig {
     pub tx_set_fetcher_config: ItemFetcherConfig,
     /// Configuration for the QuorumSet fetcher.
     pub quorum_set_fetcher_config: ItemFetcherConfig,
-    /// Maximum slots to track.
-    pub max_slots: usize,
     /// Maximum quorum sets to cache. Uses random-two-choice eviction (matching
     /// stellar-core's `RandomEvictionCache`). Must be at least 1.
     pub max_quorum_set_cache: usize,
@@ -76,7 +74,6 @@ impl Default for FetchingConfig {
         Self {
             tx_set_fetcher_config: ItemFetcherConfig::default(),
             quorum_set_fetcher_config: ItemFetcherConfig::default(),
-            max_slots: 12,
             // Parity: stellar-core uses QSET_CACHE_SIZE = 10000
             // in PendingEnvelopes.cpp.
             max_quorum_set_cache: 10_000,
@@ -468,13 +465,30 @@ impl FetchingEnvelopes {
             .count()
     }
 
-    /// Erase data for slots below the given threshold.
-    pub fn erase_below(&self, slot_index: SlotIndex, slot_to_keep: SlotIndex) {
-        // Remove old slots
+    /// Erase data for slots outside the given range.
+    ///
+    /// Parity: stellar-core `PendingEnvelopes::eraseOutsideRange(min, max, slotToKeep)`.
+    /// - `min_slot = Some(m)`: remove entries with key < m (except `slot_to_keep`)
+    /// - `max_slot = Some(m)`: remove entries with key > m (except `slot_to_keep`)
+    /// - `slot_to_keep` is exempt from both bounds
+    pub fn erase_outside_range(
+        &self,
+        min_slot: Option<SlotIndex>,
+        max_slot: Option<SlotIndex>,
+        slot_to_keep: SlotIndex,
+    ) {
         let slots_to_remove: Vec<SlotIndex> = self
             .slots
             .iter()
-            .filter(|e| *e.key() < slot_index && *e.key() != slot_to_keep)
+            .filter(|e| {
+                let key = *e.key();
+                if key == slot_to_keep {
+                    return false;
+                }
+                let below_min = min_slot.is_some_and(|m| key < m);
+                let above_max = max_slot.is_some_and(|m| key > m);
+                below_min || above_max
+            })
             .map(|e| *e.key())
             .collect();
 
@@ -482,11 +496,11 @@ impl FetchingEnvelopes {
             self.slots.remove(&slot);
         }
 
-        // Tell fetchers to stop fetching for old slots
+        // Tell fetchers to stop fetching for slots outside range
         self.tx_set_fetcher
-            .stop_fetching_below(slot_index, slot_to_keep);
+            .stop_fetching_outside_range(min_slot, max_slot, slot_to_keep);
         self.quorum_set_fetcher
-            .stop_fetching_below(slot_index, slot_to_keep);
+            .stop_fetching_outside_range(min_slot, max_slot, slot_to_keep);
     }
 
     /// Process pending fetch requests (should be called periodically).
@@ -946,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn test_erase_below() {
+    fn test_erase_outside_range_min_only() {
         let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
         cache_test_quorum_set(&fetching);
 
@@ -957,14 +971,87 @@ mod tests {
 
         assert_eq!(fetching.ready_count(), 3);
 
-        // Erase below 102, keeping 100
-        fetching.erase_below(102, 100);
+        // Erase below 102, keeping 100 (min only, no max)
+        fetching.erase_outside_range(Some(102), None, 100);
 
-        // Slot 100 should be kept, 101 erased, 102 kept
+        // Slot 100 should be kept (slot_to_keep), 101 erased (below min), 102 kept (within range)
         let ready_slots = fetching.ready_slots();
         assert!(ready_slots.contains(&100));
         assert!(!ready_slots.contains(&101));
         assert!(ready_slots.contains(&102));
+    }
+
+    #[test]
+    fn test_erase_outside_range_max_only() {
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        cache_test_quorum_set(&fetching);
+
+        fetching.recv_envelope(make_test_envelope(100, 1));
+        fetching.recv_envelope(make_test_envelope(101, 2));
+        fetching.recv_envelope(make_test_envelope(200, 3));
+
+        assert_eq!(fetching.ready_count(), 3);
+
+        // Erase above 150 (max only), keeping slot 200 as slot_to_keep
+        fetching.erase_outside_range(None, Some(150), 200);
+
+        let ready_slots = fetching.ready_slots();
+        assert!(ready_slots.contains(&100));
+        assert!(ready_slots.contains(&101));
+        assert!(ready_slots.contains(&200)); // kept as slot_to_keep
+    }
+
+    #[test]
+    fn test_erase_outside_range_both_bounds() {
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        cache_test_quorum_set(&fetching);
+
+        fetching.recv_envelope(make_test_envelope(50, 1));
+        fetching.recv_envelope(make_test_envelope(100, 2));
+        fetching.recv_envelope(make_test_envelope(150, 3));
+        fetching.recv_envelope(make_test_envelope(200, 4));
+
+        assert_eq!(fetching.ready_count(), 4);
+
+        // Keep only slots in [100, 150], preserve slot 50 as slot_to_keep
+        fetching.erase_outside_range(Some(100), Some(150), 50);
+
+        let ready_slots = fetching.ready_slots();
+        assert!(ready_slots.contains(&50)); // slot_to_keep
+        assert!(ready_slots.contains(&100)); // within range
+        assert!(ready_slots.contains(&150)); // within range
+        assert!(!ready_slots.contains(&200)); // above max
+    }
+
+    #[test]
+    fn test_erase_outside_range_none_none_is_noop() {
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        cache_test_quorum_set(&fetching);
+
+        fetching.recv_envelope(make_test_envelope(100, 1));
+        fetching.recv_envelope(make_test_envelope(200, 2));
+
+        fetching.erase_outside_range(None, None, 0);
+
+        assert_eq!(fetching.ready_count(), 2);
+    }
+
+    #[test]
+    fn test_erase_outside_range_slot_to_keep_outside_range() {
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        cache_test_quorum_set(&fetching);
+
+        fetching.recv_envelope(make_test_envelope(50, 1));
+        fetching.recv_envelope(make_test_envelope(100, 2));
+        fetching.recv_envelope(make_test_envelope(200, 3));
+
+        // slot_to_keep = 200, which is above max_slot = 150
+        fetching.erase_outside_range(Some(75), Some(150), 200);
+
+        let ready_slots = fetching.ready_slots();
+        assert!(!ready_slots.contains(&50)); // below min
+        assert!(ready_slots.contains(&100)); // within range
+        assert!(ready_slots.contains(&200)); // slot_to_keep even though above max
     }
 
     #[test]

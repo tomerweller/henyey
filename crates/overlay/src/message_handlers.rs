@@ -359,12 +359,19 @@ impl MessageDispatcher {
         self.quorum_set_fetcher.stop_fetch(hash, envelope);
     }
 
-    /// Clean up fetches for old slots.
-    pub fn stop_fetching_below(&self, slot_index: u64, slot_to_keep: u64) {
+    /// Clean up fetches for slots outside the given range.
+    ///
+    /// Parity: stellar-core's `stopAllOutsideRange`.
+    pub fn stop_fetching_outside_range(
+        &self,
+        min_slot: Option<u64>,
+        max_slot: Option<u64>,
+        slot_to_keep: u64,
+    ) {
         self.tx_set_fetcher
-            .stop_fetching_below(slot_index, slot_to_keep);
+            .stop_fetching_outside_range(min_slot, max_slot, slot_to_keep);
         self.quorum_set_fetcher
-            .stop_fetching_below(slot_index, slot_to_keep);
+            .stop_fetching_outside_range(min_slot, max_slot, slot_to_keep);
     }
 
     /// Get pending TxSet requests.
@@ -632,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stop_fetching_below() {
+    fn test_stop_fetching_outside_range() {
         let dispatcher = make_dispatcher();
         let hash = Hash([1u8; 32]);
         let env1 = make_test_envelope(100);
@@ -641,12 +648,11 @@ mod tests {
         dispatcher.fetch_tx_set(hash.clone(), &env1);
         dispatcher.fetch_tx_set(hash.clone(), &env2);
 
-        // Stop fetching for slots below 150
-        dispatcher.stop_fetching_below(150, 0);
+        // Stop fetching for slots below 150 (min only, no max)
+        dispatcher.stop_fetching_outside_range(Some(150), None, 0);
 
         // Tracker should still exist (env2 is at slot 200)
         let _stats = dispatcher.stats();
-        // The tracker is either empty or has one envelope
     }
 
     #[test]

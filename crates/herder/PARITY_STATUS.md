@@ -122,7 +122,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `startCheckForDeadNodesInterval()` | `DeadNodeTracker` | Full |
 | `checkAndMaybeReanalyzeQuorumMap()` | _(not implemented)_ | None |
 | `checkAndMaybeReanalyzeQuorumMapV2()` | _(not implemented)_ | None |
-| `eraseBelow()` | `fetching_envelopes.erase_below()` | Full |
+| `eraseOutsideRange()` | `fetching_envelopes.erase_outside_range()` | Full |
 | `verifyEnvelope()` | `scp_driver.verify_envelope()` | Full |
 | `signEnvelope()` | `scp_driver.sign_envelope()` | Full |
 | `verifyStellarValueSignature()` | `scp_driver.verify_stellar_value_signature()` | Full |
@@ -236,7 +236,7 @@ Corresponds to: `PendingEnvelopes.h`
 | `recvTxSet()` | `FetchingEnvelopes::recv_tx_set()` | Full |
 | `peerDoesntHave()` | `FetchingEnvelopes::peer_doesnt_have()` | Full |
 | `pop()` | `FetchingEnvelopes::pop()` | Full |
-| `eraseBelow()` | `FetchingEnvelopes::erase_below()` + `QuorumSetTracker::evict_pending_below()` | Full |
+| `eraseOutsideRange()` | `FetchingEnvelopes::erase_outside_range()` + `QuorumSetTracker::evict_pending_below()` | Full |
 | `stopAllOutsideRange()` (lower bound) | `PendingEnvelopes::purge_slots_below()` | Full |
 | `forceRebuildQuorum()` | _(not implemented)_ | None |
 | `readySlots()` | `FetchingEnvelopes::ready_slots()` | Full |

@@ -172,19 +172,38 @@ impl Tracker {
         self.last_seen_slot_index = 0;
     }
 
-    /// Clear envelopes below a certain slot index.
+    /// Clear envelopes for slots outside the given range.
     ///
-    /// Returns true if at least one envelope remains.
-    pub fn clear_envelopes_below(&mut self, slot_index: u64, slot_to_keep: u64) -> bool {
+    /// Keeps envelopes where `min_slot <= slot_index <= max_slot` or
+    /// `slot_index == slot_to_keep`. Returns true if at least one envelope
+    /// remains (tracker should be kept), false if empty (tracker should be removed).
+    pub fn clear_envelopes_outside_range(
+        &mut self,
+        min_slot: Option<u64>,
+        max_slot: Option<u64>,
+        slot_to_keep: u64,
+    ) -> bool {
         self.waiting_envelopes.retain(|(_, env)| {
             let idx = env.statement.slot_index;
-            idx >= slot_index || idx == slot_to_keep
+            if idx == slot_to_keep {
+                return true;
+            }
+            let below_min = min_slot.is_some_and(|m| idx < m);
+            let above_max = max_slot.is_some_and(|m| idx > m);
+            !below_min && !above_max
         });
 
         if self.waiting_envelopes.is_empty() {
             self.cancel();
             false
         } else {
+            // Recompute last_seen_slot_index from surviving envelopes
+            self.last_seen_slot_index = self
+                .waiting_envelopes
+                .iter()
+                .map(|(_, env)| env.statement.slot_index)
+                .max()
+                .unwrap_or(0);
             true
         }
     }
@@ -487,11 +506,23 @@ impl ItemFetcher {
             .unwrap_or_default()
     }
 
-    /// Stop fetching items for slots below a threshold.
-    pub fn stop_fetching_below(&self, slot_index: u64, slot_to_keep: u64) {
+    /// Stop fetching items for slots outside the given range.
+    ///
+    /// Parity: stellar-core's `stopAllOutsideRange(min, max, slotToKeep)`.
+    /// Clears envelope references from trackers for slots outside [min, max]
+    /// (except slot_to_keep). Removes trackers with no remaining envelopes.
+    /// Recomputes `last_seen_slot_index` after pruning.
+    pub fn stop_fetching_outside_range(
+        &self,
+        min_slot: Option<u64>,
+        max_slot: Option<u64>,
+        slot_to_keep: u64,
+    ) {
         let mut trackers = self.trackers.lock().unwrap();
 
-        trackers.retain(|_, tracker| tracker.clear_envelopes_below(slot_index, slot_to_keep));
+        trackers.retain(|_, tracker| {
+            tracker.clear_envelopes_outside_range(min_slot, max_slot, slot_to_keep)
+        });
     }
 
     /// Handle a DONT_HAVE response from a peer.
@@ -757,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tracker_clear_below() {
+    fn test_tracker_clear_outside_range() {
         let hash = Hash([1u8; 32]);
         let mut tracker = Tracker::new(hash, ItemFetcherConfig::default());
 
@@ -765,9 +796,9 @@ mod tests {
         tracker.listen(&make_test_envelope(200));
         tracker.listen(&make_test_envelope(300));
 
-        // Clear below 201, keep 100
+        // Clear below 201, keep 100 (min only, no max)
         // This removes slot 200 (< 201 and != 100), keeps 100 (== keep_slot) and 300 (>= 201)
-        let has_more = tracker.clear_envelopes_below(201, 100);
+        let has_more = tracker.clear_envelopes_outside_range(Some(201), None, 100);
 
         assert!(has_more);
         assert_eq!(tracker.len(), 2); // 100 (kept) and 300

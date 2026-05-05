@@ -180,7 +180,7 @@ fn test_doesnt_have_triggers_retry() {
 }
 
 #[test]
-fn test_stop_fetching_below() {
+fn test_stop_fetching_outside_range() {
     let fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default(), None);
 
     fetcher.set_available_peers(vec![make_test_peer(1)]);
@@ -196,13 +196,12 @@ fn test_stop_fetching_below() {
 
     assert_eq!(fetcher.num_trackers(), 3);
 
-    // Stop fetching below slot 102, keeping slot 100
-    fetcher.stop_fetching_below(102, 100);
+    // Stop fetching below slot 102, keeping slot 100 (min only)
+    fetcher.stop_fetching_outside_range(Some(102), None, 100);
 
-    // Slot 100 kept, slot 101 removed, slot 102 kept
-    // Trackers for hash1 and hash3 should remain
+    // Slot 100 kept (slot_to_keep), slot 101 removed (below min), slot 102 kept (within range)
     assert!(fetcher.is_tracking(&hash1));
-    assert!(!fetcher.is_tracking(&hash2)); // Slot 101 was removed
+    assert!(!fetcher.is_tracking(&hash2));
     assert!(fetcher.is_tracking(&hash3));
 }
 

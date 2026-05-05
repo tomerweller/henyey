@@ -129,7 +129,7 @@ Corresponds to: `ItemFetcher.h`, `Tracker.h`
 | `stopFetch()` | `stop_fetch()` | Full |
 | `getLastSeenSlotIndex()` | `get_last_seen_slot_index()` | Full |
 | `fetchingFor()` | `fetching_for()` | Full |
-| `stopFetchingBelow()` | `stop_fetching_below()` | Full |
+| `stopFetchingBelow()` | `stop_fetching_outside_range()` | Full |
 | `doesntHave()` | `doesnt_have()` | Full |
 | `recv()` | `recv()` | Full |
 | `Tracker()` | `Tracker::new()` | Full |

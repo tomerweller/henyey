@@ -952,7 +952,7 @@ impl Herder {
             let last_checkpoint = (lcl / freq) * freq;
 
             self.fetching_envelopes
-                .erase_below(purge_slot, last_checkpoint);
+                .erase_outside_range(Some(purge_slot), None, last_checkpoint);
 
             // Clear slot quorum tracker entries below purge_slot
             self.slot_quorum_tracker
@@ -2162,7 +2162,17 @@ impl Herder {
         // Clean up old fetching envelopes and cached tx sets (keep a small buffer)
         // Keep the current slot and 2 slots back for any late envelopes
         let keep_slot = slot.saturating_sub(2);
-        self.fetching_envelopes.erase_below(slot, keep_slot);
+        // Parity: stellar-core HerderImpl.cpp:267-278 in newSlotExternalized
+        // computes maxSlotToRemember = nextConsensusLedgerIndex() + LEDGER_VALIDITY_BRACKET
+        // when tracking. This reactively prunes slots that were once valid but
+        // are now too far ahead.
+        let max_slot = if self.is_tracking() {
+            Some(self.next_consensus_ledger_index() + LEDGER_VALIDITY_BRACKET)
+        } else {
+            None
+        };
+        self.fetching_envelopes
+            .erase_outside_range(Some(slot), max_slot, keep_slot);
 
         // Clean up old data
         self.cleanup();
@@ -3607,10 +3617,15 @@ impl Herder {
         self.fetching_envelopes.ready_slots()
     }
 
-    /// Erase fetching data for old slots.
-    pub fn erase_fetching_below(&self, slot_index: u64, slot_to_keep: u64) {
+    /// Erase fetching data for slots outside the given range.
+    pub fn erase_fetching_outside_range(
+        &self,
+        min_slot: Option<u64>,
+        max_slot: Option<u64>,
+        slot_to_keep: u64,
+    ) {
         self.fetching_envelopes
-            .erase_below(slot_index, slot_to_keep);
+            .erase_outside_range(min_slot, max_slot, slot_to_keep);
     }
 
     /// Check if we have a TxSet in the authoritative scp_driver cache.
