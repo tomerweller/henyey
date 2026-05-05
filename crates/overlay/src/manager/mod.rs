@@ -202,22 +202,46 @@ pub struct PeerSnapshot {
 ///
 /// The actual `Peer` is owned by the spawned peer task. This handle
 /// provides non-blocking access to send messages and read stats.
+///
+/// Two channels mirror stellar-core's `Peer::sendMessage()` two-path design:
+/// - `control_tx` (unbounded): for non-flood messages sent directly
+/// - `flood_tx` (bounded): for flood messages routed through FlowControl
 pub(super) struct PeerHandle {
-    /// Channel to send outbound messages to the peer task.
-    outbound_tx: mpsc::Sender<OutboundMessage>,
+    /// Unbounded channel for control messages (non-flood sends, shutdown).
+    /// Mirrors stellar-core's direct `sendAuthenticatedMessage()` path.
+    control_tx: mpsc::UnboundedSender<ControlMessage>,
+    /// Bounded channel for flood messages (goes through FlowControl).
+    /// Mirrors stellar-core's `FlowControl::addMsgAndMaybeTrimQueue()` path.
+    flood_tx: mpsc::Sender<StellarMessage>,
     /// Shared stats (atomically updated by the peer task).
     stats: Arc<PeerStats>,
     /// Per-peer flow control (shared with the peer task).
     flow_control: Arc<FlowControl>,
 }
 
-/// Messages sent to a peer task via the outbound channel.
-pub(super) enum OutboundMessage {
-    /// Direct send (non-flood, e.g. GetTxSet, ScpQuorumset response).
-    Send(StellarMessage),
-    /// Flood message (goes through FlowControl outbound queue).
-    Flood(StellarMessage),
-    /// Close the connection.
+impl PeerHandle {
+    /// Send a control message. Cannot fail due to backpressure (unbounded).
+    /// Returns false only if the peer loop has already exited (receiver dropped).
+    pub(super) fn send_control(&self, msg: ControlMessage) -> bool {
+        self.control_tx.send(msg).is_ok()
+    }
+
+    /// Send a flood message. Returns Err with the message if the flood
+    /// channel is full (backpressure) or closed.
+    #[allow(clippy::result_large_err)]
+    pub(super) fn try_send_flood(
+        &self,
+        msg: StellarMessage,
+    ) -> std::result::Result<(), StellarMessage> {
+        self.flood_tx.try_send(msg).map_err(|e| e.into_inner())
+    }
+}
+
+/// Messages on the control channel — non-flood sends and lifecycle signals.
+pub(super) enum ControlMessage {
+    /// Non-flood message to send directly (ErrorMsg, SendMore, GetTxSet, etc.)
+    Send(Box<StellarMessage>),
+    /// Terminate the peer connection.
     Shutdown,
 }
 
@@ -866,32 +890,30 @@ impl OverlayManager {
         let mut message = Some(message);
         for (i, peer_id) in target_peers.iter().enumerate() {
             let is_last = i + 1 == num_targets;
-            let outbound_msg = if is_last {
-                // Move the original into the last send to avoid one clone.
-                let msg = message.take().unwrap();
-                if is_flood {
-                    OutboundMessage::Flood(msg)
-                } else {
-                    OutboundMessage::Send(msg)
-                }
+            let msg = if is_last {
+                message.take().unwrap()
             } else {
-                // Clone for all but the last peer.
-                let msg = message.as_ref().unwrap().clone();
-                if is_flood {
-                    OutboundMessage::Flood(msg)
-                } else {
-                    OutboundMessage::Send(msg)
-                }
+                message.as_ref().unwrap().clone()
             };
             if let Some(entry) = self.peers.get(peer_id) {
-                match entry.value().outbound_tx.try_send(outbound_msg) {
-                    Ok(()) => sent += 1,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        dropped += 1;
-                        debug!("Outbound channel full for {}, dropping broadcast", peer_id);
+                if is_flood {
+                    match entry.value().try_send_flood(msg) {
+                        Ok(()) => sent += 1,
+                        Err(_) => {
+                            dropped += 1;
+                            debug!("Flood channel full for {}, dropping broadcast", peer_id);
+                        }
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        debug!("Outbound channel closed for {}", peer_id);
+                } else {
+                    // Control messages use unbounded channel — cannot fail
+                    // due to backpressure (only fails if peer loop exited).
+                    if entry
+                        .value()
+                        .send_control(ControlMessage::Send(Box::new(msg)))
+                    {
+                        sent += 1;
+                    } else {
+                        debug!("Control channel closed for {}", peer_id);
                     }
                 }
             }
@@ -920,13 +942,9 @@ impl OverlayManager {
         let Some(entry) = self.peers.get(peer_id) else {
             return false;
         };
-        // Use try_send to avoid blocking if the peer's channel is full.
-        // The peer_loop will exit on its own via the `running` flag or
-        // straggler timeout.
-        let _ = entry
-            .value()
-            .outbound_tx
-            .try_send(OutboundMessage::Shutdown);
+        // Control channel is unbounded — Shutdown delivery is not blocked by
+        // flood backpressure. The peer_loop will exit on receipt.
+        entry.value().send_control(ControlMessage::Shutdown);
         true
     }
 
@@ -934,10 +952,7 @@ impl OverlayManager {
     pub async fn ban_peer(&self, peer_id: PeerId) {
         self.banned_peers.write().insert(peer_id.clone());
         if let Some(entry) = self.peers.get(&peer_id) {
-            let _ = entry
-                .value()
-                .outbound_tx
-                .try_send(OutboundMessage::Shutdown);
+            entry.value().send_control(ControlMessage::Shutdown);
         }
     }
 
@@ -953,33 +968,37 @@ impl OverlayManager {
 
     /// Send a message to a specific peer.
     ///
-    /// Non-blocking: drops the message if the peer's outbound channel is full,
-    /// returning `Err(ChannelSend)`. This prevents a slow/malicious peer from
-    /// stalling the caller (matching stellar-core's non-blocking sendMessage).
+    /// Non-blocking: drops flood messages if the peer's flood channel is full,
+    /// returning `Err(ChannelSend)`. Control (non-flood) messages use an
+    /// unbounded channel and cannot be dropped due to backpressure.
     pub fn try_send_to(&self, peer_id: &PeerId, message: StellarMessage) -> Result<()> {
         let entry = self
             .peers
             .get(peer_id)
             .ok_or_else(|| OverlayError::PeerNotFound(peer_id.to_string()))?;
 
-        // Route flow-controlled messages through the Flood path so they
+        // Route flow-controlled messages through the flood channel so they
         // consume per-peer SEND_MORE_EXTENDED credit, matching stellar-core's
         // Peer::sendMessage() which always flow-controls flood messages
         // regardless of broadcast vs. targeted send (AUDIT-086).
-        let outbound = if helpers::is_flood_message(&message) {
-            OutboundMessage::Flood(message)
+        if helpers::is_flood_message(&message) {
+            entry.value().try_send_flood(message).map_err(|_| {
+                self.metrics.messages_dropped.add(1);
+                debug!(
+                    peer = %peer_id,
+                    "Flood channel full, dropping targeted message"
+                );
+                OverlayError::ChannelSend
+            })
         } else {
-            OutboundMessage::Send(message)
-        };
-
-        entry.value().outbound_tx.try_send(outbound).map_err(|_| {
-            self.metrics.messages_dropped.add(1);
-            debug!(
-                peer = %peer_id,
-                "Outbound channel full, dropping targeted message"
-            );
-            OverlayError::ChannelSend
-        })
+            if !entry
+                .value()
+                .send_control(ControlMessage::Send(Box::new(message)))
+            {
+                debug!(peer = %peer_id, "Control channel closed for targeted message");
+            }
+            Ok(())
+        }
     }
 
     /// Get the number of connected peers.
@@ -1303,14 +1322,11 @@ impl OverlayManager {
         for entry in self.peers.iter() {
             // Update each peer's FlowControl byte capacity
             entry.value().flow_control.handle_tx_size_increase(increase);
-            if entry
+            // SendMoreExtended is a non-flood control message — unbounded, cannot
+            // fail due to backpressure.
+            entry
                 .value()
-                .outbound_tx
-                .try_send(OutboundMessage::Send(send_more.clone()))
-                .is_err()
-            {
-                self.metrics.messages_dropped.add(1);
-            }
+                .send_control(ControlMessage::Send(Box::new(send_more.clone())));
         }
 
         debug!(
@@ -1451,14 +1467,16 @@ impl OverlayManager {
             let _ = tx.send(());
         }
 
-        // Send shutdown to all peer tasks via their outbound channels.
+        // Send shutdown to all peer tasks via their control channels.
+        // Clone the control_tx before clearing peers so the Shutdown message
+        // is delivered even though we're about to drop the PeerHandle.
         let senders: Vec<_> = self
             .peers
             .iter()
-            .map(|e| e.value().outbound_tx.clone())
+            .map(|e| e.value().control_tx.clone())
             .collect();
         for tx in senders {
-            let _ = tx.try_send(OutboundMessage::Shutdown);
+            let _ = tx.send(ControlMessage::Shutdown);
         }
         self.peers.clear();
     }
@@ -1570,30 +1588,38 @@ pub struct OverlayStats {
 
 /// A receiver for messages sent to an injected test peer.
 ///
-/// Wraps the internal outbound channel and extracts `StellarMessage` payloads,
-/// hiding the crate-internal `OutboundMessage` enum from downstream test code.
+/// Wraps the internal control and flood channels, extracting `StellarMessage`
+/// payloads for downstream test code.
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub struct TestPeerReceiver {
-    rx: tokio::sync::mpsc::Receiver<OutboundMessage>,
+    control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
+    flood_rx: tokio::sync::mpsc::Receiver<StellarMessage>,
 }
 
 #[cfg(feature = "test-utils")]
 impl TestPeerReceiver {
     /// Receive the next `StellarMessage`. Returns `None` on channel close or `Shutdown`.
     pub async fn recv(&mut self) -> Option<StellarMessage> {
-        match self.rx.recv().await? {
-            OutboundMessage::Send(msg) | OutboundMessage::Flood(msg) => Some(msg),
-            OutboundMessage::Shutdown => None,
+        tokio::select! {
+            msg = self.control_rx.recv() => match msg? {
+                ControlMessage::Send(m) => Some(*m),
+                ControlMessage::Shutdown => None,
+            },
+            msg = self.flood_rx.recv() => msg,
         }
     }
 
-    /// Non-blocking try_recv. Returns `None` if channel is empty, closed, or Shutdown.
+    /// Non-blocking try_recv. Returns `None` if channels are empty, closed, or Shutdown.
     pub fn try_recv(&mut self) -> Option<StellarMessage> {
-        match self.rx.try_recv().ok()? {
-            OutboundMessage::Send(msg) | OutboundMessage::Flood(msg) => Some(msg),
-            OutboundMessage::Shutdown => None,
+        // Try control first (priority)
+        if let Ok(msg) = self.control_rx.try_recv() {
+            return match msg {
+                ControlMessage::Send(m) => Some(*m),
+                ControlMessage::Shutdown => None,
+            };
         }
+        self.flood_rx.try_recv().ok()
     }
 }
 
@@ -1614,9 +1640,11 @@ impl OverlayManager {
         use crate::flow_control::{FlowControl, FlowControlConfig};
         use crate::peer::PeerStats;
 
-        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(channel_capacity);
+        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (flood_tx, flood_rx) = tokio::sync::mpsc::channel(channel_capacity);
         let handle = PeerHandle {
-            outbound_tx,
+            control_tx,
+            flood_tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
         };
@@ -1634,7 +1662,10 @@ impl OverlayManager {
                 original_address: None,
             },
         );
-        TestPeerReceiver { rx: outbound_rx }
+        TestPeerReceiver {
+            control_rx,
+            flood_rx,
+        }
     }
 }
 
@@ -1980,13 +2011,18 @@ mod tests {
         peer_id: PeerId,
         addr: std::net::SocketAddr,
         direction: crate::connection::ConnectionDirection,
-    ) -> tokio::sync::mpsc::Receiver<super::OutboundMessage> {
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
+        tokio::sync::mpsc::Receiver<StellarMessage>,
+    ) {
         use crate::flow_control::{FlowControl, FlowControlConfig};
         use crate::peer::PeerStats;
 
-        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(16);
-        let handle = super::PeerHandle {
-            outbound_tx,
+        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (flood_tx, flood_rx) = tokio::sync::mpsc::channel(16);
+        let handle = PeerHandle {
+            control_tx,
+            flood_tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
         };
@@ -2004,7 +2040,7 @@ mod tests {
                 original_address: None,
             },
         );
-        outbound_rx
+        (control_rx, flood_rx)
     }
 
     fn candidate_info(
@@ -2044,7 +2080,7 @@ mod tests {
         // Insert a non-preferred inbound peer.
         let non_pref_id = PeerId::from_bytes([1u8; 32]);
         let non_pref_addr: std::net::SocketAddr = "10.0.0.99:11625".parse().unwrap();
-        let mut victim_rx = insert_fake_peer(
+        let (mut victim_rx, _flood_rx) = insert_fake_peer(
             &shared,
             non_pref_id.clone(),
             non_pref_addr,
@@ -2091,7 +2127,7 @@ mod tests {
         // Insert an inbound peer that IS preferred.
         let pref_id = PeerId::from_bytes([2u8; 32]);
         let pref_addr: std::net::SocketAddr = "10.0.0.1:11625".parse().unwrap();
-        let _rx = insert_fake_peer(
+        let (_ctrl_rx, _flood_rx) = insert_fake_peer(
             &shared,
             pref_id,
             pref_addr,
@@ -2127,7 +2163,7 @@ mod tests {
         // Insert a non-preferred inbound peer.
         let np_id = PeerId::from_bytes([3u8; 32]);
         let np_addr: std::net::SocketAddr = "10.0.0.99:11625".parse().unwrap();
-        let _rx = insert_fake_peer(
+        let (_ctrl_rx, _flood_rx) = insert_fake_peer(
             &shared,
             np_id,
             np_addr,
@@ -2162,7 +2198,7 @@ mod tests {
         // Insert a non-preferred OUTBOUND peer — should not be evictable.
         let outbound_id = PeerId::from_bytes([4u8; 32]);
         let outbound_addr: std::net::SocketAddr = "10.0.0.99:11625".parse().unwrap();
-        let _rx = insert_fake_peer(
+        let (_ctrl_rx, _flood_rx) = insert_fake_peer(
             &shared,
             outbound_id,
             outbound_addr,
@@ -2195,7 +2231,7 @@ mod tests {
         pool.force_promote_authenticated();
 
         let victim_id = PeerId::from_bytes([4u8; 32]);
-        let mut victim_rx = insert_fake_peer(
+        let (mut victim_rx, _flood_rx) = insert_fake_peer(
             &shared,
             victim_id,
             "10.0.0.99:11625".parse().unwrap(),
@@ -2231,7 +2267,7 @@ mod tests {
         pool.try_reserve();
         pool.force_promote_authenticated();
         let victim_id = PeerId::from_bytes([4u8; 32]);
-        let _victim_rx = insert_fake_peer(
+        let (_victim_rx, _flood_rx) = insert_fake_peer(
             &shared,
             victim_id,
             "10.0.0.99:11625".parse().unwrap(),
@@ -2270,7 +2306,7 @@ mod tests {
         pool.try_reserve();
         pool.force_promote_authenticated();
         let victim_id = PeerId::from_bytes([4u8; 32]);
-        let _victim_rx = insert_fake_peer(
+        let (_victim_rx, _flood_rx) = insert_fake_peer(
             &shared,
             victim_id.clone(),
             "10.0.0.99:11625".parse().unwrap(),
@@ -2302,13 +2338,13 @@ mod tests {
             pool.try_reserve();
             pool.force_promote_authenticated();
             let id = PeerId::from_bytes([byte; 32]);
-            let rx = insert_fake_peer(
+            let (ctrl_rx, _flood_rx) = insert_fake_peer(
                 &shared,
                 id,
                 format!("10.0.1.{byte}:11625").parse().unwrap(),
                 ConnectionDirection::Outbound,
             );
-            receivers.push((byte, rx));
+            receivers.push((byte, ctrl_rx));
         }
 
         pool.try_reserve();
@@ -2344,7 +2380,7 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(1));
         pool.try_reserve();
         pool.force_promote_authenticated();
-        let _rx = insert_fake_peer(
+        let (_ctrl_rx, _flood_rx) = insert_fake_peer(
             &shared,
             PeerId::from_bytes([4u8; 32]),
             "10.0.0.2:11625".parse().unwrap(),
@@ -2399,15 +2435,17 @@ mod tests {
         let manager = OverlayManager::new(config, local_node).unwrap();
 
         let peer_id = PeerId::from_bytes([99u8; 32]);
-        let (outbound_tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let handle = super::PeerHandle {
-            outbound_tx,
+        let (control_tx, mut ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (flood_tx, mut flood_rx) = tokio::sync::mpsc::channel(16);
+        let handle = PeerHandle {
+            control_tx,
+            flood_tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
         };
         manager.peers.insert(peer_id.clone(), handle);
 
-        // Flow-controlled SCP message should be routed as Flood
+        // Flow-controlled SCP message should be routed to flood channel
         let scp_msg = StellarMessage::ScpMessage(ScpEnvelope {
             statement: ScpStatement {
                 node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
@@ -2427,21 +2465,33 @@ mod tests {
         manager
             .try_send_to(&peer_id, scp_msg)
             .expect("send should succeed");
-        let msg = rx.recv().await.expect("should receive message");
+        let msg = flood_rx
+            .try_recv()
+            .expect("flood channel should have message");
         assert!(
-            matches!(msg, OutboundMessage::Flood(_)),
-            "SCP message should be routed through Flood path for flow control"
+            matches!(msg, StellarMessage::ScpMessage(_)),
+            "SCP message should be routed through flood channel for flow control"
+        );
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "SCP message should NOT appear on control channel"
         );
 
-        // Non-flood messages (e.g. GetScpState) should still use Send
+        // Non-flood messages (e.g. GetScpState) should go to control channel
         let get_state = StellarMessage::GetScpState(1);
         manager
             .try_send_to(&peer_id, get_state)
             .expect("send should succeed");
-        let msg = rx.recv().await.expect("should receive message");
+        let msg = ctrl_rx
+            .try_recv()
+            .expect("control channel should have message");
         assert!(
-            matches!(msg, OutboundMessage::Send(_)),
-            "GetScpState should use direct Send path"
+            matches!(msg, ControlMessage::Send(ref m) if matches!(**m, StellarMessage::GetScpState(_))),
+            "GetScpState should use control channel"
+        );
+        assert!(
+            flood_rx.try_recv().is_err(),
+            "GetScpState should NOT appear on flood channel"
         );
     }
 
@@ -2803,9 +2853,7 @@ mod tests {
             for _ in 0..5 {
                 let cancelled = Arc::clone(&cancelled);
                 handles.push(tokio::spawn(async move {
-                    match tokio::time::sleep(Duration::from_secs(3600)).await {
-                        () => {} // Would only reach here if not aborted
-                    }
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
                     // If the task completes normally (not aborted), this
                     // wouldn't run because sleep(3600) in paused-time
                     // only resolves via time advance. Abort cancels it.
@@ -3083,7 +3131,7 @@ mod tests {
 
         // Insert preferred outbound peer
         let preferred_id = PeerId::from_bytes([1u8; 32]);
-        let _rx = insert_fake_peer(
+        let (_ctrl_rx, _flood_rx) = insert_fake_peer(
             &shared,
             preferred_id,
             "10.0.0.1:11625".parse().unwrap(),
@@ -3305,18 +3353,23 @@ mod tests {
         );
     }
 
-    /// Helper: insert a peer with a specific channel capacity into the manager.
+    /// Helper: insert a peer with a specific flood channel capacity into the manager.
     fn insert_peer_with_capacity(
         manager: &OverlayManager,
         peer_id: PeerId,
-        capacity: usize,
-    ) -> tokio::sync::mpsc::Receiver<OutboundMessage> {
+        flood_capacity: usize,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
+        tokio::sync::mpsc::Receiver<StellarMessage>,
+    ) {
         use crate::flow_control::{FlowControl, FlowControlConfig};
         use crate::peer::PeerStats;
 
-        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(capacity);
+        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (flood_tx, flood_rx) = tokio::sync::mpsc::channel(flood_capacity);
         let handle = PeerHandle {
-            outbound_tx,
+            control_tx,
+            flood_tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
         };
@@ -3334,7 +3387,7 @@ mod tests {
                 original_address: None,
             },
         );
-        outbound_rx
+        (control_rx, flood_rx)
     }
 
     fn make_hello_msg() -> StellarMessage {
@@ -3366,16 +3419,16 @@ mod tests {
         let manager = OverlayManager::new(config, local_node).unwrap();
         manager.running.store(true, Ordering::SeqCst);
 
-        // Insert a peer with channel capacity of 1
+        // Insert a peer with flood channel capacity of 1
         let peer_id = PeerId::from_bytes([1u8; 32]);
         let _rx = insert_peer_with_capacity(&manager, peer_id, 1);
 
-        // First broadcast fills the channel
-        let msg = make_hello_msg();
+        // First broadcast fills the flood channel
+        let msg = make_flood_tx_msg();
         let sent = manager.broadcast(msg.clone()).await.unwrap();
         assert_eq!(sent, 1);
 
-        // Second broadcast should drop (channel full)
+        // Second broadcast should drop (flood channel full)
         let sent = manager.broadcast(msg.clone()).await.unwrap();
         assert_eq!(sent, 0);
 
@@ -3395,13 +3448,14 @@ mod tests {
 
         let manager = OverlayManager::new(config, local_node).unwrap();
 
-        // Insert a peer with channel capacity of 1
+        // Insert a peer with flood channel capacity of 1
         let peer_id = PeerId::from_bytes([2u8; 32]);
         let _rx = insert_peer_with_capacity(&manager, peer_id.clone(), 1);
 
-        let msg = make_hello_msg();
+        // Use a flood message (only flood messages can trigger backpressure)
+        let msg = make_flood_tx_msg();
 
-        // First send fills the channel
+        // First send fills the flood channel
         assert!(manager.try_send_to(&peer_id, msg.clone()).is_ok());
 
         // Second send should fail with ChannelSend
@@ -3425,7 +3479,7 @@ mod tests {
         let manager = OverlayManager::new(config, local_node).unwrap();
         manager.running.store(true, Ordering::SeqCst);
 
-        // Insert 3 peers each with capacity 1
+        // Insert 3 peers each with flood capacity 1
         let peer1 = PeerId::from_bytes([1u8; 32]);
         let peer2 = PeerId::from_bytes([2u8; 32]);
         let peer3 = PeerId::from_bytes([3u8; 32]);
@@ -3433,9 +3487,9 @@ mod tests {
         let _rx2 = insert_peer_with_capacity(&manager, peer2, 1);
         let _rx3 = insert_peer_with_capacity(&manager, peer3, 1);
 
-        let msg = make_hello_msg();
+        let msg = make_flood_tx_msg();
 
-        // First broadcast fills all channels
+        // First broadcast fills all flood channels
         let sent = manager.broadcast(msg.clone()).await.unwrap();
         assert_eq!(sent, 3);
 

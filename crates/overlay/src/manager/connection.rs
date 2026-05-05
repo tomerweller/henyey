@@ -5,7 +5,7 @@
 //! and related helpers.
 
 use super::peer_loop::make_error_msg;
-use super::{OutboundMessage, OverlayManager, SharedPeerState};
+use super::{ControlMessage, OverlayManager, PeerHandle, SharedPeerState};
 use crate::{
     connection::ConnectionPool,
     connection_factory::ConnectionFactory,
@@ -16,11 +16,10 @@ use crate::{
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use stellar_xdr::curr::ErrorCode;
+use stellar_xdr::curr::{ErrorCode, StellarMessage};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::PeerHandle;
 use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 
@@ -97,7 +96,7 @@ impl OverlayManager {
                     );
                     if !super::peer_loop::send_error_and_drop(
                         &victim_id,
-                        &entry.value().outbound_tx,
+                        &entry.value().control_tx,
                         ErrorCode::Load,
                         "preferred peer selected instead",
                     ) {
@@ -137,19 +136,27 @@ impl OverlayManager {
         peer.close().await;
     }
 
-    /// Create a PeerHandle (outbound channel + FlowControl) and atomically
-    /// register the peer in the shared maps. Returns the receiver and
+    /// Create a PeerHandle (control + flood channels, FlowControl) and atomically
+    /// register the peer in the shared maps. Returns both receivers and
     /// FlowControl needed by `run_peer_loop`, or `Err` if a peer with the
     /// same ID is already registered (TOCTOU-safe via `DashMap::entry`).
+    #[allow(clippy::type_complexity)]
     pub(super) fn register_peer(
         peer: &Peer,
         peer_id: &PeerId,
         peer_info: PeerInfo,
         shared: &SharedPeerState,
         initial_byte_grant: u32,
-    ) -> std::result::Result<(mpsc::Receiver<OutboundMessage>, Arc<FlowControl>), OverlayError>
-    {
-        let (outbound_tx, outbound_rx) = mpsc::channel(shared.outbound_channel_capacity);
+    ) -> std::result::Result<
+        (
+            mpsc::UnboundedReceiver<ControlMessage>,
+            mpsc::Receiver<StellarMessage>,
+            Arc<FlowControl>,
+        ),
+        OverlayError,
+    > {
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (flood_tx, flood_rx) = mpsc::channel(shared.outbound_channel_capacity);
         let stats = peer.stats();
         let flow_control = Arc::new(FlowControl::with_scp_callback(
             FlowControlConfig {
@@ -162,7 +169,8 @@ impl OverlayManager {
         ));
         flow_control.set_peer_id(peer_id.clone());
         let peer_handle = PeerHandle {
-            outbound_tx,
+            control_tx,
+            flood_tx,
             stats,
             flow_control: Arc::clone(&flow_control),
         };
@@ -183,7 +191,7 @@ impl OverlayManager {
         shared
             .added_authenticated_peers
             .fetch_add(1, Ordering::Relaxed);
-        Ok((outbound_rx, flow_control))
+        Ok((control_rx, flood_rx, flow_control))
     }
 
     /// Send a PEERS advertisement to a newly accepted inbound peer.
@@ -279,7 +287,7 @@ impl OverlayManager {
             ))
             .await;
 
-        let (outbound_rx, flow_control) =
+        let (control_rx, flood_rx, flow_control) =
             match Self::register_peer(&peer, &peer_id, peer_info, &shared, initial_byte_grant) {
                 Ok(result) => result,
                 Err(_) => {
@@ -299,7 +307,8 @@ impl OverlayManager {
         Self::run_peer_loop(
             peer_id.clone(),
             peer,
-            outbound_rx,
+            control_rx,
+            flood_rx,
             flow_control,
             shared.clone(),
         )
@@ -523,7 +532,7 @@ impl OverlayManager {
         }
 
         info!("Connected to discovered peer: {} at {}", peer_id, addr);
-        let (outbound_rx, flow_control) =
+        let (control_rx, flood_rx, flow_control) =
             match Self::register_peer(&peer, &peer_id, peer_info, &shared, initial_byte_grant) {
                 Ok(result) => result,
                 Err(_) => {
@@ -547,7 +556,8 @@ impl OverlayManager {
         Self::run_peer_loop(
             peer_id.clone(),
             peer,
-            outbound_rx,
+            control_rx,
+            flood_rx,
             flow_control,
             shared.clone(),
         )
@@ -767,7 +777,7 @@ pub(super) async fn connect_to_explicit_peer(
     }
 
     info!("Connected to peer: {} at {}", peer_id, addr);
-    let (outbound_rx, flow_control) = match OverlayManager::register_peer(
+    let (control_rx, flood_rx, flow_control) = match OverlayManager::register_peer(
         &peer,
         &peer_id,
         peer_info,
@@ -804,7 +814,8 @@ pub(super) async fn connect_to_explicit_peer(
         OverlayManager::run_peer_loop(
             peer_id_clone.clone(),
             peer,
-            outbound_rx,
+            control_rx,
+            flood_rx,
             flow_control,
             shared_clone.clone(),
         )

@@ -9,13 +9,17 @@ pub trait ConnectionFactory: Send + Sync {
 
     async fn bind(&self, port: u16) -> Result<Listener>;
 
-    /// Per-peer outbound message channel capacity.
+    /// Per-peer flood channel capacity.
     ///
-    /// Controls the mpsc channel size between the overlay manager and each
-    /// peer's send loop. When the channel is full, `broadcast()` and
-    /// `try_send_to()` drop messages (logged + counted). OverLoopback
-    /// overrides this to a larger value because app-backed simulation nodes
-    /// drain the channel more slowly than production TCP peers.
+    /// Controls the bounded mpsc channel size for flood messages (SCP,
+    /// Transaction, FloodAdvert, FloodDemand) between the overlay manager
+    /// and each peer's send loop. When this channel is full, flood messages
+    /// are dropped (logged + counted via messages_dropped metric).
+    /// Non-flood messages use a separate unbounded control channel.
+    ///
+    /// Loopback overrides this to a larger value because app-backed
+    /// simulation nodes drain the channel more slowly than production
+    /// TCP peers.
     fn outbound_channel_capacity(&self) -> usize {
         256
     }

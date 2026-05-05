@@ -584,7 +584,7 @@ impl OverlayManager {
                     if let Some(entry) = peers.get(&peer_id) {
                         if !super::peer_loop::send_error_and_drop(
                             &peer_id,
-                            &entry.value().outbound_tx,
+                            &entry.value().control_tx,
                             ErrorCode::Load,
                             "random disconnect due to out of sync",
                         ) {
@@ -604,6 +604,7 @@ impl OverlayManager {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ControlMessage;
     use super::*;
     use crate::connection::{Connection, ConnectionDirection, ConnectionPool, Listener};
     use crate::connection_factory::ConnectionFactory;
@@ -642,10 +643,12 @@ mod tests {
         info_cache: &DashMap<PeerId, PeerInfo>,
         info: PeerInfo,
     ) {
-        let (tx, _rx) = mpsc::channel(8);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let (flood_tx, _flood_rx) = mpsc::channel(8);
         let peer_id = info.peer_id.clone();
         let handle = PeerHandle {
-            outbound_tx: tx,
+            control_tx,
+            flood_tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
         };
@@ -657,17 +660,19 @@ mod tests {
         peers: &DashMap<PeerId, PeerHandle>,
         info_cache: &DashMap<PeerId, PeerInfo>,
         info: PeerInfo,
-    ) -> mpsc::Receiver<super::super::OutboundMessage> {
-        let (tx, rx) = mpsc::channel(8);
+    ) -> mpsc::UnboundedReceiver<ControlMessage> {
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (flood_tx, _flood_rx) = mpsc::channel(8);
         let peer_id = info.peer_id.clone();
         let handle = PeerHandle {
-            outbound_tx: tx,
+            control_tx,
+            flood_tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
         };
         peers.insert(peer_id.clone(), handle);
         info_cache.insert(peer_id, info);
-        rx
+        control_rx
     }
 
     #[derive(Debug)]

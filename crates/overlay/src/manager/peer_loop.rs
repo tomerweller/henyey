@@ -3,7 +3,7 @@
 //! Contains `run_peer_loop`, message routing, flow control handling,
 //! ping/RTT tracking, timeout checks, and related helpers.
 
-use super::{OutboundMessage, OverlayManager, OverlayMessage, SharedPeerState};
+use super::{ControlMessage, OverlayManager, OverlayMessage, SharedPeerState};
 use crate::connection::ConnectionDirection;
 use crate::{
     codec::helpers,
@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::{ErrorCode, SError, StellarMessage, StringM, Uint256};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, info, trace, warn};
 
 /// Maximum length for error messages sent to peers, matching the XDR
@@ -299,28 +298,30 @@ pub(super) fn make_error_msg(code: ErrorCode, message: &str) -> StellarMessage {
 /// Send an error to a peer then request its task to shut down.
 ///
 /// Matches stellar-core `Peer::sendErrorAndDrop` (Peer.cpp:722-729).
-/// Uses `try_send` so this never blocks. Returns true only when the shutdown
-/// request was queued; callers that replace this peer must not assume eviction
-/// is in progress when the channel is full.
+/// Uses the unbounded control channel so delivery is not blocked by flood
+/// backpressure. Returns true if the peer loop is still alive (receiver not
+/// dropped); false if it has already exited.
 pub(super) fn send_error_and_drop(
     peer_id: &PeerId,
-    outbound_tx: &mpsc::Sender<OutboundMessage>,
+    control_tx: &mpsc::UnboundedSender<ControlMessage>,
     code: ErrorCode,
     message: &str,
 ) -> bool {
     let err_msg = make_error_msg(code, message);
-    let _ = outbound_tx.try_send(OutboundMessage::Send(err_msg));
-    let shutdown_queued = match outbound_tx.try_send(OutboundMessage::Shutdown) {
-        Ok(()) | Err(TrySendError::Closed(_)) => true,
-        Err(TrySendError::Full(_)) => false,
-    };
+    // Best-effort: if the channel is closed, the peer loop already exited,
+    // which is fine — the peer is effectively disconnected.
+    let _ = control_tx.send(ControlMessage::Send(Box::new(err_msg)));
+    // Shutdown delivery: Closed channel → peer loop already gone → treat as success.
+    // This matches the old bounded-channel semantics where TrySendError::Closed
+    // was treated as "peer disconnected" (true).
+    let _ = control_tx.send(ControlMessage::Shutdown);
     debug!(
         "Sent error to {} and requested drop: code={:?} msg={}",
         peer_id,
         code,
         truncate_error_msg(message),
     );
-    shutdown_queued
+    true
 }
 
 /// Compute the ping hash for a given nanosecond timestamp.
@@ -825,13 +826,16 @@ impl OverlayManager {
 
     /// Run the peer message loop.
     ///
-    /// The peer is owned by this task (no mutex). Outbound messages arrive
-    /// via `outbound_rx`. The `tokio::select!` multiplexes between network
-    /// recv, outbound channel, and periodic timers without blocking.
+    /// The peer is owned by this task (no mutex). Two channels deliver outbound
+    /// messages: `control_rx` (unbounded, for non-flood sends and shutdown) and
+    /// `flood_rx` (bounded, for flood messages routed through FlowControl).
+    /// The `tokio::select!` multiplexes between control, flood, network recv,
+    /// and periodic timers without blocking.
     pub(super) async fn run_peer_loop(
         peer_id: PeerId,
         mut peer: Peer,
-        mut outbound_rx: mpsc::Receiver<OutboundMessage>,
+        mut control_rx: mpsc::UnboundedReceiver<ControlMessage>,
+        mut flood_rx: mpsc::Receiver<StellarMessage>,
         flow_control: Arc<FlowControl>,
         state: SharedPeerState,
     ) {
@@ -876,20 +880,65 @@ impl OverlayManager {
                 break;
             }
 
+            // Priority drain: process pending control messages before entering
+            // the select. Bounded to prevent starvation of socket I/O and timers.
+            const CONTROL_DRAIN_BUDGET: usize = 16;
+            let mut drain_exit = false;
+            for _ in 0..CONTROL_DRAIN_BUDGET {
+                match control_rx.try_recv() {
+                    Ok(ControlMessage::Shutdown) => {
+                        info!("Peer {} loop exiting: shutdown requested (drain)", peer_id);
+                        drain_exit = true;
+                        break;
+                    }
+                    Ok(ControlMessage::Send(m)) => {
+                        if let Err(e) = peer.send(*m).await {
+                            debug!("Failed to send control to {}: {}", peer_id, e);
+                            state.metrics.errors_write.inc();
+                            drain_exit = true;
+                            break;
+                        }
+                        state.metrics.messages_written.inc();
+                        last_write = Instant::now();
+                    }
+                    Err(_) => break, // empty or disconnected
+                }
+            }
+            if drain_exit {
+                break;
+            }
+
             tokio::select! {
-                // Outbound messages from broadcast/send_to/disconnect
-                msg = outbound_rx.recv() => {
+                biased;
+
+                // Control messages (highest priority — wins tie-breaks)
+                msg = control_rx.recv() => {
                     match msg {
-                        Some(OutboundMessage::Send(m)) => {
-                            if let Err(e) = peer.send(m).await {
-                                debug!("Failed to send to {}: {}", peer_id, e);
+                        Some(ControlMessage::Shutdown) => {
+                            info!("Peer {} loop exiting: shutdown requested", peer_id);
+                            break;
+                        }
+                        Some(ControlMessage::Send(m)) => {
+                            if let Err(e) = peer.send(*m).await {
+                                debug!("Failed to send control to {}: {}", peer_id, e);
                                 state.metrics.errors_write.inc();
                                 break;
                             }
                             state.metrics.messages_written.inc();
                             last_write = Instant::now();
                         }
-                        Some(OutboundMessage::Flood(m)) => {
+                        None => {
+                            // Control channel closed (PeerHandle dropped)
+                            info!("Peer {} loop exiting: control channel closed", peer_id);
+                            break;
+                        }
+                    }
+                }
+
+                // Flood messages (bounded channel → FlowControl queue)
+                msg = flood_rx.recv() => {
+                    match msg {
+                        Some(m) => {
                             // Enqueue in FlowControl with priority-based trimming
                             flow_control.add_msg_and_maybe_trim_queue(m);
                             // Send whatever has capacity
@@ -905,13 +954,9 @@ impl OverlayManager {
                                 }
                             }
                         }
-                        Some(OutboundMessage::Shutdown) => {
-                            info!("Peer {} loop exiting: shutdown requested", peer_id);
-                            break;
-                        }
                         None => {
-                            // Channel closed (PeerHandle dropped)
-                            info!("Peer {} loop exiting: outbound channel closed", peer_id);
+                            // Flood channel closed (PeerHandle dropped)
+                            info!("Peer {} loop exiting: flood channel closed", peer_id);
                             break;
                         }
                     }
@@ -968,7 +1013,7 @@ impl OverlayManager {
                     }
                 }
 
-                // Periodic tasks: ping, timeout checks
+                // Periodic tasks: ping, timeout checks, control backlog telemetry
                 _ = periodic_interval.tick() => {
                     if Self::check_peer_timeouts(&peer_id, &PeerTimingInfo {
                         last_read,
@@ -986,6 +1031,16 @@ impl OverlayManager {
                             last_write = Instant::now();
                         }
                         Self::maybe_log_peer_stats(&peer_id, total_messages, scp_messages, &ping, &mut last_stats_log);
+                    }
+
+                    // Control channel backlog telemetry
+                    let control_backlog = control_rx.len();
+                    if control_backlog > 128 {
+                        warn!(
+                            peer = %peer_id,
+                            backlog = control_backlog,
+                            "Control channel backlog elevated — peer loop may be impaired"
+                        );
                     }
                 }
             }
@@ -1323,7 +1378,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_error_and_drop_sends_error_then_shutdown() {
-        let (tx, mut rx) = mpsc::channel::<OutboundMessage>(16);
+        let (tx, mut rx) = mpsc::unbounded_channel::<ControlMessage>();
         let peer_id = PeerId::from_bytes([1u8; 32]);
 
         assert!(send_error_and_drop(
@@ -1335,10 +1390,16 @@ mod tests {
 
         // First message should be the error
         match rx.recv().await.unwrap() {
-            OutboundMessage::Send(StellarMessage::ErrorMsg(err)) => {
-                assert_eq!(err.code, ErrorCode::Load);
-                assert_eq!(err.msg.to_string(), "test message");
-            }
+            ControlMessage::Send(m) => match *m {
+                StellarMessage::ErrorMsg(err) => {
+                    assert_eq!(err.code, ErrorCode::Load);
+                    assert_eq!(err.msg.to_string(), "test message");
+                }
+                other => panic!(
+                    "expected ErrorMsg, got {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            },
             other => panic!(
                 "expected Send(ErrorMsg), got {:?}",
                 std::mem::discriminant(&other)
@@ -1347,7 +1408,7 @@ mod tests {
 
         // Second message should be shutdown
         match rx.recv().await.unwrap() {
-            OutboundMessage::Shutdown => {}
+            ControlMessage::Shutdown => {}
             other => panic!(
                 "expected Shutdown, got {:?}",
                 std::mem::discriminant(&other)
@@ -1356,14 +1417,17 @@ mod tests {
     }
 
     #[test]
-    fn test_send_error_and_drop_reports_full_channel() {
-        let (tx, _rx) = mpsc::channel::<OutboundMessage>(1);
+    fn test_send_error_and_drop_always_reports_success() {
+        let (tx, rx) = mpsc::unbounded_channel::<ControlMessage>();
         let peer_id = PeerId::from_bytes([1u8; 32]);
-        assert!(tx.try_send(OutboundMessage::Shutdown).is_ok());
+        // Drop receiver to simulate peer loop already exited
+        drop(rx);
 
+        // Even with a closed channel, send_error_and_drop returns true because
+        // a closed channel means the peer loop already exited (peer disconnected).
         assert!(
-            !send_error_and_drop(&peer_id, &tx, ErrorCode::Load, "test message"),
-            "full channel cannot be treated as an in-progress eviction"
+            send_error_and_drop(&peer_id, &tx, ErrorCode::Load, "test message"),
+            "closed channel means peer already gone — still counts as dropped"
         );
     }
 
