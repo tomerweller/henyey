@@ -2376,7 +2376,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_restart_merges_from_has_rejects_mismatched_input() {
-        use crate::bucket_list::{BucketList, HasNextState, HAS_NEXT_STATE_INPUTS};
+        use crate::bucket_list::{BucketList, PendingMergeState};
 
         // Create a bucket list and a real bucket
         let mut bl = BucketList::default();
@@ -2391,14 +2391,12 @@ mod tests {
         let wrong_hash = wrong_bucket.hash();
         assert_ne!(real_hash, wrong_hash);
 
-        // Build next_states with state-2 inputs using the real hash
-        let mut next_states = vec![HasNextState::default(); 11];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_INPUTS,
-            output: None,
-            input_curr: Some(real_hash),
-            input_snap: Some(Hash256::ZERO),
-        };
+        // Build next_states with Inputs using the real hash
+        let mut next_states: Vec<Option<PendingMergeState>> = vec![None; 11];
+        next_states[1] = Some(PendingMergeState::Inputs {
+            curr: real_hash,
+            snap: Hash256::ZERO,
+        });
 
         // Pass a loader that returns the WRONG bucket for the real hash
         // The layer-2 assertion in restart_merges_from_has should catch this

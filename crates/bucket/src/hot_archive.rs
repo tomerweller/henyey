@@ -39,8 +39,7 @@ use henyey_common::Hash256;
 
 use crate::bucket_list::{
     bl_keep_tombstone_entries, bl_level_half, bl_level_should_spill, bl_round_down,
-    bl_should_merge_with_empty_curr, BucketListStats, HasNextState, HAS_NEXT_STATE_INPUTS,
-    HAS_NEXT_STATE_OUTPUT,
+    bl_should_merge_with_empty_curr, BucketListStats, PendingMergeState,
 };
 use crate::{BucketError, Result};
 use henyey_common::protocol::{
@@ -1269,8 +1268,8 @@ impl HotArchiveBucketList {
         let pairs: Vec<(Hash256, Hash256)> =
             hashes.chunks(2).map(|chunk| (chunk[0], chunk[1])).collect();
 
-        // Use default next states (all state=0, no pending merges)
-        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        // Use default next states (all clear, no pending merges)
+        let next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
 
         Self::restore_from_has(&pairs, &next_states, load_bucket)
     }
@@ -1283,11 +1282,11 @@ impl HotArchiveBucketList {
     /// # Arguments
     ///
     /// * `hashes` - Vec of (curr_hash, snap_hash) pairs for each level
-    /// * `next_states` - Vec of HasNextState for each level
+    /// * `next_states` - Pending merge state for each level
     /// * `load_bucket` - Thread-safe function to load a HotArchiveBucket by hash
     pub fn restore_from_has_parallel<F>(
         hashes: &[(Hash256, Hash256)],
-        next_states: &[HasNextState],
+        next_states: &[Option<PendingMergeState>],
         load_bucket: F,
     ) -> Result<Self>
     where
@@ -1320,23 +1319,16 @@ impl HotArchiveBucketList {
 
                         let snap = load_hot_or_sentinel_shared(snap_hash, load_bucket)?;
 
-                        let next = if state.state == HAS_NEXT_STATE_OUTPUT {
-                            if let Some(ref output_hash) = state.output {
-                                if !output_hash.is_zero() {
-                                    tracing::debug!(
-                                        level = i,
-                                        output_hash = %output_hash.to_hex(),
-                                        "hot_archive restore_from_has_parallel: loading completed merge output"
-                                    );
-                                    Some(load_hot_and_verify_shared(output_hash, load_bucket)?)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
+                        let next = match state {
+                            Some(PendingMergeState::Output(output_hash)) => {
+                                tracing::debug!(
+                                    level = i,
+                                    output_hash = %output_hash.to_hex(),
+                                    "hot_archive restore_from_has_parallel: loading completed merge output"
+                                );
+                                Some(load_hot_and_verify_shared(output_hash, load_bucket)?)
                             }
-                        } else {
-                            None
+                            _ => None,
                         };
 
                         let mut level = HotArchiveBucketLevel::new(i);
@@ -1372,11 +1364,11 @@ impl HotArchiveBucketList {
     /// # Arguments
     ///
     /// * `hashes` - Vec of (curr_hash, snap_hash) pairs for each level
-    /// * `next_states` - Vec of HasNextState for each level
+    /// * `next_states` - Pending merge state for each level
     /// * `load_bucket` - Function to load a HotArchiveBucket by hash
     pub fn restore_from_has<F>(
         hashes: &[(Hash256, Hash256)],
-        next_states: &[HasNextState],
+        next_states: &[Option<PendingMergeState>],
         mut load_bucket: F,
     ) -> Result<Self>
     where
@@ -1404,25 +1396,18 @@ impl HotArchiveBucketList {
 
             let snap = load_hot_or_sentinel(snap_hash, &mut load_bucket)?;
 
-            // Check if there's a completed merge (state == HAS_NEXT_STATE_OUTPUT) for this level
-            let state = &next_states[i];
-            let next = if state.state == HAS_NEXT_STATE_OUTPUT {
-                if let Some(ref output_hash) = state.output {
-                    if !output_hash.is_zero() {
-                        tracing::debug!(
-                            level = i,
-                            output_hash = %output_hash.to_hex(),
-                            "hot_archive restore_from_has: loading completed merge output"
-                        );
-                        Some(load_hot_and_verify(output_hash, &mut load_bucket)?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+            // Load completed merge output if present.
+            // Inputs-state merges are handled later in restart_merges_from_has.
+            let next = match &next_states[i] {
+                Some(PendingMergeState::Output(output_hash)) => {
+                    tracing::debug!(
+                        level = i,
+                        output_hash = %output_hash.to_hex(),
+                        "hot_archive restore_from_has: loading completed merge output"
+                    );
+                    Some(load_hot_and_verify(output_hash, &mut load_bucket)?)
                 }
-            } else {
-                None
+                _ => None,
             };
 
             let mut level = HotArchiveBucketLevel::new(i);
@@ -1457,7 +1442,7 @@ impl HotArchiveBucketList {
         &mut self,
         ledger: u32,
         protocol_version: u32,
-        next_states: &[HasNextState],
+        next_states: &[Option<PendingMergeState>],
         mut load_bucket: F,
         restart_structure_based: bool,
     ) -> Result<()>
@@ -1487,47 +1472,47 @@ impl HotArchiveBucketList {
                 continue;
             }
 
-            // Check if HAS has stored input hashes for this level (state 2)
+            // Check if HAS has stored input hashes for this level
             let state = &next_states[i];
-            if state.state == HAS_NEXT_STATE_INPUTS {
-                if let (Some(ref curr_hash), Some(ref snap_hash)) =
-                    (&state.input_curr, &state.input_snap)
-                {
-                    // Load the input buckets from the stored hashes
-                    let input_curr = load_hot_or_sentinel(curr_hash, &mut load_bucket)?;
+            if let Some(PendingMergeState::Inputs {
+                curr: ref curr_hash,
+                snap: ref snap_hash,
+            }) = state
+            {
+                // Load the input buckets from the stored hashes
+                let input_curr = load_hot_or_sentinel(curr_hash, &mut load_bucket)?;
 
-                    let input_snap = load_hot_or_sentinel(snap_hash, &mut load_bucket)?;
+                let input_snap = load_hot_or_sentinel(snap_hash, &mut load_bucket)?;
 
-                    tracing::info!(
-                        level = i,
-                        ledger = ledger,
-                        input_curr_hash = %curr_hash.to_hex(),
-                        input_snap_hash = %snap_hash.to_hex(),
-                        "hot_archive restart_merges_from_has: restarting merge with HAS input hashes"
-                    );
+                tracing::info!(
+                    level = i,
+                    ledger = ledger,
+                    input_curr_hash = %curr_hash.to_hex(),
+                    input_snap_hash = %snap_hash.to_hex(),
+                    "hot_archive restart_merges_from_has: restarting merge with HAS input hashes"
+                );
 
-                    // Perform the merge with the exact input hashes from HAS
-                    // Use the caller's protocol_version (from ledger header) as the
-                    // max protocol version, matching stellar-core behavior in restartMerges
-                    // where makeLive() is called with maxProtocolVersion.
-                    let keep_tombstones = Self::keep_tombstone_entries(i);
+                // Perform the merge with the exact input hashes from HAS
+                // Use the caller's protocol_version (from ledger header) as the
+                // max protocol version, matching stellar-core behavior in restartMerges
+                // where makeLive() is called with maxProtocolVersion.
+                let keep_tombstones = Self::keep_tombstone_entries(i);
 
-                    let merged = merge_hot_archive_buckets(
-                        &input_curr,
-                        &input_snap,
-                        protocol_version, // Use caller's protocol version, not bucket's
-                        keep_tombstones,
-                    )?;
+                let merged = merge_hot_archive_buckets(
+                    &input_curr,
+                    &input_snap,
+                    protocol_version, // Use caller's protocol version, not bucket's
+                    keep_tombstones,
+                )?;
 
-                    tracing::info!(
-                        level = i,
-                        merged_hash = %merged.hash().to_hex(),
-                        "hot_archive restart_merges_from_has: merge completed"
-                    );
+                tracing::info!(
+                    level = i,
+                    merged_hash = %merged.hash().to_hex(),
+                    "hot_archive restart_merges_from_has: merge completed"
+                );
 
-                    self.levels[i].next = Some(merged);
-                    continue;
-                }
+                self.levels[i].next = Some(merged);
+                continue;
             }
         }
 
@@ -2328,7 +2313,7 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
         hashes[0] = (correct.hash(), Hash256::ZERO);
 
-        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
 
         let correct_hash = correct.hash();
         let wrong_clone = wrong.clone();
@@ -2362,7 +2347,7 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
         hashes[0] = (correct.hash(), Hash256::ZERO);
 
-        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
 
         let correct_hash = correct.hash();
         let wrong_clone = wrong.clone();
@@ -2405,12 +2390,8 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
         hashes[0] = (hc, Hash256::ZERO);
 
-        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        next_states[0] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(ho),
-            ..Default::default()
-        };
+        let mut next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[0] = Some(PendingMergeState::Output(ho));
 
         let wrong_clone = bucket_wrong.clone();
         let loader = make_hot_loader(vec![bucket_curr]);
@@ -2454,12 +2435,8 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
         hashes[0] = (hc, Hash256::ZERO);
 
-        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        next_states[0] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(ho),
-            ..Default::default()
-        };
+        let mut next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[0] = Some(PendingMergeState::Output(ho));
 
         let wrong_clone = bucket_wrong.clone();
         let loader = make_hot_loader(vec![bucket_curr]);
@@ -2480,7 +2457,7 @@ mod tests {
     #[test]
     fn test_hot_restore_from_has_next_states_under_length() {
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS - 1];
+        let next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS - 1];
 
         let result = HotArchiveBucketList::restore_from_has(&hashes, &next_states, |_| {
             unreachable!("should not call loader")
@@ -2496,7 +2473,7 @@ mod tests {
     #[test]
     fn test_hot_restore_from_has_next_states_over_length() {
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS + 1];
+        let next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS + 1];
 
         let result = HotArchiveBucketList::restore_from_has(&hashes, &next_states, |_| {
             unreachable!("should not call loader")
@@ -2512,7 +2489,7 @@ mod tests {
     #[test]
     fn test_hot_restart_merges_from_has_next_states_under_length() {
         let mut ha = HotArchiveBucketList::new();
-        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS - 1];
+        let next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS - 1];
 
         let result = ha.restart_merges_from_has(1, 25, &next_states, |_| unreachable!(), false);
         assert!(result.is_err());
@@ -2526,7 +2503,7 @@ mod tests {
     #[test]
     fn test_hot_restart_merges_from_has_next_states_over_length() {
         let mut ha = HotArchiveBucketList::new();
-        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS + 1];
+        let next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS + 1];
 
         let result = ha.restart_merges_from_has(1, 25, &next_states, |_| unreachable!(), false);
         assert!(result.is_err());
@@ -2542,15 +2519,13 @@ mod tests {
         // Genesis restart: protocol_version=0, all-CLEAR next states, restart_structure_based=true.
         // All prev-level snaps are empty → restart_merges breaks immediately → no-op, no panic.
         let mut ha = HotArchiveBucketList::new();
-        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
         ha.restart_merges_from_has(1, 0, &next_states, |_| unreachable!(), true)
             .unwrap();
     }
 
     #[test]
     fn test_hot_restart_merges_from_has_hash_mismatch_input() {
-        use crate::bucket_list::{HasNextState, HAS_NEXT_STATE_INPUTS};
-
         let mut ha = HotArchiveBucketList::new();
 
         // Create a real hot archive bucket with an entry
@@ -2568,13 +2543,11 @@ mod tests {
         assert_ne!(real_hash, wrong_hash);
 
         // Build next_states with state-2 inputs using the real hash at level 1
-        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_INPUTS,
-            output: None,
-            input_curr: Some(real_hash),
-            input_snap: Some(Hash256::ZERO),
-        };
+        let mut next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[1] = Some(PendingMergeState::Inputs {
+            curr: real_hash,
+            snap: Hash256::ZERO,
+        });
 
         // Loader returns the WRONG bucket for the real hash
         let result = ha.restart_merges_from_has(
@@ -2650,10 +2623,8 @@ mod tests {
 
     #[test]
     fn test_restore_from_has_handles_zero_hash_sentinel() {
-        use crate::bucket_list::HasNextState;
-
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
 
         // Loader that errors on any call — proves sentinel handling works
         let loader = |_: &Hash256| -> Result<HotArchiveBucket> {
@@ -2670,10 +2641,8 @@ mod tests {
 
     #[test]
     fn test_restore_from_has_parallel_handles_zero_hash_sentinel() {
-        use crate::bucket_list::HasNextState;
-
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
 
         // Loader that errors on any call — proves parallel sentinel handling works
         let loader = |_: &Hash256| -> Result<HotArchiveBucket> {
@@ -2701,13 +2670,8 @@ mod tests {
     #[test]
     fn test_hot_archive_restore_fails_on_missing_state1_output() {
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(phantom_hash()),
-            input_curr: None,
-            input_snap: None,
-        };
+        let mut next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[1] = Some(PendingMergeState::Output(phantom_hash()));
 
         let result = HotArchiveBucketList::restore_from_has(
             &hashes,
@@ -2729,13 +2693,8 @@ mod tests {
     #[test]
     fn test_hot_archive_restore_parallel_fails_on_missing_state1_output() {
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(phantom_hash()),
-            input_curr: None,
-            input_snap: None,
-        };
+        let mut next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[1] = Some(PendingMergeState::Output(phantom_hash()));
 
         let loader = |hash: &Hash256| -> Result<HotArchiveBucket> {
             Err(BucketError::Serialization(format!(
@@ -2754,13 +2713,11 @@ mod tests {
     #[test]
     fn test_hot_archive_restart_merges_fails_on_missing_state2_inputs() {
         let mut bl = HotArchiveBucketList::default();
-        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_INPUTS,
-            input_curr: Some(phantom_hash()),
-            input_snap: Some(Hash256::ZERO),
-            output: None,
-        };
+        let mut next_states = vec![None; HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[1] = Some(PendingMergeState::Inputs {
+            curr: phantom_hash(),
+            snap: Hash256::ZERO,
+        });
 
         let result = bl.restart_merges_from_has(
             1,

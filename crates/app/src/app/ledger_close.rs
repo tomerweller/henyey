@@ -632,31 +632,13 @@ impl App {
             .filter(|h| !h.is_zero())
             .collect();
         // Include pending merge hashes (output for state-1, inputs for state-2)
-        for level in &has.current_buckets {
-            if level.next.state == 1 {
-                if let Some(ref output_hex) = level.next.output {
-                    if let Ok(hash) = Hash256::from_hex(output_hex) {
-                        if !hash.is_zero() {
-                            essential_hashes.push(hash);
-                        }
-                    }
-                }
-            } else if level.next.state == 2 {
-                if let Some(ref input_hex) = level.next.curr {
-                    if let Ok(hash) = Hash256::from_hex(input_hex) {
-                        if !hash.is_zero() {
-                            essential_hashes.push(hash);
-                        }
-                    }
-                }
-                if let Some(ref input_hex) = level.next.snap {
-                    if let Ok(hash) = Hash256::from_hex(input_hex) {
-                        if !hash.is_zero() {
-                            essential_hashes.push(hash);
-                        }
-                    }
-                }
-            }
+        for merge_state in has.live_next_states()?.iter().flatten() {
+            essential_hashes.extend(
+                merge_state
+                    .referenced_hashes()
+                    .filter(|h| !h.is_zero())
+                    .copied(),
+            );
         }
         // Also include hot archive bucket hashes (curr, snap, and pending merges)
         if let Some(hot_pairs) = has.hot_archive_bucket_hash_pairs() {
@@ -670,25 +652,13 @@ impl App {
             }
         }
         if let Some(hot_next_states) = has.hot_archive_next_states()? {
-            for state in &hot_next_states {
-                if state.state == 1 {
-                    if let Some(ref output_hash) = state.output {
-                        if !output_hash.is_zero() {
-                            essential_hashes.push(*output_hash);
-                        }
-                    }
-                } else if state.state == 2 {
-                    if let Some(ref input_hash) = state.input_curr {
-                        if !input_hash.is_zero() {
-                            essential_hashes.push(*input_hash);
-                        }
-                    }
-                    if let Some(ref input_hash) = state.input_snap {
-                        if !input_hash.is_zero() {
-                            essential_hashes.push(*input_hash);
-                        }
-                    }
-                }
+            for merge_state in hot_next_states.iter().flatten() {
+                essential_hashes.extend(
+                    merge_state
+                        .referenced_hashes()
+                        .filter(|h| !h.is_zero())
+                        .copied(),
+                );
             }
         }
 
@@ -725,16 +695,7 @@ impl App {
         let reconstruct_start = std::time::Instant::now();
 
         let live_hash_pairs = has.bucket_hash_pairs();
-        let live_next_states: Vec<HasNextState> = has
-            .live_next_states()?
-            .into_iter()
-            .map(|s| HasNextState {
-                state: s.state,
-                output: s.output,
-                input_curr: s.input_curr,
-                input_snap: s.input_snap,
-            })
-            .collect();
+        let live_next_states: Vec<Option<PendingMergeState>> = has.live_next_states()?;
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
 
         // Step 6a: Parallel restore of live BucketList (all levels loaded concurrently).
@@ -797,17 +758,8 @@ impl App {
 
         // Step 6e: Restore hot archive (~1s, sequential).
         let hot_archive = if let Some(hot_hash_pairs) = has.hot_archive_bucket_hash_pairs() {
-            let hot_next_states: Vec<HasNextState> = has
-                .hot_archive_next_states()?
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| HasNextState {
-                    state: s.state,
-                    output: s.output,
-                    input_curr: s.input_curr,
-                    input_snap: s.input_snap,
-                })
-                .collect();
+            let hot_next_states: Vec<Option<PendingMergeState>> =
+                has.hot_archive_next_states()?.unwrap_or_default();
 
             // Parity: all hot archive bucket files (including pending merge
             // outputs/inputs) are validated by the preflight check above.
@@ -1073,16 +1025,7 @@ impl App {
     ) -> anyhow::Result<(BucketList, HotArchiveBucketList)> {
         // Reconstruct live BucketList
         let live_hash_pairs = has.bucket_hash_pairs();
-        let live_next_states: Vec<HasNextState> = has
-            .live_next_states()?
-            .into_iter()
-            .map(|s| HasNextState {
-                state: s.state,
-                output: s.output,
-                input_curr: s.input_curr,
-                input_snap: s.input_snap,
-            })
-            .collect();
+        let live_next_states: Vec<Option<PendingMergeState>> = has.live_next_states()?;
 
         // Parity: stellar-core fails hard on missing bucket files
         // (LedgerManagerImpl.cpp:555-560). All referenced files (curr, snap,
@@ -1132,17 +1075,8 @@ impl App {
 
         // Reconstruct hot archive BucketList (or create empty)
         let hot_archive = if let Some(hot_hash_pairs) = has.hot_archive_bucket_hash_pairs() {
-            let hot_next_states: Vec<HasNextState> = has
-                .hot_archive_next_states()?
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| HasNextState {
-                    state: s.state,
-                    output: s.output,
-                    input_curr: s.input_curr,
-                    input_snap: s.input_snap,
-                })
-                .collect();
+            let hot_next_states: Vec<Option<PendingMergeState>> =
+                has.hot_archive_next_states()?.unwrap_or_default();
 
             let bucket_manager = self.bucket_manager.clone();
             let load_hot =

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use stellar_xdr::curr::WriteXdr;
 
 use henyey_app::AppConfig;
-use henyey_bucket::{BucketList, BucketManager, HasNextState, HotArchiveBucketList};
+use henyey_bucket::{BucketList, BucketManager, HotArchiveBucketList, PendingMergeState};
 use henyey_common::Hash256;
 use henyey_history::cdp::{
     extract_ledger_close_data, extract_ledger_header, extract_transaction_results,
@@ -624,18 +624,13 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
     // Extract bucket hashes
     let bucket_hashes = init_has.bucket_hash_pairs();
 
-    let live_next_states: Vec<HasNextState> = init_has
-        .live_next_states()?
-        .into_iter()
-        .map(HasNextState::from)
-        .collect();
+    let live_next_states: Vec<Option<PendingMergeState>> = init_has.live_next_states()?;
 
     // Extract hot archive bucket hashes (protocol 23+)
     let hot_archive_hashes = init_has.hot_archive_bucket_hash_pairs();
 
-    let hot_archive_next_states: Option<Vec<HasNextState>> = init_has
-        .hot_archive_next_states()?
-        .map(|states| states.into_iter().map(HasNextState::from).collect());
+    let hot_archive_next_states: Option<Vec<Option<PendingMergeState>>> =
+        init_has.hot_archive_next_states()?;
 
     // Collect all bucket hashes to download
     let mut all_hashes: Vec<Hash256> = Vec::new();
@@ -643,16 +638,8 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
         all_hashes.push(*curr);
         all_hashes.push(*snap);
     }
-    for state in &live_next_states {
-        if let Some(ref output) = state.output {
-            all_hashes.push(*output);
-        }
-        if let Some(ref input_curr) = state.input_curr {
-            all_hashes.push(*input_curr);
-        }
-        if let Some(ref input_snap) = state.input_snap {
-            all_hashes.push(*input_snap);
-        }
+    for merge_state in live_next_states.iter().flatten() {
+        all_hashes.extend(merge_state.referenced_hashes().copied());
     }
     if let Some(ref ha_hashes) = hot_archive_hashes {
         for (curr, snap) in ha_hashes {
@@ -661,16 +648,8 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
         }
     }
     if let Some(ref ha_states) = hot_archive_next_states {
-        for state in ha_states {
-            if let Some(ref output) = state.output {
-                all_hashes.push(*output);
-            }
-            if let Some(ref input_curr) = state.input_curr {
-                all_hashes.push(*input_curr);
-            }
-            if let Some(ref input_snap) = state.input_snap {
-                all_hashes.push(*input_snap);
-            }
+        for merge_state in ha_states.iter().flatten() {
+            all_hashes.extend(merge_state.referenced_hashes().copied());
         }
     }
     let all_hashes: Vec<&Hash256> = all_hashes.iter().filter(|h| !h.is_zero()).collect();

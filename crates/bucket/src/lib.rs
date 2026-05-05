@@ -128,8 +128,7 @@ const XDR_RECORD_LEN_MASK: u32 = 0x7FFF_FFFF;
 
 pub use bucket::Bucket;
 pub use bucket_list::{
-    BucketLevel, BucketList, BucketListStats, HasNextState, PendingMergeState, BUCKET_LIST_LEVELS,
-    HAS_NEXT_STATE_CLEAR, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT,
+    BucketLevel, BucketList, BucketListStats, PendingMergeState, BUCKET_LIST_LEVELS,
 };
 
 // ============================================================================

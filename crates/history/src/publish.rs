@@ -44,11 +44,14 @@
 //! ```
 
 use crate::{
-    archive_state::{HASBucketLevel, HASBucketNext, HistoryArchiveState},
+    archive_state::{
+        HASBucketLevel, HASBucketNext, HistoryArchiveState, HAS_NEXT_STATE_INPUTS,
+        HAS_NEXT_STATE_OUTPUT,
+    },
     checkpoint::is_checkpoint_ledger,
     paths, verify, HistoryError, Result,
 };
-use henyey_bucket::{BucketList, PendingMergeState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
+use henyey_bucket::{BucketList, PendingMergeState};
 use henyey_common::fs_utils::{
     atomic_gzip_copy, atomic_gzip_xdr_write_iter, atomic_gzip_xdr_write_slice, atomic_write_bytes,
 };

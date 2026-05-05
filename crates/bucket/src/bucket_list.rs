@@ -78,13 +78,8 @@ use henyey_common::{is_persistent_entry, is_soroban_entry, is_temporary_entry};
 /// Number of levels in the BucketList (matches stellar-core's `kNumLevels`).
 pub const BUCKET_LIST_LEVELS: usize = 11;
 
-/// FutureBucket state constants (matches stellar-core's FBStatus enum in HAS JSON).
-/// HAS_NEXT_STATE_CLEAR: No pending merge
-/// HAS_NEXT_STATE_OUTPUT: Merge complete, output hash is known
-/// HAS_NEXT_STATE_INPUTS: Merge in progress, input hashes are stored
-pub const HAS_NEXT_STATE_CLEAR: u32 = 0;
-pub const HAS_NEXT_STATE_OUTPUT: u32 = 1;
-pub const HAS_NEXT_STATE_INPUTS: u32 = 2;
+// HAS_NEXT_STATE constants moved to crates/history/src/archive_state.rs
+// (they are HAS-JSON-format concerns, not bucket-domain concepts)
 
 // ============================================================================
 // Bucket list arithmetic helpers (shared by BucketList and HotArchiveBucketList)
@@ -167,27 +162,6 @@ pub(crate) fn bl_should_merge_with_empty_curr(
     bl_level_should_spill(next_change_ledger, level, num_levels)
 }
 
-/// State of a pending bucket merge from History Archive State (HAS).
-///
-/// When restoring from a HAS, each level may have a pending merge:
-/// - State 0 (CLEAR): No pending merge
-/// - State 1 (OUTPUT): Merge complete, output hash is set
-/// - State 2 (INPUTS): Merge in progress, input curr/snap hashes are set
-///
-/// For state 1, use the output hash directly as the level's `next` bucket.
-/// For state 2, restart the merge using the stored input hashes.
-#[derive(Clone, Debug, Default)]
-pub struct HasNextState {
-    /// Merge state (0 = clear, 1 = output, 2 = inputs)
-    pub state: u32,
-    /// Output bucket hash if merge is complete (state == 1)
-    pub output: Option<Hash256>,
-    /// Input curr bucket hash for pending merge (state == 2)
-    pub input_curr: Option<Hash256>,
-    /// Input snap bucket hash for pending merge (state == 2)
-    pub input_snap: Option<Hash256>,
-}
-
 /// Pending merge result for a bucket level.
 ///
 /// This supports two modes matching stellar-core:
@@ -211,12 +185,27 @@ pub enum PendingMerge {
 /// - State 0 (clear): no pending merge (represented by `None` at call site)
 /// - State 1 (output): merge completed, output hash known
 /// - State 2 (inputs): merge in progress, input hashes known
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingMergeState {
-    /// State 1: merge completed, output bucket hash is known
+    /// State 1: merge completed, output bucket hash is known.
+    /// Invariant: the hash is guaranteed non-zero (zero-hash outputs are
+    /// canonicalized to `None` at parse time).
     Output(Hash256),
     /// State 2: merge in progress, input curr/snap hashes are known
     Inputs { curr: Hash256, snap: Hash256 },
+}
+
+impl PendingMergeState {
+    /// All bucket hashes referenced by this merge state.
+    /// Invariant: all returned hashes are non-zero (enforced by parse-time canonicalization).
+    pub fn referenced_hashes(&self) -> impl Iterator<Item = &Hash256> {
+        match self {
+            PendingMergeState::Output(h) => [Some(h), None].into_iter().flatten(),
+            PendingMergeState::Inputs { curr, snap } => {
+                [Some(curr), Some(snap)].into_iter().flatten()
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for PendingMerge {
@@ -2254,8 +2243,8 @@ impl BucketList {
         let pairs: Vec<(Hash256, Hash256)> =
             hashes.chunks(2).map(|chunk| (chunk[0], chunk[1])).collect();
 
-        // Use default next states (all state=0, no pending merges)
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        // Use default next states (all clear, no pending merges)
+        let next_states = vec![None; BUCKET_LIST_LEVELS];
 
         Self::restore_from_has(&pairs, &next_states, load_bucket)
     }
@@ -2269,11 +2258,11 @@ impl BucketList {
     /// # Arguments
     ///
     /// * `hashes` - Vec of (curr_hash, snap_hash) pairs for each level
-    /// * `next_states` - Vec of HasNextState for each level
+    /// * `next_states` - Vec of pending merge states for each level
     /// * `load_bucket` - Thread-safe function to load a bucket from its hash
     pub fn restore_from_has_parallel<F>(
         hashes: &[(Hash256, Hash256)],
-        next_states: &[HasNextState],
+        next_states: &[Option<PendingMergeState>],
         load_bucket: F,
     ) -> Result<Self>
     where
@@ -2300,16 +2289,9 @@ impl BucketList {
         let output_hashes: Vec<(usize, Hash256)> = next_states
             .iter()
             .enumerate()
-            .filter_map(|(i, state)| {
-                if state.state == HAS_NEXT_STATE_OUTPUT {
-                    state
-                        .output
-                        .as_ref()
-                        .filter(|h| !h.is_zero())
-                        .map(|h| (i, *h))
-                } else {
-                    None
-                }
+            .filter_map(|(i, state)| match state {
+                Some(PendingMergeState::Output(h)) => Some((i, *h)),
+                _ => None,
             })
             .collect();
 
@@ -2419,11 +2401,11 @@ impl BucketList {
     /// # Arguments
     ///
     /// * `hashes` - Vec of (curr_hash, snap_hash) pairs for each level
-    /// * `next_states` - Vec of HasNextState for each level
+    /// * `next_states` - Pending merge state for each level
     /// * `load_bucket` - Function to load a bucket from its hash
     pub fn restore_from_has<F>(
         hashes: &[(Hash256, Hash256)],
-        next_states: &[HasNextState],
+        next_states: &[Option<PendingMergeState>],
         mut load_bucket: F,
     ) -> Result<Self>
     where
@@ -2459,39 +2441,21 @@ impl BucketList {
                 "restore_from_has: loaded level"
             );
 
-            // Check if there's a completed merge (state == HAS_NEXT_STATE_OUTPUT) for this level
-            let state = &next_states[i];
-            let next: Option<PendingMerge> = if state.state == HAS_NEXT_STATE_OUTPUT {
-                if let Some(ref output_hash) = state.output {
-                    // `is_zero` here means "no merge result recorded" — the
-                    // FutureBucket state was effectively cleared. This is
-                    // distinct from an `empty_hash()` output, which represents
-                    // a real (empty-content) completed merge that should still
-                    // be loaded as a `PendingMerge::InMemory`. The underlying
-                    // loader (`BucketManager::load_bucket` via
-                    // `Bucket::for_sentinel_hash`) already handles
-                    // `empty_hash()` correctly, so we don't need the sentinel
-                    // helper here.
-                    if !output_hash.is_zero() {
-                        tracing::debug!(
-                            level = i,
-                            output_hash = %output_hash.to_hex(),
-                            "restore_from_has: loading completed merge output"
-                        );
-                        Some(PendingMerge::InMemory(load_and_verify(
-                            output_hash,
-                            &mut load_bucket,
-                        )?))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+            // Load completed merge output if present.
+            // Inputs-state merges are handled later in restart_merges_from_has.
+            let next: Option<PendingMerge> = match &next_states[i] {
+                Some(PendingMergeState::Output(output_hash)) => {
+                    tracing::debug!(
+                        level = i,
+                        output_hash = %output_hash.to_hex(),
+                        "restore_from_has: loading completed merge output"
+                    );
+                    Some(PendingMerge::InMemory(load_and_verify(
+                        output_hash,
+                        &mut load_bucket,
+                    )?))
                 }
-            } else {
-                // For state 2 (HAS_NEXT_STATE_INPUTS), we don't set next here.
-                // The merge will be restarted in restart_merges_from_has.
-                None
+                _ => None,
             };
 
             let mut level = BucketLevel::new(i);
@@ -2539,7 +2503,7 @@ impl BucketList {
         &mut self,
         ledger: u32,
         protocol_version: u32,
-        next_states: &[HasNextState],
+        next_states: &[Option<PendingMergeState>],
         mut load_bucket: F,
         restart_structure_based: bool,
     ) -> Result<()>
@@ -2580,28 +2544,28 @@ impl BucketList {
             }
 
             let state = &next_states[i];
-            if state.state == HAS_NEXT_STATE_INPUTS {
-                if let (Some(ref curr_hash), Some(ref snap_hash)) =
-                    (&state.input_curr, &state.input_snap)
-                {
-                    let input_curr = load_or_sentinel(curr_hash, &mut load_bucket)?;
-                    let input_snap = load_or_sentinel(snap_hash, &mut load_bucket)?;
+            if let Some(PendingMergeState::Inputs {
+                curr: ref curr_hash,
+                snap: ref snap_hash,
+            }) = state
+            {
+                let input_curr = load_or_sentinel(curr_hash, &mut load_bucket)?;
+                let input_snap = load_or_sentinel(snap_hash, &mut load_bucket)?;
 
-                    tracing::info!(
-                        level = i,
-                        ledger = ledger,
-                        input_curr_hash = %curr_hash.to_hex(),
-                        input_snap_hash = %snap_hash.to_hex(),
-                        "restart_merges_from_has: queueing merge"
-                    );
+                tracing::info!(
+                    level = i,
+                    ledger = ledger,
+                    input_curr_hash = %curr_hash.to_hex(),
+                    input_snap_hash = %snap_hash.to_hex(),
+                    "restart_merges_from_has: queueing merge"
+                );
 
-                    work_items.push(MergeWorkItem {
-                        level: i,
-                        input_curr,
-                        input_snap,
-                        keep_dead: Self::keep_tombstone_entries(i),
-                    });
-                }
+                work_items.push(MergeWorkItem {
+                    level: i,
+                    input_curr,
+                    input_snap,
+                    keep_dead: Self::keep_tombstone_entries(i),
+                });
             }
         }
 
@@ -4296,7 +4260,7 @@ mod tests {
         hashes[0] = (h0c, Hash256::ZERO);
         hashes[1] = (h1c, Hash256::ZERO);
 
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        let next_states = vec![None; BUCKET_LIST_LEVELS];
 
         let loader = make_loader(vec![bucket0_curr, bucket1_curr]);
         let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
@@ -4337,13 +4301,8 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
         hashes[0] = (hc, Hash256::ZERO);
 
-        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
-        next_states[0] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(ho),
-            input_curr: None,
-            input_snap: None,
-        };
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[0] = Some(PendingMergeState::Output(ho));
 
         let loader = make_loader(vec![bucket_curr, bucket_out]);
         let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
@@ -4372,7 +4331,7 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
         hashes[3] = (h, Hash256::ZERO);
 
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS]; // all CLEAR
+        let next_states = vec![None; BUCKET_LIST_LEVELS]; // all CLEAR
 
         let loader = make_loader(vec![bucket]);
         let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
@@ -4413,13 +4372,8 @@ mod tests {
         hashes[2] = (h2c, Hash256::ZERO);
 
         // Level 1 has a completed merge output
-        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(hout),
-            input_curr: None,
-            input_snap: None,
-        };
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[1] = Some(PendingMergeState::Output(hout));
 
         let all_buckets = vec![b0c, b0s, b2c, bout];
 
@@ -4458,7 +4412,7 @@ mod tests {
     #[test]
     fn test_restore_from_has_parallel_wrong_level_count_errors() {
         // Passing wrong number of levels must return an error.
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        let next_states = vec![None; BUCKET_LIST_LEVELS];
         let too_short = vec![(Hash256::ZERO, Hash256::ZERO); 5]; // < BUCKET_LIST_LEVELS
 
         let result = BucketList::restore_from_has_parallel(&too_short, &next_states, |_| {
@@ -4477,7 +4431,7 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
         hashes[0] = (*Hash256::empty_hash(), Hash256::ZERO);
 
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        let next_states = vec![None; BUCKET_LIST_LEVELS];
 
         let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, make_loader(vec![]))
             .unwrap();
@@ -4494,7 +4448,7 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
         hashes[0] = (*Hash256::empty_hash(), Hash256::ZERO);
 
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        let next_states = vec![None; BUCKET_LIST_LEVELS];
 
         let bl = BucketList::restore_from_has(&hashes, &next_states, make_loader(vec![])).unwrap();
 
@@ -4514,7 +4468,7 @@ mod tests {
         hashes[0] = (*Hash256::empty_hash(), Hash256::ZERO);
         hashes[1] = (Hash256::ZERO, *Hash256::empty_hash());
 
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        let next_states = vec![None; BUCKET_LIST_LEVELS];
 
         let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, make_loader(vec![]))
             .unwrap();
@@ -4811,7 +4765,7 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
         hashes[0] = (correct_bucket.hash(), Hash256::ZERO);
 
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        let next_states = vec![None; BUCKET_LIST_LEVELS];
 
         let loader = make_wrong_hash_loader(correct_bucket, wrong_bucket);
         let result = BucketList::restore_from_has(&hashes, &next_states, loader);
@@ -4830,7 +4784,7 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
         hashes[0] = (correct_bucket.hash(), Hash256::ZERO);
 
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        let next_states = vec![None; BUCKET_LIST_LEVELS];
 
         let loader = make_wrong_hash_loader(correct_bucket, wrong_bucket);
         let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader);
@@ -4855,12 +4809,8 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
         hashes[0] = (hc, Hash256::ZERO);
 
-        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
-        next_states[0] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(ho),
-            ..Default::default()
-        };
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[0] = Some(PendingMergeState::Output(ho));
 
         // Loader returns wrong bucket when output hash is requested
         let wrong_clone = bucket_wrong.clone();
@@ -4896,12 +4846,8 @@ mod tests {
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
         hashes[0] = (hc, Hash256::ZERO);
 
-        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
-        next_states[0] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(ho),
-            ..Default::default()
-        };
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[0] = Some(PendingMergeState::Output(ho));
 
         let wrong_clone = bucket_wrong.clone();
         let loader = make_loader(vec![bucket_curr]);
@@ -4921,7 +4867,7 @@ mod tests {
     #[test]
     fn test_restore_from_has_next_states_under_length() {
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS - 1]; // too short
+        let next_states = vec![None; BUCKET_LIST_LEVELS - 1]; // too short
 
         let result = BucketList::restore_from_has(&hashes, &next_states, |_| {
             unreachable!("should not call loader")
@@ -4937,7 +4883,7 @@ mod tests {
     #[test]
     fn test_restore_from_has_next_states_over_length() {
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS + 1]; // too long
+        let next_states = vec![None; BUCKET_LIST_LEVELS + 1]; // too long
 
         let result = BucketList::restore_from_has(&hashes, &next_states, |_| {
             unreachable!("should not call loader")
@@ -4953,7 +4899,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_restart_merges_from_has_next_states_under_length() {
         let mut bl = BucketList::new();
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS - 1];
+        let next_states = vec![None; BUCKET_LIST_LEVELS - 1];
 
         let result = bl
             .restart_merges_from_has(1, 25, &next_states, |_| unreachable!(), false)
@@ -4969,7 +4915,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_restart_merges_from_has_next_states_over_length() {
         let mut bl = BucketList::new();
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS + 1];
+        let next_states = vec![None; BUCKET_LIST_LEVELS + 1];
 
         let result = bl
             .restart_merges_from_has(1, 25, &next_states, |_| unreachable!(), false)
@@ -4987,7 +4933,7 @@ mod tests {
         // Genesis restart: protocol_version=0, all-CLEAR next states, restart_structure_based=true.
         // All prev-level snaps are empty → restart_merges breaks immediately → no-op, no panic.
         let mut bl = BucketList::new();
-        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        let next_states = vec![None; BUCKET_LIST_LEVELS];
         bl.restart_merges_from_has(1, 0, &next_states, |_| unreachable!(), true)
             .await
             .unwrap();
@@ -5002,13 +4948,11 @@ mod tests {
         // successful restart proves both sentinel branches fired before the
         // loader was called.
         let mut bl = BucketList::new();
-        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_INPUTS,
-            input_curr: Some(*Hash256::empty_hash()),
-            input_snap: Some(Hash256::ZERO),
-            output: None,
-        };
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[1] = Some(PendingMergeState::Inputs {
+            curr: *Hash256::empty_hash(),
+            snap: Hash256::ZERO,
+        });
 
         let result = bl
             .restart_merges_from_has(1, TEST_PROTOCOL, &next_states, make_loader(vec![]), false)
@@ -5035,13 +4979,8 @@ mod tests {
         // exist in the loader.  restore_from_has must propagate the load error
         // rather than silently clearing the merge.
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
-        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(phantom_hash()),
-            input_curr: None,
-            input_snap: None,
-        };
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[1] = Some(PendingMergeState::Output(phantom_hash()));
 
         let result = BucketList::restore_from_has(&hashes, &next_states, |hash: &Hash256| {
             Err(BucketError::Serialization(format!(
@@ -5065,13 +5004,8 @@ mod tests {
     fn test_restore_from_has_parallel_fails_on_missing_state1_output() {
         // Same as above but via the parallel restore path.
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
-        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(phantom_hash()),
-            input_curr: None,
-            input_snap: None,
-        };
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[1] = Some(PendingMergeState::Output(phantom_hash()));
 
         let loader = |hash: &Hash256| -> crate::Result<Bucket> {
             Err(BucketError::Serialization(format!(
@@ -5092,13 +5026,11 @@ mod tests {
         // HAS level 1 says state=2 (merge in progress) with input hashes
         // that don't exist in the loader.  restart_merges_from_has must fail.
         let mut bl = BucketList::new();
-        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_INPUTS,
-            input_curr: Some(phantom_hash()),
-            input_snap: Some(Hash256::ZERO),
-            output: None,
-        };
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[1] = Some(PendingMergeState::Inputs {
+            curr: phantom_hash(),
+            snap: Hash256::ZERO,
+        });
 
         let result = bl
             .restart_merges_from_has(
@@ -5129,13 +5061,8 @@ mod tests {
         let output_hash = output_bucket.hash();
 
         let hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
-        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
-        next_states[1] = HasNextState {
-            state: HAS_NEXT_STATE_OUTPUT,
-            output: Some(output_hash),
-            input_curr: None,
-            input_snap: None,
-        };
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[1] = Some(PendingMergeState::Output(output_hash));
 
         let loader = make_loader(vec![output_bucket]);
         let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader);
@@ -5227,5 +5154,28 @@ mod tests {
                 .contains("duplicate or out-of-order"),
             "expected duplicate key error for pre-v11 init+live same key"
         );
+    }
+
+    #[test]
+    fn test_referenced_hashes_output() {
+        let h =
+            Hash256::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let state = PendingMergeState::Output(h);
+        let hashes: Vec<_> = state.referenced_hashes().collect();
+        assert_eq!(hashes, vec![&h]);
+    }
+
+    #[test]
+    fn test_referenced_hashes_inputs() {
+        let h1 =
+            Hash256::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let h2 =
+            Hash256::from_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap();
+        let state = PendingMergeState::Inputs { curr: h1, snap: h2 };
+        let hashes: Vec<_> = state.referenced_hashes().collect();
+        assert_eq!(hashes, vec![&h1, &h2]);
     }
 }

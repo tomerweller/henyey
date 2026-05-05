@@ -662,13 +662,7 @@ impl HistoryArchiveManager {
         let empty_level = HASBucketLevel {
             curr: zero_hash.to_hex(),
             snap: zero_hash.to_hex(),
-            next: HASBucketNext {
-                state: henyey_bucket::HAS_NEXT_STATE_CLEAR,
-                output: None,
-                curr: None,
-                snap: None,
-                shadow: None,
-            },
+            next: HASBucketNext::default(),
         };
 
         let has = HistoryArchiveState {

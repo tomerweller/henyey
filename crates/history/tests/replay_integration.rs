@@ -117,7 +117,8 @@ async fn test_catchup_replay_bucket_hash_verification() {
     let checkpoint_bucket_hash = combined_bucket_list_hash(bucket_list.hash());
     let mut bucket_list_after = bucket_list.clone();
     // Match catchup behavior: restart merges at checkpoint before replaying
-    let default_next_states = vec![henyey_bucket::HasNextState::default(); BUCKET_LIST_LEVELS];
+    let default_next_states: Vec<Option<henyey_bucket::PendingMergeState>> =
+        vec![None; BUCKET_LIST_LEVELS];
     let load_empty = |_hash: &Hash256| -> henyey_bucket::Result<Bucket> { Ok(Bucket::empty()) };
     bucket_list_after
         .restart_merges_from_has(checkpoint, 25, &default_next_states, load_empty, true)

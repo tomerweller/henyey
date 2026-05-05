@@ -2,7 +2,7 @@
 
 use crate::{archive_state::HistoryArchiveState, HistoryError, Result};
 use henyey_bucket::{
-    canonical_bucket_filename, Bucket, BucketList, HasNextState, HotArchiveBucketList,
+    canonical_bucket_filename, Bucket, BucketList, HotArchiveBucketList, PendingMergeState,
 };
 use henyey_common::fs_utils::atomic_write_bytes;
 use henyey_common::Hash256;
@@ -62,8 +62,8 @@ impl CatchupManager {
         bucket_list: &mut BucketList,
         hot_archive_bucket_list: &mut HotArchiveBucketList,
         checkpoint_seq: u32,
-        live_next_states: &[HasNextState],
-        hot_next_states: &[HasNextState],
+        live_next_states: &[Option<PendingMergeState>],
+        hot_next_states: &[Option<PendingMergeState>],
         protocol_version: u32,
     ) -> Result<()> {
         // Run live bucket list merge restarts in parallel (all levels concurrently).
@@ -128,8 +128,8 @@ impl CatchupManager {
     ) -> Result<(
         BucketList,
         HotArchiveBucketList,
-        Vec<HasNextState>,
-        Vec<HasNextState>,
+        Vec<Option<PendingMergeState>>,
+        Vec<Option<PendingMergeState>>,
     )> {
         use std::sync::Mutex;
 
@@ -306,11 +306,7 @@ impl CatchupManager {
         // Build live bucket list hashes as (curr, snap) pairs with next states
         // This is required for proper FutureBucket restoration
         let live_hash_pairs = has.bucket_hash_pairs();
-        let live_next_states: Vec<HasNextState> = has
-            .live_next_states()?
-            .into_iter()
-            .map(HasNextState::from)
-            .collect();
+        let live_next_states: Vec<Option<PendingMergeState>> = has.live_next_states()?;
 
         for (level_idx, (curr, snap)) in live_hash_pairs.iter().enumerate() {
             info!(
@@ -345,15 +341,11 @@ impl CatchupManager {
 
         // Build hot archive next states (even if no hot archive buckets, for return value).
         // Default to the correct number of levels so restart_merges_from_has gets valid input.
-        let hot_next_states: Vec<HasNextState> = {
-            let states: Vec<HasNextState> = has
-                .hot_archive_next_states()?
-                .unwrap_or_default()
-                .into_iter()
-                .map(HasNextState::from)
-                .collect();
+        let hot_next_states: Vec<Option<PendingMergeState>> = {
+            let states: Vec<Option<PendingMergeState>> =
+                has.hot_archive_next_states()?.unwrap_or_default();
             if states.is_empty() {
-                vec![HasNextState::default(); henyey_bucket::HotArchiveBucketList::NUM_LEVELS]
+                vec![None; henyey_bucket::HotArchiveBucketList::NUM_LEVELS]
             } else {
                 states
             }

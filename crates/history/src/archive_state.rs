@@ -3,14 +3,18 @@
 //! The History Archive State is a JSON file that describes the current state
 //! of a Stellar history archive, including the current ledger and bucket list hashes.
 
-use henyey_bucket::{
-    BUCKET_LIST_LEVELS, HAS_NEXT_STATE_CLEAR, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT,
-};
+use henyey_bucket::{PendingMergeState, BUCKET_LIST_LEVELS};
 use henyey_common::Hash256;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::error::HistoryError;
+
+/// FutureBucket state constants (matches stellar-core's FBStatus enum in HAS JSON).
+/// These are HAS-JSON-format concerns used for parsing and serialization.
+pub(crate) const HAS_NEXT_STATE_CLEAR: u32 = 0;
+pub(crate) const HAS_NEXT_STATE_OUTPUT: u32 = 1;
+pub(crate) const HAS_NEXT_STATE_INPUTS: u32 = 2;
 
 /// Maximum allowed size for a bucket file downloaded from a history archive (100 GiB).
 ///
@@ -80,67 +84,71 @@ fn parse_bucket_hash_pairs(levels: &[HASBucketLevel]) -> Vec<(Hash256, Hash256)>
 /// - A hash field required by the declared state is absent (`None`). Parity:
 ///   stellar-core's FutureBucket invariants require output for state-1 and
 ///   both inputs for state-2 (FutureBucket.cpp:248-315).
+/// - The state discriminant is not 0, 1, or 2 (unknown state).
+///
+/// Canonicalization: state-1 with a zero-hash output is mapped to `None` (clear),
+/// matching the effective behavior where zero-hash outputs are never loaded as buckets.
 fn parse_next_states(
     levels: &[HASBucketLevel],
-) -> std::result::Result<Vec<LiveBucketNextState>, HistoryError> {
+) -> std::result::Result<Vec<Option<PendingMergeState>>, HistoryError> {
     levels
         .iter()
         .enumerate()
         .map(|(i, level)| {
-            let output = match (level.next.state, level.next.output.as_ref()) {
-                (HAS_NEXT_STATE_OUTPUT, Some(h)) => Some(Hash256::from_hex(h).map_err(|_| {
-                    HistoryError::InvalidResponse(format!(
-                        "level {}: state {} output hash is malformed: {}",
-                        i, level.next.state, h
-                    ))
-                })?),
-                (HAS_NEXT_STATE_OUTPUT, None) => {
-                    return Err(HistoryError::InvalidResponse(format!(
-                        "level {}: state {} requires output hash but field is absent",
-                        i, level.next.state
-                    )));
+            match level.next.state {
+                HAS_NEXT_STATE_CLEAR => Ok(None),
+                HAS_NEXT_STATE_OUTPUT => {
+                    let h_str = level.next.output.as_ref().ok_or_else(|| {
+                        HistoryError::InvalidResponse(format!(
+                            "level {}: state {} requires output hash but field is absent",
+                            i, level.next.state
+                        ))
+                    })?;
+                    let hash = Hash256::from_hex(h_str).map_err(|_| {
+                        HistoryError::InvalidResponse(format!(
+                            "level {}: state {} output hash is malformed: {}",
+                            i, level.next.state, h_str
+                        ))
+                    })?;
+                    // Canonicalize: zero-hash output → None (effectively clear)
+                    if hash.is_zero() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(PendingMergeState::Output(hash)))
+                    }
                 }
-                (_, Some(h)) => Hash256::from_hex(h).ok(),
-                (_, None) => None,
-            };
-            let input_curr = match (level.next.state, level.next.curr.as_ref()) {
-                (HAS_NEXT_STATE_INPUTS, Some(h)) => Some(Hash256::from_hex(h).map_err(|_| {
-                    HistoryError::InvalidResponse(format!(
-                        "level {}: state {} input curr hash is malformed: {}",
-                        i, level.next.state, h
-                    ))
-                })?),
-                (HAS_NEXT_STATE_INPUTS, None) => {
-                    return Err(HistoryError::InvalidResponse(format!(
-                        "level {}: state {} requires input curr hash but field is absent",
-                        i, level.next.state
-                    )));
+                HAS_NEXT_STATE_INPUTS => {
+                    let curr_str = level.next.curr.as_ref().ok_or_else(|| {
+                        HistoryError::InvalidResponse(format!(
+                            "level {}: state {} requires input curr hash but field is absent",
+                            i, level.next.state
+                        ))
+                    })?;
+                    let curr = Hash256::from_hex(curr_str).map_err(|_| {
+                        HistoryError::InvalidResponse(format!(
+                            "level {}: state {} input curr hash is malformed: {}",
+                            i, level.next.state, curr_str
+                        ))
+                    })?;
+                    let snap_str = level.next.snap.as_ref().ok_or_else(|| {
+                        HistoryError::InvalidResponse(format!(
+                            "level {}: state {} requires input snap hash but field is absent",
+                            i, level.next.state
+                        ))
+                    })?;
+                    let snap = Hash256::from_hex(snap_str).map_err(|_| {
+                        HistoryError::InvalidResponse(format!(
+                            "level {}: state {} input snap hash is malformed: {}",
+                            i, level.next.state, snap_str
+                        ))
+                    })?;
+                    Ok(Some(PendingMergeState::Inputs { curr, snap }))
                 }
-                (_, Some(h)) => Hash256::from_hex(h).ok(),
-                (_, None) => None,
-            };
-            let input_snap = match (level.next.state, level.next.snap.as_ref()) {
-                (HAS_NEXT_STATE_INPUTS, Some(h)) => Some(Hash256::from_hex(h).map_err(|_| {
-                    HistoryError::InvalidResponse(format!(
-                        "level {}: state {} input snap hash is malformed: {}",
-                        i, level.next.state, h
-                    ))
-                })?),
-                (HAS_NEXT_STATE_INPUTS, None) => {
-                    return Err(HistoryError::InvalidResponse(format!(
-                        "level {}: state {} requires input snap hash but field is absent",
-                        i, level.next.state
-                    )));
-                }
-                (_, Some(h)) => Hash256::from_hex(h).ok(),
-                (_, None) => None,
-            };
-            Ok(LiveBucketNextState {
-                state: level.next.state,
-                output,
-                input_curr,
-                input_snap,
-            })
+                unknown => Err(HistoryError::InvalidResponse(format!(
+                    "level {}: unknown FutureBucket state: {}",
+                    i, unknown
+                ))),
+            }
         })
         .collect()
 }
@@ -176,6 +184,7 @@ fn validate_future_bucket_hashes(
     next: &HASBucketNext,
 ) -> Result<(), HistoryError> {
     match next.state {
+        HAS_NEXT_STATE_CLEAR => {}
         HAS_NEXT_STATE_OUTPUT => {
             if let Some(output) = next.output.as_deref() {
                 validate_known_hash(known_hashes, level, "output", output)?;
@@ -189,7 +198,12 @@ fn validate_future_bucket_hashes(
                 validate_known_hash(known_hashes, level, "input snap", snap)?;
             }
         }
-        _ => {}
+        unknown => {
+            return Err(HistoryError::VerificationFailed(format!(
+                "level {}: unknown FutureBucket state: {}",
+                level, unknown
+            )));
+        }
     }
 
     Ok(())
@@ -562,7 +576,9 @@ impl HistoryArchiveState {
     ///
     /// Returns an error if any hash field required by the declared state
     /// contains a malformed hex string.
-    pub fn live_next_states(&self) -> std::result::Result<Vec<LiveBucketNextState>, HistoryError> {
+    pub fn live_next_states(
+        &self,
+    ) -> std::result::Result<Vec<Option<PendingMergeState>>, HistoryError> {
         parse_next_states(&self.current_buckets)
     }
 
@@ -682,37 +698,10 @@ impl HistoryArchiveState {
     /// contains a malformed hex string.
     pub fn hot_archive_next_states(
         &self,
-    ) -> std::result::Result<Option<Vec<LiveBucketNextState>>, HistoryError> {
+    ) -> std::result::Result<Option<Vec<Option<PendingMergeState>>>, HistoryError> {
         match self.hot_archive_buckets.as_ref() {
             Some(levels) => Ok(Some(parse_next_states(levels)?)),
             None => Ok(None),
-        }
-    }
-}
-
-/// State of a pending bucket merge from History Archive State.
-///
-/// This is a local copy of the structure expected by `BucketList::restore_from_has`
-/// to avoid cross-crate dependencies.
-#[derive(Clone, Debug, Default)]
-pub struct LiveBucketNextState {
-    /// Merge state (0 = clear, 1 = output, 2 = inputs)
-    pub state: u32,
-    /// Output bucket hash if merge is complete (state == 1)
-    pub output: Option<Hash256>,
-    /// Input curr bucket hash for pending merge (state == 2)
-    pub input_curr: Option<Hash256>,
-    /// Input snap bucket hash for pending merge (state == 2)
-    pub input_snap: Option<Hash256>,
-}
-
-impl From<LiveBucketNextState> for henyey_bucket::HasNextState {
-    fn from(s: LiveBucketNextState) -> Self {
-        Self {
-            state: s.state,
-            output: s.output,
-            input_curr: s.input_curr,
-            input_snap: s.input_snap,
         }
     }
 }
@@ -1477,8 +1466,10 @@ mod tests {
             shadow: None,
         });
         let states = has.live_next_states().unwrap();
-        assert_eq!(states[1].state, HAS_NEXT_STATE_OUTPUT);
-        assert!(states[1].output.is_some());
+        assert!(
+            matches!(states[1], Some(PendingMergeState::Output(_))),
+            "state-1 should be Output"
+        );
     }
 
     #[test]
@@ -1525,9 +1516,10 @@ mod tests {
             shadow: None,
         });
         let states = has.live_next_states().unwrap();
-        assert_eq!(states[1].state, HAS_NEXT_STATE_INPUTS);
-        assert!(states[1].input_curr.is_some());
-        assert!(states[1].input_snap.is_some());
+        assert!(
+            matches!(states[1], Some(PendingMergeState::Inputs { .. })),
+            "state-2 should be Inputs"
+        );
     }
 
     #[test]
@@ -1578,6 +1570,41 @@ mod tests {
         assert!(
             msg.contains("malformed"),
             "should reject state=2 with malformed curr: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_next_states_rejects_unknown_discriminant() {
+        let has = make_has_with_next(HASBucketNext {
+            state: 99,
+            output: None,
+            curr: None,
+            snap: None,
+            shadow: None,
+        });
+        let err = has.live_next_states().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown") || msg.contains("99"),
+            "should reject unknown state discriminant: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_next_states_zero_hash_output_canonicalized_to_none() {
+        // A state-1 with zero-hash output should be canonicalized to None (clear).
+        let zero_hash = "0".repeat(64);
+        let has = make_has_with_next(HASBucketNext {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(zero_hash),
+            curr: None,
+            snap: None,
+            shadow: None,
+        });
+        let states = has.live_next_states().unwrap();
+        assert!(
+            states[1].is_none(),
+            "zero-hash output should be canonicalized to None"
         );
     }
 }

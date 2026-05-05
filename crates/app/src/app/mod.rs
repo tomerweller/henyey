@@ -53,8 +53,8 @@ use tokio::sync::RwLock;
 
 use henyey_bucket::BucketManager;
 use henyey_bucket::{
-    BucketList, BucketListSnapshot, BucketSnapshotManager, HasNextState, HotArchiveBucketList,
-    HotArchiveBucketListSnapshot,
+    BucketList, BucketListSnapshot, BucketSnapshotManager, HotArchiveBucketList,
+    HotArchiveBucketListSnapshot, PendingMergeState,
 };
 use henyey_clock::{Clock, RealClock};
 use henyey_common::protocol::{
