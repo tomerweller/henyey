@@ -1522,7 +1522,7 @@ impl App {
                 }
             }
         } else {
-            tracing::info!(
+            tracing::debug!(
                 target: "henyey::envelope_path",
                 latest_externalized,
                 last_processed,

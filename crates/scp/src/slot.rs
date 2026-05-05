@@ -510,7 +510,7 @@ impl Slot {
     ) -> EnvelopeState {
         let ctx = slot_ctx!(self, driver);
         if !self.ballot.is_statement_sane(&envelope.statement, &ctx) {
-            tracing::info!(
+            tracing::debug!(
                 target: "henyey::envelope_path",
                 slot = self.slot_index,
                 node_id = ?envelope.statement.node_id,
@@ -587,7 +587,7 @@ impl Slot {
                 .validate_statement_values(&envelope.statement, driver, self.slot_index);
 
         if validation == crate::ValidationLevel::Invalid {
-            tracing::info!(
+            tracing::debug!(
                 target: "henyey::envelope_path",
                 slot = self.slot_index,
                 node_id = ?envelope.statement.node_id,
