@@ -176,9 +176,6 @@ metric_catalog! {
             => "Enqueue-to-post-verify latency microseconds (cumulative sum)";
         SCP_VERIFY_LATENCY_US_COUNT = "henyey_scp_verify_latency_us_count"
             => "Enqueue-to-post-verify latency sample count";
-        SCP_SCHEDULED_DEDUP_TOTAL = "henyey_scp_scheduled_dedup_total"
-            => "SCP envelopes rejected by in-flight scheduled dedup";
-
         // Overlay fetch channel.
         OVERLAY_FETCH_CHANNEL_DEPTH = "henyey_overlay_fetch_channel_depth"
             => "Current depth of the overlay fetch-response channel (event-loop sampled)";
@@ -220,10 +217,6 @@ metric_catalog! {
             => "Currently banned transactions in the queue";
         HERDER_TX_QUEUE_SEEN = "stellar_herder_tx_queue_seen"
             => "Deduplicated transaction hashes in the seen set";
-        HERDER_ARB_TX_SEEN = "stellar_herder_arb_tx_seen_total"
-            => "Total arbitrage (looping path-payment) transactions evaluated for broadcast";
-        HERDER_ARB_TX_DROPPED = "stellar_herder_arb_tx_dropped_total"
-            => "Total arbitrage transactions dropped by flood damping";
 
         // Herder pending-tx age gauges (Stage D).
         HERDER_PENDING_TXS_AGE0 = "stellar_herder_pending_txs_age0"
@@ -388,6 +381,8 @@ metric_catalog! {
             => "Envelopes dropped after verification (aggregate)";
         POST_CATCHUP_HARD_RESET_TOTAL = "henyey_post_catchup_hard_reset_total"
             => "Total post-catchup hard resets performed";
+        SCP_SCHEDULED_DEDUP_TOTAL = "henyey_scp_scheduled_dedup_total"
+            => "SCP envelopes rejected by in-flight scheduled dedup";
 
         // SCP/herder counters.
         SCP_ENVELOPE_EMIT_TOTAL = "stellar_scp_envelope_emit_total"
@@ -404,6 +399,10 @@ metric_catalog! {
             => "Envelopes rejected as too old by pending pool";
         HERDER_PENDING_EVICTED_TOTAL = "stellar_herder_pending_evicted_total"
             => "Envelopes evicted from pending pool";
+        HERDER_ARB_TX_SEEN = "stellar_herder_arb_tx_seen_total"
+            => "Total arbitrage (looping path-payment) transactions evaluated for broadcast";
+        HERDER_ARB_TX_DROPPED = "stellar_herder_arb_tx_dropped_total"
+            => "Total arbitrage transactions dropped by flood damping";
 
         // Bucket merge counters.
         BUCKET_MERGE_COMPLETED_TOTAL = "stellar_bucket_merge_completed_total"
@@ -1778,6 +1777,142 @@ mod tests {
                 "rendered output missing expected bucket boundary `{}`. Output:\n{}",
                 needle,
                 output
+            );
+        }
+    }
+
+    /// Regression test for #2350: metrics declared in the wrong catalog block
+    /// (gauges vs counters) produce duplicate `# TYPE` lines in Prometheus
+    /// exposition. Verify that the three formerly-misclassified metrics each
+    /// have exactly one `# TYPE` line and it says `counter`.
+    #[test]
+    fn test_no_duplicate_type_lines() {
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+            // Simulate runtime emission (as refresh_gauges does).
+            counter!(SCP_SCHEDULED_DEDUP_TOTAL).absolute(42);
+            counter!(HERDER_ARB_TX_SEEN).absolute(100);
+            counter!(HERDER_ARB_TX_DROPPED).absolute(50);
+        });
+        let output = handle.render();
+
+        for name in &[
+            SCP_SCHEDULED_DEDUP_TOTAL,
+            HERDER_ARB_TX_SEEN,
+            HERDER_ARB_TX_DROPPED,
+        ] {
+            let type_counter = format!("# TYPE {} counter", name);
+            let type_gauge = format!("# TYPE {} gauge", name);
+
+            let counter_count = output.matches(&type_counter).count();
+            let gauge_count = output.matches(&type_gauge).count();
+
+            assert_eq!(
+                counter_count, 1,
+                "expected exactly one `# TYPE {name} counter` line, found {counter_count}.\n\
+                 Output:\n{output}"
+            );
+            assert_eq!(
+                gauge_count, 0,
+                "expected zero `# TYPE {name} gauge` lines, found {gauge_count}.\n\
+                 Output:\n{output}"
+            );
+        }
+    }
+
+    /// Guard test: every `counter!()` target used in `refresh_gauges` must be
+    /// declared in the `counters {}` catalog block (appears in ALL_COUNTER_NAMES),
+    /// and every `gauge!()` target must be in the `gauges {}` block
+    /// (ALL_GAUGE_NAMES). Catches the class of bug from #2350 at compile/test
+    /// time rather than requiring a live scrape.
+    #[test]
+    fn test_refresh_gauges_type_consistency() {
+        let counter_set: HashSet<&str> = ALL_COUNTER_NAMES.iter().copied().collect();
+        let gauge_set: HashSet<&str> = ALL_GAUGE_NAMES.iter().copied().collect();
+
+        // All counter!() targets in refresh_gauges (exhaustive as of this commit).
+        let refresh_counter_targets: &[&str] = &[
+            SCP_POST_VERIFY_DROPS_TOTAL,
+            POST_CATCHUP_HARD_RESET_TOTAL,
+            SCP_SCHEDULED_DEDUP_TOTAL,
+            SCP_ENVELOPE_EMIT_TOTAL,
+            SCP_ENVELOPE_RECEIVE_TOTAL,
+            HERDER_LOST_SYNC_TOTAL,
+            HERDER_PENDING_RECEIVED_TOTAL,
+            HERDER_PENDING_DUPLICATES_TOTAL,
+            HERDER_PENDING_TOO_OLD_TOTAL,
+            HERDER_PENDING_EVICTED_TOTAL,
+            HERDER_ARB_TX_SEEN,
+            HERDER_ARB_TX_DROPPED,
+            BUCKET_MERGE_COMPLETED_TOTAL,
+            BUCKET_MERGE_TIME_US_TOTAL,
+            BUCKET_MERGE_NEW_LIVE_TOTAL,
+            BUCKET_MERGE_NEW_DEAD_TOTAL,
+            BUCKET_MERGE_NEW_INIT_TOTAL,
+            BUCKET_MERGE_NEW_META_TOTAL,
+            BUCKET_MERGE_SHADOWED_TOTAL,
+            BUCKET_MERGE_ANNIHILATED_TOTAL,
+            OVERLAY_MESSAGE_READ_TOTAL,
+            OVERLAY_MESSAGE_WRITE_TOTAL,
+            OVERLAY_MESSAGE_BROADCAST_TOTAL,
+            OVERLAY_ERROR_READ_TOTAL,
+            OVERLAY_ERROR_WRITE_TOTAL,
+            OVERLAY_TIMEOUT_IDLE_TOTAL,
+            OVERLAY_TIMEOUT_STRAGGLER_TOTAL,
+            OVERLAY_BYTE_READ_TOTAL,
+            OVERLAY_BYTE_WRITE_TOTAL,
+            OVERLAY_ASYNC_READ_TOTAL,
+            OVERLAY_ASYNC_WRITE_TOTAL,
+            OVERLAY_INBOUND_ATTEMPT_TOTAL,
+        ];
+
+        for name in refresh_counter_targets {
+            assert!(
+                counter_set.contains(name),
+                "counter!({name}) used in refresh_gauges but `{name}` is NOT in \
+                 the counters {{}} catalog block. Move it from gauges {{}} to counters {{}}."
+            );
+            assert!(
+                !gauge_set.contains(name),
+                "counter!({name}) used in refresh_gauges but `{name}` is ALSO in \
+                 the gauges {{}} catalog block — this causes duplicate # TYPE lines."
+            );
+        }
+
+        // All gauge!() targets in refresh_gauges (exhaustive as of this commit).
+        let refresh_gauge_targets: &[&str] = &[
+            LEDGER_SEQUENCE,
+            PEER_COUNT,
+            PENDING_TRANSACTIONS,
+            UPTIME_SECONDS,
+            IS_VALIDATOR,
+            SCP_VERIFY_INPUT_BACKLOG,
+            SCP_VERIFY_OUTPUT_BACKLOG,
+            SCP_VERIFIER_THREAD_STATE,
+            SCP_VERIFY_LATENCY_US_SUM,
+            SCP_VERIFY_LATENCY_US_COUNT,
+            OVERLAY_FETCH_CHANNEL_DEPTH,
+            OVERLAY_FETCH_CHANNEL_DEPTH_MAX,
+            HERDER_STATE,
+            HERDER_PENDING_ENVELOPES,
+            HERDER_CACHED_TX_SETS,
+            HERDER_TX_QUEUE_ACCOUNTS,
+            HERDER_TX_QUEUE_BANNED,
+            HERDER_TX_QUEUE_SEEN,
+        ];
+
+        for name in refresh_gauge_targets {
+            assert!(
+                gauge_set.contains(name),
+                "gauge!({name}) used in refresh_gauges but `{name}` is NOT in \
+                 the gauges {{}} catalog block. Move it from counters {{}} to gauges {{}}."
+            );
+            assert!(
+                !counter_set.contains(name),
+                "gauge!({name}) used in refresh_gauges but `{name}` is ALSO in \
+                 the counters {{}} catalog block — this causes duplicate # TYPE lines."
             );
         }
     }
