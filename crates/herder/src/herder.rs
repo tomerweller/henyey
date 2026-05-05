@@ -662,6 +662,19 @@ impl Herder {
         self.pending_envelopes.set_current_slot(slot);
     }
 
+    /// Test-only: arm the closing gate for a specific slot.
+    ///
+    /// In production, the gate is set to `externalized_slot + 1` when a slot
+    /// externalizes (see `advance_tracking_slot`). This helper allows tests to
+    /// simulate that state without going through the full externalization path.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_closing_gate_for_testing(&self, slot: u64) {
+        let mut gate = self.closing_gate.lock().unwrap();
+        gate.slot = slot;
+        gate.buffer.clear();
+    }
+
     /// Set the Herder state.
     ///
     /// Validates the transition per HERDER_SPEC §3.2: TRACKING→BOOTING and
