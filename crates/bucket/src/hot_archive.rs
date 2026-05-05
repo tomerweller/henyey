@@ -1320,7 +1320,9 @@ impl HotArchiveBucketList {
                         let snap = load_hot_or_sentinel_shared(snap_hash, load_bucket)?;
 
                         let next = match state {
-                            Some(PendingMergeState::Output(output_hash)) => {
+                            Some(PendingMergeState::Output(output_hash))
+                                if !output_hash.is_zero() =>
+                            {
                                 tracing::debug!(
                                     level = i,
                                     output_hash = %output_hash.to_hex(),
@@ -1398,8 +1400,9 @@ impl HotArchiveBucketList {
 
             // Load completed merge output if present.
             // Inputs-state merges are handled later in restart_merges_from_has.
+            // Skip zero-hash outputs as a defensive guard.
             let next = match &next_states[i] {
-                Some(PendingMergeState::Output(output_hash)) => {
+                Some(PendingMergeState::Output(output_hash)) if !output_hash.is_zero() => {
                     tracing::debug!(
                         level = i,
                         output_hash = %output_hash.to_hex(),

@@ -2286,11 +2286,13 @@ impl BucketList {
         let load_bucket = &load_bucket;
 
         // Collect (level_index, output_hash) for levels with completed merge outputs.
+        // Skip zero-hash outputs as a belt-and-suspenders defense; parse_next_states()
+        // canonicalizes these to None, but direct callers might not.
         let output_hashes: Vec<(usize, Hash256)> = next_states
             .iter()
             .enumerate()
             .filter_map(|(i, state)| match state {
-                Some(PendingMergeState::Output(h)) => Some((i, *h)),
+                Some(PendingMergeState::Output(h)) if !h.is_zero() => Some((i, *h)),
                 _ => None,
             })
             .collect();
@@ -2443,8 +2445,9 @@ impl BucketList {
 
             // Load completed merge output if present.
             // Inputs-state merges are handled later in restart_merges_from_has.
+            // Skip zero-hash outputs as a defensive guard.
             let next: Option<PendingMerge> = match &next_states[i] {
-                Some(PendingMergeState::Output(output_hash)) => {
+                Some(PendingMergeState::Output(output_hash)) if !output_hash.is_zero() => {
                     tracing::debug!(
                         level = i,
                         output_hash = %output_hash.to_hex(),
