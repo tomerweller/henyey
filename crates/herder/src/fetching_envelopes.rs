@@ -202,7 +202,6 @@ impl FetchingEnvelopes {
     /// or was already processed/discarded.
     pub fn recv_envelope(&self, envelope: ScpEnvelope) -> RecvResult {
         let slot = envelope.statement.slot_index;
-        let env_hash = Self::compute_envelope_hash(&envelope);
 
         self.stats.write().envelopes_received += 1;
 
@@ -211,6 +210,24 @@ impl FetchingEnvelopes {
             debug!(slot, "Rejecting envelope with non-SIGNED StellarValue");
             return RecvResult::Discarded;
         }
+
+        self.recv_envelope_inner(envelope)
+    }
+
+    /// Receive a pre-validated SCP envelope (skips StellarValue signed check).
+    ///
+    /// Use this for envelopes that have already passed network-level validation
+    /// (pre-filter, signature verification) and are entering FetchingEnvelopes
+    /// for dependency tracking, relay, and slot-aware queuing.
+    pub fn recv_envelope_validated(&self, envelope: ScpEnvelope) -> RecvResult {
+        self.stats.write().envelopes_received += 1;
+        self.recv_envelope_inner(envelope)
+    }
+
+    /// Inner implementation shared by recv_envelope and recv_envelope_validated.
+    fn recv_envelope_inner(&self, envelope: ScpEnvelope) -> RecvResult {
+        let slot = envelope.statement.slot_index;
+        let env_hash = Self::compute_envelope_hash(&envelope);
 
         // Get or create slot state
         let mut slot_state = self.slots.entry(slot).or_default();
@@ -383,6 +400,23 @@ impl FetchingEnvelopes {
         None
     }
 
+    /// Pop a ready envelope from exactly the given slot.
+    ///
+    /// Unlike `pop(max_slot)` which scans all slots ≤ max_slot, this only
+    /// pops from the specified slot. Used when we need to remove a specific
+    /// envelope we just inserted (e.g., after inline SCP processing in
+    /// `process_scp_envelope`).
+    pub fn pop_from_slot(&self, slot: SlotIndex) -> Option<ScpEnvelope> {
+        if let Some(mut slot_state) = self.slots.get_mut(&slot) {
+            if let Some(envelope) = slot_state.ready.pop() {
+                let env_hash = Self::compute_envelope_hash(&envelope);
+                slot_state.processed.insert(env_hash);
+                return Some(envelope);
+            }
+        }
+        None
+    }
+
     /// Test-only: directly insert envelopes into a slot's ready queue.
     ///
     /// Bypasses `recv_envelope`'s signature/dependency checks so tests can
@@ -410,6 +444,28 @@ impl FetchingEnvelopes {
             .collect();
         slots.sort_unstable();
         slots
+    }
+
+    /// Count envelopes (fetching + ready) for a given slot.
+    ///
+    /// Used for admission control to prevent unbounded memory growth from
+    /// future-slot floods.
+    pub fn slot_envelope_count(&self, slot: SlotIndex) -> usize {
+        self.slots
+            .get(&slot)
+            .map(|s| s.fetching.len() + s.ready.len())
+            .unwrap_or(0)
+    }
+
+    /// Count total slots with envelopes above a given slot threshold.
+    ///
+    /// Used for admission control to limit the number of future slots
+    /// buffered in the fetching pipeline.
+    pub fn future_slot_count(&self, current_slot: SlotIndex) -> usize {
+        self.slots
+            .iter()
+            .filter(|e| *e.key() > current_slot)
+            .count()
     }
 
     /// Erase data for slots below the given threshold.
