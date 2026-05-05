@@ -1833,10 +1833,14 @@ mod tests {
         let gauge_set: HashSet<&str> = ALL_GAUGE_NAMES.iter().copied().collect();
 
         // All counter!() targets in refresh_gauges (exhaustive as of this commit).
+        // Includes both unlabeled counters and labeled counters emitted with
+        // counter!(NAME, "key" => value).
         let refresh_counter_targets: &[&str] = &[
             META_STREAM_BYTES_TOTAL,
             META_STREAM_WRITES_TOTAL,
+            SCP_PREFILTER_REJECTS_TOTAL,
             SCP_POST_VERIFY_DROPS_TOTAL,
+            SCP_POST_VERIFY_TOTAL,
             POST_CATCHUP_HARD_RESET_TOTAL,
             SCP_SCHEDULED_DEDUP_TOTAL,
             SCP_ENVELOPE_EMIT_TOTAL,
@@ -1883,6 +1887,7 @@ mod tests {
             OVERLAY_FETCH_DUPLICATE_RECV_TOTAL,
             OVERLAY_FETCH_UNIQUE_RECV_TOTAL,
             OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL,
+            OVERLAY_SEND_TOTAL,
             LEDGER_APPLY_SUCCESS_TOTAL,
             LEDGER_APPLY_FAILURE_TOTAL,
             LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL,
