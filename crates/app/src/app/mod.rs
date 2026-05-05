@@ -4645,6 +4645,36 @@ mod tests {
     }
 
     #[test]
+    fn test_trim_syncing_ledgers_last_buffered_at_first_checkpoint_boundary() {
+        // Branch coverage: exercises the `is_checkpoint_start` path at the first
+        // checkpoint boundary (ledger 64). With last_buffered=64, prev=63, and
+        // checkpoint_start(63)=1 (the early-ledger branch: seq < freq → returns 1).
+        // trim_before=1 means entry 64 is retained.
+        let mut buffer = BTreeMap::new();
+        let make_entry = |slot: u32| henyey_herder::LedgerCloseInfo {
+            slot: slot as u64,
+            tx_set_hash: Hash256::ZERO,
+            tx_set: None,
+            close_time: 1,
+            upgrades: Vec::new(),
+            stellar_value_ext: StellarValueExt::Basic,
+        };
+
+        let current_ledger = 0u32;
+        buffer.insert(64, make_entry(64));
+
+        App::trim_syncing_ledgers(&mut buffer, current_ledger);
+
+        // last_buffered=64 is checkpoint start, prev=63, trim_before=checkpoint_start(63)=1
+        // Entry 64 >= 1, so it's retained.
+        assert!(
+            buffer.contains_key(&64),
+            "entry at first checkpoint boundary should be retained"
+        );
+        assert_eq!(buffer.len(), 1);
+    }
+
+    #[test]
     fn test_consensus_stuck_state_matches_on_current_ledger_only() {
         // Verify that ConsensusStuckState matches when current_ledger is the
         // same but first_buffered changes. This is critical for Problem 9:
