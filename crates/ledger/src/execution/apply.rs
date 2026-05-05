@@ -37,16 +37,17 @@ pub(super) const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 ///
 /// Structural guarantees:
 /// - `HotArchive` (data/code keys): always carries the original entry for meta comparison.
-/// - `HotArchiveTtl` (synthesized TTL keys): no original entry exists (TTL is computed
-///   from the data/code key hash, not restored from stored state).
+/// - `HotArchiveTtl` (synthesized TTL keys): carries the TTL entry at restoration time
+///   (derived from min_persistent_entry_ttl), enabling RESTORED vs RESTORED+UPDATED comparison.
 /// - `LiveBucketList`: always carries the original entry (both data/code and TTL).
 #[derive(Debug, Clone)]
 pub(super) enum RestoreSource {
     /// Data/code key restored from hot archive with its original entry.
     HotArchive(Box<stellar_xdr::curr::LedgerEntry>),
-    /// Synthesized TTL key for a hot-archive-restored entry. No original entry
-    /// exists because the TTL is computed from the data/code key hash.
-    HotArchiveTtl,
+    /// TTL key for a hot-archive-restored entry with its synthesized TTL entry.
+    /// The stored entry represents the TTL value at restoration time (before any
+    /// host-side extensions), enabling RESTORED vs RESTORED+UPDATED comparison.
+    HotArchiveTtl(Box<stellar_xdr::curr::LedgerEntry>),
     /// Key restored from live bucket list with its original entry.
     LiveBucketList(Box<stellar_xdr::curr::LedgerEntry>),
 }
@@ -78,7 +79,7 @@ impl RestoredEntries {
     pub(super) fn is_hot_archive_restored(&self, key: &LedgerKey) -> bool {
         matches!(
             self.entries.get(key),
-            Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl)
+            Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl(_))
         )
     }
 
@@ -97,54 +98,53 @@ impl RestoredEntries {
 
     // --- Hot archive insertion ---
 
-    /// Insert a data/code key restored from the hot archive with its original entry.
-    pub(super) fn insert_hot_archive_entry(
+    /// Insert a hot-archive restore pair (data/code + TTL) atomically.
+    ///
+    /// The structural pairing invariants (key type, TTL derivation, entry correspondence)
+    /// are guaranteed by `HotArchiveRestore::new()`. This method only checks map-state
+    /// conflicts: live-BL overlap and duplicate insertion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either key conflicts with live-BL entries or is already present.
+    pub(super) fn insert_hot_archive_pair(
         &mut self,
-        key: LedgerKey,
-        original: stellar_xdr::curr::LedgerEntry,
+        ha_restore: &henyey_tx::operations::execute::HotArchiveRestore,
     ) {
+        let data_key = ha_restore.key().clone();
+        let ttl_key = ha_restore.ttl_key();
+
         assert!(
-            !matches!(key, LedgerKey::Ttl(_)),
-            "insert_hot_archive_entry called with TTL key — use insert_hot_archive_ttl"
+            !matches!(data_key, LedgerKey::Ttl(_)),
+            "insert_hot_archive_pair: data_key is TTL: {data_key:?}"
         );
         assert!(
             !matches!(
-                self.entries.get(&key),
+                self.entries.get(&data_key),
                 Some(RestoreSource::LiveBucketList(_))
             ),
-            "key already restored from live BL: {key:?}"
+            "insert_hot_archive_pair: data_key already restored from live BL: {data_key:?}"
         );
         assert!(
-            !self.entries.contains_key(&key),
-            "duplicate hot archive entry insertion for key: {key:?}"
-        );
-        self.entries
-            .insert(key, RestoreSource::HotArchive(Box::new(original)));
-    }
-
-    /// Insert a synthesized TTL key for a hot-archive-restored entry.
-    pub(super) fn insert_hot_archive_ttl(&mut self, key: LedgerKey) {
-        assert!(
-            matches!(key, LedgerKey::Ttl(_)),
-            "insert_hot_archive_ttl called with non-TTL key: {key:?}"
+            !self.entries.contains_key(&data_key),
+            "insert_hot_archive_pair: duplicate data_key insertion: {data_key:?}"
         );
         assert!(
             !matches!(
-                self.entries.get(&key),
+                self.entries.get(&ttl_key),
                 Some(RestoreSource::LiveBucketList(_))
             ),
-            "TTL key already restored from live BL: {key:?}"
+            "insert_hot_archive_pair: ttl_key already restored from live BL: {ttl_key:?}"
         );
-        // TTL keys may be re-inserted (once from safety-net loop, once from
-        // extend_hot_archive_ttls) — allow idempotent insertion for HotArchiveTtl.
-        self.entries.insert(key, RestoreSource::HotArchiveTtl);
-    }
 
-    /// Bulk-insert synthesized TTL keys into the hot archive.
-    pub(super) fn extend_hot_archive_ttls(&mut self, keys: impl IntoIterator<Item = LedgerKey>) {
-        for key in keys {
-            self.insert_hot_archive_ttl(key);
-        }
+        self.entries.insert(
+            data_key,
+            RestoreSource::HotArchive(Box::new(ha_restore.entry().clone())),
+        );
+        self.entries.insert(
+            ttl_key,
+            RestoreSource::HotArchiveTtl(Box::new(ha_restore.ttl_entry().clone())),
+        );
     }
 
     /// Iterate hot-archive entries that have original values (data/code keys only).
@@ -164,7 +164,7 @@ impl RestoredEntries {
         assert!(
             !matches!(
                 self.entries.get(&key),
-                Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl)
+                Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl(_))
             ),
             "key already restored from hot archive: {key:?}"
         );
@@ -193,7 +193,7 @@ impl RestoredEntries {
         assert!(
             !matches!(
                 self.entries.get(restore.key()),
-                Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl)
+                Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl(_))
             ),
             "insert_live_bl_pair: data_key already restored from hot archive: {:?}",
             restore.key()
@@ -201,7 +201,7 @@ impl RestoredEntries {
         assert!(
             !matches!(
                 self.entries.get(restore.ttl_key()),
-                Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl)
+                Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl(_))
             ),
             "insert_live_bl_pair: ttl_key already restored from hot archive: {:?}",
             restore.ttl_key()
@@ -263,6 +263,37 @@ impl Default for RestoredEntries {
     }
 }
 
+#[cfg(test)]
+impl RestoredEntries {
+    /// Test-only: directly insert a hot archive data/code entry without pair enforcement.
+    pub(super) fn insert_hot_archive_entry_for_test(
+        &mut self,
+        key: LedgerKey,
+        original: stellar_xdr::curr::LedgerEntry,
+    ) {
+        assert!(
+            !matches!(key, LedgerKey::Ttl(_)),
+            "insert_hot_archive_entry_for_test: use insert_hot_archive_ttl_for_test for TTL keys"
+        );
+        self.entries
+            .insert(key, RestoreSource::HotArchive(Box::new(original)));
+    }
+
+    /// Test-only: directly insert a hot archive TTL entry without pair enforcement.
+    pub(super) fn insert_hot_archive_ttl_for_test(
+        &mut self,
+        key: LedgerKey,
+        original: stellar_xdr::curr::LedgerEntry,
+    ) {
+        assert!(
+            matches!(key, LedgerKey::Ttl(_)),
+            "insert_hot_archive_ttl_for_test: key must be TTL"
+        );
+        self.entries
+            .insert(key, RestoreSource::HotArchiveTtl(Box::new(original)));
+    }
+}
+
 /// Collect restored entries for a Soroban operation from both the hot archive
 /// and the live bucket list.
 ///
@@ -288,8 +319,6 @@ pub(super) fn collect_soroban_restored_entries(
     delta_slice: &DeltaSlice<'_>,
     collected_hot_archive_keys: &mut HashSet<LedgerKey>,
 ) -> RestoredEntries {
-    use sha2::{Digest, Sha256};
-
     let mut restored = RestoredEntries::default();
 
     // Get live BL restorations from the Soroban execution result
@@ -356,14 +385,13 @@ pub(super) fn collect_soroban_restored_entries(
             (hot_archive, for_meta)
         };
 
-    // Now store original entry values ONLY for keys that passed the meta filter.
-    // This prevents read-only auto-restores from emitting spurious RESTORED changes
-    // via hot_archive_entries_with_originals() post-processing at meta.rs.
+    // Insert hot-archive restore pairs atomically (data/code + TTL together).
+    // Only for keys that passed the meta filter — this prevents read-only auto-restores
+    // from emitting spurious RESTORED changes.
     if let Some(meta) = soroban_meta {
         for ha_restore in &meta.hot_archive_restores {
             if hot_archive_for_meta.contains(ha_restore.key()) {
-                restored
-                    .insert_hot_archive_entry(ha_restore.key().clone(), ha_restore.entry().clone());
+                restored.insert_hot_archive_pair(ha_restore);
             }
         }
     }
@@ -382,21 +410,6 @@ pub(super) fn collect_soroban_restored_entries(
             "Filtered hot archive keys: live BL restores and already-restored entries"
         );
     }
-    // For transaction meta purposes, also add the corresponding TTL keys.
-    // When a ContractData/ContractCode entry is restored from hot archive,
-    // its TTL entry should also be emitted as RESTORED (not CREATED).
-    // Use the filtered set (hot_archive_for_meta) which only includes entries
-    // actually being created/restored in this TX.
-    // NOTE: We don't add TTL keys to collected_hot_archive_keys because
-    // HotArchiveBucketList::add_batch only receives data/code entries.
-    let ttl_keys: Vec<_> = hot_archive_for_meta
-        .iter()
-        .map(|key| {
-            let key_bytes = henyey_common::xdr_to_bytes(key);
-            let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
-            LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash })
-        })
-        .collect();
     // Collect data/code keys only for HotArchiveBucketList::add_batch.
     // All hot archive keys (already filtered by live BL above) should be
     // passed to the bucket list. This is true for both RestoreFootprint
@@ -417,21 +430,16 @@ pub(super) fn collect_soroban_restored_entries(
     if is_operation_success(op_result) {
         collected_hot_archive_keys.extend(hot_archive_for_bucket_list.iter().cloned());
     }
-    // Add filtered keys to restored for meta conversion.
-    // Non-TTL keys from hot_archive_for_meta must already have been inserted
-    // via insert_hot_archive_entry (from hot_archive_restores). Only TTL keys
-    // should reach the insert path here — this is consistent with the assert
-    // in meta.rs that non-TTL keys must have an original entry.
-    for key in hot_archive_for_meta {
-        if !restored.is_hot_archive_restored(&key) {
+    // Completeness invariant: every non-TTL key in hot_archive_for_meta must
+    // have been captured as a pair via insert_hot_archive_pair above.
+    for key in &hot_archive_for_meta {
+        if !matches!(key, LedgerKey::Ttl(_)) {
             assert!(
-                matches!(key, LedgerKey::Ttl(_)),
-                "non-TTL hot archive key without original entry: {key:?}"
+                restored.is_hot_archive_restored(key),
+                "hot_archive_for_meta key without captured pair: {key:?}"
             );
-            restored.insert_hot_archive_ttl(key);
         }
     }
-    restored.extend_hot_archive_ttls(ttl_keys);
     restored
 }
 
@@ -1143,10 +1151,10 @@ impl TransactionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use henyey_tx::operations::execute::HotArchiveRestore;
     use stellar_xdr::curr::{
         ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash,
-        LedgerEntryData, LedgerEntryExt, LedgerKeyContractData, LedgerKeyTtl, ScAddress, ScVal,
-        TtlEntry,
+        LedgerEntryData, LedgerEntryExt, LedgerKeyContractData, ScAddress, ScVal, TtlEntry,
     };
 
     fn make_contract_data_key() -> LedgerKey {
@@ -1154,12 +1162,6 @@ mod tests {
             contract: ScAddress::Contract(ContractId(Hash([1u8; 32]))),
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
-        })
-    }
-
-    fn make_ttl_key() -> LedgerKey {
-        LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: Hash([2u8; 32]),
         })
     }
 
@@ -1177,39 +1179,32 @@ mod tests {
         }
     }
 
-    fn make_ttl_entry(seq: u32) -> stellar_xdr::curr::LedgerEntry {
-        stellar_xdr::curr::LedgerEntry {
-            last_modified_ledger_seq: seq,
-            data: LedgerEntryData::Ttl(TtlEntry {
-                key_hash: Hash([2u8; 32]),
-                live_until_ledger_seq: 1000,
-            }),
-            ext: LedgerEntryExt::V0,
-        }
+    /// Helper: create a valid HotArchiveRestore for testing.
+    fn make_ha_restore() -> HotArchiveRestore {
+        let key = make_contract_data_key();
+        let entry = make_entry(1);
+        HotArchiveRestore::new(key, entry, 1000)
     }
 
     #[test]
     fn test_source_returns_correct_variant() {
         let mut r = RestoredEntries::new();
-        let data_key = make_contract_data_key();
-        let ttl_key = make_ttl_key();
-        let entry = make_entry(1);
+        let ha = make_ha_restore();
+        let data_key = ha.key().clone();
+        let ttl_key = ha.ttl_key();
 
         // Before insertion, source returns None
         assert!(r.source(&data_key).is_none());
 
-        // Insert hot archive data/code
-        r.insert_hot_archive_entry(data_key.clone(), entry.clone());
+        // Insert hot archive pair
+        r.insert_hot_archive_pair(&ha);
         assert!(matches!(
             r.source(&data_key),
             Some(RestoreSource::HotArchive(_))
         ));
-
-        // Insert hot archive TTL
-        r.insert_hot_archive_ttl(ttl_key.clone());
         assert!(matches!(
             r.source(&ttl_key),
-            Some(RestoreSource::HotArchiveTtl)
+            Some(RestoreSource::HotArchiveTtl(_))
         ));
 
         // Insert live BL
@@ -1218,7 +1213,18 @@ mod tests {
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
-        r.insert_live_bl(live_key.clone(), entry.clone());
+        let live_entry = stellar_xdr::curr::LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+                key: ScVal::Void,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        r.insert_live_bl(live_key.clone(), live_entry);
         assert!(matches!(
             r.source(&live_key),
             Some(RestoreSource::LiveBucketList(_))
@@ -1226,57 +1232,74 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "key already restored from live BL")]
-    fn test_mutual_exclusion_live_bl_then_hot_archive_panics() {
-        let mut r = RestoredEntries::new();
-        let key = make_contract_data_key();
-        let entry = make_entry(1);
-        r.insert_live_bl(key.clone(), entry.clone());
-        r.insert_hot_archive_entry(key, entry); // should panic
-    }
-
-    #[test]
     #[should_panic(expected = "key already restored from hot archive")]
     fn test_mutual_exclusion_hot_archive_then_live_bl_panics() {
         let mut r = RestoredEntries::new();
-        let key = make_contract_data_key();
-        let entry = make_entry(1);
-        r.insert_hot_archive_entry(key.clone(), entry.clone());
-        r.insert_live_bl(key, entry); // should panic
+        let ha = make_ha_restore();
+        let data_key = ha.key().clone();
+        let entry = ha.entry().clone();
+        r.insert_hot_archive_pair(&ha);
+        r.insert_live_bl(data_key, entry); // should panic
     }
 
     #[test]
-    #[should_panic(expected = "insert_hot_archive_ttl called with non-TTL key")]
-    fn test_hot_archive_ttl_rejects_non_ttl() {
+    #[should_panic(expected = "data_key already restored from live BL")]
+    fn test_mutual_exclusion_live_bl_then_hot_archive_panics() {
         let mut r = RestoredEntries::new();
-        let key = make_contract_data_key();
-        r.insert_hot_archive_ttl(key); // should panic
+        let ha = make_ha_restore();
+        let data_key = ha.key().clone();
+        let entry = ha.entry().clone();
+        r.insert_live_bl(data_key, entry);
+        r.insert_hot_archive_pair(&ha); // should panic
     }
 
     #[test]
-    #[should_panic(expected = "insert_hot_archive_entry called with TTL key")]
-    fn test_hot_archive_entry_rejects_ttl() {
+    fn test_insert_hot_archive_pair_happy_path() {
         let mut r = RestoredEntries::new();
-        let key = make_ttl_key();
-        let entry = make_ttl_entry(1);
-        r.insert_hot_archive_entry(key, entry); // should panic
+        let ha = make_ha_restore();
+        let data_key = ha.key().clone();
+        let ttl_key = ha.ttl_key();
+
+        r.insert_hot_archive_pair(&ha);
+
+        assert!(r.is_hot_archive_restored(&data_key));
+        assert!(r.is_hot_archive_restored(&ttl_key));
+        assert!(!r.is_live_bl_restored(&data_key));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate data_key insertion")]
+    fn test_insert_hot_archive_pair_panics_duplicate() {
+        let mut r = RestoredEntries::new();
+        let ha = make_ha_restore();
+        r.insert_hot_archive_pair(&ha);
+        r.insert_hot_archive_pair(&ha); // should panic
     }
 
     #[test]
     fn test_iterators_filter_correctly() {
         let mut r = RestoredEntries::new();
-        let ha_key = make_contract_data_key();
-        let ttl_key = make_ttl_key();
+        let ha = make_ha_restore();
+        let ha_key = ha.key().clone();
+        r.insert_hot_archive_pair(&ha);
+
         let live_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: ScAddress::Contract(ContractId(Hash([5u8; 32]))),
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
-        let entry = make_entry(1);
-
-        r.insert_hot_archive_entry(ha_key.clone(), entry.clone());
-        r.insert_hot_archive_ttl(ttl_key.clone());
-        r.insert_live_bl(live_key.clone(), entry.clone());
+        let live_entry = stellar_xdr::curr::LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash([5u8; 32]))),
+                key: ScVal::Void,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        r.insert_live_bl(live_key.clone(), live_entry);
 
         // hot_archive_entries_with_originals returns only HotArchive variant
         let ha_entries: Vec<_> = r.hot_archive_entries_with_originals().collect();
@@ -1292,18 +1315,28 @@ mod tests {
     #[test]
     fn test_is_restored_covers_all_sources() {
         let mut r = RestoredEntries::new();
-        let ha_key = make_contract_data_key();
-        let ttl_key = make_ttl_key();
+        let ha = make_ha_restore();
+        let ha_key = ha.key().clone();
+        let ttl_key = ha.ttl_key();
+        r.insert_hot_archive_pair(&ha);
+
         let live_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: ScAddress::Contract(ContractId(Hash([7u8; 32]))),
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
-        let entry = make_entry(1);
-
-        r.insert_hot_archive_entry(ha_key.clone(), entry.clone());
-        r.insert_hot_archive_ttl(ttl_key.clone());
-        r.insert_live_bl(live_key.clone(), entry);
+        let live_entry = stellar_xdr::curr::LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash([7u8; 32]))),
+                key: ScVal::Void,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        r.insert_live_bl(live_key.clone(), live_entry);
 
         assert!(r.is_restored(&ha_key));
         assert!(r.is_restored(&ttl_key));
@@ -1325,8 +1358,8 @@ mod tests {
         let mut r = RestoredEntries::new();
         assert_eq!(r.live_bl_len(), 0);
 
-        let entry = make_entry(1);
-        r.insert_hot_archive_entry(make_contract_data_key(), entry.clone());
+        let ha = make_ha_restore();
+        r.insert_hot_archive_pair(&ha);
         assert_eq!(r.live_bl_len(), 0);
 
         let live_key1 = LedgerKey::ContractData(LedgerKeyContractData {
@@ -1334,55 +1367,36 @@ mod tests {
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
+        let live_entry1 = stellar_xdr::curr::LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash([3u8; 32]))),
+                key: ScVal::Void,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
         let live_key2 = LedgerKey::ContractData(LedgerKeyContractData {
             contract: ScAddress::Contract(ContractId(Hash([4u8; 32]))),
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
-        r.insert_live_bl(live_key1, entry.clone());
-        r.insert_live_bl(live_key2, entry);
+        let live_entry2 = stellar_xdr::curr::LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash([4u8; 32]))),
+                key: ScVal::Void,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        r.insert_live_bl(live_key1, live_entry1);
+        r.insert_live_bl(live_key2, live_entry2);
         assert_eq!(r.live_bl_len(), 2);
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate hot archive entry insertion")]
-    fn test_same_source_duplicate_panics() {
-        let mut r = RestoredEntries::new();
-        let key = make_contract_data_key();
-        let entry1 = make_entry(1);
-        let entry2 = make_entry(2);
-
-        r.insert_hot_archive_entry(key.clone(), entry1);
-        // Re-inserting same key panics (matches stellar-core behavior)
-        r.insert_hot_archive_entry(key, entry2);
-    }
-
-    #[test]
-    #[should_panic(expected = "TTL key already restored from live BL")]
-    fn test_hot_archive_ttl_rejects_existing_live_bl() {
-        let mut r = RestoredEntries::new();
-        let ttl_key = make_ttl_key();
-        let entry = make_ttl_entry(1);
-
-        r.insert_live_bl(ttl_key.clone(), entry);
-        // Inserting TTL as hot archive when already in live BL should panic
-        r.insert_hot_archive_ttl(ttl_key);
-    }
-
-    #[test]
-    fn test_hot_archive_ttl_idempotent() {
-        let mut r = RestoredEntries::new();
-        let ttl_key = make_ttl_key();
-
-        // First insertion
-        r.insert_hot_archive_ttl(ttl_key.clone());
-        // Idempotent re-insertion is allowed (same variant, same key)
-        r.insert_hot_archive_ttl(ttl_key.clone());
-
-        assert!(matches!(
-            r.source(&ttl_key),
-            Some(RestoreSource::HotArchiveTtl)
-        ));
     }
 
     // --- insert_live_bl_pair tests ---
@@ -1447,19 +1461,10 @@ mod tests {
     #[should_panic(expected = "data_key already restored from hot archive")]
     fn test_insert_live_bl_pair_panics_hot_archive_conflict_data() {
         let mut r = RestoredEntries::new();
+        let ha = make_ha_restore();
         let restore = make_live_bl_restore();
         // Put data_key in hot archive first
-        r.insert_hot_archive_entry(restore.key().clone(), restore.entry().clone());
-        r.insert_live_bl_pair(&restore);
-    }
-
-    #[test]
-    #[should_panic(expected = "ttl_key already restored from hot archive")]
-    fn test_insert_live_bl_pair_panics_hot_archive_conflict_ttl() {
-        let mut r = RestoredEntries::new();
-        let restore = make_live_bl_restore();
-        // Put ttl_key in hot archive first
-        r.insert_hot_archive_ttl(restore.ttl_key().clone());
+        r.insert_hot_archive_pair(&ha);
         r.insert_live_bl_pair(&restore);
     }
 
@@ -1468,7 +1473,6 @@ mod tests {
         let restore = make_live_bl_restore();
 
         // Use catch_unwind to test that on panic, the map is not partially mutated.
-        // We wrap the RestoredEntries in AssertUnwindSafe so we can inspect it after.
         let mut r = RestoredEntries::new();
         // Pre-insert the ttl_key to trigger duplicate check on the second half
         r.insert_live_bl(restore.ttl_key().clone(), restore.ttl_entry().clone());

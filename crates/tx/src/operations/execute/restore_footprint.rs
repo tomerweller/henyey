@@ -882,7 +882,7 @@ mod tests {
         let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         let entry = make_contract_code_entry(hash);
 
-        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry)];
+        let hot_restores = vec![HotArchiveRestore::new_for_test(key.clone(), entry)];
 
         let soroban_data = SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,
@@ -937,7 +937,7 @@ mod tests {
         let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         let entry = make_contract_code_entry(hash);
 
-        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry)];
+        let hot_restores = vec![HotArchiveRestore::new_for_test(key.clone(), entry)];
 
         let soroban_data = SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,
@@ -983,7 +983,7 @@ mod tests {
         let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         let entry = make_contract_code_entry(hash);
 
-        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry)];
+        let hot_restores = vec![HotArchiveRestore::new_for_test(key.clone(), entry)];
 
         // disk_read_bytes = 0 means any entry exceeds it
         let soroban_data = SorobanTransactionData {
@@ -1034,7 +1034,7 @@ mod tests {
         let hot_entry = make_contract_code_entry(hot_hash);
         let hot_entry_size = hot_entry.to_xdr(Limits::none()).unwrap().len() as u32;
 
-        let hot_restores = vec![HotArchiveRestore::new(hot_key.clone(), hot_entry)];
+        let hot_restores = vec![HotArchiveRestore::new_for_test(hot_key.clone(), hot_entry)];
 
         // Live entry with expired TTL
         let live_hash = Hash([61u8; 32]);
@@ -1213,7 +1213,7 @@ mod tests {
             "entry XDR size ({entry_xdr_size}) must exceed restrictive limit (100)"
         );
 
-        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry.clone())];
+        let hot_restores = vec![HotArchiveRestore::new_for_test(key.clone(), entry.clone())];
 
         let soroban_data = SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,
@@ -1309,7 +1309,7 @@ mod tests {
             "entry XDR size ({entry_xdr_size}) must exceed restrictive limit (100)"
         );
 
-        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry.clone())];
+        let hot_restores = vec![HotArchiveRestore::new_for_test(key.clone(), entry.clone())];
 
         let soroban_data = SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,
@@ -1623,7 +1623,7 @@ mod tests {
         let entry = make_contract_code_entry_with_size(hash, 100);
         let entry_xdr_size = entry.to_xdr(Limits::none()).unwrap().len() as u32;
 
-        let hot_restores = vec![HotArchiveRestore::new(key.clone(), entry)];
+        let hot_restores = vec![HotArchiveRestore::new_for_test(key.clone(), entry)];
 
         let soroban_data = SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,

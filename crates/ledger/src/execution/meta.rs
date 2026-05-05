@@ -538,9 +538,18 @@ pub(super) fn build_entry_changes_with_hot_archive(
                     changes.push(LedgerEntryChange::Updated(entry.clone()));
                 }
             }
-            Some(RestoreSource::HotArchiveTtl) => {
-                // Synthesized TTL key — no original to compare, just emit RESTORED.
-                changes.push(LedgerEntryChange::Restored(entry.clone()));
+            Some(RestoreSource::HotArchiveTtl(original)) => {
+                // TTL key restored from hot archive — compare against synthesized original.
+                // stellar-core: processOpLedgerEntryChanges compares stored TTL value
+                // at restoration time against final value to decide RESTORED vs RESTORED+UPDATED.
+                if entry.data == original.data {
+                    changes.push(LedgerEntryChange::Restored(entry.clone()));
+                } else {
+                    let mut restored_entry = original.as_ref().clone();
+                    restored_entry.last_modified_ledger_seq = current_ledger_seq;
+                    changes.push(LedgerEntryChange::Restored(restored_entry));
+                    changes.push(LedgerEntryChange::Updated(entry.clone()));
+                }
             }
             Some(RestoreSource::LiveBucketList(_)) => {
                 // Live BL restores should never appear as CREATED — they use LIVE
@@ -684,7 +693,9 @@ pub(super) fn build_entry_changes_with_hot_archive(
                         // The filtering to mRoTTLBumps only affects STATE updates (commitChangesFromSuccessfulOp),
                         // not transaction meta. Do NOT skip ro_ttl_keys here.
                         match restored.source(&key) {
-                            Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl) => {
+                            Some(
+                                RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl(_),
+                            ) => {
                                 // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
                                 // entries do not appear as UPDATED (they use CREATED path).
                                 unreachable!(
@@ -789,7 +800,9 @@ pub(super) fn build_entry_changes_with_hot_archive(
                         let post_state = &updated[*idx];
                         let key = henyey_common::entry_to_key(post_state);
                         match restored.source(&key) {
-                            Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl) => {
+                            Some(
+                                RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl(_),
+                            ) => {
                                 // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
                                 // entries do not appear as UPDATED (they use CREATED path).
                                 unreachable!(
@@ -905,7 +918,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                 seen_keys.insert(key.clone());
                 if let Some(final_entry) = final_updated.get(&key) {
                     match restored.source(&key) {
-                        Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl) => {
+                        Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl(_)) => {
                             // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
                             // entries do not appear as UPDATED (they use CREATED path).
                             unreachable!(
@@ -1613,7 +1626,7 @@ mod tests {
         });
 
         let mut restored = super::super::apply::RestoredEntries::new();
-        restored.insert_hot_archive_entry(key.clone(), original_entry.clone());
+        restored.insert_hot_archive_entry_for_test(key.clone(), original_entry.clone());
 
         let created = vec![modified_entry.clone()];
         let change_order = vec![henyey_tx::ChangeRef::Created(0)];
@@ -1687,7 +1700,7 @@ mod tests {
 
         let mut restored = super::super::apply::RestoredEntries::new();
         // Same data as the created entry — unmodified
-        restored.insert_hot_archive_entry(
+        restored.insert_hot_archive_entry_for_test(
             key.clone(),
             LedgerEntry {
                 last_modified_ledger_seq: 50, // different lmlseq is OK, only .data matters
@@ -1733,8 +1746,7 @@ mod tests {
         }
     }
 
-    /// Test that TTL keys (synthetic, no original in hot_archive_entries)
-    /// emit single RESTORED(entry) without panicking.
+    /// Test that TTL keys restored from hot archive emit single RESTORED(entry) when unmodified.
     #[test]
     fn test_hot_archive_ttl_key_restore_meta() {
         use std::collections::HashMap;
@@ -1746,8 +1758,8 @@ mod tests {
         });
 
         let mut restored = super::super::apply::RestoredEntries::new();
-        // No entry in hot_archive_entries for TTL key (it's synthetic)
-        restored.extend_hot_archive_ttls(std::iter::once(ttl_key.clone()));
+        // Insert TTL key with the same entry as original (unmodified case)
+        restored.insert_hot_archive_ttl_for_test(ttl_key.clone(), ttl_entry.clone());
 
         let created = vec![ttl_entry.clone()];
         let change_order = vec![henyey_tx::ChangeRef::Created(0)];
@@ -1782,6 +1794,81 @@ mod tests {
                 assert_eq!(e.data, ttl_entry.data);
             }
             other => panic!("Expected RESTORED, got {:?}", other),
+        }
+    }
+
+    /// Test that TTL keys restored from hot archive emit RESTORED(original) + UPDATED(final)
+    /// when the TTL was extended.
+    #[test]
+    fn test_hot_archive_ttl_key_modified_emits_restored_plus_updated() {
+        use std::collections::HashMap;
+
+        let key_hash = [0xEE; 32];
+        // Original TTL entry at restore time
+        let original_ttl = make_ttl_entry(key_hash, 200);
+        // Final TTL entry after host-side extension
+        let final_ttl = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: Hash(key_hash),
+                live_until_ledger_seq: 500, // extended
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash(key_hash),
+        });
+
+        let mut restored = super::super::apply::RestoredEntries::new();
+        // Insert with original TTL value (before extension)
+        restored.insert_hot_archive_ttl_for_test(ttl_key.clone(), original_ttl.clone());
+
+        let created = vec![final_ttl.clone()];
+        let change_order = vec![henyey_tx::ChangeRef::Created(0)];
+
+        let state = LedgerStateManager::new(5_000_000, 100);
+
+        let changes = build_entry_changes_with_hot_archive(
+            &state,
+            &LedgerChanges {
+                created: &created,
+                updated: &[],
+                update_states: &[],
+                deleted: &[],
+                delete_states: &[],
+                change_order: &change_order,
+                state_overrides: &HashMap::new(),
+                restored: &restored,
+            },
+            true,
+            100,
+        );
+
+        let changes = changes.0.to_vec();
+        assert_eq!(
+            changes.len(),
+            2,
+            "Expected RESTORED + UPDATED for modified TTL, got {:?}",
+            changes
+        );
+        match &changes[0] {
+            LedgerEntryChange::Restored(e) => {
+                // RESTORED carries original TTL data with current ledger seq
+                assert_eq!(e.last_modified_ledger_seq, 100);
+                match &e.data {
+                    LedgerEntryData::Ttl(ttl) => {
+                        assert_eq!(ttl.live_until_ledger_seq, 200);
+                    }
+                    _ => panic!("Expected TTL data"),
+                }
+            }
+            other => panic!("Expected RESTORED, got {:?}", other),
+        }
+        match &changes[1] {
+            LedgerEntryChange::Updated(e) => {
+                assert_eq!(e.data, final_ttl.data);
+            }
+            other => panic!("Expected UPDATED, got {:?}", other),
         }
     }
 

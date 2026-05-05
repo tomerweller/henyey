@@ -98,7 +98,7 @@ pub use host::{
     SorobanExecutionResult, StorageChange, StorageChangeKind,
 };
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};
-pub use ttl::{extend_ttl_target, restore_ttl_target};
+pub use ttl::{extend_ttl_target, restore_ttl_target, synthesize_ttl_entry};
 
 use stellar_xdr::curr::{
     AccountId, Hash, HostFunction, LedgerEntry, LedgerKey, SorobanAuthorizationEntry,

@@ -537,6 +537,10 @@ fn execute_contract_invocation(
     // we must emit RESTORED(oldValue) + UPDATED(newValue) instead of RESTORED(newValue).
     // GuardedHotArchive::get() is safe here — it only returns None for keys restored
     // by PRIOR transactions in this ledger, not for the current transaction's keys.
+    let restored_live_until = crate::soroban::restore_ttl_target(
+        context.sequence,
+        soroban_config.min_persistent_entry_ttl,
+    );
     let hot_archive_original_entries: Vec<HotArchiveRestore> =
         match (guarded_hot_archive.as_ref(), &soroban_data.ext) {
             (Some(guarded), SorobanTransactionDataExt::V1(ext)) => ext
@@ -549,7 +553,11 @@ fn execute_contract_invocation(
                         .read_write
                         .get(*idx as usize)?;
                     let entry = guarded.get(key).ok()??;
-                    Some(HotArchiveRestore::new(key.clone(), entry))
+                    Some(HotArchiveRestore::new(
+                        key.clone(),
+                        entry,
+                        restored_live_until,
+                    ))
                 })
                 .collect(),
             _ => Vec::new(),

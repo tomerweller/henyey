@@ -546,29 +546,41 @@ impl SorobanOperationMeta {
     }
 }
 
-/// Entry restored from the hot archive.
+/// Entry restored from the hot archive (Soroban persistent only).
 ///
 /// This type enforces structural pairing invariants at construction time:
 /// - The key must be a persistent Soroban key (ContractCode or persistent ContractData)
 /// - The entry must correspond to the key
+/// - A synthesized TTL entry is derived internally from the key hash and restore target
 ///
-/// Note: This type enforces only structural pairing, not eviction/restore semantics
-/// (whether the entry was actually evicted is contextual to the hot archive state).
+/// The TTL entry mirrors stellar-core's `getTTLEntryForTTLKey` behavior — it is
+/// synthesized at restore time (not read from the archive) and used for meta comparison
+/// in `processOpLedgerEntryChanges` to determine RESTORED vs RESTORED+UPDATED emission.
 #[derive(Debug, Clone)]
 pub struct HotArchiveRestore {
     key: stellar_xdr::curr::LedgerKey,
     entry: stellar_xdr::curr::LedgerEntry,
+    /// Synthesized TTL entry at the time of restore. Used for meta comparison.
+    ttl_entry: stellar_xdr::curr::LedgerEntry,
 }
 
 impl HotArchiveRestore {
     /// Create a new validated `HotArchiveRestore`.
+    ///
+    /// Derives the TTL entry internally from `key` and `restored_live_until_ledger`,
+    /// mirroring stellar-core's `addHotArchiveRestore(lk, le, ttlKey, ttlEntry)` where
+    /// `ttlEntry = getTTLEntryForTTLKey(ttlKey, restoredLiveUntilLedger)`.
     ///
     /// # Panics
     ///
     /// Panics if any structural invariant is violated:
     /// - `key` is not a persistent Soroban key (ContractCode or persistent ContractData)
     /// - `entry` does not correspond to `key`
-    pub fn new(key: stellar_xdr::curr::LedgerKey, entry: stellar_xdr::curr::LedgerEntry) -> Self {
+    pub fn new(
+        key: stellar_xdr::curr::LedgerKey,
+        entry: stellar_xdr::curr::LedgerEntry,
+        restored_live_until_ledger: u32,
+    ) -> Self {
         assert!(
             henyey_common::is_persistent_key(&key),
             "HotArchiveRestore::new: key must be a persistent Soroban key, got: {:?}",
@@ -581,7 +593,14 @@ impl HotArchiveRestore {
             "HotArchiveRestore::new: entry does not correspond to key"
         );
 
-        Self { key, entry }
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        let ttl_entry = crate::soroban::synthesize_ttl_entry(key_hash, restored_live_until_ledger);
+
+        Self {
+            key,
+            entry,
+            ttl_entry,
+        }
     }
 
     /// The ledger key of the restored entry (ContractCode or persistent ContractData).
@@ -592,6 +611,28 @@ impl HotArchiveRestore {
     /// The restored entry value.
     pub fn entry(&self) -> &stellar_xdr::curr::LedgerEntry {
         &self.entry
+    }
+
+    /// The synthesized TTL entry at the time of restore.
+    pub fn ttl_entry(&self) -> &stellar_xdr::curr::LedgerEntry {
+        &self.ttl_entry
+    }
+
+    /// Derive the TTL key from the data/code key.
+    pub fn ttl_key(&self) -> stellar_xdr::curr::LedgerKey {
+        let key_hash = crate::soroban::compute_key_hash(&self.key);
+        stellar_xdr::curr::LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash })
+    }
+}
+
+#[cfg(test)]
+impl HotArchiveRestore {
+    /// Test helper: create with a default TTL target of 1000.
+    pub fn new_for_test(
+        key: stellar_xdr::curr::LedgerKey,
+        entry: stellar_xdr::curr::LedgerEntry,
+    ) -> Self {
+        Self::new(key, entry, 1000)
     }
 }
 
@@ -1181,8 +1222,15 @@ pub fn execute_operation_with_soroban(
                                     old_live_until: 0, // Hot archive entries: old_live_until = 0
                                 });
                                 // Track this entry for RESTORED metadata emission
-                                hot_archive_restores
-                                    .push(HotArchiveRestore::new(key.clone(), entry.clone()));
+                                let restored_live_until = crate::soroban::restore_ttl_target(
+                                    context.sequence,
+                                    config.min_persistent_entry_ttl,
+                                );
+                                hot_archive_restores.push(HotArchiveRestore::new(
+                                    key.clone(),
+                                    entry.clone(),
+                                    restored_live_until,
+                                ));
                             }
                         }
                     }
@@ -1493,7 +1541,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let restore = HotArchiveRestore::new(key.clone(), entry);
+        let restore = HotArchiveRestore::new_for_test(key.clone(), entry);
         assert_eq!(restore.key(), &key);
         assert_eq!(restore.entry().last_modified_ledger_seq, 100);
     }
@@ -1518,7 +1566,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let restore = HotArchiveRestore::new(key.clone(), entry);
+        let restore = HotArchiveRestore::new_for_test(key.clone(), entry);
         assert_eq!(restore.key(), &key);
         assert_eq!(restore.entry().last_modified_ledger_seq, 200);
     }
@@ -1538,7 +1586,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        HotArchiveRestore::new(key, entry);
+        HotArchiveRestore::new(key, entry, 1000);
     }
 
     #[test]
@@ -1562,7 +1610,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        HotArchiveRestore::new(key, entry);
+        HotArchiveRestore::new(key, entry, 1000);
     }
 
     #[test]
@@ -1581,7 +1629,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        HotArchiveRestore::new(key, entry);
+        HotArchiveRestore::new(key, entry, 1000);
     }
 
     #[test]
@@ -1598,7 +1646,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let restore = HotArchiveRestore::new(key, entry);
+        let restore = HotArchiveRestore::new_for_test(key, entry);
         let debug_str = format!("{:?}", restore);
         assert!(debug_str.contains("HotArchiveRestore"));
     }
