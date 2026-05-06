@@ -943,6 +943,16 @@ impl BallotProtocol {
     ) -> EnvelopeState {
         self.advance_slot(hint, ctx)
     }
+
+    /// Test helper: expose attempt_confirm_commit for unit testing.
+    #[cfg(test)]
+    pub(crate) fn attempt_confirm_commit_for_test<D: SCPDriver>(
+        &mut self,
+        hint: &ScpStatement,
+        ctx: &SlotContext<'_, D>,
+    ) -> bool {
+        self.attempt_confirm_commit(hint, ctx)
+    }
 }
 
 #[cfg(test)]
@@ -4338,6 +4348,214 @@ mod tests {
             driver.emit_count.load(Ordering::SeqCst),
             0,
             "MaybeValidDeferred self-envelope should not be emitted"
+        );
+    }
+
+    /// Parity test: attempt_confirm_commit rejects PREPARE hints.
+    ///
+    /// stellar-core's attemptConfirmCommit (BallotProtocol.cpp:1460-1465)
+    /// explicitly returns false for SCP_ST_PREPARE. This test verifies that
+    /// henyey's attempt_confirm_commit also rejects PREPARE hints, even when
+    /// the ballot state would otherwise allow externalization.
+    #[test]
+    fn test_attempt_confirm_commit_rejects_prepare_hint() {
+        // 3-node quorum, threshold 2: self cannot ratify alone
+        let node_self = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+        let quorum_set =
+            make_quorum_set(vec![node_self.clone(), node_b.clone(), node_c.clone()], 2);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[42]);
+        let qs_hash: stellar_xdr::curr::Hash = hash_quorum_set(&quorum_set).into();
+
+        // Manually put bp into Confirm phase with valid commit and high_ballot
+        bp.phase = BallotPhase::Confirm;
+        bp.commit = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        bp.high_ballot = Some(ScpBallot {
+            counter: 2,
+            value: value.clone(),
+        });
+        bp.current_ballot = Some(ScpBallot {
+            counter: 2,
+            value: value.clone(),
+        });
+
+        // Seed latest_envelopes with CONFIRM envelopes from nodes B and C
+        // so that federated_ratify succeeds (quorum threshold met).
+        // n_commit=1, n_h=2 matches our commit/high_ballot setup.
+        let env_b = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: node_b.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Confirm(ScpStatementConfirm {
+                    ballot: ScpBallot {
+                        counter: 2,
+                        value: value.clone(),
+                    },
+                    n_prepared: 2,
+                    n_commit: 1,
+                    n_h: 2,
+                    quorum_set_hash: qs_hash.clone(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        let env_c = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: node_c.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Confirm(ScpStatementConfirm {
+                    ballot: ScpBallot {
+                        counter: 2,
+                        value: value.clone(),
+                    },
+                    n_prepared: 2,
+                    n_commit: 1,
+                    n_h: 2,
+                    quorum_set_hash: qs_hash.clone(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        bp.latest_envelopes.insert(node_b.clone(), env_b);
+        bp.latest_envelopes.insert(node_c.clone(), env_c);
+
+        // NEGATIVE TEST: PREPARE hint with n_c != 0 should be rejected
+        let prepare_hint = ScpStatement {
+            node_id: node_b.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: qs_hash.clone(),
+                ballot: ScpBallot {
+                    counter: 2,
+                    value: value.clone(),
+                },
+                prepared: None,
+                prepared_prime: None,
+                n_c: 1,
+                n_h: 2,
+            }),
+        };
+
+        let result = bp.attempt_confirm_commit_for_test(
+            &prepare_hint,
+            &ctx!(&node_self, &quorum_set, &driver, 1),
+        );
+        assert!(
+            !result,
+            "attempt_confirm_commit must reject PREPARE hints (stellar-core parity)"
+        );
+        assert_eq!(
+            bp.phase,
+            BallotPhase::Confirm,
+            "phase must remain Confirm after PREPARE hint rejection"
+        );
+        assert!(
+            driver.get_externalized_values().is_empty(),
+            "no externalization should occur from PREPARE hint"
+        );
+    }
+
+    /// Positive control: attempt_confirm_commit accepts CONFIRM hints and
+    /// can externalize when quorum conditions are met.
+    #[test]
+    fn test_attempt_confirm_commit_accepts_confirm_hint() {
+        // Same setup as the negative test
+        let node_self = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+        let quorum_set =
+            make_quorum_set(vec![node_self.clone(), node_b.clone(), node_c.clone()], 2);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[42]);
+        let qs_hash: stellar_xdr::curr::Hash = hash_quorum_set(&quorum_set).into();
+
+        bp.phase = BallotPhase::Confirm;
+        bp.commit = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        bp.high_ballot = Some(ScpBallot {
+            counter: 2,
+            value: value.clone(),
+        });
+        bp.current_ballot = Some(ScpBallot {
+            counter: 2,
+            value: value.clone(),
+        });
+
+        let env_b = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: node_b.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Confirm(ScpStatementConfirm {
+                    ballot: ScpBallot {
+                        counter: 2,
+                        value: value.clone(),
+                    },
+                    n_prepared: 2,
+                    n_commit: 1,
+                    n_h: 2,
+                    quorum_set_hash: qs_hash.clone(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        let env_c = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: node_c.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Confirm(ScpStatementConfirm {
+                    ballot: ScpBallot {
+                        counter: 2,
+                        value: value.clone(),
+                    },
+                    n_prepared: 2,
+                    n_commit: 1,
+                    n_h: 2,
+                    quorum_set_hash: qs_hash.clone(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        bp.latest_envelopes.insert(node_b.clone(), env_b);
+        bp.latest_envelopes.insert(node_c.clone(), env_c);
+
+        // POSITIVE CONTROL: CONFIRM hint should succeed
+        let confirm_hint = ScpStatement {
+            node_id: node_b.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Confirm(ScpStatementConfirm {
+                ballot: ScpBallot {
+                    counter: 2,
+                    value: value.clone(),
+                },
+                n_prepared: 2,
+                n_commit: 1,
+                n_h: 2,
+                quorum_set_hash: qs_hash,
+            }),
+        };
+
+        let result = bp.attempt_confirm_commit_for_test(
+            &confirm_hint,
+            &ctx!(&node_self, &quorum_set, &driver, 1),
+        );
+        assert!(
+            result,
+            "attempt_confirm_commit must accept CONFIRM hints when quorum ratifies"
+        );
+        assert!(
+            !driver.get_externalized_values().is_empty(),
+            "externalization should occur with CONFIRM hint"
         );
     }
 }

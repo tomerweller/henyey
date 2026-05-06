@@ -362,7 +362,7 @@ impl BallotProtocol {
         did_work
     }
 
-    fn attempt_confirm_commit<D: SCPDriver>(
+    pub(super) fn attempt_confirm_commit<D: SCPDriver>(
         &mut self,
         hint: &ScpStatement,
         ctx: &SlotContext<'_, D>,
@@ -371,6 +371,13 @@ impl BallotProtocol {
             return false;
         }
         if self.high_ballot.is_none() || self.commit.is_none() {
+            return false;
+        }
+        // stellar-core rejects PREPARE hints in attemptConfirmCommit
+        // (BallotProtocol.cpp:1460-1465). Unlike attempt_accept_commit which
+        // correctly processes PREPARE hints with n_c != 0, this function only
+        // acts on CONFIRM/EXTERNALIZE statements.
+        if matches!(hint.pledges, ScpStatementPledges::Prepare(_)) {
             return false;
         }
 
