@@ -1184,6 +1184,8 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
         TransactionPhase::V0(components) => {
             for component in components.iter() {
                 let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
+                // stellar-core skips all fee validation when baseFee is None
+                // (TxSetFrame.cpp:726-728: `if (!fee) { continue; }`)
                 if let Some(base_fee) = comp.base_fee {
                     // Compare as signed i64 — stellar-core promotes uint32_t baseFee
                     // to int64_t, so a negative XDR base_fee correctly fails.
@@ -1194,24 +1196,24 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
                         );
                         return false;
                     }
-                }
-                // Check each TX's inclusion fee meets the minimum
-                let component_base_fee = comp.base_fee;
-                for tx in comp.txs.iter() {
-                    let tx_inclusion_fee = envelope_inclusion_fee(tx);
-                    let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, component_base_fee);
-                    if tx_inclusion_fee < min_fee {
-                        debug!(
-                            "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
-                            tx_inclusion_fee, min_fee
-                        );
-                        return false;
+                    for tx in comp.txs.iter() {
+                        let tx_inclusion_fee = envelope_inclusion_fee(tx);
+                        let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, base_fee);
+                        if tx_inclusion_fee < min_fee {
+                            debug!(
+                                "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
+                                tx_inclusion_fee, min_fee
+                            );
+                            return false;
+                        }
                     }
                 }
             }
             true
         }
         TransactionPhase::V1(parallel) => {
+            // stellar-core skips all fee validation when baseFee is None
+            // (TxSetFrame.cpp:726-728: `if (!fee) { continue; }`)
             if let Some(base_fee) = parallel.base_fee {
                 // Compare as signed i64 — stellar-core promotes uint32_t baseFee
                 // to int64_t, so a negative XDR base_fee correctly fails.
@@ -1222,19 +1224,18 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
                     );
                     return false;
                 }
-            }
-            let component_base_fee = parallel.base_fee;
-            for stage in parallel.execution_stages.iter() {
-                for cluster in stage.iter() {
-                    for tx in cluster.iter() {
-                        let tx_inclusion_fee = envelope_inclusion_fee(tx);
-                        let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, component_base_fee);
-                        if tx_inclusion_fee < min_fee {
-                            debug!(
-                                "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
-                                tx_inclusion_fee, min_fee
-                            );
-                            return false;
+                for stage in parallel.execution_stages.iter() {
+                    for cluster in stage.iter() {
+                        for tx in cluster.iter() {
+                            let tx_inclusion_fee = envelope_inclusion_fee(tx);
+                            let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, base_fee);
+                            if tx_inclusion_fee < min_fee {
+                                debug!(
+                                    "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
+                                    tx_inclusion_fee, min_fee
+                                );
+                                return false;
+                            }
                         }
                     }
                 }
@@ -1249,15 +1250,16 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
 /// Mirrors stellar-core's `getMinInclusionFee()` (TransactionUtils.cpp:1961-1971).
 /// effectiveBaseFee = max(header.baseFee, componentBaseFee)
 /// minFee = effectiveBaseFee * max(1, numOps)
+///
+/// Only called when `component_base_fee` is known (i.e., the component's XDR
+/// `baseFee` optional was present). When `baseFee` is absent, stellar-core
+/// skips fee-map validation entirely (TxSetFrame.cpp:726-728).
 fn get_min_inclusion_fee(
     env: &TransactionEnvelope,
     lcl_base_fee: u32,
-    component_base_fee: Option<i64>,
+    component_base_fee: i64,
 ) -> henyey_tx::InclusionFee {
-    let effective_base_fee = match component_base_fee {
-        Some(bf) => std::cmp::max(lcl_base_fee as i64, bf),
-        None => lcl_base_fee as i64,
-    };
+    let effective_base_fee = std::cmp::max(lcl_base_fee as i64, component_base_fee);
     let num_ops = std::cmp::max(1, envelope_num_ops(env) as i64);
     henyey_tx::InclusionFee::new(effective_base_fee.saturating_mul(num_ops))
 }
@@ -1633,7 +1635,7 @@ pub(crate) fn check_tx_set_valid(
         // 1. Check fee map
         if !check_fee_map(phase, lcl_header.base_fee) {
             return Err(format!(
-                "check_fee_map: phase {} component base fee < lcl base fee {}",
+                "check_fee_map: phase {} fee map validation failed (lcl base fee {})",
                 phase_idx, lcl_header.base_fee
             ));
         }
@@ -2531,9 +2533,9 @@ mod tests {
 
     #[test]
     fn test_check_fee_map_negative_base_fee_rejected() {
-        // A negative base_fee in the XDR should be rejected.
-        // Before the fix, `base_fee as u32` would wrap -1 to u32::MAX,
-        // passing the >= lcl_base_fee check incorrectly.
+        // Defense-in-depth: negative base_fee is also rejected during
+        // deserialization in stellar-core. This test verifies check_fee_map
+        // catches it as an extra safety layer.
         let tx = make_valid_envelope(200, 1);
         let phase = make_v0_phase_with_fee(vec![tx], Some(-1));
         assert!(!check_fee_map(&phase, 100));
@@ -2542,7 +2544,8 @@ mod tests {
     #[test]
     fn test_check_fee_map_negative_parallel_base_fee_rejected() {
         use stellar_xdr::curr::ParallelTxsComponent;
-        // Intentionally invalid: negative base_fee tests check_fee_map rejection
+        // Defense-in-depth: negative base_fee is also rejected during
+        // deserialization in stellar-core.
         let phase = TransactionPhase::V1(ParallelTxsComponent {
             base_fee: Some(-1),
             execution_stages: vec![].try_into().unwrap(),
@@ -2563,13 +2566,67 @@ mod tests {
 
     #[test]
     fn test_check_fee_map_no_base_fee_valid() {
-        // No component base_fee. TX fee=200, 1 op.
-        // inclusion_fee = full_fee = 200
-        // min_inclusion_fee = max(100, _) * 1 = 100
-        // 200 >= 100 -> valid
+        // No component base_fee (None). stellar-core skips all fee-map
+        // validation for None-baseFee components (TxSetFrame.cpp:726-728).
+        // This tx happens to have a high enough fee, but the point is that
+        // fee checks are skipped entirely when base_fee is None.
         let tx = make_valid_envelope(200, 1);
         let phase = make_v0_phase_with_fee(vec![tx], None);
         assert!(check_fee_map(&phase, 100));
+    }
+
+    // --- AUDIT-268: None-baseFee parity regression tests ---
+
+    #[test]
+    fn test_check_fee_map_none_base_fee_low_tx_fee_skipped() {
+        // AUDIT-268: When component base_fee is None, stellar-core skips
+        // all fee validation (TxSetFrame.cpp:726-728). Previously henyey
+        // fell back to lcl_base_fee and rejected this tx.
+        // TX fee=50, 1 op, lcl_base_fee=100 → would fail if checked
+        // (50 < 100*1), but must pass because fee checks are skipped.
+        let tx = make_valid_envelope(50, 1);
+        let phase = make_v0_phase_with_fee(vec![tx], None);
+        assert!(check_fee_map(&phase, 100));
+    }
+
+    #[test]
+    fn test_check_fee_map_v1_none_base_fee_low_tx_fee_skipped() {
+        use stellar_xdr::curr::ParallelTxsComponent;
+        // AUDIT-268: V1/parallel path — same as above for V1 arm.
+        // base_fee=None, tx fee=50 < lcl_base_fee=100 → must pass.
+        let tx = make_valid_envelope(50, 1);
+        let phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: None,
+            execution_stages: vec![vec![vec![tx].try_into().unwrap()].try_into().unwrap()]
+                .try_into()
+                .unwrap(),
+        });
+        assert!(check_fee_map(&phase, 100));
+    }
+
+    #[test]
+    fn test_check_fee_map_component_base_fee_higher_than_lcl() {
+        // When component base_fee (200) > lcl_base_fee (100), the effective
+        // base fee is max(100, 200) = 200. TX fee=150 with 1 op has
+        // inclusion_fee = min(150, 1*200) = 150 < 200 → invalid.
+        let tx = make_valid_envelope(150, 1);
+        let phase = make_v0_phase_with_fee(vec![tx], Some(200));
+        assert!(!check_fee_map(&phase, 100));
+    }
+
+    #[test]
+    fn test_check_fee_map_v1_some_base_fee_tx_too_low() {
+        use stellar_xdr::curr::ParallelTxsComponent;
+        // V1/parallel with base_fee=Some(100), lcl_base_fee=100.
+        // TX fee=50, 1 op → inclusion_fee = 50 < 100 → invalid.
+        let tx = make_valid_envelope(50, 1);
+        let phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![vec![vec![tx].try_into().unwrap()].try_into().unwrap()]
+                .try_into()
+                .unwrap(),
+        });
+        assert!(!check_fee_map(&phase, 100));
     }
 
     // --- AUDIT-033: check_valid_classic tests ---
