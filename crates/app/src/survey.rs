@@ -38,8 +38,11 @@
 //! - Rate limiting prevents abuse
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use henyey_herder::Herder;
+use henyey_ledger::LedgerManager;
 use henyey_overlay::{PeerId, PeerSnapshot};
 use serde::Serialize;
 use stellar_xdr::curr::{
@@ -62,6 +65,61 @@ const DEFAULT_HISTOGRAM_SAMPLES: usize = 1024;
 /// Matches stellar-core `SurveyManager::NUM_SURVEYED_PEERS`.
 const TIME_SLICED_PEERS_MAX: usize = 25;
 
+// --- Ledger Source ---
+
+/// Trait for providing the current ledger number to the survey message limiter.
+///
+/// Mirrors stellar-core's internal `mApp.getHerder().trackingConsensusLedgerIndex()` call
+/// in `SurveyMessageLimiter::surveyLedgerNumValid()` (SurveyMessageLimiter.cpp:195-200).
+pub(crate) trait LedgerSource: Send + Sync + std::fmt::Debug {
+    fn current_ledger(&self) -> u32;
+}
+
+/// Production ledger source using herder + ledger manager.
+///
+/// Reads the tracking consensus ledger index, falling back to last-closed-ledger (LCL)
+/// when the herder is in boot/syncing state. The boot-state fallback is a henyey-specific
+/// divergence — stellar-core asserts non-boot in `trackingConsensusLedgerIndex()`.
+pub(crate) struct HerderLedgerSource {
+    herder: Arc<Herder>,
+    ledger_manager: Arc<LedgerManager>,
+}
+
+impl std::fmt::Debug for HerderLedgerSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HerderLedgerSource").finish_non_exhaustive()
+    }
+}
+
+impl Clone for HerderLedgerSource {
+    fn clone(&self) -> Self {
+        Self {
+            herder: self.herder.clone(),
+            ledger_manager: self.ledger_manager.clone(),
+        }
+    }
+}
+
+impl HerderLedgerSource {
+    pub fn new(herder: Arc<Herder>, ledger_manager: Arc<LedgerManager>) -> Self {
+        Self {
+            herder,
+            ledger_manager,
+        }
+    }
+}
+
+impl LedgerSource for HerderLedgerSource {
+    fn current_ledger(&self) -> u32 {
+        let tracking = self.herder.tracking_consensus_ledger_index();
+        if tracking.is_boot() {
+            self.ledger_manager.current_ledger_seq()
+        } else {
+            tracking.as_u32()
+        }
+    }
+}
+
 /// Current phase of a time-sliced survey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SurveyPhase {
@@ -79,29 +137,48 @@ pub enum SurveyPhase {
 /// - Limiting the number of survey requests per ledger per surveyor
 /// - Tracking which request/response pairs have been processed
 /// - Ignoring messages with stale ledger numbers
-#[derive(Debug)]
-pub struct SurveyMessageLimiter {
+///
+/// Reads the current ledger internally via [`LedgerSource`], matching
+/// stellar-core's `SurveyMessageLimiter` which reads from `mApp` internally.
+pub(crate) struct SurveyMessageLimiter {
     /// Number of ledgers after which messages are considered stale.
     num_ledgers_before_ignore: u32,
     /// Maximum requests allowed per surveyor per ledger.
     max_request_limit: u32,
     /// Tracks (ledger -> surveyor -> surveyed -> seen) for deduplication.
     record_map: BTreeMap<u32, HashMap<NodeId, HashMap<NodeId, bool>>>,
+    /// Source for the current ledger number.
+    ledger_source: Box<dyn LedgerSource>,
+}
+
+impl std::fmt::Debug for SurveyMessageLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SurveyMessageLimiter")
+            .field("num_ledgers_before_ignore", &self.num_ledgers_before_ignore)
+            .field("max_request_limit", &self.max_request_limit)
+            .field("record_map_len", &self.record_map.len())
+            .field("ledger_source", &self.ledger_source)
+            .finish()
+    }
 }
 
 impl SurveyMessageLimiter {
-    pub fn new(num_ledgers_before_ignore: u32, max_request_limit: u32) -> Self {
+    pub(crate) fn new(
+        num_ledgers_before_ignore: u32,
+        max_request_limit: u32,
+        ledger_source: Box<dyn LedgerSource>,
+    ) -> Self {
         Self {
             num_ledgers_before_ignore,
             max_request_limit,
             record_map: BTreeMap::new(),
+            ledger_source,
         }
     }
 
-    pub fn add_and_validate_request<F: FnOnce() -> bool>(
+    pub(crate) fn add_and_validate_request<F: FnOnce() -> bool>(
         &mut self,
         request: &SurveyRequestMessage,
-        local_ledger: u32,
         local_node_id: &NodeId,
         on_success_validation: F,
     ) -> bool {
@@ -109,7 +186,7 @@ impl SurveyMessageLimiter {
             return false;
         }
 
-        if !self.survey_ledger_num_valid(request.ledger_num, local_ledger) {
+        if !self.survey_ledger_num_valid(request.ledger_num) {
             return false;
         }
 
@@ -150,13 +227,12 @@ impl SurveyMessageLimiter {
         }
     }
 
-    pub fn record_and_validate_response<F: FnOnce() -> bool>(
+    pub(crate) fn record_and_validate_response<F: FnOnce() -> bool>(
         &mut self,
         response: &SurveyResponseMessage,
-        local_ledger: u32,
         on_success_validation: F,
     ) -> bool {
-        if !self.survey_ledger_num_valid(response.ledger_num, local_ledger) {
+        if !self.survey_ledger_num_valid(response.ledger_num) {
             return false;
         }
 
@@ -182,14 +258,13 @@ impl SurveyMessageLimiter {
         true
     }
 
-    pub fn validate_start_collecting<F: FnOnce() -> bool>(
+    pub(crate) fn validate_start_collecting<F: FnOnce() -> bool>(
         &self,
         start: &TimeSlicedSurveyStartCollectingMessage,
-        local_ledger: u32,
         survey_active: bool,
         on_success_validation: F,
     ) -> bool {
-        if !self.survey_ledger_num_valid(start.ledger_num, local_ledger) {
+        if !self.survey_ledger_num_valid(start.ledger_num) {
             return false;
         }
         if survey_active {
@@ -198,19 +273,18 @@ impl SurveyMessageLimiter {
         on_success_validation()
     }
 
-    pub fn validate_stop_collecting<F: FnOnce() -> bool>(
+    pub(crate) fn validate_stop_collecting<F: FnOnce() -> bool>(
         &self,
         stop: &TimeSlicedSurveyStopCollectingMessage,
-        local_ledger: u32,
         on_success_validation: F,
     ) -> bool {
-        if !self.survey_ledger_num_valid(stop.ledger_num, local_ledger) {
+        if !self.survey_ledger_num_valid(stop.ledger_num) {
             return false;
         }
         on_success_validation()
     }
 
-    pub fn clear_old_ledgers(&mut self, last_closed_ledger: u32) {
+    pub(crate) fn clear_old_ledgers(&mut self, last_closed_ledger: u32) {
         let threshold = last_closed_ledger.saturating_sub(self.num_ledgers_before_ignore);
         while let Some((&ledger, _)) = self.record_map.iter().next() {
             if ledger < threshold {
@@ -221,10 +295,13 @@ impl SurveyMessageLimiter {
         }
     }
 
-    fn survey_ledger_num_valid(&self, ledger_num: u32, local_ledger: u32) -> bool {
+    /// Check if a ledger number is within the acceptable range for survey messages.
+    /// Reads the current ledger exactly once via `self.ledger_source`.
+    fn survey_ledger_num_valid(&self, ledger_num: u32) -> bool {
+        let current_ledger = self.ledger_source.current_ledger();
         let max_offset = self.num_ledgers_before_ignore.max(1);
-        let upper = local_ledger.saturating_add(max_offset);
-        let lower = local_ledger.saturating_sub(self.num_ledgers_before_ignore);
+        let upper = current_ledger.saturating_add(max_offset);
+        let lower = current_ledger.saturating_sub(self.num_ledgers_before_ignore);
         ledger_num >= lower && ledger_num <= upper
     }
 }
@@ -799,14 +876,22 @@ impl SurveyDataManager {
 /// `mMessageLimiter` as member fields accessed on a single thread. This struct
 /// provides the same serialization guarantee for the data+limiter pair in an
 /// async context via a single `RwLock`.
-#[derive(Debug)]
 pub struct SurveyState {
     data: SurveyDataManager,
     limiter: SurveyMessageLimiter,
 }
 
+impl std::fmt::Debug for SurveyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SurveyState")
+            .field("data", &self.data)
+            .field("limiter", &self.limiter)
+            .finish()
+    }
+}
+
 impl SurveyState {
-    pub fn new(data: SurveyDataManager, limiter: SurveyMessageLimiter) -> Self {
+    pub(crate) fn new(data: SurveyDataManager, limiter: SurveyMessageLimiter) -> Self {
         Self { data, limiter }
     }
 
@@ -823,48 +908,43 @@ impl SurveyState {
     /// Validate a start-collecting message atomically.
     ///
     /// Reads `survey_is_active()` and delegates to the limiter within the same
-    /// lock acquisition, eliminating the TOCTOU race.
+    /// lock acquisition, eliminating the TOCTOU race. The limiter reads the
+    /// current ledger internally via its `LedgerSource`.
     pub fn validate_start_collecting<F: FnOnce() -> bool>(
         &self,
         start: &TimeSlicedSurveyStartCollectingMessage,
-        local_ledger: u32,
         on_success_validation: F,
     ) -> bool {
         let survey_active = self.data.survey_is_active();
-        self.limiter.validate_start_collecting(
-            start,
-            local_ledger,
-            survey_active,
-            on_success_validation,
-        )
+        self.limiter
+            .validate_start_collecting(start, survey_active, on_success_validation)
     }
 
     /// Validate a stop-collecting message (delegates to limiter).
     pub fn validate_stop_collecting<F: FnOnce() -> bool>(
         &self,
         stop: &TimeSlicedSurveyStopCollectingMessage,
-        local_ledger: u32,
         on_success_validation: F,
     ) -> bool {
         self.limiter
-            .validate_stop_collecting(stop, local_ledger, on_success_validation)
+            .validate_stop_collecting(stop, on_success_validation)
     }
 
     /// Validate a survey request atomically.
     ///
     /// Reads `nonce_is_reporting()` and delegates to the limiter within the same
-    /// lock acquisition, eliminating the TOCTOU race.
+    /// lock acquisition, eliminating the TOCTOU race. The limiter reads the
+    /// current ledger internally via its `LedgerSource`.
     pub fn add_and_validate_request<F: FnOnce() -> bool>(
         &mut self,
         request: &SurveyRequestMessage,
-        local_ledger: u32,
         local_node_id: &NodeId,
         nonce: u32,
         on_success_validation: F,
     ) -> bool {
         let nonce_is_reporting = self.data.nonce_is_reporting(nonce);
         self.limiter
-            .add_and_validate_request(request, local_ledger, local_node_id, || {
+            .add_and_validate_request(request, local_node_id, || {
                 nonce_is_reporting && on_success_validation()
             })
     }
@@ -872,19 +952,18 @@ impl SurveyState {
     /// Validate a survey response atomically.
     ///
     /// Reads `nonce_is_reporting()` and delegates to the limiter within the same
-    /// lock acquisition, eliminating the TOCTOU race.
+    /// lock acquisition, eliminating the TOCTOU race. The limiter reads the
+    /// current ledger internally via its `LedgerSource`.
     pub fn record_and_validate_response<F: FnOnce() -> bool>(
         &mut self,
         response: &SurveyResponseMessage,
-        local_ledger: u32,
         nonce: u32,
         on_success_validation: F,
     ) -> bool {
         let nonce_is_reporting = self.data.nonce_is_reporting(nonce);
-        self.limiter
-            .record_and_validate_response(response, local_ledger, || {
-                nonce_is_reporting && on_success_validation()
-            })
+        self.limiter.record_and_validate_response(response, || {
+            nonce_is_reporting && on_success_validation()
+        })
     }
 
     /// Clear old ledger entries from the limiter.
@@ -911,7 +990,26 @@ impl SurveyState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use stellar_xdr::curr::{NodeId, PublicKey, Uint256};
+
+    /// Mock ledger source for tests — returns a controllable ledger number.
+    #[derive(Debug)]
+    struct MockLedgerSource(Arc<AtomicU32>);
+
+    impl LedgerSource for MockLedgerSource {
+        fn current_ledger(&self) -> u32 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    fn mock_ledger(value: u32) -> Box<dyn LedgerSource> {
+        Box::new(MockLedgerSource(Arc::new(AtomicU32::new(value))))
+    }
+
+    fn mock_ledger_shared(counter: &Arc<AtomicU32>) -> Box<dyn LedgerSource> {
+        Box::new(MockLedgerSource(counter.clone()))
+    }
 
     fn test_node_id() -> NodeId {
         NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])))
@@ -1005,7 +1103,7 @@ mod tests {
 
     fn test_survey_state() -> SurveyState {
         let data = SurveyDataManager::new(false, 10, 10);
-        let limiter = SurveyMessageLimiter::new(6, 10);
+        let limiter = SurveyMessageLimiter::new(6, 10, mock_ledger(100));
         SurveyState::new(data, limiter)
     }
 
@@ -1038,7 +1136,7 @@ mod tests {
 
         // validate_start_collecting should reject because survey is active.
         let new_start = test_start_msg(99);
-        let is_valid = state.validate_start_collecting(&new_start, 100, || true);
+        let is_valid = state.validate_start_collecting(&new_start, || true);
         assert!(!is_valid);
     }
 
@@ -1048,7 +1146,7 @@ mod tests {
 
         // Survey is inactive — should accept.
         let start_msg = test_start_msg(42);
-        let is_valid = state.validate_start_collecting(&start_msg, 100, || true);
+        let is_valid = state.validate_start_collecting(&start_msg, || true);
         assert!(is_valid);
     }
 
@@ -1082,7 +1180,7 @@ mod tests {
         // Should succeed with matching nonce.
         let request = test_request_msg(42);
         let local_node = test_node_id();
-        let is_valid = state.add_and_validate_request(&request, 100, &local_node, 42, || true);
+        let is_valid = state.add_and_validate_request(&request, &local_node, 42, || true);
         assert!(is_valid);
 
         // With wrong nonce, closure short-circuits (nonce_is_reporting is false).
@@ -1090,7 +1188,7 @@ mod tests {
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([3u8; 32]))),
             ..request.clone()
         };
-        let is_valid = state.add_and_validate_request(&request2, 100, &local_node, 99, || true);
+        let is_valid = state.add_and_validate_request(&request2, &local_node, 99, || true);
         assert!(!is_valid);
     }
 
@@ -1121,7 +1219,7 @@ mod tests {
         // First, register a request so the limiter knows about this surveyor/surveyed pair.
         let request = test_request_msg(42);
         let local_node = test_node_id();
-        state.add_and_validate_request(&request, 100, &local_node, 42, || true);
+        state.add_and_validate_request(&request, &local_node, 42, || true);
 
         // Now validate a response.
         let response = SurveyResponseMessage {
@@ -1131,11 +1229,11 @@ mod tests {
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
             encrypted_body: stellar_xdr::curr::EncryptedBody(vec![].try_into().unwrap()),
         };
-        let is_valid = state.record_and_validate_response(&response, 100, 42, || true);
+        let is_valid = state.record_and_validate_response(&response, 42, || true);
         assert!(is_valid);
 
         // With wrong nonce, should fail.
-        let is_valid = state.record_and_validate_response(&response, 100, 99, || true);
+        let is_valid = state.record_and_validate_response(&response, 99, || true);
         assert!(!is_valid);
     }
 
@@ -1145,7 +1243,7 @@ mod tests {
 
         // validate_start_collecting accepts (survey inactive).
         let start_msg = test_start_msg(42);
-        let is_valid = state.validate_start_collecting(&start_msg, 100, || true);
+        let is_valid = state.validate_start_collecting(&start_msg, || true);
         assert!(is_valid);
 
         // Simulate race: another task starts a survey between validation and mutation.
@@ -1175,5 +1273,206 @@ mod tests {
             !result,
             "start_collecting should reject when survey is already active"
         );
+    }
+
+    // --- Limiter boundary tests ---
+
+    #[test]
+    fn test_limiter_ledger_boundary_ignore_6() {
+        // With num_ledgers_before_ignore=6, window is [current-6, current+6].
+        let mut limiter = SurveyMessageLimiter::new(6, 10, mock_ledger(100));
+        let local_node = test_node_id();
+
+        // Just inside lower bound (ledger 94 = 100-6).
+        let request_at_94 = SurveyRequestMessage {
+            surveyor_peer_id: test_node_id(),
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            ledger_num: 94,
+            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+        };
+        assert!(limiter.add_and_validate_request(&request_at_94, &local_node, || true));
+
+        // Just outside lower bound (ledger 93 = 100-7).
+        let request_at_93 = SurveyRequestMessage {
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([3u8; 32]))),
+            ledger_num: 93,
+            ..request_at_94.clone()
+        };
+        assert!(!limiter.add_and_validate_request(&request_at_93, &local_node, || true));
+
+        // Just inside upper bound (ledger 106 = 100+6).
+        let request_at_106 = SurveyRequestMessage {
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([4u8; 32]))),
+            ledger_num: 106,
+            ..request_at_94.clone()
+        };
+        assert!(limiter.add_and_validate_request(&request_at_106, &local_node, || true));
+
+        // Just outside upper bound (ledger 107 = 100+7).
+        let request_at_107 = SurveyRequestMessage {
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([5u8; 32]))),
+            ledger_num: 107,
+            ..request_at_94.clone()
+        };
+        assert!(!limiter.add_and_validate_request(&request_at_107, &local_node, || true));
+    }
+
+    #[test]
+    fn test_limiter_ledger_boundary_ignore_0() {
+        // With num_ledgers_before_ignore=0, window is [current, current+1] (max(0,1)=1).
+        let mut limiter = SurveyMessageLimiter::new(0, 10, mock_ledger(50));
+        let local_node = test_node_id();
+
+        let make_request = |ledger_num: u32, id: u8| SurveyRequestMessage {
+            surveyor_peer_id: test_node_id(),
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([id; 32]))),
+            ledger_num,
+            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+        };
+
+        // Exact current (50) — valid.
+        assert!(limiter.add_and_validate_request(&make_request(50, 2), &local_node, || true));
+        // current+1 (51) — valid (upper = 50 + max(0,1) = 51).
+        assert!(limiter.add_and_validate_request(&make_request(51, 3), &local_node, || true));
+        // current-1 (49) — invalid (lower = 50 - 0 = 50).
+        assert!(!limiter.add_and_validate_request(&make_request(49, 4), &local_node, || true));
+        // current+2 (52) — invalid.
+        assert!(!limiter.add_and_validate_request(&make_request(52, 5), &local_node, || true));
+    }
+
+    #[test]
+    fn test_limiter_ledger_zero_boot_state() {
+        // When current_ledger() returns 0 (boot state), lower saturates to 0
+        // and upper = 0 + max(ignore, 1) = max(6, 1) = 6.
+        let mut limiter = SurveyMessageLimiter::new(6, 10, mock_ledger(0));
+        let local_node = test_node_id();
+
+        let make_request = |ledger_num: u32, id: u8| SurveyRequestMessage {
+            surveyor_peer_id: test_node_id(),
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([id; 32]))),
+            ledger_num,
+            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+        };
+
+        // Ledger 0 — valid (within [0, 6]).
+        assert!(limiter.add_and_validate_request(&make_request(0, 1), &local_node, || true));
+        // Ledger 6 — valid (upper bound = 0 + max(6,1) = 6).
+        assert!(limiter.add_and_validate_request(&make_request(6, 2), &local_node, || true));
+        // Ledger 7 — invalid (above upper).
+        assert!(!limiter.add_and_validate_request(&make_request(7, 3), &local_node, || true));
+    }
+
+    #[test]
+    fn test_limiter_dynamic_ledger_read() {
+        // Verify that the limiter reads the ledger at validation time.
+        let counter = Arc::new(AtomicU32::new(100));
+        let mut limiter = SurveyMessageLimiter::new(6, 10, mock_ledger_shared(&counter));
+        let local_node = test_node_id();
+
+        // At ledger 100, request at ledger 94 is valid (100-6=94).
+        let request_94 = SurveyRequestMessage {
+            surveyor_peer_id: test_node_id(),
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            ledger_num: 94,
+            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+        };
+        assert!(limiter.add_and_validate_request(&request_94, &local_node, || true));
+
+        // Advance ledger to 105. Now ledger 94 is stale (105-6=99 > 94).
+        counter.store(105, Ordering::Relaxed);
+        let request_94b = SurveyRequestMessage {
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([3u8; 32]))),
+            ledger_num: 94,
+            ..request_94.clone()
+        };
+        assert!(!limiter.add_and_validate_request(&request_94b, &local_node, || true));
+
+        // But ledger 99 (105-6) is now valid.
+        let request_99 = SurveyRequestMessage {
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([4u8; 32]))),
+            ledger_num: 99,
+            ..request_94.clone()
+        };
+        assert!(limiter.add_and_validate_request(&request_99, &local_node, || true));
+    }
+
+    #[test]
+    fn test_limiter_duplicate_request_rejected() {
+        let mut limiter = SurveyMessageLimiter::new(6, 10, mock_ledger(100));
+        let local_node = test_node_id();
+
+        let request = SurveyRequestMessage {
+            surveyor_peer_id: test_node_id(),
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            ledger_num: 100,
+            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+        };
+
+        // First request succeeds.
+        assert!(limiter.add_and_validate_request(&request, &local_node, || true));
+        // Duplicate request is rejected.
+        assert!(!limiter.add_and_validate_request(&request, &local_node, || true));
+    }
+
+    #[test]
+    fn test_limiter_max_requests_per_surveyor() {
+        // Set max to 2 requests per surveyor.
+        let mut limiter = SurveyMessageLimiter::new(6, 2, mock_ledger(100));
+        let other_node = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32])));
+
+        let make_request = |id: u8| SurveyRequestMessage {
+            surveyor_peer_id: test_node_id(),
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([id; 32]))),
+            ledger_num: 100,
+            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+        };
+
+        // Two requests succeed (at limit).
+        assert!(limiter.add_and_validate_request(&make_request(2), &other_node, || true));
+        assert!(limiter.add_and_validate_request(&make_request(3), &other_node, || true));
+        // Third is rejected (over limit).
+        assert!(!limiter.add_and_validate_request(&make_request(4), &other_node, || true));
+    }
+
+    #[test]
+    fn test_limiter_self_bypasses_limit() {
+        // Self (local_node_id matches surveyor) bypasses the per-surveyor limit.
+        let mut limiter = SurveyMessageLimiter::new(6, 2, mock_ledger(100));
+        let local_node = test_node_id(); // Same as surveyor_peer_id in requests
+
+        let make_request = |id: u8| SurveyRequestMessage {
+            surveyor_peer_id: test_node_id(),
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([id; 32]))),
+            ledger_num: 100,
+            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+        };
+
+        // Three requests all succeed because surveyor == self.
+        assert!(limiter.add_and_validate_request(&make_request(2), &local_node, || true));
+        assert!(limiter.add_and_validate_request(&make_request(3), &local_node, || true));
+        assert!(limiter.add_and_validate_request(&make_request(4), &local_node, || true));
+    }
+
+    #[test]
+    fn test_limiter_response_without_request_rejected() {
+        let mut limiter = SurveyMessageLimiter::new(6, 10, mock_ledger(100));
+
+        let response = SurveyResponseMessage {
+            surveyor_peer_id: test_node_id(),
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            ledger_num: 100,
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+            encrypted_body: stellar_xdr::curr::EncryptedBody(vec![].try_into().unwrap()),
+        };
+
+        // No request was registered, so response is rejected.
+        assert!(!limiter.record_and_validate_response(&response, || true));
     }
 }

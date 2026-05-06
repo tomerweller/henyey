@@ -303,10 +303,8 @@ impl App {
         };
 
         let mut survey_state = self.survey_state.write().await;
-        let local_ledger = self.survey_local_ledger();
         let ok = survey_state.add_and_validate_request(
             &signed.request.request,
-            local_ledger,
             &local_node_id,
             nonce,
             || {
@@ -425,8 +423,7 @@ impl App {
         }
         let is_valid = {
             let survey_state = self.survey_state.read().await;
-            let local_ledger = self.survey_local_ledger();
-            survey_state.validate_start_collecting(message, local_ledger, || {
+            survey_state.validate_start_collecting(message, || {
                 self.verify_survey_signature(
                     &message.surveyor_id,
                     &message_bytes,
@@ -490,8 +487,7 @@ impl App {
         }
         let is_valid = {
             let survey_state = self.survey_state.read().await;
-            let local_ledger = self.survey_local_ledger();
-            survey_state.validate_stop_collecting(message, local_ledger, || {
+            survey_state.validate_stop_collecting(message, || {
                 self.verify_survey_signature(
                     &message.surveyor_id,
                     &message_bytes,
@@ -550,10 +546,8 @@ impl App {
         let local_node_id = self.local_node_id();
         let is_valid = {
             let mut survey_state = self.survey_state.write().await;
-            let local_ledger = self.survey_local_ledger();
             survey_state.add_and_validate_request(
                 &request.request,
-                local_ledger,
                 &local_node_id,
                 request.nonce,
                 || {
@@ -669,10 +663,8 @@ impl App {
 
         let is_valid = {
             let mut survey_state = self.survey_state.write().await;
-            let local_ledger = self.survey_local_ledger();
             survey_state.record_and_validate_response(
                 &response_message.response,
-                local_ledger,
                 response_message.nonce,
                 || {
                     self.verify_survey_signature(

@@ -109,7 +109,7 @@ use crate::config::AppConfig;
 use crate::logging::CatchupProgress;
 use crate::meta_stream::{MetaStreamError, MetaStreamManager};
 use crate::meta_writer::MetaWriter;
-use crate::survey::{SurveyDataManager, SurveyMessageLimiter, SurveyState};
+use crate::survey::{HerderLedgerSource, SurveyDataManager, SurveyMessageLimiter, SurveyState};
 use henyey_ledger::{close_time as ledger_close_time, compute_header_hash, verify_header_chain};
 use stellar_xdr::curr::TransactionEnvelope;
 
@@ -1021,6 +1021,11 @@ impl App {
             tracing::info!("Envelope sender configured for validator mode");
         }
 
+        let ledger_source = Box::new(HerderLedgerSource::new(
+            herder.clone(),
+            ledger_manager.clone(),
+        ));
+
         Ok(Self {
             is_validator,
             config,
@@ -1077,7 +1082,7 @@ impl App {
             last_scp_state_request_at: RwLock::new(now),
             survey_state: RwLock::new(SurveyState::new(
                 SurveyDataManager::new(is_validator, max_inbound_peers, max_outbound_peers),
-                SurveyMessageLimiter::new(6, 10),
+                SurveyMessageLimiter::new(6, 10, ledger_source),
             )),
             broadcast_op_carryover: AtomicUsize::new(0),
             broadcast_dex_op_carryover: AtomicUsize::new(0),
