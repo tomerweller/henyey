@@ -166,9 +166,12 @@ Bucket into:
 - **Closed today** — closed in last 24h (use `closed:>=...` search)
 - **Still open** — `--state open` filtered to those filed > 24h ago
 
-For each line, prefix with `urgent` (red dot 🔴), `(no-label)` (white
-circle ⚪), or `not-ready` (grey dot ⚫). Skip the rendering of `ready`
-issues except in "Filed today" since their lifecycle is short.
+For each line, prefix with severity indicator. **Precedence:** if both
+`urgent` and `not-ready` labels are present, render as `urgent` (🔴).
+
+- `urgent` → 🔴 (red dot)
+- `not-ready` → ⚫ (grey dot)
+- *(no label)* → ⚪ (white circle)
 
 ```markdown
 ## Issues activity

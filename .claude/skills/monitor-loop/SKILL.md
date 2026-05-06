@@ -10,11 +10,12 @@ Parse `$ARGUMENTS`:
 # Monitor Loop
 
 Run a henyey mainnet node and monitor it for errors. When bugs are found,
-investigate to root cause and file (or comment on) a GitHub issue labeled
-`ready`. A separate downstream process picks up `ready`-labeled issues
-and commits the fix — the monitor never edits code. All henyey issues
-are in scope: node bugs, CI failures, testnet parity bugs, performance
-regressions, infrastructure issues.
+investigate to root cause and file (or comment on) a GitHub issue with the
+appropriate severity label (see Label Policy below). Issues are added to the
+project board for downstream automation (`plan-do-review` auto-selects from
+Backlog). The monitor never edits code. All henyey issues are in scope: node
+bugs, CI failures, testnet parity bugs, performance regressions,
+infrastructure issues.
 
 **Mainnet operation is explicitly authorized** — this overrides the
 testnet-only guideline in CLAUDE.md.
@@ -26,26 +27,47 @@ testnet-only guideline in CLAUDE.md.
 > the same rules. Any change here must be mirrored there.
 
 - **The monitor does NOT commit code.** All fixes — node bugs and CI
-  failures — are delegated via `gh issue create --label ready` (or a
-  comment on an existing issue). A separate downstream process picks up
-  `ready`-labeled issues and commits the fix.
+  failures — are delegated via `gh issue create` (label per severity
+  policy) and added to the project board. A downstream process
+  (`plan-do-review`) auto-selects from the Backlog column and commits
+  the fix.
 - If a deployed commit causes a regression, file/comment an `urgent`-labeled
   issue (deploy regressions block validator operation) and restart the node
-  on the last known-good binary while waiting for the fix.
+  on the last known-good binary while waiting for the fix. See
+  `scripts/lib/monitor-label-policy.md` for the full deploy regression
+  procedure.
 
 ## Fix-Routing Policy
 
+> **Canonical reference:** `scripts/lib/monitor-label-policy.md` is the
+> single source of truth for labeling and board-routing rules. This section
+> is a normative excerpt.
+
 **All fixes — both CI failures and node bugs — are delegated via
-`gh issue` with the `ready` label.** The monitor never implements a
-fix inline. A separate downstream process watches for `ready`-labeled
-issues and drives them to completion.
+`gh issue`.** The monitor never implements a fix inline. Issues are added
+to the project board (Backlog column) where `plan-do-review` auto-selects
+and drives them to completion.
+
+**Label by severity** (not routing):
+- `--label urgent` — ONLY when the symptom blocks validator operation
+  (hash mismatch, wedge, crash, SYNC FAILURE, OOM, failing CI on main,
+  deploy regression).
+- *(no label)* — non-urgent issues (calibration, NONC alerts, cosmetic,
+  follow-ups).
+- `--label not-ready` — needs operator decision before code change.
+
+**Board routing after filing/commenting:**
+- New issues (`urgent` or no-label): `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+- New issues (`not-ready`): `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Blocked`
+- Existing issues already on project: no status change (preserve current).
+- Existing issues NOT on project: add to Backlog (or Blocked if `not-ready`).
 
 - **CI failures** (build errors, test failures, clippy, workflow YAML,
   flaky tests, timeouts): investigate to root cause, then file a GH
-  issue with `--label ready`.
+  issue (label per severity above).
 - **Node bugs** (hash mismatches, crashes, consensus/sync failures,
   pruning defects, memory leaks): investigate to root cause, then file
-  a GH issue with `--label ready`.
+  a GH issue (label per severity above).
 
 In both cases:
 
@@ -57,7 +79,8 @@ In both cases:
    the existing one is stale/closed, or when the evidence points at a
    different root cause (see Recurrence Policy below).
 2. The monitor does **not** spawn agents, open worktrees, review diffs,
-   or cherry-pick. The downstream pickup process handles all of that.
+   or cherry-pick. The downstream `plan-do-review` process handles all
+   of that.
 3. The next redeploy tick rebuilds and restarts the node whenever a
    fix has landed on main.
 
@@ -110,10 +133,10 @@ doesn't change when it should — you MUST investigate. Specifically:
   is correct, document *why* — citing the specific code path, not just
   a guess.
 - **File issues.** If investigation reveals a bug, file a GitHub issue
-  with `--label ready`, root cause, and a proposed fix. If it reveals a
-  missing feature or config issue, file it with the code-level
-  explanation. Do NOT spawn agents; the downstream pickup process
-  handles the fix.
+  (label per severity policy), root cause, and a proposed fix. If it
+  reveals a missing feature or config issue, file it with the code-level
+  explanation. Add to project board per routing rules. Do NOT spawn
+  agents; the downstream process handles the fix.
 - **File everything, including non-critical misbehavior.** Every anomaly
   that is not literal expected-correct behavior results in a GitHub issue
   (or a comment on an existing one — always search first). This includes
@@ -161,7 +184,7 @@ The node exposes 152 Prometheus metrics at `http://localhost:<ADMIN_PORT>/metric
 (39 counters, 81 gauges, 32 histograms). Each tick samples `/metrics` and
 evaluates an alert catalog against it. Alerts that fire follow the
 **Bug / CI-Failure Filing Workflow** below — search existing issues, comment
-on a match, else file a new `ready`-labeled issue. Non-critical alerts get a
+on a match, else file a new issue (label per severity policy). Non-critical alerts get a
 `Non-critical:` title prefix; the filing workflow is identical.
 
 ### Session state layout
@@ -381,8 +404,11 @@ line from watcher output entirely.
 
 ## Bug / CI-Failure Filing Workflow
 
+> **Canonical reference:** see `scripts/lib/monitor-label-policy.md` for the
+> full label policy, board routing, and failure handling rules.
+
 Use this workflow for both node bugs and CI failures — they route
-identically now (file a `ready`-labeled GH issue; no inline fix).
+identically (file a GH issue with severity label; add to project board).
 
 1. **Investigate to root cause directly in the main checkout** — read
    source code, check logs, trace code paths, grep, `git log`, read the
@@ -396,19 +422,33 @@ identically now (file a `ready`-labeled GH issue; no inline fix).
    - **Comment on it** via `gh issue comment <N>` with the new evidence
      (ledger number, timestamp, metric deltas, log snippet, etc.).
    - Do NOT file a duplicate.
-   - If the existing issue is missing the `ready` label and the
-     evidence warrants action, add it:
-     `gh issue edit <N> --add-label ready`.
-3. **Otherwise, file a new issue** using
-   `gh issue create --label ready`. The issue body should be a
-   self-contained proposal (clear symptom, evidence, suspected root
-   cause, concrete fix sketch with file:line references) so the
-   downstream pickup process has everything it needs. Capture the issue
-   number `N` returned by `gh` for the status report.
-4. **Do NOT spawn an agent.** A separate process watches for
-   `ready`-labeled issues and drives them to a fix.
+   - If the existing issue is unlabeled and new evidence shows it's now
+     operation-blocking, escalate:
+     `gh issue edit <N> --add-label urgent`.
+   - **Board-route:** if the issue is NOT on the project board, add it:
+     `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+     (or `Blocked` if labeled `not-ready`). If already on the board,
+     do nothing (preserve current status).
+3. **Otherwise, file a new issue** using `gh issue create`:
+   - Append `--label urgent` ONLY when the symptom meets urgent criteria
+     (blocks validator operation).
+   - Append `--label not-ready` ONLY for tier-3 operator-decision issues.
+   - Otherwise omit labels (non-urgent).
+   - The issue body should be a self-contained proposal (clear symptom,
+     evidence, suspected root cause, concrete fix sketch with file:line
+     references).
+   - **Board-route:** add the new issue to the project board:
+     `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+     (or `Blocked` if labeled `not-ready`).
+   - Capture the issue number `N` for the status report.
+4. **Do NOT spawn an agent.** The downstream process (`plan-do-review`)
+   auto-selects from the project board Backlog and drives issues to fix.
 5. **Do NOT edit the main checkout.** All fixes go through the
-   downstream pickup process — including CI failures.
+   downstream process — including CI failures.
+
+**Board routing failure:** If `move-issue-status.sh` fails, log as ACTION
+in the status report. Retry on next tick. Escalate after 3 consecutive
+failures (see `scripts/lib/monitor-label-policy.md`).
 
 The next redeploy tick (check 10) will pick up whatever lands on main —
 rebuild, kill, restart. The monitor does not block on the fix.
@@ -420,7 +460,7 @@ existing issue** with the new evidence. The mandatory existence check
 in the Bug / CI-Failure Filing Workflow (step 2) already enforces this:
 search first, comment if found.
 
-File a NEW `ready`-labeled issue ONLY when the recurrence's evidence
+File a NEW issue ONLY when the recurrence's evidence
 points at a materially different scope than the existing issue —
 specifically:
 
@@ -454,8 +494,8 @@ re-opening it muddles the history. Reference the closed issue with
 `Related to #<prior> (closed)` and a note on why the prior fix did not
 cover this case.
 
-The monitor does not spawn agents on any issue. The downstream pickup
-process watches for `ready`-labeled issues and handles the fix.
+The monitor does not spawn agents on any issue. The downstream process
+(`plan-do-review`) auto-selects from the project board and handles fixes.
 
 ## Startup
 
@@ -930,19 +970,20 @@ When stopping (user interrupts):
 4. Print a final status: uptime, latest ledger seen, issues filed/commented.
 5. Do NOT remove logs or cache — they may be useful for debugging.
 
-The monitor does not spawn agents. Node-bug issues filed with the `ready`
-label persist in GitHub and are picked up by a separate downstream
-process regardless of whether the monitor is still running.
+The monitor does not spawn agents. Node-bug issues are filed in GitHub
+and added to the project board, where the downstream `plan-do-review`
+process picks them up regardless of whether the monitor is still running.
 
 ## Guidelines
 
 - Always build with `--release` — debug builds are too slow for mainnet.
 - All henyey issues are in scope: mainnet bugs, testnet parity bugs, CI
   failures, performance regressions, infrastructure problems.
-- **All fixes are delegated** via `gh issue create --label ready` (or a
-  comment on an existing issue). The monitor's role is to detect,
-  investigate, and file — never to commit, push, review, merge, or
-  spawn fix agents. A separate downstream process consumes
-  `ready`-labeled issues.
+- **All fixes are delegated** via `gh issue create` (label per severity
+  policy in `scripts/lib/monitor-label-policy.md`) + project board
+  routing. The monitor's role is to detect, investigate, and file —
+  never to commit, push, review, merge, or spawn fix agents. The
+  downstream `plan-do-review` process auto-selects from the Backlog
+  column.
 - **Always search for an existing issue before filing** — see the
   Bug / CI-Failure Filing Workflow.

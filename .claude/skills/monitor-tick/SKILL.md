@@ -990,6 +990,7 @@ For each firing alert:
      values, delta, threshold, ledger, binary sha, sibling metrics). Apply the
      `urgent` label only if the metric breach blocks validator operation (per
      the Label policy in the Bug filing workflow); otherwise leave unlabeled.
+     **Board-route:** if NOT on project board, add to Backlog.
    - If no match, `gh issue create` (append `--label urgent` only when the
      metric breach is operation-blocking; most metric alerts are non-urgent
      and should be filed without a label) with:
@@ -997,6 +998,7 @@ For each firing alert:
      - Body: current/prev values, delta, threshold, ledger, binary sha, related
        sibling metrics, file:line citation from `grep -n "<metric_name_without_prefix>" crates/ -r`,
        and a suggested fix.
+     **Board-route:** `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 4. Update `anomaly_cooldown.json` with `{"<metric>": <now>}`.
 5. For SYNC-tier alerts, ALSO update the `sync:` line in the status report
    (not just `metrics:`).
@@ -1307,6 +1309,10 @@ backticks, dollar signs, etc. inside the body.
 
 ### Label policy
 
+> **Canonical reference:** `scripts/lib/monitor-label-policy.md` is the
+> single source of truth for labeling and board-routing rules. This section
+> is a normative excerpt.
+
 When creating or commenting on issues:
 
 - **`urgent`** — file with `--label urgent`, OR `gh issue edit <N> --add-label urgent`
@@ -1326,6 +1332,13 @@ When creating or commenting on issues:
   operator decision before any code change. Do not use for regular bug
   filings.
 
+**Label lifecycle:**
+- `urgent` and `not-ready` are mutually exclusive in steady state.
+- Monitors MAY add `urgent` to an existing unlabeled issue (escalation).
+- Monitors do NOT remove labels (de-escalation is operator-only).
+- If a `not-ready` issue becomes blocking: add `urgent`, comment with
+  evidence. Both labels coexist temporarily until operator resolves.
+
 ### Filing flow
 
 1. Identify the failing signature (ledger + error type for node bugs; metric
@@ -1335,13 +1348,24 @@ When creating or commenting on issues:
    If a match exists, verify its state is OPEN
    (`gh issue view <N> --json state -q .state`), `gh issue comment <N>` with
    new evidence, and apply the `urgent` label only if the recurrence meets
-   the urgent criteria above. STOP.
+   the urgent criteria above.
+   **Board-route:** if the issue is NOT on the project board, add it:
+   `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+   (or `Blocked` if labeled `not-ready`). If already on board, preserve
+   current status. STOP.
 4. If no OPEN match, file a new issue with `gh issue create` — append
    `--label urgent` only if the symptom meets the urgent criteria above;
    otherwise omit the label. Body is a self-contained proposal (symptom,
    evidence, suspected root cause, fix sketch with file:line references).
+   **Board-route:** add to project board:
+   `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+   (or `Blocked` if labeled `not-ready`).
 5. Do NOT spawn agents. Do NOT edit the main checkout. The next redeploy tick
    (check 10) will pick up whatever lands on main.
+
+**Board routing failure:** If `move-issue-status.sh` fails, log as ACTION
+in the status report. Retry on next tick. Escalate after 3 consecutive
+failures (see `scripts/lib/monitor-label-policy.md`).
 
 **Recurrence policy**: If a previously-filed bug recurs with material new
 evidence, prefer commenting on the existing issue when it is the same bug at
@@ -1353,9 +1377,10 @@ with one-line scope-diff) when new evidence points at a different named
 subsystem, phase/mark, root-cause hypothesis, or candidate site set.
 
 **Commit policy**: the monitor does NOT commit code. All fixes are delegated
-via `gh issue`.
+via `gh issue` + project board routing.
 
-**Deploy regression policy**: If the node fails after a deploy:
+**Deploy regression policy**: If the node fails after a deploy
+(see also `scripts/lib/monitor-label-policy.md`):
 
 (a) Record the bad SHA BEFORE any rollback rebuild (`build_sha` will be
 overwritten during rebuild):
