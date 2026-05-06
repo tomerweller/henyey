@@ -2247,4 +2247,66 @@ mod tests {
         let fetching = fetching_with_per_slot_cap(100);
         assert_eq!(fetching.slot_lifetime_count(999), 0);
     }
+
+    // --- Tracker cap drops tests (issue #2442) ---
+
+    /// Test: when both fetchers are at max_trackers capacity, a new envelope
+    /// needing novel hashes is dropped (not parked) and tracker_cap_drops is
+    /// incremented.
+    #[test]
+    fn test_tracker_cap_drops_when_both_fetchers_full() {
+        use henyey_overlay::ItemFetcherConfig;
+
+        let config = FetchingConfig {
+            tx_set_fetcher_config: ItemFetcherConfig {
+                max_trackers: 2,
+                ..Default::default()
+            },
+            quorum_set_fetcher_config: ItemFetcherConfig {
+                max_trackers: 2,
+                ..Default::default()
+            },
+            // Disable per-slot cap so it doesn't interfere.
+            max_envelopes_per_slot: 0,
+            ..Default::default()
+        };
+
+        // tx_set never available → tx_set fetching always needed.
+        // Quorum sets not pre-cached → quorum_set fetching always needed.
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+
+        // Fill both fetchers with 2 distinct hashes each.
+        let tx_hash_1 = Hash256::from_bytes([0xA1; 32]);
+        let tx_hash_2 = Hash256::from_bytes([0xA2; 32]);
+        let qs_hash_1 = Hash256::from_bytes([0xB1; 32]);
+        let qs_hash_2 = Hash256::from_bytes([0xB2; 32]);
+
+        let env1 = make_envelope_with_deps(100, 1, tx_hash_1, qs_hash_1);
+        let env2 = make_envelope_with_deps(100, 2, tx_hash_2, qs_hash_2);
+
+        assert_eq!(fetching.recv_envelope(env1), RecvResult::Fetching);
+        assert_eq!(fetching.recv_envelope(env2), RecvResult::Fetching);
+
+        // Verify both fetchers are at capacity.
+        assert_eq!(fetching.tx_set_fetcher.num_trackers(), 2);
+        assert_eq!(fetching.quorum_set_fetcher.num_trackers(), 2);
+        assert_eq!(fetching.fetching_count(), 2);
+        assert_eq!(fetching.stats.read().envelopes_fetching, 2);
+        assert_eq!(fetching.stats.read().tracker_cap_drops, 0);
+
+        // 3rd envelope with novel hashes — both fetchers reject.
+        let tx_hash_3 = Hash256::from_bytes([0xA3; 32]);
+        let qs_hash_3 = Hash256::from_bytes([0xB3; 32]);
+        let env3 = make_envelope_with_deps(100, 3, tx_hash_3, qs_hash_3);
+
+        let result = fetching.recv_envelope(env3);
+
+        // Returns Fetching (indistinguishable from normal fetching at API level).
+        assert_eq!(result, RecvResult::Fetching);
+        // Envelope was NOT parked — fetching count unchanged.
+        assert_eq!(fetching.fetching_count(), 2);
+        assert_eq!(fetching.stats.read().envelopes_fetching, 2);
+        // tracker_cap_drops incremented.
+        assert_eq!(fetching.stats.read().tracker_cap_drops, 1);
+    }
 }
