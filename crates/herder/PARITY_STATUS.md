@@ -663,4 +663,11 @@ Features not yet implemented. These ARE counted against parity %.
 | Implemented (Full) | 138 |
 | Gaps (None + Partial) | 37 |
 | Intentional Omissions | 13 |
+| Intentional Divergences | 1 |
 | **Parity** | **138 / (138 + 37) = 79%** |
+
+## Intentional Divergences
+
+| Area | Divergence | Rationale |
+|------|-----------|-----------|
+| TxSetTracker pending cap | `TxSetTracker.pending` has a best-effort cap of 512 entries (`MAX_PENDING_TXSET_REQUESTS`). stellar-core's `ItemFetcher` (`overlay/ItemFetcher.cpp`) does not cap its pending tracker map. | Defense-in-depth against unbounded memory growth under DoS. Does not affect ledger state or consensus outcomes — only limits network fetch scheduling. Rejected hashes are retried on next SCP envelope. |

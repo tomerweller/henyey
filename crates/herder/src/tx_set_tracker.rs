@@ -20,6 +20,13 @@ use crate::tx_queue::TransactionSet;
 /// (`stellar-core/src/herder/HerderSCPDriver.cpp:39`).
 const TXSET_VALID_CACHE_SIZE: usize = 1000;
 
+/// Best-effort cap on pending tx-set requests.
+/// Under concurrent access the map may briefly exceed this by a few entries.
+/// Defense-in-depth against unbounded growth from forged tx-set hash references.
+/// Normal operation uses ≤12 entries (one per slot in MAX_SLOTS_TO_REMEMBER);
+/// 512 provides >40× headroom. Matches `QuorumSetTracker::MAX_PENDING_QSET_REQUESTS`.
+const MAX_PENDING_TXSET_REQUESTS: usize = 512;
+
 /// Diagnostic sizes for the tx-set tracker.
 #[derive(Debug, Clone, Default)]
 pub struct TxSetTrackerSizes {
@@ -61,6 +68,8 @@ impl TxSetTracker {
     // --- Pending management ---
 
     /// Register a pending tx-set request. Returns true if new.
+    /// Returns false if already pending, already cached, or the pending map
+    /// has reached its best-effort capacity cap (`MAX_PENDING_TXSET_REQUESTS`).
     pub fn request(&self, hash: Hash256, slot: u64) -> bool {
         if self.cache.contains_key(&hash) {
             return false;
@@ -70,6 +79,16 @@ impl TxSetTracker {
             if let Some(mut entry) = self.pending.get_mut(&hash) {
                 entry.request_count += 1;
             }
+            return false;
+        }
+
+        // Defense-in-depth: best-effort cap on pending entries.
+        // Rejected hashes will be retried on the next SCP envelope referencing them.
+        if self.pending.len() >= MAX_PENDING_TXSET_REQUESTS {
+            debug!(
+                pending_count = self.pending.len(),
+                "Dropping tx set request: pending cap reached"
+            );
             return false;
         }
 
@@ -699,5 +718,109 @@ mod tests {
         let tracker = TxSetTracker::new(10);
         let hash = Hash256::from_bytes([0xDD; 32]);
         assert!(!tracker.is_cached_and_touch(&hash));
+    }
+
+    /// Regression test: pending entries are capped to prevent unbounded memory
+    /// growth from forged tx-set hash references.
+    #[test]
+    fn test_pending_cap_rejects_overflow() {
+        let tracker = TxSetTracker::new(256);
+
+        // Fill to the cap
+        for i in 0..MAX_PENDING_TXSET_REQUESTS {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i & 0xFF) as u8;
+            bytes[1] = ((i >> 8) & 0xFF) as u8;
+            let hash = Hash256::from_bytes(bytes);
+            assert!(tracker.request(hash, 100));
+        }
+        assert_eq!(tracker.pending_count(), MAX_PENDING_TXSET_REQUESTS);
+
+        // Next request should be rejected
+        let overflow_hash = Hash256::from_bytes([0xFF; 32]);
+        assert!(!tracker.request(overflow_hash, 100));
+        assert_eq!(tracker.pending_count(), MAX_PENDING_TXSET_REQUESTS);
+    }
+
+    /// Regression test: the cap is self-healing — receiving a pending tx set
+    /// frees a slot, allowing the next request to succeed.
+    #[test]
+    fn test_pending_cap_self_heals_after_receive() {
+        let tracker = TxSetTracker::new(256);
+
+        // Fill to cap, using the first entry as a "real" tx set we can receive
+        let real_ts = make_tx_set(0);
+        let real_hash = *real_ts.hash();
+        assert!(tracker.request(real_hash, 100));
+
+        for i in 1..MAX_PENDING_TXSET_REQUESTS {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i & 0xFF) as u8;
+            bytes[1] = ((i >> 8) & 0xFF) as u8;
+            let hash = Hash256::from_bytes(bytes);
+            assert!(tracker.request(hash, 100));
+        }
+        assert_eq!(tracker.pending_count(), MAX_PENDING_TXSET_REQUESTS);
+
+        // Verify overflow is rejected
+        let overflow = Hash256::from_bytes([0xFE; 32]);
+        assert!(!tracker.request(overflow, 100));
+
+        // Receive the real tx set — frees one slot
+        let slot = tracker.receive(real_ts);
+        assert_eq!(slot, Some(100));
+        assert_eq!(tracker.pending_count(), MAX_PENDING_TXSET_REQUESTS - 1);
+
+        // Now a new request should succeed
+        let new_hash = Hash256::from_bytes([0xFD; 32]);
+        assert!(tracker.request(new_hash, 101));
+    }
+
+    /// Boundary test: duplicate request at cap still returns false and does not
+    /// grow the map beyond the cap.
+    #[test]
+    fn test_pending_cap_preserves_dedup_semantics() {
+        let tracker = TxSetTracker::new(256);
+
+        // Fill to cap
+        let first_hash = Hash256::from_bytes([0; 32]);
+        assert!(tracker.request(first_hash, 100));
+        for i in 1..MAX_PENDING_TXSET_REQUESTS {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i & 0xFF) as u8;
+            bytes[1] = ((i >> 8) & 0xFF) as u8;
+            let hash = Hash256::from_bytes(bytes);
+            assert!(tracker.request(hash, 100));
+        }
+
+        // Duplicate request for an existing entry — returns false (dedup, not cap)
+        assert!(!tracker.request(first_hash, 100));
+        assert_eq!(tracker.pending_count(), MAX_PENDING_TXSET_REQUESTS);
+    }
+
+    /// Boundary test: request for an already-cached hash returns false before
+    /// the cap check is reached (cached check has priority).
+    #[test]
+    fn test_pending_cap_preserves_cached_check() {
+        let tracker = TxSetTracker::new(256);
+
+        // Cache a tx set
+        let cached_ts = make_tx_set(42);
+        let cached_hash = *cached_ts.hash();
+        tracker.store(cached_ts);
+
+        // Fill pending to cap
+        for i in 0..MAX_PENDING_TXSET_REQUESTS {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i & 0xFF) as u8;
+            bytes[1] = ((i >> 8) & 0xFF) as u8;
+            let hash = Hash256::from_bytes(bytes);
+            tracker.request(hash, 100);
+        }
+
+        // Request for cached hash still returns false (cache hit, not cap)
+        assert!(!tracker.request(cached_hash, 100));
+        // Pending count unchanged (not inserted)
+        assert_eq!(tracker.pending_count(), MAX_PENDING_TXSET_REQUESTS);
     }
 }

@@ -882,7 +882,8 @@ impl ScpDriver {
     }
 
     /// Register a pending tx set request.
-    /// Returns true if this is a new request, false if already pending.
+    /// Returns true if this is a new request, false if already pending, already
+    /// cached, or the pending map has reached its capacity cap.
     pub fn request_tx_set(&self, hash: Hash256, slot: SlotIndex) -> bool {
         self.tx_tracker.request(hash, slot)
     }
