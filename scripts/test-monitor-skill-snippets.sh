@@ -93,6 +93,66 @@ extract_md_section() {
   fi
 }
 
+# ── Label-Policy Drift Detection ─────────────────────────────────────────────
+# Validates that monitor skill files conform to the centralized label policy
+# in scripts/lib/monitor-label-policy.md.
+
+# check_label_policy_drift FILE NAME
+#
+# Checks a skill file for label-policy conformance:
+#   1. No retired 'ready' label usage
+#   2. Canonical policy reference present
+# Returns 0 if conformant, 1 if drift detected.
+check_label_policy_drift() {
+  local file="$1"
+  local name="$2"
+  local ok=true
+
+  # Assertion 1: no retired 'ready' label (covers --label ready, --add-label ready,
+  # --label=ready, quoted forms, and ready-labeled)
+  if grep -qE -- '--label[= ]["'"'"'"]?ready|--add-label[= ]["'"'"'"]?ready|ready-labeled' "$file"; then
+    echo "WARNING: $name uses retired 'ready' label" >&2
+    ok=false
+  fi
+
+  # Assertion 2: canonical policy reference present
+  if ! grep -q 'Canonical reference.*scripts/lib/monitor-label-policy.md' "$file"; then
+    echo "WARNING: $name missing canonical reference to scripts/lib/monitor-label-policy.md" >&2
+    ok=false
+  fi
+
+  [[ "$ok" == "false" ]] && return 1
+  return 0
+}
+
+# check_filing_balance FILE SECTION_HEADING NAME
+#
+# Extracts a markdown section and verifies that every `gh issue create`
+# has a corresponding `move-issue-status` instruction (count-based balance).
+# Returns 0 if balanced, 1 if imbalanced.
+check_filing_balance() {
+  local file="$1"
+  local section_heading="$2"
+  local name="$3"
+
+  local section
+  section=$(extract_md_section "$file" "$section_heading")
+  if [[ -z "$section" ]]; then
+    echo "WARNING: $name has no '$section_heading' section" >&2
+    return 1
+  fi
+
+  local create_count route_count
+  create_count=$(echo "$section" | grep -c 'gh issue create' || true)
+  route_count=$(echo "$section" | grep -c 'move-issue-status' || true)
+
+  if [[ $create_count -gt 0 && $route_count -lt $create_count ]]; then
+    echo "WARNING: $name section '$section_heading': $create_count 'gh issue create' but only $route_count 'move-issue-status' (expected >= $create_count)" >&2
+    return 1
+  fi
+  return 0
+}
+
 # ── Structural Assertions ────────────────────────────────────────────────────
 # Verify that skill markdown files reference the shared library.
 # Replaces old checksum-based drift detection.
@@ -254,6 +314,22 @@ check_skill_structure() {
       echo "WARNING: monitor-label-policy.md Deploy Regression does not capture quarantine_append return code" >&2
       drift=true
     fi
+  fi
+
+  # Label-policy drift assertions
+  if ! check_label_policy_drift "$tick_file" "monitor-tick"; then
+    drift=true
+  fi
+  if ! check_label_policy_drift "$loop_file" "monitor-loop"; then
+    drift=true
+  fi
+
+  # Filing-section balance checks (gh issue create must have move-issue-status)
+  if ! check_filing_balance "$tick_file" "^### Filing flow" "monitor-tick"; then
+    drift=true
+  fi
+  if ! check_filing_balance "$loop_file" "^## Bug \/ CI-Failure Filing Workflow" "monitor-loop"; then
+    drift=true
   fi
 
   if [[ "$drift" == "true" && "$STRICT" == "true" ]]; then
