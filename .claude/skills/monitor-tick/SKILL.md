@@ -59,6 +59,12 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `cargo-target/` | cached build tree | cargo |
 | `.alive` | session liveness marker | session startup |
 
+**Cross-session state** (lives at `$HOME/data/`, outside any session dir):
+
+| File | Purpose | Writer | Remover |
+|------|---------|--------|---------|
+| `deploy_quarantine.txt` | Commit SHAs blocked from rebuild/restart deploy; survives session wipes | Deploy regression policy (skill, during rollback) | Operator only (manual) |
+
 ## Session-dir-vanished detection
 
 Immediately after loading `monitor-loop.env`, check whether the session
@@ -1171,12 +1177,62 @@ Otherwise enter the deploy path:
    build, and restart path. In particular, changes to `Cargo.toml`,
    `Cargo.lock`, any `build.rs`, `crates/`, `configs/`, or mixed docs+code
    commits require a rebuild + restart.
-3. Check CI status on origin/main: `gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'`.
+3. **Quarantine gate** (only reached when `needs_rebuild=yes`):
+   ```bash
+   # --- Quarantine gate ---
+   QUARANTINE_FILE="$HOME/data/deploy_quarantine.txt"
+   quarantined_match=""
+   quarantine_warnings=""
+
+   if [ -s "$QUARANTINE_FILE" ]; then
+     while IFS=' ' read -r q_sha _rest || [ -n "$q_sha" ]; do
+       # Skip blank lines and comments
+       [ -z "$q_sha" ] && continue
+       case "$q_sha" in \#*) continue ;; esac
+
+       # Validate: exactly 40 lowercase hex chars
+       if ! printf '%s' "$q_sha" | grep -qxE '[0-9a-f]{40}'; then
+         quarantine_warnings="${quarantine_warnings:+$quarantine_warnings, }malformed: ${q_sha:0:12}..."
+         continue
+       fi
+
+       # Check reachability: is this SHA an ancestor-or-equal of origin/main?
+       # Exit codes: 0 = is ancestor, 1 = is NOT ancestor, 128+ = error
+       merge_base_rc=0
+       git merge-base --is-ancestor "$q_sha" origin/main 2>/dev/null || merge_base_rc=$?
+
+       if [ "$merge_base_rc" -eq 0 ]; then
+         quarantined_match="$q_sha"
+         break
+       elif [ "$merge_base_rc" -ge 128 ]; then
+         # git error (object missing, shallow clone, corrupt) — FAIL CLOSED.
+         quarantine_warnings="${quarantine_warnings:+$quarantine_warnings, }ancestry-check-error: ${q_sha:0:8} (rc=$merge_base_rc)"
+         quarantined_match="$q_sha"
+         break
+       fi
+       # rc=1 means not an ancestor — SHA not reachable, skip this entry.
+     done < "$QUARANTINE_FILE"
+   fi
+
+   if [ -n "$quarantined_match" ]; then
+     # BLOCK: do NOT proceed to CI check, build, or restart.
+     deploy_report="DEFERRED (quarantined: ${quarantined_match:0:8} reachable from origin/main — see ~/data/deploy_quarantine.txt)"
+     [ -n "$quarantine_warnings" ] && deploy_report="$deploy_report [WARN: $quarantine_warnings]"
+     # Skip to status report with this deploy_report. Do not continue.
+   fi
+   # If not quarantined, append any parse warnings to final deploy report:
+   # [ -n "$quarantine_warnings" ] && deploy_report="$deploy_report [WARN: $quarantine_warnings]"
+   ```
+   If quarantined, report `DEPLOY DEFERRED (quarantined: <sha8> reachable from
+   origin/main — see ~/data/deploy_quarantine.txt)` and exit the deploy path.
+   Do NOT proceed to CI check, build, or restart. Parse/check warnings are
+   appended to the `deploy:` status line regardless of outcome.
+4. Check CI status on origin/main: `gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'`.
    If any recent run has conclusion `failure`, do NOT deploy — route the failure
    through check (11) and wait.
-4. If all conclusions are `success` (ignore `""` for in-progress and `cancelled`):
+5. If all conclusions are `success` (ignore `""` for in-progress and `cancelled`):
    `git pull --rebase`, `CARGO_TARGET_DIR=/home/tomer/data/$MONITOR_SESSION_ID/cargo-target cargo build --release -p henyey`.
-5. If build succeeds:
+6. If build succeeds:
    ```bash
    # Persist the just-built sha BEFORE Stop-PID. Atomic via tmp + mv.
    new_sha=$(git rev-parse HEAD)
@@ -1185,7 +1241,7 @@ Otherwise enter the deploy path:
    ```
    Then: Stop-PID, Rotate-log suffix `preredeploy`, Relaunch.
    Report: `DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>`.
-6. If build fails: report `BUILD FAILED`, do NOT restart — the old binary is
+7. If build fails: report `BUILD FAILED`, do NOT restart — the old binary is
    still running. Do NOT update `BUILD_SHA_FILE`. Route the build error through
    check (11).
 
@@ -1328,11 +1384,65 @@ subsystem, phase/mark, root-cause hypothesis, or candidate site set.
 **Commit policy**: the monitor does NOT commit code. All fixes are delegated
 via `gh issue`.
 
-**Deploy regression policy**: If the node fails after a deploy, (a) file or
-comment on a GitHub issue (label `urgent` since validator operation is
-impacted) with the regression details (commit range, symptoms, watchdog
-data); (b) restart the node on the last known-good binary (rebuild from the
+**Deploy regression policy**: If the node fails after a deploy:
+
+(a) Record the bad SHA BEFORE any rollback rebuild (`build_sha` will be
+overwritten during rebuild):
+
+```bash
+bad_sha=$(cat "$BUILD_SHA_FILE")
+```
+
+(b) Append to quarantine file (idempotent, exact first-field match):
+
+```bash
+if ! awk -v sha="$bad_sha" '$1 == sha { found=1; exit } END { exit !found }' \
+     "$HOME/data/deploy_quarantine.txt" 2>/dev/null; then
+  printf '%s regression #<issue>\n' "$bad_sha" >> "$HOME/data/deploy_quarantine.txt"
+fi
+```
+
+(c) File or comment on a GitHub issue (label `urgent` since validator
+operation is impacted) with the regression details (commit range, symptoms,
+watchdog data).
+
+(d) Restart the node on the last known-good binary (rebuild from the
 previous commit) while waiting for the fix. Do NOT revert commits inline.
+
+The quarantine gate (section 10, step 3) will now block re-deployment as
+long as the quarantined SHA is reachable from origin/main. The quarantine
+does NOT auto-lift — see "Quarantine Clearance" below.
+
+### Quarantine Clearance
+
+The deploy quarantine is a safety lock. The monitor skill NEVER removes
+entries. Clearance is an explicit operator decision.
+
+**When to clear**: After ALL of:
+1. The linked issue (in the reason field) is CLOSED with a fix merged.
+2. CI on origin/main is green (the fix passes all tests).
+3. The operator has reviewed the fix commit and is confident the
+   regression is resolved.
+
+**How to clear** (exact first-field match, atomic via tmp+mv):
+
+```bash
+bad_sha="<sha-to-remove>"
+awk -v sha="$bad_sha" '$1 != sha' "$HOME/data/deploy_quarantine.txt" \
+  > "$HOME/data/deploy_quarantine.txt.tmp" \
+  && mv "$HOME/data/deploy_quarantine.txt.tmp" "$HOME/data/deploy_quarantine.txt"
+```
+
+**Operator reminders**: The `deploy:` status line reports
+`DEFERRED (quarantined: ...)` every tick (~20 minutes). This is a
+persistent, automatic reminder that requires no separate notification.
+
+**Emergency override**: To force deploy despite quarantine:
+
+```bash
+rm "$HOME/data/deploy_quarantine.txt"   # clears ALL quarantines
+# or: remove the specific entry per the awk command above
+```
 
 ## Investigation
 
@@ -1361,7 +1471,7 @@ MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   metrics: <clean | N alerts (<metric1>,<metric2>,...) — filed/commented #<N>,#<M> | N alerts, K suppressed by cooldown>
   metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating>, pending <ok (too_old=Z%) | skipped (reason) | WARNING too_old=Z%>50% (N ticks)> | collecting baseline
   recovery_stalled: <ok (delta=0) | breach (delta=N, streak M/3) | WARNING delta=N (M ticks) — investigating | WARNING delta=N (burst) — investigating | skipped (<reason>) | collecting baseline>
-  deploy:  <up-to-date | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
+  deploy:  <up-to-date | DEFERRED (quarantined: <sha8> reachable from origin/main — see ~/data/deploy_quarantine.txt) | DEFERRED (cool-down: ...) | SYNCED (no-binary-impact: ...) | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
   ci:      <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
   self_reflect: <clean | fixed inline (<sha>: <short-desc>) | filed #<N> (urgent: <short-desc>) | filed #<N> (no-label: <short-desc>) | filed #<N> (not-ready: <short-desc>)>
 ```

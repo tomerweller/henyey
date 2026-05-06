@@ -29,9 +29,9 @@ testnet-only guideline in CLAUDE.md.
   failures — are delegated via `gh issue create --label ready` (or a
   comment on an existing issue). A separate downstream process picks up
   `ready`-labeled issues and commits the fix.
-- If a deployed commit causes a regression, file/comment a `ready`-labeled
-  issue and restart the node on the last known-good binary while waiting
-  for the fix.
+- If a deployed commit causes a regression, file/comment an `urgent`-labeled
+  issue (deploy regressions block validator operation) and restart the node
+  on the last known-good binary while waiting for the fix.
 
 ## Fix-Routing Policy
 
