@@ -16,7 +16,7 @@ use henyey_history::{
     archive_state::{HASBucketLevel, HistoryArchiveState},
     catchup::{CatchupManagerBuilder, CatchupOptions},
     paths::checkpoint_path,
-    verify,
+    verify, HistoryError,
 };
 use henyey_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
@@ -905,4 +905,271 @@ async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
     assert_eq!(output.ledgers_applied, 1);
     let final_header = ledger_manager.current_header();
     assert_eq!(final_header.ledger_seq, target);
+}
+
+/// End-to-end test that `replay_via_close_ledger()` correctly translates
+/// `LedgerError::HashMismatch` into `HistoryError::ReplayHashMismatch`.
+///
+/// This covers the history-layer wiring at `catchup/replay.rs:321-336`.
+/// The ledger-layer "reject mismatch before mutating state" guarantee is
+/// separately tested by `test_close_ledger_rejects_wrong_expected_header_hash`.
+///
+/// The mismatch is triggered by corrupting the archive header's `bucket_list_hash`
+/// field. With `verify_header_hash: true`, replay computes `expected_header_hash`
+/// from the corrupted archive header and passes it to `close_ledger()`, which
+/// computes a different hash from its internal state → `HashMismatch`.
+#[tokio::test]
+async fn test_replay_hash_mismatch_produces_replay_hash_mismatch_error() {
+    let checkpoint = 63u32;
+    let target = 64u32;
+    let data_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
+
+    let bucket_list = empty_bucket_list();
+    let checkpoint_bucket_hash = combined_bucket_list_hash(bucket_list.hash());
+
+    let header63 = make_header(
+        checkpoint,
+        Hash256::ZERO,
+        checkpoint_bucket_hash,
+        Hash256::ZERO,
+        Hash256::ZERO,
+    );
+    let header63_hash = verify::compute_header_hash(&header63).expect("header63 hash");
+
+    let tx_set = TransactionSet {
+        previous_ledger_hash: Hash(*header63_hash.as_bytes()),
+        txs: VecM::default(),
+    };
+    let tx_set_hash = verify::compute_tx_set_hash(&TransactionSetVariant::Classic(tx_set.clone()))
+        .expect("tx set hash");
+
+    let result_set = TransactionResultSet {
+        results: VecM::default(),
+    };
+    let result_xdr = result_set
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("tx result xdr");
+    let tx_result_hash = Hash256::hash(&result_xdr);
+
+    // Corrupt bucket_list_hash in the archive header for ledger 64.
+    // This makes the expected_header_hash (computed from this header) differ
+    // from what close_ledger() internally computes.
+    let corrupted_bucket_hash = Hash256::from_bytes([0xFF; 32]);
+    let header64_corrupted = make_header(
+        target,
+        header63_hash,
+        corrupted_bucket_hash,
+        tx_set_hash,
+        tx_result_hash,
+    );
+
+    // Compute what replay will use as `expected_header_hash`.
+    let corrupted_header64_hash =
+        verify::compute_header_hash(&header64_corrupted).expect("corrupted header64 hash");
+
+    let headers_xdr = {
+        let entry63 = LedgerHeaderHistoryEntry {
+            hash: header63_hash.into(),
+            header: header63,
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        };
+        let entry64 = LedgerHeaderHistoryEntry {
+            hash: corrupted_header64_hash.into(),
+            header: header64_corrupted.clone(),
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        };
+        let entry63_xdr = entry63
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("header63 xdr");
+        let entry64_xdr = entry64
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("header64 xdr");
+        record_marked(&[entry63_xdr, entry64_xdr])
+    };
+    let headers_xdr_for_data_checkpoint = {
+        let entry64 = LedgerHeaderHistoryEntry {
+            hash: corrupted_header64_hash.into(),
+            header: header64_corrupted,
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        };
+        let entry64_xdr = entry64
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("header64 xdr");
+        record_marked(&[entry64_xdr])
+    };
+    let tx_history_entry = TransactionHistoryEntry {
+        ledger_seq: target,
+        tx_set: tx_set.clone(),
+        ext: TransactionHistoryEntryExt::V0,
+    };
+    let tx_history_xdr = record_marked(&[tx_history_entry
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("tx history xdr")]);
+    let tx_result_entry = TransactionHistoryResultEntry {
+        ledger_seq: target,
+        tx_result_set: result_set,
+        ext: TransactionHistoryResultEntryExt::default(),
+    };
+    let tx_result_xdr = record_marked(&[tx_result_entry
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("tx result history xdr")]);
+
+    let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
+    for _ in 0..BUCKET_LIST_LEVELS {
+        levels.push(HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        });
+    }
+
+    let has = HistoryArchiveState {
+        version: 2,
+        server: Some("rs-stellar-core test".to_string()),
+        current_ledger: checkpoint,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        current_buckets: levels,
+        hot_archive_buckets: None,
+    };
+
+    let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
+    fixtures.insert(
+        checkpoint_path("history", checkpoint, "json"),
+        has.to_json().unwrap().into_bytes(),
+    );
+    fixtures.insert(
+        checkpoint_path("ledger", checkpoint, "xdr.gz"),
+        gzip_bytes(&headers_xdr),
+    );
+    fixtures.insert(
+        checkpoint_path("transactions", checkpoint, "xdr.gz"),
+        gzip_bytes(&[]),
+    );
+    fixtures.insert(
+        checkpoint_path("results", checkpoint, "xdr.gz"),
+        gzip_bytes(&[]),
+    );
+    fixtures.insert(
+        checkpoint_path("ledger", data_checkpoint, "xdr.gz"),
+        gzip_bytes(&headers_xdr_for_data_checkpoint),
+    );
+    fixtures.insert(
+        checkpoint_path("transactions", data_checkpoint, "xdr.gz"),
+        gzip_bytes(&tx_history_xdr),
+    );
+    fixtures.insert(
+        checkpoint_path("results", data_checkpoint, "xdr.gz"),
+        gzip_bytes(&tx_result_xdr),
+    );
+
+    let fixtures = Arc::new(fixtures);
+    let app =
+        Router::new()
+            .route(
+                "/*path",
+                get(
+                    |Path(path): Path<String>,
+                     State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
+                        let key = path.trim_start_matches('/');
+                        if let Some(body) = state.get(key) {
+                            (StatusCode::OK, body.clone())
+                        } else {
+                            (StatusCode::NOT_FOUND, Vec::new())
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&fixtures));
+
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping test: tcp bind not permitted in this environment");
+            return;
+        }
+        Err(err) => panic!("bind: {err}"),
+    };
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let base_url = format!("http://{}/", addr);
+    let archive = HistoryArchive::new(&base_url).expect("archive");
+
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
+    let db = Database::open_in_memory().expect("db");
+
+    let ledger_manager = henyey_ledger::LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+
+    let mut manager = CatchupManagerBuilder::new()
+        .add_archive(archive)
+        .bucket_manager(bucket_manager)
+        .database(db)
+        .options(CatchupOptions {
+            verify_buckets: false,
+            verify_headers: false,
+        })
+        .build()
+        .expect("catchup manager");
+
+    // Enable only header hash verification to isolate the ReplayHashMismatch path.
+    manager.set_replay_config(henyey_history::ReplayConfig {
+        verify_bucket_list: false,
+        verify_results: false,
+        verify_header_hash: true,
+        ..Default::default()
+    });
+
+    let result = manager.catchup_to_ledger(target, &ledger_manager).await;
+
+    // Assert we get ReplayHashMismatch with the correct fields.
+    match result {
+        Err(HistoryError::ReplayHashMismatch {
+            ledger,
+            expected,
+            actual,
+        }) => {
+            assert_eq!(ledger, target, "mismatch should report the target ledger");
+
+            // The `expected` field comes from compute_header_hash(archive_header),
+            // which is what replay passes as expected_header_hash to close_ledger.
+            assert_eq!(
+                expected,
+                corrupted_header64_hash.to_hex(),
+                "expected hash should match the corrupted archive header hash"
+            );
+
+            // Both must be valid 64-char hex strings that differ.
+            assert_eq!(expected.len(), 64, "expected hash should be 64 hex chars");
+            assert_eq!(actual.len(), 64, "actual hash should be 64 hex chars");
+            assert_ne!(
+                expected, actual,
+                "expected and actual hashes must differ for a mismatch"
+            );
+        }
+        Err(other) => panic!("expected ReplayHashMismatch, got: {other}"),
+        Ok(_) => panic!("expected ReplayHashMismatch error, but catchup succeeded"),
+    }
+
+    // Verify LedgerManager state was NOT corrupted — it should still be at
+    // the checkpoint ledger (63), not the target (64).
+    assert_eq!(
+        ledger_manager.current_ledger_seq(),
+        checkpoint,
+        "LedgerManager should not advance past checkpoint on hash mismatch"
+    );
+    assert_eq!(
+        ledger_manager.current_header_hash(),
+        header63_hash,
+        "LedgerManager header hash should remain at checkpoint header"
+    );
 }
