@@ -462,9 +462,7 @@ impl CatchupManager {
                 checkpoint_header,
                 checkpoint_hash,
             )
-            .map_err(|e| {
-                HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
-            })?;
+            .map_err(|e| map_initialize_error(e, ""))?;
 
         Ok(())
     }
@@ -776,12 +774,7 @@ impl CatchupManager {
                                 header,
                                 hash,
                             )
-                            .map_err(|e| {
-                                HistoryError::CatchupFailed(format!(
-                                    "Failed to initialize ledger manager from existing state: {}",
-                                    e
-                                ))
-                            })?;
+                            .map_err(|e| map_initialize_error(e, " from existing state"))?;
                     }
                     None => {
                         return Err(HistoryError::CatchupFailed(
@@ -963,6 +956,26 @@ impl CatchupManager {
             ledger_manager,
         )
         .await
+    }
+}
+
+/// Maps a [`LedgerError`](henyey_ledger::LedgerError) from
+/// `LedgerManager::initialize()` to the appropriate [`HistoryError`],
+/// preserving the fatal hash-mismatch classification.
+///
+/// [`LedgerError::HashMismatch`](henyey_ledger::LedgerError::HashMismatch) is
+/// mapped to [`HistoryError::Ledger`] so that
+/// [`is_fatal_catchup_failure()`](HistoryError::is_fatal_catchup_failure) and
+/// [`is_hash_mismatch()`](HistoryError::is_hash_mismatch) correctly classify it
+/// as a fatal integrity failure. All other variants are wrapped in
+/// [`HistoryError::CatchupFailed`] with contextual information.
+fn map_initialize_error(e: henyey_ledger::LedgerError, context: &str) -> HistoryError {
+    match e {
+        e @ henyey_ledger::LedgerError::HashMismatch { .. } => HistoryError::Ledger(e),
+        other => HistoryError::CatchupFailed(format!(
+            "Failed to initialize ledger manager{}: {}",
+            context, other
+        )),
     }
 }
 
@@ -1451,5 +1464,47 @@ mod tests {
         };
 
         assert!(checkpoint_header_from_headers(63, &[entry]).is_err());
+    }
+
+    #[test]
+    fn test_map_initialize_error_hash_mismatch_is_fatal() {
+        let err = henyey_ledger::LedgerError::HashMismatch {
+            expected: "aabb".to_string(),
+            actual: "ccdd".to_string(),
+        };
+        let mapped = map_initialize_error(err, "");
+        assert!(
+            mapped.is_fatal_catchup_failure(),
+            "HashMismatch from initialize should be classified as a fatal catchup failure"
+        );
+        assert!(
+            mapped.is_hash_mismatch(),
+            "HashMismatch from initialize should be classified as a hash mismatch"
+        );
+        assert!(
+            matches!(
+                mapped,
+                HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. })
+            ),
+            "HashMismatch should be preserved as HistoryError::Ledger variant"
+        );
+    }
+
+    #[test]
+    fn test_map_initialize_error_other_variant_not_fatal() {
+        let err = henyey_ledger::LedgerError::AlreadyInitialized;
+        let mapped = map_initialize_error(err, " from existing state");
+        assert!(
+            !mapped.is_fatal_catchup_failure(),
+            "AlreadyInitialized should NOT be classified as a fatal catchup failure"
+        );
+        assert!(
+            !mapped.is_hash_mismatch(),
+            "AlreadyInitialized should NOT be classified as a hash mismatch"
+        );
+        assert!(
+            matches!(mapped, HistoryError::CatchupFailed(ref msg) if msg.contains("from existing state")),
+            "Non-HashMismatch errors should be wrapped in CatchupFailed with context"
+        );
     }
 }
