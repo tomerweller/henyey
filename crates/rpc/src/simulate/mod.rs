@@ -227,40 +227,55 @@ impl SimulationContext {
     /// Soroban network config is derived from the bucket snapshot itself
     /// (not a separate cached value) to guarantee it comes from the same
     /// ledger epoch as the simulation state.
-    fn from_app(app: &dyn crate::context::RpcAppHandle) -> Result<Self, JsonRpcError> {
+    ///
+    /// The config loading (which may read disk-backed buckets) runs on the
+    /// blocking thread pool to avoid stalling the async runtime.
+    async fn from_app(app: &dyn crate::context::RpcAppHandle) -> Result<Self, JsonRpcError> {
         let bl_snapshot = app
             .bucket_snapshot_manager()
             .copy_searchable_live_snapshot()
             .ok_or_else(|| JsonRpcError::internal("bucket list snapshot not available"))?;
 
-        let soroban_info =
-            henyey_ledger::load_soroban_network_info(&BucketEntryReader(&bl_snapshot))
-                .map_err(|e| JsonRpcError::internal(format!("soroban config load failed: {e}")))?
-                .ok_or_else(|| JsonRpcError::internal("soroban network config not available"))?;
+        let network_passphrase = app.info().network_passphrase.clone();
 
-        let header = bl_snapshot.ledger_header();
-        let ledger_num = bl_snapshot.ledger_seq();
-        let network_id = henyey_common::NetworkId::from_passphrase(&app.info().network_passphrase);
+        // Config loading traverses bucket levels that may be disk-backed;
+        // run on the blocking pool to keep the async runtime responsive.
+        tokio::task::spawn_blocking(move || {
+            let soroban_info =
+                henyey_ledger::load_soroban_network_info(&BucketEntryReader(&bl_snapshot))
+                    .map_err(|e| {
+                        JsonRpcError::internal(format!("soroban config load failed: {e}"))
+                    })?
+                    .ok_or_else(|| {
+                        JsonRpcError::internal("soroban network config not available")
+                    })?;
 
-        let ledger_info = soroban_host::LedgerInfo {
-            protocol_version: header.ledger_version,
-            sequence_number: ledger_num,
-            timestamp: header.scp_value.close_time.0,
-            network_id: network_id.0 .0,
-            base_reserve: header.base_reserve,
-            min_temp_entry_ttl: soroban_info.min_temporary_ttl,
-            min_persistent_entry_ttl: soroban_info.min_persistent_ttl,
-            max_entry_ttl: soroban_info.max_entry_ttl,
-        };
+            let header = bl_snapshot.ledger_header();
+            let ledger_num = bl_snapshot.ledger_seq();
+            let network_id = henyey_common::NetworkId::from_passphrase(&network_passphrase);
 
-        let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger_num);
+            let ledger_info = soroban_host::LedgerInfo {
+                protocol_version: header.ledger_version,
+                sequence_number: ledger_num,
+                timestamp: header.scp_value.close_time.0,
+                network_id: network_id.0 .0,
+                base_reserve: header.base_reserve,
+                min_temp_entry_ttl: soroban_info.min_temporary_ttl,
+                min_persistent_entry_ttl: soroban_info.min_persistent_ttl,
+                max_entry_ttl: soroban_info.max_entry_ttl,
+            };
 
-        Ok(Self {
-            snapshot_source,
-            ledger_info,
-            soroban_info,
-            latest_ledger: ledger_num,
+            let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger_num);
+
+            Ok(Self {
+                snapshot_source,
+                ledger_info,
+                soroban_info,
+                latest_ledger: ledger_num,
+            })
         })
+        .await
+        .map_err(|e| JsonRpcError::internal(format!("config load task panicked: {e}")))?
     }
 }
 
@@ -381,7 +396,7 @@ pub async fn handle(
     let rc = resource_config.unwrap_or(&empty_obj);
     let instruction_leeway: u32 = util::param_u32(rc, "instructionLeeway")?.unwrap_or(0);
 
-    let sim = SimulationContext::from_app(&*ctx.app)?;
+    let sim = SimulationContext::from_app(&*ctx.app).await?;
 
     match soroban_op {
         SorobanOp::InvokeHostFunction { host_fn, auth } => {

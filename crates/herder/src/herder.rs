@@ -7770,6 +7770,64 @@ mod scp_pipeline_tests {
         assert_eq!(reason, PostVerifyReason::PendingAddPerSlotFull);
     }
 
+    /// #2411: Regression test for the current-slot bypass. The original bug
+    /// was that admission control only ran for future slots, letting current-slot
+    /// floods grow unbounded. This test proves the cap now applies to current-slot.
+    #[test]
+    fn test_process_verified_per_slot_full_current_slot() {
+        use crate::pending::PendingConfig;
+        let config = HerderConfig {
+            pending_config: PendingConfig {
+                max_envelopes_per_slot: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let herder = Herder::new(config, make_default_lm());
+        herder.start_syncing();
+        herder.pending_envelopes.set_current_slot(100);
+
+        let slot = 100u64; // current slot — this was the bypass path
+
+        // Fill 3 envelopes (the cap).
+        for seed_byte in 0..3u8 {
+            let secret = SecretKey::from_seed(&[seed_byte + 10; 32]);
+            let env = make_signed_test_envelope_outer(slot, &herder, &secret);
+            let intake = PipelinedIntake {
+                envelope: env,
+                slot,
+                is_externalize: false,
+                peer_id: None,
+                enqueue_at: std::time::Instant::now(),
+                flood_msg_hash: None,
+            };
+            let (state, reason) = herder.process_verified(VerifiedEnvelope {
+                intake,
+                verdict: Verdict::Ok,
+            });
+            assert_eq!(state, EnvelopeState::Fetching);
+            assert_eq!(reason, PostVerifyReason::Accepted);
+        }
+
+        // 4th envelope for the CURRENT slot exceeds the cap → rejected.
+        let secret = SecretKey::from_seed(&[99; 32]);
+        let env = make_signed_test_envelope_outer(slot, &herder, &secret);
+        let intake = PipelinedIntake {
+            envelope: env,
+            slot,
+            is_externalize: false,
+            peer_id: None,
+            enqueue_at: std::time::Instant::now(),
+            flood_msg_hash: None,
+        };
+        let (state, reason) = herder.process_verified(VerifiedEnvelope {
+            intake,
+            verdict: Verdict::Ok,
+        });
+        assert_eq!(state, EnvelopeState::Invalid);
+        assert_eq!(reason, PostVerifyReason::PendingAddPerSlotFull);
+    }
+
     // -------- scp_verify::worker tests --------
 
     #[test]

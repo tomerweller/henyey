@@ -252,7 +252,7 @@ Corresponds to: `PendingEnvelopes.h`
 | `recordReceivedCost()` | _(not implemented)_ | None |
 | `getCostPerValidator()` | _(not implemented)_ | None |
 
-**Parity notes (pending.rs):**
+**Parity notes (pending.rs / fetching_envelopes.rs):**
 - **Per-slot safety cap (intentional henyey-specific divergence).** henyey adds
   `MAX_ENVELOPES_PER_SLOT = 5000` as a defense-in-depth bound not present in
   stellar-core. stellar-core's per-slot collections are implicitly bounded by
@@ -262,6 +262,16 @@ Corresponds to: `PendingEnvelopes.h`
   to prevent memory exhaustion from compromised validator keys or quorum-less
   watcher flood attacks. The old `max_per_slot = 100` (removed in #1899) was
   routinely hit in normal operation; this cap is 50× higher (added in #2408).
+- **Per-slot lifetime cap in FetchingEnvelopes (intentional henyey-specific
+  divergence, #2411).** `FetchingEnvelopes` enforces a per-slot lifetime cap
+  counting ALL states (fetching + ready + processed + discarded). stellar-core
+  has no equivalent cap; it relies on implicit bounds from quorum filtering.
+  The henyey cap prevents the "immediate-pop bypass" where current-slot
+  envelopes cycle rapidly through ready→processed, keeping active counts low
+  while memory grows unboundedly. The herder-level admission control now checks
+  ALL slots (not just future), and `recv_envelope_inner()` has a defense-in-depth
+  check. Under overload, valid envelopes for a saturated slot are rejected until
+  the slot is purged by range cleanup.
 - **Slot-count gating** correctly skips the `max_slots` check when appending
   to an existing slot (fixed in #1899).
 - **`purge_slots_below(min_slot)`** mirrors the lower-bound cleanup of
