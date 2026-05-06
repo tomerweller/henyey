@@ -416,13 +416,13 @@ pub fn require_soroban_config(
 /// Returns `Err` if any required setting is missing or has a wrong variant (data corruption).
 /// V23+ settings (`ContractLedgerCostExtV0`, `ScpTiming`, `ContractParallelComputeV0`) are
 /// loaded optionally since the snapshot header may be stale during protocol-upgrade ledgers.
-pub(crate) fn load_soroban_network_info(
-    snapshot: &SnapshotHandle,
+pub fn load_soroban_network_info(
+    reader: &impl crate::EntryReader,
 ) -> Result<Option<SorobanNetworkInfo>> {
     const CTX: &str = "load_soroban_network_info";
 
     // Probe: if ContractComputeV0 doesn't exist, Soroban is not active (pre-protocol 20)
-    if load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)?.is_none() {
+    if load_config_setting(reader, ConfigSettingId::ContractComputeV0)?.is_none() {
         return Ok(None);
     }
 
@@ -431,7 +431,7 @@ pub(crate) fn load_soroban_network_info(
     // --- Base required settings (must exist once Soroban is active) ---
 
     let compute = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractComputeV0,
         ContractComputeV0,
         CTX
@@ -442,26 +442,26 @@ pub(crate) fn load_soroban_network_info(
     info.tx_memory_limit = compute.tx_memory_limit;
 
     info.max_contract_data_key_size = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractDataKeySizeBytes,
         ContractDataKeySizeBytes,
         CTX
     );
     info.max_contract_data_entry_size = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractDataEntrySizeBytes,
         ContractDataEntrySizeBytes,
         CTX
     );
     info.max_contract_size = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractMaxSizeBytes,
         ContractMaxSizeBytes,
         CTX
     );
 
     let cost = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractLedgerCostV0,
         ContractLedgerCostV0,
         CTX
@@ -483,7 +483,7 @@ pub(crate) fn load_soroban_network_info(
     info.state_size_rent_fee_growth_factor = cost.soroban_state_rent_fee_growth_factor;
 
     let hist = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractHistoricalDataV0,
         ContractHistoricalDataV0,
         CTX
@@ -491,7 +491,7 @@ pub(crate) fn load_soroban_network_info(
     info.fee_historical_1kb = hist.fee_historical1_kb;
 
     let events = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractEventsV0,
         ContractEventsV0,
         CTX
@@ -500,7 +500,7 @@ pub(crate) fn load_soroban_network_info(
     info.fee_contract_events_size_1kb = events.fee_contract_events1_kb;
 
     let bandwidth = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractBandwidthV0,
         ContractBandwidthV0,
         CTX
@@ -510,14 +510,14 @@ pub(crate) fn load_soroban_network_info(
     info.fee_transaction_size_1kb = bandwidth.fee_tx_size1_kb;
 
     let lanes = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractExecutionLanes,
         ContractExecutionLanes,
         CTX
     );
     info.ledger_max_tx_count = lanes.ledger_max_tx_count;
 
-    let archival = load_config!(snapshot, ConfigSettingId::StateArchival, StateArchival, CTX);
+    let archival = load_config!(reader, ConfigSettingId::StateArchival, StateArchival, CTX);
     info.max_entry_ttl = archival.max_entry_ttl;
     info.min_temporary_ttl = archival.min_temporary_ttl;
     info.min_persistent_ttl = archival.min_persistent_ttl;
@@ -529,7 +529,7 @@ pub(crate) fn load_soroban_network_info(
     info.starting_eviction_scan_level = archival.starting_eviction_scan_level;
 
     let window = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::LiveSorobanStateSizeWindow,
         LiveSorobanStateSizeWindow,
         CTX
@@ -545,7 +545,7 @@ pub(crate) fn load_soroban_network_info(
     // --- V23+ settings (optional — may be absent during protocol upgrade ledgers) ---
 
     if let Some(ext) = load_config_optional!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractLedgerCostExtV0,
         ContractLedgerCostExtV0,
         CTX
@@ -554,8 +554,7 @@ pub(crate) fn load_soroban_network_info(
         info.tx_max_footprint_entries = ext.tx_max_footprint_entries;
     }
 
-    if let Some(timing) =
-        load_config_optional!(snapshot, ConfigSettingId::ScpTiming, ScpTiming, CTX)
+    if let Some(timing) = load_config_optional!(reader, ConfigSettingId::ScpTiming, ScpTiming, CTX)
     {
         info.nomination_timeout_initial_ms = timing.nomination_timeout_initial_milliseconds;
         info.nomination_timeout_increment_ms = timing.nomination_timeout_increment_milliseconds;
@@ -565,7 +564,7 @@ pub(crate) fn load_soroban_network_info(
     }
 
     if let Some(parallel) = load_config_optional!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractParallelComputeV0,
         ContractParallelComputeV0,
         CTX

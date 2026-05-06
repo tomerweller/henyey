@@ -13,9 +13,7 @@ use henyey_app::config::AppConfig;
 use henyey_app::{AppState, LedgerSummary};
 use henyey_bucket::BucketSnapshotManager;
 use henyey_herder::TxQueueResult;
-use henyey_ledger::{
-    compute_header_hash, HeaderSnapshot, LedgerManager, LedgerManagerConfig, SorobanNetworkInfo,
-};
+use henyey_ledger::{compute_header_hash, HeaderSnapshot, LedgerManager, LedgerManagerConfig};
 use henyey_rpc::{RpcAppHandle, RpcServer};
 use stellar_xdr::curr::{LedgerHeader, TransactionEnvelope};
 use tokio::sync::broadcast;
@@ -84,10 +82,6 @@ impl RpcAppHandle for FakeRpcApp {
 
     fn bucket_snapshot_manager(&self) -> &Arc<BucketSnapshotManager> {
         &self.bucket_snapshot_manager
-    }
-
-    fn soroban_network_info(&self) -> Option<SorobanNetworkInfo> {
-        None
     }
 
     fn subscribe_shutdown(&self) -> broadcast::Receiver<()> {

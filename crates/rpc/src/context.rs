@@ -6,7 +6,7 @@ use henyey_app::config::{AppConfig, RpcConfig};
 use henyey_app::{App, AppState, LedgerSummary};
 use henyey_bucket::BucketSnapshotManager;
 use henyey_herder::TxQueueResult;
-use henyey_ledger::{HeaderSnapshot, SorobanNetworkInfo};
+use henyey_ledger::HeaderSnapshot;
 use stellar_xdr::curr::TransactionEnvelope;
 use tokio::sync::Semaphore;
 
@@ -40,8 +40,6 @@ pub trait RpcAppHandle: Send + Sync + 'static {
     fn database(&self) -> &henyey_db::Database;
     /// Bucket list snapshot manager (for Soroban simulation).
     fn bucket_snapshot_manager(&self) -> &Arc<BucketSnapshotManager>;
-    /// Soroban network configuration (TTL bounds, fees, etc.).
-    fn soroban_network_info(&self) -> Option<SorobanNetworkInfo>;
     /// Subscribe to the application shutdown broadcast channel.
     fn subscribe_shutdown(&self) -> tokio::sync::broadcast::Receiver<()>;
     /// Submit a transaction to the herder queue and flood to peers.
@@ -79,9 +77,6 @@ impl RpcAppHandle for App {
     }
     fn bucket_snapshot_manager(&self) -> &Arc<BucketSnapshotManager> {
         App::bucket_snapshot_manager(self)
-    }
-    fn soroban_network_info(&self) -> Option<SorobanNetworkInfo> {
-        App::soroban_network_info(self)
     }
     fn subscribe_shutdown(&self) -> tokio::sync::broadcast::Receiver<()> {
         App::subscribe_shutdown(self)

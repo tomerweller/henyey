@@ -205,20 +205,38 @@ struct SimulationContext {
     latest_ledger: u32,
 }
 
+/// Adapts a `SearchableBucketListSnapshot` to the `EntryReader` trait,
+/// enabling soroban config loading from the same bucket state used for
+/// simulation. Uses `load_result()` to propagate I/O errors (fail-closed).
+struct BucketEntryReader<'a>(&'a henyey_bucket::SearchableBucketListSnapshot);
+
+impl henyey_ledger::EntryReader for BucketEntryReader<'_> {
+    fn get_entry(
+        &self,
+        key: &stellar_xdr::curr::LedgerKey,
+    ) -> henyey_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>> {
+        Ok(self.0.load_result(key)?)
+    }
+}
+
 impl SimulationContext {
     /// Build from the running app state.
     ///
     /// Uses the snapshot's own ledger header instead of `app.ledger_summary()`
     /// to avoid TOCTOU: the snapshot and header are captured atomically.
+    /// Soroban network config is derived from the bucket snapshot itself
+    /// (not a separate cached value) to guarantee it comes from the same
+    /// ledger epoch as the simulation state.
     fn from_app(app: &dyn crate::context::RpcAppHandle) -> Result<Self, JsonRpcError> {
         let bl_snapshot = app
             .bucket_snapshot_manager()
             .copy_searchable_live_snapshot()
             .ok_or_else(|| JsonRpcError::internal("bucket list snapshot not available"))?;
 
-        let soroban_info = app
-            .soroban_network_info()
-            .ok_or_else(|| JsonRpcError::internal("soroban network config not available"))?;
+        let soroban_info =
+            henyey_ledger::load_soroban_network_info(&BucketEntryReader(&bl_snapshot))
+                .map_err(|e| JsonRpcError::internal(format!("soroban config load failed: {e}")))?
+                .ok_or_else(|| JsonRpcError::internal("soroban network config not available"))?;
 
         let header = bl_snapshot.ledger_header();
         let ledger_num = bl_snapshot.ledger_seq();
@@ -1099,5 +1117,60 @@ mod tests {
             Err(e) => assert!(e.message.contains("record")),
             Ok(_) => panic!("expected error for 'record' mode with auth entries"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BucketEntryReader tests
+    // -----------------------------------------------------------------------
+
+    /// A mock EntryReader that always returns an error, for testing
+    /// fail-closed error propagation.
+    struct FailingEntryReader;
+
+    impl henyey_ledger::EntryReader for FailingEntryReader {
+        fn get_entry(
+            &self,
+            _key: &LedgerKey,
+        ) -> henyey_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>> {
+            Err(henyey_ledger::LedgerError::Internal(
+                "simulated I/O failure".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn test_load_soroban_network_info_propagates_errors() {
+        // A failing EntryReader should cause load_soroban_network_info to
+        // return Err, not silently return Ok(None).
+        let result = henyey_ledger::load_soroban_network_info(&FailingEntryReader);
+        assert!(
+            result.is_err(),
+            "expected error propagation, got {result:?}"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("simulated I/O failure"),
+            "error should contain original message: {err_msg}"
+        );
+    }
+
+    /// A mock EntryReader that returns None for all keys (pre-Soroban state).
+    struct EmptyEntryReader;
+
+    impl henyey_ledger::EntryReader for EmptyEntryReader {
+        fn get_entry(
+            &self,
+            _key: &LedgerKey,
+        ) -> henyey_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn test_load_soroban_network_info_pre_soroban_returns_none() {
+        // When ContractComputeV0 doesn't exist, should return Ok(None).
+        let result = henyey_ledger::load_soroban_network_info(&EmptyEntryReader);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }
