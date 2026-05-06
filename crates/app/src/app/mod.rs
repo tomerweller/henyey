@@ -9793,4 +9793,143 @@ mod tests {
             "survey_local_ledger must fall back to current_ledger_seq when not tracking"
         );
     }
+
+    // ---- scheduler ledger restamping regression test ----
+
+    /// Helper: create an App with overlay started for scheduler tests that
+    /// need to capture outbound messages via inject_test_peer.
+    async fn survey_test_app_with_overlay() -> (Arc<App>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("survey-test.db"))
+            .build();
+        config.overlay.known_peers.clear();
+        config.is_compat_config = true;
+        let app = Arc::new(App::new(config).await.unwrap());
+        app.start_overlay().await.unwrap();
+        (app, dir)
+    }
+
+    /// Regression test for commit 2cbb6bb: each scheduler phase must read
+    /// survey_local_ledger() fresh at emission time, not reuse a value
+    /// cached at survey start.
+    ///
+    /// Scenario: ledger advances between each scheduler phase (Idle →
+    /// StartSent → RequestSent → Idle). Asserts that the start message
+    /// carries ledger N, the request message carries N+1, and the stop
+    /// message carries N+2.
+    #[tokio::test]
+    async fn test_advance_survey_scheduler_ledger_restamping_across_phases() {
+        let (app, _dir) = survey_test_app_with_overlay().await;
+        let overlay = app.overlay().await.unwrap();
+        let now = app.clock.now();
+
+        // Inject a single test peer so select_survey_peers returns it
+        // deterministically.
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        let mut receiver = overlay.inject_test_peer(peer_id, 16);
+
+        // Bootstrap herder at ledger 10 → survey_local_ledger() = 10.
+        app.herder.bootstrap(10);
+
+        // Set app state to Synced and make the scheduler due.
+        *app.state.write().await = AppState::Synced;
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.next_action = now - Duration::from_secs(1);
+            sched.last_started = None;
+        }
+
+        // ── Phase 1: Idle → StartSent (ledger = 10) ──
+        app.advance_survey_scheduler().await;
+        {
+            let sched = app.survey_scheduler.lock().await;
+            assert_eq!(
+                sched.phase,
+                SurveySchedulerPhase::StartSent,
+                "Phase 1: scheduler must transition Idle → StartSent"
+            );
+        }
+        let msg = receiver
+            .try_recv()
+            .expect("Phase 1: expected start message");
+        match msg {
+            StellarMessage::TimeSlicedSurveyStartCollecting(signed) => {
+                assert_eq!(
+                    signed.start_collecting.ledger_num, 10,
+                    "Phase 1: start message must carry fresh ledger_num = 10"
+                );
+            }
+            other => panic!(
+                "Phase 1: expected TimeSlicedSurveyStartCollecting, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // ── Phase 2: StartSent → RequestSent (advance ledger to 11) ──
+        app.herder.bootstrap(11);
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.next_action = now - Duration::from_secs(1);
+        }
+        app.advance_survey_scheduler().await;
+        {
+            let sched = app.survey_scheduler.lock().await;
+            assert_eq!(
+                sched.phase,
+                SurveySchedulerPhase::RequestSent,
+                "Phase 2: scheduler must transition StartSent → RequestSent"
+            );
+        }
+        let msg = receiver
+            .try_recv()
+            .expect("Phase 2: expected request message");
+        match msg {
+            StellarMessage::TimeSlicedSurveyRequest(signed) => {
+                assert_eq!(
+                    signed.request.request.ledger_num, 11,
+                    "Phase 2: request message must carry fresh ledger_num = 11, not stale 10"
+                );
+            }
+            other => panic!(
+                "Phase 2: expected TimeSlicedSurveyRequest, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // ── Phase 3: RequestSent → Idle (advance ledger to 12) ──
+        app.herder.bootstrap(12);
+        {
+            let mut sched = app.survey_scheduler.lock().await;
+            sched.next_action = now - Duration::from_secs(1);
+        }
+        app.advance_survey_scheduler().await;
+        {
+            let sched = app.survey_scheduler.lock().await;
+            assert_eq!(
+                sched.phase,
+                SurveySchedulerPhase::Idle,
+                "Phase 3: scheduler must transition RequestSent → Idle"
+            );
+        }
+        let msg = receiver.try_recv().expect("Phase 3: expected stop message");
+        match msg {
+            StellarMessage::TimeSlicedSurveyStopCollecting(signed) => {
+                assert_eq!(
+                    signed.stop_collecting.ledger_num, 12,
+                    "Phase 3: stop message must carry fresh ledger_num = 12, not stale 10"
+                );
+            }
+            other => panic!(
+                "Phase 3: expected TimeSlicedSurveyStopCollecting, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // No extra messages should have been emitted.
+        assert!(
+            receiver.try_recv().is_none(),
+            "No extra messages should be in the channel"
+        );
+    }
 }
