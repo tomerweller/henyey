@@ -8495,6 +8495,89 @@ mod tests {
         );
     }
 
+    /// Rejects close_ledger when prev_ledger_hash does not match the manager's
+    /// stored header hash. This exercises the validation at manager.rs:2104-2180.
+    ///
+    /// In the replay path, prev_ledger_hash is sourced from
+    /// `ledger_manager.current_header_hash()` (catchup/replay.rs:312), making this
+    /// check unreachable via replay. It IS reachable from the live close path where
+    /// prev_ledger_hash comes from network consensus.
+    #[tokio::test]
+    async fn test_close_ledger_rejects_wrong_prev_ledger_hash() {
+        use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let network_id = "Test SDF Network ; September 2015".to_string();
+        let manager = LedgerManager::new(
+            network_id.clone(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let bucket_list = new_bl_with_config();
+        let hot_archive = henyey_bucket::HotArchiveBucketList::new();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        manager
+            .initialize(bucket_list, hot_archive, header.clone(), header_hash)
+            .expect("initialize should succeed");
+
+        // Corrupt prev_ledger_hash by flipping the first byte.
+        let mut corrupted_bytes = *header_hash.as_bytes();
+        corrupted_bytes[0] ^= 0xFF;
+        let corrupted_prev_hash = Hash256::from_bytes(corrupted_bytes);
+
+        let close_time = header.scp_value.close_time.0 + 1;
+        let close_data = LedgerCloseData::new(
+            2,
+            TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: corrupted_prev_hash.into(),
+                txs: VecM::default(),
+            }),
+            close_time,
+            corrupted_prev_hash, // wrong prev hash
+        );
+
+        let result = manager.close_ledger(close_data, None);
+        assert!(
+            result.is_err(),
+            "close_ledger with wrong prev_ledger_hash should fail"
+        );
+        let err = result.unwrap_err();
+        match err {
+            LedgerError::HashMismatch { expected, actual } => {
+                assert_eq!(
+                    expected,
+                    header_hash.to_hex(),
+                    "expected should be the manager's stored header hash"
+                );
+                assert_eq!(
+                    actual,
+                    corrupted_prev_hash.to_hex(),
+                    "actual should be the corrupted prev_ledger_hash"
+                );
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
+
+        // LedgerManager state should NOT have advanced.
+        assert_eq!(
+            manager.current_ledger_seq(),
+            1,
+            "LCL should not advance on prev_ledger_hash mismatch"
+        );
+        assert_eq!(
+            manager.current_header_hash(),
+            header_hash,
+            "LCL hash should not change on prev_ledger_hash mismatch"
+        );
+    }
+
     /// close_ledger with expected_header_hash=None (live path) proceeds normally.
     #[tokio::test]
     async fn test_close_ledger_accepts_none_expected_header_hash() {
