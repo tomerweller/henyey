@@ -234,9 +234,9 @@ check_skill_structure() {
       echo "WARNING: monitor-label-policy.md Deploy Regression does not call quarantine_append" >&2
       drift=true
     fi
-    # Positive: return code must be checked
-    if ! echo "$deploy_section" | grep -q '\$?'; then
-      echo "WARNING: monitor-label-policy.md Deploy Regression does not check quarantine_append return code" >&2
+    # Positive: return code must be captured and checked (not bare $?)
+    if ! echo "$deploy_section" | grep -qE '\|\| rc=\$\?|rc=\$\?'; then
+      echo "WARNING: monitor-label-policy.md Deploy Regression does not capture quarantine_append return code" >&2
       drift=true
     fi
   fi

@@ -126,9 +126,10 @@ If the node fails after a deploy:
 2. **Append to quarantine file** (idempotent, via shared helper):
    ```bash
    source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
-   quarantine_append "$HOME/data/deploy_quarantine.txt" "$bad_sha" "regression #<issue>"
-   if [ $? -ne 0 ]; then
-     echo "WARNING: quarantine_append failed (rc=$?) — deploy gate may not block next tick" >&2
+   local rc=0
+   quarantine_append "$HOME/data/deploy_quarantine.txt" "$bad_sha" "regression #<issue>" || rc=$?
+   if [ $rc -ne 0 ]; then
+     echo "WARNING: quarantine_append failed (rc=$rc) — deploy gate may not block next tick" >&2
    fi
    ```
    > `$bad_sha` is expected to be a valid 40-char hex SHA from step 1. The
