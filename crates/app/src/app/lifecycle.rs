@@ -841,8 +841,8 @@ impl App {
                             latency.record_self_sent(slot, self.clock.now())
                         };
                         if let Some(ms) = sample {
-                            let mut survey_data = self.survey_data.write().await;
-                            survey_data.record_scp_first_to_self_latency(ms);
+                            let mut survey_state = self.survey_state.write().await;
+                            survey_state.data_mut().record_scp_first_to_self_latency(ms);
                         }
                         let msg = StellarMessage::ScpMessage(envelope);
                         if let Some(overlay) = self.overlay().await {
@@ -2138,7 +2138,7 @@ impl App {
         // envelope spent queued on the verifier. Pre-verify bookkeeping
         // would undercount under verifier backpressure.
         // Scope scp_latency so the write guard is dropped before acquiring
-        // survey_data — matching the pattern at ~602-609. Holding both locks
+        // survey_state — matching the pattern at ~602-609. Holding both locks
         // simultaneously is a latent deadlock if a future code path acquires
         // them in reverse order.
         let self_to_other_ms = {
@@ -2148,8 +2148,8 @@ impl App {
             latency.record_other_after_self(slot, now)
         };
         if let Some(ms) = self_to_other_ms {
-            let mut survey_data = self.survey_data.write().await;
-            survey_data.record_scp_self_to_other_latency(ms);
+            let mut survey_state = self.survey_state.write().await;
+            survey_state.data_mut().record_scp_self_to_other_latency(ms);
         }
 
         // Fast-path reject surfaced by the worker (invalid signature or

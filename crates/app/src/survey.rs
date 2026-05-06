@@ -784,6 +784,130 @@ impl SurveyDataManager {
     }
 }
 
+/// Combined survey state — data manager and message limiter under one lock.
+///
+/// # Invariant
+///
+/// No `.await` may be performed while holding a guard on the enclosing
+/// `RwLock<SurveyState>`. All lock acquisitions must be scoped to synchronous
+/// blocks. The `RwLockReadGuard`/`RwLockWriteGuard` from tokio is `!Send` when
+/// the lock is not held across await points, providing a compile-time guarantee.
+///
+/// # Rationale
+///
+/// In stellar-core, `SurveyManager` owns both `mSurveyDataManager` and
+/// `mMessageLimiter` as member fields accessed on a single thread. This struct
+/// provides the same serialization guarantee for the data+limiter pair in an
+/// async context via a single `RwLock`.
+#[derive(Debug)]
+pub struct SurveyState {
+    data: SurveyDataManager,
+    limiter: SurveyMessageLimiter,
+}
+
+impl SurveyState {
+    pub fn new(data: SurveyDataManager, limiter: SurveyMessageLimiter) -> Self {
+        Self { data, limiter }
+    }
+
+    /// Access the survey data manager (read-only).
+    pub fn data(&self) -> &SurveyDataManager {
+        &self.data
+    }
+
+    /// Access the survey data manager (mutable).
+    pub fn data_mut(&mut self) -> &mut SurveyDataManager {
+        &mut self.data
+    }
+
+    /// Validate a start-collecting message atomically.
+    ///
+    /// Reads `survey_is_active()` and delegates to the limiter within the same
+    /// lock acquisition, eliminating the TOCTOU race.
+    pub fn validate_start_collecting<F: FnOnce() -> bool>(
+        &self,
+        start: &TimeSlicedSurveyStartCollectingMessage,
+        local_ledger: u32,
+        on_success_validation: F,
+    ) -> bool {
+        let survey_active = self.data.survey_is_active();
+        self.limiter.validate_start_collecting(
+            start,
+            local_ledger,
+            survey_active,
+            on_success_validation,
+        )
+    }
+
+    /// Validate a stop-collecting message (delegates to limiter).
+    pub fn validate_stop_collecting<F: FnOnce() -> bool>(
+        &self,
+        stop: &TimeSlicedSurveyStopCollectingMessage,
+        local_ledger: u32,
+        on_success_validation: F,
+    ) -> bool {
+        self.limiter
+            .validate_stop_collecting(stop, local_ledger, on_success_validation)
+    }
+
+    /// Validate a survey request atomically.
+    ///
+    /// Reads `nonce_is_reporting()` and delegates to the limiter within the same
+    /// lock acquisition, eliminating the TOCTOU race.
+    pub fn add_and_validate_request<F: FnOnce() -> bool>(
+        &mut self,
+        request: &SurveyRequestMessage,
+        local_ledger: u32,
+        local_node_id: &NodeId,
+        nonce: u32,
+        on_success_validation: F,
+    ) -> bool {
+        let nonce_is_reporting = self.data.nonce_is_reporting(nonce);
+        self.limiter
+            .add_and_validate_request(request, local_ledger, local_node_id, || {
+                nonce_is_reporting && on_success_validation()
+            })
+    }
+
+    /// Validate a survey response atomically.
+    ///
+    /// Reads `nonce_is_reporting()` and delegates to the limiter within the same
+    /// lock acquisition, eliminating the TOCTOU race.
+    pub fn record_and_validate_response<F: FnOnce() -> bool>(
+        &mut self,
+        response: &SurveyResponseMessage,
+        local_ledger: u32,
+        nonce: u32,
+        on_success_validation: F,
+    ) -> bool {
+        let nonce_is_reporting = self.data.nonce_is_reporting(nonce);
+        self.limiter
+            .record_and_validate_response(response, local_ledger, || {
+                nonce_is_reporting && on_success_validation()
+            })
+    }
+
+    /// Clear old ledger entries from the limiter.
+    pub fn clear_old_ledgers(&mut self, last_closed_ledger: u32) {
+        self.limiter.clear_old_ledgers(last_closed_ledger);
+    }
+
+    /// Update the survey phase and clear old limiter entries atomically.
+    pub fn update_phase_and_clear(
+        &mut self,
+        inbound: &[PeerSnapshot],
+        outbound: &[PeerSnapshot],
+        added: u64,
+        dropped: u64,
+        lost_sync: u64,
+        last_closed_ledger: u32,
+    ) {
+        self.data
+            .update_phase(inbound, outbound, added, dropped, lost_sync);
+        self.limiter.clear_old_ledgers(last_closed_ledger);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,5 +999,181 @@ mod tests {
         let stopped = mgr.stop_collecting_by_identity(42, &surveyor_id, &[], &[], 0, 0, 0);
         assert!(!stopped);
         assert_eq!(mgr.phase(), SurveyPhase::Inactive);
+    }
+
+    // --- SurveyState tests ---
+
+    fn test_survey_state() -> SurveyState {
+        let data = SurveyDataManager::new(false, 10, 10);
+        let limiter = SurveyMessageLimiter::new(6, 10);
+        SurveyState::new(data, limiter)
+    }
+
+    fn test_request_msg(_nonce: u32) -> SurveyRequestMessage {
+        SurveyRequestMessage {
+            surveyor_peer_id: test_node_id(),
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            ledger_num: 100,
+            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+        }
+    }
+
+    #[test]
+    fn test_survey_state_validate_start_collecting_rejects_active() {
+        let mut state = test_survey_state();
+
+        // Start a survey to make it active.
+        let start_msg = test_start_msg(42);
+        let node_stats = NodeStatsSnapshot {
+            lost_sync_count: 0,
+            out_of_sync: false,
+            added_peers: 0,
+            dropped_peers: 0,
+        };
+        assert!(state
+            .data_mut()
+            .start_collecting(&start_msg, &[], &[], node_stats));
+        assert!(state.data().survey_is_active());
+
+        // validate_start_collecting should reject because survey is active.
+        let new_start = test_start_msg(99);
+        let is_valid = state.validate_start_collecting(&new_start, 100, || true);
+        assert!(!is_valid);
+    }
+
+    #[test]
+    fn test_survey_state_validate_start_collecting_accepts_inactive() {
+        let state = test_survey_state();
+
+        // Survey is inactive — should accept.
+        let start_msg = test_start_msg(42);
+        let is_valid = state.validate_start_collecting(&start_msg, 100, || true);
+        assert!(is_valid);
+    }
+
+    #[test]
+    fn test_survey_state_add_and_validate_request_atomic() {
+        let mut state = test_survey_state();
+
+        // Put state into Reporting phase so nonce_is_reporting returns true.
+        let start_msg = test_start_msg(42);
+        let node_stats = NodeStatsSnapshot {
+            lost_sync_count: 0,
+            out_of_sync: false,
+            added_peers: 0,
+            dropped_peers: 0,
+        };
+        state
+            .data_mut()
+            .start_collecting(&start_msg, &[], &[], node_stats);
+        // Transition to Reporting.
+        let stop_msg = TimeSlicedSurveyStopCollectingMessage {
+            surveyor_id: test_node_id(),
+            nonce: 42,
+            ledger_num: 100,
+        };
+        state
+            .data_mut()
+            .stop_collecting(&stop_msg, &[], &[], 0, 0, 0);
+        assert_eq!(state.data().phase(), SurveyPhase::Reporting);
+        assert!(state.data().nonce_is_reporting(42));
+
+        // Should succeed with matching nonce.
+        let request = test_request_msg(42);
+        let local_node = test_node_id();
+        let is_valid = state.add_and_validate_request(&request, 100, &local_node, 42, || true);
+        assert!(is_valid);
+
+        // With wrong nonce, closure short-circuits (nonce_is_reporting is false).
+        let request2 = SurveyRequestMessage {
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([3u8; 32]))),
+            ..request.clone()
+        };
+        let is_valid = state.add_and_validate_request(&request2, 100, &local_node, 99, || true);
+        assert!(!is_valid);
+    }
+
+    #[test]
+    fn test_survey_state_record_and_validate_response_atomic() {
+        let mut state = test_survey_state();
+
+        // Put state into Reporting phase.
+        let start_msg = test_start_msg(42);
+        let node_stats = NodeStatsSnapshot {
+            lost_sync_count: 0,
+            out_of_sync: false,
+            added_peers: 0,
+            dropped_peers: 0,
+        };
+        state
+            .data_mut()
+            .start_collecting(&start_msg, &[], &[], node_stats);
+        let stop_msg = TimeSlicedSurveyStopCollectingMessage {
+            surveyor_id: test_node_id(),
+            nonce: 42,
+            ledger_num: 100,
+        };
+        state
+            .data_mut()
+            .stop_collecting(&stop_msg, &[], &[], 0, 0, 0);
+
+        // First, register a request so the limiter knows about this surveyor/surveyed pair.
+        let request = test_request_msg(42);
+        let local_node = test_node_id();
+        state.add_and_validate_request(&request, 100, &local_node, 42, || true);
+
+        // Now validate a response.
+        let response = SurveyResponseMessage {
+            surveyor_peer_id: test_node_id(),
+            surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            ledger_num: 100,
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+            encrypted_body: stellar_xdr::curr::EncryptedBody(vec![].try_into().unwrap()),
+        };
+        let is_valid = state.record_and_validate_response(&response, 100, 42, || true);
+        assert!(is_valid);
+
+        // With wrong nonce, should fail.
+        let is_valid = state.record_and_validate_response(&response, 100, 99, || true);
+        assert!(!is_valid);
+    }
+
+    #[test]
+    fn test_survey_state_stale_validate_then_mutate_regression() {
+        let mut state = test_survey_state();
+
+        // validate_start_collecting accepts (survey inactive).
+        let start_msg = test_start_msg(42);
+        let is_valid = state.validate_start_collecting(&start_msg, 100, || true);
+        assert!(is_valid);
+
+        // Simulate race: another task starts a survey between validation and mutation.
+        let node_stats = NodeStatsSnapshot {
+            lost_sync_count: 0,
+            out_of_sync: false,
+            added_peers: 0,
+            dropped_peers: 0,
+        };
+        state
+            .data_mut()
+            .start_collecting(&start_msg, &[], &[], node_stats);
+        assert!(state.data().survey_is_active());
+
+        // Now the original task tries to mutate — start_collecting should reject
+        // because survey is already active (idempotency guard).
+        let node_stats2 = NodeStatsSnapshot {
+            lost_sync_count: 0,
+            out_of_sync: false,
+            added_peers: 0,
+            dropped_peers: 0,
+        };
+        let result = state
+            .data_mut()
+            .start_collecting(&start_msg, &[], &[], node_stats2);
+        assert!(
+            !result,
+            "start_collecting should reject when survey is already active"
+        );
     }
 }

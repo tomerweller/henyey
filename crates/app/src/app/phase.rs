@@ -49,8 +49,8 @@ pub(crate) const PHASE_6_3_OVERLAY_CLEAR_LEDGERS: u32 = 3;
 pub(crate) const PHASE_6_4_OVERLAY_MAX_TX_SIZE: u32 = 4;
 
 /// `handle_close_complete_inner`: about to acquire
-/// `survey_limiter.write().await` for clearing old ledgers.
-pub(crate) const PHASE_6_5_SURVEY_LIMITER_WRITE: u32 = 5;
+/// `survey_state.write().await` for clearing old ledgers.
+pub(crate) const PHASE_6_5_SURVEY_STATE_WRITE: u32 = 5;
 
 /// `handle_close_complete_inner`: about to call
 /// `join.await` on `spawn_blocking` tx-queue work.

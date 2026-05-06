@@ -284,8 +284,10 @@ impl App {
         }
 
         let latency_ms = info.sent_at.elapsed().as_millis() as u64;
-        let mut survey_data = self.survey_data.write().await;
-        survey_data.record_peer_latency(peer_id, latency_ms);
+        let mut survey_state = self.survey_state.write().await;
+        survey_state
+            .data_mut()
+            .record_peer_latency(peer_id, latency_ms);
     }
 
     /// Process a peer list received from the network.

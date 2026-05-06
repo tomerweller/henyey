@@ -109,7 +109,7 @@ use crate::config::AppConfig;
 use crate::logging::CatchupProgress;
 use crate::meta_stream::{MetaStreamError, MetaStreamManager};
 use crate::meta_writer::MetaWriter;
-use crate::survey::{SurveyDataManager, SurveyMessageLimiter};
+use crate::survey::{SurveyDataManager, SurveyMessageLimiter, SurveyState};
 use henyey_ledger::{close_time as ledger_close_time, compute_header_hash, verify_header_chain};
 use stellar_xdr::curr::TransactionEnvelope;
 
@@ -511,8 +511,9 @@ pub struct App {
     /// Last time we requested SCP state due to stalled externalization.
     last_scp_state_request_at: RwLock<Instant>,
 
-    /// Time-sliced survey data manager.
-    survey_data: RwLock<SurveyDataManager>,
+    /// Combined survey data manager and message limiter under one lock.
+    /// Invariant: no `.await` while holding a guard on this lock.
+    survey_state: RwLock<SurveyState>,
 
     /// Carry-over ops budget from the previous flood period. Capped at
     /// MAX_OPS_PER_TX + 1 to prevent unbounded accumulation from missed ticks.
@@ -588,8 +589,6 @@ pub struct App {
     survey_secrets: RwLock<HashMap<u32, [u8; 32]>>,
     /// Survey responses keyed by nonce.
     survey_results: RwLock<HashMap<u32, HashMap<henyey_overlay::PeerId, TopologyResponseBodyV2>>>,
-    /// Survey message limiter for rate limiting and deduplication.
-    survey_limiter: RwLock<SurveyMessageLimiter>,
     /// Survey throttle timeout between survey runs.
     survey_throttle: Duration,
     /// Survey reporting backlog state (surveyor-side).
@@ -1076,10 +1075,9 @@ impl App {
             ballot_timeout_fires: AtomicU64::new(0),
             last_externalized_at: RwLock::new(now),
             last_scp_state_request_at: RwLock::new(now),
-            survey_data: RwLock::new(SurveyDataManager::new(
-                is_validator,
-                max_inbound_peers,
-                max_outbound_peers,
+            survey_state: RwLock::new(SurveyState::new(
+                SurveyDataManager::new(is_validator, max_inbound_peers, max_outbound_peers),
+                SurveyMessageLimiter::new(6, 10),
             )),
             broadcast_op_carryover: AtomicUsize::new(0),
             broadcast_dex_op_carryover: AtomicUsize::new(0),
@@ -1102,7 +1100,6 @@ impl App {
             survey_nonce: RwLock::new(1),
             survey_secrets: RwLock::new(HashMap::new()),
             survey_results: RwLock::new(HashMap::new()),
-            survey_limiter: RwLock::new(SurveyMessageLimiter::new(6, 10)),
             survey_throttle,
             survey_reporting: RwLock::new(SurveyReportingState::new(now)),
             scp_timeouts: RwLock::new(ScpTimeoutState::new()),
@@ -7216,7 +7213,7 @@ mod tests {
             PHASE_6_2_WRITE_META,
             PHASE_6_3_OVERLAY_CLEAR_LEDGERS,
             PHASE_6_4_OVERLAY_MAX_TX_SIZE,
-            PHASE_6_5_SURVEY_LIMITER_WRITE,
+            PHASE_6_5_SURVEY_STATE_WRITE,
             PHASE_6_6_TX_QUEUE_JOIN,
             PHASE_6_7_LAST_PROCESSED_SLOT_WRITE,
             PHASE_6_8_CLEAR_TX_ADVERT_HISTORY,
@@ -8797,7 +8794,7 @@ mod tests {
 
         // Activate survey_data so the Idle path sees survey_is_active() == true.
         {
-            let mut data = app.survey_data.write().await;
+            let mut state = app.survey_state.write().await;
             let msg = stellar_xdr::curr::TimeSlicedSurveyStartCollectingMessage {
                 surveyor_id: stellar_xdr::curr::NodeId(
                     stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
@@ -8807,7 +8804,7 @@ mod tests {
                 nonce: 99,
                 ledger_num: 1,
             };
-            let _ = data.start_collecting(
+            let _ = state.data_mut().start_collecting(
                 &msg,
                 &[],
                 &[],

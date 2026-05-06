@@ -2174,9 +2174,9 @@ impl App {
         // Clean up old survey rate limiter entries.
         // Mirrors upstream SurveyManager::clearOldLedgers() called from clearLedgersBelow().
         {
-            self.set_phase_sub(phase::PHASE_6_5_SURVEY_LIMITER_WRITE);
-            let mut limiter = self.survey_limiter.write().await;
-            limiter.clear_old_ledgers(pending.ledger_seq);
+            self.set_phase_sub(phase::PHASE_6_5_SURVEY_STATE_WRITE);
+            let mut survey_state = self.survey_state.write().await;
+            survey_state.clear_old_ledgers(pending.ledger_seq);
         }
 
         // Record externalized close time for drift tracking (std::Mutex, < 1 µs).
@@ -2188,7 +2188,7 @@ impl App {
             }
         }
         // Mark end of the inline overlay/survey/drift bookkeeping window.
-        // This brackets lines that touch tokio RwLocks (overlay, survey_limiter)
+        // This brackets lines that touch tokio RwLocks (overlay, survey_state)
         // and the std::Mutex drift tracker. Each internal operation is
         // microseconds of CPU cost, but the field's wall-clock will also
         // include scheduler-driven backlog drain at the `.await` yields on a

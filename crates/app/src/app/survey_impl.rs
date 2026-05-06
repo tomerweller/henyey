@@ -12,13 +12,13 @@ pub enum SurveyStopError {
 impl App {
     pub async fn survey_report(&self) -> SurveyReport {
         let (phase, nonce, local_node, inbound_peers, outbound_peers) = {
-            let survey_data = self.survey_data.read().await;
+            let survey_state = self.survey_state.read().await;
             (
-                survey_data.phase(),
-                survey_data.nonce(),
-                survey_data.final_node_data(),
-                survey_data.final_inbound_peers().to_vec(),
-                survey_data.final_outbound_peers().to_vec(),
+                survey_state.data().phase(),
+                survey_state.data().nonce(),
+                survey_state.data().final_node_data(),
+                survey_state.data().final_inbound_peers().to_vec(),
+                survey_state.data().final_outbound_peers().to_vec(),
             )
         };
 
@@ -77,7 +77,7 @@ impl App {
     }
 
     pub async fn stop_survey_collecting(&self) -> Result<(), SurveyStopError> {
-        let nonce = { self.survey_data.read().await.nonce() };
+        let nonce = { self.survey_state.read().await.data().nonce() };
         let Some(nonce) = nonce else {
             return Err(SurveyStopError::NoActiveSurvey);
         };
@@ -91,7 +91,7 @@ impl App {
             reporting.running = false;
         }
 
-        if let Some(nonce) = self.survey_data.read().await.nonce() {
+        if let Some(nonce) = self.survey_state.read().await.data().nonce() {
             self.survey_secrets.write().await.remove(&nonce);
         }
     }
@@ -107,7 +107,7 @@ impl App {
             return false;
         }
 
-        if let Some(nonce) = { self.survey_data.read().await.nonce() } {
+        if let Some(nonce) = { self.survey_state.read().await.data().nonce() } {
             if let Some(peers) = self.survey_results.write().await.get_mut(&nonce) {
                 peers.remove(&peer_id);
             }
@@ -131,11 +131,18 @@ impl App {
     }
 
     async fn start_survey_reporting(&self) -> SurveyReportingStart {
-        let nonce = { self.survey_data.read().await.nonce() };
+        let nonce = { self.survey_state.read().await.data().nonce() };
         let Some(nonce) = nonce else {
             return SurveyReportingStart::NotReady;
         };
-        if self.survey_data.read().await.final_node_data().is_none() {
+        if self
+            .survey_state
+            .read()
+            .await
+            .data()
+            .final_node_data()
+            .is_none()
+        {
             return SurveyReportingStart::NotReady;
         }
 
@@ -168,15 +175,17 @@ impl App {
 
     async fn local_topology_response(&self) -> Option<TopologyResponseBodyV2> {
         const MAX_PEERS: usize = 25;
-        let survey_data = self.survey_data.read().await;
-        let node_data = survey_data.final_node_data()?;
-        let inbound_peers = survey_data
+        let survey_state = self.survey_state.read().await;
+        let node_data = survey_state.data().final_node_data()?;
+        let inbound_peers = survey_state
+            .data()
             .final_inbound_peers()
             .iter()
             .take(MAX_PEERS)
             .cloned()
             .collect::<Vec<_>>();
-        let outbound_peers = survey_data
+        let outbound_peers = survey_state
+            .data()
             .final_outbound_peers()
             .iter()
             .take(MAX_PEERS)
@@ -203,12 +212,18 @@ impl App {
             return;
         }
 
-        let nonce = { self.survey_data.read().await.nonce() };
+        let nonce = { self.survey_state.read().await.data().nonce() };
         let Some(nonce) = nonce else {
             self.stop_survey_reporting().await;
             return;
         };
-        if !self.survey_data.read().await.nonce_is_reporting(nonce) {
+        if !self
+            .survey_state
+            .read()
+            .await
+            .data()
+            .nonce_is_reporting(nonce)
+        {
             self.stop_survey_reporting().await;
             return;
         }
@@ -287,12 +302,13 @@ impl App {
             request: message,
         };
 
-        let mut limiter = self.survey_limiter.write().await;
+        let mut survey_state = self.survey_state.write().await;
         let local_ledger = self.survey_local_ledger();
-        let ok = limiter.add_and_validate_request(
+        let ok = survey_state.add_and_validate_request(
             &signed.request.request,
             local_ledger,
             &local_node_id,
+            nonce,
             || {
                 self.verify_survey_signature(
                     &signed.request.request.surveyor_peer_id,
@@ -301,6 +317,7 @@ impl App {
                 )
             },
         );
+        drop(survey_state);
         if !ok {
             return false;
         }
@@ -406,17 +423,17 @@ impl App {
         if !self.surveyor_permitted(&message.surveyor_id) {
             return;
         }
-        let survey_active = { self.survey_data.read().await.survey_is_active() };
-        let limiter = self.survey_limiter.read().await;
-        let local_ledger = self.survey_local_ledger();
-        let is_valid =
-            limiter.validate_start_collecting(message, local_ledger, survey_active, || {
+        let is_valid = {
+            let survey_state = self.survey_state.read().await;
+            let local_ledger = self.survey_local_ledger();
+            survey_state.validate_start_collecting(message, local_ledger, || {
                 self.verify_survey_signature(
                     &message.surveyor_id,
                     &message_bytes,
                     &signed.signature,
                 )
-            });
+            })
+        };
         if !is_valid {
             tracing::debug!(peer = %peer_id, "Survey start rejected by limiter");
             return;
@@ -444,8 +461,11 @@ impl App {
             added_peers: added,
             dropped_peers: dropped,
         };
-        let mut survey_data = self.survey_data.write().await;
-        if survey_data.start_collecting(message, &inbound, &outbound, node_stats) {
+        let mut survey_state = self.survey_state.write().await;
+        if survey_state
+            .data_mut()
+            .start_collecting(message, &inbound, &outbound, node_stats)
+        {
             tracing::debug!(peer = %peer_id, "Survey collection started");
         } else {
             tracing::debug!(peer = %peer_id, "Survey collection already active");
@@ -468,11 +488,17 @@ impl App {
         if !self.surveyor_permitted(&message.surveyor_id) {
             return;
         }
-        let limiter = self.survey_limiter.read().await;
-        let local_ledger = self.survey_local_ledger();
-        let is_valid = limiter.validate_stop_collecting(message, local_ledger, || {
-            self.verify_survey_signature(&message.surveyor_id, &message_bytes, &signed.signature)
-        });
+        let is_valid = {
+            let survey_state = self.survey_state.read().await;
+            let local_ledger = self.survey_local_ledger();
+            survey_state.validate_stop_collecting(message, local_ledger, || {
+                self.verify_survey_signature(
+                    &message.surveyor_id,
+                    &message_bytes,
+                    &signed.signature,
+                )
+            })
+        };
         if !is_valid {
             tracing::debug!(peer = %peer_id, "Survey stop rejected by limiter");
             return;
@@ -492,8 +518,11 @@ impl App {
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
 
-        let mut survey_data = self.survey_data.write().await;
-        if survey_data.stop_collecting(message, &inbound, &outbound, added, dropped, lost_sync) {
+        let mut survey_state = self.survey_state.write().await;
+        if survey_state
+            .data_mut()
+            .stop_collecting(message, &inbound, &outbound, added, dropped, lost_sync)
+        {
             tracing::debug!(peer = %peer_id, "Survey collection stopped");
         } else {
             tracing::debug!(peer = %peer_id, "Survey stop ignored (inactive or nonce mismatch)");
@@ -519,26 +548,23 @@ impl App {
         }
 
         let local_node_id = self.local_node_id();
-        let nonce_is_reporting = self
-            .survey_data
-            .read()
-            .await
-            .nonce_is_reporting(request.nonce);
-        let mut limiter = self.survey_limiter.write().await;
-        let local_ledger = self.survey_local_ledger();
-        let is_valid = limiter.add_and_validate_request(
-            &request.request,
-            local_ledger,
-            &local_node_id,
-            || {
-                nonce_is_reporting
-                    && self.verify_survey_signature(
+        let is_valid = {
+            let mut survey_state = self.survey_state.write().await;
+            let local_ledger = self.survey_local_ledger();
+            survey_state.add_and_validate_request(
+                &request.request,
+                local_ledger,
+                &local_node_id,
+                request.nonce,
+                || {
+                    self.verify_survey_signature(
                         &request.request.surveyor_peer_id,
                         &request_bytes,
                         &signed.request_signature,
                     )
-            },
-        );
+                },
+            )
+        };
         if !is_valid {
             tracing::debug!(peer = %peer_id, "Survey request rejected by limiter");
             return;
@@ -552,8 +578,8 @@ impl App {
         }
         let response_body = match request.request.command_type {
             stellar_xdr::curr::SurveyMessageCommandType::TimeSlicedSurveyTopology => {
-                let survey_data = self.survey_data.read().await;
-                match survey_data.fill_survey_data(request) {
+                let survey_state = self.survey_state.read().await;
+                match survey_state.data().fill_survey_data(request) {
                     Some(body) => body,
                     None => {
                         tracing::debug!(peer = %peer_id, "Survey request without reporting data");
@@ -641,22 +667,22 @@ impl App {
             }
         };
 
-        let nonce_is_reporting = self
-            .survey_data
-            .read()
-            .await
-            .nonce_is_reporting(response_message.nonce);
-        let mut limiter = self.survey_limiter.write().await;
-        let local_ledger = self.survey_local_ledger();
-        let is_valid =
-            limiter.record_and_validate_response(&response_message.response, local_ledger, || {
-                nonce_is_reporting
-                    && self.verify_survey_signature(
+        let is_valid = {
+            let mut survey_state = self.survey_state.write().await;
+            let local_ledger = self.survey_local_ledger();
+            survey_state.record_and_validate_response(
+                &response_message.response,
+                local_ledger,
+                response_message.nonce,
+                || {
+                    self.verify_survey_signature(
                         &response_message.response.surveyed_peer_id,
                         &response_bytes,
                         &signed.response_signature,
                     )
-            });
+                },
+            )
+        };
         if !is_valid {
             tracing::debug!(peer = %peer_id, "Survey response rejected by limiter");
             return;
@@ -919,7 +945,7 @@ impl App {
             SchedulerAction::NotDue => {}
 
             SchedulerAction::Idle { last_started } => {
-                if self.survey_data.read().await.survey_is_active()
+                if self.survey_state.read().await.data().survey_is_active()
                     || self.survey_reporting.read().await.running
                 {
                     let mut scheduler = self.survey_scheduler.lock().await;
@@ -1037,12 +1063,16 @@ impl App {
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
 
-        let mut survey_data = self.survey_data.write().await;
-        survey_data.update_phase(&inbound, &outbound, added, dropped, lost_sync);
-
+        let mut survey_state = self.survey_state.write().await;
         let last_closed = self.current_ledger_seq();
-        let mut limiter = self.survey_limiter.write().await;
-        limiter.clear_old_ledgers(last_closed);
+        survey_state.update_phase_and_clear(
+            &inbound,
+            &outbound,
+            added,
+            dropped,
+            lost_sync,
+            last_closed,
+        );
     }
 
     async fn send_survey_start(&self, peers: &[henyey_overlay::PeerId], nonce: u32) -> bool {
@@ -1216,8 +1246,10 @@ impl App {
             added_peers: added,
             dropped_peers: dropped,
         };
-        let mut survey_data = self.survey_data.write().await;
-        let _ = survey_data.start_collecting(message, &inbound, &outbound, node_stats);
+        let mut survey_state = self.survey_state.write().await;
+        let _ = survey_state
+            .data_mut()
+            .start_collecting(message, &inbound, &outbound, node_stats);
     }
 
     async fn stop_local_survey_collecting(&self, message: &TimeSlicedSurveyStopCollectingMessage) {
@@ -1235,9 +1267,10 @@ impl App {
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
 
-        let mut survey_data = self.survey_data.write().await;
-        let _ =
-            survey_data.stop_collecting(message, &inbound, &outbound, added, dropped, lost_sync);
+        let mut survey_state = self.survey_state.write().await;
+        let _ = survey_state
+            .data_mut()
+            .stop_collecting(message, &inbound, &outbound, added, dropped, lost_sync);
     }
 
     /// Stop local survey collecting by nonce, without requiring a network
@@ -1261,8 +1294,8 @@ impl App {
                 (vec![], vec![], 0, 0, 0)
             };
 
-        let mut survey_data = self.survey_data.write().await;
-        let _ = survey_data.stop_collecting_by_identity(
+        let mut survey_state = self.survey_state.write().await;
+        let _ = survey_state.data_mut().stop_collecting_by_identity(
             nonce,
             &surveyor_id,
             &inbound,
