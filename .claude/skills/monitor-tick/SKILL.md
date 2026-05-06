@@ -1271,7 +1271,10 @@ Only act on failures from the last 2 hours (compare `createdAt` with
    snippet, timestamp) and ensure it has the `urgent` label
    (`gh issue edit <N> --add-label urgent`) — failing CI on origin/main
    blocks deploy and meets the urgent criteria.
+   **Board-route:** if NOT on project board, add to Backlog:
+   `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 5. Otherwise, file a new issue: `gh issue create --label urgent --title "<workflow>: <short signature>" --body "..."` with investigation findings.
+   **Board-route:** `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 6. Do NOT commit a fix. Report: `CI ISSUE FILED — <workflow> failed on <sha>, filed/commented #<N>`.
 
 ## Bug filing workflow
