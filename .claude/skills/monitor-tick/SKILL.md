@@ -176,6 +176,9 @@ implicitly).
 - **Label/severity:** Defer to the existing Filing Flow label policy. In
   general: OFFLINE status → `urgent`; ACTION with process alive → per policy
   (typically `urgent` since node state is uncertain).
+- **Board-route:** after filing/commenting, add to project board per
+  `scripts/lib/monitor-label-policy.md` routing rules (Backlog for
+  actionable issues, Blocked for `not-ready`).
 
 **Tick-history `watch` array:** Both `"wipe=session-dir"` and
 `"wipe=mainnet-data"` may coexist in a single tick's watch array. The
@@ -1404,7 +1407,8 @@ fi
 
 (c) File or comment on a GitHub issue (label `urgent` since validator
 operation is impacted) with the regression details (commit range, symptoms,
-watchdog data).
+watchdog data). Board-route to Backlog:
+`bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 
 (d) Restart the node on the last known-good binary (rebuild from the
 previous commit) while waiting for the fix. Do NOT revert commits inline.
@@ -1490,7 +1494,8 @@ this tick (e.g., rebuild failed after session wipe).
 Use SYNC FAILURE (not WARNING) when the node has exceeded the active sync
 deadline (15m populated / 4h fresh-start) but is not closing ledgers in
 real-time — this is a bug that requires immediate investigation AND
-filing/commenting on a GitHub issue (label `urgent` since SYNC FAILURE blocks consensus).
+filing/commenting on a GitHub issue (label `urgent` since SYNC FAILURE blocks
+consensus). Board-route to Backlog per `scripts/lib/monitor-label-policy.md`.
 
 ### Tick history capture
 
@@ -1607,6 +1612,8 @@ The issue is real and actionable but any of:
 Before filing, search for an existing open issue:
 `gh issue list --search "monitor-tick: <keywords>" --state open`.
 Comment with new evidence if a match exists; otherwise file.
+Board-route per `scripts/lib/monitor-label-policy.md`: Backlog for
+actionable issues, Blocked for `not-ready` issues.
 
 Issue body MUST include:
 - **Symptom**: one-line description of the false positive / silent
