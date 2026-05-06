@@ -256,10 +256,17 @@ impl FetchingEnvelopes {
         // Get or create slot state
         let mut slot_state = self.slots.entry(slot).or_default();
 
-        // Check if already processed or discarded
-        if slot_state.processed.contains(&env_hash) || slot_state.discarded.contains(&env_hash) {
+        // Check if already processed
+        if slot_state.processed.contains(&env_hash) {
             self.stats.write().envelopes_duplicate += 1;
             return RecvResult::AlreadyProcessed;
+        }
+
+        // Check if previously discarded.
+        // Parity: stellar-core's `isDiscarded()` (PendingEnvelopes.cpp:325-327)
+        // returns ENVELOPE_STATUS_DISCARDED, distinct from the duplicate path.
+        if slot_state.discarded.contains(&env_hash) {
+            return RecvResult::Discarded;
         }
 
         // Check if already fetching
@@ -381,9 +388,9 @@ impl FetchingEnvelopes {
                 reason = %reason,
                 "Rejecting insane QuorumSet"
             );
-            // Stop tracking this hash so fetching envelopes that depend on it
-            // eventually time out rather than wait forever
-            let _ = self.quorum_set_fetcher.recv(&Hash(hash.0));
+            // Parity: stellar-core's discardSCPEnvelopesWithQSet() discards all
+            // envelopes waiting on this quorum set and stops their fetchers.
+            self.discard_envelopes_with_quorum_set(&hash);
             return false;
         }
 
@@ -844,6 +851,67 @@ impl FetchingEnvelopes {
     fn broadcast_envelope(&self, envelope: &ScpEnvelope) {
         if let Some(ref broadcast) = *self.broadcast.read() {
             broadcast(envelope);
+        }
+    }
+
+    /// Stop fetching dependencies for an envelope.
+    ///
+    /// Parity: stellar-core's `PendingEnvelopes::stopFetch()` (PendingEnvelopes.cpp:615-629)
+    /// removes the envelope from both the quorum-set and tx-set fetchers.
+    fn stop_fetch(&self, envelope: &ScpEnvelope) {
+        if let Some(qs_hash) = Self::extract_quorum_set_hash(envelope) {
+            self.quorum_set_fetcher
+                .stop_fetch(&Hash(qs_hash.0), envelope);
+        }
+        for tx_set_hash in Self::extract_tx_set_hashes(envelope) {
+            self.tx_set_fetcher
+                .stop_fetch(&Hash(tx_set_hash.0), envelope);
+        }
+    }
+
+    /// Discard a single envelope: move from fetching to discarded and stop fetchers.
+    ///
+    /// Parity: stellar-core's `PendingEnvelopes::discardSCPEnvelope()`
+    /// (PendingEnvelopes.cpp:398-423). Idempotent — returns immediately if the
+    /// envelope is already in the discarded set.
+    fn discard_envelope(&self, envelope: &ScpEnvelope) {
+        let slot = envelope.statement.slot_index;
+        let env_hash = Self::compute_envelope_hash(envelope);
+
+        let mut slot_state = self.slots.entry(slot).or_default();
+
+        // Idempotent: if already discarded, nothing to do (matches stellar-core's
+        // early return when set::insert returns !r.second).
+        if !slot_state.discarded.insert(env_hash) {
+            return;
+        }
+
+        slot_state.fetching.remove(&env_hash);
+        // Drop the DashMap guard before calling stop_fetch to avoid holding
+        // the slot lock while acquiring fetcher locks.
+        drop(slot_state);
+
+        self.stop_fetch(envelope);
+
+        debug!(slot, hash = %hex::encode(env_hash.0), "Discarded SCP envelope");
+    }
+
+    /// Discard all envelopes waiting on a given quorum set hash.
+    ///
+    /// Parity: stellar-core's `PendingEnvelopes::discardSCPEnvelopesWithQSet()`
+    /// (PendingEnvelopes.cpp:149-158). Called when a received quorum set fails
+    /// `isQuorumSetSane`.
+    fn discard_envelopes_with_quorum_set(&self, qs_hash: &Hash256) {
+        let envelopes = self.quorum_set_fetcher.fetching_for(&Hash(qs_hash.0));
+
+        debug!(
+            hash = %hex::encode(qs_hash.0),
+            count = envelopes.len(),
+            "Discarding SCP envelopes with insane QuorumSet"
+        );
+
+        for envelope in &envelopes {
+            self.discard_envelope(envelope);
         }
     }
 
@@ -2308,5 +2376,225 @@ mod tests {
         assert_eq!(fetching.stats.read().envelopes_fetching, 2);
         // tracker_cap_drops incremented.
         assert_eq!(fetching.stats.read().tracker_cap_drops, 1);
+    }
+
+    // --- Tests for discard_envelope / discard_envelopes_with_quorum_set ---
+
+    #[test]
+    fn test_discard_insane_qset_moves_to_discarded() {
+        // Verify that receiving an insane quorum set moves waiting envelopes
+        // from fetching to discarded.
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let qs_hash = Hash256::from_bytes([42u8; 32]);
+
+        // Submit an envelope that needs this quorum set
+        let envelope = make_envelope_with_deps(100, 1, Hash256::from_bytes([0xAA; 32]), qs_hash);
+        assert_eq!(fetching.recv_envelope(envelope), RecvResult::Fetching);
+        assert_eq!(fetching.fetching_count(), 1);
+
+        // Receive an insane quorum set
+        let insane_qs = ScpQuorumSet {
+            threshold: 5,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        fetching.recv_quorum_set(qs_hash, insane_qs);
+
+        // Envelope should be removed from fetching and placed in discarded
+        assert_eq!(fetching.fetching_count(), 0);
+        let slot_state = fetching.slots.get(&100).unwrap();
+        assert_eq!(slot_state.discarded.len(), 1);
+        assert_eq!(slot_state.fetching.len(), 0);
+    }
+
+    #[test]
+    fn test_discard_insane_qset_multiple_slots() {
+        // Verify discarding works across multiple slots with envelopes waiting
+        // on the same quorum set hash.
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let qs_hash = Hash256::from_bytes([42u8; 32]);
+        let tx_hash = Hash256::from_bytes([0xAA; 32]);
+
+        // Submit envelopes in different slots referencing the same qset
+        let env1 = make_envelope_with_deps(100, 1, tx_hash, qs_hash);
+        let env2 = make_envelope_with_deps(200, 2, tx_hash, qs_hash);
+        let env3 = make_envelope_with_deps(300, 3, tx_hash, qs_hash);
+
+        assert_eq!(fetching.recv_envelope(env1), RecvResult::Fetching);
+        assert_eq!(fetching.recv_envelope(env2), RecvResult::Fetching);
+        assert_eq!(fetching.recv_envelope(env3), RecvResult::Fetching);
+        assert_eq!(fetching.fetching_count(), 3);
+
+        // Receive insane qset — all envelopes should be discarded
+        let insane_qs = ScpQuorumSet {
+            threshold: 5,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        fetching.recv_quorum_set(qs_hash, insane_qs);
+
+        assert_eq!(fetching.fetching_count(), 0);
+        for slot in [100, 200, 300] {
+            let slot_state = fetching.slots.get(&slot).unwrap();
+            assert_eq!(slot_state.discarded.len(), 1);
+            assert_eq!(slot_state.fetching.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_discarded_envelope_not_revived_by_txset() {
+        // Verify that a discarded envelope is not moved to ready when its
+        // tx_set later arrives — both fetchers must be cleaned up.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let tx_available = Arc::new(AtomicBool::new(false));
+        let tx_available_clone = tx_available.clone();
+
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(move |_| {
+            tx_available_clone.load(Ordering::Relaxed)
+        }));
+
+        let qs_hash = Hash256::from_bytes([42u8; 32]);
+        let tx_hash = Hash256::from_bytes([0xAA; 32]);
+
+        // Submit envelope needing both qset and txset
+        let envelope = make_envelope_with_deps(100, 1, tx_hash, qs_hash);
+        assert_eq!(fetching.recv_envelope(envelope), RecvResult::Fetching);
+
+        // Discard via insane qset
+        let insane_qs = ScpQuorumSet {
+            threshold: 5,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        fetching.recv_quorum_set(qs_hash, insane_qs);
+        assert_eq!(fetching.fetching_count(), 0);
+
+        // Now simulate tx_set becoming available
+        tx_available.store(true, Ordering::Relaxed);
+        fetching.on_tx_set_accepted(&tx_hash);
+
+        // Envelope should NOT be revived — it was discarded
+        assert_eq!(fetching.ready_count(), 0);
+        assert_eq!(fetching.fetching_count(), 0);
+
+        // tx_set fetcher should not be tracking the hash anymore
+        assert!(
+            !fetching.tx_set_fetcher.is_tracking(&Hash(tx_hash.0)),
+            "tx_set fetcher should be cleaned up after discard"
+        );
+    }
+
+    #[test]
+    fn test_re_receive_discarded_envelope_returns_discarded() {
+        // Verify that re-receiving a discarded envelope returns Discarded,
+        // not AlreadyProcessed.
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let qs_hash = Hash256::from_bytes([42u8; 32]);
+        let tx_hash = Hash256::from_bytes([0xAA; 32]);
+
+        let envelope = make_envelope_with_deps(100, 1, tx_hash, qs_hash);
+        assert_eq!(
+            fetching.recv_envelope(envelope.clone()),
+            RecvResult::Fetching
+        );
+
+        // Discard via insane qset
+        let insane_qs = ScpQuorumSet {
+            threshold: 5,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        fetching.recv_quorum_set(qs_hash, insane_qs);
+
+        // Re-receive the same envelope — should return Discarded
+        let result = fetching.recv_envelope(envelope);
+        assert_eq!(result, RecvResult::Discarded);
+    }
+
+    #[test]
+    fn test_discard_increases_slot_lifetime_count() {
+        // Verify that discarded envelopes contribute to slot_lifetime_count.
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let qs_hash = Hash256::from_bytes([42u8; 32]);
+        let tx_hash = Hash256::from_bytes([0xAA; 32]);
+
+        let envelope = make_envelope_with_deps(100, 1, tx_hash, qs_hash);
+        assert_eq!(fetching.recv_envelope(envelope), RecvResult::Fetching);
+
+        // Lifetime count = 1 (in fetching)
+        assert_eq!(fetching.slot_lifetime_count(100), 1);
+
+        // Discard via insane qset
+        let insane_qs = ScpQuorumSet {
+            threshold: 5,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        fetching.recv_quorum_set(qs_hash, insane_qs);
+
+        // Lifetime count should still be 1 (moved from fetching to discarded)
+        assert_eq!(fetching.slot_lifetime_count(100), 1);
+
+        // The envelope is in discarded, not fetching
+        let slot_state = fetching.slots.get(&100).unwrap();
+        assert_eq!(slot_state.fetching.len(), 0);
+        assert_eq!(slot_state.discarded.len(), 1);
+    }
+
+    #[test]
+    fn test_discard_is_idempotent() {
+        // Verify that discarding the same envelope twice is a no-op.
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let qs_hash = Hash256::from_bytes([42u8; 32]);
+        let tx_hash = Hash256::from_bytes([0xAA; 32]);
+
+        let envelope = make_envelope_with_deps(100, 1, tx_hash, qs_hash);
+        assert_eq!(
+            fetching.recv_envelope(envelope.clone()),
+            RecvResult::Fetching
+        );
+
+        // Manually discard twice
+        fetching.discard_envelope(&envelope);
+        fetching.discard_envelope(&envelope);
+
+        // Only one entry in discarded
+        let slot_state = fetching.slots.get(&100).unwrap();
+        assert_eq!(slot_state.discarded.len(), 1);
+    }
+
+    #[test]
+    fn test_discard_cleans_up_fetcher_trackers() {
+        // Verify that both quorum-set and tx-set fetcher trackers are cleaned up.
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let qs_hash = Hash256::from_bytes([42u8; 32]);
+        let tx_hash = Hash256::from_bytes([0xAA; 32]);
+
+        let envelope = make_envelope_with_deps(100, 1, tx_hash, qs_hash);
+        assert_eq!(fetching.recv_envelope(envelope), RecvResult::Fetching);
+
+        // Both fetchers should be tracking
+        assert!(fetching.quorum_set_fetcher.is_tracking(&Hash(qs_hash.0)));
+        assert!(fetching.tx_set_fetcher.is_tracking(&Hash(tx_hash.0)));
+
+        // Discard via insane qset
+        let insane_qs = ScpQuorumSet {
+            threshold: 5,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        fetching.recv_quorum_set(qs_hash, insane_qs);
+
+        // Both fetchers should have their trackers cleaned up
+        assert!(
+            !fetching.quorum_set_fetcher.is_tracking(&Hash(qs_hash.0)),
+            "quorum_set fetcher should be cleaned up after discard"
+        );
+        assert!(
+            !fetching.tx_set_fetcher.is_tracking(&Hash(tx_hash.0)),
+            "tx_set fetcher should be cleaned up after discard"
+        );
     }
 }
