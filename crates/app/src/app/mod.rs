@@ -9773,7 +9773,7 @@ mod tests {
         let app = survey_test_app().await;
         // Bootstrap at ledger 5 → tracking_slot = 6, tracking_consensus_ledger_index = 5
         app.herder.bootstrap(5);
-        let result = app.survey_local_ledger().await;
+        let result = app.survey_local_ledger();
         assert_eq!(
             result, 5,
             "survey_local_ledger must return last externalized (5), not next consensus (6)"
@@ -9785,7 +9785,7 @@ mod tests {
         let app = survey_test_app().await;
         // No bootstrap → tracking_slot = 0, tracking_consensus_ledger_index = 0
         let lcl = app.current_ledger_seq();
-        let result = app.survey_local_ledger().await;
+        let result = app.survey_local_ledger();
         assert_eq!(
             result, lcl,
             "survey_local_ledger must fall back to current_ledger_seq when not tracking"

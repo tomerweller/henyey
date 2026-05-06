@@ -251,8 +251,8 @@ impl App {
         outbound_index: u32,
     ) -> bool {
         let local_node_id = self.local_node_id();
-        let ledger_num = self.survey_local_ledger().await;
         let secret = self.ensure_survey_secret(nonce).await;
+        let ledger_num = self.survey_local_ledger();
         let public = CurvePublicKey::from(&secret);
         let encryption_key = Curve25519Public {
             key: public.to_bytes(),
@@ -287,8 +287,8 @@ impl App {
             request: message,
         };
 
-        let local_ledger = self.survey_local_ledger().await;
         let mut limiter = self.survey_limiter.write().await;
+        let local_ledger = self.survey_local_ledger();
         let ok = limiter.add_and_validate_request(
             &signed.request.request,
             local_ledger,
@@ -311,7 +311,7 @@ impl App {
     }
 
     async fn broadcast_survey_start(&self, nonce: u32) -> anyhow::Result<()> {
-        let ledger_num = self.survey_local_ledger().await;
+        let ledger_num = self.survey_local_ledger();
         let start = TimeSlicedSurveyStartCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
@@ -338,7 +338,7 @@ impl App {
     }
 
     async fn broadcast_survey_stop(&self, nonce: u32) {
-        let ledger_num = self.survey_local_ledger().await;
+        let ledger_num = self.survey_local_ledger();
         let stop = TimeSlicedSurveyStopCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
@@ -406,9 +406,9 @@ impl App {
         if !self.surveyor_permitted(&message.surveyor_id) {
             return;
         }
-        let local_ledger = self.survey_local_ledger().await;
         let survey_active = { self.survey_data.read().await.survey_is_active() };
         let limiter = self.survey_limiter.read().await;
+        let local_ledger = self.survey_local_ledger();
         let is_valid =
             limiter.validate_start_collecting(message, local_ledger, survey_active, || {
                 self.verify_survey_signature(
@@ -468,8 +468,8 @@ impl App {
         if !self.surveyor_permitted(&message.surveyor_id) {
             return;
         }
-        let local_ledger = self.survey_local_ledger().await;
         let limiter = self.survey_limiter.read().await;
+        let local_ledger = self.survey_local_ledger();
         let is_valid = limiter.validate_stop_collecting(message, local_ledger, || {
             self.verify_survey_signature(&message.surveyor_id, &message_bytes, &signed.signature)
         });
@@ -519,13 +519,13 @@ impl App {
         }
 
         let local_node_id = self.local_node_id();
-        let local_ledger = self.survey_local_ledger().await;
         let nonce_is_reporting = self
             .survey_data
             .read()
             .await
             .nonce_is_reporting(request.nonce);
         let mut limiter = self.survey_limiter.write().await;
+        let local_ledger = self.survey_local_ledger();
         let is_valid = limiter.add_and_validate_request(
             &request.request,
             local_ledger,
@@ -641,13 +641,13 @@ impl App {
             }
         };
 
-        let local_ledger = self.survey_local_ledger().await;
         let nonce_is_reporting = self
             .survey_data
             .read()
             .await
             .nonce_is_reporting(response_message.nonce);
         let mut limiter = self.survey_limiter.write().await;
+        let local_ledger = self.survey_local_ledger();
         let is_valid =
             limiter.record_and_validate_response(&response_message.response, local_ledger, || {
                 nonce_is_reporting
@@ -747,7 +747,7 @@ impl App {
         ))
     }
 
-    pub(crate) async fn survey_local_ledger(&self) -> u32 {
+    pub(crate) fn survey_local_ledger(&self) -> u32 {
         let tracking = self.herder.tracking_consensus_ledger_index();
         if tracking.is_boot() {
             // Not yet tracking (boot/syncing state). Stellar-core asserts
@@ -1046,7 +1046,7 @@ impl App {
     }
 
     async fn send_survey_start(&self, peers: &[henyey_overlay::PeerId], nonce: u32) -> bool {
-        let ledger_num = self.survey_local_ledger().await;
+        let ledger_num = self.survey_local_ledger();
         let start = TimeSlicedSurveyStartCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
@@ -1096,7 +1096,7 @@ impl App {
         for peer in peers {
             // Read ledger fresh per-peer, matching stellar-core's
             // populateSurveyRequestMessage which reads per-request.
-            let ledger_num = self.survey_local_ledger().await;
+            let ledger_num = self.survey_local_ledger();
             let request = SurveyRequestMessage {
                 surveyor_peer_id: local_node_id.clone(),
                 surveyed_peer_id: stellar_xdr::curr::NodeId(peer.0.clone()),
@@ -1141,7 +1141,7 @@ impl App {
     }
 
     async fn send_survey_stop(&self, peers: &[henyey_overlay::PeerId], nonce: u32) {
-        let ledger_num = self.survey_local_ledger().await;
+        let ledger_num = self.survey_local_ledger();
         let stop = TimeSlicedSurveyStopCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
