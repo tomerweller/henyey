@@ -1401,9 +1401,10 @@ bad_sha=$(cat "$BUILD_SHA_FILE")
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
-quarantine_append "$HOME/data/deploy_quarantine.txt" "$bad_sha" "regression #<issue>"
-if [ $? -eq 2 ]; then
-  echo "WARNING: quarantine append I/O error — deploy gate may not block next tick" >&2
+rc=0
+quarantine_append "$HOME/data/deploy_quarantine.txt" "$bad_sha" "regression #<issue>" || rc=$?
+if [ $rc -ne 0 ]; then
+  echo "WARNING: quarantine_append failed (rc=$rc) — deploy gate may not block next tick" >&2
 fi
 ```
 
@@ -1434,9 +1435,10 @@ entries. Clearance is an explicit operator decision.
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
-quarantine_remove "$HOME/data/deploy_quarantine.txt" "$bad_sha"
-if [ $? -eq 2 ]; then
-  echo "ERROR: quarantine remove I/O error — entry may still be active" >&2
+rc=0
+quarantine_remove "$HOME/data/deploy_quarantine.txt" "$bad_sha" || rc=$?
+if [ $rc -ne 0 ]; then
+  echo "ERROR: quarantine_remove failed (rc=$rc) — entry may still be active" >&2
 fi
 ```
 

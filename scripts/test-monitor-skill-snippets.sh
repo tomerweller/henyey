@@ -205,6 +205,21 @@ check_skill_structure() {
     echo "WARNING: monitor-tick/SKILL.md still contains old inline quarantine remove awk" >&2
     drift=true
   fi
+  # quarantine_append must use || rc=$? capture pattern
+  if ! grep -qE 'quarantine_append[[:space:]].*\|\|[[:space:]]*rc=\$\?' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md quarantine_append call missing || rc=\$? capture" >&2
+    drift=true
+  fi
+  # quarantine_remove must use || rc=$? capture pattern
+  if ! grep -qE 'quarantine_remove[[:space:]].*\|\|[[:space:]]*rc=\$\?' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md quarantine_remove call missing || rc=\$? capture" >&2
+    drift=true
+  fi
+  # Neither helper should use bare $? check (fragile pattern)
+  if grep -A3 'quarantine_append\|quarantine_remove' "$tick_file" | grep -qE 'if \[+ \$\? '; then
+    echo "WARNING: monitor-tick/SKILL.md uses bare \$? after quarantine helper (use || rc=\$? pattern)" >&2
+    drift=true
+  fi
 
   # monitor-label-policy.md: Deploy Regression Procedure must use quarantine helper
   local policy_file="$REPO_ROOT/scripts/lib/monitor-label-policy.md"
