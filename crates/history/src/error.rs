@@ -56,26 +56,28 @@ impl std::fmt::Display for VerifyHashKind {
 ///
 /// Boxed inside [`HistoryError::VerificationHashMismatch`] to keep the
 /// `HistoryError` enum small, consistent with [`TxSetHashMismatchInfo`].
+///
+/// Fields are private to enforce construction through [`Self::log_and_new`]
+/// (preferred, emits structured tracing) or [`Self::new_unlogged`]
+/// (crate-internal only, for callsites that handle their own logging).
 #[derive(Debug, Clone)]
 pub struct VerifyHashMismatchInfo {
-    /// What kind of hash was being verified.
-    pub kind: VerifyHashKind,
-    /// Ledger sequence where the mismatch was detected (`None` for
-    /// bucket-level checks with no ledger context).
-    pub ledger: Option<u32>,
-    /// The expected hash value.
-    pub expected: Hash256,
-    /// The actual (computed) hash value.
-    pub actual: Hash256,
+    kind: VerifyHashKind,
+    ledger: Option<u32>,
+    expected: Hash256,
+    actual: Hash256,
 }
 
 impl VerifyHashMismatchInfo {
-    /// Convenience constructor for `VerifyHashMismatchInfo`.
+    /// Construct without emitting any tracing event.
     ///
-    /// All fields remain `pub`, so direct struct literal construction is still
-    /// valid. This constructor exists purely for ergonomics — combine with
-    /// `.into()` to produce a [`HistoryError::VerificationHashMismatch`].
-    pub fn new(
+    /// **Crate-internal only.** Callers MUST have already emitted a structured
+    /// `tracing::error!` with at minimum `kind`, `ledger_seq` (when `Some`),
+    /// `expected_hash`, and `actual_hash` fields before calling this.
+    ///
+    /// For production mismatch sites, prefer [`Self::log_and_new`] which
+    /// handles the structured logging automatically.
+    pub(crate) fn new_unlogged(
         kind: VerifyHashKind,
         ledger: Option<u32>,
         expected: Hash256,
@@ -91,9 +93,9 @@ impl VerifyHashMismatchInfo {
 
     /// Construct the info and emit a structured `tracing::error!` event.
     ///
-    /// Preferred over [`Self::new`] at production mismatch sites — ensures
-    /// every hash verification failure produces a queryable log event with
-    /// `kind`, `ledger_seq`, `expected_hash`, and `actual_hash` fields.
+    /// Preferred at production mismatch sites — ensures every hash
+    /// verification failure produces a queryable log event with `kind`,
+    /// `ledger_seq`, `expected_hash`, and `actual_hash` fields.
     pub fn log_and_new(
         kind: VerifyHashKind,
         ledger: Option<u32>,
@@ -122,6 +124,27 @@ impl VerifyHashMismatchInfo {
             expected,
             actual,
         }
+    }
+
+    /// What kind of hash was being verified.
+    pub fn kind(&self) -> VerifyHashKind {
+        self.kind
+    }
+
+    /// Ledger sequence where the mismatch was detected (`None` for
+    /// bucket-level checks with no ledger context).
+    pub fn ledger(&self) -> Option<u32> {
+        self.ledger
+    }
+
+    /// The expected hash value.
+    pub fn expected(&self) -> Hash256 {
+        self.expected
+    }
+
+    /// The actual (computed) hash value.
+    pub fn actual(&self) -> Hash256 {
+        self.actual
     }
 }
 
@@ -586,23 +609,28 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_hash_mismatch_info_new_and_into() {
+    fn test_verify_hash_mismatch_info_new_unlogged_and_into() {
         let expected = Hash256::ZERO;
         let actual = Hash256::from([0xAB; 32]);
-        let info = VerifyHashMismatchInfo::new(VerifyHashKind::Bucket, Some(42), expected, actual);
+        let info = VerifyHashMismatchInfo::new_unlogged(
+            VerifyHashKind::Bucket,
+            Some(42),
+            expected,
+            actual,
+        );
 
-        assert_eq!(info.kind, VerifyHashKind::Bucket);
-        assert_eq!(info.ledger, Some(42));
-        assert_eq!(info.expected, expected);
-        assert_eq!(info.actual, actual);
+        assert_eq!(info.kind(), VerifyHashKind::Bucket);
+        assert_eq!(info.ledger(), Some(42));
+        assert_eq!(info.expected(), expected);
+        assert_eq!(info.actual(), actual);
 
         let err: HistoryError = info.into();
         match &err {
             HistoryError::VerificationHashMismatch(boxed) => {
-                assert_eq!(boxed.kind, VerifyHashKind::Bucket);
-                assert_eq!(boxed.ledger, Some(42));
-                assert_eq!(boxed.expected, expected);
-                assert_eq!(boxed.actual, actual);
+                assert_eq!(boxed.kind(), VerifyHashKind::Bucket);
+                assert_eq!(boxed.ledger(), Some(42));
+                assert_eq!(boxed.expected(), expected);
+                assert_eq!(boxed.actual(), actual);
             }
             other => panic!("expected VerificationHashMismatch, got: {other:?}"),
         }
@@ -619,7 +647,7 @@ mod tests {
             VerifyHashKind::BottomAnchor,
             VerifyHashKind::Lcl,
         ] {
-            let err: HistoryError = VerifyHashMismatchInfo::new(
+            let err: HistoryError = VerifyHashMismatchInfo::new_unlogged(
                 kind,
                 Some(42),
                 Hash256::ZERO,
@@ -644,7 +672,7 @@ mod tests {
             VerifyHashKind::BottomAnchor,
             VerifyHashKind::Lcl,
         ] {
-            let err: HistoryError = VerifyHashMismatchInfo::new(
+            let err: HistoryError = VerifyHashMismatchInfo::new_unlogged(
                 kind,
                 Some(42),
                 Hash256::ZERO,
@@ -691,7 +719,7 @@ mod tests {
 
     #[test]
     fn test_verify_hash_mismatch_display_with_ledger() {
-        let info = VerifyHashMismatchInfo::new(
+        let info = VerifyHashMismatchInfo::new_unlogged(
             VerifyHashKind::BucketList,
             Some(42),
             Hash256::ZERO,
@@ -705,7 +733,7 @@ mod tests {
 
     #[test]
     fn test_verify_hash_mismatch_display_without_ledger() {
-        let info = VerifyHashMismatchInfo::new(
+        let info = VerifyHashMismatchInfo::new_unlogged(
             VerifyHashKind::Bucket,
             None,
             Hash256::ZERO,
@@ -765,6 +793,115 @@ mod tests {
         assert!(
             display.contains("def456"),
             "Display should include actual hash"
+        );
+    }
+
+    #[test]
+    fn test_log_and_new_emits_structured_tracing() {
+        use std::sync::{Arc, Mutex};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            fields: Vec<(String, String)>,
+        }
+
+        impl tracing::field::Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .push((field.name().to_string(), format!("{:?}", value)));
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.fields
+                    .push((field.name().to_string(), value.to_string()));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.fields
+                    .push((field.name().to_string(), value.to_string()));
+            }
+        }
+
+        #[derive(Clone)]
+        struct CaptureLayer {
+            events: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.events.lock().unwrap().push(visitor.fields);
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            events: events.clone(),
+        };
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+
+        let expected = Hash256::ZERO;
+        let actual = Hash256::from([0xAB; 32]);
+
+        // log_and_new should emit a tracing event.
+        with_default(subscriber, || {
+            let _ = VerifyHashMismatchInfo::log_and_new(
+                VerifyHashKind::Bucket,
+                Some(7),
+                expected,
+                actual,
+            );
+        });
+
+        let captured = events.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "log_and_new should emit exactly one event"
+        );
+        let field_names: Vec<&str> = captured[0].iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            field_names.contains(&"kind"),
+            "event should contain 'kind' field"
+        );
+        assert!(
+            field_names.contains(&"ledger_seq"),
+            "event should contain 'ledger_seq' field"
+        );
+        assert!(
+            field_names.contains(&"expected_hash"),
+            "event should contain 'expected_hash' field"
+        );
+        assert!(
+            field_names.contains(&"actual_hash"),
+            "event should contain 'actual_hash' field"
+        );
+        drop(captured);
+
+        // new_unlogged should NOT emit any tracing event.
+        events.lock().unwrap().clear();
+        let layer2 = CaptureLayer {
+            events: events.clone(),
+        };
+        let subscriber2 = tracing_subscriber::registry::Registry::default().with(layer2);
+        with_default(subscriber2, || {
+            let _ = VerifyHashMismatchInfo::new_unlogged(
+                VerifyHashKind::Bucket,
+                Some(7),
+                expected,
+                actual,
+            );
+        });
+
+        let captured = events.lock().unwrap();
+        assert!(
+            captured.is_empty(),
+            "new_unlogged should not emit any tracing events"
         );
     }
 }

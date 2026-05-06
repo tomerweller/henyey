@@ -165,6 +165,7 @@ fn verify_bucket_list_hash(
         combined_bucket_list_hash(bucket_list, hot_archive_bucket_list, header.ledger_version);
     if actual != expected {
         tracing::error!(
+            kind = "bucket_list",
             ledger_seq = header.ledger_seq,
             expected_hash = %expected.to_hex(),
             actual_hash = %actual.to_hex(),
@@ -185,7 +186,7 @@ fn verify_bucket_list_hash(
                 "Level state at mismatch"
             );
         }
-        return Err(crate::error::VerifyHashMismatchInfo::new(
+        return Err(crate::error::VerifyHashMismatchInfo::new_unlogged(
             crate::error::VerifyHashKind::BucketList,
             Some(header.ledger_seq),
             expected,
@@ -1289,9 +1290,9 @@ mod tests {
 
         match result {
             Err(HistoryError::VerificationHashMismatch(info)) => {
-                assert_eq!(info.kind, crate::error::VerifyHashKind::BucketList);
-                assert_eq!(info.ledger, Some(127));
-                assert_ne!(info.expected, info.actual);
+                assert_eq!(info.kind(), crate::error::VerifyHashKind::BucketList);
+                assert_eq!(info.ledger(), Some(127));
+                assert_ne!(info.expected(), info.actual());
             }
             other => panic!("expected VerificationHashMismatch, got: {other:?}"),
         }

@@ -899,10 +899,10 @@ mod tests {
         let err = result.unwrap_err();
         match &err {
             HistoryError::VerificationHashMismatch(info) => {
-                assert_eq!(info.kind, crate::error::VerifyHashKind::BottomAnchor);
-                assert_eq!(info.ledger, Some(10));
-                assert_eq!(info.expected, wrong_hash);
-                assert_eq!(info.actual, Hash256::ZERO);
+                assert_eq!(info.kind(), crate::error::VerifyHashKind::BottomAnchor);
+                assert_eq!(info.ledger(), Some(10));
+                assert_eq!(info.expected(), wrong_hash);
+                assert_eq!(info.actual(), Hash256::ZERO);
             }
             other => panic!("expected VerificationHashMismatch, got: {other:?}"),
         }
@@ -934,10 +934,10 @@ mod tests {
         let err = result.unwrap_err();
         match &err {
             HistoryError::VerificationHashMismatch(info) => {
-                assert_eq!(info.kind, crate::error::VerifyHashKind::Lcl);
-                assert_eq!(info.ledger, Some(5));
-                assert_eq!(info.expected, wrong_lcl_hash);
-                assert_eq!(info.actual, h1_hash);
+                assert_eq!(info.kind(), crate::error::VerifyHashKind::Lcl);
+                assert_eq!(info.ledger(), Some(5));
+                assert_eq!(info.expected(), wrong_lcl_hash);
+                assert_eq!(info.actual(), h1_hash);
             }
             other => panic!("expected VerificationHashMismatch, got: {other:?}"),
         }
@@ -1161,10 +1161,10 @@ mod tests {
 
         match err {
             HistoryError::VerificationHashMismatch(info) => {
-                assert_eq!(info.kind, crate::error::VerifyHashKind::Bucket);
-                assert_eq!(info.ledger, None);
-                assert_eq!(info.expected, wrong_hash);
-                assert_eq!(info.actual, Hash256::hash(data));
+                assert_eq!(info.kind(), crate::error::VerifyHashKind::Bucket);
+                assert_eq!(info.ledger(), None);
+                assert_eq!(info.expected(), wrong_hash);
+                assert_eq!(info.actual(), Hash256::hash(data));
             }
             other => panic!("expected VerificationHashMismatch, got: {other}"),
         }
@@ -1188,10 +1188,10 @@ mod tests {
 
         match err {
             HistoryError::VerificationHashMismatch(info) => {
-                assert_eq!(info.kind, crate::error::VerifyHashKind::BucketList);
-                assert_eq!(info.ledger, Some(42));
-                assert_eq!(info.expected, Hash256::from(header.bucket_list_hash));
-                assert_eq!(info.actual, computed_bucket_list_hash);
+                assert_eq!(info.kind(), crate::error::VerifyHashKind::BucketList);
+                assert_eq!(info.ledger(), Some(42));
+                assert_eq!(info.expected(), Hash256::from(header.bucket_list_hash));
+                assert_eq!(info.actual(), computed_bucket_list_hash);
             }
             other => panic!("expected VerificationHashMismatch, got: {other}"),
         }
@@ -1210,12 +1210,12 @@ mod tests {
 
         match err {
             HistoryError::VerificationHashMismatch(info) => {
-                assert_eq!(info.kind, crate::error::VerifyHashKind::LedgerHeaderEntry);
-                assert_eq!(info.ledger, Some(100));
-                assert_eq!(info.expected, Hash256::from(Hash([0xFF; 32])));
+                assert_eq!(info.kind(), crate::error::VerifyHashKind::LedgerHeaderEntry);
+                assert_eq!(info.ledger(), Some(100));
+                assert_eq!(info.expected(), Hash256::from(Hash([0xFF; 32])));
                 // actual should be the computed header hash
                 let computed = compute_header_hash(&entry.header).unwrap();
-                assert_eq!(info.actual, computed);
+                assert_eq!(info.actual(), computed);
             }
             other => panic!("expected VerificationHashMismatch, got: {other}"),
         }
@@ -1231,10 +1231,10 @@ mod tests {
 
         match err {
             HistoryError::VerificationHashMismatch(info) => {
-                assert_eq!(info.kind, crate::error::VerifyHashKind::TxResultSet);
-                assert_eq!(info.ledger, Some(50));
-                assert_eq!(info.expected, Hash256::from(Hash([0xBB; 32])));
-                assert_eq!(info.actual, Hash256::hash(wrong_xdr));
+                assert_eq!(info.kind(), crate::error::VerifyHashKind::TxResultSet);
+                assert_eq!(info.ledger(), Some(50));
+                assert_eq!(info.expected(), Hash256::from(Hash([0xBB; 32])));
+                assert_eq!(info.actual(), Hash256::hash(wrong_xdr));
             }
             other => panic!("expected VerificationHashMismatch, got: {other}"),
         }
@@ -1258,12 +1258,12 @@ mod tests {
 
         match err {
             HistoryError::VerificationHashMismatch(info) => {
-                assert_eq!(info.kind, crate::error::VerifyHashKind::TrustedHeader);
-                assert_eq!(info.ledger, Some(77));
+                assert_eq!(info.kind(), crate::error::VerifyHashKind::TrustedHeader);
+                assert_eq!(info.ledger(), Some(77));
                 let trusted_hash = compute_header_hash(&trusted).unwrap();
                 let downloaded_hash = compute_header_hash(&downloaded).unwrap();
-                assert_eq!(info.expected, trusted_hash);
-                assert_eq!(info.actual, downloaded_hash);
+                assert_eq!(info.expected(), trusted_hash);
+                assert_eq!(info.actual(), downloaded_hash);
             }
             other => panic!("expected VerificationHashMismatch, got: {other}"),
         }
