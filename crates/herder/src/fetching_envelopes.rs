@@ -42,6 +42,11 @@ pub enum RecvResult {
     AlreadyProcessed,
     /// Envelope was discarded (invalid or rejected).
     Discarded,
+    /// Per-slot lifetime cap reached (defense-in-depth, henyey-specific).
+    ///
+    /// The slot already has [`FetchingConfig::max_envelopes_per_slot`]
+    /// envelopes across all states. Not present in stellar-core.
+    PerSlotFull,
 }
 
 /// State of envelopes for a single slot.
@@ -67,6 +72,19 @@ pub struct FetchingConfig {
     /// Maximum quorum sets to cache. Uses random-two-choice eviction (matching
     /// stellar-core's `RandomEvictionCache`). Must be at least 1.
     pub max_quorum_set_cache: usize,
+    /// Per-slot envelope lifetime cap (defense-in-depth, henyey-specific).
+    ///
+    /// Total unique envelopes admitted to a slot across all states
+    /// (fetching + ready + processed + discarded). Once this limit is reached,
+    /// new envelopes return [`RecvResult::PerSlotFull`].
+    ///
+    /// Default: [`super::pending::MAX_ENVELOPES_PER_SLOT`] (5000). Set to 0
+    /// to disable (useful for tests that need unrestricted insertion).
+    ///
+    /// Boundary: the Nth envelope is accepted; the (N+1)th is rejected.
+    ///
+    /// Not present in stellar-core. See `PARITY_STATUS.md`.
+    pub max_envelopes_per_slot: usize,
 }
 
 impl Default for FetchingConfig {
@@ -77,6 +95,7 @@ impl Default for FetchingConfig {
             // Parity: stellar-core uses QSET_CACHE_SIZE = 10000
             // in PendingEnvelopes.cpp.
             max_quorum_set_cache: 10_000,
+            max_envelopes_per_slot: super::pending::MAX_ENVELOPES_PER_SLOT,
         }
     }
 }
@@ -111,6 +130,8 @@ pub struct FetchingEnvelopes {
     broadcast: RwLock<Option<BroadcastFn>>,
     /// Statistics.
     stats: RwLock<FetchingStats>,
+    /// Per-slot envelope lifetime cap. See [`FetchingConfig::max_envelopes_per_slot`].
+    max_envelopes_per_slot: usize,
 }
 
 /// Statistics about fetching.
@@ -128,6 +149,8 @@ pub struct FetchingStats {
     pub tx_sets_received: u64,
     /// QuorumSets received.
     pub quorum_sets_received: u64,
+    /// Per-slot lifetime cap rejections (defense-in-depth).
+    pub per_slot_full: u64,
 }
 
 impl FetchingEnvelopes {
@@ -142,6 +165,7 @@ impl FetchingEnvelopes {
             "max_quorum_set_cache must be at least 1"
         );
         let qs_cache = RandomEvictionCache::new(config.max_quorum_set_cache);
+        let max_envelopes_per_slot = config.max_envelopes_per_slot;
         Self {
             tx_set_fetcher: ItemFetcher::new(
                 ItemType::TxSet,
@@ -158,6 +182,7 @@ impl FetchingEnvelopes {
             has_tx_set_fn,
             broadcast: RwLock::new(None),
             stats: RwLock::new(FetchingStats::default()),
+            max_envelopes_per_slot,
         }
     }
 
@@ -238,6 +263,21 @@ impl FetchingEnvelopes {
         // Check if already fetching
         if slot_state.fetching.contains_key(&env_hash) {
             return RecvResult::Fetching;
+        }
+
+        // Per-slot lifetime cap (defense-in-depth, henyey-specific).
+        // Count ALL states to prevent the "immediate-pop bypass" where
+        // deps-satisfied envelopes drain the active queue but grow
+        // `processed` without bound.
+        if self.max_envelopes_per_slot > 0 {
+            let lifetime_count = slot_state.fetching.len()
+                + slot_state.ready.len()
+                + slot_state.processed.len()
+                + slot_state.discarded.len();
+            if lifetime_count >= self.max_envelopes_per_slot {
+                self.stats.write().per_slot_full += 1;
+                return RecvResult::PerSlotFull;
+            }
         }
 
         // Check if we have all dependencies
@@ -451,6 +491,22 @@ impl FetchingEnvelopes {
         self.slots
             .get(&slot)
             .map(|s| s.fetching.len() + s.ready.len())
+            .unwrap_or(0)
+    }
+
+    /// Count total unique envelopes ever admitted to a slot (lifetime count).
+    ///
+    /// Includes all states: fetching + ready + processed + discarded.
+    /// Used for per-slot lifetime cap enforcement. Unlike
+    /// [`slot_envelope_count`](Self::slot_envelope_count) which counts only
+    /// active envelopes, this counts envelopes that have already been
+    /// consumed, preventing the "immediate-pop bypass" where deps-satisfied
+    /// envelopes drain the active queue but still grow `processed` without
+    /// bound.
+    pub fn slot_lifetime_count(&self, slot: SlotIndex) -> usize {
+        self.slots
+            .get(&slot)
+            .map(|s| s.fetching.len() + s.ready.len() + s.processed.len() + s.discarded.len())
             .unwrap_or(0)
     }
 
@@ -1948,5 +2004,230 @@ mod tests {
             1,
             "envelope should be ready after re-delivery of evicted quorum set"
         );
+    }
+
+    // --- Per-slot lifetime cap tests (issue #2411) ---
+
+    /// Helper: create a FetchingEnvelopes with a low per-slot cap for testing.
+    fn fetching_with_per_slot_cap(cap: usize) -> FetchingEnvelopes {
+        let config = FetchingConfig {
+            max_envelopes_per_slot: cap,
+            ..Default::default()
+        };
+        // Quorum set NOT available so envelopes go to fetching state
+        FetchingEnvelopes::new(config, Box::new(|_| false))
+    }
+
+    /// Helper: create FetchingEnvelopes with per-slot cap and pre-cached
+    /// quorum set (envelopes go to ready state immediately).
+    fn fetching_with_per_slot_cap_ready(cap: usize) -> FetchingEnvelopes {
+        let config = FetchingConfig {
+            max_envelopes_per_slot: cap,
+            ..Default::default()
+        };
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        cache_test_quorum_set(&fetching);
+        fetching
+    }
+
+    /// The per-slot lifetime cap is enforced: after `cap` envelopes, the next
+    /// returns `PerSlotFull`.
+    #[test]
+    fn test_per_slot_lifetime_cap_enforced() {
+        let fetching = fetching_with_per_slot_cap(3);
+
+        // Fill 3 envelopes (the cap)
+        for seed in 1..=3u8 {
+            let result = fetching.recv_envelope(make_test_envelope(100, seed));
+            assert_eq!(result, RecvResult::Fetching);
+        }
+
+        // 4th envelope exceeds the cap
+        let result = fetching.recv_envelope(make_test_envelope(100, 4));
+        assert_eq!(result, RecvResult::PerSlotFull);
+    }
+
+    /// Exactly `cap` envelopes are accepted.
+    #[test]
+    fn test_per_slot_cap_allows_up_to_limit() {
+        let fetching = fetching_with_per_slot_cap(5);
+
+        for seed in 1..=5u8 {
+            let result = fetching.recv_envelope(make_test_envelope(100, seed));
+            assert_eq!(
+                result,
+                RecvResult::Fetching,
+                "envelope {seed} should be accepted"
+            );
+        }
+    }
+
+    /// Different slots have independent caps.
+    #[test]
+    fn test_per_slot_cap_independent_slots() {
+        let fetching = fetching_with_per_slot_cap(2);
+
+        // Fill slot 100
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(100, 1)),
+            RecvResult::Fetching
+        );
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(100, 2)),
+            RecvResult::Fetching
+        );
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(100, 3)),
+            RecvResult::PerSlotFull
+        );
+
+        // Slot 101 is independent
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(101, 1)),
+            RecvResult::Fetching
+        );
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(101, 2)),
+            RecvResult::Fetching
+        );
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(101, 3)),
+            RecvResult::PerSlotFull
+        );
+    }
+
+    /// Envelopes that were popped (moved to processed state) still count
+    /// against the cap. This is the key fix: prevents the "immediate-pop
+    /// bypass" for current-slot envelopes.
+    #[test]
+    fn test_per_slot_cap_counts_processed() {
+        let fetching = fetching_with_per_slot_cap_ready(3);
+
+        // Insert 3 envelopes — they go to ready immediately (deps satisfied)
+        for seed in 1..=3u8 {
+            let result = fetching.recv_envelope(make_test_envelope(100, seed));
+            assert_eq!(result, RecvResult::Ready);
+        }
+
+        // Pop all of them (moves to processed)
+        for _ in 0..3 {
+            let _ = fetching.pop(100);
+        }
+
+        // Lifetime count should be 3 (all processed), cap should fire
+        assert_eq!(fetching.slot_lifetime_count(100), 3);
+        let result = fetching.recv_envelope(make_test_envelope(100, 4));
+        assert_eq!(result, RecvResult::PerSlotFull);
+    }
+
+    /// Duplicate envelopes get `AlreadyProcessed` (not PerSlotFull) because
+    /// the dedup check runs before the cap check.
+    #[test]
+    fn test_per_slot_cap_dedup_before_cap() {
+        let fetching = fetching_with_per_slot_cap(2);
+
+        // Insert 2 envelopes (reaches cap)
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(100, 1)),
+            RecvResult::Fetching
+        );
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(100, 2)),
+            RecvResult::Fetching
+        );
+
+        // Re-sending envelope 1 should get Fetching (already in fetching state)
+        // since the fetching-dedup check is before the cap check
+        let result = fetching.recv_envelope(make_test_envelope(100, 1));
+        assert_eq!(result, RecvResult::Fetching);
+    }
+
+    /// Cap of 0 disables the limit (for unrestricted test scenarios).
+    #[test]
+    fn test_per_slot_cap_disabled_when_zero() {
+        let fetching = fetching_with_per_slot_cap(0);
+
+        // Should accept many envelopes without hitting cap
+        for seed in 1..=100u8 {
+            let result = fetching.recv_envelope(make_test_envelope(100, seed));
+            assert_eq!(result, RecvResult::Fetching);
+        }
+    }
+
+    /// The `per_slot_full` stat counter increments on rejection.
+    #[test]
+    fn test_per_slot_cap_stats() {
+        let fetching = fetching_with_per_slot_cap(2);
+
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(100, 1)),
+            RecvResult::Fetching
+        );
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(100, 2)),
+            RecvResult::Fetching
+        );
+
+        // These should be rejected
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(100, 3)),
+            RecvResult::PerSlotFull
+        );
+        assert_eq!(
+            fetching.recv_envelope(make_test_envelope(100, 4)),
+            RecvResult::PerSlotFull
+        );
+
+        assert_eq!(fetching.stats().per_slot_full, 2);
+    }
+
+    /// The `recv_envelope_validated` path also respects the cap.
+    #[test]
+    fn test_recv_envelope_validated_also_capped() {
+        let fetching = fetching_with_per_slot_cap(2);
+
+        assert_eq!(
+            fetching.recv_envelope_validated(make_test_envelope(100, 1)),
+            RecvResult::Fetching
+        );
+        assert_eq!(
+            fetching.recv_envelope_validated(make_test_envelope(100, 2)),
+            RecvResult::Fetching
+        );
+        assert_eq!(
+            fetching.recv_envelope_validated(make_test_envelope(100, 3)),
+            RecvResult::PerSlotFull
+        );
+    }
+
+    /// Regression test for the actual attack vector: current-slot
+    /// deps-satisfied envelopes that get immediately popped. Without
+    /// the lifetime cap, these bypass active-count checks.
+    #[test]
+    fn test_per_slot_cap_current_slot_regression() {
+        let fetching = fetching_with_per_slot_cap_ready(3);
+
+        // Simulate the attack: flood unique envelopes for same slot.
+        // Each goes to ready and gets immediately popped.
+        for seed in 1..=3u8 {
+            let result = fetching.recv_envelope(make_test_envelope(100, seed));
+            assert_eq!(result, RecvResult::Ready);
+            let _ = fetching.pop(100); // Immediately consume
+        }
+
+        // The active count (fetching + ready) is now 0, but lifetime is 3.
+        assert_eq!(fetching.slot_envelope_count(100), 0);
+        assert_eq!(fetching.slot_lifetime_count(100), 3);
+
+        // The 4th envelope should be rejected even though ready queue is empty.
+        let result = fetching.recv_envelope(make_test_envelope(100, 4));
+        assert_eq!(result, RecvResult::PerSlotFull);
+    }
+
+    /// `slot_lifetime_count` returns 0 for unknown slots.
+    #[test]
+    fn test_slot_lifetime_count_unknown_slot() {
+        let fetching = fetching_with_per_slot_cap(100);
+        assert_eq!(fetching.slot_lifetime_count(999), 0);
     }
 }

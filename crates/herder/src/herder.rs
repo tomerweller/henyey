@@ -540,9 +540,14 @@ impl Herder {
         let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
         let pending_envelopes = PendingEnvelopes::new(pending_config);
         let scp_driver_for_fetching = Arc::clone(&scp_driver);
-        let fetching_envelopes = FetchingEnvelopes::with_defaults(Box::new(move |hash| {
-            scp_driver_for_fetching.has_tx_set_and_touch(hash)
-        }));
+        let fetching_config = crate::fetching_envelopes::FetchingConfig {
+            max_envelopes_per_slot: config.pending_config.max_envelopes_per_slot,
+            ..Default::default()
+        };
+        let fetching_envelopes = FetchingEnvelopes::new(
+            fetching_config,
+            Box::new(move |hash| scp_driver_for_fetching.has_tx_set_and_touch(hash)),
+        );
 
         // Pre-cache the local quorum set in fetching_envelopes so envelopes
         // referencing it don't wait for fetching.
@@ -1551,13 +1556,14 @@ impl Herder {
             }
         }
 
-        // Admission control for future-slot envelopes: prevent unbounded
-        // memory growth from floods by enforcing per-slot and total-slot
-        // limits on FetchingEnvelopes (which now buffers future-slot
-        // envelopes in its ready queue).
-        if slot > current_slot {
-            let slot_count = self.fetching_envelopes.slot_envelope_count(slot);
-            if slot_count >= self.config.pending_config.max_envelopes_per_slot {
+        // Admission control: per-slot lifetime cap for ALL slots.
+        // Uses lifetime count (fetching + ready + processed + discarded) to
+        // prevent the "immediate-pop bypass" for current-slot envelopes.
+        // This is the primary defense; the internal cap in recv_envelope_inner
+        // is defense-in-depth for non-herder callers.
+        {
+            let slot_lifetime = self.fetching_envelopes.slot_lifetime_count(slot);
+            if slot_lifetime >= self.config.pending_config.max_envelopes_per_slot {
                 let last_warned = self.pending_envelopes.last_per_slot_full_warn_slot();
                 if slot != last_warned {
                     self.pending_envelopes
@@ -1565,8 +1571,8 @@ impl Herder {
                     tracing::warn!(
                         slot,
                         current_slot,
-                        slot_count,
-                        "Per-slot safety cap reached in FetchingEnvelopes \
+                        slot_lifetime,
+                        "Per-slot lifetime cap reached in FetchingEnvelopes \
                          (possible compromised validator or watcher flood)"
                     );
                 }
@@ -1575,6 +1581,11 @@ impl Herder {
                     PostVerifyReason::PendingAddPerSlotFull,
                 );
             }
+        }
+
+        // Admission control for future-slot envelopes: prevent unbounded
+        // slot count from floods.
+        if slot > current_slot {
             let future_slots = self.fetching_envelopes.future_slot_count(current_slot);
             if future_slots >= crate::sync_recovery::LEDGER_VALIDITY_BRACKET as usize {
                 let last_warned = self.pending_envelopes.last_buffer_full_warn_slot();
@@ -1702,6 +1713,14 @@ impl Herder {
             }
             RecvResult::AlreadyProcessed => EnvelopeState::Duplicate,
             RecvResult::Discarded => EnvelopeState::Invalid,
+            RecvResult::PerSlotFull => {
+                // Defense-in-depth: the external check in process_verified
+                // should have caught this first. If we reach here, log and
+                // reject. No rate-limiting needed since the external check
+                // handles the common path.
+                debug!(slot, "Per-slot lifetime cap hit inside FetchingEnvelopes");
+                EnvelopeState::Invalid
+            }
         }
     }
 
