@@ -9149,4 +9149,194 @@ mod tests {
             }
         );
     }
+
+    /// Rejects initialize when the bucket list hash (pre-hot-archive path) does
+    /// not match the header's bucket_list_hash. Exercises verify_and_install_bucket_lists
+    /// at manager.rs:1887 with protocol < 23 (computed_hash = live_hash directly).
+    #[test]
+    fn test_initialize_rejects_bucket_list_hash_mismatch() {
+        use henyey_common::protocol::hot_archive_supported;
+
+        // Pin the protocol boundary: 22 is pre-hot-archive.
+        assert!(
+            !hot_archive_supported(22),
+            "protocol 22 must not support hot archive"
+        );
+
+        let network_id = "Test SDF Network ; September 2015".to_string();
+        let manager = LedgerManager::new(
+            network_id,
+            LedgerManagerConfig {
+                validate_bucket_hash: true,
+                ..Default::default()
+            },
+        );
+
+        let bucket_list = new_bl_with_config();
+        let hot_archive = henyey_bucket::HotArchiveBucketList::new();
+
+        // Pre-assert: populated bucket list hash differs from an empty one.
+        let live_hash = bucket_list.hash();
+        assert_ne!(
+            live_hash,
+            BucketList::default().hash(),
+            "new_bl_with_config() must produce a non-default hash"
+        );
+
+        // Create header at protocol 22 with a corrupted bucket_list_hash.
+        let mut header = create_genesis_header();
+        header.ledger_version = 22;
+        let mut bad_bytes = *live_hash.as_bytes();
+        bad_bytes[0] ^= 0xFF;
+        header.bucket_list_hash = Hash(bad_bytes);
+
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        let result = manager.initialize(bucket_list, hot_archive, header, header_hash);
+
+        // Verify HashMismatch with correct field values.
+        let err = result.expect_err("initialize should fail with hash mismatch");
+        match err {
+            LedgerError::HashMismatch { expected, actual } => {
+                let expected_hex = Hash256::from_bytes(bad_bytes).to_hex();
+                assert_eq!(
+                    expected, expected_hex,
+                    "expected field should match corrupted header hash"
+                );
+                assert_eq!(
+                    actual,
+                    live_hash.to_hex(),
+                    "actual field should match computed live bucket list hash"
+                );
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
+
+        // State non-mutation: nothing was installed.
+        assert!(
+            !manager.is_initialized(),
+            "manager must not be initialized after hash mismatch"
+        );
+        assert_eq!(
+            manager.current_header_hash(),
+            Hash256::ZERO,
+            "header hash must remain ZERO"
+        );
+        assert_eq!(
+            manager.current_ledger_seq(),
+            1,
+            "ledger seq must remain at genesis default"
+        );
+        assert_eq!(
+            manager.bucket_list().hash(),
+            BucketList::default().hash(),
+            "live bucket list must not be installed"
+        );
+        assert_eq!(
+            manager.hot_archive_bucket_list().as_ref().unwrap().hash(),
+            henyey_bucket::HotArchiveBucketList::new().hash(),
+            "hot archive bucket list must not be installed"
+        );
+    }
+
+    /// Rejects initialize when the bucket list hash (hot-archive path) does not
+    /// match the header's bucket_list_hash. Exercises verify_and_install_bucket_lists
+    /// at manager.rs:1887 with protocol >= 23 (computed_hash = SHA256(live || hot)).
+    #[test]
+    fn test_initialize_rejects_bucket_list_hash_mismatch_hot_archive() {
+        use henyey_common::protocol::hot_archive_supported;
+        use sha2::{Digest, Sha256};
+
+        // Pin the protocol boundary: 23 is hot-archive.
+        assert!(
+            hot_archive_supported(23),
+            "protocol 23 must support hot archive"
+        );
+
+        let network_id = "Test SDF Network ; September 2015".to_string();
+        let manager = LedgerManager::new(
+            network_id,
+            LedgerManagerConfig {
+                validate_bucket_hash: true,
+                ..Default::default()
+            },
+        );
+
+        let bucket_list = new_bl_with_config();
+        let hot_archive = henyey_bucket::HotArchiveBucketList::new();
+
+        // Pre-assert: populated bucket list hash differs from an empty one.
+        assert_ne!(
+            bucket_list.hash(),
+            BucketList::default().hash(),
+            "new_bl_with_config() must produce a non-default hash"
+        );
+
+        // Compute the combined hash the same way verify_and_install_bucket_lists does.
+        let live_hash = bucket_list.hash();
+        let hot_hash = hot_archive.hash();
+        let mut hasher = Sha256::new();
+        hasher.update(live_hash.as_bytes());
+        hasher.update(hot_hash.as_bytes());
+        let result_hash = hasher.finalize();
+        let mut combined_bytes = [0u8; 32];
+        combined_bytes.copy_from_slice(&result_hash);
+        let combined_hash = Hash256::from_bytes(combined_bytes);
+
+        // Corrupt the header's bucket_list_hash by flipping a byte.
+        let mut bad_bytes = combined_bytes;
+        bad_bytes[0] ^= 0xFF;
+
+        let mut header = create_genesis_header();
+        header.ledger_version = 23;
+        header.bucket_list_hash = Hash(bad_bytes);
+
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        let result = manager.initialize(bucket_list, hot_archive, header, header_hash);
+
+        // Verify HashMismatch with correct field values.
+        let err = result.expect_err("initialize should fail with hash mismatch (hot archive path)");
+        match err {
+            LedgerError::HashMismatch { expected, actual } => {
+                let expected_hex = Hash256::from_bytes(bad_bytes).to_hex();
+                assert_eq!(
+                    expected, expected_hex,
+                    "expected field should match corrupted header hash"
+                );
+                assert_eq!(
+                    actual,
+                    combined_hash.to_hex(),
+                    "actual field should match computed combined hash"
+                );
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
+
+        // State non-mutation: nothing was installed.
+        assert!(
+            !manager.is_initialized(),
+            "manager must not be initialized after hash mismatch"
+        );
+        assert_eq!(
+            manager.current_header_hash(),
+            Hash256::ZERO,
+            "header hash must remain ZERO"
+        );
+        assert_eq!(
+            manager.current_ledger_seq(),
+            1,
+            "ledger seq must remain at genesis default"
+        );
+        assert_eq!(
+            manager.bucket_list().hash(),
+            BucketList::default().hash(),
+            "live bucket list must not be installed"
+        );
+        assert_eq!(
+            manager.hot_archive_bucket_list().as_ref().unwrap().hash(),
+            henyey_bucket::HotArchiveBucketList::new().hash(),
+            "hot archive bucket list must not be installed"
+        );
+    }
 }
