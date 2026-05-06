@@ -657,12 +657,25 @@ impl OperationExecutionResult {
     }
 }
 
+/// Prior rent state for an entry. Determines the baseline for rent fee computation.
+/// stellar-core's `createEntryRentChangeWithoutModification` uses `std::nullopt` for restores
+/// (RestoreFootprintOpFrame.cpp:222-224 → TransactionUtils.cpp:2328-2329 maps to (0, 0))
+/// vs actual values for extensions.
+enum OldRentState {
+    /// Entry was already live — use actual size and TTL for delta computation.
+    /// Used by ExtendFootprintTTL and other non-restore ops.
+    Existing { size_bytes: u32, live_until: u32 },
+    /// Entry is being restored "from scratch" — old values are zero.
+    /// Used for ALL RestoreFootprint entries regardless of origin
+    /// (hot archive or expired live BL).
+    RestoreFromScratch,
+}
+
 struct RentSnapshot {
     key: stellar_xdr::curr::LedgerKey,
     is_persistent: bool,
     is_code_entry: bool,
-    old_size_bytes: u32,
-    old_live_until: u32,
+    old_state: OldRentState,
 }
 
 struct RentChange {
@@ -813,8 +826,10 @@ fn rent_snapshot_for_keys(
             key: key.clone(),
             is_persistent,
             is_code_entry,
-            old_size_bytes: entry_size,
-            old_live_until,
+            old_state: OldRentState::Existing {
+                size_bytes: entry_size,
+                live_until: old_live_until,
+            },
         });
     }
     snapshots
@@ -843,30 +858,39 @@ fn rent_changes_from_snapshots(
             cost_params,
         );
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &snapshot.key);
+
+        let (old_size_bytes, old_live_until) = match &snapshot.old_state {
+            OldRentState::Existing {
+                size_bytes,
+                live_until,
+            } => (*size_bytes, *live_until),
+            OldRentState::RestoreFromScratch => (0, 0),
+        };
+
         let new_live_until = state
             .get_ttl(&key_hash)
             .map(|ttl| ttl.live_until_ledger_seq)
-            .unwrap_or(snapshot.old_live_until);
+            .unwrap_or(old_live_until);
 
         tracing::debug!(
             ?snapshot.key,
-            old_size_bytes = snapshot.old_size_bytes,
+            old_size_bytes,
             new_size_bytes,
-            old_live_until = snapshot.old_live_until,
+            old_live_until,
             new_live_until,
             "rent_changes_from_snapshots: processing entry"
         );
 
-        if new_live_until <= snapshot.old_live_until && new_size_bytes <= snapshot.old_size_bytes {
+        if new_live_until <= old_live_until && new_size_bytes <= old_size_bytes {
             tracing::debug!(?snapshot.key, "rent_changes_from_snapshots: no change needed, skipping");
             continue;
         }
         changes.push(RentChange {
             is_persistent: snapshot.is_persistent,
             is_code_entry: snapshot.is_code_entry,
-            old_size_bytes: snapshot.old_size_bytes,
+            old_size_bytes,
             new_size_bytes,
-            old_live_until_ledger: snapshot.old_live_until,
+            old_live_until_ledger: old_live_until,
             new_live_until_ledger: new_live_until,
         });
     }
@@ -1173,25 +1197,21 @@ pub fn execute_operation_with_soroban(
                         }
                         // Case 3: TTL exists but expired -> data entry must exist
                         // stellar-core: releaseAssertOrThrow(entryLeOpt)
-                        let entry = state.get_entry(key).unwrap_or_else(|| {
+                        let _entry = state.get_entry(key).unwrap_or_else(|| {
                             panic!(
                                 "restore rent snapshot: expired TTL exists but data entry missing for key {:?}",
                                 key
                             )
                         });
-                        let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
-                            context.protocol_version,
-                            &entry,
-                            henyey_common::xdr_encoded_len_u32(&entry),
-                            Some((&config.cpu_cost_params, &config.mem_cost_params)),
-                        );
+                        // stellar-core uses (0, 0) for ALL restores regardless of origin
+                        // (RestoreFootprintOpFrame.cpp:222-224 passes std::nullopt,
+                        // TransactionUtils.cpp:2328-2329 maps nullopt → (0, 0))
                         let (is_persistent, is_code_entry) = rent_classification(key);
                         snapshots.push(RentSnapshot {
                             key: key.clone(),
                             is_persistent,
                             is_code_entry,
-                            old_size_bytes: entry_size,
-                            old_live_until: ttl,
+                            old_state: OldRentState::RestoreFromScratch,
                         });
                     } else {
                         // Case 2: No TTL -> check if already restored in this
@@ -1202,11 +1222,10 @@ pub fn execute_operation_with_soroban(
                         // deleted, skip it. The immutable hot archive snapshot would
                         // still return the entry, but restoring it again diverges.
                         // GuardedHotArchive::get() handles this check transparently.
+                        //
                         // Per stellar-core createEntryRentChangeWithoutModification():
-                        // When entryLiveUntilLedger is std::nullopt (no previous TTL):
-                        //   - old_size_bytes = 0
-                        //   - old_live_until_ledger = 0
-                        // This is different from expired entries where we use the actual old size.
+                        // ALL restores use old = (0, 0) regardless of origin
+                        // (RestoreFootprintOpFrame.cpp:222-224 passes std::nullopt).
                         if let Some(ref guarded) = soroban.guarded_hot_archive {
                             if let Some(entry) = guarded.get(key).map_err(|e| {
                                 TxError::Internal(format!(
@@ -1218,8 +1237,7 @@ pub fn execute_operation_with_soroban(
                                     key: key.clone(),
                                     is_persistent,
                                     is_code_entry,
-                                    old_size_bytes: 0, // Hot archive entries: old_size_bytes = 0
-                                    old_live_until: 0, // Hot archive entries: old_live_until = 0
+                                    old_state: OldRentState::RestoreFromScratch,
                                 });
                                 // Track this entry for RESTORED metadata emission
                                 let restored_live_until = crate::soroban::restore_ttl_target(
@@ -2212,6 +2230,112 @@ mod tests {
             ),
             "RestoreFootprint in Classic context should return Malformed, got {:?}",
             result.result
+        );
+    }
+
+    /// Regression test for AUDIT-268: RestoreFootprint rent fee must use (0, 0) for
+    /// expired live-BL entries, not actual (entry_size, ttl).
+    ///
+    /// stellar-core passes std::nullopt for ALL restores (RestoreFootprintOpFrame.cpp:222-224),
+    /// which maps to old_size_bytes=0, old_live_until=0 (TransactionUtils.cpp:2328-2329).
+    /// The bug was that henyey used actual values, yielding a lower rent fee.
+    #[test]
+    fn test_restore_footprint_rent_uses_zero_for_expired_live_bl() {
+        use crate::state::LedgerStateManager;
+
+        let current_ledger: u32 = 1000;
+        let expired_ttl: u32 = 500; // Entry expired 500 ledgers ago
+        let min_persistent_ttl: u32 = 120960;
+        let new_ttl = crate::soroban::ttl::restore_ttl_target(current_ledger, min_persistent_ttl);
+
+        // Create a persistent contract data entry
+        let contract_hash = Hash([1u8; 32]);
+        let contract = ScAddress::Contract(ContractId(contract_hash));
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract.clone(),
+            key: ScVal::Bool(true),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract,
+                key: ScVal::Bool(true),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Bytes(ScBytes(vec![0xAA; 100].try_into().unwrap())),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let entry_size = henyey_common::xdr_encoded_len_u32(&entry);
+
+        // Set up state with the entry and an expired TTL
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        if let LedgerEntryData::ContractData(data) = &entry.data {
+            state.create_contract_data(data.clone());
+        }
+        let key_hash = crate::soroban::get_or_compute_key_hash(None, &key);
+        state.create_ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: expired_ttl,
+        });
+
+        // Build RentSnapshot with RestoreFromScratch (the fix)
+        let (is_persistent, is_code_entry) = rent_classification(&key);
+        let correct_snapshot = RentSnapshot {
+            key: key.clone(),
+            is_persistent,
+            is_code_entry,
+            old_state: OldRentState::RestoreFromScratch,
+        };
+
+        // Build RentSnapshot as the buggy code would have done (Existing with actual values)
+        let buggy_snapshot = RentSnapshot {
+            key: key.clone(),
+            is_persistent,
+            is_code_entry,
+            old_state: OldRentState::Existing {
+                size_bytes: entry_size,
+                live_until: expired_ttl,
+            },
+        };
+
+        // Simulate what happens after restore: TTL gets updated to new_ttl
+        state.update_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: new_ttl,
+        });
+
+        let protocol_version = 25;
+
+        // Compute rent changes for the correct (fixed) snapshot
+        let correct_changes =
+            rent_changes_from_snapshots(&[correct_snapshot], &state, protocol_version, None, None);
+
+        // Compute rent changes for the buggy snapshot
+        let buggy_changes =
+            rent_changes_from_snapshots(&[buggy_snapshot], &state, protocol_version, None, None);
+
+        // Correct behavior: old values are (0, 0) — full rent from scratch
+        assert_eq!(correct_changes.len(), 1);
+        assert_eq!(correct_changes[0].old_size_bytes, 0);
+        assert_eq!(correct_changes[0].old_live_until_ledger, 0);
+        assert_eq!(correct_changes[0].new_live_until_ledger, new_ttl);
+
+        // Buggy behavior would have used actual values — smaller delta
+        assert_eq!(buggy_changes.len(), 1);
+        assert_eq!(buggy_changes[0].old_size_bytes, entry_size);
+        assert_eq!(buggy_changes[0].old_live_until_ledger, expired_ttl);
+
+        // The correct rent delta is LARGER than the buggy one:
+        // correct: new_ttl - 0 = new_ttl
+        // buggy: new_ttl - expired_ttl = new_ttl - 500
+        assert!(
+            correct_changes[0].new_live_until_ledger - correct_changes[0].old_live_until_ledger
+                > buggy_changes[0].new_live_until_ledger - buggy_changes[0].old_live_until_ledger,
+            "Correct rent delta should be larger than buggy delta"
         );
     }
 }
