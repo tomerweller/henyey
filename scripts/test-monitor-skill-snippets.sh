@@ -43,7 +43,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=87
+TAP_PLAN=90
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -1547,6 +1547,97 @@ except Exception as e:
     tap_ok "quarantine-remove: invalid SHA returns 1"
   else
     tap_not_ok "quarantine-remove: invalid SHA returns 1" "rc=$rc87"
+  fi
+
+  # ── Test 88: quarantine_append — reason sanitization ───────────────────────
+  # Construct a reason with control chars and >200 printable chars post-strip.
+  local sanitize_file="$qdir/sanitize_test.txt"
+  rm -f "$sanitize_file"
+  local LC_ALL=C
+  # Build 210 printable 'A' chars interspersed with control chars
+  local raw_reason
+  raw_reason=$(printf 'A%.0s' {1..210})
+  # Inject control chars at various positions
+  raw_reason="${raw_reason:0:50}"$'\n'"${raw_reason:50:50}"$'\t'"${raw_reason:100:50}"$'\r'"${raw_reason:150:30}"$'\x01'"${raw_reason:180:30}"
+  local rc88=0
+  quarantine_append "$sanitize_file" "$sha1" "$raw_reason" || rc88=$?
+  local t88_ok="ok"
+  if [[ $rc88 -ne 0 ]]; then
+    t88_ok="rc=$rc88 (expected 0)"
+  elif [[ $(wc -l < "$sanitize_file") -ne 1 ]]; then
+    t88_ok="file has $(wc -l < "$sanitize_file") lines (expected 1)"
+  elif grep -qP '[\x00-\x1f]' "$sanitize_file"; then
+    t88_ok="file contains control chars"
+  else
+    # Extract reason: skip the 40-char SHA + 1 space = 41 chars prefix
+    local stored_reason
+    stored_reason=$(cut -c42- < "$sanitize_file")
+    local reason_len=${#stored_reason}
+    if [[ $reason_len -ne 200 ]]; then
+      t88_ok="reason length=$reason_len (expected 200)"
+    else
+      # Expected: first 200 'A' chars (all control chars stripped, then truncated)
+      local expected_reason
+      expected_reason=$(printf 'A%.0s' {1..200})
+      if [[ "$stored_reason" != "$expected_reason" ]]; then
+        t88_ok="reason content mismatch"
+      fi
+    fi
+  fi
+  if [[ "$t88_ok" == "ok" ]]; then
+    tap_ok "quarantine-append: reason sanitization (control chars stripped, truncated to 200)"
+  else
+    tap_not_ok "quarantine-append: reason sanitization (control chars stripped, truncated to 200)" \
+      "$t88_ok"
+  fi
+
+  # ── Test 89: quarantine_append — I/O error (mkdir fails, rc=2) ─────────────
+  # Use a regular file as a path component so mkdir -p fails deterministically.
+  touch "$qdir/blocker_file"
+  local rc89=0
+  quarantine_append "$qdir/blocker_file/sub/quarantine.txt" "$sha1" "reason" || rc89=$?
+  local t89_ok="ok"
+  if [[ $rc89 -ne 2 ]]; then
+    t89_ok="rc=$rc89 (expected 2)"
+  elif [[ -d "$qdir/blocker_file/sub" ]]; then
+    t89_ok="sub/ directory was created (partial side effect)"
+  elif [[ -e "$qdir/blocker_file/sub/quarantine.txt" ]]; then
+    t89_ok="quarantine file was created (partial side effect)"
+  fi
+  if [[ "$t89_ok" == "ok" ]]; then
+    tap_ok "quarantine-append: I/O error (mkdir fails) returns 2"
+  else
+    tap_not_ok "quarantine-append: I/O error (mkdir fails) returns 2" \
+      "$t89_ok"
+  fi
+
+  # ── Test 90: quarantine_remove — I/O error (mv fails, rc=2) ────────────────
+  # Mock mv to simulate failure; verify rc=2, file unchanged, no .tmp leftover.
+  local mv_test_file="$qdir/mv_fail_test.txt"
+  printf '%s regression\n' "$sha1" > "$mv_test_file"
+  local pre_content
+  pre_content=$(cat "$mv_test_file")
+  mv() { return 1; }
+  local rc90=0
+  quarantine_remove "$mv_test_file" "$sha1" || rc90=$?
+  unset -f mv
+  local t90_ok="ok"
+  if [[ $rc90 -ne 2 ]]; then
+    t90_ok="rc=$rc90 (expected 2)"
+  else
+    local post_content
+    post_content=$(cat "$mv_test_file")
+    if [[ "$post_content" != "$pre_content" ]]; then
+      t90_ok="file content changed"
+    elif [[ -e "${mv_test_file}.tmp" ]]; then
+      t90_ok=".tmp file was not cleaned up"
+    fi
+  fi
+  if [[ "$t90_ok" == "ok" ]]; then
+    tap_ok "quarantine-remove: I/O error (mv fails) returns 2, file unchanged, no .tmp"
+  else
+    tap_not_ok "quarantine-remove: I/O error (mv fails) returns 2, file unchanged, no .tmp" \
+      "$t90_ok"
   fi
 }
 check_skill_structure
