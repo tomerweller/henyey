@@ -328,6 +328,12 @@ check_skill_structure() {
   if ! check_filing_balance "$tick_file" "^### Filing flow" "monitor-tick"; then
     drift=true
   fi
+  if ! check_filing_balance "$tick_file" "^### Firing alerts" "monitor-tick/alerts"; then
+    drift=true
+  fi
+  if ! check_filing_balance "$tick_file" "^## CI check workflow" "monitor-tick/ci"; then
+    drift=true
+  fi
   if ! check_filing_balance "$loop_file" "^## Bug \/ CI-Failure Filing Workflow" "monitor-loop"; then
     drift=true
   fi
