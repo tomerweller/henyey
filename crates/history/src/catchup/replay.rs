@@ -318,17 +318,22 @@ impl CatchupManager {
                 close_data = close_data.with_expected_header_hash(hash);
             }
 
-            let result = ledger_manager.close_ledger(close_data, None).map_err(|e| {
-                if matches!(e, henyey_ledger::LedgerError::HashMismatch { .. }) {
-                    HistoryError::Ledger(e)
-                } else {
-                    HistoryError::CatchupFailed(format!(
+            let result = ledger_manager
+                .close_ledger(close_data, None)
+                .map_err(|e| match e {
+                    henyey_ledger::LedgerError::HashMismatch { expected, actual } => {
+                        HistoryError::ReplayHashMismatch {
+                            ledger: data.header().ledger_seq,
+                            expected,
+                            actual,
+                        }
+                    }
+                    other => HistoryError::CatchupFailed(format!(
                         "close_ledger failed at ledger {}: {}",
                         data.header().ledger_seq,
-                        e
-                    ))
-                }
-            })?;
+                        other
+                    )),
+                })?;
 
             // Emit metadata to SQLite and external consumers (e.g., stellar-rpc's
             // meta pipe in bounded replay mode: `catchup --metadata-output-stream fd:3`).
@@ -424,6 +429,11 @@ mod tests {
                 expected: "abc".into(),
                 actual: "def".into(),
             }),
+            HistoryError::ReplayHashMismatch {
+                ledger: 100,
+                expected: "abc".into(),
+                actual: "def".into(),
+            },
         ];
         for err in &fatal_errors {
             assert!(err.is_fatal_catchup_failure(), "expected fatal: {}", err);

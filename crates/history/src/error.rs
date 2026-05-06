@@ -309,6 +309,30 @@ pub enum HistoryError {
         info: Box<TxSetHashMismatchInfo>,
     },
 
+    /// Ledger hash mismatch during catchup replay.
+    ///
+    /// Returned only by the replay path (`replay_via_close_ledger`) when
+    /// `close_ledger` produces a `LedgerError::HashMismatch`. This can
+    /// originate from:
+    /// - Header hash validation (expected vs computed ledger header hash)
+    /// - Previous-hash chain checks
+    /// - Bucket list hash verification
+    ///
+    /// Other callers may still produce `HistoryError::Ledger(LedgerError::HashMismatch { .. })`
+    /// via the `From<LedgerError>` conversion or direct propagation.
+    ///
+    /// The variant captures replay-specific context (ledger sequence)
+    /// alongside the raw hash strings from the underlying `LedgerError`.
+    #[error("replay hash mismatch at ledger {ledger}: expected {expected}, got {actual}")]
+    ReplayHashMismatch {
+        /// The ledger sequence being replayed when the mismatch was detected.
+        ledger: u32,
+        /// The expected hash (hex-encoded).
+        expected: String,
+        /// The actual computed hash (hex-encoded).
+        actual: String,
+    },
+
     /// Not a checkpoint ledger.
     #[error("not a checkpoint ledger: {0}")]
     NotCheckpointLedger(u32),
@@ -367,7 +391,7 @@ impl HistoryError {
     ///
     /// - Hash chain verification failures (`InvalidPreviousHash`)
     /// - Bucket list / ledger hash mismatches (`VerificationFailed`,
-    ///   `VerificationHashMismatch`)
+    ///   `VerificationHashMismatch`, `ReplayHashMismatch`)
     /// - Transaction set hash mismatches (`InvalidTxSetHash`)
     /// - Ledger-apply hash mismatches (`Ledger(LedgerError::HashMismatch)`)
     ///
@@ -382,6 +406,7 @@ impl HistoryError {
                 | HistoryError::InvalidTxSetHash { .. }
                 | HistoryError::InvalidSequence { .. }
                 | HistoryError::CorruptHeader { .. }
+                | HistoryError::ReplayHashMismatch { .. }
                 | HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. })
         )
     }
@@ -394,6 +419,8 @@ impl HistoryError {
     /// - [`VerificationHashMismatch`](HistoryError::VerificationHashMismatch)
     ///   — verification and replay paths (bucket, bucket list, header entry,
     ///   tx result set, trusted header, bottom anchor, LCL)
+    /// - [`ReplayHashMismatch`](HistoryError::ReplayHashMismatch) — replay
+    ///   path hash mismatch with ledger sequence context
     /// - [`InvalidTxSetHash`](HistoryError::InvalidTxSetHash) — tx set hash
     ///   mismatch with rich diagnostic context
     /// - [`Ledger(LedgerError::HashMismatch)`](HistoryError::Ledger) —
@@ -408,6 +435,7 @@ impl HistoryError {
             HistoryError::VerificationHashMismatch(_)
                 | HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. })
                 | HistoryError::InvalidTxSetHash { .. }
+                | HistoryError::ReplayHashMismatch { .. }
         )
     }
 }
@@ -468,6 +496,16 @@ mod tests {
             err.is_fatal_catchup_failure(),
             "Ledger(HashMismatch) should be a fatal catchup failure"
         );
+
+        let err = HistoryError::ReplayHashMismatch {
+            ledger: 42,
+            expected: "abc".into(),
+            actual: "def".into(),
+        };
+        assert!(
+            err.is_fatal_catchup_failure(),
+            "ReplayHashMismatch should be a fatal catchup failure"
+        );
     }
 
     #[test]
@@ -489,6 +527,14 @@ mod tests {
             "classic",
         )
         .into_error(5);
+        assert!(err.is_hash_mismatch());
+
+        // Positive: ReplayHashMismatch
+        let err = HistoryError::ReplayHashMismatch {
+            ledger: 100,
+            expected: "abc".into(),
+            actual: "def".into(),
+        };
         assert!(err.is_hash_mismatch());
 
         // Negative: CatchupFailed is NOT a hash mismatch
@@ -647,5 +693,43 @@ mod tests {
         assert_eq!(VerifyHashKind::TrustedHeader.to_string(), "trusted header");
         assert_eq!(VerifyHashKind::BottomAnchor.to_string(), "bottom anchor");
         assert_eq!(VerifyHashKind::Lcl.to_string(), "LCL");
+    }
+
+    #[test]
+    fn test_replay_hash_mismatch_fields_and_display() {
+        let err = HistoryError::ReplayHashMismatch {
+            ledger: 42,
+            expected: "abc123".into(),
+            actual: "def456".into(),
+        };
+
+        // Verify field access via pattern matching
+        if let HistoryError::ReplayHashMismatch {
+            ledger,
+            expected,
+            actual,
+        } = &err
+        {
+            assert_eq!(*ledger, 42);
+            assert_eq!(expected, "abc123");
+            assert_eq!(actual, "def456");
+        } else {
+            panic!("Expected ReplayHashMismatch variant");
+        }
+
+        // Verify Display includes all structured fields
+        let display = err.to_string();
+        assert!(
+            display.contains("42"),
+            "Display should include ledger sequence"
+        );
+        assert!(
+            display.contains("abc123"),
+            "Display should include expected hash"
+        );
+        assert!(
+            display.contains("def456"),
+            "Display should include actual hash"
+        );
     }
 }
