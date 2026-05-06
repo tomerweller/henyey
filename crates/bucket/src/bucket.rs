@@ -1874,6 +1874,21 @@ mod tests {
     }
 
     #[test]
+    fn test_from_entries_rejects_duplicates() {
+        let entry1 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+        let entry2 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 200));
+        let entry3 = BucketEntry::Liveentry(make_account_entry([2u8; 32], 100));
+
+        let result = Bucket::from_entries(vec![entry1, entry2, entry3]);
+        assert!(result.is_err(), "from_entries should reject duplicate keys");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not strictly sorted"),
+            "Expected 'not strictly sorted' in error: {err_msg}"
+        );
+    }
+
+    #[test]
     fn test_from_parts_rejects_unsorted() {
         let entry_high = BucketEntry::Liveentry(make_account_entry([2u8; 32], 100));
         let entry_low = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));

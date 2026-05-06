@@ -502,30 +502,6 @@ mod tests {
     }
 
     #[test]
-    fn test_applicator_deduplication() {
-        let entries = vec![
-            BucketEntry::Liveentry(make_account_entry(1)),
-            BucketEntry::Liveentry(make_account_entry(1)), // Duplicate
-            BucketEntry::Liveentry(make_account_entry(2)),
-        ];
-
-        let bucket = Arc::new(Bucket::from_entries(entries).unwrap());
-        let mut applicator = BucketApplicator::new(bucket, 25, 0);
-        let mut counters = ApplicatorCounters::new();
-
-        let batch = applicator.apply_all(&mut counters).unwrap();
-
-        // Duplicates should be deduplicated
-        let account_upserts = batch
-            .iter()
-            .filter(|e| !e.is_delete() && matches!(e.key(), LedgerKey::Account(_)))
-            .count();
-
-        // Due to sorting, only 2 unique accounts should be in the batch
-        assert_eq!(account_upserts, 2);
-    }
-
-    #[test]
     fn test_applicator_progress() {
         let entries: Vec<BucketEntry> = (0..10u8)
             .map(|i| BucketEntry::Liveentry(make_account_entry(i)))
