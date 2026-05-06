@@ -1085,6 +1085,7 @@ mod tests {
         metrics.fetch_unique_recv.add(3);
         metrics.fetch_duplicate_recv.add(7);
         metrics.item_fetcher_next_peer.add(4);
+        metrics.item_fetcher_tracker_cap_reached.add(2);
 
         let snap = metrics.snapshot();
         assert_eq!(snap.flood_broadcast, 5);
@@ -1093,6 +1094,7 @@ mod tests {
         assert_eq!(snap.fetch_unique_recv, 3);
         assert_eq!(snap.fetch_duplicate_recv, 7);
         assert_eq!(snap.item_fetcher_next_peer, 4);
+        assert_eq!(snap.item_fetcher_tracker_cap_reached, 2);
     }
 
     #[test]
@@ -1105,6 +1107,7 @@ mod tests {
         metrics.fetch_unique_recv.add(40);
         metrics.fetch_duplicate_recv.add(50);
         metrics.item_fetcher_next_peer.add(60);
+        metrics.item_fetcher_tracker_cap_reached.add(70);
 
         metrics.reset();
 
@@ -1115,6 +1118,7 @@ mod tests {
         assert_eq!(snap.fetch_unique_recv, 0);
         assert_eq!(snap.fetch_duplicate_recv, 0);
         assert_eq!(snap.item_fetcher_next_peer, 0);
+        assert_eq!(snap.item_fetcher_tracker_cap_reached, 0);
     }
 
     #[test]
