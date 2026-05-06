@@ -1180,51 +1180,22 @@ Otherwise enter the deploy path:
 3. **Quarantine gate** (only reached when `needs_rebuild=yes`):
    ```bash
    # --- Quarantine gate ---
-   QUARANTINE_FILE="$HOME/data/deploy_quarantine.txt"
-   quarantined_match=""
-   quarantine_warnings=""
-
-   if [ -s "$QUARANTINE_FILE" ]; then
-     while IFS=' ' read -r q_sha _rest || [ -n "$q_sha" ]; do
-       # Skip blank lines and comments
-       [ -z "$q_sha" ] && continue
-       case "$q_sha" in \#*) continue ;; esac
-
-       # Validate: exactly 40 lowercase hex chars
-       if ! printf '%s' "$q_sha" | grep -qxE '[0-9a-f]{40}'; then
-         quarantine_warnings="${quarantine_warnings:+$quarantine_warnings, }malformed: ${q_sha:0:12}..."
-         continue
-       fi
-
-       # Check reachability: is this SHA an ancestor-or-equal of origin/main?
-       # Exit codes: 0 = is ancestor, 1 = is NOT ancestor, 128+ = error
-       merge_base_rc=0
-       git merge-base --is-ancestor "$q_sha" origin/main 2>/dev/null || merge_base_rc=$?
-
-       if [ "$merge_base_rc" -eq 0 ]; then
-         quarantined_match="$q_sha"
-         break
-       elif [ "$merge_base_rc" -ge 128 ]; then
-         # git error (object missing, shallow clone, corrupt) — FAIL CLOSED.
-         quarantine_warnings="${quarantine_warnings:+$quarantine_warnings, }ancestry-check-error: ${q_sha:0:8} (rc=$merge_base_rc)"
-         quarantined_match="$q_sha"
-         break
-       fi
-       # rc=1 means not an ancestor — SHA not reachable, skip this entry.
-     done < "$QUARANTINE_FILE"
-   fi
-
-   if [ -n "$quarantined_match" ]; then
-     # BLOCK: do NOT proceed to CI check, build, or restart.
-     deploy_report="DEFERRED (quarantined: ${quarantined_match:0:8} reachable from origin/main — see ~/data/deploy_quarantine.txt)"
-     [ -n "$quarantine_warnings" ] && deploy_report="$deploy_report [WARN: $quarantine_warnings]"
+   source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
+   check_quarantine_ancestry "$HOME/data/deploy_quarantine.txt"
+   if [ $? -eq 0 ]; then
+     case "$QUARANTINE_STATUS" in
+       blocked_unreadable)
+         deploy_report="BLOCKED (quarantine file unreadable — fail-closed)" ;;
+       blocked_git_error)
+         deploy_report="BLOCKED (quarantine ancestry check failed for ${QUARANTINED_MATCH:0:8} — fail-closed)" ;;
+       blocked_ancestor)
+         deploy_report="DEFERRED (quarantined: ${QUARANTINED_MATCH:0:8} reachable from origin/main — see ~/data/deploy_quarantine.txt)" ;;
+     esac
+     [ -n "$QUARANTINE_WARNINGS" ] && deploy_report="$deploy_report [WARN: $QUARANTINE_WARNINGS]"
      # Skip to status report with this deploy_report. Do not continue.
    fi
-   # If not quarantined, append any parse warnings to final deploy report:
-   # [ -n "$quarantine_warnings" ] && deploy_report="$deploy_report [WARN: $quarantine_warnings]"
    ```
-   If quarantined, report `DEPLOY DEFERRED (quarantined: <sha8> reachable from
-   origin/main — see ~/data/deploy_quarantine.txt)` and exit the deploy path.
+   If quarantined, report the appropriate status and exit the deploy path.
    Do NOT proceed to CI check, build, or restart. Parse/check warnings are
    appended to the `deploy:` status line regardless of outcome.
 4. Check CI status on origin/main: `gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'`.
@@ -1393,12 +1364,13 @@ overwritten during rebuild):
 bad_sha=$(cat "$BUILD_SHA_FILE")
 ```
 
-(b) Append to quarantine file (idempotent, exact first-field match):
+(b) Append to quarantine file (idempotent):
 
 ```bash
-if ! awk -v sha="$bad_sha" '$1 == sha { found=1; exit } END { exit !found }' \
-     "$HOME/data/deploy_quarantine.txt" 2>/dev/null; then
-  printf '%s regression #<issue>\n' "$bad_sha" >> "$HOME/data/deploy_quarantine.txt"
+source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
+quarantine_append "$HOME/data/deploy_quarantine.txt" "$bad_sha" "regression #<issue>"
+if [ $? -eq 2 ]; then
+  echo "WARNING: quarantine append I/O error — deploy gate may not block next tick" >&2
 fi
 ```
 
@@ -1424,13 +1396,14 @@ entries. Clearance is an explicit operator decision.
 3. The operator has reviewed the fix commit and is confident the
    regression is resolved.
 
-**How to clear** (exact first-field match, atomic via tmp+mv):
+**How to clear** (using the deploy-quarantine helper):
 
 ```bash
-bad_sha="<sha-to-remove>"
-awk -v sha="$bad_sha" '$1 != sha' "$HOME/data/deploy_quarantine.txt" \
-  > "$HOME/data/deploy_quarantine.txt.tmp" \
-  && mv "$HOME/data/deploy_quarantine.txt.tmp" "$HOME/data/deploy_quarantine.txt"
+source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
+quarantine_remove "$HOME/data/deploy_quarantine.txt" "$bad_sha"
+if [ $? -eq 2 ]; then
+  echo "ERROR: quarantine remove I/O error — entry may still be active" >&2
+fi
 ```
 
 **Operator reminders**: The `deploy:` status line reports
@@ -1441,7 +1414,9 @@ persistent, automatic reminder that requires no separate notification.
 
 ```bash
 rm "$HOME/data/deploy_quarantine.txt"   # clears ALL quarantines
-# or: remove the specific entry per the awk command above
+# or: remove a specific entry using the helper:
+# source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
+# quarantine_remove "$HOME/data/deploy_quarantine.txt" "<sha>"
 ```
 
 ## Investigation
@@ -1471,7 +1446,7 @@ MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   metrics: <clean | N alerts (<metric1>,<metric2>,...) — filed/commented #<N>,#<M> | N alerts, K suppressed by cooldown>
   metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating>, pending <ok (too_old=Z%) | skipped (reason) | WARNING too_old=Z%>50% (N ticks)> | collecting baseline
   recovery_stalled: <ok (delta=0) | breach (delta=N, streak M/3) | WARNING delta=N (M ticks) — investigating | WARNING delta=N (burst) — investigating | skipped (<reason>) | collecting baseline>
-  deploy:  <up-to-date | DEFERRED (quarantined: <sha8> reachable from origin/main — see ~/data/deploy_quarantine.txt) | DEFERRED (cool-down: ...) | SYNCED (no-binary-impact: ...) | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
+  deploy:  <up-to-date | DEFERRED (quarantined: <sha8> reachable from origin/main — see ~/data/deploy_quarantine.txt) | BLOCKED (quarantine file unreadable — fail-closed) | BLOCKED (quarantine ancestry check failed for <sha8> — fail-closed) | DEFERRED (cool-down: ...) | SYNCED (no-binary-impact: ...) | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
   ci:      <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
   self_reflect: <clean | fixed inline (<sha>: <short-desc>) | filed #<N> (urgent: <short-desc>) | filed #<N> (no-label: <short-desc>) | filed #<N> (not-ready: <short-desc>)>
 ```

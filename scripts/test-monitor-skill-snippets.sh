@@ -21,8 +21,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_ROOT="$REPO_ROOT/data/test-monitor-snippets"
 
-# ── Source the shared library (single source of truth) ────────────────────────
+# ── Source the shared libraries (single source of truth) ──────────────────────
 source "$SCRIPT_DIR/lib/monitor-decisions.sh"
+source "$SCRIPT_DIR/lib/deploy-quarantine.sh"
 
 # ── Arguments ────────────────────────────────────────────────────────────────
 STRICT=false
@@ -42,7 +43,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=65
+TAP_PLAN=87
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -171,6 +172,37 @@ check_skill_structure() {
   fi
   if grep -qE 'grep.*Heartbeat.*monitor' "$loop_file" 2>/dev/null; then
     echo "WARNING: monitor-loop/SKILL.md contains raw grep Heartbeat (use grep_heartbeat_lines)" >&2
+    drift=true
+  fi
+
+  # deploy-quarantine.sh: monitor-tick must source and call quarantine helpers
+  if ! grep -q 'source.*scripts/lib/deploy-quarantine.sh\|source.*deploy-quarantine.sh' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not source scripts/lib/deploy-quarantine.sh" >&2
+    drift=true
+  fi
+  if ! grep -q 'check_quarantine_ancestry' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not call check_quarantine_ancestry" >&2
+    drift=true
+  fi
+  if ! grep -q 'quarantine_append' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not call quarantine_append" >&2
+    drift=true
+  fi
+  if ! grep -q 'quarantine_remove' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not call quarantine_remove" >&2
+    drift=true
+  fi
+  # Old inline quarantine patterns should be gone
+  if grep -q 'while IFS=.*read.*q_sha' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md still contains old inline quarantine read loop" >&2
+    drift=true
+  fi
+  if grep -qE 'awk.*\$1 == sha.*found=1' "$tick_file" 2>/dev/null; then
+    echo "WARNING: monitor-tick/SKILL.md still contains old inline quarantine append awk" >&2
+    drift=true
+  fi
+  if grep -qE 'awk.*\$1 != sha.*deploy_quarantine' "$tick_file" 2>/dev/null; then
+    echo "WARNING: monitor-tick/SKILL.md still contains old inline quarantine remove awk" >&2
     drift=true
   fi
 
@@ -1253,9 +1285,270 @@ except Exception as e:
       fi
     fi
   fi
-}
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+  # ── Deploy Quarantine Tests ──────────────────────────────────────────────────
+
+  local qdir="$TEST_ROOT/quarantine"
+  mkdir -p "$qdir"
+
+  # ── Test 66: parse_quarantine_file — missing file ──────────────────────────
+  parse_quarantine_file "$qdir/nonexistent.txt"
+  if [[ $? -eq 0 && -z "$QUARANTINE_ENTRIES" && -z "$QUARANTINE_WARNINGS" ]]; then
+    tap_ok "quarantine-parse: missing file returns 0 with empty outputs"
+  else
+    tap_not_ok "quarantine-parse: missing file returns 0 with empty outputs" \
+      "rc=$? entries='$QUARANTINE_ENTRIES' warnings='$QUARANTINE_WARNINGS'"
+  fi
+
+  # ── Test 67: parse_quarantine_file — empty file ────────────────────────────
+  touch "$qdir/empty.txt"
+  parse_quarantine_file "$qdir/empty.txt"
+  if [[ $? -eq 0 && -z "$QUARANTINE_ENTRIES" && -z "$QUARANTINE_WARNINGS" ]]; then
+    tap_ok "quarantine-parse: empty file returns 0 with empty outputs"
+  else
+    tap_not_ok "quarantine-parse: empty file returns 0 with empty outputs" \
+      "rc=$? entries='$QUARANTINE_ENTRIES' warnings='$QUARANTINE_WARNINGS'"
+  fi
+
+  # ── Test 68: parse_quarantine_file — unreadable file ───────────────────────
+  echo "abc" > "$qdir/unreadable.txt"
+  chmod 000 "$qdir/unreadable.txt"
+  local rc68=0
+  parse_quarantine_file "$qdir/unreadable.txt" || rc68=$?
+  chmod 644 "$qdir/unreadable.txt"  # restore for cleanup
+  if [[ $rc68 -eq 1 && "$QUARANTINE_WARNINGS" == *"unreadable"* ]]; then
+    tap_ok "quarantine-parse: unreadable file returns 1 (fail-closed)"
+  else
+    tap_not_ok "quarantine-parse: unreadable file returns 1 (fail-closed)" \
+      "rc=$rc68 warnings='$QUARANTINE_WARNINGS'"
+  fi
+
+  # ── Test 69: parse_quarantine_file — comments only ─────────────────────────
+  printf '# comment line\n  # indented comment\n\n' > "$qdir/comments.txt"
+  parse_quarantine_file "$qdir/comments.txt"
+  if [[ $? -eq 0 && -z "$QUARANTINE_ENTRIES" && -z "$QUARANTINE_WARNINGS" ]]; then
+    tap_ok "quarantine-parse: comments-only file returns empty"
+  else
+    tap_not_ok "quarantine-parse: comments-only file returns empty" \
+      "entries='$QUARANTINE_ENTRIES' warnings='$QUARANTINE_WARNINGS'"
+  fi
+
+  # ── Test 70: parse_quarantine_file — valid entries ─────────────────────────
+  local sha1="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  local sha2="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  printf '%s regression #100\n%s regression #200\n' "$sha1" "$sha2" > "$qdir/valid.txt"
+  parse_quarantine_file "$qdir/valid.txt"
+  local expected_entries
+  expected_entries=$(printf '%s\n%s' "$sha1" "$sha2")
+  if [[ $? -eq 0 && "$QUARANTINE_ENTRIES" == "$expected_entries" && -z "$QUARANTINE_WARNINGS" ]]; then
+    tap_ok "quarantine-parse: valid entries parsed correctly"
+  else
+    tap_not_ok "quarantine-parse: valid entries parsed correctly" \
+      "entries='$QUARANTINE_ENTRIES' expected='$expected_entries' warnings='$QUARANTINE_WARNINGS'"
+  fi
+
+  # ── Test 71: parse_quarantine_file — malformed entries ─────────────────────
+  printf 'ZZZZ not-a-sha\ntoo-short\n' > "$qdir/malformed.txt"
+  parse_quarantine_file "$qdir/malformed.txt"
+  if [[ $? -eq 0 && -z "$QUARANTINE_ENTRIES" && "$QUARANTINE_WARNINGS" == *"malformed"* ]]; then
+    tap_ok "quarantine-parse: malformed entries produce warnings"
+  else
+    tap_not_ok "quarantine-parse: malformed entries produce warnings" \
+      "entries='$QUARANTINE_ENTRIES' warnings='$QUARANTINE_WARNINGS'"
+  fi
+
+  # ── Test 72: parse_quarantine_file — mixed valid/malformed/comments ────────
+  {
+    printf '# header\n'
+    printf '%s good one\n' "$sha1"
+    printf 'BADSHA nope\n'
+    printf '\n'
+    printf '%s another good\n' "$sha2"
+  } > "$qdir/mixed.txt"
+  parse_quarantine_file "$qdir/mixed.txt"
+  expected_entries=$(printf '%s\n%s' "$sha1" "$sha2")
+  if [[ $? -eq 0 && "$QUARANTINE_ENTRIES" == "$expected_entries" && "$QUARANTINE_WARNINGS" == *"malformed: BADSHA"* ]]; then
+    tap_ok "quarantine-parse: mixed file — valid entries + warnings"
+  else
+    tap_not_ok "quarantine-parse: mixed file — valid entries + warnings" \
+      "entries='$QUARANTINE_ENTRIES' warnings='$QUARANTINE_WARNINGS'"
+  fi
+
+  # ── Test 73: parse_quarantine_file — tab-separated entry ───────────────────
+  printf '%s\tregression tab-separated\n' "$sha1" > "$qdir/tabs.txt"
+  parse_quarantine_file "$qdir/tabs.txt"
+  if [[ $? -eq 0 && "$QUARANTINE_ENTRIES" == "$sha1" ]]; then
+    tap_ok "quarantine-parse: tab-separated entry parsed"
+  else
+    tap_not_ok "quarantine-parse: tab-separated entry parsed" \
+      "entries='$QUARANTINE_ENTRIES'"
+  fi
+
+  # ── Test 74: parse_quarantine_file — CRLF line endings ─────────────────────
+  printf '%s reason\r\n' "$sha1" > "$qdir/crlf.txt"
+  parse_quarantine_file "$qdir/crlf.txt"
+  if [[ $? -eq 0 && "$QUARANTINE_ENTRIES" == "$sha1" ]]; then
+    tap_ok "quarantine-parse: CRLF stripped correctly"
+  else
+    tap_not_ok "quarantine-parse: CRLF stripped correctly" \
+      "entries='$QUARANTINE_ENTRIES'"
+  fi
+
+  # ── Test 75: parse_quarantine_file — bare SHA (no reason) ──────────────────
+  printf '%s\n' "$sha1" > "$qdir/bare.txt"
+  parse_quarantine_file "$qdir/bare.txt"
+  if [[ $? -eq 0 && "$QUARANTINE_ENTRIES" == "$sha1" ]]; then
+    tap_ok "quarantine-parse: bare SHA (no reason) is valid"
+  else
+    tap_not_ok "quarantine-parse: bare SHA (no reason) is valid" \
+      "entries='$QUARANTINE_ENTRIES'"
+  fi
+
+  # ── Test 76: check_quarantine_ancestry — empty file (clear) ────────────────
+  # Mock git to never be called
+  git() { return 99; }
+  touch "$qdir/empty_anc.txt"
+  local rc76=0
+  check_quarantine_ancestry "$qdir/empty_anc.txt" || rc76=$?
+  unset -f git
+  if [[ $rc76 -eq 1 && "$QUARANTINE_STATUS" == "clear" && -z "$QUARANTINED_MATCH" ]]; then
+    tap_ok "quarantine-ancestry: empty file returns 1 (clear)"
+  else
+    tap_not_ok "quarantine-ancestry: empty file returns 1 (clear)" \
+      "rc=$rc76 status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 77: check_quarantine_ancestry — ancestor match ────────────────────
+  printf '%s regression\n' "$sha1" > "$qdir/ancestor.txt"
+  git() { return 0; }  # mock: always ancestor
+  local rc77=0
+  check_quarantine_ancestry "$qdir/ancestor.txt" || rc77=$?
+  unset -f git
+  if [[ $rc77 -eq 0 && "$QUARANTINE_STATUS" == "blocked_ancestor" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-ancestry: ancestor returns 0 (blocked)"
+  else
+    tap_not_ok "quarantine-ancestry: ancestor returns 0 (blocked)" \
+      "rc=$rc77 status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78: check_quarantine_ancestry — not ancestor (clear) ──────────────
+  printf '%s regression\n' "$sha1" > "$qdir/not_ancestor.txt"
+  git() { return 1; }  # mock: not ancestor
+  local rc78=0
+  check_quarantine_ancestry "$qdir/not_ancestor.txt" || rc78=$?
+  unset -f git
+  if [[ $rc78 -eq 1 && "$QUARANTINE_STATUS" == "clear" && -z "$QUARANTINED_MATCH" ]]; then
+    tap_ok "quarantine-ancestry: not ancestor returns 1 (clear)"
+  else
+    tap_not_ok "quarantine-ancestry: not ancestor returns 1 (clear)" \
+      "rc=$rc78 status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 79: check_quarantine_ancestry — git error (fail-closed) ───────────
+  printf '%s regression\n' "$sha1" > "$qdir/git_error.txt"
+  git() { return 128; }  # mock: git error
+  local rc79=0
+  check_quarantine_ancestry "$qdir/git_error.txt" || rc79=$?
+  unset -f git
+  if [[ $rc79 -eq 0 && "$QUARANTINE_STATUS" == "blocked_git_error" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-ancestry: git error returns 0 (fail-closed)"
+  else
+    tap_not_ok "quarantine-ancestry: git error returns 0 (fail-closed)" \
+      "rc=$rc79 status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 80: check_quarantine_ancestry — unreadable file (fail-closed) ─────
+  echo "data" > "$qdir/unread_anc.txt"
+  chmod 000 "$qdir/unread_anc.txt"
+  local rc80=0
+  check_quarantine_ancestry "$qdir/unread_anc.txt" || rc80=$?
+  chmod 644 "$qdir/unread_anc.txt"
+  if [[ $rc80 -eq 0 && "$QUARANTINE_STATUS" == "blocked_unreadable" && "$QUARANTINED_MATCH" == "UNREADABLE" ]]; then
+    tap_ok "quarantine-ancestry: unreadable file returns 0 (fail-closed)"
+  else
+    tap_not_ok "quarantine-ancestry: unreadable file returns 0 (fail-closed)" \
+      "rc=$rc80 status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 81: quarantine_append — new entry ─────────────────────────────────
+  local append_file="$qdir/append_test.txt"
+  rm -f "$append_file"
+  quarantine_append "$append_file" "$sha1" "regression #500"
+  local rc81=$?
+  if [[ $rc81 -eq 0 && -f "$append_file" ]] && grep -q "^$sha1 regression #500$" "$append_file"; then
+    tap_ok "quarantine-append: new entry appended"
+  else
+    tap_not_ok "quarantine-append: new entry appended" \
+      "rc=$rc81 contents='$(cat "$append_file" 2>/dev/null)'"
+  fi
+
+  # ── Test 82: quarantine_append — duplicate (idempotent) ────────────────────
+  local before_content
+  before_content=$(cat "$append_file")
+  quarantine_append "$append_file" "$sha1" "regression #500"
+  local rc82=$?
+  local after_content
+  after_content=$(cat "$append_file")
+  if [[ $rc82 -eq 0 && "$before_content" == "$after_content" ]]; then
+    tap_ok "quarantine-append: duplicate is no-op"
+  else
+    tap_not_ok "quarantine-append: duplicate is no-op" \
+      "rc=$rc82 before='$before_content' after='$after_content'"
+  fi
+
+  # ── Test 83: quarantine_append — invalid SHA ───────────────────────────────
+  local rc83=0
+  quarantine_append "$append_file" "not-a-valid-sha" "reason" || rc83=$?
+  if [[ $rc83 -eq 1 ]]; then
+    tap_ok "quarantine-append: invalid SHA returns 1"
+  else
+    tap_not_ok "quarantine-append: invalid SHA returns 1" "rc=$rc83"
+  fi
+
+  # ── Test 84: quarantine_append — empty reason (bare SHA) ───────────────────
+  local bare_file="$qdir/append_bare.txt"
+  rm -f "$bare_file"
+  quarantine_append "$bare_file" "$sha2" ""
+  local rc84=$?
+  local bare_content
+  bare_content=$(cat "$bare_file")
+  if [[ $rc84 -eq 0 && "$bare_content" == "$sha2" ]]; then
+    tap_ok "quarantine-append: empty reason writes bare SHA (no trailing space)"
+  else
+    tap_not_ok "quarantine-append: empty reason writes bare SHA (no trailing space)" \
+      "rc=$rc84 content='$bare_content'"
+  fi
+
+  # ── Test 85: quarantine_remove — existing entry ────────────────────────────
+  local remove_file="$qdir/remove_test.txt"
+  printf '%s regression #100\n%s regression #200\n' "$sha1" "$sha2" > "$remove_file"
+  quarantine_remove "$remove_file" "$sha1"
+  local rc85=$?
+  if [[ $rc85 -eq 0 ]] && ! grep -q "^$sha1" "$remove_file" && grep -q "^$sha2" "$remove_file"; then
+    tap_ok "quarantine-remove: entry removed, others preserved"
+  else
+    tap_not_ok "quarantine-remove: entry removed, others preserved" \
+      "rc=$rc85 contents='$(cat "$remove_file")'"
+  fi
+
+  # ── Test 86: quarantine_remove — missing file (no-op) ──────────────────────
+  quarantine_remove "$qdir/no_such_file.txt" "$sha1"
+  local rc86=$?
+  if [[ $rc86 -eq 0 ]]; then
+    tap_ok "quarantine-remove: missing file returns 0"
+  else
+    tap_not_ok "quarantine-remove: missing file returns 0" "rc=$rc86"
+  fi
+
+  # ── Test 87: quarantine_remove — invalid SHA ───────────────────────────────
+  local rc87=0
+  quarantine_remove "$qdir/remove_test.txt" "invalid" || rc87=$?
+  if [[ $rc87 -eq 1 ]]; then
+    tap_ok "quarantine-remove: invalid SHA returns 1"
+  else
+    tap_not_ok "quarantine-remove: invalid SHA returns 1" "rc=$rc87"
+  fi
+}
 check_skill_structure
 run_tests
 
