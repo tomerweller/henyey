@@ -159,7 +159,7 @@ pub fn verify_chain_anchors(headers: &[LedgerHeader], anchors: &ChainTrustAnchor
         let first = &headers[0];
         let actual_prev = Hash256::from(first.previous_ledger_hash.clone());
         if actual_prev != *expected_prev {
-            return Err(crate::error::VerifyHashMismatchInfo::new(
+            return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
                 crate::error::VerifyHashKind::BottomAnchor,
                 Some(first.ledger_seq),
                 *expected_prev,
@@ -176,7 +176,7 @@ pub fn verify_chain_anchors(headers: &[LedgerHeader], anchors: &ChainTrustAnchor
             if header.ledger_seq == lcl_seq {
                 let header_hash = compute_header_hash(header)?;
                 if header_hash != *lcl_hash {
-                    return Err(crate::error::VerifyHashMismatchInfo::new(
+                    return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
                         crate::error::VerifyHashKind::Lcl,
                         Some(lcl_seq),
                         *lcl_hash,
@@ -206,7 +206,7 @@ pub fn verify_bucket_hash(data: &[u8], expected_hash: &Hash256) -> Result<()> {
     let actual_hash = Hash256::hash(data);
 
     if actual_hash != *expected_hash {
-        return Err(crate::error::VerifyHashMismatchInfo::new(
+        return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
             crate::error::VerifyHashKind::Bucket,
             None,
             *expected_hash,
@@ -235,7 +235,7 @@ pub fn verify_ledger_hash(header: &LedgerHeader, bucket_list_hash: &Hash256) -> 
     let header_bucket_hash = Hash256::from(header.bucket_list_hash.clone());
 
     if header_bucket_hash != *bucket_list_hash {
-        return Err(crate::error::VerifyHashMismatchInfo::new(
+        return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
             crate::error::VerifyHashKind::BucketList,
             Some(header.ledger_seq),
             header_bucket_hash,
@@ -271,7 +271,7 @@ pub fn verify_ledger_header_history_entry(entry: &LedgerHeaderHistoryEntry) -> R
     let advertised_hash = Hash256::from(entry.hash.clone());
 
     if computed_hash != advertised_hash {
-        return Err(crate::error::VerifyHashMismatchInfo::new(
+        return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
             crate::error::VerifyHashKind::LedgerHeaderEntry,
             Some(entry.header.ledger_seq),
             advertised_hash,
@@ -304,7 +304,7 @@ pub fn verify_tx_result_set(header: &LedgerHeader, tx_result_set_xdr: &[u8]) -> 
     let expected_hash = Hash256::from(header.tx_set_result_hash.clone());
 
     if actual_hash != expected_hash {
-        return Err(crate::error::VerifyHashMismatchInfo::new(
+        return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
             crate::error::VerifyHashKind::TxResultSet,
             Some(header.ledger_seq),
             expected_hash,
@@ -408,7 +408,7 @@ pub fn verify_header_matches_trusted(
     let trusted_hash = compute_header_hash(trusted_header)?;
 
     if downloaded_hash != trusted_hash {
-        return Err(crate::error::VerifyHashMismatchInfo::new(
+        return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
             crate::error::VerifyHashKind::TrustedHeader,
             Some(downloaded_header.ledger_seq),
             trusted_hash,
@@ -1338,6 +1338,176 @@ mod tests {
             err.to_string().contains("outside checkpoint range"),
             "expected range error, got: {}",
             err
+        );
+    }
+
+    /// A test layer that records event fields for assertion.
+    mod tracing_capture {
+        use std::sync::{Arc, Mutex};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        /// Captured event data.
+        #[derive(Debug, Clone)]
+        pub struct CapturedEvent {
+            pub fields: Vec<(String, String)>,
+            pub message: String,
+        }
+
+        /// A tracing layer that captures events into a shared vec.
+        #[derive(Clone)]
+        pub struct CaptureLayer {
+            pub events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl CaptureLayer {
+            pub fn new() -> Self {
+                Self {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.events.lock().unwrap().push(CapturedEvent {
+                    fields: visitor.fields,
+                    message: visitor.message,
+                });
+            }
+        }
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            fields: Vec<(String, String)>,
+            message: String,
+        }
+
+        impl tracing::field::Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{:?}", value);
+                } else {
+                    self.fields
+                        .push((field.name().to_string(), format!("{:?}", value)));
+                }
+            }
+
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.fields
+                    .push((field.name().to_string(), value.to_string()));
+            }
+
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.fields
+                    .push((field.name().to_string(), value.to_string()));
+            }
+        }
+
+        /// Run a closure under a capturing subscriber and return captured events.
+        pub fn capture_events<F: FnOnce()>(f: F) -> Vec<CapturedEvent> {
+            let layer = CaptureLayer::new();
+            let events = layer.events.clone();
+            let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+            with_default(subscriber, f);
+            let result = events.lock().unwrap().clone();
+            result
+        }
+    }
+
+    #[test]
+    fn test_verify_tx_result_set_mismatch_emits_tracing() {
+        use tracing_capture::capture_events;
+
+        let mut header = make_test_header(42, Hash256::ZERO);
+        header.tx_set_result_hash = Hash([0xAA; 32]);
+        let wrong_xdr = b"not the right result set";
+
+        let events = capture_events(|| {
+            let _ = verify_tx_result_set(&header, wrong_xdr);
+        });
+
+        assert_eq!(events.len(), 1, "expected exactly one tracing event");
+        let event = &events[0];
+        assert!(
+            event.message.contains("verification hash mismatch"),
+            "unexpected message: {}",
+            event.message
+        );
+
+        let field_map: std::collections::HashMap<&str, &str> = event
+            .fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        assert_eq!(field_map.get("ledger_seq"), Some(&"42"));
+        assert!(
+            field_map.contains_key("expected_hash"),
+            "missing expected_hash field"
+        );
+        assert!(
+            field_map.contains_key("actual_hash"),
+            "missing actual_hash field"
+        );
+        assert!(field_map.contains_key("kind"), "missing kind field");
+    }
+
+    #[test]
+    fn test_verify_bucket_hash_mismatch_emits_tracing_no_ledger_seq() {
+        use tracing_capture::capture_events;
+
+        let data = b"bucket content";
+        let wrong_hash = Hash256::from(Hash([0xFF; 32]));
+
+        let events = capture_events(|| {
+            let _ = verify_bucket_hash(data, &wrong_hash);
+        });
+
+        assert_eq!(events.len(), 1, "expected exactly one tracing event");
+        let event = &events[0];
+
+        let field_map: std::collections::HashMap<&str, &str> = event
+            .fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        // Bucket verification has no ledger context — ledger_seq should be absent.
+        assert!(
+            !field_map.contains_key("ledger_seq"),
+            "ledger_seq should not be present for bucket hash verification"
+        );
+        assert!(
+            field_map.contains_key("expected_hash"),
+            "missing expected_hash field"
+        );
+        assert!(
+            field_map.contains_key("actual_hash"),
+            "missing actual_hash field"
+        );
+    }
+
+    #[test]
+    fn test_verify_tx_result_set_genesis_does_not_emit_tracing() {
+        use tracing_capture::capture_events;
+
+        let header = make_test_header(GENESIS_LEDGER_SEQ, Hash256::ZERO);
+
+        let events = capture_events(|| {
+            // Genesis with empty result set should succeed without logging.
+            let _ = verify_tx_result_set(&header, &[]);
+        });
+
+        assert!(
+            events.is_empty(),
+            "genesis fast-path should not emit any tracing events"
         );
     }
 }

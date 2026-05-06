@@ -88,6 +88,41 @@ impl VerifyHashMismatchInfo {
             actual,
         }
     }
+
+    /// Construct the info and emit a structured `tracing::error!` event.
+    ///
+    /// Preferred over [`Self::new`] at production mismatch sites — ensures
+    /// every hash verification failure produces a queryable log event with
+    /// `kind`, `ledger_seq`, `expected_hash`, and `actual_hash` fields.
+    pub fn log_and_new(
+        kind: VerifyHashKind,
+        ledger: Option<u32>,
+        expected: Hash256,
+        actual: Hash256,
+    ) -> Self {
+        if let Some(seq) = ledger {
+            tracing::error!(
+                kind = %kind,
+                ledger_seq = seq,
+                expected_hash = %expected,
+                actual_hash = %actual,
+                "verification hash mismatch"
+            );
+        } else {
+            tracing::error!(
+                kind = %kind,
+                expected_hash = %expected,
+                actual_hash = %actual,
+                "verification hash mismatch"
+            );
+        }
+        Self {
+            kind,
+            ledger,
+            expected,
+            actual,
+        }
+    }
 }
 
 impl From<VerifyHashMismatchInfo> for HistoryError {

@@ -63,4 +63,5 @@ test-utils = ["dep:axum"]
 [dev-dependencies]
 tempfile.workspace = true
 axum.workspace = true
+tracing-subscriber.workspace = true
 henyey-history = { path = ".", features = ["test-utils"] }
