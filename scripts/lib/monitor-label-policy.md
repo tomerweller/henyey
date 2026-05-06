@@ -123,13 +123,17 @@ If the node fails after a deploy:
    bad_sha=$(cat "$BUILD_SHA_FILE")
    ```
 
-2. **Append to quarantine file** (idempotent):
+2. **Append to quarantine file** (idempotent, via shared helper):
    ```bash
-   if ! awk -v sha="$bad_sha" '$1 == sha { found=1; exit } END { exit !found }' \
-        "$HOME/data/deploy_quarantine.txt" 2>/dev/null; then
-     printf '%s regression #<issue>\n' "$bad_sha" >> "$HOME/data/deploy_quarantine.txt"
+   source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
+   quarantine_append "$HOME/data/deploy_quarantine.txt" "$bad_sha" "regression #<issue>"
+   if [ $? -ne 0 ]; then
+     echo "WARNING: quarantine_append failed (rc=$?) — deploy gate may not block next tick" >&2
    fi
    ```
+   > `$bad_sha` is expected to be a valid 40-char hex SHA from step 1. The
+   > nonzero-rc check covers both invalid-SHA (rc=1) and I/O errors (rc=2)
+   > defensively.
 
 3. **File or comment** on a GitHub issue (label `urgent` — validator
    operation is impacted) with regression details.

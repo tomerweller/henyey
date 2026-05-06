@@ -206,6 +206,41 @@ check_skill_structure() {
     drift=true
   fi
 
+  # monitor-label-policy.md: Deploy Regression Procedure must use quarantine helper
+  local policy_file="$REPO_ROOT/scripts/lib/monitor-label-policy.md"
+  local deploy_section
+  deploy_section=$(extract_md_section "$policy_file" '^## Deploy Regression Procedure')
+  if [[ -z "$deploy_section" ]]; then
+    echo "WARNING: monitor-label-policy.md has no '## Deploy Regression Procedure' section" >&2
+    drift=true
+  else
+    # Negative: old inline awk pattern must be gone
+    if echo "$deploy_section" | grep -qE 'awk.*\$1 == sha.*found=1'; then
+      echo "WARNING: monitor-label-policy.md Deploy Regression still contains old inline quarantine awk" >&2
+      drift=true
+    fi
+    # Negative: direct quarantine file writes must be gone
+    if echo "$deploy_section" | grep -qE '>>.*deploy_quarantine'; then
+      echo "WARNING: monitor-label-policy.md Deploy Regression still contains direct quarantine file writes" >&2
+      drift=true
+    fi
+    # Positive: helper must be sourced
+    if ! echo "$deploy_section" | grep -q 'source.*deploy-quarantine.sh'; then
+      echo "WARNING: monitor-label-policy.md Deploy Regression does not source deploy-quarantine.sh" >&2
+      drift=true
+    fi
+    # Positive: quarantine_append must be called
+    if ! echo "$deploy_section" | grep -q 'quarantine_append'; then
+      echo "WARNING: monitor-label-policy.md Deploy Regression does not call quarantine_append" >&2
+      drift=true
+    fi
+    # Positive: return code must be checked
+    if ! echo "$deploy_section" | grep -q '\$?'; then
+      echo "WARNING: monitor-label-policy.md Deploy Regression does not check quarantine_append return code" >&2
+      drift=true
+    fi
+  fi
+
   if [[ "$drift" == "true" && "$STRICT" == "true" ]]; then
     echo "FATAL: Structural drift detected in --strict mode." >&2
     exit 1
