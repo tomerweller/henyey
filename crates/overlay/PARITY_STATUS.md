@@ -147,6 +147,13 @@ Corresponds to: `ItemFetcher.h`, `Tracker.h`
 | `Tracker::getLastSeenSlotIndex()` | `last_seen_slot_index()` | Full |
 | `Tracker::resetLastSeenSlotIndex()` | `reset_last_seen_slot_index()` | Full |
 
+#### Intentional Divergences
+
+| Feature | stellar-core | henyey | Rationale |
+|---------|-------------|--------|-----------|
+| Tracker map cap | No cap on `mTrackers` | `max_trackers` cap (default 512) | Defense-in-depth against unbounded memory growth under adversarial flooding. Does not activate under normal operation. See #2439. |
+| Empty tracker removal | `stopFetch()` leaves empty trackers | `stop_fetch()` removes empty trackers | Prevents cap space poisoning; matches `recv()` behavior. |
+
 ### Peer (`peer.rs`, `connection.rs`)
 
 Corresponds to: `Peer.h`, `TCPPeer.h`

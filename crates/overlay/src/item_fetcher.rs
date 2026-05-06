@@ -70,6 +70,11 @@ pub enum ItemType {
 /// Parameters: peer_id, item_hash, item_type
 pub type AskPeerFn = Box<dyn Fn(&PeerId, &Hash, ItemType) + Send + Sync>;
 
+/// Defense-in-depth cap: maximum concurrent tracker entries per `ItemFetcher` instance.
+/// Matches sibling caps `MAX_PENDING_TXSET_REQUESTS` / `MAX_PENDING_QSET_REQUESTS` (512).
+/// Provides >40× headroom over typical operation (~10 concurrent trackers).
+const MAX_TRACKERS: usize = 512;
+
 /// Configuration for item fetching.
 #[derive(Debug, Clone)]
 pub struct ItemFetcherConfig {
@@ -77,6 +82,9 @@ pub struct ItemFetcherConfig {
     pub fetch_reply_timeout: Duration,
     /// Maximum number of times to rebuild the peer list.
     pub max_rebuild_fetch_list: u32,
+    /// Defense-in-depth cap on the number of concurrent trackers.
+    /// 0 = disabled (no cap). Default: `MAX_TRACKERS` (512).
+    pub max_trackers: usize,
 }
 
 impl Default for ItemFetcherConfig {
@@ -85,6 +93,7 @@ impl Default for ItemFetcherConfig {
             // Match stellar-core default: 1500ms
             fetch_reply_timeout: Duration::from_millis(1500),
             max_rebuild_fetch_list: 10,
+            max_trackers: MAX_TRACKERS,
         }
     }
 }
@@ -418,7 +427,10 @@ impl ItemFetcher {
     ///
     /// Multiple envelopes may need the same item.
     /// Immediately tries to fetch from a peer if callback is set.
-    pub fn fetch(&self, item_hash: Hash, envelope: &ScpEnvelope) {
+    ///
+    /// Returns `true` if the item is now being tracked (pre-existing or newly inserted),
+    /// `false` if the tracker cap was reached and this new hash was rejected.
+    pub fn fetch(&self, item_hash: Hash, envelope: &ScpEnvelope) -> bool {
         let available_peers = self.available_peers.lock().unwrap().clone();
         let mut trackers = self.trackers.lock().unwrap();
 
@@ -427,41 +439,56 @@ impl ItemFetcher {
         if let Some(tracker) = trackers.get_mut(&item_hash) {
             // Already tracking, just add the envelope
             tracker.listen(envelope);
-        } else {
-            // Create new tracker
-            let mut tracker = Tracker::new(item_hash.clone(), self.config.clone());
-            tracker.listen(envelope);
+            return true;
+        }
 
-            // Immediately try to fetch from a peer (like stellar-core)
-            if let Some(ref ask_peer) = self.ask_peer {
-                match self.try_next_peer_counted(&mut tracker, &available_peers) {
-                    NextPeerResult::AskPeer { ref peer, .. } => {
-                        trace!(
-                            "Immediately asking peer {} for {:?} {}",
-                            peer,
-                            self.item_type,
-                            hex::encode(item_hash.0)
-                        );
-                        ask_peer(peer, &item_hash, self.item_type);
-                    }
-                    NextPeerResult::Wait { .. } => {
-                        // No peers available yet, will retry later
-                    }
+        // New hash — check cap (0 = disabled)
+        if self.config.max_trackers > 0 && trackers.len() >= self.config.max_trackers {
+            debug!(
+                item_type = ?self.item_type,
+                trackers_count = trackers.len(),
+                "Dropping fetch request: tracker cap reached"
+            );
+            if let Some(ref m) = self.metrics {
+                m.item_fetcher_tracker_cap_reached.inc();
+            }
+            return false;
+        }
+
+        // Create new tracker
+        let mut tracker = Tracker::new(item_hash.clone(), self.config.clone());
+        tracker.listen(envelope);
+
+        // Immediately try to fetch from a peer (like stellar-core)
+        if let Some(ref ask_peer) = self.ask_peer {
+            match self.try_next_peer_counted(&mut tracker, &available_peers) {
+                NextPeerResult::AskPeer { ref peer, .. } => {
+                    trace!(
+                        "Immediately asking peer {} for {:?} {}",
+                        peer,
+                        self.item_type,
+                        hex::encode(item_hash.0)
+                    );
+                    ask_peer(peer, &item_hash, self.item_type);
+                }
+                NextPeerResult::Wait { .. } => {
+                    // No peers available yet, will retry later
                 }
             }
-
-            trackers.insert(item_hash, tracker);
         }
+
+        trackers.insert(item_hash, tracker);
+        true
     }
 
     /// Stop fetching an item for a specific envelope.
     ///
     /// If other envelopes still need this item, fetching continues.
-    // SECURITY: fetch tracker state bounded by authenticated peer count and flow control windows
+    // SECURITY: fetch tracker state bounded by max_trackers cap
     pub fn stop_fetch(&self, item_hash: &Hash, envelope: &ScpEnvelope) {
         let mut trackers = self.trackers.lock().unwrap();
 
-        if let Some(tracker) = trackers.get_mut(item_hash) {
+        let should_remove = if let Some(tracker) = trackers.get_mut(item_hash) {
             trace!(
                 "stopFetch {:?} {} : {}",
                 self.item_type,
@@ -470,16 +497,18 @@ impl ItemFetcher {
             );
 
             tracker.discard(envelope);
-
-            if tracker.is_empty() {
-                tracker.cancel();
-            }
+            tracker.is_empty()
         } else {
             trace!(
                 "stopFetch untracked {:?} {}",
                 self.item_type,
                 hex::encode(item_hash.0)
             );
+            false
+        };
+
+        if should_remove {
+            trackers.remove(item_hash);
         }
     }
 
@@ -947,7 +976,7 @@ mod tests {
 
         // fetch() internally calls try_next_peer_counted but only when
         // ask_peer callback is set — without callback, no counter.
-        fetcher.fetch(hash.clone(), &env);
+        let _ = fetcher.fetch(hash.clone(), &env);
         assert_eq!(metrics.item_fetcher_next_peer.get(), 0);
 
         // get_pending_requests calls try_next_peer_counted and DOES increment.
@@ -967,5 +996,110 @@ mod tests {
         // Should not panic even though metrics is None.
         let requests = fetcher.get_pending_requests(&peers);
         assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn test_tracker_cap_rejects_overflow() {
+        let config = ItemFetcherConfig {
+            max_trackers: 3,
+            ..Default::default()
+        };
+        let metrics = Arc::new(OverlayMetrics::new());
+        let fetcher = ItemFetcher::new(ItemType::TxSet, config, Some(Arc::clone(&metrics)));
+        let env = make_test_envelope(100);
+
+        // Insert 3 unique hashes — all should succeed
+        assert!(fetcher.fetch(Hash([1u8; 32]), &env));
+        assert!(fetcher.fetch(Hash([2u8; 32]), &env));
+        assert!(fetcher.fetch(Hash([3u8; 32]), &env));
+        assert_eq!(fetcher.num_trackers(), 3);
+
+        // 4th unique hash should be rejected
+        assert!(!fetcher.fetch(Hash([4u8; 32]), &env));
+        assert_eq!(fetcher.num_trackers(), 3);
+        assert_eq!(metrics.item_fetcher_tracker_cap_reached.get(), 1);
+
+        // 5th also rejected
+        assert!(!fetcher.fetch(Hash([5u8; 32]), &env));
+        assert_eq!(metrics.item_fetcher_tracker_cap_reached.get(), 2);
+    }
+
+    #[test]
+    fn test_tracker_cap_admits_existing_hash_at_capacity() {
+        let config = ItemFetcherConfig {
+            max_trackers: 2,
+            ..Default::default()
+        };
+        let fetcher = ItemFetcher::new(ItemType::TxSet, config, None);
+        let env1 = make_test_envelope(100);
+        let env2 = make_test_envelope(200);
+
+        // Fill to capacity
+        assert!(fetcher.fetch(Hash([1u8; 32]), &env1));
+        assert!(fetcher.fetch(Hash([2u8; 32]), &env1));
+
+        // Existing hash should still be admitted (adds envelope to tracker)
+        assert!(fetcher.fetch(Hash([1u8; 32]), &env2));
+        assert_eq!(fetcher.num_trackers(), 2);
+    }
+
+    #[test]
+    fn test_tracker_cap_self_heals_after_recv() {
+        let config = ItemFetcherConfig {
+            max_trackers: 2,
+            ..Default::default()
+        };
+        let fetcher = ItemFetcher::new(ItemType::TxSet, config, None);
+        let env = make_test_envelope(100);
+
+        // Fill to capacity
+        assert!(fetcher.fetch(Hash([1u8; 32]), &env));
+        assert!(fetcher.fetch(Hash([2u8; 32]), &env));
+
+        // Rejected
+        assert!(!fetcher.fetch(Hash([3u8; 32]), &env));
+
+        // Receive one item — frees a slot
+        let waiting = fetcher.recv(&Hash([1u8; 32]));
+        assert!(waiting.is_some());
+        assert_eq!(fetcher.num_trackers(), 1);
+
+        // Now a new hash should succeed
+        assert!(fetcher.fetch(Hash([3u8; 32]), &env));
+        assert_eq!(fetcher.num_trackers(), 2);
+    }
+
+    #[test]
+    fn test_tracker_cap_disabled_when_zero() {
+        let config = ItemFetcherConfig {
+            max_trackers: 0,
+            ..Default::default()
+        };
+        let fetcher = ItemFetcher::new(ItemType::TxSet, config, None);
+        let env = make_test_envelope(100);
+
+        // Should be able to insert many trackers without limit
+        for i in 0..1000u16 {
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[0..2].copy_from_slice(&i.to_le_bytes());
+            assert!(fetcher.fetch(Hash(hash_bytes), &env));
+        }
+        assert_eq!(fetcher.num_trackers(), 1000);
+    }
+
+    #[test]
+    fn test_stop_fetch_removes_empty_tracker() {
+        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet, None);
+        let env = make_test_envelope(100);
+        let hash = Hash([1u8; 32]);
+
+        // Add a tracker with one envelope
+        assert!(fetcher.fetch(hash.clone(), &env));
+        assert_eq!(fetcher.num_trackers(), 1);
+
+        // stop_fetch with the sole listener — tracker should be removed
+        fetcher.stop_fetch(&hash, &env);
+        assert_eq!(fetcher.num_trackers(), 0);
+        assert!(!fetcher.is_tracking(&hash));
     }
 }

@@ -340,13 +340,13 @@ impl MessageDispatcher {
     /// Fetch a TxSet needed by an SCP envelope.
     pub fn fetch_tx_set(&self, hash: Hash, envelope: &ScpEnvelope) {
         trace!("Requesting TxSet {}", hex::encode(hash.0));
-        self.tx_set_fetcher.fetch(hash, envelope);
+        let _ = self.tx_set_fetcher.fetch(hash, envelope);
     }
 
     /// Fetch a QuorumSet needed by an SCP envelope.
     pub fn fetch_quorum_set(&self, hash: Hash, envelope: &ScpEnvelope) {
         trace!("Requesting QuorumSet {}", hex::encode(hash.0));
-        self.quorum_set_fetcher.fetch(hash, envelope);
+        let _ = self.quorum_set_fetcher.fetch(hash, envelope);
     }
 
     /// Stop fetching a TxSet for an envelope.

@@ -151,6 +151,8 @@ pub struct FetchingStats {
     pub quorum_sets_received: u64,
     /// Per-slot lifetime cap rejections (defense-in-depth).
     pub per_slot_full: u64,
+    /// Envelopes dropped because all tracker caps were full (defense-in-depth).
+    pub tracker_cap_drops: u64,
 }
 
 impl FetchingEnvelopes {
@@ -295,11 +297,15 @@ impl FetchingEnvelopes {
         }
 
         // Start fetching missing dependencies
+        let mut any_tracked = false;
+
         if need_tx_set {
             for tx_set_hash in Self::extract_tx_set_hashes(&envelope) {
                 if !self.is_tx_set_available(&tx_set_hash) {
                     let hash = Hash(tx_set_hash.0);
-                    self.tx_set_fetcher.fetch(hash, &envelope);
+                    if self.tx_set_fetcher.fetch(hash, &envelope) {
+                        any_tracked = true;
+                    }
                 }
             }
         }
@@ -307,15 +313,24 @@ impl FetchingEnvelopes {
         if need_quorum_set {
             if let Some(qs_hash) = Self::extract_quorum_set_hash(&envelope) {
                 let hash = Hash(qs_hash.0);
-                self.quorum_set_fetcher.fetch(hash, &envelope);
+                if self.quorum_set_fetcher.fetch(hash, &envelope) {
+                    any_tracked = true;
+                }
             }
         }
 
-        // Add to fetching
-        slot_state
-            .fetching
-            .insert(env_hash, (envelope, Instant::now()));
-        self.stats.write().envelopes_fetching += 1;
+        if any_tracked {
+            // At least one tracker accepted — park as usual.
+            slot_state
+                .fetching
+                .insert(env_hash, (envelope, Instant::now()));
+            self.stats.write().envelopes_fetching += 1;
+        } else {
+            // All trackers at capacity — don't park. The envelope will be
+            // retried on the next SCP round when honest peers re-reference
+            // these items.
+            self.stats.write().tracker_cap_drops += 1;
+        }
 
         RecvResult::Fetching
     }
@@ -794,11 +809,13 @@ impl FetchingEnvelopes {
         } else {
             // Re-start fetching for any dependency that is not yet available.
             // Without this, the envelope would remain stranded in `fetching` forever.
+            // Cap rejections are best-effort here — envelope stays in fetching
+            // until temporal cleanup removes it.
             if need_tx_set {
                 for tx_set_hash in Self::extract_tx_set_hashes(&envelope) {
                     if !self.is_tx_set_available(&tx_set_hash) {
                         let hash = Hash(tx_set_hash.0);
-                        self.tx_set_fetcher.fetch(hash, &envelope);
+                        let _ = self.tx_set_fetcher.fetch(hash, &envelope);
                         debug!(
                             slot,
                             tx_set = %hex::encode(tx_set_hash.0),
@@ -811,7 +828,7 @@ impl FetchingEnvelopes {
                 if let Some(qs_hash) = Self::extract_quorum_set_hash(&envelope) {
                     if !self.qs_cache_exists(&qs_hash) {
                         let hash = Hash(qs_hash.0);
-                        self.quorum_set_fetcher.fetch(hash, &envelope);
+                        let _ = self.quorum_set_fetcher.fetch(hash, &envelope);
                         debug!(
                             slot,
                             quorum_set = %hex::encode(qs_hash.0),

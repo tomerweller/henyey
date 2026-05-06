@@ -580,6 +580,8 @@ pub struct OverlayMetrics {
     pub fetch_duplicate_bytes_recv: Counter,
     /// ItemFetcher next-peer selections (AskPeer results only).
     pub item_fetcher_next_peer: Counter,
+    /// ItemFetcher tracker cap rejections (new hashes rejected due to cap).
+    pub item_fetcher_tracker_cap_reached: Counter,
     /// Unique/solicited fetch responses (TxSet/QSet tracked by ItemFetcher).
     pub fetch_unique_recv: Counter,
     /// Duplicate/unsolicited fetch responses (TxSet/QSet not tracked).
@@ -678,6 +680,7 @@ impl OverlayMetrics {
             fetch_unique_bytes_recv: self.fetch_unique_bytes_recv.get(),
             fetch_duplicate_bytes_recv: self.fetch_duplicate_bytes_recv.get(),
             item_fetcher_next_peer: self.item_fetcher_next_peer.get(),
+            item_fetcher_tracker_cap_reached: self.item_fetcher_tracker_cap_reached.get(),
             fetch_unique_recv: self.fetch_unique_recv.get(),
             fetch_duplicate_recv: self.fetch_duplicate_recv.get(),
 
@@ -739,6 +742,7 @@ impl OverlayMetrics {
             &self.fetch_unique_bytes_recv,
             &self.fetch_duplicate_bytes_recv,
             &self.item_fetcher_next_peer,
+            &self.item_fetcher_tracker_cap_reached,
             &self.fetch_unique_recv,
             &self.fetch_duplicate_recv,
             &self.demand_timeouts,
@@ -854,6 +858,7 @@ pub struct OverlayMetricsSnapshot {
     pub fetch_unique_bytes_recv: u64,
     pub fetch_duplicate_bytes_recv: u64,
     pub item_fetcher_next_peer: u64,
+    pub item_fetcher_tracker_cap_reached: u64,
     pub fetch_unique_recv: u64,
     pub fetch_duplicate_recv: u64,
 
