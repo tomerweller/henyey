@@ -366,7 +366,7 @@ rm -f /home/tomer/data/$MONITOR_SESSION_ID/last_ledger
 
 Then Relaunch. The next tick will see `FRESH_START=yes` (mainnet.db absent), apply the 4h sync deadline, and let the node fresh-catchup from network archive (~10–20 min to validating).
 
-File a new `urgent` GH issue documenting the wipe with the count of crashed rotations, the hash-mismatch evidence from the latest crashed log, and the cumulative downtime — this is a data point for whether the underlying recovery code path needs further hardening even though the immediate cause was already fixed.
+File a new `urgent` GH issue documenting the wipe with the count of crashed rotations, the hash-mismatch evidence from the latest crashed log, and the cumulative downtime — this is a data point for whether the underlying recovery code path needs further hardening even though the immediate cause was already fixed. Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 
 The trigger is self-rate-limiting: after a wipe, the new `.crashed-*` rotations stop accumulating (the symptom is gone), so the 3-in-30-min window can't fire again until something else goes wrong.
 
@@ -427,6 +427,7 @@ duration (`SOFT_FAIL_BLOCKED_DURATION_SEC`), evidence source
 (`FATAL_WIPE_SOURCE`), and cumulative downtime. Use title pattern:
 `"Soft-fail state wipe: fatal_state_failure stuck for {N}m"`. Always a new
 issue (no dedup — each wipe is a distinct incident). Known prior incidents: #2363.
+Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 
 Self-limiting: after wipe, `FRESH_START=yes` blocks condition (3); new process
 has no `fatal_state_failure` so condition (1) fails; log rotation removes old
@@ -446,6 +447,7 @@ Flag WEDGE when BOTH:
 
 On WEDGE: Stop-PID, Rotate-log with suffix `frozen`, then Relaunch.
 Always file a new `urgent`-labeled issue (wedge blocks validator operation).
+Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 Recurrence-after-fix → NEW issue, not a comment on a closed one. Known prior
 incidents: #1904, #1873, #1921, #1949.
 
