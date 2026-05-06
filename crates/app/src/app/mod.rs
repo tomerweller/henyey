@@ -10051,4 +10051,204 @@ mod tests {
             "build_request must read ledger fresh per call, not cache from constructor"
         );
     }
+
+    // ---- Regression tests for top_off_survey_requests and start/stop_survey_collecting ----
+
+    /// Regression test: `top_off_survey_requests` → `send_survey_request` must
+    /// stamp the outgoing request with the *current* ledger, not a stale value
+    /// from when the survey was started.
+    ///
+    /// Scenario: survey started at ledger 10, ledger advances to 15 before
+    /// `top_off_survey_requests` drains the peer queue. The emitted request
+    /// must carry ledger_num = 15.
+    #[tokio::test]
+    async fn test_top_off_survey_requests_fresh_ledger_after_secret_resolution() {
+        let (app, _dir) = survey_test_app_with_overlay().await;
+        let overlay = app.overlay().await.unwrap();
+
+        let peer_id = PeerId::from_bytes([7u8; 32]);
+        let mut receiver = overlay.inject_test_peer(peer_id.clone(), 16);
+
+        let nonce = 42u32;
+
+        // Bootstrap herder at ledger 10.
+        app.herder.bootstrap(10);
+
+        // Transition survey to Reporting phase:
+        // 1. start_collecting → Collecting
+        let surveyor_id = expected_node_id(&app);
+        {
+            let mut state = app.survey_state.write().await;
+            let start_msg = stellar_xdr::curr::TimeSlicedSurveyStartCollectingMessage {
+                surveyor_id: surveyor_id.clone(),
+                nonce,
+                ledger_num: 10,
+            };
+            assert!(
+                state.data_mut().start_collecting(
+                    &start_msg,
+                    &[],
+                    &[],
+                    crate::survey::NodeStatsSnapshot {
+                        lost_sync_count: 0,
+                        out_of_sync: false,
+                        added_peers: 0,
+                        dropped_peers: 0,
+                    },
+                ),
+                "start_collecting must succeed (Inactive → Collecting)"
+            );
+
+            // 2. stop_collecting_by_identity → Reporting
+            assert!(
+                state.data_mut().stop_collecting_by_identity(
+                    nonce,
+                    &surveyor_id,
+                    &[],
+                    &[],
+                    0,
+                    0,
+                    0,
+                ),
+                "stop_collecting must succeed (Collecting → Reporting)"
+            );
+            assert!(
+                state.data().nonce_is_reporting(nonce),
+                "survey must be in Reporting phase"
+            );
+        }
+
+        // Verify no cached secret for this nonce — top_off will trigger
+        // async secret resolution via ensure_survey_secret.
+        assert!(
+            !app.survey_secrets.read().await.contains_key(&nonce),
+            "no cached secret should exist before top_off"
+        );
+
+        // Set up reporting state: running, peer in peers + queue, topoff due.
+        {
+            let mut reporting = app.survey_reporting.write().await;
+            reporting.running = true;
+            reporting.peers.insert(peer_id.clone());
+            reporting.queue.push_back(peer_id.clone());
+            reporting.next_topoff = app.clock.now() - Duration::from_secs(1);
+        }
+
+        // Advance the herder to ledger 15. The survey was started at 10,
+        // but the current ledger is now 15.
+        app.herder.bootstrap(15);
+
+        // Call top_off_survey_requests — this exercises the
+        // top_off → send_survey_request → SurveyRequestSigner path.
+        app.top_off_survey_requests().await;
+
+        // Assert the emitted request carries the fresh ledger value.
+        let msg = receiver
+            .try_recv()
+            .expect("top_off must emit a survey request message");
+        match msg {
+            StellarMessage::TimeSlicedSurveyRequest(signed) => {
+                assert_eq!(
+                    signed.request.request.ledger_num, 15,
+                    "request must carry fresh ledger_num = 15, not stale 10"
+                );
+                assert_eq!(signed.request.nonce, nonce, "nonce must match");
+                assert_eq!(
+                    signed.request.request.surveyed_peer_id,
+                    stellar_xdr::curr::NodeId(peer_id.0.clone()),
+                    "surveyed_peer_id must match injected peer"
+                );
+                assert_eq!(
+                    signed.request.request.surveyor_peer_id, surveyor_id,
+                    "surveyor_peer_id must match app's local node ID"
+                );
+            }
+            other => panic!(
+                "expected TimeSlicedSurveyRequest, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        assert!(
+            receiver.try_recv().is_none(),
+            "no extra messages should be in the channel"
+        );
+    }
+
+    /// Regression test: public `start_survey_collecting` / `stop_survey_collecting`
+    /// must stamp each outgoing message with the *current* ledger, not a value
+    /// cached at survey start.
+    ///
+    /// Scenario: start at ledger 20, advance to 25, then stop. The start
+    /// message must carry 20 and the stop message must carry 25.
+    #[tokio::test]
+    async fn test_start_stop_survey_collecting_fresh_ledger() {
+        let (app, _dir) = survey_test_app_with_overlay().await;
+        let overlay = app.overlay().await.unwrap();
+
+        let peer_id = PeerId::from_bytes([9u8; 32]);
+        let mut receiver = overlay.inject_test_peer(peer_id, 16);
+
+        let nonce = 55u32;
+        let surveyor_id = expected_node_id(&app);
+
+        // Bootstrap herder at ledger 20.
+        app.herder.bootstrap(20);
+
+        // ── Start collecting ──
+        app.start_survey_collecting(nonce).await.unwrap();
+
+        let msg = receiver
+            .try_recv()
+            .expect("start_survey_collecting must emit a start message");
+        match msg {
+            StellarMessage::TimeSlicedSurveyStartCollecting(signed) => {
+                assert_eq!(
+                    signed.start_collecting.ledger_num, 20,
+                    "start message must carry fresh ledger_num = 20"
+                );
+                assert_eq!(signed.start_collecting.nonce, nonce, "nonce must match");
+                assert_eq!(
+                    signed.start_collecting.surveyor_id, surveyor_id,
+                    "surveyor_id must match app's local node ID"
+                );
+            }
+            other => panic!(
+                "expected TimeSlicedSurveyStartCollecting, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // ── Advance ledger to 25 ──
+        app.herder.bootstrap(25);
+
+        // ── Stop collecting ──
+        app.stop_survey_collecting().await.unwrap();
+
+        let msg = receiver
+            .try_recv()
+            .expect("stop_survey_collecting must emit a stop message");
+        match msg {
+            StellarMessage::TimeSlicedSurveyStopCollecting(signed) => {
+                assert_eq!(
+                    signed.stop_collecting.ledger_num, 25,
+                    "stop message must carry fresh ledger_num = 25, not stale 20"
+                );
+                assert_eq!(signed.stop_collecting.nonce, nonce, "nonce must match");
+                assert_eq!(
+                    signed.stop_collecting.surveyor_id, surveyor_id,
+                    "surveyor_id must match app's local node ID"
+                );
+            }
+            other => panic!(
+                "expected TimeSlicedSurveyStopCollecting, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        assert!(
+            receiver.try_recv().is_none(),
+            "no extra messages should be in the channel"
+        );
+    }
 }
