@@ -9932,4 +9932,123 @@ mod tests {
             "No extra messages should be in the channel"
         );
     }
+
+    // ---- SurveyMessageSigner / SurveyRequestSigner tests ----
+
+    /// Helper: construct the expected local node ID from an App's keypair.
+    fn expected_node_id(app: &App) -> stellar_xdr::curr::NodeId {
+        stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*app.keypair.public_key().as_bytes()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_survey_message_signer_build_start() {
+        let app = survey_test_app().await;
+        let nonce = 42u32;
+
+        // Set tracking so survey_local_ledger returns a known value
+        app.herder.set_tracking_for_testing(11, 100);
+
+        let signer = super::survey_impl::SurveyMessageSigner::new(&app, nonce);
+        let (signed, inner) = signer.build_start().unwrap();
+
+        // Verify structure
+        assert_eq!(inner.nonce, nonce);
+        assert_eq!(inner.surveyor_id, expected_node_id(&app));
+        assert_eq!(inner.ledger_num, 10); // tracking slot 11 - 1
+
+        // Verify the signed message wraps the inner
+        assert_eq!(signed.start_collecting.nonce, nonce);
+        assert_eq!(signed.start_collecting.ledger_num, inner.ledger_num);
+
+        // Verify signature is non-empty
+        assert!(!signed.signature.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_survey_message_signer_build_stop() {
+        let app = survey_test_app().await;
+        let nonce = 77u32;
+
+        app.herder.set_tracking_for_testing(21, 200);
+
+        let signer = super::survey_impl::SurveyMessageSigner::new(&app, nonce);
+        let (signed, inner) = signer.build_stop().unwrap();
+
+        assert_eq!(inner.nonce, nonce);
+        assert_eq!(inner.surveyor_id, expected_node_id(&app));
+        assert_eq!(inner.ledger_num, 20); // tracking slot 21 - 1
+        assert_eq!(signed.stop_collecting.nonce, nonce);
+        assert!(!signed.signature.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_survey_request_signer_build_request() {
+        let app = survey_test_app().await;
+        let nonce = 123u32;
+        let peer_id = henyey_overlay::PeerId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([1u8; 32]),
+        ));
+
+        app.herder.set_tracking_for_testing(31, 300);
+
+        let signer = super::survey_impl::SurveyRequestSigner::new(&app, nonce).await;
+        let signed = signer.build_request(&peer_id, 5, 10).unwrap();
+
+        // Verify request fields
+        assert_eq!(signed.request.nonce, nonce);
+        assert_eq!(signed.request.inbound_peers_index, 5);
+        assert_eq!(signed.request.outbound_peers_index, 10);
+        assert_eq!(
+            signed.request.request.surveyed_peer_id,
+            stellar_xdr::curr::NodeId(peer_id.0.clone())
+        );
+        assert_eq!(
+            signed.request.request.surveyor_peer_id,
+            expected_node_id(&app)
+        );
+        assert_eq!(signed.request.request.ledger_num, 30); // tracking slot 31 - 1
+
+        // Verify encryption key is populated
+        assert_ne!(signed.request.request.encryption_key.key, [0u8; 32]);
+
+        // Verify signature is non-empty
+        assert!(!signed.request_signature.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_survey_request_signer_reads_fresh_ledger_per_call() {
+        let app = survey_test_app().await;
+        let nonce = 200u32;
+        let peer_a = henyey_overlay::PeerId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([2u8; 32]),
+        ));
+        let peer_b = henyey_overlay::PeerId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([3u8; 32]),
+        ));
+
+        // Set tracking to slot 11 (ledger_index = 10)
+        app.herder.set_tracking_for_testing(11, 100);
+
+        // Create signer (resolves secret/key)
+        let signer = super::survey_impl::SurveyRequestSigner::new(&app, nonce).await;
+
+        // Build first request — captures current ledger (10)
+        let signed_a = signer.build_request(&peer_a, 0, 0).unwrap();
+        let ledger_a = signed_a.request.request.ledger_num;
+        assert_eq!(ledger_a, 10);
+
+        // Advance the tracking ledger to slot 16 (ledger_index = 15)
+        app.herder.set_tracking_for_testing(16, 200);
+
+        // Build second request — should get the NEW ledger value (15)
+        let signed_b = signer.build_request(&peer_b, 0, 0).unwrap();
+        let ledger_b = signed_b.request.request.ledger_num;
+
+        assert_eq!(
+            ledger_b, 15,
+            "build_request must read ledger fresh per call, not cache from constructor"
+        );
+    }
 }

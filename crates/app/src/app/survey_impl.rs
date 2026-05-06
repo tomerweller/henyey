@@ -9,6 +9,132 @@ pub enum SurveyStopError {
     NoActiveSurvey,
 }
 
+/// Constructs and signs outgoing start/stop survey messages for a given nonce.
+///
+/// All methods are synchronous — no `.await` between ledger read and signing.
+/// Each `build_*` reads `survey_local_ledger()` fresh (never cached), matching
+/// stellar-core's per-emission ledger read (SurveyManager.cpp:293, 524).
+///
+/// Private to this module.
+pub(super) struct SurveyMessageSigner<'a> {
+    app: &'a App,
+    nonce: u32,
+}
+
+impl<'a> SurveyMessageSigner<'a> {
+    pub(super) fn new(app: &'a App, nonce: u32) -> Self {
+        Self { app, nonce }
+    }
+
+    /// Build and sign a start-collecting message. Reads ledger fresh.
+    /// Returns (signed, unsigned_inner) — caller needs inner for local state transition.
+    pub(super) fn build_start(
+        &self,
+    ) -> anyhow::Result<(
+        stellar_xdr::curr::SignedTimeSlicedSurveyStartCollectingMessage,
+        TimeSlicedSurveyStartCollectingMessage,
+    )> {
+        let ledger_num = self.app.survey_local_ledger();
+        let start = TimeSlicedSurveyStartCollectingMessage {
+            surveyor_id: self.app.local_node_id(),
+            nonce: self.nonce,
+            ledger_num,
+        };
+        let bytes = start
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .map_err(|e| anyhow::anyhow!("Failed to encode survey start message: {e}"))?;
+        let signature = self.app.sign_survey_message(&bytes);
+        let signed = stellar_xdr::curr::SignedTimeSlicedSurveyStartCollectingMessage {
+            signature,
+            start_collecting: start.clone(),
+        };
+        Ok((signed, start))
+    }
+
+    /// Build and sign a stop-collecting message. Reads ledger fresh.
+    /// Returns (signed, unsigned_inner) — caller needs inner for local state transition.
+    pub(super) fn build_stop(
+        &self,
+    ) -> anyhow::Result<(
+        stellar_xdr::curr::SignedTimeSlicedSurveyStopCollectingMessage,
+        TimeSlicedSurveyStopCollectingMessage,
+    )> {
+        let ledger_num = self.app.survey_local_ledger();
+        let stop = TimeSlicedSurveyStopCollectingMessage {
+            surveyor_id: self.app.local_node_id(),
+            nonce: self.nonce,
+            ledger_num,
+        };
+        let bytes = stop
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .map_err(|e| anyhow::anyhow!("Failed to encode survey stop message: {e}"))?;
+        let signature = self.app.sign_survey_message(&bytes);
+        let signed = stellar_xdr::curr::SignedTimeSlicedSurveyStopCollectingMessage {
+            signature,
+            stop_collecting: stop.clone(),
+        };
+        Ok((signed, stop))
+    }
+}
+
+/// Extends `SurveyMessageSigner` with request-building capability.
+///
+/// Constructed via async `new()` which resolves the encryption key upfront.
+/// `build_request` is ONLY available on this type — compile-time safety prevents
+/// calling it without first resolving the async prerequisite.
+///
+/// Private to this module.
+pub(super) struct SurveyRequestSigner<'a> {
+    base: SurveyMessageSigner<'a>,
+    encryption_key: Curve25519Public,
+}
+
+impl<'a> SurveyRequestSigner<'a> {
+    /// Resolve encryption key (async), then provide sync request building.
+    pub(super) async fn new(app: &'a App, nonce: u32) -> Self {
+        let secret = app.ensure_survey_secret(nonce).await;
+        let public = CurvePublicKey::from(&secret);
+        Self {
+            base: SurveyMessageSigner::new(app, nonce),
+            encryption_key: Curve25519Public {
+                key: public.to_bytes(),
+            },
+        }
+    }
+
+    /// Build and sign a request message for a specific peer.
+    ///
+    /// **Reads `survey_local_ledger()` fresh on each call** — never caches.
+    /// Matches stellar-core's per-request pattern (SurveyManager.cpp:217).
+    pub(super) fn build_request(
+        &self,
+        peer_id: &henyey_overlay::PeerId,
+        inbound_index: u32,
+        outbound_index: u32,
+    ) -> anyhow::Result<stellar_xdr::curr::SignedTimeSlicedSurveyRequestMessage> {
+        let ledger_num = self.base.app.survey_local_ledger();
+        let request = SurveyRequestMessage {
+            surveyor_peer_id: self.base.app.local_node_id(),
+            surveyed_peer_id: stellar_xdr::curr::NodeId(peer_id.0.clone()),
+            ledger_num,
+            encryption_key: self.encryption_key.clone(),
+            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
+        };
+        let message = TimeSlicedSurveyRequestMessage {
+            request,
+            nonce: self.base.nonce,
+            inbound_peers_index: inbound_index,
+            outbound_peers_index: outbound_index,
+        };
+        let bytes = message.to_xdr(stellar_xdr::curr::Limits::none())?;
+        let signature = self.base.app.sign_survey_message(&bytes);
+        Ok(stellar_xdr::curr::SignedTimeSlicedSurveyRequestMessage {
+            request_signature: signature,
+            request: message,
+        })
+    }
+}
+
 impl App {
     pub async fn survey_report(&self) -> SurveyReport {
         let (phase, nonce, local_node, inbound_peers, outbound_peers) = {
@@ -265,41 +391,19 @@ impl App {
         inbound_index: u32,
         outbound_index: u32,
     ) -> bool {
-        let local_node_id = self.local_node_id();
-        let secret = self.ensure_survey_secret(nonce).await;
-        let ledger_num = self.survey_local_ledger();
-        let public = CurvePublicKey::from(&secret);
-        let encryption_key = Curve25519Public {
-            key: public.to_bytes(),
-        };
-
-        let request = SurveyRequestMessage {
-            surveyor_peer_id: local_node_id.clone(),
-            surveyed_peer_id: stellar_xdr::curr::NodeId(peer_id.0.clone()),
-            ledger_num,
-            encryption_key,
-            command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
-        };
-
-        let message = TimeSlicedSurveyRequestMessage {
-            request,
-            nonce,
-            inbound_peers_index: inbound_index,
-            outbound_peers_index: outbound_index,
-        };
-
-        let message_bytes = match message.to_xdr(stellar_xdr::curr::Limits::none()) {
-            Ok(bytes) => bytes,
+        let signer = SurveyRequestSigner::new(self, nonce).await;
+        let signed = match signer.build_request(&peer_id, inbound_index, outbound_index) {
+            Ok(s) => s,
             Err(e) => {
-                tracing::debug!(peer = %peer_id, error = %e, "Failed to encode survey request");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to build survey request");
                 return false;
             }
         };
 
-        let signature = self.sign_survey_message(&message_bytes);
-        let signed = stellar_xdr::curr::SignedTimeSlicedSurveyRequestMessage {
-            request_signature: signature,
-            request: message,
+        let local_node_id = self.local_node_id();
+        let message_bytes = match signed.request.to_xdr(stellar_xdr::curr::Limits::none()) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
         };
 
         let mut survey_state = self.survey_state.write().await;
@@ -326,20 +430,8 @@ impl App {
     }
 
     async fn broadcast_survey_start(&self, nonce: u32) -> anyhow::Result<()> {
-        let ledger_num = self.survey_local_ledger();
-        let start = TimeSlicedSurveyStartCollectingMessage {
-            surveyor_id: self.local_node_id(),
-            nonce,
-            ledger_num,
-        };
-        let start_bytes = start
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .map_err(|e| anyhow::anyhow!("Failed to encode survey start message: {e}"))?;
-        let signature = self.sign_survey_message(&start_bytes);
-        let signed = stellar_xdr::curr::SignedTimeSlicedSurveyStartCollectingMessage {
-            signature,
-            start_collecting: start.clone(),
-        };
+        let signer = SurveyMessageSigner::new(self, nonce);
+        let (signed, start) = signer.build_start()?;
 
         self.broadcast_survey_message(StellarMessage::TimeSlicedSurveyStartCollecting(signed))
             .await?;
@@ -353,25 +445,13 @@ impl App {
     }
 
     async fn broadcast_survey_stop(&self, nonce: u32) {
-        let ledger_num = self.survey_local_ledger();
-        let stop = TimeSlicedSurveyStopCollectingMessage {
-            surveyor_id: self.local_node_id(),
-            nonce,
-            ledger_num,
-        };
-
-        let stop_bytes = match stop.to_xdr(stellar_xdr::curr::Limits::none()) {
-            Ok(bytes) => bytes,
+        let signer = SurveyMessageSigner::new(self, nonce);
+        let (signed, stop) = match signer.build_stop() {
+            Ok(v) => v,
             Err(e) => {
-                tracing::debug!(error = %e, "Failed to encode survey stop message");
+                tracing::debug!(error = %e, "Failed to build survey stop message");
                 return;
             }
-        };
-
-        let signature = self.sign_survey_message(&stop_bytes);
-        let signed = stellar_xdr::curr::SignedTimeSlicedSurveyStopCollectingMessage {
-            signature,
-            stop_collecting: stop.clone(),
         };
 
         let _ = self
@@ -1068,25 +1148,13 @@ impl App {
     }
 
     async fn send_survey_start(&self, peers: &[henyey_overlay::PeerId], nonce: u32) -> bool {
-        let ledger_num = self.survey_local_ledger();
-        let start = TimeSlicedSurveyStartCollectingMessage {
-            surveyor_id: self.local_node_id(),
-            nonce,
-            ledger_num,
-        };
-
-        let start_bytes = match start.to_xdr(stellar_xdr::curr::Limits::none()) {
-            Ok(bytes) => bytes,
+        let signer = SurveyMessageSigner::new(self, nonce);
+        let (signed, start) = match signer.build_start() {
+            Ok(v) => v,
             Err(e) => {
-                tracing::debug!(error = %e, "Failed to encode survey start message");
+                tracing::debug!(error = %e, "Failed to build survey start message");
                 return false;
             }
-        };
-
-        let signature = self.sign_survey_message(&start_bytes);
-        let signed = stellar_xdr::curr::SignedTimeSlicedSurveyStartCollectingMessage {
-            signature,
-            start_collecting: start.clone(),
         };
 
         let sent = self
@@ -1107,46 +1175,17 @@ impl App {
     }
 
     async fn send_survey_requests(&self, peers: &[henyey_overlay::PeerId], nonce: u32) -> bool {
-        let local_node_id = self.local_node_id();
-        let secret = self.ensure_survey_secret(nonce).await;
-        let public = CurvePublicKey::from(&secret);
-        let encryption_key = Curve25519Public {
-            key: public.to_bytes(),
-        };
+        let signer = SurveyRequestSigner::new(self, nonce).await;
 
         let mut ok = true;
         for peer in peers {
-            // Read ledger fresh per-peer, matching stellar-core's
-            // populateSurveyRequestMessage which reads per-request.
-            let ledger_num = self.survey_local_ledger();
-            let request = SurveyRequestMessage {
-                surveyor_peer_id: local_node_id.clone(),
-                surveyed_peer_id: stellar_xdr::curr::NodeId(peer.0.clone()),
-                ledger_num,
-                encryption_key: encryption_key.clone(),
-                command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
-            };
-
-            let message = TimeSlicedSurveyRequestMessage {
-                request,
-                nonce,
-                inbound_peers_index: 0,
-                outbound_peers_index: 0,
-            };
-
-            let message_bytes = match message.to_xdr(stellar_xdr::curr::Limits::none()) {
-                Ok(bytes) => bytes,
+            let signed = match signer.build_request(peer, 0, 0) {
+                Ok(s) => s,
                 Err(e) => {
-                    tracing::debug!(peer = %peer, error = %e, "Failed to encode survey request");
+                    tracing::debug!(peer = %peer, error = %e, "Failed to build survey request");
                     ok = false;
                     continue;
                 }
-            };
-
-            let signature = self.sign_survey_message(&message_bytes);
-            let signed = stellar_xdr::curr::SignedTimeSlicedSurveyRequestMessage {
-                request_signature: signature,
-                request: message,
             };
 
             if !self
@@ -1163,25 +1202,13 @@ impl App {
     }
 
     async fn send_survey_stop(&self, peers: &[henyey_overlay::PeerId], nonce: u32) {
-        let ledger_num = self.survey_local_ledger();
-        let stop = TimeSlicedSurveyStopCollectingMessage {
-            surveyor_id: self.local_node_id(),
-            nonce,
-            ledger_num,
-        };
-
-        let stop_bytes = match stop.to_xdr(stellar_xdr::curr::Limits::none()) {
-            Ok(bytes) => bytes,
+        let signer = SurveyMessageSigner::new(self, nonce);
+        let (signed, stop) = match signer.build_stop() {
+            Ok(v) => v,
             Err(e) => {
-                tracing::debug!(error = %e, "Failed to encode survey stop message");
+                tracing::debug!(error = %e, "Failed to build survey stop message");
                 return;
             }
-        };
-
-        let signature = self.sign_survey_message(&stop_bytes);
-        let signed = stellar_xdr::curr::SignedTimeSlicedSurveyStopCollectingMessage {
-            signature,
-            stop_collecting: stop.clone(),
         };
 
         let _ = self
