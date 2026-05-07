@@ -534,7 +534,8 @@ impl PreparedTransactionSet {
         soroban_info: Option<&henyey_ledger::SorobanNetworkInfo>,
         fee_balance_provider: Option<&dyn FeeBalanceProvider>,
         account_provider: Option<&dyn AccountProvider>,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), crate::tx_set_utils::TxSetValidationError> {
+        use crate::tx_set_utils::{TxSetValidationError, TxSetValidationResult};
         use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 
         let is_v20_plus =
@@ -558,11 +559,15 @@ impl PreparedTransactionSet {
             }
             (true, false) => {
                 // Generalized set on pre-V20: reject
-                Err("generalized set on pre-V20".into())
+                Err(TxSetValidationError::new(
+                    TxSetValidationResult::GeneralizedTxsetMismatch,
+                ))
             }
             (false, true) => {
                 // Legacy set on V20+: reject
-                Err("legacy set on V20+".into())
+                Err(TxSetValidationError::new(
+                    TxSetValidationResult::GeneralizedTxsetMismatch,
+                ))
             }
             (false, false) => {
                 // Legacy set on pre-V20: already validated by prepare_for_apply

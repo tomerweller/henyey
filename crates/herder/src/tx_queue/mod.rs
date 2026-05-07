@@ -6947,7 +6947,7 @@ mod tests {
     /// validation drifting apart on inclusion-fee semantics.
     #[test]
     fn test_admitted_soroban_tx_passes_check_fee_map() {
-        use crate::tx_set_utils::{check_fee_map, FeeMapValidationResult};
+        use crate::tx_set_utils::{check_fee_map, TxSetValidationResult};
 
         let queue = TransactionQueue::with_defaults();
         let envelope = make_soroban_envelope_with_resource_fee(600, 500, 100);
@@ -6963,7 +6963,7 @@ mod tests {
         for phase in v1.phases.iter() {
             assert_eq!(
                 check_fee_map(phase, lcl_base_fee),
-                FeeMapValidationResult::Valid,
+                TxSetValidationResult::Valid,
                 "every phase must pass check_fee_map after the fix"
             );
         }

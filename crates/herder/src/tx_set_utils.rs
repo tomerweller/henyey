@@ -1169,101 +1169,137 @@ pub(crate) use henyey_tx::envelope_utils::envelope_soroban_resources;
 pub(crate) use henyey_tx::envelope_utils::has_dex_operations_envelope;
 pub(crate) use henyey_tx::envelope_utils::is_soroban_envelope;
 
-/// Result of fee-map validation for a transaction phase.
+/// Unified result of transaction set content validation.
 ///
-/// Mirrors the fee-related subset of stellar-core's `TxSetValidationResult`
-/// (TxSetFrame.h:89-90). Designed to be forward-compatible with a future
-/// broader `TxSetValidationResult` enum covering all of `check_tx_set_valid`.
+/// Mirrors the content-validation subset of stellar-core's `TxSetValidationResult`
+/// (TxSetFrame.h:52-96). Covers fee-map, classic-phase, Soroban-phase, and
+/// per-TX validation results. Structural XDR validation variants (e.g.,
+/// `INCORRECT_COMPONENT_ORDER`, `EMPTY_STAGE`) are not included here — they
+/// belong to the structural validation path (`validate_generalized_tx_set_xdr_structure`
+/// / `prepare_for_apply`).
+///
+/// Display strings use SCREAMING_SNAKE_CASE matching stellar-core's `toString()`
+/// for log parity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FeeMapValidationResult {
+#[non_exhaustive]
+pub enum TxSetValidationResult {
     Valid,
+
+    // Structural errors (content-validation level)
+    /// Protocol/format mismatch: generalized set on pre-V20 or legacy set on V20+.
+    GeneralizedTxsetMismatch,
+    /// Expected exactly 2 phases (classic + Soroban).
+    WrongPhaseCount,
+
+    // Classic phase errors
+    ClassicPhaseParallelNotAllowed,
+    TooManyClassicTxs,
+
+    // Soroban phase errors
+    SorobanParallelSupportMismatch,
+    SorobanResourcesOverflow,
+    SorobanResourcesExceedLimit,
+    TooManySorobanClusters,
+    SorobanInstructionsOverflow,
+    SorobanInstructionsExceedLimit,
+    SorobanSequentialInstructionsOverflow,
+    /// Soroban phase present but network config unavailable. henyey-specific;
+    /// stellar-core always has config for V20+ ledgers.
+    SorobanConfigUnavailable,
+
+    // Transaction-level errors
+    InvalidPhaseTxType,
+    TxOrderingInvalid,
+
+    // Fee errors
     ComponentBaseFeeTooLow,
     TxFeeBidTooLow,
+
+    // Individual transaction validation
+    TxValidationFailed,
 }
 
-impl std::fmt::Display for FeeMapValidationResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Valid => write!(f, "valid"),
-            Self::ComponentBaseFeeTooLow => write!(f, "component base fee too low"),
-            Self::TxFeeBidTooLow => write!(f, "tx fee bid too low"),
-        }
-    }
-}
-
-/// Result of classic phase validation.
-///
-/// Mirrors the classic-phase subset of stellar-core's `TxSetValidationResult`
-/// (TxSetFrame.h:72-73). Designed to be forward-compatible with a future
-/// broader `TxSetValidationResult` enum covering all of `check_tx_set_valid`.
-///
-/// Note: `InvalidPhaseTxType` is defense-in-depth. stellar-core checks TX type
-/// at the phase level (TxSetFrame.cpp:1752-1777), not in `checkValidClassic`.
-/// henyey's caller `check_tx_set_valid` also pre-checks at lines 1711-1716.
-/// This variant exists so `check_valid_classic` is self-contained when called
-/// directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClassicValidationResult {
-    Valid,
-    ParallelNotAllowed,
-    TooManyTxs,
-    InvalidPhaseTxType,
-}
-
-impl std::fmt::Display for ClassicValidationResult {
+impl std::fmt::Display for TxSetValidationResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Valid => write!(f, "VALID"),
-            Self::ParallelNotAllowed => write!(f, "CLASSIC_PHASE_PARALLEL_NOT_ALLOWED"),
-            Self::TooManyTxs => write!(f, "TOO_MANY_CLASSIC_TXS"),
-            Self::InvalidPhaseTxType => write!(f, "INVALID_PHASE_TX_TYPE"),
-        }
-    }
-}
-
-/// Result of Soroban phase validation.
-///
-/// Mirrors the Soroban-specific subset of stellar-core's `TxSetValidationResult`
-/// (TxSetFrame.h:75-82). Designed to be forward-compatible with a future broader
-/// `TxSetValidationResult` enum covering all of `check_tx_set_valid`.
-///
-/// Note: `InvalidPhaseTxType` is defense-in-depth. stellar-core checks TX type
-/// at the phase level (TxSetFrame.cpp:1756-1762), not in `checkValidSoroban`.
-/// henyey's caller `check_tx_set_valid` also pre-checks at lines 1664-1669.
-/// This variant exists so `check_valid_soroban` is self-contained when called
-/// directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SorobanValidationResult {
-    Valid,
-    ParallelSupportMismatch,
-    InvalidPhaseTxType,
-    ResourcesOverflow,
-    ResourcesExceedLimit,
-    TooManyClusters,
-    SequentialInstructionsOverflow,
-    InstructionsOverflow,
-    InstructionsExceedLimit,
-    TxOrderingInvalid,
-}
-
-impl std::fmt::Display for SorobanValidationResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Valid => write!(f, "VALID"),
-            Self::ParallelSupportMismatch => write!(f, "SOROBAN_PARALLEL_SUPPORT_MISMATCH"),
-            Self::InvalidPhaseTxType => write!(f, "INVALID_PHASE_TX_TYPE"),
-            Self::ResourcesOverflow => write!(f, "SOROBAN_RESOURCES_OVERFLOW"),
-            Self::ResourcesExceedLimit => write!(f, "SOROBAN_RESOURCES_EXCEED_LIMIT"),
-            Self::TooManyClusters => write!(f, "TOO_MANY_SOROBAN_CLUSTERS"),
-            Self::SequentialInstructionsOverflow => {
+            Self::GeneralizedTxsetMismatch => write!(f, "GENERALIZED_TXSET_MISMATCH"),
+            Self::WrongPhaseCount => write!(f, "WRONG_PHASE_COUNT"),
+            Self::ClassicPhaseParallelNotAllowed => {
+                write!(f, "CLASSIC_PHASE_PARALLEL_NOT_ALLOWED")
+            }
+            Self::TooManyClassicTxs => write!(f, "TOO_MANY_CLASSIC_TXS"),
+            Self::SorobanParallelSupportMismatch => {
+                write!(f, "SOROBAN_PARALLEL_SUPPORT_MISMATCH")
+            }
+            Self::SorobanResourcesOverflow => write!(f, "SOROBAN_RESOURCES_OVERFLOW"),
+            Self::SorobanResourcesExceedLimit => write!(f, "SOROBAN_RESOURCES_EXCEED_LIMIT"),
+            Self::TooManySorobanClusters => write!(f, "TOO_MANY_SOROBAN_CLUSTERS"),
+            Self::SorobanInstructionsOverflow => write!(f, "SOROBAN_INSTRUCTIONS_OVERFLOW"),
+            Self::SorobanInstructionsExceedLimit => {
+                write!(f, "SOROBAN_INSTRUCTIONS_EXCEED_LIMIT")
+            }
+            Self::SorobanSequentialInstructionsOverflow => {
                 write!(f, "SOROBAN_SEQUENTIAL_INSTRUCTIONS_OVERFLOW")
             }
-            Self::InstructionsOverflow => write!(f, "SOROBAN_INSTRUCTIONS_OVERFLOW"),
-            Self::InstructionsExceedLimit => write!(f, "SOROBAN_INSTRUCTIONS_EXCEED_LIMIT"),
+            Self::SorobanConfigUnavailable => write!(f, "SOROBAN_CONFIG_UNAVAILABLE"),
+            Self::InvalidPhaseTxType => write!(f, "INVALID_PHASE_TX_TYPE"),
             Self::TxOrderingInvalid => write!(f, "TX_ORDERING_INVALID"),
+            Self::ComponentBaseFeeTooLow => write!(f, "COMPONENT_BASE_FEE_TOO_LOW"),
+            Self::TxFeeBidTooLow => write!(f, "TX_FEE_BID_TOO_LOW"),
+            Self::TxValidationFailed => write!(f, "TX_VALIDATION_FAILED"),
         }
     }
 }
+
+/// Structured error for transaction set content validation.
+///
+/// Wraps [`TxSetValidationResult`] with diagnostic context (phase index,
+/// invalid transaction count) to preserve the information previously embedded
+/// in ad-hoc error strings.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct TxSetValidationError {
+    pub result: TxSetValidationResult,
+    pub phase_idx: Option<usize>,
+    pub invalid_tx_count: Option<usize>,
+}
+
+impl TxSetValidationError {
+    pub fn new(result: TxSetValidationResult) -> Self {
+        Self {
+            result,
+            phase_idx: None,
+            invalid_tx_count: None,
+        }
+    }
+
+    pub fn with_phase(mut self, phase_idx: usize) -> Self {
+        self.phase_idx = Some(phase_idx);
+        self
+    }
+
+    pub fn with_invalid_tx_count(mut self, count: usize) -> Self {
+        self.invalid_tx_count = Some(count);
+        self
+    }
+}
+
+impl std::fmt::Display for TxSetValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(phase_idx) = self.phase_idx {
+            write!(f, "phase {}: {}", phase_idx, self.result)?;
+        } else {
+            write!(f, "{}", self.result)?;
+        }
+        if let Some(count) = self.invalid_tx_count {
+            write!(f, " ({} invalid transactions)", count)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for TxSetValidationError {}
 
 /// Validates fee constraints for a set of transactions with a given optional base fee.
 ///
@@ -1276,9 +1312,9 @@ fn validate_fee_component<'a>(
     base_fee: Option<i64>,
     txs: impl Iterator<Item = &'a TransactionEnvelope>,
     lcl_base_fee: u32,
-) -> FeeMapValidationResult {
+) -> TxSetValidationResult {
     let Some(base_fee) = base_fee else {
-        return FeeMapValidationResult::Valid;
+        return TxSetValidationResult::Valid;
     };
     // Compare as signed i64 — stellar-core promotes uint32_t baseFee
     // to int64_t, so a negative XDR base_fee correctly fails.
@@ -1287,7 +1323,7 @@ fn validate_fee_component<'a>(
             "Got bad txSet: component base fee {} < lcl base fee {}",
             base_fee, lcl_base_fee
         );
-        return FeeMapValidationResult::ComponentBaseFeeTooLow;
+        return TxSetValidationResult::ComponentBaseFeeTooLow;
     }
     for tx in txs {
         let tx_inclusion_fee = envelope_inclusion_fee(tx);
@@ -1297,10 +1333,10 @@ fn validate_fee_component<'a>(
                 "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
                 tx_inclusion_fee, min_fee
             );
-            return FeeMapValidationResult::TxFeeBidTooLow;
+            return TxSetValidationResult::TxFeeBidTooLow;
         }
     }
-    FeeMapValidationResult::Valid
+    TxSetValidationResult::Valid
 }
 
 /// Validate that component base fees and per-TX inclusion fees meet minimums.
@@ -1313,17 +1349,17 @@ fn validate_fee_component<'a>(
 ///
 /// For V1 (parallel) phases: checks the phase-level `base_fee` >= `lcl_base_fee`,
 /// then verifies each TX's inclusion fee.
-pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> FeeMapValidationResult {
+pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> TxSetValidationResult {
     match phase {
         TransactionPhase::V0(components) => {
             for component in components.iter() {
                 let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
                 let result = validate_fee_component(comp.base_fee, comp.txs.iter(), lcl_base_fee);
-                if result != FeeMapValidationResult::Valid {
+                if result != TxSetValidationResult::Valid {
                     return result;
                 }
             }
-            FeeMapValidationResult::Valid
+            TxSetValidationResult::Valid
         }
         TransactionPhase::V1(parallel) => validate_fee_component(
             parallel.base_fee,
@@ -1366,12 +1402,12 @@ fn get_min_inclusion_fee(
 pub(crate) fn check_valid_classic(
     phase: &TransactionPhase,
     max_tx_set_size: u32,
-) -> ClassicValidationResult {
+) -> TxSetValidationResult {
     let components = match phase {
         TransactionPhase::V0(components) => components,
         TransactionPhase::V1(_) => {
             debug!("Got bad txSet: classic phase can't be parallel");
-            return ClassicValidationResult::ParallelNotAllowed;
+            return TxSetValidationResult::ClassicPhaseParallelNotAllowed;
         }
     };
 
@@ -1381,7 +1417,7 @@ pub(crate) fn check_valid_classic(
         for tx in comp.txs.iter() {
             if is_soroban_envelope(tx) {
                 debug!("Got bad txSet: Soroban transaction found in classic phase");
-                return ClassicValidationResult::InvalidPhaseTxType;
+                return TxSetValidationResult::InvalidPhaseTxType;
             }
             total_ops += envelope_num_ops(tx) as u64;
         }
@@ -1392,10 +1428,10 @@ pub(crate) fn check_valid_classic(
             "Got bad txSet: too many classic ops {} > {}",
             total_ops, max_tx_set_size
         );
-        return ClassicValidationResult::TooManyTxs;
+        return TxSetValidationResult::TooManyClassicTxs;
     }
 
-    ClassicValidationResult::Valid
+    TxSetValidationResult::Valid
 }
 
 /// Validate the Soroban transaction phase.
@@ -1413,7 +1449,7 @@ pub(crate) fn check_valid_soroban(
     phase: &TransactionPhase,
     lcl_header: &LedgerHeader,
     soroban_info: &SorobanNetworkInfo,
-) -> SorobanValidationResult {
+) -> TxSetValidationResult {
     let protocol = lcl_header.ledger_version;
     let need_parallel = protocol_version_starts_from(protocol, ProtocolVersion::V23);
 
@@ -1423,7 +1459,7 @@ pub(crate) fn check_valid_soroban(
             "Got bad txSet: Soroban phase parallel support mismatch; expected {}",
             need_parallel
         );
-        return SorobanValidationResult::ParallelSupportMismatch;
+        return TxSetValidationResult::SorobanParallelSupportMismatch;
     }
 
     // Aggregate total resources across all TXs using TransactionFrame::resources()
@@ -1435,7 +1471,7 @@ pub(crate) fn check_valid_soroban(
     for tx in &all_txs {
         if !is_soroban_envelope(tx) {
             debug!("Got bad txSet: non-Soroban transaction found in Soroban phase");
-            return SorobanValidationResult::InvalidPhaseTxType;
+            return TxSetValidationResult::InvalidPhaseTxType;
         }
         let frame = TransactionFrame::new(Arc::new((*tx).clone()));
         let res = frame.resources(false, protocol);
@@ -1443,7 +1479,7 @@ pub(crate) fn check_valid_soroban(
             Ok(sum) => total_resources = sum,
             Err(_) => {
                 debug!("Got bad txSet: Soroban resource overflow");
-                return SorobanValidationResult::ResourcesOverflow;
+                return TxSetValidationResult::SorobanResourcesOverflow;
             }
         }
     }
@@ -1462,54 +1498,54 @@ pub(crate) fn check_valid_soroban(
             "Got bad txSet: Soroban instructions {} > ledger max {}",
             total_instructions, soroban_info.ledger_max_instructions
         );
-        return SorobanValidationResult::ResourcesExceedLimit;
+        return TxSetValidationResult::SorobanResourcesExceedLimit;
     }
     if total_read_entries > soroban_info.ledger_max_read_ledger_entries as i64 {
         debug!(
             "Got bad txSet: Soroban read entries {} > ledger max {}",
             total_read_entries, soroban_info.ledger_max_read_ledger_entries
         );
-        return SorobanValidationResult::ResourcesExceedLimit;
+        return TxSetValidationResult::SorobanResourcesExceedLimit;
     }
     if total_read_bytes > soroban_info.ledger_max_read_bytes as i64 {
         debug!(
             "Got bad txSet: Soroban read bytes {} > ledger max {}",
             total_read_bytes, soroban_info.ledger_max_read_bytes
         );
-        return SorobanValidationResult::ResourcesExceedLimit;
+        return TxSetValidationResult::SorobanResourcesExceedLimit;
     }
     if total_write_entries > soroban_info.ledger_max_write_ledger_entries as i64 {
         debug!(
             "Got bad txSet: Soroban write entries {} > ledger max {}",
             total_write_entries, soroban_info.ledger_max_write_ledger_entries
         );
-        return SorobanValidationResult::ResourcesExceedLimit;
+        return TxSetValidationResult::SorobanResourcesExceedLimit;
     }
     if total_write_bytes > soroban_info.ledger_max_write_bytes as i64 {
         debug!(
             "Got bad txSet: Soroban write bytes {} > ledger max {}",
             total_write_bytes, soroban_info.ledger_max_write_bytes
         );
-        return SorobanValidationResult::ResourcesExceedLimit;
+        return TxSetValidationResult::SorobanResourcesExceedLimit;
     }
     if total_tx_size_bytes > soroban_info.ledger_max_tx_size_bytes as i64 {
         debug!(
             "Got bad txSet: Soroban tx size bytes {} > ledger max {}",
             total_tx_size_bytes, soroban_info.ledger_max_tx_size_bytes
         );
-        return SorobanValidationResult::ResourcesExceedLimit;
+        return TxSetValidationResult::SorobanResourcesExceedLimit;
     }
     if total_ops > soroban_info.ledger_max_tx_count as i64 {
         debug!(
             "Got bad txSet: Soroban tx count {} > ledger max {}",
             total_ops, soroban_info.ledger_max_tx_count
         );
-        return SorobanValidationResult::ResourcesExceedLimit;
+        return TxSetValidationResult::SorobanResourcesExceedLimit;
     }
 
     // Sequential phase is done
     if !is_parallel {
-        return SorobanValidationResult::Valid;
+        return TxSetValidationResult::Valid;
     }
 
     // Parallel-specific validation
@@ -1525,7 +1561,7 @@ pub(crate) fn check_valid_soroban(
                 stage.len(),
                 soroban_info.ledger_max_dependent_tx_clusters
             );
-            return SorobanValidationResult::TooManyClusters;
+            return TxSetValidationResult::TooManySorobanClusters;
         }
     }
 
@@ -1540,7 +1576,7 @@ pub(crate) fn check_valid_soroban(
                     // Check overflow
                     if cluster_instructions > i64::MAX - resources.instructions as i64 {
                         debug!("Got bad txSet: Soroban sequential instructions overflow");
-                        return SorobanValidationResult::SequentialInstructionsOverflow;
+                        return TxSetValidationResult::SorobanSequentialInstructionsOverflow;
                     }
                     cluster_instructions += resources.instructions as i64;
                 }
@@ -1549,7 +1585,7 @@ pub(crate) fn check_valid_soroban(
         }
         if sequential_instructions > i64::MAX - stage_max_instructions {
             debug!("Got bad txSet: Soroban total instructions overflow");
-            return SorobanValidationResult::InstructionsOverflow;
+            return TxSetValidationResult::SorobanInstructionsOverflow;
         }
         sequential_instructions += stage_max_instructions;
     }
@@ -1558,18 +1594,18 @@ pub(crate) fn check_valid_soroban(
             "Got bad txSet: Soroban total instructions exceed limit: {} > {}",
             sequential_instructions, soroban_info.ledger_max_instructions
         );
-        return SorobanValidationResult::InstructionsExceedLimit;
+        return TxSetValidationResult::SorobanInstructionsExceedLimit;
     }
 
     // RW conflict detection between clusters within each stage
     for stage in parallel.execution_stages.iter() {
         let result = check_stage_footprint_conflicts(stage);
-        if result != SorobanValidationResult::Valid {
+        if result != TxSetValidationResult::Valid {
             return result;
         }
     }
 
-    SorobanValidationResult::Valid
+    TxSetValidationResult::Valid
 }
 
 /// Check that no cluster's footprint conflicts with another cluster within the same stage.
@@ -1578,7 +1614,7 @@ pub(crate) fn check_valid_soroban(
 /// and a read-write key in one cluster must not appear in any other cluster's footprint.
 fn check_stage_footprint_conflicts(
     stage: &stellar_xdr::curr::ParallelTxExecutionStage,
-) -> SorobanValidationResult {
+) -> TxSetValidationResult {
     let mut stage_read_only_keys: HashSet<Vec<u8>> = HashSet::new();
     let mut stage_read_write_keys: HashSet<Vec<u8>> = HashSet::new();
 
@@ -1592,7 +1628,7 @@ fn check_stage_footprint_conflicts(
                     let key_bytes = key_to_bytes(key);
                     if stage_read_write_keys.contains(&key_bytes) {
                         debug!("Got bad txSet: cluster footprint conflicts with another cluster within stage");
-                        return SorobanValidationResult::TxOrderingInvalid;
+                        return TxSetValidationResult::TxOrderingInvalid;
                     }
                     cluster_read_only_keys.push(key_bytes);
                 }
@@ -1602,7 +1638,7 @@ fn check_stage_footprint_conflicts(
                         || stage_read_write_keys.contains(&key_bytes)
                     {
                         debug!("Got bad txSet: cluster footprint conflicts with another cluster within stage");
-                        return SorobanValidationResult::TxOrderingInvalid;
+                        return TxSetValidationResult::TxOrderingInvalid;
                     }
                     cluster_read_write_keys.push(key_bytes);
                 }
@@ -1612,7 +1648,7 @@ fn check_stage_footprint_conflicts(
         stage_read_only_keys.extend(cluster_read_only_keys);
         stage_read_write_keys.extend(cluster_read_write_keys);
     }
-    SorobanValidationResult::Valid
+    TxSetValidationResult::Valid
 }
 
 /// Serialize a LedgerKey to bytes for use as a hash set key.
@@ -1672,19 +1708,23 @@ pub(crate) fn check_tx_set_valid(
     soroban_info: Option<&SorobanNetworkInfo>,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
     account_provider: Option<&dyn AccountProvider>,
-) -> Result<(), String> {
+) -> Result<(), TxSetValidationError> {
     let GeneralizedTransactionSet::V1(v1) = gen_tx_set;
 
     // Verify generalized tx set is expected for this protocol
     let need_generalized =
         protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V20);
     if !need_generalized {
-        return Err("generalized tx set not expected for protocol < 20".into());
+        return Err(TxSetValidationError::new(
+            TxSetValidationResult::GeneralizedTxsetMismatch,
+        ));
     }
 
     // Generalized sets should always have 2 phases
     if v1.phases.len() != 2 {
-        return Err(format!("expected 2 phases, got {}", v1.phases.len()));
+        return Err(TxSetValidationError::new(
+            TxSetValidationResult::WrongPhaseCount,
+        ));
     }
 
     // Cross-phase fee map handling (Protocol 26+)
@@ -1729,11 +1769,8 @@ pub(crate) fn check_tx_set_valid(
 
         // 1. Check fee map
         let fee_result = check_fee_map(phase, lcl_header.base_fee);
-        if fee_result != FeeMapValidationResult::Valid {
-            return Err(format!(
-                "check_fee_map: phase {} failed: {} (lcl base fee {})",
-                phase_idx, fee_result, lcl_header.base_fee
-            ));
+        if fee_result != TxSetValidationResult::Valid {
+            return Err(TxSetValidationError::new(fee_result).with_phase(phase_idx));
         }
 
         let is_soroban = phase_idx == 1;
@@ -1742,7 +1779,10 @@ pub(crate) fn check_tx_set_valid(
         let phase_txs = collect_phase_txs(phase);
         for tx in &phase_txs {
             if is_soroban_envelope(tx) != is_soroban {
-                return Err(format!("invalid phase {} transaction type", phase_idx));
+                return Err(
+                    TxSetValidationError::new(TxSetValidationResult::InvalidPhaseTxType)
+                        .with_phase(phase_idx),
+                );
             }
         }
 
@@ -1750,23 +1790,20 @@ pub(crate) fn check_tx_set_valid(
         if is_soroban {
             if let Some(info) = soroban_info {
                 let soroban_result = check_valid_soroban(phase, lcl_header, info);
-                if soroban_result != SorobanValidationResult::Valid {
-                    return Err(format!(
-                        "check_valid_soroban: phase {} {}",
-                        phase_idx, soroban_result
-                    ));
+                if soroban_result != TxSetValidationResult::Valid {
+                    return Err(TxSetValidationError::new(soroban_result).with_phase(phase_idx));
                 }
             } else {
                 // Soroban phase present but no network config — reject.
-                return Err("soroban phase present but soroban config unavailable".into());
+                return Err(TxSetValidationError::new(
+                    TxSetValidationResult::SorobanConfigUnavailable,
+                )
+                .with_phase(phase_idx));
             }
         } else {
             let classic_result = check_valid_classic(phase, lcl_header.max_tx_set_size);
-            if classic_result != ClassicValidationResult::Valid {
-                return Err(format!(
-                    "check_valid_classic: phase {} {}",
-                    phase_idx, classic_result
-                ));
+            if classic_result != TxSetValidationResult::Valid {
+                return Err(TxSetValidationError::new(classic_result).with_phase(phase_idx));
             }
         }
 
@@ -1782,11 +1819,11 @@ pub(crate) fn check_tx_set_valid(
             &mut account_fee_map,
         );
         if !invalid.is_empty() {
-            return Err(format!(
-                "{} invalid transactions in phase {}",
-                invalid.len(),
-                phase_idx
-            ));
+            return Err(
+                TxSetValidationError::new(TxSetValidationResult::TxValidationFailed)
+                    .with_phase(phase_idx)
+                    .with_invalid_tx_count(invalid.len()),
+            );
         }
     }
 
@@ -2620,7 +2657,7 @@ mod tests {
         // inclusion_fee = min(200, 1*100) = 100 >= 100 -> valid
         let tx = make_valid_envelope(200, 1);
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
-        assert_eq!(check_fee_map(&phase, 100), FeeMapValidationResult::Valid);
+        assert_eq!(check_fee_map(&phase, 100), TxSetValidationResult::Valid);
     }
 
     #[test]
@@ -2630,7 +2667,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(50));
         assert_eq!(
             check_fee_map(&phase, 100),
-            FeeMapValidationResult::ComponentBaseFeeTooLow
+            TxSetValidationResult::ComponentBaseFeeTooLow
         );
     }
 
@@ -2643,7 +2680,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(-1));
         assert_eq!(
             check_fee_map(&phase, 100),
-            FeeMapValidationResult::ComponentBaseFeeTooLow
+            TxSetValidationResult::ComponentBaseFeeTooLow
         );
     }
 
@@ -2658,7 +2695,7 @@ mod tests {
         });
         assert_eq!(
             check_fee_map(&phase, 100),
-            FeeMapValidationResult::ComponentBaseFeeTooLow
+            TxSetValidationResult::ComponentBaseFeeTooLow
         );
     }
 
@@ -2672,7 +2709,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
         assert_eq!(
             check_fee_map(&phase, 100),
-            FeeMapValidationResult::TxFeeBidTooLow
+            TxSetValidationResult::TxFeeBidTooLow
         );
     }
 
@@ -2684,7 +2721,7 @@ mod tests {
         // fee checks are skipped entirely when base_fee is None.
         let tx = make_valid_envelope(200, 1);
         let phase = make_v0_phase_with_fee(vec![tx], None);
-        assert_eq!(check_fee_map(&phase, 100), FeeMapValidationResult::Valid);
+        assert_eq!(check_fee_map(&phase, 100), TxSetValidationResult::Valid);
     }
 
     // --- AUDIT-268: None-baseFee parity regression tests ---
@@ -2698,7 +2735,7 @@ mod tests {
         // (50 < 100*1), but must pass because fee checks are skipped.
         let tx = make_valid_envelope(50, 1);
         let phase = make_v0_phase_with_fee(vec![tx], None);
-        assert_eq!(check_fee_map(&phase, 100), FeeMapValidationResult::Valid);
+        assert_eq!(check_fee_map(&phase, 100), TxSetValidationResult::Valid);
     }
 
     #[test]
@@ -2713,7 +2750,7 @@ mod tests {
                 .try_into()
                 .unwrap(),
         });
-        assert_eq!(check_fee_map(&phase, 100), FeeMapValidationResult::Valid);
+        assert_eq!(check_fee_map(&phase, 100), TxSetValidationResult::Valid);
     }
 
     #[test]
@@ -2725,7 +2762,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(200));
         assert_eq!(
             check_fee_map(&phase, 100),
-            FeeMapValidationResult::TxFeeBidTooLow
+            TxSetValidationResult::TxFeeBidTooLow
         );
     }
 
@@ -2743,7 +2780,7 @@ mod tests {
         });
         assert_eq!(
             check_fee_map(&phase, 100),
-            FeeMapValidationResult::TxFeeBidTooLow
+            TxSetValidationResult::TxFeeBidTooLow
         );
     }
 
@@ -2755,38 +2792,230 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(50)); // base_fee=50 < lcl=100
         assert_eq!(
             check_fee_map(&phase, 100),
-            FeeMapValidationResult::ComponentBaseFeeTooLow
+            TxSetValidationResult::ComponentBaseFeeTooLow
         );
     }
 
     #[test]
     fn test_check_fee_map_display_impl() {
-        assert_eq!(FeeMapValidationResult::Valid.to_string(), "valid");
+        assert_eq!(TxSetValidationResult::Valid.to_string(), "VALID");
         assert_eq!(
-            FeeMapValidationResult::ComponentBaseFeeTooLow.to_string(),
-            "component base fee too low"
+            TxSetValidationResult::ComponentBaseFeeTooLow.to_string(),
+            "COMPONENT_BASE_FEE_TOO_LOW"
         );
         assert_eq!(
-            FeeMapValidationResult::TxFeeBidTooLow.to_string(),
-            "tx fee bid too low"
+            TxSetValidationResult::TxFeeBidTooLow.to_string(),
+            "TX_FEE_BID_TOO_LOW"
         );
+    }
+
+    // --- TxSetValidationResult and TxSetValidationError tests ---
+
+    #[test]
+    fn test_tx_set_validation_result_display_all_variants() {
+        // Verify SCREAMING_SNAKE_CASE Display for all variants
+        assert_eq!(TxSetValidationResult::Valid.to_string(), "VALID");
+        assert_eq!(
+            TxSetValidationResult::GeneralizedTxsetMismatch.to_string(),
+            "GENERALIZED_TXSET_MISMATCH"
+        );
+        assert_eq!(
+            TxSetValidationResult::WrongPhaseCount.to_string(),
+            "WRONG_PHASE_COUNT"
+        );
+        assert_eq!(
+            TxSetValidationResult::SorobanParallelSupportMismatch.to_string(),
+            "SOROBAN_PARALLEL_SUPPORT_MISMATCH"
+        );
+        assert_eq!(
+            TxSetValidationResult::SorobanResourcesOverflow.to_string(),
+            "SOROBAN_RESOURCES_OVERFLOW"
+        );
+        assert_eq!(
+            TxSetValidationResult::SorobanResourcesExceedLimit.to_string(),
+            "SOROBAN_RESOURCES_EXCEED_LIMIT"
+        );
+        assert_eq!(
+            TxSetValidationResult::TooManySorobanClusters.to_string(),
+            "TOO_MANY_SOROBAN_CLUSTERS"
+        );
+        assert_eq!(
+            TxSetValidationResult::SorobanInstructionsOverflow.to_string(),
+            "SOROBAN_INSTRUCTIONS_OVERFLOW"
+        );
+        assert_eq!(
+            TxSetValidationResult::SorobanInstructionsExceedLimit.to_string(),
+            "SOROBAN_INSTRUCTIONS_EXCEED_LIMIT"
+        );
+        assert_eq!(
+            TxSetValidationResult::SorobanSequentialInstructionsOverflow.to_string(),
+            "SOROBAN_SEQUENTIAL_INSTRUCTIONS_OVERFLOW"
+        );
+        assert_eq!(
+            TxSetValidationResult::SorobanConfigUnavailable.to_string(),
+            "SOROBAN_CONFIG_UNAVAILABLE"
+        );
+        assert_eq!(
+            TxSetValidationResult::TxOrderingInvalid.to_string(),
+            "TX_ORDERING_INVALID"
+        );
+        assert_eq!(
+            TxSetValidationResult::TxValidationFailed.to_string(),
+            "TX_VALIDATION_FAILED"
+        );
+    }
+
+    #[test]
+    fn test_tx_set_validation_error_display_without_phase() {
+        let err = TxSetValidationError::new(TxSetValidationResult::GeneralizedTxsetMismatch);
+        assert_eq!(err.to_string(), "GENERALIZED_TXSET_MISMATCH");
+        assert_eq!(err.phase_idx, None);
+        assert_eq!(err.invalid_tx_count, None);
+    }
+
+    #[test]
+    fn test_tx_set_validation_error_display_with_phase() {
+        let err =
+            TxSetValidationError::new(TxSetValidationResult::ComponentBaseFeeTooLow).with_phase(0);
+        assert_eq!(err.to_string(), "phase 0: COMPONENT_BASE_FEE_TOO_LOW");
+        assert_eq!(err.phase_idx, Some(0));
+    }
+
+    #[test]
+    fn test_tx_set_validation_error_display_with_invalid_tx_count() {
+        let err = TxSetValidationError::new(TxSetValidationResult::TxValidationFailed)
+            .with_phase(1)
+            .with_invalid_tx_count(3);
+        assert_eq!(
+            err.to_string(),
+            "phase 1: TX_VALIDATION_FAILED (3 invalid transactions)"
+        );
+        assert_eq!(err.phase_idx, Some(1));
+        assert_eq!(err.invalid_tx_count, Some(3));
+    }
+
+    #[test]
+    fn test_check_tx_set_valid_fee_error_populates_phase_idx() {
+        let tx = make_valid_envelope(200, 1);
+        let phase_with_low_base_fee = make_v0_phase_with_fee(vec![tx], Some(50));
+        let soroban_phase = make_v0_phase_with_fee(vec![], Some(100));
+
+        use stellar_xdr::curr::{Hash, TransactionSetV1};
+        let gen_tx_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![phase_with_low_base_fee, soroban_phase]
+                .try_into()
+                .unwrap(),
+        });
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+
+        let err =
+            check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None).unwrap_err();
+        assert_eq!(err.result, TxSetValidationResult::ComponentBaseFeeTooLow);
+        assert_eq!(err.phase_idx, Some(0));
+        assert_eq!(err.invalid_tx_count, None);
+    }
+
+    #[test]
+    fn test_check_tx_set_valid_per_tx_error_populates_invalid_tx_count() {
+        let bad_seq_tx = make_valid_envelope(200, 999_999_999);
+        let gen_tx_set = make_gen_tx_set(vec![bad_seq_tx], vec![]);
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+
+        let mut fee_provider = MockFeeBalanceProvider::new();
+        fee_provider.set_balance([0u8; 32], 1_000_000);
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account([0u8; 32], 0);
+
+        let err = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            0,
+            network_id,
+            None,
+            Some(&fee_provider),
+            Some(&account_provider),
+        )
+        .unwrap_err();
+        assert_eq!(err.result, TxSetValidationResult::TxValidationFailed);
+        assert_eq!(err.phase_idx, Some(0));
+        assert!(
+            err.invalid_tx_count.is_some() && err.invalid_tx_count.unwrap() > 0,
+            "invalid_tx_count should be populated for per-TX failures"
+        );
+    }
+
+    #[test]
+    fn test_check_tx_set_valid_soroban_config_unavailable_error() {
+        let soroban_tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let gen_tx_set = make_gen_tx_set(vec![], vec![soroban_tx]);
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+
+        let err =
+            check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None).unwrap_err();
+        assert_eq!(err.result, TxSetValidationResult::SorobanConfigUnavailable);
+        assert_eq!(err.phase_idx, Some(1));
+    }
+
+    #[test]
+    fn test_check_tx_set_valid_wrong_phase_count() {
+        use stellar_xdr::curr::{Hash, TransactionSetV1};
+        // Create a tx set with only 1 phase (should be 2)
+        let phase = TransactionPhase::V0(vec![].try_into().unwrap());
+        let gen_tx_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![phase].try_into().unwrap(),
+        });
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+
+        let err =
+            check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None).unwrap_err();
+        assert_eq!(err.result, TxSetValidationResult::WrongPhaseCount);
+        assert_eq!(err.phase_idx, None);
+    }
+
+    #[test]
+    fn test_check_tx_set_valid_generalized_txset_mismatch() {
+        use stellar_xdr::curr::{Hash, TransactionSetV1};
+        let gen_tx_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![
+                TransactionPhase::V0(vec![].try_into().unwrap()),
+                TransactionPhase::V0(vec![].try_into().unwrap()),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        // Protocol 19 — pre-V20, generalized not expected
+        let mut header = make_soroban_lcl_header(19);
+        header.ledger_version = 19;
+        let network_id = NetworkId::testnet();
+
+        let err =
+            check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None).unwrap_err();
+        assert_eq!(err.result, TxSetValidationResult::GeneralizedTxsetMismatch);
+        assert_eq!(err.phase_idx, None);
     }
 
     // --- AUDIT-033: check_valid_classic tests ---
 
     #[test]
     fn test_classic_validation_result_display() {
-        assert_eq!(ClassicValidationResult::Valid.to_string(), "VALID");
+        assert_eq!(TxSetValidationResult::Valid.to_string(), "VALID");
         assert_eq!(
-            ClassicValidationResult::ParallelNotAllowed.to_string(),
+            TxSetValidationResult::ClassicPhaseParallelNotAllowed.to_string(),
             "CLASSIC_PHASE_PARALLEL_NOT_ALLOWED"
         );
         assert_eq!(
-            ClassicValidationResult::TooManyTxs.to_string(),
+            TxSetValidationResult::TooManyClassicTxs.to_string(),
             "TOO_MANY_CLASSIC_TXS"
         );
         assert_eq!(
-            ClassicValidationResult::InvalidPhaseTxType.to_string(),
+            TxSetValidationResult::InvalidPhaseTxType.to_string(),
             "INVALID_PHASE_TX_TYPE"
         );
     }
@@ -2797,10 +3026,7 @@ mod tests {
         let tx1 = make_valid_envelope(100, 1);
         let tx2 = make_valid_envelope(200, 2);
         let phase = make_v0_phase_with_fee(vec![tx1, tx2], Some(100));
-        assert_eq!(
-            check_valid_classic(&phase, 5),
-            ClassicValidationResult::Valid
-        );
+        assert_eq!(check_valid_classic(&phase, 5), TxSetValidationResult::Valid);
     }
 
     #[test]
@@ -2812,7 +3038,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx1, tx2, tx3], Some(100));
         assert_eq!(
             check_valid_classic(&phase, 2),
-            ClassicValidationResult::TooManyTxs
+            TxSetValidationResult::TooManyClassicTxs
         );
     }
 
@@ -2826,7 +3052,7 @@ mod tests {
         });
         assert_eq!(
             check_valid_classic(&phase, 100),
-            ClassicValidationResult::ParallelNotAllowed
+            TxSetValidationResult::ClassicPhaseParallelNotAllowed
         );
     }
 
@@ -2947,7 +3173,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::Valid
+            TxSetValidationResult::Valid
         );
     }
 
@@ -2960,7 +3186,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::ResourcesExceedLimit
+            TxSetValidationResult::SorobanResourcesExceedLimit
         );
     }
 
@@ -2976,7 +3202,7 @@ mod tests {
         });
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::ParallelSupportMismatch
+            TxSetValidationResult::SorobanParallelSupportMismatch
         );
     }
 
@@ -2989,7 +3215,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::ParallelSupportMismatch
+            TxSetValidationResult::SorobanParallelSupportMismatch
         );
     }
 
@@ -3019,7 +3245,7 @@ mod tests {
         );
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::TooManyClusters
+            TxSetValidationResult::TooManySorobanClusters
         );
     }
 
@@ -3052,7 +3278,7 @@ mod tests {
         );
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::InstructionsExceedLimit
+            TxSetValidationResult::SorobanInstructionsExceedLimit
         );
     }
 
@@ -3088,7 +3314,7 @@ mod tests {
         );
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::TxOrderingInvalid
+            TxSetValidationResult::TxOrderingInvalid
         );
     }
 
@@ -3126,7 +3352,7 @@ mod tests {
         );
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::Valid
+            TxSetValidationResult::Valid
         );
     }
 
@@ -3139,7 +3365,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::InvalidPhaseTxType
+            TxSetValidationResult::InvalidPhaseTxType
         );
     }
 
@@ -3149,7 +3375,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
         assert_eq!(
             check_valid_classic(&phase, 100),
-            ClassicValidationResult::InvalidPhaseTxType
+            TxSetValidationResult::InvalidPhaseTxType
         );
     }
 
@@ -3166,7 +3392,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::ResourcesExceedLimit
+            TxSetValidationResult::SorobanResourcesExceedLimit
         );
     }
 
@@ -3182,14 +3408,14 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx.clone()], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::Valid
+            TxSetValidationResult::Valid
         );
 
         // Two TXs exceed the single-TX limit
         let phase = make_v0_phase_with_fee(vec![tx.clone(), tx], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::ResourcesExceedLimit
+            TxSetValidationResult::SorobanResourcesExceedLimit
         );
     }
 
@@ -3205,7 +3431,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(txs, Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::ResourcesExceedLimit
+            TxSetValidationResult::SorobanResourcesExceedLimit
         );
     }
 
@@ -3221,7 +3447,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(txs, Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::Valid
+            TxSetValidationResult::Valid
         );
     }
 
@@ -3243,7 +3469,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![fee_bump.clone()], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::Valid
+            TxSetValidationResult::Valid
         );
 
         // Set limit below inner size: should fail
@@ -3251,7 +3477,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![fee_bump], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::ResourcesExceedLimit
+            TxSetValidationResult::SorobanResourcesExceedLimit
         );
     }
 
@@ -3268,7 +3494,7 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![fee_bump.clone()], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::Valid
+            TxSetValidationResult::Valid
         );
 
         // Limit of 1: 1 fee-bump tx with 2 ops should fail
@@ -3276,47 +3502,47 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![fee_bump], Some(100));
         assert_eq!(
             check_valid_soroban(&phase, &header, &info),
-            SorobanValidationResult::ResourcesExceedLimit
+            TxSetValidationResult::SorobanResourcesExceedLimit
         );
     }
 
     #[test]
     fn test_soroban_validation_result_display() {
-        assert_eq!(SorobanValidationResult::Valid.to_string(), "VALID");
+        assert_eq!(TxSetValidationResult::Valid.to_string(), "VALID");
         assert_eq!(
-            SorobanValidationResult::ParallelSupportMismatch.to_string(),
+            TxSetValidationResult::SorobanParallelSupportMismatch.to_string(),
             "SOROBAN_PARALLEL_SUPPORT_MISMATCH"
         );
         assert_eq!(
-            SorobanValidationResult::InvalidPhaseTxType.to_string(),
+            TxSetValidationResult::InvalidPhaseTxType.to_string(),
             "INVALID_PHASE_TX_TYPE"
         );
         assert_eq!(
-            SorobanValidationResult::ResourcesOverflow.to_string(),
+            TxSetValidationResult::SorobanResourcesOverflow.to_string(),
             "SOROBAN_RESOURCES_OVERFLOW"
         );
         assert_eq!(
-            SorobanValidationResult::ResourcesExceedLimit.to_string(),
+            TxSetValidationResult::SorobanResourcesExceedLimit.to_string(),
             "SOROBAN_RESOURCES_EXCEED_LIMIT"
         );
         assert_eq!(
-            SorobanValidationResult::TooManyClusters.to_string(),
+            TxSetValidationResult::TooManySorobanClusters.to_string(),
             "TOO_MANY_SOROBAN_CLUSTERS"
         );
         assert_eq!(
-            SorobanValidationResult::SequentialInstructionsOverflow.to_string(),
+            TxSetValidationResult::SorobanSequentialInstructionsOverflow.to_string(),
             "SOROBAN_SEQUENTIAL_INSTRUCTIONS_OVERFLOW"
         );
         assert_eq!(
-            SorobanValidationResult::InstructionsOverflow.to_string(),
+            TxSetValidationResult::SorobanInstructionsOverflow.to_string(),
             "SOROBAN_INSTRUCTIONS_OVERFLOW"
         );
         assert_eq!(
-            SorobanValidationResult::InstructionsExceedLimit.to_string(),
+            TxSetValidationResult::SorobanInstructionsExceedLimit.to_string(),
             "SOROBAN_INSTRUCTIONS_EXCEED_LIMIT"
         );
         assert_eq!(
-            SorobanValidationResult::TxOrderingInvalid.to_string(),
+            TxSetValidationResult::TxOrderingInvalid.to_string(),
             "TX_ORDERING_INVALID"
         );
     }
@@ -3605,14 +3831,16 @@ mod tests {
 
         let result = check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None);
         let err = result.unwrap_err();
-        assert!(
-            err.contains("component base fee too low"),
-            "error message should contain specific reason, got: {}",
+        assert_eq!(
+            err.result,
+            TxSetValidationResult::ComponentBaseFeeTooLow,
+            "should report specific fee-map failure reason, got: {}",
             err
         );
-        assert!(
-            err.contains("phase 0"),
-            "error message should indicate which phase failed, got: {}",
+        assert_eq!(
+            err.phase_idx,
+            Some(0),
+            "should indicate which phase failed, got: {}",
             err
         );
     }
@@ -3636,14 +3864,16 @@ mod tests {
         let result =
             check_tx_set_valid(&gen_tx_set, &header, 0, network_id, Some(&info), None, None);
         let err = result.unwrap_err();
-        assert!(
-            err.contains("SOROBAN_RESOURCES_EXCEED_LIMIT"),
-            "error message should contain specific SorobanValidationResult, got: {}",
+        assert_eq!(
+            err.result,
+            TxSetValidationResult::SorobanResourcesExceedLimit,
+            "should report specific TxSetValidationResult, got: {}",
             err
         );
-        assert!(
-            err.contains("phase 1"),
-            "error message should indicate which phase failed, got: {}",
+        assert_eq!(
+            err.phase_idx,
+            Some(1),
+            "should indicate which phase failed, got: {}",
             err
         );
     }

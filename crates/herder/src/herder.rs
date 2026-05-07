@@ -2862,14 +2862,16 @@ impl Herder {
 
         // Step 2: content validation against the same snapshot used to build
         // the set. Parity: stellar-core `checkValidInternal` step.
-        prepared.check_valid(
-            header,
-            close_time_offset,
-            NetworkId(self.scp_driver.network_id()),
-            soroban_info,
-            snapshot_providers.map(|sp| sp as &dyn crate::tx_queue::FeeBalanceProvider),
-            snapshot_providers.map(|sp| sp as &dyn crate::tx_queue::AccountProvider),
-        )
+        prepared
+            .check_valid(
+                header,
+                close_time_offset,
+                NetworkId(self.scp_driver.network_id()),
+                soroban_info,
+                snapshot_providers.map(|sp| sp as &dyn crate::tx_queue::FeeBalanceProvider),
+                snapshot_providers.map(|sp| sp as &dyn crate::tx_queue::AccountProvider),
+            )
+            .map_err(|e| e.to_string())
     }
 
     /// Create a signed StellarValue.
@@ -9115,10 +9117,10 @@ mod advance_tracking_slot_tests {
             "Stale base_fee (100) should fail check_fee_map against header base_fee (200), \
              but got Ok. This would be the #2319 bug."
         );
-        let err_msg = result_stale.unwrap_err();
+        let err = result_stale.unwrap_err();
         assert!(
-            err_msg.contains("fee"),
-            "Error should mention fee map: {err_msg}"
+            err.to_string().contains("FEE"),
+            "Error should mention fee map: {err}"
         );
 
         // Path B: BuildContext::Nomination — uses snapshot base_fee=200.
