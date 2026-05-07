@@ -58,15 +58,39 @@ const POST_RESTART_PEER_CONNECT_TIMEOUT_SECS: u64 = 60;
 /// 15s accommodates disk I/O delays on loaded CI runners.
 const POST_RESTART_OPERATIONAL_TIMEOUT_SECS: u64 = 15;
 
+/// Panics immediately if any currently-running app node's task has exited.
+/// Nodes intentionally removed via `remove_node()` return `None` from
+/// `app_task_finished` and are skipped — only `Some(true)` (crashed) triggers.
+async fn check_any_app_node_crashed(sim: &Simulation, context: &str) {
+    for id in sim.app_node_ids() {
+        if sim.app_task_finished(&id) == Some(true) {
+            let status = sim.app_task_status(&id).await;
+            let diag = collect_node_diagnostics(sim).await;
+            panic!(
+                "node {id} task exited while {context} \
+                 (task_status: {status:?}).{diag}"
+            );
+        }
+    }
+}
+
 async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if sim.have_all_app_nodes_externalized(target_ledger, 1) {
             return;
         }
+        check_any_app_node_crashed(sim, &format!("waiting for ledger {target_ledger}")).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let diag = collect_node_diagnostics(sim).await;
+    let mut diag = collect_node_diagnostics(sim).await;
+    for id in sim.app_node_ids() {
+        let finished = sim.app_task_finished(&id);
+        let status = sim.app_task_status(&id).await;
+        diag.push_str(&format!(
+            "\n  {id}: task_finished={finished:?}, task_status={status:?}"
+        ));
+    }
     assert!(
         sim.have_all_app_nodes_externalized(target_ledger, 1),
         "timed out after {timeout:?} waiting for ledger {target_ledger}.{diag}"
@@ -85,12 +109,24 @@ async fn manual_close_until(
         if sim.have_all_app_nodes_externalized(target_ledger, max_spread) {
             return;
         }
+        check_any_app_node_crashed(
+            sim,
+            &format!("waiting for ledger {target_ledger} in manual_close_until"),
+        )
+        .await;
         if let Err(e) = sim.manual_close_all_app_nodes().await {
             last_err = Some(e.to_string());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let mut diag = collect_node_diagnostics(sim).await;
+    for id in sim.app_node_ids() {
+        let finished = sim.app_task_finished(&id);
+        let status = sim.app_task_status(&id).await;
+        diag.push_str(&format!(
+            "\n  {id}: task_finished={finished:?}, task_status={status:?}"
+        ));
+    }
     if let Some(err) = &last_err {
         diag.push_str(&format!("\n  last manual_close error: {err}"));
     }
