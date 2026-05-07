@@ -1,7 +1,7 @@
 //! Deterministic multi-node simulation harness for validating consensus,
 //! overlay, and ledger-close behavior across configurable topologies.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -609,6 +609,18 @@ impl Simulation {
             .map(|n| n.app.ledger_info().ledger_seq)
             .collect();
         seqs_within_spread(&seqs, ledger_seq, max_spread)
+    }
+
+    /// Returns the configured peer topology as a sorted map from each node ID
+    /// to its list of neighbor node IDs. Useful for diagnostic logging in tests
+    /// to verify partition setup.
+    pub fn peer_topology(&self) -> BTreeMap<String, Vec<String>> {
+        let mut topo = BTreeMap::new();
+        for id in self.nodes.keys().chain(self.app_specs.keys()) {
+            topo.entry(id.clone())
+                .or_insert_with(|| self.loopback.neighbors(id));
+        }
+        topo
     }
 
     /// Advance a SimNode's ledger sequence and recompute its hash.

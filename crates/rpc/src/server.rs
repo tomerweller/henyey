@@ -412,7 +412,7 @@ async fn rpc_handler(
 mod tests {
     use super::*;
     use serde_json::json;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     // -------------------------------------------------------------------
     // Shared test helper: boot a single-node simulation App
@@ -510,7 +510,7 @@ mod tests {
     /// When the request semaphore is full, `rpc_handler` must return
     /// `-32000` (SERVER_BUSY) immediately without dispatching the method.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(tcp)]
+    #[file_serial(tcp)]
     async fn test_server_busy_when_semaphore_exhausted() {
         let (_sim, app) = boot_test_app().await;
         let ctx = make_ctx(app, 1, 1, 1, Duration::from_secs(30));
@@ -542,7 +542,7 @@ mod tests {
     /// blocks indefinitely on `acquire_owned()`. The 100ms timeout fires
     /// reliably because the semaphore is never released.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(tcp)]
+    #[file_serial(tcp)]
     async fn test_read_only_timeout_releases_permit() {
         let (_sim, app) = boot_test_app().await;
         let ctx = make_ctx(app, 2, 1, 1, Duration::from_millis(100));
@@ -607,7 +607,7 @@ mod tests {
     /// methods under the same config timeout (proven by
     /// `test_read_only_timeout_releases_permit`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(tcp)]
+    #[file_serial(tcp)]
     async fn test_send_transaction_exempt_from_timeout() {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
         use stellar_xdr::curr::{
