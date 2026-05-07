@@ -131,24 +131,22 @@ fn run_eviction_scan(
 /// re-execution without TransactionMeta may produce slightly different entry values.
 /// For protocol 23+, eviction must also be running to get accurate results.
 fn verify_bucket_list_hash(
-    config: &ReplayConfig,
     header: &LedgerHeader,
     bucket_list: &henyey_bucket::BucketList,
     hot_archive_bucket_list: &henyey_bucket::HotArchiveBucketList,
-    eviction_iterator: Option<EvictionIterator>,
+    eviction_ran: bool,
 ) -> Result<()> {
     let is_checkpoint = is_checkpoint_ledger(header.ledger_seq);
-    let eviction_running = config.run_eviction && eviction_iterator.is_some();
     let can_verify = is_checkpoint
         && (protocol_version_is_before(header.ledger_version, ProtocolVersion::V23)
-            || eviction_running);
+            || eviction_ran);
 
     if !can_verify {
         tracing::debug!(
             ledger_seq = header.ledger_seq,
             protocol_version = header.ledger_version,
             is_checkpoint = is_checkpoint,
-            eviction_running = eviction_running,
+            eviction_ran = eviction_ran,
             "Skipping bucket list verification (only verified at checkpoints)"
         );
         return Ok(());
@@ -852,13 +850,7 @@ pub fn replay_ledger_with_execution(
     );
 
     if config.verify_bucket_list {
-        verify_bucket_list_hash(
-            config,
-            header,
-            bucket_list,
-            hot_archive_bucket_list,
-            eviction_iterator,
-        )?;
+        verify_bucket_list_hash(header, bucket_list, hot_archive_bucket_list, eviction.ran)?;
     }
 
     let tx_count = tx_set_result.results.len() as u32;
@@ -2403,6 +2395,70 @@ mod tests {
                 );
             }
             _ => panic!("expected ConfigSettingEntry::EvictionIterator in bucket list"),
+        }
+    }
+
+    /// Regression test for #2482: verify_bucket_list_hash was skipped when
+    /// eviction_iterator was None on a p23+ checkpoint, even though eviction
+    /// actually ran (creating a fresh iterator). The fix uses `eviction.ran`
+    /// (post-scan truth) instead of `eviction_iterator.is_some()` (stale input).
+    #[test]
+    fn test_verify_bucket_list_hash_not_skipped_with_none_eviction_iterator() {
+        // Use checkpoint ledger (127) so bucket list verification would run
+        let mut header = make_test_header(127);
+        // Protocol 25 (p23+) — eviction applies
+        header.ledger_version = 25;
+        // Set an intentionally wrong bucket_list_hash to detect if verification runs
+        header.bucket_list_hash = Hash([0xAB; 32]);
+
+        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
+        let mut bucket_list = BucketList::new();
+        let mut hot_archive = HotArchiveBucketList::new();
+
+        let config = ReplayConfig {
+            verify_results: false,
+            verify_bucket_list: true,
+            verify_header_hash: false,
+            emit_classic_events: false,
+            backfill_stellar_asset_events: false,
+            run_eviction: true,
+            eviction_settings: StateArchivalSettings::default(),
+            wait_for_publish: false,
+        };
+
+        // Key: pass eviction_iterator as None.
+        // Before the fix, this caused verify_bucket_list_hash to skip verification
+        // because `eviction_iterator.is_some()` was false, even though eviction ran.
+        let result = replay_ledger_with_execution(
+            &header,
+            &tx_set,
+            ReplayExecutionContext {
+                bucket_list: &mut bucket_list,
+                hot_archive_bucket_list: &mut hot_archive,
+                network_id: &NetworkId::testnet(),
+                config: &config,
+                expected_tx_results: None,
+                eviction_iterator: None, // Bug trigger: None input, but eviction WILL run
+                module_cache: None,
+                soroban_state_size: None,
+                prev_id_pool: 0,
+                offer_entries: None,
+            },
+        );
+
+        // With the fix, verification runs and catches the wrong bucket_list_hash.
+        // Without the fix, this would return Ok (verification skipped).
+        match result {
+            Err(HistoryError::VerificationHashMismatch(info)) => {
+                assert_eq!(info.kind(), crate::error::VerifyHashKind::BucketList);
+                assert_eq!(info.ledger(), Some(127));
+                assert_ne!(info.expected(), info.actual());
+            }
+            Ok(_) => panic!(
+                "expected VerificationHashMismatch but got Ok — \
+                 verify_bucket_list_hash was skipped (stale eviction_iterator bug)"
+            ),
+            Err(other) => panic!("expected VerificationHashMismatch, got: {other:?}"),
         }
     }
 }

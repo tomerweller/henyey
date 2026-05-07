@@ -1756,8 +1756,63 @@ impl App {
         };
 
         let tx_set = close_info.tx_set.clone().expect("tx set present");
-        let our_header_hash = self.ledger_manager.current_header_hash();
+        let snapshot = self.ledger_manager.header_snapshot();
+        let our_header_hash = snapshot.hash;
         if our_header_hash != tx_set.previous_ledger_hash() {
+            // Log header XDR bytes for hash debugging (mirrors manager.rs:2122-2140)
+            use stellar_xdr::curr::{Limits, WriteXdr};
+            let header = &snapshot.header;
+            match header.to_xdr(Limits::none()) {
+                Ok(header_xdr) => {
+                    let first_32 = Hash256::from_bytes({
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&header_xdr[..std::cmp::min(32, header_xdr.len())]);
+                        arr
+                    })
+                    .to_hex();
+                    tracing::error!(
+                        target: "hash_mismatch_debug",
+                        header_xdr_first_32_bytes = %first_32,
+                        header_xdr_len = header_xdr.len(),
+                        "Pre-close mismatch: header XDR bytes for debugging"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Failed to encode header XDR for debugging: {e}");
+                }
+            }
+
+            // Log all individual header fields (mirrors manager.rs:2143-2175)
+            let skip_list_0 = Hash256::from_bytes(header.skip_list[0].0).to_hex();
+            let skip_list_1 = Hash256::from_bytes(header.skip_list[1].0).to_hex();
+            let skip_list_2 = Hash256::from_bytes(header.skip_list[2].0).to_hex();
+            let skip_list_3 = Hash256::from_bytes(header.skip_list[3].0).to_hex();
+            tracing::error!(
+                target: "hash_mismatch_debug",
+                ledger_seq = next_seq,
+                our_header_hash = %our_header_hash.to_hex(),
+                network_prev_hash = %tx_set.previous_ledger_hash().to_hex(),
+                header_version = header.ledger_version,
+                header_bucket_list_hash = %Hash256::from(header.bucket_list_hash.0).to_hex(),
+                header_tx_result_hash = %Hash256::from(header.tx_set_result_hash.0).to_hex(),
+                header_total_coins = header.total_coins,
+                header_fee_pool = header.fee_pool,
+                header_close_time = header.scp_value.close_time.0,
+                header_tx_set_hash = %Hash256::from(header.scp_value.tx_set_hash.0).to_hex(),
+                header_prev_ledger_hash = %Hash256::from(header.previous_ledger_hash.0).to_hex(),
+                header_id_pool = header.id_pool,
+                header_inflation_seq = header.inflation_seq,
+                header_base_fee = header.base_fee,
+                header_base_reserve = header.base_reserve,
+                header_max_tx_set_size = header.max_tx_set_size,
+                header_upgrades_count = header.scp_value.upgrades.len(),
+                skip_list_0 = %skip_list_0,
+                skip_list_1 = %skip_list_1,
+                skip_list_2 = %skip_list_2,
+                skip_list_3 = %skip_list_3,
+                "Pre-close hash mismatch - individual header fields"
+            );
+
             self.ledger_manager.log_bucket_list_debug(next_seq);
             self.trigger_fatal_shutdown(&format!(
                 "pre-close hash mismatch at ledger {next_seq}: \
