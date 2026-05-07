@@ -51,7 +51,7 @@ use parking_lot::{Mutex, RwLock};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -624,6 +624,8 @@ pub struct OverlayManager {
     /// via the same `Arc<AtomicU32>` so the overlay reads the latest value
     /// when computing initial byte grants for new peers.
     pub(super) max_tx_size_bytes: Arc<AtomicU32>,
+    /// Cached local address the listener is bound to (set by `start_listener()`).
+    listen_addr: Option<SocketAddr>,
 }
 
 impl OverlayManager {
@@ -728,6 +730,7 @@ impl OverlayManager {
             metrics: Arc::new(OverlayMetrics::new()),
             query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
             max_tx_size_bytes,
+            listen_addr: None,
         })
     }
 
@@ -789,6 +792,25 @@ impl OverlayManager {
         self.start_tick_loop();
 
         Ok(())
+    }
+
+    /// Returns the local address the overlay listener is bound to, if any.
+    ///
+    /// This is a cached snapshot of the address recorded when [`start()`](Self::start)
+    /// bound the listener. It reflects whatever the underlying
+    /// [`ConnectionFactory::bind()`] reported — for [`TcpConnectionFactory`]
+    /// this is the actual OS-assigned `0.0.0.0:<port>` address; for
+    /// [`LoopbackConnectionFactory`](crate::LoopbackConnectionFactory) the
+    /// reported address may not be meaningful (e.g., port 0 if 0 was requested).
+    ///
+    /// Returns `None` before `start()` is called or when `listen_enabled = false`.
+    ///
+    /// **Note:** This is a bind-time snapshot, not a liveness indicator.
+    /// The listener task may have stopped (e.g., after shutdown). Callers
+    /// that need only the port should use `.port()` — the IP may be
+    /// `0.0.0.0` (wildcard bind).
+    pub fn listen_addr(&self) -> Option<SocketAddr> {
+        self.listen_addr
     }
 
     /// Connect to a specific peer.

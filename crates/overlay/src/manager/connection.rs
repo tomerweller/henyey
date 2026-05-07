@@ -316,7 +316,9 @@ impl OverlayManager {
             .connection_factory
             .bind(self.config.listen_port)
             .await?;
-        info!("Listening on port {}", self.config.listen_port);
+        let bound_addr = listener.local_addr();
+        self.listen_addr = Some(bound_addr);
+        info!("Listening on {}", bound_addr);
 
         let shared = self.shared_state();
         let local_node = self.local_node.clone();

@@ -1,21 +1,25 @@
 use std::time::Duration;
 
 use henyey_crypto::SecretKey;
-use henyey_overlay::{LocalNode, OverlayConfig, OverlayManager, PeerAddress};
+use henyey_overlay::{LocalNode, OverlayConfig, OverlayError, OverlayManager, PeerAddress};
 use stellar_xdr::curr::{
     Hash, ScpEnvelope, ScpNomination, ScpStatement, ScpStatementPledges, StellarMessage, Uint256,
 };
 use tokio::time::timeout;
 
-fn allocate_port() -> Option<u16> {
-    let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
-        Ok(listener) => listener,
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
-        Err(err) => panic!("bind: {err}"),
-    };
-    let addr = listener.local_addr().expect("addr");
-    drop(listener);
-    Some(addr.port())
+/// Try to start an [`OverlayManager`].
+///
+/// Returns `false` (and the test should be skipped) when binding is denied
+/// by the environment (e.g. container sandboxes that forbid `AF_INET`).
+async fn try_start(manager: &mut OverlayManager) -> bool {
+    match manager.start().await {
+        Ok(()) => true,
+        Err(OverlayError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping test: tcp bind not permitted in this environment");
+            false
+        }
+        Err(e) => panic!("start failed: {e}"),
+    }
 }
 
 fn make_test_envelope(slot: u64) -> ScpEnvelope {
@@ -37,15 +41,6 @@ fn make_test_envelope(slot: u64) -> ScpEnvelope {
 
 #[tokio::test]
 async fn test_overlay_scp_message_roundtrip() {
-    let Some(port_a) = allocate_port() else {
-        eprintln!("skipping test: tcp bind not permitted in this environment");
-        return;
-    };
-    let Some(port_b) = allocate_port() else {
-        eprintln!("skipping test: tcp bind not permitted in this environment");
-        return;
-    };
-
     let secret_a = SecretKey::generate();
     let secret_b = SecretKey::generate();
 
@@ -53,13 +48,13 @@ async fn test_overlay_scp_message_roundtrip() {
     let local_b = LocalNode::new_testnet(secret_b);
 
     let mut config_a = OverlayConfig::testnet();
-    config_a.listen_port = port_a;
+    config_a.listen_port = 0;
     config_a.listen_enabled = true;
     config_a.known_peers.clear();
     config_a.connect_timeout_secs = 5;
 
     let mut config_b = OverlayConfig::testnet();
-    config_b.listen_port = port_b;
+    config_b.listen_port = 0;
     config_b.listen_enabled = true;
     config_b.known_peers.clear();
     config_b.connect_timeout_secs = 5;
@@ -67,8 +62,15 @@ async fn test_overlay_scp_message_roundtrip() {
     let mut manager_a = OverlayManager::new(config_a, local_a).expect("manager a");
     let mut manager_b = OverlayManager::new(config_b, local_b).expect("manager b");
 
-    manager_a.start().await.expect("start a");
-    manager_b.start().await.expect("start b");
+    if !try_start(&mut manager_a).await {
+        return;
+    }
+    if !try_start(&mut manager_b).await {
+        return;
+    }
+
+    let port_b = manager_b.listen_addr().expect("listen_addr b").port();
+    assert_ne!(port_b, 0, "OS must assign a nonzero port");
 
     let peer_addr_b = PeerAddress::new("127.0.0.1", port_b);
     let _peer_id = manager_a.connect(&peer_addr_b).await.expect("connect");
@@ -94,15 +96,6 @@ async fn test_overlay_scp_message_roundtrip() {
 
 #[tokio::test]
 async fn test_overlay_scp_duplicate_is_forwarded_to_receiver() {
-    let Some(port_a) = allocate_port() else {
-        eprintln!("skipping test: tcp bind not permitted in this environment");
-        return;
-    };
-    let Some(port_b) = allocate_port() else {
-        eprintln!("skipping test: tcp bind not permitted in this environment");
-        return;
-    };
-
     let secret_a = SecretKey::generate();
     let secret_b = SecretKey::generate();
 
@@ -110,13 +103,13 @@ async fn test_overlay_scp_duplicate_is_forwarded_to_receiver() {
     let local_b = LocalNode::new_testnet(secret_b);
 
     let mut config_a = OverlayConfig::testnet();
-    config_a.listen_port = port_a;
+    config_a.listen_port = 0;
     config_a.listen_enabled = true;
     config_a.known_peers.clear();
     config_a.connect_timeout_secs = 5;
 
     let mut config_b = OverlayConfig::testnet();
-    config_b.listen_port = port_b;
+    config_b.listen_port = 0;
     config_b.listen_enabled = true;
     config_b.known_peers.clear();
     config_b.connect_timeout_secs = 5;
@@ -124,8 +117,15 @@ async fn test_overlay_scp_duplicate_is_forwarded_to_receiver() {
     let mut manager_a = OverlayManager::new(config_a, local_a).expect("manager a");
     let mut manager_b = OverlayManager::new(config_b, local_b).expect("manager b");
 
-    manager_a.start().await.expect("start a");
-    manager_b.start().await.expect("start b");
+    if !try_start(&mut manager_a).await {
+        return;
+    }
+    if !try_start(&mut manager_b).await {
+        return;
+    }
+
+    let port_b = manager_b.listen_addr().expect("listen_addr b").port();
+    assert_ne!(port_b, 0, "OS must assign a nonzero port");
 
     let peer_addr_b = PeerAddress::new("127.0.0.1", port_b);
     let _peer_id = manager_a.connect(&peer_addr_b).await.expect("connect");
@@ -181,15 +181,6 @@ async fn test_overlay_scp_duplicate_is_forwarded_to_receiver() {
 /// the echo.
 #[tokio::test]
 async fn test_scp_self_echo_not_dropped_after_broadcast() {
-    let Some(port_a) = allocate_port() else {
-        eprintln!("skipping test: tcp bind not permitted in this environment");
-        return;
-    };
-    let Some(port_b) = allocate_port() else {
-        eprintln!("skipping test: tcp bind not permitted in this environment");
-        return;
-    };
-
     let secret_a = SecretKey::generate();
     let secret_b = SecretKey::generate();
 
@@ -197,13 +188,13 @@ async fn test_scp_self_echo_not_dropped_after_broadcast() {
     let local_b = LocalNode::new_testnet(secret_b);
 
     let mut config_a = OverlayConfig::testnet();
-    config_a.listen_port = port_a;
+    config_a.listen_port = 0;
     config_a.listen_enabled = true;
     config_a.known_peers.clear();
     config_a.connect_timeout_secs = 5;
 
     let mut config_b = OverlayConfig::testnet();
-    config_b.listen_port = port_b;
+    config_b.listen_port = 0;
     config_b.listen_enabled = true;
     config_b.known_peers.clear();
     config_b.connect_timeout_secs = 5;
@@ -211,8 +202,15 @@ async fn test_scp_self_echo_not_dropped_after_broadcast() {
     let mut manager_a = OverlayManager::new(config_a, local_a).expect("manager a");
     let mut manager_b = OverlayManager::new(config_b, local_b).expect("manager b");
 
-    manager_a.start().await.expect("start a");
-    manager_b.start().await.expect("start b");
+    if !try_start(&mut manager_a).await {
+        return;
+    }
+    if !try_start(&mut manager_b).await {
+        return;
+    }
+
+    let port_b = manager_b.listen_addr().expect("listen_addr b").port();
+    assert_ne!(port_b, 0, "OS must assign a nonzero port");
 
     let peer_addr_b = PeerAddress::new("127.0.0.1", port_b);
     let peer_id_b_on_a = manager_a.connect(&peer_addr_b).await.expect("connect");
