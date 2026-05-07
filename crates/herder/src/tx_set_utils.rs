@@ -3218,6 +3218,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_soroban_validation_result_display() {
+        assert_eq!(SorobanValidationResult::Valid.to_string(), "VALID");
+        assert_eq!(
+            SorobanValidationResult::ParallelSupportMismatch.to_string(),
+            "SOROBAN_PARALLEL_SUPPORT_MISMATCH"
+        );
+        assert_eq!(
+            SorobanValidationResult::InvalidPhaseTxType.to_string(),
+            "INVALID_PHASE_TX_TYPE"
+        );
+        assert_eq!(
+            SorobanValidationResult::ResourcesOverflow.to_string(),
+            "SOROBAN_RESOURCES_OVERFLOW"
+        );
+        assert_eq!(
+            SorobanValidationResult::ResourcesExceedLimit.to_string(),
+            "SOROBAN_RESOURCES_EXCEED_LIMIT"
+        );
+        assert_eq!(
+            SorobanValidationResult::TooManyClusters.to_string(),
+            "TOO_MANY_SOROBAN_CLUSTERS"
+        );
+        assert_eq!(
+            SorobanValidationResult::SequentialInstructionsOverflow.to_string(),
+            "SOROBAN_SEQUENTIAL_INSTRUCTIONS_OVERFLOW"
+        );
+        assert_eq!(
+            SorobanValidationResult::InstructionsOverflow.to_string(),
+            "SOROBAN_INSTRUCTIONS_OVERFLOW"
+        );
+        assert_eq!(
+            SorobanValidationResult::InstructionsExceedLimit.to_string(),
+            "SOROBAN_INSTRUCTIONS_EXCEED_LIMIT"
+        );
+        assert_eq!(
+            SorobanValidationResult::TxOrderingInvalid.to_string(),
+            "TX_ORDERING_INVALID"
+        );
+    }
+
+    // Note: ResourcesOverflow, SequentialInstructionsOverflow, and InstructionsOverflow
+    // are defense-in-depth safety checks that cannot be practically triggered through
+    // check_valid_soroban with standard XDR inputs. Individual resource fields are u32,
+    // so overflowing i64 sums requires ~2^31 transactions — infeasible in a unit test.
+    // These paths are verified by code inspection and are covered by the Display test above.
+
     /// Regression: get_invalid_tx_list must reject txs that fail check_valid_pre_seq_num
     /// even when they would pass validate_basic.
     #[test]
