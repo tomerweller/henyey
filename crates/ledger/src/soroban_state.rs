@@ -51,9 +51,10 @@ use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_pa
 use henyey_tx::soroban::convert::{
     try_convert_cost_params_ws_to_p25, try_convert_ledger_entry_ws_to_p25,
 };
-use soroban_env_host25::budget::Budget;
+use soroban_env_host25::budget::Budget as BudgetP25;
 use soroban_env_host25::e2e_invoke::entry_size_for_rent as entry_size_for_rent_p25;
 use soroban_env_host_p25 as soroban_env_host25;
+use soroban_env_host_p26 as soroban_env_host26;
 use stellar_xdr::curr::{
     ConfigSettingId, ContractCostParams, Hash, LedgerEntry, LedgerEntryData, LedgerKey,
     LedgerKeyConfigSetting, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTtl, TtlEntry,
@@ -127,12 +128,13 @@ impl Default for SorobanRentConfig {
 
 // Local conversion functions removed — use henyey_tx::soroban::convert::try_convert_* instead.
 
-fn build_rent_budget(rent_config: Option<&SorobanRentConfig>) -> Budget {
+/// Build a p25 Budget from on-chain cost parameters (for protocol 25).
+fn build_rent_budget_p25(rent_config: Option<&SorobanRentConfig>) -> BudgetP25 {
     let Some(config) = rent_config else {
-        return Budget::default();
+        return BudgetP25::default();
     };
     if !config.has_valid_cost_params() {
-        return Budget::default();
+        return BudgetP25::default();
     }
 
     let instruction_limit = config.tx_max_instructions.saturating_mul(2);
@@ -140,19 +142,47 @@ fn build_rent_budget(rent_config: Option<&SorobanRentConfig>) -> Budget {
     let cpu_params = match try_convert_cost_params_ws_to_p25(&config.cpu_cost_params) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("build_rent_budget: {e}, using default budget");
-            return Budget::default();
+            tracing::warn!("build_rent_budget_p25: {e}, using default budget");
+            return BudgetP25::default();
         }
     };
     let mem_params = match try_convert_cost_params_ws_to_p25(&config.mem_cost_params) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("build_rent_budget: {e}, using default budget");
-            return Budget::default();
+            tracing::warn!("build_rent_budget_p25: {e}, using default budget");
+            return BudgetP25::default();
         }
     };
-    Budget::try_from_configs(instruction_limit, memory_limit, cpu_params, mem_params)
-        .unwrap_or_else(|_| Budget::default())
+    BudgetP25::try_from_configs(instruction_limit, memory_limit, cpu_params, mem_params)
+        .unwrap_or_else(|_| BudgetP25::default())
+}
+
+/// Build a p26 Budget from on-chain cost parameters (for protocol 26+).
+///
+/// soroban-env-host-p26 uses stellar-xdr 26.0.0 (same as workspace), so
+/// `ContractCostParams` types are identical — no XDR roundtrip needed.
+fn build_rent_budget_p26(
+    rent_config: Option<&SorobanRentConfig>,
+) -> soroban_env_host26::budget::Budget {
+    let Some(config) = rent_config else {
+        return soroban_env_host26::budget::Budget::default();
+    };
+    if !config.has_valid_cost_params() {
+        return soroban_env_host26::budget::Budget::default();
+    }
+
+    let instruction_limit = config.tx_max_instructions.saturating_mul(2);
+    let memory_limit = config.tx_max_memory_bytes.saturating_mul(2);
+    // p26 uses stellar-xdr 26.0.0 — same as workspace. Direct clone, no conversion.
+    let cpu_params: soroban_env_host26::xdr::ContractCostParams = config.cpu_cost_params.clone();
+    let mem_params: soroban_env_host26::xdr::ContractCostParams = config.mem_cost_params.clone();
+    soroban_env_host26::budget::Budget::try_from_configs(
+        instruction_limit,
+        memory_limit,
+        cpu_params,
+        mem_params,
+    )
+    .unwrap_or_else(|_| soroban_env_host26::budget::Budget::default())
 }
 
 /// Compute the XDR-encoded byte length of a `LedgerEntry` as a `u32`.
@@ -836,6 +866,10 @@ impl InMemorySorobanState {
     /// Calculate the in-memory size for a contract code entry.
     ///
     /// Accepts a pre-computed XDR size to avoid redundant serialization.
+    /// Dispatches to the appropriate soroban host version based on protocol:
+    /// - Protocol < 25: uses p24 host (via entry_size_for_rent_by_protocol_with_cost_params)
+    /// - Protocol 25: uses p25 host
+    /// - Protocol >= 26: uses p26 host (handles 86 cost type entries)
     fn calculate_code_size(
         entry: &LedgerEntry,
         xdr_size: u32,
@@ -851,16 +885,25 @@ impl InMemorySorobanState {
                 cost_params,
             );
         }
-        let budget = build_rent_budget(rent_config);
-        match try_convert_ledger_entry_ws_to_p25(entry) {
-            Ok(p25_entry) => {
-                entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).unwrap_or(xdr_size)
-            }
-            Err(e) => {
-                tracing::warn!("calculate_code_size: {e}, falling back to XDR size");
-                xdr_size
-            }
+        if protocol_version_is_before(protocol_version, ProtocolVersion::V26) {
+            // Protocol 25: use p25 host (85 cost types)
+            let budget = build_rent_budget_p25(rent_config);
+            return match try_convert_ledger_entry_ws_to_p25(entry) {
+                Ok(p25_entry) => {
+                    entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).unwrap_or(xdr_size)
+                }
+                Err(e) => {
+                    tracing::warn!("calculate_code_size: {e}, falling back to XDR size");
+                    xdr_size
+                }
+            };
         }
+        // Protocol >= 26: use p26 host (86 cost types).
+        // p26 uses stellar-xdr 26.0.0 (same as workspace) — no conversion needed.
+        let budget = build_rent_budget_p26(rent_config);
+        let p26_entry: soroban_env_host26::xdr::LedgerEntry = entry.clone();
+        soroban_env_host26::e2e_invoke::entry_size_for_rent(&budget, &p26_entry, xdr_size)
+            .unwrap_or(xdr_size)
     }
 
     /// Update state with new entries from a ledger close.

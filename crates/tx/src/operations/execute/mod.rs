@@ -732,7 +732,7 @@ pub fn entry_size_for_rent_by_protocol_with_cost_params(
                 entry_xdr_size
             }
         }
-    } else {
+    } else if protocol_version_is_before(protocol_version, ProtocolVersion::V26) {
         let budget = match cost_params {
             Some((cpu, mem)) => build_budget_p25(cpu, mem),
             None => soroban_env_host25::budget::Budget::default(),
@@ -749,6 +749,15 @@ pub fn entry_size_for_rent_by_protocol_with_cost_params(
                 entry_xdr_size
             }
         }
+    } else {
+        // Protocol >= 26: p26 uses stellar-xdr 26.0.0 (same as workspace), no conversion needed.
+        let budget = match cost_params {
+            Some((cpu, mem)) => build_budget_p26(cpu, mem),
+            None => soroban_env_host26::budget::Budget::default(),
+        };
+        let p26_entry: soroban_env_host26::xdr::LedgerEntry = entry.clone();
+        soroban_env_host26::e2e_invoke::entry_size_for_rent(&budget, &p26_entry, entry_xdr_size)
+            .unwrap_or(entry_xdr_size)
     }
 }
 
@@ -791,6 +800,20 @@ fn build_budget_p25(
             soroban_env_host25::budget::Budget::default()
         }
     }
+}
+
+/// Build a P26 Budget from on-chain cost parameters.
+///
+/// P26 uses stellar-xdr 26.0.0 (same as workspace) — no XDR conversion needed.
+fn build_budget_p26(
+    cpu_cost_params: &stellar_xdr::curr::ContractCostParams,
+    mem_cost_params: &stellar_xdr::curr::ContractCostParams,
+) -> soroban_env_host26::budget::Budget {
+    // p26 and workspace share stellar-xdr 26.0.0, types are identical.
+    let cpu: soroban_env_host26::xdr::ContractCostParams = cpu_cost_params.clone();
+    let mem: soroban_env_host26::xdr::ContractCostParams = mem_cost_params.clone();
+    soroban_env_host26::budget::Budget::try_from_configs(0, 0, cpu, mem)
+        .unwrap_or_else(|_| soroban_env_host26::budget::Budget::default())
 }
 
 // Local conversion functions removed — use crate::soroban::convert::try_convert_* instead.
