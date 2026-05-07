@@ -8,6 +8,7 @@ use henyey_herder::scp_verify::PostVerifyReason;
 use henyey_simulation::{
     GeneratedLoadConfig, LoadGenerator, LoadStep, Simulation, SimulationMode, Topologies,
 };
+use serial_test::serial;
 
 /// Timeout for the post-remove_node ledger close over TCP.
 /// Conservative guess (2× the original 45s) to absorb CI jitter.
@@ -22,6 +23,21 @@ const TCP_POST_REMOVAL_CLOSE_TIMEOUT_SECS: u64 = 90;
 /// line 164). The extra slack over the 30s used in simpler reconnection
 /// tests accommodates CI runner load spikes.
 const TCP_RESTART_STABILIZE_TIMEOUT_SECS: u64 = 60;
+
+/// Timeout for remaining nodes to detect peer disconnection after `remove_node()`.
+/// The disconnect detection path is the same for TCP and loopback — the overlay
+/// layer notices the peer task ended. CI load can delay task scheduling.
+const POST_REMOVE_PEER_DETECT_TIMEOUT_SECS: u64 = 30;
+
+/// Timeout for establishing peer connectivity after node restart + reconnect.
+/// Covers: node initialization, overlay hello authentication, quorum-set
+/// propagation. Matches `TCP_RESTART_STABILIZE_TIMEOUT_SECS`.
+const POST_RESTART_PEER_CONNECT_TIMEOUT_SECS: u64 = 60;
+
+/// Timeout for a restarted node to reach Synced|Validating state.
+/// This is a local transition (no peers needed) — initialization + DB load.
+/// 15s accommodates disk I/O delays on loaded CI runners.
+const POST_RESTART_OPERATIONAL_TIMEOUT_SECS: u64 = 15;
 
 async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -115,6 +131,14 @@ async fn collect_node_diagnostics(sim: &Simulation) -> String {
 async fn wait_for_app_operational(sim: &Simulation, node_id: &str, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
+        if sim.app_task_finished(node_id) == Some(true) {
+            let status = sim.app_task_status(node_id).await;
+            let diag = collect_node_diagnostics(sim).await;
+            panic!(
+                "node {node_id} task exited while waiting for operational state \
+                 (task_status: {status:?}).{diag}"
+            );
+        }
         if let Some(app) = sim.app(node_id) {
             if matches!(app.state().await, AppState::Synced | AppState::Validating) {
                 return;
@@ -122,25 +146,84 @@ async fn wait_for_app_operational(sim: &Simulation, node_id: &str, timeout: Dura
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let app = sim.app(node_id).expect("app exists for operational wait");
-    assert!(matches!(
-        app.state().await,
-        AppState::Synced | AppState::Validating
-    ));
+    let finished = sim.app_task_finished(node_id);
+    let status = sim.app_task_status(node_id).await;
+    let diag = collect_node_diagnostics(sim).await;
+    match sim.app(node_id) {
+        None => panic!(
+            "timed out after {timeout:?}: node {node_id} not in running_apps \
+             (task_finished={finished:?}, task_status={status:?}).{diag}"
+        ),
+        Some(app) => {
+            let state = app.state().await;
+            panic!(
+                "timed out after {timeout:?} waiting for {node_id} to become \
+                 operational (state: {state:?}, task_finished={finished:?}, \
+                 task_status={status:?}).{diag}"
+            );
+        }
+    }
 }
 
 async fn wait_for_peer_count(sim: &Simulation, node_id: &str, expected: usize, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
-        if sim.app_peer_count(node_id).await.unwrap_or(usize::MAX) == expected {
-            return;
+        if sim.app_task_finished(node_id) == Some(true) {
+            let status = sim.app_task_status(node_id).await;
+            let diag = collect_node_diagnostics(sim).await;
+            panic!(
+                "node {node_id} task exited while waiting for peer count {expected} \
+                 (task_status: {status:?}).{diag}"
+            );
+        }
+        match sim.app_peer_count(node_id).await {
+            Some(count) if count == expected => return,
+            _ => {}
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(
-        sim.app_peer_count(node_id).await.unwrap_or(usize::MAX),
-        expected
-    );
+    let actual = sim.app_peer_count(node_id).await;
+    let finished = sim.app_task_finished(node_id);
+    let status = sim.app_task_status(node_id).await;
+    let diag = collect_node_diagnostics(sim).await;
+    match actual {
+        None => panic!(
+            "timed out after {timeout:?}: node {node_id} not in running_apps \
+             (task_finished={finished:?}, task_status={status:?}, \
+             expected peer count {expected}).{diag}"
+        ),
+        Some(count) => panic!(
+            "timed out after {timeout:?} waiting for {node_id} peer count \
+             to reach {expected} (actual: {count}, task_finished={finished:?}, \
+             task_status={status:?}).{diag}"
+        ),
+    }
+}
+
+/// Asserts that NOT all nodes reach `ledger_seq` within `observation_window`.
+/// Checks ledger-sequence spread (not hash agreement). In a partition scenario,
+/// nodes without quorum cannot advance their ledger sequence.
+///
+/// Observation window: should exceed the time a non-partitioned network would
+/// take to externalize (typically <2s with manual_close). 5s provides 2.5× margin.
+async fn assert_not_all_nodes_externalized(
+    sim: &Simulation,
+    ledger_seq: u32,
+    max_spread: u32,
+    observation_window: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + observation_window;
+    while tokio::time::Instant::now() < deadline {
+        if sim.have_all_app_nodes_externalized(ledger_seq, max_spread) {
+            let diag = collect_node_diagnostics(sim).await;
+            panic!(
+                "nodes unexpectedly all reached ledger {ledger_seq} \
+                 (max_spread={max_spread}) during {observation_window:?} \
+                 observation — partition may be ineffective.{diag}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {
@@ -674,6 +757,7 @@ async fn test_core3_app_simulation_can_close_ledgers_over_loopback() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
     let mut sim =
         build_app_backed_topology(Topologies::separate(SimulationMode::OverTcp), 75, 1).await;
@@ -683,13 +767,13 @@ async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
         .await
         .expect("manual close separate");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!sim.have_all_app_nodes_externalized(2, 1));
+    assert_not_all_nodes_externalized(&sim, 2, 1, Duration::from_secs(5)).await;
 
     sim.stop_all_nodes().await.expect("stop separate app nodes");
 }
 
 #[tokio::test]
+#[serial]
 async fn test_core3_restart_rejoin_over_tcp() {
     let mut sim =
         build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 66, 1).await;
@@ -697,8 +781,20 @@ async fn test_core3_restart_rejoin_over_tcp() {
     manual_close_until(&sim, 2, 1, Duration::from_secs(45)).await;
 
     sim.remove_node("node0").await.expect("remove node0 tcp");
-    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(20)).await;
-    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(20)).await;
+    wait_for_peer_count(
+        &sim,
+        "node1",
+        1,
+        Duration::from_secs(POST_REMOVE_PEER_DETECT_TIMEOUT_SECS),
+    )
+    .await;
+    wait_for_peer_count(
+        &sim,
+        "node2",
+        1,
+        Duration::from_secs(POST_REMOVE_PEER_DETECT_TIMEOUT_SECS),
+    )
+    .await;
 
     manual_close_until(
         &sim,
@@ -709,7 +805,12 @@ async fn test_core3_restart_rejoin_over_tcp() {
     .await;
 
     sim.restart_node("node0").await.expect("restart node0 tcp");
-    wait_for_app_operational(&sim, "node0", Duration::from_secs(5)).await;
+    wait_for_app_operational(
+        &sim,
+        "node0",
+        Duration::from_secs(POST_RESTART_OPERATIONAL_TIMEOUT_SECS),
+    )
+    .await;
 
     // Re-establish peer connections with retry (TCP connections can fail transiently).
     sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(TCP_RESTART_STABILIZE_TIMEOUT_SECS))
@@ -740,6 +841,7 @@ async fn test_core3_restart_rejoin_over_tcp() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_core3_restart_rejoin_over_loopback() {
     let mut sim =
         build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66, 1).await;
@@ -749,15 +851,32 @@ async fn test_core3_restart_rejoin_over_loopback() {
     sim.remove_node("node0")
         .await
         .expect("remove node0 loopback");
-    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(20)).await;
-    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(20)).await;
+    wait_for_peer_count(
+        &sim,
+        "node1",
+        1,
+        Duration::from_secs(POST_REMOVE_PEER_DETECT_TIMEOUT_SECS),
+    )
+    .await;
+    wait_for_peer_count(
+        &sim,
+        "node2",
+        1,
+        Duration::from_secs(POST_REMOVE_PEER_DETECT_TIMEOUT_SECS),
+    )
+    .await;
 
     manual_close_until(&sim, 3, 0, Duration::from_secs(45)).await;
 
     sim.restart_node("node0")
         .await
         .expect("restart node0 loopback");
-    wait_for_app_operational(&sim, "node0", Duration::from_secs(5)).await;
+    wait_for_app_operational(
+        &sim,
+        "node0",
+        Duration::from_secs(POST_RESTART_OPERATIONAL_TIMEOUT_SECS),
+    )
+    .await;
 
     // Re-establish peer connections.
     let _ = sim.add_connection("node0", "node1").await;
@@ -767,7 +886,13 @@ async fn test_core3_restart_rejoin_over_loopback() {
     // SCP state. add_connection() spawns the handshake asynchronously, so
     // without this wait request_scp_state_from_peers() can find zero peers
     // and silently return without requesting any state.
-    wait_for_peer_count(&sim, "node0", 2, Duration::from_secs(20)).await;
+    wait_for_peer_count(
+        &sim,
+        "node0",
+        2,
+        Duration::from_secs(POST_RESTART_PEER_CONNECT_TIMEOUT_SECS),
+    )
+    .await;
 
     // Request SCP state so node0 learns about externalized slots it missed.
     sim.app("node0")
@@ -1097,6 +1222,7 @@ async fn test_tx_queue_contention_app_backed() {
 /// by advancing with real payment load (not empty closes) while the node
 /// is down, exercising catch-up with actual transaction data.
 #[tokio::test]
+#[serial]
 async fn test_slow_node_lagging_node_recovers() {
     let mut sim =
         build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66, 1).await;
@@ -1111,8 +1237,20 @@ async fn test_slow_node_lagging_node_recovers() {
     sim.remove_node("node0")
         .await
         .expect("remove node0 to simulate lag");
-    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(20)).await;
-    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(20)).await;
+    wait_for_peer_count(
+        &sim,
+        "node1",
+        1,
+        Duration::from_secs(POST_REMOVE_PEER_DETECT_TIMEOUT_SECS),
+    )
+    .await;
+    wait_for_peer_count(
+        &sim,
+        "node2",
+        1,
+        Duration::from_secs(POST_REMOVE_PEER_DETECT_TIMEOUT_SECS),
+    )
+    .await;
 
     // Submit payment load to the majority and close 2 ledgers.
     // This ensures the lagging node must catch up with real tx data.
@@ -1138,12 +1276,23 @@ async fn test_slow_node_lagging_node_recovers() {
     sim.restart_node("node0")
         .await
         .expect("restart node0 to recover");
-    wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
+    wait_for_app_operational(
+        &sim,
+        "node0",
+        Duration::from_secs(POST_RESTART_OPERATIONAL_TIMEOUT_SECS),
+    )
+    .await;
 
     // Re-establish peer connections.
     let _ = sim.add_connection("node0", "node1").await;
     let _ = sim.add_connection("node0", "node2").await;
-    wait_for_peer_count(&sim, "node0", 2, Duration::from_secs(20)).await;
+    wait_for_peer_count(
+        &sim,
+        "node0",
+        2,
+        Duration::from_secs(POST_RESTART_PEER_CONNECT_TIMEOUT_SECS),
+    )
+    .await;
 
     // Request SCP state so node0 learns about missed slots.
     sim.app("node0")
