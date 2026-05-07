@@ -37,6 +37,7 @@ socket2.workspace = true
 # Utilities
 bytes.workspace = true
 dashmap.workspace = true
+indexmap.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 hex.workspace = true
