@@ -2361,4 +2361,223 @@ mod tests {
             "Correct rent delta should be larger than buggy delta"
         );
     }
+
+    /// Integration test for AUDIT-268: exercises the full RestoreFootprint dispatch path
+    /// through `execute_operation_with_soroban` for an expired live-BL entry and asserts
+    /// `soroban_meta.rent_fee` uses (0, 0) old values.
+    ///
+    /// stellar-core references:
+    /// - RestoreFootprintOpFrame.cpp:221-226: passes std::nullopt for old entry
+    /// - TransactionUtils.cpp:2321-2329: maps nullopt → (0, 0)
+    #[test]
+    fn test_restore_footprint_integration_rent_fee_expired_live_bl() {
+        use crate::frozen_keys::FrozenKeyConfig;
+        use crate::soroban::{OperationContext, SorobanContext};
+        use crate::state::LedgerStateManager;
+        use crate::validation::LedgerContext;
+        use henyey_common::NetworkId;
+        use soroban_env_host_p25::fees::RentFeeConfiguration;
+
+        let current_ledger: u32 = 1000;
+        let expired_ttl: u32 = 500;
+        let min_persistent_ttl: u32 = 120960;
+
+        // Explicit LedgerContext with protocol_version = 25
+        let context = LedgerContext {
+            sequence: current_ledger,
+            close_time: 1000,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            protocol_version: 25,
+            network_id: NetworkId::testnet(),
+            soroban_prng_seed: None,
+            frozen_key_config: FrozenKeyConfig::empty(),
+            ledger_flags: 0,
+        };
+
+        // State with matching ledger sequence
+        let mut state = LedgerStateManager::new(5_000_000, current_ledger);
+
+        // Source account (required by execute_operation_with_soroban)
+        let source = create_test_account_id(0);
+        state.create_account(create_test_account(source.clone(), 1_000_000_000));
+
+        let tx_id = TxIdentity {
+            source_id: &source,
+            seq: 0,
+            op_index: 0,
+        };
+
+        // Create persistent contract data entry
+        let contract_hash = Hash([1u8; 32]);
+        let contract = ScAddress::Contract(ContractId(contract_hash));
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract.clone(),
+            key: ScVal::Bool(true),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract,
+                key: ScVal::Bool(true),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Bytes(ScBytes(vec![0xAA; 100].try_into().unwrap())),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let xdr_size = henyey_common::xdr_encoded_len_u32(&entry);
+
+        // Add entry and expired TTL to state
+        if let LedgerEntryData::ContractData(data) = &entry.data {
+            state.create_contract_data(data.clone());
+        }
+        let key_hash = crate::soroban::get_or_compute_key_hash(None, &key);
+        state.create_ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: expired_ttl,
+        });
+
+        // SorobanConfig with explicit nonzero rent fee config
+        let mut config = crate::soroban::SorobanConfig::default();
+        config.min_persistent_entry_ttl = min_persistent_ttl;
+        config.rent_fee_config = RentFeeConfiguration {
+            fee_per_write_1kb: 1000,
+            fee_per_rent_1kb: 1000,
+            fee_per_write_entry: 1000,
+            persistent_rent_rate_denominator: 2103,
+            temporary_rent_rate_denominator: 4206,
+        };
+
+        // SorobanTransactionData with the expired entry in read_write footprint
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key.clone()].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 10000,
+                write_bytes: 10000,
+            },
+            resource_fee: 0,
+        };
+
+        let op_context = OperationContext::Soroban(SorobanContext {
+            soroban_data: &soroban_data,
+            config: &config,
+            module_cache: None,
+            guarded_hot_archive: None,
+            ttl_key_cache: None,
+        });
+
+        // Build RestoreFootprint operation
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::RestoreFootprint(RestoreFootprintOp {
+                ext: ExtensionPoint::V0,
+            }),
+        };
+
+        // Execute
+        let result =
+            execute_operation_with_soroban(&op, &source, &tx_id, &mut state, &context, &op_context)
+                .expect("execute_operation_with_soroban should not return Err");
+
+        // Assert success
+        assert!(
+            matches!(
+                &result.result,
+                OperationResult::OpInner(OperationResultTr::RestoreFootprint(
+                    RestoreFootprintResult::Success
+                ))
+            ),
+            "Expected RestoreFootprintResult::Success, got {:?}",
+            result.result
+        );
+
+        // Assert soroban_meta present
+        let meta = result
+            .soroban_meta
+            .as_ref()
+            .expect("soroban_meta should be Some on success");
+
+        // Assert this is the live-BL path, not hot archive
+        assert!(
+            meta.hot_archive_restores.is_empty(),
+            "Expected no hot archive restores (expired live-BL path)"
+        );
+
+        // Compute expected rent fee using the same path as production
+        let cost_params = Some((&config.cpu_cost_params, &config.mem_cost_params));
+        let rent_size =
+            entry_size_for_rent_by_protocol_with_cost_params(25, &entry, xdr_size, cost_params);
+        let new_live_until =
+            crate::soroban::ttl::restore_ttl_target(current_ledger, min_persistent_ttl);
+        let expected_change = RentChange {
+            is_persistent: true,
+            is_code_entry: false,
+            old_size_bytes: 0,
+            new_size_bytes: rent_size,
+            old_live_until_ledger: 0,
+            new_live_until_ledger: new_live_until,
+        };
+        let expected_fee = compute_rent_fee_by_protocol(
+            25,
+            &[expected_change],
+            &config.rent_fee_config,
+            current_ledger,
+        );
+
+        // Sanity: nonzero config should produce nonzero fee
+        assert!(
+            expected_fee > 0,
+            "Expected nonzero rent fee with nonzero config, got 0"
+        );
+
+        // Assert actual fee matches expected
+        assert_eq!(
+            meta.rent_fee, expected_fee,
+            "rent_fee should use (0, 0) old values for expired live-BL restore"
+        );
+
+        // Assert TTL was updated to restore target
+        let updated_ttl = state
+            .get_ttl(&key_hash)
+            .expect("TTL should exist after restore");
+        assert_eq!(
+            updated_ttl.live_until_ledger_seq, new_live_until,
+            "TTL should be updated to restore_ttl_target"
+        );
+
+        // Negative control: buggy fee with actual old values should differ from correct fee.
+        // Note: soroban's fee formula treats entry_is_new() (old_size=0, old_ttl=0) specially,
+        // using current_ledger-1 as the extension base rather than old_live_until_ledger.
+        // For expired entries (old_ttl < current_ledger), the buggy path may produce a
+        // HIGHER fee (larger extension window from old_ttl), but the semantic is wrong.
+        let buggy_change = RentChange {
+            is_persistent: true,
+            is_code_entry: false,
+            old_size_bytes: rent_size,
+            new_size_bytes: rent_size,
+            old_live_until_ledger: expired_ttl,
+            new_live_until_ledger: new_live_until,
+        };
+        let buggy_fee = compute_rent_fee_by_protocol(
+            25,
+            &[buggy_change],
+            &config.rent_fee_config,
+            current_ledger,
+        );
+        assert_ne!(
+            meta.rent_fee, buggy_fee,
+            "Correct rent fee ({}) must differ from buggy fee ({}) — \
+             RestoreFromScratch triggers entry_is_new() semantics in the fee formula",
+            meta.rent_fee, buggy_fee,
+        );
+    }
 }
