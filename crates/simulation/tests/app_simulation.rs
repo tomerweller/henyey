@@ -246,6 +246,13 @@ async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {
     assert_eq!(funded_total, expected);
 }
 
+/// Build a fully-connected app-backed topology and wait for TCP stabilization.
+///
+/// # Serial requirement
+///
+/// Tests calling this with `SimulationMode::OverTcp` **must** be annotated
+/// `#[serial(tcp)]` — TCP port allocation uses a process-local counter and
+/// concurrent TCP tests cause resource contention flakes under CI load.
 async fn build_app_backed_topology(
     mut sim: Simulation,
     threshold_percent: u32,
@@ -264,6 +271,13 @@ async fn build_app_backed_topology(
     sim
 }
 
+/// Build a 3-node topology with only 2 nodes running (threshold 66%).
+///
+/// # Serial requirement
+///
+/// Tests calling this with `SimulationMode::OverTcp` **must** be annotated
+/// `#[serial(tcp)]` — TCP port allocation uses a process-local counter and
+/// concurrent TCP tests cause resource contention flakes under CI load.
 async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
     let mut sim = Topologies::core3(mode);
     let node_ids = sim.node_ids();
@@ -319,6 +333,7 @@ fn assert_scp_intake_reached(app: &App, node: &str) {
 }
 
 #[tokio::test]
+#[serial(tcp)]
 async fn test_single_node_app_simulation_can_manual_close_over_tcp() {
     let mut sim =
         Simulation::with_network(SimulationMode::OverTcp, "Test SDF Network ; September 2015");
@@ -369,6 +384,7 @@ async fn test_single_node_app_simulation_can_manual_close_over_tcp() {
 /// Catches regressions in the solo-quorum SCP state machine, tracking-state
 /// advancement, and nomination value building across multiple slots.
 #[tokio::test]
+#[serial(tcp)]
 async fn test_standalone_validator_closes_multiple_ledgers() {
     let mut sim =
         Simulation::with_network(SimulationMode::OverTcp, "Test SDF Network ; September 2015");
@@ -571,6 +587,7 @@ async fn test_load_account_sequence_pair_topology() {
 }
 
 #[tokio::test]
+#[serial(tcp)]
 async fn test_core3_app_simulation_starts_over_tcp() {
     let mut sim =
         build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67, 1).await;
@@ -601,6 +618,7 @@ async fn test_core3_app_simulation_starts_over_tcp() {
 }
 
 #[tokio::test]
+#[serial(tcp)]
 async fn test_three_nodes_two_running_threshold_two_over_tcp() {
     let mut sim = build_two_running_of_three(SimulationMode::OverTcp).await;
 
@@ -621,6 +639,7 @@ async fn test_three_nodes_two_running_threshold_two_over_loopback() {
 }
 
 #[tokio::test]
+#[serial(tcp)]
 async fn test_core3_app_simulation_can_attempt_multi_node_close() {
     let mut sim =
         build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67, 1).await;
@@ -651,6 +670,7 @@ async fn test_core3_app_simulation_can_attempt_multi_node_close() {
 }
 
 #[tokio::test]
+#[serial(tcp)]
 async fn test_pair_app_simulation_can_close_ledgers_over_tcp() {
     let mut sim =
         build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
@@ -673,6 +693,7 @@ async fn test_pair_app_simulation_can_close_ledgers_over_loopback() {
 }
 
 #[tokio::test]
+#[serial(tcp)]
 async fn test_pair_app_simulation_executes_generated_load_over_tcp() {
     let mut sim =
         build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
@@ -725,6 +746,7 @@ async fn test_pair_app_simulation_executes_generated_load_over_loopback() {
 }
 
 #[tokio::test]
+#[serial(tcp)]
 async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
     let mut sim =
         build_app_backed_topology(Topologies::core(4, SimulationMode::OverTcp), 75, 1).await;
@@ -735,6 +757,7 @@ async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
 }
 
 #[tokio::test]
+#[serial(tcp)]
 async fn test_cycle4_app_simulation_can_close_ledgers_over_tcp() {
     let mut sim =
         build_app_backed_topology(Topologies::cycle4(SimulationMode::OverTcp), 75, 2).await;
@@ -757,7 +780,7 @@ async fn test_core3_app_simulation_can_close_ledgers_over_loopback() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(tcp)]
 async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
     let mut sim =
         build_app_backed_topology(Topologies::separate(SimulationMode::OverTcp), 75, 1).await;
@@ -773,7 +796,7 @@ async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(tcp)]
 async fn test_core3_restart_rejoin_over_tcp() {
     let mut sim =
         build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 66, 1).await;
@@ -918,6 +941,7 @@ async fn test_core3_restart_rejoin_over_loopback() {
 }
 
 #[tokio::test]
+#[serial(tcp)]
 async fn test_wait_for_app_connectivity_returns_error_on_timeout() {
     let mut sim = Topologies::core3(SimulationMode::OverTcp);
     sim.populate_app_nodes_from_existing(67);
@@ -945,6 +969,7 @@ async fn test_wait_for_app_connectivity_zero_apps_succeeds() {
 }
 
 #[tokio::test]
+#[serial(tcp)]
 async fn test_stabilize_app_tcp_connectivity_returns_error_on_timeout() {
     let mut sim = Topologies::core3(SimulationMode::OverTcp);
     sim.populate_app_nodes_from_existing(67);
@@ -1328,6 +1353,7 @@ async fn test_slow_node_lagging_node_recovers() {
 ///
 /// Regression context: #2317, #2325, #2364.
 #[tokio::test]
+#[serial(tcp)]
 async fn test_pair_tcp_scp_messages_exercise_pump_scp_intake() {
     let mut sim =
         build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
@@ -1407,6 +1433,7 @@ async fn test_pair_tcp_scp_messages_exercise_pump_scp_intake() {
 ///
 /// Regression context: #2317, #2364, #2374.
 #[tokio::test]
+#[serial(tcp)]
 async fn test_self_echo_scp_reaches_pump_scp_intake() {
     use stellar_xdr::curr::{NodeId, StellarMessage};
 
