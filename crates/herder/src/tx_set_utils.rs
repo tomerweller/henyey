@@ -1191,6 +1191,36 @@ impl std::fmt::Display for FeeMapValidationResult {
     }
 }
 
+/// Result of classic phase validation.
+///
+/// Mirrors the classic-phase subset of stellar-core's `TxSetValidationResult`
+/// (TxSetFrame.h:72-73). Designed to be forward-compatible with a future
+/// broader `TxSetValidationResult` enum covering all of `check_tx_set_valid`.
+///
+/// Note: `InvalidPhaseTxType` is defense-in-depth. stellar-core checks TX type
+/// at the phase level (TxSetFrame.cpp:1752-1777), not in `checkValidClassic`.
+/// henyey's caller `check_tx_set_valid` also pre-checks at lines 1711-1716.
+/// This variant exists so `check_valid_classic` is self-contained when called
+/// directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClassicValidationResult {
+    Valid,
+    ParallelNotAllowed,
+    TooManyTxs,
+    InvalidPhaseTxType,
+}
+
+impl std::fmt::Display for ClassicValidationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Valid => write!(f, "VALID"),
+            Self::ParallelNotAllowed => write!(f, "CLASSIC_PHASE_PARALLEL_NOT_ALLOWED"),
+            Self::TooManyTxs => write!(f, "TOO_MANY_CLASSIC_TXS"),
+            Self::InvalidPhaseTxType => write!(f, "INVALID_PHASE_TX_TYPE"),
+        }
+    }
+}
+
 /// Result of Soroban phase validation.
 ///
 /// Mirrors the Soroban-specific subset of stellar-core's `TxSetValidationResult`
@@ -1333,25 +1363,25 @@ fn get_min_inclusion_fee(
 /// - Rejects if the phase is V1 (parallel) — classic can only be V0/sequential
 /// - Counts total operations and verifies <= `max_tx_set_size`
 /// - Verifies all TXs are non-Soroban
-pub(crate) fn check_valid_classic(phase: &TransactionPhase, max_tx_set_size: u32) -> bool {
-    // Classic phase must not be parallel
-    if matches!(phase, TransactionPhase::V1(_)) {
-        debug!("Got bad txSet: classic phase can't be parallel");
-        return false;
-    }
-
-    let TransactionPhase::V0(components) = phase else {
-        return false;
+pub(crate) fn check_valid_classic(
+    phase: &TransactionPhase,
+    max_tx_set_size: u32,
+) -> ClassicValidationResult {
+    let components = match phase {
+        TransactionPhase::V0(components) => components,
+        TransactionPhase::V1(_) => {
+            debug!("Got bad txSet: classic phase can't be parallel");
+            return ClassicValidationResult::ParallelNotAllowed;
+        }
     };
 
     let mut total_ops: u64 = 0;
     for component in components.iter() {
         let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
         for tx in comp.txs.iter() {
-            // Verify all TXs are non-Soroban
             if is_soroban_envelope(tx) {
                 debug!("Got bad txSet: Soroban transaction found in classic phase");
-                return false;
+                return ClassicValidationResult::InvalidPhaseTxType;
             }
             total_ops += envelope_num_ops(tx) as u64;
         }
@@ -1362,10 +1392,10 @@ pub(crate) fn check_valid_classic(phase: &TransactionPhase, max_tx_set_size: u32
             "Got bad txSet: too many classic ops {} > {}",
             total_ops, max_tx_set_size
         );
-        return false;
+        return ClassicValidationResult::TooManyTxs;
     }
 
-    true
+    ClassicValidationResult::Valid
 }
 
 /// Validate the Soroban transaction phase.
@@ -1730,11 +1760,14 @@ pub(crate) fn check_tx_set_valid(
                 // Soroban phase present but no network config — reject.
                 return Err("soroban phase present but soroban config unavailable".into());
             }
-        } else if !check_valid_classic(phase, lcl_header.max_tx_set_size) {
-            return Err(format!(
-                "check_valid_classic: phase {} classic validation failed",
-                phase_idx
-            ));
+        } else {
+            let classic_result = check_valid_classic(phase, lcl_header.max_tx_set_size);
+            if classic_result != ClassicValidationResult::Valid {
+                return Err(format!(
+                    "check_valid_classic: phase {} {}",
+                    phase_idx, classic_result
+                ));
+            }
         }
 
         // 4. Per-TX content validation (time bounds, fees, etc.)
@@ -2742,12 +2775,32 @@ mod tests {
     // --- AUDIT-033: check_valid_classic tests ---
 
     #[test]
+    fn test_classic_validation_result_display() {
+        assert_eq!(ClassicValidationResult::Valid.to_string(), "VALID");
+        assert_eq!(
+            ClassicValidationResult::ParallelNotAllowed.to_string(),
+            "CLASSIC_PHASE_PARALLEL_NOT_ALLOWED"
+        );
+        assert_eq!(
+            ClassicValidationResult::TooManyTxs.to_string(),
+            "TOO_MANY_CLASSIC_TXS"
+        );
+        assert_eq!(
+            ClassicValidationResult::InvalidPhaseTxType.to_string(),
+            "INVALID_PHASE_TX_TYPE"
+        );
+    }
+
+    #[test]
     fn test_check_valid_classic_within_limit() {
         // 2 TXs with 1 op each, limit = 5
         let tx1 = make_valid_envelope(100, 1);
         let tx2 = make_valid_envelope(200, 2);
         let phase = make_v0_phase_with_fee(vec![tx1, tx2], Some(100));
-        assert!(check_valid_classic(&phase, 5));
+        assert_eq!(
+            check_valid_classic(&phase, 5),
+            ClassicValidationResult::Valid
+        );
     }
 
     #[test]
@@ -2757,7 +2810,10 @@ mod tests {
         let tx2 = make_valid_envelope(200, 2);
         let tx3 = make_valid_envelope(300, 3);
         let phase = make_v0_phase_with_fee(vec![tx1, tx2, tx3], Some(100));
-        assert!(!check_valid_classic(&phase, 2));
+        assert_eq!(
+            check_valid_classic(&phase, 2),
+            ClassicValidationResult::TooManyTxs
+        );
     }
 
     #[test]
@@ -2768,7 +2824,10 @@ mod tests {
             base_fee: Some(100),
             execution_stages: vec![].try_into().unwrap(),
         });
-        assert!(!check_valid_classic(&phase, 100));
+        assert_eq!(
+            check_valid_classic(&phase, 100),
+            ClassicValidationResult::ParallelNotAllowed
+        );
     }
 
     // --- AUDIT-033: check_valid_soroban tests ---
@@ -3088,7 +3147,10 @@ mod tests {
     fn test_check_valid_classic_rejects_soroban_tx() {
         let tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
-        assert!(!check_valid_classic(&phase, 100));
+        assert_eq!(
+            check_valid_classic(&phase, 100),
+            ClassicValidationResult::InvalidPhaseTxType
+        );
     }
 
     // --- AUDIT-153: TX_SIZE_BYTES and OPERATIONS resource limit tests ---
