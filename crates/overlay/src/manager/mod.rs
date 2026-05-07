@@ -38,7 +38,7 @@ mod tick;
 
 use crate::{
     codec::helpers,
-    connection::ConnectionPool,
+    connection::{ConnectionPool, Listener},
     connection_factory::{ConnectionFactory, TcpConnectionFactory},
     flood::{compute_message_hash, FloodGate, FloodGateStats},
     flow_control::{FlowControl, FlowControlBytesConfig, ScpQueueCallback},
@@ -770,8 +770,14 @@ impl OverlayManager {
         }
     }
 
-    /// Start the overlay network (listening and connecting to peers).
-    pub async fn start(&mut self) -> Result<()> {
+    /// Start the overlay manager (listening and connecting to peers).
+    ///
+    /// If `pre_bound_listener` is `Some`, the overlay will use the given
+    /// pre-bound listener instead of binding a new socket.  This is used
+    /// by the simulation harness to inject OS-assigned ephemeral-port
+    /// listeners, eliminating port-allocation races across test binaries.
+    /// Production callers pass `None`.
+    pub async fn start(&mut self, pre_bound_listener: Option<Listener>) -> Result<()> {
         if self.running.load(Ordering::Relaxed) {
             return Err(OverlayError::AlreadyStarted);
         }
@@ -781,7 +787,12 @@ impl OverlayManager {
 
         // Start listener if enabled
         if self.config.listen_enabled {
-            self.start_listener().await?;
+            self.start_listener(pre_bound_listener).await?;
+        } else {
+            debug_assert!(
+                pre_bound_listener.is_none(),
+                "pre-bound listener provided but listen_enabled is false"
+            );
         }
 
         // Start the periodic tick loop for peer management.

@@ -61,7 +61,7 @@
 //! let mut manager = OverlayManager::new(config, local_node)?;
 //!
 //! // Start the overlay (connects to known peers)
-//! manager.start().await?;
+//! manager.start(None).await?;
 //!
 //! // Subscribe to incoming messages
 //! let mut rx = manager.subscribe();

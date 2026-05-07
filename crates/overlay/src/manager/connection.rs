@@ -7,7 +7,7 @@
 use super::peer_loop::make_error_msg;
 use super::{OutboundMessage, OverlayManager, SharedPeerState};
 use crate::{
-    connection::ConnectionPool,
+    connection::{ConnectionPool, Listener},
     connection_factory::ConnectionFactory,
     flow_control::{FlowControl, FlowControlConfig},
     peer::{Peer, PeerInfo},
@@ -311,11 +311,15 @@ impl OverlayManager {
     }
 
     /// Start the connection listener.
-    pub(super) async fn start_listener(&mut self) -> Result<()> {
-        let listener = self
-            .connection_factory
-            .bind(self.config.listen_port)
-            .await?;
+    pub(super) async fn start_listener(&mut self, pre_bound: Option<Listener>) -> Result<()> {
+        let listener = match pre_bound {
+            Some(l) => l,
+            None => {
+                self.connection_factory
+                    .bind(self.config.listen_port)
+                    .await?
+            }
+        };
         let bound_addr = listener.local_addr();
         self.listen_addr = Some(bound_addr);
         info!("Listening on {}", bound_addr);
@@ -1172,8 +1176,8 @@ mod tests {
         )
         .unwrap();
 
-        manager_a.start().await.expect("start a");
-        manager_b.start().await.expect("start b");
+        manager_a.start(None).await.expect("start a");
+        manager_b.start(None).await.expect("start b");
 
         let metrics_a = Arc::clone(&manager_a.shared_state().metrics);
         let metrics_b = Arc::clone(&manager_b.shared_state().metrics);

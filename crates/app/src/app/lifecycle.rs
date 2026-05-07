@@ -1385,7 +1385,10 @@ impl App {
             .validate_headroom(self.max_tx_size_bytes.load(Ordering::Relaxed))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        overlay.start().await?;
+        // Extract the pre-bound listener before the await point to avoid
+        // holding a std::sync::MutexGuard across an async yield.
+        let pre_bound = self.pre_bound_listener.lock().unwrap().take();
+        overlay.start(pre_bound).await?;
 
         let peer_count = overlay.peer_count();
         tracing::info!(peer_count, "Overlay network started");

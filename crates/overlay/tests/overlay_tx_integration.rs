@@ -13,7 +13,7 @@ use tokio::time::timeout;
 /// Returns `false` (and the test should be skipped) when binding is denied
 /// by the environment (e.g. container sandboxes that forbid `AF_INET`).
 async fn try_start(manager: &mut OverlayManager) -> bool {
-    match manager.start().await {
+    match manager.start(None).await {
         Ok(()) => true,
         Err(OverlayError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             eprintln!("skipping test: tcp bind not permitted in this environment");

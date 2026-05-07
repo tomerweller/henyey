@@ -12,12 +12,10 @@ use std::time::Duration;
 
 use henyey_rpc::RpcServer;
 use serde_json::json;
-use serial_test::file_serial;
 
 use common::{assert_envelope, boot_single_node_sim, post_rpc};
 
 #[tokio::test]
-#[file_serial(tcp)]
 async fn rpc_http_dispatch_covers_core_methods() {
     let (sim, node_id) = boot_single_node_sim().await;
     let app = sim.app(&node_id).expect("app");

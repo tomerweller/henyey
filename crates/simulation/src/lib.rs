@@ -246,18 +246,46 @@ impl Simulation {
         let mut ids: Vec<String> = self.app_specs.keys().cloned().collect();
         ids.sort();
 
-        let base_port = allocate_port_block(ids.len() as u16 + 8);
-        let port_map: HashMap<String, u16> = ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.clone(), base_port + i as u16))
-            .collect();
-
         let overlay_connection_factory: Arc<dyn ConnectionFactory> = match self.mode {
             SimulationMode::OverLoopback => Arc::new(LoopbackConnectionFactory::default()),
             SimulationMode::OverTcp => Arc::new(TcpConnectionFactory),
         };
         self.overlay_connection_factory = Some(Arc::clone(&overlay_connection_factory));
+
+        // Build port_map and optionally pre-bind TCP listeners.
+        //
+        // TCP mode: bind each node's listener to port 0 (OS-assigned ephemeral
+        // port) up front, then derive the port_map from the actual ports.
+        // This eliminates the process-local AtomicU16 counter that caused
+        // cross-binary port collisions (see #2480, #2491).
+        //
+        // Loopback mode: the loopback registry is keyed by port number, so
+        // port 0 has no meaning.  Continue using allocate_port_block().
+        let (port_map, mut pre_bound_listeners) = match self.mode {
+            SimulationMode::OverTcp => {
+                let mut port_map = HashMap::new();
+                let mut listeners: HashMap<String, henyey_overlay::Listener> = HashMap::new();
+                for id in &ids {
+                    let listener = TcpConnectionFactory
+                        .bind(0)
+                        .await
+                        .with_context(|| format!("pre-bind TCP listener for {id}"))?;
+                    let port = listener.local_addr().port();
+                    port_map.insert(id.clone(), port);
+                    listeners.insert(id.clone(), listener);
+                }
+                (port_map, listeners)
+            }
+            SimulationMode::OverLoopback => {
+                let base_port = allocate_port_block(ids.len() as u16 + 8);
+                let port_map: HashMap<String, u16> = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| (id.clone(), base_port + i as u16))
+                    .collect();
+                (port_map, HashMap::new())
+            }
+        };
 
         for id in ids {
             let spec = self
@@ -283,6 +311,12 @@ impl Simulation {
                 )
                 .await
                 .with_context(|| format!("build app node {}", spec.node_id))?;
+
+            // Inject the pre-bound TCP listener before the app is wrapped in
+            // Arc.  The listener is consumed by start_overlay() → overlay.start().
+            if let Some(listener) = pre_bound_listeners.remove(&id) {
+                app.set_pre_bound_listener(listener);
+            }
 
             let peer_port = *port_map
                 .get(&spec.node_id)

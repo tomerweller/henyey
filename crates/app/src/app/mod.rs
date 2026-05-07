@@ -365,6 +365,12 @@ pub struct App {
     /// event loop during slow network operations.
     overlay: RwLock<Option<Arc<OverlayManager>>>,
 
+    /// Pre-bound TCP listener for the overlay, injected by the simulation
+    /// harness to use OS-assigned ephemeral ports.  Set once before
+    /// `start_overlay()` and consumed (taken) during overlay startup.
+    /// Production callers leave this as `None`.
+    pre_bound_listener: std::sync::Mutex<Option<henyey_overlay::Listener>>,
+
     /// Herder for consensus coordination.
     herder: Arc<Herder>,
 
@@ -1040,6 +1046,7 @@ impl App {
             query_is_ready: Arc::new(AtomicBool::new(false)),
             ledger_manager,
             overlay: RwLock::new(None),
+            pre_bound_listener: std::sync::Mutex::new(None),
             herder,
             shutdown_tx,
             _shutdown_rx: shutdown_rx,
@@ -1966,6 +1973,22 @@ impl App {
     #[cfg(feature = "test-utils")]
     pub fn set_skip_fee_balance_check(&self, skip: bool) {
         self.herder.tx_queue().set_skip_fee_balance_check(skip);
+    }
+
+    /// Set a pre-bound TCP listener for the overlay manager.
+    ///
+    /// When set, `start_overlay()` will pass this listener to the overlay
+    /// manager instead of binding a new socket.  The listener must be bound
+    /// to the same port as `config.overlay.peer_port`.
+    ///
+    /// This is a set-once value: calling this method more than once panics.
+    /// The listener is consumed by `start_overlay()` and is not recoverable.
+    /// If the app is dropped without starting the overlay, the listener is
+    /// dropped (closed) automatically.
+    pub fn set_pre_bound_listener(&self, listener: henyey_overlay::Listener) {
+        let mut guard = self.pre_bound_listener.lock().unwrap();
+        assert!(guard.is_none(), "pre_bound_listener already set");
+        *guard = Some(listener);
     }
 
     /// Return the SCP envelopes recorded for a given slot.

@@ -30,4 +30,4 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-serial_test = { version = "3", features = ["file_locks"] }
+serial_test = "3"
