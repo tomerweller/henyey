@@ -573,20 +573,27 @@ impl Simulation {
         )
     }
 
-    pub async fn repair_app_tcp_connectivity(&self) -> anyhow::Result<()> {
-        let peers: Vec<(String, u16, Arc<App>)> = self
+    /// Kick-start connections between topology neighbors.
+    ///
+    /// Only dials peers that are linked in the configured topology
+    /// (`LoopbackNetwork`), using the same `known_peers_for()` helper that
+    /// `build_app_from_spec` uses for `config.overlay.known_peers`. This
+    /// prevents cross-partition connections in sparse topologies like
+    /// `separate` (two isolated pairs).
+    pub async fn repair_app_connectivity(&self) -> anyhow::Result<()> {
+        let port_map: HashMap<String, u16> = self
             .running_apps
             .iter()
-            .map(|(id, node)| (id.clone(), node.peer_port, Arc::clone(&node.app)))
+            .map(|(id, node)| (id.clone(), node.peer_port))
             .collect();
 
-        for (id, _port, app) in &peers {
-            for (other_id, other_port, _) in &peers {
-                if id == other_id {
-                    continue;
-                }
-                let addr = henyey_overlay::PeerAddress::new("127.0.0.1", *other_port);
-                let _ = app.add_peer(addr).await?;
+        let mut ids: Vec<&String> = self.running_apps.keys().collect();
+        ids.sort();
+
+        for id in ids {
+            let node = &self.running_apps[id];
+            for addr in self.known_peers_for(id, &port_map) {
+                let _ = node.app.add_peer(addr).await?;
             }
         }
 
@@ -600,7 +607,7 @@ impl Simulation {
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Err(err) = self.repair_app_tcp_connectivity().await {
+            if let Err(err) = self.repair_app_connectivity().await {
                 if !err.to_string().contains("overlay not started") {
                     return Err(err);
                 }

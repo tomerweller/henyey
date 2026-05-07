@@ -57,7 +57,7 @@ Corresponds to: scoped topology/fault controls.
 | Standard topology builders | `Topologies::{pair, core, cycle, separate, hierarchical_quorum, custom_a, asymmetric}` | Full |
 | Pending and active links | `add_pending_connection()`, `add_connection()`, `drop_connection()` | Full |
 | Partition and packet-drop controls | `partition()`, `heal()`, `set_drop_prob()` | Full |
-| TCP connectivity repair | `repair_app_tcp_connectivity()`, `stabilize_app_tcp_connectivity()` | Full |
+| Connectivity repair | `repair_app_connectivity()`, `stabilize_app_tcp_connectivity()` | Full |
 | Rich network fault scheduling | link-level controls only | Partial |
 
 ### cranking and convergence (`src/lib.rs`)
