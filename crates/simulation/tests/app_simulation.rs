@@ -15,23 +15,42 @@ use serial_test::serial;
 /// See follow-up investigation issue for root cause analysis.
 const TCP_POST_REMOVAL_CLOSE_TIMEOUT_SECS: u64 = 90;
 
-/// Timeout for post-restart TCP connectivity stabilization.
-///
-/// After full node removal + restart, the node must: discover peers,
-/// TCP connect, authenticate overlay hello, pass min_peers check.
-/// This is comparable to initial topology construction (which uses 60s at
-/// line 164). The extra slack over the 30s used in simpler reconnection
-/// tests accommodates CI runner load spikes.
-const TCP_RESTART_STABILIZE_TIMEOUT_SECS: u64 = 60;
+// ── Connectivity stabilization timeout policy ────────────────────────
+//
+// Three tiers based on the complexity of the connectivity scenario:
+//
+//   STARTUP (60s) — full topology cold-start, all nodes connecting simultaneously
+//                   Used by build_app_backed_topology (both OverTcp and OverLoopback)
+//   RESTART (60s) — single node rejoining over TCP (stabilize_app_tcp_connectivity)
+//                   Loopback restart uses wait_for_peer_count + POST_RESTART_PEER_CONNECT_TIMEOUT_SECS
+//   REDUCED (30s) — reduced topology with fewer nodes/connections
+//                   Used by build_two_running_of_three (both OverTcp and OverLoopback)
+//
+// Startup and restart share the same value intentionally: although restart
+// involves only one node, it must discover peers, TCP connect, and
+// authenticate overlay hello — comparable work to a full cold-start.
+// These values include slack for CI runner load spikes.
+
+/// Full topology cold-start: all nodes starting and connecting simultaneously.
+const STABILIZE_STARTUP_TIMEOUT_SECS: u64 = 60;
+
+/// Single node rejoining an already-running cluster over TCP after removal + restart.
+/// Covers peer discovery, TCP connect, and overlay hello authentication.
+/// The loopback restart path uses `POST_RESTART_PEER_CONNECT_TIMEOUT_SECS` instead.
+const STABILIZE_RESTART_TIMEOUT_SECS: u64 = 60;
+
+/// Reduced topology (e.g., 2-of-3 nodes running): fewer connections needed.
+const STABILIZE_REDUCED_TIMEOUT_SECS: u64 = 30;
 
 /// Timeout for remaining nodes to detect peer disconnection after `remove_node()`.
 /// The disconnect detection path is the same for TCP and loopback — the overlay
 /// layer notices the peer task ended. CI load can delay task scheduling.
 const POST_REMOVE_PEER_DETECT_TIMEOUT_SECS: u64 = 30;
 
-/// Timeout for establishing peer connectivity after node restart + reconnect.
-/// Covers: node initialization, overlay hello authentication, quorum-set
-/// propagation. Matches `TCP_RESTART_STABILIZE_TIMEOUT_SECS`.
+/// Timeout for establishing peer connectivity after node restart + reconnect
+/// over loopback. Covers: overlay hello authentication, quorum-set propagation.
+/// Uses the same 60s value as `STABILIZE_RESTART_TIMEOUT_SECS` (the TCP-mode
+/// equivalent) because the handshake work is comparable.
 const POST_RESTART_PEER_CONNECT_TIMEOUT_SECS: u64 = 60;
 
 /// Timeout for a restarted node to reach Synced|Validating state.
@@ -253,7 +272,20 @@ async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {
     assert_eq!(funded_total, expected);
 }
 
-/// Build a fully-connected app-backed topology and wait for TCP stabilization.
+/// Await connectivity stabilization with a named timeout tier.
+/// Panics with a diagnostic message including the caller name, timeout, and error.
+async fn stabilize_or_panic(sim: &Simulation, min_peers: usize, timeout_secs: u64, caller: &str) {
+    sim.stabilize_app_tcp_connectivity(min_peers, Duration::from_secs(timeout_secs))
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "{caller}: connectivity did not stabilize within {timeout_secs}s \
+                 (min_peers={min_peers}): {err}"
+            )
+        });
+}
+
+/// Build a fully-connected app-backed topology and wait for connectivity stabilization.
 async fn build_app_backed_topology(
     mut sim: Simulation,
     threshold_percent: u32,
@@ -261,14 +293,13 @@ async fn build_app_backed_topology(
 ) -> Simulation {
     sim.populate_app_nodes_from_existing(threshold_percent);
     sim.start_all_nodes().await;
-    sim.stabilize_app_tcp_connectivity(min_peers, Duration::from_secs(60))
-        .await
-        .unwrap_or_else(|err| {
-            panic!(
-                "build_app_backed_topology: TCP connectivity did not stabilize \
-                 within 60s (min_peers={min_peers}): {err}",
-            )
-        });
+    stabilize_or_panic(
+        &sim,
+        min_peers,
+        STABILIZE_STARTUP_TIMEOUT_SECS,
+        "build_app_backed_topology",
+    )
+    .await;
     sim
 }
 
@@ -291,12 +322,13 @@ async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
         sim.add_app_node(id.clone(), secret, quorum_set.clone());
     }
     sim.start_all_nodes().await;
-    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(30))
-        .await
-        .expect(
-            "build_two_running_of_three: TCP connectivity did not stabilize \
-             within 30s (min_peers=1).",
-        );
+    stabilize_or_panic(
+        &sim,
+        1,
+        STABILIZE_REDUCED_TIMEOUT_SECS,
+        "build_two_running_of_three",
+    )
+    .await;
     sim
 }
 
@@ -820,9 +852,13 @@ async fn test_core3_restart_rejoin_over_tcp() {
     .await;
 
     // Re-establish peer connections with retry (TCP connections can fail transiently).
-    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(TCP_RESTART_STABILIZE_TIMEOUT_SECS))
-        .await
-        .expect("node0 failed to establish peer connectivity after restart");
+    stabilize_or_panic(
+        &sim,
+        1,
+        STABILIZE_RESTART_TIMEOUT_SECS,
+        "test_core3_restart_rejoin_over_tcp",
+    )
+    .await;
 
     // Request SCP state so node0 learns about the externalized slots it missed.
     sim.app("node0")
