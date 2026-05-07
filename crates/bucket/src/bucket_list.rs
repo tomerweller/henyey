@@ -66,7 +66,7 @@ use crate::live_iterator::LiveEntriesIterator;
 use crate::manager::{canonical_bucket_filename, promote_temp_to_canonical, temp_merge_path};
 use crate::merge::{
     merge_buckets, merge_buckets_to_file, merge_in_memory, DeadEntryPolicy, InitEntryPolicy,
-    MergeOptions,
+    MergeOptions, MetadataPolicy,
 };
 use crate::merge_map::BucketMergeMap;
 use crate::metrics::MergeCounters;
@@ -407,6 +407,7 @@ impl AsyncMergeHandle {
                         normalize_init_entries: normalize_init,
                         shadow_buckets: &shadow_buckets,
                         counters: counters_ref,
+                        ..Default::default()
                     },
                 )
             };
@@ -818,7 +819,8 @@ impl BucketLevel {
             });
             self.next = Some(PendingMerge::Async(handle));
         } else {
-            // Level 0 should use prepare_first_level, but if called here, do sync merge
+            // Level 0 should use prepare_first_level, but if called here, do sync merge.
+            // Use CurrentProtocol metadata policy to match stellar-core level-0 semantics.
             let merged = merge_buckets(
                 &curr_for_merge,
                 &incoming,
@@ -828,6 +830,7 @@ impl BucketLevel {
                     normalize_init_entries: ctx.normalize_init,
                     shadow_buckets,
                     counters: ctx.merge_counters.as_deref(),
+                    metadata_policy: MetadataPolicy::CurrentProtocol,
                 },
             )?;
 
@@ -885,7 +888,9 @@ impl BucketLevel {
                 "prepare_first_level: falling back to regular merge (in-memory entries not available)"
             );
             // Fall back to regular merge
-            // Level 0 always keeps tombstones and never normalizes INIT entries
+            // Level 0 always keeps tombstones and never normalizes INIT entries.
+            // Use CurrentProtocol metadata policy to match stellar-core's
+            // mergeInMemory level-0 behavior (LiveBucket.cpp:569).
             merge_buckets(
                 &self.curr,
                 &incoming,
@@ -893,6 +898,7 @@ impl BucketLevel {
                     keep_dead_entries: DeadEntryPolicy::Keep,
                     max_protocol_version: protocol_version,
                     normalize_init_entries: InitEntryPolicy::Preserve,
+                    metadata_policy: MetadataPolicy::CurrentProtocol,
                     ..Default::default()
                 },
             )?

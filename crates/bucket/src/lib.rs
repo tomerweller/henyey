@@ -185,7 +185,7 @@ pub use manager::{canonical_bucket_filename, BucketManager, BucketManagerStats};
 
 pub use merge::{
     merge_buckets, merge_buckets_to_file, merge_in_memory, merge_multiple, DeadEntryPolicy,
-    InitEntryPolicy, MergeIterator, MergeOptions,
+    InitEntryPolicy, MergeIterator, MergeOptions, MetadataPolicy,
 };
 
 // ============================================================================

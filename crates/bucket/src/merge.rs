@@ -88,6 +88,29 @@ impl InitEntryPolicy {
     }
 }
 
+/// Policy for output bucket metadata version derivation.
+///
+/// stellar-core uses two different rules depending on the merge context:
+/// - Level-0 in-memory merges use the current ledger protocol directly
+///   (`LiveBucket::mergeInMemory`, `LiveBucket.cpp:569`)
+/// - File-backed / restart merges use max(input metadata versions)
+///   (`calculateMergeProtocolVersion`, `BucketBase.cpp:186-220`)
+///
+/// This enum encodes that distinction so the correct rule is always applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetadataPolicy {
+    /// Output metadata version = max(old_input_version, new_input_version).
+    /// The `max_protocol_version` in MergeOptions acts as a validation cap.
+    /// Matches stellar-core `calculateMergeProtocolVersion`.
+    /// Used for level 1+ merges and restart merges.
+    #[default]
+    InputDerived,
+    /// Output metadata version = max_protocol_version directly.
+    /// Matches stellar-core `LiveBucket::mergeInMemory` level-0 behavior.
+    /// Used for level-0 merges where the current protocol is always the output version.
+    CurrentProtocol,
+}
+
 /// Options controlling how two buckets are merged.
 ///
 /// Groups the configuration flags for a bucket merge operation:
@@ -104,6 +127,9 @@ pub struct MergeOptions<'a> {
     pub shadow_buckets: &'a [Bucket],
     /// Optional merge counters for instrumentation.
     pub counters: Option<&'a MergeCounters>,
+    /// Metadata derivation policy. Defaults to `InputDerived` (max of input versions).
+    /// Level-0 fallback merges should use `CurrentProtocol` to match stellar-core.
+    pub metadata_policy: MetadataPolicy,
 }
 
 /// Record an entry type in the merge counters.
@@ -347,8 +373,12 @@ fn merge_with_shadows_impl(
         "merge_buckets starting (streaming)"
     );
 
-    let (_, output_meta) =
-        build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
+    let (_, output_meta) = build_output_metadata(
+        old_meta.as_ref(),
+        new_meta.as_ref(),
+        max_protocol_version,
+        opts.metadata_policy,
+    )?;
 
     let mut merged: Vec<BucketEntry> = Vec::with_capacity(old_bucket.len() + new_bucket.len());
 
@@ -445,6 +475,7 @@ pub fn merge_buckets_to_file(
         old_meta.as_ref(),
         new_meta.as_ref(),
         opts.max_protocol_version,
+        opts.metadata_policy,
     )?;
 
     let file = File::create(output_path)?;
@@ -930,8 +961,12 @@ impl MergeIterator {
         let new_entries: Vec<BucketEntry> = new_bucket.iter()?.collect::<Result<Vec<_>>>()?;
         let old_meta = extract_metadata(&old_entries);
         let new_meta = extract_metadata(&new_entries);
-        let (_, output_metadata) =
-            build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
+        let (_, output_metadata) = build_output_metadata(
+            old_meta.as_ref(),
+            new_meta.as_ref(),
+            max_protocol_version,
+            MetadataPolicy::InputDerived,
+        )?;
 
         let mut merged_entries = Vec::with_capacity(old_entries.len() + new_entries.len());
 
@@ -1012,8 +1047,15 @@ fn extract_metadata(entries: &[BucketEntry]) -> Option<BucketMetadata> {
 
 /// Build output metadata for a merged bucket.
 ///
-/// Calculates the merge protocol version as max of input bucket versions.
-/// This matches stellar-core's `calculateMergeProtocolVersion()` in `BucketBase.cpp`.
+/// Calculates the merge protocol version and builds output metadata.
+///
+/// Behavior depends on `policy`:
+/// - `InputDerived`: protocol version = max(input bucket versions), capped at
+///   `max_protocol_version`. Matches stellar-core's `calculateMergeProtocolVersion()`
+///   in `BucketBase.cpp:186-220`. Used for level 1+ and restart merges.
+/// - `CurrentProtocol`: protocol version = `max_protocol_version` directly.
+///   Matches stellar-core's `LiveBucket::mergeInMemory` (`LiveBucket.cpp:569`).
+///   Used for level-0 merges.
 ///
 /// NOTE (BUCKETLISTDB_SPEC §7.2): stellar-core also includes shadow bucket
 /// versions in the max calculation. Since shadow filtering was removed in
@@ -1023,23 +1065,34 @@ fn build_output_metadata(
     old_meta: Option<&BucketMetadata>,
     new_meta: Option<&BucketMetadata>,
     max_protocol_version: u32,
+    policy: MetadataPolicy,
 ) -> Result<(u32, Option<BucketEntry>)> {
-    let mut protocol_version = 0u32;
-    if let Some(meta) = old_meta {
-        protocol_version = protocol_version.max(meta.ledger_version);
-    }
-    if let Some(meta) = new_meta {
-        protocol_version = protocol_version.max(meta.ledger_version);
-    }
+    let protocol_version = match policy {
+        MetadataPolicy::InputDerived => {
+            let mut version = 0u32;
+            if let Some(meta) = old_meta {
+                version = version.max(meta.ledger_version);
+            }
+            if let Some(meta) = new_meta {
+                version = version.max(meta.ledger_version);
+            }
 
-    // Validate that the calculated version doesn't exceed max_protocol_version.
-    // max_protocol_version is a constraint, not the output version.
-    if max_protocol_version > 0 && protocol_version > max_protocol_version {
-        return Err(BucketError::Merge(format!(
-            "bucket protocol version {} exceeds max_protocol_version {}",
-            protocol_version, max_protocol_version
-        )));
-    }
+            // Validate that the calculated version doesn't exceed max_protocol_version.
+            // max_protocol_version is a constraint, not the output version.
+            if max_protocol_version > 0 && version > max_protocol_version {
+                return Err(BucketError::Merge(format!(
+                    "bucket protocol version {} exceeds max_protocol_version {}",
+                    version, max_protocol_version
+                )));
+            }
+            version
+        }
+        MetadataPolicy::CurrentProtocol => {
+            // Level-0 rule: output version is always the current protocol.
+            // stellar-core: meta.ledgerVersion = maxProtocolVersion (LiveBucket.cpp:569)
+            max_protocol_version
+        }
+    };
 
     let use_meta = protocol_version_starts_from(protocol_version, ProtocolVersion::V11);
     if !use_meta {
@@ -1802,8 +1855,13 @@ mod tests {
         };
 
         // max_protocol_version is 25 (current ledger), but output should be max(20, 22) = 22
-        let (version, output_meta) =
-            build_output_metadata(Some(&old_meta), Some(&new_meta), 25).unwrap();
+        let (version, output_meta) = build_output_metadata(
+            Some(&old_meta),
+            Some(&new_meta),
+            25,
+            MetadataPolicy::InputDerived,
+        )
+        .unwrap();
 
         assert_eq!(
             version, 22,
@@ -1828,7 +1886,12 @@ mod tests {
         };
 
         // Should fail because 26 > 25 (the constraint)
-        let result = build_output_metadata(Some(&old_meta), Some(&new_meta), 25);
+        let result = build_output_metadata(
+            Some(&old_meta),
+            Some(&new_meta),
+            25,
+            MetadataPolicy::InputDerived,
+        );
         assert!(
             result.is_err(),
             "Should fail when bucket version exceeds max_protocol_version constraint"
@@ -1843,7 +1906,8 @@ mod tests {
             ext: BucketMetadataExt::V0,
         };
 
-        let (version, _) = build_output_metadata(Some(&old_meta), None, 25).unwrap();
+        let (version, _) =
+            build_output_metadata(Some(&old_meta), None, 25, MetadataPolicy::InputDerived).unwrap();
         assert_eq!(version, 18, "Output version should be old bucket's version");
     }
 
@@ -1855,14 +1919,16 @@ mod tests {
             ext: BucketMetadataExt::V0,
         };
 
-        let (version, _) = build_output_metadata(None, Some(&new_meta), 25).unwrap();
+        let (version, _) =
+            build_output_metadata(None, Some(&new_meta), 25, MetadataPolicy::InputDerived).unwrap();
         assert_eq!(version, 21, "Output version should be new bucket's version");
     }
 
     #[test]
     fn test_build_output_metadata_no_metadata_inputs() {
         // When neither bucket has metadata (pre-protocol 11), output has no metadata
-        let (version, output_meta) = build_output_metadata(None, None, 25).unwrap();
+        let (version, output_meta) =
+            build_output_metadata(None, None, 25, MetadataPolicy::InputDerived).unwrap();
         assert_eq!(version, 0, "Version should be 0 when no metadata present");
         assert!(
             output_meta.is_none(),
@@ -2050,6 +2116,149 @@ mod tests {
             );
         } else {
             panic!("Expected metadata entries");
+        }
+    }
+
+    #[test]
+    fn test_merge_buckets_current_protocol_matches_merge_in_memory() {
+        // Regression test for #2475: When `prepare_first_level` falls back to `merge_buckets`
+        // (because restored level-0 buckets lack in-memory entries), it must produce the
+        // same hash as `merge_in_memory`. This is achieved via `MetadataPolicy::CurrentProtocol`.
+        //
+        // Without this fix, the fallback would use `InputDerived` metadata (max of inputs)
+        // which can differ from `merge_in_memory`'s behavior (uses current protocol directly).
+
+        let old_meta = BucketMetadata {
+            ledger_version: 22,
+            ext: BucketMetadataExt::V0,
+        };
+        let new_meta = BucketMetadata {
+            ledger_version: 22,
+            ext: BucketMetadataExt::V0,
+        };
+
+        let old_entries = vec![
+            BucketEntry::Metaentry(old_meta.clone()),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+        ];
+        let new_entries = vec![
+            BucketEntry::Metaentry(new_meta.clone()),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
+        ];
+
+        // In-memory path (normal level-0 operation)
+        let old_bucket_mem =
+            Bucket::from_sorted_entries_with_in_memory(old_entries.clone()).unwrap();
+        let new_bucket_mem =
+            Bucket::from_sorted_entries_with_in_memory(new_entries.clone()).unwrap();
+        let merged_mem = merge_in_memory(&old_bucket_mem, &new_bucket_mem, 25).unwrap();
+
+        // Disk-backed path with CurrentProtocol policy (post-restore level-0 fallback)
+        let old_bucket_disk = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket_disk = Bucket::from_entries(new_entries).unwrap();
+        let merged_disk = merge_buckets(
+            &old_bucket_disk,
+            &new_bucket_disk,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 25,
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                metadata_policy: MetadataPolicy::CurrentProtocol,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            merged_mem.hash(),
+            merged_disk.hash(),
+            "merge_buckets with CurrentProtocol must produce same hash as merge_in_memory"
+        );
+    }
+
+    #[test]
+    fn test_merge_buckets_current_protocol_differs_from_input_derived() {
+        // Demonstrates that when max_protocol_version > max(input versions),
+        // CurrentProtocol produces a DIFFERENT hash from InputDerived.
+        // This proves the fix is necessary for correctness.
+
+        let old_meta = BucketMetadata {
+            ledger_version: 22,
+            ext: BucketMetadataExt::V0,
+        };
+        let new_meta = BucketMetadata {
+            ledger_version: 22,
+            ext: BucketMetadataExt::V0,
+        };
+
+        let entries = vec![
+            BucketEntry::Metaentry(old_meta.clone()),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+        ];
+        let new_entries = vec![
+            BucketEntry::Metaentry(new_meta.clone()),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
+        ];
+
+        let old_bucket = Bucket::from_entries(entries.clone()).unwrap();
+        let new_bucket = Bucket::from_entries(new_entries.clone()).unwrap();
+
+        // InputDerived: version = max(22, 22) = 22
+        let merged_input_derived = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 25,
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                metadata_policy: MetadataPolicy::InputDerived,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let old_bucket2 = Bucket::from_entries(entries).unwrap();
+        let new_bucket2 = Bucket::from_entries(new_entries).unwrap();
+
+        // CurrentProtocol: version = 25
+        let merged_current_protocol = merge_buckets(
+            &old_bucket2,
+            &new_bucket2,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 25,
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                metadata_policy: MetadataPolicy::CurrentProtocol,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_ne!(
+            merged_input_derived.hash(),
+            merged_current_protocol.hash(),
+            "Different metadata policies should produce different hashes when max_pv > max(inputs)"
+        );
+    }
+
+    #[test]
+    fn test_metadata_policy_current_protocol_output_version() {
+        // Verify CurrentProtocol policy sets output metadata version to max_protocol_version
+        let old_meta = BucketMetadata {
+            ledger_version: 20,
+            ext: BucketMetadataExt::V0,
+        };
+        let (version, meta) =
+            build_output_metadata(Some(&old_meta), None, 25, MetadataPolicy::CurrentProtocol)
+                .unwrap();
+        assert_eq!(
+            version, 25,
+            "CurrentProtocol should use max_protocol_version directly"
+        );
+        if let Some(BucketEntry::Metaentry(m)) = meta {
+            assert_eq!(m.ledger_version, 25);
+        } else {
+            panic!("Expected metadata entry");
         }
     }
 
