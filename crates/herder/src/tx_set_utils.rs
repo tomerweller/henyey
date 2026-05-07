@@ -1169,6 +1169,66 @@ pub(crate) use henyey_tx::envelope_utils::envelope_soroban_resources;
 pub(crate) use henyey_tx::envelope_utils::has_dex_operations_envelope;
 pub(crate) use henyey_tx::envelope_utils::is_soroban_envelope;
 
+/// Result of fee-map validation for a transaction phase.
+///
+/// Mirrors the fee-related subset of stellar-core's `TxSetValidationResult`
+/// (TxSetFrame.h:89-90). Designed to be forward-compatible with a future
+/// broader `TxSetValidationResult` enum covering all of `check_tx_set_valid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FeeMapValidationResult {
+    Valid,
+    ComponentBaseFeeTooLow,
+    TxFeeBidTooLow,
+}
+
+impl std::fmt::Display for FeeMapValidationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Valid => write!(f, "valid"),
+            Self::ComponentBaseFeeTooLow => write!(f, "component base fee too low"),
+            Self::TxFeeBidTooLow => write!(f, "tx fee bid too low"),
+        }
+    }
+}
+
+/// Validates fee constraints for a set of transactions with a given optional base fee.
+///
+/// If `base_fee` is None, returns `Valid` — stellar-core skips fee validation
+/// for None-baseFee components (TxSetFrame.cpp:726-728).
+///
+/// Precedence matches stellar-core: base_fee vs lcl check happens first;
+/// `ComponentBaseFeeTooLow` is returned before any per-tx checks.
+fn validate_fee_component<'a>(
+    base_fee: Option<i64>,
+    txs: impl Iterator<Item = &'a TransactionEnvelope>,
+    lcl_base_fee: u32,
+) -> FeeMapValidationResult {
+    let Some(base_fee) = base_fee else {
+        return FeeMapValidationResult::Valid;
+    };
+    // Compare as signed i64 — stellar-core promotes uint32_t baseFee
+    // to int64_t, so a negative XDR base_fee correctly fails.
+    if base_fee < lcl_base_fee as i64 {
+        debug!(
+            "Got bad txSet: component base fee {} < lcl base fee {}",
+            base_fee, lcl_base_fee
+        );
+        return FeeMapValidationResult::ComponentBaseFeeTooLow;
+    }
+    for tx in txs {
+        let tx_inclusion_fee = envelope_inclusion_fee(tx);
+        let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, base_fee);
+        if tx_inclusion_fee < min_fee {
+            debug!(
+                "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
+                tx_inclusion_fee, min_fee
+            );
+            return FeeMapValidationResult::TxFeeBidTooLow;
+        }
+    }
+    FeeMapValidationResult::Valid
+}
+
 /// Validate that component base fees and per-TX inclusion fees meet minimums.
 ///
 /// Mirrors stellar-core's `checkFeeMap()` (TxSetFrame.cpp:722-751).
@@ -1179,69 +1239,27 @@ pub(crate) use henyey_tx::envelope_utils::is_soroban_envelope;
 ///
 /// For V1 (parallel) phases: checks the phase-level `base_fee` >= `lcl_base_fee`,
 /// then verifies each TX's inclusion fee.
-pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool {
+pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> FeeMapValidationResult {
     match phase {
         TransactionPhase::V0(components) => {
             for component in components.iter() {
                 let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
-                // stellar-core skips all fee validation when baseFee is None
-                // (TxSetFrame.cpp:726-728: `if (!fee) { continue; }`)
-                if let Some(base_fee) = comp.base_fee {
-                    // Compare as signed i64 — stellar-core promotes uint32_t baseFee
-                    // to int64_t, so a negative XDR base_fee correctly fails.
-                    if base_fee < lcl_base_fee as i64 {
-                        debug!(
-                            "Got bad txSet: component base fee {} < lcl base fee {}",
-                            base_fee, lcl_base_fee
-                        );
-                        return false;
-                    }
-                    for tx in comp.txs.iter() {
-                        let tx_inclusion_fee = envelope_inclusion_fee(tx);
-                        let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, base_fee);
-                        if tx_inclusion_fee < min_fee {
-                            debug!(
-                                "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
-                                tx_inclusion_fee, min_fee
-                            );
-                            return false;
-                        }
-                    }
+                let result = validate_fee_component(comp.base_fee, comp.txs.iter(), lcl_base_fee);
+                if result != FeeMapValidationResult::Valid {
+                    return result;
                 }
             }
-            true
+            FeeMapValidationResult::Valid
         }
-        TransactionPhase::V1(parallel) => {
-            // stellar-core skips all fee validation when baseFee is None
-            // (TxSetFrame.cpp:726-728: `if (!fee) { continue; }`)
-            if let Some(base_fee) = parallel.base_fee {
-                // Compare as signed i64 — stellar-core promotes uint32_t baseFee
-                // to int64_t, so a negative XDR base_fee correctly fails.
-                if base_fee < lcl_base_fee as i64 {
-                    debug!(
-                        "Got bad txSet: parallel base fee {} < lcl base fee {}",
-                        base_fee, lcl_base_fee
-                    );
-                    return false;
-                }
-                for stage in parallel.execution_stages.iter() {
-                    for cluster in stage.iter() {
-                        for tx in cluster.iter() {
-                            let tx_inclusion_fee = envelope_inclusion_fee(tx);
-                            let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, base_fee);
-                            if tx_inclusion_fee < min_fee {
-                                debug!(
-                                    "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
-                                    tx_inclusion_fee, min_fee
-                                );
-                                return false;
-                            }
-                        }
-                    }
-                }
-            }
-            true
-        }
+        TransactionPhase::V1(parallel) => validate_fee_component(
+            parallel.base_fee,
+            parallel
+                .execution_stages
+                .iter()
+                .flat_map(|stage| stage.iter())
+                .flat_map(|cluster| cluster.iter()),
+            lcl_base_fee,
+        ),
     }
 }
 
@@ -1633,10 +1651,11 @@ pub(crate) fn check_tx_set_valid(
         }
 
         // 1. Check fee map
-        if !check_fee_map(phase, lcl_header.base_fee) {
+        let fee_result = check_fee_map(phase, lcl_header.base_fee);
+        if fee_result != FeeMapValidationResult::Valid {
             return Err(format!(
-                "check_fee_map: phase {} fee map validation failed (lcl base fee {})",
-                phase_idx, lcl_header.base_fee
+                "check_fee_map: phase {} failed: {} (lcl base fee {})",
+                phase_idx, fee_result, lcl_header.base_fee
             ));
         }
 
@@ -2520,7 +2539,7 @@ mod tests {
         // inclusion_fee = min(200, 1*100) = 100 >= 100 -> valid
         let tx = make_valid_envelope(200, 1);
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
-        assert!(check_fee_map(&phase, 100));
+        assert_eq!(check_fee_map(&phase, 100), FeeMapValidationResult::Valid);
     }
 
     #[test]
@@ -2528,7 +2547,10 @@ mod tests {
         let tx = make_valid_envelope(200, 1);
         // base_fee=50 < lcl_base_fee=100
         let phase = make_v0_phase_with_fee(vec![tx], Some(50));
-        assert!(!check_fee_map(&phase, 100));
+        assert_eq!(
+            check_fee_map(&phase, 100),
+            FeeMapValidationResult::ComponentBaseFeeTooLow
+        );
     }
 
     #[test]
@@ -2538,7 +2560,10 @@ mod tests {
         // catches it as an extra safety layer.
         let tx = make_valid_envelope(200, 1);
         let phase = make_v0_phase_with_fee(vec![tx], Some(-1));
-        assert!(!check_fee_map(&phase, 100));
+        assert_eq!(
+            check_fee_map(&phase, 100),
+            FeeMapValidationResult::ComponentBaseFeeTooLow
+        );
     }
 
     #[test]
@@ -2550,7 +2575,10 @@ mod tests {
             base_fee: Some(-1),
             execution_stages: vec![].try_into().unwrap(),
         });
-        assert!(!check_fee_map(&phase, 100));
+        assert_eq!(
+            check_fee_map(&phase, 100),
+            FeeMapValidationResult::ComponentBaseFeeTooLow
+        );
     }
 
     #[test]
@@ -2561,7 +2589,10 @@ mod tests {
         // 50 < 100 -> invalid
         let tx = make_valid_envelope(50, 1);
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
-        assert!(!check_fee_map(&phase, 100));
+        assert_eq!(
+            check_fee_map(&phase, 100),
+            FeeMapValidationResult::TxFeeBidTooLow
+        );
     }
 
     #[test]
@@ -2572,7 +2603,7 @@ mod tests {
         // fee checks are skipped entirely when base_fee is None.
         let tx = make_valid_envelope(200, 1);
         let phase = make_v0_phase_with_fee(vec![tx], None);
-        assert!(check_fee_map(&phase, 100));
+        assert_eq!(check_fee_map(&phase, 100), FeeMapValidationResult::Valid);
     }
 
     // --- AUDIT-268: None-baseFee parity regression tests ---
@@ -2586,7 +2617,7 @@ mod tests {
         // (50 < 100*1), but must pass because fee checks are skipped.
         let tx = make_valid_envelope(50, 1);
         let phase = make_v0_phase_with_fee(vec![tx], None);
-        assert!(check_fee_map(&phase, 100));
+        assert_eq!(check_fee_map(&phase, 100), FeeMapValidationResult::Valid);
     }
 
     #[test]
@@ -2601,7 +2632,7 @@ mod tests {
                 .try_into()
                 .unwrap(),
         });
-        assert!(check_fee_map(&phase, 100));
+        assert_eq!(check_fee_map(&phase, 100), FeeMapValidationResult::Valid);
     }
 
     #[test]
@@ -2611,7 +2642,10 @@ mod tests {
         // inclusion_fee = min(150, 1*200) = 150 < 200 → invalid.
         let tx = make_valid_envelope(150, 1);
         let phase = make_v0_phase_with_fee(vec![tx], Some(200));
-        assert!(!check_fee_map(&phase, 100));
+        assert_eq!(
+            check_fee_map(&phase, 100),
+            FeeMapValidationResult::TxFeeBidTooLow
+        );
     }
 
     #[test]
@@ -2626,7 +2660,35 @@ mod tests {
                 .try_into()
                 .unwrap(),
         });
-        assert!(!check_fee_map(&phase, 100));
+        assert_eq!(
+            check_fee_map(&phase, 100),
+            FeeMapValidationResult::TxFeeBidTooLow
+        );
+    }
+
+    #[test]
+    fn test_check_fee_map_component_base_fee_too_low_takes_precedence() {
+        // When both base_fee < lcl_base_fee AND tx fee bid would be too low,
+        // ComponentBaseFeeTooLow is returned first (matches stellar-core traversal order).
+        let tx = make_valid_envelope(50, 1); // fee=50, would fail tx bid check too
+        let phase = make_v0_phase_with_fee(vec![tx], Some(50)); // base_fee=50 < lcl=100
+        assert_eq!(
+            check_fee_map(&phase, 100),
+            FeeMapValidationResult::ComponentBaseFeeTooLow
+        );
+    }
+
+    #[test]
+    fn test_check_fee_map_display_impl() {
+        assert_eq!(FeeMapValidationResult::Valid.to_string(), "valid");
+        assert_eq!(
+            FeeMapValidationResult::ComponentBaseFeeTooLow.to_string(),
+            "component base fee too low"
+        );
+        assert_eq!(
+            FeeMapValidationResult::TxFeeBidTooLow.to_string(),
+            "tx fee bid too low"
+        );
     }
 
     // --- AUDIT-033: check_valid_classic tests ---
@@ -3309,6 +3371,38 @@ mod tests {
         assert!(
             result.is_err(),
             "check_tx_set_valid should reject tx-set with unsigned transactions"
+        );
+    }
+
+    /// Regression test: check_tx_set_valid reports specific fee-map failure reason.
+    #[test]
+    fn test_check_tx_set_valid_fee_map_error_reports_reason() {
+        // Build a GeneralizedTransactionSet with component base_fee=50 < lcl base_fee=100.
+        let tx = make_valid_envelope(200, 1);
+        let phase_with_low_base_fee = make_v0_phase_with_fee(vec![tx.clone()], Some(50));
+        let soroban_phase = make_v0_phase_with_fee(vec![], Some(100));
+
+        use stellar_xdr::curr::{Hash, TransactionSetV1};
+        let gen_tx_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![phase_with_low_base_fee, soroban_phase]
+                .try_into()
+                .unwrap(),
+        });
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+
+        let result = check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None);
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("component base fee too low"),
+            "error message should contain specific reason, got: {}",
+            err
+        );
+        assert!(
+            err.contains("phase 0"),
+            "error message should indicate which phase failed, got: {}",
+            err
         );
     }
 
