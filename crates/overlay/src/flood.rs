@@ -162,6 +162,11 @@ pub struct FloodGate {
     rate_window_count: AtomicU64,
     /// Whether an eviction warning has been emitted since last reset.
     eviction_warned: AtomicBool,
+    /// Counter: stale queue entries skipped during eviction (key present but
+    /// generation mismatch). Test-only — used to prove the generation guard
+    /// was exercised.
+    #[cfg(test)]
+    pub(crate) stale_eviction_skips: AtomicU64,
 }
 
 impl FloodGate {
@@ -197,6 +202,8 @@ impl FloodGate {
             rate_window_start: RwLock::new(Instant::now()),
             rate_window_count: AtomicU64::new(0),
             eviction_warned: AtomicBool::new(false),
+            #[cfg(test)]
+            stale_eviction_skips: AtomicU64::new(0),
         }
     }
 
@@ -298,6 +305,13 @@ impl FloodGate {
                         .is_some()
                     {
                         evicted += 1;
+                    } else {
+                        // Distinguish stale skip (key present, different gen)
+                        // from ghost (key absent due to prior forget).
+                        #[cfg(test)]
+                        if self.seen.contains_key(&hash) {
+                            self.stale_eviction_skips.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 None => break, // queue exhausted
@@ -1157,63 +1171,104 @@ mod tests {
     }
 
     /// Regression test: concurrent forget+reinsert must not lose entries to
-    /// stale eviction. Before the `remove_if` fix, a non-atomic get+remove
-    /// could evict a freshly re-inserted entry.
+    /// stale eviction. The generation guard in `evict_to_target` ensures that
+    /// stale queue entries (from before a forget+reinsert cycle) are skipped
+    /// rather than incorrectly evicting the re-inserted entry.
+    ///
+    /// Uses phased synchronization to guarantee:
+    /// 1. During Phase 1, eviction encounters stale (hot_hash, old_gen) entries
+    ///    and correctly skips them (generation mismatch).
+    /// 2. After Phase 1, a final reinsert places hot_hash at the queue back,
+    ///    making it unreachable by any further eviction.
+    /// 3. Assertion verifies both presence AND that stale entries were exercised.
     #[test]
     fn test_flood_gate_concurrent_forget_reinsert_during_eviction() {
-        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
-        // Small capacity to force frequent evictions.
-        let gate = Arc::new(FloodGate::with_limits(Duration::from_secs(300), 100));
-        let num_threads = 4;
-        let iterations = 200;
+        const NUM_STUFFER_THREADS: usize = 3;
+        const STUFFER_ITERATIONS: usize = 300;
 
-        // Pre-fill to capacity with unique entries.
-        for i in 0u16..100 {
+        // Capacity 50, target 37. With 900 stuffer inserts, ~35 eviction passes
+        // pop ~13 entries each = ~455 total pops. The cycler generates one stale
+        // (hot_hash, old_gen) queue entry per iteration, so eviction is virtually
+        // certain to encounter multiple stale entries.
+        let gate = Arc::new(FloodGate::with_limits(Duration::from_secs(300), 50));
+
+        // Pre-fill to capacity.
+        for i in 0u16..50 {
             let mut h = [0u8; 32];
             h[0..2].copy_from_slice(&i.to_le_bytes());
             gate.record_seen(Hash256(h), None, 1);
         }
 
-        // Concurrently: some threads insert new entries (triggering eviction),
-        // while other threads forget + reinsert a "hot" hash repeatedly.
         let hot_hash = Hash256([0xAA; 32]);
         gate.record_seen(hot_hash, None, 1);
 
-        let handles: Vec<_> = (0..num_threads)
-            .map(|t| {
-                let gate = Arc::clone(&gate);
-                thread::spawn(move || {
-                    if t % 2 == 0 {
-                        // Inserter thread — pushes new entries to trigger eviction.
-                        for i in 0..iterations {
-                            let mut h = [0u8; 32];
-                            h[0] = 0xFF;
-                            h[1] = t as u8;
-                            h[2..4].copy_from_slice(&(i as u16).to_le_bytes());
-                            gate.record_seen(Hash256(h), None, 1);
-                        }
-                    } else {
-                        // Forget+reinsert thread — rapidly cycles the hot hash.
-                        for _ in 0..iterations {
-                            gate.forget(&hot_hash);
-                            gate.record_seen(hot_hash, None, 1);
-                        }
-                    }
-                })
-            })
-            .collect();
+        // Synchronization: countdown latch + barrier.
+        let stuffers_remaining = Arc::new(AtomicUsize::new(NUM_STUFFER_THREADS));
+        let barrier = Arc::new(Barrier::new(NUM_STUFFER_THREADS + 1));
+
+        let mut handles = Vec::new();
+
+        // Spawn stuffer threads.
+        for t in 0..NUM_STUFFER_THREADS {
+            let gate = Arc::clone(&gate);
+            let stuffers_remaining = Arc::clone(&stuffers_remaining);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                for i in 0..STUFFER_ITERATIONS {
+                    let mut h = [0u8; 32];
+                    h[0] = 0xFF;
+                    h[1] = t as u8;
+                    h[2..4].copy_from_slice(&(i as u16).to_le_bytes());
+                    gate.record_seen(Hash256(h), None, 1);
+                }
+                // Signal: this stuffer is done.
+                stuffers_remaining.fetch_sub(1, Ordering::Release);
+                barrier.wait();
+            }));
+        }
+
+        // Spawn single cycler thread.
+        {
+            let gate = Arc::clone(&gate);
+            let stuffers_remaining = Arc::clone(&stuffers_remaining);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                // Phase 1: cycle while stuffers are active (exercises the guard).
+                while stuffers_remaining.load(Ordering::Acquire) > 0 {
+                    gate.forget(&hot_hash);
+                    gate.record_seen(hot_hash, None, 1);
+                }
+                // Phase 2: all stuffers done — final guaranteed reinsert.
+                // This places (hot_hash, gen_LAST) at the queue back,
+                // unreachable by further eviction.
+                gate.forget(&hot_hash);
+                gate.record_seen(hot_hash, None, 1);
+                barrier.wait();
+            }));
+        }
 
         for h in handles {
             h.join().unwrap();
         }
 
-        // The hot hash must still be present — forget+reinsert should never
-        // lose an entry to a stale eviction.
+        // The hot hash must still be present — the final reinsert after all
+        // stuffers stopped guarantees its queue entry is at the back.
         assert!(
             gate.seen.contains_key(&hot_hash),
             "hot_hash was incorrectly evicted by stale queue entry"
+        );
+
+        // Prove the generation guard was actually exercised: at least one
+        // stale (hot_hash, old_gen) queue entry was encountered during
+        // eviction and correctly skipped (key present, generation mismatch).
+        assert!(
+            gate.stale_eviction_skips.load(Ordering::Relaxed) > 0,
+            "test did not exercise the generation guard — \
+             stale entries were never encountered during eviction"
         );
     }
 

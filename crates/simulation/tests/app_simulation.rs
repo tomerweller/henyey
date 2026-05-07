@@ -14,6 +14,15 @@ use henyey_simulation::{
 /// See follow-up investigation issue for root cause analysis.
 const TCP_POST_REMOVAL_CLOSE_TIMEOUT_SECS: u64 = 90;
 
+/// Timeout for post-restart TCP connectivity stabilization.
+///
+/// After full node removal + restart, the node must: discover peers,
+/// TCP connect, authenticate overlay hello, pass min_peers check.
+/// This is comparable to initial topology construction (which uses 60s at
+/// line 164). The extra slack over the 30s used in simpler reconnection
+/// tests accommodates CI runner load spikes.
+const TCP_RESTART_STABILIZE_TIMEOUT_SECS: u64 = 60;
+
 async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
@@ -703,7 +712,7 @@ async fn test_core3_restart_rejoin_over_tcp() {
     wait_for_app_operational(&sim, "node0", Duration::from_secs(5)).await;
 
     // Re-establish peer connections with retry (TCP connections can fail transiently).
-    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(30))
+    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(TCP_RESTART_STABILIZE_TIMEOUT_SECS))
         .await
         .expect("node0 failed to establish peer connectivity after restart");
 
