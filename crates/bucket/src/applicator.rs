@@ -572,4 +572,245 @@ mod tests {
         assert!(delete.entry().is_none());
         assert_eq!(delete.key(), &key);
     }
+
+    // ========================================================================
+    // Cross-bucket deduplication tests (mark_seen / is_seen / mark_seen_many)
+    // ========================================================================
+
+    #[test]
+    fn test_is_seen_and_mark_seen() {
+        let entries = vec![BucketEntry::Liveentry(make_account_entry(1))];
+        let bucket = Arc::new(Bucket::from_entries(entries).unwrap());
+        let mut applicator = BucketApplicator::new(bucket, 25, 0);
+
+        let key = make_account_key(1);
+
+        // Not seen yet
+        assert!(!applicator.is_seen(&key));
+        assert_eq!(applicator.unique_keys_seen(), 0);
+
+        // Mark as seen
+        applicator.mark_seen(key.clone());
+        assert!(applicator.is_seen(&key));
+        assert_eq!(applicator.unique_keys_seen(), 1);
+
+        // Idempotence: marking the same key again doesn't change the count
+        applicator.mark_seen(key.clone());
+        assert!(applicator.is_seen(&key));
+        assert_eq!(applicator.unique_keys_seen(), 1);
+    }
+
+    #[test]
+    fn test_mark_seen_many() {
+        let entries = vec![BucketEntry::Liveentry(make_account_entry(1))];
+        let bucket = Arc::new(Bucket::from_entries(entries).unwrap());
+        let mut applicator = BucketApplicator::new(bucket, 25, 0);
+
+        let keys: Vec<LedgerKey> = (1..=3).map(make_account_key).collect();
+
+        // Mark 3 keys at once
+        applicator.mark_seen_many(keys.clone().into_iter());
+        for key in &keys {
+            assert!(applicator.is_seen(key));
+        }
+        assert_eq!(applicator.unique_keys_seen(), 3);
+
+        // Idempotence: re-mark 2 existing keys + 1 new key
+        let mixed_keys = vec![
+            make_account_key(2),
+            make_account_key(3),
+            make_account_key(4),
+        ];
+        applicator.mark_seen_many(mixed_keys.into_iter());
+        assert_eq!(applicator.unique_keys_seen(), 4);
+        assert!(applicator.is_seen(&make_account_key(4)));
+    }
+
+    #[test]
+    fn test_cross_bucket_dedup_skips_overlapping_entries() {
+        // Bucket A: accounts [1, 2, 3]
+        let entries_a: Vec<BucketEntry> = (1..=3)
+            .map(|i| BucketEntry::Liveentry(make_account_entry(i)))
+            .collect();
+        let bucket_a = Arc::new(Bucket::from_entries(entries_a).unwrap());
+
+        // Bucket B: accounts [2, 3, 4]
+        let entries_b: Vec<BucketEntry> = (2..=4)
+            .map(|i| BucketEntry::Liveentry(make_account_entry(i)))
+            .collect();
+        let bucket_b = Arc::new(Bucket::from_entries(entries_b).unwrap());
+
+        // Process bucket A with chunk_size=2 (multi-chunk for 3+ entries)
+        let mut applicator_a = BucketApplicator::with_chunk_size(bucket_a, 25, 0, 2);
+        let mut counters_a = ApplicatorCounters::new();
+        while applicator_a.has_more() {
+            applicator_a.advance(&mut counters_a).unwrap();
+        }
+
+        // Verify A saw the expected keys
+        assert!(applicator_a.is_seen(&make_account_key(1)));
+        assert!(applicator_a.is_seen(&make_account_key(2)));
+        assert!(applicator_a.is_seen(&make_account_key(3)));
+
+        // Create applicator B with chunk_size=1, fresh counters
+        let mut applicator_b = BucketApplicator::with_chunk_size(bucket_b, 25, 0, 1);
+        let mut counters_b = ApplicatorCounters::new();
+
+        // Seed B with explicit keys from A's known set
+        applicator_b.mark_seen_many(
+            vec![
+                make_account_key(1),
+                make_account_key(2),
+                make_account_key(3),
+            ]
+            .into_iter(),
+        );
+
+        // Drain B to exhaustion, collecting batches
+        let mut all_entries = Vec::new();
+        while applicator_b.has_more() {
+            let batch = applicator_b.advance(&mut counters_b).unwrap();
+            all_entries.extend(batch);
+        }
+
+        // Only account 4 should appear (accounts 2 and 3 were skipped)
+        assert_eq!(all_entries.len(), 1);
+        assert_eq!(all_entries[0].key(), &make_account_key(4));
+        assert!(!all_entries[0].is_delete());
+        assert_eq!(counters_b.entries_skipped, 2);
+    }
+
+    #[test]
+    fn test_cross_bucket_dedup_with_dead_entries() {
+        // Bucket A: live(1), dead(2)
+        let entries_a = vec![
+            BucketEntry::Liveentry(make_account_entry(1)),
+            BucketEntry::Deadentry(make_account_key(2)),
+        ];
+        let bucket_a = Arc::new(Bucket::from_entries(entries_a).unwrap());
+
+        // Bucket B: live(2), dead(1)
+        let entries_b = vec![
+            BucketEntry::Liveentry(make_account_entry(2)),
+            BucketEntry::Deadentry(make_account_key(1)),
+        ];
+        let bucket_b = Arc::new(Bucket::from_entries(entries_b).unwrap());
+
+        // Process bucket A
+        let mut applicator_a = BucketApplicator::with_chunk_size(bucket_a, 25, 0, 2);
+        let mut counters_a = ApplicatorCounters::new();
+        while applicator_a.has_more() {
+            applicator_a.advance(&mut counters_a).unwrap();
+        }
+        assert!(applicator_a.is_seen(&make_account_key(1)));
+        assert!(applicator_a.is_seen(&make_account_key(2)));
+
+        // Create applicator B, seed with A's keys
+        let mut applicator_b = BucketApplicator::with_chunk_size(bucket_b, 25, 0, 2);
+        let mut counters_b = ApplicatorCounters::new();
+        applicator_b.mark_seen_many(vec![make_account_key(1), make_account_key(2)].into_iter());
+
+        // Drain B
+        let mut all_entries = Vec::new();
+        while applicator_b.has_more() {
+            let batch = applicator_b.advance(&mut counters_b).unwrap();
+            all_entries.extend(batch);
+        }
+
+        // Both keys already seen — batch should be empty
+        assert!(all_entries.is_empty());
+        assert_eq!(counters_b.entries_skipped, 2);
+    }
+
+    #[test]
+    fn test_cross_bucket_dedup_with_initentry() {
+        // Bucket A: initentry(1), initentry(2)
+        let entries_a = vec![
+            BucketEntry::Initentry(make_account_entry(1)),
+            BucketEntry::Initentry(make_account_entry(2)),
+        ];
+        let bucket_a = Arc::new(Bucket::from_entries(entries_a).unwrap());
+
+        // Bucket B: initentry(2), initentry(3)
+        let entries_b = vec![
+            BucketEntry::Initentry(make_account_entry(2)),
+            BucketEntry::Initentry(make_account_entry(3)),
+        ];
+        let bucket_b = Arc::new(Bucket::from_entries(entries_b).unwrap());
+
+        // Process bucket A
+        let mut applicator_a = BucketApplicator::with_chunk_size(bucket_a, 25, 0, 2);
+        let mut counters_a = ApplicatorCounters::new();
+        while applicator_a.has_more() {
+            applicator_a.advance(&mut counters_a).unwrap();
+        }
+        assert!(applicator_a.is_seen(&make_account_key(1)));
+        assert!(applicator_a.is_seen(&make_account_key(2)));
+
+        // Create applicator B, seed with A's keys
+        let mut applicator_b = BucketApplicator::with_chunk_size(bucket_b, 25, 0, 1);
+        let mut counters_b = ApplicatorCounters::new();
+        applicator_b.mark_seen_many(vec![make_account_key(1), make_account_key(2)].into_iter());
+
+        // Drain B
+        let mut all_entries = Vec::new();
+        while applicator_b.has_more() {
+            let batch = applicator_b.advance(&mut counters_b).unwrap();
+            all_entries.extend(batch);
+        }
+
+        // Only account 3 should appear (initentry)
+        assert_eq!(all_entries.len(), 1);
+        assert_eq!(all_entries[0].key(), &make_account_key(3));
+        assert!(!all_entries[0].is_delete());
+        assert_eq!(counters_b.entries_skipped, 1);
+    }
+
+    #[test]
+    fn test_cross_bucket_dedup_skip_dead_disabled() {
+        // Bucket A: live(1), dead(2)
+        let entries_a = vec![
+            BucketEntry::Liveentry(make_account_entry(1)),
+            BucketEntry::Deadentry(make_account_key(2)),
+        ];
+        let bucket_a = Arc::new(Bucket::from_entries(entries_a).unwrap());
+
+        // Bucket B: dead(1), live(3)
+        let entries_b = vec![
+            BucketEntry::Deadentry(make_account_key(1)),
+            BucketEntry::Liveentry(make_account_entry(3)),
+        ];
+        let bucket_b = Arc::new(Bucket::from_entries(entries_b).unwrap());
+
+        // Process bucket A
+        let mut applicator_a = BucketApplicator::with_chunk_size(bucket_a, 25, 0, 2);
+        let mut counters_a = ApplicatorCounters::new();
+        while applicator_a.has_more() {
+            applicator_a.advance(&mut counters_a).unwrap();
+        }
+        assert!(applicator_a.is_seen(&make_account_key(1)));
+        assert!(applicator_a.is_seen(&make_account_key(2)));
+
+        // Create applicator B with apply_dead_entries=false
+        let mut applicator_b = BucketApplicator::with_chunk_size(bucket_b, 25, 0, 2);
+        applicator_b.set_apply_dead_entries(false);
+        let mut counters_b = ApplicatorCounters::new();
+        applicator_b.mark_seen_many(vec![make_account_key(1), make_account_key(2)].into_iter());
+
+        // Drain B
+        let mut all_entries = Vec::new();
+        while applicator_b.has_more() {
+            let batch = applicator_b.advance(&mut counters_b).unwrap();
+            all_entries.extend(batch);
+        }
+
+        // dead(1) is skipped by the !apply_dead_entries guard (before seen-key check),
+        // live(3) is new and not seen — so only live(3) appears
+        assert_eq!(all_entries.len(), 1);
+        assert_eq!(all_entries[0].key(), &make_account_key(3));
+        assert!(!all_entries[0].is_delete());
+        // dead(1) was skipped by the dead-entry guard, NOT by the seen-key check,
+        // so entries_skipped should be 0
+        assert_eq!(counters_b.entries_skipped, 0);
+    }
 }
