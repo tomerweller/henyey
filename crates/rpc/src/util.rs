@@ -858,6 +858,7 @@ fn is_leap_year(year: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_toid_roundtrip() {
@@ -1179,6 +1180,7 @@ mod tests {
     /// (e.g. by a timeout), the permit must remain held until the blocking
     /// work finishes — otherwise the DB concurrency bound is violated.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(tcp)]
     async fn test_blocking_db_permit_survives_cancellation() {
         use std::sync::Arc as StdArc;
         use std::time::Duration;

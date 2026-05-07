@@ -219,7 +219,8 @@ mod tests {
     /// `bucket_io_concurrency = 0` must be clamped to MIN_SEMAPHORE_CAPACITY.
     #[test]
     fn bucket_io_zero_clamped_to_minimum() {
-        let clamped = 0usize.max(super::MIN_SEMAPHORE_CAPACITY);
+        let zero: usize = 0;
+        let clamped = zero.max(super::MIN_SEMAPHORE_CAPACITY);
         assert_eq!(clamped, 1, "zero bucket_io must clamp to 1");
     }
 }
