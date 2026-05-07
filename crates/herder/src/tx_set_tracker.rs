@@ -75,34 +75,32 @@ impl TxSetTracker {
             return false;
         }
 
-        if self.pending.contains_key(&hash) {
-            if let Some(mut entry) = self.pending.get_mut(&hash) {
-                entry.request_count += 1;
+        // Pre-check cap BEFORE entry() — DashMap::len() acquires read locks on
+        // all shards; calling it while holding an entry guard (shard write lock)
+        // would deadlock.
+        let at_cap = self.pending.len() >= MAX_PENDING_TXSET_REQUESTS;
+
+        match self.pending.entry(hash) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                // Always increment — cap does not apply to existing entries.
+                entry.get_mut().request_count += 1;
+                false
             }
-            return false;
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if at_cap {
+                    debug!("Dropping tx set request: pending cap reached");
+                    return false;
+                }
+                entry.insert(PendingTxSet {
+                    hash,
+                    slot,
+                    requested_at: Instant::now(),
+                    request_count: 1,
+                });
+                debug!(%hash, slot, "Registered pending tx set request");
+                true
+            }
         }
-
-        // Defense-in-depth: best-effort cap on pending entries.
-        // Rejected hashes will be retried on the next SCP envelope referencing them.
-        if self.pending.len() >= MAX_PENDING_TXSET_REQUESTS {
-            debug!(
-                pending_count = self.pending.len(),
-                "Dropping tx set request: pending cap reached"
-            );
-            return false;
-        }
-
-        self.pending.insert(
-            hash,
-            PendingTxSet {
-                hash,
-                slot,
-                requested_at: Instant::now(),
-                request_count: 1,
-            },
-        );
-        debug!(%hash, slot, "Registered pending tx set request");
-        true
     }
 
     /// Check if we need a tx set (pending and not cached).
@@ -169,29 +167,41 @@ impl TxSetTracker {
         let hash = *tx_set.hash();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
-        // If already cached, replace in-place without evicting another entry.
-        if self.cache.contains_key(&hash) {
-            self.cache.insert(hash, CachedTxSet::new(tx_set, seq));
-            return;
-        }
-
         if self.max_cache_size == 0 {
             return;
         }
 
-        if self.cache.len() >= self.max_cache_size {
-            // Collect the key to evict before calling remove, to avoid holding
-            // a DashMap shard read-lock while remove acquires a write-lock.
-            let to_evict: Option<Hash256> = {
-                let oldest = self.cache.iter().min_by_key(|e| e.touch_seq);
-                oldest.map(|e| *e.key())
-            };
-            if let Some(k) = to_evict {
-                self.cache.remove(&k);
+        // Pre-check capacity BEFORE entry() — DashMap::len() acquires read locks
+        // on all shards; calling it while holding an entry guard would deadlock.
+        let at_capacity = self.cache.len() >= self.max_cache_size;
+
+        match self.cache.entry(hash) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                // Already cached — atomic in-place update, no eviction needed.
+                *entry.get_mut() = CachedTxSet::new(tx_set, seq);
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if at_capacity {
+                    // Must drop entry guard before evicting — iter() acquires
+                    // read locks on all shards, which deadlocks with entry's
+                    // shard write lock.
+                    drop(entry);
+                    let to_evict: Option<Hash256> = {
+                        let oldest = self.cache.iter().min_by_key(|e| e.touch_seq);
+                        oldest.map(|e| *e.key())
+                    };
+                    if let Some(k) = to_evict {
+                        self.cache.remove(&k);
+                    }
+                    // Best-effort insert after eviction. Not atomic with the
+                    // vacancy check, but the common Occupied path is now race-free.
+                    self.cache.insert(hash, CachedTxSet::new(tx_set, seq));
+                } else {
+                    // Under capacity — fully atomic insert via entry guard.
+                    entry.insert(CachedTxSet::new(tx_set, seq));
+                }
             }
         }
-
-        self.cache.insert(hash, CachedTxSet::new(tx_set, seq));
     }
 
     /// Receive a parsed tx set from the network. Verifies hash integrity,
@@ -822,5 +832,120 @@ mod tests {
         assert!(!tracker.request(cached_hash, 100));
         // Pending count unchanged (not inserted)
         assert_eq!(tracker.pending_count(), MAX_PENDING_TXSET_REQUESTS);
+    }
+
+    // --- Concurrent regression tests for entry() TOCTOU fix (#2469) ---
+
+    #[test]
+    fn test_concurrent_request_same_hash() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tracker = Arc::new(TxSetTracker::new(256));
+        let hash = Hash256::from_bytes([42; 32]);
+        let n = 16;
+        let barrier = Arc::new(Barrier::new(n));
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let tracker = Arc::clone(&tracker);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    tracker.request(hash, 100)
+                })
+            })
+            .collect();
+
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let true_count = results.iter().filter(|&&r| r).count();
+
+        // Exactly one thread should win the insert.
+        assert_eq!(true_count, 1, "exactly one request() should return true");
+        assert_eq!(tracker.pending_count(), 1);
+
+        // request_count should equal total requests.
+        let entry = tracker.pending.get(&hash).unwrap();
+        assert_eq!(entry.request_count, n as u32);
+    }
+
+    #[test]
+    fn test_concurrent_store_same_hash_no_spurious_eviction() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        // Cache size 2: store two distinct hashes, then race-store a third
+        // that is the same as the first. The Occupied path should fire for
+        // at least some threads, preventing unnecessary eviction of hash B.
+        let tracker = Arc::new(TxSetTracker::new(2));
+        let ts_a = make_tx_set(1);
+        let ts_b = make_tx_set(2);
+        let hash_a = *ts_a.hash();
+        let hash_b = *ts_b.hash();
+
+        tracker.store(ts_a.clone());
+        tracker.store(ts_b.clone());
+        assert_eq!(tracker.cache_count(), 2);
+
+        let n = 8;
+        let barrier = Arc::new(Barrier::new(n));
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let tracker = Arc::clone(&tracker);
+                let barrier = Arc::clone(&barrier);
+                let ts = ts_a.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    tracker.store(ts);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // hash_a should still be cached (updated in place).
+        assert!(
+            tracker.get(&hash_a).is_some(),
+            "hash_a should still be cached"
+        );
+        // hash_b should still be cached (no spurious eviction from same-hash stores).
+        assert!(
+            tracker.get(&hash_b).is_some(),
+            "hash_b should not be evicted"
+        );
+    }
+
+    #[test]
+    fn test_request_at_cap_still_increments_existing() {
+        let tracker = TxSetTracker::new(256);
+
+        // Fill to capacity.
+        for i in 0..MAX_PENDING_TXSET_REQUESTS {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i & 0xFF) as u8;
+            bytes[1] = ((i >> 8) & 0xFF) as u8;
+            let hash = Hash256::from_bytes(bytes);
+            tracker.request(hash, 100);
+        }
+
+        // The first hash we inserted should still be incrementable.
+        let first_hash = Hash256::from_bytes([0u8; 32]);
+        assert!(!tracker.request(first_hash, 100));
+        let entry = tracker.pending.get(&first_hash).unwrap();
+        assert_eq!(
+            entry.request_count, 2,
+            "existing entry should increment even at cap"
+        );
+
+        // A brand new hash should be rejected.
+        let new_hash = Hash256::from_bytes([0xFF; 32]);
+        assert!(!tracker.request(new_hash, 100));
+        assert!(
+            tracker.pending.get(&new_hash).is_none(),
+            "new hash rejected at cap"
+        );
     }
 }

@@ -145,37 +145,35 @@ impl QuorumSetTracker {
             return false;
         }
 
-        // If already pending, add this node_id to the waiting set.
-        if let Some(mut entry) = self.pending.get_mut(&hash) {
-            entry.request_count += 1;
-            // Cap per-entry node_ids to prevent unbounded growth
-            if entry.node_ids.len() < MAX_PENDING_NODE_IDS {
-                entry.node_ids.insert(node_id);
+        // Pre-check cap BEFORE entry() — DashMap::len() acquires read locks on
+        // all shards; calling it while holding an entry guard would deadlock.
+        let at_cap = self.pending.len() >= MAX_PENDING_QSET_REQUESTS;
+
+        match self.pending.entry(hash) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let pending = entry.get_mut();
+                pending.request_count += 1;
+                if pending.node_ids.len() < MAX_PENDING_NODE_IDS {
+                    pending.node_ids.insert(node_id);
+                }
+                false
             }
-            return false;
-        }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if at_cap {
+                    debug!("Dropping quorum set request: pending cap reached");
+                    return false;
+                }
 
-        // Defense-in-depth: cap the number of pending entries
-        if self.pending.len() >= MAX_PENDING_QSET_REQUESTS {
-            debug!(
-                pending_count = self.pending.len(),
-                "Dropping quorum set request: pending cap reached"
-            );
-            return false;
+                let mut node_ids = HashSet::new();
+                node_ids.insert(node_id);
+                entry.insert(PendingQuorumSet {
+                    request_count: 1,
+                    node_ids,
+                });
+                info!(%hash, "Registered pending quorum set request");
+                true
+            }
         }
-
-        // New request.
-        let mut node_ids = HashSet::new();
-        node_ids.insert(node_id);
-        self.pending.insert(
-            hash,
-            PendingQuorumSet {
-                request_count: 1,
-                node_ids,
-            },
-        );
-        info!(%hash, "Registered pending quorum set request");
-        true
     }
 
     /// Get node_ids waiting for a pending qset hash.
@@ -762,5 +760,71 @@ mod tests {
             !tracker.has_hash(&unnormalized_hash),
             "tracker must not be indexed under the unnormalized hash"
         );
+    }
+
+    // --- Concurrent regression tests for entry() TOCTOU fix (#2469) ---
+
+    #[test]
+    fn test_concurrent_request_same_hash_different_nodes() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tracker = Arc::new(QuorumSetTracker::new(node_key(0), None));
+        let hash = Hash256::from_bytes([42; 32]);
+        let n = 16;
+        let barrier = Arc::new(Barrier::new(n));
+
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let tracker = Arc::clone(&tracker);
+                let barrier = Arc::clone(&barrier);
+                let node_id = make_node_id(i as u8 + 1);
+                thread::spawn(move || {
+                    barrier.wait();
+                    tracker.request(hash, node_id)
+                })
+            })
+            .collect();
+
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let true_count = results.iter().filter(|&&r| r).count();
+
+        // Exactly one thread should create the pending entry.
+        assert_eq!(true_count, 1, "exactly one request() should return true");
+        assert_eq!(tracker.pending_count(), 1);
+
+        // All node_ids should be preserved (up to MAX_PENDING_NODE_IDS).
+        let entry = tracker.pending.get(&hash).unwrap();
+        assert_eq!(entry.request_count, n as u32);
+        assert_eq!(entry.node_ids.len(), n);
+    }
+
+    #[test]
+    fn test_request_at_cap_still_increments_existing() {
+        let tracker = QuorumSetTracker::new(node_key(0), None);
+
+        // Fill to capacity with unique hashes.
+        for i in 0..MAX_PENDING_QSET_REQUESTS {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i & 0xFF) as u8;
+            bytes[1] = ((i >> 8) & 0xFF) as u8;
+            let hash = Hash256::from_bytes(bytes);
+            tracker.request(hash, make_node_id(1));
+        }
+
+        assert_eq!(tracker.pending_count(), MAX_PENDING_QSET_REQUESTS);
+
+        // Existing hash should still be updatable.
+        let first_hash = Hash256::from_bytes([0u8; 32]);
+        let new_node = make_node_id(99);
+        assert!(!tracker.request(first_hash, new_node.clone()));
+        let entry = tracker.pending.get(&first_hash).unwrap();
+        assert_eq!(entry.request_count, 2);
+        assert!(entry.node_ids.contains(&new_node));
+
+        // New hash should be rejected.
+        let new_hash = Hash256::from_bytes([0xFF; 32]);
+        assert!(!tracker.request(new_hash, make_node_id(50)));
+        assert!(tracker.pending.get(&new_hash).is_none());
     }
 }
