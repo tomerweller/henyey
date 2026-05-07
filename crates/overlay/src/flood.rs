@@ -20,6 +20,7 @@
 //! - **Rate Limiting**: Soft limit on messages per second to prevent
 //!   overwhelming the node during traffic spikes.
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use henyey_common::Hash256;
 use parking_lot::{Mutex, RwLock};
@@ -219,26 +220,35 @@ impl FloodGate {
     ) -> RelayRecord {
         self.messages_seen.fetch_add(1, Ordering::Relaxed);
 
-        // Check if we've seen this message
-        if let Some(mut entry) = self.seen.get_mut(&message_hash) {
-            // Already seen, record the peer
-            if let Some(peer) = from_peer {
-                entry.add_peer(peer);
+        // Atomic check-and-insert via entry() API. The DashMap shard lock is
+        // held from entry() until VacantEntry::insert consumes self, preventing
+        // the TOCTOU race where two threads both observe the key as absent and
+        // both insert (potentially with generation inversion).
+        let generation = match self.seen.entry(message_hash) {
+            Entry::Occupied(mut occ) => {
+                if let Some(peer) = from_peer {
+                    occ.get_mut().add_peer(peer);
+                }
+                self.messages_duplicate.fetch_add(1, Ordering::Relaxed);
+                trace!("Duplicate message: {}", message_hash);
+                return RelayRecord::Repeated;
             }
-            self.messages_duplicate.fetch_add(1, Ordering::Relaxed);
-            trace!("Duplicate message: {}", message_hash);
-            return RelayRecord::Repeated;
-        }
+            Entry::Vacant(vac) => {
+                let gen = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                let mut entry = SeenEntry::new(ledger_seq, gen);
+                if let Some(peer) = from_peer {
+                    entry.add_peer(peer);
+                }
+                vac.insert(entry);
+                gen
+                // VacantEntry::insert consumes self → shard lock released here
+            }
+        };
 
-        // New message — assign generation and insert
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        let mut entry = SeenEntry::new(ledger_seq, generation);
-        if let Some(peer) = from_peer {
-            entry.add_peer(peer);
-        }
-        self.seen.insert(message_hash, entry);
-
-        // Enqueue for FIFO eviction and check capacity
+        // Enqueue for FIFO eviction and check capacity.
+        // Safe to call seen.len() under queue lock — matches evict_to_target's
+        // existing pattern. No deadlock: shard lock is released above before
+        // queue lock is acquired here.
         let mut queue = self.eviction_queue.lock();
         queue.push_back((message_hash, generation));
         if self.seen.len() > self.max_entries {
@@ -1204,6 +1214,74 @@ mod tests {
         assert!(
             gate.seen.contains_key(&hot_hash),
             "hot_hash was incorrectly evicted by stale queue entry"
+        );
+    }
+
+    /// Invariant test: after the `entry()` fix, two threads racing to
+    /// `record_seen` the same hash (after a forget) must produce exactly
+    /// one `New` and one `Repeated`. The entry must survive moderate
+    /// eviction pressure (ghost entries from before the forget are no-ops).
+    #[test]
+    fn test_record_seen_concurrent_forget_reinsert_is_atomic() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        // Capacity 200, target 150 (75%). We'll prefill with 180 entries,
+        // so hash is near the END of the queue. Moderate eviction pressure
+        // (triggering 1-2 rounds) only removes older prefill entries.
+        let gate = Arc::new(FloodGate::with_limits(Duration::from_secs(300), 200));
+        let hash = Hash256([0xBB; 32]);
+
+        // Pre-fill with 180 entries (below capacity, no eviction yet).
+        for i in 0u16..180 {
+            let mut h = [0u8; 32];
+            h[0..2].copy_from_slice(&i.to_le_bytes());
+            gate.record_seen(Hash256(h), None, 1);
+        }
+
+        // Insert hash, then forget it (leaves ghost entry in queue).
+        gate.record_seen(hash, None, 1);
+        gate.forget(&hash);
+
+        // Two threads race to record_seen the same hash.
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    gate.record_seen(hash, None, 1)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Exactly one New, one Repeated (atomicity invariant).
+        let new_count = results.iter().filter(|r| **r == RelayRecord::New).count();
+        let repeated_count = results
+            .iter()
+            .filter(|r| **r == RelayRecord::Repeated)
+            .count();
+        assert_eq!(new_count, 1, "exactly one thread should see New");
+        assert_eq!(repeated_count, 1, "exactly one thread should see Repeated");
+
+        // Add enough entries to trigger eviction (push past capacity 200).
+        // This triggers eviction of the oldest 50 entries (down to target 150).
+        // Hash is near position 181 in the queue — well past the eviction zone.
+        for i in 200u16..230 {
+            let mut h = [0u8; 32];
+            h[0..2].copy_from_slice(&i.to_le_bytes());
+            gate.record_seen(Hash256(h), None, 1);
+        }
+
+        // The hash must survive: its queue position is far from the front,
+        // and the ghost entry (from before forget) is a generation-mismatch
+        // no-op during eviction.
+        assert!(
+            gate.seen.contains_key(&hash),
+            "hash must survive eviction pressure after atomic reinsert"
         );
     }
 }

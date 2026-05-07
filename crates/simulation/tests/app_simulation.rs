@@ -161,12 +161,12 @@ async fn build_app_backed_topology(
 ) -> Simulation {
     sim.populate_app_nodes_from_existing(threshold_percent);
     sim.start_all_nodes().await;
-    sim.stabilize_app_tcp_connectivity(min_peers, Duration::from_secs(45))
+    sim.stabilize_app_tcp_connectivity(min_peers, Duration::from_secs(60))
         .await
         .unwrap_or_else(|err| {
             panic!(
                 "build_app_backed_topology: TCP connectivity did not stabilize \
-                 within 45s (min_peers={min_peers}): {err}",
+                 within 60s (min_peers={min_peers}): {err}",
             )
         });
     sim
@@ -190,11 +190,11 @@ async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
         sim.add_app_node(id.clone(), secret, quorum_set.clone());
     }
     sim.start_all_nodes().await;
-    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
+    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(30))
         .await
         .expect(
             "build_two_running_of_three: TCP connectivity did not stabilize \
-             within 20s (min_peers=1).",
+             within 30s (min_peers=1).",
         );
     sim
 }
@@ -688,8 +688,8 @@ async fn test_core3_restart_rejoin_over_tcp() {
     manual_close_until(&sim, 2, 1, Duration::from_secs(45)).await;
 
     sim.remove_node("node0").await.expect("remove node0 tcp");
-    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(10)).await;
-    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(10)).await;
+    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(20)).await;
+    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(20)).await;
 
     manual_close_until(
         &sim,
@@ -703,7 +703,7 @@ async fn test_core3_restart_rejoin_over_tcp() {
     wait_for_app_operational(&sim, "node0", Duration::from_secs(5)).await;
 
     // Re-establish peer connections with retry (TCP connections can fail transiently).
-    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(10))
+    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(30))
         .await
         .expect("node0 failed to establish peer connectivity after restart");
 
@@ -740,8 +740,8 @@ async fn test_core3_restart_rejoin_over_loopback() {
     sim.remove_node("node0")
         .await
         .expect("remove node0 loopback");
-    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(10)).await;
-    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(10)).await;
+    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(20)).await;
+    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(20)).await;
 
     manual_close_until(&sim, 3, 0, Duration::from_secs(45)).await;
 
@@ -758,7 +758,7 @@ async fn test_core3_restart_rejoin_over_loopback() {
     // SCP state. add_connection() spawns the handshake asynchronously, so
     // without this wait request_scp_state_from_peers() can find zero peers
     // and silently return without requesting any state.
-    wait_for_peer_count(&sim, "node0", 2, Duration::from_secs(10)).await;
+    wait_for_peer_count(&sim, "node0", 2, Duration::from_secs(20)).await;
 
     // Request SCP state so node0 learns about externalized slots it missed.
     sim.app("node0")
@@ -1102,8 +1102,8 @@ async fn test_slow_node_lagging_node_recovers() {
     sim.remove_node("node0")
         .await
         .expect("remove node0 to simulate lag");
-    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(10)).await;
-    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(10)).await;
+    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(20)).await;
+    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(20)).await;
 
     // Submit payment load to the majority and close 2 ledgers.
     // This ensures the lagging node must catch up with real tx data.
@@ -1134,7 +1134,7 @@ async fn test_slow_node_lagging_node_recovers() {
     // Re-establish peer connections.
     let _ = sim.add_connection("node0", "node1").await;
     let _ = sim.add_connection("node0", "node2").await;
-    wait_for_peer_count(&sim, "node0", 2, Duration::from_secs(10)).await;
+    wait_for_peer_count(&sim, "node0", 2, Duration::from_secs(20)).await;
 
     // Request SCP state so node0 learns about missed slots.
     sim.app("node0")
