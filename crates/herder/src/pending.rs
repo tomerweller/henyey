@@ -252,11 +252,19 @@ impl PendingEnvelopes {
 
         let pending = PendingEnvelope::new(envelope);
 
-        // Check for duplicate
-        if self.seen_hashes.contains_key(&pending.hash) {
-            self.stats.write().duplicates += 1;
-            return PendingResult::Duplicate;
+        // Atomically check-and-insert to prevent TOCTOU race on duplicates.
+        // Using entry() ensures that concurrent submissions of the same hash
+        // cannot both pass the duplicate check.
+        match self.seen_hashes.entry(pending.hash) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                self.stats.write().duplicates += 1;
+                return PendingResult::Duplicate;
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(());
+            }
         }
+        // Entry guard is dropped here — no shard lock held past this point.
 
         // Existing slot — inline-evict expired, check per-slot cap, then append.
         if let Some(mut existing) = self.slots.get_mut(&slot) {
@@ -280,11 +288,11 @@ impl PendingEnvelopes {
             if self.config.max_envelopes_per_slot > 0
                 && existing.len() >= self.config.max_envelopes_per_slot
             {
+                // Clean up the eagerly-claimed hash since envelope is rejected.
+                self.seen_hashes.remove(&pending.hash);
                 self.stats.write().per_slot_full += 1;
                 return PendingResult::PerSlotFull;
             }
-
-            self.seen_hashes.insert(pending.hash, ());
             existing.push(pending);
             let count = existing.len() as u64;
             let mut stats = self.stats.write();
@@ -299,6 +307,8 @@ impl PendingEnvelopes {
         if self.slots.len() >= self.config.max_slots {
             self.evict_old_slots(current);
             if self.slots.len() >= self.config.max_slots {
+                // Clean up the eagerly-claimed hash since envelope is rejected.
+                self.seen_hashes.remove(&pending.hash);
                 let mut stats = self.stats.write();
                 stats.buffer_full += 1;
                 return PendingResult::BufferFull;
@@ -306,7 +316,6 @@ impl PendingEnvelopes {
         }
 
         // Insert into new slot.
-        self.seen_hashes.insert(pending.hash, ());
         self.slots.entry(slot).or_default().push(pending);
 
         let mut stats = self.stats.write();
@@ -1219,6 +1228,129 @@ mod tests {
             pending.last_buffer_full_warn_slot(),
             200,
             "Buffer-full warn slot must not be affected"
+        );
+    }
+
+    /// Concurrent duplicate deduplication: exactly one thread wins, rest get Duplicate.
+    /// Regression test for the TOCTOU race in seen_hashes (issue #2474).
+    #[test]
+    fn test_concurrent_duplicate_deduplication() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const NUM_THREADS: usize = 16;
+        const ITERATIONS: usize = 100;
+
+        for _ in 0..ITERATIONS {
+            let pending = Arc::new(PendingEnvelopes::with_defaults());
+            pending.set_current_slot(100);
+
+            let envelope = make_test_envelope_with_node(101, 42);
+            let barrier = Arc::new(Barrier::new(NUM_THREADS));
+
+            let handles: Vec<_> = (0..NUM_THREADS)
+                .map(|_| {
+                    let pending = Arc::clone(&pending);
+                    let env = envelope.clone();
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        pending.add(101, env)
+                    })
+                })
+                .collect();
+
+            let results: Vec<PendingResult> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            let added_count = results
+                .iter()
+                .filter(|r| **r == PendingResult::Added)
+                .count();
+            let duplicate_count = results
+                .iter()
+                .filter(|r| **r == PendingResult::Duplicate)
+                .count();
+
+            assert_eq!(
+                added_count, 1,
+                "Exactly one thread should succeed with Added, got {added_count}"
+            );
+            assert_eq!(
+                duplicate_count,
+                NUM_THREADS - 1,
+                "All other threads should get Duplicate, got {duplicate_count}"
+            );
+        }
+    }
+
+    /// When concurrent duplicates race and the claimant hits PerSlotFull,
+    /// the hash must be cleaned up so the envelope is re-submittable.
+    #[test]
+    fn test_concurrent_dedup_with_per_slot_full_cleanup() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        // Cap at 1 envelope per slot.
+        let pending = Arc::new(PendingEnvelopes::new(PendingConfig {
+            max_envelopes_per_slot: 1,
+            ..Default::default()
+        }));
+        pending.set_current_slot(100);
+
+        // Fill slot 101 to capacity.
+        let env1 = make_test_envelope_with_node(101, 1);
+        assert_eq!(pending.add(101, env1), PendingResult::Added);
+
+        // Now race N threads with a new envelope for the same (full) slot.
+        const NUM_THREADS: usize = 8;
+        let env2 = make_test_envelope_with_node(101, 2);
+        let barrier = Arc::new(Barrier::new(NUM_THREADS));
+
+        let handles: Vec<_> = (0..NUM_THREADS)
+            .map(|_| {
+                let pending = Arc::clone(&pending);
+                let env = env2.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    pending.add(101, env)
+                })
+            })
+            .collect();
+
+        let results: Vec<PendingResult> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // One thread claims the hash and hits PerSlotFull (cleans up).
+        // Others get Duplicate (the brief window where hash is claimed).
+        // After all threads finish, the hash should NOT be in seen_hashes.
+        let per_slot_full_count = results
+            .iter()
+            .filter(|r| **r == PendingResult::PerSlotFull)
+            .count();
+        let duplicate_count = results
+            .iter()
+            .filter(|r| **r == PendingResult::Duplicate)
+            .count();
+
+        assert!(
+            per_slot_full_count >= 1,
+            "At least one thread should hit PerSlotFull, got {per_slot_full_count}"
+        );
+        assert_eq!(
+            per_slot_full_count + duplicate_count,
+            NUM_THREADS,
+            "All results should be PerSlotFull or Duplicate"
+        );
+
+        // After the race, the hash should be cleaned up (not poisoned).
+        // Purge and re-add to verify.
+        pending.purge_slots_below(102);
+        pending.set_current_slot(100);
+        assert_eq!(
+            pending.add(101, env2),
+            PendingResult::Added,
+            "Hash must not be poisoned in seen_hashes after PerSlotFull cleanup"
         );
     }
 }
