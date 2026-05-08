@@ -1936,3 +1936,294 @@ impl Simulation {
         );
     }
 }
+
+#[cfg(test)]
+mod crank_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Create a simulation with two connected lightweight nodes "A" and "B",
+    /// both starting at ledger 1. One `crank_all_nodes()` call advances both
+    /// from ledger N to N+1 via `try_advance_non_partitioned`.
+    fn sim_with_two_nodes() -> Simulation {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        sim.add_node("A", SecretKey::from_seed(&[1u8; 32]));
+        sim.add_node("B", SecretKey::from_seed(&[2u8; 32]));
+        sim.add_pending_connection("A", "B");
+        sim
+    }
+
+    // ==================================================================
+    // crank_until tests
+    // ==================================================================
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_until_immediate_satisfaction() {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+
+        let result = sim
+            .crank_until(
+                |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_until_satisfaction_after_cranks() {
+        let mut sim = sim_with_two_nodes();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+
+        let result = sim
+            .crank_until(
+                |sim| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    sim.nodes.get("A").map_or(false, |n| n.ledger_seq >= 3)
+                },
+                Duration::from_secs(10),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        // Check 1: ledger=1 (false), crank→2
+        // Check 2: ledger=2 (false), crank→3
+        // Check 3: ledger=3 (true) → Ok
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert_eq!(sim.nodes["A"].ledger_seq, 3);
+        assert_eq!(sim.nodes["B"].ledger_seq, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_until_zero_timeout_satisfied() {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+
+        let result = sim
+            .crank_until(
+                |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+                Duration::ZERO,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        // while 0 <= 0 → enters loop, predicate true → returns Ok
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_until_zero_timeout_unsatisfied() {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+
+        let result = sim
+            .crank_until(
+                |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+                Duration::ZERO,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("crank_until: predicate not satisfied"));
+        // Loop: check false (elapsed=0), crank, elapsed=100ms > 0 → exit.
+        // Post-loop: check false → bail.
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_until_success_at_elapsed_eq_timeout() {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+
+        // timeout=200ms. Predicate returns true on 3rd call.
+        // Iteration 1: elapsed=0 (<=200ms), check false, crank, elapsed=100ms
+        // Iteration 2: elapsed=100ms (<=200ms), check false, crank, elapsed=200ms
+        // Iteration 3: elapsed=200ms (<=200ms), check TRUE → Ok
+        // This proves the `<=` boundary (not `<`).
+        let result = sim
+            .crank_until(
+                |_| {
+                    let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                    n >= 3
+                },
+                Duration::from_millis(200),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_until_boundary_post_check_saves() {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+
+        // timeout=100ms. Predicate returns true on 3rd call.
+        // Iteration 1: elapsed=0 (<=100ms), check false (call 1), crank, elapsed=100ms
+        // Iteration 2: elapsed=100ms (<=100ms), check false (call 2), crank, elapsed=200ms
+        // 200ms > 100ms → loop exits.
+        // Post-loop re-check: check true (call 3) → Ok
+        let result = sim
+            .crank_until(
+                |_| {
+                    let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                    n >= 3
+                },
+                Duration::from_millis(100),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_until_timeout_error() {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+
+        let result = sim
+            .crank_until(
+                |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+                Duration::from_millis(500),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("crank_until: predicate not satisfied within 500ms"));
+        // In-loop: elapsed 0, 100, 200, 300, 400, 500ms → 6 checks.
+        // Post-loop: 1 check. Total = 7.
+        assert_eq!(counter.load(Ordering::SeqCst), 7);
+    }
+
+    // ==================================================================
+    // crank_for_at_most tests
+    // ==================================================================
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_for_at_most_idle_exits_early() {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        sim.add_node("A", SecretKey::from_seed(&[1u8; 32]));
+
+        // Single node, no peers → crank_all_nodes returns false → stop_when_idle breaks.
+        sim.crank_for_at_most(Duration::from_secs(999), false).await;
+
+        assert_eq!(sim.nodes["A"].ledger_seq, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_for_at_most_final_crank_after_idle() {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        sim.add_node("A", SecretKey::from_seed(&[1u8; 32]));
+
+        // Idle exit, then final_crank triggers one extra crank_all_nodes
+        // (still no work since single node can't advance).
+        sim.crank_for_at_most(Duration::from_secs(999), true).await;
+
+        assert_eq!(sim.nodes["A"].ledger_seq, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_for_at_most_zero_duration() {
+        let mut sim = sim_with_two_nodes();
+
+        // Loop: crank advances both to 2 (did_work=true),
+        // deadline=start+0=start, now >= deadline → breaks.
+        sim.crank_for_at_most(Duration::ZERO, false).await;
+
+        assert_eq!(sim.nodes["A"].ledger_seq, 2);
+        assert_eq!(sim.nodes["B"].ledger_seq, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_for_at_most_zero_duration_with_final_crank() {
+        let mut sim = sim_with_two_nodes();
+
+        // Loop: crank → ledger 2, deadline hit → breaks.
+        // Final crank → ledger 3.
+        sim.crank_for_at_most(Duration::ZERO, true).await;
+
+        assert_eq!(sim.nodes["A"].ledger_seq, 3);
+        assert_eq!(sim.nodes["B"].ledger_seq, 3);
+    }
+
+    // ==================================================================
+    // crank_for_at_least tests
+    // ==================================================================
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_for_at_least_zero_duration_idle() {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        sim.add_node("A", SecretKey::from_seed(&[1u8; 32]));
+
+        // No idle exit (stop_when_idle=false), deadline=start → breaks.
+        sim.crank_for_at_least(Duration::ZERO, false).await;
+
+        assert_eq!(sim.nodes["A"].ledger_seq, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_for_at_least_zero_duration_idle_final_crank() {
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        sim.add_node("A", SecretKey::from_seed(&[1u8; 32]));
+
+        // Idle + final crank (no work either way).
+        sim.crank_for_at_least(Duration::ZERO, true).await;
+
+        assert_eq!(sim.nodes["A"].ledger_seq, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_for_at_least_zero_duration_workful() {
+        let mut sim = sim_with_two_nodes();
+
+        // Loop: crank → ledger 2 (did_work=true), no idle exit, deadline hit → breaks.
+        sim.crank_for_at_least(Duration::ZERO, false).await;
+
+        assert_eq!(sim.nodes["A"].ledger_seq, 2);
+        assert_eq!(sim.nodes["B"].ledger_seq, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_crank_for_at_least_zero_duration_workful_final_crank() {
+        let mut sim = sim_with_two_nodes();
+
+        // Loop: crank → ledger 2, deadline hit → breaks.
+        // Final crank → ledger 3.
+        sim.crank_for_at_least(Duration::ZERO, true).await;
+
+        assert_eq!(sim.nodes["A"].ledger_seq, 3);
+        assert_eq!(sim.nodes["B"].ledger_seq, 3);
+    }
+}
