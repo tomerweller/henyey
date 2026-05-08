@@ -514,9 +514,40 @@ The monitor does not spawn agents on any issue. The downstream process
    ```
    The lock FD stays open for the lifetime of the conversation.
 
-2. **Check if a henyey node is already running:**
-   ```
-   pgrep -af 'henyey.*run'
+2. **Check if a henyey node is already running** using session-aware
+   process discovery (replaces the former `pgrep -af 'henyey.*run'`
+   which had cross-session false positives — see #2467, #2511):
+   ```bash
+   source "$(git rev-parse --show-toplevel)/scripts/lib/monitor-decisions.sh"
+
+   pid=""
+   session_id=""
+
+   # Tier 1: Check known session from prior env (parse, don't source)
+   env_session=$(grep '^MONITOR_SESSION_ID=' ~/data/monitor-loop.env 2>/dev/null | cut -d= -f2)
+   if [[ -n "$env_session" ]]; then
+     pid=$(_find_session_process "$HOME/data" "/proc" "$env_session")
+     if [[ -n "$pid" ]]; then
+       session_id="$env_session"
+     fi
+   fi
+
+   # Tier 2: No known session or its process is gone — discover any henyey run process
+   if [[ -z "$pid" ]]; then
+     candidates=$(_enumerate_henyey_processes "$HOME/data" "/proc")
+     candidate_count=$(echo "$candidates" | grep -c . || true)
+     if [[ "$candidate_count" -eq 1 ]]; then
+       pid=$(echo "$candidates" | awk '{print $1}')
+       session_id=$(echo "$candidates" | awk '{print $2}')
+     elif [[ "$candidate_count" -gt 1 ]]; then
+       echo "ERROR: multiple henyey processes found — cannot auto-attach:"
+       echo "$candidates" | while read cpid csid; do
+         echo "  PID=$cpid session=$csid"
+       done
+       echo "Stop stale processes or specify which session to attach to."
+       exit 1
+     fi
+   fi
    ```
    Two branches:
 
@@ -525,35 +556,54 @@ The monitor does not spawn agents on any issue. The downstream process
    from cron / `/loop` with no user available to prompt, so attaching
    is the safe default. If the user explicitly wants a fresh restart,
    they can kill the node themselves first.
-   - Recover the session directory from the process's stdout fd:
-     ```
-     readlink /proc/<pid>/fd/1
-     ```
-     The result is the original `monitor.log` path; take its parent's
-     parent as `<session-id>` root. Example:
-     `/home/tomer/data/ab12cd34/logs/monitor.log` → `<session-id>=ab12cd34`.
-   - **Handle `(deleted)` paths**: If `readlink` returns a path with
-     ` (deleted)` suffix (e.g., `/home/tomer/data/ab12cd34/logs/monitor.log (deleted)`),
-     the session directory was wiped while the process was running.
-     Use the shared library function:
+   - `session_id` is already set (from Tier 1 env parse or Tier 2
+     exe path extraction).
+   - Ensure session dir exists (may have been wiped while running):
      ```bash
-     source "$(git rev-parse --show-toplevel)/scripts/lib/monitor-decisions.sh"
-     proc_stdout=$(readlink /proc/<pid>/fd/1)
-     session_id=$(recover_session_from_stdout "$HOME/data" "$proc_stdout") || {
-       echo "ERROR: could not recover session-id from stdout path"
-       exit 1
-     }
+     if [[ ! -d "$HOME/data/$session_id" ]]; then
+       echo "WARNING: session dir $session_id missing (wiped). Reconstructing."
+       mkdir -p "$HOME/data/$session_id"/{logs,cache,cargo-target,metrics}
+       touch "$HOME/data/$session_id/.alive"
+     fi
      ```
-     The `recover_session_from_stdout` function (from `scripts/lib/monitor-decisions.sh`):
-     - Detects `(deleted)` suffix, emits warning to stderr, strips suffix, extracts session-id
-     - Creates `{logs,cache,cargo-target,metrics}` subdirs and `.alive` for deleted paths
-     - For normal paths: just extracts session-id with no side effects
-     - Returns 1 on malformed input (no `/data/<segment>/` pattern found)
+   - **Best-effort stdout fd validation** (warning on mismatch, not
+     a hard failure):
+     ```bash
+     proc_stdout=$(readlink /proc/$pid/fd/1 2>/dev/null || true)
+     if [[ -n "$proc_stdout" ]]; then
+       stdout_session=$(recover_session_from_stdout "$HOME/data" "$proc_stdout" 2>/dev/null || true)
+       if [[ -n "$stdout_session" && "$stdout_session" != "$session_id" ]]; then
+         echo "WARNING: stdout fd points to session $stdout_session but exe says $session_id"
+       fi
+     fi
+     ```
    - Verify the running binary:
      ```
      readlink /proc/<pid>/exe
      ```
      Record this as the Binary line in the startup summary.
+   - **Reconstruct env values from live process cmdline** (both tiers,
+     never trust stale env values):
+     ```bash
+     binary=$(readlink /proc/$pid/exe | sed 's/ (deleted)$//')
+
+     mode="full"  # default: no mode flag = RunMode::Full
+     run_flags=""
+     while IFS= read -r -d '' arg; do
+       case "$arg" in
+         --validator) mode="validator"; run_flags="--validator"; break ;;
+         --watcher)   mode="watcher"; run_flags="--watcher"; break ;;
+       esac
+     done < /proc/$pid/cmdline 2>/dev/null
+
+     case "$mode" in
+       validator) config="configs/validator-mainnet-rpc.toml"; admin_port=11627; rpc_port=8000 ;;
+       watcher|full) config="configs/mainnet.toml"; admin_port=11727; rpc_port="" ;;
+     esac
+
+     actual_config=$(_parse_cmdline_config /proc/$pid/cmdline)
+     if [[ -n "$actual_config" ]]; then config="$actual_config"; fi
+     ```
    - Skip steps 3–7 (directory creation, build, start, startup-log check)
      and go straight to step 8 with the recovered `<session-id>`.
 

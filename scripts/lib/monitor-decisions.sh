@@ -13,27 +13,95 @@
 _MONITOR_DECISIONS_LOADED=1
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _enumerate_henyey_processes DATA_ROOT PROC_ROOT
+#
+# Enumerate all live henyey `run` processes under DATA_ROOT.
+# Validates both:
+#   - exe symlink: DATA_ROOT/<session-id>/cargo-target/release/henyey[(deleted)]
+#   - cmdline: contains `run` as a standalone argv element
+#
+# Each line of output: PID SESSION_ID
+# Silently skips entries with unreadable/empty cmdline.
+# Returns: 0 always.
+# ─────────────────────────────────────────────────────────────────────────────
+_enumerate_henyey_processes() {
+  local data_root="$1" proc_root="$2"
+  local suffix="/cargo-target/release/henyey"
+
+  for p in "$proc_root"/[0-9]*; do
+    [[ -d "$p" ]] || continue
+    local exe
+    exe=$(readlink "$p/exe" 2>/dev/null || true)
+    [[ -z "$exe" ]] && continue
+    # Strip " (deleted)" suffix
+    local clean_exe="${exe% (deleted)}"
+    # Prefix check: must be under data_root
+    [[ "$clean_exe" == "$data_root"/* ]] || continue
+    local after_root="${clean_exe#"$data_root"/}"
+    # Suffix check: must end with /cargo-target/release/henyey
+    [[ "$after_root" == *"$suffix" ]] || continue
+    # Extract session_id (between data_root/ and /cargo-target/...)
+    local session_id="${after_root%"$suffix"}"
+    # session_id must be a single path segment (no slashes)
+    [[ "$session_id" == */* ]] && continue
+    [[ -z "$session_id" ]] && continue
+
+    # Verify cmdline contains `run` subcommand (exact argv match).
+    local has_run=false
+    if [[ -r "$p/cmdline" ]]; then
+      while IFS= read -r -d '' arg; do
+        if [[ "$arg" == "run" ]]; then
+          has_run=true
+          break
+        fi
+      done < "$p/cmdline"
+    fi
+    if $has_run; then
+      printf '%s %s\n' "$(basename "$p")" "$session_id"
+    fi
+  done
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _find_session_process DATA_ROOT PROC_ROOT SESSION_ID
 #
-# Scan /proc for a process whose exe symlink matches this session's binary.
-# Derives the expected binary path internally.
+# Find a henyey `run` process for a specific session.
+# Thin wrapper around _enumerate_henyey_processes filtered by session ID.
 #
 # Stdout: PID of first matching process, or empty string if none found.
 # Returns: 0 always.
 # ─────────────────────────────────────────────────────────────────────────────
 _find_session_process() {
   local data_root="$1" proc_root="$2" session_id="$3"
-  local expected_binary="$data_root/$session_id/cargo-target/release/henyey"
+  _enumerate_henyey_processes "$data_root" "$proc_root" \
+    | awk -v sid="$session_id" '$2 == sid { print $1; exit }'
+}
 
-  for p in "$proc_root"/[0-9]*; do
-    [[ -d "$p" ]] || continue
-    local exe
-    exe=$(readlink "$p/exe" 2>/dev/null || true)
-    if [[ "$exe" == "$expected_binary" || "$exe" == "$expected_binary (deleted)" ]]; then
-      basename "$p"
+# ─────────────────────────────────────────────────────────────────────────────
+# _parse_cmdline_config CMDLINE_FILE
+#
+# Extract config file path from a NUL-separated /proc/<pid>/cmdline.
+# Supports -c, --config, --conf (alias), --config=value, --conf=value.
+#
+# Stdout: config path (one line) or empty.
+# Returns: 0 always.
+# ─────────────────────────────────────────────────────────────────────────────
+_parse_cmdline_config() {
+  local cmdline_file="$1"
+  local prev=""
+  while IFS= read -r -d '' arg; do
+    if [[ "$prev" == "-c" || "$prev" == "--config" || "$prev" == "--conf" ]]; then
+      echo "$arg"
       return 0
     fi
-  done
+    # Handle --config=value and --conf=value forms
+    case "$arg" in
+      --config=*) echo "${arg#--config=}"; return 0 ;;
+      --conf=*)   echo "${arg#--conf=}"; return 0 ;;
+    esac
+    prev="$arg"
+  done < "$cmdline_file" 2>/dev/null
   return 0
 }
 

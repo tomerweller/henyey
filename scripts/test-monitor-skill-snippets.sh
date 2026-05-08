@@ -43,7 +43,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=103
+TAP_PLAN=115
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -359,10 +359,14 @@ check_skill_structure() {
 # ── Mock Helpers ─────────────────────────────────────────────────────────────
 
 mock_proc_entry() {
-  # Create a mock /proc/<pid> with exe symlink
-  local proc_root="$1" pid="$2" exe_target="$3"
+  # Create a mock /proc/<pid> with exe symlink and optional cmdline
+  local proc_root="$1" pid="$2" exe_target="$3" cmdline="${4:-}"
   mkdir -p "$proc_root/$pid"
   ln -sf "$exe_target" "$proc_root/$pid/exe"
+  if [[ -n "$cmdline" ]]; then
+    # Write NUL-separated cmdline with trailing NUL (matches /proc/<pid>/cmdline format)
+    printf '%s\0' "$cmdline" | tr ' ' '\0' > "$proc_root/$pid/cmdline"
+  fi
 }
 
 mock_proc_stdout() {
@@ -410,7 +414,7 @@ run_tests() {
   proc="$TEST_ROOT/t1/proc"
   session_id="sess1111"
   mkdir -p "$data" "$proc"
-  mock_proc_entry "$proc" "1001" "$data/$session_id/cargo-target/release/henyey"
+  mock_proc_entry "$proc" "1001" "$data/$session_id/cargo-target/release/henyey" "henyey --mainnet run --validator"
   mock_env_file "$data/monitor-loop.env" 100
 
   check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
@@ -426,7 +430,7 @@ run_tests() {
   proc="$TEST_ROOT/t2/proc"
   session_id="sess2222"
   mkdir -p "$data" "$proc"
-  mock_proc_entry "$proc" "2001" "$data/$session_id/cargo-target/release/henyey (deleted)"
+  mock_proc_entry "$proc" "2001" "$data/$session_id/cargo-target/release/henyey (deleted)" "henyey --mainnet run --validator"
   mock_env_file "$data/monitor-loop.env" 100
 
   check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
@@ -443,7 +447,7 @@ run_tests() {
   session_id="sess3333"
   mkdir -p "$data" "$proc"
   # Process running a DIFFERENT session's binary
-  mock_proc_entry "$proc" "3001" "$data/other-session/cargo-target/release/henyey"
+  mock_proc_entry "$proc" "3001" "$data/other-session/cargo-target/release/henyey" "henyey --mainnet run --validator"
   # Create env file so freshness check passes
   mock_env_file "$data/monitor-loop.env" 100
 
@@ -612,7 +616,7 @@ run_tests() {
   proc="$TEST_ROOT/t15/proc"
   mkdir -p "$data/running-sess" "$proc"
   mock_alive_file "$data/running-sess/.alive" 7200  # old enough to pass layer 2
-  mock_proc_entry "$proc" "9001" "$data/running-sess/cargo-target/release/henyey"
+  mock_proc_entry "$proc" "9001" "$data/running-sess/cargo-target/release/henyey" "henyey --mainnet run --validator"
   local result15
   result15=$(cleanup_guard "$data" "$proc" "running-sess" "different-sess" 3600)
   if echo "$result15" | grep -q "SKIP.*process"; then
@@ -726,7 +730,7 @@ run_tests() {
   proc="$TEST_ROOT/t20b/proc"
   session_id="sess20b"
   mkdir -p "$data" "$proc"
-  mock_proc_entry "$proc" "5001" "$data/$session_id/cargo-target/release/henyey"
+  mock_proc_entry "$proc" "5001" "$data/$session_id/cargo-target/release/henyey" "henyey --mainnet run --validator"
   local found_pid
   found_pid=$(_find_session_process "$data" "$proc" "$session_id")
   if [[ "$found_pid" == "5001" ]]; then
@@ -740,12 +744,161 @@ run_tests() {
   proc="$TEST_ROOT/t20c/proc"
   session_id="sess20c"
   mkdir -p "$data" "$proc"
-  mock_proc_entry "$proc" "5002" "$data/other-session/cargo-target/release/henyey"
+  mock_proc_entry "$proc" "5002" "$data/other-session/cargo-target/release/henyey" "henyey --mainnet run"
   found_pid=$(_find_session_process "$data" "$proc" "$session_id")
   if [[ -z "$found_pid" ]]; then
     tap_ok "_find_session_process: empty for non-matching binary"
   else
     tap_not_ok "_find_session_process: empty for non-matching binary" "got: '$found_pid'"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # _enumerate_henyey_processes tests (T20c1-T20c7)
+  # Source: scripts/lib/monitor-decisions.sh — _enumerate_henyey_processes
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Test 20c1: single run process ──────────────────────────────────────
+  data="$TEST_ROOT/t20c1/data"
+  proc="$TEST_ROOT/t20c1/proc"
+  mkdir -p "$data" "$proc"
+  mock_proc_entry "$proc" "8001" "$data/sessc1/cargo-target/release/henyey" "henyey --mainnet run --validator"
+  local enum_out
+  enum_out=$(_enumerate_henyey_processes "$data" "$proc")
+  if [[ "$enum_out" == "8001 sessc1" ]]; then
+    tap_ok "_enumerate_henyey_processes: single run process"
+  else
+    tap_not_ok "_enumerate_henyey_processes: single run process" "got: '$enum_out'"
+  fi
+
+  # ── Test 20c2: multiple processes, different sessions ──────────────────
+  data="$TEST_ROOT/t20c2/data"
+  proc="$TEST_ROOT/t20c2/proc"
+  mkdir -p "$data" "$proc"
+  mock_proc_entry "$proc" "8002" "$data/sessA/cargo-target/release/henyey" "henyey run --validator"
+  mock_proc_entry "$proc" "8003" "$data/sessB/cargo-target/release/henyey" "henyey run"
+  enum_out=$(_enumerate_henyey_processes "$data" "$proc")
+  local line_count
+  line_count=$(echo "$enum_out" | grep -c . || true)
+  if [[ "$line_count" -eq 2 ]] && echo "$enum_out" | grep -q "8002 sessA" && echo "$enum_out" | grep -q "8003 sessB"; then
+    tap_ok "_enumerate_henyey_processes: multiple sessions listed"
+  else
+    tap_not_ok "_enumerate_henyey_processes: multiple sessions listed" "got: '$enum_out'"
+  fi
+
+  # ── Test 20c3: (deleted) exe matched ───────────────────────────────────
+  data="$TEST_ROOT/t20c3/data"
+  proc="$TEST_ROOT/t20c3/proc"
+  mkdir -p "$data" "$proc"
+  mock_proc_entry "$proc" "8004" "$data/sessc3/cargo-target/release/henyey (deleted)" "henyey --mainnet run"
+  enum_out=$(_enumerate_henyey_processes "$data" "$proc")
+  if [[ "$enum_out" == "8004 sessc3" ]]; then
+    tap_ok "_enumerate_henyey_processes: (deleted) exe matched"
+  else
+    tap_not_ok "_enumerate_henyey_processes: (deleted) exe matched" "got: '$enum_out'"
+  fi
+
+  # ── Test 20c4: empty proc root ─────────────────────────────────────────
+  data="$TEST_ROOT/t20c4/data"
+  proc="$TEST_ROOT/t20c4/proc"
+  mkdir -p "$data" "$proc"
+  enum_out=$(_enumerate_henyey_processes "$data" "$proc")
+  if [[ -z "$enum_out" ]]; then
+    tap_ok "_enumerate_henyey_processes: empty proc root"
+  else
+    tap_not_ok "_enumerate_henyey_processes: empty proc root" "got: '$enum_out'"
+  fi
+
+  # ── Test 20c5: non-henyey binary ignored ───────────────────────────────
+  data="$TEST_ROOT/t20c5/data"
+  proc="$TEST_ROOT/t20c5/proc"
+  mkdir -p "$data" "$proc"
+  mock_proc_entry "$proc" "8005" "/usr/bin/something" "something run"
+  enum_out=$(_enumerate_henyey_processes "$data" "$proc")
+  if [[ -z "$enum_out" ]]; then
+    tap_ok "_enumerate_henyey_processes: non-henyey binary ignored"
+  else
+    tap_not_ok "_enumerate_henyey_processes: non-henyey binary ignored" "got: '$enum_out'"
+  fi
+
+  # ── Test 20c6: henyey binary but non-run cmdline ───────────────────────
+  data="$TEST_ROOT/t20c6/data"
+  proc="$TEST_ROOT/t20c6/proc"
+  mkdir -p "$data" "$proc"
+  mock_proc_entry "$proc" "8006" "$data/sessc6/cargo-target/release/henyey" "henyey offline verify-execution --testnet"
+  enum_out=$(_enumerate_henyey_processes "$data" "$proc")
+  if [[ -z "$enum_out" ]]; then
+    tap_ok "_enumerate_henyey_processes: non-run cmdline ignored"
+  else
+    tap_not_ok "_enumerate_henyey_processes: non-run cmdline ignored" "got: '$enum_out'"
+  fi
+
+  # ── Test 20c7: unreadable cmdline (no cmdline file) ────────────────────
+  data="$TEST_ROOT/t20c7/data"
+  proc="$TEST_ROOT/t20c7/proc"
+  mkdir -p "$data" "$proc"
+  # Create mock entry WITHOUT cmdline (3 args only)
+  mock_proc_entry "$proc" "8007" "$data/sessc7/cargo-target/release/henyey"
+  enum_out=$(_enumerate_henyey_processes "$data" "$proc")
+  if [[ -z "$enum_out" ]]; then
+    tap_ok "_enumerate_henyey_processes: missing cmdline ignored"
+  else
+    tap_not_ok "_enumerate_henyey_processes: missing cmdline ignored" "got: '$enum_out'"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # _parse_cmdline_config tests (T20c8-T20c12)
+  # Source: scripts/lib/monitor-decisions.sh — _parse_cmdline_config
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Test 20c8: -c path ─────────────────────────────────────────────────
+  local cmdfile="$TEST_ROOT/t20c8_cmdline"
+  printf 'henyey\0run\0-c\0configs/mainnet.toml\0' > "$cmdfile"
+  local config_out
+  config_out=$(_parse_cmdline_config "$cmdfile")
+  if [[ "$config_out" == "configs/mainnet.toml" ]]; then
+    tap_ok "_parse_cmdline_config: -c path extracted"
+  else
+    tap_not_ok "_parse_cmdline_config: -c path extracted" "got: '$config_out'"
+  fi
+
+  # ── Test 20c9: --config path ───────────────────────────────────────────
+  cmdfile="$TEST_ROOT/t20c9_cmdline"
+  printf 'henyey\0run\0--config\0configs/validator.toml\0' > "$cmdfile"
+  config_out=$(_parse_cmdline_config "$cmdfile")
+  if [[ "$config_out" == "configs/validator.toml" ]]; then
+    tap_ok "_parse_cmdline_config: --config path extracted"
+  else
+    tap_not_ok "_parse_cmdline_config: --config path extracted" "got: '$config_out'"
+  fi
+
+  # ── Test 20c10: --conf path (alias) ────────────────────────────────────
+  cmdfile="$TEST_ROOT/t20c10_cmdline"
+  printf 'henyey\0run\0--conf\0configs/custom.toml\0' > "$cmdfile"
+  config_out=$(_parse_cmdline_config "$cmdfile")
+  if [[ "$config_out" == "configs/custom.toml" ]]; then
+    tap_ok "_parse_cmdline_config: --conf alias extracted"
+  else
+    tap_not_ok "_parse_cmdline_config: --conf alias extracted" "got: '$config_out'"
+  fi
+
+  # ── Test 20c11: --config=value form ────────────────────────────────────
+  cmdfile="$TEST_ROOT/t20c11_cmdline"
+  printf 'henyey\0run\0--config=configs/eq.toml\0' > "$cmdfile"
+  config_out=$(_parse_cmdline_config "$cmdfile")
+  if [[ "$config_out" == "configs/eq.toml" ]]; then
+    tap_ok "_parse_cmdline_config: --config=value extracted"
+  else
+    tap_not_ok "_parse_cmdline_config: --config=value extracted" "got: '$config_out'"
+  fi
+
+  # ── Test 20c12: no config flag ─────────────────────────────────────────
+  cmdfile="$TEST_ROOT/t20c12_cmdline"
+  printf 'henyey\0--mainnet\0run\0--validator\0' > "$cmdfile"
+  config_out=$(_parse_cmdline_config "$cmdfile")
+  if [[ -z "$config_out" ]]; then
+    tap_ok "_parse_cmdline_config: no config flag returns empty"
+  else
+    tap_not_ok "_parse_cmdline_config: no config flag returns empty" "got: '$config_out'"
   fi
 
   # ════════════════════════════════════════════════════════════════════════════
@@ -803,7 +956,7 @@ run_tests() {
   mkdir -p "$data/$session_id" "$proc"
   mock_alive_file "$data/$session_id/.alive" 21601
   mock_env_file "$data/monitor-loop.env" 86401
-  mock_proc_entry "$proc" "6001" "$data/$session_id/cargo-target/release/henyey"
+  mock_proc_entry "$proc" "6001" "$data/$session_id/cargo-target/release/henyey" "henyey --mainnet run --validator"
   local exit_20g=0
   check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20g=$?
   if [[ "$exit_20g" -eq 0 && "$LONG_STALE_SESSION" == "no" ]]; then
@@ -894,7 +1047,7 @@ run_tests() {
   mkdir -p "$data/$session_id" "$proc"
   # No .alive file; process running a DIFFERENT session's binary
   mock_env_file "$data/monitor-loop.env" 86401
-  mock_proc_entry "$proc" "7001" "$data/other-session/cargo-target/release/henyey"
+  mock_proc_entry "$proc" "7001" "$data/other-session/cargo-target/release/henyey" "henyey --mainnet run"
   local exit_20m=0
   check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20m=$?
   if [[ "$exit_20m" -eq 1 && "$LONG_STALE_SESSION" == "yes" ]]; then

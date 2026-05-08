@@ -1,5 +1,13 @@
 # Watcher Check Instructions
 
+> **⚠️ DEPRECATION NOTICE**: This prompt template uses `pgrep -f` / `pkill -f`
+> for process matching, which has cross-session false-positive issues (see
+> #2467, #2511). These patterns can match henyey processes from unrelated
+> sessions. For session-aware process management, use the helpers in
+> `scripts/lib/monitor-decisions.sh` (`_find_session_process`,
+> `_enumerate_henyey_processes`). A full migration of this file is tracked
+> as a follow-up issue.
+
 Check the henyey testnet watcher status and fix any issues found.
 
 ## Context
