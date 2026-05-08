@@ -6,7 +6,8 @@ use henyey_common::Hash256;
 use henyey_crypto::SecretKey;
 use henyey_herder::scp_verify::PostVerifyReason;
 use henyey_simulation::{
-    GeneratedLoadConfig, LoadGenerator, LoadStep, Simulation, SimulationMode, Topologies,
+    poll_until, CrashScope, GeneratedLoadConfig, LoadGenerator, LoadStep, PollOutcome, Simulation,
+    SimulationMode, Topologies,
 };
 use serial_test::serial;
 
@@ -58,37 +59,40 @@ const POST_RESTART_PEER_CONNECT_TIMEOUT_SECS: u64 = 60;
 /// 15s accommodates disk I/O delays on loaded CI runners.
 const POST_RESTART_OPERATIONAL_TIMEOUT_SECS: u64 = 15;
 
-/// Panics immediately if any currently-running app node's task has exited.
-/// Nodes intentionally removed via `remove_node()` return `None` from
-/// `app_task_finished` and are skipped — only `Some(true)` (crashed) triggers.
-async fn check_any_app_node_crashed(sim: &Simulation, context: &str) {
-    for id in sim.app_node_ids() {
-        if sim.app_task_finished(&id) == Some(true) {
-            let status = sim.app_task_status(&id).await;
+async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout: Duration) {
+    let outcome = poll_until(
+        sim,
+        timeout,
+        Duration::from_millis(100),
+        CrashScope::AllNodes,
+        || async {
+            if sim.have_all_app_nodes_externalized(target_ledger, 1) {
+                Ok(Some(()))
+            } else {
+                Ok(None)
+            }
+        },
+    )
+    .await
+    .expect("fatal error during ledger close wait");
+    match outcome {
+        PollOutcome::Satisfied(()) => {}
+        PollOutcome::NodeExited { node_id, status } => {
             let diag = collect_node_diagnostics(sim).await;
             panic!(
-                "node {id} task exited while {context} \
+                "node {node_id} task exited while waiting for ledger {target_ledger} \
                  (task_status: {status:?}).{diag}"
             );
         }
-    }
-}
-
-async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if sim.have_all_app_nodes_externalized(target_ledger, 1) {
-            return;
+        PollOutcome::TimedOut => {
+            let mut diag = collect_node_diagnostics(sim).await;
+            diag.push_str(&sim.node_task_diagnostics().await);
+            assert!(
+                sim.have_all_app_nodes_externalized(target_ledger, 1),
+                "timed out after {timeout:?} waiting for ledger {target_ledger}.{diag}"
+            );
         }
-        check_any_app_node_crashed(sim, &format!("waiting for ledger {target_ledger}")).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut diag = collect_node_diagnostics(sim).await;
-    diag.push_str(&sim.node_task_diagnostics().await);
-    assert!(
-        sim.have_all_app_nodes_externalized(target_ledger, 1),
-        "timed out after {timeout:?} waiting for ledger {target_ledger}.{diag}"
-    );
 }
 
 async fn manual_close_until(
@@ -97,31 +101,46 @@ async fn manual_close_until(
     max_spread: u32,
     timeout: Duration,
 ) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut last_err: Option<String> = None;
-    while tokio::time::Instant::now() < deadline {
-        if sim.have_all_app_nodes_externalized(target_ledger, max_spread) {
-            return;
+    let last_err = std::cell::RefCell::new(None::<String>);
+    let outcome = poll_until(
+        sim,
+        timeout,
+        Duration::from_millis(100),
+        CrashScope::AllNodes,
+        || async {
+            if sim.have_all_app_nodes_externalized(target_ledger, max_spread) {
+                return Ok(Some(()));
+            }
+            if let Err(e) = sim.manual_close_all_app_nodes().await {
+                *last_err.borrow_mut() = Some(e.to_string());
+            }
+            Ok(None)
+        },
+    )
+    .await
+    .expect("fatal error during manual_close_until");
+    match outcome {
+        PollOutcome::Satisfied(()) => {}
+        PollOutcome::NodeExited { node_id, status } => {
+            let diag = collect_node_diagnostics(sim).await;
+            panic!(
+                "node {node_id} task exited while waiting for ledger {target_ledger} \
+                 in manual_close_until (task_status: {status:?}).{diag}"
+            );
         }
-        check_any_app_node_crashed(
-            sim,
-            &format!("waiting for ledger {target_ledger} in manual_close_until"),
-        )
-        .await;
-        if let Err(e) = sim.manual_close_all_app_nodes().await {
-            last_err = Some(e.to_string());
+        PollOutcome::TimedOut => {
+            let mut diag = collect_node_diagnostics(sim).await;
+            diag.push_str(&sim.node_task_diagnostics().await);
+            if let Some(err) = &*last_err.borrow() {
+                diag.push_str(&format!("\n  last manual_close error: {err}"));
+            }
+            assert!(
+                sim.have_all_app_nodes_externalized(target_ledger, max_spread),
+                "manual_close_until timed out after {timeout:?} waiting for ledger \
+                 {target_ledger}.{diag}"
+            );
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut diag = collect_node_diagnostics(sim).await;
-    diag.push_str(&sim.node_task_diagnostics().await);
-    if let Some(err) = &last_err {
-        diag.push_str(&format!("\n  last manual_close error: {err}"));
-    }
-    assert!(
-        sim.have_all_app_nodes_externalized(target_ledger, max_spread),
-        "manual_close_until timed out after {timeout:?} waiting for ledger {target_ledger}.{diag}"
-    );
 }
 
 async fn collect_node_diagnostics(sim: &Simulation) -> String {
@@ -172,74 +191,95 @@ async fn collect_node_diagnostics(sim: &Simulation) -> String {
 }
 
 async fn wait_for_app_operational(sim: &Simulation, node_id: &str, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if sim.app_task_finished(node_id) == Some(true) {
-            let status = sim.app_task_status(node_id).await;
+    let outcome = poll_until(
+        sim,
+        timeout,
+        Duration::from_millis(100),
+        CrashScope::SingleNode(node_id),
+        || async {
+            if let Some(app) = sim.app(node_id) {
+                if matches!(app.state().await, AppState::Synced | AppState::Validating) {
+                    return Ok(Some(()));
+                }
+            }
+            Ok(None)
+        },
+    )
+    .await
+    .expect("fatal error during wait_for_app_operational");
+    match outcome {
+        PollOutcome::Satisfied(()) => {}
+        PollOutcome::NodeExited { node_id, status } => {
             let diag = collect_node_diagnostics(sim).await;
             panic!(
                 "node {node_id} task exited while waiting for operational state \
                  (task_status: {status:?}).{diag}"
             );
         }
-        if let Some(app) = sim.app(node_id) {
-            if matches!(app.state().await, AppState::Synced | AppState::Validating) {
-                return;
+        PollOutcome::TimedOut => {
+            let finished = sim.app_task_finished(node_id);
+            let status = sim.app_task_status(node_id).await;
+            let diag = collect_node_diagnostics(sim).await;
+            match sim.app(node_id) {
+                None => panic!(
+                    "timed out after {timeout:?}: node {node_id} not in running_apps \
+                     (task_finished={finished:?}, task_status={status:?}).{diag}"
+                ),
+                Some(app) => {
+                    let state = app.state().await;
+                    panic!(
+                        "timed out after {timeout:?} waiting for {node_id} to become \
+                         operational (state: {state:?}, task_finished={finished:?}, \
+                         task_status={status:?}).{diag}"
+                    );
+                }
             }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let finished = sim.app_task_finished(node_id);
-    let status = sim.app_task_status(node_id).await;
-    let diag = collect_node_diagnostics(sim).await;
-    match sim.app(node_id) {
-        None => panic!(
-            "timed out after {timeout:?}: node {node_id} not in running_apps \
-             (task_finished={finished:?}, task_status={status:?}).{diag}"
-        ),
-        Some(app) => {
-            let state = app.state().await;
-            panic!(
-                "timed out after {timeout:?} waiting for {node_id} to become \
-                 operational (state: {state:?}, task_finished={finished:?}, \
-                 task_status={status:?}).{diag}"
-            );
         }
     }
 }
 
 async fn wait_for_peer_count(sim: &Simulation, node_id: &str, expected: usize, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if sim.app_task_finished(node_id) == Some(true) {
-            let status = sim.app_task_status(node_id).await;
+    let outcome = poll_until(
+        sim,
+        timeout,
+        Duration::from_millis(100),
+        CrashScope::SingleNode(node_id),
+        || async {
+            match sim.app_peer_count(node_id).await {
+                Some(count) if count == expected => Ok(Some(())),
+                _ => Ok(None),
+            }
+        },
+    )
+    .await
+    .expect("fatal error during wait_for_peer_count");
+    match outcome {
+        PollOutcome::Satisfied(()) => {}
+        PollOutcome::NodeExited { node_id, status } => {
             let diag = collect_node_diagnostics(sim).await;
             panic!(
                 "node {node_id} task exited while waiting for peer count {expected} \
                  (task_status: {status:?}).{diag}"
             );
         }
-        match sim.app_peer_count(node_id).await {
-            Some(count) if count == expected => return,
-            _ => {}
+        PollOutcome::TimedOut => {
+            let actual = sim.app_peer_count(node_id).await;
+            let finished = sim.app_task_finished(node_id);
+            let status = sim.app_task_status(node_id).await;
+            let diag = collect_node_diagnostics(sim).await;
+            match actual {
+                None => panic!(
+                    "timed out after {timeout:?}: node {node_id} not in running_apps \
+                     (task_finished={finished:?}, task_status={status:?}, \
+                     expected peer count {expected}).{diag}"
+                ),
+                Some(count) => panic!(
+                    "timed out after {timeout:?} waiting for {node_id} peer count \
+                     to reach {expected} (actual: {count}, task_finished={finished:?}, \
+                     task_status={status:?}).{diag}"
+                ),
+            }
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let actual = sim.app_peer_count(node_id).await;
-    let finished = sim.app_task_finished(node_id);
-    let status = sim.app_task_status(node_id).await;
-    let diag = collect_node_diagnostics(sim).await;
-    match actual {
-        None => panic!(
-            "timed out after {timeout:?}: node {node_id} not in running_apps \
-             (task_finished={finished:?}, task_status={status:?}, \
-             expected peer count {expected}).{diag}"
-        ),
-        Some(count) => panic!(
-            "timed out after {timeout:?} waiting for {node_id} peer count \
-             to reach {expected} (actual: {count}, task_finished={finished:?}, \
-             task_status={status:?}).{diag}"
-        ),
     }
 }
 
@@ -259,9 +299,26 @@ async fn assert_not_all_nodes_externalized(
     max_spread: u32,
     observation_window: Duration,
 ) {
-    let deadline = tokio::time::Instant::now() + observation_window;
-    while tokio::time::Instant::now() < deadline {
-        if sim.have_all_app_nodes_externalized(ledger_seq, max_spread) {
+    // Inverted poll: condition returns Some(()) when all nodes externalized
+    // (which is the *failure* case — we expect this NOT to happen).
+    let outcome = poll_until(
+        sim,
+        observation_window,
+        Duration::from_millis(250),
+        CrashScope::AllNodes,
+        || async {
+            if sim.have_all_app_nodes_externalized(ledger_seq, max_spread) {
+                Ok(Some(()))
+            } else {
+                Ok(None)
+            }
+        },
+    )
+    .await
+    .expect("fatal error during partition observation");
+    match outcome {
+        PollOutcome::Satisfied(()) => {
+            // All nodes externalized — partition failed
             let diag = collect_node_diagnostics(sim).await;
             let topo = sim.peer_topology();
             let topo_str: Vec<String> = topo
@@ -276,15 +333,25 @@ async fn assert_not_all_nodes_externalized(
                 topo_diag = topo_str.join("; "),
             );
         }
-        check_any_app_node_crashed(
-            sim,
-            "observing that not all nodes externalized (partition assertion)",
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        PollOutcome::NodeExited { node_id, status } => {
+            let diag = collect_node_diagnostics(sim).await;
+            panic!(
+                "node {node_id} task exited during partition observation \
+                 (task_status: {status:?}).{diag}"
+            );
+        }
+        PollOutcome::TimedOut => {
+            // Success: partition held for the observation window.
+            // Final crash check to catch exit in the last sleep interval.
+            if let Some((node_id, status)) = sim.find_exited_node(&CrashScope::AllNodes).await {
+                let diag = collect_node_diagnostics(sim).await;
+                panic!(
+                    "node {node_id} task exited after partition observation window \
+                     (task_status: {status:?}).{diag}"
+                );
+            }
+        }
     }
-    // Final check: catch a crash in the last sleep interval.
-    check_any_app_node_crashed(sim, "final check after partition observation window").await;
 }
 
 async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {

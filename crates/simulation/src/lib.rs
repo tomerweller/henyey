@@ -37,6 +37,9 @@ pub use loadgen::{
 };
 pub use loadgen_soroban::{BatchTransfer, ContractInvocation, SacTransfer, SorobanTxBuilder};
 
+mod poll;
+pub use poll::{poll_until, CrashScope, PollOutcome};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimulationMode {
     OverLoopback,
@@ -543,18 +546,13 @@ impl Simulation {
 
     /// Bail immediately if any running app node's task has exited.
     ///
-    /// Sorted iteration ensures deterministic error output.
-    async fn check_any_node_task_exited(&self) -> anyhow::Result<()> {
-        let mut ids: Vec<&String> = self.running_apps.keys().collect();
-        ids.sort();
-        for id in ids {
-            if self.app_task_finished(id) == Some(true) {
-                let status = self.app_task_status(id).await;
-                anyhow::bail!(
-                    "node {id} task exited during connectivity wait \
-                     (task_status: {status:?})"
-                );
-            }
+    /// Thin wrapper around `find_exited_node` with `CrashScope::AllNodes`.
+    async fn bail_if_any_node_exited(&self) -> anyhow::Result<()> {
+        if let Some((id, status)) = self.find_exited_node(&CrashScope::AllNodes).await {
+            anyhow::bail!(
+                "node {id} task exited during connectivity wait \
+                 (task_status: {status:?})"
+            );
         }
         Ok(())
     }
@@ -593,46 +591,47 @@ impl Simulation {
         min_peers: usize,
         timeout: Duration,
     ) -> anyhow::Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            self.check_any_node_task_exited().await?;
-
-            let mut connected = true;
-            let mut ids: Vec<&String> = self.running_apps.keys().collect();
-            ids.sort();
-            for id in &ids {
-                if self.app_peer_count(id).await.unwrap_or(0) < min_peers {
-                    connected = false;
-                    break;
+        let outcome = poll_until(
+            self,
+            timeout,
+            Duration::from_millis(100),
+            CrashScope::AllNodes,
+            || async {
+                let mut ids: Vec<&String> = self.running_apps.keys().collect();
+                ids.sort();
+                for id in &ids {
+                    if self.app_peer_count(id).await.unwrap_or(0) < min_peers {
+                        return Ok(None);
+                    }
                 }
-            }
-            if connected {
-                // Re-check: a node may have exited between the top-of-loop
-                // check and the peer-count scan (stale counts).
-                self.check_any_node_task_exited().await?;
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(
-                Duration::from_millis(100).min(deadline - tokio::time::Instant::now()),
-            )
-            .await;
-        }
-        let mut counts = Vec::new();
-        let mut ids: Vec<&String> = self.running_apps.keys().collect();
-        ids.sort();
-        for id in &ids {
-            let count = self.app_peer_count(id).await.unwrap_or(0);
-            counts.push(format!("{id}={count}"));
-        }
-        let task_diag = self.node_task_diagnostics().await;
-        anyhow::bail!(
-            "wait_for_app_connectivity: not all apps reached {min_peers} peers \
-             within {timeout:?} (current counts: {}){task_diag}",
-            counts.join(", ")
+                Ok(Some(()))
+            },
         )
+        .await?;
+        match outcome {
+            PollOutcome::Satisfied(()) => Ok(()),
+            PollOutcome::NodeExited { node_id, status } => {
+                anyhow::bail!(
+                    "node {node_id} task exited during connectivity wait \
+                     (task_status: {status:?})"
+                )
+            }
+            PollOutcome::TimedOut => {
+                let mut counts = Vec::new();
+                let mut ids: Vec<&String> = self.running_apps.keys().collect();
+                ids.sort();
+                for id in &ids {
+                    let count = self.app_peer_count(id).await.unwrap_or(0);
+                    counts.push(format!("{id}={count}"));
+                }
+                let task_diag = self.node_task_diagnostics().await;
+                anyhow::bail!(
+                    "wait_for_app_connectivity: not all apps reached {min_peers} peers \
+                     within {timeout:?} (current counts: {}){task_diag}",
+                    counts.join(", ")
+                )
+            }
+        }
     }
 
     /// Kick-start connections between topology neighbors.
@@ -669,16 +668,18 @@ impl Simulation {
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            self.check_any_node_task_exited().await?;
+            self.bail_if_any_node_exited().await?;
 
             if let Err(err) = self.repair_app_connectivity().await {
                 if !err.to_string().contains("overlay not started") {
                     return Err(err);
                 }
                 // "overlay not started" can mask a task exit — re-check.
-                self.check_any_node_task_exited().await?;
+                self.bail_if_any_node_exited().await?;
             }
-            let remaining = deadline.duration_since(tokio::time::Instant::now());
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
             let probe_timeout = remaining.min(Duration::from_secs(1));
             match self
                 .wait_for_app_connectivity(min_peers, probe_timeout)
@@ -687,13 +688,15 @@ impl Simulation {
                 Ok(()) => return Ok(()),
                 Err(_) => {
                     // Distinguish fatal task exit from retryable probe timeout.
-                    self.check_any_node_task_exited().await?;
+                    self.bail_if_any_node_exited().await?;
                 }
             }
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            let remaining = deadline.duration_since(tokio::time::Instant::now());
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
             tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
         }
         // Final probe with zero timeout to get per-node peer counts for diagnostics.
@@ -741,94 +744,89 @@ impl Simulation {
     /// (`partition()`, `set_drop_prob()`). Invalid to call during active fault
     /// injection.
     pub async fn wait_for_topology_connectivity(&self, timeout: Duration) -> anyhow::Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            self.check_any_node_task_exited().await?;
-
-            let mut all_match = true;
-            let mut ids: Vec<&String> = self.running_apps.keys().collect();
-            ids.sort();
-            for id in &ids {
-                let expected = self.expected_peer_ids(id);
-                let actual: HashSet<PeerId> = self.running_apps[*id]
-                    .app
-                    .peer_snapshots()
-                    .await
-                    .into_iter()
-                    .map(|s| s.info.peer_id)
-                    .collect();
-                if expected != actual {
-                    all_match = false;
-                    break;
+        let outcome = poll_until(
+            self,
+            timeout,
+            Duration::from_millis(100),
+            CrashScope::AllNodes,
+            || async {
+                let mut ids: Vec<&String> = self.running_apps.keys().collect();
+                ids.sort();
+                for id in &ids {
+                    let expected = self.expected_peer_ids(id);
+                    let actual: HashSet<PeerId> = self.running_apps[*id]
+                        .app
+                        .peer_snapshots()
+                        .await
+                        .into_iter()
+                        .map(|s| s.info.peer_id)
+                        .collect();
+                    if expected != actual {
+                        return Ok(None);
+                    }
                 }
-            }
-            if all_match {
-                self.check_any_node_task_exited().await?;
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(
-                Duration::from_millis(100).min(deadline - tokio::time::Instant::now()),
-            )
-            .await;
-        }
-
-        // Build per-node diagnostics with sorted strkeys for determinism.
-        let mut diag_lines = Vec::new();
-        let mut ids: Vec<&String> = self.running_apps.keys().collect();
-        ids.sort();
-        for id in &ids {
-            let expected = self.expected_peer_ids(id);
-            let actual: HashSet<PeerId> = self.running_apps[*id]
-                .app
-                .peer_snapshots()
-                .await
-                .into_iter()
-                .map(|s| s.info.peer_id)
-                .collect();
-            let missing: Vec<String> = expected
-                .difference(&actual)
-                .map(|p| p.to_strkey())
-                .collect::<Vec<_>>()
-                .into_iter()
-                .collect();
-            let unexpected: Vec<String> = actual
-                .difference(&expected)
-                .map(|p| p.to_strkey())
-                .collect::<Vec<_>>()
-                .into_iter()
-                .collect();
-
-            let mut missing_sorted = missing;
-            missing_sorted.sort();
-            let mut unexpected_sorted = unexpected;
-            unexpected_sorted.sort();
-
-            if !missing_sorted.is_empty() || !unexpected_sorted.is_empty() {
-                let mut parts = vec![format!(
-                    "{id}: expected={} actual={}",
-                    expected.len(),
-                    actual.len()
-                )];
-                if !missing_sorted.is_empty() {
-                    parts.push(format!("missing=[{}]", missing_sorted.join(", ")));
-                }
-                if !unexpected_sorted.is_empty() {
-                    parts.push(format!("unexpected=[{}]", unexpected_sorted.join(", ")));
-                }
-                diag_lines.push(parts.join(" "));
-            }
-        }
-
-        let task_diag = self.node_task_diagnostics().await;
-        anyhow::bail!(
-            "wait_for_topology_connectivity: topology mismatch after {timeout:?} \
-             ({}){}",
-            diag_lines.join("; "),
-            task_diag
+                Ok(Some(()))
+            },
         )
+        .await?;
+        match outcome {
+            PollOutcome::Satisfied(()) => Ok(()),
+            PollOutcome::NodeExited { node_id, status } => {
+                anyhow::bail!(
+                    "node {node_id} task exited during connectivity wait \
+                     (task_status: {status:?})"
+                )
+            }
+            PollOutcome::TimedOut => {
+                // Build per-node diagnostics with sorted strkeys for determinism.
+                let mut diag_lines = Vec::new();
+                let mut ids: Vec<&String> = self.running_apps.keys().collect();
+                ids.sort();
+                for id in &ids {
+                    let expected = self.expected_peer_ids(id);
+                    let actual: HashSet<PeerId> = self.running_apps[*id]
+                        .app
+                        .peer_snapshots()
+                        .await
+                        .into_iter()
+                        .map(|s| s.info.peer_id)
+                        .collect();
+                    let mut missing: Vec<String> = expected
+                        .difference(&actual)
+                        .map(|p| p.to_strkey())
+                        .collect();
+                    missing.sort();
+                    let mut unexpected: Vec<String> = actual
+                        .difference(&expected)
+                        .map(|p| p.to_strkey())
+                        .collect();
+                    unexpected.sort();
+
+                    if !missing.is_empty() || !unexpected.is_empty() {
+                        let mut parts = vec![format!(
+                            "{id}: expected={} actual={}",
+                            expected.len(),
+                            actual.len()
+                        )];
+                        if !missing.is_empty() {
+                            parts.push(format!("missing=[{}]", missing.join(", ")));
+                        }
+                        if !unexpected.is_empty() {
+                            parts.push(format!("unexpected=[{}]", unexpected.join(", ")));
+                        }
+                        diag_lines.push(parts.join(" "));
+                    }
+                }
+
+                let task_diag = self.node_task_diagnostics().await;
+                anyhow::bail!(
+                    "wait_for_topology_connectivity: topology mismatch after {timeout:?} \
+                     ({}){}",
+                    diag_lines.join("; "),
+                    task_diag
+                )
+            }
+        }
     }
 
     /// Kick-start topology-correct connections and wait until every node is
@@ -847,26 +845,30 @@ impl Simulation {
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            self.check_any_node_task_exited().await?;
+            self.bail_if_any_node_exited().await?;
 
             if let Err(err) = self.repair_app_connectivity().await {
                 if !err.to_string().contains("overlay not started") {
                     return Err(err);
                 }
-                self.check_any_node_task_exited().await?;
+                self.bail_if_any_node_exited().await?;
             }
-            let remaining = deadline.duration_since(tokio::time::Instant::now());
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
             let probe_timeout = remaining.min(Duration::from_secs(1));
             match self.wait_for_topology_connectivity(probe_timeout).await {
                 Ok(()) => return Ok(()),
                 Err(_) => {
-                    self.check_any_node_task_exited().await?;
+                    self.bail_if_any_node_exited().await?;
                 }
             }
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            let remaining = deadline.duration_since(tokio::time::Instant::now());
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
             tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
         }
         match self
