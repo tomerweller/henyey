@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
-use henyey_common::resource::ResourceType;
+use henyey_common::resource::{ResourceError, ResourceType};
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::SorobanNetworkInfo;
 use henyey_tx::{
@@ -1434,6 +1434,53 @@ pub(crate) fn check_valid_classic(
     TxSetValidationResult::Valid
 }
 
+/// Accumulate Soroban resources, returning `SorobanResourcesOverflow` on overflow.
+///
+/// Both inputs must be canonical 7-element Soroban resources; a `SizeMismatch`
+/// error from `checked_add` indicates a programmer bug.
+fn accumulate_resources(
+    total: henyey_common::resource::Resource,
+    addition: &henyey_common::resource::Resource,
+) -> Result<henyey_common::resource::Resource, TxSetValidationResult> {
+    total.checked_add(addition).map_err(|e| {
+        match e {
+            ResourceError::Overflow { .. } => {}
+            _ => unreachable!("accumulate_resources: unexpected ResourceError: {e}"),
+        }
+        debug!("Got bad txSet: Soroban resource overflow");
+        TxSetValidationResult::SorobanResourcesOverflow
+    })
+}
+
+/// Check that adding `addition` (a u32 instruction count from XDR) to the
+/// running `current` total does not overflow i64. Returns the new total or
+/// `SorobanSequentialInstructionsOverflow`.
+fn checked_add_cluster_instructions(
+    current: i64,
+    addition: u32,
+) -> Result<i64, TxSetValidationResult> {
+    let addition = addition as i64;
+    if current > i64::MAX - addition {
+        debug!("Got bad txSet: Soroban sequential instructions overflow");
+        return Err(TxSetValidationResult::SorobanSequentialInstructionsOverflow);
+    }
+    Ok(current + addition)
+}
+
+/// Check that adding `stage_max` to `sequential` does not overflow i64.
+/// Returns the new total or `SorobanInstructionsOverflow`.
+fn checked_add_sequential_instructions(
+    sequential: i64,
+    stage_max: i64,
+) -> Result<i64, TxSetValidationResult> {
+    debug_assert!(stage_max >= 0, "stage_max must be non-negative");
+    if sequential > i64::MAX - stage_max {
+        debug!("Got bad txSet: Soroban total instructions overflow");
+        return Err(TxSetValidationResult::SorobanInstructionsOverflow);
+    }
+    Ok(sequential + stage_max)
+}
+
 /// Validate the Soroban transaction phase.
 ///
 /// Mirrors stellar-core's `TxSetPhaseFrame::checkValidSoroban()` (TxSetFrame.cpp:1819-1982).
@@ -1475,12 +1522,9 @@ pub(crate) fn check_valid_soroban(
         }
         let frame = TransactionFrame::new(Arc::new((*tx).clone()));
         let res = frame.resources(false, protocol);
-        match total_resources.checked_add(&res) {
+        match accumulate_resources(total_resources, &res) {
             Ok(sum) => total_resources = sum,
-            Err(_) => {
-                debug!("Got bad txSet: Soroban resource overflow");
-                return TxSetValidationResult::SorobanResourcesOverflow;
-            }
+            Err(e) => return e,
         }
     }
 
@@ -1573,21 +1617,21 @@ pub(crate) fn check_valid_soroban(
             let mut cluster_instructions: i64 = 0;
             for tx in cluster.iter() {
                 if let Some(resources) = envelope_soroban_resources(tx) {
-                    // Check overflow
-                    if cluster_instructions > i64::MAX - resources.instructions as i64 {
-                        debug!("Got bad txSet: Soroban sequential instructions overflow");
-                        return TxSetValidationResult::SorobanSequentialInstructionsOverflow;
+                    match checked_add_cluster_instructions(
+                        cluster_instructions,
+                        resources.instructions,
+                    ) {
+                        Ok(sum) => cluster_instructions = sum,
+                        Err(e) => return e,
                     }
-                    cluster_instructions += resources.instructions as i64;
                 }
             }
             stage_max_instructions = std::cmp::max(stage_max_instructions, cluster_instructions);
         }
-        if sequential_instructions > i64::MAX - stage_max_instructions {
-            debug!("Got bad txSet: Soroban total instructions overflow");
-            return TxSetValidationResult::SorobanInstructionsOverflow;
+        match checked_add_sequential_instructions(sequential_instructions, stage_max_instructions) {
+            Ok(sum) => sequential_instructions = sum,
+            Err(e) => return e,
         }
-        sequential_instructions += stage_max_instructions;
     }
     if sequential_instructions > soroban_info.ledger_max_instructions {
         debug!(
@@ -3547,11 +3591,104 @@ mod tests {
         );
     }
 
-    // Note: ResourcesOverflow, SequentialInstructionsOverflow, and InstructionsOverflow
-    // are defense-in-depth safety checks that cannot be practically triggered through
-    // check_valid_soroban with standard XDR inputs. Individual resource fields are u32,
-    // so overflowing i64 sums requires ~2^31 transactions — infeasible in a unit test.
-    // These paths are verified by code inspection and are covered by the Display test above.
+    // Note: End-to-end overflow triggering through check_valid_soroban remains
+    // infeasible via standard XDR inputs (individual resource fields are u32,
+    // so overflowing i64 sums requires ~2^31 transactions). The overflow
+    // detection logic is tested at the helper level below.
+
+    // --- Overflow helper tests: accumulate_resources ---
+
+    #[test]
+    fn test_accumulate_resources_normal() {
+        use henyey_common::resource::{Resource, ResourceType};
+        let mut a = Resource::make_empty_soroban();
+        a.set_val(ResourceType::Instructions, 100);
+        a.set_val(ResourceType::DiskReadBytes, 200);
+
+        let mut b = Resource::make_empty_soroban();
+        b.set_val(ResourceType::Instructions, 50);
+        b.set_val(ResourceType::DiskReadBytes, 75);
+
+        let result = accumulate_resources(a, &b).unwrap();
+        assert_eq!(result.get_val(ResourceType::Instructions), 150);
+        assert_eq!(result.get_val(ResourceType::DiskReadBytes), 275);
+    }
+
+    #[test]
+    fn test_accumulate_resources_overflow() {
+        use henyey_common::resource::{Resource, ResourceType};
+        let mut a = Resource::make_empty_soroban();
+        a.set_val(ResourceType::Instructions, i64::MAX);
+
+        let mut b = Resource::make_empty_soroban();
+        b.set_val(ResourceType::Instructions, 1);
+
+        let result = accumulate_resources(a, &b);
+        assert_eq!(
+            result.unwrap_err(),
+            TxSetValidationResult::SorobanResourcesOverflow
+        );
+    }
+
+    #[test]
+    fn test_accumulate_resources_at_boundary() {
+        use henyey_common::resource::{Resource, ResourceType};
+        let mut a = Resource::make_empty_soroban();
+        a.set_val(ResourceType::Instructions, i64::MAX - 1);
+
+        let mut b = Resource::make_empty_soroban();
+        b.set_val(ResourceType::Instructions, 1);
+
+        let result = accumulate_resources(a, &b).unwrap();
+        assert_eq!(result.get_val(ResourceType::Instructions), i64::MAX);
+    }
+
+    // --- Overflow helper tests: checked_add_cluster_instructions ---
+
+    #[test]
+    fn test_checked_add_cluster_instructions_normal() {
+        let result = checked_add_cluster_instructions(5000, 1000).unwrap();
+        assert_eq!(result, 6000);
+    }
+
+    #[test]
+    fn test_checked_add_cluster_instructions_overflow() {
+        let result = checked_add_cluster_instructions(i64::MAX - 100, 101);
+        assert_eq!(
+            result.unwrap_err(),
+            TxSetValidationResult::SorobanSequentialInstructionsOverflow
+        );
+    }
+
+    #[test]
+    fn test_checked_add_cluster_instructions_at_boundary() {
+        let result =
+            checked_add_cluster_instructions(i64::MAX - u32::MAX as i64, u32::MAX).unwrap();
+        assert_eq!(result, i64::MAX);
+    }
+
+    // --- Overflow helper tests: checked_add_sequential_instructions ---
+
+    #[test]
+    fn test_checked_add_sequential_instructions_normal() {
+        let result = checked_add_sequential_instructions(10_000, 5_000).unwrap();
+        assert_eq!(result, 15_000);
+    }
+
+    #[test]
+    fn test_checked_add_sequential_instructions_overflow() {
+        let result = checked_add_sequential_instructions(i64::MAX - 100, 101);
+        assert_eq!(
+            result.unwrap_err(),
+            TxSetValidationResult::SorobanInstructionsOverflow
+        );
+    }
+
+    #[test]
+    fn test_checked_add_sequential_instructions_at_boundary() {
+        let result = checked_add_sequential_instructions(i64::MAX - 1000, 1000).unwrap();
+        assert_eq!(result, i64::MAX);
+    }
 
     /// Regression: get_invalid_tx_list must reject txs that fail check_valid_pre_seq_num
     /// even when they would pass validate_basic.
