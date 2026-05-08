@@ -1660,14 +1660,14 @@ impl App {
         self.syncing_ledgers.read().await.len()
     }
 
-    pub async fn add_peer(&self, addr: henyey_overlay::PeerAddress) -> anyhow::Result<bool> {
+    pub async fn add_peer(
+        &self,
+        addr: henyey_overlay::PeerAddress,
+    ) -> Result<henyey_overlay::AddPeerOutcome, henyey_overlay::OverlayError> {
         let Some(overlay) = self.overlay().await else {
-            anyhow::bail!("overlay not started")
+            return Err(henyey_overlay::OverlayError::NotStarted);
         };
-        overlay
-            .add_peer(addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to add peer: {}", e))
+        overlay.add_peer(addr).await
     }
 
     pub fn latest_externalized_slot(&self) -> Option<u64> {

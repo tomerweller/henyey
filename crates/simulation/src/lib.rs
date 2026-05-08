@@ -14,7 +14,8 @@ use henyey_clock::RealClock;
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::SecretKey;
 use henyey_overlay::{
-    ConnectionFactory, LoopbackConnectionFactory, PeerAddress, PeerId, TcpConnectionFactory,
+    AddPeerOutcome, ConnectionFactory, LoopbackConnectionFactory, OverlayError, PeerAddress,
+    PeerId, TcpConnectionFactory,
 };
 use stellar_xdr::curr::{
     AccountId, Asset, CreateAccountOp, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
@@ -44,6 +45,34 @@ pub use poll::{poll_until, CrashScope, PollOutcome};
 pub enum SimulationMode {
     OverLoopback,
     OverTcp,
+}
+
+/// Aggregate stats from one round of `repair_app_connectivity`.
+///
+/// All conditions are retryable — the stabilize loop always retries until its
+/// overall timeout expires.  `RepairReport` is purely diagnostic: when the
+/// timeout fires, these stats are included in the error message.
+#[derive(Debug, Default)]
+struct RepairReport {
+    initiated: usize,
+    already_connected: usize,
+    pool_full: usize,
+    overlay_not_ready: usize,
+    errors: usize,
+}
+
+impl std::fmt::Display for RepairReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "initiated={}, already_connected={}, pool_full={}, overlay_not_ready={}, errors={}",
+            self.initiated,
+            self.already_connected,
+            self.pool_full,
+            self.overlay_not_ready,
+            self.errors,
+        )
+    }
 }
 
 /// Check whether all sequence numbers in `seqs` are at least `min_ledger`
@@ -416,7 +445,7 @@ impl Simulation {
             .running_apps
             .get(a)
             .with_context(|| format!("missing running app node {}", a))?;
-        let _ = a_app
+        a_app
             .app
             .add_peer(henyey_overlay::PeerAddress::new("127.0.0.1", b_port))
             .await?;
@@ -641,7 +670,11 @@ impl Simulation {
     /// `build_app_from_spec` uses for `config.overlay.known_peers`. This
     /// prevents cross-partition connections in sparse topologies like
     /// `separate` (two isolated pairs).
-    pub async fn repair_app_connectivity(&self) -> anyhow::Result<()> {
+    ///
+    /// Returns a [`RepairReport`] with aggregate stats.  The function never
+    /// short-circuits — every node/address pair is attempted regardless of
+    /// per-node errors.
+    async fn repair_app_connectivity(&self) -> RepairReport {
         let port_map: HashMap<String, u16> = self
             .running_apps
             .iter()
@@ -651,14 +684,25 @@ impl Simulation {
         let mut ids: Vec<&String> = self.running_apps.keys().collect();
         ids.sort();
 
+        let mut report = RepairReport::default();
+
         for id in ids {
             let node = &self.running_apps[id];
             for addr in self.known_peers_for(id, &port_map) {
-                let _ = node.app.add_peer(addr).await?;
+                match node.app.add_peer(addr).await {
+                    Ok(AddPeerOutcome::Initiated) => report.initiated += 1,
+                    Ok(AddPeerOutcome::AlreadyConnected) => report.already_connected += 1,
+                    Ok(AddPeerOutcome::PoolFull) => report.pool_full += 1,
+                    Err(OverlayError::NotStarted) => report.overlay_not_ready += 1,
+                    Err(e) => {
+                        report.errors += 1;
+                        tracing::warn!("add_peer error for node {id}: {e}");
+                    }
+                }
             }
         }
 
-        Ok(())
+        report
     }
 
     pub async fn stabilize_app_tcp_connectivity(
@@ -667,16 +711,17 @@ impl Simulation {
         timeout: Duration,
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut cumulative_report = RepairReport::default();
         loop {
             self.bail_if_any_node_exited().await?;
 
-            if let Err(err) = self.repair_app_connectivity().await {
-                if !err.to_string().contains("overlay not started") {
-                    return Err(err);
-                }
-                // "overlay not started" can mask a task exit — re-check.
-                self.bail_if_any_node_exited().await?;
-            }
+            let report = self.repair_app_connectivity().await;
+            cumulative_report.initiated += report.initiated;
+            cumulative_report.already_connected += report.already_connected;
+            cumulative_report.pool_full += report.pool_full;
+            cumulative_report.overlay_not_ready += report.overlay_not_ready;
+            cumulative_report.errors += report.errors;
+
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .unwrap_or(Duration::ZERO);
@@ -706,7 +751,7 @@ impl Simulation {
         {
             Err(detail) => anyhow::bail!(
                 "stabilize_app_tcp_connectivity: connectivity did not stabilize \
-                 within {timeout:?}: {detail}"
+                 within {timeout:?}: {detail} (repair: {cumulative_report})"
             ),
             Ok(()) => Ok(()),
         }
@@ -844,15 +889,17 @@ impl Simulation {
         timeout: Duration,
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut cumulative_report = RepairReport::default();
         loop {
             self.bail_if_any_node_exited().await?;
 
-            if let Err(err) = self.repair_app_connectivity().await {
-                if !err.to_string().contains("overlay not started") {
-                    return Err(err);
-                }
-                self.bail_if_any_node_exited().await?;
-            }
+            let report = self.repair_app_connectivity().await;
+            cumulative_report.initiated += report.initiated;
+            cumulative_report.already_connected += report.already_connected;
+            cumulative_report.pool_full += report.pool_full;
+            cumulative_report.overlay_not_ready += report.overlay_not_ready;
+            cumulative_report.errors += report.errors;
+
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .unwrap_or(Duration::ZERO);
@@ -877,7 +924,7 @@ impl Simulation {
         {
             Err(detail) => anyhow::bail!(
                 "stabilize_app_topology_connectivity: topology did not stabilize \
-                 within {timeout:?}: {detail}"
+                 within {timeout:?}: {detail} (repair: {cumulative_report})"
             ),
             Ok(()) => Ok(()),
         }
@@ -1329,6 +1376,13 @@ impl Simulation {
         config.overlay.max_inbound_peers = self.app_specs.len().max(1);
         config.http.enabled = false;
         config.compat_http.enabled = false;
+
+        // For TCP simulation, use a short connect timeout.  Localhost TCP
+        // connects in <1ms; the 10s production default wastes retry budget
+        // when a peer hasn't started its listener yet.
+        if matches!(self.mode, SimulationMode::OverTcp) {
+            config.overlay.connect_timeout_secs = Some(2);
+        }
 
         if let Some(parent) = config.database.path.parent() {
             std::fs::create_dir_all(parent)?;

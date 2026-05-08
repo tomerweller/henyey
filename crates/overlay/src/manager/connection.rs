@@ -28,6 +28,24 @@ use tokio::task::JoinHandle;
 /// filling outbound slots, to avoid overwhelming the network stack.
 const CONNECTION_ATTEMPT_DELAY_MS: u64 = 50;
 
+/// Outcome of an `add_peer` call.
+///
+/// These are success-path outcomes only — error conditions (e.g.
+/// `OverlayError::NotStarted`) are returned via the `Err` variant.
+/// Note: `OverlayError` also has `AlreadyConnected` and `PeerLimitReached`
+/// variants, but those are used for inbound-connection rejection and
+/// handshake-level errors.  In the outbound-dial path, "already connected"
+/// and "pool full" are expected flow-control outcomes, not errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddPeerOutcome {
+    /// New outbound connection task was spawned.
+    Initiated,
+    /// Already have an authenticated connection to this address.
+    AlreadyConnected,
+    /// Outbound connection pool is at capacity.
+    PoolFull,
+}
+
 /// Prune completed JoinHandles from the vec, then push the new one.
 /// This prevents unbounded growth of the peer_handles vector.
 fn push_peer_handle(handles: &RwLock<Vec<JoinHandle<()>>>, handle: JoinHandle<()>) {
@@ -575,9 +593,9 @@ impl OverlayManager {
     /// Add a peer to connect to.
     ///
     /// This is used for peer discovery when we receive a Peers message.
-    /// Returns true if a connection attempt was initiated.
+    /// Returns `AddPeerOutcome` describing what happened.
     // SECURITY: dial dedup and queue bounded by max_peer_count config + peer universe
-    pub async fn add_peer(&self, addr: PeerAddress) -> Result<bool> {
+    pub async fn add_peer(&self, addr: PeerAddress) -> Result<AddPeerOutcome> {
         if !self.running.load(Ordering::Relaxed) {
             return Err(OverlayError::NotStarted);
         }
@@ -585,7 +603,7 @@ impl OverlayManager {
         // Check if we're at the connection limit
         if !self.outbound_pool.try_reserve() {
             debug!("Outbound peer limit reached, not adding peer {}", addr);
-            return Ok(false);
+            return Ok(AddPeerOutcome::PoolFull);
         }
 
         // Check if we're already connected to this address
@@ -598,7 +616,7 @@ impl OverlayManager {
         if already_connected {
             self.outbound_pool.release_pending();
             debug!("Already connected to {}", addr);
-            return Ok(false);
+            return Ok(AddPeerOutcome::AlreadyConnected);
         }
 
         // Spawn connection task
@@ -623,7 +641,7 @@ impl OverlayManager {
 
         push_peer_handle(&peer_handles, peer_handle);
 
-        Ok(true)
+        Ok(AddPeerOutcome::Initiated)
     }
 
     /// Add multiple peers to connect to.
@@ -650,11 +668,11 @@ impl OverlayManager {
             }
             self.add_known_peer(addr.clone());
             match self.add_peer(addr).await {
-                Ok(true) => {
+                Ok(AddPeerOutcome::Initiated) => {
                     added += 1;
                     remaining = remaining.saturating_sub(1);
                 }
-                Ok(false) => {}
+                Ok(AddPeerOutcome::AlreadyConnected | AddPeerOutcome::PoolFull) => {}
                 Err(e) => {
                     debug!("Error adding peer: {}", e);
                 }

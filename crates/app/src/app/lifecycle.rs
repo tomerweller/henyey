@@ -1317,6 +1317,11 @@ impl App {
             }
         }
         overlay_config.preferred_peers_only = self.config.overlay.preferred_peers_only;
+
+        if let Some(timeout) = self.config.overlay.connect_timeout_secs {
+            overlay_config.connect_timeout_secs = timeout;
+        }
+
         // Map flow control byte config overrides.
         // Validated in AppConfig::validate(), so unwrap is safe here.
         overlay_config.flow_control_bytes_config = henyey_overlay::FlowControlBytesConfig::new(

@@ -1017,6 +1017,11 @@ pub struct OverlayConfig {
     /// constant (100 000). Must not exceed `peer_flood_reading_capacity_bytes`.
     #[serde(default)]
     pub flow_control_send_more_batch_size_bytes: u32,
+
+    /// TCP connect timeout in seconds for outbound connections.
+    /// When `None` (default), uses the overlay manager's built-in default (10s).
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
 }
 
 impl Default for OverlayConfig {
@@ -1043,6 +1048,7 @@ impl Default for OverlayConfig {
             flood_arb_tx_damping_factor: default_flood_arb_tx_damping_factor(),
             peer_flood_reading_capacity_bytes: 0,
             flow_control_send_more_batch_size_bytes: 0,
+            connect_timeout_secs: None,
         }
     }
 }

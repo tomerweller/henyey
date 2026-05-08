@@ -36,6 +36,8 @@ mod connection;
 mod peer_loop;
 mod tick;
 
+pub use connection::AddPeerOutcome;
+
 use crate::{
     codec::helpers,
     connection::{ConnectionDirection, ConnectionPool, Listener},
