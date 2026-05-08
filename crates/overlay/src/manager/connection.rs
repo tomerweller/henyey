@@ -238,7 +238,9 @@ impl OverlayManager {
             debug!("Rejected duplicate inbound peer {}", peer_id);
             shared.metrics.inbound_reject.inc();
             peer.close().await;
-            shared.pending_connections.release_peer_id(&peer_id);
+            if peer.holds_pending_peer_id() {
+                shared.pending_connections.release_peer_id(&peer_id);
+            }
             pool.release_pending();
             return;
         }
@@ -265,7 +267,9 @@ impl OverlayManager {
             );
             shared.metrics.inbound_reject.inc();
             Self::reject_authenticated_load(&mut peer, &shared).await;
-            shared.pending_connections.release_peer_id(&peer_id);
+            if peer.holds_pending_peer_id() {
+                shared.pending_connections.release_peer_id(&peer_id);
+            }
             pool.release_pending();
             return;
         }
@@ -286,14 +290,18 @@ impl OverlayManager {
                     debug!("Rejected duplicate inbound peer {} (race)", peer_id);
                     shared.metrics.inbound_reject.inc();
                     peer.close().await;
-                    shared.pending_connections.release_peer_id(&peer_id);
+                    if peer.holds_pending_peer_id() {
+                        shared.pending_connections.release_peer_id(&peer_id);
+                    }
                     pool.release_authenticated();
                     return;
                 }
             };
 
-        // Successfully registered — release the pending reservation.
-        shared.pending_connections.release_peer_id(&peer_id);
+        // Successfully registered — release the pending reservation if we own it.
+        if peer.holds_pending_peer_id() {
+            shared.pending_connections.release_peer_id(&peer_id);
+        }
         shared.metrics.inbound_establish.inc();
 
         Self::run_peer_loop(

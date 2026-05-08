@@ -38,7 +38,7 @@ mod tick;
 
 use crate::{
     codec::helpers,
-    connection::{ConnectionPool, Listener},
+    connection::{ConnectionDirection, ConnectionPool, Listener},
     connection_factory::{ConnectionFactory, TcpConnectionFactory},
     flood::{compute_message_hash, FloodGate, FloodGateStats},
     flow_control::{FlowControl, FlowControlBytesConfig, ScpQueueCallback},
@@ -265,7 +265,8 @@ impl AdmissionState {
 ///   completion.
 /// - **by_peer_id**: keyed by peer ID (known after HELLO), prevents
 ///   concurrent registration attempts for the same node. Inserted after
-///   handshake, removed after register_peer or on failure.
+///   handshake, removed after register_peer or on failure. Stores
+///   direction metadata to distinguish mutual-dial from true duplicates.
 ///
 /// Stale entries (from crashed/hung tasks) are swept periodically from
 /// the tick loop.
@@ -276,7 +277,20 @@ pub(super) struct PendingConnections {
     /// In-flight connections by target address (host:port string).
     pub(super) by_address: Arc<DashMap<String, std::time::Instant>>,
     /// In-flight connections by peer ID (known after handshake).
-    pub(super) by_peer_id: Arc<DashMap<PeerId, std::time::Instant>>,
+    pub(super) by_peer_id: Arc<DashMap<PeerId, PendingPeerEntry>>,
+}
+
+/// Metadata for a pending peer-ID reservation.
+///
+/// Tracks when the reservation was made and from which direction (inbound
+/// vs outbound). Direction is used to resolve mutual-dial races: an inbound
+/// handshake that collides with an existing OUTBOUND reservation is allowed
+/// to proceed (the post-handshake `register_peer` resolves the race), while
+/// a collision with another INBOUND reservation rejects immediately.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingPeerEntry {
+    pub reserved_at: std::time::Instant,
+    pub direction: ConnectionDirection,
 }
 
 /// Maximum age for a pending connection before it is considered stale.
@@ -307,12 +321,19 @@ impl PendingConnections {
     /// Returns false if a handshake for this peer ID is already in flight.
     /// Used in tests; production reservation now happens inside Peer::handshake().
     #[cfg(test)]
-    pub(super) fn try_reserve_peer_id(&self, peer_id: &PeerId) -> bool {
+    pub(super) fn try_reserve_peer_id(
+        &self,
+        peer_id: &PeerId,
+        direction: ConnectionDirection,
+    ) -> bool {
         use dashmap::mapref::entry::Entry;
         match self.by_peer_id.entry(peer_id.clone()) {
             Entry::Occupied(_) => false,
             Entry::Vacant(e) => {
-                e.insert(std::time::Instant::now());
+                e.insert(PendingPeerEntry {
+                    reserved_at: std::time::Instant::now(),
+                    direction,
+                });
                 true
             }
         }
@@ -332,7 +353,8 @@ impl PendingConnections {
     pub(super) fn sweep_stale(&self) {
         let cutoff = std::time::Instant::now() - PENDING_CONNECTION_TIMEOUT;
         self.by_address.retain(|_, ts| *ts > cutoff);
-        self.by_peer_id.retain(|_, ts| *ts > cutoff);
+        self.by_peer_id
+            .retain(|_, entry| entry.reserved_at > cutoff);
     }
 }
 
@@ -1916,17 +1938,17 @@ mod tests {
         let peer_id = PeerId::from_bytes([1u8; 32]);
 
         assert!(
-            pending.try_reserve_peer_id(&peer_id),
+            pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Outbound),
             "first reservation should succeed"
         );
         assert!(
-            !pending.try_reserve_peer_id(&peer_id),
+            !pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Outbound),
             "duplicate should fail"
         );
 
         pending.release_peer_id(&peer_id);
         assert!(
-            pending.try_reserve_peer_id(&peer_id),
+            pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Outbound),
             "should succeed after release"
         );
     }
@@ -1939,7 +1961,7 @@ mod tests {
 
         // Address and peer_id are independent
         assert!(pending.try_reserve_address(addr));
-        assert!(pending.try_reserve_peer_id(&peer_id));
+        assert!(pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Outbound));
 
         // Different address should work
         let addr2 = "10.0.0.2:11625".to_string();
@@ -1968,6 +1990,67 @@ mod tests {
             pending.try_reserve_address(addr),
             "should succeed after sweep removes stale entry"
         );
+    }
+
+    /// Verify that an inbound reservation attempt that collides with an
+    /// existing OUTBOUND reservation fails at the try_reserve_peer_id level
+    /// (the direction-aware bypass is in the handshake layer, not here).
+    /// This test validates that the low-level DashMap dedup still works.
+    #[test]
+    fn test_pending_connections_outbound_blocks_second_reserve() {
+        let pending = PendingConnections::new();
+        let peer_id = PeerId::from_bytes([2u8; 32]);
+
+        // Reserve as outbound
+        assert!(pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Outbound));
+        // A second reservation (regardless of direction) should fail
+        // because try_reserve_peer_id is a raw Entry::Occupied check.
+        assert!(!pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Inbound));
+    }
+
+    /// Verify that sweep_stale correctly removes old PendingPeerEntry values.
+    #[test]
+    fn test_pending_connections_sweep_stale_peer_id() {
+        let pending = PendingConnections::new();
+        let peer_id = PeerId::from_bytes([3u8; 32]);
+
+        // Insert with a backdated timestamp
+        pending.by_peer_id.insert(
+            peer_id.clone(),
+            PendingPeerEntry {
+                reserved_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+                direction: ConnectionDirection::Outbound,
+            },
+        );
+
+        // Should still block before sweep
+        assert!(!pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Outbound));
+
+        pending.sweep_stale();
+
+        // Should succeed after sweep
+        assert!(
+            pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Outbound),
+            "should succeed after sweep removes stale peer_id entry"
+        );
+    }
+
+    /// Verify the direction metadata is correctly stored in PendingPeerEntry.
+    #[test]
+    fn test_pending_peer_entry_stores_direction() {
+        let pending = PendingConnections::new();
+        let peer_id = PeerId::from_bytes([4u8; 32]);
+
+        pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Outbound);
+        let entry = pending.by_peer_id.get(&peer_id).unwrap();
+        assert_eq!(entry.direction, ConnectionDirection::Outbound);
+        drop(entry);
+
+        pending.release_peer_id(&peer_id);
+
+        pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Inbound);
+        let entry = pending.by_peer_id.get(&peer_id).unwrap();
+        assert_eq!(entry.direction, ConnectionDirection::Inbound);
     }
 
     /// Build a minimal SharedPeerState for testing preferred-peer eviction.

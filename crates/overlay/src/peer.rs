@@ -26,6 +26,7 @@ use crate::{
     codec::helpers,
     connection::{Connection, ConnectionDirection},
     flow_control::{msg_body_size, FlowControlConfig, INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES},
+    manager::PendingPeerEntry,
     metrics::{OverlayMessageKind, OverlayMetrics},
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
 };
@@ -208,6 +209,10 @@ pub struct Peer {
     /// so per-peer increments aggregate into the overlay totals exposed via
     /// `/metrics`.
     metrics: Arc<OverlayMetrics>,
+    /// Whether this peer currently owns a pending_peer_id reservation.
+    /// Used to conditionally release the reservation on cleanup; inbound
+    /// peers that bypassed reservation (mutual-dial) must not release it.
+    holds_pending_peer_id: bool,
 }
 
 impl Peer {
@@ -247,6 +252,7 @@ impl Peer {
             auth,
             stats: Arc::new(PeerStats::default()),
             metrics,
+            holds_pending_peer_id: false,
         };
 
         // Perform handshake
@@ -265,12 +271,12 @@ impl Peer {
     ///
     /// `initial_byte_grant` is the byte capacity sent in the initial
     /// SEND_MORE_EXTENDED — typically from [`FlowControlBytesConfig::bytes_total`].
-    pub async fn connect_with_connection(
+    pub(crate) async fn connect_with_connection(
         addr: &PeerAddress,
         connection: Connection,
         local_node: LocalNode,
         auth_timeout_secs: u64,
-        pending_peer_ids: Option<Arc<DashMap<PeerId, Instant>>>,
+        pending_peer_ids: Option<Arc<DashMap<PeerId, PendingPeerEntry>>>,
         initial_byte_grant: u32,
         metrics: Arc<OverlayMetrics>,
     ) -> Result<Self> {
@@ -292,6 +298,7 @@ impl Peer {
             auth,
             stats: Arc::new(PeerStats::default()),
             metrics,
+            holds_pending_peer_id: false,
         };
 
         peer.handshake(
@@ -308,12 +315,12 @@ impl Peer {
     ///
     /// `initial_byte_grant` is the byte capacity sent in the initial
     /// SEND_MORE_EXTENDED — typically from [`FlowControlBytesConfig::bytes_total`].
-    pub async fn accept(
+    pub(crate) async fn accept(
         connection: Connection,
         local_node: LocalNode,
         timeout_secs: u64,
         banned_peers: Arc<RwLock<HashSet<PeerId>>>,
-        pending_peer_ids: Arc<DashMap<PeerId, Instant>>,
+        pending_peer_ids: Arc<DashMap<PeerId, PendingPeerEntry>>,
         initial_byte_grant: u32,
         metrics: Arc<OverlayMetrics>,
     ) -> Result<Self> {
@@ -338,6 +345,7 @@ impl Peer {
             auth,
             stats: Arc::new(PeerStats::default()),
             metrics,
+            holds_pending_peer_id: false,
         };
 
         // Perform handshake (with ban + pending-dedup checks after HELLO for inbound)
@@ -365,7 +373,7 @@ impl Peer {
         &mut self,
         auth_timeout_secs: u64,
         banned_peers: Option<Arc<RwLock<HashSet<PeerId>>>>,
-        pending_peer_ids: Option<Arc<DashMap<PeerId, Instant>>>,
+        pending_peer_ids: Option<Arc<DashMap<PeerId, PendingPeerEntry>>>,
         initial_byte_grant: u32,
     ) -> Result<()> {
         self.state = PeerState::Handshaking;
@@ -390,7 +398,11 @@ impl Peer {
                         return Err(OverlayError::PeerDuplicate(self.info.peer_id.to_string()));
                     }
                     Entry::Vacant(e) => {
-                        e.insert(Instant::now());
+                        e.insert(PendingPeerEntry {
+                            reserved_at: Instant::now(),
+                            direction: ConnectionDirection::Outbound,
+                        });
+                        self.holds_pending_peer_id = true;
                     }
                 }
             }
@@ -402,8 +414,10 @@ impl Peer {
             }
             .await;
             if let Err(e) = result {
-                if let Some(ref pending) = pending_peer_ids {
-                    pending.remove(&self.info.peer_id);
+                if self.holds_pending_peer_id {
+                    if let Some(ref pending) = pending_peer_ids {
+                        pending.remove(&self.info.peer_id);
+                    }
                 }
                 return Err(e);
             }
@@ -424,29 +438,47 @@ impl Peer {
                 }
             }
 
-            // Reserve a pending peer-ID slot immediately after HELLO reveals
-            // the remote identity. Mirrors stellar-core Peer::recvHello()
-            // which rejects duplicates against getPendingPeers() before AUTH.
-            // Without this, N concurrent connections from the same peer_id
-            // can all occupy pending slots until AUTH completes.
+            // Direction-aware pending peer-ID reservation.
+            //
+            // If the existing reservation is from an OUTBOUND handshake, this
+            // is a mutual-dial scenario: both sides dialed simultaneously.
+            // We allow the inbound to proceed — the final `register_peer`
+            // DashMap::entry ensures only one peer object is registered.
+            //
+            // If the existing reservation is from another INBOUND, this is a
+            // true duplicate (e.g. the remote opened two TCP connections) and
+            // we reject immediately to prevent resource waste.
             if let Some(ref pending) = pending_peer_ids {
                 use dashmap::mapref::entry::Entry;
                 match pending.entry(self.info.peer_id.clone()) {
-                    Entry::Occupied(_) => {
-                        warn!(
-                            "Rejected duplicate inbound peer {} — handshake already in flight",
+                    Entry::Occupied(existing) => {
+                        if existing.get().direction == ConnectionDirection::Inbound {
+                            warn!(
+                                "Rejected duplicate inbound peer {} — inbound handshake already in flight",
+                                self.info.peer_id
+                            );
+                            return Err(OverlayError::PeerDuplicate(self.info.peer_id.to_string()));
+                        }
+                        // Outbound reservation exists → mutual-dial; proceed
+                        // without taking ownership of the reservation.
+                        debug!(
+                            "Mutual-dial detected for peer {} — inbound bypassing pending reservation",
                             self.info.peer_id
                         );
-                        return Err(OverlayError::PeerDuplicate(self.info.peer_id.to_string()));
                     }
                     Entry::Vacant(e) => {
-                        e.insert(Instant::now());
+                        e.insert(PendingPeerEntry {
+                            reserved_at: Instant::now(),
+                            direction: ConnectionDirection::Inbound,
+                        });
+                        self.holds_pending_peer_id = true;
                     }
                 }
             }
 
             // Remaining handshake steps after peer_id reservation.
-            // If any step fails, clean up the pending peer_id reservation.
+            // If any step fails, clean up the pending peer_id reservation
+            // only if we own it.
             let result: Result<()> = async {
                 self.send_hello().await?;
                 self.recv_auth(auth_timeout_secs).await?;
@@ -455,8 +487,10 @@ impl Peer {
             }
             .await;
             if let Err(e) = result {
-                if let Some(ref pending) = pending_peer_ids {
-                    pending.remove(&self.info.peer_id);
+                if self.holds_pending_peer_id {
+                    if let Some(ref pending) = pending_peer_ids {
+                        pending.remove(&self.info.peer_id);
+                    }
                 }
                 return Err(e);
             }
@@ -843,6 +877,14 @@ impl Peer {
         self.info.direction
     }
 
+    /// Whether this peer owns a pending_peer_id reservation.
+    /// Used by the manager to decide whether to call `release_peer_id`
+    /// during cleanup — peers that bypassed the reservation in a
+    /// mutual-dial scenario must not release the outbound reservation.
+    pub fn holds_pending_peer_id(&self) -> bool {
+        self.holds_pending_peer_id
+    }
+
     /// Request SCP state from peer.
     pub async fn request_scp_state(&mut self, ledger_seq: u32) -> Result<()> {
         let message = StellarMessage::GetScpState(ledger_seq);
@@ -947,6 +989,7 @@ mod tests {
             auth: auth_a,
             stats: Arc::new(PeerStats::default()),
             metrics: metrics_a,
+            holds_pending_peer_id: false,
         };
         let peer_b = Peer {
             info: PeerInfo {
@@ -964,6 +1007,7 @@ mod tests {
             auth: auth_b,
             stats: Arc::new(PeerStats::default()),
             metrics: metrics_b,
+            holds_pending_peer_id: false,
         };
         (peer_a, peer_b)
     }
