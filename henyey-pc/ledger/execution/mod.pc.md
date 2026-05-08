@@ -583,51 +583,6 @@ function load_soroban_footprint(snapshot, footprint):
     state.load_entry(entry)
 ```
 
-### TransactionExecutor.apply_ledger_entry_changes
-
-"Apply changes to state WITHOUT delta tracking.
-Used during verification to sync state with CDP."
-
-```
-function apply_ledger_entry_changes(changes):
-  for each change in changes:
-    if Created or Updated or Restored:
-      state.apply_entry_no_tracking(entry)
-      if entry is ContractCode:
-        add_contract_to_cache(entry.code)
-    if Removed:
-      state.delete_entry_no_tracking(key)
-    if State:
-      "informational only, no action"
-  "Clear snapshots to prevent stale snapshot state"
-  state.commit()
-```
-
-### TransactionExecutor.apply_ledger_entry_changes_preserve_seq
-
-"Preserves the current sequence number for existing accounts.
-Needed because CDP metadata can capture sequence numbers that
-include effects from later transactions in the same ledger."
-
-```
-function apply_ledger_entry_changes_preserve_seq(changes):
-  for each change in changes:
-    if Updated:
-      if entry is Account AND exists in state:
-        our_seq = state.account.seq_num
-        state.account = new_account
-        state.account.seq_num = our_seq
-        continue
-      state.apply_entry_no_tracking(entry)
-      if ContractCode: add_contract_to_cache(code)
-    if Created or Restored:
-      state.apply_entry_no_tracking(entry)
-      if ContractCode: add_contract_to_cache(code)
-    if Removed:
-      state.delete_entry_no_tracking(key)
-  state.commit()
-```
-
 ### TransactionExecutor.apply_fee_refund
 
 ```

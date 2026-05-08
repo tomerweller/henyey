@@ -291,7 +291,7 @@ delete_account(account_id):
 
 ### set_account_no_tracking / put_account
 
-"Used during verification to sync state with CDP without affecting delta"
+"Used for test and initialization state setup."
 
 ```
 set_account_no_tracking(entry):
@@ -488,32 +488,6 @@ Key = `claimable_balance_id_to_bytes(balance_id)`. Same CRUD pattern.
 Key = `pool_id_to_bytes(pool_id)`. Same CRUD pattern.
 
 ---
-
-## No-Tracking Operations
-
-### apply_entry_no_tracking
-
-"Used during verification to sync state with CDP without affecting delta"
-
-```
-apply_entry_no_tracking(entry):
-    dispatch on entry.data type:
-        insert into appropriate map by key
-        (Ttl entries also capture bucket list snapshot)
-        ConfigSetting: no-op
-```
-
-### delete_entry_no_tracking
-
-```
-delete_entry_no_tracking(key):
-    dispatch on key type:
-        remove from appropriate map
-        ConfigSetting: no-op
-    entry_sponsorships.remove(key)
-    entry_sponsorship_ext.remove(key)
-    entry_last_modified.remove(key)
-```
 
 ---
 
