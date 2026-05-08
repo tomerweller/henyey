@@ -142,6 +142,9 @@ pub struct Simulation {
     /// constructing a real `App`.
     #[cfg(test)]
     test_nodes: HashMap<String, NodeTaskHandle>,
+    /// Test-only counter for `crank_all_nodes()` invocations.
+    #[cfg(test)]
+    crank_count: usize,
 }
 
 impl std::fmt::Debug for RunningAppNode {
@@ -186,6 +189,8 @@ impl Simulation {
             setup_for_soroban_upgrade: false,
             #[cfg(test)]
             test_nodes: HashMap::new(),
+            #[cfg(test)]
+            crank_count: 0,
         }
     }
 
@@ -1075,6 +1080,10 @@ impl Simulation {
     }
 
     pub async fn crank_all_nodes(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            self.crank_count += 1;
+        }
         if self.nodes.is_empty() {
             return false;
         }
@@ -2140,6 +2149,8 @@ mod crank_tests {
         sim.crank_for_at_most(Duration::from_secs(999), false).await;
 
         assert_eq!(sim.nodes["A"].ledger_seq, 1);
+        // Loop: 1 crank (idle → break), no final_crank.
+        assert_eq!(sim.crank_count, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2147,11 +2158,12 @@ mod crank_tests {
         let mut sim = Simulation::new(SimulationMode::OverLoopback);
         sim.add_node("A", SecretKey::from_seed(&[1u8; 32]));
 
-        // Idle exit, then final_crank triggers one extra crank_all_nodes
-        // (still no work since single node can't advance).
+        // Idle exit, then final_crank triggers one extra crank_all_nodes.
         sim.crank_for_at_most(Duration::from_secs(999), true).await;
 
         assert_eq!(sim.nodes["A"].ledger_seq, 1);
+        // Loop: 1 crank (idle → break) + 1 final_crank = 2.
+        assert_eq!(sim.crank_count, 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2187,10 +2199,12 @@ mod crank_tests {
         let mut sim = Simulation::new(SimulationMode::OverLoopback);
         sim.add_node("A", SecretKey::from_seed(&[1u8; 32]));
 
-        // No idle exit (stop_when_idle=false), deadline=start → breaks.
+        // No idle exit (stop_when_idle=false), deadline=start → breaks after one crank.
         sim.crank_for_at_least(Duration::ZERO, false).await;
 
         assert_eq!(sim.nodes["A"].ledger_seq, 1);
+        // Loop: 1 crank (no work, no idle exit, deadline hit → break), no final_crank.
+        assert_eq!(sim.crank_count, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2198,10 +2212,12 @@ mod crank_tests {
         let mut sim = Simulation::new(SimulationMode::OverLoopback);
         sim.add_node("A", SecretKey::from_seed(&[1u8; 32]));
 
-        // Idle + final crank (no work either way).
+        // Idle + final crank.
         sim.crank_for_at_least(Duration::ZERO, true).await;
 
         assert_eq!(sim.nodes["A"].ledger_seq, 1);
+        // Loop: 1 crank + 1 final_crank = 2.
+        assert_eq!(sim.crank_count, 2);
     }
 
     #[tokio::test(start_paused = true)]
