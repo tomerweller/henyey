@@ -70,9 +70,15 @@ HEALTH=$(curl -s -m 5 -X POST "http://localhost:$MONITOR_RPC_PORT" \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}')
 METRICS=$(curl -s -m 5 "http://localhost:$MONITOR_ADMIN_PORT/metrics")
-PID=$(pgrep -f 'henyey.*run' | head -1)
-UPTIME_SEC=$(ps -o etimes= -p "$PID" | tr -d ' ')
-RSS_KB=$(ps -o rss= -p "$PID" | tr -d ' ')
+source "$(git rev-parse --show-toplevel)/scripts/lib/monitor-decisions.sh"
+PID=$(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")
+if [ -n "$PID" ]; then
+  UPTIME_SEC=$(ps -o etimes= -p "$PID" | tr -d ' ')
+  RSS_KB=$(ps -o rss= -p "$PID" | tr -d ' ')
+else
+  UPTIME_SEC=""
+  RSS_KB=""
+fi
 ```
 
 Extract:

@@ -248,7 +248,7 @@ recovery is considered complete regardless):
 
 ```bash
 CRASH_RECOVERY=no
-PID=$(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)
+PID=$(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")
 if [ -n "$PID" ]; then
   uptime_sec=$(ps -o etimes= -p "$PID" 2>/dev/null | tr -d ' ')
   uptime_sec=${uptime_sec:-0}
@@ -330,7 +330,7 @@ ticks so STUCK can be detected by a single invocation:
   timestamp is more than 600s old, flag STUCK.
 - If the ledger has advanced or the file is missing, overwrite
   `/home/tomer/data/$MONITOR_SESSION_ID/last_ledger` with `"<current-ledger>|<now>"`.
-- Check node uptime: `ps -o etime= -p $(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)`.
+- Check node uptime: `ps -o etime= -p $(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")`.
   Active deadline: **15m** when `FRESH_START=no` and `CRASH_RECOVERY=no`,
   **60m** when `CRASH_RECOVERY=yes`, **4h** when `FRESH_START=yes`.
 - "Real-time sync" means RPC `age < 30s` — NOT just heartbeat event `gap=0`. Gap is
@@ -348,7 +348,7 @@ ticks so STUCK can be detected by a single invocation:
 - **Fresh-start carveout (`FRESH_START=yes`, uptime < 4h)**: a large gap is
   expected during initial bucket apply — report CATCHING UP, not SYNC FAILURE.
 
-**(3) Process alive** — find by `comm` not `pgrep -f`: `for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done`. The earlier `pgrep -f 'henyey.*run'` form is unsafe in environments with parallel `claude --print` agent processes whose prompt args contain "henyey" — they false-match, yielding wrong PIDs for kill/restart. If not running: Rotate-log with suffix `crashed`, then before Relaunch evaluate the **(3a) Repeated-FATAL state-wipe trigger** below.
+**(3) Process alive** — find by `/proc/exe` path matching via `_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID"` (from `scripts/lib/monitor-decisions.sh`, sourced at skill init). This validates that the process binary is exactly `$HOME/data/$MONITOR_SESSION_ID/cargo-target/release/henyey` (including `(deleted)` suffix after rebuilds), scoping detection to the current session. Historical note: the original `pgrep -f 'henyey.*run'` form was abandoned because it false-matched parallel `claude --print` agent processes; the intermediate `comm`-only replacement was abandoned because it false-matched any `henyey` process regardless of session (cross-session false positive, see #2467). If not running: Rotate-log with suffix `crashed`, then before Relaunch evaluate the **(3a) Repeated-FATAL state-wipe trigger** below.
 
 **(3a) Repeated-FATAL state-wipe trigger** — a kill-loop on the same persisted state means the local lcl is corrupt and forward replay can never reconcile. When this happens, restart-without-wipe just accumulates crashed logs and stays offline. Detect and self-heal once per kill-loop:
 
@@ -372,7 +372,7 @@ When triggered:
 
 ```bash
 # Stop any partially-running process first (defensive — should already be dead)
-PID=$(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)
+PID=$(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")
 [ -n "$PID" ] && kill "$PID" && sleep 5 && kill -0 "$PID" 2>/dev/null && kill -9 "$PID"
 
 # Wipe the corrupt persisted state (recoverable from public network archive)
@@ -403,8 +403,8 @@ Evaluate (3c) BEFORE (3b) when the process IS alive. If (3c) fires, skip (3b)
 logs_dir=/home/tomer/data/$MONITOR_SESSION_ID/logs
 log_file="$logs_dir/monitor.log"
 
-# PID (same comm-based detection as check (3); skip (3c) if empty)
-PID=$(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)
+# PID (session-scoped via _find_session_process; skip (3c) if empty)
+PID=$(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")
 [ -z "$PID" ] && : # skip — dead-process path (3a) handles this
 
 # Process start time from /proc/$PID/stat mtime
@@ -473,7 +473,7 @@ Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-s
 Recurrence-after-fix → NEW issue, not a comment on a closed one. Known prior
 incidents: #1904, #1873, #1921, #1949.
 
-**(4) Memory** — `ps -o rss= -p $(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)`, convert to MB.
+**(4) Memory** — `ps -o rss= -p $(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")`, convert to MB.
 
 - If `RSS > 12 GB`, flag HIGH MEMORY (report-only; no restart).
 - **Restart condition** — restart only if ALL hold (this gates on system
