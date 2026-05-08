@@ -1016,19 +1016,13 @@ fn map_storage_changes(
             // the old code was a no-op (TTL branch preempted deletion, then
             // ttl_extended check caused skip). We preserve parity by skipping.
             let kind = if is_modification {
-                let raw_bytes = change.encoded_new_value.as_ref().unwrap();
-                let entry = LedgerEntry::from_xdr(raw_bytes.as_slice(), Limits::none())
-                    .map_err(|_| make_error("failed to decode LedgerEntry from storage change"))?;
-                let reserialized_len = henyey_common::xdr_encoded_len(&entry);
-                if reserialized_len != raw_bytes.len() {
-                    eprintln!(
-                        "DIAG_ROUNDTRIP key={:?} raw_len={} reserialized_len={} diff={}",
-                        std::mem::discriminant(&key),
-                        raw_bytes.len(),
-                        reserialized_len,
-                        raw_bytes.len() as i64 - reserialized_len as i64,
-                    );
-                }
+                let entry = change
+                    .encoded_new_value
+                    .as_ref()
+                    .map(|bytes| LedgerEntry::from_xdr(bytes, Limits::none()))
+                    .transpose()
+                    .map_err(|_| make_error("failed to decode LedgerEntry from storage change"))?
+                    .expect("is_modification implies encoded_new_value is Some");
                 StorageChangeKind::Modified {
                     entry: Box::new(entry),
                     live_until: change.ttl_new_live_until_ledger,

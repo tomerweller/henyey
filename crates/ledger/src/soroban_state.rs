@@ -159,7 +159,7 @@ fn build_rent_budget_p25(rent_config: Option<&SorobanRentConfig>) -> BudgetP25 {
 
 /// Build a p26 Budget from on-chain cost parameters (for protocol 26+).
 ///
-/// P26 host uses stellar-xdr 25.0.0 — XDR byte roundtrip needed for ContractCostParams.
+/// P26 host uses stellar-xdr 26.0.0 (same as workspace) — no conversion needed.
 fn build_rent_budget_p26(
     rent_config: Option<&SorobanRentConfig>,
 ) -> soroban_env_host26::budget::Budget {

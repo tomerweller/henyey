@@ -422,7 +422,7 @@ impl LedgerStateManager {
         use stellar_xdr::curr::{
             LedgerEntryData, LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance,
             LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyData, LedgerKeyLiquidityPool,
-            LedgerKeyTrustLine,
+            LedgerKeyTrustLine, LedgerKeyTtl,
         };
 
         // Extract metadata from the LedgerEntry envelope so subsequent transactions
@@ -539,6 +539,9 @@ impl LedgerStateManager {
             }
             LedgerEntryData::Ttl(ttl) => {
                 let key = ttl.key_hash.clone();
+                let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
+                    key_hash: ttl.key_hash.clone(),
+                });
                 // Capture the bucket list TTL value for Soroban.
                 // Only capture if not already present - this ensures we keep the original
                 // bucket list value even if the entry is reloaded later.
@@ -546,6 +549,9 @@ impl LedgerStateManager {
                     .entry(key.clone())
                     .or_insert(ttl.live_until_ledger_seq);
                 self.ttl_entries.insert(key, ttl.clone());
+                // TTL entries never have sponsorship ext (always V0), but
+                // last_modified must still be stored for correct reconstruction.
+                self.insert_last_modified(ledger_key, last_modified);
             }
             LedgerEntryData::ConfigSetting(_) => {
                 // Config settings not tracked
