@@ -84,13 +84,7 @@ async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let mut diag = collect_node_diagnostics(sim).await;
-    for id in sim.app_node_ids() {
-        let finished = sim.app_task_finished(&id);
-        let status = sim.app_task_status(&id).await;
-        diag.push_str(&format!(
-            "\n  {id}: task_finished={finished:?}, task_status={status:?}"
-        ));
-    }
+    diag.push_str(&sim.node_task_diagnostics().await);
     assert!(
         sim.have_all_app_nodes_externalized(target_ledger, 1),
         "timed out after {timeout:?} waiting for ledger {target_ledger}.{diag}"
@@ -120,13 +114,7 @@ async fn manual_close_until(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let mut diag = collect_node_diagnostics(sim).await;
-    for id in sim.app_node_ids() {
-        let finished = sim.app_task_finished(&id);
-        let status = sim.app_task_status(&id).await;
-        diag.push_str(&format!(
-            "\n  {id}: task_finished={finished:?}, task_status={status:?}"
-        ));
-    }
+    diag.push_str(&sim.node_task_diagnostics().await);
     if let Some(err) = &last_err {
         diag.push_str(&format!("\n  last manual_close error: {err}"));
     }
@@ -1043,6 +1031,106 @@ async fn test_stabilize_app_tcp_connectivity_returns_error_on_timeout() {
         err_msg.contains("not all apps reached"),
         "expected per-node detail in error: {err_msg}"
     );
+    sim.stop_all_nodes().await.ok();
+}
+
+#[tokio::test]
+async fn test_task_exit_detection_during_wait_for_connectivity() {
+    let mut sim = Topologies::core3(SimulationMode::OverTcp);
+    sim.populate_app_nodes_from_existing(67);
+    sim.start_all_nodes().await;
+
+    // Abort one node's task so it exits (but remains in running_apps).
+    let ids = sim.app_node_ids();
+    let victim = &ids[0];
+    sim.abort_node_task(victim);
+
+    // Wait for the task to register as finished.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if sim.app_task_finished(victim) == Some(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        sim.app_task_finished(victim),
+        Some(true),
+        "node {victim} task did not exit after abort"
+    );
+
+    // Call wait_for_app_connectivity with a long timeout — should fail fast.
+    let start = tokio::time::Instant::now();
+    let result = sim
+        .wait_for_app_connectivity(1, Duration::from_secs(10))
+        .await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "expected error from exited node");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("task exited"),
+        "expected 'task exited' in error: {err_msg}"
+    );
+    assert!(
+        err_msg.contains(victim),
+        "expected node ID '{victim}' in error: {err_msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "fail-fast took too long: {elapsed:?}"
+    );
+
+    sim.stop_all_nodes().await.ok();
+}
+
+#[tokio::test]
+async fn test_task_exit_detection_during_stabilize_connectivity() {
+    let mut sim = Topologies::core3(SimulationMode::OverTcp);
+    sim.populate_app_nodes_from_existing(67);
+    sim.start_all_nodes().await;
+
+    // Abort one node's task so it exits (but remains in running_apps).
+    let ids = sim.app_node_ids();
+    let victim = &ids[0];
+    sim.abort_node_task(victim);
+
+    // Wait for the task to register as finished.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if sim.app_task_finished(victim) == Some(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        sim.app_task_finished(victim),
+        Some(true),
+        "node {victim} task did not exit after abort"
+    );
+
+    // Call stabilize_app_tcp_connectivity with a long timeout — should fail fast.
+    let start = tokio::time::Instant::now();
+    let result = sim
+        .stabilize_app_tcp_connectivity(1, Duration::from_secs(10))
+        .await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "expected error from exited node");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("task exited"),
+        "expected 'task exited' in error: {err_msg}"
+    );
+    assert!(
+        err_msg.contains(victim),
+        "expected node ID '{victim}' in error: {err_msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "fail-fast took too long: {elapsed:?}"
+    );
+
     sim.stop_all_nodes().await.ok();
 }
 

@@ -526,9 +526,61 @@ impl Simulation {
             .map(|n| n.handle.is_finished())
     }
 
+    /// Abort a node's task without removing it from `running_apps`.
+    ///
+    /// The handle remains in place so `app_task_finished` returns
+    /// `Some(true)` — useful for testing fail-fast crash detection.
+    pub fn abort_node_task(&self, node_id: &str) {
+        if let Some(node) = self.running_apps.get(node_id) {
+            node.handle.abort();
+        }
+    }
+
     pub async fn app_task_status(&self, node_id: &str) -> Option<Result<(), String>> {
         let node = self.running_apps.get(node_id)?;
         node.status.read().await.clone()
+    }
+
+    /// Bail immediately if any running app node's task has exited.
+    ///
+    /// Sorted iteration ensures deterministic error output.
+    async fn check_any_node_task_exited(&self) -> anyhow::Result<()> {
+        let mut ids: Vec<&String> = self.running_apps.keys().collect();
+        ids.sort();
+        for id in ids {
+            if self.app_task_finished(id) == Some(true) {
+                let status = self.app_task_status(id).await;
+                anyhow::bail!(
+                    "node {id} task exited during connectivity wait \
+                     (task_status: {status:?})"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Return sorted per-node task diagnostics for all known nodes.
+    ///
+    /// Covers all nodes from `app_specs` (via `app_node_ids`), including
+    /// nodes removed from `running_apps`. Removed/not-started nodes show
+    /// `<not running>`.
+    pub async fn node_task_diagnostics(&self) -> String {
+        let mut diag = String::new();
+        for id in self.app_node_ids() {
+            let finished = self.app_task_finished(&id);
+            let status = self.app_task_status(&id).await;
+            match finished {
+                Some(_) => {
+                    diag.push_str(&format!(
+                        "\n  {id}: task_finished={finished:?}, task_status={status:?}"
+                    ));
+                }
+                None => {
+                    diag.push_str(&format!("\n  {id}: <not running>"));
+                }
+            }
+        }
+        diag
     }
 
     pub async fn app_debug_stats(&self, node_id: &str) -> Option<SimulationDebugStats> {
@@ -543,14 +595,21 @@ impl Simulation {
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            self.check_any_node_task_exited().await?;
+
             let mut connected = true;
-            for id in self.running_apps.keys() {
+            let mut ids: Vec<&String> = self.running_apps.keys().collect();
+            ids.sort();
+            for id in &ids {
                 if self.app_peer_count(id).await.unwrap_or(0) < min_peers {
                     connected = false;
                     break;
                 }
             }
             if connected {
+                // Re-check: a node may have exited between the top-of-loop
+                // check and the peer-count scan (stale counts).
+                self.check_any_node_task_exited().await?;
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -562,13 +621,16 @@ impl Simulation {
             .await;
         }
         let mut counts = Vec::new();
-        for id in self.running_apps.keys() {
+        let mut ids: Vec<&String> = self.running_apps.keys().collect();
+        ids.sort();
+        for id in &ids {
             let count = self.app_peer_count(id).await.unwrap_or(0);
             counts.push(format!("{id}={count}"));
         }
+        let task_diag = self.node_task_diagnostics().await;
         anyhow::bail!(
             "wait_for_app_connectivity: not all apps reached {min_peers} peers \
-             within {timeout:?} (current counts: {})",
+             within {timeout:?} (current counts: {}){task_diag}",
             counts.join(", ")
         )
     }
@@ -607,19 +669,26 @@ impl Simulation {
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            self.check_any_node_task_exited().await?;
+
             if let Err(err) = self.repair_app_connectivity().await {
                 if !err.to_string().contains("overlay not started") {
                     return Err(err);
                 }
+                // "overlay not started" can mask a task exit — re-check.
+                self.check_any_node_task_exited().await?;
             }
             let remaining = deadline.duration_since(tokio::time::Instant::now());
             let probe_timeout = remaining.min(Duration::from_secs(1));
-            if self
+            match self
                 .wait_for_app_connectivity(min_peers, probe_timeout)
                 .await
-                .is_ok()
             {
-                return Ok(());
+                Ok(()) => return Ok(()),
+                Err(_) => {
+                    // Distinguish fatal task exit from retryable probe timeout.
+                    self.check_any_node_task_exited().await?;
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 break;
