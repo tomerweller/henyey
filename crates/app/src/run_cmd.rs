@@ -373,6 +373,11 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
     // When set, skip all catchup and restore the node directly from DB state.
     let force_scp = app.check_force_scp().await;
     if force_scp {
+        // Parity: stellar-core ApplicationImpl.cpp:658–661 rejects startup
+        // when FORCE_SCP=true and NODE_IS_VALIDATOR=false.
+        if !app.config().node.is_validator {
+            anyhow::bail!("force_scp is set but node is not configured as a validator");
+        }
         tracing::info!("force-scp flag detected, bootstrapping from DB state");
         app.bootstrap_from_db().await?;
         app.clear_force_scp().await;

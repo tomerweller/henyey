@@ -2339,6 +2339,13 @@ async fn cmd_compare_checkpoint(
 /// bootstrap consensus from the current LCL. This matches stellar-core's
 /// `force-scp` behavior for standalone single-node networks.
 fn cmd_force_scp(config: &AppConfig) -> anyhow::Result<()> {
+    // Parity: stellar-core rejects FORCE_SCP when NODE_IS_VALIDATOR is false
+    // (ApplicationImpl.cpp:658–661). Guard here as defense-in-depth so the
+    // flag is never persisted for a non-validator config.
+    if !config.node.is_validator {
+        anyhow::bail!("force_scp cannot be set: node is not configured as a validator");
+    }
+
     let db_path = &config.database.path;
     if !db_path.exists() {
         anyhow::bail!("Database not found at {:?}. Run new-db first.", db_path);
@@ -4313,5 +4320,87 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
 
         // Should pass validation with the injected overrides.
         result.expect("config with injected validator override should pass validation");
+    }
+
+    // =========================================================================
+    // force_scp guard tests
+    // =========================================================================
+
+    #[test]
+    fn test_cmd_force_scp_rejects_non_validator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Create and initialize the database so cmd_force_scp finds it.
+        let db = henyey_db::Database::open(&db_path).unwrap();
+        drop(db);
+
+        let mut config = AppConfig::testnet();
+        config.database.path = db_path.clone();
+        config.node.is_validator = false;
+
+        let result = cmd_force_scp(&config);
+        assert!(result.is_err(), "should reject force_scp on non-validator");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not configured as a validator"),
+            "error should mention validator requirement, got: {err_msg}"
+        );
+
+        // Verify the flag was NOT written to the database.
+        let db = henyey_db::Database::open(&db_path).unwrap();
+        let flag = db
+            .with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                use henyey_db::schema::state_keys;
+                Ok(conn.get_state(state_keys::FORCE_SCP)?)
+            })
+            .unwrap();
+        assert!(
+            flag.is_none(),
+            "force_scp flag should not be written for non-validator"
+        );
+    }
+
+    #[test]
+    fn test_cmd_force_scp_accepts_validator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Create and initialize the database.
+        let db = henyey_db::Database::open(&db_path).unwrap();
+        // Ensure storestate table exists.
+        db.with_connection(|conn| {
+            use henyey_db::queries::StateQueries;
+            use henyey_db::schema::state_keys;
+            conn.set_state(state_keys::FORCE_SCP, "false")
+        })
+        .unwrap();
+        drop(db);
+
+        let mut config = AppConfig::testnet();
+        config.database.path = db_path.clone();
+        config.node.is_validator = true;
+
+        let result = cmd_force_scp(&config);
+        assert!(
+            result.is_ok(),
+            "should accept force_scp on validator: {result:?}"
+        );
+
+        // Verify the flag WAS written to the database.
+        let db = henyey_db::Database::open(&db_path).unwrap();
+        let flag = db
+            .with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                use henyey_db::schema::state_keys;
+                Ok(conn.get_state(state_keys::FORCE_SCP)?)
+            })
+            .unwrap();
+        assert_eq!(
+            flag.as_deref(),
+            Some("true"),
+            "force_scp flag should be set for validator"
+        );
     }
 }
