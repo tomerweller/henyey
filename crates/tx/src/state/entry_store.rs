@@ -95,8 +95,7 @@ where
         &self.entries
     }
 
-    /// Mutable access to the live entries map (for `apply_entry_no_tracking`,
-    /// `load_entry`, and cache clearing).
+    /// Mutable access to the live entries map (for `load_entry` and direct entry insertion).
     pub fn entries_mut(&mut self) -> &mut HashMap<K, V> {
         &mut self.entries
     }
