@@ -247,6 +247,10 @@ async fn wait_for_peer_count(sim: &Simulation, node_id: &str, expected: usize, t
 /// Checks ledger-sequence spread (not hash agreement). In a partition scenario,
 /// nodes without quorum cannot advance their ledger sequence.
 ///
+/// Also panics immediately if any node's task exits unexpectedly during the
+/// observation window (crash detection), preventing a false success where the
+/// partition holds because a node died rather than because quorum was broken.
+///
 /// Observation window: should exceed the time a non-partitioned network would
 /// take to externalize (typically <2s with manual_close). 5s provides 2.5× margin.
 async fn assert_not_all_nodes_externalized(
@@ -272,8 +276,15 @@ async fn assert_not_all_nodes_externalized(
                 topo_diag = topo_str.join("; "),
             );
         }
+        check_any_app_node_crashed(
+            sim,
+            "observing that not all nodes externalized (partition assertion)",
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    // Final check: catch a crash in the last sleep interval.
+    check_any_app_node_crashed(sim, "final check after partition observation window").await;
 }
 
 async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {
@@ -1129,6 +1140,66 @@ async fn test_task_exit_detection_during_stabilize_connectivity() {
     assert!(
         elapsed < Duration::from_secs(3),
         "fail-fast took too long: {elapsed:?}"
+    );
+
+    sim.stop_all_nodes().await.ok();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_task_exit_detection_during_partition_assertion() {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let mut sim = Topologies::core3(SimulationMode::OverTcp);
+    sim.populate_app_nodes_from_existing(67);
+    sim.start_all_nodes().await;
+
+    // Abort one node's task so it exits (but remains in running_apps).
+    let ids = sim.app_node_ids();
+    let victim = ids[0].clone();
+    sim.abort_node_task(&victim);
+
+    // Wait for the task to register as finished.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if sim.app_task_finished(&victim) == Some(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        sim.app_task_finished(&victim),
+        Some(true),
+        "node {victim} task did not exit after abort"
+    );
+
+    // Call assert_not_all_nodes_externalized with an unattainable target
+    // ledger so it can only panic from crash detection, not from the
+    // "all nodes externalized" path.
+    let result = AssertUnwindSafe(assert_not_all_nodes_externalized(
+        &sim,
+        9999,
+        1,
+        Duration::from_secs(5),
+    ))
+    .catch_unwind()
+    .await;
+
+    assert!(result.is_err(), "expected panic from crashed node");
+    let panic_payload = result.unwrap_err();
+    let msg = panic_payload
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        msg.contains("task exited"),
+        "expected 'task exited' in panic: {msg}"
+    );
+    assert!(
+        msg.contains(&victim),
+        "expected node ID '{victim}' in panic: {msg}"
     );
 
     sim.stop_all_nodes().await.ok();
