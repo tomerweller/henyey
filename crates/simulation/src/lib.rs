@@ -105,10 +105,18 @@ struct AppNodeSpec {
     peer_port: Option<u16>,
 }
 
-struct RunningAppNode {
-    app: Arc<App>,
+/// Task handle and exit status for a running node.
+///
+/// Grouped so that crash-detection (`find_exited_node`, `app_task_finished`,
+/// `app_task_status`) can operate on task state without touching the `App`.
+pub(crate) struct NodeTaskHandle {
     handle: JoinHandle<anyhow::Result<()>>,
     status: Arc<tokio::sync::RwLock<Option<Result<(), String>>>>,
+}
+
+struct RunningAppNode {
+    app: Arc<App>,
+    task: NodeTaskHandle,
     _data_dir: Arc<TempDir>,
     peer_port: u16,
 }
@@ -128,6 +136,12 @@ pub struct Simulation {
     ///
     /// Matches stellar-core `Simulation::mSetupForSorobanUpgrade`.
     setup_for_soroban_upgrade: bool,
+    /// Test-only task handles for mock nodes. `find_exited_node`,
+    /// `app_task_finished`, and `app_task_status` check this map
+    /// before `running_apps`, enabling crash-detection tests without
+    /// constructing a real `App`.
+    #[cfg(test)]
+    test_nodes: HashMap<String, NodeTaskHandle>,
 }
 
 impl std::fmt::Debug for RunningAppNode {
@@ -170,6 +184,8 @@ impl Simulation {
             root_sequence: 1,
             overlay_connection_factory: None,
             setup_for_soroban_upgrade: false,
+            #[cfg(test)]
+            test_nodes: HashMap::new(),
         }
     }
 
@@ -366,7 +382,7 @@ impl Simulation {
             node.app.shutdown();
         }
         for (id, node) in running.drain() {
-            let mut handle = node.handle;
+            let mut handle = node.task.handle;
             let join = tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
             match join {
                 Ok(result) => {
@@ -384,7 +400,7 @@ impl Simulation {
         self.disconnect_node_from_peers(node_id).await?;
         if let Some(node) = self.running_apps.remove(node_id) {
             node.app.shutdown();
-            let mut handle = node.handle;
+            let mut handle = node.task.handle;
             let join = tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
             if join.is_err() {
                 handle.abort();
@@ -553,9 +569,13 @@ impl Simulation {
     }
 
     pub fn app_task_finished(&self, node_id: &str) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(th) = self.test_nodes.get(node_id) {
+            return Some(th.handle.is_finished());
+        }
         self.running_apps
             .get(node_id)
-            .map(|n| n.handle.is_finished())
+            .map(|n| n.task.handle.is_finished())
     }
 
     /// Abort a node's task without removing it from `running_apps`.
@@ -563,14 +583,23 @@ impl Simulation {
     /// The handle remains in place so `app_task_finished` returns
     /// `Some(true)` — useful for testing fail-fast crash detection.
     pub fn abort_node_task(&self, node_id: &str) {
+        #[cfg(test)]
+        if let Some(th) = self.test_nodes.get(node_id) {
+            th.handle.abort();
+            return;
+        }
         if let Some(node) = self.running_apps.get(node_id) {
-            node.handle.abort();
+            node.task.handle.abort();
         }
     }
 
     pub async fn app_task_status(&self, node_id: &str) -> Option<Result<(), String>> {
+        #[cfg(test)]
+        if let Some(th) = self.test_nodes.get(node_id) {
+            return th.status.read().await.clone();
+        }
         let node = self.running_apps.get(node_id)?;
-        node.status.read().await.clone()
+        node.task.status.read().await.clone()
     }
 
     /// Bail immediately if any running app node's task has exited.
@@ -1338,8 +1367,7 @@ impl Simulation {
 
         Ok(RunningAppNode {
             app,
-            handle,
-            status,
+            task: NodeTaskHandle { handle, status },
             _data_dir: data_dir,
             peer_port,
         })
@@ -1885,4 +1913,26 @@ fn build_genesis_entries(
 fn root_secret(network_passphrase: &str) -> SecretKey {
     let network_id = NetworkId::from_passphrase(network_passphrase);
     SecretKey::from_seed(network_id.as_bytes())
+}
+
+#[cfg(test)]
+impl Simulation {
+    /// Insert a mock running node whose task is the given handle.
+    ///
+    /// Only `handle` and `status` are functional — no real `App` is created.
+    /// Used by `poll.rs` unit tests for lightweight crash-detection testing.
+    pub(crate) fn insert_test_node(
+        &mut self,
+        node_id: impl Into<String>,
+        handle: JoinHandle<anyhow::Result<()>>,
+        status: Option<Result<(), String>>,
+    ) {
+        self.test_nodes.insert(
+            node_id.into(),
+            NodeTaskHandle {
+                handle,
+                status: Arc::new(tokio::sync::RwLock::new(status)),
+            },
+        );
+    }
 }
