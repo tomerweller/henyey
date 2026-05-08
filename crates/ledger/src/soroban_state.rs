@@ -159,8 +159,7 @@ fn build_rent_budget_p25(rent_config: Option<&SorobanRentConfig>) -> BudgetP25 {
 
 /// Build a p26 Budget from on-chain cost parameters (for protocol 26+).
 ///
-/// soroban-env-host-p26 uses stellar-xdr 26.0.0 (same as workspace), so
-/// `ContractCostParams` types are identical — no XDR roundtrip needed.
+/// P26 host uses stellar-xdr 25.0.0 — XDR byte roundtrip needed for ContractCostParams.
 fn build_rent_budget_p26(
     rent_config: Option<&SorobanRentConfig>,
 ) -> soroban_env_host26::budget::Budget {
@@ -173,14 +172,11 @@ fn build_rent_budget_p26(
 
     let instruction_limit = config.tx_max_instructions.saturating_mul(2);
     let memory_limit = config.tx_max_memory_bytes.saturating_mul(2);
-    // p26 uses stellar-xdr 26.0.0 — same as workspace. Direct clone, no conversion.
-    let cpu_params: soroban_env_host26::xdr::ContractCostParams = config.cpu_cost_params.clone();
-    let mem_params: soroban_env_host26::xdr::ContractCostParams = config.mem_cost_params.clone();
     soroban_env_host26::budget::Budget::try_from_configs(
         instruction_limit,
         memory_limit,
-        cpu_params,
-        mem_params,
+        config.cpu_cost_params.clone(),
+        config.mem_cost_params.clone(),
     )
     .unwrap_or_else(|_| soroban_env_host26::budget::Budget::default())
 }
@@ -899,10 +895,9 @@ impl InMemorySorobanState {
             };
         }
         // Protocol >= 26: use p26 host (86 cost types).
-        // p26 uses stellar-xdr 26.0.0 (same as workspace) — no conversion needed.
+        // P26 host uses stellar-xdr 26.0.0 (same as workspace) — no conversion needed.
         let budget = build_rent_budget_p26(rent_config);
-        let p26_entry: soroban_env_host26::xdr::LedgerEntry = entry.clone();
-        soroban_env_host26::e2e_invoke::entry_size_for_rent(&budget, &p26_entry, xdr_size)
+        soroban_env_host26::e2e_invoke::entry_size_for_rent(&budget, entry, xdr_size)
             .unwrap_or(xdr_size)
     }
 

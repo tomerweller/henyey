@@ -419,41 +419,123 @@ impl LedgerStateManager {
     /// This is used during verification to sync state with CDP without
     /// affecting the delta computation for subsequent transactions.
     pub fn apply_entry_no_tracking(&mut self, entry: &stellar_xdr::curr::LedgerEntry) {
-        use stellar_xdr::curr::LedgerEntryData;
+        use stellar_xdr::curr::{
+            LedgerEntryData, LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance,
+            LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyData, LedgerKeyLiquidityPool,
+            LedgerKeyTrustLine,
+        };
+
+        // Extract metadata from the LedgerEntry envelope so subsequent transactions
+        // see the correct last_modified_ledger_seq and sponsorship ext when the entry
+        // is reconstructed via `get_entry()`.
+        let has_sponsorship_ext = matches!(entry.ext, stellar_xdr::curr::LedgerEntryExt::V1(_));
+        let sponsor = super::sponsorship_from_entry_ext(entry);
+        let last_modified = entry.last_modified_ledger_seq;
+
         match &entry.data {
             LedgerEntryData::Account(acc) => {
+                let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+                    account_id: acc.account_id.clone(),
+                });
                 self.accounts.insert(acc.account_id.clone(), acc.clone());
+                self.update_metadata_no_tracking(
+                    ledger_key,
+                    last_modified,
+                    has_sponsorship_ext,
+                    sponsor,
+                );
             }
             LedgerEntryData::Trustline(tl) => {
-                let key = (tl.account_id.clone(), tl.asset.clone());
-                self.trustlines.insert(key, tl.clone());
+                let map_key = (tl.account_id.clone(), tl.asset.clone());
+                let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+                    account_id: tl.account_id.clone(),
+                    asset: tl.asset.clone(),
+                });
+                self.trustlines.insert(map_key, tl.clone());
+                self.update_metadata_no_tracking(
+                    ledger_key,
+                    last_modified,
+                    has_sponsorship_ext,
+                    sponsor,
+                );
             }
             LedgerEntryData::Offer(_) => {
+                // Offers store metadata within OfferStore already (insert_from_ledger_entry
+                // handles has_ext and last_modified internally).
                 let mut store = self.offer_store_lock();
                 store.insert_from_ledger_entry(entry);
             }
             LedgerEntryData::Data(data) => {
                 let name = data_name_to_string(&data.data_name);
                 let key = (data.account_id.clone(), name);
+                let ledger_key = LedgerKey::Data(LedgerKeyData {
+                    account_id: data.account_id.clone(),
+                    data_name: data.data_name.clone(),
+                });
                 self.data_entries.entries_mut().insert(key, data.clone());
+                self.update_metadata_no_tracking(
+                    ledger_key,
+                    last_modified,
+                    has_sponsorship_ext,
+                    sponsor,
+                );
             }
             LedgerEntryData::ClaimableBalance(cb) => {
-                let key = cb.balance_id.clone();
+                let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                    balance_id: cb.balance_id.clone(),
+                });
                 self.claimable_balances
                     .entries_mut()
-                    .insert(key, cb.clone());
+                    .insert(cb.balance_id.clone(), cb.clone());
+                self.update_metadata_no_tracking(
+                    ledger_key,
+                    last_modified,
+                    has_sponsorship_ext,
+                    sponsor,
+                );
             }
             LedgerEntryData::LiquidityPool(lp) => {
-                let key = lp.liquidity_pool_id.clone();
-                self.liquidity_pools.entries_mut().insert(key, lp.clone());
+                let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+                    liquidity_pool_id: lp.liquidity_pool_id.clone(),
+                });
+                self.liquidity_pools
+                    .entries_mut()
+                    .insert(lp.liquidity_pool_id.clone(), lp.clone());
+                self.update_metadata_no_tracking(
+                    ledger_key,
+                    last_modified,
+                    has_sponsorship_ext,
+                    sponsor,
+                );
             }
             LedgerEntryData::ContractData(cd) => {
                 let key = StorageKey::new(cd.contract.clone(), cd.key.clone(), cd.durability);
+                let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+                    contract: cd.contract.clone(),
+                    key: cd.key.clone(),
+                    durability: cd.durability,
+                });
                 self.contract_data.entries_mut().insert(key, cd.clone());
+                self.update_metadata_no_tracking(
+                    ledger_key,
+                    last_modified,
+                    has_sponsorship_ext,
+                    sponsor,
+                );
             }
             LedgerEntryData::ContractCode(cc) => {
-                let key = cc.hash.clone();
-                self.contract_code.entries_mut().insert(key, cc.clone());
+                let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+                    hash: cc.hash.clone(),
+                });
+                self.contract_code
+                    .entries_mut()
+                    .insert(cc.hash.clone(), cc.clone());
+                self.update_metadata_no_tracking(
+                    ledger_key,
+                    last_modified,
+                    has_sponsorship_ext,
+                    sponsor,
+                );
             }
             LedgerEntryData::Ttl(ttl) => {
                 let key = ttl.key_hash.clone();
@@ -468,6 +550,30 @@ impl LedgerStateManager {
             LedgerEntryData::ConfigSetting(_) => {
                 // Config settings not tracked
             }
+        }
+    }
+
+    /// Update entry metadata without delta tracking.
+    ///
+    /// This ensures `get_entry()` reconstructs the correct LedgerEntry envelope
+    /// (last_modified_ledger_seq + ext) after CDP meta sync.
+    fn update_metadata_no_tracking(
+        &mut self,
+        ledger_key: stellar_xdr::curr::LedgerKey,
+        last_modified: u32,
+        has_sponsorship_ext: bool,
+        sponsor: Option<AccountId>,
+    ) {
+        self.insert_last_modified(ledger_key.clone(), last_modified);
+        if has_sponsorship_ext {
+            self.insert_sponsorship_ext(ledger_key.clone());
+        } else {
+            self.remove_sponsorship_ext(&ledger_key);
+        }
+        if let Some(sponsor) = sponsor {
+            self.insert_entry_sponsorship(ledger_key, sponsor);
+        } else {
+            self.remove_entry_sponsorship(&ledger_key);
         }
     }
 

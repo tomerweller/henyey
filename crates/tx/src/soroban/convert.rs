@@ -4,6 +4,9 @@
 //! as its canonical representation, but must convert to protocol-specific
 //! `soroban-env-host` types (P24, P25) for execution and rent calculation.
 //!
+//! The P26 host uses stellar-xdr 26.0.0 (same as workspace), so types are
+//! identical and no conversion is needed for P26.
+//!
 //! These conversions serialize to XDR bytes and deserialize into the target
 //! version's types. This works because the wire format is compatible across
 //! versions for these types (e.g., `ContractCostParams` is a length-prefixed

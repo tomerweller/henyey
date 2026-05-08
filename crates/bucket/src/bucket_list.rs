@@ -5667,4 +5667,255 @@ mod tests {
             );
         }
     }
+
+    /// Regression test for #2503: restart-roundtrip with disk-backed merges
+    /// and overlapping keys.
+    ///
+    /// The production bug manifests only after fresh catchup from archive, where
+    /// the restored bucket list uses disk-backed merges (bucket_dir is set).
+    /// The existing test_restart_roundtrip_determinism uses unique keys and
+    /// in-memory merges, masking potential divergence in the disk merge path.
+    ///
+    /// This test:
+    /// 1. Uses overlapping keys (same entries updated across many ledgers)
+    ///    so merges must resolve key conflicts.
+    /// 2. Sets bucket_dir on the restored bucket list to exercise disk-backed
+    ///    merging in both restart_merges and subsequent add_batch_internal.
+    /// 3. Compares per-level hashes at every ledger after restore to catch
+    ///    the first point of divergence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_restart_roundtrip_disk_backed_overlapping_keys() {
+        let total_ledgers = 512u32;
+        let restore_ledger = 128u32; // checkpoint boundary (multiple of 64)
+
+        // Use a SMALL pool of 8 account IDs, updated round-robin.
+        // This guarantees merges encounter duplicate keys.
+        let account_ids: Vec<[u8; 32]> = (0..8u8)
+            .map(|i| {
+                let mut id = [0u8; 32];
+                id[0] = i;
+                id
+            })
+            .collect();
+
+        let make_entry = |seq: u32| -> LedgerEntry {
+            let idx = (seq as usize) % account_ids.len();
+            make_account_entry(account_ids[idx], seq as i64 * 10)
+        };
+
+        // ---------------------------------------------------------------
+        // Run A: continuous (no restart), in-memory (no bucket_dir)
+        // ---------------------------------------------------------------
+        let mut bl_a = BucketList::new();
+        let mut hashes_a: Vec<Hash256> = Vec::with_capacity(total_ledgers as usize + 1);
+        hashes_a.push(bl_a.hash());
+
+        for seq in 1..=total_ledgers {
+            let entry = make_entry(seq);
+            bl_a.add_batch(
+                seq,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![],
+                vec![entry],
+                vec![],
+            )
+            .unwrap();
+            hashes_a.push(bl_a.hash());
+        }
+
+        // ---------------------------------------------------------------
+        // Run B: restore + restart with disk-backed merges
+        // ---------------------------------------------------------------
+        let mut bl_b = BucketList::new();
+        for seq in 1..=restore_ledger {
+            let entry = make_entry(seq);
+            bl_b.add_batch(
+                seq,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![],
+                vec![entry],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            bl_b.hash(),
+            hashes_a[restore_ledger as usize],
+            "Hashes must match at restore point"
+        );
+
+        // Capture HAS
+        let mut has_hashes: Vec<(Hash256, Hash256)> = Vec::new();
+        let mut has_next_states: Vec<Option<PendingMergeState>> = Vec::new();
+        let mut all_buckets: Vec<Bucket> = Vec::new();
+
+        for level in bl_b.levels() {
+            has_hashes.push((level.curr.hash(), level.snap.hash()));
+            let merge_state = level.pending_merge_state();
+            has_next_states.push(merge_state.clone());
+
+            if !level.curr.is_empty() {
+                all_buckets.push((*level.curr).clone());
+            }
+            if !level.snap.is_empty() {
+                all_buckets.push((*level.snap).clone());
+            }
+            if let Some(PendingMergeState::Output(ref h)) = merge_state {
+                if let Some(PendingMerge::InMemory(ref bucket)) = level.next {
+                    if bucket.hash() == *h {
+                        all_buckets.push(bucket.clone());
+                    }
+                }
+                if let Some(PendingMerge::Async(ref handle)) = level.next {
+                    if let MergeRecvState::Ready(Ok(ref bucket)) = handle.state {
+                        if bucket.hash() == *h {
+                            all_buckets.push((**bucket).clone());
+                        }
+                    }
+                }
+            }
+            if let Some(PendingMerge::Async(ref handle)) = level.next {
+                for input_hash in [&handle.input_curr_hash, &handle.input_snap_hash] {
+                    if !input_hash.is_zero() {
+                        for other_level in bl_b.levels() {
+                            if other_level.curr.hash() == *input_hash {
+                                all_buckets.push((*other_level.curr).clone());
+                            }
+                            if other_level.snap.hash() == *input_hash {
+                                all_buckets.push((*other_level.snap).clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Set up bucket_dir FIRST (before restoring), matching production
+        let bucket_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-buckets-2503");
+        let _ = std::fs::remove_dir_all(&bucket_dir);
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Save all buckets to disk as uncompressed XDR files (matching production
+        // where buckets are downloaded from the archive and stored on disk).
+        for bucket in &all_buckets {
+            if !bucket.is_empty() {
+                let path = bucket_dir.join(super::canonical_bucket_filename(&bucket.hash()));
+                if !path.exists() {
+                    bucket.save_to_xdr_file(&path).unwrap();
+                }
+            }
+        }
+
+        // Create a loader that loads DiskBacked buckets from the bucket_dir,
+        // matching the production catchup path (Bucket::from_xdr_file_disk_backed).
+        let disk_loader_dir = bucket_dir.clone();
+        let disk_loader = move |hash: &Hash256| -> crate::Result<Bucket> {
+            if hash.is_zero() {
+                return Ok(Bucket::empty());
+            }
+            let path = disk_loader_dir.join(super::canonical_bucket_filename(hash));
+            Bucket::from_xdr_file_disk_backed(&path)
+        };
+
+        // Restore from HAS using DiskBacked buckets (matching production)
+        let disk_loader_clone = {
+            let dir = bucket_dir.clone();
+            move |hash: &Hash256| -> crate::Result<Bucket> {
+                if hash.is_zero() {
+                    return Ok(Bucket::empty());
+                }
+                let path = dir.join(super::canonical_bucket_filename(hash));
+                Bucket::from_xdr_file_disk_backed(&path)
+            }
+        };
+        let mut bl_restored =
+            BucketList::restore_from_has_parallel(&has_hashes, &has_next_states, disk_loader_clone)
+                .unwrap();
+        bl_restored.set_ledger_seq(restore_ledger);
+
+        // Set bucket_dir to enable disk-backed merges (the production condition)
+        bl_restored.set_bucket_dir(bucket_dir.clone());
+
+        // Restart merges (structure-based, matching production)
+        bl_restored
+            .restart_merges_from_has(
+                restore_ledger,
+                TEST_PROTOCOL,
+                &has_next_states,
+                disk_loader,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Do NOT call resolve_all_pending_merges() here — in production,
+        // pending merges stay pending until commit() is called during the next
+        // spill. This matches the production flow more closely.
+
+        // Verify hash at restore point
+        assert_eq!(
+            bl_restored.hash(),
+            hashes_a[restore_ledger as usize],
+            "Restored bucket list hash must match at restore point (disk-backed)"
+        );
+
+        // Continue from restore point with disk-backed merges
+        for seq in (restore_ledger + 1)..=total_ledgers {
+            let entry = make_entry(seq);
+            bl_restored
+                .add_batch(
+                    seq,
+                    TEST_PROTOCOL,
+                    BucketListType::Live,
+                    vec![],
+                    vec![entry],
+                    vec![],
+                )
+                .unwrap();
+
+            let hash_a = &hashes_a[seq as usize];
+            let hash_b = bl_restored.hash();
+            if *hash_a != hash_b {
+                // Detailed per-level comparison for diagnostics
+                for (i, (level_a, level_b)) in bl_a
+                    .levels()
+                    .iter()
+                    .zip(bl_restored.levels().iter())
+                    .enumerate()
+                {
+                    if level_a.curr.hash() != level_b.curr.hash() {
+                        eprintln!(
+                            "  Level {} CURR diverges: continuous={} restarted={}",
+                            i,
+                            level_a.curr.hash().to_hex(),
+                            level_b.curr.hash().to_hex()
+                        );
+                    }
+                    if level_a.snap.hash() != level_b.snap.hash() {
+                        eprintln!(
+                            "  Level {} SNAP diverges: continuous={} restarted={}",
+                            i,
+                            level_a.snap.hash().to_hex(),
+                            level_b.snap.hash().to_hex()
+                        );
+                    }
+                }
+                panic!(
+                    "DISK-BACKED RESTART DIVERGENCE at ledger {}: continuous={} restarted={}",
+                    seq,
+                    hash_a.to_hex(),
+                    hash_b.to_hex()
+                );
+            }
+        }
+
+        // Cleanup test bucket directory
+        let _ = std::fs::remove_dir_all(&bucket_dir);
+    }
 }

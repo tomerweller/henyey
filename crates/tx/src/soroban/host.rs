@@ -40,11 +40,9 @@ use soroban_env_host26::{
     ModuleCache as ModuleCacheP26,
 };
 
-// After XDR alignment: our workspace stellar-xdr 26.0.0 is the same crate as
-// soroban-env-host P26's transitive stellar-xdr 26.0.0, so the Rust types are
-// identical and no conversion is needed for the P26 path.
-// soroban-env-host P25 uses stellar-xdr 25.0.0, so XDR byte roundtrips are
-// needed for the P25 SnapshotSource impl.
+// The P26 host is pinned to the stellar-core v26.0.1 submodule revision (b351f88)
+// which uses stellar-xdr 26.0.0 — the same as our workspace. Types are unified
+// by Cargo, so no XDR byte roundtrip is needed for P26 (unlike P24/P25).
 use stellar_xdr::curr::{
     DiagnosticEvent, LedgerEntry, LedgerKey, Limits, ReadXdr, ScVal, SorobanTransactionData,
     SorobanTransactionDataExt, WriteXdr,
@@ -260,7 +258,6 @@ impl PersistentModuleCache {
             }
             PersistentModuleCache::P26(cache) => {
                 let ctx = WasmCompilationContextP26::new();
-                // P26 uses stellar-xdr 26.0.0 (same as workspace) — types are identical.
                 let contract_id =
                     soroban_env_host26::xdr::Hash(<Sha256 as Digest>::digest(code).into());
                 let cost_inputs = VersionedContractCodeCostInputsP26::V0 {
@@ -290,7 +287,6 @@ impl PersistentModuleCache {
                 cache.remove_module(&contract_id).ok().flatten().is_some()
             }
             PersistentModuleCache::P26(cache) => {
-                // P26 Hash is the same type as workspace Hash (both stellar-xdr 26.0.0)
                 let contract_id = soroban_env_host26::xdr::Hash(hash.0);
                 cache.remove_module(&contract_id).ok().flatten().is_some()
             }
@@ -1020,13 +1016,19 @@ fn map_storage_changes(
             // the old code was a no-op (TTL branch preempted deletion, then
             // ttl_extended check caused skip). We preserve parity by skipping.
             let kind = if is_modification {
-                let entry = change
-                    .encoded_new_value
-                    .as_ref()
-                    .map(|bytes| LedgerEntry::from_xdr(bytes, Limits::none()))
-                    .transpose()
-                    .map_err(|_| make_error("failed to decode LedgerEntry from storage change"))?
-                    .expect("is_modification implies encoded_new_value is Some");
+                let raw_bytes = change.encoded_new_value.as_ref().unwrap();
+                let entry = LedgerEntry::from_xdr(raw_bytes.as_slice(), Limits::none())
+                    .map_err(|_| make_error("failed to decode LedgerEntry from storage change"))?;
+                let reserialized_len = henyey_common::xdr_encoded_len(&entry);
+                if reserialized_len != raw_bytes.len() {
+                    eprintln!(
+                        "DIAG_ROUNDTRIP key={:?} raw_len={} reserialized_len={} diff={}",
+                        std::mem::discriminant(&key),
+                        raw_bytes.len(),
+                        reserialized_len,
+                        raw_bytes.len() as i64 - reserialized_len as i64,
+                    );
+                }
                 StorageChangeKind::Modified {
                     entry: Box::new(entry),
                     live_until: change.ttl_new_live_until_ledger,
@@ -1691,16 +1693,14 @@ fn execute_host_function_p26(
     let instruction_limit = soroban_data.resources.instructions as u64;
     let memory_limit = soroban_config.tx_max_memory_bytes;
 
-    // P26 uses stellar-xdr 26.0.0 (same as workspace). ContractCostParams types are
-    // identical, so no XDR roundtrip is needed — we can use the workspace types directly.
     let budget = if soroban_config.has_valid_cost_params() {
-        // soroban_env_host26::xdr::ContractCostParams IS stellar_xdr::curr::ContractCostParams
-        let p26_cpu: soroban_env_host26::xdr::ContractCostParams =
-            soroban_config.cpu_cost_params.clone();
-        let p26_mem: soroban_env_host26::xdr::ContractCostParams =
-            soroban_config.mem_cost_params.clone();
-        Budget::try_from_configs(instruction_limit, memory_limit, p26_cpu, p26_mem)
-            .map_err(make_setup_error)?
+        Budget::try_from_configs(
+            instruction_limit,
+            memory_limit,
+            soroban_config.cpu_cost_params.clone(),
+            soroban_config.mem_cost_params.clone(),
+        )
+        .map_err(make_setup_error)?
     } else {
         tracing::warn!("Using default Soroban budget - cost parameters not loaded from network.");
         Budget::default()
@@ -1802,8 +1802,7 @@ fn execute_host_function_p26(
                 "P26: e2e_invoke failed"
             );
             for (i, event) in diagnostic_events.iter().enumerate() {
-                use soroban_env_host26::xdr::WriteXdr as _;
-                if let Ok(encoded) = event.to_xdr(soroban_env_host26::xdr::Limits::none()) {
+                if let Ok(encoded) = event.to_xdr(Limits::none()) {
                     tracing::warn!(
                         event_idx = i,
                         event_hex = hex::encode(&encoded),
@@ -1811,20 +1810,17 @@ fn execute_host_function_p26(
                     );
                 }
             }
-            // P26 diagnostic events use stellar-xdr 26.0.0, same as workspace.
-            let converted_diagnostics: Vec<DiagnosticEvent> = diagnostic_events;
             return Err(SorobanExecutionError {
                 host_error: convert_host_error_p26_to_p25(e),
                 cpu_insns_consumed,
                 mem_bytes_consumed,
-                diagnostic_events: converted_diagnostics,
+                diagnostic_events,
             });
         }
     };
 
     // ── Decode result ──
-    // P26 diagnostic events use stellar-xdr 26.0.0, same as workspace — no conversion needed.
-    let converted_diagnostics: Vec<DiagnosticEvent> = diagnostic_events;
+    let final_diagnostic_events = diagnostic_events;
 
     let make_budget_error = |desc: &str| -> SorobanExecutionError {
         tracing::debug!(desc, "P26: XDR decode error in result processing");
@@ -1835,7 +1831,7 @@ fn execute_host_function_p26(
             )),
             cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
             mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
-            diagnostic_events: converted_diagnostics.clone(),
+            diagnostic_events: final_diagnostic_events.clone(),
         }
     };
 
@@ -1858,7 +1854,7 @@ fn execute_host_function_p26(
                 host_error: convert_host_error_p26_to_p25(e.clone()),
                 cpu_insns_consumed,
                 mem_bytes_consumed,
-                diagnostic_events: converted_diagnostics.clone(),
+                diagnostic_events: final_diagnostic_events.clone(),
             });
         }
     };
@@ -1898,7 +1894,7 @@ fn execute_host_function_p26(
         return_value,
         storage_changes,
         contract_events,
-        diagnostic_events: converted_diagnostics,
+        diagnostic_events: final_diagnostic_events,
         cpu_insns,
         mem_bytes,
         contract_events_and_return_value_size,
