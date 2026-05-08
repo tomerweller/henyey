@@ -2603,6 +2603,27 @@ impl BucketList {
             )));
         }
 
+        // RESTART_DIAG: log per-level HAS state and bucket list state at entry
+        for (i, state) in next_states.iter().enumerate() {
+            let state_desc = match state {
+                None => "clear".to_string(),
+                Some(PendingMergeState::Output(h)) => format!("output:{}", h.to_hex()),
+                Some(PendingMergeState::Inputs { curr, snap }) => {
+                    format!("inputs:curr={},snap={}", curr.to_hex(), snap.to_hex())
+                }
+            };
+            let has_next = self.levels[i].next.is_some();
+            tracing::warn!(
+                level = i,
+                ledger = ledger,
+                has_state = %state_desc,
+                has_existing_next = has_next,
+                curr_hash = %self.levels[i].curr.hash().to_hex(),
+                snap_hash = %self.levels[i].snap.hash().to_hex(),
+                "RESTART_DIAG: live bucket list level state at restart entry"
+            );
+        }
+
         // Phase 1: Collect work items (sequential, fast — just loads input buckets)
         struct MergeWorkItem {
             level: usize,
@@ -2632,12 +2653,15 @@ impl BucketList {
                 let input_curr = load_or_sentinel(curr_hash, &mut load_bucket)?;
                 let input_snap = load_or_sentinel(snap_hash, &mut load_bucket)?;
 
-                tracing::info!(
+                tracing::warn!(
                     level = i,
                     ledger = ledger,
+                    source = "has_state2",
                     input_curr_hash = %curr_hash.to_hex(),
                     input_snap_hash = %snap_hash.to_hex(),
-                    "restart_merges_from_has: queueing merge"
+                    keep_dead = ?Self::keep_tombstone_entries(i),
+                    protocol_version = protocol_version,
+                    "RESTART_DIAG: queueing merge from HAS input hashes"
                 );
 
                 work_items.push(MergeWorkItem {
@@ -2673,11 +2697,12 @@ impl BucketList {
                         let elapsed = start.elapsed();
                         match &result {
                             Ok(bucket) => {
-                                tracing::info!(
+                                tracing::warn!(
                                     level,
                                     duration_ms = elapsed.as_millis() as u64,
                                     merged_hash = %bucket.hash().to_hex(),
-                                    "restart_merges_from_has: merge completed"
+                                    merged_entries = bucket.len(),
+                                    "RESTART_DIAG: HAS state=2 merge completed"
                                 );
                             }
                             Err(e) => {
@@ -2685,7 +2710,7 @@ impl BucketList {
                                     level,
                                     duration_ms = elapsed.as_millis() as u64,
                                     error = %e,
-                                    "restart_merges_from_has: merge failed"
+                                    "RESTART_DIAG: HAS state=2 merge failed"
                                 );
                             }
                         }
@@ -2784,16 +2809,21 @@ impl BucketList {
             let normalize_init = InitEntryPolicy::Preserve; // stellar-core never normalizes INIT to LIVE during merges
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
-            // Log detailed merge parameters for debugging
-            tracing::info!(
+            // RESTART_DIAG: log all merge parameters for post-mortem comparison
+            // with steady-state add_batch_internal parameters.
+            tracing::warn!(
                 level = i,
                 ledger = ledger,
+                source = "structure_based",
                 merge_start_ledger = merge_start_ledger,
                 use_empty_curr = use_empty_curr,
+                keep_dead = ?keep_dead,
+                merge_protocol_version = merge_protocol_version,
+                caller_protocol_version = protocol_version,
                 level_curr_hash = %self.levels[i].curr.hash().to_hex(),
                 level_snap_hash = %self.levels[i].snap.hash().to_hex(),
                 prev_snap_hash = %prev_snap.hash().to_hex(),
-                "restart_merges: starting merge"
+                "RESTART_DIAG: starting structure-based merge"
             );
 
             // Start the merge with the previous level's snap
@@ -5412,5 +5442,229 @@ mod tests {
         // Second call should return the same cached error
         let result2 = handle.resolve();
         assert!(result2.is_err(), "cached error should persist");
+    }
+
+    /// Regression test for #2499: restart-roundtrip determinism.
+    ///
+    /// Run A (continuous): apply N ledgers without interruption.
+    /// Run B (restarted): apply M ledgers, serialize HAS, restore, restart
+    /// merges, continue applying remaining N-M ledgers.
+    ///
+    /// At every ledger from M+1 to N, assert that Run A and Run B produce
+    /// identical per-level (curr_hash, snap_hash) and overall bucket_list_hash.
+    ///
+    /// This catches any divergence caused by the restart_merges_from_has /
+    /// restart_merges interaction with the first post-restart commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_restart_roundtrip_determinism() {
+        // N = 256 total ledgers, M = 100 (restore point).
+        // 100 ledgers is enough for:
+        //   level 0: 50 spills
+        //   level 1: 12 spills
+        //   level 2: 3 spills
+        //   level 3: 0 spills (but has pending merge from level 2 spill)
+        // This ensures levels 0-2 have active curr/snap and level 3 has a pending merge.
+        let total_ledgers = 256u32;
+        let restore_ledger = 100u32;
+
+        // Helper to create a unique entry for each ledger
+        let make_entry = |seq: u32| -> LedgerEntry {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&seq.to_le_bytes());
+            make_account_entry(id, seq as i64 * 10)
+        };
+
+        // ---------------------------------------------------------------
+        // Run A: continuous (no restart)
+        // ---------------------------------------------------------------
+        let mut bl_a = BucketList::new();
+        let mut hashes_a: Vec<Hash256> = Vec::with_capacity(total_ledgers as usize + 1);
+        hashes_a.push(bl_a.hash()); // ledger 0
+
+        for seq in 1..=total_ledgers {
+            let entry = make_entry(seq);
+            bl_a.add_batch(
+                seq,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![],
+                vec![entry],
+                vec![],
+            )
+            .unwrap();
+            hashes_a.push(bl_a.hash());
+        }
+
+        // ---------------------------------------------------------------
+        // Run B: apply M ledgers, then serialize/restore/restart
+        // ---------------------------------------------------------------
+        let mut bl_b = BucketList::new();
+        for seq in 1..=restore_ledger {
+            let entry = make_entry(seq);
+            bl_b.add_batch(
+                seq,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![],
+                vec![entry],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        // Sanity: hashes should match at the restore point
+        assert_eq!(
+            bl_b.hash(),
+            hashes_a[restore_ledger as usize],
+            "Hashes must match at restore point (ledger {})",
+            restore_ledger
+        );
+
+        // Serialize HAS: capture per-level (curr_hash, snap_hash) and next state.
+        // Importantly, we do NOT call resolve_all_pending_merges() here: this
+        // mirrors production where the HAS is built while merges may still be
+        // in-progress (state=2 with input hashes). The restore path must
+        // re-merge from those inputs and produce the same result.
+        let mut has_hashes: Vec<(Hash256, Hash256)> = Vec::new();
+        let mut has_next_states: Vec<Option<PendingMergeState>> = Vec::new();
+        let mut all_buckets: Vec<Bucket> = Vec::new();
+
+        for level in bl_b.levels() {
+            let curr_hash = level.curr.hash();
+            let snap_hash = level.snap.hash();
+            has_hashes.push((curr_hash, snap_hash));
+
+            let merge_state = level.pending_merge_state();
+            has_next_states.push(merge_state.clone());
+
+            // Collect all non-empty buckets for the loader
+            if !level.curr.is_empty() {
+                all_buckets.push((*level.curr).clone());
+            }
+            if !level.snap.is_empty() {
+                all_buckets.push((*level.snap).clone());
+            }
+
+            // Collect merge output bucket if state=1
+            if let Some(PendingMergeState::Output(ref h)) = merge_state {
+                if let Some(PendingMerge::InMemory(ref bucket)) = level.next {
+                    if bucket.hash() == *h {
+                        all_buckets.push(bucket.clone());
+                    }
+                }
+                if let Some(PendingMerge::Async(ref handle)) = level.next {
+                    if let MergeRecvState::Ready(Ok(ref bucket)) = handle.state {
+                        if bucket.hash() == *h {
+                            all_buckets.push((**bucket).clone());
+                        }
+                    }
+                }
+            }
+
+            // For state=2 (inputs), the input buckets are curr/snap from a
+            // lower level or from this level's own curr/snap. They should
+            // already be collected above or loadable by hash from the map.
+            // Also explicitly collect the input hashes from the async handle.
+            if let Some(PendingMerge::Async(ref handle)) = level.next {
+                // The input buckets might be different from this level's curr/snap
+                // (they are the previous snap from the level below). Collect them
+                // by following the handle's stored input hashes.
+                for input_hash in [&handle.input_curr_hash, &handle.input_snap_hash] {
+                    if !input_hash.is_zero() {
+                        // Try to find this bucket in levels below
+                        for other_level in bl_b.levels() {
+                            if other_level.curr.hash() == *input_hash {
+                                all_buckets.push((*other_level.curr).clone());
+                            }
+                            if other_level.snap.hash() == *input_hash {
+                                all_buckets.push((*other_level.snap).clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify we have at least one non-clear next state (state=1 or state=2)
+        let has_active_next = has_next_states.iter().any(|s| s.is_some());
+        assert!(
+            has_active_next,
+            "HAS must contain at least one active next state for restart test to be meaningful"
+        );
+
+        // Verify the test exercises the state=2 (re-merge from inputs) path.
+        // Without resolve_all_pending_merges() before capture, async merges
+        // that haven't completed yet produce state=2 in the HAS.
+        let state2_count = has_next_states
+            .iter()
+            .filter(|s| matches!(s, Some(PendingMergeState::Inputs { .. })))
+            .count();
+        assert!(
+            state2_count > 0,
+            "HAS must contain at least one state=2 level to exercise the re-merge path"
+        );
+
+        // Restore from HAS
+        let loader = std::sync::Arc::new(make_loader(all_buckets));
+        let loader_ref = loader.clone();
+        let mut bl_restored = BucketList::restore_from_has_parallel(
+            &has_hashes,
+            &has_next_states,
+            move |h: &Hash256| loader_ref(h),
+        )
+        .unwrap();
+        bl_restored.set_ledger_seq(restore_ledger);
+
+        // Restart merges (both HAS-based and structure-based)
+        let loader_ref2 = loader.clone();
+        bl_restored
+            .restart_merges_from_has(
+                restore_ledger,
+                TEST_PROTOCOL,
+                &has_next_states,
+                |hash: &Hash256| loader_ref2(hash),
+                true, // restart_structure_based
+            )
+            .await
+            .unwrap();
+
+        // Resolve all pending merges in the restored bucket list
+        bl_restored.resolve_all_pending_merges().unwrap();
+
+        // Verify hash matches at restore point
+        // Note: the hash only depends on curr/snap, not next, so it should match.
+        assert_eq!(
+            bl_restored.hash(),
+            hashes_a[restore_ledger as usize],
+            "Restored bucket list hash must match at restore point"
+        );
+
+        // ---------------------------------------------------------------
+        // Continue Run B from the restore point
+        // ---------------------------------------------------------------
+        for seq in (restore_ledger + 1)..=total_ledgers {
+            let entry = make_entry(seq);
+            bl_restored
+                .add_batch(
+                    seq,
+                    TEST_PROTOCOL,
+                    BucketListType::Live,
+                    vec![],
+                    vec![entry],
+                    vec![],
+                )
+                .unwrap();
+
+            let hash_a = &hashes_a[seq as usize];
+            let hash_b = bl_restored.hash();
+            assert_eq!(
+                *hash_a,
+                hash_b,
+                "RESTART DIVERGENCE at ledger {}: continuous={} restarted={}",
+                seq,
+                hash_a.to_hex(),
+                hash_b.to_hex()
+            );
+        }
     }
 }

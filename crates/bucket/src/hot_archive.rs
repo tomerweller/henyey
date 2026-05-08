@@ -1465,6 +1465,27 @@ impl HotArchiveBucketList {
             )));
         }
 
+        // RESTART_DIAG: log per-level HAS state for hot archive at entry
+        for (i, state) in next_states.iter().enumerate() {
+            let state_desc = match state {
+                None => "clear".to_string(),
+                Some(PendingMergeState::Output(h)) => format!("output:{}", h.to_hex()),
+                Some(PendingMergeState::Inputs { curr, snap }) => {
+                    format!("inputs:curr={},snap={}", curr.to_hex(), snap.to_hex())
+                }
+            };
+            let has_next = self.levels[i].next.is_some();
+            tracing::warn!(
+                level = i,
+                ledger = ledger,
+                has_state = %state_desc,
+                has_existing_next = has_next,
+                curr_hash = %self.levels[i].curr().hash().to_hex(),
+                snap_hash = %self.levels[i].snap_bucket().hash().to_hex(),
+                "RESTART_DIAG: hot archive level state at restart entry"
+            );
+        }
+
         for i in 1..HOT_ARCHIVE_BUCKET_LIST_LEVELS {
             // Skip if there's already a pending merge (from state 1 output)
             if self.levels[i].next.is_some() {
@@ -1487,19 +1508,22 @@ impl HotArchiveBucketList {
 
                 let input_snap = load_hot_or_sentinel(snap_hash, &mut load_bucket)?;
 
-                tracing::info!(
-                    level = i,
-                    ledger = ledger,
-                    input_curr_hash = %curr_hash.to_hex(),
-                    input_snap_hash = %snap_hash.to_hex(),
-                    "hot_archive restart_merges_from_has: restarting merge with HAS input hashes"
-                );
-
                 // Perform the merge with the exact input hashes from HAS
                 // Use the caller's protocol_version (from ledger header) as the
                 // max protocol version, matching stellar-core behavior in restartMerges
                 // where makeLive() is called with maxProtocolVersion.
                 let keep_tombstones = Self::keep_tombstone_entries(i);
+
+                tracing::warn!(
+                    level = i,
+                    ledger = ledger,
+                    source = "has_state2",
+                    input_curr_hash = %curr_hash.to_hex(),
+                    input_snap_hash = %snap_hash.to_hex(),
+                    keep_tombstones = ?keep_tombstones,
+                    protocol_version = protocol_version,
+                    "RESTART_DIAG: hot_archive queueing merge from HAS input hashes"
+                );
 
                 let merged = merge_hot_archive_buckets(
                     &input_curr,
@@ -1508,10 +1532,11 @@ impl HotArchiveBucketList {
                     keep_tombstones,
                 )?;
 
-                tracing::info!(
+                tracing::warn!(
                     level = i,
                     merged_hash = %merged.hash().to_hex(),
-                    "hot_archive restart_merges_from_has: merge completed"
+                    merged_entries = merged.len(),
+                    "RESTART_DIAG: hot_archive HAS state=2 merge completed"
                 );
 
                 self.levels[i].next = Some(merged);
@@ -1576,13 +1601,6 @@ impl HotArchiveBucketList {
             // Calculate the ledger when this merge would have started
             let merge_start_ledger = bl_round_down(ledger, bl_level_half(i - 1));
 
-            tracing::debug!(
-                level = i,
-                merge_start_ledger = merge_start_ledger,
-                prev_snap_hash = %prev_snap.hash(),
-                "hot_archive restart_merges: restarting merge"
-            );
-
             // Determine merge parameters
             let merge_protocol_version = match prev_snap.get_protocol_version()? {
                 0 => protocol_version,
@@ -1590,6 +1608,21 @@ impl HotArchiveBucketList {
             };
             let keep_tombstones = Self::keep_tombstone_entries(i);
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
+
+            tracing::warn!(
+                level = i,
+                ledger = ledger,
+                source = "structure_based",
+                merge_start_ledger = merge_start_ledger,
+                use_empty_curr = use_empty_curr,
+                keep_tombstones = ?keep_tombstones,
+                merge_protocol_version = merge_protocol_version,
+                caller_protocol_version = protocol_version,
+                level_curr_hash = %self.levels[i].curr().hash().to_hex(),
+                level_snap_hash = %self.levels[i].snap_bucket().hash().to_hex(),
+                prev_snap_hash = %prev_snap.hash().to_hex(),
+                "RESTART_DIAG: hot_archive starting structure-based merge"
+            );
 
             // Start the merge with the previous level's snap
             self.levels[i].prepare(
