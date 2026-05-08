@@ -42,6 +42,7 @@
 //! at each level. The first match is returned (newer entries shadow older).
 //! Dead entries (tombstones) shadow live entries, returning None.
 
+use henyey_common::{BucketListDbConfig, Hash256};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -49,9 +50,9 @@ use stellar_xdr::curr::{
     BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey, Limits,
     StateArchivalSettings, WriteXdr,
 };
-use tokio::sync::oneshot;
 
-use henyey_common::{BucketListDbConfig, Hash256};
+// Re-import oneshot for AsyncMergeHandle (needed for Sync on BucketList)
+use tokio::sync::oneshot;
 
 use crate::bucket::Bucket;
 use crate::cache::CacheStats;
@@ -230,10 +231,10 @@ impl PendingMerge {
             PendingMerge::InMemory(bucket) => bucket.hash(),
             PendingMerge::Async(handle) => {
                 // If we have a cached result, return its hash
-                if let Some(ref bucket) = handle.result {
+                if let MergeRecvState::Ready(Ok(ref bucket)) = handle.state {
                     bucket.hash()
                 } else {
-                    // Return zero hash to indicate unresolved async merge
+                    // Return zero hash to indicate unresolved or failed async merge
                     Hash256::default()
                 }
             }
@@ -280,17 +281,33 @@ struct AddBatchArgs {
     dead_entries: Vec<LedgerKey>,
 }
 
+/// State of the merge result receiver.
+///
+/// Uses an enum to make the invalid "consumed" state (receiver gone, no result)
+/// unrepresentable. After any outcome (success, error, cancellation), transitions
+/// to `Ready` and caches the result for idempotent access.
+enum MergeRecvState {
+    /// Merge in progress; receiver delivers the result.
+    Pending(oneshot::Receiver<Result<Bucket>>),
+    /// Terminal state — merge completed or failed; result is cached.
+    /// Errors stored as strings since BucketError is not Clone.
+    Ready(std::result::Result<Arc<Bucket>, String>),
+}
+
 /// Handle to an asynchronous bucket merge running in a background thread.
 ///
 /// The merge is started immediately when this handle is created, and runs
 /// concurrently with other operations. Call `resolve()` to wait for completion.
+///
+/// Uses `tokio::sync::oneshot` for the channel with a runtime-aware blocking
+/// helper (`blocking_recv_oneshot`) so that `resolve()` works on any tokio
+/// runtime flavor (multi-thread, current-thread) as well as outside of any
+/// runtime. The merge task runs on `spawn_blocking` (a separate OS thread).
 pub struct AsyncMergeHandle {
-    /// Oneshot channel to receive the merge result.
-    receiver: Option<oneshot::Receiver<Result<Bucket>>>,
+    /// Merge result state — either pending or resolved (success/failure).
+    state: MergeRecvState,
     /// The level this merge is for (for logging/debugging).
     level: usize,
-    /// Cached result after resolution (allows multiple reads).
-    result: Option<Arc<Bucket>>,
     /// Input bucket file paths that must not be deleted while merge is in progress.
     /// These paths are needed for garbage collection - we can't delete files that
     /// are being read by in-flight merges.
@@ -314,7 +331,7 @@ impl AsyncMergeHandle {
     ///
     /// # Panics
     ///
-    /// Panics if called outside of a tokio runtime context. Tests should use `#[tokio::test(flavor = "multi_thread")]`.
+    /// Panics if called outside of a tokio runtime context.
     fn start_merge(request: AsyncMergeRequest) -> Self {
         let AsyncMergeRequest {
             curr,
@@ -447,9 +464,8 @@ impl AsyncMergeHandle {
         let merge_key = MergeKey::new(keep_dead_entries, input_curr_hash, input_snap_hash);
 
         Self {
-            receiver: Some(receiver),
+            state: MergeRecvState::Pending(receiver),
             level,
-            result: None,
             input_file_paths,
             input_curr_hash,
             input_snap_hash,
@@ -460,45 +476,99 @@ impl AsyncMergeHandle {
     /// Resolve the merge, blocking until complete if necessary.
     ///
     /// After calling this, the result is cached and can be retrieved multiple times.
+    /// Both success and failure are cached — subsequent calls return the same result.
     ///
-    /// Uses `tokio::task::block_in_place` when called from within a tokio runtime
-    /// to avoid the "cannot block from async context" panic, while still allowing
-    /// synchronous use in the ledger close path.
+    /// Uses a runtime-aware blocking strategy:
+    /// - Multi-thread runtime: `block_in_place` + `blocking_recv`
+    /// - Current-thread runtime: helper thread (avoids blocking_recv panic in async context)
+    /// - No runtime: `blocking_recv` directly
     pub fn resolve(&mut self) -> Result<Arc<Bucket>> {
-        if let Some(ref result) = self.result {
-            return Ok(result.clone());
+        if let MergeRecvState::Ready(ref result) = self.state {
+            return result.clone().map_err(|msg| BucketError::Merge(msg));
         }
-
-        let receiver = self
-            .receiver
-            .take()
-            .ok_or_else(|| BucketError::Merge("merge handle already consumed".to_string()))?;
 
         let start = std::time::Instant::now();
 
-        // Use block_in_place to allow blocking from within an async context.
-        // This moves the blocking operation to a blocking thread, avoiding the
-        // "cannot block the current thread" panic when called from tokio tests
-        // or async code paths.
-        let bucket = tokio::task::block_in_place(|| {
+        // Take the Pending receiver, replacing with a temporary Ready(Err) in case
+        // the recv panics (belt-and-suspenders).
+        let MergeRecvState::Pending(rx) = std::mem::replace(
+            &mut self.state,
+            MergeRecvState::Ready(Err("merge resolve interrupted".to_string())),
+        ) else {
+            unreachable!("already checked for Ready above");
+        };
+
+        let recv_result = blocking_recv_oneshot(rx);
+
+        match recv_result {
+            Ok(bucket_result) => match bucket_result {
+                Ok(bucket) => {
+                    let elapsed = start.elapsed();
+                    if elapsed.as_millis() > 10 {
+                        tracing::info!(
+                            level = self.level,
+                            wait_ms = elapsed.as_millis(),
+                            "Waited for background merge to complete"
+                        );
+                    }
+                    let bucket = Arc::new(bucket);
+                    self.state = MergeRecvState::Ready(Ok(bucket.clone()));
+                    Ok(bucket)
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.state = MergeRecvState::Ready(Err(msg.clone()));
+                    Err(BucketError::Merge(msg))
+                }
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                self.state = MergeRecvState::Ready(Err(msg.clone()));
+                Err(BucketError::Merge(msg))
+            }
+        }
+    }
+}
+
+/// Receive from a tokio oneshot channel using the appropriate blocking strategy
+/// for the current runtime context.
+///
+/// - Multi-thread runtime: `block_in_place(|| receiver.blocking_recv())`
+/// - Current-thread runtime: spawns a helper thread (blocking_recv panics in async context)
+/// - No runtime: `receiver.blocking_recv()` directly
+fn blocking_recv_oneshot(
+    receiver: oneshot::Receiver<Result<Bucket>>,
+) -> std::result::Result<Result<Bucket>, BucketError> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                tokio::task::block_in_place(|| {
+                    receiver
+                        .blocking_recv()
+                        .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))
+                })
+            } else {
+                // Current-thread runtime: blocking_recv panics in async context,
+                // so hop to a helper thread. The merge runs on spawn_blocking
+                // (separate OS thread), so the channel will still unblock.
+                std::thread::spawn(move || {
+                    receiver
+                        .blocking_recv()
+                        .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))
+                })
+                .join()
+                .map_err(|_| BucketError::Merge("merge helper thread panicked".to_string()))?
+            }
+        }
+        Err(_) => {
+            // No runtime — blocking_recv is safe outside async context
             receiver
                 .blocking_recv()
                 .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))
-        })??;
-
-        let elapsed = start.elapsed();
-
-        if elapsed.as_millis() > 10 {
-            tracing::info!(
-                level = self.level,
-                wait_ms = elapsed.as_millis(),
-                "Waited for background merge to complete"
-            );
         }
-
-        let bucket = Arc::new(bucket);
-        self.result = Some(bucket.clone());
-        Ok(bucket)
     }
 }
 
@@ -633,7 +703,7 @@ impl BucketLevel {
                 }
             }
             Some(PendingMerge::Async(handle)) => {
-                if let Some(ref bucket) = handle.result {
+                if let MergeRecvState::Ready(Ok(ref bucket)) = handle.state {
                     // Async merge has resolved; emit state 1 (output)
                     let h = bucket.hash();
                     if h.is_zero() {
@@ -642,7 +712,7 @@ impl BucketLevel {
                         Some(PendingMergeState::Output(h))
                     }
                 } else {
-                    // Async merge still in progress; emit state 2 (input hashes)
+                    // Async merge still in progress or failed; emit state 2 (input hashes)
                     Some(PendingMergeState::Inputs {
                         curr: handle.input_curr_hash,
                         snap: handle.input_snap_hash,
@@ -663,7 +733,7 @@ impl BucketLevel {
     /// fatal behavior for merge failures).
     pub fn resolve_pending_merge(&mut self) -> Result<()> {
         if let Some(PendingMerge::Async(ref mut handle)) = self.next {
-            if handle.result.is_none() {
+            if matches!(handle.state, MergeRecvState::Pending(_)) {
                 // Resolve the async merge, which caches the result in the handle
                 handle.resolve()?;
             }
@@ -680,8 +750,12 @@ impl BucketLevel {
         match &self.next {
             Some(PendingMerge::InMemory(bucket)) => Some(bucket),
             Some(PendingMerge::Async(handle)) => {
-                // For async, only return if we have a cached result
-                handle.result.as_ref().map(|arc| arc.as_ref())
+                // For async, only return if we have a cached successful result
+                if let MergeRecvState::Ready(Ok(ref bucket)) = handle.state {
+                    Some(bucket.as_ref())
+                } else {
+                    None
+                }
             }
             None => None,
         }
@@ -945,15 +1019,12 @@ impl Clone for BucketLevel {
             None => None,
             Some(PendingMerge::InMemory(bucket)) => Some(PendingMerge::InMemory(bucket.clone())),
             Some(PendingMerge::Async(handle)) => {
-                // If the async merge has completed and we have a cached result,
-                // clone it as InMemory. Otherwise, skip the pending merge.
-                // This is safe because:
-                // 1. Cloning is typically done for snapshotting state
-                // 2. Pending merges shouldn't be part of canonical state
-                if let Some(ref result) = handle.result {
+                // If the async merge has completed successfully, clone it as InMemory.
+                // Otherwise, skip the pending merge.
+                if let MergeRecvState::Ready(Ok(ref result)) = handle.state {
                     Some(PendingMerge::InMemory((**result).clone()))
                 } else {
-                    // Async merge not yet resolved - skip it
+                    // Async merge not yet resolved or failed - skip it
                     // The caller should resolve merges before cloning if they need them
                     tracing::warn!(
                         level = self.level,
@@ -2162,7 +2233,7 @@ impl BucketList {
                     PendingMerge::Async(handle) => {
                         hashes.push(handle.input_curr_hash);
                         hashes.push(handle.input_snap_hash);
-                        if let Some(ref result) = handle.result {
+                        if let MergeRecvState::Ready(Ok(ref result)) = handle.state {
                             hashes.push(result.hash());
                         }
                     }
@@ -2209,7 +2280,7 @@ impl BucketList {
                             paths.insert(path.clone());
                         }
                         // If the merge has completed, also add the result's backing file
-                        if let Some(ref result) = handle.result {
+                        if let MergeRecvState::Ready(Ok(ref result)) = handle.state {
                             if let Some(path) = result.backing_file_path() {
                                 paths.insert(path.to_path_buf());
                             }
@@ -4567,9 +4638,8 @@ mod tests {
         );
 
         let handle = AsyncMergeHandle {
-            receiver: Some(receiver),
+            state: MergeRecvState::Pending(receiver),
             level: 1,
-            result: None,
             input_file_paths: vec![],
             input_curr_hash: Hash256::default(),
             input_snap_hash: Hash256::default(),
@@ -4608,9 +4678,8 @@ mod tests {
         );
 
         let handle = AsyncMergeHandle {
-            receiver: Some(receiver),
+            state: MergeRecvState::Pending(receiver),
             level: 1,
-            result: None,
             input_file_paths: vec![],
             input_curr_hash: Hash256::default(),
             input_snap_hash: Hash256::default(),
@@ -5232,5 +5301,116 @@ mod tests {
             bl.levels()[0].next.is_none(),
             "zero-hash output should be treated as clear in parallel restore"
         );
+    }
+
+    /// Regression test for issue #2498 defect A: AsyncMergeHandle::resolve() must
+    /// work on a current_thread tokio runtime without panicking.
+    ///
+    /// Before the fix, resolve() used `block_in_place` which panics on current_thread.
+    /// The fix uses a runtime-aware blocking strategy: helper thread on current_thread,
+    /// block_in_place on multi_thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_merge_handle_resolve_on_current_thread_runtime() {
+        use tokio::sync::oneshot;
+
+        let (sender, receiver) = oneshot::channel();
+        let merge_key = MergeKey::new(
+            DeadEntryPolicy::Keep,
+            Hash256::default(),
+            Hash256::default(),
+        );
+
+        let entry = make_account_entry([42u8; 32], 500);
+        let bucket = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry)]).unwrap();
+        let expected_hash = bucket.hash();
+
+        // Send the result before resolving
+        sender.send(Ok(bucket)).unwrap();
+
+        let mut handle = AsyncMergeHandle {
+            state: MergeRecvState::Pending(receiver),
+            level: 0,
+            input_file_paths: vec![],
+            input_curr_hash: Hash256::default(),
+            input_snap_hash: Hash256::default(),
+            merge_key,
+        };
+
+        let result = handle.resolve();
+        assert!(result.is_ok(), "resolve must not panic on current_thread");
+        assert_eq!(result.unwrap().hash(), expected_hash);
+    }
+
+    /// Regression test for issue #2498 defect B: resolve() must be idempotent.
+    ///
+    /// After the first resolve, subsequent calls must return the cached result
+    /// without re-reading from the channel (which would fail since oneshot is consumed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_async_merge_handle_resolve_idempotent() {
+        use tokio::sync::oneshot;
+
+        let (sender, receiver) = oneshot::channel();
+        let merge_key = MergeKey::new(
+            DeadEntryPolicy::Keep,
+            Hash256::default(),
+            Hash256::default(),
+        );
+
+        let entry = make_account_entry([77u8; 32], 300);
+        let bucket = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry)]).unwrap();
+        let expected_hash = bucket.hash();
+
+        sender.send(Ok(bucket)).unwrap();
+
+        let mut handle = AsyncMergeHandle {
+            state: MergeRecvState::Pending(receiver),
+            level: 0,
+            input_file_paths: vec![],
+            input_curr_hash: Hash256::default(),
+            input_snap_hash: Hash256::default(),
+            merge_key,
+        };
+
+        // First resolve — transitions to Ready
+        let result1 = handle.resolve().unwrap();
+        assert_eq!(result1.hash(), expected_hash);
+
+        // Second resolve — returns cached result
+        let result2 = handle.resolve().unwrap();
+        assert_eq!(result2.hash(), expected_hash);
+        assert!(Arc::ptr_eq(&result1, &result2), "must return same Arc");
+    }
+
+    /// Regression test for issue #2498: resolve() after sender is dropped (cancelled)
+    /// must return an error and cache it, not panic.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_merge_handle_resolve_after_cancel() {
+        use tokio::sync::oneshot;
+
+        let (sender, receiver) = oneshot::channel();
+        let merge_key = MergeKey::new(
+            DeadEntryPolicy::Keep,
+            Hash256::default(),
+            Hash256::default(),
+        );
+
+        // Drop sender to simulate merge task cancellation
+        drop(sender);
+
+        let mut handle = AsyncMergeHandle {
+            state: MergeRecvState::Pending(receiver),
+            level: 0,
+            input_file_paths: vec![],
+            input_curr_hash: Hash256::default(),
+            input_snap_hash: Hash256::default(),
+            merge_key,
+        };
+
+        let result = handle.resolve();
+        assert!(result.is_err(), "cancelled merge should return error");
+
+        // Second call should return the same cached error
+        let result2 = handle.resolve();
+        assert!(result2.is_err(), "cached error should persist");
     }
 }

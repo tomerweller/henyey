@@ -116,75 +116,149 @@ impl Default for FutureBucketSnapshot {
     }
 }
 
+/// State of a merge handle's result receiver.
+///
+/// Uses an enum to make the invalid "consumed" state (receiver gone, no result)
+/// unrepresentable. Transitions from Pending → Ready on first resolution attempt.
+enum MergeHandleState {
+    /// Merge in progress; receiver delivers the result.
+    Pending(oneshot::Receiver<Result<Bucket>>),
+    /// Terminal state — merge completed or failed; result is cached.
+    /// Errors are stored as strings so the state can be returned multiple times
+    /// (BucketError contains non-Clone variants like io::Error).
+    Ready(std::result::Result<Bucket, String>),
+}
+
 /// Async handle to receive the result of a background merge.
 pub struct MergeHandle {
-    receiver: Option<oneshot::Receiver<Result<Bucket>>>,
-    /// Cached result from a previous is_complete() check that found the value ready.
-    cached_result: Option<Result<Bucket>>,
+    state: MergeHandleState,
 }
 
 impl MergeHandle {
     /// Create a new MergeHandle from a oneshot receiver.
     fn new(receiver: oneshot::Receiver<Result<Bucket>>) -> Self {
         Self {
-            receiver: Some(receiver),
-            cached_result: None,
+            state: MergeHandleState::Pending(receiver),
         }
     }
 
     /// Check if the merge is complete without blocking.
     ///
     /// If the result is ready, it is cached internally so that a subsequent
-    /// resolve() call can still retrieve it. This avoids the problem where
-    /// try_recv() consumes the value from the oneshot channel.
+    /// resolve() call can still retrieve it.
     pub fn is_complete(&mut self) -> bool {
-        if self.cached_result.is_some() {
-            return true;
-        }
-        if let Some(ref mut receiver) = self.receiver {
-            match receiver.try_recv() {
+        match &mut self.state {
+            MergeHandleState::Ready(_) => true,
+            MergeHandleState::Pending(receiver) => match receiver.try_recv() {
                 Ok(result) => {
-                    self.cached_result = Some(result);
-                    self.receiver = None;
+                    self.state = match result {
+                        Ok(bucket) => MergeHandleState::Ready(Ok(bucket)),
+                        Err(e) => MergeHandleState::Ready(Err(e.to_string())),
+                    };
                     true
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
-                    self.cached_result = Some(Err(BucketError::Merge(
-                        "merge task was cancelled".to_string(),
-                    )));
-                    self.receiver = None;
+                    self.state =
+                        MergeHandleState::Ready(Err("merge task was cancelled".to_string()));
                     true
                 }
                 Err(oneshot::error::TryRecvError::Empty) => false,
-            }
-        } else {
-            // Receiver already consumed (channel closed without result)
-            true
+            },
         }
     }
 
     /// Wait for the merge to complete and return the result.
     pub async fn resolve(self) -> Result<Bucket> {
-        // Return cached result if is_complete() already retrieved it
-        if let Some(result) = self.cached_result {
-            return result;
+        match self.state {
+            MergeHandleState::Ready(result) => result.map_err(|msg| BucketError::Merge(msg)),
+            MergeHandleState::Pending(receiver) => receiver
+                .await
+                .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))?,
         }
-        self.receiver
-            .expect("receiver should be present if no cached result")
-            .await
-            .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))?
     }
 
     /// Block on the merge result synchronously.
-    pub fn resolve_blocking(self) -> Result<Bucket> {
-        // Return cached result if is_complete() already retrieved it
-        if let Some(result) = self.cached_result {
-            return result;
+    ///
+    /// Uses a runtime-aware blocking strategy:
+    /// - Multi-thread runtime: `block_in_place` + `blocking_recv`
+    /// - Current-thread runtime: helper thread (avoids `blocking_recv` panic in async context)
+    /// - No runtime: `blocking_recv` directly
+    ///
+    /// Both success and failure are cached — subsequent calls return the same result.
+    pub fn resolve_blocking(&mut self) -> Result<Bucket> {
+        if let MergeHandleState::Ready(ref result) = self.state {
+            return result.clone().map_err(|msg| BucketError::Merge(msg));
         }
-        self.receiver
-            .expect("receiver should be present if no cached result")
-            .blocking_recv()
-            .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))?
+
+        // Take the Pending receiver
+        let MergeHandleState::Pending(receiver) = std::mem::replace(
+            &mut self.state,
+            MergeHandleState::Ready(Err("merge resolve interrupted".to_string())),
+        ) else {
+            unreachable!("already checked for Ready above");
+        };
+
+        let recv_result = blocking_recv_compat(receiver);
+
+        match recv_result {
+            Ok(bucket_result) => match bucket_result {
+                Ok(bucket) => {
+                    self.state = MergeHandleState::Ready(Ok(bucket.clone()));
+                    Ok(bucket)
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.state = MergeHandleState::Ready(Err(msg.clone()));
+                    Err(BucketError::Merge(msg))
+                }
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                self.state = MergeHandleState::Ready(Err(msg.clone()));
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Receive from a tokio oneshot channel using the appropriate blocking strategy
+/// for the current runtime context.
+///
+/// - Multi-thread runtime: `block_in_place(|| receiver.blocking_recv())`
+/// - Current-thread runtime: spawns a helper thread (blocking_recv panics in async context)
+/// - No runtime: `receiver.blocking_recv()` directly
+fn blocking_recv_compat(
+    receiver: oneshot::Receiver<Result<Bucket>>,
+) -> std::result::Result<Result<Bucket>, BucketError> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                tokio::task::block_in_place(|| {
+                    receiver
+                        .blocking_recv()
+                        .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))
+                })
+            } else {
+                // Current-thread runtime: blocking_recv panics in async context,
+                // so we hop to a helper thread.
+                std::thread::spawn(move || {
+                    receiver
+                        .blocking_recv()
+                        .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))
+                })
+                .join()
+                .map_err(|_| BucketError::Merge("merge helper thread panicked".to_string()))?
+            }
+        }
+        Err(_) => {
+            // No runtime — blocking_recv is safe outside async context
+            receiver
+                .blocking_recv()
+                .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))
+        }
     }
 }
 
@@ -259,8 +333,11 @@ impl FutureBucket {
         let curr_clone = curr.clone();
         let snap_clone = snap.clone();
 
-        // Spawn the merge task
-        tokio::spawn(async move {
+        // Spawn the merge on tokio's blocking thread pool.
+        // merge_buckets is CPU-intensive synchronous work — spawn_blocking
+        // keeps it off the async executor and ensures the result can be
+        // received via blocking_recv on any runtime flavor.
+        tokio::task::spawn_blocking(move || {
             let result = merge_buckets(
                 &curr_clone,
                 &snap_clone,
@@ -435,8 +512,17 @@ impl FutureBucket {
                     BucketError::Merge("merge handle already consumed".to_string())
                 })?;
 
-                let bucket = handle.resolve().await?;
-                Ok(self.finalize_merge(bucket))
+                match handle.resolve().await {
+                    Ok(bucket) => Ok(self.finalize_merge(bucket)),
+                    Err(e) => {
+                        // Transition to a terminal error state — don't leave
+                        // LiveInputs with no handle (dead end).
+                        self.state = FutureBucketState::Clear;
+                        self.input_curr = None;
+                        self.input_snap = None;
+                        Err(e)
+                    }
+                }
             }
             _ => Err(BucketError::Merge(format!(
                 "cannot resolve FutureBucket in state {:?}",
@@ -456,11 +542,19 @@ impl FutureBucket {
             FutureBucketState::LiveOutput => Ok(self.output.clone().expect("output should be set")),
             FutureBucketState::LiveInputs => {
                 // If an async merge is in progress, block on its result
-                // instead of re-executing the merge (which would race with
-                // the background task).
-                if let Some(handle) = self.merge_handle.take() {
-                    let bucket = tokio::task::block_in_place(|| handle.resolve_blocking())?;
-                    return Ok(self.finalize_merge(bucket));
+                // using the runtime-aware blocking helper (no block_in_place).
+                if let Some(ref mut handle) = self.merge_handle {
+                    match handle.resolve_blocking() {
+                        Ok(bucket) => return Ok(self.finalize_merge(bucket)),
+                        Err(e) => {
+                            // Transition to Clear to avoid dead-end state
+                            self.state = FutureBucketState::Clear;
+                            self.merge_handle = None;
+                            self.input_curr = None;
+                            self.input_snap = None;
+                            return Err(e);
+                        }
+                    }
                 }
 
                 // No async task — do synchronous merge
@@ -599,7 +693,7 @@ impl FutureBucket {
                 let curr_clone = curr.clone();
                 let snap_clone = snap.clone();
 
-                tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
                     let result = merge_buckets(
                         &curr_clone,
                         &snap_clone,
@@ -1356,5 +1450,133 @@ mod tests {
         assert_eq!(fb.state(), FutureBucketState::HashInputs);
         assert!(!fb.is_live());
         assert!(!fb.is_merging());
+    }
+
+    /// Regression test for issue #2498 defect A: MergeHandle::resolve_blocking()
+    /// must work on a current_thread tokio runtime without panicking.
+    ///
+    /// Before the fix, the code path used `block_in_place` which panics on current_thread.
+    /// The fix uses `blocking_recv_compat` which spawns a helper thread on current_thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_merge_handle_resolve_blocking_on_current_thread_runtime() {
+        let (sender, receiver) = oneshot::channel();
+
+        let entry = make_account_entry([42u8; 32], 500);
+        let bucket = Bucket::from_entries(vec![BucketEntry::Liveentry(entry)]).unwrap();
+        let expected_hash = bucket.hash();
+
+        sender.send(Ok(bucket)).unwrap();
+
+        let mut handle = MergeHandle::new(receiver);
+        let result = handle.resolve_blocking();
+        assert!(
+            result.is_ok(),
+            "resolve_blocking must not panic on current_thread"
+        );
+        assert_eq!(result.unwrap().hash(), expected_hash);
+    }
+
+    /// Regression test for issue #2498 defect B: resolve_blocking() after the
+    /// sender is dropped (cancelled) must return an error and cache it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_merge_handle_resolve_blocking_after_cancel() {
+        let (sender, receiver) = oneshot::channel::<Result<Bucket>>();
+        drop(sender);
+
+        let mut handle = MergeHandle::new(receiver);
+
+        let result = handle.resolve_blocking();
+        assert!(result.is_err(), "cancelled merge should return error");
+
+        // Second call returns the cached error
+        let result2 = handle.resolve_blocking();
+        assert!(result2.is_err(), "cached error should persist");
+    }
+
+    /// Regression test for issue #2498: FutureBucket::resolve_blocking() must
+    /// work on current_thread runtime when an async merge is in progress.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_future_bucket_resolve_blocking_on_current_thread_runtime() {
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+        let bucket1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
+        let bucket2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap());
+
+        let (sender, receiver) = oneshot::channel();
+        let merged = merge_buckets(
+            &bucket1,
+            &bucket2,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 25,
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let expected_hash = merged.hash();
+
+        sender.send(Ok(merged)).unwrap();
+
+        let mut fb = FutureBucket {
+            state: FutureBucketState::LiveInputs,
+            input_curr: Some(bucket1),
+            input_snap: Some(bucket2),
+            output: None,
+            merge_handle: Some(MergeHandle::new(receiver)),
+            input_curr_hash: None,
+            input_snap_hash: None,
+            output_hash: None,
+            protocol_version: 25,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
+        };
+
+        let result = fb.resolve_blocking();
+        assert!(
+            result.is_ok(),
+            "resolve_blocking must not panic on current_thread"
+        );
+        assert_eq!(result.unwrap().hash(), expected_hash);
+        assert_eq!(fb.state(), FutureBucketState::LiveOutput);
+    }
+
+    /// Regression test for issue #2498 defect B: FutureBucket::resolve_blocking()
+    /// must transition to Clear on failure, not leave a dead-end LiveInputs state
+    /// with a consumed handle.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_future_bucket_resolve_blocking_error_transitions_to_clear() {
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+        let bucket1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
+        let bucket2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap());
+
+        let (sender, receiver) = oneshot::channel();
+        // Drop sender to simulate cancelled merge
+        drop(sender);
+
+        let mut fb = FutureBucket {
+            state: FutureBucketState::LiveInputs,
+            input_curr: Some(bucket1),
+            input_snap: Some(bucket2),
+            output: None,
+            merge_handle: Some(MergeHandle::new(receiver)),
+            input_curr_hash: None,
+            input_snap_hash: None,
+            output_hash: None,
+            protocol_version: 25,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
+        };
+
+        let result = fb.resolve_blocking();
+        assert!(result.is_err(), "cancelled merge should fail");
+
+        // Must transition to Clear, not remain in LiveInputs with no handle
+        assert_eq!(
+            fb.state(),
+            FutureBucketState::Clear,
+            "failed resolve_blocking must transition to Clear"
+        );
     }
 }
