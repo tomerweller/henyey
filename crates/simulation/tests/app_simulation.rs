@@ -1982,26 +1982,30 @@ async fn test_self_echo_scp_reaches_pump_scp_intake() {
         }
     }
 
-    // Poll until SelfMessage counter increments (event-driven, not sleep-based).
-    let poll_result = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
+    // Poll until SelfMessage counter increments (crash-aware via poll_until).
+    let outcome = poll_until(
+        &sim,
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        CrashScope::SingleNode("node0"),
+        || async {
             let current = app_0.info().scp_verify.pv_counters[PostVerifyReason::SelfMessage];
             if current > baseline {
-                return current;
+                Ok(Some(current))
+            } else {
+                Ok(None)
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
+        },
+    )
+    .await
+    .expect("fatal error during SelfMessage polling");
 
-    match poll_result {
-        Ok(observed) => {
-            assert!(
-                observed > baseline,
-                "SelfMessage counter must have incremented (baseline={baseline}, observed={observed})"
-            );
+    match outcome {
+        PollOutcome::Satisfied(_) => {}
+        PollOutcome::NodeExited { node_id, status } => {
+            panic!("node {node_id} crashed during SelfMessage polling (status: {status:?})");
         }
-        Err(_) => {
+        PollOutcome::TimedOut => {
             let final_val = app_0.info().scp_verify.pv_counters[PostVerifyReason::SelfMessage];
             panic!(
                 "SelfMessage counter did not increment within 5s \
