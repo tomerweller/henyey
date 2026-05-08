@@ -423,7 +423,7 @@ mod tests {
     use henyey_app::{App, AppState};
     use henyey_common::Hash256;
     use henyey_crypto::SecretKey;
-    use henyey_simulation::{Simulation, SimulationMode};
+    use henyey_simulation::{poll_until, CrashScope, PollOutcome, Simulation, SimulationMode};
     use tokio::sync::Semaphore;
 
     /// Boot a single-node standalone simulation and close one ledger so
@@ -445,12 +445,27 @@ mod tests {
         sim.start_all_nodes().await;
 
         let app = sim.app("node0").expect("app node");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while tokio::time::Instant::now() < deadline {
-            if app.state().await == AppState::Validating {
-                break;
+        let outcome = poll_until(
+            &sim,
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            CrashScope::SingleNode("node0"),
+            || async {
+                Ok(if app.state().await == AppState::Validating {
+                    Some(())
+                } else {
+                    None
+                })
+            },
+        )
+        .await
+        .expect("fatal error during Validating wait");
+        match outcome {
+            PollOutcome::Satisfied(()) => {}
+            PollOutcome::NodeExited { node_id, status } => {
+                panic!("node {node_id} crashed while waiting for Validating (status: {status:?})");
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            PollOutcome::TimedOut => {}
         }
         assert_eq!(app.state().await, AppState::Validating);
 
@@ -460,12 +475,29 @@ mod tests {
             .expect("manual close");
         assert_eq!(closed, vec![2]);
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while tokio::time::Instant::now() < deadline {
-            if sim.have_all_app_nodes_externalized(2, 0) {
-                break;
+        let outcome = poll_until(
+            &sim,
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            CrashScope::AllNodes,
+            || async {
+                Ok(if sim.have_all_app_nodes_externalized(2, 0) {
+                    Some(())
+                } else {
+                    None
+                })
+            },
+        )
+        .await
+        .expect("fatal error during externalization wait");
+        match outcome {
+            PollOutcome::Satisfied(()) => {}
+            PollOutcome::NodeExited { node_id, status } => {
+                panic!(
+                    "node {node_id} crashed while waiting for externalization (status: {status:?})"
+                );
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            PollOutcome::TimedOut => {}
         }
         assert!(sim.have_all_app_nodes_externalized(2, 0));
 

@@ -1187,7 +1187,7 @@ mod tests {
         use henyey_app::AppState;
         use henyey_common::Hash256;
         use henyey_crypto::SecretKey;
-        use henyey_simulation::{Simulation, SimulationMode};
+        use henyey_simulation::{poll_until, CrashScope, PollOutcome, Simulation, SimulationMode};
 
         // --- Boot a minimal App ---
         let mut sim =
@@ -1202,12 +1202,33 @@ mod tests {
         sim.add_app_node("node0", secret, quorum_set);
         sim.start_all_nodes().await;
         let app = sim.app("node0").expect("app");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while tokio::time::Instant::now() < deadline {
-            if app.state().await == AppState::Validating {
-                break;
+        let outcome = poll_until(
+            &sim,
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            CrashScope::SingleNode("node0"),
+            || async {
+                Ok(if app.state().await == AppState::Validating {
+                    Some(())
+                } else {
+                    None
+                })
+            },
+        )
+        .await
+        .expect("fatal error during Validating wait");
+        match outcome {
+            PollOutcome::Satisfied(()) => {}
+            PollOutcome::NodeExited { node_id, status } => {
+                panic!("node {node_id} crashed while waiting for Validating (status: {status:?})");
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            PollOutcome::TimedOut => {
+                assert_eq!(
+                    app.state().await,
+                    AppState::Validating,
+                    "timed out waiting for node0 to reach Validating"
+                );
+            }
         }
 
         // --- Build RpcContext with db_semaphore capacity = 1 ---

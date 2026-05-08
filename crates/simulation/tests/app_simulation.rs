@@ -59,14 +59,19 @@ const POST_RESTART_PEER_CONNECT_TIMEOUT_SECS: u64 = 60;
 /// 15s accommodates disk I/O delays on loaded CI runners.
 const POST_RESTART_OPERATIONAL_TIMEOUT_SECS: u64 = 15;
 
-async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout: Duration) {
+async fn wait_for_app_ledger_close(
+    sim: &Simulation,
+    target_ledger: u32,
+    max_spread: u32,
+    timeout: Duration,
+) {
     let outcome = poll_until(
         sim,
         timeout,
         Duration::from_millis(100),
         CrashScope::AllNodes,
         || async {
-            if sim.have_all_app_nodes_externalized(target_ledger, 1) {
+            if sim.have_all_app_nodes_externalized(target_ledger, max_spread) {
                 Ok(Some(()))
             } else {
                 Ok(None)
@@ -88,7 +93,7 @@ async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout
             let mut diag = collect_node_diagnostics(sim).await;
             diag.push_str(&sim.node_task_diagnostics().await);
             assert!(
-                sim.have_all_app_nodes_externalized(target_ledger, 1),
+                sim.have_all_app_nodes_externalized(target_ledger, max_spread),
                 "timed out after {timeout:?} waiting for ledger {target_ledger}.{diag}"
             );
         }
@@ -234,6 +239,107 @@ async fn wait_for_app_operational(sim: &Simulation, node_id: &str, timeout: Dura
                     );
                 }
             }
+        }
+    }
+}
+
+/// Wait for a single node to reach the exact specified `AppState`.
+/// Unlike `wait_for_app_operational` (which accepts `Synced | Validating`),
+/// this waits for one specific state — no risk of racing with the post-wait
+/// assert.
+async fn wait_for_app_state(
+    sim: &Simulation,
+    node_id: &str,
+    target_state: AppState,
+    timeout: Duration,
+) {
+    let outcome = poll_until(
+        sim,
+        timeout,
+        Duration::from_millis(100),
+        CrashScope::SingleNode(node_id),
+        || async {
+            if let Some(app) = sim.app(node_id) {
+                if app.state().await == target_state {
+                    return Ok(Some(()));
+                }
+            }
+            Ok(None)
+        },
+    )
+    .await
+    .expect("fatal error during wait_for_app_state");
+    match outcome {
+        PollOutcome::Satisfied(()) => {}
+        PollOutcome::NodeExited { node_id, status } => {
+            let diag = collect_node_diagnostics(sim).await;
+            panic!(
+                "node {node_id} task exited while waiting for {target_state:?} \
+                 (task_status: {status:?}).{diag}"
+            );
+        }
+        PollOutcome::TimedOut => {
+            let diag = collect_node_diagnostics(sim).await;
+            match sim.app(node_id) {
+                None => {
+                    panic!("timed out after {timeout:?}: node {node_id} not in running_apps.{diag}")
+                }
+                Some(app) => {
+                    let state = app.state().await;
+                    panic!(
+                        "timed out after {timeout:?} waiting for {node_id} to reach \
+                         {target_state:?} (current state: {state:?}).{diag}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Wait for ALL app nodes to reach the exact specified `AppState`.
+/// Panics immediately if there are no app nodes (vacuous truth guard).
+async fn wait_for_all_app_state(
+    sim: &Simulation,
+    target_state: AppState,
+    timeout: Duration,
+    caller: &str,
+) {
+    let apps = sim.apps();
+    assert!(
+        !apps.is_empty(),
+        "{caller}: wait_for_all_app_state called with zero app nodes"
+    );
+    let outcome = poll_until(
+        sim,
+        timeout,
+        Duration::from_millis(100),
+        CrashScope::AllNodes,
+        || async {
+            for app in &sim.apps() {
+                if app.state().await != target_state {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(()))
+        },
+    )
+    .await
+    .expect("fatal error during wait_for_all_app_state");
+    match outcome {
+        PollOutcome::Satisfied(()) => {}
+        PollOutcome::NodeExited { node_id, status } => {
+            let diag = collect_node_diagnostics(sim).await;
+            panic!(
+                "{caller}: node {node_id} task exited while waiting for all nodes to reach \
+                 {target_state:?} (task_status: {status:?}).{diag}"
+            );
+        }
+        PollOutcome::TimedOut => {
+            let diag = collect_node_diagnostics(sim).await;
+            panic!(
+                "{caller}: timed out after {timeout:?} waiting for all nodes to reach \
+                 {target_state:?}.{diag}"
+            );
         }
     }
 }
@@ -485,13 +591,7 @@ async fn test_single_node_app_simulation_can_manual_close_over_tcp() {
     sim.start_all_nodes().await;
 
     let app = sim.app("node0").expect("running app node");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline {
-        if app.state().await == AppState::Validating {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_app_state(&sim, "node0", AppState::Validating, Duration::from_secs(10)).await;
     assert_eq!(app.state().await, AppState::Validating);
 
     let closed = sim
@@ -500,15 +600,7 @@ async fn test_single_node_app_simulation_can_manual_close_over_tcp() {
         .expect("manual close");
     assert_eq!(closed, vec![2]);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline {
-        if sim.have_all_app_nodes_externalized(2, 0) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    assert!(sim.have_all_app_nodes_externalized(2, 0));
+    wait_for_app_ledger_close(&sim, 2, 0, Duration::from_secs(10)).await;
     sim.stop_all_nodes().await.expect("stop app-backed nodes");
 }
 
@@ -572,13 +664,7 @@ async fn test_load_account_sequence_finds_root_account() {
     let app = sim.app("node0").expect("running app node");
 
     // Wait for the app to be ready.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline {
-        if app.state().await == AppState::Validating {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_app_state(&sim, "node0", AppState::Validating, Duration::from_secs(10)).await;
     assert_eq!(app.state().await, AppState::Validating);
 
     // Derive root account ID from the network passphrase (same derivation
@@ -615,14 +701,7 @@ async fn test_load_account_sequence_finds_root_account() {
         .expect("manual close");
     assert_eq!(closed, vec![2]);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline {
-        if sim.have_all_app_nodes_externalized(2, 0) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(sim.have_all_app_nodes_externalized(2, 0));
+    wait_for_app_ledger_close(&sim, 2, 0, Duration::from_secs(10)).await;
 
     // Check after ledger close
     let result_after = app.load_account_sequence(&root_account_id);
@@ -649,17 +728,7 @@ async fn test_load_account_sequence_finds_root_account() {
         sim.manual_close_all_app_nodes()
             .await
             .expect("manual close");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while tokio::time::Instant::now() < deadline {
-            if sim.have_all_app_nodes_externalized(target, 0) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(
-            sim.have_all_app_nodes_externalized(target, 0),
-            "timed out waiting for ledger {target}"
-        );
+        wait_for_app_ledger_close(&sim, target, 0, Duration::from_secs(10)).await;
     }
 
     // Check after multiple ledger closes (step 4).
@@ -773,26 +842,13 @@ async fn test_three_nodes_two_running_threshold_two_over_loopback() {
 async fn test_core3_app_simulation_can_attempt_multi_node_close() {
     let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline {
-        let mut all_validating = true;
-        for id in ["node0", "node1", "node2"] {
-            let app = sim.app(id).expect("running core3 app node");
-            if app.state().await != AppState::Validating {
-                all_validating = false;
-                break;
-            }
-        }
-        if all_validating {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    for id in ["node0", "node1", "node2"] {
-        let app = sim.app(id).expect("running core3 app node");
-        assert_eq!(app.state().await, AppState::Validating);
-    }
+    wait_for_all_app_state(
+        &sim,
+        AppState::Validating,
+        Duration::from_secs(10),
+        "test_core3_app_simulation_can_attempt_multi_node_close",
+    )
+    .await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
     sim.stop_all_nodes().await.expect("stop core3 app nodes");
@@ -987,7 +1043,7 @@ async fn test_core3_restart_rejoin_over_tcp() {
 
     // Wait for node0 to catch up to ledger 3 (where node1/node2 are).
     // 60s timeout: post-restart catchup can be slow on CI runners.
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(60)).await;
+    wait_for_app_ledger_close(&sim, 3, 1, Duration::from_secs(60)).await;
 
     // Verify SCP envelopes traversed the pump_scp_intake pipeline during recovery.
     // restart_node() creates a fresh App with zero counters, so any positive
@@ -1064,7 +1120,7 @@ async fn test_core3_restart_rejoin_over_loopback() {
 
     // Wait for node0 to catch up to ledger 3 before triggering ledger 4.
     // 60s timeout: post-restart catchup can be slow on CI runners.
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(60)).await;
+    wait_for_app_ledger_close(&sim, 3, 1, Duration::from_secs(60)).await;
 
     // Verify SCP envelopes traversed the pump_scp_intake pipeline during recovery.
     // restart_node() creates a fresh App with zero counters, so any positive
@@ -1763,7 +1819,7 @@ async fn test_slow_node_lagging_node_recovers() {
         .await;
 
     // Wait for node0 to catch up to the majority's ledger.
-    wait_for_app_ledger_close(&sim, majority_ledger, Duration::from_secs(60)).await;
+    wait_for_app_ledger_close(&sim, majority_ledger, 1, Duration::from_secs(60)).await;
 
     // Verify SCP envelopes traversed the pump_scp_intake pipeline during recovery.
     // restart_node() creates a fresh App with zero counters, so any positive
@@ -1967,28 +2023,10 @@ async fn test_self_echo_scp_reaches_pump_scp_intake() {
 async fn test_concurrent_tcp_simulations_no_port_conflict() {
     let start_sim = |label: &'static str| async move {
         let mut sim = Topologies::core3(SimulationMode::OverTcp);
+        sim.populate_app_nodes_from_existing(67);
         sim.start_all_nodes().await;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut all_validating = false;
-        while tokio::time::Instant::now() < deadline {
-            let mut ok = true;
-            for app in &sim.apps() {
-                if app.state().await != AppState::Validating {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                all_validating = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            all_validating,
-            "{label}: not all nodes reached Validating within deadline"
-        );
+        wait_for_all_app_state(&sim, AppState::Validating, Duration::from_secs(30), label).await;
         sim.stop_all_nodes()
             .await
             .unwrap_or_else(|e| panic!("{label}: stop all nodes: {e}"));
