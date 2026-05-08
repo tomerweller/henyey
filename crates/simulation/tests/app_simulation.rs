@@ -20,7 +20,7 @@ const TCP_POST_REMOVAL_CLOSE_TIMEOUT_SECS: u64 = 90;
 // Three tiers based on the complexity of the connectivity scenario:
 //
 //   STARTUP (60s) — full topology cold-start, all nodes connecting simultaneously
-//                   Used by build_app_backed_topology (both OverTcp and OverLoopback)
+//                   Used by build_app_backed_topology (topology-aware stabilization)
 //   RESTART (60s) — single node rejoining over TCP (stabilize_app_tcp_connectivity)
 //                   Loopback restart uses wait_for_peer_count + POST_RESTART_PEER_CONNECT_TIMEOUT_SECS
 //   REDUCED (30s) — reduced topology with fewer nodes/connections
@@ -320,17 +320,24 @@ async fn stabilize_or_panic(sim: &Simulation, min_peers: usize, timeout_secs: u6
         });
 }
 
+/// Await topology-aware connectivity stabilization.
+/// Panics if any node's peer set does not match the expected topology.
+async fn stabilize_topology_or_panic(sim: &Simulation, timeout_secs: u64, caller: &str) {
+    sim.stabilize_app_topology_connectivity(Duration::from_secs(timeout_secs))
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "{caller}: topology connectivity did not stabilize within {timeout_secs}s: {err}"
+            )
+        });
+}
+
 /// Build a fully-connected app-backed topology and wait for connectivity stabilization.
-async fn build_app_backed_topology(
-    mut sim: Simulation,
-    threshold_percent: u32,
-    min_peers: usize,
-) -> Simulation {
+async fn build_app_backed_topology(mut sim: Simulation, threshold_percent: u32) -> Simulation {
     sim.populate_app_nodes_from_existing(threshold_percent);
     sim.start_all_nodes().await;
-    stabilize_or_panic(
+    stabilize_topology_or_panic(
         &sim,
-        min_peers,
         STABILIZE_STARTUP_TIMEOUT_SECS,
         "build_app_backed_topology",
     )
@@ -609,7 +616,7 @@ async fn test_load_account_sequence_finds_root_account() {
 #[tokio::test]
 async fn test_load_account_sequence_pair_topology() {
     let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100, 1).await;
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
 
     // Wait for both nodes to be operational.
     wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
@@ -648,8 +655,7 @@ async fn test_load_account_sequence_pair_topology() {
 
 #[tokio::test]
 async fn test_core3_app_simulation_starts_over_tcp() {
-    let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67, 1).await;
+    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
 
     let mut total_peers = 0usize;
 
@@ -698,8 +704,7 @@ async fn test_three_nodes_two_running_threshold_two_over_loopback() {
 
 #[tokio::test]
 async fn test_core3_app_simulation_can_attempt_multi_node_close() {
-    let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67, 1).await;
+    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
@@ -728,8 +733,7 @@ async fn test_core3_app_simulation_can_attempt_multi_node_close() {
 
 #[tokio::test]
 async fn test_pair_app_simulation_can_close_ledgers_over_tcp() {
-    let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
+    let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
@@ -739,7 +743,7 @@ async fn test_pair_app_simulation_can_close_ledgers_over_tcp() {
 #[tokio::test]
 async fn test_pair_app_simulation_can_close_ledgers_over_loopback() {
     let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100, 1).await;
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
@@ -750,8 +754,7 @@ async fn test_pair_app_simulation_can_close_ledgers_over_loopback() {
 
 #[tokio::test]
 async fn test_pair_app_simulation_executes_generated_load_over_tcp() {
-    let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
+    let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
 
     ensure_app_accounts_funded(&mut sim, 2).await;
 
@@ -776,7 +779,7 @@ async fn test_pair_app_simulation_executes_generated_load_over_tcp() {
 #[tokio::test]
 async fn test_pair_app_simulation_executes_generated_load_over_loopback() {
     let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100, 1).await;
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
 
     ensure_app_accounts_funded(&mut sim, 2).await;
 
@@ -802,8 +805,7 @@ async fn test_pair_app_simulation_executes_generated_load_over_loopback() {
 
 #[tokio::test]
 async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
-    let mut sim =
-        build_app_backed_topology(Topologies::core(4, SimulationMode::OverTcp), 75, 1).await;
+    let mut sim = build_app_backed_topology(Topologies::core(4, SimulationMode::OverTcp), 75).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
@@ -812,8 +814,7 @@ async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
 
 #[tokio::test]
 async fn test_cycle4_app_simulation_can_close_ledgers_over_tcp() {
-    let mut sim =
-        build_app_backed_topology(Topologies::cycle4(SimulationMode::OverTcp), 75, 2).await;
+    let mut sim = build_app_backed_topology(Topologies::cycle4(SimulationMode::OverTcp), 75).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(30)).await;
 
@@ -823,7 +824,7 @@ async fn test_cycle4_app_simulation_can_close_ledgers_over_tcp() {
 #[tokio::test]
 async fn test_core3_app_simulation_can_close_ledgers_over_loopback() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67, 1).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
@@ -835,7 +836,7 @@ async fn test_core3_app_simulation_can_close_ledgers_over_loopback() {
 #[tokio::test]
 async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
     let mut sim =
-        build_app_backed_topology(Topologies::separate(SimulationMode::OverTcp), 75, 1).await;
+        build_app_backed_topology(Topologies::separate(SimulationMode::OverTcp), 75).await;
 
     let _ = sim
         .manual_close_all_app_nodes()
@@ -849,8 +850,7 @@ async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
 
 #[tokio::test]
 async fn test_core3_restart_rejoin_over_tcp() {
-    let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 66, 1).await;
+    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 66).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(45)).await;
 
@@ -922,7 +922,7 @@ async fn test_core3_restart_rejoin_over_tcp() {
 #[serial]
 async fn test_core3_restart_rejoin_over_loopback() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66, 1).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(45)).await;
 
@@ -1146,6 +1146,147 @@ async fn test_task_exit_detection_during_stabilize_connectivity() {
 }
 
 #[tokio::test]
+async fn test_wait_for_topology_connectivity_zero_apps_succeeds() {
+    let sim = Topologies::core3(SimulationMode::OverTcp);
+    // No app nodes started — running_apps is empty → vacuous success
+    let result = sim
+        .wait_for_topology_connectivity(Duration::from_millis(100))
+        .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_wait_for_topology_connectivity_returns_error_on_timeout() {
+    let mut sim = Topologies::core3(SimulationMode::OverTcp);
+    sim.populate_app_nodes_from_existing(67);
+    sim.start_all_nodes().await;
+    // Immediately check before connections establish — should timeout
+    let result = sim
+        .wait_for_topology_connectivity(Duration::from_millis(0))
+        .await;
+    // Whether it succeeds or times out depends on how fast connections are,
+    // but the function should not panic either way.
+    if let Err(err) = result {
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("topology mismatch"),
+            "expected 'topology mismatch' in error: {err_msg}"
+        );
+    }
+    sim.stop_all_nodes().await.ok();
+}
+
+#[tokio::test]
+async fn test_wait_for_topology_connectivity_detects_crash() {
+    let mut sim = Topologies::core3(SimulationMode::OverTcp);
+    sim.populate_app_nodes_from_existing(67);
+    sim.start_all_nodes().await;
+
+    let ids = sim.app_node_ids();
+    let victim = &ids[0];
+    sim.abort_node_task(victim);
+
+    // Wait for the task to register as finished.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if sim.app_task_finished(victim) == Some(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        sim.app_task_finished(victim),
+        Some(true),
+        "node {victim} task did not exit after abort"
+    );
+
+    // Should fail fast with task-exited error, not wait for timeout.
+    let start = tokio::time::Instant::now();
+    let result = sim
+        .wait_for_topology_connectivity(Duration::from_secs(10))
+        .await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "expected error from exited node");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("task exited"),
+        "expected 'task exited' in error: {err_msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "fail-fast took too long: {elapsed:?}"
+    );
+
+    sim.stop_all_nodes().await.ok();
+}
+
+#[tokio::test]
+async fn test_stabilize_app_topology_connectivity_returns_error_on_timeout() {
+    let mut sim = Topologies::core3(SimulationMode::OverTcp);
+    sim.populate_app_nodes_from_existing(67);
+    sim.start_all_nodes().await;
+
+    // Abort a node to make topology unreachable.
+    let ids = sim.app_node_ids();
+    let victim = &ids[0];
+    sim.abort_node_task(victim);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if sim.app_task_finished(victim) == Some(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let result = sim
+        .stabilize_app_topology_connectivity(Duration::from_secs(10))
+        .await;
+    assert!(result.is_err(), "expected error from exited node");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("task exited"),
+        "expected 'task exited' in error: {err_msg}"
+    );
+
+    sim.stop_all_nodes().await.ok();
+}
+
+#[tokio::test]
+async fn test_topology_connectivity_detects_cross_partition_connection() {
+    // Create a separate topology: two isolated pairs (node0-node1, node2-node3).
+    let mut sim =
+        build_app_backed_topology(Topologies::separate(SimulationMode::OverTcp), 75).await;
+
+    // Verify the topology-aware check passes with correct connections.
+    sim.wait_for_topology_connectivity(Duration::from_millis(500))
+        .await
+        .expect("topology should match before modification");
+
+    // Modify the topology definition to add a link that doesn't exist in
+    // reality. Now expected_peer_ids("node0") returns {node1, node2} but
+    // node0 is only connected to node1 → "missing" node2.
+    sim.add_pending_connection("node0", "node2");
+
+    // The topology-aware check should now fail because node0 is missing node2.
+    let result = sim
+        .wait_for_topology_connectivity(Duration::from_millis(500))
+        .await;
+    assert!(
+        result.is_err(),
+        "expected topology mismatch after adding non-existent link"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("missing"),
+        "expected 'missing' peer in error diagnostics: {err_msg}"
+    );
+
+    sim.stop_all_nodes().await.expect("stop separate nodes");
+}
+
+#[tokio::test]
 #[serial]
 async fn test_task_exit_detection_during_partition_assertion() {
     use futures::FutureExt;
@@ -1260,7 +1401,7 @@ async fn assert_all_nodes_healthy(sim: &Simulation) {
 #[tokio::test]
 async fn test_simple_payment_app_backed_core3() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67, 1).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
 
     ensure_app_accounts_funded(&mut sim, 3).await;
 
@@ -1283,7 +1424,6 @@ async fn test_core4_multi_step_payment_load() {
     let mut sim = build_app_backed_topology(
         Topologies::core(4, SimulationMode::OverLoopback),
         75, // ceil(3/4) = 75%
-        1,
     )
     .await;
 
@@ -1309,7 +1449,7 @@ async fn test_core4_multi_step_payment_load() {
 #[tokio::test]
 async fn test_core5_over_loopback_can_close_ledgers() {
     let mut sim =
-        build_app_backed_topology(Topologies::core(5, SimulationMode::OverLoopback), 80, 1).await;
+        build_app_backed_topology(Topologies::core(5, SimulationMode::OverLoopback), 80).await;
 
     // Close ledgers 3-10 (8 closes, exercises multiple SCP rounds).
     manual_close_until(&sim, 10, 2, Duration::from_secs(120)).await;
@@ -1333,7 +1473,7 @@ async fn test_core5_over_loopback_can_close_ledgers() {
 #[tokio::test]
 async fn test_sustained_payment_load_app_backed() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67, 1).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
 
     ensure_app_accounts_funded(&mut sim, 3).await;
 
@@ -1359,7 +1499,7 @@ async fn test_sustained_payment_load_app_backed() {
 #[tokio::test]
 async fn test_spike_payment_load_app_backed() {
     let mut sim =
-        build_app_backed_topology(Topologies::core(4, SimulationMode::OverLoopback), 75, 1).await;
+        build_app_backed_topology(Topologies::core(4, SimulationMode::OverLoopback), 75).await;
 
     ensure_app_accounts_funded(&mut sim, 4).await;
 
@@ -1412,7 +1552,7 @@ async fn test_spike_payment_load_app_backed() {
 #[tokio::test]
 async fn test_tx_queue_contention_app_backed() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67, 1).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
 
     ensure_app_accounts_funded(&mut sim, 3).await;
 
@@ -1463,7 +1603,7 @@ async fn test_tx_queue_contention_app_backed() {
 #[serial]
 async fn test_slow_node_lagging_node_recovers() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66, 1).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66).await;
 
     // Fund accounts so we can submit payments.
     ensure_app_accounts_funded(&mut sim, 3).await;
@@ -1567,8 +1707,7 @@ async fn test_slow_node_lagging_node_recovers() {
 /// Regression context: #2317, #2325, #2364.
 #[tokio::test]
 async fn test_pair_tcp_scp_messages_exercise_pump_scp_intake() {
-    let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
+    let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
 
     // Ensure both nodes are operational before baselining counters.
     wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
@@ -1648,8 +1787,7 @@ async fn test_pair_tcp_scp_messages_exercise_pump_scp_intake() {
 async fn test_self_echo_scp_reaches_pump_scp_intake() {
     use stellar_xdr::curr::{NodeId, StellarMessage};
 
-    let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
+    let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
 
     wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
     wait_for_app_operational(&sim, "node1", Duration::from_secs(10)).await;

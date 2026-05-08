@@ -1,7 +1,7 @@
 //! Deterministic multi-node simulation harness for validating consensus,
 //! overlay, and ledger-close behavior across configurable topologies.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use henyey_clock::RealClock;
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::SecretKey;
 use henyey_overlay::{
-    ConnectionFactory, LoopbackConnectionFactory, PeerAddress, TcpConnectionFactory,
+    ConnectionFactory, LoopbackConnectionFactory, PeerAddress, PeerId, TcpConnectionFactory,
 };
 use stellar_xdr::curr::{
     AccountId, Asset, CreateAccountOp, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
@@ -703,6 +703,178 @@ impl Simulation {
         {
             Err(detail) => anyhow::bail!(
                 "stabilize_app_tcp_connectivity: connectivity did not stabilize \
+                 within {timeout:?}: {detail}"
+            ),
+            Ok(()) => Ok(()),
+        }
+    }
+
+    /// Returns the expected set of authenticated peer IDs for a node based on
+    /// the configured topology (`LoopbackNetwork` links) and currently running
+    /// apps.
+    ///
+    /// Only neighbors that are present in `running_apps` are included — a
+    /// topology neighbor that has not been started (or has been removed) is
+    /// excluded.
+    fn expected_peer_ids(&self, node_id: &str) -> HashSet<PeerId> {
+        self.loopback
+            .neighbors(node_id)
+            .into_iter()
+            .filter(|neighbor| self.running_apps.contains_key(neighbor))
+            .filter_map(|neighbor| {
+                self.secret_for_node(&neighbor)
+                    .ok()
+                    .map(|secret| PeerId::from_bytes(*secret.public_key().as_bytes()))
+            })
+            .collect()
+    }
+
+    /// Wait until every running node is connected to **exactly** the set of
+    /// peers defined by the configured topology.
+    ///
+    /// Unlike `wait_for_app_connectivity` (which uses a global minimum-peer
+    /// floor), this checks per-node peer *identity* against the topology graph,
+    /// catching under-connection, over-connection, and wrong-peer topologies.
+    ///
+    /// **Precondition:** validates the *static configured link graph* among
+    /// currently running apps. Does **not** account for runtime fault injection
+    /// (`partition()`, `set_drop_prob()`). Invalid to call during active fault
+    /// injection.
+    pub async fn wait_for_topology_connectivity(&self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.check_any_node_task_exited().await?;
+
+            let mut all_match = true;
+            let mut ids: Vec<&String> = self.running_apps.keys().collect();
+            ids.sort();
+            for id in &ids {
+                let expected = self.expected_peer_ids(id);
+                let actual: HashSet<PeerId> = self.running_apps[*id]
+                    .app
+                    .peer_snapshots()
+                    .await
+                    .into_iter()
+                    .map(|s| s.info.peer_id)
+                    .collect();
+                if expected != actual {
+                    all_match = false;
+                    break;
+                }
+            }
+            if all_match {
+                self.check_any_node_task_exited().await?;
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(
+                Duration::from_millis(100).min(deadline - tokio::time::Instant::now()),
+            )
+            .await;
+        }
+
+        // Build per-node diagnostics with sorted strkeys for determinism.
+        let mut diag_lines = Vec::new();
+        let mut ids: Vec<&String> = self.running_apps.keys().collect();
+        ids.sort();
+        for id in &ids {
+            let expected = self.expected_peer_ids(id);
+            let actual: HashSet<PeerId> = self.running_apps[*id]
+                .app
+                .peer_snapshots()
+                .await
+                .into_iter()
+                .map(|s| s.info.peer_id)
+                .collect();
+            let missing: Vec<String> = expected
+                .difference(&actual)
+                .map(|p| p.to_strkey())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect();
+            let unexpected: Vec<String> = actual
+                .difference(&expected)
+                .map(|p| p.to_strkey())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect();
+
+            let mut missing_sorted = missing;
+            missing_sorted.sort();
+            let mut unexpected_sorted = unexpected;
+            unexpected_sorted.sort();
+
+            if !missing_sorted.is_empty() || !unexpected_sorted.is_empty() {
+                let mut parts = vec![format!(
+                    "{id}: expected={} actual={}",
+                    expected.len(),
+                    actual.len()
+                )];
+                if !missing_sorted.is_empty() {
+                    parts.push(format!("missing=[{}]", missing_sorted.join(", ")));
+                }
+                if !unexpected_sorted.is_empty() {
+                    parts.push(format!("unexpected=[{}]", unexpected_sorted.join(", ")));
+                }
+                diag_lines.push(parts.join(" "));
+            }
+        }
+
+        let task_diag = self.node_task_diagnostics().await;
+        anyhow::bail!(
+            "wait_for_topology_connectivity: topology mismatch after {timeout:?} \
+             ({}){}",
+            diag_lines.join("; "),
+            task_diag
+        )
+    }
+
+    /// Kick-start topology-correct connections and wait until every node is
+    /// connected to exactly its expected peers.
+    ///
+    /// Combines `repair_app_connectivity()` with
+    /// `wait_for_topology_connectivity()` in a retry loop, analogous to
+    /// `stabilize_app_tcp_connectivity()` but topology-aware and without a
+    /// caller-supplied `min_peers`.
+    ///
+    /// **Precondition:** same as `wait_for_topology_connectivity` — validates
+    /// the static configured link graph. Invalid during active fault injection.
+    pub async fn stabilize_app_topology_connectivity(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.check_any_node_task_exited().await?;
+
+            if let Err(err) = self.repair_app_connectivity().await {
+                if !err.to_string().contains("overlay not started") {
+                    return Err(err);
+                }
+                self.check_any_node_task_exited().await?;
+            }
+            let remaining = deadline.duration_since(tokio::time::Instant::now());
+            let probe_timeout = remaining.min(Duration::from_secs(1));
+            match self.wait_for_topology_connectivity(probe_timeout).await {
+                Ok(()) => return Ok(()),
+                Err(_) => {
+                    self.check_any_node_task_exited().await?;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let remaining = deadline.duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+        }
+        match self
+            .wait_for_topology_connectivity(Duration::from_millis(0))
+            .await
+        {
+            Err(detail) => anyhow::bail!(
+                "stabilize_app_topology_connectivity: topology did not stabilize \
                  within {timeout:?}: {detail}"
             ),
             Ok(()) => Ok(()),
