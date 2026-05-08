@@ -849,6 +849,23 @@ async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
 }
 
 #[tokio::test]
+async fn test_separate_app_simulation_stays_partitioned_over_loopback() {
+    let mut sim =
+        build_app_backed_topology(Topologies::separate(SimulationMode::OverLoopback), 75).await;
+
+    let _ = sim
+        .manual_close_all_app_nodes()
+        .await
+        .expect("manual close separate loopback");
+
+    assert_not_all_nodes_externalized(&sim, 2, 1, Duration::from_secs(5)).await;
+
+    sim.stop_all_nodes()
+        .await
+        .expect("stop separate loopback app nodes");
+}
+
+#[tokio::test]
 async fn test_core3_restart_rejoin_over_tcp() {
     let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 66).await;
 
