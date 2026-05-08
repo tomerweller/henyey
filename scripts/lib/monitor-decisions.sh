@@ -13,6 +13,31 @@
 _MONITOR_DECISIONS_LOADED=1
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _find_session_process DATA_ROOT PROC_ROOT SESSION_ID
+#
+# Scan /proc for a process whose exe symlink matches this session's binary.
+# Derives the expected binary path internally.
+#
+# Stdout: PID of first matching process, or empty string if none found.
+# Returns: 0 always.
+# ─────────────────────────────────────────────────────────────────────────────
+_find_session_process() {
+  local data_root="$1" proc_root="$2" session_id="$3"
+  local expected_binary="$data_root/$session_id/cargo-target/release/henyey"
+
+  for p in "$proc_root"/[0-9]*; do
+    [[ -d "$p" ]] || continue
+    local exe
+    exe=$(readlink "$p/exe" 2>/dev/null || true)
+    if [[ "$exe" == "$expected_binary" || "$exe" == "$expected_binary (deleted)" ]]; then
+      basename "$p"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # check_session_wiped DATA_ROOT PROC_ROOT SESSION_ID ENV_FILE
 #
 # Check whether the session directory was wiped out-of-band.
@@ -38,18 +63,8 @@ check_session_wiped() {
   SESSION_WIPED_PROCESS_ALIVE=no
 
   if [[ ! -d "$data_root/$session_id" ]]; then
-    local expected_binary="$data_root/$session_id/cargo-target/release/henyey"
-    local our_pid=""
-
-    for p in "$proc_root"/[0-9]*; do
-      [[ -d "$p" ]] || continue
-      local exe
-      exe=$(readlink "$p/exe" 2>/dev/null || true)
-      if [[ "$exe" == "$expected_binary" || "$exe" == "$expected_binary (deleted)" ]]; then
-        our_pid=$(basename "$p")
-        break
-      fi
-    done
+    local our_pid
+    our_pid=$(_find_session_process "$data_root" "$proc_root" "$session_id")
 
     if [[ -n "$our_pid" ]]; then
       SESSION_WIPED=yes
@@ -72,6 +87,77 @@ check_session_wiped() {
     # Recreate minimal session structure (only reached if recoverable).
     mkdir -p "$data_root/$session_id"/{logs,cache,cargo-target,metrics}
   fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# check_long_stale_session DATA_ROOT PROC_ROOT SESSION_ID ENV_FILE
+#
+# Detect "session dir exists but is long-abandoned" state and refuse
+# auto-relaunch. Sibling to check_session_wiped (which handles missing dirs).
+#
+# Primary signal: .alive mtime (touched every tick). Fallback: env file mtime.
+# Process-alive check overrides staleness markers.
+#
+# Sets globals:
+#   LONG_STALE_SESSION  "yes" | "no"
+#
+# Returns:
+#   0 — session is not long-stale (process alive, or markers recent enough)
+#   1 — session is long-stale; caller should exit without relaunching
+#
+# Stderr on return 1:
+#   "ERROR: session <ID> long-stale (...). Refusing auto-relaunch ..."
+#
+# Call-site pattern:
+#   check_long_stale_session "$HOME/data" "/proc" "$MONITOR_SESSION_ID" \
+#     "$HOME/data/monitor-loop.env" || exit 1
+# ─────────────────────────────────────────────────────────────────────────────
+check_long_stale_session() {
+  local data_root="$1" proc_root="$2" session_id="$3" env_file="$4"
+  LONG_STALE_SESSION=no
+
+  # Not our concern if session dir is missing (check_session_wiped handles that).
+  if [[ ! -d "$data_root/$session_id" ]]; then
+    return 0
+  fi
+
+  # Check .alive freshness (primary signal — touched every tick).
+  local alive_file="$data_root/$session_id/.alive"
+  local alive_age=""
+  if [[ -f "$alive_file" ]]; then
+    local alive_mtime
+    alive_mtime=$(stat -c %Y "$alive_file" 2>/dev/null || echo 0)
+    alive_age=$(( $(date +%s) - alive_mtime ))
+    if [[ "$alive_age" -le 21600 ]]; then
+      return 0  # Recent tick activity (≤ 6h).
+    fi
+  fi
+
+  # .alive missing or stale — check env freshness as fallback.
+  local env_mtime env_age
+  env_mtime=$(stat -c %Y "$env_file" 2>/dev/null || echo 0)
+  env_age=$(( $(date +%s) - env_mtime ))
+  if [[ "$env_age" -le 86400 ]]; then
+    return 0  # Env is recent enough (≤ 24h).
+  fi
+
+  # Both markers stale — check if process is still alive (overrides staleness).
+  local our_pid
+  our_pid=$(_find_session_process "$data_root" "$proc_root" "$session_id")
+  if [[ -n "$our_pid" ]]; then
+    return 0  # Process alive; session is active despite stale markers.
+  fi
+
+  # All conditions met: no process, .alive stale/missing, env stale.
+  LONG_STALE_SESSION=yes
+  local alive_msg
+  if [[ -n "$alive_age" ]]; then
+    alive_msg=".alive age ${alive_age}s > 6h"
+  else
+    alive_msg=".alive missing"
+  fi
+  echo "ERROR: session $session_id long-stale (no process, $alive_msg, env age ${env_age}s > 24h). Refusing auto-relaunch — run /monitor-loop to reset." >&2
+  return 1
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

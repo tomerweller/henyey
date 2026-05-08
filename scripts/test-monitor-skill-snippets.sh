@@ -43,7 +43,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=90
+TAP_PLAN=103
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -180,6 +180,17 @@ check_skill_structure() {
     echo "WARNING: monitor-tick/SKILL.md does not call check_mainnet_wiped" >&2
     drift=true
   fi
+  # monitor-tick must call check_long_stale_session (long-stale session guard)
+  if ! grep -q 'check_long_stale_session' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not call check_long_stale_session" >&2
+    drift=true
+  fi
+  # Verify fail-fast: check_long_stale_session call must include || exit 1
+  if ! grep -A2 'check_long_stale_session' "$tick_file" | grep -q '|| exit 1'; then
+    echo "WARNING: monitor-tick/SKILL.md calls check_long_stale_session without || exit 1 fail-fast" >&2
+    drift=true
+  fi
+
   # monitor-tick must call detect_crash_state (3a refactor)
   if ! grep -q 'detect_crash_state' "$tick_file"; then
     echo "WARNING: monitor-tick/SKILL.md does not call detect_crash_state" >&2
@@ -703,6 +714,210 @@ run_tests() {
   else
     tap_not_ok "session-wipe: session dir exists → not wiped" \
       "exit=$exit_code19 WIPED=$SESSION_WIPED ALIVE=$SESSION_WIPED_PROCESS_ALIVE stderr='$stderr19' contents='$(ls "$data/$session_id" 2>/dev/null)'"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # _find_session_process tests (T20b-T20c)
+  # Source: scripts/lib/monitor-decisions.sh — _find_session_process
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Test 20b: _find_session_process finds matching PID ─────────────────
+  data="$TEST_ROOT/t20b/data"
+  proc="$TEST_ROOT/t20b/proc"
+  session_id="sess20b"
+  mkdir -p "$data" "$proc"
+  mock_proc_entry "$proc" "5001" "$data/$session_id/cargo-target/release/henyey"
+  local found_pid
+  found_pid=$(_find_session_process "$data" "$proc" "$session_id")
+  if [[ "$found_pid" == "5001" ]]; then
+    tap_ok "_find_session_process: returns PID for matching binary"
+  else
+    tap_not_ok "_find_session_process: returns PID for matching binary" "got: '$found_pid'"
+  fi
+
+  # ── Test 20c: _find_session_process returns empty for non-matching ─────
+  data="$TEST_ROOT/t20c/data"
+  proc="$TEST_ROOT/t20c/proc"
+  session_id="sess20c"
+  mkdir -p "$data" "$proc"
+  mock_proc_entry "$proc" "5002" "$data/other-session/cargo-target/release/henyey"
+  found_pid=$(_find_session_process "$data" "$proc" "$session_id")
+  if [[ -z "$found_pid" ]]; then
+    tap_ok "_find_session_process: empty for non-matching binary"
+  else
+    tap_not_ok "_find_session_process: empty for non-matching binary" "got: '$found_pid'"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # check_long_stale_session tests (T20d-T20n)
+  # Source: scripts/lib/monitor-decisions.sh — check_long_stale_session
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Test 20d: Session dir missing → not stale (return 0) ───────────────
+  data="$TEST_ROOT/t20d/data"
+  proc="$TEST_ROOT/t20d/proc"
+  session_id="sess20d"
+  mkdir -p "$data" "$proc"
+  # session dir does NOT exist
+  local exit_20d=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20d=$?
+  if [[ "$exit_20d" -eq 0 && "$LONG_STALE_SESSION" == "no" ]]; then
+    tap_ok "long-stale: session dir missing → not stale"
+  else
+    tap_not_ok "long-stale: session dir missing → not stale" "exit=$exit_20d LONG_STALE=$LONG_STALE_SESSION"
+  fi
+
+  # ── Test 20e: Session dir exists + .alive fresh (100s) → not stale ─────
+  data="$TEST_ROOT/t20e/data"
+  proc="$TEST_ROOT/t20e/proc"
+  session_id="sess20e"
+  mkdir -p "$data/$session_id" "$proc"
+  mock_alive_file "$data/$session_id/.alive" 100
+  local exit_20e=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20e=$?
+  if [[ "$exit_20e" -eq 0 && "$LONG_STALE_SESSION" == "no" ]]; then
+    tap_ok "long-stale: .alive fresh (100s) → not stale"
+  else
+    tap_not_ok "long-stale: .alive fresh (100s) → not stale" "exit=$exit_20e LONG_STALE=$LONG_STALE_SESSION"
+  fi
+
+  # ── Test 20f: .alive stale + env stale + no process → return 1 ─────────
+  data="$TEST_ROOT/t20f/data"
+  proc="$TEST_ROOT/t20f/proc"
+  session_id="sess20f"
+  mkdir -p "$data/$session_id" "$proc"
+  mock_alive_file "$data/$session_id/.alive" 21601
+  mock_env_file "$data/monitor-loop.env" 86401
+  local exit_20f=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20f=$?
+  if [[ "$exit_20f" -eq 1 && "$LONG_STALE_SESSION" == "yes" ]]; then
+    tap_ok "long-stale: .alive stale + env stale + no process → return 1"
+  else
+    tap_not_ok "long-stale: .alive stale + env stale + no process → return 1" "exit=$exit_20f LONG_STALE=$LONG_STALE_SESSION"
+  fi
+
+  # ── Test 20g: .alive stale + env stale + process alive → return 0 ──────
+  data="$TEST_ROOT/t20g/data"
+  proc="$TEST_ROOT/t20g/proc"
+  session_id="sess20g"
+  mkdir -p "$data/$session_id" "$proc"
+  mock_alive_file "$data/$session_id/.alive" 21601
+  mock_env_file "$data/monitor-loop.env" 86401
+  mock_proc_entry "$proc" "6001" "$data/$session_id/cargo-target/release/henyey"
+  local exit_20g=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20g=$?
+  if [[ "$exit_20g" -eq 0 && "$LONG_STALE_SESSION" == "no" ]]; then
+    tap_ok "long-stale: process alive overrides stale markers"
+  else
+    tap_not_ok "long-stale: process alive overrides stale markers" "exit=$exit_20g LONG_STALE=$LONG_STALE_SESSION"
+  fi
+
+  # ── Test 20h: .alive at boundary (21600s) → not stale (passes -le) ────
+  data="$TEST_ROOT/t20h/data"
+  proc="$TEST_ROOT/t20h/proc"
+  session_id="sess20h"
+  mkdir -p "$data/$session_id" "$proc"
+  mock_alive_file "$data/$session_id/.alive" 21600
+  mock_env_file "$data/monitor-loop.env" 86401
+  local exit_20h=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20h=$?
+  if [[ "$exit_20h" -eq 0 && "$LONG_STALE_SESSION" == "no" ]]; then
+    tap_ok "long-stale: .alive at boundary (21600s) → not stale"
+  else
+    tap_not_ok "long-stale: .alive at boundary (21600s) → not stale" "exit=$exit_20h LONG_STALE=$LONG_STALE_SESSION"
+  fi
+
+  # ── Test 20i: .alive missing + env fresh (100s) → not stale ────────────
+  data="$TEST_ROOT/t20i/data"
+  proc="$TEST_ROOT/t20i/proc"
+  session_id="sess20i"
+  mkdir -p "$data/$session_id" "$proc"
+  # No .alive file
+  mock_env_file "$data/monitor-loop.env" 100
+  local exit_20i=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20i=$?
+  if [[ "$exit_20i" -eq 0 && "$LONG_STALE_SESSION" == "no" ]]; then
+    tap_ok "long-stale: .alive missing + env fresh → not stale"
+  else
+    tap_not_ok "long-stale: .alive missing + env fresh → not stale" "exit=$exit_20i LONG_STALE=$LONG_STALE_SESSION"
+  fi
+
+  # ── Test 20j: .alive missing + env stale + no process → return 1 ───────
+  data="$TEST_ROOT/t20j/data"
+  proc="$TEST_ROOT/t20j/proc"
+  session_id="sess20j"
+  mkdir -p "$data/$session_id" "$proc"
+  # No .alive file
+  mock_env_file "$data/monitor-loop.env" 86401
+  local exit_20j=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20j=$?
+  if [[ "$exit_20j" -eq 1 && "$LONG_STALE_SESSION" == "yes" ]]; then
+    tap_ok "long-stale: .alive missing + env stale + no process → return 1"
+  else
+    tap_not_ok "long-stale: .alive missing + env stale + no process → return 1" "exit=$exit_20j LONG_STALE=$LONG_STALE_SESSION"
+  fi
+
+  # ── Test 20k: .alive missing + env at boundary (86400s) → not stale ────
+  data="$TEST_ROOT/t20k/data"
+  proc="$TEST_ROOT/t20k/proc"
+  session_id="sess20k"
+  mkdir -p "$data/$session_id" "$proc"
+  # No .alive file
+  mock_env_file "$data/monitor-loop.env" 86400
+  local exit_20k=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20k=$?
+  if [[ "$exit_20k" -eq 0 && "$LONG_STALE_SESSION" == "no" ]]; then
+    tap_ok "long-stale: env at boundary (86400s) → not stale"
+  else
+    tap_not_ok "long-stale: env at boundary (86400s) → not stale" "exit=$exit_20k LONG_STALE=$LONG_STALE_SESSION"
+  fi
+
+  # ── Test 20l: .alive stale + env fresh → not stale (env fallback) ──────
+  data="$TEST_ROOT/t20l/data"
+  proc="$TEST_ROOT/t20l/proc"
+  session_id="sess20l"
+  mkdir -p "$data/$session_id" "$proc"
+  mock_alive_file "$data/$session_id/.alive" 21601
+  mock_env_file "$data/monitor-loop.env" 100
+  local exit_20l=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20l=$?
+  if [[ "$exit_20l" -eq 0 && "$LONG_STALE_SESSION" == "no" ]]; then
+    tap_ok "long-stale: .alive stale + env fresh → not stale (env fallback)"
+  else
+    tap_not_ok "long-stale: .alive stale + env fresh → not stale (env fallback)" "exit=$exit_20l LONG_STALE=$LONG_STALE_SESSION"
+  fi
+
+  # ── Test 20m: .alive missing + env stale + different session process → return 1 ─
+  data="$TEST_ROOT/t20m/data"
+  proc="$TEST_ROOT/t20m/proc"
+  session_id="sess20m"
+  mkdir -p "$data/$session_id" "$proc"
+  # No .alive file; process running a DIFFERENT session's binary
+  mock_env_file "$data/monitor-loop.env" 86401
+  mock_proc_entry "$proc" "7001" "$data/other-session/cargo-target/release/henyey"
+  local exit_20m=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_20m=$?
+  if [[ "$exit_20m" -eq 1 && "$LONG_STALE_SESSION" == "yes" ]]; then
+    tap_ok "long-stale: different session process does not save"
+  else
+    tap_not_ok "long-stale: different session process does not save" "exit=$exit_20m LONG_STALE=$LONG_STALE_SESSION"
+  fi
+
+  # ── Test 20n: stderr message on long-stale refusal ─────────────────────
+  data="$TEST_ROOT/t20n/data"
+  proc="$TEST_ROOT/t20n/proc"
+  session_id="sess20n"
+  mkdir -p "$data/$session_id" "$proc" "$TEST_ROOT/t20n"
+  mock_alive_file "$data/$session_id/.alive" 21601
+  mock_env_file "$data/monitor-loop.env" 86401
+  local exit_20n=0
+  check_long_stale_session "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>"$TEST_ROOT/t20n/stderr" || exit_20n=$?
+  local stderr_20n
+  stderr_20n=$(cat "$TEST_ROOT/t20n/stderr")
+  if [[ "$exit_20n" -eq 1 && "$stderr_20n" == *"long-stale"* && "$stderr_20n" == *"$session_id"* && "$stderr_20n" == *"Refusing auto-relaunch"* ]]; then
+    tap_ok "long-stale: stderr message on refusal"
+  else
+    tap_not_ok "long-stale: stderr message on refusal" "exit=$exit_20n stderr='$stderr_20n'"
   fi
 
   # ════════════════════════════════════════════════════════════════════════════

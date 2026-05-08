@@ -82,8 +82,30 @@ The `check_session_wiped` function (defined in `scripts/lib/monitor-decisions.sh
 - Sets `SESSION_WIPED` ("yes"/"no") and `SESSION_WIPED_PROCESS_ALIVE` ("yes"/"no")
 - Returns 0 if not wiped or wiped-and-recoverable (recovery dirs created)
 - Returns 1 if wiped, no process alive, env stale (>2h) — dirs NOT created, caller should exit
-- Scans `/proc/[0-9]*/exe` for a process matching the expected binary path (including `(deleted)` suffix)
+- Uses `_find_session_process` to scan `/proc/[0-9]*/exe` for a process matching the expected binary path (including `(deleted)` suffix)
 - On return 0 with SESSION_WIPED=yes: recreates `{logs,cache,cargo-target,metrics}` subdirs
+
+### Long-stale session detection
+
+When the session dir exists (`SESSION_WIPED=no`), check whether the session
+is long-abandoned — no process alive AND no recent tick/orchestrator activity.
+This prevents auto-relaunching a node that was intentionally stopped hours or
+days ago.
+
+```bash
+if [[ "$SESSION_WIPED" == "no" ]]; then
+  check_long_stale_session "$HOME/data" "/proc" "$MONITOR_SESSION_ID" \
+    "$HOME/data/monitor-loop.env" || exit 1
+fi
+```
+
+The `check_long_stale_session` function (defined in `scripts/lib/monitor-decisions.sh`):
+- Sets `LONG_STALE_SESSION` ("yes"/"no")
+- Returns 0 if session is not long-stale (process alive, or `.alive`/env recent enough)
+- Returns 1 if long-stale: no process, `.alive` age > 6h (or missing), env age > 24h
+- Primary signal: `.alive` mtime (touched every tick at start). Fallback: env file mtime.
+- Process-alive check (via `_find_session_process`) overrides staleness markers.
+- On return 1: stderr error, caller should exit without relaunching.
 
 ### Recovery path when `SESSION_WIPED=yes`
 
