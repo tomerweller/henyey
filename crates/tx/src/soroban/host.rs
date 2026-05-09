@@ -231,26 +231,93 @@ impl PersistentModuleCache {
     }
 
     /// Add a contract code entry to the cache.
+    ///
+    /// Uses the entry's `ContractCodeEntryExt::V1` cost inputs when present
+    /// (P22+ contracts), falling back to V0 (wasm_bytes only) for older
+    /// contracts. This matches stellar-core's `addAnyContractsToModuleCache`
+    /// and is critical for cpu_insns parity: cached modules carry their
+    /// `cost_inputs` and the host charges different costs at instantiation
+    /// time depending on V0 vs V1 (see `charge_for_instantiation` in
+    /// soroban-env-host's `parsed_module.rs`). Using the wrong variant during
+    /// warming silently inflates or deflates per-tx CPU metering.
+    ///
     /// Returns true if compilation succeeded, false otherwise.
-    pub fn add_contract(&self, code: &[u8], protocol_version: u32) -> bool {
+    pub fn add_contract(
+        &self,
+        entry: &stellar_xdr::curr::ContractCodeEntry,
+        protocol_version: u32,
+    ) -> bool {
+        let code = entry.code.as_slice();
         match self {
             PersistentModuleCache::P24(cache) => {
+                use soroban_env_host24::xdr::ReadXdr;
+                use stellar_xdr::curr::WriteXdr;
                 let ctx = WasmCompilationContext::new();
                 let contract_id =
                     soroban_env_host24::xdr::Hash(<Sha256 as Digest>::digest(code).into());
-                let cost_inputs = VersionedContractCodeCostInputs::V0 {
-                    wasm_bytes: code.len(),
+                let cost_inputs = match &entry.ext {
+                    stellar_xdr::curr::ContractCodeEntryExt::V0 => {
+                        VersionedContractCodeCostInputs::V0 {
+                            wasm_bytes: code.len(),
+                        }
+                    }
+                    stellar_xdr::curr::ContractCodeEntryExt::V1(v1) => {
+                        // Bridge cost inputs across XDR versions via roundtrip
+                        // (workspace v26 → host v24 wire format is compatible).
+                        let bytes = v1
+                            .cost_inputs
+                            .to_xdr(stellar_xdr::curr::Limits::none())
+                            .ok();
+                        let inputs = bytes.and_then(|b| {
+                            soroban_env_host24::xdr::ContractCodeCostInputs::from_xdr(
+                                &b,
+                                soroban_env_host24::xdr::Limits::none(),
+                            )
+                            .ok()
+                        });
+                        match inputs {
+                            Some(i) => VersionedContractCodeCostInputs::V1(i),
+                            None => VersionedContractCodeCostInputs::V0 {
+                                wasm_bytes: code.len(),
+                            },
+                        }
+                    }
                 };
                 cache
                     .parse_and_cache_module(&ctx, protocol_version, &contract_id, code, cost_inputs)
                     .is_ok()
             }
             PersistentModuleCache::P25(cache) => {
+                use soroban_env_host25::xdr::ReadXdr;
+                use stellar_xdr::curr::WriteXdr;
                 let ctx = WasmCompilationContextP25::new();
                 let contract_id =
                     soroban_env_host25::xdr::Hash(<Sha256 as Digest>::digest(code).into());
-                let cost_inputs = VersionedContractCodeCostInputsP25::V0 {
-                    wasm_bytes: code.len(),
+                let cost_inputs = match &entry.ext {
+                    stellar_xdr::curr::ContractCodeEntryExt::V0 => {
+                        VersionedContractCodeCostInputsP25::V0 {
+                            wasm_bytes: code.len(),
+                        }
+                    }
+                    stellar_xdr::curr::ContractCodeEntryExt::V1(v1) => {
+                        let bytes = v1
+                            .cost_inputs
+                            .to_xdr(stellar_xdr::curr::Limits::none())
+                            .ok();
+                        let inputs = bytes.and_then(|b| {
+                            soroban_env_host25::xdr::ContractCodeCostInputs::from_xdr(
+                                &b,
+                                soroban_env_host25::xdr::Limits::none(),
+                            )
+                            .ok()
+                        });
+                        match inputs {
+                            Some(i) => VersionedContractCodeCostInputsP25::V1(i),
+                            None => VersionedContractCodeCostInputsP25::V0 {
+                                wasm_bytes: code.len(),
+                            },
+                        }
+                    }
                 };
                 cache
                     .parse_and_cache_module(&ctx, protocol_version, &contract_id, code, cost_inputs)
@@ -260,8 +327,18 @@ impl PersistentModuleCache {
                 let ctx = WasmCompilationContextP26::new();
                 let contract_id =
                     soroban_env_host26::xdr::Hash(<Sha256 as Digest>::digest(code).into());
-                let cost_inputs = VersionedContractCodeCostInputsP26::V0 {
-                    wasm_bytes: code.len(),
+                let cost_inputs = match &entry.ext {
+                    stellar_xdr::curr::ContractCodeEntryExt::V0 => {
+                        VersionedContractCodeCostInputsP26::V0 {
+                            wasm_bytes: code.len(),
+                        }
+                    }
+                    stellar_xdr::curr::ContractCodeEntryExt::V1(v1) => {
+                        // P26 host uses stellar-xdr 26.0.0 — same workspace
+                        // type, no bridging needed. Clone-by-value here is
+                        // cheap (cost_inputs is small fixed-size data).
+                        VersionedContractCodeCostInputsP26::V1(v1.cost_inputs.clone())
+                    }
                 };
                 cache
                     .parse_and_cache_module(&ctx, protocol_version, &contract_id, code, cost_inputs)
@@ -1759,55 +1836,6 @@ fn execute_host_function_p26(
 
     // ── Encode inputs and call non-typed invoke_host_function() ──
     let inputs = encode_invocation_inputs(host_function, soroban_data, source, auth_entries)?;
-
-    // DEBUG (#2503): dump exact bytes we feed to the host so we can compare
-    // against stellar-core's inputs and localize the cpu_insns divergence.
-    // Gated to L62470158 only to avoid polluting normal logs.
-    if ledger_info.sequence_number == 62470158 {
-        use sha2::{Digest, Sha256};
-        let hex8 = |b: &[u8]| {
-            let h = Sha256::digest(b);
-            format!("{:016x}", u64::from_be_bytes(h[..8].try_into().unwrap()))
-        };
-        tracing::warn!(
-            host_fn_size = inputs.encoded_host_fn.len(),
-            host_fn_hash = hex8(&inputs.encoded_host_fn),
-            resources_size = inputs.encoded_resources.len(),
-            resources_hash = hex8(&inputs.encoded_resources),
-            source_size = inputs.encoded_source.len(),
-            source_hash = hex8(&inputs.encoded_source),
-            auth_count = inputs.encoded_auth.len(),
-            auth_total_bytes = inputs.encoded_auth.iter().map(|b| b.len()).sum::<usize>(),
-            ledger_entries_count = footprint.encoded_ledger_entries.len(),
-            ledger_entries_total_bytes = footprint.encoded_ledger_entries.iter().map(|b| b.len()).sum::<usize>(),
-            ttl_entries_count = footprint.encoded_ttl_entries.len(),
-            ttl_entries_total_bytes = footprint.encoded_ttl_entries.iter().map(|b| b.len()).sum::<usize>(),
-            prng_seed_hex = hex::encode(base_prng_seed),
-            archived_indices = ?footprint.actual_restored_indices,
-            li_proto = ledger_info.protocol_version,
-            li_seq = ledger_info.sequence_number,
-            li_ts = ledger_info.timestamp,
-            li_network_id = hex::encode(ledger_info.network_id),
-            li_base_reserve = ledger_info.base_reserve,
-            li_min_temp_ttl = ledger_info.min_temp_entry_ttl,
-            li_min_persistent_ttl = ledger_info.min_persistent_entry_ttl,
-            li_max_entry_ttl = ledger_info.max_entry_ttl,
-            instruction_limit,
-            memory_limit,
-            "P26: host invoke inputs"
-        );
-        for (i, b) in footprint.encoded_ledger_entries.iter().enumerate() {
-            tracing::warn!(
-                idx = i,
-                size = b.len(),
-                hash = hex8(b),
-                "P26: footprint entry"
-            );
-        }
-        for (i, b) in inputs.encoded_auth.iter().enumerate() {
-            tracing::warn!(idx = i, size = b.len(), hash = hex8(b), "P26: auth entry");
-        }
-    }
 
     let mut diagnostic_events: Vec<soroban_env_host26::xdr::DiagnosticEvent> = Vec::new();
 

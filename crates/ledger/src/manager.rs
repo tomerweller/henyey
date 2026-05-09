@@ -254,10 +254,12 @@ impl LevelScanner {
         self.seen_keys.insert(key.clone());
 
         if let BucketEntry::Liveentry(ref le) | BucketEntry::Initentry(ref le) = entry {
-            // Compile contracts in parallel across levels via the shared module cache
+            // Compile contracts in parallel across levels via the shared module cache.
+            // Pass the full ContractCodeEntry so the cache can use the V1
+            // cost_inputs when present (critical for cpu_insns parity).
             if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
                 if let Some(ref cache) = module_cache {
-                    cache.add_contract(contract_code.code.as_slice(), protocol_version);
+                    cache.add_contract(contract_code, protocol_version);
                 }
             }
 
@@ -521,10 +523,12 @@ fn scan_and_merge_streaming(
                 seen_keys.insert(key.clone());
 
                 if let BucketEntry::Liveentry(ref le) | BucketEntry::Initentry(ref le) = entry {
-                    // Compile contracts via the shared module cache
+                    // Compile contracts via the shared module cache.
+                    // Pass the full ContractCodeEntry so the cache can use
+                    // ContractCodeEntryExt::V1 cost_inputs when present.
                     if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
                         if let Some(ref cache) = module_cache_arc {
-                            cache.add_contract(contract_code.code.as_slice(), protocol_version);
+                            cache.add_contract(contract_code, protocol_version);
                         }
                     }
 
@@ -2812,9 +2816,7 @@ impl LedgerManager {
                                             .into(),
                                     );
                                     if seen_hashes.insert(hash) {
-                                        if new_cache
-                                            .add_contract(cc.code.as_slice(), protocol_version)
-                                        {
+                                        if new_cache.add_contract(cc, protocol_version) {
                                             compiled += 1;
                                         }
                                     }

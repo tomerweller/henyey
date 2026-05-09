@@ -1573,6 +1573,61 @@ mod tests {
         );
     }
 
+    /// warm_module_cache_from_entries handles ContractCodeEntryExt::V1 entries.
+    ///
+    /// Regression test for #2503: when a contract has the V1 cost-inputs
+    /// extension (P22+), the cache must use it. Using V0 inputs (just
+    /// `wasm_bytes: code.len()`) for a V1 entry causes the host to charge
+    /// `VmCachedInstantiation` instead of the V1 multi-cost
+    /// `InstantiateWasm{Instructions,Functions,Globals,...}` charges, which
+    /// silently deflates per-tx cpu_insns and causes mainnet divergence.
+    #[test]
+    fn test_warm_module_cache_from_entries_handles_v1_ext() {
+        use stellar_xdr::curr::{
+            ContractCodeCostInputs, ContractCodeEntryV1, ExtensionPoint as XdrExtensionPoint,
+        };
+
+        let cache = PersistentModuleCache::new_for_protocol(26)
+            .expect("P26 module cache should be available");
+
+        let hash_bytes: [u8; 32] = Sha256::digest(WASM_A).into();
+        let entry = stellar_xdr::curr::LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {
+                    ext: XdrExtensionPoint::V0,
+                    cost_inputs: ContractCodeCostInputs {
+                        ext: XdrExtensionPoint::V0,
+                        n_instructions: 10,
+                        n_functions: 1,
+                        n_globals: 1,
+                        n_table_entries: 0,
+                        n_types: 1,
+                        n_data_segments: 0,
+                        n_elem_segments: 0,
+                        n_imports: 1,
+                        n_exports: 1,
+                        n_data_segment_bytes: 0,
+                    },
+                }),
+                hash: Hash(hash_bytes),
+                code: WASM_A
+                    .to_vec()
+                    .try_into()
+                    .expect("WASM bytes fit in BytesM"),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 26);
+
+        let hash = Hash(hash_bytes);
+        assert!(
+            cache.remove_contract(&hash),
+            "V1-ext ContractCode should be in module cache after \
+             warm_module_cache_from_entries"
+        );
+    }
+
     /// warm_module_cache_from_entries skips non-ContractCode entries.
     #[test]
     fn test_warm_module_cache_from_entries_skips_non_contract_code() {
