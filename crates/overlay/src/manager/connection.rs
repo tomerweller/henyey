@@ -927,6 +927,7 @@ mod tests {
     use super::*;
     use crate::connection::{Connection, ConnectionDirection, Listener};
     use crate::connection_factory::ConnectionFactory;
+    use crate::manager::PendingPeerEntry;
     use crate::{LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerType, Result};
     use async_trait::async_trait;
     use henyey_crypto::SecretKey;
@@ -1552,6 +1553,330 @@ mod tests {
         assert!(
             pending.try_reserve_address(key3),
             "different IP should succeed"
+        );
+    }
+
+    // ---- Cleanup edge-case regression tests (issue #2527) ----
+
+    /// Verify that `connect_to_explicit_peer` releases the outbound pool
+    /// slot when address resolution fails due to an IPv6 literal.
+    #[tokio::test]
+    async fn test_connect_to_explicit_peer_releases_pool_on_ipv6() {
+        let factory = Arc::new(StalledConnectFactory);
+        let (manager, mut peer_event_rx) = setup_manager_with_factory(factory);
+        let shared = manager.shared_state();
+
+        let addr = PeerAddress::new("::1", 11625);
+        let timeouts = crate::OutboundTimeouts {
+            connect_secs: 10,
+            auth_secs: 2,
+        };
+
+        // Reserve a pending slot (connect_to_explicit_peer must release it).
+        assert!(manager.outbound_pool.try_reserve());
+
+        let result = connect_to_explicit_peer(
+            &addr,
+            manager.local_node.clone(),
+            timeouts,
+            Arc::clone(&manager.outbound_pool),
+            shared.clone(),
+            manager.connection_factory.clone(),
+        )
+        .await;
+
+        assert!(result.is_err(), "IPv6 should fail at resolve");
+
+        // Pool slot must be released.
+        assert_eq!(
+            manager.outbound_pool.pending_count(),
+            0,
+            "pool slot not released after IPv6 resolve failure"
+        );
+
+        // No dial happened, so no metrics or events should fire.
+        assert_eq!(shared.metrics.outbound_attempt.get(), 0);
+        assert_eq!(shared.metrics.outbound_reject.get(), 0);
+        assert_eq!(shared.metrics.outbound_establish.get(), 0);
+        assert!(
+            peer_event_rx.try_recv().is_err(),
+            "no PeerEvent should be emitted for pre-dial failure"
+        );
+    }
+
+    /// Verify that `connect_to_explicit_peer` releases the outbound pool
+    /// slot when DNS resolution fails for an unresolvable hostname.
+    #[tokio::test]
+    async fn test_connect_to_explicit_peer_releases_pool_on_dns_failure() {
+        let factory = Arc::new(StalledConnectFactory);
+        let (manager, mut peer_event_rx) = setup_manager_with_factory(factory);
+        let shared = manager.shared_state();
+
+        let addr = PeerAddress::new("this.host.does.not.exist.invalid", 11625);
+        let timeouts = crate::OutboundTimeouts {
+            connect_secs: 10,
+            auth_secs: 2,
+        };
+
+        assert!(manager.outbound_pool.try_reserve());
+
+        let result = connect_to_explicit_peer(
+            &addr,
+            manager.local_node.clone(),
+            timeouts,
+            Arc::clone(&manager.outbound_pool),
+            shared.clone(),
+            manager.connection_factory.clone(),
+        )
+        .await;
+
+        assert!(result.is_err(), "unresolvable hostname should fail");
+
+        assert_eq!(
+            manager.outbound_pool.pending_count(),
+            0,
+            "pool slot not released after DNS failure"
+        );
+
+        assert_eq!(shared.metrics.outbound_attempt.get(), 0);
+        assert_eq!(shared.metrics.outbound_reject.get(), 0);
+        assert_eq!(shared.metrics.outbound_establish.get(), 0);
+        assert!(
+            peer_event_rx.try_recv().is_err(),
+            "no PeerEvent should be emitted for pre-dial failure"
+        );
+    }
+
+    /// Verify that `connect_to_explicit_peer` correctly cleans up when
+    /// the remote peer is banned — releases pool slot, peer-ID reservation,
+    /// and increments reject metrics.
+    #[tokio::test]
+    async fn test_connect_to_explicit_peer_rejects_banned_peer() {
+        use crate::loopback::LoopbackConnectionFactory;
+
+        let factory = Arc::new(LoopbackConnectionFactory::default());
+
+        let mut config_a = OverlayConfig::testnet();
+        config_a.listen_port = 11625;
+        config_a.listen_enabled = true;
+        config_a.known_peers.clear();
+        config_a.connect_timeout_secs = 1;
+
+        let mut config_b = OverlayConfig::testnet();
+        config_b.listen_port = 11626;
+        config_b.listen_enabled = true;
+        config_b.known_peers.clear();
+        config_b.connect_timeout_secs = 1;
+
+        let local_a = LocalNode::new_testnet(SecretKey::generate());
+        let local_b = LocalNode::new_testnet(SecretKey::generate());
+        let banned_peer_id = local_b.peer_id();
+
+        let mut manager_a = super::super::OverlayManager::new_with_connection_factory(
+            config_a,
+            local_a,
+            Arc::clone(&factory) as Arc<dyn ConnectionFactory>,
+        )
+        .unwrap();
+        let mut manager_b = super::super::OverlayManager::new_with_connection_factory(
+            config_b,
+            local_b,
+            factory as Arc<dyn ConnectionFactory>,
+        )
+        .unwrap();
+
+        // Ban B's peer-ID on A's side BEFORE connecting.
+        manager_a
+            .banned_peers
+            .write()
+            .insert(banned_peer_id.clone());
+
+        manager_a.start(None).await.expect("start a");
+        manager_b.start(None).await.expect("start b");
+
+        let metrics_a = Arc::clone(&manager_a.shared_state().metrics);
+        let shared_a = manager_a.shared_state();
+
+        // A tries to connect to B.
+        let addr_b = PeerAddress::new("127.0.0.1", 11626);
+        let result = manager_a.connect(&addr_b).await;
+
+        // The connect call should fail with PeerBanned.
+        assert!(result.is_err(), "connecting to banned peer should fail");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, OverlayError::PeerBanned(_)),
+            "expected PeerBanned, got: {err}"
+        );
+
+        // Bounded wait for metrics to settle.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while metrics_a.outbound_reject.get() < 1 {
+            if std::time::Instant::now() > deadline {
+                panic!("outbound_reject did not reach 1 within 2s");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(metrics_a.outbound_attempt.get(), 1, "outbound_attempt");
+        assert_eq!(metrics_a.outbound_reject.get(), 1, "outbound_reject");
+        assert_eq!(metrics_a.outbound_establish.get(), 0, "outbound_establish");
+
+        // Pool slot must be released.
+        assert_eq!(
+            manager_a.outbound_pool.pending_count(),
+            0,
+            "pool slot not released after banned peer rejection"
+        );
+
+        // Peer-ID reservation must be released.
+        assert!(
+            !shared_a
+                .pending_connections
+                .by_peer_id
+                .contains_key(&banned_peer_id),
+            "peer-ID reservation not released after banned peer rejection"
+        );
+
+        manager_a.shutdown().await.expect("shutdown a");
+        manager_b.shutdown().await.expect("shutdown b");
+    }
+
+    /// Verify that `handle_accepted_inbound_peer` releases the pool slot
+    /// AND the peer-ID reservation when the peer is banned and holds the
+    /// reservation (`holds_pending_peer_id == true`).
+    #[tokio::test]
+    async fn test_handle_accepted_inbound_peer_rejects_banned_peer_with_reservation() {
+        use crate::peer::Peer;
+
+        let factory = Arc::new(StalledConnectFactory);
+        let (manager, _rx) = setup_manager_with_factory(factory);
+        let shared = manager.shared_state();
+
+        let banned_id = PeerId::from_bytes([42u8; 32]);
+
+        // Pre-ban the peer.
+        shared.banned_peers.write().insert(banned_id.clone());
+
+        // Pre-insert a pending peer-ID reservation (simulates successful
+        // handshake that reserved the peer-ID).
+        shared.pending_connections.by_peer_id.insert(
+            banned_id.clone(),
+            PendingPeerEntry {
+                reserved_at: std::time::Instant::now(),
+                direction: ConnectionDirection::Inbound,
+            },
+        );
+
+        // Reserve a pool slot.
+        assert!(manager.inbound_pool.try_reserve());
+
+        let peer = Peer::new_test_inbound(banned_id.clone(), true, Arc::clone(&shared.metrics));
+
+        super::super::OverlayManager::handle_accepted_inbound_peer(
+            peer,
+            shared.clone(),
+            Arc::clone(&manager.inbound_pool),
+            300_000,
+        )
+        .await;
+
+        // Banned peer should be rejected.
+        assert_eq!(
+            shared.metrics.inbound_reject.get(),
+            1,
+            "inbound_reject should be 1"
+        );
+        assert_eq!(
+            shared.metrics.inbound_establish.get(),
+            0,
+            "inbound_establish should be 0"
+        );
+
+        // Pool slot must be released.
+        assert_eq!(
+            manager.inbound_pool.pending_count(),
+            0,
+            "pool slot not released after banned inbound peer"
+        );
+
+        // Peer-ID reservation must be released (holds_pending_peer_id was true).
+        assert!(
+            !shared
+                .pending_connections
+                .by_peer_id
+                .contains_key(&banned_id),
+            "peer-ID reservation should be released when holds_pending_peer_id is true"
+        );
+    }
+
+    /// Verify that `handle_accepted_inbound_peer` releases the pool slot
+    /// but does NOT release the peer-ID reservation when `holds_pending_peer_id`
+    /// is false (simulates a mutual-dial inbound peer that doesn't own the
+    /// reservation).
+    #[tokio::test]
+    async fn test_handle_accepted_inbound_peer_rejects_banned_peer_without_reservation() {
+        use crate::peer::Peer;
+
+        let factory = Arc::new(StalledConnectFactory);
+        let (manager, _rx) = setup_manager_with_factory(factory);
+        let shared = manager.shared_state();
+
+        let banned_id = PeerId::from_bytes([43u8; 32]);
+
+        // Pre-ban the peer.
+        shared.banned_peers.write().insert(banned_id.clone());
+
+        // Pre-insert a pending peer-ID reservation (owned by the outbound
+        // side in a mutual-dial scenario — this inbound peer should NOT
+        // release it).
+        shared.pending_connections.by_peer_id.insert(
+            banned_id.clone(),
+            PendingPeerEntry {
+                reserved_at: std::time::Instant::now(),
+                direction: ConnectionDirection::Outbound,
+            },
+        );
+
+        // Reserve a pool slot.
+        assert!(manager.inbound_pool.try_reserve());
+
+        let peer = Peer::new_test_inbound(banned_id.clone(), false, Arc::clone(&shared.metrics));
+
+        super::super::OverlayManager::handle_accepted_inbound_peer(
+            peer,
+            shared.clone(),
+            Arc::clone(&manager.inbound_pool),
+            300_000,
+        )
+        .await;
+
+        // Banned peer should be rejected.
+        assert_eq!(
+            shared.metrics.inbound_reject.get(),
+            1,
+            "inbound_reject should be 1"
+        );
+        assert_eq!(
+            shared.metrics.inbound_establish.get(),
+            0,
+            "inbound_establish should be 0"
+        );
+
+        // Pool slot must be released.
+        assert_eq!(
+            manager.inbound_pool.pending_count(),
+            0,
+            "pool slot not released after banned inbound peer"
+        );
+
+        // Peer-ID reservation must NOT be released (holds_pending_peer_id was false).
+        assert!(
+            shared
+                .pending_connections
+                .by_peer_id
+                .contains_key(&banned_id),
+            "peer-ID reservation should NOT be released when holds_pending_peer_id is false"
         );
     }
 }

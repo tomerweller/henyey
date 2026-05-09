@@ -917,6 +917,47 @@ impl Peer {
             debug!("Closed connection to {}", self.info.peer_id);
         }
     }
+
+    /// Construct a fake inbound peer for testing cleanup paths only.
+    ///
+    /// The peer is in `Authenticated` state but has no real auth keys —
+    /// only suitable for tests that exercise early-return rejection logic
+    /// (banned, duplicate, pool-full) without sending or receiving messages.
+    #[cfg(test)]
+    pub(crate) fn new_test_inbound(
+        peer_id: PeerId,
+        holds_pending_peer_id: bool,
+        metrics: Arc<OverlayMetrics>,
+    ) -> Self {
+        use crate::auth::AuthContext;
+        use crate::connection::Connection;
+        use henyey_crypto::SecretKey;
+
+        let (client, _server) = tokio::io::duplex(1024);
+        let addr: std::net::SocketAddr = "127.0.0.1:11625".parse().unwrap();
+        let conn = Connection::from_io(client, addr, ConnectionDirection::Inbound).unwrap();
+        let local = LocalNode::new_testnet(SecretKey::generate());
+        let auth = AuthContext::new(local, false);
+
+        Self {
+            info: PeerInfo {
+                peer_id,
+                address: addr,
+                direction: ConnectionDirection::Inbound,
+                version_string: String::new(),
+                overlay_version: 0,
+                ledger_version: 0,
+                connected_at: Instant::now(),
+                original_address: None,
+            },
+            state: PeerState::Authenticated,
+            connection: conn,
+            auth,
+            stats: Arc::new(PeerStats::default()),
+            metrics,
+            holds_pending_peer_id,
+        }
+    }
 }
 
 #[cfg(test)]
