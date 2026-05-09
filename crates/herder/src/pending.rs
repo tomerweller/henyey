@@ -163,11 +163,22 @@ pub enum PendingResult {
 ///
 /// When the node is catching up or when envelopes arrive for future slots,
 /// they are buffered here until the slot becomes active.
+///
+/// # Concurrency
+///
+/// The `slots` field uses `RwLock<BTreeMap>` (not `DashMap`) because:
+/// - All operations scan or mutate the entire map (no shard-level benefit).
+/// - The collection is small (max 100 entries).
+/// - A single lock eliminates TOCTOU races on capacity checks.
+///
+/// The `seen_hashes` field uses `DashMap` because it is high-cardinality
+/// (up to 500K entries) and accessed via independent point lookups.
 pub struct PendingEnvelopes {
     /// Configuration.
     config: PendingConfig,
-    /// Pending envelopes organized by slot.
-    slots: DashMap<SlotIndex, Vec<PendingEnvelope>>,
+    /// Pending envelopes organized by slot. BTreeMap for ordered iteration
+    /// matching stellar-core's `std::map` semantics.
+    slots: RwLock<BTreeMap<SlotIndex, Vec<PendingEnvelope>>>,
     /// Seen envelope hashes for deduplication.
     seen_hashes: DashMap<Hash256, ()>,
     /// Current active slot.
@@ -208,7 +219,7 @@ impl PendingEnvelopes {
     pub fn new(config: PendingConfig) -> Self {
         Self {
             config,
-            slots: DashMap::new(),
+            slots: RwLock::new(BTreeMap::new()),
             seen_hashes: DashMap::new(),
             current_slot: RwLock::new(0),
             stats: RwLock::new(PendingStats::default()),
@@ -266,8 +277,13 @@ impl PendingEnvelopes {
         }
         // Entry guard is dropped here — no shard lock held past this point.
 
+        // Take the slots write lock for the remainder of this method.
+        // This eliminates the TOCTOU race between capacity check and insertion
+        // that existed with the previous DashMap approach.
+        let mut slots = self.slots.write();
+
         // Existing slot — inline-evict expired, check per-slot cap, then append.
-        if let Some(mut existing) = self.slots.get_mut(&slot) {
+        if let Some(existing) = slots.get_mut(&slot) {
             // Inline eviction: remove expired entries from this specific slot
             // before checking cap. Prevents stale entries from consuming budget.
             let max_age = self.config.max_age;
@@ -304,19 +320,19 @@ impl PendingEnvelopes {
         }
 
         // New slot — enforce max_slots with eviction.
-        if self.slots.len() >= self.config.max_slots {
-            self.evict_old_slots(current);
-            if self.slots.len() >= self.config.max_slots {
+        // Capacity check and insertion are under the same write lock — no TOCTOU.
+        if slots.len() >= self.config.max_slots {
+            Self::evict_old_slots_inner(&mut slots, current, &self.seen_hashes, &self.stats);
+            if slots.len() >= self.config.max_slots {
                 // Clean up the eagerly-claimed hash since envelope is rejected.
                 self.seen_hashes.remove(&pending.hash);
-                let mut stats = self.stats.write();
-                stats.buffer_full += 1;
+                self.stats.write().buffer_full += 1;
                 return PendingResult::BufferFull;
             }
         }
 
         // Insert into new slot.
-        self.slots.entry(slot).or_default().push(pending);
+        slots.entry(slot).or_default().push(pending);
 
         let mut stats = self.stats.write();
         stats.added += 1;
@@ -331,8 +347,14 @@ impl PendingEnvelopes {
     /// Returns envelopes in LIFO order (last-added first), matching
     /// stellar-core's `PendingEnvelopes::pop()` which uses `v.back()` /
     /// `pop_back()`.
+    #[cfg(test)]
     fn release(&self, slot: SlotIndex) -> Vec<ScpEnvelope> {
-        if let Some((_, envelopes)) = self.slots.remove(&slot) {
+        let envelopes = {
+            let mut slots = self.slots.write();
+            slots.remove(&slot)
+        };
+
+        if let Some(envelopes) = envelopes {
             let count = envelopes.len() as u64;
             self.stats.write().released += count;
 
@@ -358,18 +380,35 @@ impl PendingEnvelopes {
     /// slot, envelopes are in LIFO order (last-added first), matching
     /// stellar-core's `PendingEnvelopes::pop()` semantics.
     pub fn release_up_to(&self, slot: SlotIndex) -> BTreeMap<SlotIndex, Vec<ScpEnvelope>> {
-        let mut result = BTreeMap::new();
-        let slots_to_release: Vec<SlotIndex> = self
-            .slots
-            .iter()
-            .filter(|e| *e.key() <= slot)
-            .map(|e| *e.key())
-            .collect();
+        // Collect all slots to release under one lock acquisition.
+        let removed: Vec<(SlotIndex, Vec<PendingEnvelope>)> = {
+            let mut slots = self.slots.write();
+            let keys: Vec<SlotIndex> = slots.keys().filter(|k| **k <= slot).copied().collect();
+            keys.into_iter()
+                .filter_map(|s| slots.remove(&s).map(|v| (s, v)))
+                .collect()
+        };
 
-        for s in slots_to_release {
-            let envelopes = self.release(s);
-            if !envelopes.is_empty() {
-                result.insert(s, envelopes);
+        let mut result = BTreeMap::new();
+        let max_age = self.config.max_age;
+
+        for (s, envelopes) in removed {
+            let count = envelopes.len() as u64;
+            self.stats.write().released += count;
+
+            for env in &envelopes {
+                self.seen_hashes.remove(&env.hash);
+            }
+
+            let filtered: Vec<ScpEnvelope> = envelopes
+                .into_iter()
+                .rev()
+                .filter(|e| !e.is_expired(max_age))
+                .map(|e| e.envelope)
+                .collect();
+
+            if !filtered.is_empty() {
+                result.insert(s, filtered);
             }
         }
 
@@ -377,71 +416,83 @@ impl PendingEnvelopes {
     }
 
     /// Evict old slots that are behind the current slot.
-    fn evict_old_slots(&self, current: SlotIndex) {
-        let old_slots: Vec<SlotIndex> = self
-            .slots
-            .iter()
-            .filter(|e| *e.key() < current)
-            .map(|e| *e.key())
-            .collect();
+    ///
+    /// This is a helper called from within `add()` which already holds the
+    /// slots write lock. Takes a mutable reference to the map directly.
+    fn evict_old_slots_inner(
+        slots: &mut BTreeMap<SlotIndex, Vec<PendingEnvelope>>,
+        current: SlotIndex,
+        seen_hashes: &DashMap<Hash256, ()>,
+        stats: &RwLock<PendingStats>,
+    ) {
+        let old_slots: Vec<SlotIndex> = slots.keys().filter(|k| **k < current).copied().collect();
 
+        let mut total_evicted = 0u64;
         for slot in old_slots {
-            if let Some((_, envelopes)) = self.slots.remove(&slot) {
-                let count = envelopes.len() as u64;
-                self.stats.write().evicted += count;
-
+            if let Some(envelopes) = slots.remove(&slot) {
+                total_evicted += envelopes.len() as u64;
                 for env in envelopes {
-                    self.seen_hashes.remove(&env.hash);
+                    seen_hashes.remove(&env.hash);
                 }
             }
+        }
+        if total_evicted > 0 {
+            stats.write().evicted += total_evicted;
         }
     }
 
     /// Evict expired envelopes from all slots.
     pub fn evict_expired(&self) {
         let max_age = self.config.max_age;
+        let mut expired_hashes = Vec::new();
+        let mut total_removed = 0u64;
 
-        for mut entry in self.slots.iter_mut() {
-            let initial_len = entry.len();
+        {
+            let mut slots = self.slots.write();
 
-            // Collect hashes of expired envelopes
-            let expired_hashes: Vec<Hash256> = entry
-                .iter()
-                .filter(|e| e.is_expired(max_age))
-                .map(|e| e.hash)
-                .collect();
+            for envelopes in slots.values_mut() {
+                let initial_len = envelopes.len();
 
-            // Remove expired envelopes
-            entry.retain(|e| !e.is_expired(max_age));
-
-            let removed = initial_len - entry.len();
-            if removed > 0 {
-                self.stats.write().evicted += removed as u64;
-
-                // Remove from seen hashes
-                for hash in expired_hashes {
-                    self.seen_hashes.remove(&hash);
+                // Collect hashes of expired envelopes
+                for e in envelopes.iter() {
+                    if e.is_expired(max_age) {
+                        expired_hashes.push(e.hash);
+                    }
                 }
+
+                // Remove expired envelopes
+                envelopes.retain(|e| !e.is_expired(max_age));
+
+                let removed = initial_len - envelopes.len();
+                total_removed += removed as u64;
             }
+
+            // Remove empty slots
+            slots.retain(|_, v| !v.is_empty());
         }
 
-        // Remove empty slots
-        self.slots.retain(|_, v| !v.is_empty());
+        // Cleanup outside the lock
+        if total_removed > 0 {
+            self.stats.write().evicted += total_removed;
+            for hash in expired_hashes {
+                self.seen_hashes.remove(&hash);
+            }
+        }
     }
 
     /// Get the number of pending envelopes.
     pub fn len(&self) -> usize {
-        self.slots.iter().map(|e| e.len()).sum()
+        self.slots.read().values().map(|v| v.len()).sum()
     }
 
     /// Check if there are no pending envelopes.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.slots.read().values().all(|v| v.is_empty())
     }
 
     /// Get the number of slots with pending envelopes.
     pub fn slot_count(&self) -> usize {
-        self.slots.len()
+        self.slots.read().len()
     }
 
     /// Get statistics.
@@ -452,21 +503,25 @@ impl PendingEnvelopes {
     /// Check if there are pending envelopes for a slot.
     pub fn has_pending(&self, slot: SlotIndex) -> bool {
         self.slots
+            .read()
             .get(&slot)
-            .map(|e| !e.is_empty())
+            .map(|v| !v.is_empty())
             .unwrap_or(false)
     }
 
     /// Get the count of pending envelopes for a slot.
     pub fn pending_count(&self, slot: SlotIndex) -> usize {
-        self.slots.get(&slot).map(|e| e.len()).unwrap_or(0)
+        self.slots.read().get(&slot).map(|v| v.len()).unwrap_or(0)
     }
 
     /// Clear all pending envelopes.
     pub fn clear(&self) {
-        let slots_count = self.slots.len();
-        let seen_count = self.seen_hashes.len();
-        self.slots.clear();
+        let (slots_count, seen_count) = {
+            let mut slots = self.slots.write();
+            let sc = slots.len();
+            slots.clear();
+            (sc, self.seen_hashes.len())
+        };
         self.seen_hashes.clear();
         if slots_count > 0 || seen_count > 0 {
             tracing::info!(slots_count, seen_count, "Cleared pending_envelopes");
@@ -480,20 +535,19 @@ impl PendingEnvelopes {
     /// bound, matching stellar-core behavior where future-slot bounds are
     /// unreliable when not tracking.
     pub fn purge_slots_below(&self, min_slot: SlotIndex) {
-        let slots_to_remove: Vec<SlotIndex> = self
-            .slots
-            .iter()
-            .filter(|e| *e.key() < min_slot)
-            .map(|e| *e.key())
-            .collect();
+        let removed: Vec<(SlotIndex, Vec<PendingEnvelope>)> = {
+            let mut slots = self.slots.write();
+            let keys: Vec<SlotIndex> = slots.keys().filter(|k| **k < min_slot).copied().collect();
+            keys.into_iter()
+                .filter_map(|s| slots.remove(&s).map(|v| (s, v)))
+                .collect()
+        };
 
         let mut total_evicted = 0u64;
-        for slot in slots_to_remove {
-            if let Some((_, envelopes)) = self.slots.remove(&slot) {
-                total_evicted += envelopes.len() as u64;
-                for env in envelopes {
-                    self.seen_hashes.remove(&env.hash);
-                }
+        for (_, envelopes) in removed {
+            total_evicted += envelopes.len() as u64;
+            for env in envelopes {
+                self.seen_hashes.remove(&env.hash);
             }
         }
         if total_evicted > 0 {
@@ -1352,5 +1406,88 @@ mod tests {
             PendingResult::Added,
             "Hash must not be poisoned in seen_hashes after PerSlotFull cleanup"
         );
+    }
+
+    /// Regression test for #2476: concurrent adds to many new slots must
+    /// respect the max_slots cap. With the old DashMap implementation, the
+    /// non-atomic len() check + entry() insertion allowed overshoot.
+    #[test]
+    fn test_issue_2476_concurrent_max_slots_enforcement() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const MAX_SLOTS: usize = 5;
+        const NUM_THREADS: usize = 20;
+
+        let pending = PendingEnvelopes::new(PendingConfig {
+            max_slots: MAX_SLOTS,
+            max_age: Duration::from_secs(300),
+            max_envelopes_per_slot: MAX_ENVELOPES_PER_SLOT,
+        });
+        pending.set_current_slot(0);
+
+        let barrier = Barrier::new(NUM_THREADS);
+
+        // Spawn threads each trying to add an envelope for a unique slot.
+        thread::scope(|s| {
+            let pending_ref = &pending;
+            let barrier_ref = &barrier;
+
+            let handles: Vec<_> = (0..NUM_THREADS)
+                .map(|i| {
+                    s.spawn(move || {
+                        let slot = (i as u64) + 1; // slots 1..=20
+                        let envelope = make_test_envelope_with_node(slot, (i + 1) as u8);
+                        barrier_ref.wait(); // maximize contention
+                        pending_ref.add(slot, envelope)
+                    })
+                })
+                .collect();
+
+            let results: Vec<PendingResult> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            let added = results
+                .iter()
+                .filter(|r| **r == PendingResult::Added)
+                .count();
+            let buffer_full = results
+                .iter()
+                .filter(|r| **r == PendingResult::BufferFull)
+                .count();
+
+            // Exactly max_slots should be added, rest should be BufferFull.
+            assert_eq!(
+                added, MAX_SLOTS,
+                "Exactly max_slots envelopes should be added (got {added})"
+            );
+            assert_eq!(
+                buffer_full,
+                NUM_THREADS - MAX_SLOTS,
+                "Remaining should be BufferFull (got {buffer_full})"
+            );
+        });
+
+        // Post-join assertions: slot_count must exactly equal max_slots.
+        assert_eq!(
+            pending.slot_count(),
+            MAX_SLOTS,
+            "slot_count must not exceed max_slots after concurrent adds"
+        );
+    }
+
+    /// Boundary test: max_slots = 0 rejects all new-slot insertions.
+    #[test]
+    fn test_max_slots_zero_rejects_all() {
+        let pending = PendingEnvelopes::new(PendingConfig {
+            max_slots: 0,
+            max_age: Duration::from_secs(300),
+            max_envelopes_per_slot: MAX_ENVELOPES_PER_SLOT,
+        });
+        pending.set_current_slot(0);
+
+        let result = pending.add(1, make_test_envelope(1));
+        assert_eq!(result, PendingResult::BufferFull);
+        assert_eq!(pending.slot_count(), 0);
     }
 }
