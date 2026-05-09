@@ -5531,6 +5531,77 @@ impl LedgerCloseContext<'_> {
                 self.manager
                     .log_bucket_list_debug(self.close_data.ledger_seq);
 
+                // Per-tx state-change diagnostic: dump SHA256 of each
+                // Created/Updated entry's data per tx, so the verify-execution
+                // side can diff against CDP's tx_apply_processing changes and
+                // localize the first divergent prior tx.
+                use sha2::{Digest, Sha256};
+                use stellar_xdr::curr::{
+                    LedgerEntryChange, LedgerEntryData, TransactionMeta, WriteXdr,
+                };
+                for (i, meta_v1) in self.tx_result_metas.iter().enumerate() {
+                    let mut changes_summary: Vec<String> = Vec::new();
+                    let walk = |changes: &stellar_xdr::curr::LedgerEntryChanges,
+                                summary: &mut Vec<String>,
+                                phase: &str| {
+                        for change in changes.iter() {
+                            let entry = match change {
+                                LedgerEntryChange::Created(e) => e,
+                                LedgerEntryChange::Updated(e) => e,
+                                LedgerEntryChange::Restored(e) => e,
+                                _ => continue,
+                            };
+                            // Skip TTL — not interesting for content divergence
+                            if matches!(entry.data, LedgerEntryData::Ttl(_)) {
+                                continue;
+                            }
+                            let data_bytes = entry
+                                .data
+                                .to_xdr(stellar_xdr::curr::Limits::none())
+                                .unwrap_or_default();
+                            let data_hash = format!("{:x}", Sha256::digest(&data_bytes));
+                            summary.push(format!(
+                                "{}:t{:?}:{}:{}",
+                                phase,
+                                std::mem::discriminant(&entry.data),
+                                data_bytes.len(),
+                                &data_hash[..16],
+                            ));
+                        }
+                    };
+                    match &meta_v1.tx_apply_processing {
+                        TransactionMeta::V3(m) => {
+                            walk(&m.tx_changes_before, &mut changes_summary, "before");
+                            for op in m.operations.iter() {
+                                walk(&op.changes, &mut changes_summary, "op");
+                            }
+                            walk(&m.tx_changes_after, &mut changes_summary, "after");
+                        }
+                        TransactionMeta::V4(m) => {
+                            walk(&m.tx_changes_before, &mut changes_summary, "before");
+                            for op in m.operations.iter() {
+                                walk(&op.changes, &mut changes_summary, "op");
+                            }
+                            walk(&m.tx_changes_after, &mut changes_summary, "after");
+                        }
+                        _ => {}
+                    }
+                    let summary_str = changes_summary.join(" | ");
+                    let truncated = if summary_str.len() > 1500 {
+                        format!("{}…", &summary_str[..1500])
+                    } else {
+                        summary_str
+                    };
+                    tracing::warn!(
+                        target: "hash_mismatch_debug",
+                        ledger_seq = self.close_data.ledger_seq,
+                        tx_index = i,
+                        tx_hash = %Hash256::from_bytes(self.tx_results[i].transaction_hash.0).to_hex(),
+                        changes = %truncated,
+                        "Per-tx state changes (ours)"
+                    );
+                }
+
                 return Err(LedgerError::HashMismatch {
                     expected: expected_hash.to_hex(),
                     actual: header_hash.to_hex(),

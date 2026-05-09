@@ -239,6 +239,66 @@ fn extract_diagnostic_event_summary(meta: Option<&stellar_xdr::curr::Transaction
     }
 }
 
+/// Build a per-tx state-changes summary string mirroring what henyey logs from
+/// manager.rs::commit on hash mismatch. Format: "phase:type:size:hash16 | …"
+fn summarize_cdp_meta_changes(meta: Option<&stellar_xdr::curr::TransactionMeta>) -> String {
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryData, TransactionMeta, WriteXdr};
+    let Some(meta) = meta else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let walk =
+        |changes: &stellar_xdr::curr::LedgerEntryChanges, parts: &mut Vec<String>, phase: &str| {
+            for change in changes.iter() {
+                let entry = match change {
+                    LedgerEntryChange::Created(e) => e,
+                    LedgerEntryChange::Updated(e) => e,
+                    LedgerEntryChange::Restored(e) => e,
+                    _ => continue,
+                };
+                if matches!(entry.data, LedgerEntryData::Ttl(_)) {
+                    continue;
+                }
+                let data_bytes = entry
+                    .data
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .unwrap_or_default();
+                let data_hash = format!("{:x}", Sha256::digest(&data_bytes));
+                parts.push(format!(
+                    "{}:t{:?}:{}:{}",
+                    phase,
+                    std::mem::discriminant(&entry.data),
+                    data_bytes.len(),
+                    &data_hash[..16],
+                ));
+            }
+        };
+    match meta {
+        TransactionMeta::V3(m) => {
+            walk(&m.tx_changes_before, &mut parts, "before");
+            for op in m.operations.iter() {
+                walk(&op.changes, &mut parts, "op");
+            }
+            walk(&m.tx_changes_after, &mut parts, "after");
+        }
+        TransactionMeta::V4(m) => {
+            walk(&m.tx_changes_before, &mut parts, "before");
+            for op in m.operations.iter() {
+                walk(&op.changes, &mut parts, "op");
+            }
+            walk(&m.tx_changes_after, &mut parts, "after");
+        }
+        _ => {}
+    }
+    let s = parts.join(" | ");
+    if s.len() > 1500 {
+        format!("{}…", &s[..1500])
+    } else {
+        s
+    }
+}
+
 /// Returns (count, total_bytes) of non-TTL Created/Updated/Restored entries
 /// across a transaction's tx_apply_processing change groups. Mirrors the
 /// stellar-core write_bytes accounting (which excludes TTL entries) for
@@ -1126,6 +1186,7 @@ async fn verify_single_ledger(
                 let op_results = describe_op_results(&info.result.result.result);
                 let (changes_count, changes_total_bytes) = summarize_cdp_meta(Some(&info.meta));
                 let diag_events = extract_diagnostic_event_summary(Some(&info.meta));
+                let changes_summary = summarize_cdp_meta_changes(Some(&info.meta));
                 tracing::warn!(
                     target: "hash_mismatch_debug",
                     ledger_seq = seq,
@@ -1141,6 +1202,7 @@ async fn verify_single_ledger(
                     cdp_meta_changes_count = changes_count,
                     cdp_meta_changes_total_bytes = changes_total_bytes,
                     diag_events = %diag_events,
+                    changes = %changes_summary,
                     "Per-tx result (mainnet/CDP, hash-aligned)"
                 );
             }
