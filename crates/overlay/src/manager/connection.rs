@@ -690,18 +690,16 @@ impl OverlayManager {
     /// `add_peers` (which resolves in batch for dedup).
     async fn add_peer_resolved(&self, resolved: ResolvedPeer) -> Result<AddPeerOutcome> {
         // Check if we're already connected to this address (any direction).
-        // Uses the canonical address-matching helper that handles hostnames
-        // (via original_address) and IP+port comparison correctly.
+        // Check both the original address (hostname match) and the resolved
+        // address (IP match) to catch aliases — e.g., a hostname that resolves
+        // to an IP we're already connected to via a different path.
         // Checked before pool capacity to match stellar-core's connectToImpl
         // ordering and ensure AlreadyConnected is returned rather than PoolFull.
-        //
-        // Note: `add_peer` checks this before resolving (with the raw address);
-        // we re-check here with the resolved address in case the resolved IP
-        // matches an existing connection that the raw hostname didn't catch.
-        let already_connected = self
-            .peer_info_cache
-            .iter()
-            .any(|entry| Self::peer_info_matches_address(entry.value(), &resolved.original));
+        let already_connected = self.peer_info_cache.iter().any(|entry| {
+            let info = entry.value();
+            Self::peer_info_matches_address(info, &resolved.original)
+                || Self::peer_info_matches_address(info, &resolved.resolved)
+        });
         if already_connected {
             debug!("Already connected to {}", resolved.original);
             return Ok(AddPeerOutcome::AlreadyConnected);
@@ -1991,5 +1989,36 @@ mod tests {
             added, 2,
             "duplicate should be skipped, unique peer should still be dialed"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peers_dedup_hostname_ip_alias() {
+        let manager = setup_manager_for_add_peer_dedup();
+
+        // "localhost" resolves to 127.0.0.1 — these should dedup to one dial.
+        let addrs = vec![
+            PeerAddress::new("localhost", 11625),
+            PeerAddress::new("127.0.0.1", 11625),
+        ];
+        let added = manager.add_peers(addrs).await;
+        assert_eq!(
+            added, 1,
+            "hostname/IP alias should dedup to one dial via resolved key"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peers_alias_does_not_starve_unique() {
+        let manager = setup_manager_for_add_peer_dedup();
+
+        // Batch [localhost:11625, 127.0.0.1:11625, 10.0.0.1:11625]
+        // The alias pair should dedup, but the unique peer should still be dialed.
+        let addrs = vec![
+            PeerAddress::new("localhost", 11625),
+            PeerAddress::new("127.0.0.1", 11625),
+            PeerAddress::new("10.0.0.1", 11625),
+        ];
+        let added = manager.add_peers(addrs).await;
+        assert_eq!(added, 2, "alias dedup should not starve unique peer");
     }
 }
