@@ -43,7 +43,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=128
+TAP_PLAN=139
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2297,8 +2297,372 @@ except Exception as e:
     tap_not_ok "watcher-ctl: shows usage on invalid command" "rc=$wt_rc out=$wt_status_out"
   fi
 
+  # ══════════════════════════════════════════════════════════════════════════
+  # watcher-ctl.sh start/stop/restart tests (T123-T133)
+  # Tests lifecycle subcommands using mock /proc and real background processes.
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # Track background PIDs for cleanup
+  local -a _wt_bg_pids=()
+  _wt_cleanup_bg() {
+    local p
+    for p in "${_wt_bg_pids[@]}"; do
+      kill "$p" 2>/dev/null && wait "$p" 2>/dev/null || true
+    done
+    _wt_bg_pids=()
+  }
+
+  # Shared mock project dir for lifecycle tests (reuse wt1 project)
+  local wt_lc_project="$TEST_ROOT/wt_lc/project"
+  mkdir -p "$wt_lc_project/target/release" "$wt_lc_project/configs"
+  touch "$wt_lc_project/target/release/henyey"
+  chmod +x "$wt_lc_project/target/release/henyey"
+  echo "test config" > "$wt_lc_project/configs/watcher-testnet.toml"
+  local wt_lc_binary
+  wt_lc_binary="$(readlink -f "$wt_lc_project/target/release/henyey")"
+
+  # ── T123: cmd_stop with no watcher running ─────────────────────────────
+  local wt_stop1_proc="$TEST_ROOT/wt_stop1/proc"
+  local wt_stop1_data="$TEST_ROOT/wt_stop1/data"
+  mkdir -p "$wt_stop1_proc/empty" "$wt_stop1_data/watcher"
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_stop1_proc/empty" \
+    PID_FILE="$wt_stop1_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="$wt_lc_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" stop 2>&1) || wt_rc=$?
+  if [[ $wt_rc -eq 0 ]] && echo "$wt_status_out" | grep -q "No watcher running"; then
+    tap_ok "watcher-ctl: stop returns 0 when no watcher running"
+  else
+    tap_not_ok "watcher-ctl: stop returns 0 when no watcher running" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # ── T124: cmd_stop happy path (process exits promptly) ─────────────────
+  # Launch a real sleep process, create mock /proc entry, stop it.
+  local wt_stop2_proc="$TEST_ROOT/wt_stop2/proc"
+  local wt_stop2_data="$TEST_ROOT/wt_stop2/data"
+  mkdir -p "$wt_stop2_data/watcher"
+
+  sleep 300 &
+  local stop2_pid=$!
+  _wt_bg_pids+=("$stop2_pid")
+
+  mkdir -p "$wt_stop2_proc/$stop2_pid"
+  ln -sf "$wt_lc_binary" "$wt_stop2_proc/$stop2_pid/exe"
+  printf '%s\0%s\0%s\0%s\0%s\0' "$wt_lc_binary" "run" "--watcher" "--config" "configs/watcher-testnet.toml" \
+    > "$wt_stop2_proc/$stop2_pid/cmdline"
+  ln -sf "$wt_lc_project" "$wt_stop2_proc/$stop2_pid/cwd"
+  echo "$stop2_pid" > "$wt_stop2_data/watcher/testnet-watcher.pid"
+
+  # Background monitor: remove mock proc dir when real process exits
+  (while kill -0 "$stop2_pid" 2>/dev/null; do sleep 0.1; done
+   rm -rf "$wt_stop2_proc/$stop2_pid") &
+  local stop2_monitor=$!
+  _wt_bg_pids+=("$stop2_monitor")
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_stop2_proc" \
+    PID_FILE="$wt_stop2_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="$wt_lc_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" stop 2>&1) || wt_rc=$?
+  local stop2_ok=true
+  if [[ $wt_rc -ne 0 ]]; then stop2_ok=false; fi
+  if ! echo "$wt_status_out" | grep -q "Watcher stopped"; then stop2_ok=false; fi
+  if [[ -f "$wt_stop2_data/watcher/testnet-watcher.pid" ]]; then stop2_ok=false; fi
+  if [[ "$stop2_ok" == "true" ]]; then
+    tap_ok "watcher-ctl: stop happy path (process exits promptly)"
+  else
+    tap_not_ok "watcher-ctl: stop happy path (process exits promptly)" \
+      "rc=$wt_rc pid_exists=$(test -f "$wt_stop2_data/watcher/testnet-watcher.pid" && echo yes || echo no) out=$wt_status_out"
+  fi
+  # Wait for monitor to finish
+  wait "$stop2_monitor" 2>/dev/null || true
+
+  # ── T125: cmd_stop timeout detection ───────────────────────────────────
+  # Mock proc dir persists (not tied to real /proc), process traps SIGTERM.
+  local wt_stop3_proc="$TEST_ROOT/wt_stop3/proc"
+  local wt_stop3_data="$TEST_ROOT/wt_stop3/data"
+  mkdir -p "$wt_stop3_data/watcher"
+
+  # Launch a process that ignores SIGTERM
+  bash -c 'trap "" TERM; sleep 300' &
+  local stop3_pid=$!
+  _wt_bg_pids+=("$stop3_pid")
+
+  # Create mock proc entry (this dir persists regardless of real process state)
+  mkdir -p "$wt_stop3_proc/$stop3_pid"
+  ln -sf "$wt_lc_binary" "$wt_stop3_proc/$stop3_pid/exe"
+  printf '%s\0%s\0%s\0%s\0%s\0' "$wt_lc_binary" "run" "--watcher" "--config" "configs/watcher-testnet.toml" \
+    > "$wt_stop3_proc/$stop3_pid/cmdline"
+  ln -sf "$wt_lc_project" "$wt_stop3_proc/$stop3_pid/cwd"
+  echo "$stop3_pid" > "$wt_stop3_data/watcher/testnet-watcher.pid"
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_stop3_proc" \
+    PID_FILE="$wt_stop3_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="$wt_lc_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" stop 2>&1) || wt_rc=$?
+  local stop3_ok=true
+  if [[ $wt_rc -ne 1 ]]; then stop3_ok=false; fi
+  if ! echo "$wt_status_out" | grep -q "did not exit after 15s"; then stop3_ok=false; fi
+  if [[ ! -f "$wt_stop3_data/watcher/testnet-watcher.pid" ]]; then stop3_ok=false; fi
+  if [[ "$stop3_ok" == "true" ]]; then
+    tap_ok "watcher-ctl: stop timeout detection (15s)"
+  else
+    tap_not_ok "watcher-ctl: stop timeout detection (15s)" \
+      "rc=$wt_rc pid_retained=$(test -f "$wt_stop3_data/watcher/testnet-watcher.pid" && echo yes || echo no) out=$wt_status_out"
+  fi
+  # Clean up the TERM-ignoring process
+  kill -9 "$stop3_pid" 2>/dev/null && wait "$stop3_pid" 2>/dev/null || true
+
+  # ── T126: cmd_stop kill failure ────────────────────────────────────────
+  # Mock proc entry exists (so cmd_status passes), but PID doesn't exist as
+  # a real OS process, so kill fails.
+  local wt_stop4_proc="$TEST_ROOT/wt_stop4/proc"
+  local wt_stop4_data="$TEST_ROOT/wt_stop4/data"
+  local stop4_fake_pid=99999
+  mkdir -p "$wt_stop4_proc/$stop4_fake_pid" "$wt_stop4_data/watcher"
+  ln -sf "$wt_lc_binary" "$wt_stop4_proc/$stop4_fake_pid/exe"
+  printf '%s\0%s\0%s\0%s\0%s\0' "$wt_lc_binary" "run" "--watcher" "--config" "configs/watcher-testnet.toml" \
+    > "$wt_stop4_proc/$stop4_fake_pid/cmdline"
+  ln -sf "$wt_lc_project" "$wt_stop4_proc/$stop4_fake_pid/cwd"
+  echo "$stop4_fake_pid" > "$wt_stop4_data/watcher/testnet-watcher.pid"
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_stop4_proc" \
+    PID_FILE="$wt_stop4_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="$wt_lc_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" stop 2>&1) || wt_rc=$?
+  if [[ $wt_rc -eq 1 ]] && echo "$wt_status_out" | grep -qE "kill.*failed"; then
+    tap_ok "watcher-ctl: stop kill failure returns 1"
+  else
+    tap_not_ok "watcher-ctl: stop kill failure returns 1" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # ── T127: cmd_start refuses when watcher already running ───────────────
+  local wt_start1_proc="$TEST_ROOT/wt_start1/proc"
+  local wt_start1_data="$TEST_ROOT/wt_start1/data"
+  mkdir -p "$wt_start1_data/watcher"
+
+  # Create mock watcher process at PID 10001
+  mkdir -p "$wt_start1_proc/10001"
+  ln -sf "$wt_lc_binary" "$wt_start1_proc/10001/exe"
+  printf '%s\0%s\0%s\0%s\0%s\0' "$wt_lc_binary" "run" "--watcher" "--config" "configs/watcher-testnet.toml" \
+    > "$wt_start1_proc/10001/cmdline"
+  ln -sf "$wt_lc_project" "$wt_start1_proc/10001/cwd"
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_start1_proc" \
+    PID_FILE="$wt_start1_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="$wt_lc_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    LOG_FILE="$wt_start1_data/watcher/test.log" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" start 2>&1) || wt_rc=$?
+  local start1_ok=true
+  if [[ $wt_rc -ne 1 ]]; then start1_ok=false; fi
+  if ! echo "$wt_status_out" | grep -q "already running"; then start1_ok=false; fi
+  # Verify PID file was adopted with the existing PID
+  if [[ ! -f "$wt_start1_data/watcher/testnet-watcher.pid" ]] || \
+     [[ "$(cat "$wt_start1_data/watcher/testnet-watcher.pid")" != "10001" ]]; then
+    start1_ok=false
+  fi
+  if [[ "$start1_ok" == "true" ]]; then
+    tap_ok "watcher-ctl: start refuses when already running + adopts PID"
+  else
+    tap_not_ok "watcher-ctl: start refuses when already running + adopts PID" \
+      "rc=$wt_rc pid_file=$(cat "$wt_start1_data/watcher/testnet-watcher.pid" 2>/dev/null || echo MISSING) out=$wt_status_out"
+  fi
+
+  # ── T128: cmd_start binary not found ───────────────────────────────────
+  local wt_start2_proc="$TEST_ROOT/wt_start2/proc"
+  local wt_start2_data="$TEST_ROOT/wt_start2/data"
+  mkdir -p "$wt_start2_proc/empty" "$wt_start2_data/watcher"
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_start2_proc/empty" \
+    PID_FILE="$wt_start2_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="/nonexistent/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    LOG_FILE="$wt_start2_data/watcher/test.log" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" start 2>&1) || wt_rc=$?
+  if [[ $wt_rc -eq 1 ]] && echo "$wt_status_out" | grep -q "Binary not found"; then
+    tap_ok "watcher-ctl: start fails when binary not found"
+  else
+    tap_not_ok "watcher-ctl: start fails when binary not found" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # ── T129: cmd_start crash detection ────────────────────────────────────
+  # /bin/true exits immediately — identity check fails after 1s sleep.
+  local wt_start3_proc="$TEST_ROOT/wt_start3/proc"
+  local wt_start3_data="$TEST_ROOT/wt_start3/data"
+  mkdir -p "$wt_start3_proc/empty" "$wt_start3_data/watcher"
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_start3_proc/empty" \
+    PID_FILE="$wt_start3_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="/bin/true" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    LOG_FILE="$wt_start3_data/watcher/test.log" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" start 2>&1) || wt_rc=$?
+  if [[ $wt_rc -eq 1 ]] && echo "$wt_status_out" | grep -q "identity check failed"; then
+    tap_ok "watcher-ctl: start detects startup crash"
+  else
+    tap_not_ok "watcher-ctl: start detects startup crash" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # ── T130: cmd_start happy path ─────────────────────────────────────────
+  # Create a mock binary that sets up its own /proc entry then sleeps.
+  local wt_start4_proc="$TEST_ROOT/wt_start4/proc"
+  local wt_start4_data="$TEST_ROOT/wt_start4/data"
+  local wt_start4_bin="$TEST_ROOT/wt_start4/mock-henyey"
+  mkdir -p "$wt_start4_data/watcher"
+
+  # The mock binary creates its own mock proc entry then sleeps
+  cat > "$wt_start4_bin" <<'MOCK_BINARY'
+#!/usr/bin/env bash
+# Mock henyey binary for testing cmd_start happy path.
+# Creates its own mock /proc entry so _is_our_watcher passes.
+set -euo pipefail
+MY_PID=$$
+MOCK_PROC="${MOCK_PROC_ROOT}/${MY_PID}"
+mkdir -p "$MOCK_PROC"
+# exe symlink: point to our own resolved binary path
+ln -sf "$(readlink -f "$0")" "$MOCK_PROC/exe"
+# cmdline: reconstruct argv as NUL-separated
+printf '%s\0' "$@" > "$MOCK_PROC/cmdline"
+# cwd symlink
+ln -sf "$(pwd)" "$MOCK_PROC/cwd"
+# Sleep until killed
+exec sleep 300
+MOCK_BINARY
+  chmod +x "$wt_start4_bin"
+  local wt_start4_bin_real
+  wt_start4_bin_real="$(readlink -f "$wt_start4_bin")"
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_start4_proc" MOCK_PROC_ROOT="$wt_start4_proc" \
+    PID_FILE="$wt_start4_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="$wt_start4_bin" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    LOG_FILE="$wt_start4_data/watcher/test.log" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" start 2>&1) || wt_rc=$?
+  local start4_ok=true
+  if [[ $wt_rc -ne 0 ]]; then start4_ok=false; fi
+  if ! echo "$wt_status_out" | grep -q "Watcher started"; then start4_ok=false; fi
+  if [[ ! -f "$wt_start4_data/watcher/testnet-watcher.pid" ]]; then start4_ok=false; fi
+  if [[ "$start4_ok" == "true" ]]; then
+    # Clean up the background process
+    local start4_launched_pid
+    start4_launched_pid=$(cat "$wt_start4_data/watcher/testnet-watcher.pid")
+    _wt_bg_pids+=("$start4_launched_pid")
+    tap_ok "watcher-ctl: start happy path succeeds"
+  else
+    tap_not_ok "watcher-ctl: start happy path succeeds" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # ── T131: cmd_restart when nothing running, start fails ────────────────
+  local wt_restart1_proc="$TEST_ROOT/wt_restart1/proc"
+  local wt_restart1_data="$TEST_ROOT/wt_restart1/data"
+  mkdir -p "$wt_restart1_proc/empty" "$wt_restart1_data/watcher"
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_restart1_proc/empty" \
+    PID_FILE="$wt_restart1_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="/nonexistent/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    LOG_FILE="$wt_restart1_data/watcher/test.log" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" restart 2>&1) || wt_rc=$?
+  local restart1_ok=true
+  if [[ $wt_rc -ne 1 ]]; then restart1_ok=false; fi
+  # Verify both stop phase and start phase ran
+  if ! echo "$wt_status_out" | grep -q "No watcher running"; then restart1_ok=false; fi
+  if ! echo "$wt_status_out" | grep -q "Binary not found"; then restart1_ok=false; fi
+  if [[ "$restart1_ok" == "true" ]]; then
+    tap_ok "watcher-ctl: restart sequencing (stop no-op then start fails)"
+  else
+    tap_not_ok "watcher-ctl: restart sequencing (stop no-op then start fails)" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # ── T132: cmd_restart propagates stop failure ──────────────────────────
+  # Mock proc entry exists (status passes) but kill fails (fake PID).
+  local wt_restart2_proc="$TEST_ROOT/wt_restart2/proc"
+  local wt_restart2_data="$TEST_ROOT/wt_restart2/data"
+  local restart2_fake_pid=99998
+  mkdir -p "$wt_restart2_proc/$restart2_fake_pid" "$wt_restart2_data/watcher"
+  ln -sf "$wt_lc_binary" "$wt_restart2_proc/$restart2_fake_pid/exe"
+  printf '%s\0%s\0%s\0%s\0%s\0' "$wt_lc_binary" "run" "--watcher" "--config" "configs/watcher-testnet.toml" \
+    > "$wt_restart2_proc/$restart2_fake_pid/cmdline"
+  ln -sf "$wt_lc_project" "$wt_restart2_proc/$restart2_fake_pid/cwd"
+  echo "$restart2_fake_pid" > "$wt_restart2_data/watcher/testnet-watcher.pid"
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_restart2_proc" \
+    PID_FILE="$wt_restart2_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="$wt_lc_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    LOG_FILE="$wt_restart2_data/watcher/test.log" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" restart 2>&1) || wt_rc=$?
+  local restart2_ok=true
+  if [[ $wt_rc -ne 1 ]]; then restart2_ok=false; fi
+  # Verify cmd_start was NOT reached — no start-phase output
+  if echo "$wt_status_out" | grep -q "Binary not found"; then restart2_ok=false; fi
+  if echo "$wt_status_out" | grep -q "already running"; then restart2_ok=false; fi
+  if echo "$wt_status_out" | grep -q "Watcher started"; then restart2_ok=false; fi
+  if [[ "$restart2_ok" == "true" ]]; then
+    tap_ok "watcher-ctl: restart propagates stop failure (start not reached)"
+  else
+    tap_not_ok "watcher-ctl: restart propagates stop failure (start not reached)" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # ── T133: cmd_restart success (stop no-op, start succeeds) ─────────────
+  # Nothing running → stop no-ops. Start succeeds with mock binary.
+  local wt_restart3_proc="$TEST_ROOT/wt_restart3/proc"
+  local wt_restart3_data="$TEST_ROOT/wt_restart3/data"
+  local wt_restart3_bin="$TEST_ROOT/wt_restart3/mock-henyey"
+  mkdir -p "$wt_restart3_data/watcher"
+
+  # Reuse the same mock binary pattern as T130
+  cat > "$wt_restart3_bin" <<'MOCK_BINARY'
+#!/usr/bin/env bash
+set -euo pipefail
+MY_PID=$$
+MOCK_PROC="${MOCK_PROC_ROOT}/${MY_PID}"
+mkdir -p "$MOCK_PROC"
+ln -sf "$(readlink -f "$0")" "$MOCK_PROC/exe"
+printf '%s\0' "$@" > "$MOCK_PROC/cmdline"
+ln -sf "$(pwd)" "$MOCK_PROC/cwd"
+exec sleep 300
+MOCK_BINARY
+  chmod +x "$wt_restart3_bin"
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_restart3_proc" MOCK_PROC_ROOT="$wt_restart3_proc" \
+    PID_FILE="$wt_restart3_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="$wt_restart3_bin" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    LOG_FILE="$wt_restart3_data/watcher/test.log" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" restart 2>&1) || wt_rc=$?
+  local restart3_ok=true
+  if [[ $wt_rc -ne 0 ]]; then restart3_ok=false; fi
+  if ! echo "$wt_status_out" | grep -q "No watcher running"; then restart3_ok=false; fi
+  if ! echo "$wt_status_out" | grep -q "Watcher started"; then restart3_ok=false; fi
+  if [[ "$restart3_ok" == "true" ]]; then
+    local restart3_launched_pid
+    restart3_launched_pid=$(cat "$wt_restart3_data/watcher/testnet-watcher.pid" 2>/dev/null || echo "")
+    [[ -n "$restart3_launched_pid" ]] && _wt_bg_pids+=("$restart3_launched_pid")
+    tap_ok "watcher-ctl: restart success (stop no-op, start succeeds)"
+  else
+    tap_not_ok "watcher-ctl: restart success (stop no-op, start succeeds)" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # Clean up all background processes from lifecycle tests
+  _wt_cleanup_bg
+
   # ════════════════════════════════════════════════════════════════════════════
-  # Post-verify label sync checks (T123-T128)
+  # Post-verify label sync checks (T134-T139)
   # Cross-validate PostVerifyReason labels in crates/herder/src/scp_verify.rs
   # against the hard-coded label sets in monitor-tick and monitor-loop SKILL.md.
   # See issue #2519 (follow-up from #2481).
@@ -2314,14 +2678,14 @@ except Exception as e:
   canonical_count=$(echo "$canonical_labels" | grep -c . || true)
   all_array_size=$(echo "$pv_impl_block" | grep -oP 'pub const ALL: \[Self; \K\d+' || true)
 
-  # Test 123: Canonical extraction guard — fail closed on extraction problems
+  # Test 134: Canonical extraction guard — fail closed on extraction problems
   if [[ "$canonical_count" -gt 0 && "$canonical_count" == "$all_array_size" ]]; then
     tap_ok "pv-label-sync: canonical extraction (count=$canonical_count, ALL size=$all_array_size)"
   else
     tap_not_ok "pv-label-sync: canonical extraction" \
       "count=$canonical_count ALL_size=$all_array_size (expected >0 and equal)"
     # Fail closed: emit remaining 5 tests as skipped
-    local _i; for _i in 124 125 126 127 128; do
+    local _i; for _i in 135 136 137 138 139; do
       tap_not_ok "pv-label-sync: skipped (canonical extraction failed)"
     done
     return
@@ -2334,13 +2698,13 @@ except Exception as e:
 
   # If sections are empty, all remaining tests fail
   if [[ -z "$tick_ratio_section" || -z "$loop_ratio_section" ]]; then
-    local _i; for _i in 124 125 126 127 128; do
+    local _i; for _i in 135 136 137 138 139; do
       tap_not_ok "pv-label-sync: skipped (section extraction failed: tick_empty=$([ -z "$tick_ratio_section" ] && echo yes || echo no) loop_empty=$([ -z "$loop_ratio_section" ] && echo yes || echo no))"
     done
     return
   fi
 
-  # Test 124: monitor-tick narrative labels match canonical
+  # Test 135: monitor-tick narrative labels match canonical
   # The label list spans multiple lines after "reason labels is:" until ". If"
   local tick_narrative_text tick_narrative_labels
   tick_narrative_text=$(echo "$tick_ratio_section" | sed -n '/reason labels is:/,/\. If/p')
@@ -2352,7 +2716,7 @@ except Exception as e:
       "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$tick_narrative_labels" | tr '\n' ' ')"
   fi
 
-  # Test 125: monitor-tick pseudocode labels match canonical
+  # Test 136: monitor-tick pseudocode labels match canonical
   local tick_printf_line tick_pseudo_labels
   tick_printf_line=$(echo "$tick_ratio_section" | grep "printf '%s\\\\n'" || true)
   tick_pseudo_labels=$(echo "$tick_printf_line" | grep -oP "(?<=\\\\n' )[^|]+" | tr ' ' '\n' | grep -v '^$' | sed 's/|.*//' | sort)
@@ -2363,7 +2727,7 @@ except Exception as e:
       "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$tick_pseudo_labels" | tr '\n' ' ')"
   fi
 
-  # Test 126: monitor-loop inline labels match canonical
+  # Test 137: monitor-loop inline labels match canonical
   local loop_label_line loop_inline_labels
   loop_label_line=$(echo "$loop_ratio_section" | grep 'Post-verify label set' || true)
   loop_inline_labels=$(echo "$loop_label_line" | grep -oP '`\K[a-z_]+(?=`)' | sort)
@@ -2374,7 +2738,7 @@ except Exception as e:
       "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$loop_inline_labels" | tr '\n' ' ')"
   fi
 
-  # Test 127: monitor-tick label count references match canonical
+  # Test 138: monitor-tick label count references match canonical
   local tick_count_refs tick_counts_ok=true
   tick_count_refs=$(echo "$tick_ratio_section" | grep -oP '(?:all |the |exact |expected )\K\d+(?=[ -](?:label|post-verify|`henyey_scp_post_verify))' || true)
   if [[ -z "$tick_count_refs" ]]; then
@@ -2394,7 +2758,7 @@ except Exception as e:
       "expected all=$canonical_count, found: $(echo "$tick_count_refs" | tr '\n' ' ')"
   fi
 
-  # Test 128: monitor-loop label count references match canonical
+  # Test 139: monitor-loop label count references match canonical
   local loop_count_refs loop_counts_ok=true
   loop_count_refs=$(echo "$loop_ratio_section" | grep -oP '(?:all |the |exact |expected )\K\d+(?=[ -](?:label|post-verify|`henyey_scp_post_verify))' || true)
   if [[ -z "$loop_count_refs" ]]; then
