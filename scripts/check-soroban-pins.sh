@@ -22,27 +22,9 @@ for proto in p24 p25 p26; do
         continue
     fi
 
-    # Extract rev from Cargo.toml using cargo metadata (most robust)
-    # Fall back to grep if cargo is not available
-    if command -v cargo &>/dev/null; then
-        cargo_rev=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
-            | jq -r --arg proto "$proto" '
-                .packages[]
-                | select(.name == "soroban-env-host")
-                | select(.source // "" | test("\\?rev=" + $proto + "|rev=[a-f0-9]"))
-                | .source' \
-            | grep -oP 'rev=\K[a-f0-9]+' \
-            | head -1 || true)
-
-        # If cargo metadata approach didn't work, fall back to grep
-        if [ -z "$cargo_rev" ]; then
-            cargo_rev=$(grep "soroban-env-host-$proto" Cargo.toml \
-                | grep -oP 'rev\s*=\s*"\K[^"]+' || true)
-        fi
-    else
-        cargo_rev=$(grep "soroban-env-host-$proto" Cargo.toml \
-            | grep -oP 'rev\s*=\s*"\K[^"]+' || true)
-    fi
+    # Extract rev from Cargo.toml by matching the soroban-env-host-$proto line
+    cargo_rev=$(grep "soroban-env-host-$proto" Cargo.toml \
+        | grep -oP 'rev\s*=\s*"\K[^"]+' || true)
 
     if [ -z "$cargo_rev" ]; then
         echo "ERROR: could not extract rev for soroban-env-host-$proto from Cargo.toml"
