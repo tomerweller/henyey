@@ -700,10 +700,14 @@ impl Simulation {
     /// Kick-start connections between topology neighbors.
     ///
     /// Only dials peers that are linked in the configured topology
-    /// (`LoopbackNetwork`), using the same `known_peers_for()` helper that
+    /// (`LoopbackNetwork`), using the same neighbor set that
     /// `build_app_from_spec` uses for `config.overlay.known_peers`. This
     /// prevents cross-partition connections in sparse topologies like
     /// `separate` (two isolated pairs).
+    ///
+    /// To avoid mutual-dial TCP races, each edge is dialed in only one
+    /// direction: the node with the lexicographically higher `node_id`
+    /// dials the lower. See issue #2522 for the race trace.
     ///
     /// Returns a [`RepairReport`] with aggregate stats.  The function never
     /// short-circuits — every node/address pair is attempted regardless of
@@ -722,7 +726,18 @@ impl Simulation {
 
         for id in ids {
             let node = &self.running_apps[id];
-            for addr in self.known_peers_for(id, &port_map) {
+            for neighbor in self.loopback.neighbors(id) {
+                // Only dial neighbors with LOWER node_id to prevent mutual-dial
+                // races. Each TCP connection is bidirectional — the single
+                // outbound from the higher-ID node establishes connectivity in
+                // both directions. See issue #2522.
+                if *neighbor >= **id {
+                    continue;
+                }
+                let Some(&port) = port_map.get(&neighbor) else {
+                    continue;
+                };
+                let addr = PeerAddress::new("127.0.0.1", port);
                 match node.app.add_peer(addr).await {
                     Ok(AddPeerOutcome::Initiated) => report.initiated += 1,
                     Ok(AddPeerOutcome::AlreadyConnected) => report.already_connected += 1,
@@ -1408,7 +1423,11 @@ impl Simulation {
         config.node.manual_close = spec.manual_close;
         config.overlay.known_peers = self.known_peers_for(&spec.node_id, port_map);
         config.overlay.preferred_peers.clear();
-        config.overlay.target_outbound_peers = config.overlay.known_peers.len();
+        // Disable the overlay tick loop's auto-dial so that only
+        // repair_app_connectivity() manages connections (unidirectionally).
+        // This eliminates the startup mutual-dial race from the tick loop.
+        // See issue #2522.
+        config.overlay.target_outbound_peers = 0;
         config.overlay.max_outbound_peers = config.overlay.known_peers.len().max(1);
         config.overlay.max_inbound_peers = self.app_specs.len().max(1);
         config.http.enabled = false;
