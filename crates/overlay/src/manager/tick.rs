@@ -613,6 +613,7 @@ mod tests {
     use async_trait::async_trait;
     use henyey_crypto::SecretKey;
     use std::collections::HashSet;
+    use std::net::SocketAddr;
     use tokio::sync::mpsc;
 
     // ---- G8 tests: maybe_drop_random_peer ----
@@ -675,7 +676,7 @@ mod tests {
 
     #[async_trait]
     impl ConnectionFactory for FailingConnectionFactory {
-        async fn connect(&self, addr: &PeerAddress, _timeout_secs: u64) -> Result<Connection> {
+        async fn connect(&self, addr: SocketAddr, _timeout_secs: u64) -> Result<Connection> {
             Err(OverlayError::ConnectionFailed(format!(
                 "intentional failure for {addr}"
             )))

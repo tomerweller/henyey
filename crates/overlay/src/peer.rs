@@ -25,7 +25,7 @@ use crate::{
     auth::AuthContext,
     codec::helpers,
     connection::{Connection, ConnectionDirection},
-    flow_control::{msg_body_size, FlowControlConfig, INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES},
+    flow_control::{msg_body_size, FlowControlConfig},
     manager::PendingPeerEntry,
     metrics::{OverlayMessageKind, OverlayMetrics},
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
@@ -217,56 +217,6 @@ pub struct Peer {
 
 impl Peer {
     /// Connect to a peer and perform handshake.
-    ///
-    /// Uses the default initial byte grant (300KB). For production connections
-    /// where `max_tx_size` may exceed the threshold, use
-    /// [`connect_with_connection`] with a computed grant instead.
-    #[allow(dead_code)]
-    pub(crate) async fn connect(
-        addr: &PeerAddress,
-        local_node: LocalNode,
-        timeouts: crate::OutboundTimeouts,
-        metrics: Arc<OverlayMetrics>,
-    ) -> Result<Self> {
-        debug!("Connecting to peer: {}", addr);
-
-        // Establish TCP connection
-        let connection = Connection::connect(addr, timeouts.connect_secs).await?;
-
-        // Create auth context (we called them)
-        let auth = AuthContext::new(local_node, true);
-
-        let mut peer = Self {
-            info: PeerInfo {
-                peer_id: PeerId::from_bytes([0u8; 32]), // Will be set after handshake
-                address: connection.remote_addr(),
-                direction: ConnectionDirection::Outbound,
-                version_string: String::new(),
-                overlay_version: 0,
-                ledger_version: 0,
-                connected_at: Instant::now(),
-                original_address: Some(addr.clone()),
-            },
-            state: PeerState::Connecting,
-            connection,
-            auth,
-            stats: Arc::new(PeerStats::default()),
-            metrics,
-            holds_pending_peer_id: false,
-        };
-
-        // Perform handshake
-        peer.handshake(
-            timeouts.auth_secs,
-            None,
-            None,
-            INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
-        )
-        .await?;
-
-        Ok(peer)
-    }
-
     /// Create an outbound peer from a pre-established transport connection.
     ///
     /// `initial_byte_grant` is the byte capacity sent in the initial

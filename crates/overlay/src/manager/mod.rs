@@ -1114,6 +1114,12 @@ impl OverlayManager {
             .unwrap_or(false)
     }
 
+    /// Returns true if a peer's connection matches the given resolved socket
+    /// address (direct IP + port comparison, no hostname lookup).
+    pub(super) fn peer_info_matches_socket_addr(info: &PeerInfo, addr: SocketAddr) -> bool {
+        info.address == addr
+    }
+
     pub(super) fn has_outbound_connection_to(
         peer_info_cache: &DashMap<PeerId, PeerInfo>,
         addr: &PeerAddress,
@@ -1152,7 +1158,7 @@ impl OverlayManager {
                     continue;
                 }
             }
-            if !unique.insert(addr.to_socket_addr()) {
+            if !unique.insert(addr.to_string()) {
                 continue;
             }
             if let Some(xdr) = Self::peer_address_to_xdr(addr) {

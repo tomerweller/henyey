@@ -432,13 +432,6 @@ impl PeerAddress {
         }
     }
 
-    /// Returns a socket address string suitable for TCP connection.
-    ///
-    /// The format is `host:port` which can be passed to `TcpStream::connect`.
-    pub fn to_socket_addr(&self) -> String {
-        self.to_string()
-    }
-
     /// Returns true if this address is a private/local network address.
     ///
     /// Private addresses include:
@@ -797,7 +790,7 @@ mod tests {
     #[test]
     fn test_peer_address() {
         let addr = PeerAddress::new("127.0.0.1", 11625);
-        assert_eq!(addr.to_socket_addr(), "127.0.0.1:11625");
+        assert_eq!(addr.to_string(), "127.0.0.1:11625");
         assert_eq!(addr.to_string(), "127.0.0.1:11625");
     }
 

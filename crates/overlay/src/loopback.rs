@@ -7,7 +7,7 @@ use tokio::io::duplex;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::connection::{Connection, ConnectionDirection, Listener};
-use crate::{ConnectionFactory, OverlayError, PeerAddress, Result};
+use crate::{ConnectionFactory, OverlayError, Result};
 
 #[derive(Debug, Default)]
 struct LoopbackRegistry {
@@ -27,8 +27,8 @@ impl LoopbackConnectionFactory {
 
 #[async_trait]
 impl ConnectionFactory for LoopbackConnectionFactory {
-    async fn connect(&self, addr: &PeerAddress, _timeout_secs: u64) -> Result<Connection> {
-        let port = addr.port;
+    async fn connect(&self, addr: SocketAddr, _timeout_secs: u64) -> Result<Connection> {
+        let port = addr.port();
         let sender = {
             let registry = self.registry.lock().await;
             registry.listeners.get(&port).cloned()

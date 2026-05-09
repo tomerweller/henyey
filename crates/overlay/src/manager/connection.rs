@@ -13,6 +13,7 @@ use crate::{
     peer::{Peer, PeerInfo},
     LocalNode, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
 };
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,31 +32,32 @@ const CONNECTION_ATTEMPT_DELAY_MS: u64 = 50;
 /// Pre-resolved peer address for batch dedup and outbound connection.
 ///
 /// Carries the original address (for known-peer tracking and PeerInfo),
-/// the resolved IPv4 address (for TCP connect), and the canonical
+/// the resolved IPv4 socket address (for TCP connect), and the canonical
 /// dedup key (`ip:port` string).
 struct ResolvedPeer {
     original: PeerAddress,
-    resolved: PeerAddress,
+    resolved: SocketAddr,
     key: String,
 }
 
-/// Resolve a PeerAddress to its canonical IPv4 form for dedup and transport.
+/// Resolve a PeerAddress to a canonical IPv4 `SocketAddr` for transport.
 ///
 /// Mirrors stellar-core's `PeerBareAddress::resolve()` (PeerBareAddress.cpp:46-115):
-/// - IPv4 literal → returned unchanged (fast path, no syscall)
+/// - IPv4 literal → parsed into `SocketAddr` (fast path, no syscall)
 /// - Hostname → DNS lookup, first IPv4 result used
 /// - IPv6 literal → error (stellar-core is IPv4-only for peer addresses)
 /// - DNS failure or no IPv4 results → error
 ///
-/// Returns `(resolved_addr, addr_key)` where `resolved_addr` has the resolved
-/// IPv4 as its host (for TCP connect) and `addr_key` is `"ip:port"` for
+/// Returns `(socket_addr, addr_key)` where `socket_addr` is the resolved
+/// IPv4 address for TCP connect and `addr_key` is `"ip:port"` for
 /// `PendingConnections` dedup.
-async fn resolve_peer_address(addr: &PeerAddress) -> Result<(PeerAddress, String)> {
+async fn resolve_peer_address(addr: &PeerAddress) -> Result<(SocketAddr, String)> {
     use std::net::IpAddr;
     match addr.host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(_)) => {
-            let key = format!("{}:{}", addr.host, addr.port);
-            Ok((addr.clone(), key))
+        Ok(IpAddr::V4(ipv4)) => {
+            let sa = SocketAddr::new(IpAddr::V4(ipv4), addr.port);
+            let key = sa.to_string();
+            Ok((sa, key))
         }
         Ok(IpAddr::V6(_)) => Err(OverlayError::ConnectionFailed(format!(
             "IPv6 address not supported: {}",
@@ -74,9 +76,8 @@ async fn resolve_peer_address(addr: &PeerAddress) -> Result<(PeerAddress, String
             let sa = addrs.find(|a| a.is_ipv4()).ok_or_else(|| {
                 OverlayError::ConnectionFailed(format!("no IPv4 address found for {}", addr))
             })?;
-            let resolved = PeerAddress::new(sa.ip().to_string(), sa.port());
-            let key = format!("{}:{}", sa.ip(), sa.port());
-            Ok((resolved, key))
+            let key = sa.to_string();
+            Ok((sa, key))
         }
     }
 }
@@ -526,7 +527,7 @@ impl OverlayManager {
         shared.metrics.outbound_attempt.inc();
 
         let connection = match connection_factory
-            .connect(&resolved_addr, timeouts.connect_secs)
+            .connect(resolved_addr, timeouts.connect_secs)
             .await
         {
             Ok(c) => c,
@@ -698,7 +699,7 @@ impl OverlayManager {
         let already_connected = self.peer_info_cache.iter().any(|entry| {
             let info = entry.value();
             Self::peer_info_matches_address(info, &resolved.original)
-                || Self::peer_info_matches_address(info, &resolved.resolved)
+                || Self::peer_info_matches_socket_addr(info, resolved.resolved)
         });
         if already_connected {
             debug!("Already connected to {}", resolved.original);
@@ -844,7 +845,7 @@ pub(super) async fn connect_to_explicit_peer(
     shared.metrics.outbound_attempt.inc();
 
     let connection = match connection_factory
-        .connect(&resolved_addr, timeouts.connect_secs)
+        .connect(resolved_addr, timeouts.connect_secs)
         .await
     {
         Ok(connection) => connection,
@@ -1012,7 +1013,7 @@ mod tests {
 
     #[async_trait]
     impl ConnectionFactory for StalledHelloFactory {
-        async fn connect(&self, _addr: &PeerAddress, _timeout_secs: u64) -> Result<Connection> {
+        async fn connect(&self, _addr: SocketAddr, _timeout_secs: u64) -> Result<Connection> {
             let (client, server) = tokio::io::duplex(8192);
             *self._server_half.lock().await = Some(server);
             Connection::from_io(
@@ -1033,7 +1034,7 @@ mod tests {
 
     #[async_trait]
     impl ConnectionFactory for StalledConnectFactory {
-        async fn connect(&self, addr: &PeerAddress, timeout_secs: u64) -> Result<Connection> {
+        async fn connect(&self, addr: SocketAddr, timeout_secs: u64) -> Result<Connection> {
             tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
             Err(OverlayError::ConnectionTimeout(addr.to_string()))
         }
@@ -1241,7 +1242,7 @@ mod tests {
         let addr_key = format!("{}:{}", addr.host, addr.port);
         let resolved = ResolvedPeer {
             original: addr.clone(),
-            resolved: addr.clone(),
+            resolved: format!("{}:{}", addr.host, addr.port).parse().unwrap(),
             key: addr_key.clone(),
         };
 
@@ -1561,8 +1562,8 @@ mod tests {
     async fn test_resolve_peer_address_ipv4_passthrough() {
         let addr = PeerAddress::new("10.0.0.1", 11625);
         let (resolved, key) = resolve_peer_address(&addr).await.unwrap();
-        assert_eq!(resolved.host, "10.0.0.1");
-        assert_eq!(resolved.port, 11625);
+        assert_eq!(resolved.ip().to_string(), "10.0.0.1");
+        assert_eq!(resolved.port(), 11625);
         assert_eq!(key, "10.0.0.1:11625");
     }
 
@@ -1570,8 +1571,8 @@ mod tests {
     async fn test_resolve_peer_address_localhost() {
         let addr = PeerAddress::new("localhost", 11625);
         let (resolved, key) = resolve_peer_address(&addr).await.unwrap();
-        assert_eq!(resolved.host, "127.0.0.1");
-        assert_eq!(resolved.port, 11625);
+        assert_eq!(resolved.ip().to_string(), "127.0.0.1");
+        assert_eq!(resolved.port(), 11625);
         assert_eq!(key, "127.0.0.1:11625");
     }
 

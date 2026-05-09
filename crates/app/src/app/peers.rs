@@ -607,7 +607,7 @@ impl App {
         let mut seen = HashSet::new();
         let mut deduped = Vec::new();
         for peer in peers {
-            if seen.insert(peer.to_socket_addr()) {
+            if seen.insert(peer.to_string()) {
                 deduped.push(peer);
             }
         }

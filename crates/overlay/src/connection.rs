@@ -17,7 +17,7 @@
 
 use crate::{
     codec::{MessageCodec, MessageFrame},
-    OverlayError, PeerAddress, Result,
+    OverlayError, Result,
 };
 use futures::{SinkExt, StreamExt};
 use std::collections::HashSet;
@@ -127,19 +127,22 @@ impl Connection {
         })
     }
 
-    /// Connects to a peer address with a timeout.
+    /// Connects to a resolved socket address with a timeout.
+    ///
+    /// The caller must resolve hostnames to `SocketAddr` before calling this
+    /// method (see `resolve_peer_address()`). This ensures the transport layer
+    /// never performs implicit DNS lookups.
     ///
     /// # Errors
     ///
     /// Returns `ConnectionTimeout` if the connection is not established
     /// within `timeout_secs`, or `ConnectionFailed` for other errors.
-    pub async fn connect(addr: &PeerAddress, timeout_secs: u64) -> Result<Self> {
+    pub async fn connect(addr: SocketAddr, timeout_secs: u64) -> Result<Self> {
         debug!("Connecting to peer: {}", addr);
 
-        let socket_addr = addr.to_socket_addr();
         let connect_timeout = Duration::from_secs(timeout_secs);
 
-        let stream = timeout(connect_timeout, TcpStream::connect(&socket_addr))
+        let stream = timeout(connect_timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| OverlayError::ConnectionTimeout(addr.to_string()))?
             .map_err(|e| OverlayError::ConnectionFailed(format!("{}: {}", addr, e)))?;
@@ -818,9 +821,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_peer_address_connect_format() {
-        let addr = PeerAddress::new("127.0.0.1", 11625);
-        assert_eq!(addr.to_socket_addr(), "127.0.0.1:11625");
+    async fn test_peer_address_format() {
+        let addr = crate::PeerAddress::new("127.0.0.1", 11625);
+        assert_eq!(addr.to_string(), "127.0.0.1:11625");
     }
 
     #[test]
