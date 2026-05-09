@@ -699,7 +699,7 @@ reset streaks):
 3. `stellar_ledger_apply_failure_total`
 4. `henyey_scp_post_verify_total{reason="accepted"}`
 5. `henyey_scp_post_verify_total{reason="processed_directly"}`
-6. Sum of all 13 `henyey_scp_post_verify_total{reason="..."}` lines (`pv_total_sum`)
+6. Sum of all 14 `henyey_scp_post_verify_total{reason="..."}` lines (`pv_total_sum`)
 
 **Per-check required inputs** — these are NOT part of the global required set.
 If missing, only the pending check (Check 3) skips; SCP and apply proceed
@@ -708,11 +708,11 @@ normally:
 7. `stellar_herder_pending_too_old_total`
 8. `stellar_herder_pending_received_total`
 
-**Post-verify label-set validation:** After extracting the 13
+**Post-verify label-set validation:** After extracting the 14
 `henyey_scp_post_verify_total{reason="..."}` lines, validate that the exact set
 of reason labels is: `invalid_sig`, `panic`, `drift_range`, `drift_close_time`,
 `drift_cannot_receive`, `self_message`, `non_quorum`, `buffered`, `duplicate`,
-`too_far`, `buffer_full`, `processed_directly`, `accepted`. If any label is
+`too_far`, `buffer_full`, `processed_directly`, `per_slot_full`, `accepted`. If any label is
 missing or unexpected labels appear, treat as missing counters (partial scrape
 or label change).
 
@@ -724,7 +724,7 @@ or label change).
 - `/metrics` fetch fails (curl error or empty response)
 - `/metrics` returns "recorder not installed"
 - Any required counter missing or invalid
-- Post-verify label set ≠ expected 13 labels
+- Post-verify label set ≠ expected 14 labels
 
 On any skip: **empty** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot`,
 reset all streak counters to 0, report `metrics_ratio: skipped (<reason>)`.
@@ -784,9 +784,9 @@ apply_failure=$(echo "$metrics_body" | grep -E '^stellar_ledger_apply_failure_to
 pv_accepted=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="accepted"\} ' | awk '{printf "%d", $2}')
 pv_processed=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="processed_directly"\} ' | awk '{printf "%d", $2}')
 
-# Validate exact 13-label set — STOP if mismatch
+# Validate exact 14-label set — STOP if mismatch
 pv_labels=$(echo "$metrics_body" | grep -oP '^henyey_scp_post_verify_total\{reason="\K[^"]+' | sort)
-expected_labels=$(printf '%s\n' accepted buffer_full buffered drift_cannot_receive drift_close_time drift_range duplicate invalid_sig non_quorum panic processed_directly self_message too_far | sort)
+expected_labels=$(printf '%s\n' accepted buffer_full buffered drift_cannot_receive drift_close_time drift_range duplicate invalid_sig non_quorum panic per_slot_full processed_directly self_message too_far | sort)
 if [ "$pv_labels" != "$expected_labels" ]; then
   > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
   # report: metrics_ratio: skipped (label set mismatch)
