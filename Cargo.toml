@@ -40,7 +40,7 @@ stellar-strkey = "0.0.11"
 
 # Soroban host crates — pinned to exact git revs from the stellar-core
 # submodule's recorded gitlinks for rs-soroban-env.
-# CI verifies alignment via scripts/check-soroban-pins.sh.
+# Verify alignment: bash scripts/check-soroban-pins.sh
 # When bumping the stellar-core submodule, update these revs to match:
 #   git -C stellar-core ls-tree HEAD src/rust/soroban/p24 src/rust/soroban/p25 src/rust/soroban/p26
 soroban-env-host-p24 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
