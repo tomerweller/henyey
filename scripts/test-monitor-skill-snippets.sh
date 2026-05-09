@@ -43,7 +43,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=115
+TAP_PLAN=122
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -346,6 +346,34 @@ check_skill_structure() {
     drift=true
   fi
   if ! check_filing_balance "$loop_file" "^## Bug \/ CI-Failure Filing Workflow" "monitor-loop"; then
+    drift=true
+  fi
+
+  # watcher-check-prompt.md must not contain pgrep or pkill
+  local watcher_prompt="$REPO_ROOT/scripts/watcher-check-prompt.md"
+  if grep -qE 'pgrep|pkill' "$watcher_prompt" 2>/dev/null; then
+    echo "WARNING: watcher-check-prompt.md still contains pgrep/pkill patterns" >&2
+    drift=true
+  fi
+  # watcher-check-prompt.md must not contain hardcoded /home/tomer/ paths
+  if grep -q '/home/tomer/' "$watcher_prompt" 2>/dev/null; then
+    echo "WARNING: watcher-check-prompt.md still contains hardcoded /home/tomer/ paths" >&2
+    drift=true
+  fi
+  # watcher-check-prompt.md must reference watcher-ctl.sh
+  if ! grep -q 'watcher-ctl.sh' "$watcher_prompt" 2>/dev/null; then
+    echo "WARNING: watcher-check-prompt.md does not reference watcher-ctl.sh" >&2
+    drift=true
+  fi
+  # watcher-ctl.sh must exist and be executable
+  local watcher_ctl="$REPO_ROOT/scripts/watcher-ctl.sh"
+  if [[ ! -x "$watcher_ctl" ]]; then
+    echo "WARNING: scripts/watcher-ctl.sh is missing or not executable" >&2
+    drift=true
+  fi
+  # watcher-ctl.sh must source monitor-decisions.sh
+  if ! grep -q 'source.*monitor-decisions.sh' "$watcher_ctl" 2>/dev/null; then
+    echo "WARNING: watcher-ctl.sh does not source monitor-decisions.sh" >&2
     drift=true
   fi
 
@@ -2138,6 +2166,135 @@ except Exception as e:
   else
     tap_not_ok "quarantine-remove: I/O error (mv fails) returns 2, file unchanged, no .tmp" \
       "$t90_ok"
+  fi
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # watcher-ctl.sh tests
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # ── Test: _is_our_watcher validates exact binary, run+watcher argv, config ─
+  local wt_data="$TEST_ROOT/wt1/data"
+  local wt_proc="$TEST_ROOT/wt1/proc"
+  local wt_project="$TEST_ROOT/wt1/project"
+  mkdir -p "$wt_data/watcher" "$wt_proc" "$wt_project/target/release" "$wt_project/configs"
+
+  # Create mock binary and config
+  touch "$wt_project/target/release/henyey"
+  chmod +x "$wt_project/target/release/henyey"
+  echo "test config" > "$wt_project/configs/watcher-testnet.toml"
+
+  local wt_binary
+  wt_binary="$(readlink -f "$wt_project/target/release/henyey")"
+
+  # Create a matching mock proc entry: correct exe, run + --watcher + --config
+  mkdir -p "$wt_proc/5001"
+  ln -sf "$wt_binary" "$wt_proc/5001/exe"
+  printf '%s\0%s\0%s\0%s\0%s\0' "$wt_binary" "run" "--watcher" "--config" "configs/watcher-testnet.toml" > "$wt_proc/5001/cmdline"
+  ln -sf "$wt_project" "$wt_proc/5001/cwd"
+
+  # Test status returns 1 with no PID file and no matching process
+  local wt_rc=0
+  PROC_ROOT="$wt_proc/empty" PID_FILE="$wt_data/watcher/nonexistent.pid" \
+    PROJECT_DIR="$wt_project" BINARY="$wt_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" status > /dev/null 2>&1 || wt_rc=$?
+  if [[ $wt_rc -eq 1 ]]; then
+    tap_ok "watcher-ctl: status returns 1 with no watcher"
+  else
+    tap_not_ok "watcher-ctl: status returns 1 with no watcher" "exit=$wt_rc"
+  fi
+
+  # Test status returns 0 when untracked watcher found via proc scan
+  mkdir -p "$wt_proc/5001"
+  wt_rc=0
+  local wt_status_out
+  wt_status_out=$(PROC_ROOT="$wt_proc" PID_FILE="$wt_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_project" BINARY="$wt_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" status 2>&1) || wt_rc=$?
+  if [[ $wt_rc -eq 0 ]] && echo "$wt_status_out" | grep -q "UNTRACKED.*5001.*adopting"; then
+    tap_ok "watcher-ctl: status adopts untracked watcher from proc scan"
+  else
+    tap_not_ok "watcher-ctl: status adopts untracked watcher from proc scan" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # Test status returns 0 when PID file points to valid watcher
+  echo "5001" > "$wt_data/watcher/testnet-watcher.pid"
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_proc" PID_FILE="$wt_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_project" BINARY="$wt_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" status 2>&1) || wt_rc=$?
+  if [[ $wt_rc -eq 0 ]] && echo "$wt_status_out" | grep -q "running.*PID 5001"; then
+    tap_ok "watcher-ctl: status returns 0 for tracked running watcher"
+  else
+    tap_not_ok "watcher-ctl: status returns 0 for tracked running watcher" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # Test status cleans up stale PID file (PID exists but wrong binary)
+  local wt_proc2="$TEST_ROOT/wt2/proc"
+  local wt_data2="$TEST_ROOT/wt2/data"
+  mkdir -p "$wt_proc2/6001" "$wt_data2/watcher"
+  ln -sf "/usr/bin/false" "$wt_proc2/6001/exe"
+  printf '%s\0' "false" > "$wt_proc2/6001/cmdline"
+  echo "6001" > "$wt_data2/watcher/testnet-watcher.pid"
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_proc2" PID_FILE="$wt_data2/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_project" BINARY="$wt_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" status 2>&1) || wt_rc=$?
+  if [[ $wt_rc -eq 1 ]] && echo "$wt_status_out" | grep -q "Stale PID file"; then
+    tap_ok "watcher-ctl: status cleans stale PID file (wrong binary)"
+  else
+    tap_not_ok "watcher-ctl: status cleans stale PID file (wrong binary)" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # Test _is_our_watcher rejects missing --watcher flag
+  local wt_proc3="$TEST_ROOT/wt3/proc"
+  mkdir -p "$wt_proc3/7001"
+  ln -sf "$wt_binary" "$wt_proc3/7001/exe"
+  # run without --watcher
+  printf '%s\0%s\0%s\0%s\0' "$wt_binary" "run" "--config" "configs/watcher-testnet.toml" > "$wt_proc3/7001/cmdline"
+  ln -sf "$wt_project" "$wt_proc3/7001/cwd"
+  local wt_data3="$TEST_ROOT/wt3/data"
+  mkdir -p "$wt_data3/watcher"
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_proc3" PID_FILE="$wt_data3/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_project" BINARY="$wt_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" status 2>&1) || wt_rc=$?
+  if [[ $wt_rc -eq 1 ]] && echo "$wt_status_out" | grep -q "NOT running"; then
+    tap_ok "watcher-ctl: rejects process without --watcher flag"
+  else
+    tap_not_ok "watcher-ctl: rejects process without --watcher flag" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # Test _is_our_watcher rejects wrong config path
+  local wt_proc4="$TEST_ROOT/wt4/proc"
+  mkdir -p "$wt_proc4/8001"
+  ln -sf "$wt_binary" "$wt_proc4/8001/exe"
+  printf '%s\0%s\0%s\0%s\0%s\0' "$wt_binary" "run" "--watcher" "--config" "configs/validator-mainnet.toml" > "$wt_proc4/8001/cmdline"
+  ln -sf "$wt_project" "$wt_proc4/8001/cwd"
+  local wt_data4="$TEST_ROOT/wt4/data"
+  mkdir -p "$wt_data4/watcher"
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_proc4" PID_FILE="$wt_data4/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_project" BINARY="$wt_project/target/release/henyey" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" status 2>&1) || wt_rc=$?
+  if [[ $wt_rc -eq 1 ]] && echo "$wt_status_out" | grep -q "NOT running"; then
+    tap_ok "watcher-ctl: rejects process with wrong config"
+  else
+    tap_not_ok "watcher-ctl: rejects process with wrong config" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # Test usage message on invalid command
+  wt_rc=0
+  wt_status_out=$(bash "$REPO_ROOT/scripts/watcher-ctl.sh" invalid 2>&1) || wt_rc=$?
+  if [[ $wt_rc -eq 1 ]] && echo "$wt_status_out" | grep -q "Usage:"; then
+    tap_ok "watcher-ctl: shows usage on invalid command"
+  else
+    tap_not_ok "watcher-ctl: shows usage on invalid command" "rc=$wt_rc out=$wt_status_out"
   fi
 }
 check_skill_structure

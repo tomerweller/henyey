@@ -52,7 +52,7 @@ This codebase is under heavy construction. Don't be afraid to make significant c
   echo "Follow along: tail -f ~/data/<session>/offline-verify.log"
 
   # Online watcher (background)
-  nohup ./target/release/henyey run --config configs/watcher-testnet.toml > ~/data/<session>/watcher.log 2>&1 &
+  nohup ./target/release/henyey run --watcher --config configs/watcher-testnet.toml > ~/data/<session>/watcher.log 2>&1 &
   echo "Follow along: tail -f ~/data/<session>/watcher.log"
   ```
 

@@ -1,22 +1,20 @@
 # Watcher Check Instructions
 
-> **⚠️ DEPRECATION NOTICE**: This prompt template uses `pgrep -f` / `pkill -f`
-> for process matching, which has cross-session false-positive issues (see
-> #2467, #2511). These patterns can match henyey processes from unrelated
-> sessions. For session-aware process management, use the helpers in
-> `scripts/lib/monitor-decisions.sh` (`_find_session_process`,
-> `_enumerate_henyey_processes`). A full migration of this file is tracked
-> as a follow-up issue.
-
 Check the henyey testnet watcher status and fix any issues found.
 
 ## Context
 
+- **Process management**: `./scripts/watcher-ctl.sh {start|stop|status|restart}`
+- PID file: `~/data/watcher/testnet-watcher.pid`
 - Watcher log: `~/data/watcher/testnet-watcher.log`
-- Project directory: `/home/tomer/henyey-2`
 - Config file: `configs/watcher-testnet.toml`
-- Watcher command: `./target/release/henyey run --config configs/watcher-testnet.toml`
-- Git remote: `origin` (github.com:tomerweller/henyey.git)
+- Watcher command (via script): `./scripts/watcher-ctl.sh start`
+
+> **Singleton constraint:** This prompt manages exactly one testnet watcher
+> per user at a time. The PID file `testnet-watcher.pid` enforces this — a
+> second start will fail if the first is still running. The script also scans
+> `/proc` for untracked watchers, so even if the PID file is missing, it will
+> detect and adopt an existing watcher process.
 
 ## Tasks
 
@@ -34,15 +32,13 @@ Check the henyey testnet watcher status and fix any issues found.
    - Rebuild: `cargo build --release -p henyey`
    - Restart watcher:
      ```bash
-     pkill -f "henyey.*run"
-     sleep 2
-     cd /home/tomer/henyey-2 && nohup ./target/release/henyey run --config configs/watcher-testnet.toml > ~/data/watcher/testnet-watcher.log 2>&1 &
+     ./scripts/watcher-ctl.sh restart
      ```
 
 ### 2. Check Watcher Status
 
 Run these diagnostic commands:
-- Check if process is running: `pgrep -f "henyey.*run"`
+- Check if process is running: `./scripts/watcher-ctl.sh status`
 - Check current ledger: `tail -50 ~/data/watcher/testnet-watcher.log | grep "Ledger closed" | tail -1`
 - Count ledgers closed: `grep -c 'Ledger closed successfully' ~/data/watcher/testnet-watcher.log`
 - Count hash mismatches: `grep -c 'Hash mismatch' ~/data/watcher/testnet-watcher.log`
@@ -60,17 +56,15 @@ Run these diagnostic commands:
 8. Rebuild: `cargo build --release -p henyey`
 9. Restart watcher:
    ```bash
-   pkill -f "henyey.*run"
-   sleep 2
-   cd /home/tomer/henyey-2 && nohup ./target/release/henyey run --config configs/watcher-testnet.toml > ~/data/watcher/testnet-watcher.log 2>&1 &
+   ./scripts/watcher-ctl.sh restart
    ```
 
 ### 4. If Watcher Not Running
 
 1. Check for crash: `grep -iE 'error|panic|WARN' ~/data/watcher/testnet-watcher.log | tail -20`
-2. Restart: 
+2. Start watcher:
    ```bash
-   cd /home/tomer/henyey-2 && nohup ./target/release/henyey run --config configs/watcher-testnet.toml > ~/data/watcher/testnet-watcher.log 2>&1 &
+   ./scripts/watcher-ctl.sh start
    ```
 
 ### 5. Report Summary
