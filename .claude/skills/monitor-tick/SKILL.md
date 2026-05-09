@@ -222,7 +222,7 @@ guards).
 ## Fresh-start state
 
 Determine once at the top of the tick: if `/home/tomer/data/mainnet/mainnet.db`
-does NOT exist, set `FRESH_START=yes` (sync deadline = 4h). Otherwise
+does NOT exist, set `FRESH_START=yes` (sync deadline = 20m). Otherwise
 `FRESH_START=no` (sync deadline = 15m). Use this when evaluating check (2).
 
 ## Crash-recovery state
@@ -332,7 +332,7 @@ ticks so STUCK can be detected by a single invocation:
   `/home/tomer/data/$MONITOR_SESSION_ID/last_ledger` with `"<current-ledger>|<now>"`.
 - Check node uptime: `ps -o etime= -p $(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")`.
   Active deadline: **15m** when `FRESH_START=no` and `CRASH_RECOVERY=no`,
-  **60m** when `CRASH_RECOVERY=yes`, **4h** when `FRESH_START=yes`.
+  **60m** when `CRASH_RECOVERY=yes`, **20m** when `FRESH_START=yes`.
 - "Real-time sync" means RPC `age < 30s` — NOT just heartbeat event `gap=0`. Gap is
   the node's local view (`latest_ext - ledger`) and can stay at 0 even when
   the node is minutes behind the network. The authoritative wall-clock signal
@@ -345,7 +345,7 @@ ticks so STUCK can be detected by a single invocation:
   by ≥ 500 ledgers since the previous tick's `last_ledger`, the node is
   actively replaying — report CATCHING UP regardless of uptime. Flag SYNC
   FAILURE only when lcl stops advancing AND uptime exceeds 60m.
-- **Fresh-start carveout (`FRESH_START=yes`, uptime < 4h)**: a large gap is
+- **Fresh-start carveout (`FRESH_START=yes`, uptime < 20m)**: a large gap is
   expected during initial bucket apply — report CATCHING UP, not SYNC FAILURE.
 
 **(3) Process alive** — find by `/proc/exe` path matching via `_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID"` (from `scripts/lib/monitor-decisions.sh`, sourced at skill init). This validates that the process binary is exactly `$HOME/data/$MONITOR_SESSION_ID/cargo-target/release/henyey` (including `(deleted)` suffix after rebuilds), scoping detection to the current session. Historical note: the original `pgrep -f 'henyey.*run'` form was abandoned because it false-matched parallel `claude --print` agent processes; the intermediate `comm`-only replacement was abandoned because it false-matched any `henyey` process regardless of session (cross-session false positive, see #2467). If not running: Rotate-log with suffix `crashed`, then before Relaunch evaluate the **(3a) Repeated-FATAL state-wipe trigger** below.
@@ -386,7 +386,7 @@ rm -rf /home/tomer/data/mainnet/buckets
 rm -f /home/tomer/data/$MONITOR_SESSION_ID/last_ledger
 ```
 
-Then Relaunch. The next tick will see `FRESH_START=yes` (mainnet.db absent), apply the 4h sync deadline, and let the node fresh-catchup from network archive (~10–20 min to validating).
+Then Relaunch. The next tick will see `FRESH_START=yes` (mainnet.db absent), apply the 20m sync deadline, and let the node fresh-catchup from network archive (typically ~10–15 min to validating, observed ~9 min on 2026-05-09).
 
 File a new `urgent` GH issue documenting the wipe with the count of crashed rotations, the hash-mismatch evidence from the latest crashed log, and the cumulative downtime — this is a data point for whether the underlying recovery code path needs further hardening even though the immediate cause was already fixed. Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 
@@ -1495,7 +1495,7 @@ Print a multiline status report:
 MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   node:    mode=<MODE> session=<session-id> pid=<PID> fresh_start=<yes|no>
   wipe:    <per wipe-state composition table — omitted when no wipe>
-  sync:    <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|60m|4h>) | SYNC FAILURE (gap=N, uptime=Xm — filed/commented #<N>)>
+  sync:    <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|20m|60m>) | SYNC FAILURE (gap=N, uptime=Xm — filed/commented #<N>)>
   mem:     <RSS_MB>MB rss | alloc=<alloc>MB resident=<resident>MB frag=<pct>%
            heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB
   disk:    <used>/<total> (<pct>%) | session+data=<size>
@@ -1518,7 +1518,7 @@ taken (restart, deploy, filed a new issue, commented on an existing issue,
 session-wipe recovery). Use OFFLINE when the node cannot be recovered in
 this tick (e.g., rebuild failed after session wipe).
 Use SYNC FAILURE (not WARNING) when the node has exceeded the active sync
-deadline (15m populated / 4h fresh-start) but is not closing ledgers in
+deadline (15m populated / 20m fresh-start / 60m crash-recovery) but is not closing ledgers in
 real-time — this is a bug that requires immediate investigation AND
 filing/commenting on a GitHub issue (label `urgent` since SYNC FAILURE blocks
 consensus). Board-route to Backlog per `scripts/lib/monitor-label-policy.md`.
