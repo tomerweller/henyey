@@ -28,6 +28,48 @@ use tokio::task::JoinHandle;
 /// filling outbound slots, to avoid overwhelming the network stack.
 const CONNECTION_ATTEMPT_DELAY_MS: u64 = 50;
 
+/// Resolve a PeerAddress to its canonical IPv4 form for dedup and transport.
+///
+/// Mirrors stellar-core's `PeerBareAddress::resolve()` (PeerBareAddress.cpp:46-115):
+/// - IPv4 literal → returned unchanged (fast path, no syscall)
+/// - Hostname → DNS lookup, first IPv4 result used
+/// - IPv6 literal → error (stellar-core is IPv4-only for peer addresses)
+/// - DNS failure or no IPv4 results → error
+///
+/// Returns `(resolved_addr, addr_key)` where `resolved_addr` has the resolved
+/// IPv4 as its host (for TCP connect) and `addr_key` is `"ip:port"` for
+/// `PendingConnections` dedup.
+async fn resolve_peer_address(addr: &PeerAddress) -> Result<(PeerAddress, String)> {
+    use std::net::IpAddr;
+    match addr.host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => {
+            let key = format!("{}:{}", addr.host, addr.port);
+            Ok((addr.clone(), key))
+        }
+        Ok(IpAddr::V6(_)) => Err(OverlayError::ConnectionFailed(format!(
+            "IPv6 address not supported: {}",
+            addr
+        ))),
+        Err(_) => {
+            // Hostname — resolve via DNS, pick first IPv4
+            let mut addrs = tokio::net::lookup_host(format!("{}:{}", addr.host, addr.port))
+                .await
+                .map_err(|e| {
+                    OverlayError::ConnectionFailed(format!(
+                        "DNS resolution failed for {}: {}",
+                        addr, e
+                    ))
+                })?;
+            let sa = addrs.find(|a| a.is_ipv4()).ok_or_else(|| {
+                OverlayError::ConnectionFailed(format!("no IPv4 address found for {}", addr))
+            })?;
+            let resolved = PeerAddress::new(sa.ip().to_string(), sa.port());
+            let key = format!("{}:{}", sa.ip(), sa.port());
+            Ok((resolved, key))
+        }
+    }
+}
+
 /// Outcome of an `add_peer` call.
 ///
 /// These are success-path outcomes only — error conditions (e.g.
@@ -442,11 +484,23 @@ impl OverlayManager {
         shared: SharedPeerState,
         connection_factory: Arc<dyn ConnectionFactory>,
     ) {
+        // Resolve hostname → IPv4 once. The resolved IP is used for both the
+        // pending-connection dedup key and the TCP connect, preventing
+        // hostname/IP aliasing. The original `addr` is kept for
+        // PeerInfo::original_address (hostname matching).
+        let (resolved_addr, addr_key) = match resolve_peer_address(&addr).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                debug!("Skipped discovered peer {}: {}", addr, e);
+                pool.release_pending();
+                return;
+            }
+        };
+
         // Reserve address slot to prevent duplicate outbound dials. If the
         // address is already in flight, no actual dial happens, so this is a
         // no-op skip — neither `outbound_attempt` nor `outbound_reject` fire
         // (those track real on-the-wire lifecycle events).
-        let addr_key = format!("{}:{}", addr.host, addr.port);
         if !shared
             .pending_connections
             .try_reserve_address(addr_key.clone())
@@ -465,7 +519,7 @@ impl OverlayManager {
         shared.metrics.outbound_attempt.inc();
 
         let connection = match connection_factory
-            .connect(&addr, timeouts.connect_secs)
+            .connect(&resolved_addr, timeouts.connect_secs)
             .await
         {
             Ok(c) => c,
@@ -697,11 +751,15 @@ pub(super) async fn connect_to_explicit_peer(
     shared: SharedPeerState,
     connection_factory: Arc<dyn ConnectionFactory>,
 ) -> Result<PeerId> {
+    // Resolve hostname → IPv4 once. The resolved IP is used for both the
+    // pending-connection dedup key and the TCP connect. The original `addr`
+    // is kept for PeerInfo::original_address (hostname matching).
+    let (resolved_addr, addr_key) = resolve_peer_address(addr).await?;
+
     // Reserve address slot to prevent duplicate outbound dials. If the
     // address is already in flight, no actual dial happens — this is a
     // no-op skip (neither `outbound_attempt` nor `outbound_reject` fire).
     // See `connect_to_discovered_peer` for the matching contract.
-    let addr_key = format!("{}:{}", addr.host, addr.port);
     if !shared
         .pending_connections
         .try_reserve_address(addr_key.clone())
@@ -718,7 +776,7 @@ pub(super) async fn connect_to_explicit_peer(
     shared.metrics.outbound_attempt.inc();
 
     let connection = match connection_factory
-        .connect(addr, timeouts.connect_secs)
+        .connect(&resolved_addr, timeouts.connect_secs)
         .await
     {
         Ok(connection) => connection,
@@ -1417,5 +1475,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, AddPeerOutcome::AlreadyConnected);
+    }
+
+    // ---- resolve_peer_address tests ----
+
+    #[tokio::test]
+    async fn test_resolve_peer_address_ipv4_passthrough() {
+        let addr = PeerAddress::new("10.0.0.1", 11625);
+        let (resolved, key) = resolve_peer_address(&addr).await.unwrap();
+        assert_eq!(resolved.host, "10.0.0.1");
+        assert_eq!(resolved.port, 11625);
+        assert_eq!(key, "10.0.0.1:11625");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_peer_address_localhost() {
+        let addr = PeerAddress::new("localhost", 11625);
+        let (resolved, key) = resolve_peer_address(&addr).await.unwrap();
+        assert_eq!(resolved.host, "127.0.0.1");
+        assert_eq!(resolved.port, 11625);
+        assert_eq!(key, "127.0.0.1:11625");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_peer_address_failure_returns_error() {
+        let addr = PeerAddress::new("this.hostname.does.not.exist.invalid", 11625);
+        let result = resolve_peer_address(&addr).await;
+        assert!(result.is_err(), "unresolvable hostname should return error");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_peer_address_ipv6_rejected() {
+        let addr = PeerAddress::new("::1", 11625);
+        let result = resolve_peer_address(&addr).await;
+        assert!(result.is_err(), "IPv6 addresses should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_pending_dedup_with_resolved_keys() {
+        use super::super::PendingConnections;
+        let pending = PendingConnections::new();
+
+        // Simulate what callers now do: resolve first, then reserve.
+        // Two addresses that resolve to the same IP should dedup.
+        let addr_ip = PeerAddress::new("127.0.0.1", 11625);
+        let (_, key1) = resolve_peer_address(&addr_ip).await.unwrap();
+        assert!(
+            pending.try_reserve_address(key1.clone()),
+            "first reservation should succeed"
+        );
+
+        // Same resolved IP via hostname should produce same key
+        let addr_hostname = PeerAddress::new("localhost", 11625);
+        let (_, key2) = resolve_peer_address(&addr_hostname).await.unwrap();
+        assert_eq!(key1, key2, "hostname and IP should produce same key");
+        assert!(
+            !pending.try_reserve_address(key2),
+            "duplicate reservation (hostname alias) should fail"
+        );
+
+        // Different IP should succeed
+        let addr_other = PeerAddress::new("10.0.0.1", 11625);
+        let (_, key3) = resolve_peer_address(&addr_other).await.unwrap();
+        assert!(
+            pending.try_reserve_address(key3),
+            "different IP should succeed"
+        );
     }
 }
