@@ -43,7 +43,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=122
+TAP_PLAN=128
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2295,6 +2295,123 @@ except Exception as e:
     tap_ok "watcher-ctl: shows usage on invalid command"
   else
     tap_not_ok "watcher-ctl: shows usage on invalid command" "rc=$wt_rc out=$wt_status_out"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Post-verify label sync checks (T123-T128)
+  # Cross-validate PostVerifyReason labels in crates/herder/src/scp_verify.rs
+  # against the hard-coded label sets in monitor-tick and monitor-loop SKILL.md.
+  # See issue #2519 (follow-up from #2481).
+  # ════════════════════════════════════════════════════════════════════════════
+
+  local scp_verify_file="$REPO_ROOT/crates/herder/src/scp_verify.rs"
+
+  # Extract canonical labels from PostVerifyReason impl block (scoped to
+  # avoid capturing PreFilterRejectReason::label() which also lives in this file).
+  local pv_impl_block canonical_labels canonical_count all_array_size
+  pv_impl_block=$(sed -n '/^impl PostVerifyReason/,/^}/p' "$scp_verify_file")
+  canonical_labels=$(echo "$pv_impl_block" | grep -oP '=> "\K[^"]+' | sort)
+  canonical_count=$(echo "$canonical_labels" | grep -c . || true)
+  all_array_size=$(echo "$pv_impl_block" | grep -oP 'pub const ALL: \[Self; \K\d+' || true)
+
+  # Test 123: Canonical extraction guard — fail closed on extraction problems
+  if [[ "$canonical_count" -gt 0 && "$canonical_count" == "$all_array_size" ]]; then
+    tap_ok "pv-label-sync: canonical extraction (count=$canonical_count, ALL size=$all_array_size)"
+  else
+    tap_not_ok "pv-label-sync: canonical extraction" \
+      "count=$canonical_count ALL_size=$all_array_size (expected >0 and equal)"
+    # Fail closed: emit remaining 5 tests as skipped
+    local _i; for _i in 124 125 126 127 128; do
+      tap_not_ok "pv-label-sync: skipped (canonical extraction failed)"
+    done
+    return
+  fi
+
+  # Extract scoped sections from skill docs
+  local tick_ratio_section loop_ratio_section
+  tick_ratio_section=$(extract_md_section "$tick_file" '^### Ratio checks')
+  loop_ratio_section=$(sed -n '/^\*\*D\. Ratio checks/,/^\*\*[A-Z]\./p' "$loop_file")
+
+  # If sections are empty, all remaining tests fail
+  if [[ -z "$tick_ratio_section" || -z "$loop_ratio_section" ]]; then
+    local _i; for _i in 124 125 126 127 128; do
+      tap_not_ok "pv-label-sync: skipped (section extraction failed: tick_empty=$([ -z "$tick_ratio_section" ] && echo yes || echo no) loop_empty=$([ -z "$loop_ratio_section" ] && echo yes || echo no))"
+    done
+    return
+  fi
+
+  # Test 124: monitor-tick narrative labels match canonical
+  # The label list spans multiple lines after "reason labels is:" until ". If"
+  local tick_narrative_text tick_narrative_labels
+  tick_narrative_text=$(echo "$tick_ratio_section" | sed -n '/reason labels is:/,/\. If/p')
+  tick_narrative_labels=$(echo "$tick_narrative_text" | grep -oP '`\K[a-z_]+(?=`)' | sort)
+  if [[ "$tick_narrative_labels" == "$canonical_labels" ]]; then
+    tap_ok "pv-label-sync: monitor-tick narrative labels ($canonical_count)"
+  else
+    tap_not_ok "pv-label-sync: monitor-tick narrative labels" \
+      "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$tick_narrative_labels" | tr '\n' ' ')"
+  fi
+
+  # Test 125: monitor-tick pseudocode labels match canonical
+  local tick_printf_line tick_pseudo_labels
+  tick_printf_line=$(echo "$tick_ratio_section" | grep "printf '%s\\\\n'" || true)
+  tick_pseudo_labels=$(echo "$tick_printf_line" | grep -oP "(?<=\\\\n' )[^|]+" | tr ' ' '\n' | grep -v '^$' | sed 's/|.*//' | sort)
+  if [[ "$tick_pseudo_labels" == "$canonical_labels" ]]; then
+    tap_ok "pv-label-sync: monitor-tick pseudocode labels ($canonical_count)"
+  else
+    tap_not_ok "pv-label-sync: monitor-tick pseudocode labels" \
+      "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$tick_pseudo_labels" | tr '\n' ' ')"
+  fi
+
+  # Test 126: monitor-loop inline labels match canonical
+  local loop_label_line loop_inline_labels
+  loop_label_line=$(echo "$loop_ratio_section" | grep 'Post-verify label set' || true)
+  loop_inline_labels=$(echo "$loop_label_line" | grep -oP '`\K[a-z_]+(?=`)' | sort)
+  if [[ "$loop_inline_labels" == "$canonical_labels" ]]; then
+    tap_ok "pv-label-sync: monitor-loop inline labels ($canonical_count)"
+  else
+    tap_not_ok "pv-label-sync: monitor-loop inline labels" \
+      "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$loop_inline_labels" | tr '\n' ' ')"
+  fi
+
+  # Test 127: monitor-tick label count references match canonical
+  local tick_count_refs tick_counts_ok=true
+  tick_count_refs=$(echo "$tick_ratio_section" | grep -oP '(?:all |the |exact |expected )\K\d+(?=[ -](?:label|post-verify|`henyey_scp_post_verify))' || true)
+  if [[ -z "$tick_count_refs" ]]; then
+    tick_counts_ok=false
+  else
+    while IFS= read -r count_val; do
+      if [[ "$count_val" != "$canonical_count" ]]; then
+        tick_counts_ok=false
+        break
+      fi
+    done <<< "$tick_count_refs"
+  fi
+  if [[ "$tick_counts_ok" == "true" ]]; then
+    tap_ok "pv-label-sync: monitor-tick count refs ($canonical_count)"
+  else
+    tap_not_ok "pv-label-sync: monitor-tick count refs" \
+      "expected all=$canonical_count, found: $(echo "$tick_count_refs" | tr '\n' ' ')"
+  fi
+
+  # Test 128: monitor-loop label count references match canonical
+  local loop_count_refs loop_counts_ok=true
+  loop_count_refs=$(echo "$loop_ratio_section" | grep -oP '(?:all |the |exact |expected )\K\d+(?=[ -](?:label|post-verify|`henyey_scp_post_verify))' || true)
+  if [[ -z "$loop_count_refs" ]]; then
+    loop_counts_ok=false
+  else
+    while IFS= read -r count_val; do
+      if [[ "$count_val" != "$canonical_count" ]]; then
+        loop_counts_ok=false
+        break
+      fi
+    done <<< "$loop_count_refs"
+  fi
+  if [[ "$loop_counts_ok" == "true" ]]; then
+    tap_ok "pv-label-sync: monitor-loop count refs ($canonical_count)"
+  else
+    tap_not_ok "pv-label-sync: monitor-loop count refs" \
+      "expected all=$canonical_count, found: $(echo "$loop_count_refs" | tr '\n' ' ')"
   fi
 }
 check_skill_structure
