@@ -657,7 +657,7 @@ async fn test_standalone_validator_closes_multiple_ledgers() {
     sim.add_app_node("node0", secret, quorum_set);
     sim.start_all_nodes().await;
 
-    wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
+    wait_for_app_state(&sim, "node0", AppState::Validating, Duration::from_secs(10)).await;
 
     // Close 5 ledgers: from genesis (ledger 1) through ledger 6.
     manual_close_until(&sim, 6, 0, Duration::from_secs(60)).await;
