@@ -111,14 +111,23 @@ fn describe_envelope(
         }
     }
     fn summarize_resources(data: &SorobanTransactionData) -> String {
+        use stellar_xdr::curr::SorobanTransactionDataExt;
         let r = &data.resources;
+        let archived = match &data.ext {
+            SorobanTransactionDataExt::V1(ext) => ext.archived_soroban_entries.len(),
+            _ => 0,
+        };
+        // archived_idx: count of read-write footprint entries marked for
+        // hot-archive autorestore (see CAP-66/77). Surfaced for diagnostic
+        // parity with stellar-core's restore-then-meter pre-execution path.
         format!(
-            "instr={},rro={},rrw={},wb={},drb={}",
+            "instr={},rro={},rrw={},wb={},drb={},archived_idx={}",
             r.instructions,
             r.footprint.read_only.len(),
             r.footprint.read_write.len(),
             r.write_bytes,
             r.disk_read_bytes,
+            archived,
         )
     }
     let Some(env) = env else {
@@ -162,6 +171,36 @@ fn describe_envelope(
             )
         }
     }
+}
+
+/// Returns (count, total_bytes) of non-TTL Created/Updated/Restored entries
+/// across a transaction's tx_apply_processing change groups. Mirrors the
+/// stellar-core write_bytes accounting (which excludes TTL entries) for
+/// side-by-side comparison with henyey's `total_write_bytes`.
+fn summarize_cdp_meta(meta: Option<&stellar_xdr::curr::TransactionMeta>) -> (u32, u64) {
+    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryData, WriteXdr};
+    let Some(meta) = meta else {
+        return (0, 0);
+    };
+    let mut count: u32 = 0;
+    let mut total_bytes: u64 = 0;
+    henyey_common::meta_walk::for_each_change_group(meta, |changes| {
+        for change in changes {
+            let entry = match change {
+                LedgerEntryChange::Created(e) | LedgerEntryChange::Updated(e) => e,
+                LedgerEntryChange::Restored(e) => e,
+                _ => continue,
+            };
+            if matches!(entry.data, LedgerEntryData::Ttl(_)) {
+                continue;
+            }
+            count += 1;
+            if let Ok(bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
+                total_bytes += bytes.len() as u64;
+            }
+        }
+    });
+    (count, total_bytes)
 }
 
 /// Returns a CSV summary of operation result discriminants for a transaction
@@ -1010,11 +1049,13 @@ async fn verify_single_ledger(
             // our per-tx WARN log emitted from manager.rs::commit.
             let cdp_results = extract_transaction_results(&lcm);
             let cdp_envelopes = henyey_history::cdp::extract_transaction_envelopes(&lcm);
+            let cdp_metas = henyey_history::cdp::extract_transaction_metas(&lcm);
             for (i, pair) in cdp_results.iter().enumerate() {
                 let env = cdp_envelopes.get(i);
                 let (op_types, declared_fee, soroban_resource_fee, soroban_resources) =
                     describe_envelope(env);
                 let op_results = describe_op_results(&pair.result.result);
+                let (changes_count, changes_total_bytes) = summarize_cdp_meta(cdp_metas.get(i));
                 tracing::warn!(
                     target: "hash_mismatch_debug",
                     ledger_seq = seq,
@@ -1027,6 +1068,8 @@ async fn verify_single_ledger(
                     op_types = %op_types,
                     soroban_resource_fee = soroban_resource_fee,
                     soroban_resources = %soroban_resources,
+                    cdp_meta_changes_count = changes_count,
+                    cdp_meta_changes_total_bytes = changes_total_bytes,
                     "Per-tx result (mainnet/CDP)"
                 );
             }
