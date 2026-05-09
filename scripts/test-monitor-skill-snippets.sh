@@ -43,7 +43,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=139
+TAP_PLAN=140
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2298,7 +2298,7 @@ except Exception as e:
   fi
 
   # ══════════════════════════════════════════════════════════════════════════
-  # watcher-ctl.sh start/stop/restart tests (T123-T133)
+  # watcher-ctl.sh start/stop/restart tests (T123-T134)
   # Tests lifecycle subcommands using mock /proc and real background processes.
   # ══════════════════════════════════════════════════════════════════════════
 
@@ -2310,6 +2310,18 @@ except Exception as e:
       kill "$p" 2>/dev/null && wait "$p" 2>/dev/null || true
     done
     _wt_bg_pids=()
+  }
+
+  # Find a PID guaranteed not to be in use on the host.
+  # Scans downward from pid_max-1 to find the first non-existent /proc entry.
+  _unused_pid() {
+    local max
+    max=$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 4194304)
+    local candidate=$((max - 1))
+    while [[ -d "/proc/$candidate" ]] && [[ $candidate -gt 2 ]]; do
+      candidate=$((candidate - 1))
+    done
+    echo "$candidate"
   }
 
   # Shared mock project dir for lifecycle tests (reuse wt1 project)
@@ -2422,7 +2434,8 @@ except Exception as e:
   # a real OS process, so kill fails.
   local wt_stop4_proc="$TEST_ROOT/wt_stop4/proc"
   local wt_stop4_data="$TEST_ROOT/wt_stop4/data"
-  local stop4_fake_pid=99999
+  local stop4_fake_pid
+  stop4_fake_pid=$(_unused_pid)
   mkdir -p "$wt_stop4_proc/$stop4_fake_pid" "$wt_stop4_data/watcher"
   ln -sf "$wt_lc_binary" "$wt_stop4_proc/$stop4_fake_pid/exe"
   printf '%s\0%s\0%s\0%s\0%s\0' "$wt_lc_binary" "run" "--watcher" "--config" "configs/watcher-testnet.toml" \
@@ -2590,7 +2603,8 @@ MOCK_BINARY
   # Mock proc entry exists (status passes) but kill fails (fake PID).
   local wt_restart2_proc="$TEST_ROOT/wt_restart2/proc"
   local wt_restart2_data="$TEST_ROOT/wt_restart2/data"
-  local restart2_fake_pid=99998
+  local restart2_fake_pid
+  restart2_fake_pid=$(_unused_pid)
   mkdir -p "$wt_restart2_proc/$restart2_fake_pid" "$wt_restart2_data/watcher"
   ln -sf "$wt_lc_binary" "$wt_restart2_proc/$restart2_fake_pid/exe"
   printf '%s\0%s\0%s\0%s\0%s\0' "$wt_lc_binary" "run" "--watcher" "--config" "configs/watcher-testnet.toml" \
@@ -2658,11 +2672,80 @@ MOCK_BINARY
     tap_not_ok "watcher-ctl: restart success (stop no-op, start succeeds)" "rc=$wt_rc out=$wt_status_out"
   fi
 
+  # ── T134: cmd_restart full cycle (stop running watcher, start new) ─────
+  # Launch a "old" watcher process, then restart it with a new mock binary.
+  local wt_restart4_proc="$TEST_ROOT/wt_restart4/proc"
+  local wt_restart4_data="$TEST_ROOT/wt_restart4/data"
+  local wt_restart4_bin="$TEST_ROOT/wt_restart4/mock-henyey"
+  mkdir -p "$wt_restart4_data/watcher"
+
+  # Mock binary for the new watcher (creates its own mock proc entry)
+  # Create this first so we can use its path for the old watcher's exe too.
+  cat > "$wt_restart4_bin" <<'MOCK_BINARY'
+#!/usr/bin/env bash
+set -euo pipefail
+MY_PID=$$
+MOCK_PROC="${MOCK_PROC_ROOT}/${MY_PID}"
+mkdir -p "$MOCK_PROC"
+ln -sf "$(readlink -f "$0")" "$MOCK_PROC/exe"
+printf '%s\0' "$@" > "$MOCK_PROC/cmdline"
+ln -sf "$(pwd)" "$MOCK_PROC/cwd"
+exec sleep 300
+MOCK_BINARY
+  chmod +x "$wt_restart4_bin"
+  local wt_restart4_bin_real
+  wt_restart4_bin_real="$(readlink -f "$wt_restart4_bin")"
+
+  # Old watcher: a real sleep process
+  sleep 300 &
+  local restart4_old_pid=$!
+  _wt_bg_pids+=("$restart4_old_pid")
+
+  # Set up mock proc entry for the old watcher (exe must match BINARY)
+  mkdir -p "$wt_restart4_proc/$restart4_old_pid"
+  ln -sf "$wt_restart4_bin_real" "$wt_restart4_proc/$restart4_old_pid/exe"
+  printf '%s\0%s\0%s\0%s\0%s\0' "$wt_restart4_bin_real" "run" "--watcher" "--config" "configs/watcher-testnet.toml" \
+    > "$wt_restart4_proc/$restart4_old_pid/cmdline"
+  ln -sf "$wt_lc_project" "$wt_restart4_proc/$restart4_old_pid/cwd"
+  echo "$restart4_old_pid" > "$wt_restart4_data/watcher/testnet-watcher.pid"
+
+  # Background monitor: remove old watcher's mock proc dir when it exits
+  (while kill -0 "$restart4_old_pid" 2>/dev/null; do sleep 0.1; done
+   rm -rf "$wt_restart4_proc/$restart4_old_pid") &
+  local restart4_monitor=$!
+  _wt_bg_pids+=("$restart4_monitor")
+
+  wt_rc=0
+  wt_status_out=$(PROC_ROOT="$wt_restart4_proc" MOCK_PROC_ROOT="$wt_restart4_proc" \
+    PID_FILE="$wt_restart4_data/watcher/testnet-watcher.pid" \
+    PROJECT_DIR="$wt_lc_project" BINARY="$wt_restart4_bin" \
+    WATCHER_CONFIG="configs/watcher-testnet.toml" \
+    LOG_FILE="$wt_restart4_data/watcher/test.log" \
+    bash "$REPO_ROOT/scripts/watcher-ctl.sh" restart 2>&1) || wt_rc=$?
+  local restart4_ok=true
+  if [[ $wt_rc -ne 0 ]]; then restart4_ok=false; fi
+  if ! echo "$wt_status_out" | grep -q "Watcher stopped"; then restart4_ok=false; fi
+  if ! echo "$wt_status_out" | grep -q "Watcher started"; then restart4_ok=false; fi
+  # Verify old PID is gone and new PID is different
+  local restart4_new_pid
+  restart4_new_pid=$(cat "$wt_restart4_data/watcher/testnet-watcher.pid" 2>/dev/null || echo "")
+  if [[ -z "$restart4_new_pid" ]] || [[ "$restart4_new_pid" == "$restart4_old_pid" ]]; then
+    restart4_ok=false
+  fi
+  if [[ "$restart4_ok" == "true" ]]; then
+    _wt_bg_pids+=("$restart4_new_pid")
+    tap_ok "watcher-ctl: restart full cycle (old stopped, new started)"
+  else
+    tap_not_ok "watcher-ctl: restart full cycle (old stopped, new started)" \
+      "rc=$wt_rc old=$restart4_old_pid new=$restart4_new_pid out=$wt_status_out"
+  fi
+  wait "$restart4_monitor" 2>/dev/null || true
+
   # Clean up all background processes from lifecycle tests
   _wt_cleanup_bg
 
   # ════════════════════════════════════════════════════════════════════════════
-  # Post-verify label sync checks (T134-T139)
+  # Post-verify label sync checks (T135-T140)
   # Cross-validate PostVerifyReason labels in crates/herder/src/scp_verify.rs
   # against the hard-coded label sets in monitor-tick and monitor-loop SKILL.md.
   # See issue #2519 (follow-up from #2481).
@@ -2678,14 +2761,14 @@ MOCK_BINARY
   canonical_count=$(echo "$canonical_labels" | grep -c . || true)
   all_array_size=$(echo "$pv_impl_block" | grep -oP 'pub const ALL: \[Self; \K\d+' || true)
 
-  # Test 134: Canonical extraction guard — fail closed on extraction problems
+  # Test 135: Canonical extraction guard — fail closed on extraction problems
   if [[ "$canonical_count" -gt 0 && "$canonical_count" == "$all_array_size" ]]; then
     tap_ok "pv-label-sync: canonical extraction (count=$canonical_count, ALL size=$all_array_size)"
   else
     tap_not_ok "pv-label-sync: canonical extraction" \
       "count=$canonical_count ALL_size=$all_array_size (expected >0 and equal)"
     # Fail closed: emit remaining 5 tests as skipped
-    local _i; for _i in 135 136 137 138 139; do
+    local _i; for _i in 136 137 138 139 140; do
       tap_not_ok "pv-label-sync: skipped (canonical extraction failed)"
     done
     return
@@ -2698,13 +2781,13 @@ MOCK_BINARY
 
   # If sections are empty, all remaining tests fail
   if [[ -z "$tick_ratio_section" || -z "$loop_ratio_section" ]]; then
-    local _i; for _i in 135 136 137 138 139; do
+    local _i; for _i in 136 137 138 139 140; do
       tap_not_ok "pv-label-sync: skipped (section extraction failed: tick_empty=$([ -z "$tick_ratio_section" ] && echo yes || echo no) loop_empty=$([ -z "$loop_ratio_section" ] && echo yes || echo no))"
     done
     return
   fi
 
-  # Test 135: monitor-tick narrative labels match canonical
+  # Test 136: monitor-tick narrative labels match canonical
   # The label list spans multiple lines after "reason labels is:" until ". If"
   local tick_narrative_text tick_narrative_labels
   tick_narrative_text=$(echo "$tick_ratio_section" | sed -n '/reason labels is:/,/\. If/p')
@@ -2716,7 +2799,7 @@ MOCK_BINARY
       "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$tick_narrative_labels" | tr '\n' ' ')"
   fi
 
-  # Test 136: monitor-tick pseudocode labels match canonical
+  # Test 137: monitor-tick pseudocode labels match canonical
   local tick_printf_line tick_pseudo_labels
   tick_printf_line=$(echo "$tick_ratio_section" | grep "printf '%s\\\\n'" || true)
   tick_pseudo_labels=$(echo "$tick_printf_line" | grep -oP "(?<=\\\\n' )[^|]+" | tr ' ' '\n' | grep -v '^$' | sed 's/|.*//' | sort)
@@ -2727,7 +2810,7 @@ MOCK_BINARY
       "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$tick_pseudo_labels" | tr '\n' ' ')"
   fi
 
-  # Test 137: monitor-loop inline labels match canonical
+  # Test 138: monitor-loop inline labels match canonical
   local loop_label_line loop_inline_labels
   loop_label_line=$(echo "$loop_ratio_section" | grep 'Post-verify label set' || true)
   loop_inline_labels=$(echo "$loop_label_line" | grep -oP '`\K[a-z_]+(?=`)' | sort)
@@ -2738,7 +2821,7 @@ MOCK_BINARY
       "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$loop_inline_labels" | tr '\n' ' ')"
   fi
 
-  # Test 138: monitor-tick label count references match canonical
+  # Test 139: monitor-tick label count references match canonical
   local tick_count_refs tick_counts_ok=true
   tick_count_refs=$(echo "$tick_ratio_section" | grep -oP '(?:all |the |exact |expected )\K\d+(?=[ -](?:label|post-verify|`henyey_scp_post_verify))' || true)
   if [[ -z "$tick_count_refs" ]]; then
@@ -2758,7 +2841,7 @@ MOCK_BINARY
       "expected all=$canonical_count, found: $(echo "$tick_count_refs" | tr '\n' ' ')"
   fi
 
-  # Test 139: monitor-loop label count references match canonical
+  # Test 140: monitor-loop label count references match canonical
   local loop_count_refs loop_counts_ok=true
   loop_count_refs=$(echo "$loop_ratio_section" | grep -oP '(?:all |the |exact |expected )\K\d+(?=[ -](?:label|post-verify|`henyey_scp_post_verify))' || true)
   if [[ -z "$loop_count_refs" ]]; then
