@@ -105,6 +105,31 @@ use apply::{RestoreSource, RestoredEntries, AUTHORIZED_FLAG};
 use meta::*;
 use signatures::*;
 
+/// Scan ledger entries for ContractCode and add them to the module cache.
+///
+/// Mirrors stellar-core's `addAnyContractsToModuleCache()` which iterates
+/// `initEntries` and `liveEntries` once at ledger close
+/// (`LedgerManagerImpl.cpp:2929-2930, 3036-3064`).
+///
+/// Called once per ledger close — NEVER between individual transactions.
+/// Same-ledger contract invocations intentionally use the more expensive
+/// `VmInstantiation` (uncached) cost model, matching stellar-core behavior.
+///
+/// No-op when `cache` is `None` (pre-Soroban protocol or cache init failure).
+pub fn warm_module_cache_from_entries(
+    cache: Option<&PersistentModuleCache>,
+    entries: &[LedgerEntry],
+    protocol_version: u32,
+) {
+    if let Some(cache) = cache {
+        for entry in entries {
+            if let LedgerEntryData::ContractCode(cc) = &entry.data {
+                cache.add_contract(cc.code.as_slice(), protocol_version);
+            }
+        }
+    }
+}
+
 /// Wrapper around HotArchiveBucketList that implements the HotArchiveLookup trait.
 ///
 /// This allows the ledger execution layer to look up archived entries without
@@ -783,20 +808,6 @@ impl TransactionExecutor {
     ) {
         self.emit_soroban_tx_meta_ext_v1 = emit_soroban_tx_meta_ext_v1;
         self.enable_soroban_diagnostic_events = enable_soroban_diagnostic_events;
-    }
-
-    /// Add contract code to the module cache.
-    ///
-    /// This is called when new contract code entries are created, updated, or restored
-    /// during ledger close. Adding the code to the cache enables subsequent transactions
-    /// to use VmCachedInstantiation (cheap) instead of VmInstantiation (expensive).
-    ///
-    /// Without this, contracts deployed in transaction N would not be cached for
-    /// transaction N+1 in the same ledger, causing cost model divergence.
-    fn add_contract_to_cache(&self, code: &[u8]) {
-        if let Some(cache) = &self.module_cache {
-            cache.add_contract(code, self.protocol_version);
-        }
     }
 
     /// Advance to a new ledger, clearing cached entries but preserving offers.

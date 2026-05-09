@@ -85,7 +85,7 @@ pub fn execute_transaction_set(
         executor.set_offer_store(offer_store.clone());
     }
 
-    run_transactions_on_executor(RunTransactionsParams {
+    let result = run_transactions_on_executor(RunTransactionsParams {
         executor: &mut executor,
         snapshot,
         transactions,
@@ -93,7 +93,19 @@ pub fn execute_transaction_set(
         soroban_base_prng_seed: soroban.base_prng_seed,
         fee_strategy: FeeStrategy::PreChargeInternally,
         delta,
-    })
+    })?;
+
+    // Warm the module cache with ContractCode entries created/updated during
+    // this ledger's TX set execution. Mirrors stellar-core's
+    // addAnyContractsToModuleCache() at ledger close. Makes entries available
+    // for the NEXT ledger's VmCachedInstantiation — same-ledger invocations
+    // intentionally use uncached cost.
+    let init = delta.init_entries();
+    let live = delta.live_entries();
+    super::warm_module_cache_from_entries(soroban.module_cache, &init, context.protocol_version);
+    super::warm_module_cache_from_entries(soroban.module_cache, &live, context.protocol_version);
+
+    Ok(result)
 }
 
 /// Execute transactions on a pre-configured executor, apply results to delta.

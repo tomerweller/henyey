@@ -563,8 +563,6 @@ impl TransactionExecutor {
         let mut soroban_return_value = None;
         let mut all_success = true;
         let mut failure = None;
-        // Track pre-TX delta position so we only scan NEW created entries for contract cache.
-        let pre_tx_created_count = self.state.delta().created_entries().len();
         // For multi-operation transactions, stellar-core records STATE/UPDATED
         // for every accessed entry per operation, even if values are identical.
         // For single-operation transactions, it only records if values changed.
@@ -898,7 +896,7 @@ impl TransactionExecutor {
             // them unconditionally in V4 meta (TransactionMeta.cpp:1119-1126).
             soroban_return_value = None;
         } else {
-            self.commit_successful_tx(pre_tx_created_count);
+            self.commit_successful_tx();
         }
 
         let commit_phase_us = meta_phase_start.elapsed().as_micros() as u64;
@@ -1128,23 +1126,15 @@ impl TransactionExecutor {
         }
     }
 
-    /// Commit a successful transaction and update the module cache.
+    /// Commit a successful transaction.
     ///
-    /// After all operations succeed, commits the state changes and scans
-    /// newly created entries for contract code to add to the module cache
-    /// (enabling `VmCachedInstantiation` for subsequent transactions).
-    pub(super) fn commit_successful_tx(&mut self, pre_tx_created_count: usize) {
+    /// After all operations succeed, commits the state changes to the delta.
+    /// Module cache warming is NOT done here — it happens once at ledger close
+    /// via `warm_module_cache_from_entries()`, matching stellar-core's
+    /// `addAnyContractsToModuleCache()` which runs only at ledger close
+    /// (LedgerManagerImpl.cpp:2929-2930).
+    pub(super) fn commit_successful_tx(&mut self) {
         self.state.commit();
-
-        // Update module cache with any newly created contract code.
-        // Only scan entries created by THIS TX (not all prior TXs in the cluster)
-        // to avoid O(n²) iteration over the growing delta.
-        let created = self.state.delta().created_entries();
-        for entry in &created[pre_tx_created_count..] {
-            if let stellar_xdr::curr::LedgerEntryData::ContractCode(cc) = &entry.data {
-                self.add_contract_to_cache(cc.code.as_slice());
-            }
-        }
     }
 }
 
@@ -1491,7 +1481,12 @@ mod tests {
         );
     }
 
-    // ── Module-cache warming tests for commit_successful_tx ──────────
+    // ── Module-cache warming tests ──────────────────────────────────────
+    //
+    // These tests verify the parity-critical invariant:
+    //   - commit_successful_tx() does NOT warm the module cache (same-ledger
+    //     contracts remain uncached, matching stellar-core)
+    //   - warm_module_cache_from_entries() warms the cache (for next-ledger use)
 
     use henyey_common::NetworkId;
     use henyey_tx::soroban::PersistentModuleCache;
@@ -1536,98 +1531,120 @@ mod tests {
         }
     }
 
+    /// Regression test: commit_successful_tx does NOT warm the module cache.
+    ///
+    /// This is the parity-critical invariant. In stellar-core,
+    /// addAnyContractsToModuleCache runs only at ledger close — NOT per-TX.
+    /// Same-ledger contract invocations use uncached (higher) cost.
     #[test]
-    fn test_commit_successful_tx_warms_module_cache_for_new_contract_code() {
+    fn test_commit_successful_tx_does_not_warm_module_cache() {
         let mut executor = make_executor_with_module_cache();
 
         // Record a ContractCode entry as newly created in this TX.
         let entry = make_contract_code_ledger_entry(WASM_A);
         executor.state_mut().delta_mut().record_create(entry);
 
-        // Commit — should scan created entries and add ContractCode to cache.
-        executor.commit_successful_tx(0);
+        // Commit — should NOT add ContractCode to cache.
+        executor.commit_successful_tx();
 
-        // Verify the module is now in the cache.
+        // Verify the module is NOT in the cache.
         let hash = Hash(Sha256::digest(WASM_A).into());
         let cache = executor.module_cache().expect("cache should be set");
         assert!(
-            cache.remove_contract(&hash),
-            "ContractCode entry should be in module cache after commit_successful_tx"
+            !cache.remove_contract(&hash),
+            "ContractCode should NOT be in module cache after commit_successful_tx \
+             (same-ledger contracts must remain uncached for parity)"
         );
     }
 
+    /// warm_module_cache_from_entries correctly adds ContractCode entries.
     #[test]
-    fn test_commit_successful_tx_skips_non_contract_code_entries() {
-        let mut executor = make_executor_with_module_cache();
+    fn test_warm_module_cache_from_entries_adds_contract_code() {
+        let cache = PersistentModuleCache::new_for_protocol(25)
+            .expect("P25 module cache should be available");
 
-        // Record a ContractData entry (NOT ContractCode).
-        let entry = make_entry(100);
-        executor.state_mut().delta_mut().record_create(entry);
+        let entry = make_contract_code_ledger_entry(WASM_A);
+        super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 25);
 
-        executor.commit_successful_tx(0);
-
-        // Verify the cache does NOT contain any module — use WASM A hash as probe.
         let hash = Hash(Sha256::digest(WASM_A).into());
-        let cache = executor.module_cache().expect("cache should be set");
+        assert!(
+            cache.remove_contract(&hash),
+            "ContractCode should be in module cache after warm_module_cache_from_entries"
+        );
+    }
+
+    /// warm_module_cache_from_entries skips non-ContractCode entries.
+    #[test]
+    fn test_warm_module_cache_from_entries_skips_non_contract_code() {
+        let cache = PersistentModuleCache::new_for_protocol(25)
+            .expect("P25 module cache should be available");
+
+        // ContractData entry, NOT ContractCode.
+        let entry = make_entry(100);
+        super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 25);
+
+        // Verify nothing was added — probe with WASM A hash.
+        let hash = Hash(Sha256::digest(WASM_A).into());
         assert!(
             !cache.remove_contract(&hash),
             "non-ContractCode entries should not be added to module cache"
         );
     }
 
+    /// warm_module_cache_from_entries is a no-op when cache is None.
     #[test]
-    fn test_commit_successful_tx_only_caches_entries_from_current_tx() {
-        let mut executor = make_executor_with_module_cache();
-
-        // Index 0: ContractCode with WASM A (from a prior TX in the same ledger).
-        let entry_a = make_contract_code_ledger_entry(WASM_A);
-        executor.state_mut().delta_mut().record_create(entry_a);
-
-        // Index 1: ContractData (current TX, should be skipped).
-        let data_entry = make_entry(100);
-        executor.state_mut().delta_mut().record_create(data_entry);
-
-        // Index 2: ContractCode with WASM B (current TX, should be cached).
-        let entry_b = make_contract_code_ledger_entry(WASM_B);
-        executor.state_mut().delta_mut().record_create(entry_b);
-
-        // pre_tx_created_count=1: only entries at index 1+ belong to this TX.
-        executor.commit_successful_tx(1);
-
-        let cache = executor.module_cache().expect("cache should be set");
-
-        // Prior TX entry (index 0) should NOT be cached.
-        let hash_a = Hash(Sha256::digest(WASM_A).into());
-        assert!(
-            !cache.remove_contract(&hash_a),
-            "prior TX ContractCode should not be cached"
-        );
-
-        // Current TX ContractCode (index 2) SHOULD be cached.
-        let hash_b = Hash(Sha256::digest(WASM_B).into());
-        assert!(
-            cache.remove_contract(&hash_b),
-            "current TX ContractCode should be cached"
-        );
+    fn test_warm_module_cache_from_entries_noop_when_no_cache() {
+        let entry = make_contract_code_ledger_entry(WASM_A);
+        // Should not panic.
+        super::super::warm_module_cache_from_entries(None, &[entry], 25);
     }
 
+    /// Full lifecycle: commit does NOT warm, then warm_module_cache_from_entries does.
+    ///
+    /// Validates the same-ledger/next-ledger boundary:
+    /// 1. After commit_successful_tx: cache empty (same-ledger uncached)
+    /// 2. After warm_module_cache_from_entries: cache populated (next-ledger cached)
     #[test]
-    fn test_commit_successful_tx_no_new_entries_with_prior_entries() {
+    fn test_same_ledger_commit_then_warm_lifecycle() {
         let mut executor = make_executor_with_module_cache();
 
-        // Simulate a prior TX that created a ContractCode entry.
-        let entry = make_contract_code_ledger_entry(WASM_A);
-        executor.state_mut().delta_mut().record_create(entry);
+        // Create ContractCode entries for two different contracts.
+        let entry_a = make_contract_code_ledger_entry(WASM_A);
+        let entry_b = make_contract_code_ledger_entry(WASM_B);
+        executor
+            .state_mut()
+            .delta_mut()
+            .record_create(entry_a.clone());
+        executor
+            .state_mut()
+            .delta_mut()
+            .record_create(entry_b.clone());
 
-        // pre_tx_created_count equals created.len(): empty scanned slice.
-        executor.commit_successful_tx(1);
+        // Phase 1: commit — cache should be empty (same-ledger behavior).
+        executor.commit_successful_tx();
 
-        // The prior TX entry should NOT be cached (it was before pre_tx_created_count).
-        let hash = Hash(Sha256::digest(WASM_A).into());
+        let hash_a = Hash(Sha256::digest(WASM_A).into());
+        let hash_b = Hash(Sha256::digest(WASM_B).into());
         let cache = executor.module_cache().expect("cache should be set");
         assert!(
-            !cache.remove_contract(&hash),
-            "prior TX entry should not be cached when scanned slice is empty"
+            !cache.remove_contract(&hash_a),
+            "WASM A should NOT be cached after commit (same-ledger)"
+        );
+        assert!(
+            !cache.remove_contract(&hash_b),
+            "WASM B should NOT be cached after commit (same-ledger)"
+        );
+
+        // Phase 2: warm from entries — cache should be populated (next-ledger behavior).
+        super::super::warm_module_cache_from_entries(Some(cache), &[entry_a, entry_b], 25);
+
+        assert!(
+            cache.remove_contract(&hash_a),
+            "WASM A should be cached after warm_module_cache_from_entries (next-ledger)"
+        );
+        assert!(
+            cache.remove_contract(&hash_b),
+            "WASM B should be cached after warm_module_cache_from_entries (next-ledger)"
         );
     }
 }

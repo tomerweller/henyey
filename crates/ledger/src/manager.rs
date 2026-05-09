@@ -4827,6 +4827,26 @@ impl LedgerCloseContext<'_> {
         let delta_has_pool_share_trustlines = cat.has_pool_share_trustlines;
         let offer_pool_changes = cat.offer_pool_changes;
 
+        // Warm the module cache with newly created/updated ContractCode entries.
+        // Mirrors stellar-core's addAnyContractsToModuleCache() which runs once
+        // at ledger close (LedgerManagerImpl.cpp:2929-2930), AFTER all TXs are
+        // applied but BEFORE the bucket list update. Uses post-upgrade protocol
+        // version to match stellar-core's use of lh.ledgerVersion.
+        {
+            let module_cache_guard = self.manager.module_cache.read();
+            let module_cache = module_cache_guard.as_ref();
+            crate::execution::warm_module_cache_from_entries(
+                module_cache,
+                &init_entries,
+                protocol_version,
+            );
+            crate::execution::warm_module_cache_from_entries(
+                module_cache,
+                &live_entries,
+                protocol_version,
+            );
+        }
+
         let commit_setup_us = commit_start.elapsed().as_micros() as u64;
 
         // Apply delta to bucket list FIRST, then compute its hash
