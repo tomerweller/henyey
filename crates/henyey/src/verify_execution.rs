@@ -291,12 +291,22 @@ fn summarize_cdp_meta_changes(meta: Option<&stellar_xdr::curr::TransactionMeta>)
         }
         _ => {}
     }
+    let mut sorted = parts.clone();
+    sorted.sort();
+    let set_str = sorted.join(" | ");
+    let set_hash = format!("{:x}", Sha256::digest(set_str.as_bytes()));
     let s = parts.join(" | ");
-    if s.len() > 1500 {
-        format!("{}…", &s[..1500])
+    let truncated = if s.len() > 1000 {
+        format!("{}…", &s[..1000])
     } else {
         s
-    }
+    };
+    format!(
+        "count={} sethash={} {}",
+        parts.len(),
+        &set_hash[..16],
+        truncated
+    )
 }
 
 /// Returns (count, total_bytes) of non-TTL Created/Updated/Restored entries

@@ -5586,9 +5586,13 @@ impl LedgerCloseContext<'_> {
                         }
                         _ => {}
                     }
+                    let mut sorted = changes_summary.clone();
+                    sorted.sort();
+                    let set_str = sorted.join(" | ");
+                    let set_hash = format!("{:x}", Sha256::digest(set_str.as_bytes()));
                     let summary_str = changes_summary.join(" | ");
-                    let truncated = if summary_str.len() > 1500 {
-                        format!("{}…", &summary_str[..1500])
+                    let truncated = if summary_str.len() > 1000 {
+                        format!("{}…", &summary_str[..1000])
                     } else {
                         summary_str
                     };
@@ -5597,6 +5601,8 @@ impl LedgerCloseContext<'_> {
                         ledger_seq = self.close_data.ledger_seq,
                         tx_index = i,
                         tx_hash = %Hash256::from_bytes(self.tx_results[i].transaction_hash.0).to_hex(),
+                        count = changes_summary.len(),
+                        sethash = %&set_hash[..16],
                         changes = %truncated,
                         "Per-tx state changes (ours)"
                     );
