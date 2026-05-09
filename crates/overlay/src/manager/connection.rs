@@ -754,7 +754,13 @@ pub(super) async fn connect_to_explicit_peer(
     // Resolve hostname → IPv4 once. The resolved IP is used for both the
     // pending-connection dedup key and the TCP connect. The original `addr`
     // is kept for PeerInfo::original_address (hostname matching).
-    let (resolved_addr, addr_key) = resolve_peer_address(addr).await?;
+    let (resolved_addr, addr_key) = match resolve_peer_address(addr).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            pool.release_pending();
+            return Err(e);
+        }
+    };
 
     // Reserve address slot to prevent duplicate outbound dials. If the
     // address is already in flight, no actual dial happens — this is a
