@@ -36,6 +36,8 @@ done
 
 # ── Cleanup ──────────────────────────────────────────────────────────────────
 cleanup() {
+  # Kill any tracked background processes (from watcher lifecycle tests)
+  if type -t _wt_cleanup_bg &>/dev/null; then _wt_cleanup_bg; fi
   rm -rf "$TEST_ROOT" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -2302,12 +2304,14 @@ except Exception as e:
   # Tests lifecycle subcommands using mock /proc and real background processes.
   # ══════════════════════════════════════════════════════════════════════════
 
-  # Track background PIDs for cleanup
-  local -a _wt_bg_pids=()
+  # Track background PIDs for cleanup (global so the EXIT trap can reach it)
+  _wt_bg_pids=()
   _wt_cleanup_bg() {
-    local p
+    local p children c
     for p in "${_wt_bg_pids[@]}"; do
-      kill "$p" 2>/dev/null && wait "$p" 2>/dev/null || true
+      children=$(ps --ppid "$p" -o pid= 2>/dev/null) || true
+      kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null || true
+      for c in $children; do kill -9 "$c" 2>/dev/null || true; done
     done
     _wt_bg_pids=()
   }
@@ -2426,8 +2430,11 @@ except Exception as e:
     tap_not_ok "watcher-ctl: stop timeout detection (15s)" \
       "rc=$wt_rc pid_retained=$(test -f "$wt_stop3_data/watcher/testnet-watcher.pid" && echo yes || echo no) out=$wt_status_out"
   fi
-  # Clean up the TERM-ignoring process
-  kill -9 "$stop3_pid" 2>/dev/null && wait "$stop3_pid" 2>/dev/null || true
+  # Clean up the TERM-ignoring process and its children (sleep)
+  local stop3_children
+  stop3_children=$(ps --ppid "$stop3_pid" -o pid= 2>/dev/null) || true
+  kill -9 "$stop3_pid" 2>/dev/null; wait "$stop3_pid" 2>/dev/null || true
+  local stop3_c; for stop3_c in $stop3_children; do kill -9 "$stop3_c" 2>/dev/null || true; done
 
   # ── T126: cmd_stop kill failure ────────────────────────────────────────
   # Mock proc entry exists (so cmd_status passes), but PID doesn't exist as
