@@ -59,6 +59,12 @@ const POST_RESTART_PEER_CONNECT_TIMEOUT_SECS: u64 = 60;
 /// 15s accommodates disk I/O delays on loaded CI runners.
 const POST_RESTART_OPERATIONAL_TIMEOUT_SECS: u64 = 15;
 
+/// Post-connectivity budget for all nodes to reach `AppState::Validating`.
+/// The Synced → Validating transition requires the run loop to bootstrap the
+/// herder and call `restore_operational_state()` — typically <1s, but 10s
+/// accommodates CI load spikes.
+const WAIT_FOR_VALIDATING_TIMEOUT_SECS: u64 = 10;
+
 async fn wait_for_app_ledger_close(
     sim: &Simulation,
     target_ledger: u32,
@@ -505,7 +511,12 @@ async fn stabilize_topology_or_panic(sim: &Simulation, timeout_secs: u64, caller
         });
 }
 
-/// Build a fully-connected app-backed topology and wait for connectivity stabilization.
+/// Build a fully-connected app-backed topology and wait for startup readiness.
+///
+/// Post-condition: all peers connected per topology graph AND all nodes in
+/// `AppState::Validating` (herder in `Tracking` state). Callers can
+/// immediately issue `manual_close`, submit transactions, or assert
+/// consensus state without additional waits.
 async fn build_app_backed_topology(mut sim: Simulation, threshold_percent: u32) -> Simulation {
     sim.populate_app_nodes_from_existing(threshold_percent);
     sim.start_all_nodes().await;
@@ -515,10 +526,23 @@ async fn build_app_backed_topology(mut sim: Simulation, threshold_percent: u32) 
         "build_app_backed_topology",
     )
     .await;
+    // Wait for all nodes to reach Validating (herder Tracking).
+    // Synced is NOT sufficient — bootstrap_from_db() sets Synced before the
+    // run loop bootstraps the herder, so a node in Synced may not yet accept
+    // manual_close / trigger_next_ledger.
+    wait_for_all_app_state(
+        &sim,
+        AppState::Validating,
+        Duration::from_secs(WAIT_FOR_VALIDATING_TIMEOUT_SECS),
+        "build_app_backed_topology",
+    )
+    .await;
     sim
 }
 
 /// Build a 3-node topology with only 2 nodes running (threshold 66%).
+///
+/// Post-condition: both running nodes connected AND in `AppState::Validating`.
 async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
     let mut sim = Topologies::core3(mode);
     let node_ids = sim.node_ids();
@@ -541,6 +565,13 @@ async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
         &sim,
         1,
         STABILIZE_REDUCED_TIMEOUT_SECS,
+        "build_two_running_of_three",
+    )
+    .await;
+    wait_for_all_app_state(
+        &sim,
+        AppState::Validating,
+        Duration::from_secs(WAIT_FOR_VALIDATING_TIMEOUT_SECS),
         "build_two_running_of_three",
     )
     .await;
@@ -754,10 +785,6 @@ async fn test_load_account_sequence_pair_topology() {
     let mut sim =
         build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
 
-    // Wait for both nodes to be operational.
-    wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
-    wait_for_app_operational(&sim, "node1", Duration::from_secs(10)).await;
-
     // Close a few ledgers.
     manual_close_until(&sim, 3, 1, Duration::from_secs(20)).await;
 
@@ -841,14 +868,6 @@ async fn test_three_nodes_two_running_threshold_two_over_loopback() {
 #[tokio::test]
 async fn test_core3_app_simulation_can_attempt_multi_node_close() {
     let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
-
-    wait_for_all_app_state(
-        &sim,
-        AppState::Validating,
-        Duration::from_secs(10),
-        "test_core3_app_simulation_can_attempt_multi_node_close",
-    )
-    .await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
     sim.stop_all_nodes().await.expect("stop core3 app nodes");
@@ -1849,10 +1868,6 @@ async fn test_slow_node_lagging_node_recovers() {
 async fn test_pair_tcp_scp_messages_exercise_pump_scp_intake() {
     let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
 
-    // Ensure both nodes are operational before baselining counters.
-    wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
-    wait_for_app_operational(&sim, "node1", Duration::from_secs(10)).await;
-
     // Baseline: capture SCP counters after startup to isolate manual-close traffic.
     let app_0 = sim.app("node0").unwrap();
     let app_1 = sim.app("node1").unwrap();
@@ -1928,9 +1943,6 @@ async fn test_self_echo_scp_reaches_pump_scp_intake() {
     use stellar_xdr::curr::{NodeId, StellarMessage};
 
     let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
-
-    wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
-    wait_for_app_operational(&sim, "node1", Duration::from_secs(10)).await;
 
     // Close ledgers so both nodes have SCP envelopes in memory.
     manual_close_until(&sim, 5, 1, Duration::from_secs(30)).await;
