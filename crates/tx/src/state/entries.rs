@@ -401,15 +401,17 @@ impl LedgerStateManager {
 
     /// Set an account entry directly without delta tracking.
     ///
-    /// Used for test and initialization state setup.
-    pub fn set_account_no_tracking(&mut self, entry: AccountEntry) {
+    /// Crate-internal helper currently used by tests.
+    #[cfg(test)]
+    pub(crate) fn set_account_no_tracking(&mut self, entry: AccountEntry) {
         self.accounts.insert(entry.account_id.clone(), entry);
     }
 
-    /// Add or update an account entry (convenience alias for set_account_no_tracking).
+    /// Add or update an account entry (convenience alias for `set_account_no_tracking`).
     ///
-    /// Use this for setting up test state or initializing accounts.
-    pub fn put_account(&mut self, entry: AccountEntry) {
+    /// Crate-internal helper currently used by tests.
+    #[cfg(test)]
+    pub(crate) fn put_account(&mut self, entry: AccountEntry) {
         self.set_account_no_tracking(entry);
     }
 
