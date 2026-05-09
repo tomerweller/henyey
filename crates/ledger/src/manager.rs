@@ -5482,6 +5482,55 @@ impl LedgerCloseContext<'_> {
         // before commit_close mutates LedgerManagerState.
         if let Some(expected_hash) = &self.close_data.expected_header_hash {
             if header_hash != *expected_hash {
+                // Emit a per-field WARN log of every constituent that feeds
+                // into header_hash, so a hash mismatch produces actionable
+                // diagnostic output instead of just "they differ". The
+                // overlay-side live FATAL surface (ledger_close.rs:1816,
+                // manager.rs:2175) calls log_bucket_list_debug for the same
+                // purpose; mirror its field set here so analysts comparing
+                // live vs replay diagnostics see directly comparable output.
+                let stellar_value_ext_desc = match &new_header.scp_value.ext {
+                    stellar_xdr::curr::StellarValueExt::Basic => "Basic",
+                    stellar_xdr::curr::StellarValueExt::Signed(_) => "Signed",
+                };
+                let header_ext_desc = match &new_header.ext {
+                    stellar_xdr::curr::LedgerHeaderExt::V0 => "V0".to_string(),
+                    stellar_xdr::curr::LedgerHeaderExt::V1(v1) => {
+                        format!("V1(flags={})", v1.flags)
+                    }
+                };
+                tracing::warn!(
+                    target: "hash_mismatch_debug",
+                    ledger_seq = new_header.ledger_seq,
+                    expected_header_hash = %expected_hash.to_hex(),
+                    actual_header_hash = %header_hash.to_hex(),
+                    bucket_list_hash = %bucket_list_hash.to_hex(),
+                    tx_result_hash = %tx_result_hash.to_hex(),
+                    total_coins = new_header.total_coins,
+                    fee_pool = new_header.fee_pool,
+                    inflation_seq = new_header.inflation_seq,
+                    id_pool = new_header.id_pool,
+                    base_fee = new_header.base_fee,
+                    base_reserve = new_header.base_reserve,
+                    max_tx_set_size = new_header.max_tx_set_size,
+                    ledger_version = new_header.ledger_version,
+                    previous_ledger_hash = %Hash256::from(
+                        new_header.previous_ledger_hash.0
+                    ).to_hex(),
+                    skip_list_0 = %Hash256::from_bytes(new_header.skip_list[0].0).to_hex(),
+                    skip_list_1 = %Hash256::from_bytes(new_header.skip_list[1].0).to_hex(),
+                    skip_list_2 = %Hash256::from_bytes(new_header.skip_list[2].0).to_hex(),
+                    skip_list_3 = %Hash256::from_bytes(new_header.skip_list[3].0).to_hex(),
+                    scp_value_close_time = new_header.scp_value.close_time.0,
+                    scp_value_tx_set_hash = %Hash256::from(new_header.scp_value.tx_set_hash.0).to_hex(),
+                    scp_value_upgrades_count = new_header.scp_value.upgrades.len(),
+                    scp_value_ext = %stellar_value_ext_desc,
+                    header_ext = %header_ext_desc,
+                    "Pre-commit hash mismatch (replay mode) - per-field constituents"
+                );
+                self.manager
+                    .log_bucket_list_debug(self.close_data.ledger_seq);
+
                 return Err(LedgerError::HashMismatch {
                     expected: expected_hash.to_hex(),
                     actual: header_hash.to_hex(),

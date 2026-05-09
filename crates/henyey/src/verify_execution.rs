@@ -71,6 +71,144 @@ pub(crate) struct VerifyStats {
     peak_rss_bytes: u64,
 }
 
+/// Returns a short description of a TransactionEnvelope for diagnostics:
+/// (op_types_csv, declared_fee, soroban_resource_fee, soroban_resources_summary).
+fn describe_envelope(
+    env: Option<&stellar_xdr::curr::TransactionEnvelope>,
+) -> (String, i64, i64, String) {
+    use stellar_xdr::curr::{
+        Operation, OperationBody, SorobanTransactionData, TransactionEnvelope, TransactionExt,
+    };
+    fn describe_op(op: &Operation) -> &'static str {
+        match op.body {
+            OperationBody::CreateAccount(_) => "CreateAccount",
+            OperationBody::Payment(_) => "Payment",
+            OperationBody::PathPaymentStrictReceive(_) => "PathPayStrictRecv",
+            OperationBody::ManageSellOffer(_) => "ManageSellOffer",
+            OperationBody::CreatePassiveSellOffer(_) => "CreatePassiveSellOffer",
+            OperationBody::SetOptions(_) => "SetOptions",
+            OperationBody::ChangeTrust(_) => "ChangeTrust",
+            OperationBody::AllowTrust(_) => "AllowTrust",
+            OperationBody::AccountMerge(_) => "AccountMerge",
+            OperationBody::Inflation => "Inflation",
+            OperationBody::ManageData(_) => "ManageData",
+            OperationBody::BumpSequence(_) => "BumpSequence",
+            OperationBody::ManageBuyOffer(_) => "ManageBuyOffer",
+            OperationBody::PathPaymentStrictSend(_) => "PathPayStrictSend",
+            OperationBody::CreateClaimableBalance(_) => "CreateClaimableBalance",
+            OperationBody::ClaimClaimableBalance(_) => "ClaimClaimableBalance",
+            OperationBody::BeginSponsoringFutureReserves(_) => "BeginSponsoringFutureReserves",
+            OperationBody::EndSponsoringFutureReserves => "EndSponsoringFutureReserves",
+            OperationBody::RevokeSponsorship(_) => "RevokeSponsorship",
+            OperationBody::Clawback(_) => "Clawback",
+            OperationBody::ClawbackClaimableBalance(_) => "ClawbackClaimableBalance",
+            OperationBody::SetTrustLineFlags(_) => "SetTrustLineFlags",
+            OperationBody::LiquidityPoolDeposit(_) => "LiquidityPoolDeposit",
+            OperationBody::LiquidityPoolWithdraw(_) => "LiquidityPoolWithdraw",
+            OperationBody::InvokeHostFunction(_) => "InvokeHostFunction",
+            OperationBody::ExtendFootprintTtl(_) => "ExtendFootprintTtl",
+            OperationBody::RestoreFootprint(_) => "RestoreFootprint",
+        }
+    }
+    fn summarize_resources(data: &SorobanTransactionData) -> String {
+        let r = &data.resources;
+        format!(
+            "instr={},rro={},rrw={},wb={},drb={}",
+            r.instructions,
+            r.footprint.read_only.len(),
+            r.footprint.read_write.len(),
+            r.write_bytes,
+            r.disk_read_bytes,
+        )
+    }
+    let Some(env) = env else {
+        return (String::from("?"), 0, 0, String::new());
+    };
+    match env {
+        TransactionEnvelope::TxV0(v0) => {
+            let ops: Vec<&str> = v0.tx.operations.iter().map(describe_op).collect();
+            (ops.join(","), v0.tx.fee as i64, 0, String::new())
+        }
+        TransactionEnvelope::Tx(v1) => {
+            let ops: Vec<&str> = v1.tx.operations.iter().map(describe_op).collect();
+            let (sb_fee, sb_summary) = match &v1.tx.ext {
+                TransactionExt::V1(data) => (data.resource_fee, summarize_resources(data)),
+                _ => (0, String::new()),
+            };
+            (ops.join(","), v1.tx.fee as i64, sb_fee, sb_summary)
+        }
+        TransactionEnvelope::TxFeeBump(fb) => {
+            let (inner_ops_str, inner_sb_fee, inner_sb_summary) = match &fb.tx.inner_tx {
+                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                    let ops_str = inner
+                        .tx
+                        .operations
+                        .iter()
+                        .map(describe_op)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let (sb_fee, sb_summary) = match &inner.tx.ext {
+                        TransactionExt::V1(data) => (data.resource_fee, summarize_resources(data)),
+                        _ => (0, String::new()),
+                    };
+                    (ops_str, sb_fee, sb_summary)
+                }
+            };
+            (
+                format!("FB({inner_ops_str})"),
+                fb.tx.fee,
+                inner_sb_fee,
+                inner_sb_summary,
+            )
+        }
+    }
+}
+
+/// Returns a CSV summary of operation result discriminants for a transaction
+/// result, e.g. "InvokeHostFunction:Trapped". Used to diagnose tx-level
+/// success/fail divergence by exposing per-op outcomes.
+fn describe_op_results(r: &stellar_xdr::curr::TransactionResultResult) -> String {
+    use stellar_xdr::curr::{
+        InnerTransactionResultResult, OperationResult, TransactionResultResult,
+    };
+    fn one_op(op: &OperationResult) -> String {
+        // Print the full Debug repr (without payload values) so that
+        // success/failure variants of inner result types like
+        // InvokeHostFunctionResult::{Success,Trapped,ResourceLimitExceeded,…}
+        // are visible. Truncate to keep log lines reasonable.
+        let s = format!("{:?}", op);
+        if s.len() > 200 {
+            format!("{}…", &s[..200])
+        } else {
+            s
+        }
+    }
+    fn ops_to_csv(ops: &[OperationResult]) -> String {
+        ops.iter().map(one_op).collect::<Vec<_>>().join(",")
+    }
+    match r {
+        TransactionResultResult::TxSuccess(ops) => ops_to_csv(ops.as_slice()),
+        TransactionResultResult::TxFailed(ops) => ops_to_csv(ops.as_slice()),
+        TransactionResultResult::TxFeeBumpInnerSuccess(pair) => {
+            let inner_ops = match &pair.result.result {
+                InnerTransactionResultResult::TxSuccess(ops) => ops_to_csv(ops.as_slice()),
+                InnerTransactionResultResult::TxFailed(ops) => ops_to_csv(ops.as_slice()),
+                other => format!("{:?}", other.discriminant()),
+            };
+            format!("FB+{inner_ops}")
+        }
+        TransactionResultResult::TxFeeBumpInnerFailed(pair) => {
+            let inner_ops = match &pair.result.result {
+                InnerTransactionResultResult::TxSuccess(ops) => ops_to_csv(ops.as_slice()),
+                InnerTransactionResultResult::TxFailed(ops) => ops_to_csv(ops.as_slice()),
+                other => format!("{:?}", other.discriminant()),
+            };
+            format!("FB-{inner_ops}")
+        }
+        other => format!("{:?}", other.discriminant()),
+    }
+}
+
 /// Returns a human-readable name for a `TransactionResultResult` variant.
 fn tx_result_code_name(r: &stellar_xdr::curr::TransactionResultResult) -> String {
     use stellar_xdr::curr::TransactionResultResult;
@@ -847,6 +985,51 @@ async fn verify_single_ledger(
         Ok(r) => r,
         Err(e) => {
             println!("  Ledger {}: close_ledger failed: {}", seq, e);
+            // Print the CDP/mainnet expected header fields so the WARN
+            // log emitted by manager.rs::commit (which prints OUR
+            // computed fields) can be diffed against mainnet's directly
+            // from CI output.
+            tracing::warn!(
+                target: "hash_mismatch_debug",
+                ledger_seq = seq,
+                expected_header_hash = %verified_header_hash.to_hex(),
+                expected_bucket_list_hash = %Hash256::from(cdp_header.bucket_list_hash.0).to_hex(),
+                expected_tx_result_hash = %Hash256::from(cdp_header.tx_set_result_hash.0).to_hex(),
+                expected_total_coins = cdp_header.total_coins,
+                expected_fee_pool = cdp_header.fee_pool,
+                expected_inflation_seq = cdp_header.inflation_seq,
+                expected_id_pool = cdp_header.id_pool,
+                expected_base_fee = cdp_header.base_fee,
+                expected_base_reserve = cdp_header.base_reserve,
+                expected_max_tx_set_size = cdp_header.max_tx_set_size,
+                expected_ledger_version = cdp_header.ledger_version,
+                "Pre-commit hash mismatch (replay mode) - mainnet/CDP expected fields"
+            );
+            // Per-tx CDP result diagnostic: log each tx hash + fee_charged
+            // from mainnet's recorded results so they can be diffed against
+            // our per-tx WARN log emitted from manager.rs::commit.
+            let cdp_results = extract_transaction_results(&lcm);
+            let cdp_envelopes = henyey_history::cdp::extract_transaction_envelopes(&lcm);
+            for (i, pair) in cdp_results.iter().enumerate() {
+                let env = cdp_envelopes.get(i);
+                let (op_types, declared_fee, soroban_resource_fee, soroban_resources) =
+                    describe_envelope(env);
+                let op_results = describe_op_results(&pair.result.result);
+                tracing::warn!(
+                    target: "hash_mismatch_debug",
+                    ledger_seq = seq,
+                    tx_index = i,
+                    tx_hash = %Hash256::from_bytes(pair.transaction_hash.0).to_hex(),
+                    fee_charged = pair.result.fee_charged,
+                    result_code = ?pair.result.result.discriminant(),
+                    op_results = %op_results,
+                    declared_fee = declared_fee,
+                    op_types = %op_types,
+                    soroban_resource_fee = soroban_resource_fee,
+                    soroban_resources = %soroban_resources,
+                    "Per-tx result (mainnet/CDP)"
+                );
+            }
             if ctx.stop_on_error {
                 anyhow::bail!("close_ledger failed at ledger {}: {}", seq, e);
             }

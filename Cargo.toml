@@ -46,7 +46,9 @@ soroban-env-host-p25 = { package = "soroban-env-host", version = "=25.0.0" }
 
 # Soroban host for Protocol 26 (supports protocol 26+)
 # Pinned to the exact revision used by stellar-core v26.0.1 on mainnet
-# (submodule at src/rust/soroban/p26). This is v26.0.0 of soroban-env-host.
+# (submodule at src/rust/soroban/p26). When the stellar-core submodule is
+# bumped, this pin must be updated to match the new submodule's p26
+# sub-submodule SHA (see #2503).
 soroban-env-host-p26 = { package = "soroban-env-host", version = "=26.0.0", git = "https://github.com/stellar/rs-soroban-env", rev = "b351f88a468d3b9e1d6de53d5b0ca585f6b7dadb" }
 
 # Workspace crates
