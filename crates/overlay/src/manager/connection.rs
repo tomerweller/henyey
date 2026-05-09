@@ -1028,6 +1028,24 @@ mod tests {
         }
     }
 
+    /// A connection factory whose `connect()` immediately returns an error,
+    /// simulating a refused TCP connection.
+    struct FailingConnectFactory;
+
+    #[async_trait]
+    impl ConnectionFactory for FailingConnectFactory {
+        async fn connect(&self, addr: SocketAddr, _timeout_secs: u64) -> Result<Connection> {
+            Err(OverlayError::ConnectionFailed(format!(
+                "test: connection refused to {}",
+                addr
+            )))
+        }
+
+        async fn bind(&self, _port: u16) -> Result<Listener> {
+            Err(OverlayError::ConnectionFailed("not used in test".into()))
+        }
+    }
+
     /// A connection factory whose `connect()` sleeps for the given timeout
     /// then returns `ConnectionTimeout`, simulating a stalled TCP SYN.
     struct StalledConnectFactory;
@@ -2021,5 +2039,252 @@ mod tests {
         ];
         let added = manager.add_peers(addrs).await;
         assert_eq!(added, 2, "alias dedup should not starve unique peer");
+    }
+
+    // ---- Discovered-peer cleanup regression tests (issue #2530) ----
+
+    /// Verify that `connect_to_discovered_peer` releases the pool slot and
+    /// address reservation when TCP connect fails immediately.
+    #[tokio::test]
+    async fn test_connect_to_discovered_peer_releases_pool_on_connect_failure() {
+        let factory = Arc::new(FailingConnectFactory);
+        let (manager, mut peer_event_rx) = setup_manager_with_factory(factory);
+        let shared = manager.shared_state();
+
+        let addr = PeerAddress::new("10.0.0.1", 11625);
+        let timeouts = crate::OutboundTimeouts {
+            connect_secs: 10,
+            auth_secs: 2,
+        };
+
+        // Reserve a pending pool slot (connect_to_discovered_peer must release it).
+        assert!(manager.outbound_pool.try_reserve());
+
+        let addr_key = format!("{}:{}", addr.host, addr.port);
+        let resolved = ResolvedPeer {
+            original: addr.clone(),
+            resolved: format!("{}:{}", addr.host, addr.port).parse().unwrap(),
+            key: addr_key.clone(),
+        };
+
+        OverlayManager::connect_to_discovered_peer(
+            resolved,
+            manager.local_node.clone(),
+            timeouts,
+            Arc::clone(&manager.outbound_pool),
+            shared.clone(),
+            manager.connection_factory.clone(),
+        )
+        .await;
+
+        // Pool slot must be released.
+        assert_eq!(
+            manager.outbound_pool.pending_count(),
+            0,
+            "pool slot not released after connect failure"
+        );
+
+        // Address reservation must be released.
+        assert!(
+            !shared
+                .pending_connections
+                .by_address
+                .contains_key(&addr_key),
+            "address reservation not released after connect failure"
+        );
+
+        // Metrics: one attempt, one reject, no establish.
+        assert_eq!(shared.metrics.outbound_attempt.get(), 1, "outbound_attempt");
+        assert_eq!(shared.metrics.outbound_reject.get(), 1, "outbound_reject");
+        assert_eq!(
+            shared.metrics.outbound_establish.get(),
+            0,
+            "outbound_establish"
+        );
+
+        // PeerEvent::Failed should have been emitted.
+        let event = peer_event_rx
+            .try_recv()
+            .expect("expected PeerEvent::Failed");
+        assert!(
+            matches!(event, PeerEvent::Failed(_, PeerType::Outbound)),
+            "expected Failed(_, Outbound), got: {event:?}"
+        );
+    }
+
+    /// Verify that `connect_to_discovered_peer` releases the pool slot when
+    /// the address is already in flight (another connection is pending to
+    /// the same address).
+    #[tokio::test]
+    async fn test_connect_to_discovered_peer_releases_pool_on_address_in_flight() {
+        let factory = Arc::new(StalledConnectFactory);
+        let (manager, mut peer_event_rx) = setup_manager_with_factory(factory);
+        let shared = manager.shared_state();
+
+        let addr = PeerAddress::new("10.0.0.1", 11625);
+        let timeouts = crate::OutboundTimeouts {
+            connect_secs: 10,
+            auth_secs: 2,
+        };
+
+        // Pre-insert an address reservation to simulate a prior in-flight connection.
+        let addr_key = format!("{}:{}", addr.host, addr.port);
+        assert!(
+            shared
+                .pending_connections
+                .try_reserve_address(addr_key.clone()),
+            "pre-reservation should succeed"
+        );
+
+        // Reserve a pending pool slot (connect_to_discovered_peer must release it).
+        assert!(manager.outbound_pool.try_reserve());
+
+        let resolved = ResolvedPeer {
+            original: addr.clone(),
+            resolved: format!("{}:{}", addr.host, addr.port).parse().unwrap(),
+            key: addr_key.clone(),
+        };
+
+        OverlayManager::connect_to_discovered_peer(
+            resolved,
+            manager.local_node.clone(),
+            timeouts,
+            Arc::clone(&manager.outbound_pool),
+            shared.clone(),
+            manager.connection_factory.clone(),
+        )
+        .await;
+
+        // Pool slot must be released.
+        assert_eq!(
+            manager.outbound_pool.pending_count(),
+            0,
+            "pool slot not released after address-in-flight skip"
+        );
+
+        // The pre-existing address reservation must still be present (not our
+        // reservation to clear — it belongs to the other in-flight connection).
+        assert!(
+            shared
+                .pending_connections
+                .by_address
+                .contains_key(&addr_key),
+            "pre-existing address reservation should not be removed"
+        );
+
+        // No metrics should fire — this is a no-op skip, not a real dial.
+        assert_eq!(shared.metrics.outbound_attempt.get(), 0, "outbound_attempt");
+        assert_eq!(shared.metrics.outbound_reject.get(), 0, "outbound_reject");
+        assert_eq!(
+            shared.metrics.outbound_establish.get(),
+            0,
+            "outbound_establish"
+        );
+
+        // No PeerEvent should be emitted.
+        assert!(
+            peer_event_rx.try_recv().is_err(),
+            "no PeerEvent should be emitted for address-in-flight skip"
+        );
+    }
+
+    /// Verify that `connect_to_discovered_peer` (via `add_peer`) releases
+    /// the pool slot and peer-ID reservation when the remote peer is banned.
+    #[tokio::test]
+    async fn test_connect_to_discovered_peer_rejects_banned_peer() {
+        use crate::loopback::LoopbackConnectionFactory;
+
+        let factory = Arc::new(LoopbackConnectionFactory::default());
+
+        let mut config_a = OverlayConfig::testnet();
+        config_a.listen_port = 11625;
+        config_a.listen_enabled = true;
+        config_a.known_peers.clear();
+        config_a.connect_timeout_secs = 1;
+
+        let mut config_b = OverlayConfig::testnet();
+        config_b.listen_port = 11626;
+        config_b.listen_enabled = true;
+        config_b.known_peers.clear();
+        config_b.connect_timeout_secs = 1;
+
+        let local_a = LocalNode::new_testnet(SecretKey::generate());
+        let local_b = LocalNode::new_testnet(SecretKey::generate());
+        let banned_peer_id = local_b.peer_id();
+
+        let mut manager_a = super::super::OverlayManager::new_with_connection_factory(
+            config_a,
+            local_a,
+            Arc::clone(&factory) as Arc<dyn ConnectionFactory>,
+        )
+        .unwrap();
+        let mut manager_b = super::super::OverlayManager::new_with_connection_factory(
+            config_b,
+            local_b,
+            factory as Arc<dyn ConnectionFactory>,
+        )
+        .unwrap();
+
+        // Ban B's peer-ID on A's side BEFORE connecting.
+        manager_a
+            .banned_peers
+            .write()
+            .insert(banned_peer_id.clone());
+
+        manager_a.start(None).await.expect("start a");
+        manager_b.start(None).await.expect("start b");
+
+        let metrics_a = Arc::clone(&manager_a.shared_state().metrics);
+        let shared_a = manager_a.shared_state();
+
+        // A tries to connect to B via add_peer (discovered path).
+        let addr_b = PeerAddress::new("127.0.0.1", 11626);
+        let outcome = manager_a.add_peer(addr_b).await;
+
+        // add_peer() spawns the connection task and returns Initiated.
+        assert!(
+            matches!(outcome, Ok(super::super::AddPeerOutcome::Initiated)),
+            "expected Initiated, got: {outcome:?}"
+        );
+
+        // Bounded wait for the async task to detect the ban.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while metrics_a.outbound_reject.get() < 1 {
+            if std::time::Instant::now() > deadline {
+                panic!("outbound_reject did not reach 1 within 2s");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(metrics_a.outbound_attempt.get(), 1, "outbound_attempt");
+        assert_eq!(metrics_a.outbound_reject.get(), 1, "outbound_reject");
+        assert_eq!(metrics_a.outbound_establish.get(), 0, "outbound_establish");
+
+        // Pool slot must be released.
+        assert_eq!(
+            manager_a.outbound_pool.pending_count(),
+            0,
+            "pool slot not released after banned peer rejection"
+        );
+
+        // Peer-ID reservation must be released.
+        assert!(
+            !shared_a
+                .pending_connections
+                .by_peer_id
+                .contains_key(&banned_peer_id),
+            "peer-ID reservation not released after banned peer rejection"
+        );
+
+        // The banned-peer branch does NOT emit a PeerEvent (unlike connect
+        // failure which sends PeerEvent::Failed). Verify no peer was registered.
+        assert_eq!(
+            shared_a.peers.len(),
+            0,
+            "banned peer should not be registered"
+        );
+
+        manager_a.shutdown().await.expect("shutdown a");
+        manager_b.shutdown().await.expect("shutdown b");
     }
 }
