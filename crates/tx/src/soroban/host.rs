@@ -1760,6 +1760,55 @@ fn execute_host_function_p26(
     // ── Encode inputs and call non-typed invoke_host_function() ──
     let inputs = encode_invocation_inputs(host_function, soroban_data, source, auth_entries)?;
 
+    // DEBUG (#2503): dump exact bytes we feed to the host so we can compare
+    // against stellar-core's inputs and localize the cpu_insns divergence.
+    // Gated to L62470158 only to avoid polluting normal logs.
+    if ledger_info.sequence_number == 62470158 {
+        use sha2::{Digest, Sha256};
+        let hex8 = |b: &[u8]| {
+            let h = Sha256::digest(b);
+            format!("{:016x}", u64::from_be_bytes(h[..8].try_into().unwrap()))
+        };
+        tracing::warn!(
+            host_fn_size = inputs.encoded_host_fn.len(),
+            host_fn_hash = hex8(&inputs.encoded_host_fn),
+            resources_size = inputs.encoded_resources.len(),
+            resources_hash = hex8(&inputs.encoded_resources),
+            source_size = inputs.encoded_source.len(),
+            source_hash = hex8(&inputs.encoded_source),
+            auth_count = inputs.encoded_auth.len(),
+            auth_total_bytes = inputs.encoded_auth.iter().map(|b| b.len()).sum::<usize>(),
+            ledger_entries_count = footprint.encoded_ledger_entries.len(),
+            ledger_entries_total_bytes = footprint.encoded_ledger_entries.iter().map(|b| b.len()).sum::<usize>(),
+            ttl_entries_count = footprint.encoded_ttl_entries.len(),
+            ttl_entries_total_bytes = footprint.encoded_ttl_entries.iter().map(|b| b.len()).sum::<usize>(),
+            prng_seed_hex = hex::encode(base_prng_seed),
+            archived_indices = ?footprint.actual_restored_indices,
+            li_proto = ledger_info.protocol_version,
+            li_seq = ledger_info.sequence_number,
+            li_ts = ledger_info.timestamp,
+            li_network_id = hex::encode(ledger_info.network_id),
+            li_base_reserve = ledger_info.base_reserve,
+            li_min_temp_ttl = ledger_info.min_temp_entry_ttl,
+            li_min_persistent_ttl = ledger_info.min_persistent_entry_ttl,
+            li_max_entry_ttl = ledger_info.max_entry_ttl,
+            instruction_limit,
+            memory_limit,
+            "P26: host invoke inputs"
+        );
+        for (i, b) in footprint.encoded_ledger_entries.iter().enumerate() {
+            tracing::warn!(
+                idx = i,
+                size = b.len(),
+                hash = hex8(b),
+                "P26: footprint entry"
+            );
+        }
+        for (i, b) in inputs.encoded_auth.iter().enumerate() {
+            tracing::warn!(idx = i, size = b.len(), hash = hex8(b), "P26: auth entry");
+        }
+    }
+
     let mut diagnostic_events: Vec<soroban_env_host26::xdr::DiagnosticEvent> = Vec::new();
 
     let result = match e2e_invoke::invoke_host_function(
