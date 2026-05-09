@@ -1490,4 +1490,144 @@ mod tests {
             "data_key was partially inserted despite ttl_key conflict"
         );
     }
+
+    // ── Module-cache warming tests for commit_successful_tx ──────────
+
+    use henyey_common::NetworkId;
+    use henyey_tx::soroban::PersistentModuleCache;
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::{ContractCodeEntry, ContractCodeEntryExt};
+
+    /// Valid Soroban WASM fixture A (small contract).
+    const WASM_A: &[u8] =
+        include_bytes!("../../../henyey/wasm/soroban_write_upgrade_bytes_contract.wasm");
+    /// Valid Soroban WASM fixture B (loadgen contract).
+    const WASM_B: &[u8] = include_bytes!("../../../simulation/wasm/loadgen.wasm");
+
+    /// Create a `TransactionExecutor` configured with a P25 module cache.
+    fn make_executor_with_module_cache() -> super::TransactionExecutor {
+        let context = henyey_tx::LedgerContext::new(
+            100, // ledger sequence
+            1_700_000_000,
+            100,
+            5_000_000,
+            25,
+            NetworkId::from_passphrase("Test SDF Network ; September 2015"),
+        );
+        let mut executor =
+            super::TransactionExecutor::new(&context, 0, Default::default(), Default::default());
+        let cache = PersistentModuleCache::new_for_protocol(25)
+            .expect("P25 module cache should be available");
+        executor.set_module_cache(cache);
+        executor
+    }
+
+    /// Build a `LedgerEntry` wrapping a `ContractCodeEntry` for the given WASM.
+    fn make_contract_code_ledger_entry(wasm: &[u8]) -> stellar_xdr::curr::LedgerEntry {
+        let hash_bytes: [u8; 32] = Sha256::digest(wasm).into();
+        stellar_xdr::curr::LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash: Hash(hash_bytes),
+                code: wasm.to_vec().try_into().expect("WASM bytes fit in BytesM"),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_commit_successful_tx_warms_module_cache_for_new_contract_code() {
+        let mut executor = make_executor_with_module_cache();
+
+        // Record a ContractCode entry as newly created in this TX.
+        let entry = make_contract_code_ledger_entry(WASM_A);
+        executor.state_mut().delta_mut().record_create(entry);
+
+        // Commit — should scan created entries and add ContractCode to cache.
+        executor.commit_successful_tx(0);
+
+        // Verify the module is now in the cache.
+        let hash = Hash(Sha256::digest(WASM_A).into());
+        let cache = executor.module_cache().expect("cache should be set");
+        assert!(
+            cache.remove_contract(&hash),
+            "ContractCode entry should be in module cache after commit_successful_tx"
+        );
+    }
+
+    #[test]
+    fn test_commit_successful_tx_skips_non_contract_code_entries() {
+        let mut executor = make_executor_with_module_cache();
+
+        // Record a ContractData entry (NOT ContractCode).
+        let entry = make_entry(100);
+        executor.state_mut().delta_mut().record_create(entry);
+
+        executor.commit_successful_tx(0);
+
+        // Verify the cache does NOT contain any module — use WASM A hash as probe.
+        let hash = Hash(Sha256::digest(WASM_A).into());
+        let cache = executor.module_cache().expect("cache should be set");
+        assert!(
+            !cache.remove_contract(&hash),
+            "non-ContractCode entries should not be added to module cache"
+        );
+    }
+
+    #[test]
+    fn test_commit_successful_tx_only_caches_entries_from_current_tx() {
+        let mut executor = make_executor_with_module_cache();
+
+        // Index 0: ContractCode with WASM A (from a prior TX in the same ledger).
+        let entry_a = make_contract_code_ledger_entry(WASM_A);
+        executor.state_mut().delta_mut().record_create(entry_a);
+
+        // Index 1: ContractData (current TX, should be skipped).
+        let data_entry = make_entry(100);
+        executor.state_mut().delta_mut().record_create(data_entry);
+
+        // Index 2: ContractCode with WASM B (current TX, should be cached).
+        let entry_b = make_contract_code_ledger_entry(WASM_B);
+        executor.state_mut().delta_mut().record_create(entry_b);
+
+        // pre_tx_created_count=1: only entries at index 1+ belong to this TX.
+        executor.commit_successful_tx(1);
+
+        let cache = executor.module_cache().expect("cache should be set");
+
+        // Prior TX entry (index 0) should NOT be cached.
+        let hash_a = Hash(Sha256::digest(WASM_A).into());
+        assert!(
+            !cache.remove_contract(&hash_a),
+            "prior TX ContractCode should not be cached"
+        );
+
+        // Current TX ContractCode (index 2) SHOULD be cached.
+        let hash_b = Hash(Sha256::digest(WASM_B).into());
+        assert!(
+            cache.remove_contract(&hash_b),
+            "current TX ContractCode should be cached"
+        );
+    }
+
+    #[test]
+    fn test_commit_successful_tx_no_new_entries_with_prior_entries() {
+        let mut executor = make_executor_with_module_cache();
+
+        // Simulate a prior TX that created a ContractCode entry.
+        let entry = make_contract_code_ledger_entry(WASM_A);
+        executor.state_mut().delta_mut().record_create(entry);
+
+        // pre_tx_created_count equals created.len(): empty scanned slice.
+        executor.commit_successful_tx(1);
+
+        // The prior TX entry should NOT be cached (it was before pre_tx_created_count).
+        let hash = Hash(Sha256::digest(WASM_A).into());
+        let cache = executor.module_cache().expect("cache should be set");
+        assert!(
+            !cache.remove_contract(&hash),
+            "prior TX entry should not be cached when scanned slice is empty"
+        );
+    }
 }
