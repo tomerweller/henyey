@@ -600,23 +600,24 @@ impl OverlayManager {
             return Err(OverlayError::NotStarted);
         }
 
+        // Check if we're already connected to this address (any direction).
+        // Uses the canonical address-matching helper that handles hostnames
+        // (via original_address) and IP+port comparison correctly.
+        // Checked before pool capacity to match stellar-core's connectToImpl
+        // ordering and ensure AlreadyConnected is returned rather than PoolFull.
+        let already_connected = self
+            .peer_info_cache
+            .iter()
+            .any(|entry| Self::peer_info_matches_address(entry.value(), &addr));
+        if already_connected {
+            debug!("Already connected to {}", addr);
+            return Ok(AddPeerOutcome::AlreadyConnected);
+        }
+
         // Check if we're at the connection limit
         if !self.outbound_pool.try_reserve() {
             debug!("Outbound peer limit reached, not adding peer {}", addr);
             return Ok(AddPeerOutcome::PoolFull);
-        }
-
-        // Check if we're already connected to this address
-        // (We check by address, not by peer ID since we don't know it yet)
-        let target_addr = addr.to_socket_addr();
-        let already_connected = self
-            .peer_info_cache
-            .iter()
-            .any(|entry| entry.value().address.to_string() == target_addr);
-        if already_connected {
-            self.outbound_pool.release_pending();
-            debug!("Already connected to {}", addr);
-            return Ok(AddPeerOutcome::AlreadyConnected);
         }
 
         // Spawn connection task
@@ -1266,5 +1267,155 @@ mod tests {
         }
         assert_eq!(metrics_a.outbound_drop.get(), 1);
         assert_eq!(metrics_b.inbound_drop.get(), 1);
+    }
+
+    // ---- add_peer dedup tests ----
+
+    /// Helper to set up a manager with running=true and a pre-populated peer_info_cache.
+    fn setup_manager_for_add_peer_dedup() -> super::super::OverlayManager {
+        let factory = Arc::new(StalledConnectFactory);
+        let (manager, _rx) = setup_manager_with_factory(factory);
+        manager.running.store(true, Ordering::Relaxed);
+        manager
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peer_already_connected_by_resolved_ip() {
+        let manager = setup_manager_for_add_peer_dedup();
+        let shared = manager.shared_state();
+
+        // Simulate an authenticated peer cached at 1.2.3.4:11625
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        let peer_info = crate::peer::PeerInfo {
+            peer_id: peer_id.clone(),
+            address: "1.2.3.4:11625".parse().unwrap(),
+            direction: ConnectionDirection::Inbound,
+            version_string: String::new(),
+            overlay_version: 0,
+            ledger_version: 0,
+            connected_at: std::time::Instant::now(),
+            original_address: None,
+        };
+        shared.peer_info_cache.insert(peer_id, peer_info);
+
+        // add_peer with same IP:port should return AlreadyConnected
+        let result = manager
+            .add_peer(PeerAddress::new("1.2.3.4", 11625))
+            .await
+            .unwrap();
+        assert_eq!(result, AddPeerOutcome::AlreadyConnected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peer_already_connected_by_hostname() {
+        let manager = setup_manager_for_add_peer_dedup();
+        let shared = manager.shared_state();
+
+        // Simulate an outbound peer with original_address preserving hostname
+        let peer_id = PeerId::from_bytes([2u8; 32]);
+        let peer_info = crate::peer::PeerInfo {
+            peer_id: peer_id.clone(),
+            address: "10.0.0.42:11625".parse().unwrap(),
+            direction: ConnectionDirection::Outbound,
+            version_string: String::new(),
+            overlay_version: 0,
+            ledger_version: 0,
+            connected_at: std::time::Instant::now(),
+            original_address: Some(PeerAddress::new("core.stellar.org", 11625)),
+        };
+        shared.peer_info_cache.insert(peer_id, peer_info);
+
+        // add_peer with hostname should match via original_address
+        let result = manager
+            .add_peer(PeerAddress::new("core.stellar.org", 11625))
+            .await
+            .unwrap();
+        assert_eq!(result, AddPeerOutcome::AlreadyConnected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peer_different_port_not_matched() {
+        let manager = setup_manager_for_add_peer_dedup();
+        let shared = manager.shared_state();
+
+        // Peer at port 11625
+        let peer_id = PeerId::from_bytes([3u8; 32]);
+        let peer_info = crate::peer::PeerInfo {
+            peer_id: peer_id.clone(),
+            address: "1.2.3.4:11625".parse().unwrap(),
+            direction: ConnectionDirection::Outbound,
+            version_string: String::new(),
+            overlay_version: 0,
+            ledger_version: 0,
+            connected_at: std::time::Instant::now(),
+            original_address: None,
+        };
+        shared.peer_info_cache.insert(peer_id, peer_info);
+
+        // Different port should NOT match
+        let result = manager
+            .add_peer(PeerAddress::new("1.2.3.4", 11626))
+            .await
+            .unwrap();
+        assert_eq!(result, AddPeerOutcome::Initiated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peer_different_ip_not_matched() {
+        let manager = setup_manager_for_add_peer_dedup();
+        let shared = manager.shared_state();
+
+        // Peer at 1.2.3.4
+        let peer_id = PeerId::from_bytes([4u8; 32]);
+        let peer_info = crate::peer::PeerInfo {
+            peer_id: peer_id.clone(),
+            address: "1.2.3.4:11625".parse().unwrap(),
+            direction: ConnectionDirection::Inbound,
+            version_string: String::new(),
+            overlay_version: 0,
+            ledger_version: 0,
+            connected_at: std::time::Instant::now(),
+            original_address: None,
+        };
+        shared.peer_info_cache.insert(peer_id, peer_info);
+
+        // Different IP should NOT match
+        let result = manager
+            .add_peer(PeerAddress::new("5.6.7.8", 11625))
+            .await
+            .unwrap();
+        assert_eq!(result, AddPeerOutcome::Initiated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peer_already_connected_returns_before_pool_full() {
+        let manager = setup_manager_for_add_peer_dedup();
+        let shared = manager.shared_state();
+
+        // Exhaust pool capacity so try_reserve would fail
+        while manager.outbound_pool.try_reserve() {}
+        // Confirm pool is full
+        assert!(!manager.outbound_pool.try_reserve());
+
+        // Insert an authenticated peer
+        let peer_id = PeerId::from_bytes([5u8; 32]);
+        let peer_info = crate::peer::PeerInfo {
+            peer_id: peer_id.clone(),
+            address: "1.2.3.4:11625".parse().unwrap(),
+            direction: ConnectionDirection::Inbound,
+            version_string: String::new(),
+            overlay_version: 0,
+            ledger_version: 0,
+            connected_at: std::time::Instant::now(),
+            original_address: None,
+        };
+        shared.peer_info_cache.insert(peer_id, peer_info);
+
+        // Should return AlreadyConnected, NOT PoolFull (duplicate check first)
+        let result = manager
+            .add_peer(PeerAddress::new("1.2.3.4", 11625))
+            .await
+            .unwrap();
+        assert_eq!(result, AddPeerOutcome::AlreadyConnected);
     }
 }
