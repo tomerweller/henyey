@@ -7,13 +7,13 @@
 //!
 //! This is the Rust equivalent of stellar-core's `PendingEnvelopes` fetching logic.
 
-use dashmap::DashMap;
 use henyey_common::Hash256;
 use henyey_crypto::RandomEvictionCache;
 use henyey_overlay::{ItemFetcher, ItemFetcherConfig, ItemType, PeerId};
 use henyey_scp::{is_quorum_set_sane, SlotIndex};
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use stellar_xdr::curr::{Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet};
@@ -47,6 +47,13 @@ pub enum RecvResult {
     /// The slot already has [`FetchingConfig::max_envelopes_per_slot`]
     /// envelopes across all states. Not present in stellar-core.
     PerSlotFull,
+    /// Future-slot budget exhausted (henyey-specific).
+    ///
+    /// The number of distinct future slots (slots > current_slot) has
+    /// reached [`FetchingConfig::max_future_slots`]. Envelopes for
+    /// *existing* future slots are still accepted; only new slot creation
+    /// is blocked. Not present in stellar-core.
+    FutureSlotsFull,
 }
 
 /// State of envelopes for a single slot.
@@ -85,6 +92,15 @@ pub struct FetchingConfig {
     ///
     /// Not present in stellar-core. See `PARITY_STATUS.md`.
     pub max_envelopes_per_slot: usize,
+    /// Maximum distinct future slots to buffer (henyey-specific).
+    ///
+    /// Limits the number of distinct slot keys with `slot > current_slot`.
+    /// Envelopes for an existing future slot are always accepted; only
+    /// creation of a *new* slot entry is blocked when the budget is full.
+    ///
+    /// Default: [`crate::sync_recovery::LEDGER_VALIDITY_BRACKET`] (100).
+    /// Set to 0 to disable (useful for tests).
+    pub max_future_slots: usize,
 }
 
 impl Default for FetchingConfig {
@@ -96,6 +112,7 @@ impl Default for FetchingConfig {
             // in PendingEnvelopes.cpp.
             max_quorum_set_cache: 10_000,
             max_envelopes_per_slot: super::pending::MAX_ENVELOPES_PER_SLOT,
+            max_future_slots: crate::sync_recovery::LEDGER_VALIDITY_BRACKET as usize,
         }
     }
 }
@@ -107,7 +124,13 @@ impl Default for FetchingConfig {
 /// waiting for that data become ready for processing.
 pub struct FetchingEnvelopes {
     /// Per-slot envelope state.
-    pub(crate) slots: DashMap<SlotIndex, SlotEnvelopes>,
+    ///
+    /// Uses `RwLock<BTreeMap>` (not `DashMap`) so that the future-slot
+    /// admission check and slot insertion are atomic under the same write
+    /// lock, eliminating the TOCTOU race described in #2520.
+    /// BTreeMap provides ordered iteration matching stellar-core's
+    /// `std::map` and is consistent with `PendingEnvelopes` (#2476).
+    pub(crate) slots: RwLock<BTreeMap<SlotIndex, SlotEnvelopes>>,
     /// TxSet fetcher.
     tx_set_fetcher: ItemFetcher,
     /// QuorumSet fetcher.
@@ -132,6 +155,11 @@ pub struct FetchingEnvelopes {
     stats: RwLock<FetchingStats>,
     /// Per-slot envelope lifetime cap. See [`FetchingConfig::max_envelopes_per_slot`].
     max_envelopes_per_slot: usize,
+    /// Maximum distinct future slots to buffer. See [`FetchingConfig::max_future_slots`].
+    max_future_slots: usize,
+    /// Current slot index, updated by the herder lifecycle.
+    /// Read with `Relaxed` ordering (no cross-atomic synchronization needed).
+    current_slot: AtomicU64,
 }
 
 /// Statistics about fetching.
@@ -153,6 +181,8 @@ pub struct FetchingStats {
     pub per_slot_full: u64,
     /// Envelopes dropped because all tracker caps were full (defense-in-depth).
     pub tracker_cap_drops: u64,
+    /// Future-slot budget rejections.
+    pub future_slots_full: u64,
 }
 
 impl FetchingEnvelopes {
@@ -168,6 +198,7 @@ impl FetchingEnvelopes {
         );
         let qs_cache = RandomEvictionCache::new(config.max_quorum_set_cache);
         let max_envelopes_per_slot = config.max_envelopes_per_slot;
+        let max_future_slots = config.max_future_slots;
         Self {
             tx_set_fetcher: ItemFetcher::new(
                 ItemType::TxSet,
@@ -179,18 +210,32 @@ impl FetchingEnvelopes {
                 config.quorum_set_fetcher_config.clone(),
                 None,
             ),
-            slots: DashMap::new(),
+            slots: RwLock::new(BTreeMap::new()),
             quorum_set_cache: Mutex::new(qs_cache),
             has_tx_set_fn,
             broadcast: RwLock::new(None),
             stats: RwLock::new(FetchingStats::default()),
             max_envelopes_per_slot,
+            max_future_slots,
+            current_slot: AtomicU64::new(0),
         }
     }
 
     /// Create with default configuration and a given tx_set presence callback.
     pub fn with_defaults(has_tx_set_fn: HasTxSetFn) -> Self {
         Self::new(FetchingConfig::default(), has_tx_set_fn)
+    }
+
+    /// Update the current slot index for future-slot admission control.
+    ///
+    /// Called by the herder at bootstrap and on tracking-slot advance.
+    pub fn set_current_slot(&self, slot: SlotIndex) {
+        self.current_slot.store(slot, Ordering::Relaxed);
+    }
+
+    /// Read the current slot index.
+    pub fn current_slot(&self) -> SlotIndex {
+        self.current_slot.load(Ordering::Relaxed)
     }
 
     /// Set the callback for requesting TxSets from peers.
@@ -249,97 +294,148 @@ impl FetchingEnvelopes {
     }
 
     /// Inner implementation shared by recv_envelope and recv_envelope_validated.
+    ///
+    /// Two-phase design (#2520):
+    /// Phase 1 (write lock): admission checks + state mutation
+    /// Phase 2 (lock dropped): I/O operations (broadcast, fetch)
     fn recv_envelope_inner(&self, envelope: ScpEnvelope) -> RecvResult {
         let slot = envelope.statement.slot_index;
         let env_hash = Self::compute_envelope_hash(&envelope);
 
-        // Get or create slot state
-        let mut slot_state = self.slots.entry(slot).or_default();
-
-        // Check if already processed
-        if slot_state.processed.contains(&env_hash) {
-            self.stats.write().envelopes_duplicate += 1;
-            return RecvResult::AlreadyProcessed;
+        // Phase 1: Under write lock — admission, dedup, deps, insert.
+        enum Action {
+            Broadcast(ScpEnvelope),
+            Fetch {
+                need_tx_set: bool,
+                need_quorum_set: bool,
+                envelope: ScpEnvelope,
+                env_hash: Hash256,
+            },
         }
 
-        // Check if previously discarded.
-        // Parity: stellar-core's `isDiscarded()` (PendingEnvelopes.cpp:325-327)
-        // returns ENVELOPE_STATUS_DISCARDED, distinct from the duplicate path.
-        if slot_state.discarded.contains(&env_hash) {
-            return RecvResult::Discarded;
-        }
+        let (result, action) = {
+            let mut slots = self.slots.write();
 
-        // Check if already fetching
-        if slot_state.fetching.contains_key(&env_hash) {
-            return RecvResult::Fetching;
-        }
-
-        // Per-slot lifetime cap (defense-in-depth, henyey-specific).
-        // Count ALL states to prevent the "immediate-pop bypass" where
-        // deps-satisfied envelopes drain the active queue but grow
-        // `processed` without bound.
-        if self.max_envelopes_per_slot > 0 {
-            let lifetime_count = slot_state.fetching.len()
-                + slot_state.ready.len()
-                + slot_state.processed.len()
-                + slot_state.discarded.len();
-            if lifetime_count >= self.max_envelopes_per_slot {
-                self.stats.write().per_slot_full += 1;
-                return RecvResult::PerSlotFull;
+            // Future-slot admission control (atomic with insert, fixes #2520).
+            // Only check when creating a NEW slot entry for a future slot.
+            let current = self.current_slot.load(Ordering::Relaxed);
+            if self.max_future_slots > 0 && slot > current && !slots.contains_key(&slot) {
+                let future_count = slots.keys().filter(|&&k| k > current).count();
+                if future_count >= self.max_future_slots {
+                    self.stats.write().future_slots_full += 1;
+                    return RecvResult::FutureSlotsFull;
+                }
             }
-        }
 
-        // Check if we have all dependencies
-        let (need_tx_set, need_quorum_set) = self.check_dependencies(&envelope);
+            let slot_state = slots.entry(slot).or_default();
 
-        if !need_tx_set && !need_quorum_set {
-            // All dependencies available - envelope is ready.
-            // Parity: stellar-core PendingEnvelopes::envelopeReady() broadcasts
-            // after isFullyFetched(). Broadcast here for both this immediate-ready
-            // path and the deferred-ready path (check_and_move_to_ready).
-            self.broadcast_envelope(&envelope);
-            slot_state.ready.push(envelope);
-            self.stats.write().envelopes_ready += 1;
-            return RecvResult::Ready;
-        }
+            // Check if already processed
+            if slot_state.processed.contains(&env_hash) {
+                self.stats.write().envelopes_duplicate += 1;
+                return RecvResult::AlreadyProcessed;
+            }
 
-        // Start fetching missing dependencies
-        let mut any_tracked = false;
+            // Check if previously discarded.
+            // Parity: stellar-core's `isDiscarded()` (PendingEnvelopes.cpp:325-327)
+            // returns ENVELOPE_STATUS_DISCARDED, distinct from the duplicate path.
+            if slot_state.discarded.contains(&env_hash) {
+                return RecvResult::Discarded;
+            }
 
-        if need_tx_set {
-            for tx_set_hash in Self::extract_tx_set_hashes(&envelope) {
-                if !self.is_tx_set_available(&tx_set_hash) {
-                    let hash = Hash(tx_set_hash.0);
-                    if self.tx_set_fetcher.fetch(hash, &envelope) {
-                        any_tracked = true;
+            // Check if already fetching
+            if slot_state.fetching.contains_key(&env_hash) {
+                return RecvResult::Fetching;
+            }
+
+            // Per-slot lifetime cap (defense-in-depth, henyey-specific).
+            if self.max_envelopes_per_slot > 0 {
+                let lifetime_count = slot_state.fetching.len()
+                    + slot_state.ready.len()
+                    + slot_state.processed.len()
+                    + slot_state.discarded.len();
+                if lifetime_count >= self.max_envelopes_per_slot {
+                    self.stats.write().per_slot_full += 1;
+                    return RecvResult::PerSlotFull;
+                }
+            }
+
+            // Check if we have all dependencies.
+            // Lock-order safety: check_dependencies calls qs_cache_exists
+            // (Mutex<RandomEvictionCache>) and has_tx_set_fn (ScpDriver cache
+            // lookup). Neither acquires the slots lock, so no deadlock. See
+            // lock-order analysis in #2520.
+            let (need_tx_set, need_quorum_set) = self.check_dependencies(&envelope);
+
+            if !need_tx_set && !need_quorum_set {
+                // All dependencies available — envelope is ready.
+                slot_state.ready.push(envelope.clone());
+                self.stats.write().envelopes_ready += 1;
+                (RecvResult::Ready, Action::Broadcast(envelope))
+            } else {
+                // Park envelope — will be moved to ready when deps arrive.
+                slot_state
+                    .fetching
+                    .insert(env_hash, (envelope.clone(), Instant::now()));
+                (
+                    RecvResult::Fetching,
+                    Action::Fetch {
+                        need_tx_set,
+                        need_quorum_set,
+                        envelope,
+                        env_hash,
+                    },
+                )
+            }
+        }; // write lock dropped here
+
+        // Phase 2: I/O operations outside the lock.
+        match action {
+            Action::Broadcast(env) => {
+                self.broadcast_envelope(&env);
+            }
+            Action::Fetch {
+                need_tx_set,
+                need_quorum_set,
+                envelope,
+                env_hash,
+            } => {
+                let mut any_tracked = false;
+
+                if need_tx_set {
+                    for tx_set_hash in Self::extract_tx_set_hashes(&envelope) {
+                        if !self.is_tx_set_available(&tx_set_hash) {
+                            let hash = Hash(tx_set_hash.0);
+                            if self.tx_set_fetcher.fetch(hash, &envelope) {
+                                any_tracked = true;
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        if need_quorum_set {
-            if let Some(qs_hash) = Self::extract_quorum_set_hash(&envelope) {
-                let hash = Hash(qs_hash.0);
-                if self.quorum_set_fetcher.fetch(hash, &envelope) {
-                    any_tracked = true;
+                if need_quorum_set {
+                    if let Some(qs_hash) = Self::extract_quorum_set_hash(&envelope) {
+                        let hash = Hash(qs_hash.0);
+                        if self.quorum_set_fetcher.fetch(hash, &envelope) {
+                            any_tracked = true;
+                        }
+                    }
+                }
+
+                if !any_tracked {
+                    // All trackers at capacity — remove from fetching since
+                    // the envelope can't actually be tracked. Preserves the
+                    // pre-#2520 behavior where untracked envelopes are dropped.
+                    if let Some(s) = self.slots.write().get_mut(&slot) {
+                        s.fetching.remove(&env_hash);
+                    }
+                    self.stats.write().tracker_cap_drops += 1;
+                } else {
+                    self.stats.write().envelopes_fetching += 1;
                 }
             }
         }
 
-        if any_tracked {
-            // At least one tracker accepted — park as usual.
-            slot_state
-                .fetching
-                .insert(env_hash, (envelope, Instant::now()));
-            self.stats.write().envelopes_fetching += 1;
-        } else {
-            // All trackers at capacity — don't park. The envelope will be
-            // retried on the next SCP round when honest peers re-reference
-            // these items.
-            self.stats.write().tracker_cap_drops += 1;
-        }
-
-        RecvResult::Fetching
+        result
     }
 
     /// Receive a TxSet.
@@ -437,17 +533,16 @@ impl FetchingEnvelopes {
     /// returns the first available ready envelope. This ensures envelopes
     /// are processed in slot order.
     pub fn pop(&self, max_slot: SlotIndex) -> Option<ScpEnvelope> {
-        // Collect slots that have ready envelopes, up to max_slot
-        let mut ready: Vec<SlotIndex> = self
-            .slots
+        let mut slots = self.slots.write();
+        // BTreeMap iterates in order — no need for collect + sort.
+        let ready_slot = slots
             .iter()
-            .filter(|e| *e.key() <= max_slot && !e.value().ready.is_empty())
-            .map(|e| *e.key())
-            .collect();
-        ready.sort_unstable();
+            .filter(|(&k, v)| k <= max_slot && !v.ready.is_empty())
+            .map(|(&k, _)| k)
+            .next();
 
-        for slot in ready {
-            if let Some(mut slot_state) = self.slots.get_mut(&slot) {
+        if let Some(slot) = ready_slot {
+            if let Some(slot_state) = slots.get_mut(&slot) {
                 if let Some(envelope) = slot_state.ready.pop() {
                     let env_hash = Self::compute_envelope_hash(&envelope);
                     slot_state.processed.insert(env_hash);
@@ -466,7 +561,8 @@ impl FetchingEnvelopes {
     /// envelope we just inserted (e.g., after inline SCP processing in
     /// `process_scp_envelope`).
     pub fn pop_from_slot(&self, slot: SlotIndex) -> Option<ScpEnvelope> {
-        if let Some(mut slot_state) = self.slots.get_mut(&slot) {
+        let mut slots = self.slots.write();
+        if let Some(slot_state) = slots.get_mut(&slot) {
             if let Some(envelope) = slot_state.ready.pop() {
                 let env_hash = Self::compute_envelope_hash(&envelope);
                 slot_state.processed.insert(env_hash);
@@ -487,22 +583,21 @@ impl FetchingEnvelopes {
     /// dependency resolution pipeline; this helper skips it entirely.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn test_insert_ready(&self, slot: SlotIndex, envelopes: Vec<ScpEnvelope>) {
-        let mut slot_state = self.slots.entry(slot).or_default();
-        slot_state.ready.extend(envelopes);
+        let mut slots = self.slots.write();
+        slots.entry(slot).or_default().ready.extend(envelopes);
     }
 
     /// Get all ready slots in ascending order.
     ///
     /// Parity: stellar-core returns slots in sorted order since it uses std::map.
     pub fn ready_slots(&self) -> Vec<SlotIndex> {
-        let mut slots: Vec<SlotIndex> = self
-            .slots
+        // BTreeMap iterates in order — no need for sort.
+        self.slots
+            .read()
             .iter()
-            .filter(|entry| !entry.value().ready.is_empty())
-            .map(|entry| *entry.key())
-            .collect();
-        slots.sort_unstable();
-        slots
+            .filter(|(_, v)| !v.ready.is_empty())
+            .map(|(&k, _)| k)
+            .collect()
     }
 
     /// Count envelopes (fetching + ready) for a given slot.
@@ -511,6 +606,7 @@ impl FetchingEnvelopes {
     /// future-slot floods.
     pub fn slot_envelope_count(&self, slot: SlotIndex) -> usize {
         self.slots
+            .read()
             .get(&slot)
             .map(|s| s.fetching.len() + s.ready.len())
             .unwrap_or(0)
@@ -527,6 +623,7 @@ impl FetchingEnvelopes {
     /// bound.
     pub fn slot_lifetime_count(&self, slot: SlotIndex) -> usize {
         self.slots
+            .read()
             .get(&slot)
             .map(|s| s.fetching.len() + s.ready.len() + s.processed.len() + s.discarded.len())
             .unwrap_or(0)
@@ -538,8 +635,9 @@ impl FetchingEnvelopes {
     /// buffered in the fetching pipeline.
     pub fn future_slot_count(&self, current_slot: SlotIndex) -> usize {
         self.slots
-            .iter()
-            .filter(|e| *e.key() > current_slot)
+            .read()
+            .keys()
+            .filter(|&&k| k > current_slot)
             .count()
     }
 
@@ -555,23 +653,18 @@ impl FetchingEnvelopes {
         max_slot: Option<SlotIndex>,
         slot_to_keep: SlotIndex,
     ) {
-        let slots_to_remove: Vec<SlotIndex> = self
-            .slots
-            .iter()
-            .filter(|e| {
-                let key = *e.key();
+        // Remove slot entries outside the valid range in a single write lock,
+        // matching trim_stale's retain pattern.
+        {
+            let mut slots = self.slots.write();
+            slots.retain(|&key, _| {
                 if key == slot_to_keep {
-                    return false;
+                    return true;
                 }
                 let below_min = min_slot.is_some_and(|m| key < m);
                 let above_max = max_slot.is_some_and(|m| key > m);
-                below_min || above_max
-            })
-            .map(|e| *e.key())
-            .collect();
-
-        for slot in slots_to_remove {
-            self.slots.remove(&slot);
+                !(below_min || above_max)
+            });
         }
 
         // Tell fetchers to stop fetching for slots outside range
@@ -597,10 +690,10 @@ impl FetchingEnvelopes {
     /// Called after catchup to release memory from stale data.
     pub fn trim_stale(&self, keep_after_slot: SlotIndex) {
         let initial_quorum_set_count = self.qs_cache_len();
-        let initial_slots_count = self.slots.len();
+        let initial_slots_count = self.slots.read().len();
 
         // Clear slots for old ledgers only
-        self.slots.retain(|slot, _| *slot > keep_after_slot);
+        self.slots.write().retain(|&slot, _| slot > keep_after_slot);
 
         // Keep quorum_set_cache — quorum sets are small, don't have slot-based
         // relevance, and are needed by check_dependencies() to determine if
@@ -615,7 +708,7 @@ impl FetchingEnvelopes {
         // requests, so envelopes waiting on those quorum sets would be stuck
         // in "fetching" state until a new envelope re-triggers the fetch.
 
-        let kept_slots = self.slots.len();
+        let kept_slots = self.slots.read().len();
 
         tracing::info!(
             initial_quorum_set_count,
@@ -633,30 +726,25 @@ impl FetchingEnvelopes {
 
     /// Get the number of slots being tracked.
     pub fn slots_count(&self) -> usize {
-        self.slots.len()
+        self.slots.read().len()
     }
 
     /// Get the number of envelopes being fetched.
     pub fn fetching_count(&self) -> usize {
-        self.slots
-            .iter()
-            .map(|entry| entry.value().fetching.len())
-            .sum()
+        self.slots.read().values().map(|v| v.fetching.len()).sum()
     }
 
     /// Get the number of ready envelopes.
     pub fn ready_count(&self) -> usize {
-        self.slots
-            .iter()
-            .map(|entry| entry.value().ready.len())
-            .sum()
+        self.slots.read().values().map(|v| v.ready.len()).sum()
     }
 
     /// Check if a slot has envelopes currently being fetched (waiting for tx_set).
     pub fn has_fetching_for_slot(&self, slot: SlotIndex) -> bool {
         self.slots
+            .read()
             .get(&slot)
-            .map(|entry| !entry.value().fetching.is_empty())
+            .map(|s| !s.fetching.is_empty())
             .unwrap_or(false)
     }
 
@@ -693,13 +781,12 @@ impl FetchingEnvelopes {
 
     /// Check all fetching envelopes and move any that are now ready.
     fn move_ready_envelopes_for_tx_set(&self, tx_set_hash: &Hash256) {
-        // Phase 1: Collect envelopes under read guards only.
-        // Scoped to ensure all RefMulti (per-shard read guards) drop
-        // before phase 2 acquires write locks via get_mut().
+        // Phase 1: Collect envelopes under read lock.
         let to_check: Vec<ScpEnvelope> = {
+            let slots = self.slots.read();
             let mut result = Vec::new();
-            for slot_entry in self.slots.iter() {
-                for (_, (env, _)) in slot_entry.fetching.iter() {
+            for slot_state in slots.values() {
+                for (_, (env, _)) in slot_state.fetching.iter() {
                     if Self::extract_tx_set_hashes(env)
                         .iter()
                         .any(|h| h == tx_set_hash)
@@ -709,9 +796,9 @@ impl FetchingEnvelopes {
                 }
             }
             result
-        }; // ← All RefMulti guards dropped here
+        }; // read lock dropped
 
-        // Phase 2: Mutate with no read guards held.
+        // Phase 2: Mutate with no lock held.
         for envelope in to_check {
             self.check_and_move_to_ready(envelope);
         }
@@ -721,9 +808,10 @@ impl FetchingEnvelopes {
     /// any that are now ready.
     fn move_ready_envelopes_for_quorum_set(&self, qs_hash: &Hash256) {
         let to_check: Vec<ScpEnvelope> = {
+            let slots = self.slots.read();
             let mut result = Vec::new();
-            for slot_entry in self.slots.iter() {
-                for (_, (env, _)) in slot_entry.fetching.iter() {
+            for slot_state in slots.values() {
+                for (_, (env, _)) in slot_state.fetching.iter() {
                     if Self::extract_quorum_set_hash(env).as_ref() == Some(qs_hash) {
                         result.push(env.clone());
                     }
@@ -804,15 +892,19 @@ impl FetchingEnvelopes {
         let (need_tx_set, need_quorum_set) = self.check_dependencies(&envelope);
 
         if !need_tx_set && !need_quorum_set {
-            // All dependencies available - move to ready
-            // Parity: broadcast to peers when dependencies are satisfied
-            self.broadcast_envelope(&envelope);
-            if let Some(mut slot_state) = self.slots.get_mut(&slot) {
-                if slot_state.fetching.remove(&env_hash).is_some() {
-                    slot_state.ready.push(envelope);
-                    debug!(slot, "Envelope ready after receiving dependencies");
+            // All dependencies available - move to ready.
+            // Mutate under write lock, broadcast after dropping.
+            {
+                let mut slots = self.slots.write();
+                if let Some(slot_state) = slots.get_mut(&slot) {
+                    if slot_state.fetching.remove(&env_hash).is_some() {
+                        slot_state.ready.push(envelope.clone());
+                        debug!(slot, "Envelope ready after receiving dependencies");
+                    }
                 }
             }
+            // Parity: broadcast to peers when dependencies are satisfied
+            self.broadcast_envelope(&envelope);
         } else {
             // Re-start fetching for any dependency that is not yet available.
             // Without this, the envelope would remain stranded in `fetching` forever.
@@ -878,18 +970,18 @@ impl FetchingEnvelopes {
         let slot = envelope.statement.slot_index;
         let env_hash = Self::compute_envelope_hash(envelope);
 
-        let mut slot_state = self.slots.entry(slot).or_default();
+        {
+            let mut slots = self.slots.write();
+            let slot_state = slots.entry(slot).or_default();
 
-        // Idempotent: if already discarded, nothing to do (matches stellar-core's
-        // early return when set::insert returns !r.second).
-        if !slot_state.discarded.insert(env_hash) {
-            return;
-        }
+            // Idempotent: if already discarded, nothing to do (matches stellar-core's
+            // early return when set::insert returns !r.second).
+            if !slot_state.discarded.insert(env_hash) {
+                return;
+            }
 
-        slot_state.fetching.remove(&env_hash);
-        // Drop the DashMap guard before calling stop_fetch to avoid holding
-        // the slot lock while acquiring fetcher locks.
-        drop(slot_state);
+            slot_state.fetching.remove(&env_hash);
+        } // write lock dropped before I/O
 
         self.stop_fetch(envelope);
 
@@ -1020,6 +1112,11 @@ mod tests {
             },
             signature: Signature(vec![0u8; 64].try_into().unwrap()),
         }
+    }
+
+    /// Short alias for tests that only need slot + unique node.
+    fn make_envelope(slot: SlotIndex, node_seed: u8) -> ScpEnvelope {
+        make_test_envelope(slot, node_seed)
     }
 
     /// Helper to pre-cache the quorum set used by test envelopes.
@@ -1211,8 +1308,8 @@ mod tests {
         );
 
         // Add slot state for old and new slots
-        fetching.slots.entry(98).or_default();
-        fetching.slots.entry(101).or_default();
+        fetching.slots.write().entry(98).or_default();
+        fetching.slots.write().entry(101).or_default();
 
         // Trim with keep_after_slot = 100
         fetching.trim_stale(100);
@@ -1224,8 +1321,8 @@ mod tests {
         );
 
         // Old slot should be removed, new slot kept
-        assert!(!fetching.slots.contains_key(&98));
-        assert!(fetching.slots.contains_key(&101));
+        assert!(!fetching.slots.read().contains_key(&98));
+        assert!(fetching.slots.read().contains_key(&101));
     }
 
     // =========================================================================
@@ -1769,6 +1866,7 @@ mod tests {
         let env_hash = FetchingEnvelopes::compute_envelope_hash(&envelope);
         fetching
             .slots
+            .write()
             .entry(slot)
             .or_default()
             .fetching
@@ -1892,6 +1990,7 @@ mod tests {
         let env_hash = FetchingEnvelopes::compute_envelope_hash(&envelope);
         fetching
             .slots
+            .write()
             .entry(100)
             .or_default()
             .fetching
@@ -2402,9 +2501,10 @@ mod tests {
 
         // Envelope should be removed from fetching and placed in discarded
         assert_eq!(fetching.fetching_count(), 0);
-        let slot_state = fetching.slots.get(&100).unwrap();
-        assert_eq!(slot_state.discarded.len(), 1);
-        assert_eq!(slot_state.fetching.len(), 0);
+        let slot_state = fetching.slots.read();
+        let slot = slot_state.get(&100).unwrap();
+        assert_eq!(slot.discarded.len(), 1);
+        assert_eq!(slot.fetching.len(), 0);
     }
 
     #[test]
@@ -2435,7 +2535,8 @@ mod tests {
 
         assert_eq!(fetching.fetching_count(), 0);
         for slot in [100, 200, 300] {
-            let slot_state = fetching.slots.get(&slot).unwrap();
+            let slots = fetching.slots.read();
+            let slot_state = slots.get(&slot).unwrap();
             assert_eq!(slot_state.discarded.len(), 1);
             assert_eq!(slot_state.fetching.len(), 0);
         }
@@ -2538,7 +2639,8 @@ mod tests {
         assert_eq!(fetching.slot_lifetime_count(100), 1);
 
         // The envelope is in discarded, not fetching
-        let slot_state = fetching.slots.get(&100).unwrap();
+        let slots = fetching.slots.read();
+        let slot_state = slots.get(&100).unwrap();
         assert_eq!(slot_state.fetching.len(), 0);
         assert_eq!(slot_state.discarded.len(), 1);
     }
@@ -2561,7 +2663,8 @@ mod tests {
         fetching.discard_envelope(&envelope);
 
         // Only one entry in discarded
-        let slot_state = fetching.slots.get(&100).unwrap();
+        let slots = fetching.slots.read();
+        let slot_state = slots.get(&100).unwrap();
         assert_eq!(slot_state.discarded.len(), 1);
     }
 
@@ -2595,6 +2698,166 @@ mod tests {
         assert!(
             !fetching.tx_set_fetcher.is_tracking(&Hash(tx_hash.0)),
             "tx_set fetcher should be cleaned up after discard"
+        );
+    }
+
+    // ── #2520 regression: future-slot admission (TOCTOU fix) ──
+
+    #[test]
+    fn test_future_slot_admission_rejects_when_budget_full() {
+        // Verify that FetchingEnvelopes enforces max_future_slots internally.
+        let config = FetchingConfig {
+            max_future_slots: 3,
+            max_envelopes_per_slot: 0,
+            ..Default::default()
+        };
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        fetching.set_current_slot(100);
+
+        // Fill 3 future slots
+        for s in [101, 102, 103] {
+            let env = make_envelope(s, 1);
+            assert_eq!(fetching.recv_envelope(env), RecvResult::Fetching);
+        }
+        assert_eq!(fetching.future_slot_count(100), 3);
+
+        // 4th new future slot is rejected
+        let env = make_envelope(104, 1);
+        assert_eq!(fetching.recv_envelope(env), RecvResult::FutureSlotsFull);
+        assert_eq!(fetching.slots_count(), 3); // no new slot created
+    }
+
+    #[test]
+    fn test_future_slot_admission_existing_slot_bypass() {
+        // Envelopes targeting an existing future slot must still be accepted
+        // even when the future-slot budget is full (#2520).
+        let config = FetchingConfig {
+            max_future_slots: 2,
+            max_envelopes_per_slot: 0,
+            ..Default::default()
+        };
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        fetching.set_current_slot(100);
+
+        // Fill 2 future slots
+        let env1 = make_envelope(101, 1);
+        let env2 = make_envelope(102, 1);
+        assert_eq!(fetching.recv_envelope(env1), RecvResult::Fetching);
+        assert_eq!(fetching.recv_envelope(env2), RecvResult::Fetching);
+
+        // Budget is full, but a second envelope for slot 101 is allowed
+        let env3 = make_envelope(101, 2);
+        assert_eq!(fetching.recv_envelope(env3), RecvResult::Fetching);
+        assert_eq!(fetching.slot_envelope_count(101), 2);
+    }
+
+    #[test]
+    fn test_future_slot_admission_current_and_past_always_accepted() {
+        // Current-slot and past-slot envelopes bypass future-slot admission.
+        let config = FetchingConfig {
+            max_future_slots: 1,
+            max_envelopes_per_slot: 0,
+            ..Default::default()
+        };
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        fetching.set_current_slot(100);
+
+        // Fill the single future-slot budget
+        let env = make_envelope(101, 1);
+        assert_eq!(fetching.recv_envelope(env), RecvResult::Fetching);
+
+        // Current slot (100) and past slot (99) are unaffected
+        let env_current = make_envelope(100, 1);
+        let env_past = make_envelope(99, 1);
+        assert_eq!(fetching.recv_envelope(env_current), RecvResult::Fetching);
+        assert_eq!(fetching.recv_envelope(env_past), RecvResult::Fetching);
+    }
+
+    #[test]
+    fn test_future_slot_admission_stats_tracked() {
+        // Verify that FutureSlotsFull rejections increment the stat counter.
+        let config = FetchingConfig {
+            max_future_slots: 1,
+            max_envelopes_per_slot: 0,
+            ..Default::default()
+        };
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        fetching.set_current_slot(100);
+
+        let env1 = make_envelope(101, 1);
+        assert_eq!(fetching.recv_envelope(env1), RecvResult::Fetching);
+
+        let env2 = make_envelope(102, 1);
+        assert_eq!(fetching.recv_envelope(env2), RecvResult::FutureSlotsFull);
+        let env3 = make_envelope(103, 1);
+        assert_eq!(fetching.recv_envelope(env3), RecvResult::FutureSlotsFull);
+
+        let stats = fetching.stats.read();
+        assert_eq!(stats.future_slots_full, 2);
+    }
+
+    #[test]
+    fn test_future_slot_admission_disabled_when_zero() {
+        // max_future_slots=0 disables the check — unlimited future slots.
+        let config = FetchingConfig {
+            max_future_slots: 0,
+            max_envelopes_per_slot: 0,
+            ..Default::default()
+        };
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        fetching.set_current_slot(100);
+
+        for s in 101..=300 {
+            let env = make_envelope(s, 1);
+            assert_eq!(fetching.recv_envelope(env), RecvResult::Fetching);
+        }
+        assert_eq!(fetching.slots_count(), 200);
+    }
+
+    #[test]
+    fn test_future_slot_admission_concurrent_race() {
+        // Regression test for the TOCTOU race (#2520): spawn threads that
+        // concurrently attempt to create new future slots. Without the
+        // RwLock fix, more than max_future_slots could sneak in.
+        use std::sync::{Arc, Barrier};
+
+        let config = FetchingConfig {
+            max_future_slots: 5,
+            max_envelopes_per_slot: 0,
+            ..Default::default()
+        };
+        let fetching = Arc::new(FetchingEnvelopes::new(config, Box::new(|_| false)));
+        fetching.set_current_slot(100);
+
+        let barrier = Arc::new(Barrier::new(20));
+        let mut handles = Vec::new();
+
+        for i in 0..20u64 {
+            let fe = Arc::clone(&fetching);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let env = make_envelope(101 + i, 1);
+                fe.recv_envelope(env)
+            }));
+        }
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let accepted = results
+            .iter()
+            .filter(|r| matches!(r, RecvResult::Fetching))
+            .count();
+        let rejected = results
+            .iter()
+            .filter(|r| matches!(r, RecvResult::FutureSlotsFull))
+            .count();
+
+        assert_eq!(accepted, 5, "exactly max_future_slots should be accepted");
+        assert_eq!(rejected, 15, "the rest should be rejected");
+        assert_eq!(
+            fetching.slots_count(),
+            5,
+            "no more than max_future_slots slot entries"
         );
     }
 }

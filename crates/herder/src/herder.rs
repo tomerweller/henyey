@@ -735,6 +735,7 @@ impl Herder {
     #[doc(hidden)]
     pub fn set_pending_current_slot_for_testing(&self, slot: u64) {
         self.pending_envelopes.set_current_slot(slot);
+        self.fetching_envelopes.set_current_slot(slot);
     }
 
     /// Test-only: arm the closing gate for a specific slot.
@@ -1110,8 +1111,9 @@ impl Herder {
         }
         *self.tracking_started_at.write() = Some(Instant::now());
 
-        // Update pending envelopes current slot
+        // Update pending and fetching envelopes current slot
         self.pending_envelopes.set_current_slot(slot);
+        self.fetching_envelopes.set_current_slot(slot);
 
         // Transition to tracking state
         *tracked_write(LOCK_HERDER_STATE, &self.state) = HerderState::Tracking;
@@ -1583,34 +1585,29 @@ impl Herder {
             }
         }
 
-        // Admission control for future-slot envelopes: prevent unbounded
-        // slot count from floods.
-        if slot > current_slot {
-            let future_slots = self.fetching_envelopes.future_slot_count(current_slot);
-            if future_slots >= crate::sync_recovery::LEDGER_VALIDITY_BRACKET as usize {
-                let last_warned = self.pending_envelopes.last_buffer_full_warn_slot();
-                if slot != last_warned {
-                    self.pending_envelopes.set_last_buffer_full_warn_slot(slot);
-                    tracing::warn!(
-                        slot,
-                        current_slot,
-                        future_slots,
-                        "Future-slot count limit reached in FetchingEnvelopes"
-                    );
-                }
-                return (
-                    EnvelopeState::Invalid,
-                    PostVerifyReason::PendingAddBufferFull,
-                );
-            }
-        }
+        // Future-slot admission is now handled atomically inside
+        // FetchingEnvelopes::recv_envelope_inner (#2520), eliminating the
+        // TOCTOU race. The result is propagated through process_scp_envelope.
 
         // Process through unified FetchingEnvelopes intake. This handles
         // dep-fetching, relay, slot-aware routing, and EXTERNALIZE bypass.
-        (
-            self.process_scp_envelope(envelope),
-            PostVerifyReason::Accepted,
-        )
+        let (state, recv_result) = self.process_scp_envelope(envelope);
+        if let Some(crate::fetching_envelopes::RecvResult::FutureSlotsFull) = recv_result {
+            let last_warned = self.pending_envelopes.last_buffer_full_warn_slot();
+            if slot != last_warned {
+                self.pending_envelopes.set_last_buffer_full_warn_slot(slot);
+                tracing::warn!(
+                    slot,
+                    current_slot,
+                    "Future-slot count limit reached in FetchingEnvelopes"
+                );
+            }
+            return (
+                EnvelopeState::Invalid,
+                PostVerifyReason::PendingAddBufferFull,
+            );
+        }
+        (state, PostVerifyReason::Accepted)
     }
 
     /// Process an SCP envelope through the unified FetchingEnvelopes intake.
@@ -1623,7 +1620,10 @@ impl Herder {
     ///
     /// EXTERNALIZE bypass: EXTERNALIZE envelopes are processed through SCP
     /// immediately regardless of missing deps (catchup recovery requirement).
-    fn process_scp_envelope(&self, envelope: ScpEnvelope) -> EnvelopeState {
+    fn process_scp_envelope(
+        &self,
+        envelope: ScpEnvelope,
+    ) -> (EnvelopeState, Option<crate::fetching_envelopes::RecvResult>) {
         let slot = envelope.statement.slot_index;
         let is_externalize = matches!(
             envelope.statement.pledges,
@@ -1645,7 +1645,7 @@ impl Herder {
         let envelope_clone = envelope.clone();
         let result = self.fetching_envelopes.recv_envelope_validated(envelope);
 
-        match result {
+        let state = match result {
             RecvResult::Ready => {
                 // Deps satisfied, envelope broadcast by FetchingEnvelopes.
                 // Route based on slot eligibility.
@@ -1721,7 +1721,13 @@ impl Herder {
                 debug!(slot, "Per-slot lifetime cap hit inside FetchingEnvelopes");
                 EnvelopeState::Invalid
             }
-        }
+            RecvResult::FutureSlotsFull => {
+                // Propagated to caller for warning/metric handling.
+                return (EnvelopeState::Invalid, Some(result));
+            }
+        };
+
+        (state, Some(result))
     }
 
     /// Process an SCP envelope after confirming tx sets are available.
@@ -1873,6 +1879,8 @@ impl Herder {
 
         if should_advance {
             self.pending_envelopes
+                .set_current_slot(externalized_slot + 1);
+            self.fetching_envelopes
                 .set_current_slot(externalized_slot + 1);
 
             // Transition to Tracking on successful externalization.
@@ -11169,13 +11177,13 @@ mod fetching_envelopes_routing_tests {
             .test_insert_ready(91, vec![make_fetching_test_envelope(91, 1)]);
 
         // Verify pre-conditions: all slots present
-        assert!(herder.fetching_envelopes.slots.contains_key(&50));
-        assert!(herder.fetching_envelopes.slots.contains_key(&64));
-        assert!(herder.fetching_envelopes.slots.contains_key(&91));
-        assert!(herder.fetching_envelopes.slots.contains_key(&103));
-        assert!(herder.fetching_envelopes.slots.contains_key(&202));
-        assert!(herder.fetching_envelopes.slots.contains_key(&203));
-        assert!(herder.fetching_envelopes.slots.contains_key(&210));
+        assert!(herder.fetching_envelopes.slots.read().contains_key(&50));
+        assert!(herder.fetching_envelopes.slots.read().contains_key(&64));
+        assert!(herder.fetching_envelopes.slots.read().contains_key(&91));
+        assert!(herder.fetching_envelopes.slots.read().contains_key(&103));
+        assert!(herder.fetching_envelopes.slots.read().contains_key(&202));
+        assert!(herder.fetching_envelopes.slots.read().contains_key(&203));
+        assert!(herder.fetching_envelopes.slots.read().contains_key(&210));
 
         // Act: call ledger_closed which triggers the pruning
         herder.ledger_closed(101, &[], &[], 0);
@@ -11183,7 +11191,7 @@ mod fetching_envelopes_routing_tests {
         // Assert upper-bound pruning: slots above 202 are gone
         for slot in 203..=210 {
             assert!(
-                !herder.fetching_envelopes.slots.contains_key(&slot),
+                !herder.fetching_envelopes.slots.read().contains_key(&slot),
                 "slot {} should have been pruned (above upper bound 202)",
                 slot
             );
@@ -11191,31 +11199,31 @@ mod fetching_envelopes_routing_tests {
 
         // Assert lower-bound pruning: slot 50 is gone (below min_slot=90, not checkpoint)
         assert!(
-            !herder.fetching_envelopes.slots.contains_key(&50),
+            !herder.fetching_envelopes.slots.read().contains_key(&50),
             "slot 50 should have been pruned (below min_slot 90, not checkpoint slot)"
         );
 
         // Assert checkpoint keep_slot exemption: slot 64 survives despite being below min
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&64),
+            herder.fetching_envelopes.slots.read().contains_key(&64),
             "slot 64 should be preserved (keep_slot = checkpoint = 64)"
         );
 
         // Assert within-retention-window slots are preserved
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&91),
+            herder.fetching_envelopes.slots.read().contains_key(&91),
             "slot 91 should be preserved (>= min_slot 90)"
         );
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&103),
+            herder.fetching_envelopes.slots.read().contains_key(&103),
             "slot 103 should be preserved (within bracket, above tracking)"
         );
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&150),
+            herder.fetching_envelopes.slots.read().contains_key(&150),
             "slot 150 should be preserved (within bracket)"
         );
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&202),
+            herder.fetching_envelopes.slots.read().contains_key(&202),
             "slot 202 should be preserved (boundary: 102 + 100 = 202)"
         );
     }
@@ -11243,7 +11251,7 @@ mod fetching_envelopes_routing_tests {
         herder.ledger_closed(1, &[], &[], 0);
 
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&1),
+            herder.fetching_envelopes.slots.read().contains_key(&1),
             "slot 1 should be preserved (no lower purge at genesis)"
         );
     }
@@ -11278,17 +11286,17 @@ mod fetching_envelopes_routing_tests {
 
         // Slot 1 is below min_slot (2) but is checkpoint keep_slot — preserved.
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&1),
+            herder.fetching_envelopes.slots.read().contains_key(&1),
             "slot 1 preserved as checkpoint keep_slot"
         );
         // Slot 2 is exactly at min_slot — preserved.
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&2),
+            herder.fetching_envelopes.slots.read().contains_key(&2),
             "slot 2 preserved (>= min_slot)"
         );
         // Slot 10 is within range — preserved.
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&10),
+            herder.fetching_envelopes.slots.read().contains_key(&10),
             "slot 10 preserved (within range)"
         );
     }
@@ -11327,22 +11335,22 @@ mod fetching_envelopes_routing_tests {
 
         // Slot 50 < min_slot (54) and != keep_slot (64) — pruned.
         assert!(
-            !herder.fetching_envelopes.slots.contains_key(&50),
+            !herder.fetching_envelopes.slots.read().contains_key(&50),
             "slot 50 should be pruned (below min_slot 54, not checkpoint)"
         );
         // Slot 53 < min_slot (54) and != keep_slot (64) — pruned.
         assert!(
-            !herder.fetching_envelopes.slots.contains_key(&53),
+            !herder.fetching_envelopes.slots.read().contains_key(&53),
             "slot 53 should be pruned (below min_slot 54, not checkpoint)"
         );
         // Slot 54 is exactly at min_slot — preserved.
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&54),
+            herder.fetching_envelopes.slots.read().contains_key(&54),
             "slot 54 preserved (== min_slot)"
         );
         // Slot 64 is checkpoint keep_slot — preserved.
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&64),
+            herder.fetching_envelopes.slots.read().contains_key(&64),
             "slot 64 preserved (checkpoint keep_slot and within range)"
         );
     }
@@ -11431,19 +11439,19 @@ mod fetching_envelopes_routing_tests {
 
         // Slot 1 should be PRESERVED as the checkpoint keep_slot.
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&1),
+            herder.fetching_envelopes.slots.read().contains_key(&1),
             "slot 1 must be preserved as checkpoint keep_slot (#2417)"
         );
 
         // Slot 5 is below purge_slot (202) and not the checkpoint — it gets erased.
         assert!(
-            !herder.fetching_envelopes.slots.contains_key(&5),
+            !herder.fetching_envelopes.slots.read().contains_key(&5),
             "slot 5 should be erased (below purge_slot 202, not checkpoint)"
         );
 
         // Slot 250 is above purge_slot — preserved (erase_outside_range only has min_slot).
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&250),
+            herder.fetching_envelopes.slots.read().contains_key(&250),
             "slot 250 should be preserved (above purge_slot)"
         );
     }
@@ -11477,7 +11485,7 @@ mod fetching_envelopes_routing_tests {
 
         // Slot 1 preserved as checkpoint keep_slot even with tracking_slot=0
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&1),
+            herder.fetching_envelopes.slots.read().contains_key(&1),
             "slot 1 must be preserved even with tracking_slot=0 (#2417)"
         );
     }
@@ -11520,19 +11528,19 @@ mod fetching_envelopes_routing_tests {
 
         // Slot 64 preserved as checkpoint keep_slot
         assert!(
-            herder.fetching_envelopes.slots.contains_key(&64),
+            herder.fetching_envelopes.slots.read().contains_key(&64),
             "slot 64 must be preserved as checkpoint keep_slot"
         );
 
         // Slot 1 is below purge_slot and NOT the checkpoint — erased
         assert!(
-            !herder.fetching_envelopes.slots.contains_key(&1),
+            !herder.fetching_envelopes.slots.read().contains_key(&1),
             "slot 1 should be erased (not checkpoint when past boundary)"
         );
 
         // Slot 50 is below purge_slot and NOT the checkpoint — erased
         assert!(
-            !herder.fetching_envelopes.slots.contains_key(&50),
+            !herder.fetching_envelopes.slots.read().contains_key(&50),
             "slot 50 should be erased"
         );
     }
