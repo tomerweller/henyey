@@ -291,6 +291,9 @@ impl OverlayManager {
             warn!("Rejected banned peer {}", peer_id);
             shared.metrics.inbound_reject.inc();
             peer.close().await;
+            if peer.holds_pending_peer_id() {
+                shared.pending_connections.release_peer_id(&peer_id);
+            }
             pool.release_pending();
             return;
         }
@@ -834,6 +837,9 @@ pub(super) async fn connect_to_explicit_peer(
     if shared.banned_peers.read().contains(&peer_id) {
         shared.metrics.outbound_reject.inc();
         peer.close().await;
+        if peer.holds_pending_peer_id() {
+            shared.pending_connections.release_peer_id(&peer_id);
+        }
         pool.release_pending();
         return Err(OverlayError::PeerBanned(peer_id.to_string()));
     }
