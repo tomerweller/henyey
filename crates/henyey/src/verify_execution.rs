@@ -173,6 +173,72 @@ fn describe_envelope(
     }
 }
 
+/// Extract a CSV summary of soroban diagnostic events from a transaction's
+/// meta. Captures the SCEC_EXCEEDED_LIMIT errors that pinpoint which
+/// stellar-core resource check fired (e.g.
+/// "operation byte-write resources exceeds amount specified") — critical
+/// for #2503 hash-mismatch divergence diagnosis.
+fn extract_diagnostic_event_summary(meta: Option<&stellar_xdr::curr::TransactionMeta>) -> String {
+    use stellar_xdr::curr::{ScVal, TransactionMeta};
+    let Some(meta) = meta else {
+        return String::new();
+    };
+    let events: &[stellar_xdr::curr::DiagnosticEvent] = match meta {
+        TransactionMeta::V3(m) => m
+            .soroban_meta
+            .as_ref()
+            .map(|s| s.diagnostic_events.as_slice())
+            .unwrap_or(&[]),
+        TransactionMeta::V4(m) => m.diagnostic_events.as_slice(),
+        _ => return String::new(),
+    };
+    let mut summaries = Vec::new();
+    for event in events {
+        let body = match &event.event.body {
+            stellar_xdr::curr::ContractEventBody::V0(b) => b,
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for topic in body.topics.as_slice() {
+            match topic {
+                ScVal::Symbol(s) => parts.push(s.to_utf8_string_lossy()),
+                ScVal::Error(e) => parts.push(format!("{:?}", e)),
+                ScVal::String(s) => parts.push(s.to_utf8_string_lossy()),
+                _ => parts.push(format!("{:?}", std::mem::discriminant(topic))),
+            }
+        }
+        match &body.data {
+            ScVal::Vec(Some(v)) => {
+                let inner: Vec<String> =
+                    v.0.as_slice()
+                        .iter()
+                        .filter_map(|x| match x {
+                            ScVal::U64(n) => Some(n.to_string()),
+                            ScVal::U32(n) => Some(n.to_string()),
+                            ScVal::I64(n) => Some(n.to_string()),
+                            ScVal::I32(n) => Some(n.to_string()),
+                            ScVal::Symbol(s) => Some(s.to_utf8_string_lossy()),
+                            ScVal::String(s) => Some(s.to_utf8_string_lossy()),
+                            _ => None,
+                        })
+                        .collect();
+                if !inner.is_empty() {
+                    parts.push(format!("[{}]", inner.join(",")));
+                }
+            }
+            ScVal::U64(n) => parts.push(n.to_string()),
+            ScVal::String(s) => parts.push(s.to_utf8_string_lossy()),
+            _ => {}
+        }
+        summaries.push(parts.join(":"));
+    }
+    let s = summaries.join(" | ");
+    if s.len() > 2000 {
+        format!("{}…", &s[..2000])
+    } else {
+        s
+    }
+}
+
 /// Returns (count, total_bytes) of non-TTL Created/Updated/Restored entries
 /// across a transaction's tx_apply_processing change groups. Mirrors the
 /// stellar-core write_bytes accounting (which excludes TTL entries) for
@@ -1047,22 +1113,26 @@ async fn verify_single_ledger(
             // Per-tx CDP result diagnostic: log each tx hash + fee_charged
             // from mainnet's recorded results so they can be diffed against
             // our per-tx WARN log emitted from manager.rs::commit.
-            let cdp_results = extract_transaction_results(&lcm);
-            let cdp_envelopes = henyey_history::cdp::extract_transaction_envelopes(&lcm);
-            let cdp_metas = henyey_history::cdp::extract_transaction_metas(&lcm);
-            for (i, pair) in cdp_results.iter().enumerate() {
-                let env = cdp_envelopes.get(i);
+            //
+            // CRITICAL: cdp envelopes (from tx_set, canonical order) and
+            // tx_processing (apply order) are NOT aligned by index. We MUST
+            // align by tx hash via extract_transaction_processing.
+            let network_id = stellar_xdr::curr::Hash(*ctx.ledger_manager.network_id().0.as_bytes());
+            let cdp_processing =
+                henyey_history::cdp::extract_transaction_processing(&lcm, &network_id);
+            for (i, info) in cdp_processing.iter().enumerate() {
                 let (op_types, declared_fee, soroban_resource_fee, soroban_resources) =
-                    describe_envelope(env);
-                let op_results = describe_op_results(&pair.result.result);
-                let (changes_count, changes_total_bytes) = summarize_cdp_meta(cdp_metas.get(i));
+                    describe_envelope(Some(&info.envelope));
+                let op_results = describe_op_results(&info.result.result.result);
+                let (changes_count, changes_total_bytes) = summarize_cdp_meta(Some(&info.meta));
+                let diag_events = extract_diagnostic_event_summary(Some(&info.meta));
                 tracing::warn!(
                     target: "hash_mismatch_debug",
                     ledger_seq = seq,
                     tx_index = i,
-                    tx_hash = %Hash256::from_bytes(pair.transaction_hash.0).to_hex(),
-                    fee_charged = pair.result.fee_charged,
-                    result_code = ?pair.result.result.discriminant(),
+                    tx_hash = %Hash256::from_bytes(info.result.transaction_hash.0).to_hex(),
+                    fee_charged = info.result.result.fee_charged,
+                    result_code = ?info.result.result.result.discriminant(),
                     op_results = %op_results,
                     declared_fee = declared_fee,
                     op_types = %op_types,
@@ -1070,7 +1140,8 @@ async fn verify_single_ledger(
                     soroban_resources = %soroban_resources,
                     cdp_meta_changes_count = changes_count,
                     cdp_meta_changes_total_bytes = changes_total_bytes,
-                    "Per-tx result (mainnet/CDP)"
+                    diag_events = %diag_events,
+                    "Per-tx result (mainnet/CDP, hash-aligned)"
                 );
             }
             if ctx.stop_on_error {
