@@ -28,6 +28,17 @@ use tokio::task::JoinHandle;
 /// filling outbound slots, to avoid overwhelming the network stack.
 const CONNECTION_ATTEMPT_DELAY_MS: u64 = 50;
 
+/// Pre-resolved peer address for batch dedup and outbound connection.
+///
+/// Carries the original address (for known-peer tracking and PeerInfo),
+/// the resolved IPv4 address (for TCP connect), and the canonical
+/// dedup key (`ip:port` string).
+struct ResolvedPeer {
+    original: PeerAddress,
+    resolved: PeerAddress,
+    key: String,
+}
+
 /// Resolve a PeerAddress to its canonical IPv4 form for dedup and transport.
 ///
 /// Mirrors stellar-core's `PeerBareAddress::resolve()` (PeerBareAddress.cpp:46-115):
@@ -480,25 +491,18 @@ impl OverlayManager {
     ///
     /// Used by `add_peer` for background connections discovered via Peers messages.
     async fn connect_to_discovered_peer(
-        addr: PeerAddress,
+        peer: ResolvedPeer,
         local_node: LocalNode,
         timeouts: crate::OutboundTimeouts,
         pool: Arc<ConnectionPool>,
         shared: SharedPeerState,
         connection_factory: Arc<dyn ConnectionFactory>,
     ) {
-        // Resolve hostname → IPv4 once. The resolved IP is used for both the
-        // pending-connection dedup key and the TCP connect, preventing
-        // hostname/IP aliasing. The original `addr` is kept for
-        // PeerInfo::original_address (hostname matching).
-        let (resolved_addr, addr_key) = match resolve_peer_address(&addr).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                debug!("Skipped discovered peer {}: {}", addr, e);
-                pool.release_pending();
-                return;
-            }
-        };
+        let ResolvedPeer {
+            original: addr,
+            resolved: resolved_addr,
+            key: addr_key,
+        } = peer;
 
         // Reserve address slot to prevent duplicate outbound dials. If the
         // address is already in flight, no actual dial happens, so this is a
@@ -657,11 +661,8 @@ impl OverlayManager {
             return Err(OverlayError::NotStarted);
         }
 
-        // Check if we're already connected to this address (any direction).
-        // Uses the canonical address-matching helper that handles hostnames
-        // (via original_address) and IP+port comparison correctly.
-        // Checked before pool capacity to match stellar-core's connectToImpl
-        // ordering and ensure AlreadyConnected is returned rather than PoolFull.
+        // Check already-connected before DNS resolution to avoid unnecessary
+        // lookups for peers we're already talking to.
         let already_connected = self
             .peer_info_cache
             .iter()
@@ -671,9 +672,47 @@ impl OverlayManager {
             return Ok(AddPeerOutcome::AlreadyConnected);
         }
 
+        // Resolve hostname → IPv4 once up front. The resolved IP is used for
+        // dedup and TCP connect; the original addr is kept for PeerInfo.
+        let (resolved_addr, addr_key) = resolve_peer_address(&addr).await?;
+        let resolved = ResolvedPeer {
+            original: addr,
+            resolved: resolved_addr,
+            key: addr_key,
+        };
+
+        self.add_peer_resolved(resolved).await
+    }
+
+    /// Add a pre-resolved peer to connect to.
+    ///
+    /// Internal helper used by both `add_peer` (after resolving) and
+    /// `add_peers` (which resolves in batch for dedup).
+    async fn add_peer_resolved(&self, resolved: ResolvedPeer) -> Result<AddPeerOutcome> {
+        // Check if we're already connected to this address (any direction).
+        // Uses the canonical address-matching helper that handles hostnames
+        // (via original_address) and IP+port comparison correctly.
+        // Checked before pool capacity to match stellar-core's connectToImpl
+        // ordering and ensure AlreadyConnected is returned rather than PoolFull.
+        //
+        // Note: `add_peer` checks this before resolving (with the raw address);
+        // we re-check here with the resolved address in case the resolved IP
+        // matches an existing connection that the raw hostname didn't catch.
+        let already_connected = self
+            .peer_info_cache
+            .iter()
+            .any(|entry| Self::peer_info_matches_address(entry.value(), &resolved.original));
+        if already_connected {
+            debug!("Already connected to {}", resolved.original);
+            return Ok(AddPeerOutcome::AlreadyConnected);
+        }
+
         // Check if we're at the connection limit
         if !self.outbound_pool.try_reserve() {
-            debug!("Outbound peer limit reached, not adding peer {}", addr);
+            debug!(
+                "Outbound peer limit reached, not adding peer {}",
+                resolved.original
+            );
             return Ok(AddPeerOutcome::PoolFull);
         }
 
@@ -687,7 +726,7 @@ impl OverlayManager {
         let peer_handles = Arc::clone(&shared.peer_handles);
         let peer_handle = tokio::spawn(async move {
             Self::connect_to_discovered_peer(
-                addr,
+                resolved,
                 local_node,
                 timeouts,
                 pool,
@@ -706,26 +745,48 @@ impl OverlayManager {
     ///
     /// This is used for peer discovery when we receive a Peers message.
     /// Returns the number of connection attempts initiated.
+    ///
+    /// Each address is resolved via DNS before dedup so that the canonical
+    /// `ip:port` key is used — matching the key used downstream by
+    /// `PendingConnections`. This prevents hostname/IP aliasing from
+    /// causing wasted dials and pool-slot churn.
     // SECURITY: dial dedup and queue bounded by max_peer_count config + peer universe
     pub async fn add_peers(&self, addrs: Vec<PeerAddress>) -> usize {
-        // Deduplicate addresses within the batch to prevent repeated dials
-        // to the same endpoint. Matches stellar-core's connectToImpl which
-        // checks pending connections by address before dialing.
-        let mut seen_addrs = std::collections::HashSet::new();
-        let unique_addrs: Vec<PeerAddress> = addrs
-            .into_iter()
-            .filter(|addr| seen_addrs.insert(format!("{}:{}", addr.host, addr.port)))
-            .collect();
-
+        let mut seen_keys = std::collections::HashSet::new();
         let mut added = 0;
         let target_outbound = self.config.target_outbound_peers;
         let mut remaining = target_outbound.saturating_sub(self.outbound_pool.count());
-        for addr in unique_addrs {
+
+        for addr in addrs {
+            // Always record the peer for future connection attempts, even if
+            // we can't resolve or dial it right now. The address was already
+            // persisted to the peer DB by the caller.
+            self.add_known_peer(addr.clone());
+
+            // Resolve to canonical ip:port key for dedup.
+            let (resolved_addr, addr_key) = match resolve_peer_address(&addr).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    debug!("Skipped peer {} in batch: {}", addr, e);
+                    continue;
+                }
+            };
+
+            // Dedup on resolved key — duplicates don't consume remaining budget.
+            if !seen_keys.insert(addr_key.clone()) {
+                continue;
+            }
+
             if remaining == 0 || !self.outbound_pool.can_accept() {
                 break;
             }
-            self.add_known_peer(addr.clone());
-            match self.add_peer(addr).await {
+
+            let resolved = ResolvedPeer {
+                original: addr,
+                resolved: resolved_addr,
+                key: addr_key,
+            };
+            match self.add_peer_resolved(resolved).await {
                 Ok(AddPeerOutcome::Initiated) => {
                     added += 1;
                     remaining = remaining.saturating_sub(1);
@@ -1179,9 +1240,16 @@ mod tests {
 
         assert!(manager.outbound_pool.try_reserve());
 
+        let addr_key = format!("{}:{}", addr.host, addr.port);
+        let resolved = ResolvedPeer {
+            original: addr.clone(),
+            resolved: addr.clone(),
+            key: addr_key.clone(),
+        };
+
         let start = Instant::now();
         OverlayManager::connect_to_discovered_peer(
-            addr.clone(),
+            resolved,
             manager.local_node.clone(),
             timeouts,
             Arc::clone(&manager.outbound_pool),
@@ -1206,7 +1274,6 @@ mod tests {
         assert_eq!(manager.outbound_pool.pending_count(), 0);
 
         // Verify cleanup: pending address reservation cleared.
-        let addr_key = format!("{}:{}", addr.host, addr.port);
         assert!(
             !shared
                 .pending_connections
@@ -1877,6 +1944,52 @@ mod tests {
                 .by_peer_id
                 .contains_key(&banned_id),
             "peer-ID reservation should NOT be released when holds_pending_peer_id is false"
+        );
+    }
+
+    // ---- add_peers batch dedup tests ----
+
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peers_dedup_same_ip_port() {
+        let manager = setup_manager_for_add_peer_dedup();
+
+        // Two identical entries should produce only one connection attempt.
+        let addrs = vec![
+            PeerAddress::new("127.0.0.1", 11625),
+            PeerAddress::new("127.0.0.1", 11625),
+        ];
+        let added = manager.add_peers(addrs).await;
+        assert_eq!(added, 1, "duplicate ip:port should be deduped to one dial");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peers_no_dedup_different_ports() {
+        let manager = setup_manager_for_add_peer_dedup();
+
+        // Different ports are distinct peers — both should be dialed.
+        let addrs = vec![
+            PeerAddress::new("127.0.0.1", 11625),
+            PeerAddress::new("127.0.0.1", 11626),
+        ];
+        let added = manager.add_peers(addrs).await;
+        assert_eq!(added, 2, "different ports should not dedup");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peers_duplicate_does_not_starve_unique() {
+        let manager = setup_manager_for_add_peer_dedup();
+
+        // Batch [A, A, B] with enough remaining budget — duplicate A
+        // should be skipped without consuming budget, so B gets dialed.
+        let addrs = vec![
+            PeerAddress::new("127.0.0.1", 11625),
+            PeerAddress::new("127.0.0.1", 11625),
+            PeerAddress::new("10.0.0.1", 11625),
+        ];
+        let added = manager.add_peers(addrs).await;
+        assert_eq!(
+            added, 2,
+            "duplicate should be skipped, unique peer should still be dialed"
         );
     }
 }
