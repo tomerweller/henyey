@@ -2,7 +2,7 @@
 //!
 //! This module provides Soroban execution for protocol version 25.
 //! It uses soroban-env-host-p25 which is pinned to the exact git revision
-//! used by stellar-core for protocol 25.
+//! recorded by the stellar-core submodule for protocol 25.
 //!
 //! After XDR alignment: the workspace stellar-xdr 25.0.0 and soroban-env-host
 //! P25's stellar-xdr 25.0.0 are the same crate, so all types are identical

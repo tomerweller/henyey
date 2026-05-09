@@ -38,18 +38,14 @@ rust-version = "1.76"
 stellar-xdr = { version = "=26.0.0", default-features = false, features = ["std", "curr", "serde", "serde_json"] }
 stellar-strkey = "0.0.11"
 
-# Soroban host for Protocol 24 (supports protocols 20-24)
-soroban-env-host-p24 = { package = "soroban-env-host", version = "=24.0.0" }
-
-# Soroban host for Protocol 25 (supports protocol 25+)
-soroban-env-host-p25 = { package = "soroban-env-host", version = "=25.0.0" }
-
-# Soroban host for Protocol 26 (supports protocol 26+)
-# Pinned to the exact revision used by stellar-core v26.0.1 on mainnet
-# (submodule at src/rust/soroban/p26). When the stellar-core submodule is
-# bumped, this pin must be updated to match the new submodule's p26
-# sub-submodule SHA (see #2503).
-soroban-env-host-p26 = { package = "soroban-env-host", version = "=26.0.0", git = "https://github.com/stellar/rs-soroban-env", rev = "b351f88a468d3b9e1d6de53d5b0ca585f6b7dadb" }
+# Soroban host crates — pinned to exact git revs from the stellar-core
+# submodule's recorded gitlinks for rs-soroban-env.
+# CI verifies alignment via scripts/check-soroban-pins.sh.
+# When bumping the stellar-core submodule, update these revs to match:
+#   git -C stellar-core ls-tree HEAD src/rust/soroban/p24 src/rust/soroban/p25 src/rust/soroban/p26
+soroban-env-host-p24 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
+soroban-env-host-p25 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "6323c1fc03ecb9f53b7c1e42fd62c1bbd3aebc2c" }
+soroban-env-host-p26 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "b351f88a468d3b9e1d6de53d5b0ca585f6b7dadb" }
 
 # Workspace crates
 henyey-common = { path = "crates/common" }
