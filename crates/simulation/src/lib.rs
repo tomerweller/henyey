@@ -1440,6 +1440,17 @@ impl Simulation {
     ) -> anyhow::Result<()> {
         let app = Self::wrap_app(app).await;
         app.bootstrap_from_db().await?;
+
+        // Defense-in-depth: a fresh simulation node must start at ledger 1.
+        let info = app.ledger_info();
+        anyhow::ensure!(
+            info.ledger_seq == 1,
+            "SIMULATION STATE LEAK: node {id} bootstrapped at ledger_seq={}, \
+             expected 1 (genesis). Database: {:?}",
+            info.ledger_seq,
+            data_dir.path(),
+        );
+
         self.spawn_insert_ready_node(id, app, data_dir, peer_port, timeout)
             .await
     }
@@ -1918,6 +1929,30 @@ pub fn initialize_genesis_ledger(
     let genesis_test_account_count = config.testing.genesis_test_account_count;
 
     let db = henyey_db::Database::open(&config.database.path)?;
+
+    // Defense-in-depth: verify the database is genuinely empty before writing
+    // genesis state. Catches state leaks from stale or reused database files.
+    db.with_connection(|conn| {
+        use henyey_db::queries::{LedgerQueries, StateQueries};
+        let existing_lcl = conn.get_last_closed_ledger()?;
+        if existing_lcl.is_some() {
+            return Err(henyey_db::DbError::Integrity(format!(
+                "SIMULATION STATE LEAK: database at {:?} already has LCL={:?}. \
+                 Expected empty database for genesis initialization.",
+                config.database.path, existing_lcl,
+            )));
+        }
+        let latest_header = conn.get_latest_ledger_seq()?;
+        if latest_header.is_some() {
+            return Err(henyey_db::DbError::Integrity(format!(
+                "SIMULATION STATE LEAK: database at {:?} has ledger headers \
+                 (latest={:?}) but no LCL. Expected empty database.",
+                config.database.path, latest_header,
+            )));
+        }
+        Ok(())
+    })?;
+
     let network_id = NetworkId::from_passphrase(network_passphrase);
     let root_secret = SecretKey::from_seed(network_id.as_bytes());
     let root_public = root_secret.public_key();
@@ -2063,6 +2098,25 @@ fn build_genesis_entries(
 fn root_secret(network_passphrase: &str) -> SecretKey {
     let network_id = NetworkId::from_passphrase(network_passphrase);
     SecretKey::from_seed(network_id.as_bytes())
+}
+
+impl Drop for Simulation {
+    fn drop(&mut self) {
+        if self.running_apps.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            count = self.running_apps.len(),
+            "Simulation::drop: running apps not stopped, forcing shutdown"
+        );
+        for (id, node) in &self.running_apps {
+            node.app.shutdown();
+            tracing::debug!(node = %id, "Simulation::drop: shutdown requested");
+        }
+        for (_id, node) in self.running_apps.drain() {
+            node.task.handle.abort();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2382,5 +2436,137 @@ mod crank_tests {
 
         assert_eq!(sim.nodes["A"].ledger_seq, 3);
         assert_eq!(sim.nodes["B"].ledger_seq, 3);
+    }
+}
+
+#[cfg(test)]
+mod genesis_freshness_tests {
+    use henyey_app::config::ConfigBuilder;
+    use henyey_db::queries::StateQueries;
+
+    use super::initialize_genesis_ledger;
+
+    #[test]
+    fn test_genesis_init_rejects_prepopulated_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("node.db");
+        let db = henyey_db::Database::open(&db_path).unwrap();
+        db.with_connection(|conn| {
+            conn.set_last_closed_ledger(999)?;
+            Ok::<_, henyey_db::DbError>(())
+        })
+        .unwrap();
+        drop(db);
+
+        let config = ConfigBuilder::new()
+            .database_path(&db_path)
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let result = initialize_genesis_ledger(&config, "Test SDF Network ; September 2015");
+        assert!(result.is_err(), "should reject pre-populated database");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("STATE LEAK"), "error: {err}");
+    }
+
+    #[test]
+    fn test_genesis_init_rejects_lcl_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("node.db");
+        let db = henyey_db::Database::open(&db_path).unwrap();
+        db.with_connection(|conn| {
+            conn.set_last_closed_ledger(0)?;
+            Ok::<_, henyey_db::DbError>(())
+        })
+        .unwrap();
+        drop(db);
+
+        let config = ConfigBuilder::new()
+            .database_path(&db_path)
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let result = initialize_genesis_ledger(&config, "Test SDF Network ; September 2015");
+        assert!(result.is_err(), "should reject database with LCL=0");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("STATE LEAK"), "error: {err}");
+    }
+
+    #[test]
+    fn test_genesis_init_rejects_stale_headers_without_lcl() {
+        use henyey_db::queries::LedgerQueries;
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("node.db");
+        let db = henyey_db::Database::open(&db_path).unwrap();
+
+        // Write a stale ledger header without setting LCL.
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 42,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 100_000_000,
+            max_tx_set_size: 100,
+            skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_xdr =
+            stellar_xdr::curr::WriteXdr::to_xdr(&header, stellar_xdr::curr::Limits::none())
+                .unwrap();
+        db.with_connection(|conn| {
+            conn.store_ledger_header(&header, &header_xdr)?;
+            Ok::<_, henyey_db::DbError>(())
+        })
+        .unwrap();
+        drop(db);
+
+        let config = ConfigBuilder::new()
+            .database_path(&db_path)
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let result = initialize_genesis_ledger(&config, "Test SDF Network ; September 2015");
+        assert!(
+            result.is_err(),
+            "should reject database with stale headers but no LCL"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("STATE LEAK"), "error: {err}");
+    }
+
+    #[test]
+    fn test_genesis_init_succeeds_on_empty_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("node.db");
+        // Create an empty database (schema only, no data).
+        let db = henyey_db::Database::open(&db_path).unwrap();
+        drop(db);
+
+        let config = ConfigBuilder::new()
+            .database_path(&db_path)
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let result = initialize_genesis_ledger(&config, "Test SDF Network ; September 2015");
+        assert!(
+            result.is_ok(),
+            "should succeed on empty database: {result:?}"
+        );
     }
 }
