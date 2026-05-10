@@ -2120,19 +2120,23 @@ fn root_secret(network_passphrase: &str) -> SecretKey {
 
 impl Drop for Simulation {
     fn drop(&mut self) {
-        if self.running_apps.is_empty() {
-            return;
+        if !self.running_apps.is_empty() {
+            tracing::warn!(
+                count = self.running_apps.len(),
+                "Simulation::drop: running apps not stopped, forcing shutdown"
+            );
+            for (id, node) in &self.running_apps {
+                node.app.shutdown();
+                tracing::debug!(node = %id, "Simulation::drop: shutdown requested");
+            }
+            for (_id, node) in self.running_apps.drain() {
+                node.task.handle.abort();
+            }
         }
-        tracing::warn!(
-            count = self.running_apps.len(),
-            "Simulation::drop: running apps not stopped, forcing shutdown"
-        );
-        for (id, node) in &self.running_apps {
-            node.app.shutdown();
-            tracing::debug!(node = %id, "Simulation::drop: shutdown requested");
-        }
-        for (_id, node) in self.running_apps.drain() {
-            node.task.handle.abort();
+
+        #[cfg(test)]
+        for (_id, node) in self.test_nodes.drain() {
+            node.handle.abort();
         }
     }
 }
@@ -2846,6 +2850,42 @@ mod defense_layer_tests {
             assert!(
                 rx.try_recv().is_ok(),
                 "node-{i} should have received shutdown signal"
+            );
+        }
+    }
+
+    /// Verify that `Simulation::drop` aborts task handles in `test_nodes`,
+    /// not just `running_apps`. Regression test for #2560.
+    #[tokio::test]
+    async fn test_drop_aborts_test_nodes() {
+        let mut abort_handles = Vec::new();
+
+        {
+            let mut sim = Simulation::new(SimulationMode::OverLoopback);
+
+            for i in 0..2 {
+                let handle = tokio::spawn(async {
+                    // Long-running pending task that should be aborted on drop.
+                    tokio::time::sleep(Duration::from_secs(999)).await;
+                    Ok(())
+                });
+                let abort = handle.abort_handle();
+                abort_handles.push(abort);
+
+                sim.insert_test_node(format!("test-node-{i}"), handle, None);
+            }
+
+            // Simulation is dropped here — Drop impl should abort test_nodes.
+        }
+
+        // Give the runtime a chance to process the abort signals.
+        tokio::task::yield_now().await;
+
+        // Verify all test_nodes tasks were aborted.
+        for (i, abort) in abort_handles.iter().enumerate() {
+            assert!(
+                abort.is_finished(),
+                "test-node-{i} task should be finished (aborted) after Simulation drop"
             );
         }
     }
