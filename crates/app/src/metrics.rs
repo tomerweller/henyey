@@ -1958,4 +1958,145 @@ mod tests {
     // counter!() and gauge constants only with gauge!(). That invariant is now
     // enforced at compile time by the typed wrapper structs (GaugeMetric,
     // CounterMetric, HistogramMetric) — a type mismatch is a compile error.
+
+    // ── Alert rules YAML validation ───────────────────────────────────────
+
+    mod alert_rules_validation {
+        use super::*;
+        use std::path::PathBuf;
+
+        /// Load and parse the alert rules YAML file.
+        fn load_alert_yaml() -> serde_yaml::Value {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../metrics/alerts/henyey-slo-alerts.yaml");
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            serde_yaml::from_str(&contents)
+                .unwrap_or_else(|e| panic!("failed to parse YAML {}: {e}", path.display()))
+        }
+
+        /// Collect all rule objects from groups[*].rules[*].
+        fn collect_rules(yaml: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
+            let groups = yaml["groups"]
+                .as_sequence()
+                .expect("YAML must have a 'groups' array");
+            let mut rules = Vec::new();
+            for group in groups {
+                if let Some(group_rules) = group["rules"].as_sequence() {
+                    rules.extend(group_rules.iter());
+                }
+            }
+            assert!(!rules.is_empty(), "no rules found in alert YAML");
+            rules
+        }
+
+        #[test]
+        fn test_alert_yaml_parses() {
+            let yaml = load_alert_yaml();
+            assert!(
+                yaml["groups"].as_sequence().is_some(),
+                "parsed YAML must contain a 'groups' array"
+            );
+        }
+
+        #[test]
+        fn test_alert_uids_unique() {
+            let yaml = load_alert_yaml();
+            let rules = collect_rules(&yaml);
+            let mut seen = HashSet::new();
+            let mut duplicates = Vec::new();
+            for rule in &rules {
+                let uid = rule["uid"].as_str().unwrap_or_else(|| {
+                    panic!("rule missing 'uid' or uid is not a string: {rule:?}")
+                });
+                if !seen.insert(uid) {
+                    duplicates.push(uid.to_string());
+                }
+            }
+            assert!(
+                duplicates.is_empty(),
+                "duplicate alert UIDs found: {duplicates:?}"
+            );
+        }
+
+        #[test]
+        fn test_alert_metrics_exist() {
+            let yaml = load_alert_yaml();
+            let rules = collect_rules(&yaml);
+
+            // Build the set of all known metric names from the catalog.
+            let mut known: HashSet<&str> = HashSet::new();
+            known.extend(ALL_GAUGE_NAMES.iter().copied());
+            known.extend(ALL_COUNTER_NAMES.iter().copied());
+            known.extend(ALL_HISTOGRAM_NAMES.iter().copied());
+
+            let ident_re = regex::Regex::new(r"[a-zA-Z_:][a-zA-Z0-9_:]*").unwrap();
+
+            let mut unknown = Vec::new();
+            for rule in &rules {
+                let uid = rule["uid"].as_str().unwrap_or("<no-uid>");
+                let data = match rule["data"].as_sequence() {
+                    Some(d) => d,
+                    None => continue,
+                };
+                for entry in data {
+                    // Skip Grafana expression nodes (threshold, reduce, etc.).
+                    if entry["datasourceUid"].as_str() == Some("__expr__") {
+                        continue;
+                    }
+                    let expr = match entry["model"]["expr"].as_str() {
+                        Some(e) => e,
+                        None => {
+                            panic!(
+                                "rule '{uid}': non-__expr__ data entry missing model.expr string"
+                            );
+                        }
+                    };
+                    for cap in ident_re.find_iter(expr) {
+                        let token = cap.as_str();
+                        if (token.starts_with("stellar_") || token.starts_with("henyey_"))
+                            && !known.contains(token)
+                        {
+                            unknown.push(format!("{uid}: {token}"));
+                        }
+                    }
+                }
+            }
+            assert!(
+                unknown.is_empty(),
+                "alert rules reference unknown metrics:\n  {}",
+                unknown.join("\n  ")
+            );
+        }
+
+        #[test]
+        fn test_alert_rule_count_matches_readme() {
+            let yaml = load_alert_yaml();
+            let rules = collect_rules(&yaml);
+            let yaml_count = rules.len();
+
+            let readme_path =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../metrics/alerts/README.md");
+            let readme = std::fs::read_to_string(&readme_path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", readme_path.display()));
+
+            let marker_re = regex::Regex::new(r"rule_count:\s*(\d+)").unwrap();
+            let matches: Vec<_> = marker_re.captures_iter(&readme).collect();
+            assert!(
+                !matches.is_empty(),
+                "no <!-- rule_count: N --> marker found in README"
+            );
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected exactly one rule_count marker in README, found {}",
+                matches.len()
+            );
+            let readme_count: usize = matches[0][1].parse().unwrap();
+            assert_eq!(
+                yaml_count, readme_count,
+                "YAML has {yaml_count} rules but README marker says {readme_count}"
+            );
+        }
+    }
 }

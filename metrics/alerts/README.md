@@ -1,5 +1,7 @@
 # Henyey SLO Alert Rules
 
+<!-- rule_count: 18 -->
+
 Grafana alert provisioning rules for henyey validator metrics. Rules are
 split into two categories:
 
@@ -102,7 +104,7 @@ alertable conditions).
    curl -s http://localhost:3000/api/v1/provisioning/alert-rules | jq '.[] | .title'
    ```
 
-   You should see 18 rules in the `Henyey` folder under the `henyey-slo`
+   You should see the alert rules in the `Henyey` folder under the `henyey-slo`
    rule group.
 
 ## Configuration

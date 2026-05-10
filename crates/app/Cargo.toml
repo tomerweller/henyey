@@ -104,3 +104,5 @@ henyey-herder = { workspace = true, features = ["test-utils", "test-support"] }
 # Enable test-only instrumentation on henyey-overlay (e.g.
 # `OverlayManager::inject_test_peer`) for handle_flood_demand regression tests.
 henyey-overlay = { workspace = true, features = ["test-utils"] }
+serde_yaml = "0.9"
+regex = "1"
