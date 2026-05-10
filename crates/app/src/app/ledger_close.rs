@@ -1725,12 +1725,52 @@ impl App {
             match buffer.get(&next_seq) {
                 Some(info) if info.tx_set.is_some() => info.clone(),
                 Some(info) => {
-                    tracing::debug!(
-                        next_seq,
-                        tx_set_hash = %info.tx_set_hash,
-                        "Buffered but waiting for tx_set"
-                    );
-                    return None;
+                    let buffered_hash = info.tx_set_hash;
+                    // Drop the lock before probing the herder — check_ledger_close
+                    // may call request_tx_set (benign side effect).
+                    drop(buffer);
+
+                    // Attempt to refresh the entry from the herder cache.
+                    // This resolves the race where tx_set was cached locally
+                    // (via trigger_next_ledger / handle_nomination_timeout /
+                    // cache_tx_set_and_drain) after the initial buffer insert.
+                    let refreshed = self.herder.check_ledger_close(next_seq as u64);
+                    if let Some(ref info) = refreshed {
+                        if info.tx_set.is_some() {
+                            let mut buffer = tracked_lock::tracked_write(
+                                "syncing_ledgers",
+                                &self.syncing_ledgers,
+                            )
+                            .await;
+                            let entry = buffer.entry(next_seq);
+                            let outcome = merge_into_buffer_entry(next_seq, entry, info.clone());
+                            if outcome.has_tx_set() {
+                                // Successfully refreshed — fall through to close.
+                                info.clone()
+                            } else {
+                                tracing::debug!(
+                                    next_seq,
+                                    tx_set_hash = %buffered_hash,
+                                    "Refresh merge rejected (hash mismatch)"
+                                );
+                                return None;
+                            }
+                        } else {
+                            tracing::debug!(
+                                next_seq,
+                                tx_set_hash = %buffered_hash,
+                                "Buffered but waiting for tx_set (refresh still None)"
+                            );
+                            return None;
+                        }
+                    } else {
+                        tracing::debug!(
+                            next_seq,
+                            tx_set_hash = %buffered_hash,
+                            "Buffered but waiting for tx_set"
+                        );
+                        return None;
+                    }
                 }
                 None => {
                     let is_externalized = self.herder.get_externalized(next_seq as u64).is_some();
@@ -3225,6 +3265,150 @@ mod fatal_shutdown_tests {
         assert!(
             result.is_none(),
             "try_start_ledger_close must return None when fatal_state_failure is set"
+        );
+    }
+}
+
+/// Regression test for #2564: try_start_ledger_close must refresh a stale
+/// syncing_ledgers entry (tx_set=None) from the herder cache.
+#[cfg(test)]
+mod refresh_stale_buffer_tests {
+    use super::*;
+    use henyey_common::Hash256;
+    use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
+
+    /// Helper: create a minimal App for testing.
+    async fn test_app() -> (Arc<App>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("test.db");
+        let bucket_dir = dir.path().join("buckets");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .bucket_directory(&bucket_dir)
+            .build();
+        let app = App::new(config).await.unwrap();
+        let app = Arc::new(app);
+        app.set_self_arc().await;
+        (app, dir)
+    }
+
+    /// When syncing_ledgers has an entry with tx_set=None but the herder's
+    /// TxSetTracker already has the set cached, try_start_ledger_close must
+    /// refresh the entry and proceed with the close.
+    #[tokio::test]
+    async fn test_refresh_stale_syncing_ledgers_entry() {
+        let (app, _dir) = test_app().await;
+
+        // The fresh app has current_ledger = 0, so next_seq = 1.
+        let next_seq: u32 = 1;
+        let slot: u64 = next_seq as u64;
+
+        // Create a tx_set with a known previous_ledger_hash.
+        let prev_hash = Hash256::ZERO;
+        let tx_set = henyey_herder::TransactionSet::new(prev_hash, vec![]);
+        let tx_set_hash = *tx_set.hash();
+
+        // Build a valid StellarValue XDR for the externalized slot.
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: Default::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let value_bytes = stellar_value.to_xdr(Limits::none()).unwrap();
+        let value = stellar_xdr::curr::Value(value_bytes.try_into().unwrap());
+
+        // Seed the herder: record the slot as externalized (with valid XDR).
+        app.herder
+            .scp_driver()
+            .record_externalized(slot, value, None);
+
+        // Seed syncing_ledgers with tx_set=None (simulating the race).
+        {
+            let mut buffer =
+                tracked_lock::tracked_write("syncing_ledgers", &app.syncing_ledgers).await;
+            buffer.insert(
+                next_seq,
+                henyey_herder::LedgerCloseInfo {
+                    slot,
+                    close_time: 1_700_000_000,
+                    tx_set_hash,
+                    tx_set: None,
+                    upgrades: vec![],
+                    stellar_value_ext: StellarValueExt::Basic,
+                },
+            );
+        }
+
+        // Without the tx_set cached, refresh should still return None.
+        let result = app.try_start_ledger_close().await;
+        assert!(
+            result.is_none(),
+            "Should return None when tx_set is not in herder cache"
+        );
+
+        // Now cache the tx_set in the herder's TxSetTracker.
+        app.herder.scp_driver().cache_tx_set(tx_set.clone());
+
+        // try_start_ledger_close should now refresh and succeed.
+        let result = app.try_start_ledger_close().await;
+        assert!(
+            result.is_some(),
+            "Should refresh stale buffer entry and return PendingLedgerClose"
+        );
+    }
+
+    /// When the herder returns a tx_set with a different hash than what's
+    /// buffered, the refresh must be rejected (no-op).
+    #[tokio::test]
+    async fn test_refresh_rejected_on_hash_mismatch() {
+        let (app, _dir) = test_app().await;
+
+        let next_seq: u32 = 1;
+        let slot: u64 = next_seq as u64;
+
+        // Create a tx_set and record externalized with its hash.
+        let tx_set = henyey_herder::TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_hash = *tx_set.hash();
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: Default::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let value_bytes = stellar_value.to_xdr(Limits::none()).unwrap();
+        let value = stellar_xdr::curr::Value(value_bytes.try_into().unwrap());
+
+        app.herder
+            .scp_driver()
+            .record_externalized(slot, value, None);
+        app.herder.scp_driver().cache_tx_set(tx_set);
+
+        // Seed syncing_ledgers with a DIFFERENT tx_set_hash (simulating mismatch).
+        let fake_hash = Hash256::from_bytes([0xAA; 32]);
+        {
+            let mut buffer =
+                tracked_lock::tracked_write("syncing_ledgers", &app.syncing_ledgers).await;
+            buffer.insert(
+                next_seq,
+                henyey_herder::LedgerCloseInfo {
+                    slot,
+                    close_time: 1_700_000_000,
+                    tx_set_hash: fake_hash,
+                    tx_set: None,
+                    upgrades: vec![],
+                    stellar_value_ext: StellarValueExt::Basic,
+                },
+            );
+        }
+
+        // Should return None because the hash doesn't match.
+        let result = app.try_start_ledger_close().await;
+        assert!(
+            result.is_none(),
+            "Should reject refresh when tx_set_hash doesn't match"
         );
     }
 }
