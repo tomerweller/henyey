@@ -1670,6 +1670,17 @@ impl App {
         overlay.add_peer(addr).await
     }
 
+    /// Returns true once the overlay manager has been started.
+    ///
+    /// This checks whether `App::run()` has completed its `start_overlay()`
+    /// call. It is a startup-completion signal, not a liveness guarantee —
+    /// the overlay may subsequently shut down. Used by the simulation harness
+    /// to gate connection attempts until all nodes are ready.
+    #[cfg(feature = "test-utils")]
+    pub async fn is_overlay_started(&self) -> bool {
+        self.overlay.read().await.is_some()
+    }
+
     pub fn latest_externalized_slot(&self) -> Option<u64> {
         self.herder.latest_externalized_slot()
     }

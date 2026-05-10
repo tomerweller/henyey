@@ -378,6 +378,11 @@ impl Simulation {
             self.running_apps.insert(id, running);
         }
 
+        // Wait for all overlays to start before returning, so callers
+        // can assume add_peer() won't return NotStarted.
+        self.wait_for_all_overlays_started(Duration::from_secs(30))
+            .await?;
+
         Ok(())
     }
 
@@ -453,6 +458,11 @@ impl Simulation {
 
         let running = Self::restore_and_spawn(app, data_dir, peer_port).await?;
         self.running_apps.insert(node_id.to_string(), running);
+
+        // Wait for all overlays (including the restarted node) to be started.
+        self.wait_for_all_overlays_started(Duration::from_secs(30))
+            .await?;
+
         Ok(())
     }
 
@@ -692,6 +702,55 @@ impl Simulation {
                     "wait_for_app_connectivity: not all apps reached {min_peers} peers \
                      within {timeout:?} (current counts: {}){task_diag}",
                     counts.join(", ")
+                )
+            }
+        }
+    }
+
+    /// Wait until every running app node's overlay manager has been started.
+    ///
+    /// Polls `is_overlay_started()` for each node with 50ms intervals using
+    /// the shared `poll_until` + `CrashScope::AllNodes` machinery.
+    ///
+    /// Called at the end of `try_start_all_nodes()` and `restart_node()` to
+    /// guarantee that `add_peer()` will not return `OverlayError::NotStarted`
+    /// when callers begin establishing connections.
+    async fn wait_for_all_overlays_started(&self, timeout: Duration) -> anyhow::Result<()> {
+        let outcome = poll_until(
+            self,
+            timeout,
+            Duration::from_millis(50),
+            CrashScope::AllNodes,
+            || async {
+                for node in self.running_apps.values() {
+                    if !node.app.is_overlay_started().await {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(()))
+            },
+        )
+        .await?;
+        match outcome {
+            PollOutcome::Satisfied(()) => Ok(()),
+            PollOutcome::NodeExited { node_id, status } => {
+                anyhow::bail!(
+                    "wait_for_all_overlays_started: node {node_id} task exited \
+                     (status: {status:?}) before all overlays were ready"
+                )
+            }
+            PollOutcome::TimedOut => {
+                let mut not_ready = Vec::new();
+                for (id, node) in &self.running_apps {
+                    if !node.app.is_overlay_started().await {
+                        not_ready.push(id.clone());
+                    }
+                }
+                not_ready.sort();
+                let task_diag = self.node_task_diagnostics().await;
+                anyhow::bail!(
+                    "wait_for_all_overlays_started: timed out after {timeout:?}, \
+                     nodes not ready: {not_ready:?}{task_diag}"
                 )
             }
         }
@@ -1191,6 +1250,16 @@ impl Simulation {
         let mut ids: Vec<String> = self.app_specs.keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// Check whether a specific node's overlay is started.
+    ///
+    /// Returns false if the node is not in `running_apps`.
+    pub async fn is_app_overlay_started(&self, node_id: &str) -> bool {
+        match self.running_apps.get(node_id) {
+            Some(node) => node.app.is_overlay_started().await,
+            None => false,
+        }
     }
 
     pub fn app_spec_public_key(&self, node_id: &str) -> Option<String> {

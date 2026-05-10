@@ -1412,6 +1412,46 @@ async fn test_stabilize_app_topology_connectivity_returns_error_on_timeout() {
     sim.stop_all_nodes().await.ok();
 }
 
+/// After `start_all_nodes()` returns, all overlays must be started and
+/// `repair_app_connectivity()` must not observe `overlay_not_ready`.
+#[tokio::test]
+async fn test_start_all_nodes_overlays_ready() {
+    for mode in [SimulationMode::OverLoopback, SimulationMode::OverTcp] {
+        let mut sim = Topologies::pair(mode);
+        sim.populate_app_nodes_from_existing(100);
+        sim.start_all_nodes().await;
+
+        // All overlays must be started after start_all_nodes returns.
+        for id in sim.app_node_ids() {
+            assert!(
+                sim.is_app_overlay_started(&id).await,
+                "overlay not started for {id} after start_all_nodes ({mode:?})"
+            );
+        }
+
+        sim.stop_all_nodes().await.ok();
+    }
+}
+
+/// After `restart_node()` returns, the restarted node's overlay must be
+/// started and an immediate connection must not return `NotStarted`.
+#[tokio::test]
+async fn test_restart_node_overlay_ready() {
+    let mut sim =
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
+    let ids = sim.app_node_ids();
+    let target = &ids[0];
+
+    sim.restart_node(target).await.expect("restart failed");
+
+    assert!(
+        sim.is_app_overlay_started(target).await,
+        "overlay not started for restarted node {target}"
+    );
+
+    sim.stop_all_nodes().await.ok();
+}
+
 #[tokio::test]
 async fn test_topology_connectivity_detects_cross_partition_connection() {
     // Create a separate topology: two isolated pairs (node0-node1, node2-node3).
