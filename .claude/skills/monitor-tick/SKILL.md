@@ -51,8 +51,9 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `last_ledger_count` | STUCK confirmation counter (check 4) | check 4 |
 | `wipe_attempted_at` | Epoch of most recent (3a) wipe; read by (3d) post-wipe recurrence guard | check 3a (write), check 3d marker-clear rule (remove) |
 | `tick-history.jsonl` | daily-summary aggregation | tick epilogue |
-| `metrics/current.prom` | latest Prometheus scrape | check 8 |
-| `metrics/prev.prom` | previous Prometheus scrape | check 8 |
+| `metrics/current.prom` | latest Prometheus scrape | check 12 |
+| `metrics/prev.prom` | previous Prometheus scrape | check 12 |
+| `metrics/scrape_identity` | process identity of the scrape now in prev.prom | check 12 |
 | `metrics/ratio_snapshot` | counter-ratio history (check 12) | check 12 |
 | `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b ([constants](../shared/check-12b-constants.toml)) |
 | `metrics/anomaly_cooldown.json` | alert dedup state | check 9 |
@@ -615,9 +616,85 @@ against a node that is in real-time sync with age=2s).
 
 1. `mkdir -p /home/tomer/data/$MONITOR_SESSION_ID/metrics`.
 2. `mv /home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom /home/tomer/data/$MONITOR_SESSION_ID/metrics/prev.prom 2>/dev/null || true`.
-3. `curl -s http://localhost:$MONITOR_ADMIN_PORT/metrics > /home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom`.
-4. **Counter reset handling**: for any counter, if `current < prev`, treat
-   `delta = current` (process restarted).
+3. Capture process identity (before curl):
+   ```bash
+   PID=$(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")
+   # If PID is empty (process not running), skip the entire metrics scan.
+   START_TICKS=$(awk '{print $22}' /proc/$PID/stat 2>/dev/null)
+   # If /proc/$PID/stat is unreadable, skip the entire metrics scan (fail closed).
+   ```
+4. `curl -s http://localhost:$MONITOR_ADMIN_PORT/metrics > /home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom`.
+5. **Process identity check for prev.prom validity:**
+
+   Verify PID stability across scrape:
+   ```bash
+   POST_TICKS=$(awk '{print $22}' /proc/$PID/stat 2>/dev/null)
+   # If unreadable OR POST_TICKS != START_TICKS: process died or was replaced
+   # during the scrape. Discard current.prom (truncate to empty). Do NOT write
+   # scrape_identity. Skip the entire metrics scan (fail closed).
+   ```
+
+   **Identity file:** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/scrape_identity`
+
+   This file describes the process that produced the scrape **now in `prev.prom`**.
+   It is written at the end of this step with the current tick's identity, which
+   becomes the prev.prom identity on the next tick (after step 2's `mv`).
+
+   Format (version 1):
+   ```
+   version=1
+   pid=<PID>
+   start_ticks=<field 22 from /proc/$PID/stat>
+   timestamp=<ISO8601>
+   ```
+
+   If `version` is not `1`, treat as malformed.
+
+   Procedure:
+   - If `scrape_identity` exists and is well-formed (`version=1`, contains `pid=`
+     and `start_ticks=` lines):
+     - Read `prev_pid` and `prev_start_ticks` from it.
+     - If `prev_pid != PID` or `prev_start_ticks != START_TICKS`:
+       **Process identity changed.** Set `PREV_PROM_INVALID=true`,
+       reason=`process identity changed`.
+     - If identity matches AND `prev.prom` is missing or empty:
+       **No baseline data.** Set `PREV_PROM_INVALID=true`,
+       reason=`no prev.prom`.
+   - If `scrape_identity` does not exist OR is malformed (`version` ≠ `1`,
+     missing required fields):
+     Set `PREV_PROM_INVALID=true` unconditionally,
+     reason=`no scrape_identity` or `scrape_identity malformed`.
+     This handles rollout (existing sessions have prev.prom but no
+     scrape_identity), manual deletion, and corruption.
+   - Write fresh identity file:
+     ```bash
+     printf "version=1\npid=%s\nstart_ticks=%s\ntimestamp=%s\n" \
+       "$PID" "$START_TICKS" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       > /home/tomer/data/$MONITOR_SESSION_ID/metrics/scrape_identity
+     ```
+
+   **Scrape failure / "recorder not installed" handling:** If the curl in step 4
+   returns empty or contains "recorder not installed", the existing metrics scan
+   skip logic halts processing before reaching this step's comparison logic.
+   `scrape_identity` from the previous tick is left untouched (still correctly
+   describes `prev.prom`). The fresh identity write is not reached, so no stale
+   identity is written. On the next tick, step 2 will `mv current.prom prev.prom`
+   (moving the empty scrape), and the "identity matches AND prev.prom is missing
+   or empty" clause will set `PREV_PROM_INVALID=true`.
+
+   **When `PREV_PROM_INVALID=true`:**
+   - Skip all §COUNTERS delta checks for this tick.
+   - Skip all §HISTOGRAMS delta checks for this tick (including the mean
+     fallback `sum_delta / count_delta`).
+   - Do NOT skip §GAUGES — gauges are point-in-time readings from `current.prom`
+     only and do not use `prev.prom`.
+   - Do NOT skip ratio_snapshot or counter_streak_snapshot checks — they have
+     their own independent PID/start_ticks invalidation logic and snapshot files.
+     Independence is safe: each check reads PID/start_ticks from `/proc` and
+     compares against its own snapshot.
+
+6. **Counter reset handling**: for any counter, if `current < prev`, treat
+   `delta = current` (defense-in-depth for within-incarnation counter resets).
 
 **Post-restart warmup exemptions** — for the first 2 ticks after a detected
 restart (check 3, check 10, or `CRASH_RECOVERY=yes`), skip these alerts.
@@ -951,7 +1028,7 @@ states (ledger age > 30s, gap > 5, etc.), but the recovery-stalled counter fires
 precisely during recovery transitions when the node is briefly unsynced.
 
 **Data source:** Reuses the same `/metrics` scrape result (`$metrics_body` /
-`metrics/current.prom`) already fetched by check-8/check-12. Does NOT perform a
+`metrics/current.prom`) already fetched by check-12. Does NOT perform a
 second `/metrics` fetch.
 
 **Applicability:** Validator mode only. In watcher mode, skip Check 12b entirely
@@ -1567,7 +1644,7 @@ MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   disk:    <used>/<total> (<pct>%) | session+data=<size>
   rpc:     <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
   obsrvr:  <validating=<Y/N> val24h=<pct>% lag=<N> | N/A (watcher) | N/A (api-error)>
-  metrics: <clean | N alerts (<metric1>,<metric2>,...) — filed/commented #<N>,#<M> | N alerts, K suppressed by cooldown>
+  metrics: <clean | N alerts (<metric1>,<metric2>,...) — filed/commented #<N>,#<M> | N alerts, K suppressed by cooldown | baselines skipped (<reason>) | baselines skipped (<reason>), N gauge alerts (<metric1>,...) — filed/commented #<N>>
   metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating>, pending <ok (too_old=Z%) | skipped (reason) | WARNING too_old=Z%>50% (N ticks)> | collecting baseline
   recovery_stalled: <ok (delta=0) | breach (delta=N, streak M/3) | WARNING delta=N (M ticks) — investigating | WARNING delta=N (burst) — investigating | skipped (<reason>) | collecting baseline>
   deploy:  <up-to-date | DEFERRED (quarantined: <sha8> reachable from origin/main — see ~/data/deploy_quarantine.txt) | BLOCKED (quarantine file unreadable — fail-closed) | BLOCKED (quarantine ancestry check failed for <sha8> — fail-closed) | DEFERRED (cool-down: ...) | SYNCED (no-binary-impact: ...) | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
