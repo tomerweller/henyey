@@ -49,6 +49,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `build_sha` | Cache of deployed binary's source commit (authoritative source: runtime `/info.commit_hash`; seeded by build step) | check 10 (after successful build or runtime self-heal) and `monitor-loop` step 5 |
 | `last_ledger` | STUCK detection state (check 4) | check 4 |
 | `last_ledger_count` | STUCK confirmation counter (check 4) | check 4 |
+| `wipe_attempted_at` | Epoch of most recent (3a) wipe; read by (3d) post-wipe recurrence guard | check 3a (write), check 3d marker-clear rule (remove) |
 | `tick-history.jsonl` | daily-summary aggregation | tick epilogue |
 | `metrics/current.prom` | latest Prometheus scrape | check 8 |
 | `metrics/prev.prom` | previous Prometheus scrape | check 8 |
@@ -384,13 +385,78 @@ rm -rf /home/tomer/data/mainnet/buckets
 
 # Reset progression tracker so the next tick treats this as a fresh start
 rm -f /home/tomer/data/$MONITOR_SESSION_ID/last_ledger
+
+# Mark the wipe action — read by (3d) to detect post-wipe recurrence.
+# Stores the wipe epoch; cleared by (3d) when stable-recovery condition holds.
+date -u +%s > /home/tomer/data/$MONITOR_SESSION_ID/wipe_attempted_at
 ```
 
 Then Relaunch. The next tick will see `FRESH_START=yes` (mainnet.db absent), apply the 20m sync deadline, and let the node fresh-catchup from network archive (typically ~10–15 min to validating, observed ~9 min on 2026-05-09).
 
 File a new `urgent` GH issue documenting the wipe with the count of crashed rotations, the hash-mismatch evidence from the latest crashed log, and the cumulative downtime — this is a data point for whether the underlying recovery code path needs further hardening even though the immediate cause was already fixed. Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 
-The trigger is self-rate-limiting: after a wipe, the new `.crashed-*` rotations stop accumulating (the symptom is gone), so the 3-in-30-min window can't fire again until something else goes wrong.
+The 3-in-30-min trigger is self-rate-limiting only when the underlying fault is local state corruption — after a successful wipe + fresh-catchup, new `.crashed-*` rotations stop. **(3d) Post-wipe recurrence guard** below catches the alternate failure mode where the freshly-rebuilt state trips the same `fatal_wipe_required` signal — proof that the bug is in the apply path itself, not on disk — and prevents an infinite wipe→catchup→crash loop.
+
+**(3d) Post-wipe recurrence guard** — when 3a's wipe doesn't fix the symptom (a new `crashed-*` rotation with `fatal_wipe_required=true` appears AFTER the wipe), the binary is the suspect, not local state. Looping 3a indefinitely wastes downtime and archive bandwidth. Stop relaunching, auto-quarantine the build SHA, and wait for operator-applied rollback or fix. Evaluate (3d) BEFORE (3a) in the dead-process path; if (3d) fires, skip (3a) and skip Relaunch.
+
+```bash
+marker=/home/tomer/data/$MONITOR_SESSION_ID/wipe_attempted_at
+post_wipe_recurrence=no
+if [ -s "$marker" ]; then
+  wipe_epoch=$(cat "$marker" 2>/dev/null | tr -dc '0-9')
+  # Use the same detect_crash_state result already populated for (3a):
+  # CRASH_LATEST_FILE + CRASH_HASH_MISMATCH are valid in this scope.
+  if [ -n "${CRASH_LATEST_FILE:-}" ] && [ -n "${wipe_epoch:-}" ]; then
+    latest_mtime=$(stat -c %Y "$CRASH_LATEST_FILE" 2>/dev/null || echo 0)
+    if [ "$latest_mtime" -gt "$wipe_epoch" ] && [ "${CRASH_HASH_MISMATCH:-no}" = "yes" ]; then
+      post_wipe_recurrence=yes
+    fi
+  fi
+fi
+```
+
+When `post_wipe_recurrence=yes`:
+
+```bash
+# 1. Auto-quarantine the build SHA. Idempotent — already-present is OK.
+source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
+build_sha=$(cat "/home/tomer/data/$MONITOR_SESSION_ID/build_sha" 2>/dev/null || true)
+if [ -n "$build_sha" ]; then
+  quarantine_append "$HOME/data/deploy_quarantine.txt" "$build_sha" \
+    "post-wipe recurrence (3d) — see urgent issue"
+fi
+
+# 2. Do NOT relaunch. Do NOT fire (3a) again — wipe already proved insufficient.
+# 3. Report OFFLINE with `actions: ["post-wipe-recurrence", "auto-quarantined"]`
+#    and `watch: ["determinism-suspect-binary"]`.
+```
+
+File or comment on an `urgent` GH issue marking the binary as a determinism-suspect: include the build SHA, the wipe epoch from the marker, the latest crashed-log hash-mismatch evidence, and the cumulative downtime since wipe. Title pattern: `"OFFLINE: post-wipe recurrence on <sha:8> — binary quarantined"`. If an open issue already names the same `build_sha` as determinism-suspect, comment on it instead of filing a duplicate. Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+
+**Recovery from (3d) is operator-driven.** The deploy gate at section 10 step 3 (Quarantine gate) will continue to BLOCK redeploy of the quarantined SHA as long as it is reachable from `origin/main`. Operator action: revert/rollback the bad commit so it is no longer in `origin/main`'s ancestry; the next tick's deploy gate will then let the rebuild + relaunch proceed normally. The marker is cleared automatically by the recovery rule below — operators do not need to remove it manually.
+
+**Marker-clear rule** — runs each tick when the process is alive. Clear `wipe_attempted_at` only when the binary has demonstrably stabilized:
+
+```bash
+marker=/home/tomer/data/$MONITOR_SESSION_ID/wipe_attempted_at
+if [ -s "$marker" ] && [ -n "${PID:-}" ]; then
+  PROC_START_EPOCH=$(stat -c %Y /proc/$PID/stat 2>/dev/null || echo 0)
+  uptime_sec=$(( $(date -u +%s) - PROC_START_EPOCH ))
+  has_fatal_wipe_evidence "$logs_dir" "$logs_dir/monitor.log"  # sets FATAL_WIPE_EVIDENCE
+  ledger_advanced=no
+  # last_ledger holds the previous tick's value, stashed before check (2) overwrites
+  if [ -n "${PREV_LEDGER:-}" ] && [ -n "${LEDGER:-}" ] && [ "$LEDGER" -gt "$PREV_LEDGER" ]; then
+    ledger_advanced=yes
+  fi
+  if [ "$uptime_sec" -gt 1800 ] \
+     && [ "${FATAL_WIPE_EVIDENCE:-no}" = "no" ] \
+     && [ "$ledger_advanced" = "yes" ]; then
+    rm -f "$marker"
+  fi
+fi
+```
+
+All four conditions (alive, uptime > 30m, no `fatal_wipe_required` since proc start, last_ledger advanced) must hold simultaneously to clear the marker. Quarantine entries are NOT auto-removed — operators clear them deliberately per the Quarantine Clearance procedure (section 10).
 
 **(3c) Soft-fail state-wipe trigger** — defense-in-depth for the case where
 `trigger_fatal_shutdown()` signals exit but the process fails to terminate,
