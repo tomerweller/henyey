@@ -1286,6 +1286,11 @@ impl App {
         overlay_config.is_validator = self.is_validator; // Watchers filter non-essential messages
         overlay_config.network_passphrase = self.config.network.passphrase.clone();
 
+        // Resolve config hostnames to IPs so the merge with persisted (already
+        // resolved) peers can dedup correctly via canonical_key().
+        overlay_config.known_peers =
+            Self::resolve_peers_for_storage(&overlay_config.known_peers).await;
+
         match self.load_persisted_peers().await {
             Ok(persisted) => {
                 let mut existing_keys: std::collections::HashSet<String> = overlay_config

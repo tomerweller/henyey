@@ -920,7 +920,13 @@ mod tests {
 
     #[test]
     fn test_canonical_key_same_ip_different_format() {
-        // Both should produce the same canonical key
+        // Hostname falls back to raw string — it won't match its resolved IP.
+        // This documents the limitation (hostnames must be resolved before dedup).
+        let hostname = PeerAddress::new("core-testnet1.stellar.org", 11625);
+        let ip = PeerAddress::new("34.235.168.98", 11625);
+        assert_ne!(hostname.canonical_key(), ip.canonical_key());
+
+        // But two identical IPs always produce the same key
         let addr1 = PeerAddress::new("10.0.0.1", 11625);
         let addr2 = PeerAddress::new("10.0.0.1", 11625);
         assert_eq!(addr1.canonical_key(), addr2.canonical_key());

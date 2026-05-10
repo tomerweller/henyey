@@ -499,18 +499,19 @@ impl PeerManager {
     /// Get peers to send to another peer.
     pub fn get_peers_to_send(&self, size: usize, exclude: &PeerAddress) -> Vec<PeerAddress> {
         let cache = self.cache.read();
+        let exclude_key = exclude.canonical_key();
 
         let mut candidates: Vec<&PeerRecord> = cache
             .values()
             .filter(|r| {
                 // Don't send peer back to itself
-                if r.ip == exclude.host && r.port == exclude.port {
+                let r_addr = PeerAddress::new(r.ip.clone(), r.port);
+                if r_addr.canonical_key() == exclude_key {
                     return false;
                 }
 
                 // Don't send private addresses
-                let addr = PeerAddress::new(r.ip.clone(), r.port);
-                !addr.is_private()
+                !r_addr.is_private()
             })
             .collect();
 

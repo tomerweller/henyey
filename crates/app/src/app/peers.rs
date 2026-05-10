@@ -404,7 +404,7 @@ impl App {
     ///
     /// If DNS resolution fails for a hostname, the original hostname is kept
     /// so the peer is still stored (it will be resolved later in the DNS cycle).
-    async fn resolve_peers_for_storage(peers: &[PeerAddress]) -> Vec<PeerAddress> {
+    pub(super) async fn resolve_peers_for_storage(peers: &[PeerAddress]) -> Vec<PeerAddress> {
         use std::net::IpAddr;
 
         let mut resolved = Vec::with_capacity(peers.len());
@@ -518,8 +518,9 @@ impl App {
         let preferred_peers_config = self.config.overlay.preferred_peers.clone();
         let max_failures = self.config.overlay.peer_max_failures;
 
-        // Resolve preferred peer hostnames to IPs before DB operations,
+        // Resolve config hostnames to IPs before DB operations,
         // preventing hostname/IP alias duplicates in the peer database.
+        let resolved_known = Self::resolve_peers_for_storage(&known_peers_config).await;
         let resolved_preferred = Self::resolve_peers_for_storage(&preferred_peers_config).await;
 
         // Phase 1: All DB work on the blocking pool
@@ -533,9 +534,9 @@ impl App {
             .db_blocking("refresh-known-peers", move |db| {
                 let now = current_epoch_seconds();
 
-                // Build peer list from config
+                // Build peer list from resolved config peers
                 let mut peers = Vec::new();
-                for addr in &known_peers_config {
+                for addr in &resolved_known {
                     peers.push(addr.clone());
                 }
                 for addr in &resolved_preferred {
@@ -588,12 +589,12 @@ impl App {
                     filtered_peers.push(peer);
                 }
 
-                // Build advertised outbound
+                // Build advertised outbound (use resolved addresses)
                 let mut advertised_outbound = Vec::new();
-                for addr in &known_peers_config {
+                for addr in &resolved_known {
                     advertised_outbound.push(addr.clone());
                 }
-                for addr in &preferred_peers_config {
+                for addr in &resolved_preferred {
                     advertised_outbound.push(addr.clone());
                 }
                 let adv_outbound_filter = henyey_db::queries::PeerFilter {
