@@ -121,9 +121,9 @@ impl CatchupManager {
         target: u32,
         ledger_manager: &LedgerManager,
     ) -> Result<(HeaderSnapshot, u32)> {
-        let fallback_archive = self
+        let last_archive = self
             .archives
-            .first()
+            .last()
             .map(|a| a.name().to_owned())
             .unwrap_or_default();
         let result = self
@@ -138,9 +138,10 @@ impl CatchupManager {
                 .increment(1);
             }
             Err(_) => {
+                // All retries exhausted — attribute to the last attempted archive.
                 metrics::counter!(
                     "stellar_history_apply_ledger_chain_failure_total",
-                    "archive" => fallback_archive,
+                    "archive" => last_archive,
                 )
                 .increment(1);
             }
@@ -177,13 +178,9 @@ impl CatchupManager {
 
             if replay_first > target {
                 // Already past target — previous partial replay succeeded fully.
+                // No download occurred this iteration, so use "none".
                 let ledgers_applied = target.saturating_sub(current_lcl);
-                let archive = self
-                    .archives
-                    .first()
-                    .map(|a| a.name().to_owned())
-                    .unwrap_or_default();
-                return Ok((snap, ledgers_applied, archive));
+                return Ok((snap, ledgers_applied, "none".to_owned()));
             }
 
             // Download from the checkpoint containing replay_first - 1 (the LCL).

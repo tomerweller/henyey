@@ -328,11 +328,8 @@ impl CatchupManager {
         let mut data = Vec::new();
         let mut checkpoint_cache: HashMap<u32, CheckpointLedgerData> = HashMap::new();
         // Track the last archive that served data; used for metric attribution.
-        let mut last_archive_name = self
-            .archives
-            .first()
-            .map(|a| a.name().to_owned())
-            .unwrap_or_default();
+        // Initialized to "none" — only set to an actual archive when a download occurs.
+        let mut last_archive_name = "none".to_owned();
 
         // We need to download data for ledgers (from_ledger+1) to to_ledger.
         // The from_ledger's state is already in the bucket list.
