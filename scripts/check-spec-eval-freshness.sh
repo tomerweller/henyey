@@ -42,7 +42,9 @@ echo
 # =========================================================================
 echo "Pass 1: Checking version references in spec-eval docs..."
 
+shopt -s nullglob
 spec_eval_files=( docs/spec-eval/*_SPEC_HENYEY_EVAL.md )
+shopt -u nullglob
 if [ ${#spec_eval_files[@]} -eq 0 ]; then
     echo "  WARNING: no *_SPEC_HENYEY_EVAL.md files found in docs/spec-eval/"
     warnings=$((warnings + 1))
@@ -121,8 +123,8 @@ for ps in crates/*/PARITY_STATUS.md; do
     done
 
     if [ "$found" = false ]; then
-        echo "  ⚠ $ps exists but is not referenced in README.md"
-        warnings=$((warnings + 1))
+        echo "  ✗ $ps exists but is not referenced in README.md"
+        errors=$((errors + 1))
     fi
 done
 echo
