@@ -1287,19 +1287,20 @@ impl App {
         overlay_config.network_passphrase = self.config.network.passphrase.clone();
 
         // Resolve config hostnames to IPs so the merge with persisted (already
-        // resolved) peers can dedup correctly via canonical_key().
+        // resolved) peers can dedup correctly via dial_key().
         overlay_config.known_peers =
             Self::resolve_peers_for_storage(&overlay_config.known_peers).await;
 
         match self.load_persisted_peers().await {
             Ok(persisted) => {
-                let mut existing_keys: std::collections::HashSet<String> = overlay_config
-                    .known_peers
-                    .iter()
-                    .map(|p| p.canonical_key())
-                    .collect();
+                let mut existing_keys: std::collections::HashSet<henyey_overlay::DialKey> =
+                    overlay_config
+                        .known_peers
+                        .iter()
+                        .map(|p| p.dial_key())
+                        .collect();
                 for addr in persisted {
-                    if existing_keys.insert(addr.canonical_key()) {
+                    if existing_keys.insert(addr.dial_key()) {
                         overlay_config.known_peers.push(addr);
                     }
                 }

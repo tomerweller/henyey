@@ -46,7 +46,8 @@ use crate::{
     flow_control::{FlowControl, FlowControlBytesConfig, ScpQueueCallback},
     metrics::OverlayMetrics,
     peer::{PeerInfo, PeerStats, PeerStatsSnapshot},
-    LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, Result,
+    DialKey, LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId,
+    ResolvedPeerAddr, Result,
 };
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -210,8 +211,8 @@ pub(super) struct KnownPeerSet {
     /// Peers discovered via gossip/DB refresh (arrive as IPs).
     /// Capped at `MAX_KNOWN_PEERS - config_entries.len()`.
     discovered: Vec<PeerAddress>,
-    /// Dedup set for discovered entries (canonical_key based).
-    discovered_keys: HashSet<String>,
+    /// Dedup set for discovered entries (DialKey based).
+    discovered_keys: HashSet<DialKey>,
 }
 
 impl KnownPeerSet {
@@ -250,14 +251,14 @@ impl KnownPeerSet {
         if self.discovered.len() >= cap {
             return false;
         }
-        let key = addr.canonical_key();
+        let key = addr.dial_key();
         // Check against config entries (both hostname and resolved forms)
         for (i, config) in self.config_entries.iter().enumerate() {
-            if config.canonical_key() == key {
+            if config.dial_key() == key {
                 return false;
             }
             if let Some(resolved) = &self.resolved[i] {
-                if resolved.canonical_key() == key {
+                if resolved.dial_key() == key {
                     return false;
                 }
             }
@@ -277,14 +278,14 @@ impl KnownPeerSet {
         self.discovered_keys.clear();
         self.discovered.clear();
         // Build config key set for filtering (both hostname and resolved forms).
-        let config_keys: HashSet<String> = self
+        let config_keys: HashSet<DialKey> = self
             .config_entries
             .iter()
             .enumerate()
             .flat_map(|(i, config)| {
-                let mut keys = vec![config.canonical_key()];
+                let mut keys = vec![config.dial_key()];
                 if let Some(resolved) = &self.resolved[i] {
-                    keys.push(resolved.canonical_key());
+                    keys.push(resolved.dial_key());
                 }
                 keys
             })
@@ -294,7 +295,7 @@ impl KnownPeerSet {
             if self.discovered.len() >= cap {
                 break;
             }
-            let key = peer.canonical_key();
+            let key = peer.dial_key();
             if config_keys.contains(&key) {
                 continue;
             }
@@ -306,23 +307,23 @@ impl KnownPeerSet {
 
     /// Get shuffled dial targets: resolved IP for config entries with successful
     /// DNS, hostname for never-resolved entries, discovered peers as-is.
-    /// Deduplicates by canonical_key (two hostnames → same IP = one entry).
+    /// Deduplicates by dial_key (two hostnames → same IP = one entry).
     pub(super) fn shuffled_dial_entries(&self, rng: &mut impl Rng) -> Vec<PeerAddress> {
         let mut entries = Vec::with_capacity(self.config_entries.len() + self.discovered.len());
-        let mut seen_keys = HashSet::new();
+        let mut seen_keys: HashSet<DialKey> = HashSet::new();
 
         for (i, config) in self.config_entries.iter().enumerate() {
             let dial_addr = match &self.resolved[i] {
                 Some(resolved) => resolved.clone(),
                 None => config.clone(),
             };
-            if seen_keys.insert(dial_addr.canonical_key()) {
+            if seen_keys.insert(dial_addr.dial_key()) {
                 entries.push(dial_addr);
             }
         }
 
         for discovered in &self.discovered {
-            if seen_keys.insert(discovered.canonical_key()) {
+            if seen_keys.insert(discovered.dial_key()) {
                 entries.push(discovered.clone());
             }
         }
@@ -449,8 +450,8 @@ impl AdmissionState {
 /// Matches stellar-core's `mPendingPeers` dedup (Peer.cpp:1881-1909).
 #[derive(Clone)]
 pub(super) struct PendingConnections {
-    /// In-flight connections by target address (host:port string).
-    pub(super) by_address: Arc<DashMap<String, std::time::Instant>>,
+    /// In-flight connections by resolved target address.
+    pub(super) by_address: Arc<DashMap<ResolvedPeerAddr, std::time::Instant>>,
     /// In-flight connections by peer ID (known after handshake).
     pub(super) by_peer_id: Arc<DashMap<PeerId, PendingPeerEntry>>,
 }
@@ -481,7 +482,7 @@ impl PendingConnections {
 
     /// Try to reserve a pending outbound connection to the given address.
     /// Returns false if a connection to this address is already in flight.
-    pub(super) fn try_reserve_address(&self, addr_key: String) -> bool {
+    pub(super) fn try_reserve_address(&self, addr_key: ResolvedPeerAddr) -> bool {
         use dashmap::mapref::entry::Entry;
         match self.by_address.entry(addr_key) {
             Entry::Occupied(_) => false,
@@ -515,7 +516,7 @@ impl PendingConnections {
     }
 
     /// Release a pending address reservation.
-    pub(super) fn release_address(&self, addr_key: &str) {
+    pub(super) fn release_address(&self, addr_key: &ResolvedPeerAddr) {
         self.by_address.remove(addr_key);
     }
 
@@ -1315,7 +1316,7 @@ impl OverlayManager {
         exclude: Option<&PeerAddress>,
     ) -> Option<StellarMessage> {
         let mut peers = Vec::new();
-        let mut unique = HashSet::new();
+        let mut unique: HashSet<ResolvedPeerAddr> = HashSet::new();
         let mut ordered_outbound: Vec<&PeerAddress> = outbound.iter().collect();
         let mut ordered_inbound: Vec<&PeerAddress> = inbound.iter().collect();
         ordered_outbound.shuffle(&mut rand::thread_rng());
@@ -1333,7 +1334,11 @@ impl OverlayManager {
                     continue;
                 }
             }
-            if !unique.insert(addr.canonical_key()) {
+            // Only advertise resolved IPv4 addresses; skip hostnames at startup.
+            let Some(key) = ResolvedPeerAddr::try_from_peer_address(addr) else {
+                continue;
+            };
+            if !unique.insert(key) {
                 continue;
             }
             if let Some(xdr) = Self::peer_address_to_xdr(addr) {
@@ -2084,8 +2089,12 @@ mod tests {
 
     #[test]
     fn test_pending_connections_address_dedup() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
         let pending = PendingConnections::new();
-        let addr = "10.0.0.1:11625".to_string();
+        let addr = ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            11625,
+        ));
 
         assert!(
             pending.try_reserve_address(addr.clone()),
@@ -2103,7 +2112,10 @@ mod tests {
         );
 
         // Same IP, different port should succeed independently
-        let addr2 = "10.0.0.1:11626".to_string();
+        let addr2 = ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            11626,
+        ));
         assert!(
             pending.try_reserve_address(addr2),
             "same IP but different port should succeed"
@@ -2133,8 +2145,12 @@ mod tests {
 
     #[test]
     fn test_pending_connections_independent_tracking() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
         let pending = PendingConnections::new();
-        let addr = "10.0.0.1:11625".to_string();
+        let addr = ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            11625,
+        ));
         let peer_id = PeerId::from_bytes([1u8; 32]);
 
         // Address and peer_id are independent
@@ -2142,14 +2158,21 @@ mod tests {
         assert!(pending.try_reserve_peer_id(&peer_id, ConnectionDirection::Outbound));
 
         // Different address should work
-        let addr2 = "10.0.0.2:11625".to_string();
+        let addr2 = ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+            Ipv4Addr::new(10, 0, 0, 2),
+            11625,
+        ));
         assert!(pending.try_reserve_address(addr2));
     }
 
     #[test]
     fn test_pending_connections_sweep_stale() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
         let pending = PendingConnections::new();
-        let addr = "10.0.0.1:11625".to_string();
+        let addr = ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            11625,
+        ));
 
         // Insert with a backdated timestamp
         pending.by_address.insert(

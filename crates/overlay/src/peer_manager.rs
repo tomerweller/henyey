@@ -24,7 +24,7 @@
 //! );
 //! ```
 
-use crate::{OverlayError, PeerAddress, Result};
+use crate::{OverlayError, PeerAddress, ResolvedPeerAddr, Result};
 use parking_lot::{Mutex, RwLock};
 use rand::seq::SliceRandom;
 use rusqlite::{params, Connection};
@@ -499,15 +499,17 @@ impl PeerManager {
     /// Get peers to send to another peer.
     pub fn get_peers_to_send(&self, size: usize, exclude: &PeerAddress) -> Vec<PeerAddress> {
         let cache = self.cache.read();
-        let exclude_key = exclude.canonical_key();
+        let exclude_key = ResolvedPeerAddr::try_from_peer_address(exclude);
 
         let mut candidates: Vec<&PeerRecord> = cache
             .values()
             .filter(|r| {
                 // Don't send peer back to itself
                 let r_addr = PeerAddress::new(r.ip.clone(), r.port);
-                if r_addr.canonical_key() == exclude_key {
-                    return false;
+                if let Some(ref ek) = exclude_key {
+                    if ResolvedPeerAddr::try_from_peer_address(&r_addr).as_ref() == Some(ek) {
+                        return false;
+                    }
                 }
 
                 // Don't send private addresses
