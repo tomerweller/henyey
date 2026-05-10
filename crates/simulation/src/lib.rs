@@ -2,7 +2,6 @@
 //! overlay, and ledger-close behavior across configurable topologies.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +44,37 @@ pub use poll::{poll_until, CrashScope, PollOutcome};
 pub enum SimulationMode {
     OverLoopback,
     OverTcp,
+}
+
+/// How a simulation node should be initialized.
+///
+/// Controls both database initialization (genesis vs. existing state) and
+/// the post-construction bootstrap path. Used by [`NodeStartupPlan`] to bind
+/// the mode at plan-construction time so that `insert_ready_node` cannot
+/// diverge from the build-time decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapMode {
+    /// Fresh genesis — writes genesis state to an empty DB, then boots via
+    /// `bootstrap_from_db()`. Asserts `ledger_seq == 1` as a postcondition.
+    Genesis,
+    /// Restore from persisted state — skips genesis init, loads last known
+    /// ledger. Errors if no persisted state exists. This is stricter than
+    /// `App::load_last_known_ledger()` (which treats NoState as non-fatal)
+    /// because the simulation's Restore path is only used by `restart_node`,
+    /// which always has a persisted data dir.
+    Restore,
+}
+
+/// A prepared node ready for bootstrap. Carries the [`BootstrapMode`] chosen
+/// at build time so that [`Simulation::insert_ready_node`] cannot use a
+/// different mode than the one used to initialize the database.
+struct NodeStartupPlan {
+    id: String,
+    app: App,
+    data_dir: Arc<TempDir>,
+    peer_port: u16,
+    mode: BootstrapMode,
+    pre_bound_listener: Option<henyey_overlay::Listener>,
 }
 
 /// Aggregate stats from one round of `repair_app_connectivity`.
@@ -342,14 +372,7 @@ impl Simulation {
 
         // Phase 1: Collect all data needed for spawning. Write data_dir and
         // peer_port back into self.app_specs (needed by restart_node later).
-        struct NodeSetup {
-            id: String,
-            app: App,
-            data_dir: Arc<TempDir>,
-            peer_port: u16,
-            pre_bound_listener: Option<henyey_overlay::Listener>,
-        }
-        let mut setups: Vec<NodeSetup> = Vec::new();
+        let mut plans: Vec<NodeStartupPlan> = Vec::new();
         for id in ids {
             let spec = self
                 .app_specs
@@ -362,48 +385,33 @@ impl Simulation {
             spec.data_dir = Some(Arc::clone(&data_dir));
             spec.peer_port = port_map.get(&id).copied();
 
-            // Re-borrow as shared ref to satisfy build_app_from_spec(&self, ...).
+            let listener = pre_bound_listeners.remove(&id);
+
+            // Re-borrow as shared ref to satisfy build_node_startup_plan(&self, ...).
             let spec = &self.app_specs[&id];
-            let app = self
-                .build_app_from_spec(
-                    &spec,
+            let plan = self
+                .build_node_startup_plan(
+                    spec,
                     &port_map,
-                    data_dir.path().to_path_buf(),
+                    data_dir,
                     Arc::clone(&overlay_connection_factory),
-                    true,
+                    BootstrapMode::Genesis,
+                    listener,
                 )
                 .await
                 .with_context(|| format!("build app node {}", spec.node_id))?;
 
-            let listener = pre_bound_listeners.remove(&id);
-            let peer_port = *port_map.get(&id).expect("port assigned for app spec");
-            setups.push(NodeSetup {
-                id,
-                app,
-                data_dir,
-                peer_port,
-                pre_bound_listener: listener,
-            });
+            plans.push(plan);
         }
 
         // Phase 2: Bootstrap and insert each node. Each call waits for
         // overlay readiness before returning, enforcing the invariant by
         // construction.
-        for setup in setups {
-            // Inject the pre-bound TCP listener before the app is wrapped in
-            // Arc. The listener is consumed by start_overlay() → overlay.start().
-            if let Some(listener) = setup.pre_bound_listener {
-                setup.app.set_pre_bound_listener(listener);
-            }
-            self.bootstrap_insert_ready_node(
-                setup.id.clone(),
-                setup.app,
-                setup.data_dir,
-                setup.peer_port,
-                Duration::from_secs(30),
-            )
-            .await
-            .with_context(|| format!("bootstrap app node {}", setup.id))?;
+        for plan in plans {
+            let node_id = plan.id.clone();
+            self.insert_ready_node(plan, Duration::from_secs(30))
+                .await
+                .with_context(|| format!("bootstrap app node {}", node_id))?;
         }
 
         Ok(())
@@ -469,24 +477,19 @@ impl Simulation {
             .clone()
             .with_context(|| "simulation overlay connection factory not initialized".to_string())?;
 
-        let app = self
-            .build_app_from_spec(
+        let plan = self
+            .build_node_startup_plan(
                 &spec,
                 &port_map,
-                data_dir.path().to_path_buf(),
+                data_dir,
                 Arc::clone(&overlay_connection_factory),
-                false,
+                BootstrapMode::Restore,
+                None,
             )
             .await?;
 
-        self.restore_insert_ready_node(
-            node_id.to_string(),
-            app,
-            data_dir,
-            peer_port,
-            Duration::from_secs(30),
-        )
-        .await?;
+        self.insert_ready_node(plan, Duration::from_secs(30))
+            .await?;
 
         Ok(())
     }
@@ -1426,69 +1429,68 @@ impl Simulation {
         Ok(())
     }
 
-    /// Bootstrap a fresh node from genesis, spawn its run loop, insert into
+    /// Bootstrap or restore a node, spawn its run loop, insert into
     /// `running_apps`, and wait for overlay readiness.
     ///
-    /// Pre-bound listeners must be set on `app` BEFORE calling this method.
-    async fn bootstrap_insert_ready_node(
+    /// Consumes a [`NodeStartupPlan`] so the bootstrap mode is locked to the
+    /// same value used during database initialization.
+    async fn insert_ready_node(
         &mut self,
-        id: String,
-        app: App,
-        data_dir: Arc<TempDir>,
-        peer_port: u16,
+        plan: NodeStartupPlan,
         timeout: Duration,
     ) -> anyhow::Result<()> {
-        let app = Self::wrap_app(app).await;
-        app.bootstrap_from_db().await?;
+        let NodeStartupPlan {
+            id,
+            app,
+            data_dir,
+            peer_port,
+            mode,
+            pre_bound_listener,
+        } = plan;
 
-        // Defense-in-depth: a fresh simulation node must start at ledger 1.
-        let info = app.ledger_info();
-        anyhow::ensure!(
-            info.ledger_seq == 1,
-            "SIMULATION STATE LEAK: node {id} bootstrapped at ledger_seq={}, \
-             expected 1 (genesis). Database: {:?}",
-            info.ledger_seq,
-            data_dir.path(),
-        );
-
-        self.spawn_insert_ready_node(id, app, data_dir, peer_port, timeout)
-            .await
-    }
-
-    /// Restore a node from persisted state, spawn its run loop, insert into
-    /// `running_apps`, and wait for overlay readiness.
-    ///
-    /// Used by `restart_node` so that the node resumes at its last closed
-    /// ledger instead of re-initializing genesis.
-    async fn restore_insert_ready_node(
-        &mut self,
-        id: String,
-        app: App,
-        data_dir: Arc<TempDir>,
-        peer_port: u16,
-        timeout: Duration,
-    ) -> anyhow::Result<()> {
-        let app = Self::wrap_app(app).await;
-        match app.load_last_known_ledger().await {
-            Ok(henyey_app::RestoreResult::Restored) => {
-                let info = app.ledger_info();
-                tracing::info!(
-                    lcl_seq = info.ledger_seq,
-                    "Restored restarted node from disk"
-                );
-            }
-            Ok(henyey_app::RestoreResult::NoState) => {
-                tracing::warn!(
-                    "No persisted state for restarted node, falling back to genesis bootstrap"
-                );
-                app.bootstrap_from_db().await?;
-            }
-            Err(e) => {
-                return Err(
-                    e.context("Failed to restore restarted node — persisted state is corrupt")
-                );
-            }
+        // Install pre-bound TCP listener before wrapping in Arc.
+        if let Some(listener) = pre_bound_listener {
+            app.set_pre_bound_listener(listener);
         }
+
+        let app = Self::wrap_app(app).await;
+
+        match mode {
+            BootstrapMode::Genesis => {
+                app.bootstrap_from_db().await?;
+                // Defense-in-depth: a fresh simulation node must start at ledger 1.
+                let info = app.ledger_info();
+                anyhow::ensure!(
+                    info.ledger_seq == 1,
+                    "SIMULATION STATE LEAK: node {id} bootstrapped at ledger_seq={}, \
+                     expected 1 (genesis). Database: {:?}",
+                    info.ledger_seq,
+                    data_dir.path(),
+                );
+            }
+            BootstrapMode::Restore => match app.load_last_known_ledger().await {
+                Ok(henyey_app::RestoreResult::Restored) => {
+                    let info = app.ledger_info();
+                    tracing::info!(
+                        lcl_seq = info.ledger_seq,
+                        "Restored restarted node from disk"
+                    );
+                }
+                Ok(henyey_app::RestoreResult::NoState) => {
+                    anyhow::bail!(
+                        "Restore mode: no persisted state in {:?}. \
+                             Use BootstrapMode::Genesis for fresh nodes.",
+                        data_dir.path(),
+                    );
+                }
+                Err(e) => {
+                    return Err(
+                        e.context("Failed to restore restarted node — persisted state is corrupt")
+                    );
+                }
+            },
+        }
+
         self.spawn_insert_ready_node(id, app, data_dir, peer_port, timeout)
             .await
     }
@@ -1534,14 +1536,20 @@ impl Simulation {
         })
     }
 
-    async fn build_app_from_spec(
+    /// Build a [`NodeStartupPlan`] from an [`AppNodeSpec`].
+    ///
+    /// The `mode` parameter controls both genesis DB initialization and the
+    /// post-construction bootstrap path, binding both decisions into the
+    /// returned plan so they cannot diverge.
+    async fn build_node_startup_plan(
         &self,
         spec: &AppNodeSpec,
         port_map: &HashMap<String, u16>,
-        data_dir: PathBuf,
+        data_dir: Arc<TempDir>,
         overlay_connection_factory: Arc<dyn ConnectionFactory>,
-        init_genesis: bool,
-    ) -> anyhow::Result<App> {
+        mode: BootstrapMode,
+        pre_bound_listener: Option<henyey_overlay::Listener>,
+    ) -> anyhow::Result<NodeStartupPlan> {
         let peer_port = *port_map
             .get(&spec.node_id)
             .with_context(|| format!("missing peer port for {}", spec.node_id))?;
@@ -1550,8 +1558,8 @@ impl Simulation {
             .node_name(spec.node_id.clone())
             .node_seed(spec.secret_key.to_strkey())
             .validator(spec.is_validator)
-            .database_path(data_dir.join("node.db"))
-            .bucket_directory(data_dir.join("buckets"))
+            .database_path(data_dir.path().join("node.db"))
+            .bucket_directory(data_dir.path().join("buckets"))
             .peer_port(peer_port)
             .build();
 
@@ -1578,15 +1586,25 @@ impl Simulation {
         }
         std::fs::create_dir_all(&config.buckets.directory)?;
 
-        if init_genesis {
+        if matches!(mode, BootstrapMode::Genesis) {
             initialize_genesis_ledger(&config, &self.network_passphrase)?;
         }
-        App::new_with_clock_and_connection_factory(
+
+        let app = App::new_with_clock_and_connection_factory(
             config,
             Arc::new(RealClock),
             overlay_connection_factory,
         )
-        .await
+        .await?;
+
+        Ok(NodeStartupPlan {
+            id: spec.node_id.clone(),
+            app,
+            data_dir,
+            peer_port,
+            mode,
+            pre_bound_listener,
+        })
     }
 
     fn known_peers_for(&self, node_id: &str, port_map: &HashMap<String, u16>) -> Vec<PeerAddress> {
@@ -2608,8 +2626,8 @@ mod defense_layer_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Layer 2: `bootstrap_insert_ready_node` rejects a database seeded at
-    /// ledger_seq != 1.
+    /// Layer 2: `insert_ready_node` with `BootstrapMode::Genesis` rejects a
+    /// database seeded at ledger_seq != 1.
     ///
     /// Fixture: run `initialize_genesis_ledger` to produce a valid genesis DB,
     /// then mutate the stored LCL and header to seq 5. This bypasses Layer 1
@@ -2668,38 +2686,86 @@ mod defense_layer_tests {
         let data_dir = Arc::new(dir);
         sim.app_specs.get_mut(node_id).unwrap().data_dir = Some(Arc::clone(&data_dir));
 
-        // Step 4: Build an App with init_genesis=false (bypasses Layer 1).
+        // Step 4: Build a plan with BootstrapMode::Restore (bypasses Layer 1
+        // genesis init) but still use Genesis mode for insert_ready_node to
+        // trigger the ledger_seq == 1 check.
         let port_map: HashMap<String, u16> = [(node_id.to_string(), 19000)].into();
         let conn_factory: Arc<dyn ConnectionFactory> =
             Arc::new(LoopbackConnectionFactory::default());
 
-        let app = sim
-            .build_app_from_spec(
+        let plan = sim
+            .build_node_startup_plan(
                 &sim.app_specs[node_id].clone(),
                 &port_map,
-                data_dir.path().to_path_buf(),
+                data_dir,
                 conn_factory,
-                false, // skip Layer 1
+                BootstrapMode::Restore, // skip Layer 1 genesis init
+                None,
             )
             .await
-            .expect("build app from spec");
+            .expect("build node startup plan");
 
-        // Step 5: Call bootstrap_insert_ready_node — Layer 2 should reject it.
-        let result = sim
-            .bootstrap_insert_ready_node(
-                node_id.to_string(),
-                app,
-                data_dir,
-                19000,
-                Duration::from_secs(5),
-            )
-            .await;
+        // Override the mode to Genesis to trigger the ledger_seq == 1 check.
+        let plan = NodeStartupPlan {
+            mode: BootstrapMode::Genesis,
+            ..plan
+        };
+
+        // Step 5: Call insert_ready_node — Layer 2 should reject it.
+        let result = sim.insert_ready_node(plan, Duration::from_secs(5)).await;
 
         assert!(result.is_err(), "Layer 2 should reject seeded DB");
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("SIMULATION STATE LEAK"),
             "error should mention STATE LEAK: {err}"
+        );
+    }
+
+    /// `insert_ready_node` with `BootstrapMode::Restore` on an empty database
+    /// produces a clear error instead of silently failing.
+    #[tokio::test]
+    async fn test_restore_on_empty_db_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let _db_path = dir.path().join("node.db");
+        let bucket_dir = dir.path().join("buckets");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Build a simulation with one app node.
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        let secret = SecretKey::from_seed(&[99u8; 32]);
+        let node_id = "empty-node";
+        sim.add_node(node_id, secret.clone());
+        sim.populate_app_nodes_from_existing(100);
+
+        let data_dir = Arc::new(dir);
+        sim.app_specs.get_mut(node_id).unwrap().data_dir = Some(Arc::clone(&data_dir));
+
+        let port_map: HashMap<String, u16> = [(node_id.to_string(), 19001)].into();
+        let conn_factory: Arc<dyn ConnectionFactory> =
+            Arc::new(LoopbackConnectionFactory::default());
+
+        // Build a plan with BootstrapMode::Restore on an empty DB.
+        let plan = sim
+            .build_node_startup_plan(
+                &sim.app_specs[node_id].clone(),
+                &port_map,
+                data_dir,
+                conn_factory,
+                BootstrapMode::Restore,
+                None,
+            )
+            .await
+            .expect("build node startup plan");
+
+        // insert_ready_node should fail with a clear error.
+        let result = sim.insert_ready_node(plan, Duration::from_secs(5)).await;
+
+        assert!(result.is_err(), "Restore on empty DB should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Restore mode: no persisted state"),
+            "error should mention restore mode: {err}"
         );
     }
 
