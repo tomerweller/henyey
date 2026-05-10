@@ -179,7 +179,7 @@ impl OverlayManager {
         };
 
         let handle = tokio::spawn(async move {
-            let mut retry_after: HashMap<PeerAddress, Instant> = HashMap::new();
+            let mut retry_after: HashMap<String, Instant> = HashMap::new();
             let mut interval = tokio::time::interval(TICK_INTERVAL);
             // G8: Track when we first noticed we were out of sync, for
             // random-peer-drop cooldown (OUT_OF_SYNC_RECONNECT_DELAY = 60s).
@@ -330,16 +330,16 @@ impl OverlayManager {
         match handle_ref.await {
             Ok(result) => {
                 // Merge resolved known peers (add new, keep existing).
+                // Use canonical keys to prevent hostname/IP alias duplicates.
                 {
                     let mut kp = known_peers.write();
+                    let mut existing_keys: std::collections::HashSet<String> =
+                        kp.iter().map(|p| p.canonical_key()).collect();
                     for addr in &result.known {
                         if kp.len() >= super::MAX_KNOWN_PEERS {
                             break;
                         }
-                        if !kp
-                            .iter()
-                            .any(|p| p.host == addr.host && p.port == addr.port)
-                        {
+                        if existing_keys.insert(addr.canonical_key()) {
                             kp.push(addr.clone());
                         }
                     }
@@ -385,7 +385,7 @@ impl OverlayManager {
     #[allow(clippy::too_many_arguments)]
     async fn connect_preferred_peers(
         preferred_set: &PreferredPeerSet,
-        retry_after: &mut HashMap<PeerAddress, Instant>,
+        retry_after: &mut HashMap<String, Instant>,
         now: Instant,
         mut remaining: usize,
         _max_outbound: usize,
@@ -393,14 +393,16 @@ impl OverlayManager {
         shared: &SharedPeerState,
         ctx: &TickConnectCtx,
     ) -> usize {
-        // Shuffle to avoid starvation — stellar-core uses random selection.
-        let entries = preferred_set.shuffled_config_entries(&mut rand::thread_rng());
+        // Use resolved entries (canonical IPs) when available, falling back to
+        // config hostnames for entries whose DNS resolution hasn't succeeded yet.
+        let entries = preferred_set.shuffled_dial_entries(&mut rand::thread_rng());
         for addr in &entries {
             if remaining == 0 {
                 break;
             }
 
-            if let Some(next) = retry_after.get(addr) {
+            let key = addr.canonical_key();
+            if let Some(next) = retry_after.get(&key) {
                 if *next > now {
                     continue;
                 }
@@ -426,12 +428,12 @@ impl OverlayManager {
             .await
             {
                 Ok(_) => {
-                    retry_after.remove(addr);
+                    retry_after.remove(&key);
                     remaining = remaining.saturating_sub(1);
                 }
                 Err(e) => {
                     warn!("Failed to connect to preferred peer {}: {}", addr, e);
-                    retry_after.insert(addr.clone(), now + OUTBOUND_CONNECT_RETRY_DELAY);
+                    retry_after.insert(key, now + OUTBOUND_CONNECT_RETRY_DELAY);
                 }
             }
         }
@@ -441,7 +443,7 @@ impl OverlayManager {
     /// Fill remaining outbound slots from the shuffled known-peer list.
     async fn fill_outbound_slots(
         known_peers: &RwLock<Vec<PeerAddress>>,
-        retry_after: &mut HashMap<PeerAddress, Instant>,
+        retry_after: &mut HashMap<String, Instant>,
         now: Instant,
         mut remaining: usize,
         pool: &Arc<ConnectionPool>,
@@ -461,7 +463,8 @@ impl OverlayManager {
                 break;
             }
 
-            if let Some(next) = retry_after.get(addr) {
+            let key = addr.canonical_key();
+            if let Some(next) = retry_after.get(&key) {
                 if *next > now {
                     continue;
                 }
@@ -487,12 +490,12 @@ impl OverlayManager {
             .await
             {
                 Ok(_) => {
-                    retry_after.remove(addr);
+                    retry_after.remove(&key);
                     remaining = remaining.saturating_sub(1);
                 }
                 Err(e) => {
                     debug!("Failed to connect to peer {}: {}", addr, e);
-                    retry_after.insert(addr.clone(), now + OUTBOUND_CONNECT_RETRY_DELAY);
+                    retry_after.insert(key, now + OUTBOUND_CONNECT_RETRY_DELAY);
                 }
             }
         }
@@ -747,7 +750,7 @@ mod tests {
             "failed preferred dial must not evict before authentication"
         );
         assert!(
-            retry_after.contains_key(&preferred_addr),
+            retry_after.contains_key(&preferred_addr.canonical_key()),
             "failed preferred dial should still enter retry backoff"
         );
     }

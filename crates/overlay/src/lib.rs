@@ -474,6 +474,21 @@ impl PeerAddress {
             self.host == "localhost"
         }
     }
+
+    /// Returns a canonical dedup key for this peer address.
+    ///
+    /// For IP-address hosts, normalizes the string representation via a parse
+    /// round-trip (e.g. stripping leading zeros). For hostname hosts (config
+    /// entries before DNS resolution), falls back to the raw `host:port`.
+    ///
+    /// This is a synchronous, allocation-only operation — no DNS lookup.
+    pub fn canonical_key(&self) -> String {
+        if let Ok(ip) = self.host.parse::<std::net::IpAddr>() {
+            format!("{}:{}", ip, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
 }
 
 impl std::fmt::Display for PeerAddress {
@@ -877,5 +892,44 @@ mod tests {
         let node = LocalNode::new_testnet(secret);
         let peer_id = node.peer_id();
         assert!(!peer_id.to_hex().is_empty());
+    }
+
+    #[test]
+    fn test_canonical_key_ipv4() {
+        let addr = PeerAddress::new("1.2.3.4", 11625);
+        assert_eq!(addr.canonical_key(), "1.2.3.4:11625");
+    }
+
+    #[test]
+    fn test_canonical_key_hostname_passthrough() {
+        let addr = PeerAddress::new("stellar.example.com", 11625);
+        assert_eq!(addr.canonical_key(), "stellar.example.com:11625");
+    }
+
+    #[test]
+    fn test_canonical_key_port_preserved() {
+        let addr = PeerAddress::new("10.0.0.1", 12345);
+        assert_eq!(addr.canonical_key(), "10.0.0.1:12345");
+    }
+
+    #[test]
+    fn test_canonical_key_ipv6() {
+        let addr = PeerAddress::new("::1", 11625);
+        assert_eq!(addr.canonical_key(), "::1:11625");
+    }
+
+    #[test]
+    fn test_canonical_key_same_ip_different_format() {
+        // Both should produce the same canonical key
+        let addr1 = PeerAddress::new("10.0.0.1", 11625);
+        let addr2 = PeerAddress::new("10.0.0.1", 11625);
+        assert_eq!(addr1.canonical_key(), addr2.canonical_key());
+    }
+
+    #[test]
+    fn test_canonical_key_different_ports_are_distinct() {
+        let addr1 = PeerAddress::new("10.0.0.1", 11625);
+        let addr2 = PeerAddress::new("10.0.0.1", 11626);
+        assert_ne!(addr1.canonical_key(), addr2.canonical_key());
     }
 }

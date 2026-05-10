@@ -1288,8 +1288,13 @@ impl App {
 
         match self.load_persisted_peers().await {
             Ok(persisted) => {
+                let mut existing_keys: std::collections::HashSet<String> = overlay_config
+                    .known_peers
+                    .iter()
+                    .map(|p| p.canonical_key())
+                    .collect();
                 for addr in persisted {
-                    if !overlay_config.known_peers.contains(&addr) {
+                    if existing_keys.insert(addr.canonical_key()) {
                         overlay_config.known_peers.push(addr);
                     }
                 }

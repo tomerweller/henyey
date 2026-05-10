@@ -172,6 +172,22 @@ impl PreferredPeerSet {
         entries
     }
 
+    /// Get entries for preferred-peer dialing: resolved IPs when available,
+    /// config hostname entries before first DNS resolution.
+    ///
+    /// After DNS resolution, resolved entries have canonical IP addresses,
+    /// eliminating hostname/IP aliasing in `retry_after` and
+    /// `has_outbound_connection_to`. Peers that failed DNS resolution are
+    /// omitted from dialing (they will be retried on the next DNS cycle).
+    pub(super) fn shuffled_dial_entries(&self, rng: &mut impl Rng) -> Vec<PeerAddress> {
+        if self.resolved.is_empty() {
+            return self.shuffled_config_entries(rng);
+        }
+        let mut entries = self.resolved.clone();
+        entries.shuffle(rng);
+        entries
+    }
+
     /// Get the resolved IP addresses for updating ConnectionPool.
     pub(super) fn resolved_ips(&self) -> &HashSet<IpAddr> {
         &self.resolved_ips
@@ -1158,7 +1174,7 @@ impl OverlayManager {
                     continue;
                 }
             }
-            if !unique.insert(addr.to_string()) {
+            if !unique.insert(addr.canonical_key()) {
                 continue;
             }
             if let Some(xdr) = Self::peer_address_to_xdr(addr) {
@@ -1491,7 +1507,8 @@ impl OverlayManager {
 
     pub(super) fn add_known_peer(&self, addr: PeerAddress) -> bool {
         let mut known = self.known_peers.write();
-        if known.len() >= MAX_KNOWN_PEERS || known.contains(&addr) {
+        let key = addr.canonical_key();
+        if known.len() >= MAX_KNOWN_PEERS || known.iter().any(|p| p.canonical_key() == key) {
             return false;
         }
         known.push(addr);
@@ -3139,6 +3156,69 @@ mod tests {
                 "all config entries must appear in shuffled output"
             );
         }
+    }
+
+    #[test]
+    fn test_shuffled_dial_entries_uses_config_when_no_resolved() {
+        use rand::SeedableRng;
+        let config = vec![
+            PeerAddress::new("a.example.com", 11625),
+            PeerAddress::new("b.example.com", 11625),
+        ];
+        let set = PreferredPeerSet::from_config(config.clone(), HashSet::new());
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let entries = set.shuffled_dial_entries(&mut rng);
+        assert_eq!(entries.len(), 2);
+        for cfg in &config {
+            assert!(entries.iter().any(|e| e.host == cfg.host));
+        }
+    }
+
+    #[test]
+    fn test_shuffled_dial_entries_uses_resolved_when_available() {
+        use rand::SeedableRng;
+        let config = vec![PeerAddress::new("a.example.com", 11625)];
+        let set = PreferredPeerSet::from_config(config, HashSet::new());
+        let resolved = vec![PeerAddress::new("10.0.0.42", 11625)];
+        let updated = set.with_resolved(resolved);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let entries = updated.shuffled_dial_entries(&mut rng);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host, "10.0.0.42");
+    }
+
+    #[test]
+    fn test_shuffled_dial_entries_partial_dns_omits_failed() {
+        use rand::SeedableRng;
+        let config = vec![
+            PeerAddress::new("a.example.com", 11625),
+            PeerAddress::new("b.example.com", 11625),
+        ];
+        let set = PreferredPeerSet::from_config(config, HashSet::new());
+        // Only one hostname resolved — the other is omitted (retried next DNS cycle)
+        let resolved = vec![PeerAddress::new("10.0.0.42", 11625)];
+        let updated = set.with_resolved(resolved);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let entries = updated.shuffled_dial_entries(&mut rng);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host, "10.0.0.42");
+    }
+
+    #[test]
+    fn test_add_known_peer_canonical_key_dedup() {
+        let local_node = {
+            let secret = henyey_crypto::SecretKey::generate();
+            crate::LocalNode::new_testnet(secret)
+        };
+        let config = crate::OverlayConfig {
+            known_peers: vec![PeerAddress::new("10.0.0.1", 11625)],
+            ..Default::default()
+        };
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        // Same IP, should be rejected as duplicate via canonical key
+        assert!(!manager.add_known_peer(PeerAddress::new("10.0.0.1", 11625)));
+        // Different port, should be accepted
+        assert!(manager.add_known_peer(PeerAddress::new("10.0.0.1", 11626)));
     }
 
     #[test]

@@ -373,15 +373,21 @@ impl App {
     pub(super) async fn store_config_peers(&self) {
         let known_peers = self.config.overlay.known_peers.clone();
         let preferred_peers = self.config.overlay.preferred_peers.clone();
+
+        // Resolve hostnames to IPs before storing, matching stellar-core's
+        // behavior of resolving config peers at startup.
+        let resolved_known = Self::resolve_peers_for_storage(&known_peers).await;
+        let resolved_preferred = Self::resolve_peers_for_storage(&preferred_peers).await;
+
         if let Err(e) = self
             .db_blocking("store-config-peers", move |db| {
                 let now = current_epoch_seconds();
-                for addr in &known_peers {
+                for addr in &resolved_known {
                     let record =
                         henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Outbound);
                     db.store_peer(&addr.host, addr.port, record)?;
                 }
-                for addr in &preferred_peers {
+                for addr in &resolved_preferred {
                     let record =
                         henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Preferred);
                     db.store_peer(&addr.host, addr.port, record)?;
@@ -392,6 +398,44 @@ impl App {
         {
             tracing::warn!(error = %e, "Failed to store config peers");
         }
+    }
+
+    /// Resolve peer addresses for DB storage: hostnames → IPs, IPs kept as-is.
+    ///
+    /// If DNS resolution fails for a hostname, the original hostname is kept
+    /// so the peer is still stored (it will be resolved later in the DNS cycle).
+    async fn resolve_peers_for_storage(peers: &[PeerAddress]) -> Vec<PeerAddress> {
+        use std::net::IpAddr;
+
+        let mut resolved = Vec::with_capacity(peers.len());
+        for peer in peers {
+            if peer.host.parse::<IpAddr>().is_ok() {
+                resolved.push(peer.clone());
+                continue;
+            }
+            match tokio::net::lookup_host((peer.host.as_str(), peer.port)).await {
+                Ok(addrs) => {
+                    if let Some(sa) = addrs.into_iter().find(|a| a.is_ipv4()) {
+                        resolved.push(PeerAddress::from(sa));
+                    } else {
+                        tracing::warn!(
+                            "No IPv4 address for config peer {}, storing as hostname",
+                            peer
+                        );
+                        resolved.push(peer.clone());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "DNS failed for config peer {}: {}, storing as hostname",
+                        peer,
+                        e
+                    );
+                    resolved.push(peer.clone());
+                }
+            }
+        }
+        resolved
     }
 
     async fn persist_peers(&self, peers: &[PeerAddress]) {
@@ -474,6 +518,10 @@ impl App {
         let preferred_peers_config = self.config.overlay.preferred_peers.clone();
         let max_failures = self.config.overlay.peer_max_failures;
 
+        // Resolve preferred peer hostnames to IPs before DB operations,
+        // preventing hostname/IP alias duplicates in the peer database.
+        let resolved_preferred = Self::resolve_peers_for_storage(&preferred_peers_config).await;
+
         // Phase 1: All DB work on the blocking pool
         struct DbResult {
             peers: Vec<PeerAddress>,
@@ -490,7 +538,7 @@ impl App {
                 for addr in &known_peers_config {
                     peers.push(addr.clone());
                 }
-                for addr in &preferred_peers_config {
+                for addr in &resolved_preferred {
                     // upsert_peer_type inline
                     let existing = db.load_peer(&addr.host, addr.port)?;
                     let record = match existing {
@@ -607,7 +655,7 @@ impl App {
         let mut seen = HashSet::new();
         let mut deduped = Vec::new();
         for peer in peers {
-            if seen.insert(peer.to_string()) {
+            if seen.insert(peer.canonical_key()) {
                 deduped.push(peer);
             }
         }
