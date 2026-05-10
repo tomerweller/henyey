@@ -274,8 +274,11 @@ impl Work for DownloadBucketsWork {
                             "archive" => archive_name.clone(),
                         )
                         .increment(1);
-                        metrics::counter!("stellar_history_verify_bucket_success_total")
-                            .increment(1);
+                        metrics::counter!(
+                            "stellar_history_verify_bucket_success_total",
+                            "archive" => archive_name.clone(),
+                        )
+                        .increment(1);
                     }
                     Err(failure) => {
                         match &failure {
@@ -288,8 +291,11 @@ impl Work for DownloadBucketsWork {
                                 .increment(1);
                             }
                             BucketDownloadFailure::Verify(_) => {
-                                metrics::counter!("stellar_history_verify_bucket_failure_total")
-                                    .increment(1);
+                                metrics::counter!(
+                                    "stellar_history_verify_bucket_failure_total",
+                                    "archive" => archive_name.clone(),
+                                )
+                                .increment(1);
                             }
                         }
                         if first_failure.is_none() {
@@ -372,10 +378,18 @@ impl Work for DownloadLedgerHeadersWork {
         };
 
         if let Err(err) = verify::verify_header_chain_from_entries(&headers) {
-            metrics::counter!("stellar_history_verify_ledger_chain_failure_total").increment(1);
+            metrics::counter!(
+                "stellar_history_verify_ledger_chain_failure_total",
+                "archive" => archive_name.clone(),
+            )
+            .increment(1);
             return WorkOutcome::Failed(format!("header chain verification failed: {err}"));
         }
-        metrics::counter!("stellar_history_verify_ledger_chain_success_total").increment(1);
+        metrics::counter!(
+            "stellar_history_verify_ledger_chain_success_total",
+            "archive" => archive_name,
+        )
+        .increment(1);
 
         let mut guard = self.state.lock().await;
         guard.headers = headers;
@@ -702,14 +716,14 @@ mod tests {
         }
     }
 
-    /// Stage E: download counters must carry the `"archive"` label at every
+    /// Stage E: download and verify counters must carry the `"archive"` label at every
     /// emit site (not just the first occurrence).
     #[test]
     fn test_stage_e_historywork_archive_label_present() {
         let src = include_str!("download.rs");
         // Only check the main code, not test string literals.
         let main_code = src.split("#[cfg(test)]").next().unwrap_or(src);
-        // Every download counter emit site must include archive labeling.
+        // Every download and verify counter emit site must include archive labeling.
         for metric in &[
             "stellar_history_download_history_archive_state_success_total",
             "stellar_history_download_history_archive_state_failure_total",
@@ -717,6 +731,10 @@ mod tests {
             "stellar_history_download_bucket_failure_total",
             "stellar_history_download_ledger_success_total",
             "stellar_history_download_ledger_failure_total",
+            "stellar_history_verify_bucket_success_total",
+            "stellar_history_verify_bucket_failure_total",
+            "stellar_history_verify_ledger_chain_success_total",
+            "stellar_history_verify_ledger_chain_failure_total",
         ] {
             // Find ALL occurrences and verify "archive" appears nearby in each.
             let mut search_from = 0;

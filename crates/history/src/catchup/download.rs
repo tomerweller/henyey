@@ -324,9 +324,15 @@ impl CatchupManager {
         from_ledger: u32,
         to_ledger: u32,
         initial_lcl: LclContext,
-    ) -> Result<Vec<LedgerData>> {
+    ) -> Result<(Vec<LedgerData>, String)> {
         let mut data = Vec::new();
         let mut checkpoint_cache: HashMap<u32, CheckpointLedgerData> = HashMap::new();
+        // Track the last archive that served data; used for metric attribution.
+        let mut last_archive_name = self
+            .archives
+            .first()
+            .map(|a| a.name().to_owned())
+            .unwrap_or_default();
 
         // We need to download data for ledgers (from_ledger+1) to to_ledger.
         // The from_ledger's state is already in the bucket list.
@@ -334,7 +340,7 @@ impl CatchupManager {
 
         if start > to_ledger {
             // No ledgers to replay, we're at the checkpoint
-            return Ok(data);
+            return Ok((data, last_archive_name));
         }
 
         // Resolve the LCL context from the archive when from_ledger > 0.
@@ -356,7 +362,9 @@ impl CatchupManager {
 
             if let std::collections::hash_map::Entry::Vacant(e) = checkpoint_cache.entry(checkpoint)
             {
-                let downloaded = self.download_checkpoint_ledger_data(checkpoint).await?;
+                let (downloaded, archive_name) =
+                    self.download_checkpoint_ledger_data(checkpoint).await?;
+                last_archive_name = archive_name;
                 e.insert(downloaded);
             }
 
@@ -401,7 +409,7 @@ impl CatchupManager {
             current_lcl = LclContext::new(header.ledger_version, header_hash);
         }
 
-        Ok(data)
+        Ok((data, last_archive_name))
     }
 
     /// Download ledger headers, transactions, and results for a checkpoint.
@@ -413,19 +421,20 @@ impl CatchupManager {
     async fn download_checkpoint_ledger_data(
         &self,
         checkpoint: u32,
-    ) -> Result<CheckpointLedgerData> {
+    ) -> Result<(CheckpointLedgerData, String)> {
         // Try each archive until one succeeds
         let mut last_archive_name = String::new();
         for archive in &self.archives {
             last_archive_name = archive.name().to_owned();
             match self.try_download_checkpoint(archive, checkpoint).await {
                 Ok(data) => {
+                    let archive_name = archive.name().to_owned();
                     metrics::counter!(
                         "stellar_history_download_ledger_success_total",
-                        "archive" => archive.name().to_owned(),
+                        "archive" => archive_name.clone(),
                     )
                     .increment(1);
-                    return Ok(data);
+                    return Ok((data, archive_name));
                 }
                 Err(e) => {
                     warn!(
@@ -441,7 +450,7 @@ impl CatchupManager {
 
         metrics::counter!(
             "stellar_history_download_ledger_failure_total",
-            "archive" => last_archive_name,
+            "archive" => last_archive_name.clone(),
         )
         .increment(1);
         Err(HistoryError::CatchupFailed(format!(

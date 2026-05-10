@@ -121,15 +121,31 @@ impl CatchupManager {
         target: u32,
         ledger_manager: &LedgerManager,
     ) -> Result<(HeaderSnapshot, u32)> {
+        // Use the primary archive name for apply_ledger_chain attribution.
+        // This counter represents the terminal outcome of the full retry loop,
+        // not a single archive interaction.
+        let archive_name = self
+            .archives
+            .first()
+            .map(|a| a.name().to_owned())
+            .unwrap_or_default();
         let result = self
             .download_verify_and_replay_with_retry_inner(target, ledger_manager)
             .await;
         match &result {
             Ok(_) => {
-                metrics::counter!("stellar_history_apply_ledger_chain_success_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_apply_ledger_chain_success_total",
+                    "archive" => archive_name,
+                )
+                .increment(1);
             }
             Err(_) => {
-                metrics::counter!("stellar_history_apply_ledger_chain_failure_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_apply_ledger_chain_failure_total",
+                    "archive" => archive_name,
+                )
+                .increment(1);
             }
         }
         result
@@ -214,7 +230,7 @@ impl CatchupManager {
             4,
             "Downloading ledger data",
         );
-        let ledger_data = self
+        let (ledger_data, archive_name) = self
             .download_ledger_data(download_from, target, lcl)
             .await?;
 
@@ -232,10 +248,18 @@ impl CatchupManager {
         };
         match self.verify_downloaded_data(&ledger_data, &anchors) {
             Ok(()) => {
-                metrics::counter!("stellar_history_verify_ledger_chain_success_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_verify_ledger_chain_success_total",
+                    "archive" => archive_name.clone(),
+                )
+                .increment(1);
             }
             Err(e) => {
-                metrics::counter!("stellar_history_verify_ledger_chain_failure_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_verify_ledger_chain_failure_total",
+                    "archive" => archive_name,
+                )
+                .increment(1);
                 return Err(e);
             }
         }
@@ -543,6 +567,34 @@ mod tests {
                 src.contains(literal),
                 "expected metric literal {literal} in catchup/replay.rs",
             );
+        }
+    }
+
+    /// Stage E: verify and apply counters must carry the `"archive"` label.
+    #[test]
+    fn test_stage_e_replay_archive_label_present() {
+        let src = include_str!("replay.rs");
+        let main_code = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for metric in &[
+            "stellar_history_apply_ledger_chain_success_total",
+            "stellar_history_apply_ledger_chain_failure_total",
+            "stellar_history_verify_ledger_chain_success_total",
+            "stellar_history_verify_ledger_chain_failure_total",
+        ] {
+            let mut search_from = 0;
+            let mut found_any = false;
+            while let Some(rel_idx) = main_code[search_from..].find(metric) {
+                found_any = true;
+                let idx = search_from + rel_idx;
+                let window = &main_code[idx..std::cmp::min(idx + 200, main_code.len())];
+                assert!(
+                    window.contains("\"archive\""),
+                    "metric {metric} missing \"archive\" label at byte offset {idx} \
+                     in catchup/replay.rs",
+                );
+                search_from = idx + metric.len();
+            }
+            assert!(found_any, "metric {metric} not found in catchup/replay.rs",);
         }
     }
 }

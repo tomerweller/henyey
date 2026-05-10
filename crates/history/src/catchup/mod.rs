@@ -393,6 +393,7 @@ impl CatchupManager {
     /// invocation, so all three callers (`catchup_to_ledger`,
     /// `catchup_to_ledger_with_mode`, `catchup_to_ledger_with_checkpoint_data`)
     /// share the same boundary.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_buckets_and_init_ledger_manager(
         &mut self,
         has: &HistoryArchiveState,
@@ -401,6 +402,7 @@ impl CatchupManager {
         checkpoint_header: LedgerHeader,
         checkpoint_hash: Hash256,
         ledger_manager: &LedgerManager,
+        archive_name: &str,
     ) -> Result<()> {
         let result = self
             .apply_buckets_and_init_ledger_manager_inner(
@@ -414,10 +416,18 @@ impl CatchupManager {
             .await;
         match &result {
             Ok(()) => {
-                metrics::counter!("stellar_history_bucket_apply_success_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_bucket_apply_success_total",
+                    "archive" => archive_name.to_owned(),
+                )
+                .increment(1);
             }
             Err(_) => {
-                metrics::counter!("stellar_history_bucket_apply_failure_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_bucket_apply_failure_total",
+                    "archive" => archive_name.to_owned(),
+                )
+                .increment(1);
             }
         }
         result
@@ -657,6 +667,11 @@ impl CatchupManager {
             checkpoint_header.clone(),
             checkpoint_hash,
             ledger_manager,
+            &self
+                .archives
+                .first()
+                .map(|a| a.name().to_owned())
+                .unwrap_or_default(),
         )
         .await?;
 
@@ -750,6 +765,11 @@ impl CatchupManager {
                 checkpoint_header,
                 checkpoint_hash,
                 ledger_manager,
+                &self
+                    .archives
+                    .first()
+                    .map(|a| a.name().to_owned())
+                    .unwrap_or_default(),
             )
             .await?;
 
@@ -915,6 +935,7 @@ impl CatchupManager {
             checkpoint_header.clone(),
             checkpoint_hash,
             ledger_manager,
+            "provided",
         )
         .await?;
 
@@ -1430,6 +1451,32 @@ mod tests {
                 src.contains(literal),
                 "expected metric literal {literal} in catchup/mod.rs",
             );
+        }
+    }
+
+    /// Stage E: bucket_apply counters must carry the `"archive"` label.
+    #[test]
+    fn test_stage_e_mod_archive_label_present() {
+        let src = include_str!("mod.rs");
+        let main_code = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for metric in &[
+            "stellar_history_bucket_apply_success_total",
+            "stellar_history_bucket_apply_failure_total",
+        ] {
+            let mut search_from = 0;
+            let mut found_any = false;
+            while let Some(rel_idx) = main_code[search_from..].find(metric) {
+                found_any = true;
+                let idx = search_from + rel_idx;
+                let window = &main_code[idx..std::cmp::min(idx + 200, main_code.len())];
+                assert!(
+                    window.contains("\"archive\""),
+                    "metric {metric} missing \"archive\" label at byte offset {idx} \
+                     in catchup/mod.rs",
+                );
+                search_from = idx + metric.len();
+            }
+            assert!(found_any, "metric {metric} not found in catchup/mod.rs",);
         }
     }
 

@@ -180,7 +180,11 @@ impl CatchupManager {
                 let bucket = Bucket::from_xdr_file_disk_backed(&bucket_path)?;
                 // Verify hash matches (protects against corrupt files on disk)
                 if bucket.hash() != *hash {
-                    metrics::counter!("stellar_history_verify_bucket_failure_total").increment(1);
+                    metrics::counter!(
+                        "stellar_history_verify_bucket_failure_total",
+                        "archive" => "local",
+                    )
+                    .increment(1);
                     warn!(
                         "Existing bucket file has wrong hash: expected {}, got {}",
                         hash,
@@ -189,7 +193,11 @@ impl CatchupManager {
                     let _ = std::fs::remove_file(&bucket_path);
                     // Fall through to download the bucket fresh
                 } else {
-                    metrics::counter!("stellar_history_verify_bucket_success_total").increment(1);
+                    metrics::counter!(
+                        "stellar_history_verify_bucket_success_total",
+                        "archive" => "local",
+                    )
+                    .increment(1);
                     let mut cache = bucket_cache.lock().unwrap();
                     cache.insert(*hash, bucket.clone());
                     return Ok(bucket);
@@ -267,7 +275,7 @@ impl CatchupManager {
                 // Successful fetch + persistence — terminal success.
                 metrics::counter!(
                     "stellar_history_download_bucket_success_total",
-                    "archive" => download_archive_name,
+                    "archive" => download_archive_name.clone(),
                 )
                 .increment(1);
             }
@@ -276,9 +284,19 @@ impl CatchupManager {
 
             let bucket = Bucket::from_xdr_file_disk_backed(&bucket_path)?;
 
-            // Verify hash matches
+            // Verify hash matches — attribute to the archive that served the
+            // download, or "local" if the data was preloaded/provided.
+            let verify_archive = if was_preloaded {
+                "local".to_owned()
+            } else {
+                download_archive_name
+            };
             if bucket.hash() != *hash {
-                metrics::counter!("stellar_history_verify_bucket_failure_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_verify_bucket_failure_total",
+                    "archive" => verify_archive,
+                )
+                .increment(1);
                 // Clean up the bad file
                 let _ = std::fs::remove_file(&bucket_path);
                 return Err(henyey_bucket::BucketError::HashMismatch {
@@ -286,7 +304,11 @@ impl CatchupManager {
                     actual: bucket.hash().to_hex(),
                 });
             }
-            metrics::counter!("stellar_history_verify_bucket_success_total").increment(1);
+            metrics::counter!(
+                "stellar_history_verify_bucket_success_total",
+                "archive" => verify_archive,
+            )
+            .increment(1);
 
             info!(
                 "Created disk-backed bucket {} with {} entries",
@@ -448,6 +470,7 @@ impl CatchupManager {
                     // If we downloaded data, save it to disk atomically. A
                     // persistence error here is the terminal download outcome
                     // for this bucket — emit failure before propagating.
+                    let verify_archive_name: String;
                     if let Some((downloaded_data, archive_name)) = xdr_data {
                         if let Err(e) = atomic_write_bytes(&bucket_path, &downloaded_data) {
                             metrics::counter!(
@@ -462,9 +485,12 @@ impl CatchupManager {
                         }
                         metrics::counter!(
                             "stellar_history_download_bucket_success_total",
-                            "archive" => archive_name,
+                            "archive" => archive_name.clone(),
                         )
                         .increment(1);
+                        verify_archive_name = archive_name;
+                    } else {
+                        verify_archive_name = "local".to_owned();
                     }
 
                     // Load hot archive bucket from disk eagerly — builds the index
@@ -473,15 +499,22 @@ impl CatchupManager {
 
                     // Verify hash matches (same as live bucket verification)
                     if bucket.hash() != *hash {
-                        metrics::counter!("stellar_history_verify_bucket_failure_total")
-                            .increment(1);
+                        metrics::counter!(
+                            "stellar_history_verify_bucket_failure_total",
+                            "archive" => verify_archive_name,
+                        )
+                        .increment(1);
                         let _ = std::fs::remove_file(&bucket_path);
                         return Err(henyey_bucket::BucketError::HashMismatch {
                             expected: hash.to_hex(),
                             actual: bucket.hash().to_hex(),
                         });
                     }
-                    metrics::counter!("stellar_history_verify_bucket_success_total").increment(1);
+                    metrics::counter!(
+                        "stellar_history_verify_bucket_success_total",
+                        "archive" => verify_archive_name,
+                    )
+                    .increment(1);
 
                     // Cache for reuse (same hash can appear at multiple levels)
                     {
@@ -557,6 +590,34 @@ mod tests {
                 src.contains(literal),
                 "expected metric literal {literal} in catchup/buckets.rs",
             );
+        }
+    }
+
+    /// Stage E: verify and download counters must carry the `"archive"` label.
+    #[test]
+    fn test_stage_e_buckets_archive_label_present() {
+        let src = include_str!("buckets.rs");
+        let main_code = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for metric in &[
+            "stellar_history_verify_bucket_success_total",
+            "stellar_history_verify_bucket_failure_total",
+            "stellar_history_download_bucket_success_total",
+            "stellar_history_download_bucket_failure_total",
+        ] {
+            let mut search_from = 0;
+            let mut found_any = false;
+            while let Some(rel_idx) = main_code[search_from..].find(metric) {
+                found_any = true;
+                let idx = search_from + rel_idx;
+                let window = &main_code[idx..std::cmp::min(idx + 200, main_code.len())];
+                assert!(
+                    window.contains("\"archive\""),
+                    "metric {metric} missing \"archive\" label at byte offset {idx} \
+                     in catchup/buckets.rs",
+                );
+                search_from = idx + metric.len();
+            }
+            assert!(found_any, "metric {metric} not found in catchup/buckets.rs",);
         }
     }
 }
