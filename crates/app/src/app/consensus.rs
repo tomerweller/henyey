@@ -236,19 +236,44 @@ impl App {
         // Track consecutive recovery attempts without progress.
         let baseline = self.recovery_baseline_ledger.load(Ordering::SeqCst);
         if current_ledger as u64 > baseline {
-            // Progress!  Reset the counter.
+            // Progress — always update the baseline ledger.
             self.recovery_baseline_ledger
                 .store(current_ledger as u64, Ordering::SeqCst);
-            self.reset_recovery_attempts(0);
-            // Also clear any archive-behind backoff, the confirmed-behind
-            // signal (#1867), and urgent cache mode — the node is advancing
-            // again, so the next stall (if any) should query fresh.
-            self.archive_confirmed_behind.store(false, Ordering::SeqCst);
-            let mut guard = self.archive_behind_until.write().await;
-            *guard = None;
-            self.archive_checkpoint_cache.set_urgent(false);
-            // Clear hard-reset livelock tracking: ledger advanced (#2389).
-            self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
+
+            let peer_gap = self.effective_peer_gap(current_ledger);
+            let still_behind = relation.is_behind() && peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD;
+
+            if still_behind {
+                // Partial progress: node advanced (e.g. via fast-track) but
+                // is still significantly behind verified peers. Re-seed the
+                // attempt counter high for faster re-escalation (~30s instead
+                // of ~120s). See RecoveryResetMode::Partial docs.
+                self.reset_recovery_attempts(RecoveryResetMode::Partial {
+                    seed: PARTIAL_PROGRESS_RESEED,
+                });
+                // Clear stale archive signals — they were relative to the
+                // old next_checkpoint. Urgent polling re-confirms quickly.
+                self.archive_confirmed_behind.store(false, Ordering::SeqCst);
+                let mut guard = self.archive_behind_until.write().await;
+                *guard = None;
+                self.archive_checkpoint_cache.set_urgent(true);
+                // Clear livelock tracker — ledger advanced.
+                self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
+                tracing::info!(
+                    current_ledger,
+                    peer_gap,
+                    "Partial recovery progress — still behind, re-seeding escalation"
+                );
+            } else {
+                // Full progress: node is at or near the tip. Clear all
+                // escalation state (#1867).
+                self.reset_recovery_attempts(RecoveryResetMode::Full);
+                self.archive_confirmed_behind.store(false, Ordering::SeqCst);
+                let mut guard = self.archive_behind_until.write().await;
+                *guard = None;
+                self.archive_checkpoint_cache.set_urgent(false);
+                self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
+            }
         }
         let attempts = self
             .recovery_attempts_without_progress
@@ -1465,7 +1490,7 @@ impl App {
             }
             self.herder.clear_pending_tx_sets();
             self.reset_tx_set_tracking().await;
-            self.reset_recovery_attempts(0);
+            self.reset_recovery_attempts(RecoveryResetMode::Full);
         }
 
         result

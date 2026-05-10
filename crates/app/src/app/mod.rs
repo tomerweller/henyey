@@ -248,6 +248,32 @@ const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS: u64 =
 const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP: u64 =
     (HARD_RESET_STALL_SECS * 3 / 2 / OUT_OF_SYNC_RECOVERY_TIMER_SECS) - 1;
 
+/// Attempt-counter seed for partial-progress resets. When the node makes
+/// progress via a fast-track jump but is still significantly behind peers,
+/// we re-seed the attempt counter to this value so re-escalation fires
+/// after ~3 more ticks (~30s) instead of the full ~120s.
+///
+/// Derived from `RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS` so it tracks
+/// any future tuning of that constant.
+const PARTIAL_PROGRESS_RESEED: u64 = RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS.saturating_sub(3);
+
+/// Controls which recovery state is reset when progress is detected.
+///
+/// `Full` clears all escalation state including `max_verified_scp_slot`.
+/// `Partial` preserves `max_verified_scp_slot` (peer-gap evidence for the
+/// hard-reset gate) and uses monotonic reseeding (`fetch_max`) so the
+/// attempt counter is never lowered by a partial-progress reset.
+///
+/// Both variants always snapshot the SCP baseline to invalidate stale
+/// pre-progress SCP traffic (preventing false fast-track triggers).
+pub(super) enum RecoveryResetMode {
+    /// Node is at or near the tip. Clear all escalation state.
+    Full,
+    /// Node advanced but is still significantly behind. Preserve peer-gap
+    /// evidence and re-seed the attempt counter for faster re-escalation.
+    Partial { seed: u64 },
+}
+
 /// Maximum wall-clock duration (seconds) a node may remain stuck at the same
 /// ledger with hard resets firing before triggering a fail-fast shutdown with
 /// wipe signal. Computed as 2× the checkpoint publish window, floored at 120s.
@@ -1802,24 +1828,47 @@ impl App {
     }
 
     /// Reset (or re-arm) the recovery attempt counter and snapshot the current
-    /// SCP message count. The `seed` parameter sets the initial attempt value:
-    /// - `0` for a full reset (after progress, hard reset, or successful catchup spawn)
-    /// - `1` for a re-arm (after catchup with progress, to re-enter recovery immediately)
+    /// SCP message count. See [`RecoveryResetMode`] for the two reset policies.
     ///
     /// The SCP snapshot ensures the fast-track gate only considers SCP traffic
-    /// received *after* this reset/re-arm point.
+    /// received *after* this reset/re-arm point. Both variants always snapshot
+    /// the SCP baseline.
     ///
     /// Store order: SCP baseline first, then attempt counter, so that any
     /// concurrent reader that observes the new attempt count also sees the
     /// updated SCP baseline (or a fresher one).
-    pub(super) fn reset_recovery_attempts(&self, seed: u64) {
-        self.max_verified_scp_slot.store(0, Ordering::Relaxed);
+    pub(super) fn reset_recovery_attempts(&self, mode: RecoveryResetMode) {
+        // SCP baseline snapshot — always: invalidates stale pre-progress
+        // SCP traffic so fast-track doesn't fire on old envelopes.
         self.recovery_baseline_scp_received.store(
             self.scp_messages_received.load(Ordering::Relaxed),
             Ordering::SeqCst,
         );
-        self.recovery_attempts_without_progress
-            .store(seed, Ordering::SeqCst);
+
+        match mode {
+            RecoveryResetMode::Full => {
+                // Clear peer-gap evidence — node is caught up.
+                // max_verified_scp_slot is Relaxed (monotonic hint from
+                // verified envelopes). Zeroing is safe because peer traffic
+                // will re-populate it within one SCP cycle.
+                self.max_verified_scp_slot.store(0, Ordering::Relaxed);
+                self.recovery_attempts_without_progress
+                    .store(0, Ordering::SeqCst);
+            }
+            RecoveryResetMode::Partial { seed } => {
+                // Preserve max_verified_scp_slot — the hard-reset gate at
+                // consensus.rs relies on effective_peer_gap() which reads
+                // it. This is a Relaxed monotonic hint; correctness does
+                // not depend on memory ordering — the dual guard
+                // (relation.is_behind() AND peer_gap >= threshold) ensures
+                // a stale far-ahead slot alone cannot trigger partial mode.
+                //
+                // Monotonic reseed: never lower the counter. Existing stall
+                // history may exceed the seed.
+                self.recovery_attempts_without_progress
+                    .fetch_max(seed, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Get Soroban network configuration information.
@@ -8632,7 +8681,7 @@ mod tests {
 
     /// Unit test for `reset_recovery_attempts`: verifies that the helper
     /// snapshots the SCP baseline and sets the attempt counter correctly
-    /// for both reset (seed=0) and re-arm (seed=1) cases.
+    /// for both Full and Partial cases.
     #[tokio::test]
     async fn test_reset_recovery_attempts_snapshots_scp_baseline() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -8642,34 +8691,46 @@ mod tests {
             .build();
         let app = App::new(config).await.unwrap();
 
-        // Test reset (seed=0).
+        // Test Full reset.
         app.scp_messages_received.store(42, Ordering::Relaxed);
-        app.reset_recovery_attempts(0);
+        app.max_verified_scp_slot.store(999, Ordering::Relaxed);
+        app.reset_recovery_attempts(RecoveryResetMode::Full);
         assert_eq!(
             app.recovery_baseline_scp_received.load(Ordering::SeqCst),
             42,
-            "reset must snapshot current SCP count"
+            "Full reset must snapshot current SCP count"
         );
         assert_eq!(
             app.recovery_attempts_without_progress
                 .load(Ordering::SeqCst),
             0,
-            "reset must set attempts to 0"
+            "Full reset must set attempts to 0"
+        );
+        assert_eq!(
+            app.max_verified_scp_slot.load(Ordering::Relaxed),
+            0,
+            "Full reset must clear max_verified_scp_slot"
         );
 
-        // Test re-arm (seed=1).
+        // Test Partial re-arm (seed=1).
         app.scp_messages_received.store(100, Ordering::Relaxed);
-        app.reset_recovery_attempts(1);
+        app.max_verified_scp_slot.store(500, Ordering::Relaxed);
+        app.reset_recovery_attempts(RecoveryResetMode::Partial { seed: 1 });
         assert_eq!(
             app.recovery_baseline_scp_received.load(Ordering::SeqCst),
             100,
-            "re-arm must snapshot current SCP count"
+            "Partial must snapshot current SCP count"
         );
         assert_eq!(
             app.recovery_attempts_without_progress
                 .load(Ordering::SeqCst),
             1,
-            "re-arm must set attempts to 1"
+            "Partial must set attempts to seed"
+        );
+        assert_eq!(
+            app.max_verified_scp_slot.load(Ordering::Relaxed),
+            500,
+            "Partial must preserve max_verified_scp_slot"
         );
     }
 
@@ -8694,7 +8755,7 @@ mod tests {
         app.recovery_baseline_ledger.store(0, Ordering::SeqCst);
 
         // Call 1: current_ledger=5 > baseline=0 → progress detected.
-        // This triggers reset_recovery_attempts(0), snapshotting SCP baseline to 10.
+        // This triggers reset_recovery_attempts(Full), snapshotting SCP baseline to 10.
         let _ = app.out_of_sync_recovery(5).await;
 
         // Verify the progress path snapshotted the SCP baseline.
@@ -9700,11 +9761,65 @@ mod tests {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
         app.max_verified_scp_slot.store(999, Ordering::Relaxed);
         app.scp_messages_received.store(42, Ordering::Relaxed);
-        app.reset_recovery_attempts(0);
+        app.reset_recovery_attempts(RecoveryResetMode::Full);
         assert_eq!(
             app.max_verified_scp_slot.load(Ordering::Relaxed),
             0,
-            "reset_recovery_attempts must clear max_verified_scp_slot"
+            "Full reset must clear max_verified_scp_slot"
+        );
+    }
+
+    /// Partial reset (RecoveryResetMode::Partial) must preserve
+    /// max_verified_scp_slot so the hard-reset gate can still see peer gap.
+    #[tokio::test]
+    async fn test_partial_progress_preserves_peer_gap() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        app.max_verified_scp_slot.store(500, Ordering::Relaxed);
+        app.scp_messages_received.store(50, Ordering::Relaxed);
+        app.recovery_attempts_without_progress
+            .store(3, Ordering::SeqCst);
+
+        app.reset_recovery_attempts(RecoveryResetMode::Partial {
+            seed: PARTIAL_PROGRESS_RESEED,
+        });
+
+        assert_eq!(
+            app.max_verified_scp_slot.load(Ordering::Relaxed),
+            500,
+            "Partial must preserve max_verified_scp_slot"
+        );
+        assert_eq!(
+            app.recovery_baseline_scp_received.load(Ordering::SeqCst),
+            50,
+            "Partial must snapshot SCP baseline"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            PARTIAL_PROGRESS_RESEED,
+            "Partial must reseed attempts to PARTIAL_PROGRESS_RESEED"
+        );
+    }
+
+    /// Monotonic reseeding: if attempts are already higher than the seed,
+    /// fetch_max is a no-op and existing stall history is preserved.
+    #[tokio::test]
+    async fn test_partial_progress_monotonic_reseed() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        // Set attempts higher than PARTIAL_PROGRESS_RESEED.
+        let high_attempts = PARTIAL_PROGRESS_RESEED + 5;
+        app.recovery_attempts_without_progress
+            .store(high_attempts, Ordering::SeqCst);
+
+        app.reset_recovery_attempts(RecoveryResetMode::Partial {
+            seed: PARTIAL_PROGRESS_RESEED,
+        });
+
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            high_attempts,
+            "fetch_max must not lower attempts below existing value"
         );
     }
 
@@ -9741,7 +9856,7 @@ mod tests {
         // force_post_catchup_hard_reset returns None on test App (no self_arc),
         // but we verify it was called by checking that recovery state was reset.
         assert!(result.is_none());
-        // hard reset calls reset_recovery_attempts(0) which clears this:
+        // hard reset calls reset_recovery_attempts(Full) which clears this:
         assert_eq!(
             app.max_verified_scp_slot.load(Ordering::Relaxed),
             0,
