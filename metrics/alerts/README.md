@@ -210,12 +210,13 @@ already cover the downstream quorum-loss risk at `critical` severity.
 This provides layered escalation: "peers dropping" (warning) →
 "quorum at risk" (critical).
 
-#### Peer count — noDataState: Alerting
+#### Peer count — noDataState: OK
 
-Unlike most alerts which use `noDataState: OK` (relying on Process Down
-for crash detection), the Peer Count alerts use `noDataState: Alerting`.
-An absent peer count metric — even if the process is still technically
-running — indicates a severe connectivity problem worth investigating.
+The Peer Count alerts use `noDataState: OK`, consistent with most other
+alerts. `stellar_peer_count` is a pre-registered gauge that is always
+emitted when the henyey process is running. If it disappears, the process
+has crashed — which is already covered by the Process Down alert. Using
+`noDataState: OK` avoids duplicate no-data pages.
 
 ## Testing
 

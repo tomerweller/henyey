@@ -723,6 +723,9 @@ groups:
       # ── Alert 12a: Peer Count — Warning ───────────────────────────
       # Fires when connected peer count drops below 8 (yellow zone).
       # Dashboard-derived: matches panel id=5 yellow threshold.
+      # noDataState: OK — peer_count is a pre-registered gauge always
+      # emitted when the process is running; absence means process
+      # down, which is already covered by the Process Down alert.
       - uid: henyey-peer-count-warn
         title: "Henyey: Peer Count (Warning)"
         condition: threshold
@@ -735,7 +738,7 @@ groups:
           description: >-
             stellar_peer_count < 8 for 5m on {{ $labels.instance }}.
             Connected peer count is low.
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Alerting
         data:
           - refId: A
@@ -783,7 +786,7 @@ groups:
           description: >-
             stellar_peer_count < 3 for 5m on {{ $labels.instance }}.
             Critically low peer connectivity. Network isolation possible.
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Alerting
         data:
           - refId: A
