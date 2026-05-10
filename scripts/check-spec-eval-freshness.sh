@@ -46,8 +46,8 @@ shopt -s nullglob
 spec_eval_files=( docs/spec-eval/*_SPEC_HENYEY_EVAL.md )
 shopt -u nullglob
 if [ ${#spec_eval_files[@]} -eq 0 ]; then
-    echo "  WARNING: no *_SPEC_HENYEY_EVAL.md files found in docs/spec-eval/"
-    warnings=$((warnings + 1))
+    echo "  ERROR: no *_SPEC_HENYEY_EVAL.md files found in docs/spec-eval/"
+    errors=$((errors + 1))
 else
     for f in "${spec_eval_files[@]}"; do
         basename=$(basename "$f")
