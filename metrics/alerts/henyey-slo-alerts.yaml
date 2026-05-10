@@ -818,3 +818,117 @@ groups:
                   reducer:
                     type: last
               refId: threshold
+
+      # ════════════════════════════════════════════════════════════════
+      # Phase 3: Remaining Dashboard-Threshold Alerts (issue #2552)
+      # ════════════════════════════════════════════════════════════════
+      # Assessed 4 panels; 2 alert rules added, 2 classified as
+      # diagnostic-only (Bucket Cache Hit Ratio, Snapshot Cache Hit
+      # Ratio). See README.md for full assessment rationale.
+
+      # ── Alert 13: Validator Not Tracking ──────────────────────────
+      # Fires when herder state is not Tracking (≠ 2) for 20 minutes.
+      # Uses != bool 2 to always produce a series (returns 0 when
+      # healthy, 1 when not tracking).
+      # for: 20m covers normal boot (15m) and fresh-start (20m)
+      # scenarios. Crash recovery (~60m) may cause a brief transient
+      # warning that auto-resolves.
+      - uid: henyey-validator-not-tracking
+        title: "Henyey: Validator Not Tracking"
+        condition: threshold
+        for: 20m
+        labels:
+          severity: warning
+          team: henyey
+        annotations:
+          summary: "Validator not tracking on {{ $labels.instance }}"
+          description: >-
+            stellar_herder_state != 2 for 20m on {{ $labels.instance }}.
+            The validator is not in Tracking state. Investigate herder
+            state and connectivity.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "stellar_herder_state{job=\"henyey\"} != bool 2"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 14: Fragmentation ──────────────────────────────────
+      # Fires when jemalloc fragmentation exceeds 50% for 15 minutes.
+      # Threshold from ops guidance (monitor-tick SKILL.md:627);
+      # steady-state is ~18%, post-restart ramps to ~35-45%.
+      # Dashboard visual thresholds (yellow=15%, red=30%) are
+      # diagnostic color bands, not alert thresholds — normal
+      # operation sits between them.
+      - uid: henyey-fragmentation
+        title: "Henyey: Fragmentation"
+        condition: threshold
+        for: 15m
+        labels:
+          severity: warning
+          team: henyey
+        annotations:
+          summary: "Fragmentation > 50% on {{ $labels.instance }}"
+          description: >-
+            henyey_jemalloc_fragmentation_pct > 50 for 15m
+            on {{ $labels.instance }}.
+            Jemalloc fragmentation is abnormally high.
+            Investigate memory usage patterns.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1500
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "henyey_jemalloc_fragmentation_pct{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 1500
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 50
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold

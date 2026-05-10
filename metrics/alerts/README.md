@@ -44,6 +44,26 @@ split into two categories:
 | 12a | Peer Count (warn) | `stellar_peer_count` | `< 8` | 5m | warning | id=5 |
 | 12b | Peer Count (crit) | `stellar_peer_count` | `< 3` | 5m | critical | id=5 |
 
+### Phase 3: Remaining Dashboard-Threshold Alerts
+
+Four dashboard panels were assessed for alerting. Two were added as alert
+rules; two were classified as diagnostic-only (visual indicators, not
+alertable conditions).
+
+#### Active Rules
+
+| # | Rule | Metric | Condition | For | Severity | Panel |
+|---|------|--------|-----------|-----|----------|-------|
+| 13 | Validator Not Tracking | `stellar_herder_state` | `!= bool 2` | 20m | warning | id=4 |
+| 14 | Fragmentation | `henyey_jemalloc_fragmentation_pct` | `> 50` | 15m | warning | — |
+
+#### Diagnostic-Only Panels (No Alert)
+
+| Panel | Metric | Dashboard Threshold | Assessment |
+|-------|--------|---------------------|------------|
+| Bucket Cache Hit Ratio | `henyey_ledger_bucket_cache_hit_ratio` | red < 0.5, green ≥ 0.5 | Low values expected (secondary cache behind snapshot prefetch). No actionable response. |
+| Snapshot Cache Hit Ratio | `henyey_ledger_snapshot_cache_hit_ratio` | red < 0.5, green ≥ 0.5 | No stable baseline; low ratios normal after restart/catchup. No ops-defined threshold. |
+
 ## Prerequisites
 
 - **Grafana ≥ 9.x** with unified alerting enabled (legacy alerting is not
@@ -82,7 +102,7 @@ split into two categories:
    curl -s http://localhost:3000/api/v1/provisioning/alert-rules | jq '.[] | .title'
    ```
 
-   You should see 16 rules in the `Henyey` folder under the `henyey-slo`
+   You should see 18 rules in the `Henyey` folder under the `henyey-slo`
    rule group.
 
 ## Configuration
@@ -217,6 +237,54 @@ alerts. `stellar_peer_count` is a pre-registered gauge that is always
 emitted when the henyey process is running. If it disappears, the process
 has crashed — which is already covered by the Process Down alert. Using
 `noDataState: OK` avoids duplicate no-data pages.
+
+### Phase 3 design notes
+
+#### Validator Not Tracking — PromQL pattern
+
+The alert uses `stellar_herder_state != bool 2` instead of `!= 2`. Plain
+`!= 2` returns no series when the value equals 2 (healthy), which would
+trigger `noDataState` handling. The `bool` modifier always returns a series
+(0 when healthy, 1 when not tracking), making the threshold evaluation
+reliable.
+
+#### Validator Not Tracking — for: 20m gating
+
+Ops guidance defines three deadlines for reaching Tracking state:
+- Normal: 15m
+- Fresh start: 20m
+- Crash recovery: 60m
+
+`for: 20m` covers normal and fresh-start scenarios. During crash recovery
+(~60m), the warning-severity alert may fire transiently but auto-resolves.
+This is acceptable because warning does not page on-call, crash recovery
+is rare, and encoding full 3-tier gating in PromQL adds complexity
+disproportionate to the benefit.
+
+#### Fragmentation — dashboard vs alert threshold divergence
+
+The dashboard panel uses yellow=15% and red=30% as visual color bands.
+Normal steady-state fragmentation is ~18% (per ops guidance), which sits
+between these visual thresholds. Alerting at 15% or 30% would cause
+constant false positives.
+
+The alert threshold of >50% comes from ops guidance
+(`.claude/skills/monitor-tick/SKILL.md:627`), which treats this as the
+actionable level. Post-restart fragmentation ramps to ~35-45% before
+settling. `for: 15m` avoids transient spikes during warmup.
+
+#### Bucket and Snapshot Cache — diagnostic-only classification
+
+Both cache hit ratio panels use red/green visual thresholds at 0.5, but
+these are diagnostic indicators, not alertable conditions:
+
+- **Bucket cache:** Dashboard description explicitly states low values are
+  expected because the snapshot prefetch cache absorbs most lookups.
+- **Snapshot cache:** No stable baseline exists — the ratio depends on
+  workload mix, cache warmth, and protocol version. Low ratios after
+  restart, catchup, or burst transactions are normal. No ops guidance
+  defines a threshold. The only response to sustained low ratios is
+  development investigation (cache sizing), not operational action.
 
 ## Testing
 
