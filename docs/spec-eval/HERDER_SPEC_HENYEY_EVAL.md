@@ -2,7 +2,7 @@
 
 **Evaluated against:** stellar-core v26.0.1 herder implementation (C++ reference)
 **Crate:** `crates/herder/` (henyey-herder)
-**SCP core library:** `crates/scp/` (henyey-scp) — 100% parity (164/164 functions)
+**SCP core library:** `crates/scp/` (henyey-scp) — 95% parity (see `crates/scp/PARITY_STATUS.md`)
 **Parity:** see `crates/herder/PARITY_STATUS.md` for current function-level status
 **Date:** 2026-05-10
 
@@ -39,7 +39,7 @@
 
 ## 1. Executive Summary
 
-The henyey herder crate coordinates SCP consensus on top of the core SCP library (`henyey-scp`, which is at **100% parity** with stellar-core's SCP implementation). The herder is responsible for driving nomination, validating values, managing the transaction mempool, constructing and validating transaction sets, handling upgrades, persisting SCP state, and coordinating ledger closes.
+The henyey herder crate coordinates SCP consensus on top of the core SCP library (`henyey-scp`, which is at **95% parity** with stellar-core's SCP implementation — see `crates/scp/PARITY_STATUS.md`). The herder is responsible for driving nomination, validating values, managing the transaction mempool, constructing and validating transaction sets, handling upgrades, persisting SCP state, and coordinating ledger closes.
 
 The herder crate is at **79% function-level parity** (see `crates/herder/PARITY_STATUS.md` for current counts). However, function-level parity does not capture the full picture — many behaviors are implemented with different architectural patterns (e.g., unified `TransactionQueue` vs C++ inheritance hierarchy, actor-model `TimerManager` vs `VirtualTimer` per slot).
 

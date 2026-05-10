@@ -40,7 +40,7 @@
 
 The henyey bucket crate implements the BucketListDB — the core state storage structure for Stellar's ledger. It manages two append-only bucket lists (live and hot archive), each with 11 levels, providing deterministic ledger state snapshots, background merges, indexed point lookups, and state eviction for Soroban entries.
 
-The bucket crate is at **93% function-level parity** (138/149 functions implemented per `PARITY_STATUS.md`). The core data structures, merge algorithm, indexing system, and query layer are fully implemented. The primary gaps are in BucketManager's merge future deduplication cache and some operational metrics.
+The bucket crate is at **84% function-level parity** (see `crates/bucket/PARITY_STATUS.md` for current counts). The core data structures, merge algorithm, indexing system, and query layer are fully implemented. The primary gaps are in BucketManager's merge future deduplication cache and some operational metrics.
 
 ### Overall Adherence Rating
 
@@ -559,7 +559,7 @@ The v26 changes are overwhelmingly concurrency fixes for C++ shared-mutable-stat
 
 ### Priority 2: Complete Partial Implementations
 - **What:** Finish `loadCompleteHotArchiveState()`, `scheduleVerifyReferencedBucketsWork()`, and `BucketInputIterator::seek()`
-- **Why:** Completes the remaining 7% of function-level parity
+- **Why:** Completes the remaining parity gap (see `crates/bucket/PARITY_STATUS.md`)
 - **Effort:** Low per item
 
 ### Priority 3: Adopt v26 Hot Archive Scan Filter

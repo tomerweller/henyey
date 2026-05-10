@@ -1,0 +1,5 @@
+error: multiple workspace roots found in the same workspace:
+  /home/tomer/henyey-3/stellar-core/src/rust/soroban/p24
+  /home/tomer/henyey-3/stellar-core/src/rust/soroban/p25
+  /home/tomer/henyey-3/stellar-core/src/rust/soroban/p26
+  /home/tomer/henyey-3

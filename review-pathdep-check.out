@@ -1,0 +1,26 @@
+error: failed to load manifest for workspace member `/home/tomer/henyey-3/crates/henyey`
+referenced by workspace at `/home/tomer/henyey-3/Cargo.toml`
+
+Caused by:
+  failed to load manifest for dependency `henyey-app`
+
+Caused by:
+  failed to load manifest for dependency `henyey-herder`
+
+Caused by:
+  failed to load manifest for dependency `henyey-ledger`
+
+Caused by:
+  failed to load manifest for dependency `henyey-tx`
+
+Caused by:
+  failed to load manifest for dependency `soroban-env-host`
+
+Caused by:
+  failed to parse manifest at `/home/tomer/henyey-3/stellar-core/src/rust/soroban/p24/soroban-env-host/Cargo.toml`
+
+Caused by:
+  error inheriting `soroban-builtin-sdk-macros` from workspace root manifest's `workspace.dependencies.soroban-builtin-sdk-macros`
+
+Caused by:
+  `dependency.soroban-builtin-sdk-macros` was not found in `workspace.dependencies`
