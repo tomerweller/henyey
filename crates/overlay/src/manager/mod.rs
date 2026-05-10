@@ -385,6 +385,14 @@ pub(super) struct PeerHandle {
     stats: Arc<PeerStats>,
     /// Per-peer flow control (shared with the peer task).
     flow_control: Arc<FlowControl>,
+    /// Whether this is an inbound or outbound connection. Used by the
+    /// mutual-dial tiebreaker to distinguish same-direction duplicates
+    /// from cross-direction collisions.
+    direction: ConnectionDirection,
+    /// Monotonically-increasing generation counter. Used by `cleanup_peer`
+    /// to avoid removing an entry that was replaced by a mutual-dial
+    /// tiebreaker while the old peer_loop was still running.
+    generation: u64,
 }
 
 /// Messages sent to a peer task via the outbound channel.
@@ -607,6 +615,11 @@ pub(super) struct SharedPeerState {
     /// This breaks mutual-dial oscillation by introducing asymmetric jitter
     /// between the two sides of a simultaneous dial.
     pub(super) dial_cooldowns: Arc<DashMap<ResolvedPeerAddr, std::time::Instant>>,
+    /// Our own peer ID. Used by the mutual-dial tiebreaker to
+    /// deterministically decide which side yields its outbound connection.
+    pub(super) local_peer_id: PeerId,
+    /// Monotonically-increasing counter for `PeerHandle::generation`.
+    pub(super) next_peer_generation: Arc<AtomicU64>,
 }
 
 impl SharedPeerState {
@@ -619,12 +632,26 @@ impl SharedPeerState {
 
     /// Clean up shared state after a peer disconnects.
     /// Must be called after `run_peer_loop` completes for any authenticated peer.
-    pub(super) fn cleanup_peer(&self, peer_id: &PeerId) {
-        self.peers.remove(peer_id);
-        self.peer_info_cache.remove(peer_id);
-        self.admission_state.lock().clear_evicting(peer_id);
-        self.dropped_authenticated_peers
-            .fetch_add(1, Ordering::Relaxed);
+    ///
+    /// The `generation` parameter is the generation of the `PeerHandle` that the
+    /// caller registered. If a mutual-dial tiebreaker replaced the entry since
+    /// registration, the installed generation will differ and this call is a no-op
+    /// — preventing the old peer_loop's cleanup from clobbering the replacement.
+    pub(super) fn cleanup_peer(&self, peer_id: &PeerId, generation: u64) {
+        let removed = self
+            .peers
+            .remove_if(peer_id, |_, handle| handle.generation == generation);
+        if removed.is_some() {
+            self.peer_info_cache.remove(peer_id);
+            self.admission_state.lock().clear_evicting(peer_id);
+            self.dropped_authenticated_peers
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            debug!(
+                "cleanup_peer: skipped stale cleanup for {} gen={} (generation mismatch)",
+                peer_id, generation
+            );
+        }
     }
 
     /// Forward an overlay message to the appropriate subscriber channels.
@@ -980,6 +1007,8 @@ impl OverlayManager {
             flow_control_bytes_config: self.config.flow_control_bytes_config,
             outbound_channel_capacity: self.connection_factory.outbound_channel_capacity(),
             dial_cooldowns: Arc::clone(&self.dial_cooldowns),
+            local_peer_id: PeerId::from_xdr(self.local_node.xdr_public_key()),
+            next_peer_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1875,6 +1904,8 @@ impl OverlayManager {
             outbound_tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+            direction: crate::connection::ConnectionDirection::Inbound,
+            generation: 0,
         };
         self.peers.insert(peer_id.clone(), handle);
         self.peer_info_cache.insert(
@@ -2309,6 +2340,8 @@ mod tests {
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             outbound_channel_capacity: 256,
             dial_cooldowns: Arc::new(DashMap::new()),
+            local_peer_id: PeerId::from_bytes([0u8; 32]),
+            next_peer_generation: Arc::new(AtomicU64::new(0)),
         }
     }
     fn insert_fake_peer(
@@ -2325,6 +2358,8 @@ mod tests {
             outbound_tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+            direction,
+            generation: 0,
         };
         shared.peers.insert(peer_id.clone(), handle);
         shared.peer_info_cache.insert(
@@ -2623,7 +2658,7 @@ mod tests {
             &candidate, &shared, &pool
         ));
         assert!(shared.admission_state.lock().is_evicting(&victim_id));
-        shared.cleanup_peer(&victim_id);
+        shared.cleanup_peer(&victim_id, 0);
         assert!(!shared.admission_state.lock().is_evicting(&victim_id));
     }
 
@@ -2740,6 +2775,8 @@ mod tests {
             outbound_tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+            direction: crate::connection::ConnectionDirection::Outbound,
+            generation: 0,
         };
         manager.peers.insert(peer_id.clone(), handle);
 
@@ -2827,6 +2864,8 @@ mod tests {
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             outbound_channel_capacity: 256,
             dial_cooldowns: Arc::new(DashMap::new()),
+            local_peer_id: PeerId::from_bytes([0u8; 32]),
+            next_peer_generation: Arc::new(AtomicU64::new(0)),
         };
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
@@ -2919,6 +2958,8 @@ mod tests {
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             outbound_channel_capacity: 256,
             dial_cooldowns: Arc::new(DashMap::new()),
+            local_peer_id: PeerId::from_bytes([0u8; 32]),
+            next_peer_generation: Arc::new(AtomicU64::new(0)),
         };
         (shared, broadcast_rx, fetch_rx)
     }
@@ -3618,6 +3659,8 @@ mod tests {
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             outbound_channel_capacity: 256,
             dial_cooldowns: Arc::new(DashMap::new()),
+            local_peer_id: PeerId::from_bytes([0u8; 32]),
+            next_peer_generation: Arc::new(AtomicU64::new(0)),
         };
 
         // Pool with capacity (max=10, current authenticated=0)
@@ -3685,6 +3728,8 @@ mod tests {
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             outbound_channel_capacity: 256,
             dial_cooldowns: Arc::new(DashMap::new()),
+            local_peer_id: PeerId::from_bytes([0u8; 32]),
+            next_peer_generation: Arc::new(AtomicU64::new(0)),
         };
 
         // Pool with capacity — reserve a pending slot (required before promote)
@@ -3722,6 +3767,8 @@ mod tests {
             outbound_tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+            direction: crate::connection::ConnectionDirection::Inbound,
+            generation: 0,
         };
         manager.peers.insert(peer_id.clone(), handle);
         manager.peer_info_cache.insert(

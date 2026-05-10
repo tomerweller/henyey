@@ -717,6 +717,8 @@ mod tests {
             outbound_tx: tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+            direction: info.direction,
+            generation: 0,
         };
         peers.insert(peer_id.clone(), handle);
         info_cache.insert(peer_id, info);
@@ -733,6 +735,8 @@ mod tests {
             outbound_tx: tx,
             stats: Arc::new(PeerStats::default()),
             flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+            direction: info.direction,
+            generation: 0,
         };
         peers.insert(peer_id.clone(), handle);
         info_cache.insert(peer_id, info);

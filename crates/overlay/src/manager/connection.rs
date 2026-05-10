@@ -7,7 +7,7 @@
 use super::peer_loop::make_error_msg;
 use super::{OutboundMessage, OverlayManager, SharedPeerState};
 use crate::{
-    connection::{ConnectionPool, Listener},
+    connection::{ConnectionDirection, ConnectionPool, Listener},
     connection_factory::ConnectionFactory,
     flow_control::{FlowControl, FlowControlConfig},
     peer::{Peer, PeerInfo},
@@ -25,6 +25,22 @@ use tracing::{debug, info, warn};
 use super::PeerHandle;
 use parking_lot::RwLock;
 use tokio::task::JoinHandle;
+
+/// Result of a successful `try_register_peer` call.
+pub(super) struct RegisterResult {
+    pub outbound_rx: mpsc::Receiver<OutboundMessage>,
+    pub flow_control: Arc<FlowControl>,
+    pub generation: u64,
+    pub replaced: Option<ReplacedPeer>,
+}
+
+/// A peer handle that was displaced by the mutual-dial tiebreaker.
+/// Dropping the handle closes its outbound channel, signalling the old
+/// peer_loop to exit.
+pub(super) struct ReplacedPeer {
+    pub handle: PeerHandle,
+    pub direction: ConnectionDirection,
+}
 
 /// Delay in milliseconds between successive connection attempts when
 /// filling outbound slots, to avoid overwhelming the network stack.
@@ -213,18 +229,23 @@ impl OverlayManager {
         peer.close().await;
     }
 
-    /// Create a PeerHandle (outbound channel + FlowControl) and atomically
-    /// register the peer in the shared maps. Returns the receiver and
-    /// FlowControl needed by `run_peer_loop`, or `Err` if a peer with the
-    /// same ID is already registered (TOCTOU-safe via `DashMap::entry`).
-    pub(super) fn register_peer(
+    /// Atomically register a peer, applying a mutual-dial tiebreaker when
+    /// a cross-direction collision is detected.
+    ///
+    /// Returns `RegisterResult` on success, which may include a replaced
+    /// `PeerHandle` from a mutual-dial resolution. The caller MUST drop
+    /// the replaced handle promptly — dropping closes its outbound channel,
+    /// causing the old peer_loop to exit.
+    ///
+    /// Returns `Err(AlreadyConnected)` for same-direction duplicates or
+    /// when the tiebreaker favors the existing connection.
+    pub(super) fn try_register_peer(
         peer: &Peer,
         peer_id: &PeerId,
         peer_info: PeerInfo,
         shared: &SharedPeerState,
         initial_byte_grant: u32,
-    ) -> std::result::Result<(mpsc::Receiver<OutboundMessage>, Arc<FlowControl>), OverlayError>
-    {
+    ) -> std::result::Result<RegisterResult, OverlayError> {
         let (outbound_tx, outbound_rx) = mpsc::channel(shared.outbound_channel_capacity);
         let stats = peer.stats();
         let flow_control = Arc::new(FlowControl::with_scp_callback(
@@ -237,29 +258,79 @@ impl OverlayManager {
             shared.scp_callback.clone(),
         ));
         flow_control.set_peer_id(peer_id.clone());
+        let generation = shared.next_peer_generation.fetch_add(1, Ordering::Relaxed);
+        let new_direction = peer_info.direction;
         let peer_handle = PeerHandle {
             outbound_tx,
             stats,
             flow_control: Arc::clone(&flow_control),
+            direction: new_direction,
+            generation,
         };
 
-        // Atomic check-and-insert: prevents TOCTOU race where two concurrent
-        // tasks both pass the earlier `contains_key` check and both try to
-        // register the same PeerId.
         use dashmap::mapref::entry::Entry;
-        match shared.peers.entry(peer_id.clone()) {
-            Entry::Occupied(_) => {
-                return Err(OverlayError::AlreadyConnected);
-            }
+        let replaced = match shared.peers.entry(peer_id.clone()) {
             Entry::Vacant(e) => {
                 e.insert(peer_handle);
+                None
             }
-        }
+            Entry::Occupied(mut e) => {
+                let existing_direction = e.get().direction;
+                if existing_direction == new_direction {
+                    // Same-direction duplicate — always reject.
+                    return Err(OverlayError::AlreadyConnected);
+                }
+                // Cross-direction collision (mutual-dial).
+                // Tiebreaker: higher peer ID keeps outbound.
+                let local_bytes = shared.local_peer_id.as_bytes();
+                let remote_bytes = peer_id.as_bytes();
+                let local_is_higher = local_bytes > remote_bytes;
+
+                // Determine if the NEW connection should win.
+                let new_wins = match (new_direction, existing_direction) {
+                    (ConnectionDirection::Inbound, ConnectionDirection::Outbound) => {
+                        // We're accepting inbound. We should yield outbound
+                        // (accept inbound) when local < remote.
+                        !local_is_higher
+                    }
+                    (ConnectionDirection::Outbound, ConnectionDirection::Inbound) => {
+                        // We're dialing outbound. We should keep outbound
+                        // when local > remote.
+                        local_is_higher
+                    }
+                    _ => unreachable!("same-direction case handled above"),
+                };
+
+                if new_wins {
+                    let old = e.insert(peer_handle);
+                    let old_direction = old.direction;
+                    info!(
+                        "Mutual-dial tiebreaker: replaced {:?} with {:?} for peer {}",
+                        old_direction, new_direction, peer_id
+                    );
+                    Some(ReplacedPeer {
+                        handle: old,
+                        direction: old_direction,
+                    })
+                } else {
+                    debug!(
+                        "Mutual-dial tiebreaker: keeping existing {:?} for peer {}, rejecting {:?}",
+                        existing_direction, peer_id, new_direction
+                    );
+                    return Err(OverlayError::AlreadyConnected);
+                }
+            }
+        };
         shared.peer_info_cache.insert(peer_id.clone(), peer_info);
         shared
             .added_authenticated_peers
             .fetch_add(1, Ordering::Relaxed);
-        Ok((outbound_rx, flow_control))
+        Ok(RegisterResult {
+            outbound_rx,
+            flow_control,
+            generation,
+            replaced,
+        })
     }
 
     /// Send a PEERS advertisement to a newly accepted inbound peer.
@@ -313,19 +384,24 @@ impl OverlayManager {
             pool.release_pending();
             return;
         }
-        if shared.peers.contains_key(&peer_id) {
-            debug!("Rejected duplicate inbound peer {}", peer_id);
-            shared.metrics.inbound_reject.inc();
-            // Notify peer of rejection (matches stellar-core Peer.cpp:1889).
-            let _ = peer
-                .send(make_error_msg(ErrorCode::Conf, "already connected"))
-                .await;
-            peer.close().await;
-            if peer.holds_pending_peer_id() {
-                shared.pending_connections.release_peer_id(&peer_id);
+        if let Some(existing) = shared.peers.get(&peer_id) {
+            if existing.direction == ConnectionDirection::Inbound {
+                debug!("Rejected duplicate inbound peer {}", peer_id);
+                drop(existing);
+                shared.metrics.inbound_reject.inc();
+                let _ = peer
+                    .send(make_error_msg(ErrorCode::Conf, "already connected"))
+                    .await;
+                peer.close().await;
+                if peer.holds_pending_peer_id() {
+                    shared.pending_connections.release_peer_id(&peer_id);
+                }
+                pool.release_pending();
+                return;
             }
-            pool.release_pending();
-            return;
+            // Cross-direction (outbound exists, inbound arriving): fall through
+            // to tiebreaker in try_register_peer.
+            drop(existing);
         }
 
         let peer_info = peer.info().clone();
@@ -366,20 +442,38 @@ impl OverlayManager {
             ))
             .await;
 
-        let (outbound_rx, flow_control) =
-            match Self::register_peer(&peer, &peer_id, peer_info, &shared, initial_byte_grant) {
-                Ok(result) => result,
-                Err(_) => {
-                    debug!("Rejected duplicate inbound peer {} (race)", peer_id);
-                    shared.metrics.inbound_reject.inc();
-                    peer.close().await;
-                    if peer.holds_pending_peer_id() {
-                        shared.pending_connections.release_peer_id(&peer_id);
-                    }
-                    pool.release_authenticated();
-                    return;
+        let register_result = match Self::try_register_peer(
+            &peer,
+            &peer_id,
+            peer_info,
+            &shared,
+            initial_byte_grant,
+        ) {
+            Ok(result) => result,
+            Err(_) => {
+                debug!(
+                    "Rejected duplicate inbound peer {} (race or tiebreaker)",
+                    peer_id
+                );
+                shared.metrics.inbound_reject.inc();
+                peer.close().await;
+                if peer.holds_pending_peer_id() {
+                    shared.pending_connections.release_peer_id(&peer_id);
                 }
-            };
+                pool.release_authenticated();
+                return;
+            }
+        };
+
+        // If a mutual-dial replacement occurred, drop the old handle to
+        // signal the old peer_loop to exit.
+        if let Some(replaced) = register_result.replaced {
+            info!(
+                "Dropping replaced {:?} handle for peer {} after mutual-dial resolution",
+                replaced.direction, peer_id
+            );
+            drop(replaced.handle);
+        }
 
         // Successfully registered — release the pending reservation if we own it.
         if peer.holds_pending_peer_id() {
@@ -387,17 +481,18 @@ impl OverlayManager {
         }
         shared.metrics.inbound_establish.inc();
 
+        let generation = register_result.generation;
         Self::run_peer_loop(
             peer_id.clone(),
             peer,
-            outbound_rx,
-            flow_control,
+            register_result.outbound_rx,
+            register_result.flow_control,
             shared.clone(),
         )
         .await;
 
         shared.metrics.inbound_drop.inc();
-        shared.cleanup_peer(&peer_id);
+        shared.cleanup_peer(&peer_id, generation);
         pool.release_authenticated();
     }
 
@@ -593,14 +688,20 @@ impl OverlayManager {
             return;
         }
 
-        // Reject peers we're already connected to (mirrors connect_outbound_inner).
-        if shared.peers.contains_key(&peer_id) {
-            debug!("Rejected duplicate discovered peer {} at {}", peer_id, addr);
-            shared.metrics.outbound_reject.inc();
-            peer.close().await;
-            shared.pending_connections.release_peer_id(&peer_id);
-            pool.release_pending();
-            return;
+        // Reject peers we're already connected to in the same direction.
+        // Cross-direction collisions (mutual-dial) fall through to the
+        // tiebreaker in try_register_peer.
+        if let Some(existing) = shared.peers.get(&peer_id) {
+            if existing.direction == ConnectionDirection::Outbound {
+                debug!("Rejected duplicate discovered peer {} at {}", peer_id, addr);
+                drop(existing);
+                shared.metrics.outbound_reject.inc();
+                peer.close().await;
+                shared.pending_connections.release_peer_id(&peer_id);
+                pool.release_pending();
+                return;
+            }
+            drop(existing);
         }
 
         let peer_info = peer.info().clone();
@@ -622,18 +723,34 @@ impl OverlayManager {
         }
 
         info!("Connected to discovered peer: {} at {}", peer_id, addr);
-        let (outbound_rx, flow_control) =
-            match Self::register_peer(&peer, &peer_id, peer_info, &shared, initial_byte_grant) {
-                Ok(result) => result,
-                Err(_) => {
-                    debug!("Rejected duplicate discovered peer {} (race)", peer_id);
-                    shared.metrics.outbound_reject.inc();
-                    peer.close().await;
-                    shared.pending_connections.release_peer_id(&peer_id);
-                    pool.release_authenticated();
-                    return;
-                }
-            };
+        let register_result = match Self::try_register_peer(
+            &peer,
+            &peer_id,
+            peer_info,
+            &shared,
+            initial_byte_grant,
+        ) {
+            Ok(result) => result,
+            Err(_) => {
+                debug!(
+                    "Rejected duplicate discovered peer {} (race or tiebreaker)",
+                    peer_id
+                );
+                shared.metrics.outbound_reject.inc();
+                peer.close().await;
+                shared.pending_connections.release_peer_id(&peer_id);
+                pool.release_authenticated();
+                return;
+            }
+        };
+
+        if let Some(replaced) = register_result.replaced {
+            info!(
+                "Dropping replaced {:?} handle for peer {} after mutual-dial resolution",
+                replaced.direction, peer_id
+            );
+            drop(replaced.handle);
+        }
 
         shared.pending_connections.release_peer_id(&peer_id);
         shared.metrics.outbound_establish.inc();
@@ -643,17 +760,18 @@ impl OverlayManager {
 
         // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
+        let generation = register_result.generation;
         Self::run_peer_loop(
             peer_id.clone(),
             peer,
-            outbound_rx,
-            flow_control,
+            register_result.outbound_rx,
+            register_result.flow_control,
             shared.clone(),
         )
         .await;
 
         shared.metrics.outbound_drop.inc();
-        shared.cleanup_peer(&peer_id);
+        shared.cleanup_peer(&peer_id, generation);
         // Insert reconnection cooldown with random jitter to break
         // mutual-dial oscillation. Both sides insert independent random
         // delays, ensuring one side's cooldown expires first and dials
@@ -922,12 +1040,18 @@ pub(super) async fn connect_to_explicit_peer(
         return Err(OverlayError::PeerBanned(peer_id.to_string()));
     }
 
-    if shared.peers.contains_key(&peer_id) {
-        shared.metrics.outbound_reject.inc();
-        peer.close().await;
-        shared.pending_connections.release_peer_id(&peer_id);
-        pool.release_pending();
-        return Err(OverlayError::AlreadyConnected);
+    // Reject same-direction (outbound) duplicates early.
+    // Cross-direction collisions fall through to tiebreaker.
+    if let Some(existing) = shared.peers.get(&peer_id) {
+        if existing.direction == ConnectionDirection::Outbound {
+            drop(existing);
+            shared.metrics.outbound_reject.inc();
+            peer.close().await;
+            shared.pending_connections.release_peer_id(&peer_id);
+            pool.release_pending();
+            return Err(OverlayError::AlreadyConnected);
+        }
+        drop(existing);
     }
 
     let peer_info = peer.info().clone();
@@ -948,7 +1072,7 @@ pub(super) async fn connect_to_explicit_peer(
     }
 
     info!("Connected to peer: {} at {}", peer_id, addr);
-    let (outbound_rx, flow_control) = match OverlayManager::register_peer(
+    let register_result = match OverlayManager::try_register_peer(
         &peer,
         &peer_id,
         peer_info,
@@ -957,7 +1081,7 @@ pub(super) async fn connect_to_explicit_peer(
     ) {
         Ok(result) => result,
         Err(e) => {
-            debug!("Rejected duplicate peer {} (race)", peer_id);
+            debug!("Rejected duplicate peer {} (race or tiebreaker)", peer_id);
             shared.metrics.outbound_reject.inc();
             peer.close().await;
             shared.pending_connections.release_peer_id(&peer_id);
@@ -965,6 +1089,14 @@ pub(super) async fn connect_to_explicit_peer(
             return Err(e);
         }
     };
+
+    if let Some(replaced) = register_result.replaced {
+        info!(
+            "Dropping replaced {:?} handle for peer {} after mutual-dial resolution",
+            replaced.direction, peer_id
+        );
+        drop(replaced.handle);
+    }
 
     shared.pending_connections.release_peer_id(&peer_id);
     shared.metrics.outbound_establish.inc();
@@ -980,18 +1112,19 @@ pub(super) async fn connect_to_explicit_peer(
     let peer_id_clone = peer_id.clone();
     let shared_clone = shared.clone();
     let pool_clone = Arc::clone(&pool);
+    let generation = register_result.generation;
     let handle = tokio::spawn(async move {
         // Clone again for run_peer_loop (takes ownership); originals used for cleanup.
         OverlayManager::run_peer_loop(
             peer_id_clone.clone(),
             peer,
-            outbound_rx,
-            flow_control,
+            register_result.outbound_rx,
+            register_result.flow_control,
             shared_clone.clone(),
         )
         .await;
         shared_clone.metrics.outbound_drop.inc();
-        shared_clone.cleanup_peer(&peer_id_clone);
+        shared_clone.cleanup_peer(&peer_id_clone, generation);
         // Insert reconnection cooldown with random jitter (see connect_to_discovered_peer).
         let jitter = Duration::from_millis(rand::thread_rng().gen_range(1000..3000));
         shared_clone
@@ -2374,5 +2507,301 @@ mod tests {
 
         manager_a.shutdown().await.expect("shutdown a");
         manager_b.shutdown().await.expect("shutdown b");
+    }
+
+    // ---- Mutual-dial tiebreaker tests ----
+
+    mod tiebreaker {
+        use super::*;
+        use crate::connection::ConnectionDirection;
+        use crate::flow_control::{FlowControl, FlowControlConfig};
+        use crate::peer::PeerStats;
+
+        /// Build a minimal SharedPeerState with a specific local peer ID.
+        fn make_shared(local_id: PeerId) -> SharedPeerState {
+            use crate::flow_control::FlowControlBytesConfig;
+            use crate::manager::{AdmissionState, PendingConnections, PreferredPeerSet};
+            use dashmap::DashMap;
+            use parking_lot::Mutex;
+            use std::collections::HashSet;
+            use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
+
+            let (message_tx, _) = tokio::sync::broadcast::channel(1);
+            let (scp_message_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (fetch_response_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            SharedPeerState {
+                peers: Arc::new(DashMap::new()),
+                flood_gate: Arc::new(crate::flood::FloodGate::new()),
+                running: Arc::new(AtomicBool::new(true)),
+                message_tx,
+                scp_message_tx,
+                fetch_response_tx,
+                peer_handles: Arc::new(RwLock::new(Vec::new())),
+                advertised_outbound_peers: Arc::new(RwLock::new(Vec::new())),
+                advertised_inbound_peers: Arc::new(RwLock::new(Vec::new())),
+                added_authenticated_peers: Arc::new(AtomicU64::new(0)),
+                dropped_authenticated_peers: Arc::new(AtomicU64::new(0)),
+                banned_peers: Arc::new(RwLock::new(HashSet::new())),
+                peer_info_cache: Arc::new(DashMap::new()),
+                last_closed_ledger: Arc::new(AtomicU32::new(0)),
+                scp_callback: None,
+                is_validator: false,
+                peer_event_tx: None,
+                extra_subscribers: Arc::new(RwLock::new(Vec::new())),
+                is_tracking: Arc::new(AtomicBool::new(true)),
+                pending_connections: PendingConnections::new(),
+                preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
+                    vec![],
+                    HashSet::new(),
+                ))),
+                preferred_peers_only: false,
+                admission_state: Arc::new(Mutex::new(AdmissionState::default())),
+                fetch_channel_depth: Arc::new(AtomicI64::new(0)),
+                fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
+                metrics: Arc::new(crate::OverlayMetrics::new()),
+                query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
+                max_tx_size_bytes: Arc::new(AtomicU32::new(
+                    crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
+                )),
+                flow_control_bytes_config: FlowControlBytesConfig::default(),
+                outbound_channel_capacity: 256,
+                dial_cooldowns: Arc::new(DashMap::new()),
+                local_peer_id: local_id,
+                next_peer_generation: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        /// Insert a fake peer handle into the shared state with a given direction.
+        fn insert_fake(shared: &SharedPeerState, peer_id: &PeerId, direction: ConnectionDirection) {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let handle = PeerHandle {
+                outbound_tx: tx,
+                stats: Arc::new(PeerStats::default()),
+                flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+                direction,
+                generation: shared
+                    .next_peer_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            };
+            shared.peers.insert(peer_id.clone(), handle);
+        }
+
+        // Deterministic IDs: low < high lexicographically
+        fn low_id() -> PeerId {
+            PeerId::from_bytes([0x11; 32])
+        }
+        fn high_id() -> PeerId {
+            PeerId::from_bytes([0xFF; 32])
+        }
+
+        #[tokio::test]
+        async fn same_direction_inbound_rejected() {
+            let local = low_id();
+            let remote = high_id();
+            let shared = make_shared(local);
+            insert_fake(&shared, &remote, ConnectionDirection::Inbound);
+
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let result = OverlayManager::try_register_peer(
+                &peer,
+                &remote,
+                peer.info().clone(),
+                &shared,
+                1024,
+            );
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn same_direction_outbound_rejected() {
+            let local = low_id();
+            let remote = high_id();
+            let shared = make_shared(local);
+            insert_fake(&shared, &remote, ConnectionDirection::Outbound);
+
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let mut info = peer.info().clone();
+            info.direction = ConnectionDirection::Outbound;
+            let result = OverlayManager::try_register_peer(&peer, &remote, info, &shared, 1024);
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn cross_direction_local_low_inbound_replaces_outbound() {
+            // local < remote → lower ID yields outbound, accepts inbound.
+            // Existing = outbound, new = inbound → new wins.
+            let local = low_id();
+            let remote = high_id();
+            let shared = make_shared(local);
+            insert_fake(&shared, &remote, ConnectionDirection::Outbound);
+
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let result = OverlayManager::try_register_peer(
+                &peer,
+                &remote,
+                peer.info().clone(),
+                &shared,
+                1024,
+            );
+            let reg = result.expect("should replace outbound with inbound");
+            assert!(reg.replaced.is_some());
+            assert_eq!(
+                reg.replaced.as_ref().unwrap().direction,
+                ConnectionDirection::Outbound
+            );
+            assert_eq!(
+                shared.peers.get(&remote).unwrap().direction,
+                ConnectionDirection::Inbound
+            );
+        }
+
+        #[tokio::test]
+        async fn cross_direction_local_high_outbound_replaces_inbound() {
+            // local > remote → higher ID keeps outbound.
+            // Existing = inbound, new = outbound → new wins.
+            let local = high_id();
+            let remote = low_id();
+            let shared = make_shared(local);
+            insert_fake(&shared, &remote, ConnectionDirection::Inbound);
+
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let mut info = peer.info().clone();
+            info.direction = ConnectionDirection::Outbound;
+            let result = OverlayManager::try_register_peer(&peer, &remote, info, &shared, 1024);
+            let reg = result.expect("should replace inbound with outbound");
+            assert!(reg.replaced.is_some());
+            assert_eq!(
+                reg.replaced.as_ref().unwrap().direction,
+                ConnectionDirection::Inbound
+            );
+            assert_eq!(
+                shared.peers.get(&remote).unwrap().direction,
+                ConnectionDirection::Outbound
+            );
+        }
+
+        #[tokio::test]
+        async fn cross_direction_local_high_inbound_loses_to_outbound() {
+            // local > remote → higher ID keeps outbound.
+            // Existing = outbound, new = inbound → existing wins → reject.
+            let local = high_id();
+            let remote = low_id();
+            let shared = make_shared(local);
+            insert_fake(&shared, &remote, ConnectionDirection::Outbound);
+
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let result = OverlayManager::try_register_peer(
+                &peer,
+                &remote,
+                peer.info().clone(),
+                &shared,
+                1024,
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                shared.peers.get(&remote).unwrap().direction,
+                ConnectionDirection::Outbound
+            );
+        }
+
+        #[tokio::test]
+        async fn cross_direction_local_low_outbound_loses_to_inbound() {
+            // local < remote → lower ID yields outbound, keeps inbound.
+            // Existing = inbound, new = outbound → existing wins → reject.
+            let local = low_id();
+            let remote = high_id();
+            let shared = make_shared(local);
+            insert_fake(&shared, &remote, ConnectionDirection::Inbound);
+
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let mut info = peer.info().clone();
+            info.direction = ConnectionDirection::Outbound;
+            let result = OverlayManager::try_register_peer(&peer, &remote, info, &shared, 1024);
+            assert!(result.is_err());
+            assert_eq!(
+                shared.peers.get(&remote).unwrap().direction,
+                ConnectionDirection::Inbound
+            );
+        }
+
+        #[tokio::test]
+        async fn vacant_entry_always_succeeds() {
+            let local = low_id();
+            let remote = high_id();
+            let shared = make_shared(local);
+
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let result = OverlayManager::try_register_peer(
+                &peer,
+                &remote,
+                peer.info().clone(),
+                &shared,
+                1024,
+            );
+            let reg = result.expect("vacant entry should succeed");
+            assert!(reg.replaced.is_none());
+            assert!(shared.peers.contains_key(&remote));
+        }
+
+        #[tokio::test]
+        async fn cleanup_peer_generation_guard() {
+            let local = low_id();
+            let remote = high_id();
+            let shared = make_shared(local);
+            insert_fake(&shared, &remote, ConnectionDirection::Outbound);
+
+            // The fake was inserted with generation 0. Replace via tiebreaker.
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let reg = OverlayManager::try_register_peer(
+                &peer,
+                &remote,
+                peer.info().clone(),
+                &shared,
+                1024,
+            )
+            .expect("replacement should succeed");
+            let new_gen = reg.generation;
+            assert!(new_gen > 0);
+
+            // Old peer_loop cleanup with stale generation = no-op.
+            shared.cleanup_peer(&remote, 0);
+            assert!(shared.peers.contains_key(&remote));
+
+            // Correct generation cleanup removes it.
+            shared.cleanup_peer(&remote, new_gen);
+            assert!(!shared.peers.contains_key(&remote));
+        }
     }
 }
