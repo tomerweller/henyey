@@ -115,3 +115,14 @@ jobs:
         run: git submodule update --init stellar-core
       - name: Verify soroban pins
         run: bash scripts/check-soroban-pins.sh
+
+  spec-eval-freshness:
+    name: Spec-Eval Freshness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init stellar-core submodule
+        run: git submodule update --init stellar-core
+      - name: Check spec-eval freshness
+        run: bash scripts/check-spec-eval-freshness.sh
