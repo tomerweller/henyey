@@ -271,15 +271,33 @@ impl KnownPeerSet {
 
     /// Replace all discovered peers (from DB refresh via set_known_peers).
     /// Config entries and their resolution state are preserved.
+    /// Peers matching config entries (by hostname or resolved IP) are filtered out.
     pub(super) fn set_discovered(&mut self, peers: Vec<PeerAddress>) {
         let cap = MAX_KNOWN_PEERS.saturating_sub(self.config_entries.len());
         self.discovered_keys.clear();
         self.discovered.clear();
+        // Build config key set for filtering (both hostname and resolved forms).
+        let config_keys: HashSet<String> = self
+            .config_entries
+            .iter()
+            .enumerate()
+            .flat_map(|(i, config)| {
+                let mut keys = vec![config.canonical_key()];
+                if let Some(resolved) = &self.resolved[i] {
+                    keys.push(resolved.canonical_key());
+                }
+                keys
+            })
+            .collect();
+
         for peer in peers {
             if self.discovered.len() >= cap {
                 break;
             }
             let key = peer.canonical_key();
+            if config_keys.contains(&key) {
+                continue;
+            }
             if self.discovered_keys.insert(key) {
                 self.discovered.push(peer);
             }
@@ -4002,6 +4020,23 @@ mod tests {
         assert!(hosts.contains("10.0.0.99")); // resolved config
         assert!(hosts.contains("10.0.0.5"));
         assert!(hosts.contains("10.0.0.6"));
+    }
+
+    #[test]
+    fn test_known_peer_set_set_discovered_filters_config_entries() {
+        let config = vec![PeerAddress::new("stellar.example.com", 11625)];
+        let mut set = KnownPeerSet::from_config(config);
+        set.update_resolved(&[Some(PeerAddress::new("10.0.0.99", 11625))]);
+
+        // DB refresh includes the resolved IP of a config peer — should be filtered
+        set.set_discovered(vec![
+            PeerAddress::new("10.0.0.99", 11625), // matches resolved config
+            PeerAddress::new("10.0.0.5", 11625),  // new peer
+        ]);
+
+        // Only the non-config peer should be stored
+        assert_eq!(set.discovered.len(), 1);
+        assert_eq!(set.discovered[0].host, "10.0.0.5");
     }
 
     #[test]
