@@ -4,8 +4,8 @@ This document maps henyey's Prometheus metrics to their stellar-core counterpart
 and documents henyey-only metrics. All constants are defined in
 `crates/app/src/metrics.rs`.
 
-**Dashboards:** [`docs/henyey-monitoring.json`](henyey-monitoring.json) (21-panel overview,
-10603 equivalent) | [`docs/henyey-monitoring-full.json`](henyey-monitoring-full.json) (full
+**Dashboards:** [`metrics/henyey-monitoring.json`](henyey-monitoring.json) (21-panel overview,
+10603 equivalent) | [`metrics/henyey-monitoring-full.json`](henyey-monitoring-full.json) (full
 drill-down, 10334 equivalent).
 
 ## 1. Exact Stellar-Core Equivalents

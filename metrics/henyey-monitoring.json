@@ -151,7 +151,7 @@
       },
       "targets": [
         {
-          "expr": "avg_over_time(stellar_ledger_age_current_seconds{instance=~\"$instance\"}[5m])",
+          "expr": "avg_over_time(stellar_ledger_age_current_seconds{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}} 5m avg"
         }
       ],
@@ -397,7 +397,7 @@
       },
       "targets": [
         {
-          "expr": "rate(henyey_ledger_close_bucket_add_seconds_sum{instance=~\"$instance\"}[5m]) / rate(henyey_ledger_close_bucket_add_seconds_count{instance=~\"$instance\"}[5m])",
+          "expr": "rate(henyey_ledger_close_bucket_add_seconds_sum{instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_bucket_add_seconds_count{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}} avg"
         }
       ],
@@ -424,7 +424,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_bucket_merge_new_live_total{instance=~\"$instance\"}[5m]) + rate(stellar_bucket_merge_new_dead_total{instance=~\"$instance\"}[5m]) + rate(stellar_bucket_merge_new_init_total{instance=~\"$instance\"}[5m]) + rate(stellar_bucket_merge_new_meta_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_bucket_merge_new_live_total{instance=~\"$instance\"}[$__rate_interval]) + rate(stellar_bucket_merge_new_dead_total{instance=~\"$instance\"}[$__rate_interval]) + rate(stellar_bucket_merge_new_init_total{instance=~\"$instance\"}[$__rate_interval]) + rate(stellar_bucket_merge_new_meta_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}} objects/s"
         }
       ],
@@ -464,7 +464,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_timeout_idle_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_timeout_idle_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}}"
         }
       ],
@@ -491,7 +491,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_timeout_straggler_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_timeout_straggler_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}}"
         }
       ],

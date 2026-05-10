@@ -416,11 +416,11 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\"}[5m]))",
+          "expr": "histogram_quantile(0.99, rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "p99"
         },
         {
-          "expr": "histogram_quantile(0.50, rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\"}[5m]))",
+          "expr": "histogram_quantile(0.50, rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "p50"
         }
       ],
@@ -625,7 +625,7 @@
     {
       "id": 20,
       "type": "timeseries",
-      "title": "% Closed Within ≤5/7/10s",
+      "title": "% Closed Within \u22645/7/10s",
       "description": "Panel 23 of 10334. Percentage of ledgers closed within 5s, 7s, 10s thresholds.",
       "gridPos": {
         "h": 6,
@@ -639,15 +639,15 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\",le=\"5\"}[5m]) / rate(stellar_ledger_age_closed_seconds_count{instance=~\"$instance\"}[5m]) * 100",
+          "expr": "rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\",le=\"5.0\"}[$__rate_interval]) / rate(stellar_ledger_age_closed_seconds_count{instance=~\"$instance\"}[$__rate_interval]) * 100",
           "legendFormat": "\u22645s"
         },
         {
-          "expr": "rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\",le=\"7\"}[5m]) / rate(stellar_ledger_age_closed_seconds_count{instance=~\"$instance\"}[5m]) * 100",
+          "expr": "rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\",le=\"7.0\"}[$__rate_interval]) / rate(stellar_ledger_age_closed_seconds_count{instance=~\"$instance\"}[$__rate_interval]) * 100",
           "legendFormat": "\u22647s"
         },
         {
-          "expr": "rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\",le=\"10\"}[5m]) / rate(stellar_ledger_age_closed_seconds_count{instance=~\"$instance\"}[5m]) * 100",
+          "expr": "rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\",le=\"10.0\"}[$__rate_interval]) / rate(stellar_ledger_age_closed_seconds_count{instance=~\"$instance\"}[$__rate_interval]) * 100",
           "legendFormat": "\u226410s"
         }
       ],
@@ -730,7 +730,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_ledger_close_duration_seconds_sum{instance=~\"$instance\"}[5m]) / rate(stellar_ledger_close_duration_seconds_count{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_ledger_close_duration_seconds_sum{instance=~\"$instance\"}[$__rate_interval]) / rate(stellar_ledger_close_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}} avg"
         }
       ],
@@ -757,11 +757,11 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, rate(stellar_ledger_operation_apply_seconds_bucket{instance=~\"$instance\"}[5m]))",
+          "expr": "histogram_quantile(0.99, rate(stellar_ledger_operation_apply_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "p99"
         },
         {
-          "expr": "histogram_quantile(0.50, rate(stellar_ledger_operation_apply_seconds_bucket{instance=~\"$instance\"}[5m]))",
+          "expr": "histogram_quantile(0.50, rate(stellar_ledger_operation_apply_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "p50"
         }
       ],
@@ -788,11 +788,11 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, rate(stellar_ledger_transaction_apply_seconds_bucket{instance=~\"$instance\"}[5m]))",
+          "expr": "histogram_quantile(0.99, rate(stellar_ledger_transaction_apply_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "p99"
         },
         {
-          "expr": "histogram_quantile(0.50, rate(stellar_ledger_transaction_apply_seconds_bucket{instance=~\"$instance\"}[5m]))",
+          "expr": "histogram_quantile(0.50, rate(stellar_ledger_transaction_apply_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "p50"
         }
       ],
@@ -884,7 +884,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_ledger_transaction_internal_error_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_ledger_transaction_internal_error_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": ""
         }
       ],
@@ -1024,16 +1024,24 @@
               "type": "value",
               "options": {
                 "0": {
-                  "text": "unknown"
+                  "text": "unknown",
+                  "color": "gray",
+                  "index": 0
                 },
                 "1": {
-                  "text": "prepare"
+                  "text": "prepare",
+                  "color": "yellow",
+                  "index": 1
                 },
                 "2": {
-                  "text": "confirm"
+                  "text": "confirm",
+                  "color": "orange",
+                  "index": 2
                 },
                 "3": {
-                  "text": "externalize"
+                  "text": "externalize",
+                  "color": "green",
+                  "index": 3
                 }
               }
             }
@@ -1210,23 +1218,23 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_scp_timeout_nominate_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_scp_timeout_nominate_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "nominate timeout/s"
         },
         {
-          "expr": "rate(stellar_scp_timeout_prepare_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_scp_timeout_prepare_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "prepare timeout/s"
         },
         {
-          "expr": "rate(stellar_scp_envelope_sign_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_scp_envelope_sign_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "sign/s"
         },
         {
-          "expr": "rate(stellar_scp_envelope_validsig_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_scp_envelope_validsig_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "valid sig/s"
         },
         {
-          "expr": "rate(stellar_scp_envelope_invalidsig_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_scp_envelope_invalidsig_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "invalid sig/s"
         }
       ],
@@ -1253,19 +1261,19 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_scp_value_valid_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_scp_value_valid_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "valid/s"
         },
         {
-          "expr": "rate(stellar_scp_value_invalid_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_scp_value_invalid_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "invalid/s"
         },
         {
-          "expr": "rate(stellar_scp_nomination_combinecandidates_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_scp_nomination_combinecandidates_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "combine/s"
         },
         {
-          "expr": "rate(stellar_herder_lost_sync_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_herder_lost_sync_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "sync lost/s"
         }
       ],
@@ -1292,19 +1300,19 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_herder_pending_received_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_herder_pending_received_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "received/s"
         },
         {
-          "expr": "rate(stellar_herder_pending_added_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_herder_pending_added_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "added/s"
         },
         {
-          "expr": "rate(stellar_herder_pending_released_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_herder_pending_released_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "released/s"
         },
         {
-          "expr": "rate(stellar_herder_pending_duplicates_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_herder_pending_duplicates_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "duplicates/s"
         }
       ],
@@ -1410,7 +1418,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "**N/A** \u2014 Henyey does not implement a signature verification cache (`crypto_verify_{hit,miss,total}`). SCP envelope verification is done fresh each time via the SCP verify pipeline. See `docs/metrics-mapping.md` \u00a75 for details."
+            "content": "**N/A** \u2014 Henyey does not implement a signature verification cache (`crypto_verify_{hit,miss,total}`). SCP envelope verification is done fresh each time via the SCP verify pipeline. See `metrics/metrics-mapping.md` \u00a75 for details."
           }
         }
       ]
@@ -1445,7 +1453,7 @@
       },
       "targets": [
         {
-          "expr": "rate(henyey_ledger_close_bucket_add_seconds_sum{instance=~\"$instance\"}[5m]) / rate(henyey_ledger_close_bucket_add_seconds_count{instance=~\"$instance\"}[5m])",
+          "expr": "rate(henyey_ledger_close_bucket_add_seconds_sum{instance=~\"$instance\"}[$__rate_interval]) / rate(henyey_ledger_close_bucket_add_seconds_count{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}} avg"
         }
       ],
@@ -1472,7 +1480,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_bucket_merge_time_us_total{instance=~\"$instance\"}[5m]) / 1e6",
+          "expr": "rate(stellar_bucket_merge_time_us_total{instance=~\"$instance\"}[$__rate_interval]) / 1e6",
           "legendFormat": "{{instance}}"
         }
       ],
@@ -1515,7 +1523,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_bucket_merge_new_live_total{instance=~\"$instance\"}[5m]) + rate(stellar_bucket_merge_new_dead_total{instance=~\"$instance\"}[5m]) + rate(stellar_bucket_merge_new_init_total{instance=~\"$instance\"}[5m]) + rate(stellar_bucket_merge_new_meta_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_bucket_merge_new_live_total{instance=~\"$instance\"}[$__rate_interval]) + rate(stellar_bucket_merge_new_dead_total{instance=~\"$instance\"}[$__rate_interval]) + rate(stellar_bucket_merge_new_init_total{instance=~\"$instance\"}[$__rate_interval]) + rate(stellar_bucket_merge_new_meta_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "objects/s"
         }
       ],
@@ -1637,7 +1645,7 @@
           },
           "targets": [
             {
-              "expr": "rate(stellar_history_publish_time_seconds_sum{instance=~\"$instance\"}[5m]) / rate(stellar_history_publish_time_seconds_count{instance=~\"$instance\"}[5m])",
+              "expr": "rate(stellar_history_publish_time_seconds_sum{instance=~\"$instance\"}[$__rate_interval]) / rate(stellar_history_publish_time_seconds_count{instance=~\"$instance\"}[$__rate_interval])",
               "legendFormat": "{{instance}} avg"
             }
           ],
@@ -2529,7 +2537,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "**N/A** \u2014 Stellar-core's `app_post_on_{main,background}_thread_delay_seconds` metrics measure queue-backed thread dispatch latency. Henyey uses the tokio async runtime with cooperative task scheduling \u2014 there is no main/background thread queue to measure. See `docs/metrics-mapping.md` \u00a75."
+        "content": "**N/A** \u2014 Stellar-core's `app_post_on_{main,background}_thread_delay_seconds` metrics measure queue-backed thread dispatch latency. Henyey uses the tokio async runtime with cooperative task scheduling \u2014 there is no main/background thread queue to measure. See `metrics/metrics-mapping.md` \u00a75."
       }
     },
     {
@@ -2592,11 +2600,11 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_byte_read_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_byte_read_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "read"
         },
         {
-          "expr": "rate(stellar_overlay_byte_write_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_byte_write_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "write"
         }
       ],
@@ -2623,7 +2631,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_message_read_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_message_read_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}}"
         }
       ],
@@ -2650,7 +2658,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_message_write_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_message_write_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}}"
         }
       ],
@@ -2677,7 +2685,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_message_broadcast_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_message_broadcast_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}}"
         }
       ],
@@ -2704,7 +2712,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_error_read_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_error_read_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}}"
         }
       ],
@@ -2731,7 +2739,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_error_write_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_error_write_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}}"
         }
       ],
@@ -2820,7 +2828,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_flood_broadcast_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_flood_broadcast_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "flood_broadcast"
         }
       ],
@@ -2847,11 +2855,11 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_flood_unique_recv_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_flood_unique_recv_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "unique"
         },
         {
-          "expr": "rate(stellar_overlay_flood_duplicate_recv_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_flood_duplicate_recv_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "duplicate"
         }
       ],
@@ -2883,11 +2891,11 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_fetch_unique_recv_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_fetch_unique_recv_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "unique"
         },
         {
-          "expr": "rate(stellar_overlay_fetch_duplicate_recv_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_fetch_duplicate_recv_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "duplicate"
         }
       ],
@@ -2919,7 +2927,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_item_fetcher_next_peer_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_item_fetcher_next_peer_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "next_peer"
         }
       ],
@@ -2973,7 +2981,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_send_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_send_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{type}}"
         }
       ],
@@ -3000,11 +3008,11 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_async_read_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_async_read_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "async_read"
         },
         {
-          "expr": "rate(stellar_overlay_async_write_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_async_write_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "async_write"
         }
       ],
@@ -3031,19 +3039,19 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_inbound_attempt_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_inbound_attempt_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "attempt"
         },
         {
-          "expr": "rate(stellar_overlay_inbound_establish_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_inbound_establish_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "establish"
         },
         {
-          "expr": "rate(stellar_overlay_inbound_drop_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_inbound_drop_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "drop"
         },
         {
-          "expr": "rate(stellar_overlay_inbound_reject_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_inbound_reject_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "reject"
         }
       ],
@@ -3070,19 +3078,19 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_outbound_attempt_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_outbound_attempt_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "attempt"
         },
         {
-          "expr": "rate(stellar_overlay_outbound_establish_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_outbound_establish_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "establish"
         },
         {
-          "expr": "rate(stellar_overlay_outbound_drop_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_outbound_drop_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "drop"
         },
         {
-          "expr": "rate(stellar_overlay_outbound_reject_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_outbound_reject_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "reject"
         }
       ],
@@ -3187,7 +3195,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_timeout_idle_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_timeout_idle_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}}"
         }
       ],
@@ -3214,7 +3222,7 @@
       },
       "targets": [
         {
-          "expr": "rate(stellar_overlay_timeout_straggler_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(stellar_overlay_timeout_straggler_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "{{instance}}"
         }
       ],
