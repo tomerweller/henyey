@@ -1575,9 +1575,10 @@ mod tests {
 
     /// warm_module_cache_from_entries handles ContractCodeEntryExt::V1 entries.
     ///
-    /// V1-ext entries are warmed with V0 cost inputs (wasm_bytes only),
-    /// matching stellar-core's bridge warm path. This test verifies the
-    /// entry is successfully compiled and cached regardless of its ext.
+    /// V1-ext entries are warmed via `parse_and_cache_module_simple`,
+    /// matching stellar-core's bridge warm path. Cost inputs are determined
+    /// by the host crate (V0 for P24/P25, derived V1 for P26). This test
+    /// verifies the entry is successfully compiled and cached.
     #[test]
     fn test_warm_module_cache_from_entries_handles_v1_ext() {
         let cache = PersistentModuleCache::new_for_protocol(26)

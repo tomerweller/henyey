@@ -669,7 +669,7 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
 
 #### Resolved Issues
 
-1. **CPU Metering Differences (Fixed)**: Previously, minor CPU consumption differences (~100 instructions) were observed due to the module cache using V1 cost inputs. stellar-core's `SharedModuleCacheCompiler` always uses `parse_and_cache_module_simple` which uses V0 cost inputs (just `wasm_bytes`). The Rust implementation now matches this behavior.
+1. **CPU Metering Differences (Fixed)**: Previously, minor CPU consumption differences (~100 instructions) were observed due to the module cache using entry-ext V1 cost inputs instead of delegating to `parse_and_cache_module_simple`. stellar-core's `SharedModuleCacheCompiler` always calls `parse_and_cache_module_simple` which determines cost inputs internally (V0 for P24/P25, derived V1 for P26). The Rust implementation now delegates to `parse_and_cache_module_simple` directly, matching this behavior.
 
 2. **HashX Signature Validation (Fixed January 2026)**: Signature validation was incorrectly requiring all signatures to be exactly 64 bytes (Ed25519 format). Fixed to accept all signature formats (Ed25519: 64 bytes, HashX: variable length, Pre-auth TX: 0 bytes).
 
