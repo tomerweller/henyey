@@ -805,8 +805,8 @@
     {
       "id": 26,
       "type": "stat",
-      "title": "Invariant Failure",
-      "description": "Panel 29 of 10334. Total invariant check failures (should always be 0).",
+      "title": "Invariant Failures (24h)",
+      "description": "Count of new invariant failures in the last 24 hours. Non-zero indicates a bug \u2014 investigate immediately.",
       "gridPos": {
         "h": 6,
         "w": 3,
@@ -819,7 +819,7 @@
       },
       "targets": [
         {
-          "expr": "stellar_ledger_invariant_failure_total{instance=~\"$instance\"}",
+          "expr": "increase(stellar_ledger_invariant_failure_total{instance=~\"$instance\"}[24h])",
           "legendFormat": "{{instance}}"
         }
       ],
@@ -832,7 +832,7 @@
                 "color": "green"
               },
               {
-                "value": 1,
+                "value": 1e-06,
                 "color": "red"
               }
             ]

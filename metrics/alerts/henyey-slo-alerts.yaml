@@ -1,0 +1,280 @@
+# Henyey SLO Alert Rules
+#
+# Grafana file-based alert provisioning for henyey validator metrics.
+# Deploy by copying to your Grafana provisioning/alerting/ directory.
+# See README.md in this directory for full deployment instructions.
+#
+# Datasource UID "000000001" matches the henyey dashboards.
+# Change it if your Prometheus datasource uses a different UID.
+
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: henyey-slo
+    folder: Henyey
+    interval: 1m
+    rules:
+      # ── Alert 1: Invariant Failure ────────────────────────────────
+      # Fires on any new non-strict invariant failure in the last 10m.
+      # Strict invariant failures panic before Prometheus can scrape;
+      # those are covered by the companion process-down alert below.
+      - uid: henyey-invariant-failure
+        title: "Henyey: Invariant Failure"
+        condition: threshold
+        for: 0s
+        labels:
+          severity: critical
+          team: henyey
+        annotations:
+          summary: "Invariant failure on {{ $labels.instance }}"
+          description: >-
+            Non-strict invariant failure detected:
+            increase(stellar_ledger_invariant_failure_total) > 0
+            in last 10m on {{ $labels.instance }}.
+            Investigate immediately.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "increase(stellar_ledger_invariant_failure_total{job=\"henyey\"}[10m])"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 2: TX Internal Error Rate ───────────────────────────
+      # Fires when transaction internal error rate exceeds 0.01/s for
+      # 5 minutes, matching the dashboard red threshold.
+      - uid: henyey-tx-internal-error
+        title: "Henyey: TX Internal Error Rate"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: critical
+          team: henyey
+        annotations:
+          summary: "TX internal error rate > 0.01/s on {{ $labels.instance }}"
+          description: >-
+            rate(stellar_ledger_transaction_internal_error_total[5m]) > 0.01
+            sustained for 5m on {{ $labels.instance }}.
+        noDataState: OK
+        execErrState: Error
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "rate(stellar_ledger_transaction_internal_error_total{job=\"henyey\"}[5m])"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0.01
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 3a: Quorum Fail At — Warning ───────────────────────
+      # Fires when quorum resilience drops to exactly 1 (yellow zone).
+      - uid: henyey-quorum-failat-warn
+        title: "Henyey: Quorum Fail At (Warning)"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: warning
+          team: henyey
+        annotations:
+          summary: "Quorum fail-at == 1 on {{ $labels.instance }}"
+          description: >-
+            stellar_quorum_fail_at == 1 for 5m on {{ $labels.instance }}.
+            One more node failure will cause quorum loss.
+        noDataState: Alerting
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "stellar_quorum_fail_at{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 2
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+          # Exclude values < 1 (those fire the critical rule instead).
+          - refId: exclude_crit
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: exclude_crit
+
+      # ── Alert 3b: Quorum Fail At — Critical ──────────────────────
+      # Fires when quorum resilience drops to 0 (red zone).
+      - uid: henyey-quorum-failat-crit
+        title: "Henyey: Quorum Fail At (Critical)"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: critical
+          team: henyey
+        annotations:
+          summary: "Quorum fail-at < 1 on {{ $labels.instance }}"
+          description: >-
+            stellar_quorum_fail_at < 1 for 5m on {{ $labels.instance }}.
+            Quorum may already be lost. Immediate attention required.
+        noDataState: Alerting
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "stellar_quorum_fail_at{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 4: Process Down ─────────────────────────────────────
+      # Companion alert: fires when the henyey process stops being
+      # scraped. Required for noDataState: OK rules to be sound, and
+      # catches strict invariant panics that crash before scrape.
+      - uid: henyey-process-down
+        title: "Henyey: Process Down"
+        condition: threshold
+        for: 2m
+        labels:
+          severity: critical
+          team: henyey
+        annotations:
+          summary: "Henyey process down on {{ $labels.instance }}"
+          description: >-
+            up{job="henyey"} == 0 for 2m on {{ $labels.instance }}.
+            The henyey process is not responding to scrapes.
+            This may indicate a crash (including strict invariant panics).
+        noDataState: Alerting
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "up{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
