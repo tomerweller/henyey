@@ -1793,8 +1793,15 @@ mod tests {
         // from the wasm itself (not from the entry's ext), matching the
         // stellar-core v26 bridge behavior.
         match &module.cost_inputs {
-            soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V1(_) => {
-                // V1 derived from wasm — correct for P26.
+            soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V1(inputs) => {
+                // The entry's ext used sentinel values (10, 20, 30, …).
+                // Derived values come from parsing the actual wasm, so they
+                // must differ from the sentinels — proving we didn't copy
+                // from entry.ext.
+                assert_ne!(
+                    inputs.n_instructions, 10,
+                    "cost inputs should be derived from wasm, not copied from entry ext"
+                );
             }
             soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V0 { .. } => {
                 panic!(

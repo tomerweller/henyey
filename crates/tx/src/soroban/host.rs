@@ -227,12 +227,15 @@ impl PersistentModuleCache {
 
     /// Warm the module cache with a compiled WASM module.
     ///
-    /// Always uses `VersionedContractCodeCostInputs::V0` (wasm_bytes only),
+    /// Delegates to each host crate's `parse_and_cache_module_simple`,
     /// matching stellar-core's bridge warm path: `compile()` →
-    /// `parse_and_cache_module_simple()`. The entry's `ContractCodeEntryExt`
-    /// is intentionally not consulted — stellar-core's C++ bridge passes
-    /// only raw wasm bytes, and `parse_and_cache_module_simple` always
-    /// constructs V0 cost inputs internally.
+    /// `parse_and_cache_module_simple()`. Only raw wasm bytes are passed —
+    /// the entry's `ContractCodeEntryExt` is not consulted, since
+    /// stellar-core's C++ bridge passes only wasm bytes.
+    ///
+    /// Cost input behavior is protocol-dependent:
+    /// - P24/P25: `parse_and_cache_module_simple` uses V0 (wasm_bytes only)
+    /// - P26: `parse_and_cache_module_simple` derives refined V1 from wasm
     ///
     /// Returns true if compilation succeeded, false otherwise.
     pub fn add_wasm(&self, wasm: &[u8], protocol_version: u32) -> bool {

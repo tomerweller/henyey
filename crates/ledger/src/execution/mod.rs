@@ -125,8 +125,9 @@ pub fn warm_module_cache_from_entries(
         for entry in entries {
             if let LedgerEntryData::ContractCode(cc) = &entry.data {
                 // Warm with wasm bytes only — stellar-core's bridge warm
-                // path (`compile` → `parse_and_cache_module_simple`) always
-                // uses V0 cost inputs, ignoring the entry's ext.
+                // path (`compile` → `parse_and_cache_module_simple`)
+                // ignores the entry's ext. Cost inputs are determined by
+                // the host crate (V0 for P24/P25, derived V1 for P26).
                 cache.add_wasm(cc.code.as_slice(), protocol_version);
             }
         }

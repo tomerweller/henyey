@@ -255,7 +255,7 @@ impl LevelScanner {
 
         if let BucketEntry::Liveentry(ref le) | BucketEntry::Initentry(ref le) = entry {
             // Compile contracts in parallel across levels via the shared module cache.
-            // Warm with wasm bytes only (V0 cost inputs), matching stellar-core.
+            // Warm with wasm bytes only, matching stellar-core's bridge.
             if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
                 if let Some(ref cache) = module_cache {
                     cache.add_wasm(contract_code.code.as_slice(), protocol_version);
@@ -523,7 +523,7 @@ fn scan_and_merge_streaming(
 
                 if let BucketEntry::Liveentry(ref le) | BucketEntry::Initentry(ref le) = entry {
                     // Compile contracts via the shared module cache.
-                    // Warm with wasm bytes only (V0 cost inputs), matching stellar-core.
+                    // Warm with wasm bytes only, matching stellar-core's bridge.
                     if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
                         if let Some(ref cache) = module_cache_arc {
                             cache.add_wasm(contract_code.code.as_slice(), protocol_version);
