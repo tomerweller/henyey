@@ -1546,7 +1546,7 @@ impl Simulation {
             .get(&spec.node_id)
             .with_context(|| format!("missing peer port for {}", spec.node_id))?;
 
-        let mut config = ConfigBuilder::new()
+        let mut config = ConfigBuilder::simulation()
             .node_name(spec.node_id.clone())
             .node_seed(spec.secret_key.to_strkey())
             .validator(spec.is_validator)

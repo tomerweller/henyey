@@ -2299,6 +2299,36 @@ impl ConfigBuilder {
         }
     }
 
+    /// Create a builder for simulation/test nodes.
+    ///
+    /// Uses testnet defaults for quorum/passphrase but replaces real
+    /// history archives with a dummy entry that has `get_enabled: false`.
+    /// This prevents simulation nodes from accidentally catching up from
+    /// real testnet archives while still passing config validation
+    /// (which rejects empty archives).
+    ///
+    /// The dummy archive is filtered out by both `ArchiveHttpFetcher::fetch()`
+    /// and the catchup archive selection logic (`catchup_impl.rs`), so
+    /// simulation nodes will never initiate a remote catchup.
+    pub fn simulation() -> Self {
+        let mut config = AppConfig::testnet();
+        // Replace real archive URLs with a dummy that cannot be read from.
+        config.history.archives = vec![HistoryArchiveEntry {
+            name: "simulation-placeholder".to_string(),
+            url: "file:///dev/null/simulation".to_string(),
+            get_enabled: false,
+            put_enabled: false,
+            put: None,
+            mkdir: None,
+        }];
+        // Simulation manages its own overlay topology.
+        config.overlay.known_peers.clear();
+        Self {
+            config,
+            bucket_dir_explicit: false,
+        }
+    }
+
     /// Set the node name.
     pub fn node_name(mut self, name: impl Into<String>) -> Self {
         self.config.node.name = name.into();
@@ -3986,6 +4016,42 @@ name = "test"
             .database_path("/data/stellar/node.db")
             .build();
         assert_eq!(config.buckets.directory, PathBuf::from("/custom/buckets"));
+    }
+
+    #[test]
+    fn test_simulation_config_has_no_get_enabled_archives() {
+        let config = ConfigBuilder::simulation()
+            .node_name("sim-test")
+            .node_seed("SCZANGBA5YHTNYVVV3C7CAZMCLXPILIGYG3G3A4JYFL3EBKOX7YZPCQS")
+            .validator(true)
+            .database_path("/dev/null/sim.db")
+            .peer_port(11625)
+            .build();
+
+        // Validation must pass (non-empty archives).
+        config.validate().unwrap();
+
+        // No archive should have get_enabled=true.
+        assert!(
+            config.history.archives.iter().all(|a| !a.get_enabled),
+            "Simulation config must not have get-enabled archives; \
+             real network archives would cause state leaks via out-of-sync recovery"
+        );
+
+        // No archive should point to a real network URL.
+        for archive in &config.history.archives {
+            assert!(
+                !archive.url.contains("history.stellar.org"),
+                "Simulation archive URL must not point to real network: {}",
+                archive.url
+            );
+        }
+
+        // Known peers must be empty (simulation manages its own overlay).
+        assert!(
+            config.overlay.known_peers.is_empty(),
+            "Simulation config must have empty known_peers"
+        );
     }
 
     #[test]
