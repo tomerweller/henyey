@@ -99,6 +99,17 @@ healthy values (> 1) and critical values (< 1). Empty results here mean
 "not in warning state," not "metric missing." Process-down coverage handles
 the case where the metric truly disappears.
 
+### execErrState
+
+If Grafana cannot evaluate a rule (e.g., datasource timeout, PromQL error):
+
+- **Invariant Failure**, **Quorum Fail At** (both), and **Process Down** use
+  `execErrState: Alerting` — a broken evaluation pipeline for these critical
+  rules should page, because silent evaluation failures mask real problems.
+- **TX Internal Error Rate** uses `execErrState: Error` — transient evaluation
+  errors for a rate-based metric are less urgent and should surface as Grafana
+  health errors rather than false pages.
+
 ### Panel vs. alert window divergence
 
 Dashboard panel 26 (Invariant Failures) uses a 24-hour window
