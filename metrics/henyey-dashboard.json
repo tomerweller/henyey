@@ -272,22 +272,13 @@
               "type": "value",
               "options": {
                 "0": {
-                  "text": "BOOTING"
+                  "text": "Booting"
                 },
                 "1": {
-                  "text": "JOINING_SCP"
+                  "text": "Syncing"
                 },
                 "2": {
-                  "text": "LEDGER_SYNC"
-                },
-                "3": {
-                  "text": "CATCHING_UP"
-                },
-                "4": {
-                  "text": "SYNCED"
-                },
-                "5": {
-                  "text": "NUM_STATES"
+                  "text": "Tracking"
                 }
               }
             }
