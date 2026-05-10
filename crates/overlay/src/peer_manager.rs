@@ -879,4 +879,28 @@ mod tests {
             assert!(port <= 3, "expected inbound peer, got {}", addr);
         }
     }
+
+    #[test]
+    fn test_get_peers_to_send_canonical_key_exclusion() {
+        // Exclusion must compare via canonical_key, not raw field equality.
+        // PeerManager records store IP strings; canonical_key normalizes
+        // them (e.g. IPv6 shortening, future IPv4-mapped IPv6 handling).
+        let manager = PeerManager::new_in_memory();
+
+        let peer1 = PeerAddress::new("1.2.3.4", 11625);
+        let peer2 = PeerAddress::new("5.6.7.8", 11625);
+        manager.ensure_exists(&peer1).unwrap();
+        manager.ensure_exists(&peer2).unwrap();
+
+        // Exclude peer1 — result should contain only peer2
+        let peers = manager.get_peers_to_send(10, &peer1);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].host, "5.6.7.8");
+
+        // Verify canonical_key is used by constructing a fresh PeerAddress
+        // with the same IP — it should still be excluded
+        let exclude_fresh = PeerAddress::new("1.2.3.4".to_string(), 11625);
+        let peers = manager.get_peers_to_send(10, &exclude_fresh);
+        assert_eq!(peers.len(), 1);
+    }
 }
