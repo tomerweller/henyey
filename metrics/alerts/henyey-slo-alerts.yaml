@@ -130,7 +130,7 @@ groups:
           description: >-
             stellar_quorum_fail_at == 1 for 5m on {{ $labels.instance }}.
             One more node failure will cause quorum loss.
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Alerting
         data:
           - refId: A

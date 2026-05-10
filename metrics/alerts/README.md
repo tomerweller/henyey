@@ -89,9 +89,15 @@ occurred" — which is the normal state. The companion **Process Down** rule
 (`up{job="henyey"} == 0`) covers the gap: if henyey crashes (including from
 strict invariant panics), the process-down alert fires within 2 minutes.
 
-The **Quorum Fail At** rules use `noDataState: Alerting` because a
+The **Quorum Fail At (Critical)** rule uses `noDataState: Alerting` because a
 disappearing quorum metric indicates a serious problem that warrants
 investigation.
+
+The **Quorum Fail At (Warning)** rule uses `noDataState: OK` because its
+PromQL query (`stellar_quorum_fail_at == 1`) returns empty results for both
+healthy values (> 1) and critical values (< 1). Empty results here mean
+"not in warning state," not "metric missing." Process-down coverage handles
+the case where the metric truly disappears.
 
 ### Panel vs. alert window divergence
 
