@@ -862,6 +862,9 @@ pub struct OverlayManager {
     /// Cooldown map preventing immediate re-dial after a connection drops.
     /// Shared with `SharedPeerState` via `Arc`.
     pub(super) dial_cooldowns: Arc<DashMap<ResolvedPeerAddr, std::time::Instant>>,
+    /// Monotonically-increasing counter for `PeerHandle::generation`.
+    /// Shared with all `SharedPeerState` snapshots via `Arc`.
+    pub(super) next_peer_generation: Arc<AtomicU64>,
 }
 
 impl OverlayManager {
@@ -970,6 +973,7 @@ impl OverlayManager {
             max_tx_size_bytes,
             listen_addr: None,
             dial_cooldowns: Arc::new(DashMap::new()),
+            next_peer_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1008,7 +1012,7 @@ impl OverlayManager {
             outbound_channel_capacity: self.connection_factory.outbound_channel_capacity(),
             dial_cooldowns: Arc::clone(&self.dial_cooldowns),
             local_peer_id: PeerId::from_xdr(self.local_node.xdr_public_key()),
-            next_peer_generation: Arc::new(AtomicU64::new(0)),
+            next_peer_generation: Arc::clone(&self.next_peer_generation),
         }
     }
 
