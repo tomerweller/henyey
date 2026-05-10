@@ -2139,6 +2139,32 @@ impl Simulation {
             },
         );
     }
+
+    /// Insert a mock running node into `running_apps` (not `test_nodes`).
+    ///
+    /// Used by defense-layer tests to exercise `Simulation::Drop` cleanup
+    /// without starting a real overlay or run loop.
+    pub(crate) fn insert_running_test_node(
+        &mut self,
+        node_id: impl Into<String>,
+        app: Arc<App>,
+        handle: JoinHandle<anyhow::Result<()>>,
+        data_dir: Arc<TempDir>,
+        peer_port: u16,
+    ) {
+        self.running_apps.insert(
+            node_id.into(),
+            RunningAppNode {
+                app,
+                task: NodeTaskHandle {
+                    handle,
+                    status: Arc::new(tokio::sync::RwLock::new(None)),
+                },
+                _data_dir: data_dir,
+                peer_port,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2568,5 +2594,193 @@ mod genesis_freshness_tests {
             result.is_ok(),
             "should succeed on empty database: {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod defense_layer_tests {
+    use super::*;
+    use henyey_app::config::ConfigBuilder;
+    use henyey_clock::RealClock;
+    use henyey_db::queries::{LedgerQueries, StateQueries};
+    use henyey_overlay::LoopbackConnectionFactory;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Layer 2: `bootstrap_insert_ready_node` rejects a database seeded at
+    /// ledger_seq != 1.
+    ///
+    /// Fixture: run `initialize_genesis_ledger` to produce a valid genesis DB,
+    /// then mutate the stored LCL and header to seq 5. This bypasses Layer 1
+    /// (pre-genesis emptiness check) but triggers Layer 2 (post-bootstrap
+    /// `ledger_seq == 1` assertion).
+    #[tokio::test]
+    async fn test_bootstrap_rejects_seeded_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("node.db");
+        let bucket_dir = dir.path().join("buckets");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let passphrase = "Test SDF Network ; September 2015";
+
+        // Step 1: Initialize a valid genesis DB at LCL=1.
+        let config = ConfigBuilder::simulation()
+            .database_path(&db_path)
+            .bucket_directory(&bucket_dir)
+            .build();
+        initialize_genesis_ledger(&config, passphrase).unwrap();
+
+        // Step 2: Mutate the DB — move LCL to 5 and write a header at seq 5.
+        {
+            let db = henyey_db::Database::open(&db_path).unwrap();
+            db.with_connection(|conn| {
+                let header = conn
+                    .load_ledger_header(1)
+                    .expect("load genesis header")
+                    .expect("genesis header exists");
+
+                // Clone header with ledger_seq = 5
+                let mut seeded_header = header;
+                seeded_header.ledger_seq = 5;
+                let seeded_xdr = stellar_xdr::curr::WriteXdr::to_xdr(
+                    &seeded_header,
+                    stellar_xdr::curr::Limits::none(),
+                )
+                .unwrap();
+
+                conn.store_ledger_header(&seeded_header, &seeded_xdr)
+                    .expect("store seeded header");
+                conn.set_last_closed_ledger(5).expect("set LCL to 5");
+                Ok::<_, henyey_db::DbError>(())
+            })
+            .unwrap();
+        }
+
+        // Step 3: Build a Simulation with one app node.
+        let mut sim = Simulation::new(SimulationMode::OverLoopback);
+        let secret = SecretKey::from_seed(&[42u8; 32]);
+        let node_id = "seeded-node";
+        sim.add_node(node_id, secret.clone());
+        sim.populate_app_nodes_from_existing(100);
+
+        // Give the spec the pre-seeded data_dir.
+        let data_dir = Arc::new(dir);
+        sim.app_specs.get_mut(node_id).unwrap().data_dir = Some(Arc::clone(&data_dir));
+
+        // Step 4: Build an App with init_genesis=false (bypasses Layer 1).
+        let port_map: HashMap<String, u16> = [(node_id.to_string(), 19000)].into();
+        let conn_factory: Arc<dyn ConnectionFactory> =
+            Arc::new(LoopbackConnectionFactory::default());
+
+        let app = sim
+            .build_app_from_spec(
+                &sim.app_specs[node_id].clone(),
+                &port_map,
+                data_dir.path().to_path_buf(),
+                conn_factory,
+                false, // skip Layer 1
+            )
+            .await
+            .expect("build app from spec");
+
+        // Step 5: Call bootstrap_insert_ready_node — Layer 2 should reject it.
+        let result = sim
+            .bootstrap_insert_ready_node(
+                node_id.to_string(),
+                app,
+                data_dir,
+                19000,
+                Duration::from_secs(5),
+            )
+            .await;
+
+        assert!(result.is_err(), "Layer 2 should reject seeded DB");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("SIMULATION STATE LEAK"),
+            "error should mention STATE LEAK: {err}"
+        );
+    }
+
+    /// Layer 3: Dropping a `Simulation` with running apps forces shutdown and
+    /// aborts their tasks.
+    ///
+    /// Inserts two mock `RunningAppNode` entries (via `insert_running_test_node`)
+    /// and verifies that both apps receive shutdown signals and both task handles
+    /// are aborted when the `Simulation` is dropped.
+    #[tokio::test]
+    async fn test_drop_shuts_down_leaked_nodes() {
+        let mut abort_handles = Vec::new();
+        let mut shutdown_rxs = Vec::new();
+
+        {
+            let mut sim = Simulation::new(SimulationMode::OverLoopback);
+
+            for i in 0..2 {
+                let dir = tempfile::tempdir().unwrap();
+                let db_path = dir.path().join("node.db");
+                let bucket_dir = dir.path().join("buckets");
+                std::fs::create_dir_all(&bucket_dir).unwrap();
+
+                let config = ConfigBuilder::simulation()
+                    .database_path(&db_path)
+                    .bucket_directory(&bucket_dir)
+                    .node_name(format!("drop-test-{i}"))
+                    .build();
+
+                let conn_factory: Arc<dyn ConnectionFactory> =
+                    Arc::new(LoopbackConnectionFactory::default());
+                let app = App::new_with_clock_and_connection_factory(
+                    config,
+                    Arc::new(RealClock),
+                    conn_factory,
+                )
+                .await
+                .expect("create test app");
+                let app = Arc::new(app);
+
+                // Subscribe to shutdown before handing the app to the sim.
+                shutdown_rxs.push(app.subscribe_shutdown());
+
+                // Spawn a long-sleeping task as the mock run loop.
+                let handle = tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_secs(999)).await;
+                    Ok(())
+                });
+                let abort = handle.abort_handle();
+                abort_handles.push(abort);
+
+                let data_dir = Arc::new(dir);
+                sim.insert_running_test_node(
+                    format!("node-{i}"),
+                    app,
+                    handle,
+                    data_dir,
+                    19100 + i as u16,
+                );
+            }
+
+            // Simulation is dropped here — Drop impl should shutdown + abort.
+        }
+
+        // Give the runtime a chance to process the abort signals.
+        tokio::task::yield_now().await;
+
+        // Verify all tasks were aborted.
+        for (i, abort) in abort_handles.iter().enumerate() {
+            assert!(
+                abort.is_finished(),
+                "node-{i} task should be finished (aborted) after Simulation drop"
+            );
+        }
+
+        // Verify all apps received shutdown signals.
+        for (i, rx) in shutdown_rxs.iter_mut().enumerate() {
+            assert!(
+                rx.try_recv().is_ok(),
+                "node-{i} should have received shutdown signal"
+            );
+        }
     }
 }
