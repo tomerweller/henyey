@@ -2777,13 +2777,13 @@ MOCK_BINARY
 
   # Test 136: PREV_PROM_INVALID invalidation rules documented
   if echo "$identity_section" | grep -Fq 'process identity changed' \
-     && (echo "$identity_section" | grep -Fq 'no scrape_identity' \
-         || echo "$identity_section" | grep -Fq 'scrape_identity malformed') \
+     && echo "$identity_section" | grep -Fq 'no scrape_identity' \
+     && echo "$identity_section" | grep -Fq 'scrape_identity malformed' \
      && echo "$identity_section" | grep -Fq 'no prev.prom'; then
     tap_ok "scrape-identity: PREV_PROM_INVALID invalidation rules (3 triggers documented)"
   else
     tap_not_ok "scrape-identity: PREV_PROM_INVALID invalidation rules" \
-      "Missing one of: 'process identity changed', 'no scrape_identity'/'scrape_identity malformed', 'no prev.prom'"
+      "Missing one of: 'process identity changed', 'no scrape_identity', 'scrape_identity malformed', 'no prev.prom'"
   fi
 
   # Test 137: Persistence-reset gauges listed in PREV_PROM_INVALID block
