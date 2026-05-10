@@ -116,6 +116,8 @@ groups:
 
       # ── Alert 3a: Quorum Fail At — Warning ───────────────────────
       # Fires when quorum resilience drops to exactly 1 (yellow zone).
+      # Uses PromQL comparison to filter to only == 1 values, making
+      # this mutually exclusive with the critical rule (< 1).
       - uid: henyey-quorum-failat-warn
         title: "Henyey: Quorum Fail At (Warning)"
         condition: threshold
@@ -137,31 +139,10 @@ groups:
               to: 0
             datasourceUid: "000000001"
             model:
-              expr: "stellar_quorum_fail_at{job=\"henyey\"}"
+              expr: "stellar_quorum_fail_at{job=\"henyey\"} == 1"
               instant: true
               refId: A
           - refId: threshold
-            relativeTimeRange:
-              from: 600
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              conditions:
-                - evaluator:
-                    type: lt
-                    params:
-                      - 2
-                  operator:
-                    type: and
-                  query:
-                    params:
-                      - A
-                  reducer:
-                    type: last
-              refId: threshold
-          # Exclude values < 1 (those fire the critical rule instead).
-          - refId: exclude_crit
             relativeTimeRange:
               from: 600
               to: 0
@@ -180,7 +161,7 @@ groups:
                       - A
                   reducer:
                     type: last
-              refId: exclude_crit
+              refId: threshold
 
       # ── Alert 3b: Quorum Fail At — Critical ──────────────────────
       # Fires when quorum resilience drops to 0 (red zone).
