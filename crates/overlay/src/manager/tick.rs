@@ -358,9 +358,8 @@ impl OverlayManager {
                 .await;
 
                 // Sweep expired dial cooldowns to avoid unbounded growth.
-                shared
-                    .dial_cooldowns
-                    .retain(|_, expiry| std::time::Instant::now() < *expiry);
+                let now = std::time::Instant::now();
+                shared.dial_cooldowns.retain(|_, expiry| now < *expiry);
             }
         });
 

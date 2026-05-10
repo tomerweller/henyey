@@ -1606,6 +1606,44 @@ mod tests {
         assert_eq!(result, AddPeerOutcome::AlreadyConnected);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_add_peer_respects_dial_cooldown() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let manager = setup_manager_for_add_peer_dedup();
+        let shared = manager.shared_state();
+
+        let addr_key = ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+            Ipv4Addr::new(1, 2, 3, 4),
+            11625,
+        ));
+
+        // Insert a cooldown expiring 2 seconds from now.
+        shared
+            .dial_cooldowns
+            .insert(addr_key, std::time::Instant::now() + Duration::from_secs(2));
+
+        // Should be blocked by cooldown (returns AlreadyConnected).
+        let result = manager
+            .add_peer(PeerAddress::new("1.2.3.4", 11625))
+            .await
+            .unwrap();
+        assert_eq!(result, AddPeerOutcome::AlreadyConnected);
+
+        // Advance past cooldown. Note: start_paused doesn't affect
+        // std::time::Instant, so we simulate expiry by removing and
+        // re-inserting with an already-past timestamp.
+        shared
+            .dial_cooldowns
+            .insert(addr_key, std::time::Instant::now() - Duration::from_secs(1));
+
+        // Now the dial should proceed (Initiated, since no existing connection).
+        let result = manager
+            .add_peer(PeerAddress::new("1.2.3.4", 11625))
+            .await
+            .unwrap();
+        assert_eq!(result, AddPeerOutcome::Initiated);
+    }
+
     // ---- resolve_peer_address tests ----
 
     #[tokio::test]
