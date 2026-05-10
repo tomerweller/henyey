@@ -1702,4 +1702,228 @@ mod tests {
             "WASM B should be cached after warm_module_cache_from_entries (next-ledger)"
         );
     }
+
+    // ── V1 cost-inputs preservation tests ──────────────────────────────
+    //
+    // Regression tests for #2542 / #2503: verify that modules cached via
+    // warm_module_cache_from_entries retain V1 cost inputs (not V0
+    // fallback). The original bug caused VmCachedInstantiation charges
+    // instead of refined InstantiateWasm* charges, causing cpu_insns
+    // divergence.
+
+    /// Helper: build a V1 `LedgerEntry` with known cost inputs for the
+    /// given WASM blob.
+    fn make_v1_contract_code_ledger_entry(
+        wasm: &[u8],
+    ) -> (stellar_xdr::curr::LedgerEntry, [u8; 32]) {
+        use stellar_xdr::curr::{
+            ContractCodeCostInputs, ContractCodeEntryV1, ExtensionPoint as XdrExtensionPoint,
+        };
+        let hash_bytes: [u8; 32] = Sha256::digest(wasm).into();
+        let entry = stellar_xdr::curr::LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {
+                    ext: XdrExtensionPoint::V0,
+                    cost_inputs: ContractCodeCostInputs {
+                        ext: XdrExtensionPoint::V0,
+                        n_instructions: 10,
+                        n_functions: 1,
+                        n_globals: 1,
+                        n_table_entries: 0,
+                        n_types: 1,
+                        n_data_segments: 0,
+                        n_elem_segments: 0,
+                        n_imports: 1,
+                        n_exports: 1,
+                        n_data_segment_bytes: 0,
+                    },
+                }),
+                hash: Hash(hash_bytes),
+                code: wasm.to_vec().try_into().expect("WASM bytes fit in BytesM"),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        (entry, hash_bytes)
+    }
+
+    #[test]
+    fn test_warm_module_cache_v1_cost_inputs_preserved_p24() {
+        let cache = PersistentModuleCache::new_for_protocol(24)
+            .expect("P24 module cache should be available");
+        let (entry, hash_bytes) = make_v1_contract_code_ledger_entry(WASM_A);
+        super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 24);
+
+        let host_hash = soroban_env_host_p24::xdr::Hash(hash_bytes);
+        let module = cache
+            .as_p24()
+            .unwrap()
+            .get_module(&host_hash)
+            .expect("get_module should not error")
+            .expect("V1 module should be in cache");
+
+        match &module.cost_inputs {
+            soroban_env_host_p24::vm::VersionedContractCodeCostInputs::V1(inputs) => {
+                assert_eq!(inputs.n_instructions, 10);
+                assert_eq!(inputs.n_functions, 1);
+                assert_eq!(inputs.n_globals, 1);
+                assert_eq!(inputs.n_table_entries, 0);
+                assert_eq!(inputs.n_types, 1);
+                assert_eq!(inputs.n_data_segments, 0);
+                assert_eq!(inputs.n_elem_segments, 0);
+                assert_eq!(inputs.n_imports, 1);
+                assert_eq!(inputs.n_exports, 1);
+                assert_eq!(inputs.n_data_segment_bytes, 0);
+            }
+            soroban_env_host_p24::vm::VersionedContractCodeCostInputs::V0 { .. } => {
+                panic!("V1 entry was cached with V0 cost inputs — regression from #2503");
+            }
+        }
+    }
+
+    #[test]
+    fn test_warm_module_cache_v1_cost_inputs_preserved_p25() {
+        let cache = PersistentModuleCache::new_for_protocol(25)
+            .expect("P25 module cache should be available");
+        let (entry, hash_bytes) = make_v1_contract_code_ledger_entry(WASM_A);
+        super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 25);
+
+        let host_hash = soroban_env_host_p25::xdr::Hash(hash_bytes);
+        let module = cache
+            .as_p25()
+            .unwrap()
+            .get_module(&host_hash)
+            .expect("get_module should not error")
+            .expect("V1 module should be in cache");
+
+        match &module.cost_inputs {
+            soroban_env_host_p25::vm::VersionedContractCodeCostInputs::V1(inputs) => {
+                assert_eq!(inputs.n_instructions, 10);
+                assert_eq!(inputs.n_functions, 1);
+                assert_eq!(inputs.n_globals, 1);
+                assert_eq!(inputs.n_table_entries, 0);
+                assert_eq!(inputs.n_types, 1);
+                assert_eq!(inputs.n_data_segments, 0);
+                assert_eq!(inputs.n_elem_segments, 0);
+                assert_eq!(inputs.n_imports, 1);
+                assert_eq!(inputs.n_exports, 1);
+                assert_eq!(inputs.n_data_segment_bytes, 0);
+            }
+            soroban_env_host_p25::vm::VersionedContractCodeCostInputs::V0 { .. } => {
+                panic!("V1 entry was cached with V0 cost inputs — regression from #2503");
+            }
+        }
+    }
+
+    #[test]
+    fn test_warm_module_cache_v1_cost_inputs_preserved_p26() {
+        let cache = PersistentModuleCache::new_for_protocol(26)
+            .expect("P26 module cache should be available");
+        let (entry, hash_bytes) = make_v1_contract_code_ledger_entry(WASM_A);
+        super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 26);
+
+        let host_hash = soroban_env_host_p26::xdr::Hash(hash_bytes);
+        let module = cache
+            .as_p26()
+            .unwrap()
+            .get_module(&host_hash)
+            .expect("get_module should not error")
+            .expect("V1 module should be in cache");
+
+        match &module.cost_inputs {
+            soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V1(inputs) => {
+                assert_eq!(inputs.n_instructions, 10);
+                assert_eq!(inputs.n_functions, 1);
+                assert_eq!(inputs.n_globals, 1);
+                assert_eq!(inputs.n_table_entries, 0);
+                assert_eq!(inputs.n_types, 1);
+                assert_eq!(inputs.n_data_segments, 0);
+                assert_eq!(inputs.n_elem_segments, 0);
+                assert_eq!(inputs.n_imports, 1);
+                assert_eq!(inputs.n_exports, 1);
+                assert_eq!(inputs.n_data_segment_bytes, 0);
+            }
+            soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V0 { .. } => {
+                panic!("V1 entry was cached with V0 cost inputs — regression from #2503");
+            }
+        }
+    }
+
+    #[test]
+    fn test_warm_module_cache_v0_cost_inputs_p24() {
+        let cache = PersistentModuleCache::new_for_protocol(24)
+            .expect("P24 module cache should be available");
+        let entry = make_contract_code_ledger_entry(WASM_A);
+        super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 24);
+
+        let hash_bytes: [u8; 32] = Sha256::digest(WASM_A).into();
+        let host_hash = soroban_env_host_p24::xdr::Hash(hash_bytes);
+        let module = cache
+            .as_p24()
+            .unwrap()
+            .get_module(&host_hash)
+            .expect("get_module should not error")
+            .expect("V0 module should be in cache");
+
+        match &module.cost_inputs {
+            soroban_env_host_p24::vm::VersionedContractCodeCostInputs::V0 { wasm_bytes } => {
+                assert_eq!(*wasm_bytes, WASM_A.len());
+            }
+            soroban_env_host_p24::vm::VersionedContractCodeCostInputs::V1(_) => {
+                panic!("V0 entry should not be cached with V1 cost inputs");
+            }
+        }
+    }
+
+    #[test]
+    fn test_warm_module_cache_v0_cost_inputs_p25() {
+        let cache = PersistentModuleCache::new_for_protocol(25)
+            .expect("P25 module cache should be available");
+        let entry = make_contract_code_ledger_entry(WASM_A);
+        super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 25);
+
+        let hash_bytes: [u8; 32] = Sha256::digest(WASM_A).into();
+        let host_hash = soroban_env_host_p25::xdr::Hash(hash_bytes);
+        let module = cache
+            .as_p25()
+            .unwrap()
+            .get_module(&host_hash)
+            .expect("get_module should not error")
+            .expect("V0 module should be in cache");
+
+        match &module.cost_inputs {
+            soroban_env_host_p25::vm::VersionedContractCodeCostInputs::V0 { wasm_bytes } => {
+                assert_eq!(*wasm_bytes, WASM_A.len());
+            }
+            soroban_env_host_p25::vm::VersionedContractCodeCostInputs::V1(_) => {
+                panic!("V0 entry should not be cached with V1 cost inputs");
+            }
+        }
+    }
+
+    #[test]
+    fn test_warm_module_cache_v0_cost_inputs_p26() {
+        let cache = PersistentModuleCache::new_for_protocol(26)
+            .expect("P26 module cache should be available");
+        let entry = make_contract_code_ledger_entry(WASM_A);
+        super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 26);
+
+        let hash_bytes: [u8; 32] = Sha256::digest(WASM_A).into();
+        let host_hash = soroban_env_host_p26::xdr::Hash(hash_bytes);
+        let module = cache
+            .as_p26()
+            .unwrap()
+            .get_module(&host_hash)
+            .expect("get_module should not error")
+            .expect("V0 module should be in cache");
+
+        match &module.cost_inputs {
+            soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V0 { wasm_bytes } => {
+                assert_eq!(*wasm_bytes, WASM_A.len());
+            }
+            soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V1(_) => {
+                panic!("V0 entry should not be cached with V1 cost inputs");
+            }
+        }
+    }
 }

@@ -45,6 +45,7 @@ jemalloc = ["dep:tikv-jemalloc-ctl"]
 test-utils = []
 
 [dev-dependencies]
+soroban-env-host-p24.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
 hex.workspace = true
