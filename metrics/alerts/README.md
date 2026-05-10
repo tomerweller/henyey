@@ -1,18 +1,48 @@
 # Henyey SLO Alert Rules
 
-Grafana alert provisioning rules for henyey validator metrics. These rules
-wire alerting to the visual thresholds already defined in the henyey
-monitoring dashboards.
+Grafana alert provisioning rules for henyey validator metrics. Rules are
+split into two categories:
+
+- **Dashboard-derived** alerts mirror visual thresholds from the henyey
+  monitoring dashboard panels.
+- **Policy-based** alerts cover henyey-specific operational metrics that
+  have no dashboard panel but have clear alerting significance. Thresholds
+  are explicitly tunable.
 
 ## Alert Rules
 
-| Rule | Metric | Condition | For | Severity |
-|------|--------|-----------|-----|----------|
-| Invariant Failure | `stellar_ledger_invariant_failure_total` | `increase(...[10m]) > 0` | 0s | critical |
-| TX Internal Error Rate | `stellar_ledger_transaction_internal_error_total` | `rate(...[5m]) > 0.01` | 5m | critical |
-| Quorum Fail At (warn) | `stellar_quorum_fail_at` | `== 1` | 5m | warning |
-| Quorum Fail At (crit) | `stellar_quorum_fail_at` | `< 1` | 5m | critical |
-| Process Down | `up` | `== 0` | 2m | critical |
+### Phase 1: Dashboard-Threshold Alerts
+
+| # | Rule | Metric | Condition | For | Severity |
+|---|------|--------|-----------|-----|----------|
+| 1 | Invariant Failure | `stellar_ledger_invariant_failure_total` | `increase(...[10m]) > 0` | 0s | critical |
+| 2 | TX Internal Error Rate | `stellar_ledger_transaction_internal_error_total` | `rate(...[5m]) > 0.01` | 5m | critical |
+| 3a | Quorum Fail At (warn) | `stellar_quorum_fail_at` | `== 1` | 5m | warning |
+| 3b | Quorum Fail At (crit) | `stellar_quorum_fail_at` | `< 1` | 5m | critical |
+| 4 | Process Down | `up` | `== 0` | 2m | critical |
+
+### Phase 2: Henyey-Specific Alerts
+
+#### Policy-Based (no dashboard panel)
+
+| # | Rule | Metric | Condition | For | Severity |
+|---|------|--------|-----------|-----|----------|
+| 5 | Post-Catchup Hard Reset | `henyey_post_catchup_hard_reset_total` | `increase(...[10m]) > 0` | 0s | critical |
+| 6 | Recovery Stalled | `henyey_recovery_stalled_tick_total` | `increase(...{reason="forcing_catchup_behind"}[10m]) >= 3` | 0s | warning |
+| 7 | Recovery TX Set Stuck | `henyey_recovery_tx_set_stuck_seconds` | `> 60` | 0s | warning |
+| 8 | Overlay Fetch Channel Depth | `henyey_overlay_fetch_channel_depth` | `> 128` | 5m | warning |
+
+#### Dashboard-Derived
+
+| # | Rule | Metric | Condition | For | Severity | Panel |
+|---|------|--------|-----------|-----|----------|-------|
+| 9a | FD Exhaustion (warn) | `open_fds / max_fds` | `> 0.6` | 5m | warning | id=10 |
+| 9b | FD Exhaustion (crit) | `open_fds / max_fds` | `> 0.8` | 5m | critical | id=10 |
+| 10a | Ledger Age (warn) | `stellar_ledger_age_current_seconds` | `> 10` (tracking only) | 5m | warning | id=2 |
+| 10b | Ledger Age (crit) | `stellar_ledger_age_current_seconds` | `> 30` (tracking only) | 5m | critical | id=2 |
+| 11 | Quorum Missing Peers | `stellar_quorum_missing` | `>= 1` | 5m | warning | id=7 |
+| 12a | Peer Count (warn) | `stellar_peer_count` | `< 8` | 5m | warning | id=5 |
+| 12b | Peer Count (crit) | `stellar_peer_count` | `< 3` | 5m | critical | id=5 |
 
 ## Prerequisites
 
@@ -52,7 +82,7 @@ monitoring dashboards.
    curl -s http://localhost:3000/api/v1/provisioning/alert-rules | jq '.[] | .title'
    ```
 
-   You should see 5 rules in the `Henyey` folder under the `henyey-slo`
+   You should see 16 rules in the `Henyey` folder under the `henyey-slo`
    rule group.
 
 ## Configuration
@@ -133,6 +163,59 @@ and catches strict failures only if the scrape happens before the panic.
 
 Strict failure detection is primarily covered by the Process Down alert,
 which fires when the henyey process stops responding to scrapes.
+
+### Phase 2 design notes
+
+#### Recovery Stalled — label filtering
+
+The `henyey_recovery_stalled_tick_total` counter is partitioned by a
+`reason` label with values: `backoff_active`, `forcing_catchup_not_behind`,
+`forcing_catchup_behind`, `at_tip_no_scp_hard_reset`, and
+`archive_behind_peer_ahead_hard_reset`. Only `forcing_catchup_behind` is
+operationally significant — the others are transient/debug signals. The
+alert filters to `reason="forcing_catchup_behind"` and uses a threshold
+of `>= 3` increments in 10 minutes, matching the streak threshold from
+the ops guidance in `.claude/skills/shared/check-12b-constants.toml`.
+
+#### Overlay fetch channel depth vs depth_max
+
+The issue references `henyey_overlay_fetch_channel_depth_max`, but this
+metric is a monotonic high-water mark that never decreases — alerting on
+it would fire permanently after a single spike. Instead, the alert uses
+`henyey_overlay_fetch_channel_depth` (the current instantaneous depth),
+which reflects real-time backpressure. The channel is unbounded (tokio
+mpsc), so the threshold (128) is a tunable policy value.
+
+#### FD exhaustion — absent denominator
+
+`henyey_process_max_fds` is not emitted when `RLIMIT_NOFILE` is infinity
+or on non-Linux platforms (`crates/app/src/metrics.rs:1223-1239`). When
+the denominator is absent, PromQL division yields no result. Combined
+with `noDataState: OK`, the alert is silently disabled — this is
+intentional, as infinite FD limits don't need exhaustion alerts.
+
+#### Ledger age — herder state filter
+
+The ledger age alerts use `and stellar_herder_state == 2` to fire only
+when the herder is in Tracking state. During Syncing or Booting, high
+ledger age is expected and not actionable. This matches the dashboard
+panel query (panel id=2).
+
+#### Quorum missing vs quorum fail-at — layered severity
+
+The Quorum Missing alert fires at `warning` severity despite the
+dashboard's red threshold at ≥ 1. Missing peers are upstream network
+conditions, not henyey bugs. The existing Quorum Fail At alerts (3a/3b)
+already cover the downstream quorum-loss risk at `critical` severity.
+This provides layered escalation: "peers dropping" (warning) →
+"quorum at risk" (critical).
+
+#### Peer count — noDataState: Alerting
+
+Unlike most alerts which use `noDataState: OK` (relying on Process Down
+for crash detection), the Peer Count alerts use `noDataState: Alerting`.
+An absent peer count metric — even if the process is still technically
+running — indicates a severe connectivity problem worth investigating.
 
 ## Testing
 

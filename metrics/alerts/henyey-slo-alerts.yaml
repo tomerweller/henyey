@@ -259,3 +259,559 @@ groups:
                   reducer:
                     type: last
               refId: threshold
+
+      # ════════════════════════════════════════════════════════════════
+      # Phase 2: Henyey-Specific Alerts (issue #2551)
+      # ════════════════════════════════════════════════════════════════
+
+      # ── Alert 5: Post-Catchup Hard Reset ─────────────────────────
+      # Fires on any post-catchup hard reset in the last 10m.
+      # A hard reset discards local state and restarts catchup —
+      # any occurrence on a converged node is abnormal.
+      # Policy-based alert (no dashboard panel).
+      - uid: henyey-post-catchup-hard-reset
+        title: "Henyey: Post-Catchup Hard Reset"
+        condition: threshold
+        for: 0s
+        labels:
+          severity: critical
+          team: henyey
+        annotations:
+          summary: "Post-catchup hard reset on {{ $labels.instance }}"
+          description: >-
+            increase(henyey_post_catchup_hard_reset_total) > 0
+            in last 10m on {{ $labels.instance }}.
+            Local state was discarded and catchup restarted.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "increase(henyey_post_catchup_hard_reset_total{job=\"henyey\"}[10m])"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 6: Recovery Stalled (Forcing Catchup Behind) ────────
+      # Fires when the recovery loop is stalled with reason
+      # "forcing_catchup_behind" — the only operationally significant
+      # stall reason per ops guidance (check-12b-constants.toml).
+      # Threshold >= 3 matches the streak threshold.
+      # Policy-based alert (no dashboard panel).
+      - uid: henyey-recovery-stalled
+        title: "Henyey: Recovery Stalled"
+        condition: threshold
+        for: 0s
+        labels:
+          severity: warning
+          team: henyey
+        annotations:
+          summary: "Recovery stalled (forcing_catchup_behind) on {{ $labels.instance }}"
+          description: >-
+            increase(henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}) >= 3
+            in last 10m on {{ $labels.instance }}.
+            The recovery loop is stuck behind and unable to catch up.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "increase(henyey_recovery_stalled_tick_total{job=\"henyey\",reason=\"forcing_catchup_behind\"}[10m])"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gte
+                    params:
+                      - 3
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 7: Recovery TX Set Stuck ────────────────────────────
+      # Fires when the tx set fetch has been stuck for > 60 seconds.
+      # The gauge value itself encodes duration (0 = not stuck).
+      # Policy-based alert (no dashboard panel).
+      - uid: henyey-recovery-txset-stuck
+        title: "Henyey: Recovery TX Set Stuck"
+        condition: threshold
+        for: 0s
+        labels:
+          severity: warning
+          team: henyey
+        annotations:
+          summary: "TX set fetch stuck > 60s on {{ $labels.instance }}"
+          description: >-
+            henyey_recovery_tx_set_stuck_seconds > 60
+            on {{ $labels.instance }}.
+            All peers exhausted for pending tx_set hashes.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "henyey_recovery_tx_set_stuck_seconds{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 60
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 8: Overlay Fetch Channel Depth ──────────────────────
+      # Fires when the overlay fetch channel current depth exceeds 128
+      # for 5 minutes, indicating sustained backpressure.
+      # Uses the instantaneous depth gauge, NOT the monotonic max
+      # (which is sticky and never decreases).
+      # Policy-based alert (no dashboard panel). Threshold is tunable.
+      - uid: henyey-overlay-fetch-depth
+        title: "Henyey: Overlay Fetch Channel Depth"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: warning
+          team: henyey
+        annotations:
+          summary: "Overlay fetch channel depth > 128 on {{ $labels.instance }}"
+          description: >-
+            henyey_overlay_fetch_channel_depth > 128
+            sustained for 5m on {{ $labels.instance }}.
+            The overlay consumer may not be keeping up with fetch responses.
+        noDataState: OK
+        execErrState: Error
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "henyey_overlay_fetch_channel_depth{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 128
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 9a: FD Exhaustion — Warning ─────────────────────────
+      # Fires when FD usage ratio exceeds 0.6 (yellow zone).
+      # Dashboard-derived: matches panel id=10 yellow threshold.
+      # Absent on non-Linux or when RLIMIT_NOFILE is infinity —
+      # PromQL division yields no result, noDataState: OK suppresses.
+      - uid: henyey-fd-exhaustion-warn
+        title: "Henyey: FD Exhaustion (Warning)"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: warning
+          team: henyey
+        annotations:
+          summary: "FD usage > 60% on {{ $labels.instance }}"
+          description: >-
+            henyey_process_open_fds / henyey_process_max_fds > 0.6
+            for 5m on {{ $labels.instance }}.
+            File descriptor exhaustion approaching.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "henyey_process_open_fds{job=\"henyey\"} / henyey_process_max_fds{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0.6
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 9b: FD Exhaustion — Critical ────────────────────────
+      # Fires when FD usage ratio exceeds 0.8 (red zone).
+      # Dashboard-derived: matches panel id=10 red threshold.
+      - uid: henyey-fd-exhaustion-crit
+        title: "Henyey: FD Exhaustion (Critical)"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: critical
+          team: henyey
+        annotations:
+          summary: "FD usage > 80% on {{ $labels.instance }}"
+          description: >-
+            henyey_process_open_fds / henyey_process_max_fds > 0.8
+            for 5m on {{ $labels.instance }}.
+            File descriptor exhaustion imminent.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "henyey_process_open_fds{job=\"henyey\"} / henyey_process_max_fds{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0.8
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 10a: Ledger Age — Warning ───────────────────────────
+      # Fires when ledger age exceeds 10s while herder is tracking.
+      # Dashboard-derived: matches panel id=2 yellow threshold.
+      # Only fires in herder Tracking state (== 2); high age during
+      # Syncing/Booting is expected and not actionable.
+      - uid: henyey-ledger-age-warn
+        title: "Henyey: Ledger Age (Warning)"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: warning
+          team: henyey
+        annotations:
+          summary: "Ledger age > 10s on {{ $labels.instance }}"
+          description: >-
+            stellar_ledger_age_current_seconds > 10 (while tracking)
+            for 5m on {{ $labels.instance }}.
+            The node is falling behind in ledger closes.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "stellar_ledger_age_current_seconds{job=\"henyey\"} and stellar_herder_state{job=\"henyey\"} == 2"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 10
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 10b: Ledger Age — Critical ──────────────────────────
+      # Fires when ledger age exceeds 30s while herder is tracking.
+      # Dashboard-derived: matches panel id=2 red threshold.
+      - uid: henyey-ledger-age-crit
+        title: "Henyey: Ledger Age (Critical)"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: critical
+          team: henyey
+        annotations:
+          summary: "Ledger age > 30s on {{ $labels.instance }}"
+          description: >-
+            stellar_ledger_age_current_seconds > 30 (while tracking)
+            for 5m on {{ $labels.instance }}.
+            The node is significantly behind. Investigate immediately.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "stellar_ledger_age_current_seconds{job=\"henyey\"} and stellar_herder_state{job=\"henyey\"} == 2"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 30
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 11: Quorum Missing Peers ────────────────────────────
+      # Fires when any quorum set nodes are not responding.
+      # Dashboard-derived: matches panel id=7 red threshold (>= 1).
+      # Warning severity — the quorum-fail-at alerts (3a/3b) cover
+      # the downstream impact at critical severity, providing layered
+      # escalation.
+      - uid: henyey-quorum-missing
+        title: "Henyey: Quorum Missing Peers"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: warning
+          team: henyey
+        annotations:
+          summary: "Quorum missing peers >= 1 on {{ $labels.instance }}"
+          description: >-
+            stellar_quorum_missing >= 1 for 5m on {{ $labels.instance }}.
+            One or more quorum set nodes are not responding.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "stellar_quorum_missing{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gte
+                    params:
+                      - 1
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 12a: Peer Count — Warning ───────────────────────────
+      # Fires when connected peer count drops below 8 (yellow zone).
+      # Dashboard-derived: matches panel id=5 yellow threshold.
+      - uid: henyey-peer-count-warn
+        title: "Henyey: Peer Count (Warning)"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: warning
+          team: henyey
+        annotations:
+          summary: "Peer count < 8 on {{ $labels.instance }}"
+          description: >-
+            stellar_peer_count < 8 for 5m on {{ $labels.instance }}.
+            Connected peer count is low.
+        noDataState: Alerting
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "stellar_peer_count{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 8
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
+
+      # ── Alert 12b: Peer Count — Critical ──────────────────────────
+      # Fires when connected peer count drops below 3 (red zone).
+      # Dashboard-derived: matches panel id=5 red threshold.
+      - uid: henyey-peer-count-crit
+        title: "Henyey: Peer Count (Critical)"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: critical
+          team: henyey
+        annotations:
+          summary: "Peer count < 3 on {{ $labels.instance }}"
+          description: >-
+            stellar_peer_count < 3 for 5m on {{ $labels.instance }}.
+            Critically low peer connectivity. Network isolation possible.
+        noDataState: Alerting
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "stellar_peer_count{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 3
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold
