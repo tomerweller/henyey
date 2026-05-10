@@ -1671,12 +1671,11 @@ mod tests {
 
     // ── V1 cost-inputs warming parity tests ────────────────────────────
     //
-    // Parity tests for #2543: verify that modules cached via
-    // warm_module_cache_from_entries always use V0 cost inputs (wasm_bytes
-    // only), matching stellar-core's bridge warm path. The entry's
-    // ContractCodeEntryExt::V1 cost_inputs are intentionally ignored —
-    // stellar-core's `compile()` → `parse_and_cache_module_simple()` always
-    // constructs V0.
+    // Parity tests for #2543: verify that module cache warming delegates
+    // to `parse_and_cache_module_simple`, matching stellar-core's bridge
+    // warm path. The entry's ContractCodeEntryExt::V1 cost_inputs are
+    // intentionally ignored — only raw wasm bytes are passed. Cost input
+    // behavior is protocol-dependent (V0 for P24/P25, derived V1 for P26).
 
     /// Helper: build a V1 `LedgerEntry` with known cost inputs for the
     /// given WASM blob.
@@ -1692,8 +1691,8 @@ mod tests {
             data: LedgerEntryData::ContractCode(ContractCodeEntry {
                 ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {
                     ext: XdrExtensionPoint::V0,
-                    // Use distinct non-zero sentinels so field-transposition
-                    // bugs in the XDR bridge are caught by per-field assertions.
+                    // Use distinct non-zero sentinels so the P26 test can
+                    // verify values were derived from wasm, not copied.
                     cost_inputs: ContractCodeCostInputs {
                         ext: XdrExtensionPoint::V0,
                         n_instructions: 10,
