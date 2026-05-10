@@ -1437,19 +1437,26 @@ async fn test_start_all_nodes_overlays_ready() {
 /// started and an immediate connection must not return `NotStarted`.
 #[tokio::test]
 async fn test_restart_node_overlay_ready() {
-    let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
-    let ids = sim.app_node_ids();
-    let target = &ids[0];
+    for mode in [SimulationMode::OverLoopback, SimulationMode::OverTcp] {
+        let mut sim = build_app_backed_topology(Topologies::pair(mode), 100).await;
+        let ids = sim.app_node_ids();
+        let target = &ids[0];
+        let other = &ids[1];
 
-    sim.restart_node(target).await.expect("restart failed");
+        sim.restart_node(target).await.expect("restart failed");
 
-    assert!(
-        sim.is_app_overlay_started(target).await,
-        "overlay not started for restarted node {target}"
-    );
+        assert!(
+            sim.is_app_overlay_started(target).await,
+            "overlay not started for restarted node {target} ({mode:?})"
+        );
 
-    sim.stop_all_nodes().await.ok();
+        // Verify an immediate connection attempt succeeds (no NotStarted).
+        sim.add_connection(target, other)
+            .await
+            .expect("add_connection after restart should not return NotStarted");
+
+        sim.stop_all_nodes().await.ok();
+    }
 }
 
 #[tokio::test]
