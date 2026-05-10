@@ -44,12 +44,60 @@ const OUTBOUND_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// Result of a background DNS resolution of configured peers.
 struct ResolvedPeers {
-    /// Successfully resolved known peers (hostname → IP:port).
-    known: Vec<PeerAddress>,
+    /// Per-entry resolution results for known peers. Same length and order as
+    /// the input `config_known_peers`. `None` = resolution failed for that entry.
+    known: Vec<Option<PeerAddress>>,
     /// Successfully resolved preferred peers (hostname → IP:port).
+    /// Failures are filtered out (PreferredPeerSet handles omission).
     preferred: Vec<PeerAddress>,
     /// True if any peer in either list failed to resolve.
     errors: bool,
+}
+
+/// Resolve a list of peer addresses, returning per-entry results preserving
+/// positional correspondence. `None` entries indicate resolution failure.
+///
+/// This variant is used for known peers where `KnownPeerSet` needs to track
+/// which specific config entry resolved (or failed).
+pub(super) async fn resolve_peer_list_positional(
+    peers: &[PeerAddress],
+) -> (Vec<Option<PeerAddress>>, bool) {
+    let mut resolved = Vec::with_capacity(peers.len());
+    let mut errors = false;
+
+    for peer in peers {
+        if peer.host.parse::<IpAddr>().is_ok() {
+            resolved.push(Some(peer.clone()));
+            continue;
+        }
+
+        let lookup_result = tokio::net::lookup_host((peer.host.as_str(), peer.port)).await;
+        match lookup_result {
+            Ok(addrs) => {
+                let ipv4_addr = addrs.into_iter().find(|a| a.is_ipv4());
+                if let Some(socket_addr) = ipv4_addr {
+                    resolved.push(Some(PeerAddress::from(socket_addr)));
+                    tracing::trace!(
+                        "Resolved peer {} -> {}:{}",
+                        peer,
+                        socket_addr.ip(),
+                        socket_addr.port()
+                    );
+                } else {
+                    resolved.push(None);
+                    errors = true;
+                    warn!("No IPv4 address found for peer {}", peer);
+                }
+            }
+            Err(e) => {
+                resolved.push(None);
+                errors = true;
+                error!("Unable to resolve peer '{}': {}", peer, e);
+            }
+        }
+    }
+
+    (resolved, errors)
 }
 
 /// Resolve a list of peer addresses, performing DNS lookup for hostnames.
@@ -102,7 +150,7 @@ fn spawn_dns_resolution(
     preferred_peers: Vec<PeerAddress>,
 ) -> JoinHandle<ResolvedPeers> {
     tokio::spawn(async move {
-        let (known, known_err) = resolve_peer_list(&known_peers).await;
+        let (known, known_err) = resolve_peer_list_positional(&known_peers).await;
         let (preferred, pref_err) = resolve_peer_list(&preferred_peers).await;
         ResolvedPeers {
             known,
@@ -315,7 +363,7 @@ impl OverlayManager {
     #[allow(clippy::too_many_arguments)]
     async fn maybe_collect_dns_result(
         dns_resolve_handle: &mut Option<JoinHandle<ResolvedPeers>>,
-        known_peers: &RwLock<Vec<PeerAddress>>,
+        known_peers: &RwLock<super::KnownPeerSet>,
         preferred_set: &mut Arc<PreferredPeerSet>,
         inbound_pool: &Arc<ConnectionPool>,
         shared_preferred_peers: &Arc<RwLock<PreferredPeerSet>>,
@@ -329,21 +377,8 @@ impl OverlayManager {
         };
         match handle_ref.await {
             Ok(result) => {
-                // Merge resolved known peers (add new, keep existing).
-                // Use canonical keys to prevent hostname/IP alias duplicates.
-                {
-                    let mut kp = known_peers.write();
-                    let mut existing_keys: std::collections::HashSet<String> =
-                        kp.iter().map(|p| p.canonical_key()).collect();
-                    for addr in &result.known {
-                        if kp.len() >= super::MAX_KNOWN_PEERS {
-                            break;
-                        }
-                        if existing_keys.insert(addr.canonical_key()) {
-                            kp.push(addr.clone());
-                        }
-                    }
-                }
+                // Update known peer resolution cache (last-good preserved on failure).
+                known_peers.write().update_resolved(&result.known);
 
                 // Update preferred peer set with DNS-resolved addresses.
                 let new_set = preferred_set.with_resolved(result.preferred);
@@ -442,7 +477,7 @@ impl OverlayManager {
 
     /// Fill remaining outbound slots from the shuffled known-peer list.
     async fn fill_outbound_slots(
-        known_peers: &RwLock<Vec<PeerAddress>>,
+        known_peers: &RwLock<super::KnownPeerSet>,
         retry_after: &mut HashMap<String, Instant>,
         now: Instant,
         mut remaining: usize,
@@ -450,8 +485,9 @@ impl OverlayManager {
         shared: &SharedPeerState,
         ctx: &TickConnectCtx,
     ) {
-        let mut known_snapshot = known_peers.read().clone();
-        known_snapshot.shuffle(&mut rand::thread_rng());
+        let known_snapshot = known_peers
+            .read()
+            .shuffled_dial_entries(&mut rand::thread_rng());
 
         for addr in &known_snapshot {
             if remaining == 0 {
@@ -1210,5 +1246,38 @@ mod tests {
             needs_eviction,
             "eviction should trigger based on authenticated count"
         );
+    }
+
+    // ──────── resolve_peer_list_positional tests ────────
+
+    #[tokio::test]
+    async fn test_resolve_peer_list_positional_ip_passthrough() {
+        let peers = vec![
+            PeerAddress::new("10.0.0.1", 11625),
+            PeerAddress::new("192.168.1.1", 11625),
+        ];
+        let (results, errors) = resolve_peer_list_positional(&peers).await;
+        assert_eq!(results.len(), 2);
+        assert!(!errors);
+        assert_eq!(results[0].as_ref().unwrap().host, "10.0.0.1");
+        assert_eq!(results[1].as_ref().unwrap().host, "192.168.1.1");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_peer_list_positional_preserves_order_on_failure() {
+        let peers = vec![
+            PeerAddress::new("10.0.0.1", 11625),
+            PeerAddress::new("this-will-never-resolve-xyz123.invalid", 11625),
+            PeerAddress::new("10.0.0.2", 11625),
+        ];
+        let (results, errors) = resolve_peer_list_positional(&peers).await;
+        assert_eq!(results.len(), 3);
+        assert!(errors);
+        // IP entries pass through
+        assert_eq!(results[0].as_ref().unwrap().host, "10.0.0.1");
+        // Failed hostname → None
+        assert!(results[1].is_none());
+        // Third entry still present at index 2
+        assert_eq!(results[2].as_ref().unwrap().host, "10.0.0.2");
     }
 }

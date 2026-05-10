@@ -194,6 +194,145 @@ impl PreferredPeerSet {
     }
 }
 
+/// Typed known-peer storage separating configured hostnames from discovered IPs
+/// and maintaining a per-entry DNS resolution cache.
+///
+/// Analogous to `PreferredPeerSet` but for the general known-peer pool used by
+/// `fill_outbound_slots()`. Config entries are immutable; DNS resolution state
+/// is tracked per-entry with last-good preservation on failure.
+pub(super) struct KnownPeerSet {
+    /// Original hostname entries from config (immutable after init).
+    config_entries: Vec<PeerAddress>,
+    /// Per-config-entry resolution state. Same length as `config_entries`.
+    /// `Some(addr)` = last successful resolution; `None` = never resolved.
+    /// On DNS failure, last-good is preserved (not cleared).
+    resolved: Vec<Option<PeerAddress>>,
+    /// Peers discovered via gossip/DB refresh (arrive as IPs).
+    /// Capped at `MAX_KNOWN_PEERS - config_entries.len()`.
+    discovered: Vec<PeerAddress>,
+    /// Dedup set for discovered entries (canonical_key based).
+    discovered_keys: HashSet<String>,
+}
+
+impl KnownPeerSet {
+    /// Create from config entries with no resolution state.
+    pub(super) fn from_config(config_entries: Vec<PeerAddress>) -> Self {
+        let resolved = vec![None; config_entries.len()];
+        Self {
+            config_entries,
+            resolved,
+            discovered: Vec::new(),
+            discovered_keys: HashSet::new(),
+        }
+    }
+
+    /// Apply DNS resolution results. `results` must be positionally aligned
+    /// with `config_entries`. On `Some(addr)`: updates resolution. On `None`:
+    /// preserves last-good (does NOT clear).
+    pub(super) fn update_resolved(&mut self, results: &[Option<PeerAddress>]) {
+        debug_assert_eq!(
+            results.len(),
+            self.config_entries.len(),
+            "resolve results length must match config_entries"
+        );
+        for (i, result) in results.iter().enumerate() {
+            if let Some(addr) = result {
+                self.resolved[i] = Some(addr.clone());
+            }
+            // None → preserve last-good (no-op)
+        }
+    }
+
+    /// Add a discovered peer (from gossip or DB). Returns false if full or duplicate
+    /// (checks against both existing discovered peers and config entries).
+    pub(super) fn add_discovered(&mut self, addr: PeerAddress) -> bool {
+        let cap = MAX_KNOWN_PEERS.saturating_sub(self.config_entries.len());
+        if self.discovered.len() >= cap {
+            return false;
+        }
+        let key = addr.canonical_key();
+        // Check against config entries (both hostname and resolved forms)
+        for (i, config) in self.config_entries.iter().enumerate() {
+            if config.canonical_key() == key {
+                return false;
+            }
+            if let Some(resolved) = &self.resolved[i] {
+                if resolved.canonical_key() == key {
+                    return false;
+                }
+            }
+        }
+        if !self.discovered_keys.insert(key) {
+            return false;
+        }
+        self.discovered.push(addr);
+        true
+    }
+
+    /// Replace all discovered peers (from DB refresh via set_known_peers).
+    /// Config entries and their resolution state are preserved.
+    pub(super) fn set_discovered(&mut self, peers: Vec<PeerAddress>) {
+        let cap = MAX_KNOWN_PEERS.saturating_sub(self.config_entries.len());
+        self.discovered_keys.clear();
+        self.discovered.clear();
+        for peer in peers {
+            if self.discovered.len() >= cap {
+                break;
+            }
+            let key = peer.canonical_key();
+            if self.discovered_keys.insert(key) {
+                self.discovered.push(peer);
+            }
+        }
+    }
+
+    /// Get shuffled dial targets: resolved IP for config entries with successful
+    /// DNS, hostname for never-resolved entries, discovered peers as-is.
+    /// Deduplicates by canonical_key (two hostnames → same IP = one entry).
+    pub(super) fn shuffled_dial_entries(&self, rng: &mut impl Rng) -> Vec<PeerAddress> {
+        let mut entries = Vec::with_capacity(self.config_entries.len() + self.discovered.len());
+        let mut seen_keys = HashSet::new();
+
+        for (i, config) in self.config_entries.iter().enumerate() {
+            let dial_addr = match &self.resolved[i] {
+                Some(resolved) => resolved.clone(),
+                None => config.clone(),
+            };
+            if seen_keys.insert(dial_addr.canonical_key()) {
+                entries.push(dial_addr);
+            }
+        }
+
+        for discovered in &self.discovered {
+            if seen_keys.insert(discovered.canonical_key()) {
+                entries.push(discovered.clone());
+            }
+        }
+
+        entries.shuffle(rng);
+        entries
+    }
+
+    /// All entries for diagnostics (config dial targets + discovered).
+    pub(super) fn all_entries(&self) -> Vec<PeerAddress> {
+        let mut entries = Vec::with_capacity(self.config_entries.len() + self.discovered.len());
+        for (i, config) in self.config_entries.iter().enumerate() {
+            match &self.resolved[i] {
+                Some(resolved) => entries.push(resolved.clone()),
+                None => entries.push(config.clone()),
+            }
+        }
+        entries.extend(self.discovered.iter().cloned());
+        entries
+    }
+
+    /// Total known peer count.
+    #[allow(dead_code)]
+    pub(super) fn len(&self) -> usize {
+        self.config_entries.len() + self.discovered.len()
+    }
+}
+
 /// An overlay message received from a peer, ready for dispatch to subscribers.
 #[derive(Clone)]
 pub struct OverlayMessage {
@@ -594,8 +733,8 @@ pub struct OverlayManager {
     pub(super) connector_handle: Option<JoinHandle<()>>,
     /// Handle to peer tasks.
     pub(super) peer_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
-    /// Known peers learned from discovery.
-    pub(super) known_peers: Arc<RwLock<Vec<PeerAddress>>>,
+    /// Known peers: config hostnames (with DNS resolution cache) + discovered IPs.
+    pub(super) known_peers: Arc<RwLock<KnownPeerSet>>,
     /// Outbound peers to advertise in Peers messages.
     pub(super) advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
     /// Inbound peers to advertise in Peers messages.
@@ -745,7 +884,9 @@ impl OverlayManager {
             listener_handle: None,
             connector_handle: None,
             peer_handles: Arc::new(RwLock::new(Vec::new())),
-            known_peers: Arc::new(RwLock::new(config.known_peers.clone())),
+            known_peers: Arc::new(RwLock::new(KnownPeerSet::from_config(
+                config.known_peers.clone(),
+            ))),
             advertised_outbound_peers: Arc::new(RwLock::new(config.known_peers.clone())),
             advertised_inbound_peers: Arc::new(RwLock::new(Vec::new())),
             added_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1440,15 +1581,15 @@ impl OverlayManager {
         self.dropped_authenticated_peers.load(Ordering::Relaxed)
     }
 
-    /// Return the current known peer list.
+    /// Return the current known peer list (diagnostics view).
     pub fn known_peers(&self) -> Vec<PeerAddress> {
-        self.known_peers.read().clone()
+        self.known_peers.read().all_entries()
     }
 
-    /// Replace the known peer list.
+    /// Replace discovered peers (from DB refresh). Config entries and their
+    /// resolution state are preserved.
     pub fn set_known_peers(&self, peers: Vec<PeerAddress>) {
-        let mut known = self.known_peers.write();
-        *known = peers;
+        self.known_peers.write().set_discovered(peers);
     }
 
     /// Replace the peers used for Peers advertisements.
@@ -1506,13 +1647,7 @@ impl OverlayManager {
     }
 
     pub(super) fn add_known_peer(&self, addr: PeerAddress) -> bool {
-        let mut known = self.known_peers.write();
-        let key = addr.canonical_key();
-        if known.len() >= MAX_KNOWN_PEERS || known.iter().any(|p| p.canonical_key() == key) {
-            return false;
-        }
-        known.push(addr);
-        true
+        self.known_peers.write().add_discovered(addr)
     }
 
     /// Timeout for joining overlay handles (listener, connector, peers)
@@ -3721,5 +3856,195 @@ mod tests {
             0,
             "non-flood messages should not increment flood_broadcast"
         );
+    }
+
+    // ──────── KnownPeerSet tests ────────
+
+    #[test]
+    fn test_known_peer_set_from_config() {
+        let config = vec![
+            PeerAddress::new("stellar.example.com", 11625),
+            PeerAddress::new("10.0.0.1", 11625),
+        ];
+        let set = KnownPeerSet::from_config(config.clone());
+        assert_eq!(set.config_entries.len(), 2);
+        assert_eq!(set.resolved.len(), 2);
+        assert!(set.resolved.iter().all(|r| r.is_none()));
+        assert!(set.discovered.is_empty());
+    }
+
+    #[test]
+    fn test_known_peer_set_update_resolved() {
+        let config = vec![
+            PeerAddress::new("stellar.example.com", 11625),
+            PeerAddress::new("peer2.example.com", 11625),
+        ];
+        let mut set = KnownPeerSet::from_config(config);
+
+        // First resolution: both succeed
+        let results = vec![
+            Some(PeerAddress::new("10.0.0.1", 11625)),
+            Some(PeerAddress::new("10.0.0.2", 11625)),
+        ];
+        set.update_resolved(&results);
+        assert_eq!(set.resolved[0].as_ref().unwrap().host, "10.0.0.1");
+        assert_eq!(set.resolved[1].as_ref().unwrap().host, "10.0.0.2");
+
+        // Second resolution: first fails, second changes IP
+        let results2 = vec![None, Some(PeerAddress::new("10.0.0.99", 11625))];
+        set.update_resolved(&results2);
+        // Last-good preserved on failure
+        assert_eq!(set.resolved[0].as_ref().unwrap().host, "10.0.0.1");
+        // Updated on success
+        assert_eq!(set.resolved[1].as_ref().unwrap().host, "10.0.0.99");
+    }
+
+    #[test]
+    fn test_known_peer_set_shuffled_dial_entries_uses_resolved() {
+        let config = vec![
+            PeerAddress::new("stellar.example.com", 11625),
+            PeerAddress::new("peer2.example.com", 11625),
+        ];
+        let mut set = KnownPeerSet::from_config(config);
+
+        // Before resolution: returns hostnames
+        let entries = set.shuffled_dial_entries(&mut rand::thread_rng());
+        assert_eq!(entries.len(), 2);
+        let hosts: HashSet<String> = entries.iter().map(|e| e.host.clone()).collect();
+        assert!(hosts.contains("stellar.example.com"));
+        assert!(hosts.contains("peer2.example.com"));
+
+        // After resolution: returns IPs
+        set.update_resolved(&[
+            Some(PeerAddress::new("10.0.0.1", 11625)),
+            Some(PeerAddress::new("10.0.0.2", 11625)),
+        ]);
+        let entries = set.shuffled_dial_entries(&mut rand::thread_rng());
+        assert_eq!(entries.len(), 2);
+        let hosts: HashSet<String> = entries.iter().map(|e| e.host.clone()).collect();
+        assert!(hosts.contains("10.0.0.1"));
+        assert!(hosts.contains("10.0.0.2"));
+    }
+
+    #[test]
+    fn test_known_peer_set_deduplicates_same_resolved_ip() {
+        let config = vec![
+            PeerAddress::new("alias1.example.com", 11625),
+            PeerAddress::new("alias2.example.com", 11625),
+        ];
+        let mut set = KnownPeerSet::from_config(config);
+
+        // Both resolve to same IP
+        set.update_resolved(&[
+            Some(PeerAddress::new("10.0.0.1", 11625)),
+            Some(PeerAddress::new("10.0.0.1", 11625)),
+        ]);
+        let entries = set.shuffled_dial_entries(&mut rand::thread_rng());
+        assert_eq!(
+            entries.len(),
+            1,
+            "two hostnames → same IP should dedup to one dial entry"
+        );
+        assert_eq!(entries[0].host, "10.0.0.1");
+    }
+
+    #[test]
+    fn test_known_peer_set_add_discovered() {
+        let config = vec![PeerAddress::new("stellar.example.com", 11625)];
+        let mut set = KnownPeerSet::from_config(config);
+
+        assert!(set.add_discovered(PeerAddress::new("10.0.0.5", 11625)));
+        assert_eq!(set.discovered.len(), 1);
+
+        // Duplicate rejected
+        assert!(!set.add_discovered(PeerAddress::new("10.0.0.5", 11625)));
+        assert_eq!(set.discovered.len(), 1);
+    }
+
+    #[test]
+    fn test_known_peer_set_add_discovered_cap() {
+        // Config takes 1 slot, discovered gets MAX_KNOWN_PEERS - 1
+        let config = vec![PeerAddress::new("stellar.example.com", 11625)];
+        let mut set = KnownPeerSet::from_config(config);
+
+        let cap = MAX_KNOWN_PEERS - 1;
+        for i in 0..cap {
+            let addr = PeerAddress::new(&format!("10.0.{}.{}", (i >> 8) & 0xFF, i & 0xFF), 11625);
+            assert!(set.add_discovered(addr), "peer {i} should be accepted");
+        }
+        // One more should be rejected
+        assert!(!set.add_discovered(PeerAddress::new("192.168.1.1", 9999)));
+    }
+
+    #[test]
+    fn test_known_peer_set_set_discovered() {
+        let config = vec![PeerAddress::new("stellar.example.com", 11625)];
+        let mut set = KnownPeerSet::from_config(config);
+
+        // Add initial discovered
+        set.add_discovered(PeerAddress::new("10.0.0.1", 11625));
+
+        // Set resolution for config entry
+        set.update_resolved(&[Some(PeerAddress::new("10.0.0.99", 11625))]);
+
+        // Replace discovered via set_discovered (simulates DB refresh)
+        set.set_discovered(vec![
+            PeerAddress::new("10.0.0.5", 11625),
+            PeerAddress::new("10.0.0.6", 11625),
+        ]);
+
+        // Discovered replaced, config + resolution preserved
+        assert_eq!(set.discovered.len(), 2);
+        assert_eq!(set.resolved[0].as_ref().unwrap().host, "10.0.0.99");
+
+        let entries = set.shuffled_dial_entries(&mut rand::thread_rng());
+        let hosts: HashSet<String> = entries.iter().map(|e| e.host.clone()).collect();
+        assert!(hosts.contains("10.0.0.99")); // resolved config
+        assert!(hosts.contains("10.0.0.5"));
+        assert!(hosts.contains("10.0.0.6"));
+    }
+
+    #[test]
+    fn test_known_peer_set_all_entries() {
+        let config = vec![PeerAddress::new("stellar.example.com", 11625)];
+        let mut set = KnownPeerSet::from_config(config);
+        set.add_discovered(PeerAddress::new("10.0.0.5", 11625));
+        set.update_resolved(&[Some(PeerAddress::new("10.0.0.1", 11625))]);
+
+        let all = set.all_entries();
+        assert_eq!(all.len(), 2);
+        // Config entry returns resolved IP
+        assert_eq!(all[0].host, "10.0.0.1");
+        // Discovered entry as-is
+        assert_eq!(all[1].host, "10.0.0.5");
+    }
+
+    #[test]
+    fn test_known_peer_set_dial_entries_includes_discovered() {
+        let config = vec![PeerAddress::new("stellar.example.com", 11625)];
+        let mut set = KnownPeerSet::from_config(config);
+        set.add_discovered(PeerAddress::new("10.0.0.5", 11625));
+        set.update_resolved(&[Some(PeerAddress::new("10.0.0.1", 11625))]);
+
+        let entries = set.shuffled_dial_entries(&mut rand::thread_rng());
+        assert_eq!(entries.len(), 2);
+        let hosts: HashSet<String> = entries.iter().map(|e| e.host.clone()).collect();
+        assert!(hosts.contains("10.0.0.1"));
+        assert!(hosts.contains("10.0.0.5"));
+    }
+
+    #[test]
+    fn test_known_peer_set_discovered_dedup_with_resolved_config() {
+        let config = vec![PeerAddress::new("stellar.example.com", 11625)];
+        let mut set = KnownPeerSet::from_config(config);
+        set.update_resolved(&[Some(PeerAddress::new("10.0.0.1", 11625))]);
+
+        // Add discovered peer with same IP as resolved config entry
+        set.add_discovered(PeerAddress::new("10.0.0.1", 11625));
+
+        let entries = set.shuffled_dial_entries(&mut rand::thread_rng());
+        // Dedup: config resolved and discovered have same canonical_key
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host, "10.0.0.1");
     }
 }
