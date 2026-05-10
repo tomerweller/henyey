@@ -195,10 +195,14 @@ Each tick persists two snapshots and a cooldown map under the session dir:
 ~/data/<session-id>/metrics/
   current.prom            # snapshot taken this tick
   prev.prom               # snapshot from previous tick (rotated from current)
+  scrape_identity         # process identity (pid+start_ticks) of the scrape in prev.prom
   anomaly_cooldown.json   # { "<metric-name>": <unix-ts-of-last-file> }
 ```
 
 Two snapshots is enough for tick-over-tick deltas on counters and histograms.
+`scrape_identity` tracks which process incarnation produced `prev.prom`; when
+identity changes (process restart), counter/histogram deltas and "two
+consecutive ticks" gauge persistence are invalidated (see Check 12, step 5).
 Cooldown is 2 hours per metric: if `now - last_filed < 7200s`, include the
 alert in the status report but skip the file/comment step.
 
@@ -207,6 +211,9 @@ alert in the status report but skip the file/comment step.
 When the node restarts, histogram/counter values reset. Rule: **if any
 counter's `current` < `prev`, treat this tick's delta as `current` (not
 `current - prev`)**. Also applies to histograms (bucket and count).
+Additionally, `scrape_identity` detects restarts where counters exceed prior
+values (see Check 12, step 5); when identity changes, all counter/histogram
+deltas and "two consecutive ticks" gauge persistence are skipped for that tick.
 For the first 2 ticks after a detected restart (from check 3 or check 10),
 skip `henyey_jemalloc_fragmentation_pct` gauge checks (post-restart
 warmup lands near 30–45% and settles to ~18% within 10 min) and skip
@@ -324,6 +331,8 @@ report as WARNING without filing.
 | `henyey_herder_drift_max_seconds` | > 10 | NONC | Clock/close-time drift |
 
 "Two consecutive ticks": alert fires only if `prev.prom` also breached.
+On `PREV_PROM_INVALID` (process identity change), the previous reading is
+discarded — see Check 12, step 5 in `monitor-tick/SKILL.md`.
 
 **Intentionally not included** (these were in an earlier draft but removed after first-tick
 validation showed them to be noise, not signal):

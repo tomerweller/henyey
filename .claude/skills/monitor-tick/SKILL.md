@@ -686,8 +686,15 @@ against a node that is in real-time sync with age=2s).
    - Skip all §COUNTERS delta checks for this tick.
    - Skip all §HISTOGRAMS delta checks for this tick (including the mean
      fallback `sum_delta / count_delta`).
-   - Do NOT skip §GAUGES — gauges are point-in-time readings from `current.prom`
-     only and do not use `prev.prom`.
+   - For §GAUGES with "two consecutive ticks" persistence guards
+     (`henyey_jemalloc_fragmentation_pct`, `henyey_scp_verify_input_backlog`,
+     `henyey_overlay_fetch_channel_depth`): reset the persistence counter.
+     The previous tick's gauge reading from `prev.prom` is from a different
+     process incarnation and must not count toward the two-tick requirement.
+     Evaluate the current gauge value normally but require a second consecutive
+     breach on the next tick before firing.
+   - All other §GAUGES are unaffected — they are point-in-time readings from
+     `current.prom` only.
    - Do NOT skip ratio_snapshot or counter_streak_snapshot checks — they have
      their own independent PID/start_ticks invalidation logic and snapshot files.
      Independence is safe: each check reads PID/start_ticks from `/proc` and
@@ -1053,7 +1060,7 @@ This catches restarts during skip ticks and prevents comparing post-restart
 counters to a pre-restart baseline.
 
 **Skip conditions (skip Check 12b only when any is true):**
-- `/metrics` fetch failed this tick (same condition check-8 detects)
+- `/metrics` fetch failed this tick (same condition check-12 detects)
 - `/metrics` returns "recorder not installed"
 - `forcing_catchup_behind` label missing from the scrape
 
