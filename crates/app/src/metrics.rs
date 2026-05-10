@@ -1305,6 +1305,20 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusRecorder;
     use std::collections::HashSet;
 
+    /// Build the union of all known metric names from the catalog.
+    fn known_metric_names() -> HashSet<&'static str> {
+        let mut known = HashSet::new();
+        known.extend(ALL_GAUGE_NAMES.iter().copied());
+        known.extend(ALL_COUNTER_NAMES.iter().copied());
+        known.extend(ALL_HISTOGRAM_NAMES.iter().copied());
+        known
+    }
+
+    /// Regex matching PromQL identifier tokens.
+    fn metric_token_regex() -> regex::Regex {
+        regex::Regex::new(r"[a-zA-Z_:][a-zA-Z0-9_:]*").unwrap()
+    }
+
     /// Build a pristine local recorder for tests that assert absolute zero values.
     ///
     /// `with_local_recorder` is thread-local — this helper is only correct for
@@ -2024,13 +2038,8 @@ mod tests {
             let yaml = load_alert_yaml();
             let rules = collect_rules(&yaml);
 
-            // Build the set of all known metric names from the catalog.
-            let mut known: HashSet<&str> = HashSet::new();
-            known.extend(ALL_GAUGE_NAMES.iter().copied());
-            known.extend(ALL_COUNTER_NAMES.iter().copied());
-            known.extend(ALL_HISTOGRAM_NAMES.iter().copied());
-
-            let ident_re = regex::Regex::new(r"[a-zA-Z_:][a-zA-Z0-9_:]*").unwrap();
+            let known = known_metric_names();
+            let ident_re = metric_token_regex();
 
             let mut unknown = Vec::new();
             for rule in &rules {
@@ -2096,6 +2105,206 @@ mod tests {
             assert_eq!(
                 yaml_count, readme_count,
                 "YAML has {yaml_count} rules but README marker says {readme_count}"
+            );
+        }
+    }
+
+    // ── Dashboard JSON validation ─────────────────────────────────────────
+
+    mod dashboard_json_validation {
+        use super::*;
+        use std::path::PathBuf;
+
+        /// stellar-core metrics referenced in the vs-core comparison dashboard.
+        /// These are emitted by stellar-core's Prometheus exporter, not by henyey.
+        const VS_CORE_EXTERNAL_METRICS: &[&str] = &[
+            "stellar_core_bucket_snap_merge_seconds",
+            "stellar_core_ledger_age",
+            "stellar_core_ledger_ledger_close_seconds",
+            "stellar_core_ledger_operation_count",
+            "stellar_core_ledger_transaction_apply_seconds",
+            "stellar_core_ledger_transaction_count",
+            "stellar_core_overlay_connection_authenticated",
+            "stellar_core_overlay_inbound_live",
+            "stellar_core_quorum_agree",
+            "stellar_core_quorum_disagree",
+            "stellar_core_quorum_fail_at",
+            "stellar_core_quorum_missing",
+            "stellar_core_scp_envelope_receive",
+            "stellar_core_scp_envelope_sign",
+            "stellar_core_scp_timing_externalized_seconds",
+            "stellar_core_scp_timing_first_to_self_externalize_lag_seconds",
+            "stellar_core_scp_timing_nominated_seconds",
+            "stellar_core_started_on",
+            "stellar_core_synced",
+        ];
+
+        /// All dashboard JSON files to validate.
+        const DASHBOARD_FILES: &[&str] = &[
+            "henyey-dashboard.json",
+            "henyey-vs-core-dashboard.json",
+            "henyey-monitoring-full.json",
+            "henyey-monitoring.json",
+        ];
+
+        fn load_dashboard_json(filename: &str) -> serde_json::Value {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../metrics")
+                .join(filename);
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            serde_json::from_str(&contents)
+                .unwrap_or_else(|e| panic!("failed to parse JSON {}: {e}", path.display()))
+        }
+
+        /// Strip histogram sub-series suffixes to get the base name stored in
+        /// the catalog. Does NOT strip `_total` — counters are cataloged with it.
+        fn normalize_histogram_suffix(name: &str) -> &str {
+            for suffix in &["_bucket", "_sum", "_count"] {
+                if let Some(base) = name.strip_suffix(suffix) {
+                    return base;
+                }
+            }
+            name
+        }
+
+        /// Recursively collect `(panel_title, expr)` from nested panels.
+        fn collect_panel_exprs(panels: &serde_json::Value) -> Vec<(String, String)> {
+            let mut result = Vec::new();
+            let panels = match panels.as_array() {
+                Some(p) => p,
+                None => return result,
+            };
+            for panel in panels {
+                let title = panel["title"].as_str().unwrap_or("<untitled>").to_string();
+
+                // Collect exprs from targets.
+                if let Some(targets) = panel["targets"].as_array() {
+                    for target in targets {
+                        if let Some(expr) = target["expr"].as_str() {
+                            if !expr.is_empty() {
+                                result.push((title.clone(), expr.to_string()));
+                            }
+                        }
+                    }
+                }
+
+                // Recurse into nested panels (row panels, collapsed panels).
+                if panel["panels"].is_array() {
+                    result.extend(collect_panel_exprs(&panel["panels"]));
+                }
+            }
+            result
+        }
+
+        /// Collect `(var_name, query_string)` from dashboard template variables.
+        fn collect_templating_queries(dashboard: &serde_json::Value) -> Vec<(String, String)> {
+            let mut result = Vec::new();
+            let list = match dashboard["templating"]["list"].as_array() {
+                Some(l) => l,
+                None => return result,
+            };
+            for item in list {
+                let name = item["name"].as_str().unwrap_or("<unnamed>").to_string();
+                let query = &item["query"];
+                let query_str = if let Some(s) = query.as_str() {
+                    s.to_string()
+                } else if let Some(s) = query["query"].as_str() {
+                    s.to_string()
+                } else {
+                    continue;
+                };
+                if !query_str.is_empty() {
+                    result.push((name, query_str));
+                }
+            }
+            result
+        }
+
+        /// Check whether a token at the given position in `expr` is a Grafana
+        /// variable reference (preceded by `$`).
+        fn is_grafana_variable(expr: &str, match_start: usize) -> bool {
+            match_start > 0 && expr.as_bytes()[match_start - 1] == b'$'
+        }
+
+        /// Validate metric references in a single expression. Unknown metrics
+        /// are appended to `unknown` as `"<context>: <metric_name>"`.
+        fn validate_expr_tokens(
+            expr: &str,
+            context: &str,
+            ident_re: &regex::Regex,
+            known: &HashSet<&str>,
+            external: &HashSet<&str>,
+            unknown: &mut Vec<String>,
+        ) {
+            for cap in ident_re.find_iter(expr) {
+                let token = cap.as_str();
+                if !(token.starts_with("stellar_") || token.starts_with("henyey_")) {
+                    continue;
+                }
+                if is_grafana_variable(expr, cap.start()) {
+                    continue;
+                }
+                let normalized = normalize_histogram_suffix(token);
+                if known.contains(token)
+                    || known.contains(normalized)
+                    || external.contains(token)
+                    || external.contains(normalized)
+                {
+                    continue;
+                }
+                unknown.push(format!("{context}: {token}"));
+            }
+        }
+
+        #[test]
+        fn test_dashboard_json_parses() {
+            for filename in DASHBOARD_FILES {
+                let dashboard = load_dashboard_json(filename);
+                assert!(
+                    dashboard["panels"].is_array(),
+                    "{filename}: parsed JSON must contain a 'panels' array"
+                );
+            }
+        }
+
+        #[test]
+        fn test_dashboard_metrics_exist() {
+            let known = known_metric_names();
+            let ident_re = metric_token_regex();
+
+            let vs_core_external: HashSet<&str> =
+                VS_CORE_EXTERNAL_METRICS.iter().copied().collect();
+            let empty_external: HashSet<&str> = HashSet::new();
+
+            let mut unknown = Vec::new();
+
+            for filename in DASHBOARD_FILES {
+                let dashboard = load_dashboard_json(filename);
+
+                let external = if *filename == "henyey-vs-core-dashboard.json" {
+                    &vs_core_external
+                } else {
+                    &empty_external
+                };
+
+                // Validate panel target expressions.
+                for (title, expr) in collect_panel_exprs(&dashboard["panels"]) {
+                    let ctx = format!("{filename} panel '{title}'");
+                    validate_expr_tokens(&expr, &ctx, &ident_re, &known, external, &mut unknown);
+                }
+
+                // Validate template variable queries.
+                for (var_name, query) in collect_templating_queries(&dashboard) {
+                    let ctx = format!("{filename} template var '{var_name}'");
+                    validate_expr_tokens(&query, &ctx, &ident_re, &known, external, &mut unknown);
+                }
+            }
+
+            assert!(
+                unknown.is_empty(),
+                "dashboard JSON files reference unknown metrics:\n  {}",
+                unknown.join("\n  ")
             );
         }
     }
