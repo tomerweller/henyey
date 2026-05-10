@@ -28,6 +28,29 @@ mod loadgen;
 mod loopback;
 use loadgen::deterministic_seed;
 use loopback::LoopbackNetwork;
+
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const ROLLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Wait for a task handle to complete within `timeout`, aborting it if the
+/// deadline expires.
+///
+/// - Clean exit → returns `Ok(())`
+/// - Task error or `JoinError` → returns `Err(...)`
+/// - Timeout → calls `handle.abort()` and returns `Ok(())` (abort is
+///   best-effort cancellation, not an error for the caller)
+async fn join_or_abort(
+    mut handle: JoinHandle<anyhow::Result<()>>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(join_result) => join_result?,
+        Err(_elapsed) => {
+            handle.abort();
+            Ok(())
+        }
+    }
+}
 mod applyload;
 mod loadgen_soroban;
 pub use applyload::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode, Histogram};
@@ -418,34 +441,35 @@ impl Simulation {
     }
 
     pub async fn stop_all_nodes(&mut self) -> anyhow::Result<()> {
-        let mut running = std::mem::take(&mut self.running_apps);
+        let running = std::mem::take(&mut self.running_apps);
+        // Phase 1: Signal shutdown to ALL nodes before waiting on any.
         for node in running.values() {
             node.app.shutdown();
         }
-        for (id, node) in running.drain() {
-            let mut handle = node.task.handle;
-            let join = tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
-            match join {
-                Ok(result) => {
-                    result.with_context(|| format!("join app task for {}", id))??;
-                }
-                Err(_) => {
-                    handle.abort();
+        // Phase 2: Wait for each task to exit, aborting on timeout.
+        // Attempt cleanup of every node before returning the first error.
+        let mut first_error: Option<anyhow::Error> = None;
+        for (id, node) in running {
+            if let Err(e) = join_or_abort(node.task.handle, DEFAULT_SHUTDOWN_TIMEOUT)
+                .await
+                .with_context(|| format!("join app task for {}", id))
+            {
+                if first_error.is_none() {
+                    first_error = Some(e);
                 }
             }
         }
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub async fn remove_node(&mut self, node_id: &str) -> anyhow::Result<()> {
         self.disconnect_node_from_peers(node_id).await?;
         if let Some(node) = self.running_apps.remove(node_id) {
             node.app.shutdown();
-            let mut handle = node.task.handle;
-            let join = tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
-            if join.is_err() {
-                handle.abort();
-            }
+            let _ = join_or_abort(node.task.handle, DEFAULT_SHUTDOWN_TIMEOUT).await;
         }
         Ok(())
     }
@@ -1416,13 +1440,7 @@ impl Simulation {
             // Rollback: remove and shut down the node we just inserted.
             if let Some(node) = self.running_apps.remove(&id) {
                 node.app.shutdown();
-                let mut handle = node.task.handle;
-                if tokio::time::timeout(Duration::from_secs(2), &mut handle)
-                    .await
-                    .is_err()
-                {
-                    handle.abort();
-                }
+                let _ = join_or_abort(node.task.handle, ROLLBACK_SHUTDOWN_TIMEOUT).await;
             }
             return Err(e);
         }
@@ -2888,5 +2906,71 @@ mod defense_layer_tests {
                 "test-node-{i} task should be finished (aborted) after Simulation drop"
             );
         }
+    }
+
+    /// Verify that `join_or_abort` aborts a task that exceeds the timeout.
+    #[tokio::test]
+    async fn test_join_or_abort_aborts_on_timeout() {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(999)).await;
+            Ok(())
+        });
+        let abort = handle.abort_handle();
+
+        let result = join_or_abort(handle, Duration::from_millis(10)).await;
+        assert!(result.is_ok(), "timeout-abort should return Ok");
+
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished(), "task should be aborted after timeout");
+    }
+
+    /// Verify that `join_or_abort` returns the task error on failure.
+    #[tokio::test]
+    async fn test_join_or_abort_propagates_error() {
+        let handle = tokio::spawn(async { anyhow::bail!("task failed") });
+
+        // Wait for the task to complete.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let result = join_or_abort(handle, Duration::from_secs(1)).await;
+        assert!(result.is_err(), "should propagate task error");
+        assert!(
+            result.unwrap_err().to_string().contains("task failed"),
+            "error message should be preserved"
+        );
+    }
+
+    /// Verify that the sequential join_or_abort pattern (as used by
+    /// `stop_all_nodes` phase 2) cleans up all nodes even when one errors.
+    #[tokio::test]
+    async fn test_join_or_abort_sequence_cleans_all_on_error() {
+        let failing_handle = tokio::spawn(async { anyhow::bail!("intentional failure") });
+        let hanging_handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(999)).await;
+            Ok(())
+        });
+        let hanging_abort = hanging_handle.abort_handle();
+
+        // Let the failing task complete.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Mimic stop_all_nodes phase 2: collect errors, don't stop early.
+        let mut first_error: Option<anyhow::Error> = None;
+        for handle in [failing_handle, hanging_handle] {
+            if let Err(e) = join_or_abort(handle, Duration::from_millis(10)).await {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+
+        assert!(first_error.is_some(), "should report first error");
+        tokio::task::yield_now().await;
+        assert!(
+            hanging_abort.is_finished(),
+            "hanging task should be aborted even though first node errored"
+        );
     }
 }
