@@ -599,6 +599,14 @@ pub(super) struct SharedPeerState {
     /// Per-peer outbound channel capacity. Sourced from the `ConnectionFactory`
     /// so OverLoopback can use a larger value than TCP. See issue #2356.
     pub(super) outbound_channel_capacity: usize,
+    /// Cooldown map preventing immediate re-dial after a connection drops.
+    ///
+    /// When an outbound peer loop exits (connection lost), the address is
+    /// inserted with a random expiry (1–3 s in the future). Subsequent dial
+    /// attempts to the same address are skipped until the cooldown expires.
+    /// This breaks mutual-dial oscillation by introducing asymmetric jitter
+    /// between the two sides of a simultaneous dial.
+    pub(super) dial_cooldowns: Arc<DashMap<ResolvedPeerAddr, std::time::Instant>>,
 }
 
 impl SharedPeerState {
@@ -824,6 +832,9 @@ pub struct OverlayManager {
     pub(super) max_tx_size_bytes: Arc<AtomicU32>,
     /// Cached local address the listener is bound to (set by `start_listener()`).
     listen_addr: Option<SocketAddr>,
+    /// Cooldown map preventing immediate re-dial after a connection drops.
+    /// Shared with `SharedPeerState` via `Arc`.
+    pub(super) dial_cooldowns: Arc<DashMap<ResolvedPeerAddr, std::time::Instant>>,
 }
 
 impl OverlayManager {
@@ -931,6 +942,7 @@ impl OverlayManager {
             query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
             max_tx_size_bytes,
             listen_addr: None,
+            dial_cooldowns: Arc::new(DashMap::new()),
         })
     }
 
@@ -967,6 +979,7 @@ impl OverlayManager {
             max_tx_size_bytes: Arc::clone(&self.max_tx_size_bytes),
             flow_control_bytes_config: self.config.flow_control_bytes_config,
             outbound_channel_capacity: self.connection_factory.outbound_channel_capacity(),
+            dial_cooldowns: Arc::clone(&self.dial_cooldowns),
         }
     }
 
@@ -2295,6 +2308,7 @@ mod tests {
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             outbound_channel_capacity: 256,
+            dial_cooldowns: Arc::new(DashMap::new()),
         }
     }
     fn insert_fake_peer(
@@ -2812,6 +2826,7 @@ mod tests {
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             outbound_channel_capacity: 256,
+            dial_cooldowns: Arc::new(DashMap::new()),
         };
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
@@ -2903,6 +2918,7 @@ mod tests {
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             outbound_channel_capacity: 256,
+            dial_cooldowns: Arc::new(DashMap::new()),
         };
         (shared, broadcast_rx, fetch_rx)
     }
@@ -3601,6 +3617,7 @@ mod tests {
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             outbound_channel_capacity: 256,
+            dial_cooldowns: Arc::new(DashMap::new()),
         };
 
         // Pool with capacity (max=10, current authenticated=0)
@@ -3667,6 +3684,7 @@ mod tests {
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             outbound_channel_capacity: 256,
+            dial_cooldowns: Arc::new(DashMap::new()),
         };
 
         // Pool with capacity — reserve a pending slot (required before promote)

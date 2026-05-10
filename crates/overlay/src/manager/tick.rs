@@ -228,7 +228,14 @@ impl OverlayManager {
 
         let handle = tokio::spawn(async move {
             let mut retry_after: HashMap<DialKey, Instant> = HashMap::new();
-            let mut interval = tokio::time::interval(TICK_INTERVAL);
+            // Delay the first tick by one full interval. This matches
+            // stellar-core's timer semantics (timers fire AFTER the interval,
+            // not at T=0) and prevents simultaneous outbound dials during
+            // sequential node startup, reducing mutual-dial races.
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + TICK_INTERVAL,
+                TICK_INTERVAL,
+            );
             // G8: Track when we first noticed we were out of sync, for
             // random-peer-drop cooldown (OUT_OF_SYNC_RECONNECT_DELAY = 60s).
             let mut last_out_of_sync_reconnect: Option<Instant> = None;
@@ -349,6 +356,11 @@ impl OverlayManager {
                     &ctx,
                 )
                 .await;
+
+                // Sweep expired dial cooldowns to avoid unbounded growth.
+                shared
+                    .dial_cooldowns
+                    .retain(|_, expiry| std::time::Instant::now() < *expiry);
             }
         });
 
@@ -447,6 +459,15 @@ impl OverlayManager {
                 continue;
             }
 
+            // Skip if within reconnection cooldown (mutual-dial oscillation guard).
+            if let DialKey::Resolved(resolved) = &key {
+                if let Some(expiry) = shared.dial_cooldowns.get(resolved) {
+                    if std::time::Instant::now() < *expiry.value() {
+                        continue;
+                    }
+                }
+            }
+
             if !pool.try_reserve() {
                 debug!("Outbound peer pending limit reached");
                 return 0;
@@ -508,6 +529,15 @@ impl OverlayManager {
 
             if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
                 continue;
+            }
+
+            // Skip if within reconnection cooldown (mutual-dial oscillation guard).
+            if let DialKey::Resolved(resolved) = &key {
+                if let Some(expiry) = shared.dial_cooldowns.get(resolved) {
+                    if std::time::Instant::now() < *expiry.value() {
+                        continue;
+                    }
+                }
             }
 
             if !pool.try_reserve() {

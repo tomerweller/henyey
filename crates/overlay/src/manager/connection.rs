@@ -13,6 +13,7 @@ use crate::{
     peer::{Peer, PeerInfo},
     LocalNode, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, ResolvedPeerAddr, Result,
 };
+use rand::Rng;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -315,6 +316,10 @@ impl OverlayManager {
         if shared.peers.contains_key(&peer_id) {
             debug!("Rejected duplicate inbound peer {}", peer_id);
             shared.metrics.inbound_reject.inc();
+            // Notify peer of rejection (matches stellar-core Peer.cpp:1889).
+            let _ = peer
+                .send(make_error_msg(ErrorCode::Conf, "already connected"))
+                .await;
             peer.close().await;
             if peer.holds_pending_peer_id() {
                 shared.pending_connections.release_peer_id(&peer_id);
@@ -649,6 +654,14 @@ impl OverlayManager {
 
         shared.metrics.outbound_drop.inc();
         shared.cleanup_peer(&peer_id);
+        // Insert reconnection cooldown with random jitter to break
+        // mutual-dial oscillation. Both sides insert independent random
+        // delays, ensuring one side's cooldown expires first and dials
+        // alone (no simultaneous mutual-dial).
+        let jitter = Duration::from_millis(rand::thread_rng().gen_range(1000..3000));
+        shared
+            .dial_cooldowns
+            .insert(addr_key, std::time::Instant::now() + jitter);
         pool.release_authenticated();
     }
 
@@ -690,6 +703,14 @@ impl OverlayManager {
     /// Internal helper used by both `add_peer` (after resolving) and
     /// `add_peers` (which resolves in batch for dedup).
     async fn add_peer_resolved(&self, resolved: ResolvedPeer) -> Result<AddPeerOutcome> {
+        // Check reconnection cooldown — prevents immediate re-dial after a
+        // connection drops, breaking mutual-dial oscillation.
+        if let Some(expiry) = self.shared_state().dial_cooldowns.get(&resolved.key) {
+            if std::time::Instant::now() < *expiry.value() {
+                return Ok(AddPeerOutcome::AlreadyConnected);
+            }
+        }
+
         // Check if we're already connected to this address (any direction).
         // Check both the original address (hostname match) and the resolved
         // address (IP match) to catch aliases — e.g., a hostname that resolves
@@ -971,6 +992,11 @@ pub(super) async fn connect_to_explicit_peer(
         .await;
         shared_clone.metrics.outbound_drop.inc();
         shared_clone.cleanup_peer(&peer_id_clone);
+        // Insert reconnection cooldown with random jitter (see connect_to_discovered_peer).
+        let jitter = Duration::from_millis(rand::thread_rng().gen_range(1000..3000));
+        shared_clone
+            .dial_cooldowns
+            .insert(addr_key, std::time::Instant::now() + jitter);
         pool_clone.release_authenticated();
     });
 
