@@ -798,58 +798,13 @@ mod tests {
 
     #[test]
     fn test_log_and_new_emits_structured_tracing() {
-        use std::sync::{Arc, Mutex};
-        use tracing::subscriber::with_default;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Default)]
-        struct FieldVisitor {
-            fields: Vec<(String, String)>,
-        }
-
-        impl tracing::field::Visit for FieldVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.fields
-                    .push((field.name().to_string(), format!("{:?}", value)));
-            }
-            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-                self.fields
-                    .push((field.name().to_string(), value.to_string()));
-            }
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                self.fields
-                    .push((field.name().to_string(), value.to_string()));
-            }
-        }
-
-        #[derive(Clone)]
-        struct CaptureLayer {
-            events: Arc<Mutex<Vec<Vec<(String, String)>>>>,
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let mut visitor = FieldVisitor::default();
-                event.record(&mut visitor);
-                self.events.lock().unwrap().push(visitor.fields);
-            }
-        }
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let layer = CaptureLayer {
-            events: events.clone(),
-        };
-        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        use crate::tracing_test_support::capture_events;
 
         let expected = Hash256::ZERO;
         let actual = Hash256::from([0xAB; 32]);
 
         // log_and_new should emit a tracing event.
-        with_default(subscriber, || {
+        let events = capture_events(|| {
             let _ = VerifyHashMismatchInfo::log_and_new(
                 VerifyHashKind::Bucket,
                 Some(7),
@@ -858,13 +813,8 @@ mod tests {
             );
         });
 
-        let captured = events.lock().unwrap();
-        assert_eq!(
-            captured.len(),
-            1,
-            "log_and_new should emit exactly one event"
-        );
-        let field_names: Vec<&str> = captured[0].iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(events.len(), 1, "log_and_new should emit exactly one event");
+        let field_names: Vec<&str> = events[0].fields.iter().map(|(k, _)| k.as_str()).collect();
         assert!(
             field_names.contains(&"kind"),
             "event should contain 'kind' field"
@@ -881,15 +831,9 @@ mod tests {
             field_names.contains(&"actual_hash"),
             "event should contain 'actual_hash' field"
         );
-        drop(captured);
 
         // new_unlogged should NOT emit any tracing event.
-        events.lock().unwrap().clear();
-        let layer2 = CaptureLayer {
-            events: events.clone(),
-        };
-        let subscriber2 = tracing_subscriber::registry::Registry::default().with(layer2);
-        with_default(subscriber2, || {
+        let events = capture_events(|| {
             let _ = VerifyHashMismatchInfo::new_unlogged(
                 VerifyHashKind::Bucket,
                 Some(7),
@@ -898,9 +842,8 @@ mod tests {
             );
         });
 
-        let captured = events.lock().unwrap();
         assert!(
-            captured.is_empty(),
+            events.is_empty(),
             "new_unlogged should not emit any tracing events"
         );
     }

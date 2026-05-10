@@ -1341,90 +1341,11 @@ mod tests {
         );
     }
 
-    /// A test layer that records event fields for assertion.
-    mod tracing_capture {
-        use std::sync::{Arc, Mutex};
-        use tracing::subscriber::with_default;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        /// Captured event data.
-        #[derive(Debug, Clone)]
-        pub struct CapturedEvent {
-            pub fields: Vec<(String, String)>,
-            pub message: String,
-        }
-
-        /// A tracing layer that captures events into a shared vec.
-        #[derive(Clone)]
-        pub struct CaptureLayer {
-            pub events: Arc<Mutex<Vec<CapturedEvent>>>,
-        }
-
-        impl CaptureLayer {
-            pub fn new() -> Self {
-                Self {
-                    events: Arc::new(Mutex::new(Vec::new())),
-                }
-            }
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let mut visitor = FieldVisitor::default();
-                event.record(&mut visitor);
-                self.events.lock().unwrap().push(CapturedEvent {
-                    fields: visitor.fields,
-                    message: visitor.message,
-                });
-            }
-        }
-
-        #[derive(Default)]
-        struct FieldVisitor {
-            fields: Vec<(String, String)>,
-            message: String,
-        }
-
-        impl tracing::field::Visit for FieldVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.message = format!("{:?}", value);
-                } else {
-                    self.fields
-                        .push((field.name().to_string(), format!("{:?}", value)));
-                }
-            }
-
-            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-                self.fields
-                    .push((field.name().to_string(), value.to_string()));
-            }
-
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                self.fields
-                    .push((field.name().to_string(), value.to_string()));
-            }
-        }
-
-        /// Run a closure under a capturing subscriber and return captured events.
-        pub fn capture_events<F: FnOnce()>(f: F) -> Vec<CapturedEvent> {
-            let layer = CaptureLayer::new();
-            let events = layer.events.clone();
-            let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
-            with_default(subscriber, f);
-            let result = events.lock().unwrap().clone();
-            result
-        }
-    }
+    // Use the shared tracing capture helper (serialized via process-wide mutex).
+    use crate::tracing_test_support::capture_events;
 
     #[test]
     fn test_verify_tx_result_set_mismatch_emits_tracing() {
-        use tracing_capture::capture_events;
-
         let mut header = make_test_header(42, Hash256::ZERO);
         header.tx_set_result_hash = Hash([0xAA; 32]);
         let wrong_xdr = b"not the right result set";
@@ -1461,8 +1382,6 @@ mod tests {
 
     #[test]
     fn test_verify_bucket_hash_mismatch_emits_tracing_no_ledger_seq() {
-        use tracing_capture::capture_events;
-
         let data = b"bucket content";
         let wrong_hash = Hash256::from(Hash([0xFF; 32]));
 
@@ -1496,8 +1415,6 @@ mod tests {
 
     #[test]
     fn test_verify_tx_result_set_genesis_does_not_emit_tracing() {
-        use tracing_capture::capture_events;
-
         let header = make_test_header(GENESIS_LEDGER_SEQ, Hash256::ZERO);
 
         let events = capture_events(|| {
