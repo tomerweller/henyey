@@ -1583,41 +1583,10 @@ mod tests {
     /// silently deflates per-tx cpu_insns and causes mainnet divergence.
     #[test]
     fn test_warm_module_cache_from_entries_handles_v1_ext() {
-        use stellar_xdr::curr::{
-            ContractCodeCostInputs, ContractCodeEntryV1, ExtensionPoint as XdrExtensionPoint,
-        };
-
         let cache = PersistentModuleCache::new_for_protocol(26)
             .expect("P26 module cache should be available");
 
-        let hash_bytes: [u8; 32] = Sha256::digest(WASM_A).into();
-        let entry = stellar_xdr::curr::LedgerEntry {
-            last_modified_ledger_seq: 100,
-            data: LedgerEntryData::ContractCode(ContractCodeEntry {
-                ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {
-                    ext: XdrExtensionPoint::V0,
-                    cost_inputs: ContractCodeCostInputs {
-                        ext: XdrExtensionPoint::V0,
-                        n_instructions: 10,
-                        n_functions: 1,
-                        n_globals: 1,
-                        n_table_entries: 0,
-                        n_types: 1,
-                        n_data_segments: 0,
-                        n_elem_segments: 0,
-                        n_imports: 1,
-                        n_exports: 1,
-                        n_data_segment_bytes: 0,
-                    },
-                }),
-                hash: Hash(hash_bytes),
-                code: WASM_A
-                    .to_vec()
-                    .try_into()
-                    .expect("WASM bytes fit in BytesM"),
-            }),
-            ext: LedgerEntryExt::V0,
-        };
+        let (entry, hash_bytes) = make_v1_contract_code_ledger_entry(WASM_A);
         super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 26);
 
         let hash = Hash(hash_bytes);
@@ -1725,18 +1694,20 @@ mod tests {
             data: LedgerEntryData::ContractCode(ContractCodeEntry {
                 ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {
                     ext: XdrExtensionPoint::V0,
+                    // Use distinct non-zero sentinels so field-transposition
+                    // bugs in the XDR bridge are caught by per-field assertions.
                     cost_inputs: ContractCodeCostInputs {
                         ext: XdrExtensionPoint::V0,
                         n_instructions: 10,
-                        n_functions: 1,
-                        n_globals: 1,
-                        n_table_entries: 0,
-                        n_types: 1,
-                        n_data_segments: 0,
-                        n_elem_segments: 0,
-                        n_imports: 1,
-                        n_exports: 1,
-                        n_data_segment_bytes: 0,
+                        n_functions: 20,
+                        n_globals: 30,
+                        n_table_entries: 40,
+                        n_types: 50,
+                        n_data_segments: 60,
+                        n_elem_segments: 70,
+                        n_imports: 80,
+                        n_exports: 90,
+                        n_data_segment_bytes: 100,
                     },
                 }),
                 hash: Hash(hash_bytes),
@@ -1765,15 +1736,15 @@ mod tests {
         match &module.cost_inputs {
             soroban_env_host_p24::vm::VersionedContractCodeCostInputs::V1(inputs) => {
                 assert_eq!(inputs.n_instructions, 10);
-                assert_eq!(inputs.n_functions, 1);
-                assert_eq!(inputs.n_globals, 1);
-                assert_eq!(inputs.n_table_entries, 0);
-                assert_eq!(inputs.n_types, 1);
-                assert_eq!(inputs.n_data_segments, 0);
-                assert_eq!(inputs.n_elem_segments, 0);
-                assert_eq!(inputs.n_imports, 1);
-                assert_eq!(inputs.n_exports, 1);
-                assert_eq!(inputs.n_data_segment_bytes, 0);
+                assert_eq!(inputs.n_functions, 20);
+                assert_eq!(inputs.n_globals, 30);
+                assert_eq!(inputs.n_table_entries, 40);
+                assert_eq!(inputs.n_types, 50);
+                assert_eq!(inputs.n_data_segments, 60);
+                assert_eq!(inputs.n_elem_segments, 70);
+                assert_eq!(inputs.n_imports, 80);
+                assert_eq!(inputs.n_exports, 90);
+                assert_eq!(inputs.n_data_segment_bytes, 100);
             }
             soroban_env_host_p24::vm::VersionedContractCodeCostInputs::V0 { .. } => {
                 panic!("V1 entry was cached with V0 cost inputs — regression from #2503");
@@ -1799,15 +1770,15 @@ mod tests {
         match &module.cost_inputs {
             soroban_env_host_p25::vm::VersionedContractCodeCostInputs::V1(inputs) => {
                 assert_eq!(inputs.n_instructions, 10);
-                assert_eq!(inputs.n_functions, 1);
-                assert_eq!(inputs.n_globals, 1);
-                assert_eq!(inputs.n_table_entries, 0);
-                assert_eq!(inputs.n_types, 1);
-                assert_eq!(inputs.n_data_segments, 0);
-                assert_eq!(inputs.n_elem_segments, 0);
-                assert_eq!(inputs.n_imports, 1);
-                assert_eq!(inputs.n_exports, 1);
-                assert_eq!(inputs.n_data_segment_bytes, 0);
+                assert_eq!(inputs.n_functions, 20);
+                assert_eq!(inputs.n_globals, 30);
+                assert_eq!(inputs.n_table_entries, 40);
+                assert_eq!(inputs.n_types, 50);
+                assert_eq!(inputs.n_data_segments, 60);
+                assert_eq!(inputs.n_elem_segments, 70);
+                assert_eq!(inputs.n_imports, 80);
+                assert_eq!(inputs.n_exports, 90);
+                assert_eq!(inputs.n_data_segment_bytes, 100);
             }
             soroban_env_host_p25::vm::VersionedContractCodeCostInputs::V0 { .. } => {
                 panic!("V1 entry was cached with V0 cost inputs — regression from #2503");
@@ -1833,15 +1804,15 @@ mod tests {
         match &module.cost_inputs {
             soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V1(inputs) => {
                 assert_eq!(inputs.n_instructions, 10);
-                assert_eq!(inputs.n_functions, 1);
-                assert_eq!(inputs.n_globals, 1);
-                assert_eq!(inputs.n_table_entries, 0);
-                assert_eq!(inputs.n_types, 1);
-                assert_eq!(inputs.n_data_segments, 0);
-                assert_eq!(inputs.n_elem_segments, 0);
-                assert_eq!(inputs.n_imports, 1);
-                assert_eq!(inputs.n_exports, 1);
-                assert_eq!(inputs.n_data_segment_bytes, 0);
+                assert_eq!(inputs.n_functions, 20);
+                assert_eq!(inputs.n_globals, 30);
+                assert_eq!(inputs.n_table_entries, 40);
+                assert_eq!(inputs.n_types, 50);
+                assert_eq!(inputs.n_data_segments, 60);
+                assert_eq!(inputs.n_elem_segments, 70);
+                assert_eq!(inputs.n_imports, 80);
+                assert_eq!(inputs.n_exports, 90);
+                assert_eq!(inputs.n_data_segment_bytes, 100);
             }
             soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V0 { .. } => {
                 panic!("V1 entry was cached with V0 cost inputs — regression from #2503");
