@@ -1,8 +1,8 @@
 # Henyey Bucket Crate — Specification Adherence Evaluation
 
-**Evaluated against:** `stellar-specs/BUCKETLISTDB_SPEC.md` (stellar-core v25.0.1 BucketListDB reference)
+**Evaluated against:** `stellar-specs/BUCKETLISTDB_SPEC.md` (stellar-core v26.0.1 BucketListDB reference)
 **Crate:** `crates/bucket/` (henyey-bucket)
-**Date:** 2026-02-20
+**Date:** 2026-05-10
 
 ---
 
@@ -31,7 +31,8 @@
    - [§18 Appendices](#318-appendices)
 4. [Gap Summary](#4-gap-summary)
 5. [Risk Assessment](#5-risk-assessment)
-6. [Recommendations](#6-recommendations)
+6. [v26.0.1 Implementation Delta](#6-v2601-implementation-delta)
+7. [Recommendations](#7-recommendations)
 
 ---
 
@@ -53,7 +54,7 @@ The bucket crate is at **93% function-level parity** (138/149 functions implemen
 | **Async Merge Management** | **High** | Async merges via tokio spawn_blocking; FutureBucket 5-state machine; merge future cache not wired |
 | **BucketManager** | **Medium** | Core bucket management works; `getMergeFuture()`/`putMergeFuture()` not wired; some metrics missing |
 | **Indexing** | **Full** | DiskIndex (page-based + bloom filter), InMemoryIndex, index persistence |
-| **Snapshot & Query Layer** | **Full** | BucketSnapshot, BucketSnapshotManager, SearchableBucketListSnapshot with full query API |
+| **Snapshot & Query Layer** | **Full** | BucketListSnapshot with Arc-based cloning, BucketSnapshotManager with RwLock, full query API |
 | **Hot Archive BucketList** | **Full** | 11 levels, proper ARCHIVED/LIVE merge semantics, V1 metadata |
 | **Eviction** | **Full** | EvictionIterator, TTL-based scanning, state archival settings |
 | **Catchup & State Reconstruction** | **Full** | BucketApplicator with chunked processing, dedup via seen keys |
@@ -68,7 +69,7 @@ The bucket crate is at **93% function-level parity** (138/149 functions implemen
 
 ## 2. Evaluation Methodology
 
-This evaluation compares the henyey bucket implementation against the `BUCKETLISTDB_SPEC.md` specification derived from stellar-core v25.0.1. All key source files in `crates/bucket/src/` were read and compared against the spec requirements.
+This evaluation compares the henyey bucket implementation against the `BUCKETLISTDB_SPEC.md` specification derived from stellar-core v26.0.1. All key source files in `crates/bucket/src/` were read and compared against the spec requirements.
 
 Each behavior is assessed on three dimensions:
 
@@ -88,6 +89,8 @@ Ratings per requirement:
 Source file references use the format `file.rs:line`.
 
 **Note on scope:** Henyey targets protocol 24+ only. Shadow buckets (removed in protocol 12) and pre-protocol-11 INITENTRY behavior are not applicable.
+
+**Note on v26.0.1 changes:** stellar-core v26.0.1 introduced significant concurrency/race fixes, a snapshot refactor to a single `BucketListSnapshot` class, and an XDR offset bug fix for old protocols. These changes are evaluated for parity impact in [§6 v26.0.1 Implementation Delta](#6-v2601-implementation-delta).
 
 ---
 
@@ -268,8 +271,9 @@ Source file references use the format `file.rs:line`.
 | Index persistence (save/load from disk) | ✅ | `index_persistence.rs`: Save/load using bincode serialization (vs Cereal in C++) |
 | Bloom filter false positive rate tuning | ✅ | Bloom filter configured with appropriate parameters |
 | Bloom miss meter for monitoring false positive rate | ❌ | `PARITY_STATUS.md`: Bloom miss meters not integrated into metrics |
+| Thread-safe index pointer access (v26 race fix) | ✅ | Henyey uses Rust's ownership model and `Arc`-based sharing; the C++ index pointer race (fixed in v26) is structurally impossible |
 
-**Assessment: Full adherence.** The indexing system is comprehensively implemented with both disk and in-memory variants, bloom filter integration, page-based lookup, and persistence. The only gap is the bloom miss meter for monitoring, which is an observability concern rather than a correctness issue.
+**Assessment: Full adherence.** The indexing system is comprehensively implemented with both disk and in-memory variants, bloom filter integration, page-based lookup, and persistence. The only gap is the bloom miss meter for monitoring, which is an observability concern rather than a correctness issue. Notably, the v26 index pointer race fix is not applicable to henyey — Rust's type system prevents the category of data races that affected stellar-core.
 
 ---
 
@@ -292,8 +296,10 @@ Source file references use the format `file.rs:line`.
 | `scanForEntriesOfType()` — type-based scanning | ✅ | Uses `TypeRange` from index for efficient scanning |
 | Historical snapshots for past ledger queries | ✅ | `snapshot.rs`: Historical snapshot support |
 | `RandomEvictionCache` for hot entry caching | ✅ | `cache.rs`: Random eviction cache for frequently accessed entries |
+| Unified snapshot class (v26 refactor) | ✅ | Henyey already uses a single `BucketListSnapshot` struct; the v26 refactor to consolidate multiple C++ snapshot classes is not applicable |
+| Snapshot copy safety for background threads (v26 race fix) | ✅ | `snapshot.rs`: Arc-based cloning (`copy_searchable_live_snapshot`) provides safe concurrent access without the deep-copy races that affected stellar-core |
 
-**Assessment: Full adherence.** The snapshot and query layer is comprehensive. All query methods specified in the spec are implemented, concurrent access is properly handled via `parking_lot::RwLock`, and the random eviction cache provides performance optimization.
+**Assessment: Full adherence.** The snapshot and query layer is comprehensive. All query methods specified in the spec are implemented, concurrent access is properly handled via `parking_lot::RwLock` and `Arc` cloning, and the random eviction cache provides performance optimization. The v26 snapshot race fixes and refactor to a single class are structurally addressed by henyey's Rust-based design.
 
 ---
 
@@ -313,8 +319,9 @@ Source file references use the format `file.rs:line`.
 | `fresh()` — create bucket from new evicted entries | ✅ | Bucket creation from eviction candidates |
 | Hot archive spill mechanics match live BucketList | ✅ | Same level structure and spill timing |
 | `loadCompleteHotArchiveState()` — full archive scan | ⚠️ | `PARITY_STATUS.md`: Partial implementation |
+| Scan for valid entry types (v26 addition) | ⚠️ | stellar-core v26 added validation that hot archive scans only return valid entry types; henyey's hot archive scan does not yet enforce this filter |
 
-**Assessment: Full adherence.** The hot archive BucketList is comprehensively implemented with correct merge semantics. The only partial item is `loadCompleteHotArchiveState()` which is used for diagnostics rather than consensus-critical operations.
+**Assessment: Full adherence.** The hot archive BucketList is comprehensively implemented with correct merge semantics. The `loadCompleteHotArchiveState()` partial implementation is used for diagnostics rather than consensus-critical operations. The v26 valid entry type scan filter is a minor gap.
 
 ---
 
@@ -335,8 +342,10 @@ Source file references use the format `file.rs:line`.
 | Eviction respects persistent vs temporary entry distinction | ✅ | Different TTL handling for persistent (archivable) vs temporary (deletable) entries |
 | `EvictionStatistics` — cycle metrics | ⚠️ | `PARITY_STATUS.md`: `submitMetricsAndRestartCycle()` simplified; basic counters present but full cycle reporting missing |
 | Protocol gate: persistent eviction from protocol 23+ | ✅ | `lib.rs`: `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION = 23` |
+| Background eviction scan snapshot safety (v26 fix) | ✅ | Henyey passes snapshot data by value/Arc-clone to background eviction scans; the v26 fix for passing snapshot copies to background threads is structurally addressed |
+| Eviction scan duration metrics (v26 addition) | ⚠️ | stellar-core v26 added `eviction_scan_duration` timer metric; henyey has `EvictionCounters` with cycle counts but not wall-clock duration per scan |
 
-**Assessment: Full adherence.** The eviction system is fully functional with correct TTL-based scanning, proper persistent vs temporary entry handling, and iterator state persistence. The only gap is in cycle-level eviction metrics reporting, which is an observability concern.
+**Assessment: Full adherence.** The eviction system is fully functional with correct TTL-based scanning, proper persistent vs temporary entry handling, and iterator state persistence. The v26 background scan safety fix is already addressed by Rust's ownership model. The eviction scan duration metric is a minor observability gap.
 
 ---
 
@@ -395,6 +404,7 @@ Source file references use the format `file.rs:line`.
 | Metadata entry always at position 0 | ✅ | Enforced by output iterator; validated by input iterator |
 | Protocol version gates for feature behavior | ✅ | `lib.rs`: All protocol version constants defined and used for gating |
 | `scheduleVerifyReferencedBucketsWork()` — verify bucket integrity | ⚠️ | Partial per PARITY_STATUS.md; full integrity verification not complete |
+| In-memory state deep copy safety (v26 fix) | ✅ | Rust's ownership semantics ensure deep copies where needed; the C++ deep-copy bug for invariant checking does not apply |
 
 **Assessment: Full adherence.** All critical safety invariants are enforced. Sort order, merge determinism, hash consistency, and INITENTRY invariants are all properly maintained. The partial bucket verification work is a defense-in-depth measure rather than a correctness requirement.
 
@@ -460,6 +470,8 @@ None. All consensus-critical behavior (merge algorithm, BucketList structure, ha
 | `BucketInputIterator::seek()` missing | §6 | Cannot seek within bucket stream; must scan from start | Low |
 | Bloom miss meters not integrated | §9 | Cannot monitor bloom filter false positive rates | Low |
 | `EvictionStatistics::submitMetricsAndRestartCycle()` simplified | §12 | Eviction cycle metrics less detailed than stellar-core | Low |
+| Hot archive valid entry type scan filter (v26) | §11 | Missing validation in hot archive scan results | Low |
+| Eviction scan duration metric (v26) | §12 | No wall-clock timer for eviction scan duration | Low |
 
 ---
 
@@ -476,17 +488,69 @@ The core BucketListDB behavior is fully implemented:
 
 There are no known correctness gaps. The merge future deduplication gap affects performance/efficiency, not determinism or state correctness.
 
+The v26 concurrency race fixes (index pointer, startup, snapshot access) are **not applicable** to henyey — Rust's ownership model, `Arc` cloning, and `parking_lot::RwLock` structurally prevent the categories of data races that affected stellar-core's C++ implementation.
+
+The v26 XDR offset bug fix for old protocols is **not applicable** — henyey targets protocol 24+ only and does not process old-protocol bucket entries with the affected offset calculation.
+
 ### Performance Risk: Low–Medium
 
 The unconnected merge future cache means that during catchup or restart, the same merge may be computed multiple times. In production steady-state operation this is unlikely to matter (merges are sequential per level), but during catchup from a distant ledger, duplicate work could slow recovery. The data structures are already implemented — wiring them in is the remaining work.
 
 ### Operational Risk: Low
 
-Missing metrics (bloom miss meters, eviction cycle statistics) reduce observability but do not affect node operation. Operators will have less visibility into BucketListDB internals compared to stellar-core, but the system will function correctly.
+Missing metrics (bloom miss meters, eviction cycle statistics, eviction scan duration) reduce observability but do not affect node operation. Operators will have less visibility into BucketListDB internals compared to stellar-core, but the system will function correctly.
 
 ---
 
-## 6. Recommendations
+## 6. v26.0.1 Implementation Delta
+
+stellar-core v26.0.1 introduced significant bucket-related changes between v25.0.1 and v26.0.1. This section evaluates their impact on henyey parity.
+
+### Concurrency & Race Fixes
+
+| upstream commit | Change | Henyey Impact |
+|-----------------|--------|---------------|
+| `f1207c46c` | Fix race on bucket index pointer | **N/A** — Rust's type system prevents shared mutable access to index pointers without synchronization |
+| `3f610e582` | Fix race on startup with HTTP server | **N/A** — henyey's `BucketSnapshotManager` initializes under `RwLock`; no startup race possible |
+| `f31785617` | Fix snapshot access races | **N/A** — snapshot access uses `Arc` cloning via `copy_searchable_live_snapshot()`; no shared mutable state |
+| `cde79db48`, `f75749645` | Bucket race fixes (index creation on merge) | **N/A** — index creation in henyey is scoped to the merge task and returned by value |
+| `daf2fe92f`, `c603a9690` | Copy snapshot before background eviction scan | **N/A** — henyey clones snapshot Arc before passing to background tasks |
+| `952546d3f` | Address gaps in concurrency thread safety | **N/A** — broadly addresses C++ shared-state issues not present in Rust's ownership model |
+
+**Summary:** All v26 concurrency fixes address C++ shared-mutable-state bugs that are structurally impossible in henyey's Rust implementation. No action required.
+
+### Architectural Refactors
+
+| upstream commit | Change | Henyey Impact |
+|-----------------|--------|---------------|
+| `1a8409f81` | Refactor snapshots to single `BucketListSnapshot` class | **Already aligned** — henyey uses a single `BucketListSnapshot` struct (`snapshot.rs`) |
+| `489516e53` | Move `inMemoryState` init to Bucket constructor for safety | **N/A** — henyey initializes bucket state at construction time via Rust struct initialization |
+| `eb0030727` | Remove maintenance | **N/A** — maintenance scheduling not implemented (not needed for protocol 24+) |
+
+### Bug Fixes
+
+| upstream commit | Change | Henyey Impact |
+|-----------------|--------|---------------|
+| `20f87324a` | Fix BucketListDB XDR offset bug for old protocols | **N/A** — henyey targets protocol 24+ only; the affected offset calculation for pre-protocol entries does not exist |
+| `2ef729710` | Fix deep copy of in-memory state for invariant | **N/A** — Rust's ownership ensures proper deep copies; no aliasing bugs possible |
+
+### New Features & Improvements
+
+| upstream commit | Change | Henyey Impact |
+|-----------------|--------|---------------|
+| `9a80e3ddc` | Scan hot archive for valid entry types | **Minor gap** — henyey's hot archive scan does not yet filter for valid entry types |
+| `084f41c7d` | Add metrics for eviction scan duration | **Minor gap** — henyey has eviction counters but not wall-clock duration timers |
+| `9b446e829` | Harden eviction scan interface | **Review needed** — may require interface alignment for robustness |
+| `d6d4ce431` | Remove confusing `ltxEvictions` | **N/A** — henyey does not use this naming pattern |
+| `8f2c51a71` | Ensure expired entries are never modified by LedgerTxn | **Handled in `henyey-tx`** — evicted entry immutability is enforced at the transaction layer |
+
+### Overall v26 Parity Assessment
+
+The v26 changes are overwhelmingly concurrency fixes for C++ shared-mutable-state bugs. Henyey's Rust implementation is **structurally immune** to these classes of bugs due to the ownership model, `Arc`/`RwLock` synchronization, and value-based snapshot cloning. The two minor functional gaps (hot archive valid entry type filtering and eviction scan duration metric) do not affect consensus correctness.
+
+---
+
+## 7. Recommendations
 
 ### Priority 1: Wire BucketMergeMap into Merge Workflow
 - **What:** Connect `BucketMergeMap`/`LiveMergeFutures` (already implemented in `merge_map.rs`) to `BucketManager` so that `getMergeFuture()`/`putMergeFuture()` are called during merge scheduling
@@ -498,7 +562,12 @@ Missing metrics (bloom miss meters, eviction cycle statistics) reduce observabil
 - **Why:** Completes the remaining 7% of function-level parity
 - **Effort:** Low per item
 
-### Priority 3: Integrate Observability Metrics
-- **What:** Wire bloom miss meters, eviction cycle statistics, and remaining BucketManager metrics
+### Priority 3: Adopt v26 Hot Archive Scan Filter
+- **What:** Add valid entry type filtering to hot archive scans (per `9a80e3ddc`)
+- **Why:** Ensures hot archive queries only return well-formed entries
+- **Effort:** Low
+
+### Priority 4: Integrate Observability Metrics
+- **What:** Wire bloom miss meters, eviction cycle statistics, eviction scan duration timer, and remaining BucketManager metrics
 - **Why:** Enables production monitoring and debugging parity with stellar-core
 - **Effort:** Low

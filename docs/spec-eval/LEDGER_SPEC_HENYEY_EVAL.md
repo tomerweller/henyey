@@ -2,15 +2,18 @@
 
 **Spec**: `stellar-specs/LEDGER_SPEC.md`
 **Crate**: `crates/ledger/`
-**Date**: 2026-02-20
+**Date**: 2026-05-10
 **Evaluator**: AI-assisted review
 **Henyey target**: Protocol 24+ only
+**stellar-core baseline**: v26.0.1
 
 ---
 
 ## Executive Summary
 
-Henyey's ledger crate provides a comprehensive implementation of the stellar-core ledger close pipeline with strong coverage across all major subsystems — the 17-step close pipeline, parallel Soroban execution (stages sequential, clusters parallel via `tokio::task::spawn_blocking`), full `LedgerCloseMeta::V2` generation and streaming, fee calculations, header management, protocol upgrades, network configuration, and bucket list persistence. The state management uses a `LedgerDelta` with savepoints rather than nested `LedgerTxn`, which is architecturally different but functionally equivalent for all rollback patterns. The remaining gaps are in genesis bootstrapping (`createLedgerEntries` for v20–v25), invariant checking (no `InvariantManager`), and the per-TX module cache (vs shared global cache).
+Henyey's ledger crate provides a comprehensive implementation of the stellar-core ledger close pipeline with strong coverage across all major subsystems — the 17-step close pipeline, parallel Soroban execution (stages sequential, clusters parallel via `tokio::task::spawn_blocking`), full `LedgerCloseMeta::V2` generation and streaming, fee calculations, header management, protocol upgrades, network configuration, and bucket list persistence. The state management uses a `LedgerDelta` with savepoints rather than nested `LedgerTxn`, which is architecturally different but functionally equivalent for all rollback patterns.
+
+Since the v25.0.1 evaluation, Henyey has implemented key v26 features including CAP-77 (frozen ledger keys via network configuration) and `createLedgerEntriesForV26`. The remaining gaps are in genesis bootstrapping (`createLedgerEntries` for v20–v25), invariant checking (no `InvariantManager`), and the per-TX module cache (vs shared global cache).
 
 | Section | Rating | Notes |
 |---|---|---|
@@ -22,19 +25,19 @@ Henyey's ledger crate provides a comprehensive implementation of the stellar-cor
 | §6 LedgerTxn Nested State | ✅ | LedgerDelta + savepoints — functionally equivalent to nested LedgerTxn |
 | §7 Protocol Upgrades | ✅ | All 7 upgrade types with validation bounds |
 | §8 Ledger Header Management | ✅ | Hash computation, skip list, chain verification |
-| §9 Network Configuration | ✅ | All 14 Soroban settings loaded and applied |
+| §9 Network Configuration | ✅ | All 14 Soroban settings + CAP-77 frozen keys loaded and applied |
 | §10 Soroban State Management | ⚠️ | In-memory state present; per-TX module cache vs shared |
 | §11 Commit & Persistence | ✅ | Bucket list commit, HAS publishing |
 | §12 Ledger Close Meta | ✅ | Full V4 `TransactionMeta`, V2 `LedgerCloseMeta`, streaming via `MetaStreamManager` |
-| §13 Genesis Ledger | ⚠️ | Basic genesis; missing `createLedgerEntries` for v20–v25 |
+| §13 Genesis Ledger | ⚠️ | Basic genesis + v26 entries; missing `createLedgerEntries` for v20–v25 |
 | §14 Threading Model | ✅ | Parallel Soroban clusters, background eviction scan, parallel cache init |
 | §15 Invariants | ⚠️ | Partial invariant checking; no `InvariantManager` |
 | §16 Constants | ✅ | All key constants present and tested |
 | §17 References | ➖ | Informational only |
 | §18 Appendices | ➖ | Informational only |
 
-**Overall adherence: ~90%**
-Self-reported parity: 64% (84/131 functions), with 30 intentional omissions. Behavioral coverage is significantly higher than function-level parity suggests due to architectural consolidation.
+**Overall adherence: ~92%**
+Self-reported parity: 94% (per `PARITY_STATUS.md`). Behavioral coverage is significantly higher than function-level parity suggests due to architectural consolidation. Up from ~90% at v25.0.1 evaluation due to CAP-77 implementation and genesis improvements.
 
 ---
 
@@ -234,8 +237,9 @@ The spec describes a nested transaction model (`LedgerTxnRoot → LedgerTxn → 
 | Write fee configuration | ✅ | Write fees per config |
 | Historical data retention | ✅ | Archival settings present |
 | Parallel compute config | ✅ | `ContractParallelComputeV0` loaded and validated (max clusters < 128); used in parallel Soroban execution |
+| Frozen ledger keys (CAP-77, P26+) | ✅ | `load_frozen_key_config()` loads frozen keys and bypass tx hashes from CONFIG_SETTING entries; enforced during transaction application |
 
-**Analysis**: All 14 configuration areas are loaded and applied correctly, including parallel compute configuration which is used by the parallel Soroban execution engine.
+**Analysis**: All 14+ configuration areas are loaded and applied correctly, including parallel compute configuration and the Protocol 26 frozen ledger keys (CAP-77). The frozen key configuration is loaded at ledger close time and passed into execution contexts for enforcement.
 
 ---
 
@@ -312,8 +316,9 @@ The spec describes a nested transaction model (`LedgerTxnRoot → LedgerTxn → 
 | `createLedgerEntriesForV22` | ❌ | Not implemented |
 | `createLedgerEntriesForV23` | ❌ | Not implemented |
 | `createLedgerEntriesForV25` | ❌ | Not implemented |
+| `createLedgerEntriesForV26` (CAP-77) | ✅ | Creates 2 CONFIG_SETTING entries for frozen keys and bypass tx sets (`manager.rs:3774`) |
 
-**Analysis**: Basic genesis works, but the `createLedgerEntries` functions that initialize Soroban configuration entries for protocols v20–v25 are missing. This means Henyey cannot bootstrap a new network from genesis with Soroban support — it must join an existing network that already has these entries. For the primary use case (validating/watching an existing network), this is acceptable.
+**Analysis**: Basic genesis works, and v26 genesis entries are implemented (CAP-77 frozen key CONFIG_SETTING entries). However, the `createLedgerEntries` functions for protocols v20–v25 are still missing. This means Henyey cannot bootstrap a new network from genesis with Soroban support for protocols prior to v26 — it must join an existing network that already has these entries. For the primary use case (validating/watching an existing network), this is acceptable.
 
 ---
 
@@ -403,7 +408,7 @@ None. The two previously-identified critical gaps (ledger close meta and paralle
 |---|---|---|
 | **No explicit phase state machine** | §2 | Phase transitions rely on code structure rather than runtime guards. Lower defense-in-depth. |
 | **Per-TX module cache vs shared** | §10 | Repeated Wasm compilation across transactions. Performance impact on Soroban-heavy ledgers. |
-| **Missing genesis `createLedgerEntries` (v20–v25)** | §13 | Cannot bootstrap a new Soroban-enabled network from genesis. Must join existing networks. |
+| **Missing genesis `createLedgerEntries` (v20–v25)** | §13 | Cannot bootstrap a new Soroban-enabled network from genesis for pre-v26 protocols. Must join existing networks. v26 entries (CAP-77) are implemented. |
 | **No explicit invariant checking pass** | §15 | Invariants maintained by construction but not independently verified post-close. No `InvariantManager`. Bugs could violate invariants silently. |
 
 ### Minor Gaps
@@ -454,3 +459,54 @@ Ledger close meta generation and streaming are fully implemented, enabling all d
 3. **Consider shared module cache** (§10) — Replace per-TX `PersistentModuleCache` with a shared cache that persists across transactions within a ledger close. This is a moderate-effort change with significant Soroban performance benefits.
 
 4. **Consider explicit phase state machine** (§2) — Low priority but improves code clarity and defense-in-depth. An enum-based state machine for the close pipeline would make invalid transitions a compile-time error.
+
+---
+
+## v26.0.1 Implementation Delta
+
+This section summarizes changes in stellar-core between v25.0.1 and v26.0.1 (`src/ledger/`) and their impact on Henyey parity.
+
+### Changes Implemented in Henyey
+
+| stellar-core Change | Henyey Status | Location |
+|---|---|---|
+| **CAP-77: Freeze ledger keys via network configuration** | ✅ Implemented | `execution/config.rs:load_frozen_key_config()`, `manager.rs:3928` — loads frozen keys and bypass tx hashes from CONFIG_SETTING entries at ledger close; enforced during tx application |
+| **`createLedgerEntriesForV26`** | ✅ Implemented | `manager.rs:3774` — creates 2 CONFIG_SETTING entries for frozen key and bypass tx sets |
+| **Restored keys tracking cleanup** | ✅ Implemented | `execution/apply.rs:collect_soroban_restored_entries()` — tracks restored entries per-TX with `hot_archive_restored_keys`; v26 cleanup of `LedgerTxn` restore tracking doesn't apply (Henyey uses `LedgerDelta`) |
+
+### Changes Not Applicable to Henyey
+
+| stellar-core Change | Why N/A |
+|---|---|
+| **Remove maintenance mode** | Henyey never implemented maintenance mode; bucket list is the sole persistence layer with no SQL sync |
+| **Background apply with RUN_STANDALONE** | Henyey's `close_ledger()` is always synchronous inline; no background apply thread model |
+| **DB dead code cleanup** | Henyey has no SQL persistence layer for ledger state |
+| **SQLite parallel apply (split database)** | Henyey has no SQL persistence layer; parallelism is achieved via `tokio::task::spawn_blocking` on `LedgerDelta` clones |
+| **Drop prepared statement cache** | No SQL layer |
+| **Fix race on startup with HTTP server** | Henyey's HTTP server has independent lifecycle management |
+| **BucketListStateConsistency snapshot invariant** | Henyey has no `InvariantManager`; bucket list consistency verified by hash matching |
+| **Snapshot access race fixes** | Henyey snapshots are immutable Rust `Arc<>` values; no races possible due to ownership model |
+| **MSVS project updates** | Build system not applicable |
+| **C++20 upgrade** | Language not applicable |
+
+### Changes with Indirect Parity Impact
+
+| stellar-core Change | Henyey Impact |
+|---|---|
+| **CAP-80 updates** | Henyey does not reference CAP-80 explicitly; any behavioral changes from CAP-80 would need to be verified through integration tests. No explicit code paths found in `crates/ledger/`. |
+| **`markRestoredFromLiveBucketList`** | stellar-core added explicit tracking of entries restored from the live bucket list (vs hot archive). Henyey tracks restores via `collect_soroban_restored_entries()` and `hot_archive_restored_keys` but does not distinguish live-bucket-list restores. This is a tracking detail, not a consensus-affecting difference. |
+| **Concurrency thread safety annotations** | stellar-core added annotations and fixed concurrency gaps. Henyey's Rust type system (`Send`/`Sync` bounds, `Arc<>`, ownership) provides compile-time concurrency safety without runtime annotations. |
+| **Log state rebuild timings** | Observability only; Henyey logs rebuild progress via `tracing` crate |
+| **Remove P26 ifdefs / Bump to P26** | Henyey uses runtime protocol version checks (`ledger_version >= 26`) rather than compile-time ifdefs; no action needed |
+| **Refactored `ParallelTxReturnVal`** | Henyey's parallel return type is `TxSetResult` in `tx_set.rs`; structurally different but functionally equivalent |
+| **Cost types recalibration (arkworks)** | Soroban cost model is loaded from network config at runtime; no hardcoded cost tables in `crates/ledger/` |
+
+### Summary
+
+Of the ~40 commits to `src/ledger/` between v25.0.1 and v26.0.1:
+- **3 changes** are directly implemented in Henyey (CAP-77, genesis v26, restore tracking)
+- **10 changes** are not applicable (SQL/maintenance/build system/C++ specifics)
+- **7 changes** have indirect impact requiring monitoring but no code changes
+- Remaining commits are test additions, minor renames, and review feedback iterations
+
+**Net parity change**: Improved. CAP-77 implementation brings Henyey up to date with the primary Protocol 26 ledger feature. Self-reported parity increased from ~64% (function-level, v25) to 94% (area-level, v26) reflecting both new implementations and a more accurate measurement methodology.

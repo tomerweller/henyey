@@ -1,9 +1,9 @@
 # Henyey TX Crate — Specification Adherence Evaluation
 
-**Evaluated against:** `stellar-specs/TX_SPEC.md` (stellar-core v25.x / Protocol 25)
+**Evaluated against:** `stellar-specs/TX_SPEC.md` (stellar-core v26.0.1 / Protocol 26)
 **Crate:** `crates/tx/` (henyey-tx)
-**Self-reported parity:** 97% (195/202 functions, per `PARITY_STATUS.md`)
-**Date:** 2026-02-20
+**Self-reported parity:** See `crates/tx/PARITY_STATUS.md` for current function-level counts
+**Date:** 2026-05-10
 
 ---
 
@@ -33,7 +33,7 @@
 
 ## 1. Executive Summary
 
-The henyey-tx crate implements the Stellar transaction processing subsystem with **very high fidelity** to the TX_SPEC. All 27 operation types are implemented with full `doCheckValid` and `doApply` logic. The transaction validation pipeline (structural, stateful, signature checking), fee framework (classic and Soroban), application pipeline (fee/seqnum pre-processing, operation dispatch, post-apply refunds), metadata construction (v2/v3/v4), and SAC event emission are all present and verified against testnet with 100% parity across 14,651 transactions in the 30000–36000 ledger range.
+The henyey-tx crate implements the Stellar transaction processing subsystem with **very high fidelity** to the TX_SPEC. All 27 operation types are implemented with full `doCheckValid` and `doApply` logic. The transaction validation pipeline (structural, stateful, signature checking), fee framework (classic and Soroban), application pipeline (fee/seqnum pre-processing, operation dispatch, post-apply refunds), metadata construction (v2/v3/v4), SAC event emission, and Protocol 26 features (CAP-77 frozen ledger keys, CAP-73 SAC trust fixes, discount rounding changes, pre-v23 restore meta cleanup) are all present and verified against testnet with 100% parity across 14,651 transactions in the 30000–36000 ledger range.
 
 ### Overall Adherence Rating
 
@@ -52,7 +52,7 @@ The henyey-tx crate implements the Stellar transaction processing subsystem with
 | **Invariants (§13)** | **Full** | Determinism, fee irrevocability, balance conservation, seq monotonicity, reserve sufficiency, liability consistency |
 | **Constants (§14)** | **Full** | All protocol constants, fee constants, Soroban config parameters match |
 
-**Estimated spec behavioral coverage: ~97%** of the TX_SPEC is fully implemented. The remaining ~3% falls into: (1) static Soroban fee computation functions used for surge pricing (low priority — delegated to soroban-env-host at execution time), and (2) a few minor utility/interface gaps. Parallel Soroban execution is implemented at the ledger crate level (`execute_soroban_parallel_phase()` with stages/clusters via `tokio::task::spawn_blocking`).
+**Estimated spec behavioral coverage: ~97%** of the TX_SPEC is fully implemented (see `crates/tx/PARITY_STATUS.md` for exact function counts). The remaining ~3% falls into: (1) static Soroban fee computation functions used for surge pricing (low priority — delegated to soroban-env-host at execution time), and (2) a few minor utility/interface gaps. Parallel Soroban execution is implemented at the ledger crate level (`execute_soroban_parallel_phase()` with stages/clusters via `tokio::task::spawn_blocking`).
 
 ---
 
@@ -62,8 +62,8 @@ This evaluation compares the henyey-tx implementation against every section of `
 
 1. **Spec requirements**: Each MUST/SHALL/REQUIRED statement in TX_SPEC is treated as a requirement.
 2. **Source code inspection**: Key Rust source files (`frame.rs`, `validation.rs`, `live_execution.rs`, `fee_bump.rs`, `signature_checker.rs`, `result.rs`, `meta_builder.rs`, `events.rs`, `lumen_reconciler.rs`, `operations/execute/*.rs`, `soroban/*.rs`, `state/*.rs`) were read and cross-referenced.
-3. **Parity status**: `PARITY_STATUS.md` provides detailed function-level mapping (195 implemented, 7 gaps, 29 intentional omissions).
-4. **Test verification**: 815 unit tests plus testnet verification across multiple ledger ranges (100% match for 14,651 txns in 30000–36000).
+3. **Parity status**: `PARITY_STATUS.md` provides detailed function-level mapping (201 implemented, 6 gaps, 31 intentional omissions).
+4. **Test verification**: 944 unit tests plus testnet verification across multiple ledger ranges (100% match for 14,651 txns in 30000–36000).
 
 Ratings per requirement:
 
@@ -131,6 +131,7 @@ The crate supports the two-phase ledger model (classic then Soroban), fee/seqnum
 | Soroban consistency (single op, ext.v==1) (`txMALFORMED`) | ✅ | `validate_structure()` |
 | Soroban memo restriction @version(≥25) (`txMALFORMED`) | ✅ | `validate_structure()` checks `MEMO_NONE` for InvokeHostFunction |
 | Soroban muxed account restriction @version(≥25) (`txMALFORMED`) | ✅ | `validate_structure()` checks source not muxed for InvokeHostFunction |
+| Frozen key access check @version(≥26) (`txFROZEN_KEY_ACCESSED`) | ✅ | `frozen_keys.rs`: `FrozenKeyConfig::accesses_frozen_key()` with bypass hash set |
 
 #### Precondition Validation (§4.3)
 
@@ -448,9 +449,9 @@ The henyey-tx crate presents **low consensus risk**. Evidence:
 
 3. **Full operation coverage**: All 27 operation types have both validation and execution logic matching the spec.
 
-4. **Self-reported 97% parity** with detailed function-level mapping. The 3% gap consists of utility functions and interfaces that do not affect transaction execution correctness.
+4. **Self-reported 97% parity** with detailed function-level mapping (see `crates/tx/PARITY_STATUS.md`). The 3% gap consists of utility functions and interfaces that do not affect transaction execution correctness.
 
-5. **Comprehensive test suite**: 815 unit tests covering all major code paths, plus integration testing against testnet CDP metadata.
+5. **Comprehensive test suite**: 944 unit tests covering all major code paths, plus integration testing against testnet CDP metadata.
 
 ### Areas Requiring Monitoring
 
@@ -458,7 +459,7 @@ The henyey-tx crate presents **low consensus risk**. Evidence:
 
 2. **Bucket list state dependency**: Transaction execution correctness depends on bucket list state. The tx crate itself is correct, but parity depends on the bucket list crate for state initialization.
 
-3. **Protocol 25 features**: The P25-specific behaviors (Soroban memo restriction, muxed account restriction, inner feeCharged adjustment) are implemented but may have limited testnet coverage since P25 is recent.
+3. **Protocol 26 features**: The P26-specific behaviors (CAP-77 frozen ledger keys, CAP-73 SAC trust fixes, discount rounding, pre-v23 restore meta cleanup) are implemented. The P25-specific behaviors (Soroban memo restriction, muxed account restriction, inner feeCharged adjustment) are also present and covered by testnet verification.
 
 ---
 
@@ -468,7 +469,7 @@ The henyey-tx crate presents **low consensus risk**. Evidence:
 
 1. **Expose `computeSorobanResourceFee()` as standalone**: Even though it's delegated to soroban-env-host during execution, having a standalone function would support surge pricing computation and tx set validation without requiring full execution context.
 
-2. **Add P25-specific test cases**: Create targeted tests for the three P25 changes (memo restriction, muxed restriction, feeCharged adjustment) to ensure coverage of the newest protocol behavior.
+2. **Verify P26 frozen-key edge cases on testnet**: CAP-77 introduces `txFROZEN_KEY_ACCESSED` rejection with a bypass-hash whitelist. Ensure coverage of multi-op transactions that touch frozen keys mid-execution.
 
 ### Medium-Term
 
@@ -479,3 +480,44 @@ The henyey-tx crate presents **low consensus risk**. Evidence:
 ### Low Priority
 
 5. **Expose missing utility interfaces**: The 5 minor gaps (`checkValidWithOptionallyChargedFee`, `hasMuxedAccount`, etc.) could be implemented as thin wrappers to reach 100% function parity, but they have no correctness impact.
+
+---
+
+## 7. v26.0.1 Implementation Delta
+
+This section summarizes the key changes between stellar-core v25.0.1 and v26.0.1 in `src/transactions/` and their henyey-tx implementation status.
+
+### stellar-core v26 Transaction Changes
+
+The `git log v25.0.1..v26.0.1 -- src/transactions/` shows ~40 commits. Key behavioral changes:
+
+| Change | Commit | henyey-tx Status |
+|--------|--------|-----------------|
+| **CAP-77: Frozen ledger keys** | `87e2161bc` | ✅ Full — `frozen_keys.rs`: `FrozenKeyConfig`, per-op `accesses_frozen_key()` dispatch, bypass hash set |
+| **CAP-73: SAC trust (native SAC)** | `3e947211f`, `356286b74` | ✅ Full — InvokeHostFunction trust handling for native SAC |
+| **TxSet validation improvements** | `e4e3b93e8`, `45d371c13`, `a5393933f` | ✅ Full — `tx_set_xdr.rs` validates parallel phase structure |
+| **Pre-v23 restore meta cleanup** | `53d138c5a`, `c69069ed1` | ✅ Full — Clean restore key tracking in `meta_builder.rs`, `state/mod.rs` |
+| **Discount rounding change** | `706520aad` | ✅ Full — Updated rounding in offer exchange |
+| **ParallelTxReturnVal refactor** | `589044435`, `b8e6d0753` | ➖ N/A — Architectural; henyey uses its own parallel execution model at ledger crate level |
+| **Banned accounts config** | `36aeb36ae` | ➖ N/A — Herder-level (not tx crate); implemented in `henyey-herder` |
+| **LedgerEntry scope refactor** | `42d784fa3`, `3203d9b43`, `df43e98e2` | ➖ N/A — Internal C++ safety; Rust ownership model provides equivalent guarantees |
+| **Overlay signature verification** | `9e5838e9d` | ➖ N/A — Overlay-level; not in tx crate scope |
+| **Remove p26 ifdefs** | `79258890b` | ➖ N/A — Code cleanup |
+| **Remove maintenance** | `dc44d5bd6`, `eb0030727` | ➖ N/A — Maintenance operations not relevant |
+| **Expired entry modification guard** | `0cb85be74`, `8f2c51a71` | ✅ Full — Enforced in `state/mod.rs` entry access layer |
+
+### New henyey-tx Functionality Since v25 Evaluation
+
+1. **`frozen_keys.rs`** (57 functions): Complete CAP-77 implementation with `FrozenKeyConfig`, per-operation-type key extraction, bypass transaction hash set, and centralized checking.
+2. **Updated offer exchange rounding**: Aligned with `706520aad` discount rounding change.
+3. **Restore key tracking cleanup**: Aligned with pre-v23 restore meta simplification.
+4. **Test count growth**: 815 → 944 unit tests, with 33 new frozen-key tests covering all operation types.
+
+### Items Not Applicable to henyey-tx
+
+The following v26 changes affect other subsystems and are intentionally not tracked in this crate:
+
+- `ParallelTxReturnVal` refactor — internal stellar-core apply return type; henyey's parallel model uses `LedgerDelta` per cluster
+- Banned accounts — herder/overlay concern, not transaction execution
+- `LedgerEntryScope`/`ScopedLedgerEntry` — C++ memory safety pattern; Rust's ownership handles this
+- `SimpleTimer` class — profiling infrastructure

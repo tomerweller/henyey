@@ -1,9 +1,9 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey-tx`
-**Upstream**: `stellar-core/src/transactions/`
+**Upstream**: `stellar-core/src/transactions/` (v26.0.1)
 **Overall Parity**: 97%
-**Last Updated**: 2026-04-27
+**Last Updated**: 2026-05-10
 
 ## Summary
 

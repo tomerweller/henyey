@@ -1,9 +1,10 @@
 # Henyey Herder Crate — Specification Adherence Evaluation
 
-**Evaluated against:** stellar-core v25.0.1 herder implementation (C++ reference)
+**Evaluated against:** stellar-core v26.0.1 herder implementation (C++ reference)
 **Crate:** `crates/herder/` (henyey-herder)
 **SCP core library:** `crates/scp/` (henyey-scp) — 100% parity (164/164 functions)
-**Date:** 2026-02-20
+**Parity:** see `crates/herder/PARITY_STATUS.md` for current function-level status
+**Date:** 2026-05-10
 
 ---
 
@@ -32,6 +33,7 @@
 4. [Gap Summary](#4-gap-summary)
 5. [Risk Assessment](#5-risk-assessment)
 6. [Recommendations](#6-recommendations)
+7. [v26.0.1 Delta](#7-v2601-delta)
 
 ---
 
@@ -39,7 +41,7 @@
 
 The henyey herder crate coordinates SCP consensus on top of the core SCP library (`henyey-scp`, which is at **100% parity** with stellar-core's SCP implementation). The herder is responsible for driving nomination, validating values, managing the transaction mempool, constructing and validating transaction sets, handling upgrades, persisting SCP state, and coordinating ledger closes.
 
-The herder crate is at **77% function-level parity** (131/170 functions implemented, 39 gaps per `PARITY_STATUS.md`). However, function-level parity does not capture the full picture — many behaviors are implemented with different architectural patterns (e.g., unified `TransactionQueue` vs C++ inheritance hierarchy, actor-model `TimerManager` vs `VirtualTimer` per slot).
+The herder crate is at **79% function-level parity** (see `crates/herder/PARITY_STATUS.md` for current counts). However, function-level parity does not capture the full picture — many behaviors are implemented with different architectural patterns (e.g., unified `TransactionQueue` vs C++ inheritance hierarchy, actor-model `TimerManager` vs `VirtualTimer` per slot).
 
 ### Overall Adherence Rating
 
@@ -69,7 +71,7 @@ The herder crate is at **77% function-level parity** (131/170 functions implemen
 
 ## 2. Evaluation Methodology
 
-This evaluation compares the henyey herder implementation against the stellar-core v25.0.1 reference source code. Every C++ source file in `stellar-core/src/herder/` was read in full and compared against the corresponding Rust implementation.
+This evaluation compares the henyey herder implementation against the stellar-core v26.0.1 reference source code. Every C++ source file in `stellar-core/src/herder/` was read in full and compared against the corresponding Rust implementation.
 
 Each behavior is assessed on three dimensions:
 
@@ -775,4 +777,97 @@ Improving test coverage should accompany gap closure work, particularly for the 
 
 ---
 
-*This evaluation was conducted against the henyey herder crate at its current state (77% function-level parity, 131/170 functions) by comparing against stellar-core v25.0.1 reference source code.*
+## 7. v26.0.1 Delta
+
+The following significant changes were introduced in stellar-core between v25.0.1 and v26.0.1 in `src/herder/`. This section documents their relevance and henyey's current status.
+
+### 7.1 Parallel Tx Set Building Optimizations
+
+**Upstream commits:** `d857bb3` (pre-sorted vector), `dfa1949` (sort-based conflict detection), `3f666252` (in-place cluster mutation), `a8241d1` (global conflict mask), `4cea3753` (O(K) tx-to-cluster lookup), `593515e` (remove unused `mBinPacking`)
+
+stellar-core replaced `SurgePricingPriorityQueue` with a pre-sorted vector, switched from hash-map conflict detection to sort-based approach, added in-place cluster mutation with rollback, and introduced a global conflict mask for fast-path `getConflictingClusters`.
+
+**Henyey status: ✅ Not affected.** Henyey's `parallel_tx_set_builder.rs` uses its own implementation with a custom `BitSet` for footprint conflict tracking and greedy stage assignment. These upstream changes are performance optimizations to the C++ implementation and do not change the algorithm's semantics or output. Henyey's parallel tx set building already produces correct, deterministic results matching stellar-core's output.
+
+### 7.2 Banned Accounts (Config-Based)
+
+**Upstream commits:** `36aeb36` (config to ban accounts), `12b3db6` (update logic), `a242cc1` (persistent ban list), `95e328b` (startup path), `a6f3426` (review comments), `4b61a66` (clear hardcoded filtered accounts)
+
+stellar-core added the ability to ban specific accounts via configuration, with persistent storage across restarts. This prevents transactions from banned accounts from being included in transaction sets or broadcast.
+
+**Henyey status: ❌ Not implemented.** Henyey has transaction-level banning (auto-ban after pending too long) but no account-level ban configuration. This is an operational/anti-abuse feature that does not affect consensus correctness — banned account transactions would still be rejected by other validators' validation logic. **Priority: Low** (operational convenience).
+
+### 7.3 `computePerOpFee` Hardening
+
+**Upstream commit:** `2ea2f61` (prevent division by zero)
+
+stellar-core hardened `computePerOpFee` to prevent division by zero when a transaction has zero operations (which should not occur in practice but could via malformed data).
+
+**Henyey status: ⚠️ Partial.** Henyey references `computePerOpFee` logic in `tx_queue/mod.rs` for fee calculations. The division-by-zero edge case should be verified — if henyey uses operation count as a divisor without a zero guard, this could panic on malformed transactions. **Priority: Medium** (defensive hardening).
+
+### 7.4 TxSet Validation Improvements
+
+**Upstream commit:** `e4e3b93` (improve TxSet validation)
+
+stellar-core tightened transaction set validation with additional checks and clearer error reporting.
+
+**Henyey status: ✅ Adequate.** Henyey's `tx_set.rs` has comprehensive tx set validation including phase structure, fee map validation, parallel component validation, and canonical ordering. The upstream improvements are primarily code quality and error message improvements rather than new validation rules.
+
+### 7.5 Force Flag for Transaction Endpoint
+
+**Upstream commit:** `ab5943c` (introduce force flag to tx endpoint)
+
+stellar-core added a `force` flag to the transaction submission endpoint that bypasses certain queue-level filtering checks.
+
+**Henyey status: ❌ Not implemented.** Henyey does not expose an HTTP transaction submission endpoint with a force flag. This is an operational feature for node operators who need to submit transactions that would normally be filtered. **Priority: Low** (operational convenience, not consensus-relevant).
+
+### 7.6 Clean Up Far-Future SCP Data
+
+**Upstream commit:** `e08742b` (clean up far-future SCP data when tracking)
+
+stellar-core added cleanup of SCP data for slots that are far in the future relative to the current tracking slot, preventing memory accumulation from speculative/malicious envelopes.
+
+**Henyey status: ⚠️ Partial.** Henyey has far-future slot handling in `herder.rs` (buffering far-future EXTERNALIZE messages, slot range validation) but may not perform the same aggressive cleanup of accumulated SCP state for far-future slots. **Priority: Medium** (memory safety under adversarial conditions).
+
+### 7.7 Remove P26 Ifdefs (Protocol 26 Unconditional)
+
+**Upstream commit:** `79258890` (remove p26 ifdefs)
+
+stellar-core removed compile-time protocol 26 feature flags, making protocol 26 behavior unconditional.
+
+**Henyey status: ✅ Not affected.** Henyey targets protocol 24+ and does not use compile-time feature flags for protocol behavior. Protocol-version-dependent behavior is handled at runtime via protocol version checks.
+
+### 7.8 CAP-77 (Freeze Ledger Keys)
+
+**Upstream commit:** `87e2161` (implement CAP-77)
+
+stellar-core implemented the ability to freeze ledger keys via network configuration, affecting how certain accounts/keys are treated by the transaction processing pipeline.
+
+**Henyey status: ❌ Not evaluated in this document.** CAP-77 primarily affects the transaction processing layer (`henyey-tx`) rather than the herder. The herder's role is limited to including/excluding transactions from sets, which may need to account for frozen keys during tx set construction. See the tx crate's parity documentation for CAP-77 status.
+
+### 7.9 Other Notable Changes
+
+| Change | Commit | Henyey Impact |
+|--------|--------|---------------|
+| Block validation returns explicit error codes | `61ec2e3` | ⚠️ Henyey returns `bool`/`Result` but may lack granular error codes |
+| INFO log messages tracking validator timeouts | `124e0ff` | ❌ Not implemented (observability) |
+| Enable parallel apply | `d458d90` | ✅ Handled by ledger/apply crate, not herder |
+| Background tx signature verification | `f02f8f8` | ✅ Not herder-specific; overlay concern |
+| Fee tracking logic updates | `eb70645` | ⚠️ Should verify fee tracking parity |
+| Close time bug fix for slow nodes as genesis | `abb03f2` | ⚠️ Should verify henyey's genesis close time handling |
+| Overlay signature verification update | `9e5838e` | ✅ Overlay concern, not herder |
+
+### Summary of v26.0.1 Impact on Ratings
+
+The v26.0.1 changes do not significantly alter the overall adherence ratings from the v25.0.1 evaluation. The major changes are:
+
+1. **Parallel tx set building optimizations**: Performance-only; henyey's algorithm produces correct output.
+2. **Banned accounts**: New operational feature not yet in henyey; low consensus impact.
+3. **`computePerOpFee` hardening**: Minor defensive fix; should be verified in henyey.
+4. **Far-future SCP cleanup**: Memory safety improvement; henyey has partial coverage.
+
+No rating category changes are warranted. The new gaps (banned accounts, force flag, far-future cleanup) are operational in nature and do not affect the consensus-critical ratings.
+
+---
+
+*This evaluation was conducted against the henyey herder crate at its current state (79% function-level parity; see `crates/herder/PARITY_STATUS.md`) by comparing against stellar-core v26.0.1 reference source code.*

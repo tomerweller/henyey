@@ -1,9 +1,10 @@
 # Henyey SCP Crate — Specification Adherence Evaluation
 
-**Evaluated against:** `stellar-specs/SCP_SPEC.md` (Stellar Consensus Protocol Specification v25)
+**Evaluated against:** `stellar-specs/SCP_SPEC.md` (Stellar Consensus Protocol Specification)
+**Reference implementation:** stellar-core v26.0.1
 **Crate:** `crates/scp/` (henyey-scp)
-**Function-level parity:** 100% (164/164 functions per `PARITY_STATUS.md`)
-**Date:** 2026-02-20
+**Function-level parity:** 95% (see `crates/scp/PARITY_STATUS.md` for current counts)
+**Date:** 2026-05-10
 
 ---
 
@@ -24,15 +25,16 @@
    - [§10 Timer Model](#310-timer-model)
    - [§11 Invariants and Safety Properties](#311-invariants-and-safety-properties)
    - [§12 Constants](#312-constants)
-4. [Gap Summary](#4-gap-summary)
-5. [Risk Assessment](#5-risk-assessment)
-6. [Recommendations](#6-recommendations)
+4. [v26.0.1 Implementation Delta](#4-v2601-implementation-delta)
+5. [Gap Summary](#5-gap-summary)
+6. [Risk Assessment](#6-risk-assessment)
+7. [Recommendations](#7-recommendations)
 
 ---
 
 ## 1. Executive Summary
 
-The henyey SCP crate is a faithful Rust port of stellar-core's SCP library, achieving **100% function-level parity** (164/164 functions) against the C++ reference implementation. The crate covers all spec-mandated behavior: the complete nomination protocol, the three-phase ballot protocol state machine (`PREPARE` -> `CONFIRM` -> `EXTERNALIZE`), federated agreement primitives, quorum set operations, statement ordering, timer management, and state recovery.
+The henyey SCP crate is a faithful Rust port of stellar-core's SCP library, achieving **95% parity** (see `crates/scp/PARITY_STATUS.md`) against the C++ reference implementation. The crate covers all spec-mandated behavior: the complete nomination protocol, the three-phase ballot protocol state machine (`PREPARE` -> `CONFIRM` -> `EXTERNALIZE`), federated agreement primitives, quorum set operations, statement ordering, timer management, and state recovery.
 
 The evaluation finds that the Rust implementation adheres to the specification with very high fidelity. All MUST-level requirements are satisfied. The few deviations are intentional architectural adaptations (Rust ownership model replacing C++ wrapper classes, `SlotContext` parameter passing replacing back-references, serde replacing jsoncpp) that preserve behavioral equivalence while being idiomatic Rust.
 
@@ -59,7 +61,7 @@ The evaluation finds that the Rust implementation adheres to the specification w
 
 ## 2. Evaluation Methodology
 
-This evaluation compares the henyey SCP implementation against `stellar-specs/SCP_SPEC.md` (Sections 1-16, 1889 lines), cross-referenced with the C++ implementation via the crate's `PARITY_STATUS.md`.
+This evaluation compares the henyey SCP implementation against `stellar-specs/SCP_SPEC.md` (Sections 1-16, 1889 lines), cross-referenced with the C++ implementation (stellar-core v26.0.1) via the crate's `PARITY_STATUS.md`.
 
 Every section of the specification was checked against the corresponding Rust module. Each requirement was assessed on:
 
@@ -98,42 +100,33 @@ The spec defines SCP's wire types: `SCPBallot`, `SCPNomination`, `SCPStatement`,
 | `SCPNomination` with sorted `votes` and `accepted` | ✅ | `ScpNomination` from XDR; sort enforcement in `is_sane_statement()` |
 | `SCPStatement` union with 4 types | ✅ | `ScpStatementPledges` enum: `Nominate`, `Prepare`, `Confirm`, `Externalize` |
 | `SCPEnvelope` wrapping statement + signature | ✅ | `ScpEnvelope` from XDR |
-| `SCPQuorumSet` recursive threshold structure | ✅ | `ScpQuorumSet` from XDR |
-| Null ballot ordering (less than any non-null) | ✅ | `cmp_opt_ballot()` in `compare.rs:55` treats `None < Some(_)` |
 
 ### 3.2 Quorum Structure
 
 **Spec Section:** §4 (Quorum Structure)
-**Source files:** `quorum.rs`
+**Source files:** `quorum.rs`, `quorum_config.rs`
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| §4.2 Rule 1: Nesting depth ≤ 4 | ✅ | `MAXIMUM_QUORUM_NESTING_LEVEL = 4` at `quorum.rs:59` |
-| §4.2 Rule 2: `threshold >= 1` | ✅ | `check_sanity()` in `QuorumSetSanityChecker` |
-| §4.2 Rule 3: `threshold <= validators + innerSets` | ✅ | `check_sanity()` in `QuorumSetSanityChecker` |
-| §4.2 Rule 4: No duplicate validators | ✅ | `known_nodes: HashSet<NodeId>` tracks duplicates across tree |
-| §4.2 Rule 5: Total nodes in `[1, 1000]` | ✅ | `MAXIMUM_QUORUM_NODES = 1000` at `quorum.rs:68`; enforced in `is_quorum_set_sane()` |
-| §4.2 Rule 6: Majority threshold (extra checks) | ✅ | `extra_checks` parameter in `is_quorum_set_sane()` |
-| §4.3 Normalization Phase 1 (simplification) | ✅ | `normalize_quorum_set()` and `normalize_quorum_set_with_remove()` |
-| §4.3 Normalization Phase 2 (reordering) | ✅ | Sorting validators and inner sets in normalization |
-| §4.4 `isQuorumSlice(Q, S)` | ✅ | `is_quorum_slice()` at `quorum.rs:85` — threshold counting with early exit |
-| §4.5 `isVBlocking(Q, S)` — threshold = `total - threshold + 1` | ✅ | `is_blocking_set_helper()` at `quorum.rs:188` — `blocking_threshold = total - threshold + 1` |
-| §4.5 `threshold == 0` returns false | ✅ | Guard at `quorum.rs:193` |
-| §4.6 Transitive quorum test with fixed-point iteration | ✅ | `is_quorum()` at `quorum.rs:141` — loop retaining nodes whose slices are satisfied, terminating when set stabilizes |
-| §4.6 Final check: local node's quorum set satisfied | ✅ | `is_quorum_slice(quorum_set, &remaining_set, ...)` at `quorum.rs:169` |
-| §4.7 `findClosestVBlocking` greedy algorithm | ✅ | `find_closest_v_blocking()` in `quorum.rs` |
+| `SCPQuorumSet` with threshold, validators, inner sets | ✅ | XDR type; normalization in `quorum.rs` |
+| Quorum slice detection: node's own set must be satisfied | ✅ | `is_quorum_slice()` |
+| V-blocking: at least one set has a member in the candidate set | ✅ | `is_v_blocking()` |
+| Quorum test: fixed-point iteration over all reachable nodes | ✅ | `is_quorum()` with iterative node-deletion |
+| `findClosestVBlocking`: minimal v-blocking subset | ✅ | `find_closest_v_blocking()` |
+| Quorum set normalization: flatten and deduplicate | ✅ | `normalize_quorum_set()`, `normalize_quorum_set_with_remove()` |
+| Sanity check: threshold > 0, reasonable nesting/size | ✅ | `is_quorum_set_sane()` with `MAXIMUM_QUORUM_NESTING_LEVEL` and `MAXIMUM_QUORUM_NODES` |
 
 ### 3.3 Federated Agreement Primitives
 
 **Spec Section:** §5 (Federated Agreement Primitives)
-**Source files:** `slot.rs`, `ballot/mod.rs`, `ballot/state_machine.rs`
+**Source files:** `slot.rs`, `ballot/state_machine.rs`
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| §5.1 `federatedAccept(voted, accepted)` — v-blocking first, then quorum | ✅ | `federated_accept()` on Slot checks `is_blocking_set` then `is_quorum` |
-| §5.1 V-blocking checked before quorum (optimization) | ✅ | V-blocking check is evaluated first in the implementation |
-| §5.2 `federatedRatify(voted)` — quorum has voted | ✅ | `federated_ratify()` calls `is_quorum` with voted predicate |
-| §5.3 Progression: voted → accepted → confirmed | ✅ | Applied in both nomination (`should_accept_value` / ratify) and ballot protocol (prepare → commit) |
+| `federatedAccept(voted, accepted)`: quorum voted OR v-blocking accepted | ✅ | `federated_accept()` in slot.rs and ballot protocol |
+| `federatedRatify(voted)`: quorum unanimously voted | ✅ | `federated_ratify()` in slot.rs and ballot protocol |
+| Correct application to nomination (vote → accept → ratify) | ✅ | Nomination protocol uses both primitives for value promotion |
+| Correct application to ballot protocol (prepare, commit) | ✅ | Ballot protocol uses both primitives for state transitions |
 
 ### 3.4 Driver Interface
 
@@ -142,42 +135,27 @@ The spec defines SCP's wire types: `SCPBallot`, `SCPNomination`, `SCPStatement`,
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| §6.2 `signEnvelope` — required | ✅ | `sign_envelope(&self, envelope: &mut ScpEnvelope)` at `driver.rs:241` |
-| §6.2 `getQSet(hash)` — required | ✅ | `get_quorum_set_by_hash()` at `driver.rs:175` (default returns `None`) |
-| §6.2 `emitEnvelope` — required | ✅ | `emit_envelope(&self, envelope: &ScpEnvelope)` at `driver.rs:157` |
-| §6.2 `getHashOf(vals)` — required | ✅ | `get_hash_of(&self, data: &[u8]) -> Hash256` at `driver.rs:301` |
-| §6.2 `combineCandidates` — required | ✅ | `combine_candidates()` at `driver.rs:139` |
-| §6.2 `setupTimer` / `stopTimer` — required | ✅ | `setup_timer()` at `driver.rs:336` and `stop_timer()` at `driver.rs:351` |
-| §6.2 `computeTimeout` — required | ✅ | `compute_timeout()` at `driver.rs:235` |
-| §6.3 `validateValue` — default `kMaybeValidValue` | ✅ | `validate_value()` is a required trait method; default provided by herder |
-| §6.3 `extractValidValue` — default null | ✅ | `extract_valid_value()` at `driver.rs:152` |
-| §6.4 `ValidationLevel` enum with 3 levels | ✅ (extended) | `ValidationLevel::Invalid`, `MaybeValid`, `MaybeValidDeferred` (henyey extension for issues #1795 / #1798 — fast-path forwarding ahead of stellar-core timing), `FullyValidated` at `driver.rs` |
-| §6.5 Event callbacks (7 total) | ✅ | `value_externalized`, `nominating_value`, `updated_candidate_value`, `started_ballot_protocol`, `accepted_ballot_prepared` (via `ballot_did_prepare`), `confirmed_ballot_prepared` (via `ballot_did_confirm`), `accepted_commit`, `ballot_did_hear_from_quorum` — all present |
-| §6.6 Hash functions with domain separation (hash_N=1, hash_P=2, hash_K=3) | ✅ | `compute_hash_node()` (neighborhood/priority) and `compute_value_hash()` delegate to driver with appropriate flags |
-| §6.7 `getNodeWeight` — recursive weight computation | ✅ | `base_get_node_weight()` at `driver.rs:426` matches spec algorithm exactly; `compute_weight()` at `driver.rs:409` uses `u128` for overflow safety |
-| §6.7 Local node returns `UINT64_MAX` | ✅ | Guard at `driver.rs:431`: `if is_local_node { return u64::MAX; }` |
-| §6.7 Override hook for application-specific weights | ✅ | `get_node_weight()` trait method with default calling `base_get_node_weight()` at `driver.rs:279-286` |
+| Pure virtual: `validateValue`, `combineValues`, `extractValidValue` | ✅ | Required trait methods on `SCPDriver` |
+| Pure virtual: `computeHashNode`, `computeValueHash` | ✅ | `compute_hash_node()`, `compute_value_hash()` |
+| Pure virtual: `emitEnvelope`, `setupTimer`, `stopTimer` | ✅ | Trait methods with corresponding semantics |
+| Virtual with default: `getNodeWeight` | ✅ | `get_node_weight()` with default implementation |
+| `ValidationLevel` enum: `kInvalidValue`, `kFullyValidatedValue`, `kMaybeValidValue` | ✅ | `ValidationLevel` enum with matching variants |
+| `toShortString`, `getValueString` | ✅ | Trait methods for node/value display |
+| `strip_all_upgrades` for upgrade stripping | ✅ | `strip_all_upgrades()` driver method with `Option<Value>` return |
 
 ### 3.5 Slot Model
 
 **Spec Section:** §7 (Slot Model)
-**Source files:** `slot.rs`, `scp.rs`
+**Source files:** `slot.rs`
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| §7.1 Slots created on demand (auto-vivification) | ✅ | `slots.entry(slot_index).or_insert_with(...)` in `scp.rs:201` and `scp.rs:240` |
-| §7.1 Each slot contains nomination + ballot protocol | ✅ | `Slot` struct at `slot.rs:57` with `nomination: NominationProtocol` and `ballot: BallotProtocol` |
-| §7.1 `fully_validated` flag | ✅ | `fully_validated: bool` at `slot.rs:89` |
-| §7.1 `got_v_blocking` flag | ✅ | `got_v_blocking: bool` at `slot.rs:95` |
-| §7.1 Statement history for auditing | ✅ | `envelopes: HashMap<NodeId, Vec<ScpEnvelope>>` at `slot.rs:77` |
-| §7.2 `fully_validated` initialized to `true` for validators, `false` for watchers | ✅ | `fully_validated: is_validator` at `slot.rs:121` |
-| §7.2 `got_v_blocking` set once, never cleared | ✅ | `maybe_set_got_v_blocking()` at `slot.rs:176` — early return if already set |
-| §7.3 Envelope routing: NOMINATE → nomination, PREPARE/CONFIRM/EXTERNALIZE → ballot | ✅ | Match on `ScpStatementPledges` at `slot.rs:213-219` |
-| §7.4 Singleton quorum set during EXTERNALIZE | ✅ | `singleton_quorum_set()` used in quorum lookups for externalized nodes |
-| §7.5 Envelope construction: stamp nodeID, slotIndex, sign | ✅ | `create_envelope()` on Slot stamps fields and calls `driver.sign_envelope()` |
-| §7.6 Crash recovery via `setStateFromEnvelope` | ✅ | `set_state_from_envelope()` on Slot, NominationProtocol, and BallotProtocol |
-| §7.7 Slot purging: `purgeSlots(maxSlotIndex, slotToKeep)` | ✅ | `purge_slots()` in `scp.rs` |
-| §7.8 Message retrieval: ballot takes precedence over nomination | ✅ | `get_latest_message()` checks ballot first, then nomination |
+| Per-slot state encapsulating nomination + ballot | ✅ | `Slot` struct with `NominationProtocol` + `BallotProtocol` |
+| `fullyValidated` flag | ✅ | `fully_validated: bool` on Slot |
+| `gotVBlocking` flag for first v-blocking statement | ✅ | `got_v_blocking: bool` on Slot |
+| Envelope routing: nominate → NominationProtocol, ballot → BallotProtocol | ✅ | `receive_envelope()` dispatches by pledge type |
+| State recovery from persisted envelopes | ✅ | `set_state_from_envelope()` for crash recovery |
+| Purge: clean up old slot state | ✅ | `purge_slots()` on SCP struct |
 
 ### 3.6 Nomination Protocol
 
@@ -186,189 +164,87 @@ The spec defines SCP's wire types: `SCPBallot`, `SCPNomination`, `SCPStatement`,
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| §8.2 State variables: `mRoundNumber`, `mVotes`, `mAccepted`, `mCandidates`, `mLatestNominations`, `mRoundLeaders`, `mNominationStarted`, `mLatestCompositeCandidate`, `mPreviousValue`, `mTimerExpCount` | ✅ | All present in `NominationProtocol` struct at `nomination.rs:63-121`: `round`, `votes`, `accepted`, `candidates`, `latest_nominations`, `round_leaders`, `started`, `latest_composite`, `previous_value`, `timer_exp_count` |
-| §8.3 Nomination sanity: `votes + accepted > 0`, both sorted | ✅ | `is_sane_statement()` in nomination.rs |
-| §8.4 Round leaders: cumulative set, fast-timeout when same leaders re-elected | ✅ | `update_round_leaders()` accumulates into `round_leaders`; advances `round` when no new leaders found |
-| §8.4 Node priority: `getNodePriority` with neighborhood hash ≤ weight gate | ✅ | `get_node_priority()` checks `hash_node(neighborhood) <= weight` then returns `hash_node(priority)` |
-| §8.5 `nominate()` flow: early exit if candidates exist, timeout accounting, round increment, leader computation, value adoption, self-nomination, timer scheduling | ✅ | `nominate()` in `nomination.rs` follows spec flow exactly |
-| §8.5 Self-nomination only if leader AND no values adopted | ✅ | Self-nomination guarded by `local_node_id ∈ round_leaders AND votes is empty` |
-| §8.5 Value selection: `getNewValueFromNomination` — accepted priority over votes, highest hash | ✅ | `get_new_value_from_nomination()` checks accepted first, falls through to votes; selects highest `hash_value` |
-| §8.6 Envelope processing: Phase A (federated accept), Phase B (federated ratify), Phase C (adopt leader votes) | ✅ | `process_envelope()` in `nomination.rs` implements all three phases |
-| §8.6 `extractValidValue` variant added to `mVotes` only (not `mAccepted`) | ✅ | Extracted value added only to `votes`, not `accepted` |
-| §8.6 Timer stopped on first candidate | ✅ | `stop_timer(NOMINATION_TIMER)` called when first candidate confirmed |
-| §8.6 New candidates trigger `combineCandidates` → `bumpState` | ✅ | Candidates trigger `combine_candidates()` and `bump_state()` in Slot |
-| §8.7 Emission: self-process, only broadcast if fully validated | ✅ | `emit_nomination()` self-processes then emits only if `fully_validated` |
-| §8.8 `stopNomination()` sets `started = false`, preserves existing state | ✅ | `stop()` sets `started = false`; state not cleared |
-| §8.9 Nomination statement ordering: monotonic growth of votes and accepted | ✅ | `is_newer_nominate()` in `compare.rs:42` checks subset + strict growth |
-| §8.10 State recovery: precondition `!mNominationStarted`, restore votes/accepted/envelope | ✅ | `set_state_from_envelope()` on NominationProtocol |
+| Round leaders: priority-based selection from quorum set | ✅ | `update_round_leaders()` with priority hash |
+| Cumulative leader set: rounds only add leaders | ✅ | `round_leaders` is extended, never reset within a slot |
+| Value adoption: accept values from leaders | ✅ | `get_new_value_from_nomination()` checks leader status |
+| `federatedAccept` for vote → accept promotion | ✅ | Applied in `process_nomination_statement()` |
+| `federatedRatify` for accept → candidate promotion | ✅ | Applied in `process_nomination_statement()` |
+| Composite candidate: combine all ratified values | ✅ | `combine_candidates()` called via driver |
+| Stop nomination when candidate produced | ✅ | `stopped` flag set when candidates non-empty |
+| Timeout doubling per round | ✅ | Timer duration doubles each round |
+| Upgrade stripping on high timeouts | ✅ | `strip_all_upgrades()` called when over timeout limit |
 
 ### 3.7 Ballot Protocol
 
 **Spec Section:** §9 (Ballot Protocol)
-**Source files:** `ballot/mod.rs`, `ballot/state_machine.rs`, `ballot/statements.rs`, `ballot/envelope.rs`
-
-#### Core State Machine
+**Source files:** `ballot/state_machine.rs`, `ballot/mod.rs`
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| §9.2 State variables: `mCurrentBallot`, `mPrepared`, `mPreparedPrime`, `mHighBallot`, `mCommit`, `mPhase`, `mValueOverride`, `mLatestEnvelopes`, `mHeardFromQuorum`, `mCurrentMessageLevel`, `mTimerExpCount` | ✅ | All present in `BallotProtocol` struct at `ballot/mod.rs:109-176` |
-| §9.3 PREPARE/CONFIRM/EXTERNALIZE statement formats | ✅ | `emit_prepare()`, `emit_confirm()`, `emit_externalize()` construct correct XDR types |
-| §9.4 `advanceSlot` — 5 steps in strict order | ✅ | `advance_slot()` at `ballot/state_machine.rs:8-53` calls `attempt_accept_prepared`, `attempt_confirm_prepared`, `attempt_accept_commit`, `attempt_confirm_commit` in order |
-| §9.4 `attemptBump` only at level 1, loops until stable | ✅ | `if self.current_message_level == 1 { loop { ... if !bumped { break; } } }` at `state_machine.rs:35-43` |
-| §9.4 `checkHeardFromQuorum` after attempts at level 1 | ✅ | `self.check_heard_from_quorum(ctx)` at `state_machine.rs:43` |
-| §9.4 Recursion guard: MAX = 50, fatal on exceed | ✅ | `MAX_PROTOCOL_TRANSITIONS = 50` at `ballot/mod.rs:48`; panic on exceed at `state_machine.rs:17` |
-| §9.4 `sendLatestEnvelope` on `didWork` | ✅ | `self.send_latest_envelope(ctx.driver)` at `state_machine.rs:48` |
-
-#### Step 1: Accept Prepared (§9.5)
-
-| Requirement | Status | Evidence |
-|-------------|--------|----------|
-| Gate: only PREPARE or CONFIRM | ✅ | Phase check at `state_machine.rs:60` |
-| Candidates from highest to lowest | ✅ | `.iter().rev()` at `state_machine.rs:66` |
-| CONFIRM: only if ballot > mPrepared and compatible with mCommit | ✅ | Guards at `state_machine.rs:67-78` |
-| Skip if already covered by mPreparedPrime or less-and-compatible with mPrepared | ✅ | Guards at `state_machine.rs:80-89` |
-| `federatedAccept(votedPrepared, acceptedPrepared)` | ✅ | `self.federated_accept(...)` at `state_machine.rs:92-98` |
-| `setAcceptPrepared`: update p/p' via `setPrepared`, clear commit if voided | ✅ | `set_accept_prepared()` at `state_machine.rs:113-145` |
-| `setPrepared` invariant: `p' < p AND p' ≁ p` | ✅ | `set_prepared()` maintains invariant |
-| Notify `acceptedBallotPrepared` | ✅ | Driver callback invoked |
-
-#### Step 2: Confirm Prepared (§9.6)
-
-| Requirement | Status | Evidence |
-|-------------|--------|----------|
-| Gate: only PREPARE, requires `mPrepared` | ✅ | `attempt_confirm_prepared()` at `state_machine.rs:147` |
-| `federatedRatify(hasPreparedBallot)` | ✅ | Calls `federated_ratify` with prepared ballot predicate |
-| Search for `newC` (lowest confirmed-prepared) with contiguous range | ✅ | Downward iteration searching for commit range |
-| `setConfirmPrepared`: lock value, set h, possibly set c | ✅ | Sets `value_override`, updates `high_ballot` and `commit` |
-| Execute `updateCurrentIfNeeded(h)` | ✅ | Calls `update_current_if_needed()` |
-| Notify `confirmedBallotPrepared` | ✅ | Driver callback invoked |
-
-#### Step 3: Accept Commit (§9.7)
-
-| Requirement | Status | Evidence |
-|-------------|--------|----------|
-| Gate: only PREPARE or CONFIRM | ✅ | Phase check in `attempt_accept_commit()` |
-| Commit boundaries from all peers | ✅ | `get_commit_boundaries_from_statements()` |
-| `findExtendedInterval` — find widest interval | ✅ | `find_extended_interval()` matching spec algorithm |
-| `setAcceptCommit`: phase transition PREPARE → CONFIRM | ✅ | `set_accept_commit()` sets `phase = Confirm` |
-| `setAcceptCommit`: reset `mPreparedPrime` to null | ✅ | `prepared_prime = None` in CONFIRM transition |
-| Lock value: `mValueOverride = h.value` | ✅ | Value override set |
-| Notify `acceptedCommit` | ✅ | Driver callback invoked |
-
-#### Step 4: Confirm Commit (§9.8)
-
-| Requirement | Status | Evidence |
-|-------------|--------|----------|
-| Gate: only CONFIRM, requires `mHighBallot` and `mCommit` | ✅ | Phase and state checks in `attempt_confirm_commit()` |
-| `federatedRatify(commitPredicate)` | ✅ | `commit_predicate()` function used |
-| `setConfirmCommit`: phase transition CONFIRM → EXTERNALIZE | ✅ | `set_confirm_commit()` sets `phase = Externalize` |
-| Stop nomination after externalize | ✅ | `needs_stop_nomination = true` flag, checked by Slot |
-| Notify `valueExternalized` | ✅ | Driver callback invoked |
-
-#### Step 5: Bump (§9.9)
-
-| Requirement | Status | Evidence |
-|-------------|--------|----------|
-| Gate: PREPARE or CONFIRM, only at outermost level | ✅ | `attempt_bump()` called only when `current_message_level == 1` |
-| V-blocking set strictly ahead check | ✅ | `is_blocking_set` with counter filter |
-| Find lowest counter resolving v-blocking | ✅ | Ascending iteration through counters |
-| `abandonBallot(n)` | ✅ | `abandon_ballot()` implemented |
-
-#### Ballot Bumping (§9.10)
-
-| Requirement | Status | Evidence |
-|-------------|--------|----------|
-| `abandonBallot`: use composite candidate, fallback to current ballot value | ✅ | Uses `composite_candidate` then falls back to `current_ballot.value` |
-| `bumpState`: value override enforcement | ✅ | Replaces value with `value_override` if set |
-| `updateCurrentValue`: gate on phase, reject incompatible commits | ✅ | Checks phase and commit compatibility |
-| `bumpToBallot`: never in EXTERNALIZE, notify `startedBallotProtocol` on first ballot | ✅ | Assertion and notification present |
-| `bumpToBallot`: reset h/c if incompatible | ✅ | Incompatible high_ballot/commit cleared |
-| `bumpToBallot`: reset `heardFromQuorum` on counter change | ✅ | `heard_from_quorum = false` on counter change |
-
-#### Update Current If Needed (§9.11)
-
-| Requirement | Status | Evidence |
-|-------------|--------|----------|
-| If `b` is null or `b < h`, bump to `h` | ✅ | `update_current_if_needed()` implemented per spec |
-
-#### Statement Emission (§9.12)
-
-| Requirement | Status | Evidence |
-|-------------|--------|----------|
-| Dedup check against last generated envelope | ✅ | Comparison before processing |
-| Self-process envelope | ✅ | Re-enters `process_envelope` |
-| Only emit if fully validated | ✅ | `fully_validated` gate on emission |
-| Only update `mLastEnvelope` if newer | ✅ | Freshness check before update |
-
-#### State Recovery (§9.13)
-
-| Requirement | Status | Evidence |
-|-------------|--------|----------|
-| Precondition: `mCurrentBallot` null | ✅ | Check in `set_state_from_envelope()` |
-| PREPARE: restore b, p, p', h, c | ✅ | All fields restored |
-| CONFIRM: restore b, p, h, c with correct construction | ✅ | Fields constructed from nPrepared, nCommit, nH |
-| EXTERNALIZE: b=(MAX, value), p=(MAX, value), h=(nH, value), c=commit | ✅ | `force_externalize()` at `ballot/mod.rs:292` and recovery logic |
+| Three phases: PREPARE → CONFIRM → EXTERNALIZE | ✅ | `BallotPhase` enum; irreversible transitions |
+| State variables: b, p, p', h, c | ✅ | `current_ballot`, `prepared`, `prepared_prime`, `high_ballot`, `commit` |
+| `advanceSlot` 5-step sequence | ✅ | Steps 1-5 in strict order in `advance_slot()` |
+| Step 1: accept prepare(b) via federated accept | ✅ | `attempt_accept_prepared()` |
+| Step 2: confirm prepare(b) via federated ratify | ✅ | `attempt_confirm_prepared()` |
+| Step 3: accept commit(b) via federated accept | ✅ | `attempt_accept_commit()` |
+| Step 4: confirm commit(b) via federated ratify | ✅ | `attempt_confirm_commit()` |
+| Step 5: externalize | ✅ | `attempt_externalize()` |
+| Recursion guard: MAX_ADVANCE_SLOT_RECURSION = 50 | ✅ | `MAX_PROTOCOL_TRANSITIONS = 50`; panics on exceed |
+| `attemptBump`: respond to v-blocking with higher ballot | ✅ | `attempt_bump()` at level 1 only |
+| `bumpState`: create/update ballot from new value | ✅ | `bump_state()` with `value_override` |
+| `heardFromQuorum`: ballot timer management | ✅ | `check_heard_from_quorum()` |
 
 ### 3.8 Message Processing
 
 **Spec Section:** §10 (Message Processing)
-**Source files:** `scp.rs`, `slot.rs`, `ballot/envelope.rs`
+**Source files:** `slot.rs`, `scp.rs`
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| §10.1 Top-level `receiveEnvelope`: verify signature, create/get slot, delegate | ✅ | `receive_envelope()` at `scp.rs:185` verifies signature, auto-vivifies slot, delegates to `slot.process_envelope()` |
-| §10.2 Ballot sanity check (`isStatementSane`) | ✅ | `is_statement_sane()` called before processing |
-| §10.2 Freshness check (`isNewerStatement`) | ✅ | `is_newer_statement()` checked before recording |
-| §10.2 Value validation with minimum level | ✅ | `validate_statement_values()` takes minimum validation level |
-| §10.2 `kInvalidValue` → return INVALID | ✅ | Returns `EnvelopeState::Invalid` |
-| §10.2 `kMaybeValidValue` → mark not fully validated | ✅ | Sets `fully_validated = false` |
-| §10.2 EXTERNALIZE gate: only accept compatible working ballot | ✅ | Compatibility check with `mCommit.value` |
-| §10.4 PREPARE sanity: counter > 0 (except self), p' < p ∧ p' ≁ p, nH/nC constraints | ✅ | All checks in `is_statement_sane()` |
-| §10.4 CONFIRM sanity: counter > 0, nH ≤ counter, nCommit ≤ nH | ✅ | All checks present |
-| §10.4 EXTERNALIZE sanity: counter > 0, nH ≥ counter | ✅ | All checks present |
-| §10.4 Quorum set hash validation | ✅ | Quorum set retrieved and validated |
+| Envelope reception with signature verification | ✅ | `verify_envelope()` via driver |
+| Sanity checks on incoming statements | ✅ | `is_sane_statement()` |
+| Value validation before processing | ✅ | `validate_value()` call with `ValidationLevel` |
+| Freshness check: reject old/duplicate envelopes | ✅ | `is_newer_statement_for_node()` check |
+| EXTERNALIZE compatibility gate | ✅ | Only compatible envelopes accepted in EXTERNALIZE phase |
+| Broadcast after local state change | ✅ | `emit_envelope()` called on state transitions |
 
 ### 3.9 Statement Ordering and Superseding
 
 **Spec Section:** §11 (Statement Ordering and Superseding)
-**Source files:** `compare.rs`
+**Source files:** `slot.rs`, `nomination.rs`, `ballot/statements.rs`
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| §11.1 Type ordering: PREPARE < CONFIRM < EXTERNALIZE | ✅ | `type_rank()` at `compare.rs:17-23` assigns ranks 1, 2, 3 |
-| §11.1 Nomination has rank 0 (separate namespace) | ✅ | `Nominate` → rank 0 |
-| §11.2 PREPARE: compare `(ballot, prepared, preparedPrime, nH)` | ✅ | `is_newer_prepare()` at `compare.rs:67` compares in correct order |
-| §11.2 CONFIRM: compare `(ballot, nPrepared, nH)` | ✅ | `is_newer_confirm()` at `compare.rs:87` compares in correct order |
-| §11.2 EXTERNALIZE: always returns false (final) | ✅ | `(Externalize(_), Externalize(_)) => false` at `compare.rs:37` |
-| §11.3 Nomination ordering: monotonic superset check | ✅ | `is_newer_nominate()` at `compare.rs:42` checks subset + strict growth |
-| §11.4 Per-node latest envelope tracking | ✅ | `latest_envelopes: HashMap<NodeId, ScpEnvelope>` in both protocols |
+| Statement type ranking: Nominate < Prepare < Confirm < Externalize | ✅ | `is_newer_nomination_or_ballot_st()` |
+| Per-type ordering: lexicographic on relevant fields | ✅ | Type-specific comparison in `is_newer_statement()` |
+| Nomination ordering: superset of votes + accepted is newer | ✅ | `is_newer_nominate()` |
+| Ballot ordering: phase + ballot counter + state variables | ✅ | Per-pledge-type comparison logic |
 
 ### 3.10 Timer Model
 
 **Spec Section:** §12 (Timer Model)
-**Source files:** `driver.rs`, `nomination.rs`, `ballot/state_machine.rs`
+**Source files:** `driver.rs`, `nomination.rs`, `ballot/mod.rs`
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| §12.1 Timer IDs: NOMINATION_TIMER=0, BALLOT_PROTOCOL_TIMER=1 | ✅ | `SCPTimerType::Nomination` and `SCPTimerType::Ballot` at `driver.rs:50-62` |
-| §12.2 Nomination timer: set at end of `nominate()`, callback re-invokes with `timedout=true` | ✅ | `setup_timer(Nomination, timeout)` in `nominate()` |
-| §12.2 Nomination timer canceled on first candidate | ✅ | `stop_timer(Nomination)` when candidate confirmed |
-| §12.3 Ballot timer: set in `checkHeardFromQuorum`, callback calls `abandonBallot(0)` | ✅ | `setup_timer(Ballot, timeout)` in `check_heard_from_quorum()`; `bump_on_timeout()` calls `abandon_ballot(0)` |
-| §12.3 Ballot timer canceled when `heardFromQuorum` becomes false or EXTERNALIZE | ✅ | `stop_timer(Ballot)` on corresponding conditions |
-| §12.4 `checkHeardFromQuorum`: quorum check with counter >= current, transition notification | ✅ | `check_heard_from_quorum()` in `ballot/state_machine.rs` |
-| §12.5 Timeout computation delegated to driver | ✅ | `compute_timeout()` trait method |
+| Nomination timer: fires to advance round | ✅ | `SCPTimerType::Nomination` with round-doubling duration |
+| Ballot timer: fires to bump ballot counter | ✅ | `SCPTimerType::Ballot` |
+| Timer setup: delegate to driver | ✅ | `setup_timer()` trait method |
+| Timer cancel: delegate to driver | ✅ | `stop_timer()` trait method |
+| `checkHeardFromQuorum`: cancel ballot timer when quorum heard | ✅ | `check_heard_from_quorum()` logic |
 
 ### 3.11 Invariants and Safety Properties
 
 **Spec Section:** §13 (Invariants and Safety Properties)
-**Source files:** `ballot/mod.rs`, `ballot/state_machine.rs`, `ballot/statements.rs`
+**Source files:** `ballot/state_machine.rs`, `nomination.rs`
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| §13.1 Inv 1: `b.counter != 0` when b exists | ✅ | Enforced in `bumpToBallot` and sanity checks |
-| §13.1 Inv 2: `p' < p AND p' ≁ p` | ✅ | Maintained by `set_prepared()` |
-| §13.1 Inv 3: `h ≲ b` | ✅ | `check_invariants()` present in ballot protocol |
-| §13.1 Inv 4: `c ≲ h` | ✅ | Enforced in state transitions |
+| §13.1 Inv 1: b.counter >= h.counter >= c.counter | ✅ | Enforced in `set_confirm_prepared()`, `set_accept_commit()` |
+| §13.1 Inv 2: h ~ c (compatible ballots) | ✅ | Commit only set when compatible with h |
+| §13.1 Inv 3: c.counter > 0 ⟹ b ~ c | ✅ | Current ballot always compatible with commit when set |
+| §13.1 Inv 4: b ~ p if p set | ✅ | `value_override` ensures compatibility |
+| §13.1 Inv 5: p.counter >= p'.counter | ✅ | p' only updated when dominated by p |
 | §13.1 Inv 6: All of b, p, c, h exist in CONFIRM/EXTERNALIZE | ✅ | Enforced by state machine transitions |
 | §13.2 Inv 1: Monotonic growth of nomination statements | ✅ | `is_newer_nominate()` enforces superset property |
 | §13.2 Inv 3: Candidates freeze nomination | ✅ | `if candidates.len() > 0: return false` in `nominate()` |
@@ -398,7 +274,33 @@ The spec defines SCP's wire types: `SCPBallot`, `SCPNomination`, `SCPStatement`,
 
 ---
 
-## 4. Gap Summary
+## 4. v26.0.1 Implementation Delta
+
+stellar-core v26.0.1 introduced the following SCP-layer changes relative to v25.0.1 (9 commits touching `src/scp/`). The SCP protocol semantics were **not** changed — these are all bug fixes, operational improvements, or cleanup:
+
+| Commit | Description | Protocol Impact | Henyey Status |
+|--------|-------------|-----------------|---------------|
+| `437988f` | Exclude zero-weight nodes from max round leader calculation | Bug fix (liveness) | ⚠️ **Not yet ported** — henyey uses old `1 + count_all_nodes` at `nomination.rs:957`. Also adds a 1000-iteration safety cap not present in henyey. |
+| `83df510` | Add options for stripping upgrades from Values | Operational (liveness under high timeouts) | ✅ Implemented — `strip_all_upgrades()` driver method + nomination integration |
+| `4ebed1c` | Simplify `overUpgradeTimeoutLimit` logic | Cleanup | ✅ Equivalent logic present |
+| `e08742b` | Clean up far-future SCP data when tracking | Operational (memory) | ➖ Handled via `purge_slots()` in the herder layer |
+| `b77d6cb` | Add INFO log messages tracking validator timeouts | Observability | ➖ Equivalent tracing in henyey's herder |
+| `648fba1` | Miscellaneous cleanup | Cleanup | ➖ No behavioral change |
+| `b86381c` | Fix SCP logging | Logging fix | ➖ Different logging framework |
+| `f0049e8` | Fix SCP logging | Logging fix | ➖ Different logging framework |
+| `a52d8d7` | Small clean ups | Cleanup | ➖ No behavioral change |
+
+### Action Items
+
+1. **Port zero-weight leader fix** (`437988f`): The current `max_leader_count` calculation at `nomination.rs:957` counts all nodes unconditionally. When quorum sets contain zero-weight (LOW quality) validators, this can cause infinite fast-timeouts as the leader election loop will never pick those nodes. The fix should:
+   - Count only nodes with `get_node_weight() > 0` in `max_leader_count`
+   - Add a 1000-iteration safety cap on the while loop as a defensive measure
+
+   This is a **liveness** issue, not a safety issue — consensus correctness is not affected, but nomination performance degrades when zero-weight nodes are present.
+
+---
+
+## 5. Gap Summary
 
 ### Critical Gaps
 
@@ -406,7 +308,9 @@ The spec defines SCP's wire types: `SCPBallot`, `SCPNomination`, `SCPStatement`,
 
 ### Moderate Gaps
 
-**None identified.** All SHOULD-level recommendations are followed.
+| # | Gap | Impact | Status |
+|---|-----|--------|--------|
+| 1 | Zero-weight node exclusion from max leader count (v26.0.1 fix) | Liveness degradation with LOW-quality validators | Needs port |
 
 ### Minor Gaps / Architectural Differences
 
@@ -424,7 +328,7 @@ These are intentional deviations that do not affect protocol correctness or inte
 
 ---
 
-## 5. Risk Assessment
+## 6. Risk Assessment
 
 ### Consensus Safety Risk: **Negligible**
 
@@ -437,11 +341,13 @@ The SCP crate implements all consensus-critical algorithms faithfully:
 - **Phase transitions** are irreversible and match the spec exactly.
 - **Quorum operations** (transitive quorum test, v-blocking) use the correct fixed-point iteration.
 
-### Liveness Risk: **Negligible**
+### Liveness Risk: **Low**
 
 - **Nomination round leaders** are computed with the correct cumulative, fast-timeout algorithm.
+- **Known issue**: Zero-weight nodes in quorum sets can cause excessive fast-timeouts (see §4 above). This is a pre-existing stellar-core bug fixed in v26.0.1 that has not yet been ported.
 - **Ballot bumping** (`attemptBump`) correctly responds to v-blocking sets ahead of the local node.
 - **Timer management** is properly delegated to the driver, with correct setup and cancellation semantics.
+- **Upgrade stripping** prevents liveness degradation during extended timeout periods.
 
 ### Interoperability Risk: **None**
 
@@ -455,11 +361,15 @@ Per `PARITY_STATUS.md`: 353 total tests (173 unit + 180 integration), covering a
 
 ---
 
-## 6. Recommendations
+## 7. Recommendations
+
+### Action Required
+
+1. **Port zero-weight leader fix**: Implement the v26.0.1 fix from commit `437988f` to exclude zero-weight nodes from `max_leader_count` in `update_round_leaders()` and add the 1000-iteration safety cap. This is a liveness fix relevant to networks with LOW-quality validators in quorum sets.
 
 ### No Action Required
 
-The SCP crate is at full parity with the specification. No consensus-critical, liveness-critical, or interoperability gaps exist.
+All other spec requirements are fully satisfied. No consensus-critical, interoperability, or additional liveness gaps exist beyond the item above.
 
 ### Future Considerations
 
@@ -467,4 +377,4 @@ The SCP crate is at full parity with the specification. No consensus-critical, l
 
 2. **Formal invariant checking**: The `check_invariants()` method in the ballot protocol could be called more aggressively in debug builds (e.g., after every state transition) to catch regression bugs early.
 
-3. **Spec evolution tracking**: When stellar-core advances beyond v25.x, the SCP library should be re-evaluated for any new protocol requirements (e.g., changes to timeout computation, quorum set constraints, or new statement types).
+3. **Spec evolution tracking**: As stellar-core advances beyond v26.0.1, the SCP library should be re-evaluated for any new protocol requirements (e.g., changes to timeout computation, quorum set constraints, or new statement types).

@@ -1,8 +1,8 @@
 # Henyey Catchup/History Crates — Specification Adherence Evaluation
 
-**Evaluated against:** `stellar-specs/CATCHUP_SPEC.md` (stellar-core v25.x / Protocol 25)
-**Crates:** `crates/history/` (henyey-history, 76% parity) and `crates/historywork/` (henyey-historywork, 56% parity)
-**Date:** 2026-02-20
+**Evaluated against:** `stellar-specs/CATCHUP_SPEC.md` (stellar-core v26.0.1 / Protocol 25)
+**Crates:** `crates/history/` (henyey-history, 79% parity) and `crates/historywork/` (henyey-historywork, 49% parity)
+**Date:** 2026-05-10
 
 ---
 
@@ -27,6 +27,7 @@
 4. [Gap Summary](#4-gap-summary)
 5. [Risk Assessment](#5-risk-assessment)
 6. [Recommendations](#6-recommendations)
+7. [v26.0.1 Implementation Delta](#7-v2601-implementation-delta)
 
 ---
 
@@ -34,7 +35,7 @@
 
 The henyey catchup and history subsystem is split across two crates: `henyey-history` (archive management, catchup orchestration, verification, publishing, checkpoint building) and `henyey-historywork` (download work items, batch scheduling, publish work items). Together they implement the core catchup, history publishing, and verification workflows defined in the specification.
 
-The history crate is at **76% function-level parity** and the historywork crate at **56% parity** per their respective `PARITY_STATUS.md` files. These numbers understate functional coverage in some areas (catchup range computation and checkpoint arithmetic are complete) and overstate it in others (the Ledger Apply Manager is entirely absent from these crates).
+The history crate is at **79% function-level parity** and the historywork crate at **49% parity** per their respective `PARITY_STATUS.md` files. These numbers understate functional coverage in some areas (catchup range computation and checkpoint arithmetic are complete) and overstate it in others (the Ledger Apply Manager is entirely absent from these crates).
 
 ### Overall Adherence Rating
 
@@ -609,3 +610,84 @@ Catchup correctness is solid. The gaps are primarily in efficiency (differential
 9. **Pipeline download+apply** for transaction replay across checkpoints (§11.3).
 
 10. **Add network passphrase validation** during catchup HAS fetch (§8.2).
+
+---
+
+## 7. v26.0.1 Implementation Delta
+
+This section documents changes introduced in stellar-core between v25.0.1 and v26.0.1 that affect the catchup and history subsystems, and assesses henyey's alignment.
+
+### Key stellar-core v26 Changes
+
+| Commit | Change | Impact on Catchup/History |
+|--------|--------|---------------------------|
+| `e58bf7d` | **Catch runtime errors in catchup** — wraps `getNextLedgerCloseData()` in `ApplyCheckpointWork` and `DownloadApplyTxsWork` with try/catch for `std::runtime_error`, returning `WORK_FAILURE` instead of crashing | Error resilience during ledger apply within catchup pipeline |
+| `5de9a43` | **History test fixes** — removes dead `HistoryManager` methods, simplifies test utilities | Cleanup only; no behavioral change |
+| `e9c07eb` | **Clear prepared statements cache at end of catchup** | Post-catchup DB cleanup |
+| `87e2161` | **CAP-77: Freeze ledger keys via network configuration** | Protocol-level change; indirectly affects bucket contents |
+| `dc44d5b` | **Remove maintenance** — removes periodic maintenance scheduling from history | Simplifies operational model |
+| `1a8409f` | **Refactor snapshots to single BucketListSnapshot class** | Internal refactor; changes snapshot access patterns |
+| `c8a3f1f` | **Drop prepared statement cache** | DB layer cleanup |
+| `87f71c6` | **SQLite parallel apply support** — database splitting for background apply | Performance improvement for catchup apply |
+| `dcfbcd2` | **Minor improvements to publishing** | Publishing quality-of-life |
+| `5a618d0` | **Fix missing durable writes in CheckpointBuilder** | Durability fix directly relevant to crash recovery |
+| `cde79db` | **Bucket race fixes** | Correctness fix for concurrent bucket operations |
+| `f757496` | **Fix race in index creation on merge** | Bucket index correctness |
+
+### Henyey Alignment Assessment
+
+#### Runtime Error Handling in Catchup (e58bf7d)
+
+stellar-core v26 added explicit `try/catch` blocks around `getNextLedgerCloseData()` in `ApplyCheckpointWork::onRun()` and similar error wrapping in `DownloadApplyTxsWork`. This prevents unhandled runtime errors from crashing the node during catchup.
+
+**Henyey status: ✅ Aligned by design.** Henyey's Rust-based catchup uses `Result<T, E>` return types throughout the replay path. Runtime errors (panics) in Rust are not expected in normal operation and would indicate a bug. The `replay_ledger_with_execution()` function and `CatchupManager` orchestration propagate errors via `?` operator, achieving the same graceful failure without the need for explicit catch blocks. Panics in test assertions (`persist.rs`) are expected test-only behavior.
+
+#### History Test Fixes (5de9a43)
+
+stellar-core removed dead methods from `HistoryManager` (`CATCHUP_RECENT`, `CATCHUP_COMPLETE`, `CATCHUP_MINIMAL` constants moved to test-only) and simplified test utilities.
+
+**Henyey status: ➖ Not applicable.** Henyey's `CatchupMode` enum (`Minimal`, `Complete`, `Recent`) is already cleanly separated from test utilities. No dead code equivalent exists.
+
+#### Prepared Statement Cache Clearing (e9c07eb, c8a3f1f)
+
+stellar-core added explicit clearing of the prepared statement cache at the end of catchup to free resources, and later dropped the cache entirely.
+
+**Henyey status: ➖ Not applicable.** Henyey uses SQLite via `rusqlite` which manages statement lifetime through Rust's ownership system. No prepared statement cache requires manual clearing.
+
+#### Missing Durable Writes in CheckpointBuilder (5a618d0)
+
+stellar-core fixed cases where checkpoint data could be lost on crash due to missing `fsync` calls.
+
+**Henyey status: ✅ Already addressed.** `checkpoint_builder.rs` calls `file.sync_all()` (equivalent to `fsync`) before rename operations, ensuring durability.
+
+#### Bucket Race Fixes (cde79db, f757496)
+
+stellar-core fixed race conditions in bucket operations during concurrent access and index creation during merges.
+
+**Henyey status: ⚠️ Different architecture.** Henyey's bucket operations are primarily single-threaded within the catchup path. The `henyey-bucket` crate uses Rust's ownership model to prevent data races at compile time. However, the specific scenarios (concurrent bucket adoption during live operation) should be verified if/when henyey implements background bucket merges.
+
+#### SQLite Parallel Apply (87f71c6)
+
+stellar-core added support for splitting the database to enable parallel ledger application during catchup.
+
+**Henyey status: ❌ Not implemented.** Henyey's catchup applies ledgers sequentially. Parallel apply is a performance optimization that could be considered for future work but does not affect correctness.
+
+#### Remove Maintenance (dc44d5b)
+
+stellar-core removed the periodic maintenance scheduling from the history subsystem.
+
+**Henyey status: ✅ Aligned.** Henyey never implemented a maintenance scheduling system; maintenance operations are handled on-demand or at checkpoint boundaries.
+
+### Summary of v26 Delta
+
+| Area | stellar-core v26 Change | Henyey Status |
+|------|------------------------|---------------|
+| Runtime error handling in catchup | Added try/catch | ✅ Covered by Result types |
+| History test cleanup | Removed dead code | ➖ N/A |
+| Prepared statement lifecycle | Cache cleared/dropped | ➖ N/A (Rust ownership) |
+| CheckpointBuilder durability | Fixed missing fsync | ✅ Already correct |
+| Bucket race conditions | Fixed concurrent access | ⚠️ Architecture differs |
+| Parallel apply support | Database splitting | ❌ Not implemented |
+| Maintenance removal | Removed scheduler | ✅ Never implemented |
+
+**Overall v26 impact on henyey: Low.** The most significant behavioral change (runtime error handling) is already covered by Rust's type system. The parallel apply optimization is a future performance opportunity but not a correctness requirement.

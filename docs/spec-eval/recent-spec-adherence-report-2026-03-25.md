@@ -1,5 +1,10 @@
 # Recent Stellar Spec Changes Adherence Report
 
+> **Historical snapshot.** This report was written on 2026-03-25 against
+> stellar-core v25.0.1. The stellar-core submodule has since been bumped to
+> v26.0.1. See the individual `docs/spec-eval/*_SPEC_HENYEY_EVAL.md`
+> documents for current v26.0.1 evaluations.
+
 Date: 2026-03-25
 Repository: `henyey`
 Spec baseline reviewed: `stellar-specs` commits `2516d0f` and `244b056`
