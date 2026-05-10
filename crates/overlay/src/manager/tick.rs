@@ -5,7 +5,7 @@
 //! advertisement.
 
 use super::{OverlayManager, PeerHandle, PreferredPeerSet, SharedPeerState, TickConnectCtx};
-use crate::{connection::ConnectionPool, peer::PeerInfo, PeerAddress, PeerId};
+use crate::{connection::ConnectionPool, peer::PeerInfo, DialKey, PeerAddress, PeerId};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
@@ -227,7 +227,7 @@ impl OverlayManager {
         };
 
         let handle = tokio::spawn(async move {
-            let mut retry_after: HashMap<String, Instant> = HashMap::new();
+            let mut retry_after: HashMap<DialKey, Instant> = HashMap::new();
             let mut interval = tokio::time::interval(TICK_INTERVAL);
             // G8: Track when we first noticed we were out of sync, for
             // random-peer-drop cooldown (OUT_OF_SYNC_RECONNECT_DELAY = 60s).
@@ -420,7 +420,7 @@ impl OverlayManager {
     #[allow(clippy::too_many_arguments)]
     async fn connect_preferred_peers(
         preferred_set: &PreferredPeerSet,
-        retry_after: &mut HashMap<String, Instant>,
+        retry_after: &mut HashMap<DialKey, Instant>,
         now: Instant,
         mut remaining: usize,
         _max_outbound: usize,
@@ -436,7 +436,7 @@ impl OverlayManager {
                 break;
             }
 
-            let key = addr.canonical_key();
+            let key = addr.dial_key();
             if let Some(next) = retry_after.get(&key) {
                 if *next > now {
                     continue;
@@ -478,7 +478,7 @@ impl OverlayManager {
     /// Fill remaining outbound slots from the shuffled known-peer list.
     async fn fill_outbound_slots(
         known_peers: &RwLock<super::KnownPeerSet>,
-        retry_after: &mut HashMap<String, Instant>,
+        retry_after: &mut HashMap<DialKey, Instant>,
         now: Instant,
         mut remaining: usize,
         pool: &Arc<ConnectionPool>,
@@ -499,7 +499,7 @@ impl OverlayManager {
                 break;
             }
 
-            let key = addr.canonical_key();
+            let key = addr.dial_key();
             if let Some(next) = retry_after.get(&key) {
                 if *next > now {
                     continue;
@@ -786,7 +786,7 @@ mod tests {
             "failed preferred dial must not evict before authentication"
         );
         assert!(
-            retry_after.contains_key(&preferred_addr.canonical_key()),
+            retry_after.contains_key(&preferred_addr.dial_key()),
             "failed preferred dial should still enter retry backoff"
         );
     }

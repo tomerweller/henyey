@@ -653,10 +653,10 @@ impl App {
     }
 
     fn dedupe_peers(&self, peers: Vec<PeerAddress>) -> Vec<PeerAddress> {
-        let mut seen = HashSet::new();
+        let mut seen: HashSet<henyey_overlay::DialKey> = HashSet::new();
         let mut deduped = Vec::new();
         for peer in peers {
-            if seen.insert(peer.canonical_key()) {
+            if seen.insert(peer.dial_key()) {
                 deduped.push(peer);
             }
         }

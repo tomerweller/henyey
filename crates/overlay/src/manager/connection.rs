@@ -11,7 +11,7 @@ use crate::{
     connection_factory::ConnectionFactory,
     flow_control::{FlowControl, FlowControlConfig},
     peer::{Peer, PeerInfo},
-    LocalNode, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
+    LocalNode, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, ResolvedPeerAddr, Result,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -33,11 +33,11 @@ const CONNECTION_ATTEMPT_DELAY_MS: u64 = 50;
 ///
 /// Carries the original address (for known-peer tracking and PeerInfo),
 /// the resolved IPv4 socket address (for TCP connect), and the canonical
-/// dedup key (`ip:port` string).
+/// dedup key.
 struct ResolvedPeer {
     original: PeerAddress,
     resolved: SocketAddr,
-    key: String,
+    key: ResolvedPeerAddr,
 }
 
 /// Resolve a PeerAddress to a canonical IPv4 `SocketAddr` for transport.
@@ -48,15 +48,15 @@ struct ResolvedPeer {
 /// - IPv6 literal → error (stellar-core is IPv4-only for peer addresses)
 /// - DNS failure or no IPv4 results → error
 ///
-/// Returns `(socket_addr, addr_key)` where `socket_addr` is the resolved
-/// IPv4 address for TCP connect and `addr_key` is `"ip:port"` for
-/// `PendingConnections` dedup.
-async fn resolve_peer_address(addr: &PeerAddress) -> Result<(SocketAddr, String)> {
-    use std::net::IpAddr;
+/// Returns `(socket_addr, resolved_key)` where `socket_addr` is the resolved
+/// IPv4 address for TCP connect and `resolved_key` is the typed
+/// `ResolvedPeerAddr` for `PendingConnections` dedup.
+async fn resolve_peer_address(addr: &PeerAddress) -> Result<(SocketAddr, ResolvedPeerAddr)> {
+    use std::net::{IpAddr, SocketAddrV4};
     match addr.host.parse::<IpAddr>() {
         Ok(IpAddr::V4(ipv4)) => {
             let sa = SocketAddr::new(IpAddr::V4(ipv4), addr.port);
-            let key = sa.to_string();
+            let key = ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(ipv4, addr.port));
             Ok((sa, key))
         }
         Ok(IpAddr::V6(_)) => Err(OverlayError::ConnectionFailed(format!(
@@ -76,7 +76,10 @@ async fn resolve_peer_address(addr: &PeerAddress) -> Result<(SocketAddr, String)
             let sa = addrs.find(|a| a.is_ipv4()).ok_or_else(|| {
                 OverlayError::ConnectionFailed(format!("no IPv4 address found for {}", addr))
             })?;
-            let key = sa.to_string();
+            let key = match sa {
+                SocketAddr::V4(v4) => ResolvedPeerAddr::from_socket_addr_v4(v4),
+                _ => unreachable!("filtered to IPv4 above"),
+            };
             Ok((sa, key))
         }
     }
@@ -509,10 +512,7 @@ impl OverlayManager {
         // address is already in flight, no actual dial happens, so this is a
         // no-op skip — neither `outbound_attempt` nor `outbound_reject` fire
         // (those track real on-the-wire lifecycle events).
-        if !shared
-            .pending_connections
-            .try_reserve_address(addr_key.clone())
-        {
+        if !shared.pending_connections.try_reserve_address(addr_key) {
             debug!(
                 "Skipped discovered peer {} — connection already in flight",
                 addr
@@ -772,7 +772,7 @@ impl OverlayManager {
             };
 
             // Dedup on resolved key — duplicates don't consume remaining budget.
-            if !seen_keys.insert(addr_key.clone()) {
+            if !seen_keys.insert(addr_key) {
                 continue;
             }
 
@@ -829,10 +829,7 @@ pub(super) async fn connect_to_explicit_peer(
     // address is already in flight, no actual dial happens — this is a
     // no-op skip (neither `outbound_attempt` nor `outbound_reject` fire).
     // See `connect_to_discovered_peer` for the matching contract.
-    if !shared
-        .pending_connections
-        .try_reserve_address(addr_key.clone())
-    {
+    if !shared.pending_connections.try_reserve_address(addr_key) {
         pool.release_pending();
         return Err(OverlayError::Internal(format!(
             "connection to {} already in flight",
@@ -1134,7 +1131,10 @@ mod tests {
         assert_eq!(manager.outbound_pool.pending_count(), 0);
 
         // Verify cleanup: pending address reservation cleared.
-        let addr_key = format!("{}:{}", addr.host, addr.port);
+        let addr_key = ResolvedPeerAddr::from_socket_addr_v4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            11625,
+        ));
         assert!(
             !shared
                 .pending_connections
@@ -1216,7 +1216,10 @@ mod tests {
 
         assert_eq!(manager.outbound_pool.pending_count(), 0);
 
-        let addr_key = format!("{}:{}", addr.host, addr.port);
+        let addr_key = ResolvedPeerAddr::from_socket_addr_v4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(10, 0, 0, 2),
+            11625,
+        ));
         assert!(
             !shared
                 .pending_connections
@@ -1257,7 +1260,10 @@ mod tests {
 
         assert!(manager.outbound_pool.try_reserve());
 
-        let addr_key = format!("{}:{}", addr.host, addr.port);
+        let addr_key = ResolvedPeerAddr::from_socket_addr_v4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(10, 0, 0, 2),
+            11625,
+        ));
         let resolved = ResolvedPeer {
             original: addr.clone(),
             resolved: format!("{}:{}", addr.host, addr.port).parse().unwrap(),
@@ -1578,20 +1584,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_peer_address_ipv4_passthrough() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
         let addr = PeerAddress::new("10.0.0.1", 11625);
         let (resolved, key) = resolve_peer_address(&addr).await.unwrap();
         assert_eq!(resolved.ip().to_string(), "10.0.0.1");
         assert_eq!(resolved.port(), 11625);
-        assert_eq!(key, "10.0.0.1:11625");
+        assert_eq!(
+            key,
+            ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+                Ipv4Addr::new(10, 0, 0, 1),
+                11625
+            ))
+        );
     }
 
     #[tokio::test]
     async fn test_resolve_peer_address_localhost() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
         let addr = PeerAddress::new("localhost", 11625);
         let (resolved, key) = resolve_peer_address(&addr).await.unwrap();
         assert_eq!(resolved.ip().to_string(), "127.0.0.1");
         assert_eq!(resolved.port(), 11625);
-        assert_eq!(key, "127.0.0.1:11625");
+        assert_eq!(
+            key,
+            ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+                Ipv4Addr::new(127, 0, 0, 1),
+                11625
+            ))
+        );
     }
 
     #[tokio::test]
@@ -2060,7 +2080,10 @@ mod tests {
         // Reserve a pending pool slot (connect_to_discovered_peer must release it).
         assert!(manager.outbound_pool.try_reserve());
 
-        let addr_key = format!("{}:{}", addr.host, addr.port);
+        let addr_key = ResolvedPeerAddr::from_socket_addr_v4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(1, 2, 3, 4),
+            11625,
+        ));
         let resolved = ResolvedPeer {
             original: addr.clone(),
             resolved: format!("{}:{}", addr.host, addr.port).parse().unwrap(),
@@ -2128,11 +2151,12 @@ mod tests {
         };
 
         // Pre-insert an address reservation to simulate a prior in-flight connection.
-        let addr_key = format!("{}:{}", addr.host, addr.port);
+        let addr_key = ResolvedPeerAddr::from_socket_addr_v4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            11625,
+        ));
         assert!(
-            shared
-                .pending_connections
-                .try_reserve_address(addr_key.clone()),
+            shared.pending_connections.try_reserve_address(addr_key),
             "pre-reservation should succeed"
         );
 

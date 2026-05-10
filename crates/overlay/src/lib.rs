@@ -482,6 +482,7 @@ impl PeerAddress {
     /// entries before DNS resolution), falls back to the raw `host:port`.
     ///
     /// This is a synchronous, allocation-only operation — no DNS lookup.
+    #[deprecated(note = "Use dial_key() or ResolvedPeerAddr::try_from_peer_address() instead")]
     pub fn canonical_key(&self) -> String {
         if let Ok(ip) = self.host.parse::<std::net::IpAddr>() {
             format!("{}:{}", ip, self.port)
@@ -489,6 +490,87 @@ impl PeerAddress {
             format!("{}:{}", self.host, self.port)
         }
     }
+
+    /// Compute the dial key for this address.
+    ///
+    /// IPs produce a normalized `DialKey::Resolved`; hostnames and IPv6 literals
+    /// produce `DialKey::Hostname`. This replaces `canonical_key()` with a
+    /// type-safe equivalent that makes hostname/IP aliasing impossible.
+    pub fn dial_key(&self) -> DialKey {
+        match ResolvedPeerAddr::try_from_peer_address(self) {
+            Some(resolved) => DialKey::Resolved(resolved),
+            None => DialKey::Hostname(format!("{}:{}", self.host, self.port)),
+        }
+    }
+}
+
+/// A peer address that has been resolved to a concrete IPv4 socket address.
+///
+/// Wraps `SocketAddrV4` and can only be constructed from a valid IPv4 parse
+/// or DNS resolution result. This makes hostname/IP aliasing structurally
+/// impossible in any data structure that uses this type as a key.
+///
+/// Matches stellar-core's constraint that overlay peer addresses are IPv4-only
+/// (PeerBareAddress.cpp:46-100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolvedPeerAddr(std::net::SocketAddrV4);
+
+impl ResolvedPeerAddr {
+    /// Try to resolve a `PeerAddress` to IPv4. Returns `None` if:
+    /// - The host is a hostname (not yet DNS-resolved)
+    /// - The host is an IPv6 address
+    /// - The host fails to parse as an IP
+    pub fn try_from_peer_address(addr: &PeerAddress) -> Option<Self> {
+        match addr.host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(v4)) => Some(Self(std::net::SocketAddrV4::new(v4, addr.port))),
+            _ => None,
+        }
+    }
+
+    /// Construct from an already-resolved `SocketAddrV4` (e.g. DNS lookup result).
+    pub fn from_socket_addr_v4(addr: std::net::SocketAddrV4) -> Self {
+        Self(addr)
+    }
+
+    /// The IPv4 address.
+    pub fn ip(&self) -> std::net::Ipv4Addr {
+        *self.0.ip()
+    }
+
+    /// The port number.
+    pub fn port(&self) -> u16 {
+        self.0.port()
+    }
+
+    /// Convert to a generic `SocketAddr`.
+    pub fn socket_addr(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::V4(self.0)
+    }
+
+    /// The underlying `SocketAddrV4`.
+    pub fn socket_addr_v4(&self) -> std::net::SocketAddrV4 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ResolvedPeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Dedup/throttle key for a peer address in the dial path.
+///
+/// Resolved entries use `ResolvedPeerAddr` (normalized IPv4). Unresolved
+/// hostname entries (and IPv6 literals) use the raw `host:port` string.
+/// The enum makes it structurally impossible to accidentally compare a
+/// hostname against a resolved IP — they live in different key spaces.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DialKey {
+    /// Resolved IPv4 address — normalized, no aliasing possible.
+    Resolved(ResolvedPeerAddr),
+    /// Unresolved hostname or IPv6 literal — `"host:port"` string.
+    Hostname(String),
 }
 
 impl std::fmt::Display for PeerAddress {
@@ -895,47 +977,99 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_key_ipv4() {
+    fn test_dial_key_ipv4() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
         let addr = PeerAddress::new("1.2.3.4", 11625);
-        assert_eq!(addr.canonical_key(), "1.2.3.4:11625");
+        assert_eq!(
+            addr.dial_key(),
+            DialKey::Resolved(ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+                Ipv4Addr::new(1, 2, 3, 4),
+                11625
+            )))
+        );
     }
 
     #[test]
-    fn test_canonical_key_hostname_passthrough() {
+    fn test_dial_key_hostname_passthrough() {
         let addr = PeerAddress::new("stellar.example.com", 11625);
-        assert_eq!(addr.canonical_key(), "stellar.example.com:11625");
+        assert_eq!(
+            addr.dial_key(),
+            DialKey::Hostname("stellar.example.com:11625".to_string())
+        );
     }
 
     #[test]
-    fn test_canonical_key_port_preserved() {
+    fn test_dial_key_port_preserved() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
         let addr = PeerAddress::new("10.0.0.1", 12345);
-        assert_eq!(addr.canonical_key(), "10.0.0.1:12345");
+        assert_eq!(
+            addr.dial_key(),
+            DialKey::Resolved(ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+                Ipv4Addr::new(10, 0, 0, 1),
+                12345
+            )))
+        );
     }
 
     #[test]
-    fn test_canonical_key_ipv6() {
+    fn test_dial_key_ipv6() {
         let addr = PeerAddress::new("::1", 11625);
-        assert_eq!(addr.canonical_key(), "::1:11625");
+        assert_eq!(addr.dial_key(), DialKey::Hostname("::1:11625".to_string()));
     }
 
     #[test]
-    fn test_canonical_key_same_ip_different_format() {
-        // Hostname falls back to raw string — it won't match its resolved IP.
+    fn test_dial_key_same_ip_different_format() {
+        // Hostname falls back to DialKey::Hostname — it won't match its resolved IP.
         // This documents the limitation (hostnames must be resolved before dedup).
         let hostname = PeerAddress::new("core-testnet1.stellar.org", 11625);
         let ip = PeerAddress::new("34.235.168.98", 11625);
-        assert_ne!(hostname.canonical_key(), ip.canonical_key());
+        assert_ne!(hostname.dial_key(), ip.dial_key());
 
         // But two identical IPs always produce the same key
         let addr1 = PeerAddress::new("10.0.0.1", 11625);
         let addr2 = PeerAddress::new("10.0.0.1", 11625);
-        assert_eq!(addr1.canonical_key(), addr2.canonical_key());
+        assert_eq!(addr1.dial_key(), addr2.dial_key());
     }
 
     #[test]
-    fn test_canonical_key_different_ports_are_distinct() {
+    fn test_dial_key_different_ports_are_distinct() {
         let addr1 = PeerAddress::new("10.0.0.1", 11625);
         let addr2 = PeerAddress::new("10.0.0.1", 11626);
-        assert_ne!(addr1.canonical_key(), addr2.canonical_key());
+        assert_ne!(addr1.dial_key(), addr2.dial_key());
+    }
+
+    #[test]
+    fn test_resolved_peer_addr_try_from_ipv4() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let addr = PeerAddress::new("192.168.1.1", 11625);
+        let resolved = ResolvedPeerAddr::try_from_peer_address(&addr).unwrap();
+        assert_eq!(resolved.ip(), Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(resolved.port(), 11625);
+        assert_eq!(
+            resolved.socket_addr_v4(),
+            SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 11625)
+        );
+    }
+
+    #[test]
+    fn test_resolved_peer_addr_try_from_hostname_returns_none() {
+        let addr = PeerAddress::new("stellar.org", 11625);
+        assert!(ResolvedPeerAddr::try_from_peer_address(&addr).is_none());
+    }
+
+    #[test]
+    fn test_resolved_peer_addr_try_from_ipv6_returns_none() {
+        let addr = PeerAddress::new("::1", 11625);
+        assert!(ResolvedPeerAddr::try_from_peer_address(&addr).is_none());
+    }
+
+    #[test]
+    fn test_resolved_peer_addr_display() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let resolved = ResolvedPeerAddr::from_socket_addr_v4(SocketAddrV4::new(
+            Ipv4Addr::new(1, 2, 3, 4),
+            11625,
+        ));
+        assert_eq!(resolved.to_string(), "1.2.3.4:11625");
     }
 }
