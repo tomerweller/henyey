@@ -124,13 +124,10 @@ pub fn warm_module_cache_from_entries(
     if let Some(cache) = cache {
         for entry in entries {
             if let LedgerEntryData::ContractCode(cc) = &entry.data {
-                // Pass the full ContractCodeEntry so the cache can use
-                // ContractCodeEntryExt::V1's cost_inputs when present —
-                // critical for cpu_insns parity with stellar-core, since
-                // cached modules' stored cost_inputs determine the
-                // per-invocation VmCachedInstantiation vs
-                // InstantiateWasm{Instructions,Functions,...} charges.
-                cache.add_contract(cc, protocol_version);
+                // Warm with wasm bytes only — stellar-core's bridge warm
+                // path (`compile` → `parse_and_cache_module_simple`) always
+                // uses V0 cost inputs, ignoring the entry's ext.
+                cache.add_wasm(cc.code.as_slice(), protocol_version);
             }
         }
     }

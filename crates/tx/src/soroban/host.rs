@@ -12,7 +12,6 @@ use sha2::{Digest, Sha256};
 use soroban_env_host24::{
     budget::{AsBudget, Budget},
     fees::compute_rent_fee,
-    vm::VersionedContractCodeCostInputs,
     CompilationContext, ErrorHandler, HostError as HostErrorP24, LedgerInfo as LedgerInfoP24,
     ModuleCache,
 };
@@ -23,10 +22,8 @@ use soroban_env_host_p26 as soroban_env_host26;
 
 // P25 module cache types
 use soroban_env_host25::{
-    budget::AsBudget as AsBudgetP25,
-    vm::VersionedContractCodeCostInputs as VersionedContractCodeCostInputsP25,
-    CompilationContext as CompilationContextP25, ErrorHandler as ErrorHandlerP25,
-    ModuleCache as ModuleCacheP25,
+    budget::AsBudget as AsBudgetP25, CompilationContext as CompilationContextP25,
+    ErrorHandler as ErrorHandlerP25, ModuleCache as ModuleCacheP25,
 };
 
 // P26 module cache types
@@ -34,10 +31,8 @@ use soroban_env_host25::{
 // This means P26 XDR types ARE the workspace types — no XDR byte roundtrip needed.
 use soroban_env_host26::HostError as HostErrorP26;
 use soroban_env_host26::{
-    budget::AsBudget as AsBudgetP26,
-    vm::VersionedContractCodeCostInputs as VersionedContractCodeCostInputsP26,
-    CompilationContext as CompilationContextP26, ErrorHandler as ErrorHandlerP26,
-    ModuleCache as ModuleCacheP26,
+    budget::AsBudget as AsBudgetP26, CompilationContext as CompilationContextP26,
+    ErrorHandler as ErrorHandlerP26, ModuleCache as ModuleCacheP26,
 };
 
 // The P26 host is pinned to the stellar-core v26.0.1 submodule revision (b351f88)
@@ -230,118 +225,34 @@ impl PersistentModuleCache {
         }
     }
 
-    /// Add a contract code entry to the cache.
+    /// Warm the module cache with a compiled WASM module.
     ///
-    /// Uses the entry's `ContractCodeEntryExt::V1` cost inputs when present
-    /// (P22+ contracts), falling back to V0 (wasm_bytes only) for older
-    /// contracts. This matches stellar-core's `addAnyContractsToModuleCache`
-    /// and is critical for cpu_insns parity: cached modules carry their
-    /// `cost_inputs` and the host charges different costs at instantiation
-    /// time depending on V0 vs V1 (see `charge_for_instantiation` in
-    /// soroban-env-host's `parsed_module.rs`). Using the wrong variant during
-    /// warming silently inflates or deflates per-tx CPU metering.
+    /// Always uses `VersionedContractCodeCostInputs::V0` (wasm_bytes only),
+    /// matching stellar-core's bridge warm path: `compile()` →
+    /// `parse_and_cache_module_simple()`. The entry's `ContractCodeEntryExt`
+    /// is intentionally not consulted — stellar-core's C++ bridge passes
+    /// only raw wasm bytes, and `parse_and_cache_module_simple` always
+    /// constructs V0 cost inputs internally.
     ///
     /// Returns true if compilation succeeded, false otherwise.
-    pub fn add_contract(
-        &self,
-        entry: &stellar_xdr::curr::ContractCodeEntry,
-        protocol_version: u32,
-    ) -> bool {
-        let code = entry.code.as_slice();
+    pub fn add_wasm(&self, wasm: &[u8], protocol_version: u32) -> bool {
         match self {
             PersistentModuleCache::P24(cache) => {
-                use soroban_env_host24::xdr::ReadXdr;
-                use stellar_xdr::curr::WriteXdr;
                 let ctx = WasmCompilationContext::new();
-                let contract_id =
-                    soroban_env_host24::xdr::Hash(<Sha256 as Digest>::digest(code).into());
-                let cost_inputs = match &entry.ext {
-                    stellar_xdr::curr::ContractCodeEntryExt::V0 => {
-                        VersionedContractCodeCostInputs::V0 {
-                            wasm_bytes: code.len(),
-                        }
-                    }
-                    stellar_xdr::curr::ContractCodeEntryExt::V1(v1) => {
-                        // Bridge cost inputs across XDR versions via roundtrip
-                        // (workspace v26 → host v24 wire format is compatible).
-                        let bytes = v1
-                            .cost_inputs
-                            .to_xdr(stellar_xdr::curr::Limits::none())
-                            .ok();
-                        let inputs = bytes.and_then(|b| {
-                            soroban_env_host24::xdr::ContractCodeCostInputs::from_xdr(
-                                &b,
-                                soroban_env_host24::xdr::Limits::none(),
-                            )
-                            .ok()
-                        });
-                        match inputs {
-                            Some(i) => VersionedContractCodeCostInputs::V1(i),
-                            None => VersionedContractCodeCostInputs::V0 {
-                                wasm_bytes: code.len(),
-                            },
-                        }
-                    }
-                };
                 cache
-                    .parse_and_cache_module(&ctx, protocol_version, &contract_id, code, cost_inputs)
+                    .parse_and_cache_module_simple(&ctx, protocol_version, wasm)
                     .is_ok()
             }
             PersistentModuleCache::P25(cache) => {
-                use soroban_env_host25::xdr::ReadXdr;
-                use stellar_xdr::curr::WriteXdr;
                 let ctx = WasmCompilationContextP25::new();
-                let contract_id =
-                    soroban_env_host25::xdr::Hash(<Sha256 as Digest>::digest(code).into());
-                let cost_inputs = match &entry.ext {
-                    stellar_xdr::curr::ContractCodeEntryExt::V0 => {
-                        VersionedContractCodeCostInputsP25::V0 {
-                            wasm_bytes: code.len(),
-                        }
-                    }
-                    stellar_xdr::curr::ContractCodeEntryExt::V1(v1) => {
-                        let bytes = v1
-                            .cost_inputs
-                            .to_xdr(stellar_xdr::curr::Limits::none())
-                            .ok();
-                        let inputs = bytes.and_then(|b| {
-                            soroban_env_host25::xdr::ContractCodeCostInputs::from_xdr(
-                                &b,
-                                soroban_env_host25::xdr::Limits::none(),
-                            )
-                            .ok()
-                        });
-                        match inputs {
-                            Some(i) => VersionedContractCodeCostInputsP25::V1(i),
-                            None => VersionedContractCodeCostInputsP25::V0 {
-                                wasm_bytes: code.len(),
-                            },
-                        }
-                    }
-                };
                 cache
-                    .parse_and_cache_module(&ctx, protocol_version, &contract_id, code, cost_inputs)
+                    .parse_and_cache_module_simple(&ctx, protocol_version, wasm)
                     .is_ok()
             }
             PersistentModuleCache::P26(cache) => {
                 let ctx = WasmCompilationContextP26::new();
-                let contract_id =
-                    soroban_env_host26::xdr::Hash(<Sha256 as Digest>::digest(code).into());
-                let cost_inputs = match &entry.ext {
-                    stellar_xdr::curr::ContractCodeEntryExt::V0 => {
-                        VersionedContractCodeCostInputsP26::V0 {
-                            wasm_bytes: code.len(),
-                        }
-                    }
-                    stellar_xdr::curr::ContractCodeEntryExt::V1(v1) => {
-                        // P26 host uses stellar-xdr 26.0.0 — same workspace
-                        // type, no bridging needed. Clone-by-value here is
-                        // cheap (cost_inputs is small fixed-size data).
-                        VersionedContractCodeCostInputsP26::V1(v1.cost_inputs.clone())
-                    }
-                };
                 cache
-                    .parse_and_cache_module(&ctx, protocol_version, &contract_id, code, cost_inputs)
+                    .parse_and_cache_module_simple(&ctx, protocol_version, wasm)
                     .is_ok()
             }
         }

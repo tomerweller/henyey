@@ -255,11 +255,10 @@ impl LevelScanner {
 
         if let BucketEntry::Liveentry(ref le) | BucketEntry::Initentry(ref le) = entry {
             // Compile contracts in parallel across levels via the shared module cache.
-            // Pass the full ContractCodeEntry so the cache can use the V1
-            // cost_inputs when present (critical for cpu_insns parity).
+            // Warm with wasm bytes only (V0 cost inputs), matching stellar-core.
             if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
                 if let Some(ref cache) = module_cache {
-                    cache.add_contract(contract_code, protocol_version);
+                    cache.add_wasm(contract_code.code.as_slice(), protocol_version);
                 }
             }
 
@@ -524,11 +523,10 @@ fn scan_and_merge_streaming(
 
                 if let BucketEntry::Liveentry(ref le) | BucketEntry::Initentry(ref le) = entry {
                     // Compile contracts via the shared module cache.
-                    // Pass the full ContractCodeEntry so the cache can use
-                    // ContractCodeEntryExt::V1 cost_inputs when present.
+                    // Warm with wasm bytes only (V0 cost inputs), matching stellar-core.
                     if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
                         if let Some(ref cache) = module_cache_arc {
-                            cache.add_contract(contract_code, protocol_version);
+                            cache.add_wasm(contract_code.code.as_slice(), protocol_version);
                         }
                     }
 
@@ -2816,7 +2814,8 @@ impl LedgerManager {
                                             .into(),
                                     );
                                     if seen_hashes.insert(hash) {
-                                        if new_cache.add_contract(cc, protocol_version) {
+                                        if new_cache.add_wasm(cc.code.as_slice(), protocol_version)
+                                        {
                                             compiled += 1;
                                         }
                                     }

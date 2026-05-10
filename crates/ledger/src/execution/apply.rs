@@ -1575,12 +1575,9 @@ mod tests {
 
     /// warm_module_cache_from_entries handles ContractCodeEntryExt::V1 entries.
     ///
-    /// Regression test for #2503: when a contract has the V1 cost-inputs
-    /// extension (P22+), the cache must use it. Using V0 inputs (just
-    /// `wasm_bytes: code.len()`) for a V1 entry causes the host to charge
-    /// `VmCachedInstantiation` instead of the V1 multi-cost
-    /// `InstantiateWasm{Instructions,Functions,Globals,...}` charges, which
-    /// silently deflates per-tx cpu_insns and causes mainnet divergence.
+    /// V1-ext entries are warmed with V0 cost inputs (wasm_bytes only),
+    /// matching stellar-core's bridge warm path. This test verifies the
+    /// entry is successfully compiled and cached regardless of its ext.
     #[test]
     fn test_warm_module_cache_from_entries_handles_v1_ext() {
         let cache = PersistentModuleCache::new_for_protocol(26)
@@ -1672,13 +1669,14 @@ mod tests {
         );
     }
 
-    // ── V1 cost-inputs preservation tests ──────────────────────────────
+    // ── V1 cost-inputs warming parity tests ────────────────────────────
     //
-    // Regression tests for #2542 / #2503: verify that modules cached via
-    // warm_module_cache_from_entries retain V1 cost inputs (not V0
-    // fallback). The original bug caused VmCachedInstantiation charges
-    // instead of refined InstantiateWasm* charges, causing cpu_insns
-    // divergence.
+    // Parity tests for #2543: verify that modules cached via
+    // warm_module_cache_from_entries always use V0 cost inputs (wasm_bytes
+    // only), matching stellar-core's bridge warm path. The entry's
+    // ContractCodeEntryExt::V1 cost_inputs are intentionally ignored —
+    // stellar-core's `compile()` → `parse_and_cache_module_simple()` always
+    // constructs V0.
 
     /// Helper: build a V1 `LedgerEntry` with known cost inputs for the
     /// given WASM blob.
@@ -1719,7 +1717,7 @@ mod tests {
     }
 
     #[test]
-    fn test_warm_module_cache_v1_cost_inputs_preserved_p24() {
+    fn test_warm_module_cache_v1_entry_uses_v0_cost_inputs_p24() {
         let cache = PersistentModuleCache::new_for_protocol(24)
             .expect("P24 module cache should be available");
         let (entry, hash_bytes) = make_v1_contract_code_ledger_entry(WASM_A);
@@ -1731,29 +1729,24 @@ mod tests {
             .unwrap()
             .get_module(&host_hash)
             .expect("get_module should not error")
-            .expect("V1 module should be in cache");
+            .expect("V1-ext entry should be in cache");
 
         match &module.cost_inputs {
-            soroban_env_host_p24::vm::VersionedContractCodeCostInputs::V1(inputs) => {
-                assert_eq!(inputs.n_instructions, 10);
-                assert_eq!(inputs.n_functions, 20);
-                assert_eq!(inputs.n_globals, 30);
-                assert_eq!(inputs.n_table_entries, 40);
-                assert_eq!(inputs.n_types, 50);
-                assert_eq!(inputs.n_data_segments, 60);
-                assert_eq!(inputs.n_elem_segments, 70);
-                assert_eq!(inputs.n_imports, 80);
-                assert_eq!(inputs.n_exports, 90);
-                assert_eq!(inputs.n_data_segment_bytes, 100);
+            soroban_env_host_p24::vm::VersionedContractCodeCostInputs::V0 { wasm_bytes } => {
+                assert_eq!(
+                    *wasm_bytes,
+                    WASM_A.len(),
+                    "V0 cost inputs should use wasm byte length"
+                );
             }
-            soroban_env_host_p24::vm::VersionedContractCodeCostInputs::V0 { .. } => {
-                panic!("V1 entry was cached with V0 cost inputs — regression from #2503");
+            soroban_env_host_p24::vm::VersionedContractCodeCostInputs::V1(_) => {
+                panic!("V1-ext entry should be cached with V0 cost inputs (parity with stellar-core bridge warm path)");
             }
         }
     }
 
     #[test]
-    fn test_warm_module_cache_v1_cost_inputs_preserved_p25() {
+    fn test_warm_module_cache_v1_entry_uses_v0_cost_inputs_p25() {
         let cache = PersistentModuleCache::new_for_protocol(25)
             .expect("P25 module cache should be available");
         let (entry, hash_bytes) = make_v1_contract_code_ledger_entry(WASM_A);
@@ -1765,29 +1758,24 @@ mod tests {
             .unwrap()
             .get_module(&host_hash)
             .expect("get_module should not error")
-            .expect("V1 module should be in cache");
+            .expect("V1-ext entry should be in cache");
 
         match &module.cost_inputs {
-            soroban_env_host_p25::vm::VersionedContractCodeCostInputs::V1(inputs) => {
-                assert_eq!(inputs.n_instructions, 10);
-                assert_eq!(inputs.n_functions, 20);
-                assert_eq!(inputs.n_globals, 30);
-                assert_eq!(inputs.n_table_entries, 40);
-                assert_eq!(inputs.n_types, 50);
-                assert_eq!(inputs.n_data_segments, 60);
-                assert_eq!(inputs.n_elem_segments, 70);
-                assert_eq!(inputs.n_imports, 80);
-                assert_eq!(inputs.n_exports, 90);
-                assert_eq!(inputs.n_data_segment_bytes, 100);
+            soroban_env_host_p25::vm::VersionedContractCodeCostInputs::V0 { wasm_bytes } => {
+                assert_eq!(
+                    *wasm_bytes,
+                    WASM_A.len(),
+                    "V0 cost inputs should use wasm byte length"
+                );
             }
-            soroban_env_host_p25::vm::VersionedContractCodeCostInputs::V0 { .. } => {
-                panic!("V1 entry was cached with V0 cost inputs — regression from #2503");
+            soroban_env_host_p25::vm::VersionedContractCodeCostInputs::V1(_) => {
+                panic!("V1-ext entry should be cached with V0 cost inputs (parity with stellar-core bridge warm path)");
             }
         }
     }
 
     #[test]
-    fn test_warm_module_cache_v1_cost_inputs_preserved_p26() {
+    fn test_warm_module_cache_v1_entry_uses_derived_v1_cost_inputs_p26() {
         let cache = PersistentModuleCache::new_for_protocol(26)
             .expect("P26 module cache should be available");
         let (entry, hash_bytes) = make_v1_contract_code_ledger_entry(WASM_A);
@@ -1799,23 +1787,19 @@ mod tests {
             .unwrap()
             .get_module(&host_hash)
             .expect("get_module should not error")
-            .expect("V1 module should be in cache");
+            .expect("V1-ext entry should be in cache");
 
+        // P26's parse_and_cache_module_simple derives refined V1 cost inputs
+        // from the wasm itself (not from the entry's ext), matching the
+        // stellar-core v26 bridge behavior.
         match &module.cost_inputs {
-            soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V1(inputs) => {
-                assert_eq!(inputs.n_instructions, 10);
-                assert_eq!(inputs.n_functions, 20);
-                assert_eq!(inputs.n_globals, 30);
-                assert_eq!(inputs.n_table_entries, 40);
-                assert_eq!(inputs.n_types, 50);
-                assert_eq!(inputs.n_data_segments, 60);
-                assert_eq!(inputs.n_elem_segments, 70);
-                assert_eq!(inputs.n_imports, 80);
-                assert_eq!(inputs.n_exports, 90);
-                assert_eq!(inputs.n_data_segment_bytes, 100);
+            soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V1(_) => {
+                // V1 derived from wasm — correct for P26.
             }
             soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V0 { .. } => {
-                panic!("V1 entry was cached with V0 cost inputs — regression from #2503");
+                panic!(
+                    "P26 should derive V1 cost inputs from wasm via parse_and_cache_module_simple"
+                );
             }
         }
     }
@@ -1888,12 +1872,16 @@ mod tests {
             .expect("get_module should not error")
             .expect("V0 module should be in cache");
 
+        // P26's parse_and_cache_module_simple derives refined V1 cost inputs
+        // from the wasm itself, regardless of the entry's ext variant.
         match &module.cost_inputs {
-            soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V0 { wasm_bytes } => {
-                assert_eq!(*wasm_bytes, WASM_A.len());
-            }
             soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V1(_) => {
-                panic!("V0 entry should not be cached with V1 cost inputs");
+                // V1 derived from wasm — correct for P26.
+            }
+            soroban_env_host_p26::vm::VersionedContractCodeCostInputs::V0 { .. } => {
+                panic!(
+                    "P26 should derive V1 cost inputs from wasm via parse_and_cache_module_simple"
+                );
             }
         }
     }
