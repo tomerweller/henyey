@@ -5954,49 +5954,72 @@ mod tests {
     }
 
     /// Verify that a watchdog thread exits promptly when the guard is dropped.
+    ///
+    /// Uses a deterministic channel+mutex handshake instead of sleep-based
+    /// synchronization (issue #2549). The mock thread signals readiness
+    /// while holding the watchdog mutex, then enters `wait_timeout` (which
+    /// atomically releases the mutex). The test thread acquires the mutex
+    /// to confirm the mock is waiting, then drops `WatchdogGuard` while
+    /// still holding the mutex — guaranteeing `notify_one` cannot be lost.
     #[test]
     fn test_watchdog_thread_exits_on_guard_drop() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let condvar = Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new()));
         let tick_ms = Arc::new(AtomicU64::new(1_000_000));
 
-        // Use a barrier to ensure the thread is ready before we signal.
-        let ready = Arc::new(std::sync::Barrier::new(2));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
-        // Spawn a thread that mimics the watchdog loop.
         let shutdown_t = Arc::clone(&shutdown);
         let condvar_t = Arc::clone(&condvar);
-        let ready_t = Arc::clone(&ready);
         let handle = std::thread::spawn(move || {
-            ready_t.wait(); // Signal that we're about to wait on the condvar.
+            let (lock, cvar) = &*condvar_t;
+            let mut guard = lock.lock().unwrap();
+
+            // Signal readiness while holding the watchdog mutex.
+            ready_tx.send(()).unwrap();
+
+            // Enter wait — atomically releases watchdog mutex + blocks.
             loop {
-                {
-                    let (lock, cvar) = &*condvar_t;
-                    let guard = lock.lock().unwrap();
-                    let _ = cvar.wait_timeout(guard, Duration::from_secs(60));
+                let result = cvar.wait_timeout(guard, Duration::from_secs(5)).unwrap();
+                guard = result.0;
+                if result.1.timed_out() {
+                    panic!("mock watchdog thread timed out waiting for shutdown signal");
                 }
                 if shutdown_t.load(Ordering::Acquire) {
                     break;
                 }
             }
+            done_tx.send(()).unwrap();
         });
 
-        // Wait until the thread is ready to receive signals.
-        ready.wait();
-        // Small sleep to let the thread enter wait_timeout.
-        std::thread::sleep(Duration::from_millis(50));
+        // Wait for the mock thread to signal readiness.
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock thread did not signal readiness within 5s");
 
-        // Drop the guard, which should signal the thread.
-        let guard = super::WatchdogGuard {
-            shutdown: Arc::clone(&shutdown),
-            condvar: Arc::clone(&condvar),
-            tick_ms: Arc::clone(&tick_ms),
-        };
-        drop(guard);
+        // Acquire the watchdog mutex — blocks until wait_timeout has
+        // atomically released it, proving the mock thread is waiting.
+        // Hold it across the WatchdogGuard drop so notify_one cannot
+        // be lost to a spurious-wakeup race.
+        {
+            let (lock, _) = &*condvar;
+            let _mutex_guard = lock.lock().unwrap();
 
-        // Thread should exit almost immediately (condvar was notified).
-        let result = handle.join();
-        assert!(result.is_ok(), "watchdog thread should exit cleanly");
+            let wd_guard = super::WatchdogGuard {
+                shutdown: Arc::clone(&shutdown),
+                condvar: Arc::clone(&condvar),
+                tick_ms: Arc::clone(&tick_ms),
+            };
+            drop(wd_guard);
+        }
+
+        // Bounded wait for the mock thread to exit.
+        done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("watchdog thread did not exit within 3s of guard drop");
+
+        handle.join().expect("watchdog thread should exit cleanly");
     }
 
     // ------------------------------------------------------------------
