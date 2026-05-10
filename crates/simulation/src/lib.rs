@@ -340,6 +340,16 @@ impl Simulation {
             }
         };
 
+        // Phase 1: Collect all data needed for spawning. Write data_dir and
+        // peer_port back into self.app_specs (needed by restart_node later).
+        struct NodeSetup {
+            id: String,
+            app: App,
+            data_dir: Arc<TempDir>,
+            peer_port: u16,
+            pre_bound_listener: Option<henyey_overlay::Listener>,
+        }
+        let mut setups: Vec<NodeSetup> = Vec::new();
         for id in ids {
             let spec = self
                 .app_specs
@@ -365,23 +375,36 @@ impl Simulation {
                 .await
                 .with_context(|| format!("build app node {}", spec.node_id))?;
 
-            // Inject the pre-bound TCP listener before the app is wrapped in
-            // Arc.  The listener is consumed by start_overlay() → overlay.start().
-            if let Some(listener) = pre_bound_listeners.remove(&id) {
-                app.set_pre_bound_listener(listener);
-            }
-
-            let peer_port = *port_map
-                .get(&spec.node_id)
-                .expect("port assigned for app spec");
-            let running = Self::bootstrap_and_spawn(app, data_dir, peer_port).await?;
-            self.running_apps.insert(id, running);
+            let listener = pre_bound_listeners.remove(&id);
+            let peer_port = *port_map.get(&id).expect("port assigned for app spec");
+            setups.push(NodeSetup {
+                id,
+                app,
+                data_dir,
+                peer_port,
+                pre_bound_listener: listener,
+            });
         }
 
-        // Wait for all overlays to start before returning, so callers
-        // can assume add_peer() won't return NotStarted.
-        self.wait_for_all_overlays_started(Duration::from_secs(30))
-            .await?;
+        // Phase 2: Bootstrap and insert each node. Each call waits for
+        // overlay readiness before returning, enforcing the invariant by
+        // construction.
+        for setup in setups {
+            // Inject the pre-bound TCP listener before the app is wrapped in
+            // Arc. The listener is consumed by start_overlay() → overlay.start().
+            if let Some(listener) = setup.pre_bound_listener {
+                setup.app.set_pre_bound_listener(listener);
+            }
+            self.bootstrap_insert_ready_node(
+                setup.id.clone(),
+                setup.app,
+                setup.data_dir,
+                setup.peer_port,
+                Duration::from_secs(30),
+            )
+            .await
+            .with_context(|| format!("bootstrap app node {}", setup.id))?;
+        }
 
         Ok(())
     }
@@ -456,12 +479,14 @@ impl Simulation {
             )
             .await?;
 
-        let running = Self::restore_and_spawn(app, data_dir, peer_port).await?;
-        self.running_apps.insert(node_id.to_string(), running);
-
-        // Wait for all overlays (including the restarted node) to be started.
-        self.wait_for_all_overlays_started(Duration::from_secs(30))
-            .await?;
+        self.restore_insert_ready_node(
+            node_id.to_string(),
+            app,
+            data_dir,
+            peer_port,
+            Duration::from_secs(30),
+        )
+        .await?;
 
         Ok(())
     }
@@ -1366,31 +1391,73 @@ impl Simulation {
         Ok(submitted)
     }
 
-    /// Bootstrap a fresh node from genesis and spawn its run loop.
-    async fn bootstrap_and_spawn(
-        app: App,
+    /// Spawn a node's run loop, insert into `running_apps`, and wait until
+    /// ALL nodes (including the new one) have their overlay ready.
+    ///
+    /// Uses `wait_for_all_overlays_started` with `CrashScope::AllNodes`, so
+    /// if any already-running node crashes during the wait, it's detected.
+    ///
+    /// **Failure semantics**: If the wait fails (timeout or crash detected),
+    /// the newly inserted node is removed and shut down before returning Err.
+    async fn spawn_insert_ready_node(
+        &mut self,
+        id: String,
+        app: Arc<App>,
         data_dir: Arc<TempDir>,
         peer_port: u16,
-    ) -> anyhow::Result<RunningAppNode> {
-        let app = Self::wrap_app(app).await;
-        app.bootstrap_from_db().await?;
-        Self::spawn_app_run_loop(app, data_dir, peer_port)
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let running = Self::spawn_app_run_loop(app, data_dir, peer_port)?;
+        self.running_apps.insert(id.clone(), running);
+        if let Err(e) = self.wait_for_all_overlays_started(timeout).await {
+            // Rollback: remove and shut down the node we just inserted.
+            if let Some(node) = self.running_apps.remove(&id) {
+                node.app.shutdown();
+                let mut handle = node.task.handle;
+                if tokio::time::timeout(Duration::from_secs(2), &mut handle)
+                    .await
+                    .is_err()
+                {
+                    handle.abort();
+                }
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
-    /// Restore a previously-running node from its persisted DB + bucket
-    /// state and spawn its run loop.  Used by `restart_node` so that the
-    /// node resumes at its last closed ledger instead of re-initializing
-    /// genesis.
-    async fn restore_and_spawn(
+    /// Bootstrap a fresh node from genesis, spawn its run loop, insert into
+    /// `running_apps`, and wait for overlay readiness.
+    ///
+    /// Pre-bound listeners must be set on `app` BEFORE calling this method.
+    async fn bootstrap_insert_ready_node(
+        &mut self,
+        id: String,
         app: App,
         data_dir: Arc<TempDir>,
         peer_port: u16,
-    ) -> anyhow::Result<RunningAppNode> {
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
         let app = Self::wrap_app(app).await;
+        app.bootstrap_from_db().await?;
+        self.spawn_insert_ready_node(id, app, data_dir, peer_port, timeout)
+            .await
+    }
 
-        // Restore the LedgerManager from persisted DB + on-disk buckets.
-        // App::run() will read the restored ledger via get_current_ledger()
-        // and set state via restore_operational_state().
+    /// Restore a node from persisted state, spawn its run loop, insert into
+    /// `running_apps`, and wait for overlay readiness.
+    ///
+    /// Used by `restart_node` so that the node resumes at its last closed
+    /// ledger instead of re-initializing genesis.
+    async fn restore_insert_ready_node(
+        &mut self,
+        id: String,
+        app: App,
+        data_dir: Arc<TempDir>,
+        peer_port: u16,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let app = Self::wrap_app(app).await;
         match app.load_last_known_ledger().await {
             Ok(henyey_app::RestoreResult::Restored) => {
                 let info = app.ledger_info();
@@ -1411,8 +1478,8 @@ impl Simulation {
                 );
             }
         }
-
-        Self::spawn_app_run_loop(app, data_dir, peer_port)
+        self.spawn_insert_ready_node(id, app, data_dir, peer_port, timeout)
+            .await
     }
 
     /// Wrap a raw `App` in an `Arc`, set its self-reference, and configure
@@ -1426,6 +1493,11 @@ impl Simulation {
         app
     }
 
+    /// Low-level: spawn the app run loop and return a RunningAppNode.
+    ///
+    /// **Does NOT wait for overlay readiness.** Use `spawn_insert_ready_node`
+    /// (or its bootstrap/restore variants) for normal node startup. This
+    /// exists only as the building block for those higher-level methods.
     fn spawn_app_run_loop(
         app: Arc<App>,
         data_dir: Arc<TempDir>,
