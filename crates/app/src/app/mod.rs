@@ -736,6 +736,13 @@ pub struct App {
     /// watchdog to detect event loop freezes.
     last_event_loop_tick_ms: Arc<AtomicU64>,
 
+    /// Signals the watchdog thread to exit its loop.
+    watchdog_shutdown: Arc<AtomicBool>,
+
+    /// Condvar used to wake the watchdog thread from its sleep so it can
+    /// exit promptly on shutdown (instead of waiting up to 10s).
+    watchdog_condvar: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+
     /// Numeric code indicating what the event loop is currently doing.
     /// Read by the watchdog to identify where a freeze occurs.
     /// Codes: 0=idle/select, 1=scp_message, 2=fetch_response, 3=broadcast_msg,
@@ -1157,6 +1164,8 @@ impl App {
             ping_state: tokio::sync::Mutex::new(PingState::default()),
             self_arc: RwLock::new(std::sync::Weak::new()),
             last_event_loop_tick_ms: Arc::new(AtomicU64::new(0)),
+            watchdog_shutdown: Arc::new(AtomicBool::new(false)),
+            watchdog_condvar: Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
             event_loop_phase: Arc::new(AtomicU64::new(0)),
             event_loop_phase_sub: Arc::new(AtomicU32::new(0)),
         })
@@ -2736,7 +2745,11 @@ impl App {
     /// [`henyey_herder::scp_verify`]): it fires an error if the worker is
     /// `Dead`, or if its heartbeat is stuck while there is a non-empty backlog
     /// for at least [`BACKLOG_STALE_TICKS`] consecutive ticks.
-    pub fn start_event_loop_watchdog(&self) {
+    ///
+    /// Returns a [`WatchdogGuard`] whose `Drop` impl signals the thread to
+    /// exit and resets `last_event_loop_tick_ms` to 0 (preventing spurious
+    /// abort after the event loop has exited).
+    pub(crate) fn start_event_loop_watchdog(&self) -> WatchdogGuard {
         /// Number of consecutive 10s ticks the verifier heartbeat must be
         /// stuck (with a non-empty backlog) before the watchdog logs.
         const BACKLOG_STALE_TICKS: u32 = 3;
@@ -2750,17 +2763,33 @@ impl App {
         let verifier = self.herder.scp_verifier_handle();
         let abort_threshold_secs = self.config.diagnostics.watchdog_abort_secs;
 
+        let shutdown = Arc::clone(&self.watchdog_shutdown);
+        let condvar = Arc::clone(&self.watchdog_condvar);
+
+        let shutdown_thread = Arc::clone(&shutdown);
+        let condvar_thread = Arc::clone(&condvar);
+
         std::thread::Builder::new()
             .name("watchdog".into())
             .spawn(move || {
                 let mut last_hb_seen: u64 = 0;
                 let mut stale_hb_ticks: u32 = 0;
                 loop {
-                    std::thread::sleep(Duration::from_secs(10));
+                    // Sleep via condvar so we can be woken promptly on shutdown.
+                    {
+                        let (lock, cvar) = &*condvar_thread;
+                        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = cvar.wait_timeout(guard, Duration::from_secs(10));
+                    }
+
+                    // Check shutdown flag after waking.
+                    if shutdown_thread.load(Ordering::Acquire) {
+                        break;
+                    }
 
                     let last_tick = tick_ms.load(Ordering::Relaxed);
                     if last_tick == 0 {
-                        // Event loop hasn't started yet
+                        // Event loop hasn't started yet (or was reset on shutdown).
                         continue;
                     }
 
@@ -2915,6 +2944,38 @@ impl App {
             .expect("Failed to spawn watchdog thread");
 
         tracing::info!("Event loop watchdog started");
+
+        WatchdogGuard {
+            shutdown,
+            condvar,
+            tick_ms: Arc::clone(&self.last_event_loop_tick_ms),
+        }
+    }
+}
+
+/// RAII guard for the watchdog thread. When dropped, signals the watchdog
+/// to exit and resets `last_event_loop_tick_ms` to 0 so any residual
+/// watchdog iteration (between signal and actual thread exit) won't fire.
+///
+/// This ensures the watchdog is stopped on all exit paths: normal shutdown,
+/// task abort, task drop, and panic unwind.
+pub(crate) struct WatchdogGuard {
+    shutdown: Arc<AtomicBool>,
+    condvar: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+    tick_ms: Arc<AtomicU64>,
+}
+
+impl Drop for WatchdogGuard {
+    fn drop(&mut self) {
+        // Signal the watchdog thread to exit.
+        self.shutdown.store(true, Ordering::Release);
+        // Reset tick to 0 so even if the thread does one more iteration
+        // before seeing the flag, it hits the `if last_tick == 0 { continue }`
+        // guard and won't fire the abort.
+        self.tick_ms.store(0, Ordering::Relaxed);
+        // Wake the thread from its condvar wait so it exits promptly.
+        let (_, cvar) = &*self.condvar;
+        cvar.notify_one();
     }
 }
 
@@ -5862,6 +5923,80 @@ mod tests {
             hint.contains("core.12345"),
             "tier-2 hint must contain core.<pid>; got: {hint}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // WatchdogGuard lifecycle tests (issue #2547)
+    // ------------------------------------------------------------------
+
+    /// Verify that dropping a WatchdogGuard signals shutdown and resets tick_ms.
+    #[test]
+    fn test_watchdog_guard_drop_signals_shutdown() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let condvar = Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new()));
+        let tick_ms = Arc::new(AtomicU64::new(1_000_000)); // non-zero = "running"
+
+        let guard = super::WatchdogGuard {
+            shutdown: Arc::clone(&shutdown),
+            condvar: Arc::clone(&condvar),
+            tick_ms: Arc::clone(&tick_ms),
+        };
+
+        // Before drop: shutdown not set, tick is non-zero.
+        assert!(!shutdown.load(Ordering::Acquire));
+        assert_ne!(tick_ms.load(Ordering::Relaxed), 0);
+
+        drop(guard);
+
+        // After drop: shutdown set, tick reset to 0.
+        assert!(shutdown.load(Ordering::Acquire));
+        assert_eq!(tick_ms.load(Ordering::Relaxed), 0);
+    }
+
+    /// Verify that a watchdog thread exits promptly when the guard is dropped.
+    #[test]
+    fn test_watchdog_thread_exits_on_guard_drop() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let condvar = Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new()));
+        let tick_ms = Arc::new(AtomicU64::new(1_000_000));
+
+        // Use a barrier to ensure the thread is ready before we signal.
+        let ready = Arc::new(std::sync::Barrier::new(2));
+
+        // Spawn a thread that mimics the watchdog loop.
+        let shutdown_t = Arc::clone(&shutdown);
+        let condvar_t = Arc::clone(&condvar);
+        let ready_t = Arc::clone(&ready);
+        let handle = std::thread::spawn(move || {
+            ready_t.wait(); // Signal that we're about to wait on the condvar.
+            loop {
+                {
+                    let (lock, cvar) = &*condvar_t;
+                    let guard = lock.lock().unwrap();
+                    let _ = cvar.wait_timeout(guard, Duration::from_secs(60));
+                }
+                if shutdown_t.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        });
+
+        // Wait until the thread is ready to receive signals.
+        ready.wait();
+        // Small sleep to let the thread enter wait_timeout.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Drop the guard, which should signal the thread.
+        let guard = super::WatchdogGuard {
+            shutdown: Arc::clone(&shutdown),
+            condvar: Arc::clone(&condvar),
+            tick_ms: Arc::clone(&tick_ms),
+        };
+        drop(guard);
+
+        // Thread should exit almost immediately (condvar was notified).
+        let result = handle.join();
+        assert!(result.is_ok(), "watchdog thread should exit cleanly");
     }
 
     // ------------------------------------------------------------------

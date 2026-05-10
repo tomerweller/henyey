@@ -386,7 +386,9 @@ impl App {
         tracing::info!("Entering main event loop");
 
         // Start the std::thread watchdog (independent of tokio runtime).
-        self.start_event_loop_watchdog();
+        // The guard's Drop signals the watchdog to exit, covering all exit
+        // paths (normal shutdown, task abort, panic unwind).
+        let watchdog_guard = self.start_event_loop_watchdog();
 
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(10));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1180,6 +1182,11 @@ impl App {
                 }
             }
         }
+
+        // Event loop has exited — stop the watchdog immediately (before
+        // pipeline drain which may take time). The guard's Drop signals the
+        // thread and resets tick_ms to 0.
+        drop(watchdog_guard);
 
         // Clean up pending catchup on shutdown
         if let Some(pending) = pending_catchup.take() {
