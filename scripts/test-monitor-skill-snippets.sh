@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=140
+TAP_PLAN=145
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2748,11 +2748,88 @@ MOCK_BINARY
   fi
   wait "$restart4_monitor" 2>/dev/null || true
 
+  # ── Check 12 scrape_identity / PREV_PROM_INVALID semantic assertions ────────
+  # Verify that the identity check and invalidation semantics added to Check 12
+  # are documented in monitor-tick SKILL.md. See issue #2563.
+
+  local identity_section
+  identity_section=$(extract_md_section "$tick_file" '^5\. \*\*Process identity check')
+
+  # Fail-closed guard: if extraction is empty, skip dependent tests
+  if [[ -z "$identity_section" ]]; then
+    tap_not_ok "scrape-identity: section extraction" "identity section not found in $tick_file"
+    tap_not_ok "scrape-identity: invalidation rules (skipped)"
+    tap_not_ok "scrape-identity: persistence-reset gauges (skipped)"
+    tap_not_ok "scrape-identity: metrics baselines skipped (skipped)"
+    tap_not_ok "scrape-identity: state files table (skipped)"
+  else
+
+  # Test 135: scrape_identity file format documented
+  if echo "$identity_section" | grep -Fq 'version=1' \
+     && echo "$identity_section" | grep -Fq 'pid=' \
+     && echo "$identity_section" | grep -Fq 'start_ticks=' \
+     && echo "$identity_section" | grep -Fq 'timestamp='; then
+    tap_ok "scrape-identity: file format fields documented (version=1, pid, start_ticks, timestamp)"
+  else
+    tap_not_ok "scrape-identity: file format fields documented" \
+      "Identity section missing one or more of: version=1, pid=, start_ticks=, timestamp="
+  fi
+
+  # Test 136: PREV_PROM_INVALID invalidation rules documented
+  if echo "$identity_section" | grep -Fq 'process identity changed' \
+     && (echo "$identity_section" | grep -Fq 'no scrape_identity' \
+         || echo "$identity_section" | grep -Fq 'scrape_identity malformed') \
+     && echo "$identity_section" | grep -Fq 'no prev.prom'; then
+    tap_ok "scrape-identity: PREV_PROM_INVALID invalidation rules (3 triggers documented)"
+  else
+    tap_not_ok "scrape-identity: PREV_PROM_INVALID invalidation rules" \
+      "Missing one of: 'process identity changed', 'no scrape_identity'/'scrape_identity malformed', 'no prev.prom'"
+  fi
+
+  # Test 137: Persistence-reset gauges listed in PREV_PROM_INVALID block
+  if echo "$identity_section" | grep -Fq 'henyey_jemalloc_fragmentation_pct' \
+     && echo "$identity_section" | grep -Fq 'henyey_scp_verify_input_backlog' \
+     && echo "$identity_section" | grep -Fq 'henyey_overlay_fetch_channel_depth' \
+     && echo "$identity_section" | grep -Fq 'reset the persistence counter'; then
+    tap_ok "scrape-identity: persistence-reset gauges (3 gauges + reset semantics)"
+  else
+    tap_not_ok "scrape-identity: persistence-reset gauges" \
+      "Missing one of: henyey_jemalloc_fragmentation_pct, henyey_scp_verify_input_backlog, henyey_overlay_fetch_channel_depth, or 'reset the persistence counter'"
+  fi
+
+  # Test 138: metrics: status format includes baselines skipped variants
+  local metrics_line
+  metrics_line=$(echo "$output_section" | grep -F 'metrics:' | head -1)
+  if [[ -n "$metrics_line" ]] \
+     && echo "$metrics_line" | grep -Fq 'baselines skipped' \
+     && echo "$metrics_line" | grep -Fq 'gauge alerts'; then
+    tap_ok "scrape-identity: metrics status format includes baselines skipped + gauge alerts"
+  else
+    tap_not_ok "scrape-identity: metrics status format includes baselines skipped + gauge alerts" \
+      "metrics: line missing 'baselines skipped' or 'gauge alerts' variant"
+  fi
+
+  # Test 139: State files table labels current.prom, prev.prom, scrape_identity as check 12
+  local state_table_ok=true
+  for state_file in "current.prom" "prev.prom" "scrape_identity"; do
+    local row
+    row=$(grep -F "$state_file" "$tick_file" | grep -F '|' | head -1)
+    if [[ -z "$row" ]] || ! echo "$row" | grep -Fq 'check 12'; then
+      state_table_ok=false
+      break
+    fi
+  done
+  if [[ "$state_table_ok" == "true" ]]; then
+    tap_ok "scrape-identity: state files table (current.prom, prev.prom, scrape_identity → check 12)"
+  else
+    tap_not_ok "scrape-identity: state files table" \
+      "One or more of current.prom, prev.prom, scrape_identity missing from state table or not labeled check 12"
+  fi
+
+  fi  # end identity_section guard
+
   # Clean up all background processes from lifecycle tests
   _wt_cleanup_bg
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # Post-verify label sync checks (T135-T140)
   # Cross-validate PostVerifyReason labels in crates/herder/src/scp_verify.rs
   # against the hard-coded label sets in monitor-tick and monitor-loop SKILL.md.
   # See issue #2519 (follow-up from #2481).
@@ -2768,14 +2845,14 @@ MOCK_BINARY
   canonical_count=$(echo "$canonical_labels" | grep -c . || true)
   all_array_size=$(echo "$pv_impl_block" | grep -oP 'pub const ALL: \[Self; \K\d+' || true)
 
-  # Test 135: Canonical extraction guard — fail closed on extraction problems
+  # Test 140: Canonical extraction guard — fail closed on extraction problems
   if [[ "$canonical_count" -gt 0 && "$canonical_count" == "$all_array_size" ]]; then
     tap_ok "pv-label-sync: canonical extraction (count=$canonical_count, ALL size=$all_array_size)"
   else
     tap_not_ok "pv-label-sync: canonical extraction" \
       "count=$canonical_count ALL_size=$all_array_size (expected >0 and equal)"
     # Fail closed: emit remaining 5 tests as skipped
-    local _i; for _i in 136 137 138 139 140; do
+    local _i; for _i in 141 142 143 144 145; do
       tap_not_ok "pv-label-sync: skipped (canonical extraction failed)"
     done
     return
@@ -2788,13 +2865,13 @@ MOCK_BINARY
 
   # If sections are empty, all remaining tests fail
   if [[ -z "$tick_ratio_section" || -z "$loop_ratio_section" ]]; then
-    local _i; for _i in 136 137 138 139 140; do
+    local _i; for _i in 141 142 143 144 145; do
       tap_not_ok "pv-label-sync: skipped (section extraction failed: tick_empty=$([ -z "$tick_ratio_section" ] && echo yes || echo no) loop_empty=$([ -z "$loop_ratio_section" ] && echo yes || echo no))"
     done
     return
   fi
 
-  # Test 136: monitor-tick narrative labels match canonical
+  # Test 141: monitor-tick narrative labels match canonical
   # The label list spans multiple lines after "reason labels is:" until ". If"
   local tick_narrative_text tick_narrative_labels
   tick_narrative_text=$(echo "$tick_ratio_section" | sed -n '/reason labels is:/,/\. If/p')
@@ -2806,7 +2883,7 @@ MOCK_BINARY
       "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$tick_narrative_labels" | tr '\n' ' ')"
   fi
 
-  # Test 137: monitor-tick pseudocode labels match canonical
+  # Test 142: monitor-tick pseudocode labels match canonical
   local tick_printf_line tick_pseudo_labels
   tick_printf_line=$(echo "$tick_ratio_section" | grep "printf '%s\\\\n'" || true)
   tick_pseudo_labels=$(echo "$tick_printf_line" | grep -oP "(?<=\\\\n' )[^|]+" | tr ' ' '\n' | grep -v '^$' | sed 's/|.*//' | sort)
@@ -2817,7 +2894,7 @@ MOCK_BINARY
       "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$tick_pseudo_labels" | tr '\n' ' ')"
   fi
 
-  # Test 138: monitor-loop inline labels match canonical
+  # Test 143: monitor-loop inline labels match canonical
   local loop_label_line loop_inline_labels
   loop_label_line=$(echo "$loop_ratio_section" | grep 'Post-verify label set' || true)
   loop_inline_labels=$(echo "$loop_label_line" | grep -oP '`\K[a-z_]+(?=`)' | sort)
@@ -2828,7 +2905,7 @@ MOCK_BINARY
       "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$loop_inline_labels" | tr '\n' ' ')"
   fi
 
-  # Test 139: monitor-tick label count references match canonical
+  # Test 144: monitor-tick label count references match canonical
   local tick_count_refs tick_counts_ok=true
   tick_count_refs=$(echo "$tick_ratio_section" | grep -oP '(?:all |the |exact |expected )\K\d+(?=[ -](?:label|post-verify|`henyey_scp_post_verify))' || true)
   if [[ -z "$tick_count_refs" ]]; then
@@ -2848,7 +2925,7 @@ MOCK_BINARY
       "expected all=$canonical_count, found: $(echo "$tick_count_refs" | tr '\n' ' ')"
   fi
 
-  # Test 140: monitor-loop label count references match canonical
+  # Test 145: monitor-loop label count references match canonical
   local loop_count_refs loop_counts_ok=true
   loop_count_refs=$(echo "$loop_ratio_section" | grep -oP '(?:all |the |exact |expected )\K\d+(?=[ -](?:label|post-verify|`henyey_scp_post_verify))' || true)
   if [[ -z "$loop_count_refs" ]]; then
