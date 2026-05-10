@@ -550,16 +550,19 @@ impl CatchupManager {
     /// counters on terminal outcome. The combined download+verify is a single
     /// "HAS acquired" event from a dashboard perspective, so any failure in
     /// either step counts as one failure here.
-    async fn download_and_verify_has(&self, checkpoint_seq: u32) -> Result<HistoryArchiveState> {
+    async fn download_and_verify_has(
+        &self,
+        checkpoint_seq: u32,
+    ) -> Result<(HistoryArchiveState, String)> {
         match self.download_has(checkpoint_seq).await {
             Ok((has, archive_name)) => match self.verify_has(&has, checkpoint_seq) {
                 Ok(()) => {
                     metrics::counter!(
                         "stellar_history_download_history_archive_state_success_total",
-                        "archive" => archive_name,
+                        "archive" => archive_name.clone(),
                     )
                     .increment(1);
-                    Ok(has)
+                    Ok((has, archive_name))
                 }
                 Err(e) => {
                     metrics::counter!(
@@ -640,7 +643,7 @@ impl CatchupManager {
             1,
             "Downloading History Archive State",
         );
-        let has = self.download_and_verify_has(checkpoint_seq).await?;
+        let (has, has_archive_name) = self.download_and_verify_has(checkpoint_seq).await?;
 
         let scp_history = self.download_scp_history(checkpoint_seq).await?;
         self.verify_and_persist_scp_history(&scp_history)?;
@@ -667,11 +670,7 @@ impl CatchupManager {
             checkpoint_header.clone(),
             checkpoint_hash,
             ledger_manager,
-            &self
-                .archives
-                .first()
-                .map(|a| a.name().to_owned())
-                .unwrap_or_default(),
+            &has_archive_name,
         )
         .await?;
 
@@ -739,7 +738,7 @@ impl CatchupManager {
                 1,
                 "Downloading History Archive State",
             );
-            let has = self.download_and_verify_has(bucket_apply_at).await?;
+            let (has, has_archive_name) = self.download_and_verify_has(bucket_apply_at).await?;
 
             let scp_history = self.download_scp_history(bucket_apply_at).await?;
             self.verify_and_persist_scp_history(&scp_history)?;
@@ -765,11 +764,7 @@ impl CatchupManager {
                 checkpoint_header,
                 checkpoint_hash,
                 ledger_manager,
-                &self
-                    .archives
-                    .first()
-                    .map(|a| a.name().to_owned())
-                    .unwrap_or_default(),
+                &has_archive_name,
             )
             .await?;
 

@@ -121,10 +121,7 @@ impl CatchupManager {
         target: u32,
         ledger_manager: &LedgerManager,
     ) -> Result<(HeaderSnapshot, u32)> {
-        // Use the primary archive name for apply_ledger_chain attribution.
-        // This counter represents the terminal outcome of the full retry loop,
-        // not a single archive interaction.
-        let archive_name = self
+        let fallback_archive = self
             .archives
             .first()
             .map(|a| a.name().to_owned())
@@ -133,29 +130,29 @@ impl CatchupManager {
             .download_verify_and_replay_with_retry_inner(target, ledger_manager)
             .await;
         match &result {
-            Ok(_) => {
+            Ok((_, _, archive_name)) => {
                 metrics::counter!(
                     "stellar_history_apply_ledger_chain_success_total",
-                    "archive" => archive_name,
+                    "archive" => archive_name.clone(),
                 )
                 .increment(1);
             }
             Err(_) => {
                 metrics::counter!(
                     "stellar_history_apply_ledger_chain_failure_total",
-                    "archive" => archive_name,
+                    "archive" => fallback_archive,
                 )
                 .increment(1);
             }
         }
-        result
+        result.map(|(snap, count, _)| (snap, count))
     }
 
     async fn download_verify_and_replay_with_retry_inner(
         &mut self,
         target: u32,
         ledger_manager: &LedgerManager,
-    ) -> Result<(HeaderSnapshot, u32)> {
+    ) -> Result<(HeaderSnapshot, u32, String)> {
         let mut last_error: Option<HistoryError> = None;
 
         for attempt in 0..=REPLAY_RETRY_COUNT {
@@ -181,7 +178,12 @@ impl CatchupManager {
             if replay_first > target {
                 // Already past target — previous partial replay succeeded fully.
                 let ledgers_applied = target.saturating_sub(current_lcl);
-                return Ok((snap, ledgers_applied));
+                let archive = self
+                    .archives
+                    .first()
+                    .map(|a| a.name().to_owned())
+                    .unwrap_or_default();
+                return Ok((snap, ledgers_applied, archive));
             }
 
             // Download from the checkpoint containing replay_first - 1 (the LCL).
@@ -221,7 +223,7 @@ impl CatchupManager {
         target: u32,
         lcl: LclContext,
         ledger_manager: &LedgerManager,
-    ) -> Result<(HeaderSnapshot, u32)> {
+    ) -> Result<(HeaderSnapshot, u32, String)> {
         use henyey_common::NetworkId;
 
         // Download ledger data for replay
@@ -275,7 +277,7 @@ impl CatchupManager {
         let snap = ledger_manager.header_snapshot();
         let ledgers_applied = snap.header.ledger_seq.saturating_sub(download_from);
 
-        Ok((snap, ledgers_applied))
+        Ok((snap, ledgers_applied, archive_name))
     }
 
     /// Replay ledgers by calling `LedgerManager::close_ledger()` for each one.
