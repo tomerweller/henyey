@@ -238,10 +238,12 @@ def read_snapshot(path: Path) -> dict[str, str]:
 
 
 def write_snapshot(path: Path, data: dict[str, str]) -> None:
-    """Write a key=value snapshot file."""
+    """Write a key=value snapshot file atomically via rename."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"{k}={v}" for k, v in data.items()]
-    path.write_text("\n".join(lines) + "\n")
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.rename(path)
 
 
 # ── Alarm evaluation ────────────────────────────────────────────────────────
@@ -711,7 +713,7 @@ def eval_counter_ratio(
     if denominator_sum:
         cur_den = 0.0
         for m in denominator_sum:
-            v = extract_value(current, m, num_extraction)
+            v = extract_value(current, m, den_extraction)
             if v is None:
                 return make_result(alarm, "skipped", skip_reason="missing denominator counter")
             cur_den += v
