@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=147
+TAP_PLAN=153
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -3126,7 +3126,7 @@ EXEMPT_TOML
     python3 "$eval_script" --catalog "$exempt_toml" \
     --current "$exempt_current" --prev "$exempt_prev" \
     --state-dir "$exempt_state_dir" 2>/dev/null) || true
-  local exempt_state
+  local exempt_state exempt_skip_reason
   exempt_state=$(echo "$exempt_runtime" | python3 -c "
 import json, sys
 try:
@@ -3140,11 +3140,24 @@ try:
 except:
     print('parse-error')
 " 2>/dev/null || echo "parse-error")
-  if [[ "$exempt_state" == "skipped" ]]; then
-    tap_ok "eval-alarms: exempt alarm runtime state=skipped"
+  exempt_skip_reason=$(echo "$exempt_runtime" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'test-exempt-alarm':
+            print(r.get('skip_reason', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+  if [[ "$exempt_state" == "skipped" && "$exempt_skip_reason" == *"exempt: Test metric"* ]]; then
+    tap_ok "eval-alarms: exempt alarm runtime state=skipped with skip_reason"
   else
     tap_not_ok "eval-alarms: exempt alarm runtime skip" \
-      "Expected state=skipped, got $exempt_state"
+      "Expected state=skipped + skip_reason='exempt: Test metric', got state=$exempt_state reason=$exempt_skip_reason"
   fi
   rm -f "$exempt_current" "$exempt_prev" "$exempt_toml"
   rm -rf "$exempt_state_dir"
