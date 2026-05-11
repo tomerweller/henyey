@@ -3113,7 +3113,41 @@ EXEMPT_TOML
     tap_not_ok "eval-alarms: exempt alarm validation" \
       "Validation failed: $exempt_validate"
   fi
-  rm -f "$exempt_toml"
+
+  # Test 147a-runtime: exempt alarm returns state="skipped" at runtime
+  local exempt_current exempt_prev exempt_state_dir
+  exempt_current=$(mktemp)
+  exempt_prev=$(mktemp)
+  exempt_state_dir=$(mktemp -d)
+  echo "# empty" > "$exempt_current"
+  echo "# empty" > "$exempt_prev"
+  local exempt_runtime
+  exempt_runtime=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+    python3 "$eval_script" --catalog "$exempt_toml" \
+    --current "$exempt_current" --prev "$exempt_prev" \
+    --state-dir "$exempt_state_dir" 2>/dev/null) || true
+  local exempt_state
+  exempt_state=$(echo "$exempt_runtime" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'test-exempt-alarm':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+  if [[ "$exempt_state" == "skipped" ]]; then
+    tap_ok "eval-alarms: exempt alarm runtime state=skipped"
+  else
+    tap_not_ok "eval-alarms: exempt alarm runtime skip" \
+      "Expected state=skipped, got $exempt_state"
+  fi
+  rm -f "$exempt_current" "$exempt_prev" "$exempt_toml"
+  rm -rf "$exempt_state_dir"
 
   # Test 147b: exempt=true without exempt_reason is rejected by evaluator
   local bad_exempt_toml
@@ -3149,6 +3183,52 @@ BAD_EXEMPT_TOML
       "Expected rejection but got (exit=$bad_exempt_exit): $bad_exempt_validate"
   fi
   rm -f "$bad_exempt_toml"
+
+  # Test 147c: ledger-invariant-failure and tx-internal-error fire on breach fixtures
+  local fixture_dir="$REPO_ROOT/scripts/fixtures/eval-alarms"
+  local counter_state_dir
+  counter_state_dir=$(mktemp -d)
+  local counter_eval_out
+  counter_eval_out=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$fixture_dir/breach-current.prom" \
+    --prev "$fixture_dir/healthy-prev.prom" \
+    --state-dir "$counter_state_dir" 2>/dev/null) || true
+  local inv_state tx_state
+  inv_state=$(echo "$counter_eval_out" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for r in data.get('alarms', []):
+    if r.get('name') == 'ledger-invariant-failure':
+        print(r.get('state', 'missing'))
+        break
+else:
+    print('not-found')
+" 2>/dev/null || echo "parse-error")
+  tx_state=$(echo "$counter_eval_out" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for r in data.get('alarms', []):
+    if r.get('name') == 'tx-internal-error':
+        print(r.get('state', 'missing'))
+        break
+else:
+    print('not-found')
+" 2>/dev/null || echo "parse-error")
+  if [[ "$inv_state" == "firing" ]]; then
+    tap_ok "eval-alarms: ledger-invariant-failure fires on breach fixture"
+  else
+    tap_not_ok "eval-alarms: ledger-invariant-failure" \
+      "Expected firing, got $inv_state"
+  fi
+  if [[ "$tx_state" == "firing" ]]; then
+    tap_ok "eval-alarms: tx-internal-error fires on breach fixture"
+  else
+    tap_not_ok "eval-alarms: tx-internal-error" \
+      "Expected firing, got $tx_state"
+  fi
+  rm -rf "$counter_state_dir"
 
   # Test 148: quorum-fail-at-low multi-tick persistence test (for_ticks=3)
   local state_dir

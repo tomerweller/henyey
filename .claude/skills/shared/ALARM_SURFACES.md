@@ -63,8 +63,8 @@ When an alarm legitimately belongs in both surfaces:
 | TX internal error | `tx-internal-error`: counter ≥ 1, ACTION | Rule 2: `rate > 0.01` over 5m, critical | Different detection semantics (any vs rate) |
 | Quorum fail-at | `quorum-fail-at-low`: gauge ≤ 1, WARN, 3 ticks | Rules 3a/3b: `== 1` warn/`< 1` critical, 5m | Monitor-tick collapses tiers; Grafana escalates |
 | Post-catchup reset | `post-catchup-hard-reset`: counter ≥ 1, ACTION | Rule 5: `increase > 0` over 10m, critical | |
-| Fetch channel depth | `fetch-channel-depth-high`: gauge > 256, WARN | Rule 8: `> 128`, warning, 5m | Different thresholds |
-| Fragmentation | `jemalloc-fragmentation-high`: gauge > 45, WARN | Rule (jemalloc): `> 50%`, warning | Different thresholds |
+| Fetch channel depth | `fetch-channel-deep`: gauge > 500, WARN, 2 ticks | Rule 8: `> 128`, warning, 5m | Different thresholds |
+| Fragmentation | `jemalloc-frag-high`: gauge > 50, WARN, 2 ticks | Rule (jemalloc): `> 50%`, warning | Matching thresholds |
 
 ## Default for New Alarms
 
