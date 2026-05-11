@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=145
+TAP_PLAN=147
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -1344,12 +1344,12 @@ run_tests() {
   # ── Check 12b semantic assertions ──────────────────────────────────────────
   # Verify that the Check 12b recovery-stalled streak semantics in the
   # monitor-tick and monitor-loop SKILL.md specs have not regressed.
-  # Cross-validates inline literals against the canonical TOML source.
-  # See issues #2399, #2402.
+  # Cross-validates inline literals against the canonical TOML catalog.
+  # See issues #2399, #2402, #2566.
 
   local tick_file="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
   local loop_file="$REPO_ROOT/.claude/skills/monitor-loop/SKILL.md"
-  local constants_file="$REPO_ROOT/.claude/skills/shared/check-12b-constants.toml"
+  local constants_file="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
 
   # Section extractions (scoped to avoid false positives from unrelated text)
   local check_12b_section watcher_section output_section
@@ -1381,23 +1381,45 @@ run_tests() {
     return
   fi
 
-  # Test 41: TOML constants file exists and is parseable (fail closed)
+  # Test 41: TOML catalog file exists, is parseable, and contains recovery-stalled alarm
+  # Extract recovery-stalled alarm constants from metric-alarms.toml
   local streak_val burst_val delta_val snapshot_file mode_val metric_name metric_label
-  streak_val=$(grep -oP '^streak\s*=\s*\K\d+' "$constants_file" 2>/dev/null) || streak_val=""
-  burst_val=$(grep -oP '^burst\s*=\s*\K\d+' "$constants_file" 2>/dev/null) || burst_val=""
-  delta_val=$(grep -oP '^delta\s*=\s*\K\d+' "$constants_file" 2>/dev/null) || delta_val=""
-  snapshot_file=$(grep -oP '^file\s*=\s*"\K[^"]+' "$constants_file" 2>/dev/null) || snapshot_file=""
-  mode_val=$(grep -oP '^mode\s*=\s*"\K[^"]+' "$constants_file" 2>/dev/null) || mode_val=""
-  metric_name=$(grep -oP '^name\s*=\s*"\K[^"]+' "$constants_file" 2>/dev/null) || metric_name=""
-  metric_label=$(grep -oP "^label\s*=\s*'\K[^']+" "$constants_file" 2>/dev/null) || metric_label=""
+  # Use Python to extract the recovery-stalled alarm entry from the TOML
+  local toml_extract
+  toml_extract=$(python3 - "$constants_file" <<'PYEOF'
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], 'rb') as f:
+    data = tomllib.load(f)
+for a in data['alarm']:
+    if a['name'] == 'recovery-stalled':
+        print('streak_val=' + str(a['streak_threshold']))
+        print('burst_val=' + str(a['burst_threshold']))
+        print('delta_val=' + str(a['delta_threshold']))
+        print('snapshot_file=' + a['snapshot_file'])
+        print('metric_name=' + a['metric'])
+        labels = a.get('labels', [])
+        if labels:
+            lbl = labels[0]['key'] + '="' + labels[0]['value'] + '"'
+            print("metric_label='" + lbl + "'")
+        gates = a.get('gates', [])
+        if 'validator-only' in gates:
+            print('mode_val=validator')
+        sys.exit(0)
+print('NOT_FOUND')
+sys.exit(1)
+PYEOF
+  ) || toml_extract=""
 
-  if [[ -n "$streak_val" && -n "$burst_val" && -n "$delta_val" \
-        && -n "$snapshot_file" && -n "$mode_val" \
-        && -n "$metric_name" && -n "$metric_label" ]]; then
-    tap_ok "check-12b-constants: TOML exists and parseable (streak=$streak_val burst=$burst_val delta=$delta_val)"
+  if [[ -n "$toml_extract" && "$toml_extract" != "NOT_FOUND" ]]; then
+    eval "$toml_extract"
+    tap_ok "metric-alarms: TOML exists and parseable (streak=$streak_val burst=$burst_val delta=$delta_val)"
   else
-    tap_not_ok "check-12b-constants: TOML exists and parseable" \
-      "Missing or unparseable: streak=$streak_val burst=$burst_val delta=$delta_val file=$snapshot_file mode=$mode_val metric=$metric_name label=$metric_label"
+    tap_not_ok "metric-alarms: TOML exists and parseable" \
+      "Failed to parse recovery-stalled alarm from metric-alarms.toml"
     # Fail closed: remaining 12b tests cannot proceed
     while [[ $TAP_CURRENT -lt $TAP_PLAN ]]; do
       tap_not_ok "check-12b (skipped: TOML parse failed)"
@@ -1484,13 +1506,13 @@ run_tests() {
       "monitor-loop: watcher must mention Check 12b + recovery_stalled; snapshot must say Validator mode only"
   fi
 
-  # Test 50: Reference link to constants file in both SKILL.md files
-  if grep -Fq 'check-12b-constants.toml' "$tick_file" \
-     && grep -Fq 'check-12b-constants.toml' "$loop_file"; then
-    tap_ok "check-12b-constants: reference link in both SKILL.md files"
+  # Test 50: Reference link to catalog file in both SKILL.md files
+  if grep -Fq 'metric-alarms.toml' "$tick_file" \
+     && grep -Fq 'metric-alarms.toml' "$loop_file"; then
+    tap_ok "metric-alarms: reference link in both SKILL.md files"
   else
-    tap_not_ok "check-12b-constants: reference link in both SKILL.md files" \
-      "Both SKILL.md must contain 'check-12b-constants.toml'"
+    tap_not_ok "metric-alarms: reference link in both SKILL.md files" \
+      "Both SKILL.md must contain 'metric-alarms.toml'"
   fi
 
   # Test 51: Delta threshold cross-validated against TOML
@@ -2829,7 +2851,11 @@ MOCK_BINARY
   fi  # end identity_section guard
 
   # Clean up all background processes from lifecycle tests
+  # Disable errexit temporarily — kill+wait of background processes can
+  # propagate SIGCHLD exit codes that trigger set -e and premature exit.
+  set +e
   _wt_cleanup_bg
+  set -e
   # Cross-validate PostVerifyReason labels in crates/herder/src/scp_verify.rs
   # against the hard-coded label sets in monitor-tick and monitor-loop SKILL.md.
   # See issue #2519 (follow-up from #2481).
@@ -2859,39 +2885,53 @@ MOCK_BINARY
   fi
 
   # Extract scoped sections from skill docs
-  local tick_ratio_section loop_ratio_section
-  tick_ratio_section=$(extract_md_section "$tick_file" '^### Ratio checks')
+  # The ratio checks section was moved from monitor-tick SKILL.md to the TOML
+  # catalog (metric-alarms.toml). Validate labels against TOML and monitor-loop.
+  local loop_ratio_section
   loop_ratio_section=$(sed -n '/^\*\*D\. Ratio checks/,/^\*\*[A-Z]\./p' "$loop_file")
 
+  # Extract expected_labels from the TOML catalog (scp-accept-rate-low alarm)
+  local toml_labels
+  toml_labels=$(python3 - "$REPO_ROOT/.claude/skills/shared/metric-alarms.toml" <<'PYEOF'
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], 'rb') as f:
+    data = tomllib.load(f)
+for a in data['alarm']:
+    if a['name'] == 'scp-accept-rate-low' and 'expected_labels' in a:
+        for lbl in sorted(a['expected_labels']):
+            print(lbl)
+        break
+PYEOF
+  ) || toml_labels=""
+
   # If sections are empty, all remaining tests fail
-  if [[ -z "$tick_ratio_section" || -z "$loop_ratio_section" ]]; then
+  if [[ -z "$loop_ratio_section" || -z "$toml_labels" ]]; then
     local _i; for _i in 141 142 143 144 145; do
-      tap_not_ok "pv-label-sync: skipped (section extraction failed: tick_empty=$([ -z "$tick_ratio_section" ] && echo yes || echo no) loop_empty=$([ -z "$loop_ratio_section" ] && echo yes || echo no))"
+      tap_not_ok "pv-label-sync: skipped (section extraction failed: loop_empty=$([ -z "$loop_ratio_section" ] && echo yes || echo no) toml_empty=$([ -z "$toml_labels" ] && echo yes || echo no))"
     done
     return
   fi
 
-  # Test 141: monitor-tick narrative labels match canonical
-  # The label list spans multiple lines after "reason labels is:" until ". If"
-  local tick_narrative_text tick_narrative_labels
-  tick_narrative_text=$(echo "$tick_ratio_section" | sed -n '/reason labels is:/,/\. If/p')
-  tick_narrative_labels=$(echo "$tick_narrative_text" | grep -oP '`\K[a-z_]+(?=`)' | sort)
-  if [[ "$tick_narrative_labels" == "$canonical_labels" ]]; then
-    tap_ok "pv-label-sync: monitor-tick narrative labels ($canonical_count)"
+  # Test 141: TOML expected_labels match canonical source labels
+  if [[ "$toml_labels" == "$canonical_labels" ]]; then
+    tap_ok "pv-label-sync: TOML expected_labels match source ($canonical_count)"
   else
-    tap_not_ok "pv-label-sync: monitor-tick narrative labels" \
-      "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$tick_narrative_labels" | tr '\n' ' ')"
+    tap_not_ok "pv-label-sync: TOML expected_labels match source" \
+      "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$toml_labels" | tr '\n' ' ')"
   fi
 
-  # Test 142: monitor-tick pseudocode labels match canonical
-  local tick_printf_line tick_pseudo_labels
-  tick_printf_line=$(echo "$tick_ratio_section" | grep "printf '%s\\\\n'" || true)
-  tick_pseudo_labels=$(echo "$tick_printf_line" | grep -oP "(?<=\\\\n' )[^|]+" | tr ' ' '\n' | grep -v '^$' | sed 's/|.*//' | sort)
-  if [[ "$tick_pseudo_labels" == "$canonical_labels" ]]; then
-    tap_ok "pv-label-sync: monitor-tick pseudocode labels ($canonical_count)"
+  # Test 142: TOML expected_labels count matches canonical
+  local toml_label_count
+  toml_label_count=$(echo "$toml_labels" | grep -c . || true)
+  if [[ "$toml_label_count" == "$canonical_count" ]]; then
+    tap_ok "pv-label-sync: TOML label count matches source ($canonical_count)"
   else
-    tap_not_ok "pv-label-sync: monitor-tick pseudocode labels" \
-      "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$tick_pseudo_labels" | tr '\n' ' ')"
+    tap_not_ok "pv-label-sync: TOML label count" \
+      "expected $canonical_count, got $toml_label_count"
   fi
 
   # Test 143: monitor-loop inline labels match canonical
@@ -2905,27 +2945,7 @@ MOCK_BINARY
       "expected: $(echo "$canonical_labels" | tr '\n' ' ') got: $(echo "$loop_inline_labels" | tr '\n' ' ')"
   fi
 
-  # Test 144: monitor-tick label count references match canonical
-  local tick_count_refs tick_counts_ok=true
-  tick_count_refs=$(echo "$tick_ratio_section" | grep -oP '(?:all |the |exact |expected )\K\d+(?=[ -](?:label|post-verify|`henyey_scp_post_verify))' || true)
-  if [[ -z "$tick_count_refs" ]]; then
-    tick_counts_ok=false
-  else
-    while IFS= read -r count_val; do
-      if [[ "$count_val" != "$canonical_count" ]]; then
-        tick_counts_ok=false
-        break
-      fi
-    done <<< "$tick_count_refs"
-  fi
-  if [[ "$tick_counts_ok" == "true" ]]; then
-    tap_ok "pv-label-sync: monitor-tick count refs ($canonical_count)"
-  else
-    tap_not_ok "pv-label-sync: monitor-tick count refs" \
-      "expected all=$canonical_count, found: $(echo "$tick_count_refs" | tr '\n' ' ')"
-  fi
-
-  # Test 145: monitor-loop label count references match canonical
+  # Test 144: monitor-loop label count references match canonical
   local loop_count_refs loop_counts_ok=true
   loop_count_refs=$(echo "$loop_ratio_section" | grep -oP '(?:all |the |exact |expected )\K\d+(?=[ -](?:label|post-verify|`henyey_scp_post_verify))' || true)
   if [[ -z "$loop_count_refs" ]]; then
@@ -2943,6 +2963,87 @@ MOCK_BINARY
   else
     tap_not_ok "pv-label-sync: monitor-loop count refs" \
       "expected all=$canonical_count, found: $(echo "$loop_count_refs" | tr '\n' ' ')"
+  fi
+
+  # Test 145: evaluator source references all expected labels
+  local eval_script="$REPO_ROOT/scripts/lib/eval-alarms.py"
+  if [[ -f "$eval_script" ]] && grep -Fq 'expected_labels' "$eval_script"; then
+    tap_ok "pv-label-sync: evaluator handles expected_labels"
+  else
+    tap_not_ok "pv-label-sync: evaluator handles expected_labels" \
+      "eval-alarms.py missing or doesn't reference expected_labels"
+  fi
+
+  # ── Alarm catalog evaluator tests (T146-T147) ──────────────────────────────
+  # Validate the TOML alarm catalog and evaluator script
+
+  # Test 146: evaluator --validate-only passes for the TOML catalog
+  local eval_script="$REPO_ROOT/scripts/lib/eval-alarms.py"
+  local catalog_file="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
+  if [[ -f "$eval_script" && -f "$catalog_file" ]]; then
+    local validate_out
+    validate_out=$(python3 "$eval_script" --catalog "$catalog_file" --validate-only 2>&1) || true
+    if echo "$validate_out" | grep -q '"valid": true'; then
+      local alarm_count
+      alarm_count=$(echo "$validate_out" | python3 -c "import json,sys; print(json.load(sys.stdin)['alarm_count'])" 2>/dev/null || echo "?")
+      tap_ok "eval-alarms: --validate-only passes ($alarm_count alarms)"
+    else
+      tap_not_ok "eval-alarms: --validate-only" \
+        "Validation failed: $validate_out"
+    fi
+  else
+    tap_not_ok "eval-alarms: --validate-only" \
+      "Missing eval-alarms.py or metric-alarms.toml"
+  fi
+
+  # Test 147: every alarm metric in the TOML exists in crates/ source or is a known
+  #           stellar-core metric (stellar_* prefix)
+  local metrics_missing=0 metrics_checked=0 missing_list=""
+  if [[ -f "$catalog_file" ]]; then
+    local alarm_metrics
+    alarm_metrics=$(python3 - "$catalog_file" <<'PYEOF'
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], 'rb') as f:
+    data = tomllib.load(f)
+for a in data['alarm']:
+    # Extract all metric names from any alarm kind
+    for key in ['metric', 'metric_sum', 'numerator_metric', 'denominator_metric',
+                'numerator', 'denominator', 'numerator_sum', 'denominator_sum']:
+        v = a.get(key)
+        if isinstance(v, str):
+            print(v)
+        elif isinstance(v, list):
+            for m in v:
+                print(m)
+PYEOF
+    ) || true
+    alarm_metrics=$(echo "$alarm_metrics" | sort -u)
+    while IFS= read -r m; do
+      [[ -z "$m" ]] && continue
+      metrics_checked=$((metrics_checked + 1))
+      # stellar_* metrics come from stellar-core, henyey_* from our crates
+      if [[ "$m" == stellar_* ]]; then
+        continue  # stellar-core metrics — accepted without source grep
+      fi
+      # Strip label selector for source grep (e.g., metric{key="val"} → metric)
+      local base_metric="${m%%\{*}"
+      if ! grep -rq "$base_metric" "$REPO_ROOT/crates/" 2>/dev/null; then
+        metrics_missing=$((metrics_missing + 1))
+        missing_list="$missing_list $m"
+      fi
+    done <<< "$alarm_metrics"
+    if [[ "$metrics_missing" -eq 0 ]]; then
+      tap_ok "eval-alarms: all $metrics_checked alarm metrics found in source"
+    else
+      tap_not_ok "eval-alarms: alarm metrics source-grep" \
+        "$metrics_missing missing:$missing_list"
+    fi
+  else
+    tap_not_ok "eval-alarms: alarm metrics source-grep" "catalog missing"
   fi
 }
 check_skill_structure

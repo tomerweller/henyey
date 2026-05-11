@@ -1,0 +1,26 @@
+# Breaching node — ledger age high, lost sync, fd near exhaustion
+stellar_ledger_age_current_seconds 45
+stellar_herder_state 1
+stellar_peer_count 3
+stellar_overlay_inbound_authenticated 1
+stellar_herder_pending_envelopes 3000
+henyey_jemalloc_fragmentation_pct 55
+henyey_scp_verify_input_backlog 200
+henyey_scp_verifier_thread_state 2
+henyey_overlay_fetch_channel_depth 600
+henyey_process_open_fds 900
+henyey_process_max_fds 1024
+henyey_herder_drift_max_seconds 15
+stellar_scp_timing_externalized_seconds 12
+stellar_scp_timing_nominated_seconds 9
+# Counters with large deltas
+stellar_herder_lost_sync_total 105
+henyey_post_catchup_hard_reset_total 1
+stellar_overlay_timeout_idle_total 200
+stellar_overlay_timeout_straggler_total 100
+stellar_overlay_error_read_total 80
+stellar_overlay_error_write_total 30
+henyey_archive_cache_refresh_error_total 3
+henyey_archive_cache_refresh_timeout_total 8
+# Counter-streak — large delta (burst)
+henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"} 20

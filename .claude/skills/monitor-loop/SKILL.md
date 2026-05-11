@@ -239,7 +239,7 @@ table is the human reference.
 **B. Streak-gated counters — fire on sustained delta breach (3 consecutive ticks) or burst (single-tick delta ≥ 10)**
 
 > **Canonical constants:** Check 12b threshold values and rules are defined in
-> [`shared/check-12b-constants.toml`](../shared/check-12b-constants.toml).
+> [`shared/metric-alarms.toml`](../shared/metric-alarms.toml).
 > The table below is a quick-reference summary; the TOML file is authoritative.
 
 These counter-based checks use streak gating rather than immediate-fire thresholds
@@ -298,7 +298,7 @@ Invalidate on PID/start_ticks change, malformed snapshot, or counter reset (curr
 
 **Counter-streak snapshot** persisted at `~/data/<session-id>/metrics/counter_streak_snapshot`
 (format and invalidation rules defined in Check 12b of monitor-tick/SKILL.md;
-path canonicalized in [`shared/check-12b-constants.toml`](../shared/check-12b-constants.toml)).
+path canonicalized in [`shared/metric-alarms.toml`](../shared/metric-alarms.toml)).
 Separate from ratio snapshot — runs independently of ratio skip conditions (see
 Check 12b in monitor-tick for full state machine). Validator mode only.
 
@@ -728,8 +728,8 @@ Invocation options:
   ```
 
 For the authoritative catalog (thresholds, metric names, rules), see
-`/monitor-tick/SKILL.md`. Check 12b threshold constants are canonicalized in
-[`shared/check-12b-constants.toml`](../shared/check-12b-constants.toml) for
+`/monitor-tick/SKILL.md`. All alarm constants are canonicalized in
+[`shared/metric-alarms.toml`](../shared/metric-alarms.toml) for
 machine-readable validation. The human-readable reference catalog in
 [Metrics Scan](#metrics-scan) above is informational; the live catalog
 is in the tick skill.

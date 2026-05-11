@@ -55,7 +55,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `metrics/prev.prom` | previous Prometheus scrape | check 12 |
 | `metrics/scrape_identity` | process identity of the scrape now in prev.prom | check 12 |
 | `metrics/ratio_snapshot` | counter-ratio history (check 12) | check 12 |
-| `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b ([constants](../shared/check-12b-constants.toml)) |
+| `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b ([metric-alarms](../shared/metric-alarms.toml)) |
 | `metrics/anomaly_cooldown.json` | alert dedup state | check 9 |
 | `logs/monitor.log` | node stdout/stderr (rotated on restart) | node process |
 | `cargo-target/` | cached build tree | cargo |
@@ -703,328 +703,53 @@ against a node that is in real-time sync with age=2s).
 6. **Counter reset handling**: for any counter, if `current < prev`, treat
    `delta = current` (defense-in-depth for within-incarnation counter resets).
 
-**Post-restart warmup exemptions** — for the first 2 ticks after a detected
-restart (check 3, check 10, or `CRASH_RECOVERY=yes`), skip these alerts.
-Overlay handshake + jemalloc arena stabilization + from-zero counters take
-~10 minutes to settle.
+### Alarm evaluation via TOML catalog + Python evaluator
 
-- `henyey_jemalloc_fragmentation_pct > 50` (post-restart frag ramps ~35-45%, settles to ~18%)
-- `stellar_peer_count < 8` (peer count ramps 0 → 10+ over the first 10 min)
-- `stellar_overlay_inbound_authenticated < 3`
-- `stellar_scp_timing_externalized_seconds > 3`
-- `stellar_scp_timing_nominated_seconds > 2`
-- counter-started-at-zero delta alerts (any catalog entry whose `prev` is 0)
+All alarm definitions (thresholds, extraction forms, gating, persistence guards,
+filing metadata) are in [`shared/metric-alarms.toml`](../shared/metric-alarms.toml).
+The evaluator script handles extraction, delta/ratio/p99/streak computation, and
+emits structured JSON. Warmup exemptions, counter-reset handling, and
+`PREV_PROM_INVALID` semantics are encoded in the evaluator — see the TOML
+catalog for per-alarm gates and the evaluator source for edge-case behavior.
 
-### Metric alert catalog
-
-Catalog-wide notes:
-- All entries below are subject to the warmup exemptions above and the cooldown
-  rule in §Firing alerts.
-- "Synced-only gating" = `uptime > 15m AND CRASH_RECOVERY=no AND FRESH_START=no`.
-  These gauges fire only when the node should be in real-time sync; the
-  authoritative sync check is (2). The catchup phases are legitimate
-  non-synced states.
-
-**COUNTERS** (fire on `delta ≥ threshold` per tick):
-
-- `stellar_herder_lost_sync_total` ≥1 → SYNC
-- `henyey_post_catchup_hard_reset_total` ≥1 → ACTION
-- `(stellar_overlay_timeout_idle_total + stellar_overlay_timeout_straggler_total)` ≥5× prior-tick-sum → WARN
-- `(stellar_overlay_error_read_total + stellar_overlay_error_write_total)` ≥50 → WARN
-- `henyey_archive_cache_refresh_error_total` ≥1 → NONC
-- `henyey_archive_cache_refresh_timeout_total` ≥3 → NONC
-
-`stellar_ledger_apply_failure_total`, `henyey_scp_post_verify_drops_total`,
-and `stellar_herder_pending_too_old_total` are covered by the ratio checks
-below (traffic-proportional and self-calibrating); do NOT check absolute deltas.
-
-**GAUGES** (fire on absolute threshold against current snapshot):
-
-- `stellar_peer_count` <8 → WARN
-- `stellar_overlay_inbound_authenticated` <3 → WARN (synced-only gating; healthy fleet has 50+ inbound. Aggregate `peer_count` can be ≥8 from outbound while inbound starves consensus; this catches that case)
-- `stellar_ledger_age_current_seconds` >30 → SYNC (synced-only gating)
-- `stellar_herder_state` !=2 → SYNC (synced-only gating)
-- `henyey_jemalloc_fragmentation_pct` >50 on two consecutive ticks → WARN
-- `henyey_scp_verify_input_backlog` >100 on two consecutive ticks → WARN (single snapshots routinely spike to 100+ during slot externalize bursts and drain to 0 within seconds — gate on persistence. Sample /metrics 5x at 2s intervals to verify before filing)
-- `henyey_scp_verifier_thread_state` !=0 → WARN (0=Running, 1=Stopping, 2=Dead)
-- `stellar_herder_pending_envelopes` >2000 → WARN
-- `henyey_overlay_fetch_channel_depth` >500 on two consecutive ticks → WARN (the `_max` variant is a monotonic high-water mark that never resets after catchup-tail spikes — use the live gauge with persistence guard, mirroring the scp_verify_input_backlog pattern. Sample /metrics 5x at 2s intervals to verify before filing)
-- `(henyey_process_open_fds / henyey_process_max_fds)` >0.85 → WARN
-- `henyey_herder_drift_max_seconds` >10 → NONC
-- `stellar_scp_timing_externalized_seconds` >10 → WARN (this is a SLOT-CYCLE metric:
-  first-envelope-received → self-externalize, naturally ~4-6s on mainnet's 5s slots.
-  The earlier `>3` threshold was a misread of #1934 — it compared against stellar-core's
-  `mFirstToSelfExternalizeLag` which measures a different, much narrower window (any-node
-  externalize → self-externalize, ~0.3-0.5s healthy). Until we expose a matching metric,
-  alert only on >2x normal slot-cycle = real degradation)
-- `stellar_scp_timing_nominated_seconds` >7 → WARN (also a SLOT-CYCLE metric measured from
-  first local nomination vote to self-externalize; healthy floor ~3-5s on mainnet)
-
-`quorum_agree` / `quorum_missing` / `quorum_fail_at` are intentionally NOT
-monitored — they snapshot the tracking slot's QuorumInfo and return
-false-positive noise between externalizations; see `monitor-loop/SKILL.md`
-Metrics Scan section for the code-path explanation.
-
-**HISTOGRAMS** (fire on p99 bucket of per-tick delta): for each histogram H,
-
-```
-bucket_delta[le] = H_bucket_current[le] - H_bucket_prev[le]
-count_delta = H_count_current - H_count_prev
-```
-
-Skip if `count_delta < 20`. Compute cumulative bucket delta at upper edge L:
-`sum(bucket_delta[le] for le ≤ L)`. The smallest L where cumulative ≥
-`0.99 * count_delta` is the p99 upper bound.
-
-Thresholds (all WARN):
-
-- `henyey_ledger_close_handle_complete_seconds` p99 >0.5s
-- `henyey_ledger_close_dispatch_to_join_seconds` p99 >5s
-- `henyey_ledger_close_post_complete_seconds` p99 >0.5s
-- `henyey_ledger_close_tx_exec_seconds` p99 >1s
-- `henyey_ledger_close_soroban_exec_seconds` p99 >1s
-- `henyey_ledger_close_commit_seconds` p99 >0.5s
-- `henyey_ledger_close_soroban_state_seconds` p99 >0.5s
-- `henyey_ledger_close_complete_tx_queue_seconds` p99 >0.5s
-
-Mean check (`sum_delta / count_delta`) is a cheaper fallback — fire on whichever breaches.
-
-### Metric extraction forms
-
-Counter catalog entries use one of three extraction forms. When adding a new
-counter, check the emission site in `crates/app/src/metrics.rs` to determine
-whether the metric is scalar or labeled, and use the appropriate form.
-
-**Form 1 — Scalar counter** (most counters):
-```bash
-cur=$(grep -E '^<metric_name> ' current.prom | awk '{printf "%d", $2}')
-prev=$(grep -E '^<metric_name> ' prev.prom | awk '{printf "%d", $2}')
-```
-
-**Form 2 — Single labeled series** (extract one specific label value):
-```bash
-cur=$(grep -E '^<metric_name>\{<label>="<value>"\} ' current.prom | awk '{printf "%d", $2}')
-prev=$(grep -E '^<metric_name>\{<label>="<value>"\} ' prev.prom | awk '{printf "%d", $2}')
-```
-
-**Form 3 — Sum of explicit labeled series** (sum specific label values):
-```bash
-cur=$(awk '/^<metric_name>\{<label>="<value1>"\}|^<metric_name>\{<label>="<value2>"\}/ {sum+=$NF} END{printf "%d", sum+0}' current.prom)
-prev=$(awk '/^<metric_name>\{<label>="<value1>"\}|^<metric_name>\{<label>="<value2>"\}/ {sum+=$NF} END{printf "%d", sum+0}' prev.prom)
-```
-
-For all forms, delta handling is identical:
-- Extract `prev` using the same pattern against `prev.prom` (default 0 if absent)
-- If `current < prev`: counter reset (node restarted) → `delta = current`
-- Otherwise: `delta = current - prev`
-
-**Label-presence validation:** For labeled counters, validate that the
-expected label set is present before extracting. This catches silent
-renames or removals that would weaken an alert. If the expected label set
-is missing or mutated, **skip the alert entirely** rather than treating
-missing series as zero. Follow the existing pattern used for
-`henyey_scp_post_verify_total` (lines 406-413):
-```bash
-labels=$(grep -oP '^<metric_name>\{<label>="\K[^"]+' current.prom | sort)
-expected=$(printf '%s\n' <label1> <label2> ... | sort)
-if [ "$labels" != "$expected" ]; then
-  # report: <metric>: skipped (label set mismatch)
-fi
-```
-
-### Ratio checks — sustained breach detection
-
-Three ratio-based checks replace the former absolute-delta thresholds for
-`stellar_ledger_apply_failure_total`, `henyey_scp_post_verify_drops_total`,
-and `stellar_herder_pending_too_old_total`.
-These fire only after **3 consecutive ticks** of threshold breach, avoiding
-transient spikes.
-
-**Required inputs** — global (all must be present, non-empty, numeric; if any
-missing or invalid, skip ratio checks entirely, empty the ratio snapshot,
-reset streaks):
-
-1. `stellar_ledger_age_current_seconds` — sync gating
-2. `stellar_ledger_apply_success_total`
-3. `stellar_ledger_apply_failure_total`
-4. `henyey_scp_post_verify_total{reason="accepted"}`
-5. `henyey_scp_post_verify_total{reason="processed_directly"}`
-6. Sum of all 14 `henyey_scp_post_verify_total{reason="..."}` lines (`pv_total_sum`)
-
-**Per-check required inputs** — these are NOT part of the global required set.
-If missing, only the pending check (Check 3) skips; SCP and apply proceed
-normally:
-
-7. `stellar_herder_pending_too_old_total`
-8. `stellar_herder_pending_received_total`
-
-**Post-verify label-set validation:** After extracting the 14
-`henyey_scp_post_verify_total{reason="..."}` lines, validate that the exact set
-of reason labels is: `invalid_sig`, `panic`, `drift_range`, `drift_close_time`,
-`drift_cannot_receive`, `self_message`, `non_quorum`, `buffered`, `duplicate`,
-`too_far`, `buffer_full`, `processed_directly`, `per_slot_full`, `accepted`. If any label is
-missing or unexpected labels appear, treat as missing counters (partial scrape
-or label change).
-
-**Skip conditions** (skip all ratio checks when any is true):
-- `FRESH_START=yes`
-- heartbeat event `gap` > 5
-- `stellar_ledger_age_current_seconds > 30`
-- Process uptime < 10 minutes
-- `/metrics` fetch fails (curl error or empty response)
-- `/metrics` returns "recorder not installed"
-- Any required counter missing or invalid
-- Post-verify label set ≠ expected 14 labels
-
-On any skip: **empty** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot`,
-reset all streak counters to 0, report `metrics_ratio: skipped (<reason>)`.
-
-**Snapshot file:** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot`
-
-Format:
-```
-version=1
-pid=<PID>
-start_ticks=<field 22 from /proc/$PID/stat>
-timestamp=<ISO8601>
-apply_success=<value>
-apply_failure=<value>
-pv_accepted=<value>
-pv_processed_directly=<value>
-pv_total_sum=<value>
-apply_breach_streak=<N>
-scp_breach_streak=<N>
-pending_too_old=<value>
-pending_received=<value>
-pending_breach_streak=<N>
-```
-
-**Process identity:** `start_ticks` = field 22 from `/proc/$PID/stat` (starttime
-in clock ticks since boot). Extract with `awk '{print $22}' /proc/$PID/stat`.
-Locale-independent, catches PID reuse.
-
-**Invalidation:**
-- PID or `start_ticks` changed → discard, write new baseline, reset streaks
-- Snapshot malformed, missing fields, or `version` ≠ `1` → discard
-- Any current counter < previous value → discard (counter reset)
-
-**Metric extraction** — illustrative pseudocode (not literal shell; each bail
-point must stop ratio-check processing for this tick):
+**Run the evaluator:**
 
 ```bash
-metrics_body=$(curl -s http://localhost:$MONITOR_ADMIN_PORT/metrics)
+# Set env vars from checks 3/10 state:
+export PREV_PROM_INVALID=...     # true/false from scrape_identity check
+export WARMUP_TICKS_REMAINING=... # 0/1/2 from restart detection
+export FRESH_START=...            # yes/no
+export CRASH_RECOVERY=...        # yes/no
+export UPTIME_SECONDS=...        # from process uptime
+export MONITOR_MODE=...          # validator/watcher
+export PID=...                   # process PID
+export START_TICKS=...           # field 22 from /proc/$PID/stat
 
-# Bail on fetch failure — stop ratio checks for this tick
-if [ -z "$metrics_body" ]; then
-  > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
-  # report: metrics_ratio: skipped (fetch failed)
-  # STOP — do not proceed to extraction or ratio evaluation
-fi
-
-# Bail if recorder not installed — stop ratio checks
-if echo "$metrics_body" | grep -q 'metrics recorder not installed'; then
-  > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
-  # report: metrics_ratio: skipped (recorder not installed)
-  # STOP
-fi
-
-ledger_age=$(echo "$metrics_body" | grep -E '^stellar_ledger_age_current_seconds ' | awk '{printf "%d", $2}')
-apply_success=$(echo "$metrics_body" | grep -E '^stellar_ledger_apply_success_total ' | awk '{printf "%d", $2}')
-apply_failure=$(echo "$metrics_body" | grep -E '^stellar_ledger_apply_failure_total ' | awk '{printf "%d", $2}')
-pv_accepted=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="accepted"\} ' | awk '{printf "%d", $2}')
-pv_processed=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="processed_directly"\} ' | awk '{printf "%d", $2}')
-
-# Validate exact 14-label set — STOP if mismatch
-pv_labels=$(echo "$metrics_body" | grep -oP '^henyey_scp_post_verify_total\{reason="\K[^"]+' | sort)
-expected_labels=$(printf '%s\n' accepted buffer_full buffered drift_cannot_receive drift_close_time drift_range duplicate invalid_sig non_quorum panic per_slot_full processed_directly self_message too_far | sort)
-if [ "$pv_labels" != "$expected_labels" ]; then
-  > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
-  # report: metrics_ratio: skipped (label set mismatch)
-  # STOP
-fi
-
-pv_total_sum=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="[^"]+"\} ' | awk '{sum+=$2} END {printf "%d", sum}')
-
-# Validate all 6 global values present and numeric — STOP if any invalid
-for v in "$ledger_age" "$apply_success" "$apply_failure" "$pv_accepted" "$pv_processed" "$pv_total_sum"; do
-  if [ -z "$v" ] || ! echo "$v" | grep -qE '^[0-9]+$'; then
-    > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
-    # report: metrics_ratio: skipped (missing counters)
-    # STOP
-  fi
-done
-
-# Per-check inputs for pending (Check 3) — if missing, only Check 3 skips
-pending_too_old=$(echo "$metrics_body" | grep -E '^stellar_herder_pending_too_old_total ' | awk '{printf "%d", $2}')
-pending_received=$(echo "$metrics_body" | grep -E '^stellar_herder_pending_received_total ' | awk '{printf "%d", $2}')
-pending_counters_valid=true
-for v in "$pending_too_old" "$pending_received"; do
-  if [ -z "$v" ] || ! echo "$v" | grep -qE '^[0-9]+$'; then
-    pending_counters_valid=false
-    break
-  fi
-done
-
-# henyey_recovery_stalled_tick_total: extract via Form 2 (see §Metric extraction
-# forms). Relaxed label validation: require only the forcing_catchup_behind
-# label to be present (minimum for Check 12b alerting). Other labels
-# (backoff_active, forcing_catchup_not_behind, archive_behind_peer_ahead_hard_reset,
-# at_tip_no_scp_hard_reset) may not yet exist on a fresh node — only 3 of the 5
-# are pre-registered in the metrics macro (crates/app/src/metrics.rs:613); the
-# remaining 2 are created dynamically on first use of each recovery path.
-# If forcing_catchup_behind is missing, skip Check 12b for this tick.
-# Alerting is streak-gated — see Check 12b section for logic.
+eval_result=$(python3 scripts/lib/eval-alarms.py \
+    --catalog .claude/skills/shared/metric-alarms.toml \
+    --current "$HOME/data/$MONITOR_SESSION_ID/metrics/current.prom" \
+    --prev "$HOME/data/$MONITOR_SESSION_ID/metrics/prev.prom" \
+    --state-dir "$HOME/data/$MONITOR_SESSION_ID/metrics")
 ```
 
-**Check 1: SCP post-verify acceptance rate**
-- Numerator delta: `delta(pv_accepted) + delta(pv_processed)`
-- Denominator delta: `delta(pv_total_sum)`
-- Alert: `(numerator / denominator) < 0.05` (less than 5% accepted) for 3 consecutive ticks
-- Min denominator delta: 500 (below → `scp: skipped (low volume)`, reset scp streak)
-- Baseline acceptance on mainnet: ~10-20%. <5% sustained = nearly nothing reaching SCP.
-- On breach: increment `scp_breach_streak`. If streak ≥ 3, route through Bug Filing Workflow
-  (investigate verifier thread, stale envelopes, sync state).
-- **On healthy tick** (ratio ≥ 0.05 with sufficient volume): reset `scp_breach_streak` to 0.
+**Process the JSON output:**
 
-**Check 2: Transaction apply failure rate**
-- Numerator delta: `delta(apply_failure)`
-- Denominator delta: `delta(apply_failure) + delta(apply_success)`
-- Alert: `(numerator / denominator) > 0.50` (over 50% fail) for 3 consecutive ticks
-- Min denominator delta: 200 (below → `apply: skipped (low volume)`, reset apply streak)
-- On breach: increment `apply_breach_streak`. If streak ≥ 3, investigate in same tick.
-  If evidence points to henyey apply-engine bug, file/comment via Bug Filing Workflow.
-  If expected bad-tx traffic (spam wave, known rejections), report as WARNING without filing.
-- **On healthy tick** (ratio ≤ 0.50 with sufficient volume): reset `apply_breach_streak` to 0.
-
-**Check 3: Pending too-old rate**
-- Numerator delta: `delta(pending_too_old)`
-- Denominator delta: `delta(pending_received)`
-- Alert: `(numerator / denominator) > 0.50` (over 50% too old) for 3 consecutive ticks
-- Min denominator delta: 100 (below → `pending: skipped (low volume)`, reset pending streak)
-- **Per-check skip:** If `pending_counters_valid` is false (missing counters), skip this check
-  only — report `pending: skipped (missing counters)`, reset `pending_breach_streak` to 0.
-  SCP and apply checks proceed normally.
-- On breach: increment `pending_breach_streak`. If streak ≥ 3, report as WARNING
-  (overlay lag or stale-envelope flood). Investigate overlay peer health and slot progression.
-- **On healthy tick** (ratio ≤ 0.50 with sufficient volume): reset `pending_breach_streak` to 0.
-
-**Per-check state machine** (each check independently):
-- **Skip** (global skip, low volume, or missing data) → reset that check's streak to 0
-- **Healthy** (ratio within threshold, sufficient volume) → reset streak to 0
-- **Breach** (ratio exceeds threshold, sufficient volume) → increment streak
-
-**Per-check low-volume:** When only one check's denominator delta is below its
-minimum, that check skips (streak resets to 0) and the others proceed normally.
-
-**Thresholds are provisional** — tune after 1-2 weeks of production data.
-
-**Status report:** Each check independently reports one of: `ok (value)`,
-`skipped (reason)`, `WARNING value (N ticks)`, or `collecting baseline`.
+1. Parse `eval_result` as JSON.
+2. Read `aggregate.metrics_line`, `aggregate.metrics_ratio_line`, and
+   `aggregate.recovery_stalled_line` for the status report.
+3. For each alarm with `state == "firing"`:
+   - Read `cooldown_key`, `cooldown_seconds`, `filing_title`, `filing_search`,
+     `notes`, and `severity` from the alarm entry.
+   - Apply the cooldown + filing workflow below (§Firing alerts).
+   - For alarms with `notes`, apply the investigation guidance before filing
+     (e.g., "Sample /metrics 5x at 2s intervals to verify before filing").
+4. Check stderr (evaluator telemetry) for `series_matched=0` lines — these
+   indicate dead alarms that need investigation.
 
 ### Check 12b: Recovery-stalled streak (counter-based, independent of ratio checks)
 
 > **Canonical constants:** Threshold values, snapshot path, and applicability
-> are defined in [`shared/check-12b-constants.toml`](../shared/check-12b-constants.toml).
+> are defined in [`shared/metric-alarms.toml`](../shared/metric-alarms.toml).
 > This section is authoritative for the state machine *logic*; inline literals
 > are cross-validated against the TOML by `scripts/test-monitor-skill-snippets.sh`.
 

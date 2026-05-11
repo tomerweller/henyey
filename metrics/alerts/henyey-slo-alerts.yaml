@@ -318,7 +318,7 @@ groups:
       # ── Alert 6: Recovery Stalled (Forcing Catchup Behind) ────────
       # Fires when the recovery loop is stalled with reason
       # "forcing_catchup_behind" — the only operationally significant
-      # stall reason per ops guidance (check-12b-constants.toml).
+      # stall reason per ops guidance (metric-alarms.toml).
       # Threshold >= 3 matches the streak threshold.
       # Policy-based alert (no dashboard panel).
       - uid: henyey-recovery-stalled

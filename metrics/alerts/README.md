@@ -197,7 +197,7 @@ The `henyey_recovery_stalled_tick_total` counter is partitioned by a
 operationally significant — the others are transient/debug signals. The
 alert filters to `reason="forcing_catchup_behind"` and uses a threshold
 of `>= 3` increments in 10 minutes, matching the streak threshold from
-the ops guidance in `.claude/skills/shared/check-12b-constants.toml`.
+the ops guidance in `.claude/skills/shared/metric-alarms.toml`.
 
 #### Overlay fetch channel depth vs depth_max
 

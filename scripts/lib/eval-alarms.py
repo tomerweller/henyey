@@ -1,0 +1,1232 @@
+#!/usr/bin/env python3
+"""
+Evaluate monitor-tick alarms from a TOML catalog against Prometheus scrape data.
+
+Usage:
+    eval-alarms.py --catalog PATH --current PATH [--prev PATH] --state-dir PATH
+
+Inputs (env vars):
+    PREV_PROM_INVALID   true/false (default: false)
+    WARMUP_TICKS_REMAINING  0/1/2 (default: 0)
+    FRESH_START         yes/no (default: no)
+    CRASH_RECOVERY      yes/no (default: no)
+    UPTIME_SECONDS      integer (default: 9999)
+    MONITOR_MODE        validator/watcher (default: validator)
+    PID                 process PID (required for counter-ratio/counter-streak)
+    START_TICKS         /proc/PID/stat field 22 (required for counter-ratio/counter-streak)
+
+Outputs:
+    stdout: JSON (schema_version=1) with alarms array + aggregate lines
+    stderr: per-alarm telemetry (# alarm=NAME metric=METRIC series_matched=N state=STATE)
+    Side effects: writes updated snapshot files in --state-dir
+
+Exit codes:
+    0 = success
+    1 = fatal error (invalid TOML, missing required args)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib  # type: ignore[no-redef]
+
+SCHEMA_VERSION = 1
+VALID_KINDS = {
+    "gauge", "gauge-ratio", "counter", "counter-dynamic",
+    "counter-ratio", "histogram-p99", "counter-streak",
+}
+VALID_SEVERITIES = {"SYNC", "ACTION", "WARN", "NONC"}
+VALID_GATES = {"warmup-2-ticks", "synced-only", "uptime-min-15m", "validator-only"}
+VALID_OPS = {">", "<", ">=", "<=", "!=", "=="}
+
+
+# ── Prometheus parsing ───────────────────────────────────────────────────────
+
+def parse_prom(path: Path | None) -> dict[str, list[tuple[dict[str, str], float]]]:
+    """Parse a Prometheus text exposition file.
+
+    Returns {metric_name: [(labels_dict, value), ...]} where metric_name
+    is the base name (without labels). Labels are parsed from {k="v",...}.
+    """
+    if path is None or not path.exists() or path.stat().st_size == 0:
+        return {}
+
+    metrics: dict[str, list[tuple[dict[str, str], float]]] = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Parse: metric_name{label="val",...} value [timestamp]
+        # or:   metric_name value [timestamp]
+        m = re.match(
+            r'^([a-zA-Z_:][a-zA-Z0-9_:]*)'
+            r'(?:\{([^}]*)\})?\s+'
+            r'([0-9eE.+\-]+(?:NaN|Inf)?)',
+            line,
+        )
+        if not m:
+            continue
+        name = m.group(1)
+        labels_str = m.group(2) or ""
+        try:
+            value = float(m.group(3))
+        except ValueError:
+            continue
+
+        labels: dict[str, str] = {}
+        if labels_str:
+            for pair in re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)="([^"]*)"', labels_str):
+                labels[pair[0]] = pair[1]
+
+        metrics.setdefault(name, []).append((labels, value))
+    return metrics
+
+
+def extract_value(
+    metrics: dict[str, list[tuple[dict[str, str], float]]],
+    metric_name: str,
+    extraction: str,
+    labels: list[dict[str, str]] | None = None,
+) -> float | None:
+    """Extract a single numeric value from parsed metrics.
+
+    Returns None if the metric/label combination is not found.
+    """
+    # Handle metric names with inline label selectors like
+    # 'henyey_scp_post_verify_total{reason="accepted"}'
+    inline_labels: dict[str, str] = {}
+    m = re.match(r'^([^{]+)\{(.+)\}$', metric_name)
+    if m:
+        metric_name = m.group(1)
+        for pair in re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)="([^"]*)"', m.group(2)):
+            inline_labels[pair[0]] = pair[1]
+
+    series = metrics.get(metric_name, [])
+    if not series:
+        return None
+
+    if extraction == "form1" and not inline_labels:
+        # Scalar — expect exactly one series without labels (or first match)
+        for lbl, val in series:
+            if not lbl:
+                return val
+        # Fallback: return first series if no unlabeled one
+        return series[0][1] if series else None
+
+    if extraction == "form2" or inline_labels:
+        # Single labeled series
+        target_labels = dict(inline_labels)
+        if labels:
+            for l in labels:
+                target_labels[l["key"]] = l["value"]
+        for lbl, val in series:
+            if all(lbl.get(k) == v for k, v in target_labels.items()):
+                return val
+        return None
+
+    if extraction == "form3":
+        # Sum of all matching series (for metric_sum with labels)
+        total = 0.0
+        matched = 0
+        for lbl, val in series:
+            total += val
+            matched += 1
+        return total if matched > 0 else None
+
+    if extraction == "form2-sum-all":
+        # Sum of all labeled series for a metric
+        total = 0.0
+        matched = 0
+        for lbl, val in series:
+            total += val
+            matched += 1
+        return total if matched > 0 else None
+
+    return None
+
+
+def extract_sum(
+    metrics: dict[str, list[tuple[dict[str, str], float]]],
+    metric_names: list[str],
+    extraction: str,
+) -> float | None:
+    """Extract and sum values from multiple metrics."""
+    total = 0.0
+    for name in metric_names:
+        val = extract_value(metrics, name, extraction)
+        if val is None:
+            return None
+        total += val
+    return total
+
+
+def count_series(
+    metrics: dict[str, list[tuple[dict[str, str], float]]],
+    metric_name: str,
+) -> int:
+    """Count how many series match a metric name (stripping inline labels)."""
+    m = re.match(r'^([^{]+)', metric_name)
+    base = m.group(1) if m else metric_name
+    return len(metrics.get(base, []))
+
+
+# ── Gate evaluation ──────────────────────────────────────────────────────────
+
+def gates_pass(
+    gates: list[str],
+    warmup_remaining: int,
+    fresh_start: bool,
+    crash_recovery: bool,
+    uptime: int,
+    monitor_mode: str,
+) -> tuple[bool, str | None]:
+    """Check if all gates pass. Returns (pass, skip_reason)."""
+    for gate in gates:
+        if gate == "validator-only" and monitor_mode == "watcher":
+            return False, "watcher mode (validator-only alarm)"
+        if gate == "warmup-2-ticks" and warmup_remaining > 0:
+            return False, f"warmup ({warmup_remaining} ticks remaining)"
+        if gate == "synced-only":
+            if uptime < 900 or crash_recovery or fresh_start:
+                return False, "not synced (synced-only gate)"
+        if gate == "uptime-min-15m" and uptime < 900:
+            return False, "uptime < 15m"
+    return True, None
+
+
+# ── Comparison operators ─────────────────────────────────────────────────────
+
+def compare(value: float, op: str, threshold: float) -> bool:
+    """Apply comparison operator."""
+    if op == ">":
+        return value > threshold
+    if op == "<":
+        return value < threshold
+    if op == ">=":
+        return value >= threshold
+    if op == "<=":
+        return value <= threshold
+    if op == "!=":
+        return value != threshold
+    if op == "==":
+        return value == threshold
+    return False
+
+
+# ── Snapshot management ──────────────────────────────────────────────────────
+
+def read_snapshot(path: Path) -> dict[str, str]:
+    """Read a key=value snapshot file."""
+    result: dict[str, str] = {}
+    if not path.exists():
+        return result
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            result[k.strip()] = v.strip()
+    return result
+
+
+def write_snapshot(path: Path, data: dict[str, str]) -> None:
+    """Write a key=value snapshot file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"{k}={v}" for k, v in data.items()]
+    path.write_text("\n".join(lines) + "\n")
+
+
+# ── Alarm evaluation ────────────────────────────────────────────────────────
+
+def interpolate(template: str, values: dict[str, object]) -> str:
+    """Interpolate {key} placeholders in a template string."""
+    result = template
+    for k, v in values.items():
+        result = result.replace(f"{{{k}}}", str(v))
+    return result
+
+
+def make_result(
+    alarm: dict,
+    state: str,
+    value: float | None = None,
+    threshold: float | None = None,
+    skip_reason: str | None = None,
+    for_ticks_elapsed: int = 0,
+    extra_values: dict | None = None,
+) -> dict:
+    """Create a result dict for one alarm."""
+    values = {"value": value or 0, "threshold": threshold or 0}
+    if extra_values:
+        values.update(extra_values)
+
+    kind = alarm["kind"]
+    if kind in ("counter-ratio", ):
+        contributes_to = "metrics_ratio"
+    elif kind == "counter-streak":
+        contributes_to = "recovery_stalled"
+    else:
+        contributes_to = "metrics"
+
+    return {
+        "name": alarm["name"],
+        "state": state,
+        "severity": alarm.get("severity", "") if state == "firing" else "",
+        "value": value,
+        "threshold": threshold,
+        "summary": interpolate(alarm.get("summary", ""), values),
+        "details": interpolate(alarm.get("details", ""), values),
+        "cooldown_key": alarm.get("cooldown_key", alarm["name"]),
+        "cooldown_seconds": alarm.get("cooldown_seconds", 3600),
+        "filing_title": interpolate(alarm.get("filing_title", ""), values),
+        "filing_search": alarm.get("filing_search", ""),
+        "notes": alarm.get("notes", ""),
+        "for_ticks_elapsed": for_ticks_elapsed,
+        "skip_reason": skip_reason,
+        "contributes_to": contributes_to,
+    }
+
+
+def eval_gauge(
+    alarm: dict,
+    current: dict,
+    persistence_state: dict,
+    prev_prom_invalid: bool,
+) -> dict:
+    """Evaluate a gauge alarm."""
+    metric = alarm["metric"]
+    extraction = alarm.get("extraction", "form1")
+    labels = alarm.get("labels", [])
+
+    val = extract_value(current, metric, extraction, labels)
+    if val is None:
+        return make_result(alarm, "skipped", skip_reason="metric not found")
+
+    op = alarm["op"]
+    threshold = alarm["threshold"]
+    for_ticks = alarm.get("for_ticks", 1)
+    breaching = compare(val, op, threshold)
+
+    if for_ticks <= 1:
+        if breaching:
+            return make_result(alarm, "firing", value=val, threshold=threshold, for_ticks_elapsed=1)
+        return make_result(alarm, "ok", value=val, threshold=threshold)
+
+    # Persistence guard
+    key = f"gauge_persist_{alarm['name']}"
+    prev_count = int(persistence_state.get(key, "0"))
+
+    if prev_prom_invalid:
+        # Reset persistence counter
+        persistence_state[key] = "0"
+        if breaching:
+            persistence_state[key] = "1"
+            return make_result(alarm, "breach", value=val, threshold=threshold, for_ticks_elapsed=1)
+        return make_result(alarm, "ok", value=val, threshold=threshold)
+
+    if breaching:
+        new_count = prev_count + 1
+        persistence_state[key] = str(new_count)
+        if new_count >= for_ticks:
+            return make_result(alarm, "firing", value=val, threshold=threshold, for_ticks_elapsed=new_count)
+        return make_result(alarm, "breach", value=val, threshold=threshold, for_ticks_elapsed=new_count)
+    else:
+        persistence_state[key] = "0"
+        return make_result(alarm, "ok", value=val, threshold=threshold)
+
+
+def eval_gauge_ratio(
+    alarm: dict,
+    current: dict,
+    persistence_state: dict,
+    prev_prom_invalid: bool,
+) -> dict:
+    """Evaluate a gauge-ratio alarm."""
+    num_metric = alarm["numerator_metric"]
+    den_metric = alarm["denominator_metric"]
+    num_extraction = alarm.get("numerator_extraction", "form1")
+    den_extraction = alarm.get("denominator_extraction", "form1")
+
+    num_val = extract_value(current, num_metric, num_extraction)
+    if num_val is None:
+        return make_result(alarm, "skipped", skip_reason="numerator metric not found")
+
+    den_val = extract_value(current, den_metric, den_extraction)
+    if den_val is None:
+        absent = alarm.get("absent_denominator", "skip")
+        if absent == "skip":
+            return make_result(alarm, "skipped", skip_reason="denominator absent")
+        return make_result(alarm, "skipped", skip_reason="denominator missing (error)")
+
+    if den_val == 0:
+        return make_result(alarm, "skipped", skip_reason="zero denominator")
+
+    ratio = num_val / den_val
+    op = alarm["op"]
+    threshold = alarm["threshold"]
+    breaching = compare(ratio, op, threshold)
+
+    for_ticks = alarm.get("for_ticks", 1)
+    if for_ticks <= 1:
+        if breaching:
+            return make_result(alarm, "firing", value=round(ratio, 4), threshold=threshold, for_ticks_elapsed=1)
+        return make_result(alarm, "ok", value=round(ratio, 4), threshold=threshold)
+
+    # Persistence guard (same logic as gauge)
+    key = f"gauge_persist_{alarm['name']}"
+    prev_count = int(persistence_state.get(key, "0"))
+
+    if prev_prom_invalid:
+        persistence_state[key] = "0"
+        if breaching:
+            persistence_state[key] = "1"
+            return make_result(alarm, "breach", value=round(ratio, 4), threshold=threshold, for_ticks_elapsed=1)
+        return make_result(alarm, "ok", value=round(ratio, 4), threshold=threshold)
+
+    if breaching:
+        new_count = prev_count + 1
+        persistence_state[key] = str(new_count)
+        if new_count >= for_ticks:
+            return make_result(alarm, "firing", value=round(ratio, 4), threshold=threshold, for_ticks_elapsed=new_count)
+        return make_result(alarm, "breach", value=round(ratio, 4), threshold=threshold, for_ticks_elapsed=new_count)
+    else:
+        persistence_state[key] = "0"
+        return make_result(alarm, "ok", value=round(ratio, 4), threshold=threshold)
+
+
+def eval_counter(
+    alarm: dict,
+    current: dict,
+    prev: dict,
+    prev_prom_invalid: bool,
+    warmup_remaining: int,
+) -> dict:
+    """Evaluate a counter alarm."""
+    if prev_prom_invalid:
+        return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID")
+
+    metric = alarm.get("metric")
+    metric_sum_list = alarm.get("metric_sum")
+    extraction = alarm.get("extraction", "form1")
+    labels = alarm.get("labels", [])
+
+    if metric_sum_list:
+        cur_val = extract_sum(current, metric_sum_list, extraction)
+        prev_val = extract_sum(prev, metric_sum_list, extraction)
+    else:
+        cur_val = extract_value(current, metric, extraction, labels)
+        prev_val = extract_value(prev, metric, extraction, labels)
+
+    if cur_val is None:
+        return make_result(alarm, "skipped", skip_reason="metric not found")
+    if prev_val is None:
+        return make_result(alarm, "skipped", skip_reason="no previous data")
+
+    # Warmup: skip if prev=0 (counter started at zero after restart)
+    if warmup_remaining > 0 and prev_val == 0:
+        return make_result(alarm, "skipped", skip_reason="warmup (prev=0)")
+
+    # Counter reset: if cur < prev, delta = cur
+    if cur_val < prev_val:
+        delta = cur_val
+    else:
+        delta = cur_val - prev_val
+
+    op = alarm["op"]
+    threshold = alarm["threshold"]
+    breaching = compare(delta, op, threshold)
+
+    if breaching:
+        return make_result(alarm, "firing", value=delta, threshold=threshold, for_ticks_elapsed=1)
+    return make_result(alarm, "ok", value=delta, threshold=threshold)
+
+
+def eval_counter_dynamic(
+    alarm: dict,
+    current: dict,
+    prev: dict,
+    state_dir: Path,
+    prev_prom_invalid: bool,
+    warmup_remaining: int,
+) -> dict:
+    """Evaluate a counter-dynamic alarm (threshold = multiplier × prior delta)."""
+    if prev_prom_invalid:
+        return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID")
+
+    metric_sum_list = alarm["metric_sum"]
+    extraction = alarm.get("extraction", "form1")
+
+    cur_val = extract_sum(current, metric_sum_list, extraction)
+    prev_val = extract_sum(prev, metric_sum_list, extraction)
+
+    if cur_val is None:
+        return make_result(alarm, "skipped", skip_reason="metric not found")
+    if prev_val is None:
+        return make_result(alarm, "skipped", skip_reason="no previous data")
+
+    if warmup_remaining > 0 and prev_val == 0:
+        return make_result(alarm, "skipped", skip_reason="warmup (prev=0)")
+
+    # Counter reset
+    delta = cur_val if cur_val < prev_val else cur_val - prev_val
+
+    # Read prior delta from snapshot
+    snapshot_path = state_dir / "counter_dynamic_snapshot"
+    snapshot = read_snapshot(snapshot_path)
+    prior_delta_key = f"prior_delta_{alarm['name']}"
+    prior_delta_str = snapshot.get(prior_delta_key)
+
+    # Store current delta for next tick
+    snapshot[prior_delta_key] = str(int(delta))
+    write_snapshot(snapshot_path, snapshot)
+
+    if prior_delta_str is None:
+        return make_result(alarm, "skipped", skip_reason="collecting baseline (no prior delta)")
+
+    prior_delta = int(prior_delta_str)
+    multiplier = alarm["multiplier"]
+    min_absolute = alarm.get("min_absolute", 0)
+
+    # Don't fire if prior delta is too small
+    if prior_delta < min_absolute:
+        return make_result(
+            alarm, "ok", value=delta, threshold=multiplier * prior_delta,
+            extra_values={"prior_delta": prior_delta},
+        )
+
+    # Don't fire if prior delta is 0
+    if prior_delta == 0:
+        return make_result(
+            alarm, "ok", value=delta, threshold=0,
+            extra_values={"prior_delta": prior_delta},
+        )
+
+    threshold = multiplier * prior_delta
+    if delta >= threshold:
+        return make_result(
+            alarm, "firing", value=delta, threshold=threshold, for_ticks_elapsed=1,
+            extra_values={"prior_delta": prior_delta},
+        )
+    return make_result(
+        alarm, "ok", value=delta, threshold=threshold,
+        extra_values={"prior_delta": prior_delta},
+    )
+
+
+def eval_histogram_p99(
+    alarm: dict,
+    current: dict,
+    prev: dict,
+    prev_prom_invalid: bool,
+) -> dict:
+    """Evaluate a histogram-p99 alarm with mean fallback."""
+    if prev_prom_invalid:
+        return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID")
+
+    metric = alarm["metric"]
+    min_count = alarm.get("min_count_delta", 20)
+
+    # Check suffixes exist
+    for suffix in ("_bucket", "_sum", "_count"):
+        if not current.get(f"{metric}{suffix}"):
+            return make_result(alarm, "skipped", skip_reason=f"missing {metric}{suffix}")
+    for suffix in ("_bucket", "_sum", "_count"):
+        if not prev.get(f"{metric}{suffix}"):
+            return make_result(alarm, "skipped", skip_reason=f"no previous {metric}{suffix}")
+
+    # Count delta
+    cur_count = extract_value(current, f"{metric}_count", "form1")
+    prev_count = extract_value(prev, f"{metric}_count", "form1")
+    if cur_count is None or prev_count is None:
+        return make_result(alarm, "skipped", skip_reason="missing count metric")
+
+    count_delta = cur_count - prev_count
+    if count_delta < 0:
+        return make_result(alarm, "skipped", skip_reason="counter reset (count)")
+    if count_delta < min_count:
+        return make_result(alarm, "skipped", skip_reason=f"low volume (count_delta={int(count_delta)} < {min_count})")
+
+    # Mean fallback
+    cur_sum = extract_value(current, f"{metric}_sum", "form1")
+    prev_sum = extract_value(prev, f"{metric}_sum", "form1")
+    mean_value = None
+    if cur_sum is not None and prev_sum is not None:
+        sum_delta = cur_sum - prev_sum
+        if sum_delta >= 0 and count_delta > 0:
+            mean_value = sum_delta / count_delta
+
+    # P99 from buckets
+    bucket_series_cur = current.get(f"{metric}_bucket", [])
+    bucket_series_prev = prev.get(f"{metric}_bucket", [])
+
+    # Build {le: delta} map
+    bucket_deltas: dict[float, float] = {}
+    cur_by_le: dict[float, float] = {}
+    prev_by_le: dict[float, float] = {}
+    for labels, val in bucket_series_cur:
+        le = labels.get("le")
+        if le is not None:
+            try:
+                cur_by_le[float(le)] = val
+            except ValueError:
+                if le == "+Inf":
+                    cur_by_le[float("inf")] = val
+    for labels, val in bucket_series_prev:
+        le = labels.get("le")
+        if le is not None:
+            try:
+                prev_by_le[float(le)] = val
+            except ValueError:
+                if le == "+Inf":
+                    prev_by_le[float("inf")] = val
+
+    for le in sorted(cur_by_le.keys()):
+        cur_b = cur_by_le.get(le, 0)
+        prev_b = prev_by_le.get(le, 0)
+        d = cur_b - prev_b
+        if d < 0:
+            d = cur_b  # counter reset
+        bucket_deltas[le] = d
+
+    # Compute p99
+    p99_value = None
+    if bucket_deltas and count_delta > 0:
+        target = 0.99 * count_delta
+        cumulative = 0.0
+        for le in sorted(bucket_deltas.keys()):
+            cumulative += bucket_deltas[le]
+            if cumulative >= target:
+                p99_value = le
+                break
+
+    p99_threshold = alarm.get("p99_threshold", 0)
+    mean_threshold = alarm.get("mean_threshold", 0)
+
+    p99_breach = p99_value is not None and p99_value > p99_threshold
+    mean_breach = mean_value is not None and mean_value > mean_threshold
+
+    ev = {
+        "p99_value": round(p99_value, 4) if p99_value is not None else None,
+        "mean_value": round(mean_value, 4) if mean_value is not None else None,
+    }
+
+    if p99_breach or mean_breach:
+        display_value = p99_value if p99_breach else mean_value
+        return make_result(
+            alarm, "firing", value=round(display_value, 4) if display_value else 0,
+            threshold=p99_threshold, for_ticks_elapsed=1, extra_values=ev,
+        )
+    return make_result(
+        alarm, "ok",
+        value=round(p99_value, 4) if p99_value is not None else 0,
+        threshold=p99_threshold, extra_values=ev,
+    )
+
+
+def eval_counter_ratio(
+    alarm: dict,
+    current: dict,
+    prev: dict,
+    state_dir: Path,
+    pid: str,
+    start_ticks: str,
+    fresh_start: bool,
+    crash_recovery: bool,
+    uptime: int,
+) -> dict:
+    """Evaluate a counter-ratio alarm with streak detection.
+
+    Independent of PREV_PROM_INVALID — uses own PID/start_ticks in snapshot.
+    """
+    # Global skip conditions for ratio checks
+    ledger_age = extract_value(current, "stellar_ledger_age_current_seconds", "form1")
+    if fresh_start:
+        return make_result(alarm, "skipped", skip_reason="FRESH_START")
+    if ledger_age is not None and ledger_age > 30:
+        return make_result(alarm, "skipped", skip_reason="ledger age > 30s")
+    if uptime < 600:
+        return make_result(alarm, "skipped", skip_reason="uptime < 10m")
+
+    # Label validation for alarms with expected_labels
+    expected_labels = alarm.get("expected_labels")
+    if expected_labels:
+        # Check that the expected label values exist in the current scrape
+        base_metric = alarm.get("denominator", alarm.get("numerator", ""))
+        if "{" in base_metric:
+            base_metric = base_metric.split("{")[0]
+        series = current.get(base_metric, [])
+        if series:
+            found_labels = set()
+            for lbl, _ in series:
+                reason_val = lbl.get("reason")
+                if reason_val:
+                    found_labels.add(reason_val)
+            expected_set = set(expected_labels)
+            if found_labels != expected_set:
+                return make_result(alarm, "skipped", skip_reason="label set mismatch")
+
+    snapshot_path = state_dir / "ratio_snapshot"
+    snapshot = read_snapshot(snapshot_path)
+
+    # Process identity check
+    if snapshot:
+        if snapshot.get("version") != "1":
+            snapshot = {}
+        elif snapshot.get("pid") != pid or snapshot.get("start_ticks") != start_ticks:
+            snapshot = {}
+
+    # Extract current values
+    numerator_metric = alarm.get("numerator")
+    numerator_sum = alarm.get("numerator_sum")
+    denominator_metric = alarm.get("denominator")
+    denominator_sum = alarm.get("denominator_sum")
+    num_extraction = alarm.get("numerator_extraction", "form1")
+    den_extraction = alarm.get("denominator_extraction", "form1")
+
+    if numerator_sum:
+        cur_num = 0.0
+        for m in numerator_sum:
+            v = extract_value(current, m, num_extraction)
+            if v is None:
+                return make_result(alarm, "skipped", skip_reason="missing numerator counter")
+            cur_num += v
+    elif numerator_metric:
+        cur_num_v = extract_value(current, numerator_metric, num_extraction)
+        if cur_num_v is None:
+            if alarm.get("optional_counters"):
+                return make_result(alarm, "skipped", skip_reason="missing counters")
+            return make_result(alarm, "skipped", skip_reason="missing numerator counter")
+        cur_num = cur_num_v
+    else:
+        return make_result(alarm, "skipped", skip_reason="no numerator defined")
+
+    if denominator_sum:
+        cur_den = 0.0
+        for m in denominator_sum:
+            v = extract_value(current, m, num_extraction)
+            if v is None:
+                return make_result(alarm, "skipped", skip_reason="missing denominator counter")
+            cur_den += v
+    elif denominator_metric:
+        cur_den_v = extract_value(current, denominator_metric, den_extraction)
+        if cur_den_v is None:
+            if alarm.get("optional_counters"):
+                return make_result(alarm, "skipped", skip_reason="missing counters")
+            return make_result(alarm, "skipped", skip_reason="missing denominator counter")
+        cur_den = cur_den_v
+    else:
+        return make_result(alarm, "skipped", skip_reason="no denominator defined")
+
+    # Check for collecting baseline
+    alarm_name = alarm["name"]
+    prev_num_key = f"{alarm_name}_numerator"
+    prev_den_key = f"{alarm_name}_denominator"
+    streak_key = f"{alarm_name}_streak"
+
+    if not snapshot or prev_num_key not in snapshot:
+        # Collecting baseline — write current values
+        snapshot["version"] = "1"
+        snapshot["pid"] = pid
+        snapshot["start_ticks"] = start_ticks
+        snapshot[prev_num_key] = str(int(cur_num))
+        snapshot[prev_den_key] = str(int(cur_den))
+        snapshot[streak_key] = "0"
+        write_snapshot(snapshot_path, snapshot)
+        return make_result(alarm, "collecting_baseline")
+
+    prev_num = int(snapshot[prev_num_key])
+    prev_den = int(snapshot[prev_den_key])
+    streak = int(snapshot.get(streak_key, "0"))
+
+    # Counter reset check
+    if cur_num < prev_num or cur_den < prev_den:
+        snapshot[prev_num_key] = str(int(cur_num))
+        snapshot[prev_den_key] = str(int(cur_den))
+        snapshot[streak_key] = "0"
+        write_snapshot(snapshot_path, snapshot)
+        return make_result(alarm, "collecting_baseline")
+
+    num_delta = cur_num - prev_num
+    den_delta = cur_den - prev_den
+
+    # Update snapshot
+    snapshot[prev_num_key] = str(int(cur_num))
+    snapshot[prev_den_key] = str(int(cur_den))
+
+    # Min volume check
+    min_volume = alarm.get("min_volume", 0)
+    if den_delta < min_volume:
+        snapshot[streak_key] = "0"
+        write_snapshot(snapshot_path, snapshot)
+        return make_result(alarm, "skipped", skip_reason=f"low volume (delta={int(den_delta)} < {min_volume})")
+
+    # Compute ratio
+    if den_delta == 0:
+        snapshot[streak_key] = "0"
+        write_snapshot(snapshot_path, snapshot)
+        return make_result(alarm, "ok", value=0, threshold=alarm["ratio_threshold"])
+
+    ratio = num_delta / den_delta
+    ratio_op = alarm.get("ratio_op", ">")
+    ratio_threshold = alarm["ratio_threshold"]
+    streak_threshold = alarm.get("streak_threshold", 3)
+
+    breaching = compare(ratio, ratio_op, ratio_threshold)
+
+    if breaching:
+        streak += 1
+        snapshot[streak_key] = str(streak)
+        write_snapshot(snapshot_path, snapshot)
+
+        ev = {"streak": streak, "streak_threshold": streak_threshold, "ratio_threshold": ratio_threshold}
+        if streak >= streak_threshold:
+            return make_result(
+                alarm, "firing", value=round(ratio, 4), threshold=ratio_threshold,
+                for_ticks_elapsed=streak, extra_values=ev,
+            )
+        return make_result(
+            alarm, "breach", value=round(ratio, 4), threshold=ratio_threshold,
+            for_ticks_elapsed=streak, extra_values=ev,
+        )
+    else:
+        snapshot[streak_key] = "0"
+        write_snapshot(snapshot_path, snapshot)
+        ev = {"streak": 0, "streak_threshold": streak_threshold, "ratio_threshold": ratio_threshold}
+        return make_result(alarm, "ok", value=round(ratio, 4), threshold=ratio_threshold, extra_values=ev)
+
+
+def eval_counter_streak(
+    alarm: dict,
+    current: dict,
+    state_dir: Path,
+    pid: str,
+    start_ticks: str,
+) -> dict:
+    """Evaluate a counter-streak alarm.
+
+    Independent of PREV_PROM_INVALID — uses own PID/start_ticks in snapshot.
+    """
+    metric = alarm["metric"]
+    extraction = alarm.get("extraction", "form2")
+    labels = alarm.get("labels", [])
+
+    cur_val = extract_value(current, metric, extraction, labels)
+    if cur_val is None:
+        return make_result(alarm, "skipped", skip_reason="metric not found")
+
+    snapshot_file = alarm.get("snapshot_file", "counter_streak_snapshot")
+    snapshot_path = state_dir / snapshot_file
+    snapshot = read_snapshot(snapshot_path)
+
+    # Process identity check
+    if snapshot:
+        if snapshot.get("version") != "1":
+            snapshot = {}
+        elif snapshot.get("pid") != pid or snapshot.get("start_ticks") != start_ticks:
+            # Process identity changed — invalidate
+            new_snapshot = {
+                "version": "1",
+                "pid": pid,
+                "start_ticks": start_ticks,
+                "counter_value": str(int(cur_val)),
+                "breach_streak": "0",
+            }
+            write_snapshot(snapshot_path, new_snapshot)
+            return make_result(alarm, "collecting_baseline")
+
+    if not snapshot:
+        # First tick — collecting baseline
+        new_snapshot = {
+            "version": "1",
+            "pid": pid,
+            "start_ticks": start_ticks,
+            "counter_value": str(int(cur_val)),
+            "breach_streak": "0",
+        }
+        write_snapshot(snapshot_path, new_snapshot)
+        return make_result(alarm, "collecting_baseline")
+
+    prev_counter = int(snapshot.get("counter_value", "0"))
+    streak = int(snapshot.get("breach_streak", "0"))
+
+    # Counter reset
+    if cur_val < prev_counter:
+        new_snapshot = {
+            "version": "1",
+            "pid": pid,
+            "start_ticks": start_ticks,
+            "counter_value": str(int(cur_val)),
+            "breach_streak": "0",
+        }
+        write_snapshot(snapshot_path, new_snapshot)
+        return make_result(alarm, "collecting_baseline")
+
+    delta = int(cur_val) - prev_counter
+    delta_threshold = alarm.get("delta_threshold", 1)
+    streak_threshold = alarm.get("streak_threshold", 3)
+    burst_threshold = alarm.get("burst_threshold", 10)
+
+    ev = {"streak": streak, "streak_threshold": streak_threshold}
+
+    if delta >= burst_threshold:
+        streak += 1
+        new_snapshot = {
+            "version": "1",
+            "pid": pid,
+            "start_ticks": start_ticks,
+            "counter_value": str(int(cur_val)),
+            "breach_streak": str(streak),
+        }
+        write_snapshot(snapshot_path, new_snapshot)
+        return make_result(
+            alarm, "firing", value=delta, threshold=burst_threshold,
+            for_ticks_elapsed=streak, extra_values={"streak": streak, "streak_threshold": streak_threshold},
+        )
+
+    if delta >= delta_threshold:
+        streak += 1
+        new_snapshot = {
+            "version": "1",
+            "pid": pid,
+            "start_ticks": start_ticks,
+            "counter_value": str(int(cur_val)),
+            "breach_streak": str(streak),
+        }
+        write_snapshot(snapshot_path, new_snapshot)
+
+        if streak >= streak_threshold:
+            return make_result(
+                alarm, "firing", value=delta, threshold=delta_threshold,
+                for_ticks_elapsed=streak, extra_values={"streak": streak, "streak_threshold": streak_threshold},
+            )
+        return make_result(
+            alarm, "breach", value=delta, threshold=delta_threshold,
+            for_ticks_elapsed=streak, extra_values={"streak": streak, "streak_threshold": streak_threshold},
+        )
+
+    # delta == 0
+    new_snapshot = {
+        "version": "1",
+        "pid": pid,
+        "start_ticks": start_ticks,
+        "counter_value": str(int(cur_val)),
+        "breach_streak": "0",
+    }
+    write_snapshot(snapshot_path, new_snapshot)
+    return make_result(alarm, "ok", value=delta, threshold=delta_threshold, extra_values={"streak": 0, "streak_threshold": streak_threshold})
+
+
+# ── Aggregate line rendering ────────────────────────────────────────────────
+
+def render_aggregate(results: list[dict], watcher_mode: bool) -> dict:
+    """Render aggregate status lines from alarm results."""
+    # metrics line
+    metrics_alarms = [r for r in results if r["contributes_to"] == "metrics"]
+    firing = [r for r in metrics_alarms if r["state"] == "firing"]
+    skipped = [r for r in metrics_alarms if r["state"] == "skipped"]
+    total = len(metrics_alarms)
+    metrics_line = f"metrics: {len(firing)}/{total} firing"
+    if skipped:
+        skip_reasons = set(r.get("skip_reason", "") for r in skipped)
+        metrics_line += f", {len(skipped)} skipped ({', '.join(r for r in skip_reasons if r)})"
+
+    # metrics_ratio line
+    ratio_alarms = [r for r in results if r["contributes_to"] == "metrics_ratio"]
+    if not ratio_alarms or watcher_mode:
+        metrics_ratio_line = None
+    else:
+        # Check for global skip (all ratio alarms skipped for same reason)
+        all_skipped = all(r["state"] == "skipped" for r in ratio_alarms)
+        all_baseline = all(r["state"] == "collecting_baseline" for r in ratio_alarms)
+        if all_skipped:
+            reasons = set(r.get("skip_reason", "") for r in ratio_alarms)
+            metrics_ratio_line = f"metrics_ratio: skipped ({', '.join(r for r in reasons if r)})"
+        elif all_baseline:
+            metrics_ratio_line = "metrics_ratio: collecting baseline"
+        else:
+            parts = []
+            name_map = {
+                "scp-accept-rate-low": "scp",
+                "apply-failure-ratio": "apply",
+                "pending-too-old-ratio": "pending",
+            }
+            for r in ratio_alarms:
+                short = name_map.get(r["name"], r["name"])
+                if r["state"] == "firing":
+                    parts.append(f"{short} WARNING {r['details']}")
+                elif r["state"] == "breach":
+                    parts.append(f"{short} breach ({r['details']})")
+                elif r["state"] == "skipped":
+                    parts.append(f"{short} skipped ({r.get('skip_reason', '')})")
+                elif r["state"] == "collecting_baseline":
+                    parts.append(f"{short} collecting baseline")
+                else:
+                    val = r.get("value", 0)
+                    val_pct = f"{val:.0%}" if isinstance(val, float) and val < 1 else str(val)
+                    parts.append(f"{short} ok ({val_pct})")
+            metrics_ratio_line = f"metrics_ratio: {', '.join(parts)}"
+
+    # recovery_stalled line
+    stalled_alarms = [r for r in results if r["contributes_to"] == "recovery_stalled"]
+    if not stalled_alarms or watcher_mode:
+        recovery_stalled_line = None
+    else:
+        r = stalled_alarms[0]
+        if r["state"] == "firing":
+            if r.get("value", 0) >= 10:
+                recovery_stalled_line = f"recovery_stalled: WARNING delta={r['value']} (burst) — investigating"
+            else:
+                streak = r.get("for_ticks_elapsed", 0)
+                recovery_stalled_line = f"recovery_stalled: WARNING delta={r['value']} ({streak} ticks) — investigating"
+        elif r["state"] == "breach":
+            streak = r.get("for_ticks_elapsed", 0)
+            recovery_stalled_line = f"recovery_stalled: breach (delta={r['value']}, streak {streak}/3)"
+        elif r["state"] == "skipped":
+            recovery_stalled_line = f"recovery_stalled: skipped ({r.get('skip_reason', '')})"
+        elif r["state"] == "collecting_baseline":
+            recovery_stalled_line = "recovery_stalled: collecting baseline"
+        else:
+            recovery_stalled_line = f"recovery_stalled: ok (delta={r.get('value', 0)})"
+
+    return {
+        "metrics_line": metrics_line,
+        "metrics_ratio_line": metrics_ratio_line,
+        "recovery_stalled_line": recovery_stalled_line,
+    }
+
+
+# ── Schema validation ───────────────────────────────────────────────────────
+
+def validate_catalog(catalog: dict) -> list[str]:
+    """Validate the TOML catalog schema. Returns list of errors."""
+    errors: list[str] = []
+
+    version = catalog.get("schema_version")
+    if version != SCHEMA_VERSION:
+        errors.append(f"Unknown schema_version: {version} (expected {SCHEMA_VERSION})")
+        return errors
+
+    alarms = catalog.get("alarm", [])
+    names_seen: set[str] = set()
+    cooldown_keys_seen: set[str] = set()
+
+    for i, alarm in enumerate(alarms):
+        name = alarm.get("name", f"<unnamed-{i}>")
+
+        # Duplicate name check
+        if name in names_seen:
+            errors.append(f"Duplicate alarm name: {name}")
+        names_seen.add(name)
+
+        # Required fields
+        kind = alarm.get("kind")
+        if kind not in VALID_KINDS:
+            errors.append(f"{name}: invalid kind '{kind}'")
+            continue
+
+        severity = alarm.get("severity")
+        if severity not in VALID_SEVERITIES:
+            errors.append(f"{name}: invalid severity '{severity}'")
+
+        # Gate validation
+        for gate in alarm.get("gates", []):
+            if gate not in VALID_GATES:
+                errors.append(f"{name}: invalid gate '{gate}'")
+
+        # Duplicate cooldown_key check
+        ck = alarm.get("cooldown_key", name)
+        if not alarm.get("allow_duplicate_cooldown") and ck in cooldown_keys_seen:
+            errors.append(f"{name}: duplicate cooldown_key '{ck}'")
+        cooldown_keys_seen.add(ck)
+
+        # Kind-specific validation
+        if kind == "gauge":
+            if "metric" not in alarm:
+                errors.append(f"{name}: gauge requires 'metric'")
+            if "op" not in alarm or alarm["op"] not in VALID_OPS:
+                errors.append(f"{name}: gauge requires valid 'op'")
+            if "threshold" not in alarm:
+                errors.append(f"{name}: gauge requires 'threshold'")
+        elif kind == "gauge-ratio":
+            for field in ("numerator_metric", "denominator_metric", "op", "threshold"):
+                if field not in alarm:
+                    errors.append(f"{name}: gauge-ratio requires '{field}'")
+        elif kind == "counter":
+            if "metric" not in alarm and "metric_sum" not in alarm:
+                errors.append(f"{name}: counter requires 'metric' or 'metric_sum'")
+            if "op" not in alarm:
+                errors.append(f"{name}: counter requires 'op'")
+            if "threshold" not in alarm:
+                errors.append(f"{name}: counter requires 'threshold'")
+        elif kind == "counter-dynamic":
+            if "metric_sum" not in alarm:
+                errors.append(f"{name}: counter-dynamic requires 'metric_sum'")
+            if "multiplier" not in alarm:
+                errors.append(f"{name}: counter-dynamic requires 'multiplier'")
+        elif kind == "counter-ratio":
+            if "numerator" not in alarm and "numerator_sum" not in alarm:
+                errors.append(f"{name}: counter-ratio requires 'numerator' or 'numerator_sum'")
+            if "denominator" not in alarm and "denominator_sum" not in alarm:
+                errors.append(f"{name}: counter-ratio requires 'denominator' or 'denominator_sum'")
+            if "ratio_threshold" not in alarm:
+                errors.append(f"{name}: counter-ratio requires 'ratio_threshold'")
+        elif kind == "histogram-p99":
+            if "metric" not in alarm:
+                errors.append(f"{name}: histogram-p99 requires 'metric'")
+            if "p99_threshold" not in alarm:
+                errors.append(f"{name}: histogram-p99 requires 'p99_threshold'")
+        elif kind == "counter-streak":
+            if "metric" not in alarm:
+                errors.append(f"{name}: counter-streak requires 'metric'")
+            if "delta_threshold" not in alarm:
+                errors.append(f"{name}: counter-streak requires 'delta_threshold'")
+            if "streak_threshold" not in alarm:
+                errors.append(f"{name}: counter-streak requires 'streak_threshold'")
+            if "burst_threshold" not in alarm:
+                errors.append(f"{name}: counter-streak requires 'burst_threshold'")
+
+    return errors
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Evaluate monitor-tick alarms")
+    parser.add_argument("--catalog", required=True, help="Path to metric-alarms.toml")
+    parser.add_argument("--current", default=None, help="Path to current.prom")
+    parser.add_argument("--prev", default=None, help="Path to prev.prom")
+    parser.add_argument("--state-dir", default=None, help="Directory for snapshot files")
+    parser.add_argument("--validate-only", action="store_true", help="Only validate schema, don't evaluate")
+    args = parser.parse_args()
+
+    # Validate-only mode only needs --catalog
+    if not args.validate_only:
+        if not args.current or not args.state_dir:
+            parser.error("--current and --state-dir are required unless --validate-only is set")
+
+    # Read catalog
+    catalog_path = Path(args.catalog)
+    if not catalog_path.exists():
+        print(f"ERROR: catalog not found: {catalog_path}", file=sys.stderr)
+        return 1
+
+    with open(catalog_path, "rb") as f:
+        catalog = tomllib.load(f)
+
+    # Validate schema
+    errors = validate_catalog(catalog)
+    if errors:
+        for e in errors:
+            print(f"SCHEMA ERROR: {e}", file=sys.stderr)
+        return 1
+
+    if args.validate_only:
+        print(json.dumps({"schema_version": SCHEMA_VERSION, "valid": True, "alarm_count": len(catalog.get("alarm", []))}))
+        return 0
+
+    # Read env vars
+    prev_prom_invalid = os.environ.get("PREV_PROM_INVALID", "false").lower() == "true"
+    warmup_remaining = int(os.environ.get("WARMUP_TICKS_REMAINING", "0"))
+    fresh_start = os.environ.get("FRESH_START", "no").lower() == "yes"
+    crash_recovery = os.environ.get("CRASH_RECOVERY", "no").lower() == "yes"
+    uptime = int(os.environ.get("UPTIME_SECONDS", "9999"))
+    monitor_mode = os.environ.get("MONITOR_MODE", "validator")
+    pid = os.environ.get("PID", "")
+    start_ticks_val = os.environ.get("START_TICKS", "")
+
+    # Parse metrics
+    current_path = Path(args.current)
+    prev_path = Path(args.prev) if args.prev else None
+    current = parse_prom(current_path)
+    prev = parse_prom(prev_path)
+
+    state_dir = Path(args.state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Persistence state for gauge for_ticks
+    persist_path = state_dir / "gauge_persistence"
+    persistence_state = read_snapshot(persist_path)
+
+    alarms = catalog.get("alarm", [])
+    results: list[dict] = []
+
+    for alarm in alarms:
+        name = alarm["name"]
+        kind = alarm["kind"]
+
+        # Gate check
+        gates = alarm.get("gates", [])
+        passed, skip_reason = gates_pass(
+            gates, warmup_remaining, fresh_start, crash_recovery, uptime, monitor_mode,
+        )
+        if not passed:
+            result = make_result(alarm, "skipped", skip_reason=skip_reason)
+            results.append(result)
+            # Telemetry
+            metric = alarm.get("metric", alarm.get("numerator", alarm.get("numerator_metric", "")))
+            n = count_series(current, metric) if metric else 0
+            print(f"# alarm={name} metric={metric} series_matched={n} state=skipped", file=sys.stderr)
+            continue
+
+        # Evaluate based on kind
+        if kind == "gauge":
+            result = eval_gauge(alarm, current, persistence_state, prev_prom_invalid)
+        elif kind == "gauge-ratio":
+            result = eval_gauge_ratio(alarm, current, persistence_state, prev_prom_invalid)
+        elif kind == "counter":
+            result = eval_counter(alarm, current, prev, prev_prom_invalid, warmup_remaining)
+        elif kind == "counter-dynamic":
+            result = eval_counter_dynamic(alarm, current, prev, state_dir, prev_prom_invalid, warmup_remaining)
+        elif kind == "histogram-p99":
+            result = eval_histogram_p99(alarm, current, prev, prev_prom_invalid)
+        elif kind == "counter-ratio":
+            result = eval_counter_ratio(
+                alarm, current, prev, state_dir, pid, start_ticks_val,
+                fresh_start, crash_recovery, uptime,
+            )
+        elif kind == "counter-streak":
+            result = eval_counter_streak(alarm, current, state_dir, pid, start_ticks_val)
+        else:
+            result = make_result(alarm, "skipped", skip_reason=f"unknown kind: {kind}")
+
+        results.append(result)
+
+        # Telemetry
+        metric = alarm.get("metric", alarm.get("numerator", alarm.get("numerator_metric", "")))
+        if not metric and alarm.get("metric_sum"):
+            metric = alarm["metric_sum"][0]
+        n = count_series(current, metric) if metric else 0
+        state = result["state"]
+        if n == 0 and state != "skipped":
+            print(f"# alarm={name} metric={metric} series_matched=0 state=ERROR_NO_SERIES", file=sys.stderr)
+        else:
+            print(f"# alarm={name} metric={metric} series_matched={n} state={state}", file=sys.stderr)
+
+    # Save gauge persistence state
+    write_snapshot(persist_path, persistence_state)
+
+    watcher_mode = monitor_mode == "watcher"
+    aggregate = render_aggregate(results, watcher_mode)
+
+    output = {
+        "schema_version": SCHEMA_VERSION,
+        "alarms": results,
+        "aggregate": aggregate,
+        "watcher_mode": watcher_mode,
+    }
+
+    json.dump(output, sys.stdout, indent=2)
+    print()  # trailing newline
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
