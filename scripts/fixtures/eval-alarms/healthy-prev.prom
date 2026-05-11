@@ -22,6 +22,8 @@ stellar_overlay_error_read_total 8
 stellar_overlay_error_write_total 4
 henyey_archive_cache_refresh_error_total 0
 henyey_archive_cache_refresh_timeout_total 2
+stellar_ledger_invariant_failure_total 0
+stellar_ledger_transaction_internal_error_total 0
 # Ratio inputs
 stellar_ledger_apply_success_total 4500
 stellar_ledger_apply_failure_total 90

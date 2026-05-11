@@ -1028,6 +1028,14 @@ def validate_catalog(catalog: dict) -> list[str]:
             errors.append(f"Duplicate alarm name: {name}")
         names_seen.add(name)
 
+        # Exempt validation
+        exempt = alarm.get("exempt", False)
+        exempt_reason = alarm.get("exempt_reason", "")
+        if exempt and not exempt_reason:
+            errors.append(f"{name}: exempt=true requires non-empty exempt_reason")
+        if not exempt and exempt_reason:
+            errors.append(f"{name}: exempt_reason without exempt=true")
+
         # Required fields
         kind = alarm.get("kind")
         if kind not in VALID_KINDS:
@@ -1163,6 +1171,14 @@ def main() -> int:
     for alarm in alarms:
         name = alarm["name"]
         kind = alarm["kind"]
+
+        # Exempt check — skip evaluation entirely
+        if alarm.get("exempt", False):
+            reason = alarm.get("exempt_reason", "exempt")
+            result = make_result(alarm, "skipped", skip_reason=f"exempt: {reason}")
+            results.append(result)
+            print(f"# alarm={name} state=skipped reason=exempt", file=sys.stderr)
+            continue
 
         # Gate check
         gates = alarm.get("gates", [])

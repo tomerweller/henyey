@@ -11,6 +11,11 @@ split into two categories:
   have no dashboard panel but have clear alerting significance. Thresholds
   are explicitly tunable.
 
+> **Related:** This is one of two alarm surfaces. The other is the monitor-tick
+> alarm catalog at `.claude/skills/shared/metric-alarms.toml`. See
+> `.claude/skills/shared/ALARM_SURFACES.md` for the ownership policy,
+> overlap rules, and reconciliation table between the two surfaces.
+
 ## Alert Rules
 
 ### Phase 1: Dashboard-Threshold Alerts
@@ -301,3 +306,16 @@ To verify alerts are working:
 
 3. **Verify notification routing:** Configure a test contact point and
    trigger an alert to confirm notifications are delivered.
+
+## Post-Refactor Verification
+
+After modifying alarm rules or the evaluator, verify no regressions:
+
+1. **Pick a recent 24h window** where multiple alarms fired (check
+   `~/data/$SESSION/metrics/anomaly_cooldown.json` history).
+2. **Replay each tick's snapshots** (`current.prom` + `prev.prom`) through
+   `scripts/lib/eval-alarms.py` with the updated catalog.
+3. **Compare firing list** against historical evidence (status reports in
+   GitHub Discussions, issue threads filed during that window).
+4. **Investigate any divergence** — alarms that should have fired but didn't,
+   or new false positives.

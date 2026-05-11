@@ -22,5 +22,7 @@ stellar_overlay_error_read_total 80
 stellar_overlay_error_write_total 30
 henyey_archive_cache_refresh_error_total 3
 henyey_archive_cache_refresh_timeout_total 8
+stellar_ledger_invariant_failure_total 5
+stellar_ledger_transaction_internal_error_total 3
 # Counter-streak — large delta (burst)
 henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"} 20

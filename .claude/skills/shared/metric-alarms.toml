@@ -8,6 +8,9 @@
 # Prometheus rate()/increase() over time windows. Threshold differences
 # between the two systems are intentional.
 #
+# See .claude/skills/shared/ALARM_SURFACES.md for the policy on alarm surface
+# ownership, overlap, and reconciliation.
+#
 # Schema version — evaluator rejects unknown versions.
 schema_version = 1
 
@@ -127,7 +130,67 @@ summary = "Archive cache refresh timeouts"
 details = "delta={value} threshold={threshold}"
 notes = ""
 
+[[alarm]]
+name = "ledger-invariant-failure"
+metric = "stellar_ledger_invariant_failure_total"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "ACTION"
+gates = ["warmup-2-ticks"]
+cooldown_key = "stellar_ledger_invariant_failure_total"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_ledger_invariant_failure_total — delta={value}"
+filing_search = "metrics: stellar_ledger_invariant_failure_total"
+summary = "Ledger invariant failure detected"
+details = "delta={value}"
+notes = "Best-effort for strict invariants: counter increments before panic (crates/invariant/src/lib.rs). Process-down (Grafana rule 4) is primary for strict crashes. Reliable for non-strict."
+# mirrors: henyey-slo-alerts.yaml rule 1 (critical, increase > 0 over 10m)
+
+[[alarm]]
+name = "tx-internal-error"
+metric = "stellar_ledger_transaction_internal_error_total"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "ACTION"
+gates = ["warmup-2-ticks"]
+cooldown_key = "stellar_ledger_transaction_internal_error_total"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_ledger_transaction_internal_error_total — delta={value}"
+filing_search = "metrics: stellar_ledger_transaction_internal_error_total"
+summary = "Transaction internal error detected"
+details = "delta={value}"
+notes = ""
+# mirrors: henyey-slo-alerts.yaml rule 2 (critical, rate > 0.01 over 5m)
+
 # ── GAUGES ───────────────────────────────────────────────────────────────────
+
+[[alarm]]
+name = "quorum-fail-at-low"
+metric = "stellar_quorum_fail_at"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = "<="
+threshold = 1
+for_ticks = 3
+severity = "WARN"
+gates = ["synced-only", "validator-only"]
+cooldown_key = "stellar_quorum_fail_at_low"
+cooldown_seconds = 1800
+filing_title = "metrics: stellar_quorum_fail_at — value={value} (quorum degraded)"
+filing_search = "metrics: stellar_quorum_fail_at"
+summary = "Quorum fail-at low (degraded quorum health)"
+details = "value={value} threshold={threshold}"
+notes = "Covers fail_at==1 (one failure causes v-blocking) and fail_at==0 (already v-blocked). Monitor-tick files issues; Grafana rules 3a/3b handle tiered paging. Short cooldown (30min) ensures fail_at=0 is not suppressed by prior fail_at=1 filing."
+# mirrors: henyey-slo-alerts.yaml rules 3a (warn, ==1, 5m) and 3b (critical, <1, 5m)
+# NOTE: surface mirror, NOT threshold-identical. Monitor-tick uses per-tick
+# gauge <= 1 with 3-tick persistence; Grafana uses == 1 / < 1 with 5m for-duration.
 
 [[alarm]]
 name = "peer-count-low"

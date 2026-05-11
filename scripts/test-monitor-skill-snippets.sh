@@ -2996,12 +2996,15 @@ PYEOF
       "Missing eval-alarms.py or metric-alarms.toml"
   fi
 
-  # Test 147: every alarm metric in the TOML exists in crates/ source or is a known
-  #           stellar-core metric (stellar_* prefix)
-  local metrics_missing=0 metrics_checked=0 missing_list=""
+  # Test 147: every alarm metric in the TOML exists in crates/app/src/metrics.rs
+  #           (where all metric name declarations live). Alarms with exempt = true
+  #           are skipped. exempt = true requires a non-empty exempt_reason.
+  local metrics_missing=0 metrics_checked=0 metrics_exempt=0 missing_list=""
+  local exempt_errors=""
   if [[ -f "$catalog_file" ]]; then
-    local alarm_metrics
-    alarm_metrics=$(python3 - "$catalog_file" <<'PYEOF'
+    # Extract per-alarm metric info including exempt status
+    local alarm_data
+    alarm_data=$(python3 - "$catalog_file" <<'PYEOF'
 import sys
 try:
     import tomllib
@@ -3010,34 +3013,65 @@ except ImportError:
 with open(sys.argv[1], 'rb') as f:
     data = tomllib.load(f)
 for a in data['alarm']:
+    name = a.get('name', '<unnamed>')
+    exempt = a.get('exempt', False)
+    exempt_reason = a.get('exempt_reason', '')
+    # Validate exempt/exempt_reason pairing
+    if exempt and not exempt_reason:
+        print(f"EXEMPT_ERROR:{name}:exempt=true but no exempt_reason")
+        continue
+    if not exempt and exempt_reason:
+        print(f"EXEMPT_ERROR:{name}:exempt_reason without exempt=true")
+        continue
     # Extract all metric names from any alarm kind
     for key in ['metric', 'metric_sum', 'numerator_metric', 'denominator_metric',
                 'numerator', 'denominator', 'numerator_sum', 'denominator_sum']:
         v = a.get(key)
         if isinstance(v, str):
-            print(v)
+            # Strip label selector
+            m = v.split('{')[0]
+            print(f"{'EXEMPT' if exempt else 'CHECK'}:{name}:{m}")
         elif isinstance(v, list):
-            for m in v:
-                print(m)
+            for item in v:
+                m = item.split('{')[0]
+                print(f"{'EXEMPT' if exempt else 'CHECK'}:{name}:{m}")
 PYEOF
     ) || true
-    alarm_metrics=$(echo "$alarm_metrics" | sort -u)
-    while IFS= read -r m; do
-      [[ -z "$m" ]] && continue
+    # Check for exempt validation errors
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      if [[ "$line" == EXEMPT_ERROR:* ]]; then
+        exempt_errors="$exempt_errors ${line#EXEMPT_ERROR:}"
+      fi
+    done <<< "$alarm_data"
+    if [[ -n "$exempt_errors" ]]; then
+      tap_not_ok "eval-alarms: exempt validation" \
+        "Invalid exempt config:$exempt_errors"
+    fi
+    # Source-grep check (per alarm, not per deduplicated metric)
+    local metrics_file="$REPO_ROOT/crates/app/src/metrics.rs"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      [[ "$line" == EXEMPT_ERROR:* ]] && continue
+      local status alarm_name metric_name
+      status="${line%%:*}"
+      local rest="${line#*:}"
+      alarm_name="${rest%%:*}"
+      metric_name="${rest#*:}"
+      if [[ "$status" == "EXEMPT" ]]; then
+        metrics_exempt=$((metrics_exempt + 1))
+        continue
+      fi
       metrics_checked=$((metrics_checked + 1))
-      # stellar_* metrics come from stellar-core, henyey_* from our crates
-      if [[ "$m" == stellar_* ]]; then
-        continue  # stellar-core metrics — accepted without source grep
-      fi
-      # Strip label selector for source grep (e.g., metric{key="val"} → metric)
-      local base_metric="${m%%\{*}"
-      if ! grep -rq "$base_metric" "$REPO_ROOT/crates/" 2>/dev/null; then
+      if ! grep -q "$metric_name" "$metrics_file" 2>/dev/null; then
         metrics_missing=$((metrics_missing + 1))
-        missing_list="$missing_list $m"
+        missing_list="$missing_list $alarm_name:$metric_name"
       fi
-    done <<< "$alarm_metrics"
+    done <<< "$alarm_data"
     if [[ "$metrics_missing" -eq 0 ]]; then
-      tap_ok "eval-alarms: all $metrics_checked alarm metrics found in source"
+      local exempt_note=""
+      [[ "$metrics_exempt" -gt 0 ]] && exempt_note=", $metrics_exempt exempt"
+      tap_ok "eval-alarms: all $metrics_checked alarm metrics found in source${exempt_note}"
     else
       tap_not_ok "eval-alarms: alarm metrics source-grep" \
         "$metrics_missing missing:$missing_list"
@@ -3045,6 +3079,170 @@ PYEOF
   else
     tap_not_ok "eval-alarms: alarm metrics source-grep" "catalog missing"
   fi
+
+  # Test 147a: exempt alarm is skipped by source-grep and evaluator
+  local exempt_toml
+  exempt_toml=$(mktemp)
+  cat > "$exempt_toml" <<'EXEMPT_TOML'
+schema_version = 1
+[[alarm]]
+name = "test-exempt-alarm"
+metric = "nonexistent_metric_that_does_not_exist_anywhere"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "WARN"
+gates = []
+cooldown_key = "test-exempt"
+cooldown_seconds = 3600
+filing_title = "test"
+filing_search = "test"
+summary = "test"
+details = "test"
+notes = ""
+exempt = true
+exempt_reason = "Test metric — does not exist in our codebase"
+EXEMPT_TOML
+  local exempt_validate
+  exempt_validate=$(python3 "$eval_script" --catalog "$exempt_toml" --validate-only 2>&1) || true
+  if echo "$exempt_validate" | grep -q '"valid": true'; then
+    tap_ok "eval-alarms: exempt alarm passes --validate-only"
+  else
+    tap_not_ok "eval-alarms: exempt alarm validation" \
+      "Validation failed: $exempt_validate"
+  fi
+  rm -f "$exempt_toml"
+
+  # Test 147b: exempt=true without exempt_reason is rejected by evaluator
+  local bad_exempt_toml
+  bad_exempt_toml=$(mktemp)
+  cat > "$bad_exempt_toml" <<'BAD_EXEMPT_TOML'
+schema_version = 1
+[[alarm]]
+name = "test-bad-exempt"
+metric = "some_metric"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "WARN"
+gates = []
+cooldown_key = "test-bad-exempt"
+cooldown_seconds = 3600
+filing_title = "test"
+filing_search = "test"
+summary = "test"
+details = "test"
+notes = ""
+exempt = true
+BAD_EXEMPT_TOML
+  local bad_exempt_validate
+  bad_exempt_validate=$(python3 "$eval_script" --catalog "$bad_exempt_toml" --validate-only 2>&1) || true
+  # Check that validation rejected the bad exempt config
+  if echo "$bad_exempt_validate" | grep -q "exempt"; then
+    tap_ok "eval-alarms: exempt=true without exempt_reason is rejected"
+  else
+    tap_not_ok "eval-alarms: exempt without reason validation" \
+      "Expected rejection but got (exit=$bad_exempt_exit): $bad_exempt_validate"
+  fi
+  rm -f "$bad_exempt_toml"
+
+  # Test 148: quorum-fail-at-low multi-tick persistence test (for_ticks=3)
+  local state_dir
+  state_dir=$(mktemp -d)
+  local tick_prom prev_prom
+  tick_prom=$(mktemp)
+  prev_prom=$(mktemp)
+  # Breaching value: quorum_fail_at = 0 (<= 1 threshold)
+  cat > "$tick_prom" <<'TICK_PROM'
+stellar_quorum_fail_at 0
+stellar_herder_state 2
+TICK_PROM
+  cat > "$prev_prom" <<'PREV_PROM'
+stellar_quorum_fail_at 0
+stellar_herder_state 2
+PREV_PROM
+  local t148_pass=true
+  local t148_detail=""
+  for tick in 1 2 3; do
+    local tick_out
+    tick_out=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+      python3 "$eval_script" \
+      --catalog "$catalog_file" \
+      --current "$tick_prom" \
+      --prev "$prev_prom" \
+      --state-dir "$state_dir" 2>/dev/null) || true
+    # Extract quorum-fail-at-low result
+    local qfa_state
+    qfa_state=$(echo "$tick_out" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'quorum-fail-at-low':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+    if [[ "$tick" -lt 3 ]]; then
+      if [[ "$qfa_state" != "breach" ]]; then
+        t148_pass=false
+        t148_detail="tick $tick: expected breach, got $qfa_state"
+        break
+      fi
+    else
+      if [[ "$qfa_state" != "firing" ]]; then
+        t148_pass=false
+        t148_detail="tick $tick: expected firing, got $qfa_state"
+        break
+      fi
+    fi
+  done
+  # Tick 4: clear (quorum_fail_at = 5, above threshold)
+  if $t148_pass; then
+    cat > "$tick_prom" <<'TICK_PROM_CLEAR'
+stellar_quorum_fail_at 5
+stellar_herder_state 2
+TICK_PROM_CLEAR
+    local clear_out
+    clear_out=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+      python3 "$eval_script" \
+      --catalog "$catalog_file" \
+      --current "$tick_prom" \
+      --prev "$prev_prom" \
+      --state-dir "$state_dir" 2>/dev/null) || true
+    local clear_state
+    clear_state=$(echo "$clear_out" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'quorum-fail-at-low':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+    if [[ "$clear_state" == "firing" ]] || [[ "$clear_state" == "breach" ]]; then
+      t148_pass=false
+      t148_detail="tick 4 (clear): expected ok/skipped, got $clear_state"
+    fi
+  fi
+  if $t148_pass; then
+    tap_ok "eval-alarms: quorum-fail-at-low multi-tick persistence (breach→breach→firing→clear)"
+  else
+    tap_not_ok "eval-alarms: quorum-fail-at-low multi-tick" "$t148_detail"
+  fi
+  rm -f "$tick_prom" "$prev_prom"
+  rm -rf "$state_dir"
 }
 check_skill_structure
 run_tests
