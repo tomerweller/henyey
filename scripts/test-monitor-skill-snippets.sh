@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=180
+TAP_PLAN=182
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -4072,14 +4072,16 @@ except Exception as e:
     --state-dir "$telemetry_state_dir" 2>"$telemetry_state_dir/stderr.log") || true
   telemetry_stderr=$(cat "$telemetry_state_dir/stderr.log")
 
-  # Test: histogram-p99 alarms should NOT produce ERROR_NO_SERIES
+  # Test: histogram-p99 alarms should NOT produce ERROR_NO_SERIES (all 8 alarms)
   local hist_error
-  hist_error=$(echo "$telemetry_stderr" | grep -c 'ERROR_NO_SERIES.*histogram\|lc-handle-complete.*ERROR_NO_SERIES\|lc-dispatch-to-join.*ERROR_NO_SERIES' || true)
+  hist_error=$(echo "$telemetry_stderr" | grep -c 'ERROR_NO_SERIES' || true)
   if [[ "$hist_error" -eq 0 ]]; then
-    tap_ok "eval-alarms: histogram-p99 no false ERROR_NO_SERIES"
+    tap_ok "eval-alarms: no false ERROR_NO_SERIES in telemetry"
   else
-    tap_not_ok "eval-alarms: histogram-p99 no false ERROR_NO_SERIES" \
-      "Found $hist_error false ERROR_NO_SERIES for histogram alarms"
+    local hist_detail
+    hist_detail=$(echo "$telemetry_stderr" | grep 'ERROR_NO_SERIES' | head -3)
+    tap_not_ok "eval-alarms: no false ERROR_NO_SERIES in telemetry" \
+      "Found $hist_error ERROR_NO_SERIES lines: $hist_detail"
   fi
 
   # Test: counter-ratio alarms with numerator_sum should have non-empty metric
@@ -4127,6 +4129,67 @@ for l in leaks[:5]:
     tap_not_ok "eval-alarms: no placeholder guard warnings on healthy fixtures" \
       "$guard_warnings warnings: $guard_detail"
   fi
+
+  # Test: gauge-ratio telemetry shows numerator_metric (fd-exhaustion alarm)
+  local gr_metric
+  gr_metric=$(echo "$telemetry_stderr" | grep 'fd-exhaustion' | head -1)
+  if echo "$gr_metric" | grep -q 'metric=henyey_process_open_fds'; then
+    tap_ok "eval-alarms: gauge-ratio telemetry uses numerator_metric"
+  else
+    tap_not_ok "eval-alarms: gauge-ratio telemetry uses numerator_metric" \
+      "fd-exhaustion line: $gr_metric"
+  fi
+
+  # Test: exempt/gate skip paths produce placeholder-free results
+  # Create a catalog with an exempt counter-ratio alarm to test exempt skip path
+  local exempt_catalog exempt_state_dir exempt_stdout
+  exempt_catalog=$(mktemp)
+  exempt_state_dir=$(mktemp -d)
+  cat > "$exempt_catalog" <<'EXEMPT_CAT'
+schema_version = 1
+
+[[alarm]]
+name = "test-exempt-ratio"
+kind = "counter-ratio"
+numerator = "stellar_ledger_apply_failure_total"
+denominator = "stellar_ledger_apply_success_total"
+ratio_op = ">"
+ratio_threshold = 0.5
+streak_threshold = 3
+severity = "WARN"
+exempt = true
+exempt_reason = "testing exempt path"
+details = "fail_ratio={value} threshold={threshold} streak={streak}/{streak_threshold}"
+filing_title = "test"
+summary = "test"
+EXEMPT_CAT
+  exempt_stdout=$(MONITOR_MODE=validator UPTIME_SECONDS=900 \
+    WARMUP_TICKS_REMAINING=0 PID=12345 START_TICKS=100 \
+    python3 "$eval_script" \
+    --catalog "$exempt_catalog" \
+    --current "$fixture_dir/healthy-current.prom" \
+    --prev "$fixture_dir/healthy-prev.prom" \
+    --state-dir "$exempt_state_dir" 2>/dev/null) || true
+  local exempt_leaks
+  exempt_leaks=$(echo "$exempt_stdout" | python3 -c "
+import json, sys, re
+data = json.load(sys.stdin)
+leaks = []
+for r in data.get('alarms', []):
+    for field in ('details', 'filing_title', 'summary'):
+        val = r.get(field, '')
+        if val and re.search(r'\{[a-z_]+\}', val):
+            leaks.append(f\"{r['name']}.{field}: {val}\")
+print(len(leaks))
+" 2>/dev/null) || echo "error"
+  if [[ "$exempt_leaks" == "0" ]]; then
+    tap_ok "eval-alarms: exempt skip path produces placeholder-free results"
+  else
+    tap_not_ok "eval-alarms: exempt skip path produces placeholder-free results" \
+      "$exempt_leaks placeholder leaks in exempt results"
+  fi
+  rm -f "$exempt_catalog"
+  rm -rf "$exempt_state_dir"
 
   rm -rf "$telemetry_state_dir"
 }
