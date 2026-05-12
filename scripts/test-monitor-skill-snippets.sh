@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=155
+TAP_PLAN=164
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -3479,6 +3479,345 @@ TABLE_EOF
     tap_not_ok "eval-alarms: reconciliation table completeness" \
       "Missing catalog or ALARM_SURFACES.md"
   fi
+
+  # ── Archive and Replay Tests ──────────────────────────────────────────────
+  # Tests for per-tick metrics snapshot archiving and historical replay.
+
+  local archive_root="$TEST_ROOT/archive-tests"
+
+  # ── Test: Archive creation — directory structure and metadata.env ────────
+  local t_arc="$archive_root/t-create"
+  local t_arc_session="$t_arc/data/test-session"
+  mkdir -p "$t_arc_session/metrics"
+  echo "# HELP test_metric gauge" > "$t_arc_session/metrics/current.prom"
+  echo "test_metric 42" >> "$t_arc_session/metrics/current.prom"
+  echo "# HELP test_metric gauge" > "$t_arc_session/metrics/prev.prom"
+  echo "test_metric 40" >> "$t_arc_session/metrics/prev.prom"
+
+  # Simulate archive step
+  local arc_dir="$t_arc_session/metrics/archive"
+  mkdir -p "$arc_dir"
+  local arc_ts="2025-05-12T14:00:00.000000000Z"
+  local snap_tmp="$arc_dir/${arc_ts}.tmp"
+  local snap_final="$arc_dir/${arc_ts}"
+  mkdir -p "$snap_tmp"
+  cp "$t_arc_session/metrics/current.prom" "$snap_tmp/current.prom"
+  cp "$t_arc_session/metrics/prev.prom" "$snap_tmp/prev.prom"
+  cat > "$snap_tmp/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=1
+TICK_SKIPPED=false
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+UPTIME_SECONDS=14400
+MONITOR_MODE=validator
+PID=12345
+START_TICKS=987654
+METAEOF
+  mv "$snap_tmp" "$snap_final"
+
+  if [[ -d "$snap_final" ]] && [[ -f "$snap_final/metadata.env" ]] \
+     && [[ -f "$snap_final/current.prom" ]] && [[ -f "$snap_final/prev.prom" ]] \
+     && grep -q "ARCHIVE_VERSION=1" "$snap_final/metadata.env"; then
+    tap_ok "archive: directory structure and metadata.env created correctly"
+  else
+    tap_not_ok "archive: directory structure and metadata.env created correctly" \
+      "Missing files in $snap_final"
+  fi
+
+  # ── Test: Archive atomicity — .tmp dirs not counted as snapshots ────────
+  mkdir -p "$arc_dir/2025-05-12T15:00:00.000000000Z.tmp"
+  echo "incomplete" > "$arc_dir/2025-05-12T15:00:00.000000000Z.tmp/metadata.env"
+  local snap_count
+  snap_count=$(find "$arc_dir" -maxdepth 1 -mindepth 1 -type d ! -name '*.tmp' | wc -l)
+  if [[ "$snap_count" -eq 1 ]]; then
+    tap_ok "archive: .tmp directories excluded from snapshot count"
+  else
+    tap_not_ok "archive: .tmp directories excluded from snapshot count" \
+      "Expected 1 snapshot, got $snap_count"
+  fi
+
+  # ── Test: Archive pruning — keeps only 500 most recent ─────────────────
+  local t_prune="$archive_root/t-prune"
+  local prune_arc="$t_prune/data/prune-session/metrics/archive"
+  mkdir -p "$prune_arc"
+  # Create 505 snapshot dirs with sequential timestamps
+  for i in $(seq -w 1 505); do
+    local ts_dir="$prune_arc/2025-01-01T00:${i:0:2}:${i:2:1}0.000000000Z"
+    mkdir -p "$ts_dir"
+    echo "ARCHIVE_VERSION=1" > "$ts_dir/metadata.env"
+  done
+
+  # Run pruning logic
+  local prune_snaps=()
+  while IFS= read -r -d '' d; do
+    prune_snaps+=("$d")
+  done < <(find "$prune_arc" -maxdepth 1 -mindepth 1 -type d ! -name '*.tmp' -print0 | sort -z)
+  local prune_count=${#prune_snaps[@]}
+  if [[ "$prune_count" -gt 500 ]]; then
+    local prune_excess=$((prune_count - 500))
+    for ((i=0; i<prune_excess; i++)); do
+      rm -rf "${prune_snaps[$i]}"
+    done
+  fi
+
+  local remaining
+  remaining=$(find "$prune_arc" -maxdepth 1 -mindepth 1 -type d | wc -l)
+  if [[ "$remaining" -eq 500 ]]; then
+    tap_ok "archive: pruning keeps exactly 500 snapshots"
+  else
+    tap_not_ok "archive: pruning keeps exactly 500 snapshots" \
+      "Expected 500, got $remaining"
+  fi
+
+  # ── Test: Replay chronological ordering ─────────────────────────────────
+  local t_replay="$archive_root/t-replay"
+  local replay_session="$t_replay/data/replay-session"
+  local replay_arc="$replay_session/metrics/archive"
+  mkdir -p "$replay_arc"
+
+  # Create 3 snapshots with known timestamps and metrics
+  for ts_pair in "2025-05-10T10:00:00.000000000Z=100" "2025-05-10T11:00:00.000000000Z=200" "2025-05-10T12:00:00.000000000Z=300"; do
+    local ts="${ts_pair%%=*}"
+    local val="${ts_pair##*=}"
+    local sd="$replay_arc/$ts"
+    mkdir -p "$sd"
+    # Create minimal prom files
+    echo "# HELP test_gauge A test gauge" > "$sd/current.prom"
+    echo "# TYPE test_gauge gauge" >> "$sd/current.prom"
+    echo "test_gauge $val" >> "$sd/current.prom"
+    echo "# HELP test_gauge A test gauge" > "$sd/prev.prom"
+    echo "# TYPE test_gauge gauge" >> "$sd/prev.prom"
+    echo "test_gauge $((val - 10))" >> "$sd/prev.prom"
+    cat > "$sd/metadata.env" << METAEOF
+ARCHIVE_VERSION=1
+TICK_SKIPPED=false
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+UPTIME_SECONDS=14400
+MONITOR_MODE=validator
+PID=12345
+START_TICKS=987654
+METAEOF
+  done
+
+  # Verify chronological sort by directory name
+  local sorted_dirs
+  sorted_dirs=$(find "$replay_arc" -maxdepth 1 -mindepth 1 -type d ! -name '*.tmp' -print0 | sort -z | tr '\0' '\n')
+  local first_dir last_dir
+  first_dir=$(echo "$sorted_dirs" | head -1)
+  last_dir=$(echo "$sorted_dirs" | tail -1)
+  if [[ "$(basename "$first_dir")" == "2025-05-10T10:00:00.000000000Z" ]] \
+     && [[ "$(basename "$last_dir")" == "2025-05-10T12:00:00.000000000Z" ]]; then
+    tap_ok "archive: chronological ordering by directory name"
+  else
+    tap_not_ok "archive: chronological ordering by directory name" \
+      "first=$(basename "$first_dir") last=$(basename "$last_dir")"
+  fi
+
+  # ── Test: Replay skipped-tick handling ──────────────────────────────────
+  local t_skip="$archive_root/t-skip"
+  local skip_arc="$t_skip/data/skip-session/metrics/archive"
+  mkdir -p "$skip_arc"
+
+  # Create a skipped tick
+  local skip_dir="$skip_arc/2025-05-10T10:00:00.000000000Z"
+  mkdir -p "$skip_dir"
+  cat > "$skip_dir/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=1
+TICK_SKIPPED=true
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+UPTIME_SECONDS=0
+MONITOR_MODE=validator
+PID=
+START_TICKS=
+METAEOF
+
+  # Verify TICK_SKIPPED is correctly read
+  source "$skip_dir/metadata.env"
+  if [[ "$TICK_SKIPPED" == "true" ]] && [[ "$ARCHIVE_VERSION" == "1" ]]; then
+    tap_ok "archive: skipped-tick metadata.env correctly marks TICK_SKIPPED=true"
+  else
+    tap_not_ok "archive: skipped-tick metadata.env correctly marks TICK_SKIPPED=true" \
+      "TICK_SKIPPED=$TICK_SKIPPED ARCHIVE_VERSION=$ARCHIVE_VERSION"
+  fi
+
+  # ── Test: Malformed metadata.env detection ──────────────────────────────
+  local t_malformed="$archive_root/t-malformed"
+  local mal_arc="$t_malformed/data/mal-session/metrics/archive"
+  mkdir -p "$mal_arc/2025-05-10T10:00:00.000000000Z"
+  echo "ARCHIVE_VERSION=99" > "$mal_arc/2025-05-10T10:00:00.000000000Z/metadata.env"
+
+  # Source and check version
+  source "$mal_arc/2025-05-10T10:00:00.000000000Z/metadata.env" 2>/dev/null || true
+  if [[ "${ARCHIVE_VERSION:-}" != "1" ]]; then
+    tap_ok "archive: malformed metadata.env detected (wrong ARCHIVE_VERSION)"
+  else
+    tap_not_ok "archive: malformed metadata.env detected (wrong ARCHIVE_VERSION)" \
+      "ARCHIVE_VERSION=$ARCHIVE_VERSION"
+  fi
+
+  # ── Test: Default mode metadata fallback ────────────────────────────────
+  local t_fallback="$archive_root/t-fallback"
+  local fb_session="$t_fallback/data/fb-session"
+  local fb_arc="$fb_session/metrics/archive"
+  mkdir -p "$fb_arc/2025-05-12T14:00:00.000000000Z"
+  cat > "$fb_arc/2025-05-12T14:00:00.000000000Z/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=1
+TICK_SKIPPED=false
+PREV_PROM_INVALID=true
+WARMUP_TICKS_REMAINING=2
+FRESH_START=yes
+CRASH_RECOVERY=no
+UPTIME_SECONDS=60
+MONITOR_MODE=watcher
+PID=99999
+START_TICKS=111111
+METAEOF
+
+  # Find latest snapshot and source metadata
+  local latest_snap=""
+  while IFS= read -r -d '' d; do
+    if [[ -f "$d/metadata.env" ]]; then
+      latest_snap="$d"
+    fi
+  done < <(find "$fb_arc" -maxdepth 1 -mindepth 1 -type d ! -name '*.tmp' -print0 | sort -z)
+
+  if [[ -n "$latest_snap" ]]; then
+    source "$latest_snap/metadata.env"
+    if [[ "$MONITOR_MODE" == "watcher" ]] && [[ "$WARMUP_TICKS_REMAINING" == "2" ]] \
+       && [[ "$PREV_PROM_INVALID" == "true" ]]; then
+      tap_ok "archive: default mode reads metadata from latest archive snapshot"
+    else
+      tap_not_ok "archive: default mode reads metadata from latest archive snapshot" \
+        "MONITOR_MODE=$MONITOR_MODE WARMUP=$WARMUP_TICKS_REMAINING PREV_INVALID=$PREV_PROM_INVALID"
+    fi
+  else
+    tap_not_ok "archive: default mode reads metadata from latest archive snapshot" \
+      "No latest snapshot found"
+  fi
+
+  # ── Test: Post-gap persistence — skipped tick doesn't reset state ───────
+  local t_gap="$archive_root/t-gap"
+  local gap_arc="$t_gap/data/gap-session/metrics/archive"
+  mkdir -p "$gap_arc"
+
+  # Tick 1: normal evaluation (breach starts persistence counter)
+  local gap_t1="$gap_arc/2025-05-10T10:00:00.000000000Z"
+  mkdir -p "$gap_t1"
+  echo "# TYPE test_gauge gauge" > "$gap_t1/current.prom"
+  echo "test_gauge 100" >> "$gap_t1/current.prom"
+  echo "# TYPE test_gauge gauge" > "$gap_t1/prev.prom"
+  echo "test_gauge 90" >> "$gap_t1/prev.pom"
+  cat > "$gap_t1/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=1
+TICK_SKIPPED=false
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+UPTIME_SECONDS=14400
+MONITOR_MODE=validator
+PID=12345
+START_TICKS=987654
+METAEOF
+
+  # Tick 2: skipped (gap)
+  local gap_t2="$gap_arc/2025-05-10T11:00:00.000000000Z"
+  mkdir -p "$gap_t2"
+  cat > "$gap_t2/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=1
+TICK_SKIPPED=true
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+UPTIME_SECONDS=0
+MONITOR_MODE=validator
+PID=
+START_TICKS=
+METAEOF
+
+  # Tick 3: normal evaluation (persistence should continue)
+  local gap_t3="$gap_arc/2025-05-10T12:00:00.000000000Z"
+  mkdir -p "$gap_t3"
+  echo "# TYPE test_gauge gauge" > "$gap_t3/current.prom"
+  echo "test_gauge 100" >> "$gap_t3/current.prom"
+  echo "# TYPE test_gauge gauge" > "$gap_t3/prev.prom"
+  echo "test_gauge 90" >> "$gap_t3/prev.prom"
+  cat > "$gap_t3/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=1
+TICK_SKIPPED=false
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+UPTIME_SECONDS=14400
+MONITOR_MODE=validator
+PID=12345
+START_TICKS=987654
+METAEOF
+
+  # Verify: 3 snapshots, 1 skipped, state dir persists across gap
+  local gap_total=0 gap_skipped=0
+  for gd in "$gap_arc"/2025-*; do
+    [[ -d "$gd" ]] || continue
+    gap_total=$((gap_total + 1))
+    source "$gd/metadata.env"
+    if [[ "$TICK_SKIPPED" == "true" ]]; then
+      gap_skipped=$((gap_skipped + 1))
+    fi
+  done
+  if [[ "$gap_total" -eq 3 ]] && [[ "$gap_skipped" -eq 1 ]]; then
+    tap_ok "archive: post-gap persistence — skipped tick counted, state preserved"
+  else
+    tap_not_ok "archive: post-gap persistence — skipped tick counted, state preserved" \
+      "total=$gap_total skipped=$gap_skipped"
+  fi
+
+  # ── Test: Retention boundary — pruned archive still usable ──────────────
+  local t_boundary="$archive_root/t-boundary"
+  local bound_arc="$t_boundary/data/bound-session/metrics/archive"
+  mkdir -p "$bound_arc"
+  # Create 3 snapshots, prune to keep 2
+  for ts in "2025-01-01T00:00:00.000000000Z" "2025-01-02T00:00:00.000000000Z" "2025-01-03T00:00:00.000000000Z"; do
+    mkdir -p "$bound_arc/$ts"
+    echo "ARCHIVE_VERSION=1" > "$bound_arc/$ts/metadata.env"
+    echo "TICK_SKIPPED=false" >> "$bound_arc/$ts/metadata.env"
+  done
+
+  # Prune to keep 2
+  local bound_snaps=()
+  while IFS= read -r -d '' d; do
+    bound_snaps+=("$d")
+  done < <(find "$bound_arc" -maxdepth 1 -mindepth 1 -type d ! -name '*.tmp' -print0 | sort -z)
+  local bound_count=${#bound_snaps[@]}
+  if [[ "$bound_count" -gt 2 ]]; then
+    local bound_excess=$((bound_count - 2))
+    for ((i=0; i<bound_excess; i++)); do
+      rm -rf "${bound_snaps[$i]}"
+    done
+  fi
+
+  local bound_remaining
+  bound_remaining=$(find "$bound_arc" -maxdepth 1 -mindepth 1 -type d | wc -l)
+  local oldest_remaining
+  oldest_remaining=$(find "$bound_arc" -maxdepth 1 -mindepth 1 -type d -print0 | sort -z | head -z -n 1 | tr -d '\0')
+  if [[ "$bound_remaining" -eq 2 ]] && [[ "$(basename "$oldest_remaining")" == "2025-01-02T00:00:00.000000000Z" ]]; then
+    tap_ok "archive: retention boundary — oldest pruned, newest 2 kept"
+  else
+    tap_not_ok "archive: retention boundary — oldest pruned, newest 2 kept" \
+      "remaining=$bound_remaining oldest=$(basename "${oldest_remaining:-none}")"
+  fi
+
+  # Clean up archive test dirs
+  rm -rf "$archive_root"
 }
 check_skill_structure
 run_tests

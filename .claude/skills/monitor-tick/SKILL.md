@@ -57,6 +57,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `metrics/ratio_snapshot` | counter-ratio history (check 12) | check 12 |
 | `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b ([metric-alarms](../shared/metric-alarms.toml)) |
 | `metrics/anomaly_cooldown.json` | alert dedup state | check 9 |
+| `metrics/archive/` | Per-tick snapshot dirs (current.prom + prev.prom + metadata.env), rolling 500, atomic write | check 12 |
 | `logs/monitor.log` | node stdout/stderr (rotated on restart) | node process |
 | `cargo-target/` | cached build tree | cargo |
 | `.alive` | session liveness marker | session startup |
@@ -619,9 +620,9 @@ against a node that is in real-time sync with age=2s).
 3. Capture process identity (before curl):
    ```bash
    PID=$(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")
-   # If PID is empty (process not running), skip the entire metrics scan.
+   # If PID is empty (process not running), set TICK_SKIPPED=true and skip to step 7 (archive).
    START_TICKS=$(awk '{print $22}' /proc/$PID/stat 2>/dev/null)
-   # If /proc/$PID/stat is unreadable, skip the entire metrics scan (fail closed).
+   # If /proc/$PID/stat is unreadable, set TICK_SKIPPED=true and skip to step 7 (archive).
    ```
 4. `curl -s http://localhost:$MONITOR_ADMIN_PORT/metrics > /home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom`.
 5. **Process identity check for prev.prom validity:**
@@ -631,7 +632,7 @@ against a node that is in real-time sync with age=2s).
    POST_TICKS=$(awk '{print $22}' /proc/$PID/stat 2>/dev/null)
    # If unreadable OR POST_TICKS != START_TICKS: process died or was replaced
    # during the scrape. Discard current.prom (truncate to empty). Do NOT write
-   # scrape_identity. Skip the entire metrics scan (fail closed).
+   # scrape_identity. Set TICK_SKIPPED=true and skip to step 7 (archive).
    ```
 
    **Identity file:** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/scrape_identity`
@@ -702,6 +703,59 @@ against a node that is in real-time sync with age=2s).
 
 6. **Counter reset handling**: for any counter, if `current < prev`, treat
    `delta = current` (defense-in-depth for within-incarnation counter resets).
+
+7. **Archive snapshot** — archive the current tick's metrics and metadata for
+   historical replay (see `scripts/dev/replay-alarms-on-history.sh`). This step
+   runs regardless of whether evaluation was skipped (`TICK_SKIPPED` captures
+   that). All ticks are archived to preserve accurate sequential replay state.
+
+   ```bash
+   ARCHIVE_DIR="$HOME/data/$MONITOR_SESSION_ID/metrics/archive"
+   mkdir -p "$ARCHIVE_DIR"
+   TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
+   SNAP_TMP="$ARCHIVE_DIR/${TIMESTAMP}.tmp"
+   SNAP_FINAL="$ARCHIVE_DIR/${TIMESTAMP}"
+   mkdir -p "$SNAP_TMP"
+
+   # Copy prom files (may be empty/missing — expected for skipped ticks)
+   cp "$HOME/data/$MONITOR_SESSION_ID/metrics/current.prom" "$SNAP_TMP/current.prom" 2>/dev/null || true
+   cp "$HOME/data/$MONITOR_SESSION_ID/metrics/prev.prom"    "$SNAP_TMP/prev.prom"    2>/dev/null || true
+
+   # Write metadata sidecar (marks directory as complete)
+   cat > "$SNAP_TMP/metadata.env" << METAEOF
+   ARCHIVE_VERSION=1
+   TICK_SKIPPED=${TICK_SKIPPED:-false}
+   PREV_PROM_INVALID=${PREV_PROM_INVALID:-false}
+   WARMUP_TICKS_REMAINING=${WARMUP_TICKS_REMAINING:-0}
+   FRESH_START=${FRESH_START:-no}
+   CRASH_RECOVERY=${CRASH_RECOVERY:-no}
+   UPTIME_SECONDS=${UPTIME_SECONDS:-0}
+   MONITOR_MODE=${MONITOR_MODE:-validator}
+   PID=${PID:-}
+   START_TICKS=${START_TICKS:-}
+   METAEOF
+
+   # Atomic rename
+   mv "$SNAP_TMP" "$SNAP_FINAL"
+
+   # Retention: keep most recent 500 snapshots
+   SNAPSHOTS=()
+   while IFS= read -r -d '' d; do
+     SNAPSHOTS+=("$d")
+   done < <(find "$ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d \
+     ! -name '*.tmp' -print0 | sort -z)
+   ARCHIVE_COUNT=${#SNAPSHOTS[@]}
+   if [ "$ARCHIVE_COUNT" -gt 500 ]; then
+     EXCESS=$((ARCHIVE_COUNT - 500))
+     for ((i=0; i<EXCESS; i++)); do
+       rm -rf "${SNAPSHOTS[$i]}"
+     done
+   fi
+
+   # Clean up orphaned .tmp dirs from crashed prior ticks
+   find "$ARCHIVE_DIR" -maxdepth 1 -name '*.tmp' -type d -mmin +5 \
+     -exec rm -rf {} + 2>/dev/null || true
+   ```
 
 ### Alarm evaluation via TOML catalog + Python evaluator
 

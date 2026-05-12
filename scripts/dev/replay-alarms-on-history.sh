@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# replay-alarms-on-history.sh — Point-in-time alarm regression check.
+# replay-alarms-on-history.sh — Alarm regression check with historical replay.
 #
-# Validates the current alarm catalog against a session's most recent
-# metrics snapshot pair. This is a schema + single-evaluation check,
-# NOT a historical replay (only one current.prom/prev.prom pair is
-# retained per session).
+# Modes:
+#   Default:  Single-evaluation of the most recent current.prom/prev.prom pair.
+#   --replay: Evaluate all archived snapshot triplets chronologically, producing
+#             per-alarm fired-count summaries across the retention window.
 #
 # Usage:
 #   scripts/dev/replay-alarms-on-history.sh [SESSION_DIR]
+#   scripts/dev/replay-alarms-on-history.sh [SESSION_DIR] --replay [--window N] [--alarm NAME]
 #
 # SESSION_DIR defaults to the most recent session under ~/data/.
 
@@ -26,12 +27,52 @@ if [[ ! -f "$CATALOG" ]]; then
   exit 1
 fi
 
-# Find session directory
-if [[ $# -ge 1 ]]; then
-  SESSION_DIR="$1"
-else
-  # Find the most recent session directory that has metrics/
-  SESSION_DIR=""
+# Parse arguments
+SESSION_DIR=""
+REPLAY_MODE=false
+WINDOW=""
+ALARM_FILTER=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --replay)
+      REPLAY_MODE=true
+      shift
+      ;;
+    --window)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --window requires a numeric argument" >&2
+        exit 1
+      fi
+      WINDOW="$2"
+      if ! [[ "$WINDOW" =~ ^[0-9]+$ ]] || [[ "$WINDOW" -lt 1 ]]; then
+        echo "ERROR: --window must be a positive integer, got '$WINDOW'" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --alarm)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --alarm requires a name argument" >&2
+        exit 1
+      fi
+      ALARM_FILTER="$2"
+      shift 2
+      ;;
+    *)
+      if [[ -z "$SESSION_DIR" ]]; then
+        SESSION_DIR="$1"
+      else
+        echo "ERROR: Unexpected argument: $1" >&2
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Find session directory if not specified
+if [[ -z "$SESSION_DIR" ]]; then
   for d in "$HOME"/data/*/metrics; do
     if [[ -d "$d" ]]; then
       parent="$(dirname "$d")"
@@ -47,6 +88,200 @@ else
 fi
 
 METRICS_DIR="$SESSION_DIR/metrics"
+ARCHIVE_DIR="$METRICS_DIR/archive"
+
+# --- Replay mode ---
+if [[ "$REPLAY_MODE" == true ]]; then
+  # Discover complete snapshot directories (those containing metadata.env)
+  SNAPSHOTS=()
+  if [[ -d "$ARCHIVE_DIR" ]]; then
+    while IFS= read -r -d '' d; do
+      if [[ -f "$d/metadata.env" ]]; then
+        SNAPSHOTS+=("$d")
+      else
+        echo "WARNING: Skipping incomplete archive entry: $d (no metadata.env)" >&2
+      fi
+    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d \
+      ! -name '*.tmp' -print0 | sort -z)
+  fi
+
+  if [[ ${#SNAPSHOTS[@]} -eq 0 ]]; then
+    echo "No archived snapshots found in $ARCHIVE_DIR"
+    exit 0
+  fi
+
+  # Create a fresh state directory for this replay invocation
+  REPLAY_STATE_DIR=$(mktemp -d "${METRICS_DIR}/replay-state-XXXXXX")
+  trap 'rm -rf "$REPLAY_STATE_DIR"' EXIT
+
+  # Evaluate all snapshots chronologically, collecting JSON results
+  TOTAL=${#SNAPSHOTS[@]}
+  SKIPPED_COUNT=0
+  EVALUATED_COUNT=0
+  RESULTS_FILE=$(mktemp "${METRICS_DIR}/replay-results-XXXXXX")
+  FIRST_TS=""
+  LAST_TS=""
+
+  for snap_dir in "${SNAPSHOTS[@]}"; do
+    ts_name="$(basename "$snap_dir")"
+
+    # Track time range
+    if [[ -z "$FIRST_TS" ]]; then
+      FIRST_TS="$ts_name"
+    fi
+    LAST_TS="$ts_name"
+
+    # Validate and source metadata
+    if ! source "$snap_dir/metadata.env" 2>/dev/null; then
+      echo "ERROR: Corrupt archive at $snap_dir: metadata.env is not parseable" >&2
+      rm -f "$RESULTS_FILE"
+      exit 1
+    fi
+
+    # Validate required v1 keys
+    if [[ "${ARCHIVE_VERSION:-}" != "1" ]]; then
+      echo "ERROR: Corrupt archive at $snap_dir: ARCHIVE_VERSION=${ARCHIVE_VERSION:-missing} (expected 1)" >&2
+      rm -f "$RESULTS_FILE"
+      exit 1
+    fi
+
+    # Handle skipped ticks — preserve state dir, skip evaluation
+    if [[ "${TICK_SKIPPED:-false}" == "true" ]]; then
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue
+    fi
+
+    EVALUATED_COUNT=$((EVALUATED_COUNT + 1))
+
+    # Build eval command with archived env vars
+    CURRENT_FILE="$snap_dir/current.prom"
+    PREV_FILE="$snap_dir/prev.prom"
+
+    # Run evaluator with archived metadata
+    RESULT=$(PREV_PROM_INVALID="${PREV_PROM_INVALID:-false}" \
+      WARMUP_TICKS_REMAINING="${WARMUP_TICKS_REMAINING:-0}" \
+      FRESH_START="${FRESH_START:-no}" \
+      CRASH_RECOVERY="${CRASH_RECOVERY:-no}" \
+      UPTIME_SECONDS="${UPTIME_SECONDS:-0}" \
+      MONITOR_MODE="${MONITOR_MODE:-validator}" \
+      PID="${PID:-}" \
+      START_TICKS="${START_TICKS:-}" \
+      python3 "$EVAL_SCRIPT" \
+        --catalog "$CATALOG" \
+        --current "$CURRENT_FILE" \
+        --prev "$PREV_FILE" \
+        --state-dir "$REPLAY_STATE_DIR" 2>/dev/null) || true
+
+    if [[ -n "$RESULT" ]]; then
+      echo "$RESULT" >> "$RESULTS_FILE"
+    fi
+  done
+
+  # Generate summary table
+  python3 -c "
+import json, sys
+
+results_file = sys.argv[1]
+window = int(sys.argv[2]) if sys.argv[2] else 0
+alarm_filter = sys.argv[3] if sys.argv[3] else ''
+evaluated = int(sys.argv[4])
+skipped = int(sys.argv[5])
+first_ts = sys.argv[6]
+last_ts = sys.argv[7]
+session_dir = sys.argv[8]
+catalog = sys.argv[9]
+
+# Parse all result lines
+all_results = []
+with open(results_file) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                all_results.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+# Apply window filter (display only last N evaluated ticks)
+if window > 0 and window < len(all_results):
+    display_results = all_results[-window:]
+    displayed = window
+else:
+    display_results = all_results
+    displayed = len(all_results)
+
+# Aggregate per-alarm states
+alarm_counts = {}  # name -> {firing, breach, ok, baseline, skip}
+for result in display_results:
+    for alarm in result.get('alarms', []):
+        name = alarm.get('name', 'unknown')
+        state = alarm.get('state', 'unknown')
+        if name not in alarm_counts:
+            alarm_counts[name] = {'firing': 0, 'breach': 0, 'ok': 0, 'baseline': 0, 'skip': 0}
+        if state == 'firing':
+            alarm_counts[name]['firing'] += 1
+        elif state == 'breach':
+            alarm_counts[name]['breach'] += 1
+        elif state in ('ok', 'clear'):
+            alarm_counts[name]['ok'] += 1
+        elif state == 'collecting_baseline':
+            alarm_counts[name]['baseline'] += 1
+        elif state == 'skipped':
+            alarm_counts[name]['skip'] += 1
+        else:
+            alarm_counts[name]['skip'] += 1
+
+# Apply alarm filter
+if alarm_filter:
+    matching = {k: v for k, v in alarm_counts.items() if alarm_filter in k}
+    if not matching:
+        print(f\"No alarm matching '{alarm_filter}' found\", file=sys.stderr)
+        sys.exit(1)
+    alarm_counts = matching
+
+# Print summary
+print('=== Alarm History Replay ===')
+print(f'Session:   {session_dir}')
+print(f'Evaluated: {evaluated} ticks ({skipped} skipped)')
+if window > 0 and window < evaluated:
+    print(f'Displayed: {displayed} of {evaluated} (--window {window})')
+print(f'Range:     {first_ts} -> {last_ts}')
+print(f'Catalog:   {catalog}')
+print()
+
+if not alarm_counts:
+    print('No alarm results to display.')
+    sys.exit(0)
+
+# Table header
+name_width = max(30, max(len(n) for n in alarm_counts) + 2)
+header = f\"{'Alarm Name':<{name_width}} | {'Firing':>6} | {'Breach':>6} | {'OK':>6} | {'Baseline':>8} | {'Skip':>4}\"
+separator = '-' * name_width + '-|' + '--------|--------|--------|----------|------'
+print(header)
+print(separator)
+
+# Table rows (sorted by name)
+firing_count = 0
+breach_count = 0
+for name in sorted(alarm_counts.keys()):
+    c = alarm_counts[name]
+    print(f\"{name:<{name_width}} | {c['firing']:>6} | {c['breach']:>6} | {c['ok']:>6} | {c['baseline']:>8} | {c['skip']:>4}\")
+    if c['firing'] > 0:
+        firing_count += 1
+    if c['breach'] > 0:
+        breach_count += 1
+
+print()
+print(f'Alarms with any firings: {firing_count}')
+print(f'Alarms with any breaches: {breach_count}')
+" "$RESULTS_FILE" "${WINDOW:-0}" "$ALARM_FILTER" "$EVALUATED_COUNT" "$SKIPPED_COUNT" "$FIRST_TS" "$LAST_TS" "$SESSION_DIR" "$CATALOG"
+
+  rm -f "$RESULTS_FILE"
+  exit 0
+fi
+
+# --- Default mode: single-pair evaluation ---
+
 CURRENT="$METRICS_DIR/current.prom"
 PREV="$METRICS_DIR/prev.prom"
 
@@ -72,11 +307,28 @@ if [[ -f "$CURRENT" ]] && [[ -f "$PREV" ]]; then
   echo "prev.prom:    $PREV ($(wc -l < "$PREV") lines)"
   echo ""
 
-  # Create a temporary state dir for the evaluation
-  STATE_DIR=$(mktemp -d)
+  STATE_DIR=$(mktemp -d "${METRICS_DIR}/eval-state-XXXXXX")
   trap 'rm -rf "$STATE_DIR"' EXIT
 
-  RESULT=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+  # Use metadata from latest archive snapshot if available
+  EVAL_ENV_ARGS="MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0"
+  if [[ -d "$ARCHIVE_DIR" ]]; then
+    LATEST_SNAP=""
+    while IFS= read -r -d '' d; do
+      if [[ -f "$d/metadata.env" ]]; then
+        LATEST_SNAP="$d"
+      fi
+    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d \
+      ! -name '*.tmp' -print0 | sort -z)
+    if [[ -n "$LATEST_SNAP" ]] && [[ -f "$LATEST_SNAP/metadata.env" ]]; then
+      echo "Using metadata from latest archive: $(basename "$LATEST_SNAP")"
+      source "$LATEST_SNAP/metadata.env"
+      EVAL_ENV_ARGS="PREV_PROM_INVALID=${PREV_PROM_INVALID:-false} WARMUP_TICKS_REMAINING=${WARMUP_TICKS_REMAINING:-0} FRESH_START=${FRESH_START:-no} CRASH_RECOVERY=${CRASH_RECOVERY:-no} UPTIME_SECONDS=${UPTIME_SECONDS:-0} MONITOR_MODE=${MONITOR_MODE:-validator} PID=${PID:-} START_TICKS=${START_TICKS:-}"
+      echo ""
+    fi
+  fi
+
+  RESULT=$(env $EVAL_ENV_ARGS \
     python3 "$EVAL_SCRIPT" \
     --catalog "$CATALOG" \
     --current "$CURRENT" \
@@ -98,15 +350,17 @@ try:
     breach = [a for a in alarms if a.get('state') == 'breach']
     skipped = [a for a in alarms if a.get('state') == 'skipped']
     ok = [a for a in alarms if a.get('state') in ('ok', 'clear')]
-    other = [a for a in alarms if a.get('state') not in ('firing', 'breach', 'skipped', 'ok', 'clear')]
+    baseline = [a for a in alarms if a.get('state') == 'collecting_baseline']
+    other = [a for a in alarms if a.get('state') not in ('firing', 'breach', 'skipped', 'ok', 'clear', 'collecting_baseline')]
 
     print(f'Total alarms evaluated: {len(alarms)}')
-    print(f'  Firing:  {len(firing)}')
-    print(f'  Breach:  {len(breach)}')
-    print(f'  OK:      {len(ok)}')
-    print(f'  Skipped: {len(skipped)}')
+    print(f'  Firing:   {len(firing)}')
+    print(f'  Breach:   {len(breach)}')
+    print(f'  OK:       {len(ok)}')
+    print(f'  Baseline: {len(baseline)}')
+    print(f'  Skipped:  {len(skipped)}')
     if other:
-        print(f'  Other:   {len(other)}')
+        print(f'  Other:    {len(other)}')
     print()
 
     if firing:
@@ -119,6 +373,12 @@ try:
         print('BREACH alarms (building persistence):')
         for a in breach:
             print(f'  - {a[\"name\"]}: {a.get(\"details\", \"\")}')
+        print()
+
+    if baseline:
+        print('COLLECTING BASELINE:')
+        for a in baseline:
+            print(f'  - {a[\"name\"]}')
         print()
 
     if skipped:
@@ -138,7 +398,5 @@ else
   echo "  Expected: $CURRENT"
   echo "  Expected: $PREV"
   echo ""
-  echo "NOTE: Only one current.prom/prev.prom pair is retained per session."
-  echo "      Multi-day historical replay requires snapshot archiving"
-  echo "      (not yet implemented)."
+  echo "NOTE: Use --replay to evaluate archived snapshot history."
 fi
