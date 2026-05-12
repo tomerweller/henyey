@@ -893,7 +893,7 @@ against a node that is in real-time sync with age=2s).
      # Determine replay_state watch item (precedence: failed > archive-too-small > stale > never-run)
      if [[ "$REPLAY_FAILED" == true ]]; then
        WATCH_ITEMS+=("replay_state=failed")
-     elif [[ "$RUN_REPLAY" == true ]] && [[ "${EVAL_TICKS:-0}" -lt 100 ]] && [[ "${EVAL_TICKS:-0}" -gt 0 || -z "${REPLAY_JSON:-}" ]]; then
+     elif [[ "$RUN_REPLAY" == true ]] && [[ "${EVAL_TICKS:-0}" -lt 100 ]]; then
        WATCH_ITEMS+=("replay_state=archive-too-small")
      elif [[ ! -f "$REPLAY_THROTTLE" ]]; then
        WATCH_ITEMS+=("replay_state=never-run")
