@@ -10676,4 +10676,180 @@ mod tests {
         // Episode 3.
         assert!(latch.try_mark_onset());
     }
+
+    // ── Recovery stall onset diagnostic App-level tests (#2569) ────────
+
+    /// Parse the `henyey_recovery_stall_onset_total` counter from Prometheus
+    /// text output.
+    fn parse_onset_count(rendered: &str) -> u64 {
+        for line in rendered.lines() {
+            if line.starts_with("henyey_recovery_stall_onset_total ") {
+                return line
+                    .split_whitespace()
+                    .last()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        0
+    }
+
+    /// Helper: create a minimal App for onset diagnostic tests.
+    async fn make_onset_test_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        (dir, app)
+    }
+
+    /// Comprehensive test for the recovery stall onset diagnostic through
+    /// the live `out_of_sync_recovery()` method. Runs all scenarios
+    /// sequentially in one test to avoid metric-recorder serialization
+    /// issues (the recorder is process-global).
+    ///
+    /// Covers: AppState gating (Synced, Validating, Initializing,
+    /// CatchingUp, ShuttingDown), `did_full_reset` suppression, latch
+    /// once-per-episode semantics, and short-circuit evaluation.
+    ///
+    /// Regression coverage for #2569 (follow-up from #2568).
+    #[tokio::test]
+    async fn test_recovery_stall_onset_diagnostic() {
+        let handle = crate::metrics::ensure_test_recorder();
+        crate::metrics::describe_metrics();
+        crate::metrics::register_label_series();
+
+        // ── Scenario A: Synced positive case ───────────────────────────
+        // AppState = Synced, no progress → onset should fire.
+        {
+            let (_dir, app) = make_onset_test_app().await;
+            *app.state.write().await = AppState::Synced;
+            // No progress: baseline defaults to 0, current_ledger = 0.
+            let before = parse_onset_count(&handle.render());
+            app.out_of_sync_recovery(0).await;
+            let after = parse_onset_count(&handle.render());
+            assert_eq!(
+                after - before,
+                1,
+                "Scenario A: Synced + no progress → onset should fire once"
+            );
+        }
+
+        // ── Scenario B: Validating positive case ───────────────────────
+        {
+            let (_dir, app) = make_onset_test_app().await;
+            *app.state.write().await = AppState::Validating;
+            let before = parse_onset_count(&handle.render());
+            app.out_of_sync_recovery(0).await;
+            let after = parse_onset_count(&handle.render());
+            assert_eq!(
+                after - before,
+                1,
+                "Scenario B: Validating + no progress → onset should fire once"
+            );
+        }
+
+        // ── Scenario C: Full reset suppression ─────────────────────────
+        // AppState = Synced, but progress causes Full reset → onset
+        // suppressed by `did_full_reset == true`.
+        {
+            let (_dir, app) = make_onset_test_app().await;
+            *app.state.write().await = AppState::Synced;
+            // baseline = 0, current_ledger = 1 → progress detected.
+            // Fresh herder: latest_externalized = 0, peer gap = 0 → Ahead,
+            // still_behind = false → Full reset.
+            app.recovery_baseline_ledger.store(0, Ordering::SeqCst);
+            let before = parse_onset_count(&handle.render());
+            app.out_of_sync_recovery(1).await;
+            let after = parse_onset_count(&handle.render());
+            assert_eq!(
+                after - before,
+                0,
+                "Scenario C: Full reset tick → onset suppressed despite Synced state"
+            );
+        }
+
+        // ── Scenario D: Non-synced state suppression ───────────────────
+        for non_synced_state in [
+            AppState::Initializing,
+            AppState::CatchingUp,
+            AppState::ShuttingDown,
+        ] {
+            let (_dir, app) = make_onset_test_app().await;
+            *app.state.write().await = non_synced_state;
+            let before = parse_onset_count(&handle.render());
+            app.out_of_sync_recovery(0).await;
+            let after = parse_onset_count(&handle.render());
+            assert_eq!(
+                after - before,
+                0,
+                "Scenario D: {non_synced_state} → onset suppressed"
+            );
+        }
+
+        // ── Scenario E: Fires once per episode ─────────────────────────
+        {
+            let (_dir, app) = make_onset_test_app().await;
+            *app.state.write().await = AppState::Synced;
+
+            // Episode 1: three calls, only the first should fire.
+            let before = parse_onset_count(&handle.render());
+            app.out_of_sync_recovery(0).await;
+            app.out_of_sync_recovery(0).await;
+            app.out_of_sync_recovery(0).await;
+            let after = parse_onset_count(&handle.render());
+            assert_eq!(
+                after - before,
+                1,
+                "Scenario E (episode 1): latch should fire exactly once"
+            );
+
+            // Trigger Full reset to rearm the latch: set baseline = 0 so
+            // current_ledger = 1 triggers progress, and fresh herder means
+            // Ahead + not still_behind → Full reset.
+            app.recovery_baseline_ledger.store(0, Ordering::SeqCst);
+            app.out_of_sync_recovery(1).await; // Full reset tick (onset suppressed)
+
+            // Episode 2: stop progress, call again.
+            app.recovery_baseline_ledger.store(1, Ordering::SeqCst);
+            let before2 = parse_onset_count(&handle.render());
+            app.out_of_sync_recovery(1).await;
+            let after2 = parse_onset_count(&handle.render());
+            assert_eq!(
+                after2 - before2,
+                1,
+                "Scenario E (episode 2): latch should fire once after Full reset rearm"
+            );
+        }
+
+        // ── Scenario F: Non-synced does not consume latch ──────────────
+        // Calling in CatchingUp should NOT consume the latch (short-circuit
+        // in `matches!(...) && try_mark_onset()`), so switching to Synced
+        // should still fire.
+        {
+            let (_dir, app) = make_onset_test_app().await;
+            *app.state.write().await = AppState::CatchingUp;
+
+            let before = parse_onset_count(&handle.render());
+            app.out_of_sync_recovery(0).await;
+            let mid = parse_onset_count(&handle.render());
+            assert_eq!(
+                mid - before,
+                0,
+                "Scenario F: CatchingUp → onset suppressed (latch not consumed)"
+            );
+
+            // Switch to Synced — latch should still be available.
+            *app.state.write().await = AppState::Synced;
+            app.out_of_sync_recovery(0).await;
+            let after = parse_onset_count(&handle.render());
+            assert_eq!(
+                after - mid,
+                1,
+                "Scenario F: after switching to Synced, onset should fire"
+            );
+        }
+    }
 }
