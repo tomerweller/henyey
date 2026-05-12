@@ -51,6 +51,7 @@ filing_search = "metrics: henyey_post_catchup_hard_reset_total"
 summary = "Post-catchup hard reset detected"
 details = "delta={value}"
 notes = ""
+# mirrors: henyey-slo-alerts.yaml henyey-post-catchup-hard-reset
 
 [[alarm]]
 name = "overlay-timeouts-spike"
@@ -147,7 +148,7 @@ filing_search = "metrics: stellar_ledger_invariant_failure_total"
 summary = "Ledger invariant failure detected"
 details = "delta={value}"
 notes = "Best-effort for strict invariants: counter increments before panic (crates/invariant/src/lib.rs). Process-down (Grafana rule 4) is primary for strict crashes. Reliable for non-strict."
-# mirrors: henyey-slo-alerts.yaml rule 1 (critical, increase > 0 over 10m)
+# mirrors: henyey-slo-alerts.yaml henyey-invariant-failure
 
 [[alarm]]
 name = "tx-internal-error"
@@ -166,7 +167,7 @@ filing_search = "metrics: stellar_ledger_transaction_internal_error_total"
 summary = "Transaction internal error detected"
 details = "delta={value}"
 notes = ""
-# mirrors: henyey-slo-alerts.yaml rule 2 (critical, rate > 0.01 over 5m)
+# mirrors: henyey-slo-alerts.yaml henyey-tx-internal-error
 
 # ── GAUGES ───────────────────────────────────────────────────────────────────
 
@@ -188,7 +189,7 @@ filing_search = "metrics: stellar_quorum_fail_at"
 summary = "Quorum fail-at low (degraded quorum health)"
 details = "value={value} threshold={threshold}"
 notes = "Covers fail_at==1 (one failure causes v-blocking) and fail_at==0 (already v-blocked). Monitor-tick files issues; Grafana rules 3a/3b handle tiered paging. Short cooldown (30min) ensures fail_at=0 is not suppressed by prior fail_at=1 filing."
-# mirrors: henyey-slo-alerts.yaml rules 3a (warn, ==1, 5m) and 3b (critical, <1, 5m)
+# mirrors: henyey-slo-alerts.yaml henyey-quorum-failat-warn, henyey-quorum-failat-crit
 # NOTE: surface mirror, NOT threshold-identical. Monitor-tick uses per-tick
 # gauge <= 1 with 3-tick persistence; Grafana uses == 1 / < 1 with 5m for-duration.
 
@@ -210,6 +211,7 @@ filing_search = "metrics: stellar_peer_count"
 summary = "Peer count below threshold"
 details = "peer_count={value} threshold={threshold}"
 notes = ""
+# mirrors: henyey-slo-alerts.yaml henyey-peer-count-warn, henyey-peer-count-crit
 
 [[alarm]]
 name = "inbound-auth-low"
@@ -248,6 +250,7 @@ filing_search = "metrics: stellar_ledger_age_current_seconds"
 summary = "Ledger age above threshold"
 details = "ledger_age={value}s threshold={threshold}s"
 notes = ""
+# mirrors: henyey-slo-alerts.yaml henyey-ledger-age-warn, henyey-ledger-age-crit
 
 [[alarm]]
 name = "herder-not-tracking"
@@ -267,6 +270,7 @@ filing_search = "metrics: stellar_herder_state"
 summary = "Herder not in tracking state"
 details = "herder_state={value} expected=2"
 notes = ""
+# mirrors: henyey-slo-alerts.yaml henyey-validator-not-tracking
 
 [[alarm]]
 name = "jemalloc-frag-high"
@@ -286,6 +290,7 @@ filing_search = "metrics: henyey_jemalloc_fragmentation_pct"
 summary = "Jemalloc fragmentation high (sustained)"
 details = "fragmentation={value}% threshold={threshold}%"
 notes = "Post-restart frag ramps ~35-45%, settles to ~18%."
+# mirrors: henyey-slo-alerts.yaml henyey-fragmentation
 
 [[alarm]]
 name = "scp-verify-backlog"
@@ -362,6 +367,7 @@ filing_search = "metrics: henyey_overlay_fetch_channel_depth"
 summary = "Overlay fetch channel depth high (sustained)"
 details = "depth={value} threshold={threshold}"
 notes = "The _max variant is a monotonic high-water mark that never resets after catchup-tail spikes — use the live gauge with persistence guard. Sample /metrics 5x at 2s intervals to verify before filing."
+# mirrors: henyey-slo-alerts.yaml henyey-overlay-fetch-depth
 
 [[alarm]]
 name = "fd-exhaustion"
@@ -383,6 +389,7 @@ filing_search = "metrics: fd exhaustion"
 summary = "FD usage above 85%"
 details = "open_fds/max_fds={value} threshold={threshold}"
 notes = "henyey_process_max_fds is absent on non-Linux / RLIM_INFINITY — alarm is silently disabled."
+# mirrors: henyey-slo-alerts.yaml henyey-fd-exhaustion-warn, henyey-fd-exhaustion-crit
 
 [[alarm]]
 name = "herder-drift-high"
@@ -694,3 +701,4 @@ filing_search = "metrics: henyey_recovery_stalled_tick_total{reason=\"forcing_ca
 summary = "Recovery stalled — sustained breach"
 details = "delta={value} streak={streak}/{streak_threshold}"
 notes = ""
+# mirrors: henyey-slo-alerts.yaml henyey-recovery-stalled

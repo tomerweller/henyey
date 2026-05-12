@@ -57,18 +57,34 @@ When an alarm legitimately belongs in both surfaces:
 
 ## Reconciliation Table
 
-| Alarm | monitor-tick | Grafana | Notes |
-|---|---|---|---|
-| Invariant failure | `ledger-invariant-failure`: counter ≥ 1, ACTION | Rule 1: `increase > 0` over 10m, critical | Monitor-tick best-effort for strict (panic before scrape) |
-| TX internal error | `tx-internal-error`: counter ≥ 1, ACTION | Rule 2: `rate > 0.01` over 5m, critical | Different detection semantics (any vs rate) |
-| Quorum fail-at | `quorum-fail-at-low`: gauge ≤ 1, WARN, 3 ticks | Rules 3a/3b: `== 1` warn/`< 1` critical, 5m | Monitor-tick collapses tiers; Grafana escalates |
-| Post-catchup reset | `post-catchup-hard-reset`: counter ≥ 1, ACTION | Rule 5: `increase > 0` over 10m, critical | |
-| Fetch channel depth | `fetch-channel-deep`: gauge > 500, WARN, 2 ticks | Rule 8: `> 128`, warning, 5m | Different thresholds |
-| Fragmentation | `jemalloc-frag-high`: gauge > 50, WARN, 2 ticks | Rule (jemalloc): `> 50%`, warning | Matching thresholds |
+| Alarm | TOML name | Grafana UID(s) | monitor-tick | Grafana | Notes |
+|---|---|---|---|---|---|
+| Invariant failure | `ledger-invariant-failure` | `henyey-invariant-failure` | counter ≥ 1, ACTION | increase > 0 over 10m, critical | Monitor-tick best-effort for strict (panic before scrape) |
+| TX internal error | `tx-internal-error` | `henyey-tx-internal-error` | counter ≥ 1, ACTION | rate > 0.01 over 5m, critical | Different detection semantics (any vs rate) |
+| Quorum fail-at | `quorum-fail-at-low` | `henyey-quorum-failat-warn`, `henyey-quorum-failat-crit` | gauge ≤ 1, WARN, 3 ticks | == 1 warn / < 1 critical, 5m | Monitor-tick collapses tiers; Grafana escalates |
+| Post-catchup reset | `post-catchup-hard-reset` | `henyey-post-catchup-hard-reset` | counter ≥ 1, ACTION | increase > 0 over 10m, critical | |
+| Recovery stalled | `recovery-stalled` | `henyey-recovery-stalled` | counter-streak ≥ 3, WARN | increase >= 3 over 10m, warning | |
+| Fetch channel depth | `fetch-channel-deep` | `henyey-overlay-fetch-depth` | gauge > 500, WARN, 2 ticks | > 128, warning, 5m | Different thresholds |
+| FD exhaustion | `fd-exhaustion` | `henyey-fd-exhaustion-warn`, `henyey-fd-exhaustion-crit` | ratio > 0.85, WARN | > 0.6 warn / > 0.8 crit, 5m | Different thresholds |
+| Ledger age | `ledger-age-high` | `henyey-ledger-age-warn`, `henyey-ledger-age-crit` | gauge > 30, WARN | > 10 warn / > 30 crit, 5m; guards on herder_state == 2 | |
+| Peer count | `peer-count-low` | `henyey-peer-count-warn`, `henyey-peer-count-crit` | gauge < 8, WARN | < 8 warn / < 3 crit, 5m | |
+| Validator not tracking | `herder-not-tracking` | `henyey-validator-not-tracking` | gauge != 2, SYNC | != bool 2, warning, 20m | |
+| Fragmentation | `jemalloc-frag-high` | `henyey-fragmentation` | gauge > 50, WARN, 2 ticks | > 50%, warning, 15m | Matching thresholds |
+
+## Intentional Non-Overlaps (Grafana-Only)
+
+These Grafana alerts intentionally have no monitor-tick counterpart:
+
+| Grafana UID | Alert | Rationale |
+|---|---|---|
+| `henyey-process-down` | Process Down | Process-down makes in-process alarms unreachable |
+| `henyey-recovery-txset-stuck` | Recovery TX Set Stuck | No current monitor-tick action needed |
+| `henyey-quorum-missing` | Quorum Missing Peers | Fleet-level visibility needed; monitor-tick covers via `quorum-fail-at-low` |
 
 ## Default for New Alarms
 
 1. New alarms go to `metric-alarms.toml` first (in-process action).
 2. Add a Grafana rule when operator paging, fleet-wide visibility, or
    time-windowed rate analysis is needed.
-3. Document the overlap with a `# mirrors:` comment in the TOML entry.
+3. Document the overlap with a `# mirrors:` comment in the TOML entry,
+   referencing the Grafana alert UID(s).

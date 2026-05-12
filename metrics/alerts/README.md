@@ -311,11 +311,22 @@ To verify alerts are working:
 
 After modifying alarm rules or the evaluator, verify no regressions:
 
-1. **Pick a recent 24h window** where multiple alarms fired (check
-   `~/data/$SESSION/metrics/anomaly_cooldown.json` history).
-2. **Replay each tick's snapshots** (`current.prom` + `prev.prom`) through
-   `scripts/lib/eval-alarms.py` with the updated catalog.
-3. **Compare firing list** against historical evidence (status reports in
-   GitHub Discussions, issue threads filed during that window).
-4. **Investigate any divergence** — alarms that should have fired but didn't,
+1. **Run the point-in-time regression check:**
+   ```bash
+   scripts/dev/replay-alarms-on-history.sh [~/data/$SESSION]
+   ```
+   This validates the alarm catalog schema and runs a single evaluation
+   against the most recent `current.prom` + `prev.prom` snapshot pair.
+
+2. **Review firing results** — check that expected alarms fire and no
+   unexpected alarms appear.
+
+3. **Investigate any divergence** — alarms that should have fired but didn't,
    or new false positives.
+
+> **Limitation:** The current data model retains only one `current.prom` /
+> `prev.prom` pair per session (the most recent tick). Multi-day historical
+> replay — iterating over archived snapshot pairs to detect regressions
+> across a time window — requires per-tick snapshot archiving, which is
+> not yet implemented. The `anomaly_cooldown.json` file is deduplication
+> state, not a historical record of past firings.
