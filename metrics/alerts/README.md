@@ -1,6 +1,6 @@
 # Henyey SLO Alert Rules
 
-<!-- rule_count: 18 -->
+<!-- rule_count: 19 -->
 
 Grafana alert provisioning rules for henyey validator metrics. Rules are
 split into two categories:
@@ -63,6 +63,7 @@ alertable conditions).
 |---|------|--------|-----------|-----|----------|-------|
 | 13 | Validator Not Tracking | `stellar_herder_state` | `!= bool 2` | 20m | warning | id=4 |
 | 14 | Fragmentation | `henyey_jemalloc_fragmentation_pct` | `> 50` | 15m | warning | — |
+| 15 | Quorum Intersection Lost | `stellar_quorum_transitive_intersection` | `< 1` | 5m | critical | — |
 
 #### Diagnostic-Only Panels (No Alert)
 

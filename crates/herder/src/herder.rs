@@ -3412,6 +3412,23 @@ impl Herder {
         Some((agree, missing, disagree, fail_at, delayed))
     }
 
+    /// Quorum intersection publishable status for metrics export.
+    ///
+    /// Returns `Some(true)` if intersection holds, `Some(false)` if split
+    /// detected after a prior good result, `None` if no publishable result
+    /// exists yet (no analysis, or first-ever result was a split).
+    ///
+    /// Matches stellar-core's `hasAnyResults()` + `enjoysQuorunIntersection()`
+    /// semantics (QuorumIntersectionChecker.h:45,51).
+    pub fn quorum_intersection_publishable(&self) -> Option<bool> {
+        let state = self.quorum_intersection_state.read();
+        if state.has_any_results() {
+            Some(state.enjoys_quorum_intersection())
+        } else {
+            None
+        }
+    }
+
     /// Determine the slot index to use for quorum info queries.
     ///
     /// Mirrors `ApplicationImpl.cpp:527-530`: use `trackingConsensusLedgerIndex()`
@@ -10194,6 +10211,65 @@ mod quorum_intersection_deadlock_tests {
         let state = herder.quorum_intersection_state.read();
         // Result should still be from ledger 100 (not re-analyzed).
         assert_eq!(state.last_good_ledger(), 100);
+    }
+
+    /// Verify `quorum_intersection_publishable()` returns correct values
+    /// for each lifecycle state.
+    #[test]
+    fn test_quorum_intersection_publishable() {
+        let herder = make_herder_with_n_quorum_nodes(5);
+
+        // Before any analysis: None.
+        assert_eq!(herder.quorum_intersection_publishable(), None);
+
+        // After intersecting check: Some(true).
+        herder.check_and_maybe_reanalyze_quorum_map(100);
+        assert_eq!(herder.quorum_intersection_publishable(), Some(true));
+
+        // After a split (simulated by directly setting state):
+        // Record a split result with a different hash so it publishes.
+        {
+            let mut state = herder.quorum_intersection_state.write();
+            let split_hash = Hash256::from([99u8; 32]);
+            state.start_checking(split_hash);
+            state.complete_check(
+                &split_hash,
+                QuorumIntersectionResult::Split {
+                    check_ledger: 200,
+                    num_nodes: 4,
+                    quorum_map_hash: split_hash,
+                    potential_split: (vec![], vec![]),
+                },
+            );
+        }
+        // has_any_results() is still true (last_good_ledger = 100 from prior check),
+        // but enjoys_quorum_intersection() is false.
+        assert_eq!(herder.quorum_intersection_publishable(), Some(false));
+    }
+
+    /// Verify `quorum_intersection_publishable()` returns None when
+    /// the first-ever check is a split (no prior good result).
+    #[test]
+    fn test_quorum_intersection_publishable_first_split() {
+        let herder = make_herder_with_n_quorum_nodes(5);
+
+        // Directly record a split without prior intersecting check.
+        {
+            let mut state = herder.quorum_intersection_state.write();
+            let hash = Hash256::from([1u8; 32]);
+            state.start_checking(hash);
+            state.complete_check(
+                &hash,
+                QuorumIntersectionResult::Split {
+                    check_ledger: 50,
+                    num_nodes: 3,
+                    quorum_map_hash: hash,
+                    potential_split: (vec![], vec![]),
+                },
+            );
+        }
+        // First-ever split → has_any_results() is false → None.
+        assert_eq!(herder.quorum_intersection_publishable(), None);
     }
 }
 

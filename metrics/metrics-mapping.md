@@ -315,14 +315,13 @@ They reference concepts or architecture that don't exist in henyey.
 
 | Stellar-core metric | Reason not applicable |
 |---|---|
-| `stellar_core_quorum_transitive_intersection` | Stellar-core's periodic transitive quorum intersection check is not implemented in henyey. |
-| `stellar_core_quorum_transitive_last_check_ledger` | Same as above — no transitive quorum check. |
+| `stellar_core_quorum_transitive_last_check_ledger` | Henyey implements quorum intersection analysis and exposes it via `/info` JSON, but does not export per-field Prometheus metrics for last check ledger. Only the boolean intersection gauge (`stellar_quorum_transitive_intersection`) is exported. |
 | `stellar_core_bucket_memory_shared` | Stellar-core's in-memory bucket sharing model differs from henyey's bucket cache architecture. |
 | `stellar_core_app_post_on_main_thread_delay_seconds` | Stellar-core's queue-backed main thread; henyey uses tokio async runtime instead. |
 | `stellar_core_app_post_on_background_thread_delay_seconds` | Same as above — no background thread queue. |
 | `stellar_core_crypto_verify_hit` / `_total` | Stellar-core's signature verification cache; henyey has no signature cache (SCP verify pipeline uses `henyey_scp_verify_*` metrics). |
-| `stellar_core_quorum_transitive_critical` | Transitive quorum critical node analysis not implemented in henyey. |
-| `stellar_core_quorum_transitive_node_count` | Transitive quorum node count not implemented. |
+| `stellar_core_quorum_transitive_critical` | Henyey implements quorum intersection analysis and exposes critical groups via `/info` JSON, but does not export a separate Prometheus metric. |
+| `stellar_core_quorum_transitive_node_count` | Henyey implements quorum intersection analysis and exposes node count via `/info` JSON, but does not export a separate Prometheus metric. |
 | `stellar_core_database_{operation}_seconds` (73 metrics) | Per-SOCI-statement timings (e.g., `select_account`, `insert_ledgerheader`, `commit`). Henyey uses rusqlite directly without per-statement instrumentation. |
 | `stellar_core_overlay_{message_type}_seconds` (24 metrics) | Per-message-type overlay wire timing. Henyey does not expose per-message-type duration metrics; deferred pending operator demand. |
 | `stellar_core_app_post_on_main_thread_with_delay_delay_seconds` | Same as `app_post_on_main_thread_delay` — tokio async runtime. |

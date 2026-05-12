@@ -74,6 +74,7 @@ When an alarm legitimately belongs in both surfaces:
 | Peer count | `peer-count-low` | `henyey-peer-count-warn`, `henyey-peer-count-crit` | gauge < 8, WARN | < 8 warn / < 3 crit, 5m | |
 | Validator not tracking | `herder-not-tracking` | `henyey-validator-not-tracking` | gauge != 2, SYNC | != bool 2, warning, 20m | |
 | Fragmentation | `jemalloc-frag-high` | `henyey-fragmentation` | gauge > 50, WARN, 2 ticks | > 50%, warning, 15m | Matching thresholds |
+| Quorum intersection lost | `quorum-intersection-lost` | `henyey-quorum-intersection-lost` | gauge == 0, ACTION | < 1, critical, 5m | Both surfaces per policy |
 
 ## Intentional Non-Overlaps (Grafana-Only)
 

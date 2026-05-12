@@ -202,7 +202,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "**N/A** \u2014 Transitive quorum intersection analysis is not implemented in henyey. This is a stellar-core-specific feature for multi-node fleet monitoring."
+        "content": "Quorum intersection is checked after each externalization. The `stellar_quorum_transitive_intersection` gauge reports 1 (intersection holds) or 0 (split detected). Absent until first publishable check completes."
       }
     },
     {

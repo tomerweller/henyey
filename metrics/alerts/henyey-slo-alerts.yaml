@@ -932,3 +932,55 @@ groups:
                   reducer:
                     type: last
               refId: threshold
+
+      # ── Alert 15: Quorum Intersection Lost ───────────────────────
+      # Fires when the network no longer enjoys transitive quorum
+      # intersection. The metric is absent until the first publishable
+      # check completes, so noDataState=OK avoids false alarms on
+      # startup.
+      - uid: henyey-quorum-intersection-lost
+        title: "Henyey: Quorum Intersection Lost"
+        condition: threshold
+        for: 5m
+        labels:
+          severity: critical
+          team: henyey
+        annotations:
+          summary: "Quorum intersection lost on {{ $labels.instance }}"
+          description: >-
+            stellar_quorum_transitive_intersection < 1 for 5m
+            on {{ $labels.instance }}.
+            Network no longer enjoys transitive quorum intersection.
+            Investigate quorum configuration immediately.
+        noDataState: OK
+        execErrState: Alerting
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "000000001"
+            model:
+              expr: "stellar_quorum_transitive_intersection{job=\"henyey\"}"
+              instant: true
+              refId: A
+          - refId: threshold
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - A
+                  reducer:
+                    type: last
+              refId: threshold

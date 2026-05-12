@@ -702,3 +702,24 @@ summary = "Recovery stalled — sustained breach"
 details = "delta={value} streak={streak}/{streak_threshold}"
 notes = ""
 # mirrors: henyey-slo-alerts.yaml henyey-recovery-stalled
+
+# ── GAUGE (quorum intersection) ────────────────────────────────────────────
+
+[[alarm]]
+name = "quorum-intersection-lost"
+metric = "stellar_quorum_transitive_intersection"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = "=="
+threshold = 0
+severity = "ACTION"
+gates = ["synced-only", "validator-only"]
+cooldown_key = "stellar_quorum_transitive_intersection"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_quorum_transitive_intersection — quorum intersection lost"
+filing_search = "metrics: stellar_quorum_transitive_intersection"
+summary = "Quorum intersection lost"
+details = "Network no longer enjoys transitive quorum intersection"
+notes = ""
+# mirrors: henyey-slo-alerts.yaml henyey-quorum-intersection-lost

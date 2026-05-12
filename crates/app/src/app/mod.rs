@@ -2592,6 +2592,13 @@ impl App {
         })
     }
 
+    /// Quorum intersection publishable status for metrics export.
+    ///
+    /// See [`henyey_herder::Herder::quorum_intersection_publishable`].
+    pub fn quorum_intersection_publishable(&self) -> Option<bool> {
+        self.herder.quorum_intersection_publishable()
+    }
+
     /// Quorum info for the `/info` endpoint (None when no quorum data available).
     pub fn quorum_info_for_info(&self) -> Option<henyey_herder::json_api::InfoQuorumSnapshot> {
         let lcl_seq = self.ledger_summary().num;

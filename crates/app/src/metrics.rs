@@ -508,6 +508,10 @@ metric_catalog! {
     }
 
     gauges_no_prereg {
+        // Phase 4: Quorum transitive intersection — absent until first publishable check.
+        QUORUM_TRANSITIVE_INTERSECTION = "stellar_quorum_transitive_intersection"
+            => "Whether the network enjoys transitive quorum intersection (1=yes, 0=no, absent until first publishable check)";
+
         // Phase 6: TxSet exhaustion stuck gauge — set conditionally in refresh_gauges.
         RECOVERY_TX_SET_STUCK_SECONDS = "henyey_recovery_tx_set_stuck_seconds"
             => "Seconds since all peers exhausted for pending tx_set hashes (0 = not stuck)";
@@ -1141,6 +1145,13 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         QUORUM_DISAGREE.set(0.0);
         QUORUM_FAIL_AT.set(0.0);
         QUORUM_DELAYED.set(0.0);
+    }
+
+    // Phase 4: Quorum transitive intersection.
+    // Only set when a publishable result exists (gauges_no_prereg keeps it
+    // absent until the first intersecting check completes).
+    if let Some(intersection) = state.app.quorum_intersection_publishable() {
+        QUORUM_TRANSITIVE_INTERSECTION.set(if intersection { 1.0 } else { 0.0 });
     }
 
     // Phase 4: SCP timing.
