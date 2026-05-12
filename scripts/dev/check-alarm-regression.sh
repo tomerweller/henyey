@@ -4,14 +4,19 @@
 #
 # Compares current alarm replay JSON against a stored baseline to detect
 # regressions (alarms that were meaningfully active but have gone silent).
+# Only alarms present in the alarm catalog are considered; non-catalog alarm
+# names (e.g. from stale baselines or test contamination) are silently pruned.
 #
 # Usage:
-#   scripts/dev/check-alarm-regression.sh SESSION_DIR [--current FILE] [--baseline FILE]
+#   scripts/dev/check-alarm-regression.sh SESSION_DIR [--current FILE] [--baseline FILE] [--catalog FILE]
 #
 # If --current is omitted, runs replay-alarms-on-history.sh --replay --json
 # internally. If --baseline is omitted, defaults to $METRICS_DIR/replay-baseline.json.
+# If --catalog is omitted, defaults to $REPO_ROOT/.claude/skills/shared/metric-alarms.toml.
 #
-# Exit code: always 0 (regressions are informational, not failures).
+# Exit codes:
+#   0 — success (regressions are informational, not failures)
+#   2 — fatal error (missing/invalid catalog, schema mismatch)
 # Stdout: JSON array of regression objects (empty [] if none).
 
 set -euo pipefail
@@ -22,6 +27,7 @@ REPLAY_SCRIPT="$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh"
 SESSION_DIR=""
 CURRENT_FILE=""
 BASELINE_FILE=""
+CATALOG_FILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +45,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       BASELINE_FILE="$2"
+      shift 2
+      ;;
+    --catalog)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --catalog requires a file path argument" >&2
+        exit 1
+      fi
+      CATALOG_FILE="$2"
       shift 2
       ;;
     *)
@@ -64,6 +78,16 @@ if [[ -z "$BASELINE_FILE" ]]; then
   BASELINE_FILE="$METRICS_DIR/replay-baseline.json"
 fi
 
+# Catalog: default to repo-root metric-alarms.toml (matching replay-alarms-on-history.sh)
+if [[ -z "$CATALOG_FILE" ]]; then
+  CATALOG_FILE="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
+fi
+
+if [[ ! -f "$CATALOG_FILE" ]]; then
+  echo "ERROR: Alarm catalog not found: $CATALOG_FILE" >&2
+  exit 2
+fi
+
 # Get current replay JSON if not provided
 if [[ -z "$CURRENT_FILE" ]]; then
   CURRENT_JSON=$("$REPLAY_SCRIPT" "$SESSION_DIR" --replay --json 2>/dev/null) || {
@@ -80,22 +104,59 @@ else
   CURRENT_JSON=$(cat "$CURRENT_FILE")
 fi
 
-# If no baseline exists, establish one
+# If no baseline exists, establish one (pruning non-catalog alarms)
 if [[ ! -f "$BASELINE_FILE" ]]; then
-  echo "$CURRENT_JSON" > "$BASELINE_FILE"
-  ALARM_COUNT=$(echo "$CURRENT_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('alarms',{})))" 2>/dev/null || echo "0")
-  EVAL_TICKS=$(echo "$CURRENT_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('evaluated_ticks',0))" 2>/dev/null || echo "0")
+  python3 -c "
+import json, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+catalog_path = sys.argv[1]
+current_str = sys.argv[2]
+with open(catalog_path, 'rb') as f:
+    catalog = tomllib.load(f)
+valid = {a['name'] for a in catalog.get('alarm', [])}
+if not valid:
+    print('ERROR: Catalog has no alarm entries', file=sys.stderr)
+    sys.exit(2)
+data = json.loads(current_str)
+alarms = data.get('alarms', {})
+data['alarms'] = {k: v for k, v in alarms.items() if k in valid}
+print(json.dumps(data))
+" "$CATALOG_FILE" "$CURRENT_JSON" > "$BASELINE_FILE" || {
+    echo "ERROR: Failed to prune baseline" >&2
+    rm -f "$BASELINE_FILE"
+    exit 2
+  }
+  ALARM_COUNT=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('alarms',{})))" < "$BASELINE_FILE" 2>/dev/null || echo "0")
+  EVAL_TICKS=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('evaluated_ticks',0))" < "$BASELINE_FILE" 2>/dev/null || echo "0")
   echo "Baseline established ($ALARM_COUNT alarms, $EVAL_TICKS evaluated ticks)" >&2
   echo "[]"
   exit 0
 fi
 
 # Compare baseline vs current — compute regressions once, capture output
+set +e
 REGRESSION_OUTPUT=$(python3 -c "
 import json, sys
 
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+
 baseline_file = sys.argv[1]
 current_json_str = sys.argv[2]
+catalog_path = sys.argv[3]
+
+# Load alarm catalog — build set of valid alarm names
+with open(catalog_path, 'rb') as f:
+    catalog = tomllib.load(f)
+valid_alarms = {a['name'] for a in catalog.get('alarm', [])}
+if not valid_alarms:
+    print('ERROR: Catalog has no alarm entries', file=sys.stderr)
+    sys.exit(2)
 
 with open(baseline_file) as f:
     baseline = json.load(f)
@@ -118,6 +179,10 @@ current_evaluated = current.get('evaluated_ticks', 0)
 regressions = []
 
 for alarm_name, b_counts in baseline_alarms.items():
+    # Skip alarms not in the catalog (stale/test data)
+    if alarm_name not in valid_alarms:
+        continue
+
     # Compute eligible samples (exclude skip and baseline/collecting_baseline)
     b_eligible = baseline_evaluated - b_counts.get('skip', 0) - b_counts.get('baseline', 0)
     if b_eligible < 10:
@@ -133,6 +198,7 @@ for alarm_name, b_counts in baseline_alarms.items():
         regressions.append({
             'alarm': alarm_name,
             'baseline_fired_pct': round(b_fired_pct, 4),
+            'baseline_fired_pct_display': round(b_fired_pct * 100, 2),
             'current_fired_pct': 0.0,
             'baseline_evaluated': baseline_evaluated,
             'current_evaluated': current_evaluated,
@@ -150,6 +216,7 @@ for alarm_name, b_counts in baseline_alarms.items():
         regressions.append({
             'alarm': alarm_name,
             'baseline_fired_pct': round(b_fired_pct, 4),
+            'baseline_fired_pct_display': round(b_fired_pct * 100, 2),
             'current_fired_pct': 0.0,
             'baseline_evaluated': baseline_evaluated,
             'current_evaluated': current_evaluated,
@@ -157,8 +224,9 @@ for alarm_name, b_counts in baseline_alarms.items():
         })
 
 print(json.dumps(regressions))
-" "$BASELINE_FILE" "$CURRENT_JSON")
+" "$BASELINE_FILE" "$CURRENT_JSON" "$CATALOG_FILE")
 COMPARE_EXIT=$?
+set -e
 
 if [[ $COMPARE_EXIT -ne 0 ]]; then
   echo "ERROR: Regression comparison failed (exit $COMPARE_EXIT)" >&2
@@ -173,8 +241,23 @@ echo "$REGRESSION_OUTPUT"
 REGRESSION_COUNT=$(echo "$REGRESSION_OUTPUT" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
 
 if [[ "$REGRESSION_COUNT" == "0" ]]; then
-  # No regressions — update baseline (rolling forward)
-  echo "$CURRENT_JSON" > "$BASELINE_FILE"
+  # No regressions — update baseline (rolling forward, pruning non-catalog alarms)
+  python3 -c "
+import json, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+catalog_path = sys.argv[1]
+current_str = sys.argv[2]
+with open(catalog_path, 'rb') as f:
+    catalog = tomllib.load(f)
+valid = {a['name'] for a in catalog.get('alarm', [])}
+data = json.loads(current_str)
+alarms = data.get('alarms', {})
+data['alarms'] = {k: v for k, v in alarms.items() if k in valid}
+print(json.dumps(data))
+" "$CATALOG_FILE" "$CURRENT_JSON" > "$BASELINE_FILE"
   echo "No regressions found. Baseline updated." >&2
 else
   # Regressions found — keep last-known-good baseline
@@ -194,7 +277,7 @@ for r in json.load(sys.stdin):
 " 2>/dev/null | while IFS= read -r regression_line; do
     [[ -z "$regression_line" ]] && continue
     ALARM_NAME=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['alarm'])" 2>/dev/null) || continue
-    BASELINE_PCT=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['baseline_fired_pct'])" 2>/dev/null) || continue
+    BASELINE_DISPLAY_PCT=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['baseline_fired_pct_display'])" 2>/dev/null) || continue
     REASON=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['reason'])" 2>/dev/null) || continue
 
     EXPECTED_TITLE="Alarm regression: $ALARM_NAME"
@@ -223,7 +306,7 @@ for r in json.load(sys.stdin):
     ISSUE_BODY="## Alarm Regression Detected
 
 **Alarm**: \`$ALARM_NAME\`
-**Baseline fired**: ${BASELINE_PCT} (${BASELINE_PCT}% of eligible ticks)
+**Baseline fired**: ${BASELINE_DISPLAY_PCT}% of eligible ticks
 **Current fired**: 0%
 **Reason**: $REASON
 

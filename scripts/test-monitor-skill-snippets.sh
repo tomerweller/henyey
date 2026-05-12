@@ -4001,15 +4001,19 @@ except Exception as e:
 
   # ── check-alarm-regression.sh behavioral tests ─────────────────────────
 
+  local catalog_for_reg="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
+
   # Test: no baseline → creates baseline, exits 0
+  # Use real catalog alarm names so catalog validation passes
   local reg_session="$replay_root/reg-session"
   mkdir -p "$reg_session/metrics"
-  local reg_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"alarm_a":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"alarm_b":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  local reg_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
   echo "$reg_current" > "$reg_session/metrics/reg-current.json"
 
   local reg_out
   reg_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
-    "$reg_session" --current "$reg_session/metrics/reg-current.json" 2>&1) || true
+    "$reg_session" --current "$reg_session/metrics/reg-current.json" \
+    --catalog "$catalog_for_reg" 2>&1) || true
   if [[ -f "$reg_session/metrics/replay-baseline.json" ]] && echo "$reg_out" | grep -q "Baseline established"; then
     tap_ok "regression: no baseline creates baseline"
   else
@@ -4020,7 +4024,8 @@ except Exception as e:
   # Same current as baseline → no regressions
   local reg_out2
   reg_out2=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
-    "$reg_session" --current "$reg_session/metrics/reg-current.json" 2>&1) || true
+    "$reg_session" --current "$reg_session/metrics/reg-current.json" \
+    --catalog "$catalog_for_reg" 2>&1) || true
   local reg_stdout2
   reg_stdout2=$(echo "$reg_out2" | grep -v "^No regressions\|^Baseline" | head -1)
   if echo "$reg_out2" | grep -q "No regressions" && [[ "$reg_stdout2" == "[]" ]]; then
@@ -4030,7 +4035,7 @@ except Exception as e:
   fi
 
   # Test: baseline + regression → baseline NOT updated
-  local reg_regressed='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"alarm_a":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"alarm_b":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  local reg_regressed='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
   echo "$reg_regressed" > "$reg_session/metrics/reg-regressed.json"
   # Save baseline mtime before
   local baseline_before
@@ -4039,7 +4044,8 @@ except Exception as e:
 
   local reg_out3
   reg_out3=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
-    "$reg_session" --current "$reg_session/metrics/reg-regressed.json" 2>&1) || true
+    "$reg_session" --current "$reg_session/metrics/reg-regressed.json" \
+    --catalog "$catalog_for_reg" 2>&1) || true
   local baseline_after
   baseline_after=$(stat -c %Y "$reg_session/metrics/replay-baseline.json" 2>/dev/null) || baseline_after=0
 
@@ -4048,6 +4054,107 @@ except Exception as e:
   else
     tap_not_ok "regression: regressions found, baseline NOT updated" \
       "output: $reg_out3 before=$baseline_before after=$baseline_after"
+  fi
+
+  # Test: regression JSON contains correct baseline_fired_pct_display (percentage)
+  local pct_display
+  pct_display=$(echo "$reg_out3" | grep -v "regression(s) found" | head -1 | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+if data and 'baseline_fired_pct_display' in data[0]:
+    print(data[0]['baseline_fired_pct_display'])
+else:
+    print('MISSING')
+" 2>/dev/null) || pct_display="ERROR"
+  if [[ "$pct_display" != "MISSING" ]] && [[ "$pct_display" != "ERROR" ]]; then
+    tap_ok "regression: baseline_fired_pct_display present in output (${pct_display}%)"
+  else
+    tap_not_ok "regression: baseline_fired_pct_display present in output" "got: $pct_display"
+  fi
+
+  # Test: non-catalog alarms are filtered out (contamination test)
+  local reg_contaminated_session="$replay_root/reg-contaminated"
+  mkdir -p "$reg_contaminated_session/metrics"
+  # Baseline has both real (lost-sync) and fake (alarm_a) alarms firing
+  local reg_contaminated_baseline='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"alarm_a":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}'
+  echo "$reg_contaminated_baseline" > "$reg_contaminated_session/metrics/replay-baseline.json"
+  # Current has neither firing
+  local reg_contaminated_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"alarm_a":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$reg_contaminated_current" > "$reg_contaminated_session/metrics/reg-contaminated-current.json"
+
+  local reg_contam_out
+  reg_contam_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$reg_contaminated_session" \
+    --current "$reg_contaminated_session/metrics/reg-contaminated-current.json" \
+    --catalog "$catalog_for_reg" 2>&1) || true
+  # Should report regression for lost-sync but NOT for alarm_a
+  local contam_has_lost_sync contam_has_alarm_a
+  contam_has_lost_sync=$(echo "$reg_contam_out" | grep -c '"lost-sync"') || true
+  contam_has_alarm_a=$(echo "$reg_contam_out" | grep -c '"alarm_a"') || true
+  if [[ "$contam_has_lost_sync" -ge 1 ]] && [[ "$contam_has_alarm_a" -eq 0 ]]; then
+    tap_ok "regression: non-catalog alarms filtered (alarm_a excluded, lost-sync kept)"
+  else
+    tap_not_ok "regression: non-catalog alarms filtered" \
+      "lost-sync=$contam_has_lost_sync alarm_a=$contam_has_alarm_a output: ${reg_contam_out:0:200}"
+  fi
+
+  # Test: baseline pruning on write — non-catalog alarms removed from baseline file
+  local reg_prune_session="$replay_root/reg-prune"
+  mkdir -p "$reg_prune_session/metrics"
+  # Current with real + fake alarms, no baseline exists yet
+  local reg_prune_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"fake_alarm":{"firing":15,"breach":3,"ok":172,"baseline":0,"skip":10}}}'
+  echo "$reg_prune_current" > "$reg_prune_session/metrics/reg-prune-current.json"
+
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$reg_prune_session" --current "$reg_prune_session/metrics/reg-prune-current.json" \
+    --catalog "$catalog_for_reg" >/dev/null 2>&1 || true
+  # Check that baseline file does not contain fake_alarm
+  local prune_has_fake
+  prune_has_fake=$(grep -c 'fake_alarm' "$reg_prune_session/metrics/replay-baseline.json" 2>/dev/null) || true
+  local prune_has_real
+  prune_has_real=$(grep -c 'lost-sync' "$reg_prune_session/metrics/replay-baseline.json" 2>/dev/null) || true
+  if [[ "$prune_has_fake" -eq 0 ]] && [[ "$prune_has_real" -ge 1 ]]; then
+    tap_ok "regression: baseline pruned on write (fake_alarm removed)"
+  else
+    tap_not_ok "regression: baseline pruned on write" \
+      "fake=$prune_has_fake real=$prune_has_real"
+  fi
+
+  # Test: missing catalog → exit 2
+  local reg_missing_cat_out
+  set +e
+  reg_missing_cat_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$reg_session" --current "$reg_session/metrics/reg-current.json" \
+    --catalog "/nonexistent/catalog.toml" 2>&1)
+  local reg_missing_cat_exit=$?
+  set -e
+  if [[ "$reg_missing_cat_exit" -eq 2 ]]; then
+    tap_ok "regression: missing catalog exits 2"
+  else
+    tap_not_ok "regression: missing catalog exits 2" \
+      "exit=$reg_missing_cat_exit output: ${reg_missing_cat_out:0:200}"
+  fi
+
+  # Test: malformed catalog (valid TOML, no alarm entries) → exit 2
+  local malformed_catalog="$replay_root/malformed-catalog.toml"
+  echo 'schema_version = 1' > "$malformed_catalog"
+  # Need a fresh session dir without baseline for this test
+  local reg_malformed_session="$replay_root/reg-malformed"
+  mkdir -p "$reg_malformed_session/metrics"
+  echo "$reg_current" > "$reg_malformed_session/metrics/reg-current.json"
+
+  local reg_malformed_out
+  set +e
+  reg_malformed_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$reg_malformed_session" --current "$reg_malformed_session/metrics/reg-current.json" \
+    --catalog "$malformed_catalog" 2>&1)
+  local reg_malformed_exit=$?
+  set -e
+  if [[ "$reg_malformed_exit" -eq 2 ]]; then
+    tap_ok "regression: malformed catalog (no alarms) exits 2"
+  else
+    tap_not_ok "regression: malformed catalog (no alarms) exits 2" \
+      "exit=$reg_malformed_exit output: ${reg_malformed_out:0:200}"
   fi
 
   rm -rf "$replay_root"
