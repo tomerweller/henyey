@@ -179,6 +179,56 @@ def count_series(
     return len(metrics.get(base, []))
 
 
+def telemetry_metric(alarm: dict, kind: str) -> str:
+    """Return the representative metric name for telemetry output.
+
+    Each alarm kind stores its metric under different catalog keys.
+    This mirrors the evaluator's own lookup order so that the telemetry
+    line reflects the metric that was actually evaluated.
+    """
+    if kind == "histogram-p99":
+        m = alarm.get("metric", "")
+        return f"{m}_bucket" if m else ""
+    if kind == "gauge-ratio":
+        return alarm.get("numerator_metric", "")
+    if kind == "counter-ratio":
+        if alarm.get("numerator_sum"):
+            return alarm["numerator_sum"][0]
+        if alarm.get("numerator"):
+            return alarm["numerator"]
+        if alarm.get("denominator_sum"):
+            return alarm["denominator_sum"][0]
+        return alarm.get("denominator", "")
+    if kind == "counter-streak":
+        return alarm.get("metric", "")
+    if kind in ("counter", "counter-dynamic"):
+        if alarm.get("metric_sum"):
+            return alarm["metric_sum"][0]
+        return alarm.get("metric", "")
+    return alarm.get("metric", "")
+
+
+def default_extra_values(alarm: dict, kind: str) -> dict:
+    """Return default extra_values for a given alarm kind.
+
+    Ensures that all template placeholders in details/filing_title are
+    resolved even on skip, baseline, and early-return paths.
+    """
+    if kind == "histogram-p99":
+        return {"p99_value": None, "mean_value": None}
+    if kind == "counter-ratio":
+        return {
+            "streak": 0,
+            "streak_threshold": alarm.get("streak_threshold", 3),
+            "ratio_threshold": alarm.get("ratio_threshold", 0),
+        }
+    if kind == "counter-dynamic":
+        return {"prior_delta": 0}
+    if kind == "counter-streak":
+        return {"streak": 0, "streak_threshold": alarm.get("streak_threshold", 3)}
+    return {}
+
+
 # ── Gate evaluation ──────────────────────────────────────────────────────────
 
 def gates_pass(
@@ -278,7 +328,7 @@ def make_result(
     else:
         contributes_to = "metrics"
 
-    return {
+    result = {
         "name": alarm["name"],
         "state": state,
         "severity": alarm.get("severity", "") if state == "firing" else "",
@@ -295,6 +345,18 @@ def make_result(
         "skip_reason": skip_reason,
         "contributes_to": contributes_to,
     }
+
+    # Safety net: warn about unresolved template placeholders.
+    # Pattern matches {word} but not Prometheus label syntax like {reason="..."}.
+    for field in ("details", "summary", "filing_title"):
+        val = result[field]
+        if val and re.search(r'\{[a-z_]+\}', val):
+            print(
+                f"WARNING: unresolved placeholder in {alarm['name']}.{field}: {val}",
+                file=sys.stderr,
+            )
+
+    return result
 
 
 def eval_gauge(
@@ -460,8 +522,11 @@ def eval_counter_dynamic(
     warmup_remaining: int,
 ) -> dict:
     """Evaluate a counter-dynamic alarm (threshold = multiplier × prior delta)."""
+    ev_default = default_extra_values(alarm, "counter-dynamic")
+
     if prev_prom_invalid:
-        return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID")
+        return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID",
+                           extra_values=ev_default)
 
     metric_sum_list = alarm["metric_sum"]
     extraction = alarm.get("extraction", "form1")
@@ -470,12 +535,15 @@ def eval_counter_dynamic(
     prev_val = extract_sum(prev, metric_sum_list, extraction)
 
     if cur_val is None:
-        return make_result(alarm, "skipped", skip_reason="metric not found")
+        return make_result(alarm, "skipped", skip_reason="metric not found",
+                           extra_values=ev_default)
     if prev_val is None:
-        return make_result(alarm, "skipped", skip_reason="no previous data")
+        return make_result(alarm, "skipped", skip_reason="no previous data",
+                           extra_values=ev_default)
 
     if warmup_remaining > 0 and prev_val == 0:
-        return make_result(alarm, "skipped", skip_reason="warmup (prev=0)")
+        return make_result(alarm, "skipped", skip_reason="warmup (prev=0)",
+                           extra_values=ev_default)
 
     # Counter reset
     delta = cur_val if cur_val < prev_val else cur_val - prev_val
@@ -491,7 +559,8 @@ def eval_counter_dynamic(
     write_snapshot(snapshot_path, snapshot)
 
     if prior_delta_str is None:
-        return make_result(alarm, "skipped", skip_reason="collecting baseline (no prior delta)")
+        return make_result(alarm, "skipped", skip_reason="collecting baseline (no prior delta)",
+                           extra_values=ev_default)
 
     prior_delta = int(prior_delta_str)
     multiplier = alarm["multiplier"]
@@ -530,8 +599,11 @@ def eval_histogram_p99(
     prev_prom_invalid: bool,
 ) -> dict:
     """Evaluate a histogram-p99 alarm with mean fallback."""
+    ev_default = default_extra_values(alarm, "histogram-p99")
+
     if prev_prom_invalid:
-        return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID")
+        return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID",
+                           extra_values=ev_default)
 
     metric = alarm["metric"]
     min_count = alarm.get("min_count_delta", 20)
@@ -539,22 +611,27 @@ def eval_histogram_p99(
     # Check suffixes exist
     for suffix in ("_bucket", "_sum", "_count"):
         if not current.get(f"{metric}{suffix}"):
-            return make_result(alarm, "skipped", skip_reason=f"missing {metric}{suffix}")
+            return make_result(alarm, "skipped", skip_reason=f"missing {metric}{suffix}",
+                               extra_values=ev_default)
     for suffix in ("_bucket", "_sum", "_count"):
         if not prev.get(f"{metric}{suffix}"):
-            return make_result(alarm, "skipped", skip_reason=f"no previous {metric}{suffix}")
+            return make_result(alarm, "skipped", skip_reason=f"no previous {metric}{suffix}",
+                               extra_values=ev_default)
 
     # Count delta
     cur_count = extract_value(current, f"{metric}_count", "form1")
     prev_count = extract_value(prev, f"{metric}_count", "form1")
     if cur_count is None or prev_count is None:
-        return make_result(alarm, "skipped", skip_reason="missing count metric")
+        return make_result(alarm, "skipped", skip_reason="missing count metric",
+                           extra_values=ev_default)
 
     count_delta = cur_count - prev_count
     if count_delta < 0:
-        return make_result(alarm, "skipped", skip_reason="counter reset (count)")
+        return make_result(alarm, "skipped", skip_reason="counter reset (count)",
+                           extra_values=ev_default)
     if count_delta < min_count:
-        return make_result(alarm, "skipped", skip_reason=f"low volume (count_delta={int(count_delta)} < {min_count})")
+        return make_result(alarm, "skipped", skip_reason=f"low volume (count_delta={int(count_delta)} < {min_count})",
+                           extra_values=ev_default)
 
     # Mean fallback
     cur_sum = extract_value(current, f"{metric}_sum", "form1")
@@ -648,14 +725,19 @@ def eval_counter_ratio(
 
     Independent of PREV_PROM_INVALID — uses own PID/start_ticks in snapshot.
     """
+    ev_default = default_extra_values(alarm, "counter-ratio")
+
     # Global skip conditions for ratio checks
     ledger_age = extract_value(current, "stellar_ledger_age_current_seconds", "form1")
     if fresh_start:
-        return make_result(alarm, "skipped", skip_reason="FRESH_START")
+        return make_result(alarm, "skipped", skip_reason="FRESH_START",
+                           extra_values=ev_default)
     if ledger_age is not None and ledger_age > 30:
-        return make_result(alarm, "skipped", skip_reason="ledger age > 30s")
+        return make_result(alarm, "skipped", skip_reason="ledger age > 30s",
+                           extra_values=ev_default)
     if uptime < 600:
-        return make_result(alarm, "skipped", skip_reason="uptime < 10m")
+        return make_result(alarm, "skipped", skip_reason="uptime < 10m",
+                           extra_values=ev_default)
 
     # Label validation for alarms with expected_labels
     expected_labels = alarm.get("expected_labels")
@@ -673,7 +755,8 @@ def eval_counter_ratio(
                     found_labels.add(reason_val)
             expected_set = set(expected_labels)
             if found_labels != expected_set:
-                return make_result(alarm, "skipped", skip_reason="label set mismatch")
+                return make_result(alarm, "skipped", skip_reason="label set mismatch",
+                                   extra_values=ev_default)
 
     snapshot_path = state_dir / "ratio_snapshot"
     snapshot = read_snapshot(snapshot_path)
@@ -698,34 +781,42 @@ def eval_counter_ratio(
         for m in numerator_sum:
             v = extract_value(current, m, num_extraction)
             if v is None:
-                return make_result(alarm, "skipped", skip_reason="missing numerator counter")
+                return make_result(alarm, "skipped", skip_reason="missing numerator counter",
+                                   extra_values=ev_default)
             cur_num += v
     elif numerator_metric:
         cur_num_v = extract_value(current, numerator_metric, num_extraction)
         if cur_num_v is None:
             if alarm.get("optional_counters"):
-                return make_result(alarm, "skipped", skip_reason="missing counters")
-            return make_result(alarm, "skipped", skip_reason="missing numerator counter")
+                return make_result(alarm, "skipped", skip_reason="missing counters",
+                                   extra_values=ev_default)
+            return make_result(alarm, "skipped", skip_reason="missing numerator counter",
+                               extra_values=ev_default)
         cur_num = cur_num_v
     else:
-        return make_result(alarm, "skipped", skip_reason="no numerator defined")
+        return make_result(alarm, "skipped", skip_reason="no numerator defined",
+                           extra_values=ev_default)
 
     if denominator_sum:
         cur_den = 0.0
         for m in denominator_sum:
             v = extract_value(current, m, den_extraction)
             if v is None:
-                return make_result(alarm, "skipped", skip_reason="missing denominator counter")
+                return make_result(alarm, "skipped", skip_reason="missing denominator counter",
+                                   extra_values=ev_default)
             cur_den += v
     elif denominator_metric:
         cur_den_v = extract_value(current, denominator_metric, den_extraction)
         if cur_den_v is None:
             if alarm.get("optional_counters"):
-                return make_result(alarm, "skipped", skip_reason="missing counters")
-            return make_result(alarm, "skipped", skip_reason="missing denominator counter")
+                return make_result(alarm, "skipped", skip_reason="missing counters",
+                                   extra_values=ev_default)
+            return make_result(alarm, "skipped", skip_reason="missing denominator counter",
+                               extra_values=ev_default)
         cur_den = cur_den_v
     else:
-        return make_result(alarm, "skipped", skip_reason="no denominator defined")
+        return make_result(alarm, "skipped", skip_reason="no denominator defined",
+                           extra_values=ev_default)
 
     # Check for collecting baseline
     alarm_name = alarm["name"]
@@ -742,7 +833,7 @@ def eval_counter_ratio(
         snapshot[prev_den_key] = str(int(cur_den))
         snapshot[streak_key] = "0"
         write_snapshot(snapshot_path, snapshot)
-        return make_result(alarm, "collecting_baseline")
+        return make_result(alarm, "collecting_baseline", extra_values=ev_default)
 
     prev_num = int(snapshot[prev_num_key])
     prev_den = int(snapshot[prev_den_key])
@@ -754,7 +845,7 @@ def eval_counter_ratio(
         snapshot[prev_den_key] = str(int(cur_den))
         snapshot[streak_key] = "0"
         write_snapshot(snapshot_path, snapshot)
-        return make_result(alarm, "collecting_baseline")
+        return make_result(alarm, "collecting_baseline", extra_values=ev_default)
 
     num_delta = cur_num - prev_num
     den_delta = cur_den - prev_den
@@ -768,13 +859,15 @@ def eval_counter_ratio(
     if den_delta < min_volume:
         snapshot[streak_key] = "0"
         write_snapshot(snapshot_path, snapshot)
-        return make_result(alarm, "skipped", skip_reason=f"low volume (delta={int(den_delta)} < {min_volume})")
+        return make_result(alarm, "skipped", skip_reason=f"low volume (delta={int(den_delta)} < {min_volume})",
+                           extra_values=ev_default)
 
     # Compute ratio
     if den_delta == 0:
         snapshot[streak_key] = "0"
         write_snapshot(snapshot_path, snapshot)
-        return make_result(alarm, "ok", value=0, threshold=alarm["ratio_threshold"])
+        return make_result(alarm, "ok", value=0, threshold=alarm["ratio_threshold"],
+                           extra_values=ev_default)
 
     ratio = num_delta / den_delta
     ratio_op = alarm.get("ratio_op", ">")
@@ -816,13 +909,16 @@ def eval_counter_streak(
 
     Independent of PREV_PROM_INVALID — uses own PID/start_ticks in snapshot.
     """
+    ev_default = default_extra_values(alarm, "counter-streak")
+
     metric = alarm["metric"]
     extraction = alarm.get("extraction", "form2")
     labels = alarm.get("labels", [])
 
     cur_val = extract_value(current, metric, extraction, labels)
     if cur_val is None:
-        return make_result(alarm, "skipped", skip_reason="metric not found")
+        return make_result(alarm, "skipped", skip_reason="metric not found",
+                           extra_values=ev_default)
 
     snapshot_file = alarm.get("snapshot_file", "counter_streak_snapshot")
     snapshot_path = state_dir / snapshot_file
@@ -842,7 +938,8 @@ def eval_counter_streak(
                 "breach_streak": "0",
             }
             write_snapshot(snapshot_path, new_snapshot)
-            return make_result(alarm, "collecting_baseline")
+            return make_result(alarm, "collecting_baseline",
+                               extra_values=ev_default)
 
     if not snapshot:
         # First tick — collecting baseline
@@ -854,7 +951,8 @@ def eval_counter_streak(
             "breach_streak": "0",
         }
         write_snapshot(snapshot_path, new_snapshot)
-        return make_result(alarm, "collecting_baseline")
+        return make_result(alarm, "collecting_baseline",
+                           extra_values=ev_default)
 
     prev_counter = int(snapshot.get("counter_value", "0"))
     streak = int(snapshot.get("breach_streak", "0"))
@@ -869,7 +967,8 @@ def eval_counter_streak(
             "breach_streak": "0",
         }
         write_snapshot(snapshot_path, new_snapshot)
-        return make_result(alarm, "collecting_baseline")
+        return make_result(alarm, "collecting_baseline",
+                           extra_values=ev_default)
 
     delta = int(cur_val) - prev_counter
     delta_threshold = alarm.get("delta_threshold", 1)
@@ -1175,7 +1274,8 @@ def main() -> int:
         # Exempt check — skip evaluation entirely
         if alarm.get("exempt", False):
             reason = alarm.get("exempt_reason", "exempt")
-            result = make_result(alarm, "skipped", skip_reason=f"exempt: {reason}")
+            result = make_result(alarm, "skipped", skip_reason=f"exempt: {reason}",
+                                 extra_values=default_extra_values(alarm, kind))
             results.append(result)
             print(f"# alarm={name} state=skipped reason=exempt", file=sys.stderr)
             continue
@@ -1186,10 +1286,11 @@ def main() -> int:
             gates, warmup_remaining, fresh_start, crash_recovery, uptime, monitor_mode,
         )
         if not passed:
-            result = make_result(alarm, "skipped", skip_reason=skip_reason)
+            result = make_result(alarm, "skipped", skip_reason=skip_reason,
+                                 extra_values=default_extra_values(alarm, kind))
             results.append(result)
             # Telemetry
-            metric = alarm.get("metric", alarm.get("numerator", alarm.get("numerator_metric", "")))
+            metric = telemetry_metric(alarm, kind)
             n = count_series(current, metric) if metric else 0
             print(f"# alarm={name} metric={metric} series_matched={n} state=skipped", file=sys.stderr)
             continue
@@ -1218,9 +1319,7 @@ def main() -> int:
         results.append(result)
 
         # Telemetry
-        metric = alarm.get("metric", alarm.get("numerator", alarm.get("numerator_metric", "")))
-        if not metric and alarm.get("metric_sum"):
-            metric = alarm["metric_sum"][0]
+        metric = telemetry_metric(alarm, kind)
         n = count_series(current, metric) if metric else 0
         state = result["state"]
         if n == 0 and state != "skipped":

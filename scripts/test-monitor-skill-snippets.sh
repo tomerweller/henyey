@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=176
+TAP_PLAN=180
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -4051,6 +4051,84 @@ except Exception as e:
   fi
 
   rm -rf "$replay_root"
+
+  # ── eval-alarms telemetry regression tests ─────────────────────────────────
+  # Tests for issue #2574: misleading ERROR_NO_SERIES and unsubstituted placeholders
+
+  local eval_script="$REPO_ROOT/scripts/lib/eval-alarms.py"
+  local catalog_file="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
+  local fixture_dir="$REPO_ROOT/scripts/fixtures/eval-alarms"
+  local telemetry_state_dir
+  telemetry_state_dir=$(mktemp -d)
+
+  # Run eval-alarms with healthy fixtures and capture stderr (telemetry)
+  local telemetry_stderr telemetry_stdout
+  telemetry_stdout=$(MONITOR_MODE=validator UPTIME_SECONDS=900 \
+    WARMUP_TICKS_REMAINING=0 PID=12345 START_TICKS=100 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$fixture_dir/healthy-current.prom" \
+    --prev "$fixture_dir/healthy-prev.prom" \
+    --state-dir "$telemetry_state_dir" 2>"$telemetry_state_dir/stderr.log") || true
+  telemetry_stderr=$(cat "$telemetry_state_dir/stderr.log")
+
+  # Test: histogram-p99 alarms should NOT produce ERROR_NO_SERIES
+  local hist_error
+  hist_error=$(echo "$telemetry_stderr" | grep -c 'ERROR_NO_SERIES.*histogram\|lc-handle-complete.*ERROR_NO_SERIES\|lc-dispatch-to-join.*ERROR_NO_SERIES' || true)
+  if [[ "$hist_error" -eq 0 ]]; then
+    tap_ok "eval-alarms: histogram-p99 no false ERROR_NO_SERIES"
+  else
+    tap_not_ok "eval-alarms: histogram-p99 no false ERROR_NO_SERIES" \
+      "Found $hist_error false ERROR_NO_SERIES for histogram alarms"
+  fi
+
+  # Test: counter-ratio alarms with numerator_sum should have non-empty metric
+  local ratio_empty_metric
+  ratio_empty_metric=$(echo "$telemetry_stderr" | grep 'scp-accept-rate' | grep 'metric= ' || true)
+  if [[ -z "$ratio_empty_metric" ]]; then
+    tap_ok "eval-alarms: counter-ratio numerator_sum metric resolved"
+  else
+    tap_not_ok "eval-alarms: counter-ratio numerator_sum metric resolved" \
+      "Empty metric in telemetry: $ratio_empty_metric"
+  fi
+
+  # Test: no unresolved {placeholder} in any alarm result details or filing_title
+  local placeholder_leaks
+  placeholder_leaks=$(echo "$telemetry_stdout" | python3 -c "
+import json, sys, re
+data = json.load(sys.stdin)
+leaks = []
+for r in data.get('alarms', []):
+    for field in ('details', 'filing_title', 'summary'):
+        val = r.get(field, '')
+        if val and re.search(r'\{[a-z_]+\}', val):
+            leaks.append(f\"{r['name']}.{field}: {val}\")
+print(len(leaks))
+for l in leaks[:5]:
+    print(l, file=sys.stderr)
+" 2>"$telemetry_state_dir/placeholder-leaks.log") || echo "error"
+  if [[ "$placeholder_leaks" == "0" ]]; then
+    tap_ok "eval-alarms: no unresolved placeholders in results"
+  else
+    local leak_detail
+    leak_detail=$(cat "$telemetry_state_dir/placeholder-leaks.log" | head -3)
+    tap_not_ok "eval-alarms: no unresolved placeholders in results" \
+      "$placeholder_leaks leaks: $leak_detail"
+  fi
+
+  # Test: no false WARNING from placeholder guard
+  local guard_warnings
+  guard_warnings=$(echo "$telemetry_stderr" | grep -c 'WARNING: unresolved placeholder' || true)
+  if [[ "$guard_warnings" -eq 0 ]]; then
+    tap_ok "eval-alarms: no placeholder guard warnings on healthy fixtures"
+  else
+    local guard_detail
+    guard_detail=$(echo "$telemetry_stderr" | grep 'WARNING: unresolved placeholder' | head -3)
+    tap_not_ok "eval-alarms: no placeholder guard warnings on healthy fixtures" \
+      "$guard_warnings warnings: $guard_detail"
+  fi
+
+  rm -rf "$telemetry_state_dir"
 }
 check_skill_structure
 run_tests
