@@ -192,8 +192,8 @@
     {
       "id": 5,
       "type": "text",
-      "title": "Transitive Quorum Intersection (N/A)",
-      "description": "Panel 5 of 10334. N/A: Henyey does not implement transitive quorum analysis.",
+      "title": "Transitive Quorum Intersection",
+      "description": "Panel 5 of 10334. Reports whether the network enjoys transitive quorum intersection.",
       "gridPos": {
         "h": 3,
         "w": 3,

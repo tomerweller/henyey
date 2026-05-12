@@ -107,6 +107,7 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `QUORUM_DISAGREE` | `stellar_quorum_disagree` | gauge | Nodes disagreeing in latest slot |
 | `QUORUM_FAIL_AT` | `stellar_quorum_fail_at` | gauge | Peers that can fail before quorum loss (via `find_closest_v_blocking`, excludes self) |
 | `QUORUM_DELAYED` | `stellar_quorum_delayed` | gauge | Quorum set nodes lagging behind the local node (subset of agree) |
+| `QUORUM_TRANSITIVE_INTERSECTION` | `stellar_quorum_transitive_intersection` | gauge | Whether the network enjoys transitive quorum intersection (1=yes, 0=no, absent until first publishable check) |
 | `LEDGER_INVARIANT_FAILURE_TOTAL` | `stellar_ledger_invariant_failure_total` | counter | `InvariantManagerImpl::handleInvariantFailure` |
 | `LEDGER_TRANSACTION_INTERNAL_ERROR_TOTAL` | `stellar_ledger_transaction_internal_error_total` | counter | `TransactionFrame::apply` txINTERNAL_ERROR path |
 

@@ -1528,6 +1528,41 @@ mod tests {
     }
 
     #[test]
+    fn test_quorum_transitive_intersection_absent_until_set() {
+        // Verify gauges_no_prereg semantics: the metric value is absent
+        // from scrape output after describe+register, and only appears
+        // after an explicit set().
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+
+            let output = handle.render();
+            // The metric value should NOT appear (no pre-registered zero).
+            assert!(
+                !output.contains("stellar_quorum_transitive_intersection"),
+                "gauges_no_prereg metric should not appear before first set()"
+            );
+
+            // Set to 1 (intersection holds).
+            QUORUM_TRANSITIVE_INTERSECTION.set(1.0);
+            let output = handle.render();
+            assert!(
+                output.contains("stellar_quorum_transitive_intersection 1"),
+                "metric should be 1 after set(1.0)"
+            );
+
+            // Set to 0 (split detected).
+            QUORUM_TRANSITIVE_INTERSECTION.set(0.0);
+            let output = handle.render();
+            assert!(
+                output.contains("stellar_quorum_transitive_intersection 0"),
+                "metric should be 0 after set(0.0)"
+            );
+        });
+    }
+
+    #[test]
     fn test_removed_overlay_metrics_absent() {
         let handle = ensure_test_recorder();
         describe_metrics();
