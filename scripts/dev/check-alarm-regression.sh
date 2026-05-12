@@ -2,21 +2,32 @@
 # check-alarm-regression.sh — Baseline comparison and regression detection
 # for alarm replay results.
 #
-# Compares current alarm replay JSON against a stored baseline to detect
-# regressions (alarms that were meaningfully active but have gone silent).
+# Compares current alarm replay JSON against two stored baselines to detect
+# regressions (alarms that were meaningfully active but have gone silent):
+#
+#   - Rolling baseline (replay-baseline.json): updated on each clean run.
+#     Catches sudden regressions from one run to the next.
+#   - Stable baseline (replay-baseline-stable.json): frozen at creation time,
+#     never auto-updated. Catches gradual decay where an alarm that was
+#     historically active (≥5%) has silently drifted to 0% over successive
+#     rolling-baseline updates. To refresh the stable baseline after
+#     intentional alarm changes, delete replay-baseline-stable.json and re-run.
+#
 # Only alarms present in the alarm catalog are considered; non-catalog alarm
 # names (e.g. from stale baselines or test contamination) are silently pruned.
 #
 # Usage:
-#   scripts/dev/check-alarm-regression.sh SESSION_DIR [--current FILE] [--baseline FILE] [--catalog FILE]
+#   scripts/dev/check-alarm-regression.sh SESSION_DIR [--current FILE] \
+#       [--baseline FILE] [--stable-baseline FILE] [--catalog FILE]
 #
 # If --current is omitted, runs replay-alarms-on-history.sh --replay --json
 # internally. If --baseline is omitted, defaults to $METRICS_DIR/replay-baseline.json.
+# If --stable-baseline is omitted, defaults to $METRICS_DIR/replay-baseline-stable.json.
 # If --catalog is omitted, defaults to $REPO_ROOT/.claude/skills/shared/metric-alarms.toml.
 #
 # Exit codes:
 #   0 — success (regressions are informational, not failures)
-#   2 — fatal error (missing/invalid catalog, schema mismatch)
+#   2 — fatal error (missing/invalid catalog, schema mismatch, corrupt baseline)
 # Stdout: JSON array of regression objects (empty [] if none).
 
 set -euo pipefail
@@ -27,6 +38,7 @@ REPLAY_SCRIPT="$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh"
 SESSION_DIR=""
 CURRENT_FILE=""
 BASELINE_FILE=""
+STABLE_BASELINE_FILE=""
 CATALOG_FILE=""
 
 while [[ $# -gt 0 ]]; do
@@ -45,6 +57,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       BASELINE_FILE="$2"
+      shift 2
+      ;;
+    --stable-baseline)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --stable-baseline requires a file path argument" >&2
+        exit 1
+      fi
+      STABLE_BASELINE_FILE="$2"
       shift 2
       ;;
     --catalog)
@@ -78,6 +98,18 @@ if [[ -z "$BASELINE_FILE" ]]; then
   BASELINE_FILE="$METRICS_DIR/replay-baseline.json"
 fi
 
+if [[ -z "$STABLE_BASELINE_FILE" ]]; then
+  STABLE_BASELINE_FILE="$METRICS_DIR/replay-baseline-stable.json"
+fi
+
+# Reject if rolling and stable point to the same file
+ROLLING_CANONICAL=$(realpath --canonicalize-missing "$BASELINE_FILE" 2>/dev/null || readlink -f "$BASELINE_FILE" 2>/dev/null || echo "$BASELINE_FILE")
+STABLE_CANONICAL=$(realpath --canonicalize-missing "$STABLE_BASELINE_FILE" 2>/dev/null || readlink -f "$STABLE_BASELINE_FILE" 2>/dev/null || echo "$STABLE_BASELINE_FILE")
+if [[ "$ROLLING_CANONICAL" == "$STABLE_CANONICAL" ]]; then
+  echo "ERROR: --baseline and --stable-baseline must be different files" >&2
+  exit 2
+fi
+
 # Catalog: default to repo-root metric-alarms.toml (matching replay-alarms-on-history.sh)
 if [[ -z "$CATALOG_FILE" ]]; then
   CATALOG_FILE="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
@@ -104,8 +136,54 @@ else
   CURRENT_JSON=$(cat "$CURRENT_FILE")
 fi
 
-# If no baseline exists, establish one (pruning non-catalog alarms)
-if [[ ! -f "$BASELINE_FILE" ]]; then
+# Validate current replay data before any baseline writes
+python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except (json.JSONDecodeError, ValueError):
+    print('ERROR: Current replay data is not valid JSON', file=sys.stderr)
+    sys.exit(2)
+if data.get('schema_version') != 1:
+    print('ERROR: Current replay data has unexpected schema_version', file=sys.stderr)
+    sys.exit(2)
+if not isinstance(data.get('alarms'), dict):
+    print('ERROR: Current replay data missing alarms object', file=sys.stderr)
+    sys.exit(2)
+if not isinstance(data.get('evaluated_ticks'), int) or data['evaluated_ticks'] < 0:
+    print('ERROR: Current replay data has invalid evaluated_ticks', file=sys.stderr)
+    sys.exit(2)
+" "$CURRENT_JSON" || exit 2
+
+# Helper: validate a baseline file (JSON, schema_version, structure)
+# Returns 0 if valid, 1 if missing, 2 if corrupt/invalid
+validate_baseline() {
+  local file="$1"
+  local label="$2"
+  if [[ ! -f "$file" ]]; then
+    return 1
+  fi
+  python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+except (json.JSONDecodeError, ValueError, OSError):
+    print('ERROR: %s baseline is not valid JSON: ' % sys.argv[2] + sys.argv[1], file=sys.stderr)
+    sys.exit(2)
+if data.get('schema_version') != 1:
+    print('ERROR: %s baseline has unexpected schema_version' % sys.argv[2], file=sys.stderr)
+    sys.exit(2)
+if not isinstance(data.get('alarms'), dict):
+    print('ERROR: %s baseline missing alarms object' % sys.argv[2], file=sys.stderr)
+    sys.exit(2)
+" "$file" "$label" || return 2
+  return 0
+}
+
+# Helper: create a catalog-pruned baseline from current replay data
+create_baseline() {
+  local output_file="$1"
   python3 -c "
 import json, sys
 try:
@@ -124,11 +202,38 @@ data = json.loads(current_str)
 alarms = data.get('alarms', {})
 data['alarms'] = {k: v for k, v in alarms.items() if k in valid}
 print(json.dumps(data))
-" "$CATALOG_FILE" "$CURRENT_JSON" > "$BASELINE_FILE" || {
-    echo "ERROR: Failed to prune baseline" >&2
-    rm -f "$BASELINE_FILE"
+" "$CATALOG_FILE" "$CURRENT_JSON" > "$output_file" || {
+    echo "ERROR: Failed to create baseline: $output_file" >&2
+    rm -f "$output_file"
     exit 2
   }
+}
+
+# Determine baseline states
+ROLLING_STATE="missing"
+STABLE_STATE="missing"
+
+set +e
+validate_baseline "$BASELINE_FILE" "Rolling"
+case $? in
+  0) ROLLING_STATE="valid" ;;
+  1) ROLLING_STATE="missing" ;;
+  2) exit 2 ;;
+esac
+
+validate_baseline "$STABLE_BASELINE_FILE" "Stable"
+case $? in
+  0) STABLE_STATE="valid" ;;
+  1) STABLE_STATE="missing" ;;
+  2) exit 2 ;;
+esac
+set -e
+
+# Bootstrap: handle all missing/valid combinations
+if [[ "$ROLLING_STATE" == "missing" && "$STABLE_STATE" == "missing" ]]; then
+  # First run — create both baselines
+  create_baseline "$BASELINE_FILE"
+  cp "$BASELINE_FILE" "$STABLE_BASELINE_FILE"
   ALARM_COUNT=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('alarms',{})))" < "$BASELINE_FILE" 2>/dev/null || echo "0")
   EVAL_TICKS=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('evaluated_ticks',0))" < "$BASELINE_FILE" 2>/dev/null || echo "0")
   echo "Baseline established ($ALARM_COUNT alarms, $EVAL_TICKS evaluated ticks)" >&2
@@ -136,7 +241,17 @@ print(json.dumps(data))
   exit 0
 fi
 
-# Compare baseline vs current — compute regressions once, capture output
+if [[ "$ROLLING_STATE" == "valid" && "$STABLE_STATE" == "missing" ]]; then
+  create_baseline "$STABLE_BASELINE_FILE"
+  echo "Stable baseline established" >&2
+fi
+
+if [[ "$ROLLING_STATE" == "missing" && "$STABLE_STATE" == "valid" ]]; then
+  create_baseline "$BASELINE_FILE"
+  echo "Rolling baseline re-established" >&2
+fi
+
+# Both baselines now exist and are valid — run dual comparison
 set +e
 REGRESSION_OUTPUT=$(python3 -c "
 import json, sys
@@ -146,11 +261,12 @@ try:
 except ImportError:
     import tomli as tomllib
 
-baseline_file = sys.argv[1]
-current_json_str = sys.argv[2]
-catalog_path = sys.argv[3]
+rolling_file = sys.argv[1]
+stable_file = sys.argv[2]
+current_json_str = sys.argv[3]
+catalog_path = sys.argv[4]
 
-# Load alarm catalog — build set of valid alarm names
+# Load alarm catalog
 with open(catalog_path, 'rb') as f:
     catalog = tomllib.load(f)
 valid_alarms = {a['name'] for a in catalog.get('alarm', [])}
@@ -158,79 +274,90 @@ if not valid_alarms:
     print('ERROR: Catalog has no alarm entries', file=sys.stderr)
     sys.exit(2)
 
-with open(baseline_file) as f:
-    baseline = json.load(f)
-
+with open(rolling_file) as f:
+    rolling = json.load(f)
+with open(stable_file) as f:
+    stable = json.load(f)
 current = json.loads(current_json_str)
 
-# Validate schema versions — exit 2 to signal error (distinct from exit 0 = success)
-if baseline.get('schema_version') != 1:
-    print('ERROR: Baseline has unexpected schema_version', file=sys.stderr)
-    sys.exit(2)
-if current.get('schema_version') != 1:
-    print('ERROR: Current has unexpected schema_version', file=sys.stderr)
-    sys.exit(2)
-
-baseline_alarms = baseline.get('alarms', {})
 current_alarms = current.get('alarms', {})
-baseline_evaluated = baseline.get('evaluated_ticks', 0)
 current_evaluated = current.get('evaluated_ticks', 0)
 
-regressions = []
+def compare_baseline(baseline_data, source_label):
+    \"\"\"Compare a baseline against current data. Returns list of regression dicts.\"\"\"
+    results = []
+    baseline_alarms = baseline_data.get('alarms', {})
+    baseline_evaluated = baseline_data.get('evaluated_ticks', 0)
 
-for alarm_name, b_counts in baseline_alarms.items():
-    # Skip alarms not in the catalog (stale/test data)
-    if alarm_name not in valid_alarms:
-        continue
+    if source_label == 'rolling':
+        absent_reason = 'alarm absent from current replay (catalog drift?)'
+        silent_reason = 'alarm was active but is now silent'
+    else:
+        absent_reason = 'alarm absent from current replay but was active in stable baseline (gradual drift?)'
+        silent_reason = 'alarm was active in stable baseline but has gradually decayed to silent'
 
-    # Compute eligible samples (exclude skip and baseline/collecting_baseline)
-    b_eligible = baseline_evaluated - b_counts.get('skip', 0) - b_counts.get('baseline', 0)
-    if b_eligible < 10:
-        continue  # Insufficient data in baseline
+    for alarm_name, b_counts in baseline_alarms.items():
+        if alarm_name not in valid_alarms:
+            continue
 
-    b_fired_pct = b_counts.get('firing', 0) / b_eligible if b_eligible > 0 else 0
+        b_eligible = baseline_evaluated - b_counts.get('skip', 0) - b_counts.get('baseline', 0)
+        if b_eligible < 10:
+            continue
 
-    if b_fired_pct < 0.05:
-        continue  # Not meaningfully active in baseline
+        b_fired_pct = b_counts.get('firing', 0) / b_eligible if b_eligible > 0 else 0
+        if b_fired_pct < 0.05:
+            continue
 
-    # Check current
-    if alarm_name not in current_alarms:
-        regressions.append({
-            'alarm': alarm_name,
-            'baseline_fired_pct': round(b_fired_pct, 4),
-            'baseline_fired_pct_display': round(b_fired_pct * 100, 2),
-            'current_fired_pct': 0.0,
-            'baseline_evaluated': baseline_evaluated,
-            'current_evaluated': current_evaluated,
-            'reason': 'alarm absent from current replay (catalog drift?)',
-        })
-        continue
+        if alarm_name not in current_alarms:
+            results.append({
+                'alarm': alarm_name,
+                'baseline_source': source_label,
+                'baseline_fired_pct': round(b_fired_pct, 4),
+                'baseline_fired_pct_display': round(b_fired_pct * 100, 2),
+                'current_fired_pct': 0.0,
+                'baseline_evaluated': baseline_evaluated,
+                'current_evaluated': current_evaluated,
+                'reason': absent_reason,
+            })
+            continue
 
-    c_counts = current_alarms[alarm_name]
-    c_eligible = current_evaluated - c_counts.get('skip', 0) - c_counts.get('baseline', 0)
-    if c_eligible < 10:
-        continue  # Insufficient data in current
+        c_counts = current_alarms[alarm_name]
+        c_eligible = current_evaluated - c_counts.get('skip', 0) - c_counts.get('baseline', 0)
+        if c_eligible < 10:
+            continue
 
-    c_firing = c_counts.get('firing', 0)
-    if c_firing == 0:
-        regressions.append({
-            'alarm': alarm_name,
-            'baseline_fired_pct': round(b_fired_pct, 4),
-            'baseline_fired_pct_display': round(b_fired_pct * 100, 2),
-            'current_fired_pct': 0.0,
-            'baseline_evaluated': baseline_evaluated,
-            'current_evaluated': current_evaluated,
-            'reason': 'alarm was active but is now silent',
-        })
+        c_firing = c_counts.get('firing', 0)
+        if c_firing == 0:
+            results.append({
+                'alarm': alarm_name,
+                'baseline_source': source_label,
+                'baseline_fired_pct': round(b_fired_pct, 4),
+                'baseline_fired_pct_display': round(b_fired_pct * 100, 2),
+                'current_fired_pct': 0.0,
+                'baseline_evaluated': baseline_evaluated,
+                'current_evaluated': current_evaluated,
+                'reason': silent_reason,
+            })
+    return results
 
-print(json.dumps(regressions))
-" "$BASELINE_FILE" "$CURRENT_JSON" "$CATALOG_FILE")
+# Run both comparisons
+rolling_regressions = compare_baseline(rolling, 'rolling')
+stable_regressions = compare_baseline(stable, 'stable')
+
+# Merge with stable-wins dedup (stable overwrites rolling on key collision)
+merged = {}
+for r in rolling_regressions:
+    merged[r['alarm']] = r
+for r in stable_regressions:
+    merged[r['alarm']] = r  # stable wins
+
+print(json.dumps(list(merged.values())))
+" "$BASELINE_FILE" "$STABLE_BASELINE_FILE" "$CURRENT_JSON" "$CATALOG_FILE")
 COMPARE_EXIT=$?
 set -e
 
 if [[ $COMPARE_EXIT -ne 0 ]]; then
   echo "ERROR: Regression comparison failed (exit $COMPARE_EXIT)" >&2
-  # Fail closed — do NOT update baseline, do NOT print success output
   exit 2
 fi
 
@@ -241,7 +368,7 @@ echo "$REGRESSION_OUTPUT"
 REGRESSION_COUNT=$(echo "$REGRESSION_OUTPUT" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
 
 if [[ "$REGRESSION_COUNT" == "0" ]]; then
-  # No regressions — update baseline (rolling forward, pruning non-catalog alarms)
+  # No regressions from either baseline — update rolling (stable is never updated)
   python3 -c "
 import json, sys
 try:
@@ -258,16 +385,15 @@ alarms = data.get('alarms', {})
 data['alarms'] = {k: v for k, v in alarms.items() if k in valid}
 print(json.dumps(data))
 " "$CATALOG_FILE" "$CURRENT_JSON" > "$BASELINE_FILE"
-  echo "No regressions found. Baseline updated." >&2
+  echo "No regressions found. Rolling baseline updated." >&2
 else
-  # Regressions found — keep last-known-good baseline
-  echo "$REGRESSION_COUNT regression(s) found. Baseline NOT updated (preserving last-known-good)." >&2
+  # Regressions found — keep last-known-good rolling baseline
+  echo "$REGRESSION_COUNT regression(s) found. Rolling baseline NOT updated (preserving last-known-good)." >&2
 
   # Ensure alarm-regression label exists
   gh label create alarm-regression --description "Alarm regression detected by replay" --color "d93f0b" 2>/dev/null || true
 
   # Serialize concurrent filing attempts with an exclusive lock.
-  # -w 30: block up to 30s for the lock (each alarm filing takes ~2s).
   LOCK_FILE="$REPO_ROOT/.alarm-regression-filing.lock"
   (
     flock -w 30 9 || {
@@ -277,12 +403,11 @@ else
 
     declare -A FILED_THIS_RUN
 
-    # Process regressions via process substitution (runs loop in main shell
-    # so FILED_THIS_RUN persists across iterations).
     while IFS= read -r regression_line; do
       [[ -z "$regression_line" ]] && continue
       ALARM_NAME=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['alarm'])" 2>/dev/null) || continue
       BASELINE_DISPLAY_PCT=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['baseline_fired_pct_display'])" 2>/dev/null) || continue
+      BASELINE_SOURCE=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['baseline_source'])" 2>/dev/null) || continue
       REASON=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['reason'])" 2>/dev/null) || continue
 
       EXPECTED_TITLE="Alarm regression: $ALARM_NAME"
@@ -295,7 +420,6 @@ else
       fi
 
       # Per-alarm dedup: server-side narrowing + client-side exact verification.
-      # Two queries cover both title-based and body-marker-based matches.
       TITLE_CANDIDATES=$(gh issue list --label alarm-regression --state open \
         --search "in:title \"$ALARM_NAME\"" \
         --json title,body 2>/dev/null) || TITLE_CANDIDATES="[]"
@@ -322,23 +446,33 @@ else
         continue
       fi
 
+      # Build investigation steps based on baseline source
+      if [[ "$BASELINE_SOURCE" == "stable" ]]; then
+        INVESTIGATION_STEPS="1. Check if this alarm was intentionally removed or its threshold changed
+2. If intentional: delete \`replay-baseline-stable.json\` to refresh the stable baseline
+3. If unintentional: investigate why the alarm stopped firing — it was historically active"
+      else
+        INVESTIGATION_STEPS="1. Check if the alarm was intentionally removed or its threshold changed
+2. Check if the underlying metric is still being emitted
+3. If the alarm should still be active, investigate why it stopped firing"
+      fi
+
       # File new issue
       ISSUE_BODY="## Alarm Regression Detected
 
 **Alarm**: \`$ALARM_NAME\`
+**Baseline source**: $BASELINE_SOURCE
 **Baseline fired**: ${BASELINE_DISPLAY_PCT}% of eligible ticks
 **Current fired**: 0%
 **Reason**: $REASON
 
 ### Context
 This regression was detected by the weekly alarm replay in \`monitor-tick\` Step 8.
-The alarm was meaningfully active (≥5% of ticks) in the baseline but fires 0% in
+The alarm was meaningfully active (≥5% of ticks) in the $BASELINE_SOURCE baseline but fires 0% in
 the current replay window.
 
 ### Investigation
-1. Check if the alarm was intentionally removed or its threshold changed
-2. Check if the underlying metric is still being emitted
-3. If the alarm should still be active, investigate why it stopped firing
+$INVESTIGATION_STEPS
 
 <!-- alarm-regression-key: $ALARM_NAME -->"
 

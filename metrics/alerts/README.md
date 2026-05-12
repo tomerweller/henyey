@@ -328,8 +328,12 @@ After modifying alarm rules or the evaluator, verify no regressions:
 > **Historical replay.** Weekly alarm regression replay is now implemented.
 > `monitor-tick` Step 8 schedules it: `replay-alarms-on-history.sh --replay`
 > evaluates archived snapshot pairs through the current alarm catalog, then
-> `check-alarm-regression.sh` compares the result against a stored baseline
-> to detect regressions. This detects forward drift (week N+1 vs week N).
+> `check-alarm-regression.sh` compares the result against two baselines:
+> a **rolling baseline** (updated each clean run, catches sudden regressions)
+> and a **frozen stable baseline** (never auto-updated, catches gradual decay
+> where an alarm silently drifts from active to silent over successive runs).
+> To refresh the stable baseline after intentional alarm changes, delete
+> `replay-baseline-stable.json` and re-run.
 >
 > **Pre-refactor limitation.** Pre-#2566 runtime equivalence cannot be
 > proven — no pre-refactor snapshots or baseline exist. The original

@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=192
+TAP_PLAN=208
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -4032,10 +4032,12 @@ except Exception as e:
   reg_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
     "$reg_session" --current "$reg_session/metrics/reg-current.json" \
     --catalog "$catalog_for_reg" 2>&1) || true
-  if [[ -f "$reg_session/metrics/replay-baseline.json" ]] && echo "$reg_out" | grep -q "Baseline established"; then
-    tap_ok "regression: no baseline creates baseline"
+  if [[ -f "$reg_session/metrics/replay-baseline.json" ]] && \
+     [[ -f "$reg_session/metrics/replay-baseline-stable.json" ]] && \
+     echo "$reg_out" | grep -q "Baseline established"; then
+    tap_ok "regression: no baseline creates both baselines"
   else
-    tap_not_ok "regression: no baseline creates baseline" "output: $reg_out"
+    tap_not_ok "regression: no baseline creates both baselines" "output: $reg_out"
   fi
 
   # Test: baseline + no regressions → baseline updated, exits 0
@@ -4176,6 +4178,310 @@ else:
   fi
 
   rm -rf "$replay_root"
+
+  # ── check-alarm-regression.sh stable-baseline tests ────────────────────────
+
+  local stable_root
+  stable_root=$(mktemp -d)
+  local stable_catalog="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
+
+  # Shared test data: alarm active at 10% (20/200)
+  local stable_current_active='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  # Current with alarm silent (0% firing)
+  local stable_current_silent='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  # Current with alarm absent
+  local stable_current_absent='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  # Current with low sample count
+  local stable_current_low='{"schema_version":1,"evaluated_ticks":5,"skipped_ticks":0,"error_ticks":0,"total_snapshots":5,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":5,"baseline":0,"skip":0}}}'
+  # Rolling baseline where alarm has decayed below 5%
+  local stable_rolling_decayed='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":5,"breach":0,"ok":185,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+
+  # Test 1: Initial run creates both baselines (already tested above, this is the
+  # stable-specific verification that content is identical)
+  local sb_t1="$stable_root/t1"
+  mkdir -p "$sb_t1/metrics"
+  echo "$stable_current_active" > "$sb_t1/metrics/current.json"
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t1" --current "$sb_t1/metrics/current.json" --catalog "$stable_catalog" >/dev/null 2>&1 || true
+  if diff -q "$sb_t1/metrics/replay-baseline.json" "$sb_t1/metrics/replay-baseline-stable.json" >/dev/null 2>&1; then
+    tap_ok "stable: initial run creates identical rolling and stable baselines"
+  else
+    tap_not_ok "stable: initial run creates identical rolling and stable baselines"
+  fi
+
+  # Test 2: Stable NOT updated on clean run (mtime check)
+  local stable_mtime_before
+  stable_mtime_before=$(stat -c %Y "$sb_t1/metrics/replay-baseline-stable.json" 2>/dev/null) || stable_mtime_before=0
+  sleep 1
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t1" --current "$sb_t1/metrics/current.json" --catalog "$stable_catalog" >/dev/null 2>&1 || true
+  local stable_mtime_after
+  stable_mtime_after=$(stat -c %Y "$sb_t1/metrics/replay-baseline-stable.json" 2>/dev/null) || stable_mtime_after=0
+  if [[ "$stable_mtime_before" == "$stable_mtime_after" ]]; then
+    tap_ok "stable: stable baseline NOT updated on clean run"
+  else
+    tap_not_ok "stable: stable baseline NOT updated on clean run" \
+      "before=$stable_mtime_before after=$stable_mtime_after"
+  fi
+
+  # Test 3: Gradual decay detected via stable baseline
+  # Setup: stable has alarm at 10%, rolling has decayed below 5%, current is 0%
+  local sb_t3="$stable_root/t3"
+  mkdir -p "$sb_t3/metrics"
+  echo "$stable_current_active" > "$sb_t3/metrics/replay-baseline-stable.json"
+  echo "$stable_rolling_decayed" > "$sb_t3/metrics/replay-baseline.json"
+  echo "$stable_current_silent" > "$sb_t3/metrics/current.json"
+  local sb_t3_out
+  sb_t3_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t3" --current "$sb_t3/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
+  if echo "$sb_t3_out" | grep -q "gradually decayed to silent"; then
+    tap_ok "stable: gradual decay detected via stable baseline"
+  else
+    tap_not_ok "stable: gradual decay detected via stable baseline" "output: ${sb_t3_out:0:300}"
+  fi
+
+  # Test 4: No false positive when alarm still active
+  local sb_t4="$stable_root/t4"
+  mkdir -p "$sb_t4/metrics"
+  echo "$stable_current_active" > "$sb_t4/metrics/replay-baseline-stable.json"
+  echo "$stable_current_active" > "$sb_t4/metrics/replay-baseline.json"
+  echo "$stable_current_active" > "$sb_t4/metrics/current.json"
+  local sb_t4_out
+  sb_t4_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t4" --current "$sb_t4/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
+  local sb_t4_json
+  sb_t4_json=$(echo "$sb_t4_out" | grep -v "^No regressions\|^Rolling\|^Stable\|^Baseline" | head -1)
+  if [[ "$sb_t4_json" == "[]" ]]; then
+    tap_ok "stable: no false positive when alarm still active"
+  else
+    tap_not_ok "stable: no false positive when alarm still active" "output: ${sb_t4_out:0:200}"
+  fi
+
+  # Test 5: Partial bootstrap — rolling exists, stable missing
+  local sb_t5="$stable_root/t5"
+  mkdir -p "$sb_t5/metrics"
+  echo "$stable_current_active" > "$sb_t5/metrics/replay-baseline.json"
+  echo "$stable_current_active" > "$sb_t5/metrics/current.json"
+  local sb_t5_out
+  sb_t5_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t5" --current "$sb_t5/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
+  if [[ -f "$sb_t5/metrics/replay-baseline-stable.json" ]] && echo "$sb_t5_out" | grep -q "Stable baseline established"; then
+    tap_ok "stable: partial bootstrap — rolling exists, stable created"
+  else
+    tap_not_ok "stable: partial bootstrap — rolling exists, stable created" "output: ${sb_t5_out:0:200}"
+  fi
+
+  # Test 6: Partial bootstrap — stable exists, rolling missing
+  local sb_t6="$stable_root/t6"
+  mkdir -p "$sb_t6/metrics"
+  echo "$stable_current_active" > "$sb_t6/metrics/replay-baseline-stable.json"
+  echo "$stable_current_active" > "$sb_t6/metrics/current.json"
+  local sb_t6_out
+  sb_t6_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t6" --current "$sb_t6/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
+  if [[ -f "$sb_t6/metrics/replay-baseline.json" ]] && echo "$sb_t6_out" | grep -q "Rolling baseline re-established"; then
+    tap_ok "stable: partial bootstrap — stable exists, rolling created"
+  else
+    tap_not_ok "stable: partial bootstrap — stable exists, rolling created" "output: ${sb_t6_out:0:200}"
+  fi
+
+  # Test 7: Corrupt stable baseline (invalid JSON) → exit 2
+  local sb_t7="$stable_root/t7"
+  mkdir -p "$sb_t7/metrics"
+  echo "$stable_current_active" > "$sb_t7/metrics/replay-baseline.json"
+  echo "NOT VALID JSON" > "$sb_t7/metrics/replay-baseline-stable.json"
+  echo "$stable_current_active" > "$sb_t7/metrics/current.json"
+  local sb_t7_out
+  set +e
+  sb_t7_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t7" --current "$sb_t7/metrics/current.json" --catalog "$stable_catalog" 2>&1)
+  local sb_t7_exit=$?
+  set -e
+  if [[ "$sb_t7_exit" -eq 2 ]]; then
+    tap_ok "stable: corrupt stable baseline exits 2"
+  else
+    tap_not_ok "stable: corrupt stable baseline exits 2" "exit=$sb_t7_exit output: ${sb_t7_out:0:200}"
+  fi
+
+  # Test 8: Schema mismatch stable → exit 2
+  local sb_t8="$stable_root/t8"
+  mkdir -p "$sb_t8/metrics"
+  echo "$stable_current_active" > "$sb_t8/metrics/replay-baseline.json"
+  echo '{"schema_version":2,"evaluated_ticks":200,"alarms":{}}' > "$sb_t8/metrics/replay-baseline-stable.json"
+  echo "$stable_current_active" > "$sb_t8/metrics/current.json"
+  local sb_t8_out
+  set +e
+  sb_t8_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t8" --current "$sb_t8/metrics/current.json" --catalog "$stable_catalog" 2>&1)
+  local sb_t8_exit=$?
+  set -e
+  if [[ "$sb_t8_exit" -eq 2 ]]; then
+    tap_ok "stable: schema mismatch stable exits 2"
+  else
+    tap_not_ok "stable: schema mismatch stable exits 2" "exit=$sb_t8_exit output: ${sb_t8_out:0:200}"
+  fi
+
+  # Test 9: Absent alarm from stable → regression reported
+  local sb_t9="$stable_root/t9"
+  mkdir -p "$sb_t9/metrics"
+  echo "$stable_current_active" > "$sb_t9/metrics/replay-baseline-stable.json"
+  echo "$stable_current_active" > "$sb_t9/metrics/replay-baseline.json"
+  echo "$stable_current_absent" > "$sb_t9/metrics/current.json"
+  local sb_t9_out
+  sb_t9_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t9" --current "$sb_t9/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
+  if echo "$sb_t9_out" | grep -q "gradual drift"; then
+    tap_ok "stable: absent alarm from stable reports regression"
+  else
+    tap_not_ok "stable: absent alarm from stable reports regression" "output: ${sb_t9_out:0:300}"
+  fi
+
+  # Test 10: Low-sample current → alarm skipped
+  local sb_t10="$stable_root/t10"
+  mkdir -p "$sb_t10/metrics"
+  echo "$stable_current_active" > "$sb_t10/metrics/replay-baseline-stable.json"
+  echo "$stable_current_active" > "$sb_t10/metrics/replay-baseline.json"
+  echo "$stable_current_low" > "$sb_t10/metrics/current.json"
+  local sb_t10_out
+  sb_t10_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t10" --current "$sb_t10/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
+  local sb_t10_json
+  sb_t10_json=$(echo "$sb_t10_out" | grep -v "^No regressions\|^Rolling\|^Stable\|^Baseline" | head -1)
+  if [[ "$sb_t10_json" == "[]" ]]; then
+    tap_ok "stable: low-sample current skips alarm"
+  else
+    tap_not_ok "stable: low-sample current skips alarm" "output: ${sb_t10_out:0:200}"
+  fi
+
+  # Test 11: Dedup — both baselines flag same alarm → stable wins with full object
+  local sb_t11="$stable_root/t11"
+  mkdir -p "$sb_t11/metrics"
+  # Stable: alarm at 10% (20/200)
+  echo "$stable_current_active" > "$sb_t11/metrics/replay-baseline-stable.json"
+  # Rolling: alarm at 8% (16/200) — different percentage
+  local rolling_8pct='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":16,"breach":5,"ok":169,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$rolling_8pct" > "$sb_t11/metrics/replay-baseline.json"
+  echo "$stable_current_silent" > "$sb_t11/metrics/current.json"
+  local sb_t11_out
+  sb_t11_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t11" --current "$sb_t11/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
+  # Should have stable source and stable's percentage (10%, not 8%)
+  local sb_t11_source
+  sb_t11_source=$(echo "$sb_t11_out" | grep -v "regression(s)" | head -1 | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+r = [x for x in data if x['alarm'] == 'lost-sync']
+if r and r[0]['baseline_source'] == 'stable' and r[0]['baseline_fired_pct_display'] == 10.53:
+    print('ok')
+else:
+    print('fail: ' + json.dumps(r))
+" 2>/dev/null) || sb_t11_source="fail"
+  if [[ "$sb_t11_source" == "ok" ]]; then
+    tap_ok "stable: dedup — stable wins with full object"
+  else
+    tap_not_ok "stable: dedup — stable wins with full object" "result: $sb_t11_source output: ${sb_t11_out:0:300}"
+  fi
+
+  # Test 12: --stable-baseline flag overrides default path
+  local sb_t12="$stable_root/t12"
+  mkdir -p "$sb_t12/metrics"
+  echo "$stable_current_active" > "$sb_t12/metrics/current.json"
+  local custom_stable_path="$sb_t12/metrics/custom-stable.json"
+  # First create rolling baseline so we trigger the partial-bootstrap path
+  echo "$stable_current_active" > "$sb_t12/metrics/replay-baseline.json"
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t12" --current "$sb_t12/metrics/current.json" \
+    --stable-baseline "$custom_stable_path" \
+    --catalog "$stable_catalog" >/dev/null 2>&1 || true
+  if [[ -f "$custom_stable_path" ]]; then
+    tap_ok "stable: --stable-baseline flag overrides path"
+  else
+    tap_not_ok "stable: --stable-baseline flag overrides path"
+  fi
+
+  # Test 13: Stable-only regressions prevent rolling baseline update
+  local sb_t13="$stable_root/t13"
+  mkdir -p "$sb_t13/metrics"
+  # Stable has alarm active at 10%, rolling has it decayed below 5%
+  echo "$stable_current_active" > "$sb_t13/metrics/replay-baseline-stable.json"
+  echo "$stable_rolling_decayed" > "$sb_t13/metrics/replay-baseline.json"
+  echo "$stable_current_silent" > "$sb_t13/metrics/current.json"
+  local rolling_mtime_before
+  rolling_mtime_before=$(stat -c %Y "$sb_t13/metrics/replay-baseline.json" 2>/dev/null) || rolling_mtime_before=0
+  sleep 1
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t13" --current "$sb_t13/metrics/current.json" --catalog "$stable_catalog" >/dev/null 2>&1 || true
+  local rolling_mtime_after
+  rolling_mtime_after=$(stat -c %Y "$sb_t13/metrics/replay-baseline.json" 2>/dev/null) || rolling_mtime_after=0
+  if [[ "$rolling_mtime_before" == "$rolling_mtime_after" ]]; then
+    tap_ok "stable: stable-only regressions prevent rolling update"
+  else
+    tap_not_ok "stable: stable-only regressions prevent rolling update" \
+      "before=$rolling_mtime_before after=$rolling_mtime_after"
+  fi
+
+  # Test 14: Same-path rejection via realpath
+  local sb_t14="$stable_root/t14"
+  mkdir -p "$sb_t14/metrics"
+  echo "$stable_current_active" > "$sb_t14/metrics/current.json"
+  echo "$stable_current_active" > "$sb_t14/metrics/replay-baseline.json"
+  set +e
+  local sb_t14_out
+  sb_t14_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t14" --current "$sb_t14/metrics/current.json" \
+    --baseline "$sb_t14/metrics/replay-baseline.json" \
+    --stable-baseline "$sb_t14/metrics/replay-baseline.json" \
+    --catalog "$stable_catalog" 2>&1)
+  local sb_t14_exit=$?
+  set -e
+  if [[ "$sb_t14_exit" -eq 2 ]] && echo "$sb_t14_out" | grep -q "must be different files"; then
+    tap_ok "stable: same-path rejection via realpath"
+  else
+    tap_not_ok "stable: same-path rejection via realpath" "exit=$sb_t14_exit output: ${sb_t14_out:0:200}"
+  fi
+
+  # Test 15: Invalid current replay → exit 2
+  local sb_t15="$stable_root/t15"
+  mkdir -p "$sb_t15/metrics"
+  echo "INVALID JSON" > "$sb_t15/metrics/current.json"
+  set +e
+  local sb_t15_out
+  sb_t15_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t15" --current "$sb_t15/metrics/current.json" \
+    --catalog "$stable_catalog" 2>&1)
+  local sb_t15_exit=$?
+  set -e
+  if [[ "$sb_t15_exit" -eq 2 ]]; then
+    tap_ok "stable: invalid current replay exits 2"
+  else
+    tap_not_ok "stable: invalid current replay exits 2" "exit=$sb_t15_exit output: ${sb_t15_out:0:200}"
+  fi
+
+  # Test 16: baseline_source field present in regression JSON
+  local sb_t16="$stable_root/t16"
+  mkdir -p "$sb_t16/metrics"
+  echo "$stable_current_active" > "$sb_t16/metrics/replay-baseline-stable.json"
+  echo "$stable_current_active" > "$sb_t16/metrics/replay-baseline.json"
+  echo "$stable_current_silent" > "$sb_t16/metrics/current.json"
+  local sb_t16_out
+  sb_t16_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t16" --current "$sb_t16/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
+  local sb_t16_has_source
+  sb_t16_has_source=$(echo "$sb_t16_out" | grep -v "regression(s)" | head -1 | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+if all('baseline_source' in r for r in data) and len(data) > 0:
+    print('ok')
+else:
+    print('fail')
+" 2>/dev/null) || sb_t16_has_source="fail"
+  if [[ "$sb_t16_has_source" == "ok" ]]; then
+    tap_ok "stable: baseline_source field present in regression JSON"
+  else
+    tap_not_ok "stable: baseline_source field present in regression JSON" "output: ${sb_t16_out:0:200}"
+  fi
+
+  rm -rf "$stable_root"
 
   # ── check-alarm-regression.sh dedup tests ──────────────────────────────────
   # Tests for issue #2608: duplicate issue filing due to stale dedup snapshot.
