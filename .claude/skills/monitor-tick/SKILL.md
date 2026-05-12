@@ -21,6 +21,43 @@ If the file is missing, **bail out immediately** with:
 ERROR: /home/tomer/data/monitor-loop.env not found — run /monitor-loop first.
 ```
 
+### Skill version tracks `origin/main`, binary tracks `build_sha`
+
+This skill (`SKILL.md`, `scripts/lib/eval-alarms.{sh,py}`,
+`shared/metric-alarms.toml`) is documentation and tooling that evolves
+independently of the validator binary. The deployed binary is pinned to
+a specific commit recorded in `$HOME/data/$MONITOR_SESSION_ID/build_sha`,
+but the skill always tracks `origin/main`.
+
+Why: an operator may land a SKILL.md update (new check, new alarm, new
+archive step) without rebuilding the validator. A tick that follows the
+skill in a working tree pinned to the deployed sha will silently miss
+those updates.
+
+**Deploy-procedure convention:** when a tick builds and deploys a new
+validator sha, it must return the working tree to `main` after the build
+so subsequent ticks read the latest procedure:
+
+```bash
+git checkout <new-sha>
+CARGO_TARGET_DIR=... cargo build --release -p henyey
+# … Stop-PID, Rotate-log, Relaunch, atomic build_sha update …
+git checkout main && git pull --ff-only   # ← restore working tree
+```
+
+If the working tree is detached at a deployed sha when a tick runs, the
+tick must `git checkout main && git pull --ff-only` before reading any
+file under `.claude/skills/`, `scripts/lib/`, or `shared/`. The
+deployed-sha tree may have stale paths that produce silent procedure
+drift (missing alarms, missing archive step, etc.).
+
+Audit at a glance:
+
+```bash
+git rev-parse HEAD          # working tree (should equal origin/main)
+git rev-parse origin/main   # current upstream
+```
+
 Load the env file at the start of the tick:
 
 ```bash
