@@ -3355,248 +3355,123 @@ except:
   rm -f "$tick_prom" "$prev_prom"
   rm -rf "$state_dir"
 
-  # Test 149: every # mirrors: UID in metric-alarms.toml resolves to a real
-  #           Grafana alert uid in henyey-slo-alerts.yaml.
+  # Test 149: alarm-surfaces.toml file-local invariants + mirrored UIDs
+  #           resolve to real Grafana alert UIDs in henyey-slo-alerts.yaml.
   local yaml_file="$REPO_ROOT/metrics/alerts/henyey-slo-alerts.yaml"
-  if [[ -f "$catalog_file" ]] && [[ -f "$yaml_file" ]]; then
+  local surfaces_file="$REPO_ROOT/.claude/skills/shared/alarm-surfaces.toml"
+  if [[ -f "$surfaces_file" ]] && [[ -f "$yaml_file" ]]; then
     local mirrors_result
-    mirrors_result=$(python3 - "$catalog_file" "$yaml_file" <<'MIRRORS_EOF'
-import sys, re
-
-toml_path = sys.argv[1]
-yaml_path = sys.argv[2]
-
-# Extract all UIDs from # mirrors: comments in the TOML
-mirror_uids = []
-with open(toml_path) as f:
-    for line in f:
-        m = re.match(r'^# mirrors:\s+henyey-slo-alerts\.yaml\s+(.+)$', line.strip())
-        if m:
-            raw = m.group(1)
-            for uid in re.split(r',\s*', raw):
-                uid = uid.strip()
-                if uid:
-                    mirror_uids.append(uid)
-
-# Extract all uid: values from the YAML
-yaml_uids = set()
-with open(yaml_path) as f:
-    for line in f:
-        m = re.match(r'\s*-?\s*uid:\s+(\S+)', line)
-        if m:
-            yaml_uids.add(m.group(1))
-
-# Check each mirror UID exists in YAML
+    mirrors_result=$(PYTHONPATH="$REPO_ROOT/scripts/lib" python3 -c "
+import sys, alarm_surfaces
+surfaces = alarm_surfaces.load_surfaces(sys.argv[1])
+errors = alarm_surfaces.validate_local(surfaces)
+if errors:
+    print('FAIL:' + '; '.join(errors))
+    sys.exit(0)
+yaml_uids = alarm_surfaces.extract_yaml_uids(sys.argv[2])
+yaml_set = set(yaml_uids)
+mirrored = surfaces.get('mirrored', [])
 missing = []
-for uid in mirror_uids:
-    if uid not in yaml_uids:
-        missing.append(uid)
-
+for e in mirrored:
+    for uid in e.get('grafana_uid', []):
+        if uid not in yaml_set:
+            missing.append(uid)
 if missing:
-    print("FAIL:" + ",".join(missing))
+    print('FAIL:mirrored UIDs not in YAML: ' + ', '.join(missing))
 else:
-    print("OK:" + str(len(mirror_uids)))
-MIRRORS_EOF
-    ) || mirrors_result="FAIL:python-error"
+    count = sum(len(e.get('grafana_uid', [])) for e in mirrored)
+    print('OK:' + str(count))
+" "$surfaces_file" "$yaml_file") || mirrors_result="FAIL:python-error"
     if [[ "$mirrors_result" == OK:* ]]; then
       local uid_count="${mirrors_result#OK:}"
-      tap_ok "eval-alarms: all $uid_count # mirrors: UIDs resolve to Grafana alerts"
+      tap_ok "eval-alarms: all $uid_count mirrored UIDs resolve to Grafana alerts"
     else
       local missing_uids="${mirrors_result#FAIL:}"
-      tap_not_ok "eval-alarms: # mirrors: UID validation" \
-        "UIDs not found in henyey-slo-alerts.yaml: $missing_uids"
+      tap_not_ok "eval-alarms: mirrored UID validation" \
+        "$missing_uids"
     fi
   else
-    tap_not_ok "eval-alarms: # mirrors: UID validation" \
-      "Missing catalog or YAML file"
+    tap_not_ok "eval-alarms: mirrored UID validation" \
+      "Missing alarm-surfaces.toml or YAML file"
   fi
 
-  # Test 150: every TOML alarm with a # mirrors: comment appears in the
-  #           ALARM_SURFACES.md reconciliation table, and every referenced
-  #           UID appears in the table's Grafana UID(s) column.
-  local surfaces_file="$REPO_ROOT/.claude/skills/shared/ALARM_SURFACES.md"
-  if [[ -f "$catalog_file" ]] && [[ -f "$surfaces_file" ]]; then
-    local table_result
-    table_result=$(python3 - "$catalog_file" "$surfaces_file" <<'TABLE_EOF'
-import sys, re
-
-toml_path = sys.argv[1]
-surfaces_path = sys.argv[2]
-
-# Extract (alarm_name, [uids]) from # mirrors: comments in the TOML.
-# Walk the TOML to associate each # mirrors: line with the preceding alarm name.
-mirrors_map = {}  # alarm_name -> [uids]
-current_alarm = None
-with open(toml_path) as f:
-    for line in f:
-        stripped = line.strip()
-        m = re.match(r'^name\s*=\s*"([^"]+)"', stripped)
-        if m:
-            current_alarm = m.group(1)
-        m = re.match(r'^# mirrors:\s+henyey-slo-alerts\.yaml\s+(.+)$', stripped)
-        if m and current_alarm:
-            uids = [u.strip() for u in m.group(1).split(',') if u.strip()]
-            mirrors_map[current_alarm] = uids
-
-# Parse ALARM_SURFACES.md reconciliation table.
-# Table format: | Alarm | TOML name | Grafana UID(s) | ... |
-# TOML name is in column 2 (backtick-wrapped), Grafana UIDs in column 3.
-table_toml_names = set()
-table_uids = set()
-with open(surfaces_path) as f:
-    in_table = False
-    for line in f:
-        stripped = line.strip()
-        if '| TOML name |' in stripped:
-            in_table = True
-            continue
-        if in_table and stripped.startswith('|---'):
-            continue
-        if in_table and stripped.startswith('|'):
-            cols = [c.strip() for c in stripped.split('|')]
-            if len(cols) >= 4:
-                # cols[0] is empty (before first |), cols[1] is Alarm,
-                # cols[2] is TOML name, cols[3] is Grafana UID(s)
-                toml_col = cols[2]
-                uid_col = cols[3]
-                # Extract backtick-wrapped name
-                tn = re.findall(r'`([^`]+)`', toml_col)
-                for t in tn:
-                    table_toml_names.add(t)
-                # Extract backtick-wrapped UIDs (comma-separated)
-                uids = re.findall(r'`([^`]+)`', uid_col)
-                for u in uids:
-                    table_uids.add(u)
-        elif in_table and not stripped.startswith('|'):
-            in_table = False
-
-errors = []
-# Every mirrored alarm must appear in the table
-for alarm_name, uids in mirrors_map.items():
-    if alarm_name not in table_toml_names:
-        errors.append(f"alarm {alarm_name} not in table")
-    for uid in uids:
-        if uid not in table_uids:
-            errors.append(f"uid {uid} not in table")
-
-if errors:
-    print("FAIL:" + "; ".join(errors))
+  # Test 150: every mirrored toml_name in alarm-surfaces.toml resolves to
+  #           an alarm name in metric-alarms.toml.
+  if [[ -f "$surfaces_file" ]] && [[ -f "$catalog_file" ]]; then
+    local toml_result
+    toml_result=$(PYTHONPATH="$REPO_ROOT/scripts/lib" python3 -c "
+import sys, alarm_surfaces
+surfaces = alarm_surfaces.load_surfaces(sys.argv[1])
+toml_names = alarm_surfaces.extract_toml_alarm_names(sys.argv[2])
+mirrored = surfaces.get('mirrored', [])
+missing = []
+for e in mirrored:
+    if e['toml_name'] not in toml_names:
+        missing.append(e['toml_name'])
+if missing:
+    print('FAIL:toml_names not in metric-alarms.toml: ' + ', '.join(missing))
 else:
-    print("OK:" + str(len(mirrors_map)))
-TABLE_EOF
-    ) || table_result="FAIL:python-error"
-    if [[ "$table_result" == OK:* ]]; then
-      local alarm_count="${table_result#OK:}"
-      tap_ok "eval-alarms: all $alarm_count mirrored alarms present in reconciliation table"
+    print('OK:' + str(len(mirrored)))
+" "$surfaces_file" "$catalog_file") || toml_result="FAIL:python-error"
+    if [[ "$toml_result" == OK:* ]]; then
+      local alarm_count="${toml_result#OK:}"
+      tap_ok "eval-alarms: all $alarm_count mirrored toml_names resolve to alarms"
     else
-      local table_errors="${table_result#FAIL:}"
-      tap_not_ok "eval-alarms: reconciliation table completeness" \
-        "$table_errors"
+      local toml_errors="${toml_result#FAIL:}"
+      tap_not_ok "eval-alarms: toml_name resolution" \
+        "$toml_errors"
     fi
   else
-    tap_not_ok "eval-alarms: reconciliation table completeness" \
-      "Missing catalog or ALARM_SURFACES.md"
+    tap_not_ok "eval-alarms: toml_name resolution" \
+      "Missing alarm-surfaces.toml or catalog file"
   fi
 
   # Test 151: every Grafana alert UID in henyey-slo-alerts.yaml is classified
-  #           as either mirrored (via # mirrors: in metric-alarms.toml) or
-  #           intentionally Grafana-only (via ALARM_SURFACES.md "Intentional
-  #           Non-Overlaps" table). No unclassified, no stale, no overlap.
-  if [[ -f "$yaml_file" ]] && [[ -f "$catalog_file" ]] && [[ -f "$surfaces_file" ]]; then
+  #           in alarm-surfaces.toml as either mirrored or grafana_only.
+  #           Complete coverage, disjoint sets, no stale entries, unique YAML UIDs.
+  if [[ -f "$yaml_file" ]] && [[ -f "$surfaces_file" ]] && [[ -f "$catalog_file" ]]; then
     local reverse_result
-    reverse_result=$(python3 - "$yaml_file" "$catalog_file" "$surfaces_file" <<'REVERSE_EOF'
-import sys, re
-
-yaml_path = sys.argv[1]
-toml_path = sys.argv[2]
-surfaces_path = sys.argv[3]
-
-# 1. Extract all UIDs from henyey-slo-alerts.yaml
-yaml_uids = set()
-with open(yaml_path) as f:
-    for line in f:
-        m = re.match(r'\s*-?\s*uid:\s+(\S+)', line)
-        if m:
-            yaml_uids.add(m.group(1))
-
-# 2. Extract all mirrored UIDs from # mirrors: comments in metric-alarms.toml
-mirrored_uids = set()
-with open(toml_path) as f:
-    for line in f:
-        m = re.match(r'^# mirrors:\s+henyey-slo-alerts\.yaml\s+(.+)$', line.strip())
-        if m:
-            for uid in re.split(r',\s*', m.group(1)):
-                uid = uid.strip()
-                if uid:
-                    mirrored_uids.add(uid)
-
-# 3. Extract intentional non-overlap UIDs from ALARM_SURFACES.md
-#    Find the "Intentional Non-Overlaps" section, then parse the table
-#    that follows (header: "| Grafana UID | ...").
-intentional_uids = set()
-with open(surfaces_path) as f:
-    found_section = False
-    in_table = False
-    for line in f:
-        stripped = line.strip()
-        if 'Intentional Non-Overlaps' in stripped:
-            found_section = True
-            continue
-        if found_section and not in_table:
-            if '| Grafana UID |' in stripped:
-                in_table = True
-            continue
-        if in_table:
-            if stripped.startswith('|---'):
-                continue
-            if stripped.startswith('|'):
-                cols = [c.strip() for c in stripped.split('|')]
-                if len(cols) >= 2:
-                    uids = re.findall(r'`([^`]+)`', cols[1])
-                    for u in uids:
-                        intentional_uids.add(u)
-            else:
-                break
-
-errors = []
-
-# Check 1: no unclassified — every YAML UID must be mirrored or intentional
-unclassified = yaml_uids - mirrored_uids - intentional_uids
-if unclassified:
-    errors.append("unclassified UIDs: " + ", ".join(sorted(unclassified)))
-
-# Check 2: disjoint — no UID in both sets
-overlap = mirrored_uids & intentional_uids
-if overlap:
-    errors.append("UIDs in both mirrored and intentional: " + ", ".join(sorted(overlap)))
-
-# Check 3: no stale — every intentional UID must exist in YAML
-stale = intentional_uids - yaml_uids
-if stale:
-    errors.append("stale intentional UIDs not in YAML: " + ", ".join(sorted(stale)))
-
-# Check 4: exact coverage — union must equal YAML set
-extra = (mirrored_uids | intentional_uids) - yaml_uids
-if extra:
-    errors.append("extra UIDs not in YAML: " + ", ".join(sorted(extra)))
-
+    reverse_result=$(PYTHONPATH="$REPO_ROOT/scripts/lib" python3 -c "
+import sys, alarm_surfaces
+surfaces = alarm_surfaces.load_surfaces(sys.argv[1])
+toml_names = alarm_surfaces.extract_toml_alarm_names(sys.argv[2])
+yaml_uids = alarm_surfaces.extract_yaml_uids(sys.argv[3])
+errors = alarm_surfaces.validate_cross(surfaces, toml_names, yaml_uids)
 if errors:
-    print("FAIL:" + "; ".join(errors))
+    print('FAIL:' + '; '.join(errors))
 else:
-    print("OK:" + str(len(yaml_uids)))
-REVERSE_EOF
-    ) || reverse_result="FAIL:python-error"
+    print('OK:' + str(len(set(yaml_uids))))
+" "$surfaces_file" "$catalog_file" "$yaml_file") || reverse_result="FAIL:python-error"
     if [[ "$reverse_result" == OK:* ]]; then
       local yaml_uid_count="${reverse_result#OK:}"
-      tap_ok "eval-alarms: all $yaml_uid_count Grafana UIDs classified (mirrored or intentional)"
+      tap_ok "eval-alarms: all $yaml_uid_count Grafana UIDs classified (mirrored or grafana_only)"
     else
       local reverse_errors="${reverse_result#FAIL:}"
-      tap_not_ok "eval-alarms: Grafana UID reverse classification" \
+      tap_not_ok "eval-alarms: Grafana UID classification" \
         "$reverse_errors"
     fi
   else
-    tap_not_ok "eval-alarms: Grafana UID reverse classification" \
-      "Missing YAML, catalog, or ALARM_SURFACES.md"
+    tap_not_ok "eval-alarms: Grafana UID classification" \
+      "Missing YAML, alarm-surfaces.toml, or catalog file"
+  fi
+
+  # Test 152: ALARM_SURFACES.md is not stale — generated tables match
+  #           the committed file.
+  local surfaces_md="$REPO_ROOT/.claude/skills/shared/ALARM_SURFACES.md"
+  if [[ -f "$surfaces_file" ]] && [[ -f "$surfaces_md" ]]; then
+    local gen_result
+    gen_result=$(PYTHONPATH="$REPO_ROOT/scripts/lib" python3 \
+      "$REPO_ROOT/scripts/lib/gen-alarm-surfaces.py" --check \
+      "$surfaces_file" "$surfaces_md" 2>&1) || true
+    if [[ "$gen_result" == OK:* ]]; then
+      tap_ok "eval-alarms: ALARM_SURFACES.md is up to date with alarm-surfaces.toml"
+    else
+      tap_not_ok "eval-alarms: ALARM_SURFACES.md staleness check" \
+        "$gen_result"
+    fi
+  else
+    tap_not_ok "eval-alarms: ALARM_SURFACES.md staleness check" \
+      "Missing alarm-surfaces.toml or ALARM_SURFACES.md"
   fi
 
   # ── Archive and Replay Tests ──────────────────────────────────────────────
