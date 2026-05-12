@@ -806,13 +806,14 @@ against a node that is in real-time sync with age=2s).
          if [[ "$EVAL_TICKS" -ge 100 ]]; then
            # Write current replay to temp file for regression check
            echo "$REPLAY_JSON" > "$METRICS_DIR/replay-current.json"
-           "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+           if "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
              "$HOME/data/$MONITOR_SESSION_ID" \
-             --current "$METRICS_DIR/replay-current.json" 2>&1 || true
+             --current "$METRICS_DIR/replay-current.json" 2>&1; then
+             # Update throttle only on explicit success (exit 0).
+             # On failure (exit 2), skip throttle update so next tick retries.
+             echo "$NOW_TS" > "$REPLAY_THROTTLE"
+           fi
            rm -f "$METRICS_DIR/replay-current.json"
-
-           # Update throttle — only after successful replay + regression check
-           echo "$NOW_TS" > "$REPLAY_THROTTLE"
          fi
        fi
      fi

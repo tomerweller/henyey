@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=168
+TAP_PLAN=175
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -4068,6 +4068,60 @@ except:
   else
     tap_not_ok "replay: --replay --json on empty archive returns zeroed schema" \
       "output: $empty_json"
+  fi
+
+  # Test: --replay --json parses multi-line evaluator JSON correctly
+  # This is the regression test for the original bug: eval-alarms.py outputs
+  # pretty-printed JSON (indent=2), and the old parser used json.loads(line)
+  # which silently dropped all multi-line results.
+  local multiline_session="$replay_root/multiline-session"
+  mkdir -p "$multiline_session/metrics/archive"
+  local ts1="2025-06-01T00:00:00.000000000Z"
+  local ts2="2025-06-01T00:20:00.000000000Z"
+  for ts in "$ts1" "$ts2"; do
+    local snap="$multiline_session/metrics/archive/$ts"
+    mkdir -p "$snap"
+    cat > "$snap/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=1
+TICK_SKIPPED=false
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+UPTIME_SECONDS=900
+MONITOR_MODE=validator
+PID=12345
+START_TICKS=100
+METAEOF
+    # Create minimal prom files (evaluator will find no metrics, producing
+    # alarms with state=skipped, which is sufficient to verify parsing works)
+    echo "# empty" > "$snap/current.prom"
+    echo "# empty" > "$snap/prev.prom"
+  done
+
+  local multiline_json
+  multiline_json=$("$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh" \
+    "$multiline_session" --replay --json 2>/dev/null) || true
+  local multiline_ok
+  multiline_ok=$(echo "$multiline_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    # Must have evaluated_ticks > 0 to prove parsing worked
+    ok = (d.get('schema_version') == 1 and
+          d.get('evaluated_ticks', 0) > 0 and
+          d.get('total_snapshots', 0) == 2 and
+          isinstance(d.get('alarms'), dict) and
+          len(d.get('alarms', {})) > 0)
+    print('ok' if ok else 'fail')
+except Exception as e:
+    print('fail')
+" 2>/dev/null) || echo "fail"
+  if [[ "$multiline_ok" == "ok" ]]; then
+    tap_ok "replay: --replay --json parses multi-line evaluator JSON"
+  else
+    tap_not_ok "replay: --replay --json parses multi-line evaluator JSON" \
+      "output: ${multiline_json:0:200}"
   fi
 
   # ── check-alarm-regression.sh behavioral tests ─────────────────────────

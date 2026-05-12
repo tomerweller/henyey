@@ -102,15 +102,13 @@ with open(baseline_file) as f:
 
 current = json.loads(current_json_str)
 
-# Validate schema versions
+# Validate schema versions — exit 2 to signal error (distinct from exit 0 = success)
 if baseline.get('schema_version') != 1:
     print('ERROR: Baseline has unexpected schema_version', file=sys.stderr)
-    print('[]')
-    sys.exit(0)
+    sys.exit(2)
 if current.get('schema_version') != 1:
     print('ERROR: Current has unexpected schema_version', file=sys.stderr)
-    print('[]')
-    sys.exit(0)
+    sys.exit(2)
 
 baseline_alarms = baseline.get('alarms', {})
 current_alarms = current.get('alarms', {})
@@ -159,11 +157,14 @@ for alarm_name, b_counts in baseline_alarms.items():
         })
 
 print(json.dumps(regressions))
-" "$BASELINE_FILE" "$CURRENT_JSON" 2>/dev/null) || {
-  echo "ERROR: Regression comparison failed" >&2
-  echo "[]"
-  exit 0
-}
+" "$BASELINE_FILE" "$CURRENT_JSON")
+COMPARE_EXIT=$?
+
+if [[ $COMPARE_EXIT -ne 0 ]]; then
+  echo "ERROR: Regression comparison failed (exit $COMPARE_EXIT)" >&2
+  # Fail closed — do NOT update baseline, do NOT print success output
+  exit 2
+fi
 
 # Print regression JSON to stdout
 echo "$REGRESSION_OUTPUT"
@@ -182,8 +183,8 @@ else
   # Ensure alarm-regression label exists
   gh label create alarm-regression --description "Alarm regression detected by replay" --color "d93f0b" 2>/dev/null || true
 
-  # Get existing open alarm-regression issues for dedup
-  EXISTING_TITLES=$(gh issue list --label alarm-regression --state open --json title --jq '.[].title' 2>/dev/null) || true
+  # Get existing open alarm-regression issues for dedup (by title and body marker)
+  EXISTING_ISSUES=$(gh issue list --label alarm-regression --state open --json title,body --jq '.[].title + "|||" + .body' 2>/dev/null) || true
 
   # File issues for each regression
   echo "$REGRESSION_OUTPUT" | python3 -c "
@@ -197,9 +198,23 @@ for r in json.load(sys.stdin):
     REASON=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['reason'])" 2>/dev/null) || continue
 
     EXPECTED_TITLE="Alarm regression: $ALARM_NAME"
+    BODY_MARKER="<!-- alarm-regression-key: $ALARM_NAME -->"
 
-    # Dedup: check for exact title match
-    if echo "$EXISTING_TITLES" | grep -qFx "$EXPECTED_TITLE" 2>/dev/null; then
+    # Dedup: check for exact title match OR body marker match
+    FOUND_DUP=false
+    while IFS= read -r issue_line; do
+      [[ -z "$issue_line" ]] && continue
+      if echo "$issue_line" | grep -qF "$EXPECTED_TITLE" 2>/dev/null; then
+        FOUND_DUP=true
+        break
+      fi
+      if echo "$issue_line" | grep -qF "$BODY_MARKER" 2>/dev/null; then
+        FOUND_DUP=true
+        break
+      fi
+    done <<< "$EXISTING_ISSUES"
+
+    if [[ "$FOUND_DUP" == true ]]; then
       echo "Skipping duplicate: $EXPECTED_TITLE" >&2
       continue
     fi
