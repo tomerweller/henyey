@@ -738,7 +738,10 @@ against a node that is in real-time sync with age=2s).
    # Atomic rename
    mv "$SNAP_TMP" "$SNAP_FINAL"
 
-   # Retention: keep most recent 500 snapshots
+   # Retention: keep newest 500 complete archive dirs (ignore .tmp).
+   # At ~20 min/tick ≈ 7 days of history. This bounds the replay window.
+   # Pruned data is gone — not recoverable. For longer investigations,
+   # bump retention or implement cold-archiving. See #2573 Gap 4.
    SNAPSHOTS=()
    while IFS= read -r -d '' d; do
      SNAPSHOTS+=("$d")
@@ -755,6 +758,14 @@ against a node that is in real-time sync with age=2s).
    # Clean up orphaned .tmp dirs from crashed prior ticks
    find "$ARCHIVE_DIR" -maxdepth 1 -name '*.tmp' -type d -mmin +5 \
      -exec rm -rf {} + 2>/dev/null || true
+
+   # Replay-pending sentinel: surface in watch array if no replay has ever
+   # run. The replay step (when implemented) writes a timestamp file after
+   # successful execution; until then this watch key appears in every tick,
+   # surfacing in daily-summary reports.
+   if [[ ! -f "$METRICS_DIR/replay-last-run.ts" ]]; then
+     WATCH_ITEMS+=("replay_pending=no-archive")
+   fi
    ```
 
 ### Alarm evaluation via TOML catalog + Python evaluator

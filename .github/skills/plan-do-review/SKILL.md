@@ -875,11 +875,21 @@ rm -f "$tmpfile"
 
 ## Step 5: Completion
 
-Move the issue to `Done`, post a completion comment, and unassign yourself:
+**5a. Validate, post, then close.** The completion comment must be posted
+*before* moving the issue to `Done` and unassigning. This way, if posting
+fails the issue stays in `In review` and the assignee lock is preserved.
 
 ```bash
-bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" Done
-gh issue edit $ISSUE --remove-assignee @me
+# Fail-closed: refuse to close with empty critical sections.
+# $what_was_deferred is allowed to be empty (renders as "_(none)_").
+for var_name in commit_list brief_summary what_was_done; do
+  eval "val=\$$var_name"
+  if [ -z "$val" ]; then
+    echo "ERROR: Step 5 blocked — \$$var_name is empty." >&2
+    # Do NOT move to Done or unassign — leave issue In review
+    exit 1
+  fi
+done
 ```
 
 ```bash
@@ -895,15 +905,19 @@ tmpfile=$(mktemp)
   printf '### Summary\n%s\n\n' "$brief_summary"
   printf '### Review Status\nPassed review-fix in %s round(s).\nFinal verdict: **SOUND**\n\n' "$review_round"
   printf '### What was done\n%s\n\n' "$what_was_done"
-
-### What was deferred (if any)
-{bullet list of follow-up items with issue links}
-
+  printf '### What was deferred (if any)\n%s\n\n' "${what_was_deferred:-_(none)_}"
   printf -- '---\n\n*Implemented and reviewed using the `plan-do-review` skill.*\n'
   printf '\n---\n\n*Skill: `/plan-do-review` | Harness: %s | Model: %s*\n' "$HARNESS" "$MODEL"
 } > "$tmpfile"
 gh issue comment $ISSUE --body-file "$tmpfile"
 rm -f "$tmpfile"
+```
+
+Only after the comment is successfully posted, move the issue and unassign:
+
+```bash
+bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" Done
+gh issue edit $ISSUE --remove-assignee @me
 ```
 
 ### 5b: File Issues for Deferred Work

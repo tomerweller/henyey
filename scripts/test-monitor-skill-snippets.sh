@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=167
+TAP_PLAN=168
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -3478,6 +3478,107 @@ TABLE_EOF
   else
     tap_not_ok "eval-alarms: reconciliation table completeness" \
       "Missing catalog or ALARM_SURFACES.md"
+  fi
+
+  # Test 151: every Grafana alert UID in henyey-slo-alerts.yaml is classified
+  #           as either mirrored (via # mirrors: in metric-alarms.toml) or
+  #           intentionally Grafana-only (via ALARM_SURFACES.md "Intentional
+  #           Non-Overlaps" table). No unclassified, no stale, no overlap.
+  if [[ -f "$yaml_file" ]] && [[ -f "$catalog_file" ]] && [[ -f "$surfaces_file" ]]; then
+    local reverse_result
+    reverse_result=$(python3 - "$yaml_file" "$catalog_file" "$surfaces_file" <<'REVERSE_EOF'
+import sys, re
+
+yaml_path = sys.argv[1]
+toml_path = sys.argv[2]
+surfaces_path = sys.argv[3]
+
+# 1. Extract all UIDs from henyey-slo-alerts.yaml
+yaml_uids = set()
+with open(yaml_path) as f:
+    for line in f:
+        m = re.match(r'\s*-?\s*uid:\s+(\S+)', line)
+        if m:
+            yaml_uids.add(m.group(1))
+
+# 2. Extract all mirrored UIDs from # mirrors: comments in metric-alarms.toml
+mirrored_uids = set()
+with open(toml_path) as f:
+    for line in f:
+        m = re.match(r'^# mirrors:\s+henyey-slo-alerts\.yaml\s+(.+)$', line.strip())
+        if m:
+            for uid in re.split(r',\s*', m.group(1)):
+                uid = uid.strip()
+                if uid:
+                    mirrored_uids.add(uid)
+
+# 3. Extract intentional non-overlap UIDs from ALARM_SURFACES.md
+#    Find the "Intentional Non-Overlaps" section, then parse the table
+#    that follows (header: "| Grafana UID | ...").
+intentional_uids = set()
+with open(surfaces_path) as f:
+    found_section = False
+    in_table = False
+    for line in f:
+        stripped = line.strip()
+        if 'Intentional Non-Overlaps' in stripped:
+            found_section = True
+            continue
+        if found_section and not in_table:
+            if '| Grafana UID |' in stripped:
+                in_table = True
+            continue
+        if in_table:
+            if stripped.startswith('|---'):
+                continue
+            if stripped.startswith('|'):
+                cols = [c.strip() for c in stripped.split('|')]
+                if len(cols) >= 2:
+                    uids = re.findall(r'`([^`]+)`', cols[1])
+                    for u in uids:
+                        intentional_uids.add(u)
+            else:
+                break
+
+errors = []
+
+# Check 1: no unclassified — every YAML UID must be mirrored or intentional
+unclassified = yaml_uids - mirrored_uids - intentional_uids
+if unclassified:
+    errors.append("unclassified UIDs: " + ", ".join(sorted(unclassified)))
+
+# Check 2: disjoint — no UID in both sets
+overlap = mirrored_uids & intentional_uids
+if overlap:
+    errors.append("UIDs in both mirrored and intentional: " + ", ".join(sorted(overlap)))
+
+# Check 3: no stale — every intentional UID must exist in YAML
+stale = intentional_uids - yaml_uids
+if stale:
+    errors.append("stale intentional UIDs not in YAML: " + ", ".join(sorted(stale)))
+
+# Check 4: exact coverage — union must equal YAML set
+extra = (mirrored_uids | intentional_uids) - yaml_uids
+if extra:
+    errors.append("extra UIDs not in YAML: " + ", ".join(sorted(extra)))
+
+if errors:
+    print("FAIL:" + "; ".join(errors))
+else:
+    print("OK:" + str(len(yaml_uids)))
+REVERSE_EOF
+    ) || reverse_result="FAIL:python-error"
+    if [[ "$reverse_result" == OK:* ]]; then
+      local yaml_uid_count="${reverse_result#OK:}"
+      tap_ok "eval-alarms: all $yaml_uid_count Grafana UIDs classified (mirrored or intentional)"
+    else
+      local reverse_errors="${reverse_result#FAIL:}"
+      tap_not_ok "eval-alarms: Grafana UID reverse classification" \
+        "$reverse_errors"
+    fi
+  else
+    tap_not_ok "eval-alarms: Grafana UID reverse classification" \
+      "Missing YAML, catalog, or ALARM_SURFACES.md"
   fi
 
   # ── Archive and Replay Tests ──────────────────────────────────────────────
