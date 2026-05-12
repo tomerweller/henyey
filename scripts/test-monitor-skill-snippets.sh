@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=166
+TAP_PLAN=167
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -3649,18 +3649,19 @@ METAEOF
   fi
 
   # ── Test: Malformed metadata.env detection ──────────────────────────────
+  # Source the validate_metadata function from the replay script
+  eval "$(sed -n '/^validate_metadata()/,/^}/p' "$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh")"
+
   local t_malformed="$archive_root/t-malformed"
   local mal_arc="$t_malformed/data/mal-session/metrics/archive"
   mkdir -p "$mal_arc/2025-05-10T10:00:00.000000000Z"
   echo "ARCHIVE_VERSION=99" > "$mal_arc/2025-05-10T10:00:00.000000000Z/metadata.env"
 
-  # Source and check version
-  source "$mal_arc/2025-05-10T10:00:00.000000000Z/metadata.env" 2>/dev/null || true
-  if [[ "${ARCHIVE_VERSION:-}" != "1" ]]; then
-    tap_ok "archive: malformed metadata.env detected (wrong ARCHIVE_VERSION)"
+  if ! validate_metadata "$mal_arc/2025-05-10T10:00:00.000000000Z" 2>/dev/null; then
+    tap_ok "archive: validate_metadata rejects wrong ARCHIVE_VERSION"
   else
-    tap_not_ok "archive: malformed metadata.env detected (wrong ARCHIVE_VERSION)" \
-      "ARCHIVE_VERSION=$ARCHIVE_VERSION"
+    tap_not_ok "archive: validate_metadata rejects wrong ARCHIVE_VERSION" \
+      "validate_metadata returned 0"
   fi
 
   # ── Test: Missing required key in metadata.env ──────────────────────────
@@ -3679,14 +3680,11 @@ MONITOR_MODE=validator
 PID=12345
 START_TICKS=987654
 METAEOF
-  # Unset UPTIME_SECONDS to ensure it's actually missing
-  unset UPTIME_SECONDS 2>/dev/null || true
-  source "$mk_arc/2025-05-10T10:00:00.000000000Z/metadata.env" 2>/dev/null || true
-  if [[ -z "${UPTIME_SECONDS+x}" ]]; then
-    tap_ok "archive: missing required key (UPTIME_SECONDS) detected"
+  if ! validate_metadata "$mk_arc/2025-05-10T10:00:00.000000000Z" 2>/dev/null; then
+    tap_ok "archive: validate_metadata rejects missing UPTIME_SECONDS"
   else
-    tap_not_ok "archive: missing required key (UPTIME_SECONDS) detected" \
-      "UPTIME_SECONDS unexpectedly set to '${UPTIME_SECONDS:-}'"
+    tap_not_ok "archive: validate_metadata rejects missing UPTIME_SECONDS" \
+      "validate_metadata returned 0 for incomplete metadata"
   fi
 
   # ── Test: Invalid numeric field in metadata.env ─────────────────────────
@@ -3705,12 +3703,37 @@ MONITOR_MODE=validator
 PID=12345
 START_TICKS=987654
 METAEOF
-  source "$in_arc/2025-05-10T10:00:00.000000000Z/metadata.env" 2>/dev/null || true
-  if ! [[ "${UPTIME_SECONDS:-}" =~ ^[0-9]+$ ]]; then
-    tap_ok "archive: invalid numeric field (UPTIME_SECONDS=abc) detected"
+  if ! validate_metadata "$in_arc/2025-05-10T10:00:00.000000000Z" 2>/dev/null; then
+    tap_ok "archive: validate_metadata rejects non-numeric UPTIME_SECONDS"
   else
-    tap_not_ok "archive: invalid numeric field (UPTIME_SECONDS=abc) detected" \
-      "UPTIME_SECONDS=$UPTIME_SECONDS passed numeric check"
+    tap_not_ok "archive: validate_metadata rejects non-numeric UPTIME_SECONDS" \
+      "validate_metadata returned 0 for UPTIME_SECONDS=abc"
+  fi
+
+  # ── Test: Stale state isolation — missing key after valid snapshot ──────
+  # First set UPTIME_SECONDS (simulating a valid prior snapshot having set it),
+  # then validate a metadata.env that is missing it — should fail because
+  # validate_metadata clears stale state before sourcing.
+  UPTIME_SECONDS=9999  # simulate stale state from prior snapshot
+  local t_stale="$archive_root/t-stale"
+  local stale_arc="$t_stale/data/stale-session/metrics/archive"
+  mkdir -p "$stale_arc/2025-05-10T10:00:00.000000000Z"
+  cat > "$stale_arc/2025-05-10T10:00:00.000000000Z/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=1
+TICK_SKIPPED=false
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+MONITOR_MODE=validator
+PID=12345
+START_TICKS=987654
+METAEOF
+  if ! validate_metadata "$stale_arc/2025-05-10T10:00:00.000000000Z" 2>/dev/null; then
+    tap_ok "archive: validate_metadata detects missing key despite stale shell state"
+  else
+    tap_not_ok "archive: validate_metadata detects missing key despite stale shell state" \
+      "validate_metadata returned 0 — stale UPTIME_SECONDS=$UPTIME_SECONDS leaked through"
   fi
 
   # ── Test: Default mode metadata fallback ────────────────────────────────

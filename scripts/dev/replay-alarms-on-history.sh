@@ -93,6 +93,7 @@ ARCHIVE_DIR="$METRICS_DIR/archive"
 # Validate a metadata.env file has all required v1 keys and valid types.
 # Usage: validate_metadata <dir-path>
 # Returns 0 on success, 1 on failure (with error message on stderr).
+# Sources the metadata.env into the current shell on success.
 validate_metadata() {
   local dir="$1"
   local meta="$dir/metadata.env"
@@ -101,6 +102,12 @@ validate_metadata() {
     echo "ERROR: Corrupt archive at $dir: metadata.env not found" >&2
     return 1
   fi
+
+  # Clear all schema variables before sourcing to prevent stale state
+  # from a prior snapshot leaking into this one's validation.
+  unset ARCHIVE_VERSION TICK_SKIPPED PREV_PROM_INVALID WARMUP_TICKS_REMAINING \
+        FRESH_START CRASH_RECOVERY UPTIME_SECONDS MONITOR_MODE PID START_TICKS \
+        2>/dev/null || true
 
   if ! source "$meta" 2>/dev/null; then
     echo "ERROR: Corrupt archive at $dir: metadata.env is not parseable" >&2
@@ -112,9 +119,18 @@ validate_metadata() {
     return 1
   fi
 
-  # Validate required keys are present (not empty or unset)
+  # Validate required keys are present (not unset)
   local required_keys="TICK_SKIPPED PREV_PROM_INVALID WARMUP_TICKS_REMAINING FRESH_START CRASH_RECOVERY UPTIME_SECONDS MONITOR_MODE"
   for key in $required_keys; do
+    if [[ -z "${!key+x}" ]]; then
+      echo "ERROR: Corrupt archive at $dir: missing required key $key" >&2
+      return 1
+    fi
+  done
+
+  # PID and START_TICKS must be present as keys but may be empty strings
+  # (empty is valid for skipped ticks where process was not found)
+  for key in PID START_TICKS; do
     if [[ -z "${!key+x}" ]]; then
       echo "ERROR: Corrupt archive at $dir: missing required key $key" >&2
       return 1
