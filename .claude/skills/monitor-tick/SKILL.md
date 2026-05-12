@@ -77,6 +77,26 @@ Variables provided by the env file (all required):
 
 Throughout this skill, substitute those values for the `$MONITOR_*` references below.
 
+### Skill checkout drift detection
+
+After loading the env file, detect whether the working tree has drifted
+from `origin/main`. This is *detection only* — the tick proceeds normally
+regardless. The watch item surfaces in the daily summary so an operator
+can investigate.
+
+```bash
+# Skill checkout drift detection: surface when working tree diverges from origin/main.
+# Known false negatives: git fetch failure (offline/network) silently skips the check;
+# checkouts predating this guard don't have it at all.
+if git fetch origin main --quiet 2>/dev/null; then
+  SKILL_SHA=$(git rev-parse HEAD)
+  MAIN_SHA=$(git rev-parse origin/main)
+  if [[ "$SKILL_SHA" != "$MAIN_SHA" ]]; then
+    WATCH_ITEMS+=("skill_stale=HEAD@${SKILL_SHA:0:8} vs origin/main@${MAIN_SHA:0:8}")
+  fi
+fi
+```
+
 ### Per-session state files
 
 All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
@@ -795,13 +815,6 @@ against a node that is in real-time sync with age=2s).
    # Clean up orphaned .tmp dirs from crashed prior ticks
    find "$ARCHIVE_DIR" -maxdepth 1 -name '*.tmp' -type d -mmin +5 \
      -exec rm -rf {} + 2>/dev/null || true
-
-   # Replay-pending sentinel: surface in watch array if no replay has ever
-   # run. Step 8 writes a timestamp file after successful execution; until
-   # then this watch key appears in every tick, surfacing in daily-summary.
-   if [[ ! -f "$METRICS_DIR/replay-last-run.ts" ]]; then
-     WATCH_ITEMS+=("replay_pending=never-run")
-   fi
    ```
 
 8. **Weekly alarm regression replay** — replay the archived metrics history
@@ -809,10 +822,27 @@ against a node that is in real-time sync with age=2s).
    to detect regressions (alarms that were meaningfully active but have gone
    silent). This step only runs for validator mode — watcher keeps a reduced
    catalog (process/jemalloc/overlay only, no SCP/quorum/ratio/p99) that
-   doesn't have action semantics worth regressing.
+   doesn't have action semantics worth regressing. Watcher mode emits no
+   replay watch item.
 
    See `scripts/dev/check-alarm-regression.sh` for the baseline comparison,
    regression detection, and issue-filing logic.
+
+   **Replay state machine** (validator-only): surfaces the highest-priority
+   applicable state as a `replay_state=` watch item. States in precedence
+   order: `failed` > `archive-too-small` > `stale` > `never-run`. When
+   replay succeeded within 14 days, no watch item is emitted.
+
+   | State | Condition | Emitted string |
+   |-------|-----------|---------------|
+   | `never-run` | No `replay-last-run.ts` (no successful replay ever) | `replay_state=never-run` |
+   | `archive-too-small` | Replay ran but `evaluated_ticks < 100` | `replay_state=archive-too-small` |
+   | `failed` | Replay script error, empty/invalid JSON, or `check-alarm-regression.sh` nonzero exit | `replay_state=failed` |
+   | `stale` | `replay-last-run.ts` exists but age > 1209600s (14 days) | `replay_state=stale` |
+   | ok | Last successful replay within 14 days, no failure this tick | (none) |
+
+   `replay-last-run.ts` is written only on success — it records the
+   timestamp of the last *successful* replay.
 
    ```bash
    # Step 8: Weekly alarm regression replay (validator-only)
@@ -820,6 +850,7 @@ against a node that is in real-time sync with age=2s).
      REPLAY_THROTTLE="$METRICS_DIR/replay-last-run.ts"
      NOW_TS=$(date +%s)
      RUN_REPLAY=false
+     REPLAY_FAILED=false
 
      if [[ ! -f "$REPLAY_THROTTLE" ]]; then
        RUN_REPLAY=true
@@ -833,25 +864,44 @@ against a node that is in real-time sync with age=2s).
 
      if [[ "$RUN_REPLAY" == true ]]; then
        REPLAY_JSON=$("$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh" \
-         "$HOME/data/$MONITOR_SESSION_ID" --replay --json 2>/dev/null) || true
+         "$HOME/data/$MONITOR_SESSION_ID" --replay --json 2>/dev/null) || REPLAY_FAILED=true
 
-       if [[ -n "$REPLAY_JSON" ]]; then
+       if [[ "$REPLAY_FAILED" != true ]] && [[ -n "$REPLAY_JSON" ]]; then
          EVAL_TICKS=$(echo "$REPLAY_JSON" | python3 -c \
            "import json,sys; print(json.load(sys.stdin).get('evaluated_ticks',0))" \
-           2>/dev/null) || EVAL_TICKS=0
+           2>/dev/null) || { EVAL_TICKS=0; REPLAY_FAILED=true; }
 
-         if [[ "$EVAL_TICKS" -ge 100 ]]; then
+         if [[ "$REPLAY_FAILED" != true ]] && [[ "$EVAL_TICKS" -ge 100 ]]; then
            # Write current replay to temp file for regression check
            echo "$REPLAY_JSON" > "$METRICS_DIR/replay-current.json"
            if "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
              "$HOME/data/$MONITOR_SESSION_ID" \
              --current "$METRICS_DIR/replay-current.json" 2>&1; then
              # Update throttle only on explicit success (exit 0).
-             # On failure (exit 2), skip throttle update so next tick retries.
              echo "$NOW_TS" > "$REPLAY_THROTTLE"
+           else
+             REPLAY_FAILED=true
            fi
            rm -f "$METRICS_DIR/replay-current.json"
          fi
+       else
+         # Empty REPLAY_JSON without prior failure flag → treat as failure
+         REPLAY_FAILED=true
+       fi
+     fi
+
+     # Determine replay_state watch item (precedence: failed > archive-too-small > stale > never-run)
+     if [[ "$REPLAY_FAILED" == true ]]; then
+       WATCH_ITEMS+=("replay_state=failed")
+     elif [[ "$RUN_REPLAY" == true ]] && [[ "${EVAL_TICKS:-0}" -lt 100 ]] && [[ "${EVAL_TICKS:-0}" -gt 0 || -z "${REPLAY_JSON:-}" ]]; then
+       WATCH_ITEMS+=("replay_state=archive-too-small")
+     elif [[ ! -f "$REPLAY_THROTTLE" ]]; then
+       WATCH_ITEMS+=("replay_state=never-run")
+     elif [[ -f "$REPLAY_THROTTLE" ]]; then
+       LAST_SUCCESS=$(cat "$REPLAY_THROTTLE" 2>/dev/null || echo "0")
+       STALE_AGE=$((NOW_TS - LAST_SUCCESS))
+       if [[ $STALE_AGE -gt 1209600 ]]; then
+         WATCH_ITEMS+=("replay_state=stale")
        fi
      fi
    fi

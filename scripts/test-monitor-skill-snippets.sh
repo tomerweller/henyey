@@ -389,12 +389,30 @@ check_skill_structure() {
     echo "WARNING: monitor-tick/SKILL.md does not reference check-alarm-regression.sh" >&2
     drift=true
   fi
-  if ! grep -q 'replay_pending=never-run' "$tick_file"; then
-    echo "WARNING: monitor-tick/SKILL.md uses wrong replay sentinel (expected never-run)" >&2
+  # Verify replay_state watch items (replaced legacy replay_pending)
+  if grep -q 'replay_pending=' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md still uses deprecated replay_pending (should be replay_state)" >&2
     drift=true
   fi
-  if grep -q 'replay_pending=no-archive' "$tick_file"; then
-    echo "WARNING: monitor-tick/SKILL.md still uses deprecated replay_pending=no-archive" >&2
+  for state in never-run archive-too-small failed stale; do
+    if ! grep -q "replay_state=$state" "$tick_file"; then
+      echo "WARNING: monitor-tick/SKILL.md missing replay_state=$state" >&2
+      drift=true
+    fi
+  done
+  # Verify replay state logic is inside the validator gate
+  if ! grep -A200 'MONITOR_MODE.*validator' "$tick_file" | grep -q 'replay_state='; then
+    echo "WARNING: replay_state logic is not inside the MONITOR_MODE==validator gate" >&2
+    drift=true
+  fi
+  # Verify REPLAY_FAILED tracking variable is used
+  if ! grep -q 'REPLAY_FAILED' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md missing REPLAY_FAILED failure tracking" >&2
+    drift=true
+  fi
+  # Verify skill checkout drift detection guard
+  if ! grep -q 'skill_stale=' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md missing skill_stale drift detection guard" >&2
     drift=true
   fi
   if [[ ! -x "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" ]]; then

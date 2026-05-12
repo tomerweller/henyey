@@ -325,9 +325,14 @@ After modifying alarm rules or the evaluator, verify no regressions:
 3. **Investigate any divergence** — alarms that should have fired but didn't,
    or new false positives.
 
-> **Limitation:** The current data model retains only one `current.prom` /
-> `prev.prom` pair per session (the most recent tick). Multi-day historical
-> replay — iterating over archived snapshot pairs to detect regressions
-> across a time window — requires per-tick snapshot archiving, which is
-> not yet implemented. The `anomaly_cooldown.json` file is deduplication
-> state, not a historical record of past firings.
+> **Historical replay.** Weekly alarm regression replay is now implemented.
+> `monitor-tick` Step 8 schedules it: `replay-alarms-on-history.sh --replay`
+> evaluates archived snapshot pairs through the current alarm catalog, then
+> `check-alarm-regression.sh` compares the result against a stored baseline
+> to detect regressions. This detects forward drift (week N+1 vs week N).
+>
+> **Pre-refactor limitation.** Pre-#2566 runtime equivalence cannot be
+> proven — no pre-refactor snapshots or baseline exist. The original
+> refactor's correctness is partially evidenced by TOML schema validation,
+> source-grep checks, and golden-fixture tests, but these do not constitute
+> proof of pre-/post-refactor runtime equivalence.
