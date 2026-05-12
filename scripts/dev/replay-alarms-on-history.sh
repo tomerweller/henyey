@@ -90,6 +90,72 @@ fi
 METRICS_DIR="$SESSION_DIR/metrics"
 ARCHIVE_DIR="$METRICS_DIR/archive"
 
+# Validate a metadata.env file has all required v1 keys and valid types.
+# Usage: validate_metadata <dir-path>
+# Returns 0 on success, 1 on failure (with error message on stderr).
+validate_metadata() {
+  local dir="$1"
+  local meta="$dir/metadata.env"
+
+  if [[ ! -f "$meta" ]]; then
+    echo "ERROR: Corrupt archive at $dir: metadata.env not found" >&2
+    return 1
+  fi
+
+  if ! source "$meta" 2>/dev/null; then
+    echo "ERROR: Corrupt archive at $dir: metadata.env is not parseable" >&2
+    return 1
+  fi
+
+  if [[ "${ARCHIVE_VERSION:-}" != "1" ]]; then
+    echo "ERROR: Corrupt archive at $dir: ARCHIVE_VERSION=${ARCHIVE_VERSION:-missing} (expected 1)" >&2
+    return 1
+  fi
+
+  # Validate required keys are present (not empty or unset)
+  local required_keys="TICK_SKIPPED PREV_PROM_INVALID WARMUP_TICKS_REMAINING FRESH_START CRASH_RECOVERY UPTIME_SECONDS MONITOR_MODE"
+  for key in $required_keys; do
+    if [[ -z "${!key+x}" ]]; then
+      echo "ERROR: Corrupt archive at $dir: missing required key $key" >&2
+      return 1
+    fi
+  done
+
+  # Validate boolean fields
+  for key in TICK_SKIPPED PREV_PROM_INVALID; do
+    local val="${!key}"
+    if [[ "$val" != "true" ]] && [[ "$val" != "false" ]]; then
+      echo "ERROR: Corrupt archive at $dir: $key='$val' (expected true/false)" >&2
+      return 1
+    fi
+  done
+
+  # Validate numeric fields
+  for key in WARMUP_TICKS_REMAINING UPTIME_SECONDS; do
+    local val="${!key}"
+    if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: Corrupt archive at $dir: $key='$val' (expected non-negative integer)" >&2
+      return 1
+    fi
+  done
+
+  # Validate enum fields
+  if [[ "$FRESH_START" != "yes" ]] && [[ "$FRESH_START" != "no" ]]; then
+    echo "ERROR: Corrupt archive at $dir: FRESH_START='$FRESH_START' (expected yes/no)" >&2
+    return 1
+  fi
+  if [[ "$CRASH_RECOVERY" != "yes" ]] && [[ "$CRASH_RECOVERY" != "no" ]]; then
+    echo "ERROR: Corrupt archive at $dir: CRASH_RECOVERY='$CRASH_RECOVERY' (expected yes/no)" >&2
+    return 1
+  fi
+  if [[ "$MONITOR_MODE" != "validator" ]] && [[ "$MONITOR_MODE" != "watcher" ]]; then
+    echo "ERROR: Corrupt archive at $dir: MONITOR_MODE='$MONITOR_MODE' (expected validator/watcher)" >&2
+    return 1
+  fi
+
+  return 0
+}
+
 # --- Replay mode ---
 if [[ "$REPLAY_MODE" == true ]]; then
   # Discover complete snapshot directories (those containing metadata.env)
@@ -132,15 +198,7 @@ if [[ "$REPLAY_MODE" == true ]]; then
     LAST_TS="$ts_name"
 
     # Validate and source metadata
-    if ! source "$snap_dir/metadata.env" 2>/dev/null; then
-      echo "ERROR: Corrupt archive at $snap_dir: metadata.env is not parseable" >&2
-      rm -f "$RESULTS_FILE"
-      exit 1
-    fi
-
-    # Validate required v1 keys
-    if [[ "${ARCHIVE_VERSION:-}" != "1" ]]; then
-      echo "ERROR: Corrupt archive at $snap_dir: ARCHIVE_VERSION=${ARCHIVE_VERSION:-missing} (expected 1)" >&2
+    if ! validate_metadata "$snap_dir"; then
       rm -f "$RESULTS_FILE"
       exit 1
     fi
@@ -321,10 +379,13 @@ if [[ -f "$CURRENT" ]] && [[ -f "$PREV" ]]; then
     done < <(find "$ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d \
       ! -name '*.tmp' -print0 | sort -z)
     if [[ -n "$LATEST_SNAP" ]] && [[ -f "$LATEST_SNAP/metadata.env" ]]; then
-      echo "Using metadata from latest archive: $(basename "$LATEST_SNAP")"
-      source "$LATEST_SNAP/metadata.env"
-      EVAL_ENV_ARGS="PREV_PROM_INVALID=${PREV_PROM_INVALID:-false} WARMUP_TICKS_REMAINING=${WARMUP_TICKS_REMAINING:-0} FRESH_START=${FRESH_START:-no} CRASH_RECOVERY=${CRASH_RECOVERY:-no} UPTIME_SECONDS=${UPTIME_SECONDS:-0} MONITOR_MODE=${MONITOR_MODE:-validator} PID=${PID:-} START_TICKS=${START_TICKS:-}"
-      echo ""
+      if validate_metadata "$LATEST_SNAP"; then
+        echo "Using metadata from latest archive: $(basename "$LATEST_SNAP")"
+        EVAL_ENV_ARGS="PREV_PROM_INVALID=${PREV_PROM_INVALID:-false} WARMUP_TICKS_REMAINING=${WARMUP_TICKS_REMAINING:-0} FRESH_START=${FRESH_START:-no} CRASH_RECOVERY=${CRASH_RECOVERY:-no} UPTIME_SECONDS=${UPTIME_SECONDS:-0} MONITOR_MODE=${MONITOR_MODE:-validator} PID=${PID:-} START_TICKS=${START_TICKS:-}"
+        echo ""
+      else
+        echo "WARNING: Latest archive metadata is corrupt, using defaults" >&2
+      fi
     fi
   fi
 

@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=164
+TAP_PLAN=166
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -3663,6 +3663,56 @@ METAEOF
       "ARCHIVE_VERSION=$ARCHIVE_VERSION"
   fi
 
+  # ── Test: Missing required key in metadata.env ──────────────────────────
+  local t_missing_key="$archive_root/t-missing-key"
+  local mk_arc="$t_missing_key/data/mk-session/metrics/archive"
+  mkdir -p "$mk_arc/2025-05-10T10:00:00.000000000Z"
+  # metadata.env with ARCHIVE_VERSION=1 but missing UPTIME_SECONDS
+  cat > "$mk_arc/2025-05-10T10:00:00.000000000Z/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=1
+TICK_SKIPPED=false
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+MONITOR_MODE=validator
+PID=12345
+START_TICKS=987654
+METAEOF
+  # Unset UPTIME_SECONDS to ensure it's actually missing
+  unset UPTIME_SECONDS 2>/dev/null || true
+  source "$mk_arc/2025-05-10T10:00:00.000000000Z/metadata.env" 2>/dev/null || true
+  if [[ -z "${UPTIME_SECONDS+x}" ]]; then
+    tap_ok "archive: missing required key (UPTIME_SECONDS) detected"
+  else
+    tap_not_ok "archive: missing required key (UPTIME_SECONDS) detected" \
+      "UPTIME_SECONDS unexpectedly set to '${UPTIME_SECONDS:-}'"
+  fi
+
+  # ── Test: Invalid numeric field in metadata.env ─────────────────────────
+  local t_invalid_num="$archive_root/t-invalid-num"
+  local in_arc="$t_invalid_num/data/in-session/metrics/archive"
+  mkdir -p "$in_arc/2025-05-10T10:00:00.000000000Z"
+  cat > "$in_arc/2025-05-10T10:00:00.000000000Z/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=1
+TICK_SKIPPED=false
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+UPTIME_SECONDS=abc
+MONITOR_MODE=validator
+PID=12345
+START_TICKS=987654
+METAEOF
+  source "$in_arc/2025-05-10T10:00:00.000000000Z/metadata.env" 2>/dev/null || true
+  if ! [[ "${UPTIME_SECONDS:-}" =~ ^[0-9]+$ ]]; then
+    tap_ok "archive: invalid numeric field (UPTIME_SECONDS=abc) detected"
+  else
+    tap_not_ok "archive: invalid numeric field (UPTIME_SECONDS=abc) detected" \
+      "UPTIME_SECONDS=$UPTIME_SECONDS passed numeric check"
+  fi
+
   # ── Test: Default mode metadata fallback ────────────────────────────────
   local t_fallback="$archive_root/t-fallback"
   local fb_session="$t_fallback/data/fb-session"
@@ -3714,7 +3764,7 @@ METAEOF
   echo "# TYPE test_gauge gauge" > "$gap_t1/current.prom"
   echo "test_gauge 100" >> "$gap_t1/current.prom"
   echo "# TYPE test_gauge gauge" > "$gap_t1/prev.prom"
-  echo "test_gauge 90" >> "$gap_t1/prev.pom"
+  echo "test_gauge 90" >> "$gap_t1/prev.prom"
   cat > "$gap_t1/metadata.env" << 'METAEOF'
 ARCHIVE_VERSION=1
 TICK_SKIPPED=false
