@@ -39,10 +39,14 @@ and the policy for managing overlaps between them.
 
 When an alarm legitimately belongs in both surfaces:
 
-1. The TOML entry includes a `# mirrors:` comment naming the corresponding
-   Grafana rule(s), e.g.:
+1. The TOML entry includes a `# mirrors:` comment referencing the corresponding
+   Grafana alert UID(s), e.g.:
    ```toml
-   # mirrors: henyey-slo-alerts.yaml rule 1 (critical, increase > 0 over 10m)
+   # mirrors: henyey-slo-alerts.yaml henyey-invariant-failure
+   ```
+   For alarms mirroring multiple Grafana rules, use comma-separated UIDs:
+   ```toml
+   # mirrors: henyey-slo-alerts.yaml henyey-quorum-failat-warn, henyey-quorum-failat-crit
    ```
 
 2. **Thresholds and severities may intentionally differ.** Monitor-tick uses
@@ -66,7 +70,7 @@ When an alarm legitimately belongs in both surfaces:
 | Recovery stalled | `recovery-stalled` | `henyey-recovery-stalled` | counter-streak ≥ 3, WARN | increase >= 3 over 10m, warning | |
 | Fetch channel depth | `fetch-channel-deep` | `henyey-overlay-fetch-depth` | gauge > 500, WARN, 2 ticks | > 128, warning, 5m | Different thresholds |
 | FD exhaustion | `fd-exhaustion` | `henyey-fd-exhaustion-warn`, `henyey-fd-exhaustion-crit` | ratio > 0.85, WARN | > 0.6 warn / > 0.8 crit, 5m | Different thresholds |
-| Ledger age | `ledger-age-high` | `henyey-ledger-age-warn`, `henyey-ledger-age-crit` | gauge > 30, WARN | > 10 warn / > 30 crit, 5m; guards on herder_state == 2 | |
+| Ledger age | `ledger-age-high` | `henyey-ledger-age-warn`, `henyey-ledger-age-crit` | gauge > 30, SYNC | > 10 warn / > 30 crit, 5m; guards on herder_state == 2 | |
 | Peer count | `peer-count-low` | `henyey-peer-count-warn`, `henyey-peer-count-crit` | gauge < 8, WARN | < 8 warn / < 3 crit, 5m | |
 | Validator not tracking | `herder-not-tracking` | `henyey-validator-not-tracking` | gauge != 2, SYNC | != bool 2, warning, 20m | |
 | Fragmentation | `jemalloc-frag-high` | `henyey-fragmentation` | gauge > 50, WARN, 2 ticks | > 50%, warning, 15m | Matching thresholds |
