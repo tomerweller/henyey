@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=182
+TAP_PLAN=192
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -4158,6 +4158,165 @@ else:
   fi
 
   rm -rf "$replay_root"
+
+  # ── check-alarm-regression.sh dedup tests ──────────────────────────────────
+  # Tests for issue #2608: duplicate issue filing due to stale dedup snapshot.
+  # Uses PATH-based gh stub to intercept GitHub API calls.
+
+  local dedup_root
+  dedup_root=$(mktemp -d)
+  local dedup_session="$dedup_root/session"
+  mkdir -p "$dedup_session/metrics"
+
+  # Create a baseline where lost-sync was active
+  local dedup_baseline='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}'
+  echo "$dedup_baseline" > "$dedup_session/metrics/replay-baseline.json"
+
+  # Current where lost-sync went silent → regression
+  local dedup_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$dedup_current" > "$dedup_session/metrics/dedup-current.json"
+
+  local dedup_gh_dir="$dedup_root/gh-stub"
+  local dedup_gh_log="$dedup_root/gh-calls.log"
+  mkdir -p "$dedup_gh_dir"
+
+  # Helper: create a gh stub with configurable issue list response
+  create_gh_stub() {
+    local stub_dir="$1"
+    local list_response="$2"  # JSON to return for 'gh issue list'
+    local create_response="$3"  # URL to return for 'gh issue create'
+    cat > "$stub_dir/gh" << STUBEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$dedup_gh_log"
+if [[ "\$1" == "issue" && "\$2" == "list" ]]; then
+  echo '$list_response'
+  exit 0
+elif [[ "\$1" == "issue" && "\$2" == "create" ]]; then
+  echo '${create_response:-https://github.com/stellar-experimental/henyey/issues/9999}'
+  exit 0
+elif [[ "\$1" == "label" ]]; then
+  exit 0
+fi
+exit 0
+STUBEOF
+    chmod +x "$stub_dir/gh"
+  }
+
+  # Also stub move-issue-status.sh to be a no-op
+  local dedup_skills_dir="$dedup_root/fake-skills/plan-do-review/scripts"
+  mkdir -p "$dedup_skills_dir"
+  echo '#!/usr/bin/env bash' > "$dedup_skills_dir/move-issue-status.sh"
+  echo 'exit 0' >> "$dedup_skills_dir/move-issue-status.sh"
+  chmod +x "$dedup_skills_dir/move-issue-status.sh"
+
+  # We need a fake REPO_ROOT that points to our stub skills dir
+  # but still has the real script. Symlink approach:
+  local dedup_fake_repo="$dedup_root/fake-repo"
+  mkdir -p "$dedup_fake_repo/.github/skills/plan-do-review/scripts"
+  cp "$dedup_skills_dir/move-issue-status.sh" "$dedup_fake_repo/.github/skills/plan-do-review/scripts/"
+  mkdir -p "$dedup_fake_repo/scripts/dev"
+  cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$dedup_fake_repo/scripts/dev/"
+
+  # Test 1: Existing-issue dedup (exact title match → skip filing)
+  > "$dedup_gh_log"
+  create_gh_stub "$dedup_gh_dir" \
+    '[{"title":"Alarm regression: lost-sync","body":"<!-- alarm-regression-key: lost-sync -->"}]' \
+    ""
+  set +e
+  PATH="$dedup_gh_dir:$PATH" "$dedup_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$dedup_session" --current "$dedup_session/metrics/dedup-current.json" \
+    --catalog "$catalog_for_reg" >/dev/null 2>&1
+  set -e
+  if ! grep -q "issue create" "$dedup_gh_log" 2>/dev/null; then
+    tap_ok "regression dedup: existing issue (exact title) skips filing"
+  else
+    tap_not_ok "regression dedup: existing issue (exact title) skips filing" \
+      "gh issue create was called: $(cat "$dedup_gh_log")"
+  fi
+
+  # Test 2: Title false-positive rejection (similar but not exact title → still file)
+  > "$dedup_gh_log"
+  create_gh_stub "$dedup_gh_dir" \
+    '[{"title":"Alarm regression: lost-sync-extra","body":"no marker"}]' \
+    "https://github.com/stellar-experimental/henyey/issues/9999"
+  set +e
+  PATH="$dedup_gh_dir:$PATH" "$dedup_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$dedup_session" --current "$dedup_session/metrics/dedup-current.json" \
+    --catalog "$catalog_for_reg" >/dev/null 2>&1
+  set -e
+  if grep -q "issue create" "$dedup_gh_log" 2>/dev/null; then
+    tap_ok "regression dedup: false-positive title rejected, issue filed"
+  else
+    tap_not_ok "regression dedup: false-positive title rejected, issue filed" \
+      "gh issue create was NOT called: $(cat "$dedup_gh_log")"
+  fi
+
+  # Test 3: Body-marker fallback (wrong title, correct marker → skip filing)
+  > "$dedup_gh_log"
+  create_gh_stub "$dedup_gh_dir" \
+    '[{"title":"Wrong title entirely","body":"some text <!-- alarm-regression-key: lost-sync --> more text"}]' \
+    ""
+  set +e
+  PATH="$dedup_gh_dir:$PATH" "$dedup_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$dedup_session" --current "$dedup_session/metrics/dedup-current.json" \
+    --catalog "$catalog_for_reg" >/dev/null 2>&1
+  set -e
+  if ! grep -q "issue create" "$dedup_gh_log" 2>/dev/null; then
+    tap_ok "regression dedup: body-marker fallback skips filing"
+  else
+    tap_not_ok "regression dedup: body-marker fallback skips filing" \
+      "gh issue create was called: $(cat "$dedup_gh_log")"
+  fi
+
+  # Test 4: Clean filing (no existing issues → file once)
+  > "$dedup_gh_log"
+  create_gh_stub "$dedup_gh_dir" \
+    '[]' \
+    "https://github.com/stellar-experimental/henyey/issues/9999"
+  set +e
+  PATH="$dedup_gh_dir:$PATH" "$dedup_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$dedup_session" --current "$dedup_session/metrics/dedup-current.json" \
+    --catalog "$catalog_for_reg" >/dev/null 2>&1
+  set -e
+  local create_count
+  create_count=$(grep -c "issue create" "$dedup_gh_log" 2>/dev/null) || create_count=0
+  if [[ "$create_count" -eq 1 ]]; then
+    tap_ok "regression dedup: clean filing creates exactly one issue"
+  else
+    tap_not_ok "regression dedup: clean filing creates exactly one issue" \
+      "expected 1 create call, got $create_count: $(cat "$dedup_gh_log")"
+  fi
+
+  # Test 5: Lookup failure graceful degradation (gh issue list fails → still file)
+  > "$dedup_gh_log"
+  cat > "$dedup_gh_dir/gh" << 'FAILSTUBEOF'
+#!/usr/bin/env bash
+echo "$*" >> LOGFILE
+if [[ "$1" == "issue" && "$2" == "list" ]]; then
+  exit 1
+elif [[ "$1" == "issue" && "$2" == "create" ]]; then
+  echo "https://github.com/stellar-experimental/henyey/issues/9999"
+  exit 0
+elif [[ "$1" == "label" ]]; then
+  exit 0
+fi
+exit 0
+FAILSTUBEOF
+  sed -i "s|LOGFILE|$dedup_gh_log|g" "$dedup_gh_dir/gh"
+  chmod +x "$dedup_gh_dir/gh"
+  set +e
+  PATH="$dedup_gh_dir:$PATH" "$dedup_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$dedup_session" --current "$dedup_session/metrics/dedup-current.json" \
+    --catalog "$catalog_for_reg" >/dev/null 2>&1
+  set -e
+  if grep -q "issue create" "$dedup_gh_log" 2>/dev/null; then
+    tap_ok "regression dedup: lookup failure still files issue (fail open)"
+  else
+    tap_not_ok "regression dedup: lookup failure still files issue (fail open)" \
+      "gh issue create was NOT called: $(cat "$dedup_gh_log")"
+  fi
+
+  rm -rf "$dedup_root"
 
   # ── eval-alarms telemetry regression tests ─────────────────────────────────
   # Tests for issue #2574: misleading ERROR_NO_SERIES and unsubstituted placeholders

@@ -91,3 +91,4 @@ crates/*/results/[0-9a-f][0-9a-f]/
 crates/*/scp/[0-9a-f][0-9a-f]/
 crates/*/transactions/[0-9a-f][0-9a-f]/
 scripts/lib/__pycache__/
+.alarm-regression-filing.lock

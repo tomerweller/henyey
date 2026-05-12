@@ -266,44 +266,64 @@ else
   # Ensure alarm-regression label exists
   gh label create alarm-regression --description "Alarm regression detected by replay" --color "d93f0b" 2>/dev/null || true
 
-  # Get existing open alarm-regression issues for dedup (by title and body marker)
-  EXISTING_ISSUES=$(gh issue list --label alarm-regression --state open --json title,body --jq '.[].title + "|||" + .body' 2>/dev/null) || true
+  # Serialize concurrent filing attempts with an exclusive lock.
+  # -w 30: block up to 30s for the lock (each alarm filing takes ~2s).
+  LOCK_FILE="$REPO_ROOT/.alarm-regression-filing.lock"
+  (
+    flock -w 30 9 || {
+      echo "Could not acquire alarm-regression filing lock after 30s; skipping." >&2
+      exit 0
+    }
 
-  # File issues for each regression
-  echo "$REGRESSION_OUTPUT" | python3 -c "
-import json, sys
-for r in json.load(sys.stdin):
-    print(json.dumps(r))
-" 2>/dev/null | while IFS= read -r regression_line; do
-    [[ -z "$regression_line" ]] && continue
-    ALARM_NAME=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['alarm'])" 2>/dev/null) || continue
-    BASELINE_DISPLAY_PCT=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['baseline_fired_pct_display'])" 2>/dev/null) || continue
-    REASON=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['reason'])" 2>/dev/null) || continue
+    declare -A FILED_THIS_RUN
 
-    EXPECTED_TITLE="Alarm regression: $ALARM_NAME"
-    BODY_MARKER="<!-- alarm-regression-key: $ALARM_NAME -->"
+    # Process regressions via process substitution (runs loop in main shell
+    # so FILED_THIS_RUN persists across iterations).
+    while IFS= read -r regression_line; do
+      [[ -z "$regression_line" ]] && continue
+      ALARM_NAME=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['alarm'])" 2>/dev/null) || continue
+      BASELINE_DISPLAY_PCT=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['baseline_fired_pct_display'])" 2>/dev/null) || continue
+      REASON=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['reason'])" 2>/dev/null) || continue
 
-    # Dedup: check for exact title match OR body marker match
-    FOUND_DUP=false
-    while IFS= read -r issue_line; do
-      [[ -z "$issue_line" ]] && continue
-      if echo "$issue_line" | grep -qF "$EXPECTED_TITLE" 2>/dev/null; then
-        FOUND_DUP=true
-        break
+      EXPECTED_TITLE="Alarm regression: $ALARM_NAME"
+      BODY_MARKER="<!-- alarm-regression-key: $ALARM_NAME -->"
+
+      # Defensive within-run dedup
+      if [[ -n "${FILED_THIS_RUN[$ALARM_NAME]+x}" ]]; then
+        echo "Skipping within-run duplicate: $EXPECTED_TITLE" >&2
+        continue
       fi
-      if echo "$issue_line" | grep -qF "$BODY_MARKER" 2>/dev/null; then
-        FOUND_DUP=true
-        break
+
+      # Per-alarm dedup: server-side narrowing + client-side exact verification.
+      # Two queries cover both title-based and body-marker-based matches.
+      TITLE_CANDIDATES=$(gh issue list --label alarm-regression --state open \
+        --search "in:title \"$ALARM_NAME\"" \
+        --json title,body 2>/dev/null) || TITLE_CANDIDATES="[]"
+
+      MARKER_CANDIDATES=$(gh issue list --label alarm-regression --state open \
+        --search "in:body \"alarm-regression-key: $ALARM_NAME\"" \
+        --json title,body 2>/dev/null) || MARKER_CANDIDATES="[]"
+
+      FOUND_DUP=false
+      for candidate_json in "$TITLE_CANDIDATES" "$MARKER_CANDIDATES"; do
+        while IFS= read -r candidate; do
+          [[ -z "$candidate" ]] && continue
+          c_title=$(echo "$candidate" | python3 -c "import json,sys; print(json.load(sys.stdin).get('title',''))" 2>/dev/null) || continue
+          c_body=$(echo "$candidate" | python3 -c "import json,sys; print(json.load(sys.stdin).get('body',''))" 2>/dev/null) || continue
+          if [[ "$c_title" == "$EXPECTED_TITLE" ]] || echo "$c_body" | grep -qF "$BODY_MARKER" 2>/dev/null; then
+            FOUND_DUP=true
+            break 2
+          fi
+        done < <(echo "$candidate_json" | python3 -c "import json,sys; [print(json.dumps(x)) for x in json.load(sys.stdin)]" 2>/dev/null)
+      done
+
+      if [[ "$FOUND_DUP" == true ]]; then
+        echo "Skipping duplicate: $EXPECTED_TITLE" >&2
+        continue
       fi
-    done <<< "$EXISTING_ISSUES"
 
-    if [[ "$FOUND_DUP" == true ]]; then
-      echo "Skipping duplicate: $EXPECTED_TITLE" >&2
-      continue
-    fi
-
-    # File new issue
-    ISSUE_BODY="## Alarm Regression Detected
+      # File new issue
+      ISSUE_BODY="## Alarm Regression Detected
 
 **Alarm**: \`$ALARM_NAME\`
 **Baseline fired**: ${BASELINE_DISPLAY_PCT}% of eligible ticks
@@ -322,22 +342,30 @@ the current replay window.
 
 <!-- alarm-regression-key: $ALARM_NAME -->"
 
-    NEW_ISSUE=$(gh issue create \
-      --title "$EXPECTED_TITLE" \
-      --label alarm-regression \
-      --body "$ISSUE_BODY" 2>/dev/null) || {
-      echo "WARNING: Failed to file issue for $ALARM_NAME" >&2
-      continue
-    }
+      NEW_ISSUE=$(gh issue create \
+        --title "$EXPECTED_TITLE" \
+        --label alarm-regression \
+        --body "$ISSUE_BODY" 2>/dev/null) || {
+        echo "WARNING: Failed to file issue for $ALARM_NAME" >&2
+        continue
+      }
 
-    # Extract issue number and board-route
-    ISSUE_NUM=$(echo "$NEW_ISSUE" | grep -oP '\d+$') || true
-    if [[ -n "$ISSUE_NUM" ]]; then
-      bash "$REPO_ROOT/.github/skills/plan-do-review/scripts/move-issue-status.sh" "$ISSUE_NUM" Backlog 2>/dev/null || true
-    fi
+      FILED_THIS_RUN["$ALARM_NAME"]=1
 
-    echo "Filed: $NEW_ISSUE" >&2
-  done
+      # Extract issue number and board-route
+      ISSUE_NUM=$(echo "$NEW_ISSUE" | grep -oP '\d+$') || true
+      if [[ -n "$ISSUE_NUM" ]]; then
+        bash "$REPO_ROOT/.github/skills/plan-do-review/scripts/move-issue-status.sh" "$ISSUE_NUM" Backlog 2>/dev/null || true
+      fi
+
+      echo "Filed: $NEW_ISSUE" >&2
+    done < <(echo "$REGRESSION_OUTPUT" | python3 -c "
+import json, sys
+for r in json.load(sys.stdin):
+    print(json.dumps(r))
+" 2>/dev/null)
+
+  ) 9>"$LOCK_FILE"
 fi
 
 exit 0
