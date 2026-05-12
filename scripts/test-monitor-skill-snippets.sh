@@ -383,6 +383,24 @@ check_skill_structure() {
     echo "FATAL: Structural drift detected in --strict mode." >&2
     exit 1
   fi
+
+  # Step 8 (alarm regression replay) structural checks
+  if ! grep -q 'check-alarm-regression.sh' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not reference check-alarm-regression.sh" >&2
+    drift=true
+  fi
+  if ! grep -q 'replay_pending=never-run' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md uses wrong replay sentinel (expected never-run)" >&2
+    drift=true
+  fi
+  if grep -q 'replay_pending=no-archive' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md still uses deprecated replay_pending=no-archive" >&2
+    drift=true
+  fi
+  if [[ ! -x "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" ]]; then
+    echo "WARNING: scripts/dev/check-alarm-regression.sh is missing or not executable" >&2
+    drift=true
+  fi
 }
 
 
@@ -3992,6 +4010,118 @@ METAEOF
 
   # Clean up archive test dirs
   rm -rf "$archive_root"
+
+  # ── Alarm replay --json behavioral tests ────────────────────────────────
+  local replay_root
+  replay_root=$(mktemp -d "$TEST_ROOT/replay-XXXXXX")
+
+  # Test: --json without --replay → error
+  local json_only_err
+  json_only_err=$("$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh" --json 2>&1) && {
+    tap_not_ok "replay: --json without --replay exits with error" "exited 0"
+  } || {
+    if echo "$json_only_err" | grep -q "requires --replay"; then
+      tap_ok "replay: --json without --replay exits with error"
+    else
+      tap_not_ok "replay: --json without --replay exits with error" \
+        "wrong error: $json_only_err"
+    fi
+  }
+
+  # Test: --replay --json --window → error
+  local json_window_err
+  json_window_err=$("$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh" \
+    "$replay_root" --replay --json --window 10 2>&1) && {
+    tap_not_ok "replay: --json with --window exits with error" "exited 0"
+  } || {
+    if echo "$json_window_err" | grep -q "cannot be used with --json"; then
+      tap_ok "replay: --json with --window exits with error"
+    else
+      tap_not_ok "replay: --json with --window exits with error" \
+        "wrong error: $json_window_err"
+    fi
+  }
+
+  # Test: --replay --json on empty archive → zeroed JSON schema
+  local empty_session="$replay_root/empty-session"
+  mkdir -p "$empty_session/metrics/archive"
+  local empty_json
+  empty_json=$("$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh" \
+    "$empty_session" --replay --json 2>/dev/null) || true
+  local empty_schema_ok
+  empty_schema_ok=$(echo "$empty_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    ok = (d.get('schema_version') == 1 and
+          d.get('evaluated_ticks') == 0 and
+          d.get('skipped_ticks') == 0 and
+          d.get('error_ticks') == 0 and
+          d.get('total_snapshots') == 0 and
+          d.get('alarms') == {})
+    print('ok' if ok else 'fail')
+except:
+    print('fail')
+" 2>/dev/null) || echo "fail"
+  if [[ "$empty_schema_ok" == "ok" ]]; then
+    tap_ok "replay: --replay --json on empty archive returns zeroed schema"
+  else
+    tap_not_ok "replay: --replay --json on empty archive returns zeroed schema" \
+      "output: $empty_json"
+  fi
+
+  # ── check-alarm-regression.sh behavioral tests ─────────────────────────
+
+  # Test: no baseline → creates baseline, exits 0
+  local reg_session="$replay_root/reg-session"
+  mkdir -p "$reg_session/metrics"
+  local reg_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"alarm_a":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"alarm_b":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$reg_current" > "$reg_session/metrics/reg-current.json"
+
+  local reg_out
+  reg_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$reg_session" --current "$reg_session/metrics/reg-current.json" 2>&1) || true
+  if [[ -f "$reg_session/metrics/replay-baseline.json" ]] && echo "$reg_out" | grep -q "Baseline established"; then
+    tap_ok "regression: no baseline creates baseline"
+  else
+    tap_not_ok "regression: no baseline creates baseline" "output: $reg_out"
+  fi
+
+  # Test: baseline + no regressions → baseline updated, exits 0
+  # Same current as baseline → no regressions
+  local reg_out2
+  reg_out2=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$reg_session" --current "$reg_session/metrics/reg-current.json" 2>&1) || true
+  local reg_stdout2
+  reg_stdout2=$(echo "$reg_out2" | grep -v "^No regressions\|^Baseline" | head -1)
+  if echo "$reg_out2" | grep -q "No regressions" && [[ "$reg_stdout2" == "[]" ]]; then
+    tap_ok "regression: no regressions updates baseline"
+  else
+    tap_not_ok "regression: no regressions updates baseline" "output: $reg_out2"
+  fi
+
+  # Test: baseline + regression → baseline NOT updated
+  local reg_regressed='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"alarm_a":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"alarm_b":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$reg_regressed" > "$reg_session/metrics/reg-regressed.json"
+  # Save baseline mtime before
+  local baseline_before
+  baseline_before=$(stat -c %Y "$reg_session/metrics/replay-baseline.json" 2>/dev/null) || baseline_before=0
+  sleep 1  # ensure mtime difference if updated
+
+  local reg_out3
+  reg_out3=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$reg_session" --current "$reg_session/metrics/reg-regressed.json" 2>&1) || true
+  local baseline_after
+  baseline_after=$(stat -c %Y "$reg_session/metrics/replay-baseline.json" 2>/dev/null) || baseline_after=0
+
+  if echo "$reg_out3" | grep -q "regression(s) found" && [[ "$baseline_before" == "$baseline_after" ]]; then
+    tap_ok "regression: regressions found, baseline NOT updated"
+  else
+    tap_not_ok "regression: regressions found, baseline NOT updated" \
+      "output: $reg_out3 before=$baseline_before after=$baseline_after"
+  fi
+
+  rm -rf "$replay_root"
 }
 check_skill_structure
 run_tests

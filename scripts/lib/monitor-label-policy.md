@@ -11,6 +11,7 @@
 | Label | Criteria | Examples |
 |-------|----------|----------|
 | `urgent` | Blocks validator operation or consensus participation | Hash mismatch (any kind), wedged node (frozen event loop, watchdog auto-abort), failing CI on origin/main blocking deploy, panic or crash from production code, SYNC FAILURE past active deadline, OOM-driven restart, deploy regression |
+| `alarm-regression` | Alarm that was meaningfully active (≥5% of ticks) in the replay baseline has gone completely silent (0% firing) in the current replay window | An alarm tracking recovery-stalled ticks that stops firing after a code change, an alarm for high open_fds that disappears after a refactor |
 | *(no label)* | Non-urgent: does not block operation | Calibration, threshold tuning, NONC alerts, cosmetic noise, follow-up improvements, metric drift without visible effect |
 | `not-ready` | Needs operator decision before any code change | Tier-3 self-reflection issues, design decisions pending, ambiguous requirements needing human input |
 
@@ -28,6 +29,11 @@
   this signals "needs operator decision AND is now blocking." The operator
   resolves by removing `not-ready` when ready, or removing `urgent` if the
   evidence is dismissed.
+- **`alarm-regression`:** Filed automatically by `scripts/dev/check-alarm-regression.sh`
+  when weekly alarm replay detects a regression. Closed manually after
+  investigation — the alarm was intentionally removed, its threshold was
+  adjusted, or the underlying issue was fixed. May coexist with `urgent` if
+  the missing alarm was operation-blocking.
 
 ## Board Routing
 
@@ -40,6 +46,7 @@ column on project #2).
 | Severity | Board Status | Rationale |
 |----------|-------------|-----------|
 | `urgent` or *(no label)* | Backlog | Eligible for auto-selection by `plan-do-review` |
+| `alarm-regression` | Backlog | Eligible for auto-selection; supplemental to urgency labels |
 | `not-ready` | Blocked | NOT eligible for auto-selection; operator must unblock |
 
 ### When to Route

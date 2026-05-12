@@ -9,6 +9,7 @@
 # Usage:
 #   scripts/dev/replay-alarms-on-history.sh [SESSION_DIR]
 #   scripts/dev/replay-alarms-on-history.sh [SESSION_DIR] --replay [--window N] [--alarm NAME]
+#   scripts/dev/replay-alarms-on-history.sh [SESSION_DIR] --replay --json
 #
 # SESSION_DIR defaults to the most recent session under ~/data/.
 
@@ -30,6 +31,7 @@ fi
 # Parse arguments
 SESSION_DIR=""
 REPLAY_MODE=false
+JSON_MODE=false
 WINDOW=""
 ALARM_FILTER=""
 
@@ -37,6 +39,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --replay)
       REPLAY_MODE=true
+      shift
+      ;;
+    --json)
+      JSON_MODE=true
       shift
       ;;
     --window)
@@ -70,6 +76,20 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Validate flag combinations
+if [[ "$JSON_MODE" == true ]] && [[ "$REPLAY_MODE" != true ]]; then
+  echo "ERROR: --json requires --replay" >&2
+  exit 1
+fi
+if [[ "$JSON_MODE" == true ]] && [[ -n "$WINDOW" ]]; then
+  echo "ERROR: --window cannot be used with --json (JSON always covers full archive)" >&2
+  exit 1
+fi
+if [[ "$JSON_MODE" == true ]] && [[ -n "$ALARM_FILTER" ]]; then
+  echo "ERROR: --alarm cannot be used with --json (JSON always covers all alarms)" >&2
+  exit 1
+fi
 
 # Find session directory if not specified
 if [[ -z "$SESSION_DIR" ]]; then
@@ -188,7 +208,11 @@ if [[ "$REPLAY_MODE" == true ]]; then
   fi
 
   if [[ ${#SNAPSHOTS[@]} -eq 0 ]]; then
-    echo "No archived snapshots found in $ARCHIVE_DIR"
+    if [[ "$JSON_MODE" == true ]]; then
+      echo '{"schema_version":1,"evaluated_ticks":0,"skipped_ticks":0,"error_ticks":0,"total_snapshots":0,"first_ts":"","last_ts":"","alarms":{}}'
+    else
+      echo "No archived snapshots found in $ARCHIVE_DIR"
+    fi
     exit 0
   fi
 
@@ -200,6 +224,7 @@ if [[ "$REPLAY_MODE" == true ]]; then
   TOTAL=${#SNAPSHOTS[@]}
   SKIPPED_COUNT=0
   EVALUATED_COUNT=0
+  ERROR_COUNT=0
   RESULTS_FILE=$(mktemp "${METRICS_DIR}/replay-results-XXXXXX")
   FIRST_TS=""
   LAST_TS=""
@@ -225,8 +250,6 @@ if [[ "$REPLAY_MODE" == true ]]; then
       continue
     fi
 
-    EVALUATED_COUNT=$((EVALUATED_COUNT + 1))
-
     # Build eval command with archived env vars
     CURRENT_FILE="$snap_dir/current.prom"
     PREV_FILE="$snap_dir/prev.prom"
@@ -248,10 +271,13 @@ if [[ "$REPLAY_MODE" == true ]]; then
 
     if [[ -n "$RESULT" ]]; then
       echo "$RESULT" >> "$RESULTS_FILE"
+      EVALUATED_COUNT=$((EVALUATED_COUNT + 1))
+    else
+      ERROR_COUNT=$((ERROR_COUNT + 1))
     fi
   done
 
-  # Generate summary table
+  # Generate output (JSON or human-readable table)
   python3 -c "
 import json, sys
 
@@ -264,20 +290,30 @@ first_ts = sys.argv[6]
 last_ts = sys.argv[7]
 session_dir = sys.argv[8]
 catalog = sys.argv[9]
+json_mode = sys.argv[10] == 'true'
+error_count = int(sys.argv[11])
+total_snapshots = int(sys.argv[12])
 
-# Parse all result lines
+# Parse all results using streaming JSON decoder (evaluator outputs
+# multi-line pretty-printed JSON with indent=2)
 all_results = []
 with open(results_file) as f:
-    for line in f:
-        line = line.strip()
-        if line:
-            try:
-                all_results.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
+    content = f.read()
+decoder = json.JSONDecoder()
+idx = 0
+while idx < len(content):
+    remaining = content[idx:].lstrip()
+    if not remaining:
+        break
+    try:
+        obj, end = decoder.raw_decode(remaining)
+        all_results.append(obj)
+        idx = len(content) - len(remaining) + end
+    except json.JSONDecodeError:
+        break
 
-# Apply window filter (display only last N evaluated ticks)
-if window > 0 and window < len(all_results):
+# Apply window filter (display only last N evaluated ticks, table mode only)
+if not json_mode and window > 0 and window < len(all_results):
     display_results = all_results[-window:]
     displayed = window
 else:
@@ -305,7 +341,23 @@ for result in display_results:
         else:
             alarm_counts[name]['skip'] += 1
 
-# Apply alarm filter
+if json_mode:
+    # JSON output mode
+    output = {
+        'schema_version': 1,
+        'evaluated_ticks': evaluated,
+        'skipped_ticks': skipped,
+        'error_ticks': error_count,
+        'total_snapshots': total_snapshots,
+        'first_ts': first_ts,
+        'last_ts': last_ts,
+        'alarms': alarm_counts,
+    }
+    json.dump(output, sys.stdout)
+    print()
+    sys.exit(0)
+
+# Apply alarm filter (table mode only)
 if alarm_filter:
     matching = {k: v for k, v in alarm_counts.items() if alarm_filter in k}
     if not matching:
@@ -313,10 +365,10 @@ if alarm_filter:
         sys.exit(1)
     alarm_counts = matching
 
-# Print summary
+# Print summary table
 print('=== Alarm History Replay ===')
 print(f'Session:   {session_dir}')
-print(f'Evaluated: {evaluated} ticks ({skipped} skipped)')
+print(f'Evaluated: {evaluated} ticks ({skipped} skipped, {error_count} errors)')
 if window > 0 and window < evaluated:
     print(f'Displayed: {displayed} of {evaluated} (--window {window})')
 print(f'Range:     {first_ts} -> {last_ts}')
@@ -348,7 +400,7 @@ for name in sorted(alarm_counts.keys()):
 print()
 print(f'Alarms with any firings: {firing_count}')
 print(f'Alarms with any breaches: {breach_count}')
-" "$RESULTS_FILE" "${WINDOW:-0}" "$ALARM_FILTER" "$EVALUATED_COUNT" "$SKIPPED_COUNT" "$FIRST_TS" "$LAST_TS" "$SESSION_DIR" "$CATALOG"
+" "$RESULTS_FILE" "${WINDOW:-0}" "$ALARM_FILTER" "$EVALUATED_COUNT" "$SKIPPED_COUNT" "$FIRST_TS" "$LAST_TS" "$SESSION_DIR" "$CATALOG" "$JSON_MODE" "$ERROR_COUNT" "$TOTAL"
 
   rm -f "$RESULTS_FILE"
   exit 0

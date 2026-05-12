@@ -760,11 +760,62 @@ against a node that is in real-time sync with age=2s).
      -exec rm -rf {} + 2>/dev/null || true
 
    # Replay-pending sentinel: surface in watch array if no replay has ever
-   # run. The replay step (when implemented) writes a timestamp file after
-   # successful execution; until then this watch key appears in every tick,
-   # surfacing in daily-summary reports.
+   # run. Step 8 writes a timestamp file after successful execution; until
+   # then this watch key appears in every tick, surfacing in daily-summary.
    if [[ ! -f "$METRICS_DIR/replay-last-run.ts" ]]; then
-     WATCH_ITEMS+=("replay_pending=no-archive")
+     WATCH_ITEMS+=("replay_pending=never-run")
+   fi
+   ```
+
+8. **Weekly alarm regression replay** — replay the archived metrics history
+   through the current alarm catalog and compare against a stored baseline
+   to detect regressions (alarms that were meaningfully active but have gone
+   silent). This step only runs for validator mode — watcher keeps a reduced
+   catalog (process/jemalloc/overlay only, no SCP/quorum/ratio/p99) that
+   doesn't have action semantics worth regressing.
+
+   See `scripts/dev/check-alarm-regression.sh` for the baseline comparison,
+   regression detection, and issue-filing logic.
+
+   ```bash
+   # Step 8: Weekly alarm regression replay (validator-only)
+   if [[ "$MONITOR_MODE" == "validator" ]]; then
+     REPLAY_THROTTLE="$METRICS_DIR/replay-last-run.ts"
+     NOW_TS=$(date +%s)
+     RUN_REPLAY=false
+
+     if [[ ! -f "$REPLAY_THROTTLE" ]]; then
+       RUN_REPLAY=true
+     else
+       LAST_RUN=$(cat "$REPLAY_THROTTLE" 2>/dev/null || echo "0")
+       ELAPSED=$((NOW_TS - LAST_RUN))
+       if [[ $ELAPSED -ge 604800 ]]; then
+         RUN_REPLAY=true
+       fi
+     fi
+
+     if [[ "$RUN_REPLAY" == true ]]; then
+       REPLAY_JSON=$("$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh" \
+         "$HOME/data/$MONITOR_SESSION_ID" --replay --json 2>/dev/null) || true
+
+       if [[ -n "$REPLAY_JSON" ]]; then
+         EVAL_TICKS=$(echo "$REPLAY_JSON" | python3 -c \
+           "import json,sys; print(json.load(sys.stdin).get('evaluated_ticks',0))" \
+           2>/dev/null) || EVAL_TICKS=0
+
+         if [[ "$EVAL_TICKS" -ge 100 ]]; then
+           # Write current replay to temp file for regression check
+           echo "$REPLAY_JSON" > "$METRICS_DIR/replay-current.json"
+           "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+             "$HOME/data/$MONITOR_SESSION_ID" \
+             --current "$METRICS_DIR/replay-current.json" 2>&1 || true
+           rm -f "$METRICS_DIR/replay-current.json"
+
+           # Update throttle — only after successful replay + regression check
+           echo "$NOW_TS" > "$REPLAY_THROTTLE"
+         fi
+       fi
+     fi
    fi
    ```
 
