@@ -10637,21 +10637,43 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_recovery_attempts_full_rearms_latch() {
-        // Verify that RecoveryResetMode::Full resets the episode latch
-        // while Partial does not. Uses a minimal App-like setup.
+    fn test_recovery_episode_latch_partial_does_not_rearm() {
+        // Verify that only Full reset re-arms the latch, not Partial.
         let latch = RecoveryEpisodeLatch::new();
 
         // Simulate first onset.
         assert!(latch.try_mark_onset());
         assert!(!latch.try_mark_onset());
 
-        // Simulate Partial reseed — should NOT re-arm.
-        // (Partial doesn't call latch.reset().)
+        // Partial reseed does NOT call latch.reset(), so latch stays latched.
         assert!(!latch.try_mark_onset());
 
-        // Simulate Full reset — should re-arm.
+        // Full reset re-arms.
         latch.reset();
+        assert!(latch.try_mark_onset());
+    }
+
+    #[test]
+    fn test_recovery_episode_latch_multiple_episodes() {
+        // Verify multiple consecutive episodes each get exactly one onset.
+        let latch = RecoveryEpisodeLatch::new();
+
+        // Episode 1.
+        assert!(latch.try_mark_onset());
+        assert!(!latch.try_mark_onset());
+        assert!(!latch.try_mark_onset());
+
+        // Full reset ends episode 1.
+        latch.reset();
+
+        // Episode 2.
+        assert!(latch.try_mark_onset());
+        assert!(!latch.try_mark_onset());
+
+        // Full reset ends episode 2.
+        latch.reset();
+
+        // Episode 3.
         assert!(latch.try_mark_onset());
     }
 }

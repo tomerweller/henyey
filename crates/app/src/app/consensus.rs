@@ -235,6 +235,7 @@ impl App {
 
         // Track consecutive recovery attempts without progress.
         let baseline = self.recovery_baseline_ledger.load(Ordering::SeqCst);
+        let mut did_full_reset = false;
         if current_ledger as u64 > baseline {
             // Progress — always update the baseline ledger.
             self.recovery_baseline_ledger
@@ -268,6 +269,7 @@ impl App {
                 // Full progress: node is at or near the tip. Clear all
                 // escalation state (#1867).
                 self.reset_recovery_attempts(RecoveryResetMode::Full);
+                did_full_reset = true;
                 self.archive_confirmed_behind.store(false, Ordering::SeqCst);
                 let mut guard = self.archive_behind_until.write().await;
                 *guard = None;
@@ -292,8 +294,9 @@ impl App {
 
         // Onset diagnostic: emit a structured info-level snapshot exactly once
         // per recovery episode, gated on Synced/Validating to suppress startup
-        // and catchup noise. See #2568.
-        {
+        // and catchup noise. Skip on progress ticks that just performed a Full
+        // reset — those are episode-ending, not episode-starting. See #2568.
+        if !did_full_reset {
             let app_state = self.state().await;
             if matches!(app_state, AppState::Synced | AppState::Validating)
                 && self.recovery_episode_latch.try_mark_onset()
