@@ -290,6 +290,37 @@ impl App {
             "Performing out-of-sync recovery"
         );
 
+        // Onset diagnostic: emit a structured info-level snapshot exactly once
+        // per recovery episode, gated on Synced/Validating to suppress startup
+        // and catchup noise. See #2568.
+        {
+            let app_state = self.state().await;
+            if matches!(app_state, AppState::Synced | AppState::Validating)
+                && self.recovery_episode_latch.try_mark_onset()
+            {
+                let peer_gap = self.effective_peer_gap(current_ledger);
+                let last_close_ms = self.last_close_stats.read().close_time_ms;
+                let tx_set_peers_exhausted = self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
+                let (_, auth_peer_count) = self.peer_counts().await;
+                let herder_state = self.herder.state();
+                crate::metrics::RECOVERY_STALL_ONSET_TOTAL.increment(1);
+                tracing::info!(
+                    current_ledger,
+                    latest_externalized,
+                    gap = relation.behind_gap().unwrap_or(0),
+                    peer_gap,
+                    last_close_ms,
+                    buffer_count,
+                    pending_tx_sets = pending_tx_sets.len(),
+                    tx_set_peers_exhausted,
+                    auth_peer_count,
+                    %herder_state,
+                    %app_state,
+                    "Recovery stall onset — diagnostic snapshot"
+                );
+            }
+        }
+
         // Clean up stale pending tx_set requests for slots we've already closed.
         // After rapid close, stale EXTERNALIZE messages from previous SCP state
         // requests create pending tx_set entries for old slots whose tx_sets are

@@ -519,6 +519,8 @@ metric_catalog! {
             => "Envelopes dropped after verification (aggregate)";
         POST_CATCHUP_HARD_RESET_TOTAL = "henyey_post_catchup_hard_reset_total"
             => "Total post-catchup hard resets performed";
+        RECOVERY_STALL_ONSET_TOTAL = "henyey_recovery_stall_onset_total"
+            => "Recovery stall onset events (one per episode)";
         SCP_SCHEDULED_DEDUP_TOTAL = "henyey_scp_scheduled_dedup_total"
             => "SCP envelopes rejected by in-flight scheduled dedup";
 

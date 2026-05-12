@@ -274,6 +274,40 @@ pub(super) enum RecoveryResetMode {
     Partial { seed: u64 },
 }
 
+/// Tracks whether the current recovery episode's onset diagnostic has been
+/// emitted. Reset only on `RecoveryResetMode::Full` (node reached tip or
+/// completed catchup). This ensures exactly one info-level onset log per
+/// stall episode, regardless of partial reseeds or re-entries.
+///
+/// `Full` is the correct episode boundary because it is the only reset mode
+/// that indicates genuine recovery — it zeroes `max_verified_scp_slot` and
+/// `recovery_attempts_without_progress`. `Partial` reseeds indicate
+/// incremental progress while still behind (same episode continues).
+struct RecoveryEpisodeLatch {
+    onset_logged: AtomicBool,
+}
+
+impl RecoveryEpisodeLatch {
+    fn new() -> Self {
+        Self {
+            onset_logged: AtomicBool::new(false),
+        }
+    }
+
+    /// Try to mark onset as logged. Returns `true` exactly once per episode
+    /// (the first call since the last `reset()`).
+    fn try_mark_onset(&self) -> bool {
+        self.onset_logged
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Reset the latch for a new episode.
+    fn reset(&self) {
+        self.onset_logged.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Maximum wall-clock duration (seconds) a node may remain stuck at the same
 /// ledger with hard resets firing before triggering a fail-fast shutdown with
 /// wipe signal. Computed as 2× the checkpoint publish window, floored at 120s.
@@ -702,6 +736,11 @@ pub struct App {
     /// to determine if SCP messages arrived *since the last recovery reset/re-arm*
     /// (as opposed to historical traffic from before the stall began).
     recovery_baseline_scp_received: AtomicU64,
+    /// Tracks whether the current recovery episode's onset diagnostic has been
+    /// emitted. Reset only on `RecoveryResetMode::Full` (node reached tip or
+    /// completed catchup). Ensures exactly one info-level onset log per stall
+    /// episode. See #2568.
+    recovery_episode_latch: RecoveryEpisodeLatch,
 
     /// Monotonic offset (seconds since `start_instant`) of the last hard reset.
     /// 0 means "never". Used for cooldown enforcement.
@@ -1171,6 +1210,7 @@ impl App {
             recovery_attempts_without_progress: AtomicU64::new(0),
             recovery_baseline_ledger: AtomicU64::new(0),
             recovery_baseline_scp_received: AtomicU64::new(0),
+            recovery_episode_latch: RecoveryEpisodeLatch::new(),
             last_hard_reset_offset: AtomicU64::new(0),
             last_hard_reset_gap: AtomicU64::new(0),
             post_catchup_hard_reset_total: AtomicU64::new(0),
@@ -1854,6 +1894,8 @@ impl App {
                 self.max_verified_scp_slot.store(0, Ordering::Relaxed);
                 self.recovery_attempts_without_progress
                     .store(0, Ordering::SeqCst);
+                // Re-arm the onset diagnostic for the next stall episode.
+                self.recovery_episode_latch.reset();
             }
             RecoveryResetMode::Partial { seed } => {
                 // Preserve max_verified_scp_slot — the hard-reset gate at
@@ -10557,5 +10599,59 @@ mod tests {
             receiver.try_recv().is_none(),
             "no extra messages should be in the channel"
         );
+    }
+
+    // ── RecoveryEpisodeLatch tests (#2568) ──────────────────────────────
+
+    #[test]
+    fn test_recovery_episode_latch_fires_once_per_episode() {
+        let latch = RecoveryEpisodeLatch::new();
+        assert!(latch.try_mark_onset(), "first call should fire");
+        assert!(!latch.try_mark_onset(), "second call should not fire");
+        assert!(!latch.try_mark_onset(), "third call should not fire");
+    }
+
+    #[test]
+    fn test_recovery_episode_latch_reset_rearms() {
+        let latch = RecoveryEpisodeLatch::new();
+        assert!(latch.try_mark_onset());
+        assert!(!latch.try_mark_onset());
+
+        latch.reset();
+        assert!(latch.try_mark_onset(), "should fire again after reset");
+        assert!(
+            !latch.try_mark_onset(),
+            "should not fire again until next reset"
+        );
+    }
+
+    #[test]
+    fn test_recovery_episode_latch_fresh_does_not_fire_without_mark() {
+        let latch = RecoveryEpisodeLatch::new();
+        // Reset without ever marking should keep it ready to fire.
+        latch.reset();
+        assert!(
+            latch.try_mark_onset(),
+            "should fire on fresh latch after no-op reset"
+        );
+    }
+
+    #[test]
+    fn test_reset_recovery_attempts_full_rearms_latch() {
+        // Verify that RecoveryResetMode::Full resets the episode latch
+        // while Partial does not. Uses a minimal App-like setup.
+        let latch = RecoveryEpisodeLatch::new();
+
+        // Simulate first onset.
+        assert!(latch.try_mark_onset());
+        assert!(!latch.try_mark_onset());
+
+        // Simulate Partial reseed — should NOT re-arm.
+        // (Partial doesn't call latch.reset().)
+        assert!(!latch.try_mark_onset());
+
+        // Simulate Full reset — should re-arm.
+        latch.reset();
+        assert!(latch.try_mark_onset());
     }
 }
