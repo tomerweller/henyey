@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=208
+TAP_PLAN=210
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -4479,6 +4479,42 @@ else:
     tap_ok "stable: baseline_source field present in regression JSON"
   else
     tap_not_ok "stable: baseline_source field present in regression JSON" "output: ${sb_t16_out:0:200}"
+  fi
+
+  # Test 17: Stable baseline with missing evaluated_ticks → exit 2
+  local sb_t17="$stable_root/t17"
+  mkdir -p "$sb_t17/metrics"
+  echo "$stable_current_active" > "$sb_t17/metrics/replay-baseline.json"
+  echo '{"schema_version":1,"alarms":{}}' > "$sb_t17/metrics/replay-baseline-stable.json"
+  echo "$stable_current_active" > "$sb_t17/metrics/current.json"
+  local sb_t17_out
+  set +e
+  sb_t17_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t17" --current "$sb_t17/metrics/current.json" --catalog "$stable_catalog" 2>&1)
+  local sb_t17_exit=$?
+  set -e
+  if [[ "$sb_t17_exit" -eq 2 ]] && echo "$sb_t17_out" | grep -q "invalid evaluated_ticks"; then
+    tap_ok "stable: missing evaluated_ticks in stable exits 2"
+  else
+    tap_not_ok "stable: missing evaluated_ticks in stable exits 2" "exit=$sb_t17_exit output: ${sb_t17_out:0:200}"
+  fi
+
+  # Test 18: Rolling baseline with negative evaluated_ticks → exit 2
+  local sb_t18="$stable_root/t18"
+  mkdir -p "$sb_t18/metrics"
+  echo '{"schema_version":1,"evaluated_ticks":-1,"alarms":{}}' > "$sb_t18/metrics/replay-baseline.json"
+  echo "$stable_current_active" > "$sb_t18/metrics/replay-baseline-stable.json"
+  echo "$stable_current_active" > "$sb_t18/metrics/current.json"
+  local sb_t18_out
+  set +e
+  sb_t18_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$sb_t18" --current "$sb_t18/metrics/current.json" --catalog "$stable_catalog" 2>&1)
+  local sb_t18_exit=$?
+  set -e
+  if [[ "$sb_t18_exit" -eq 2 ]] && echo "$sb_t18_out" | grep -q "invalid evaluated_ticks"; then
+    tap_ok "stable: negative evaluated_ticks in rolling exits 2"
+  else
+    tap_not_ok "stable: negative evaluated_ticks in rolling exits 2" "exit=$sb_t18_exit output: ${sb_t18_out:0:200}"
   fi
 
   rm -rf "$stable_root"

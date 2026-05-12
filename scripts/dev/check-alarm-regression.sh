@@ -177,6 +177,9 @@ if data.get('schema_version') != 1:
 if not isinstance(data.get('alarms'), dict):
     print('ERROR: %s baseline missing alarms object' % sys.argv[2], file=sys.stderr)
     sys.exit(2)
+if not isinstance(data.get('evaluated_ticks'), int) or data['evaluated_ticks'] < 0:
+    print('ERROR: %s baseline has invalid evaluated_ticks' % sys.argv[2], file=sys.stderr)
+    sys.exit(2)
 " "$file" "$label" || return 2
   return 0
 }
