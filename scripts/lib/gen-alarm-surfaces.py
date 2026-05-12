@@ -8,8 +8,8 @@ Usage:
     gen-alarm-surfaces.py <surfaces-toml> <alarm-surfaces-md>
     gen-alarm-surfaces.py --check <surfaces-toml> <alarm-surfaces-md>
 
---check: Print to stdout what the file would contain; exit 0 if it matches
-         the committed file, exit 1 if stale.
+--check: Compare what the file would contain against the committed file.
+         Exit 0 with "OK" message if up to date, exit 1 if stale.
 """
 
 import os
