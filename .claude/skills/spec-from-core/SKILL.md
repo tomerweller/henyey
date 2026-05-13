@@ -173,20 +173,32 @@ EXTRACTION PRINCIPLES (used in both strategies)
    is protocol 24+.
 
 ═══════════════════════════════════════════════════════════════════
-DOCUMENT STRUCTURE (regenerate strategy — follow exactly)
+DOCUMENT STRUCTURE
 ═══════════════════════════════════════════════════════════════════
 
-Every spec file MUST follow this structure:
+Every spec file MUST follow this structure.
+
+**TITLE** (subsystem specs): use the form
+`# Stellar <Subsystem> [<Modifier>] Specification`. Examples:
+"Stellar Consensus Protocol (SCP) Specification", "Stellar Ledger
+Close Pipeline Specification", "Stellar Catchup, Replay, and History
+Publishing Specification". The `<Modifier>` MAY name the scope when
+the subsystem has multiple aspects.
 
 **HEADER:**
 
 ```
 # <Full Descriptive Title>
 
-**Version:** <N> (stellar-core v<N.x> / Protocol <N>)
+**Version:** <N> (<qualifier>)
 **Status:** Informational
-**Date:** <today>
+**Date:** YYYY-MM-DD
 ```
+
+The `<qualifier>` is `stellar-core v<N.x> / Protocol <N>` for specs
+coupled to ledger versioning. Specs with their own version axis MAY
+use a domain-specific qualifier (e.g., OVERLAY uses
+`Overlay Protocol v38–v39`).
 
 **TABLE OF CONTENTS**: manually numbered, with Markdown anchor
 links. Use plain integers (1, 2, 3...), not hierarchical numbering
@@ -196,28 +208,40 @@ links. Use plain integers (1, 2, 3...), not hierarchical numbering
 
 ```
 ## 1. Introduction
-  ### 1.1 Purpose and Scope
+  ### 1.1 Purpose and Scope (REQUIRED)
     - State what the spec covers and what is out of scope
-    - Include: "This specification is **implementation agnostic**.
-      It is derived exclusively from the vetted stellar-core C++
-      implementation (v<N.x>)."
+    - MUST include the boilerplate sentence (substituting the
+      subsystem's observable outputs as appropriate):
+      "This specification is **implementation agnostic**. It is
+      derived exclusively from the vetted stellar-core C++
+      implementation (v<N.x>). Any conforming implementation that
+      produces identical <observable outputs for this subsystem>
+      for all valid inputs is considered correct."
     - Explicit out-of-scope list
-  ### 1.2 Conventions and Terminology
+  ### 1.2 Conventions and Terminology (REQUIRED)
     - RFC 2119 boilerplate
     - Glossary table: Term | Definition
-  ### 1.3 Notation
+    - MAY include the Relationship to Other Specifications table
+      here (see §1.x below)
+  ### 1.3 Notation (RECOMMENDED)
     - Explain pseudocode conventions, version annotations, XDR
-      references
-  ### 1.4 Document Organization
-    - Brief guide to section structure
-    - Relationship to Other Specifications table:
-      | Specification | Relationship |
+      references — include only if the spec uses notation beyond
+      what the global Pseudocode Notation section already covers
+  ### 1.x Relationship to Other Specifications (RECOMMENDED)
+    - Table: | Specification | Relationship |
+    - May live under §1.2 or as a separate §1.3 / §1.4; numbering
+      is flexible
 
 ## 2. Architecture/Protocol Overview
   - High-level design, component relationships, design goals
   - Include a Mermaid diagram showing component architecture
 
-## 3. Data Types and Encoding
+## 3. Data Types (RECOMMENDED — title flexible)
+  - Title MAY be "Data Types", "Data Types and Encoding", or
+    "Data Encoding"
+  - OPTIONAL where the subsystem has no distinct XDR types of its
+    own (e.g., HERDER, whose types are inherited from TX/LEDGER —
+    in that case document type usage inline with the algorithms)
   - XDR type references (by name, not full definitions)
   - Field-level tables: Field | Type | Description
   - Sort order, encoding conventions
@@ -230,21 +254,45 @@ links. Use plain integers (1, 2, 3...), not hierarchical numbering
   - Error handling: result codes mapped to SCREAMING_SNAKE_CASE
     XDR enums
   - Lifecycle sequences: step-by-step multi-phase processes
+  - Network-facing specs MAY include a "Security Considerations"
+    section in lieu of (or in addition to) Invariants
 
-## N-3. Invariants and Safety Properties
-  - Named invariants with IDs: INV-X1, INV-X2, etc.
+## N-3. Invariants and Safety Properties (RECOMMENDED)
+  - OPTIONAL where the subsystem has no consensus-deterministic
+    invariants of its own (e.g., HERDER's invariants live in
+    SCP+LEDGER+TX; OVERLAY's safety is covered under "Security
+    Considerations")
+  - Each invariant SHOULD have a stable identifier of the form
+    `INV-<X><N>` where `<X>` is the 1-2 letter spec sigil
+    (`S` SCP, `O` OVERLAY, `H` HERDER, `L` LEDGER, `T` TX,
+    `B` BUCKETLISTDB, `C` CATCHUP). Example: `INV-L8`. Stable IDs
+    let code reference invariants directly
+    (`// Invariant: INV-L8`).
   - Formal statements using MUST/SHALL keywords
   - Each invariant: what it guarantees, why it matters, what breaks
     if violated
 
-## N-2. Constants
-  - Split into "Protocol Constants" (MUST NOT change) and
-    "Recommended Parameters" (RECOMMENDED defaults)
-  - Table format: Constant | Value | Description
+## N-2. Constants (RECOMMENDED)
+  - SHOULD split into "Protocol Constants" (MUST NOT change) and
+    "Recommended Parameters" (RECOMMENDED defaults) where both
+    coexist
+  - MAY use a single flat table where only consensus-fixed values
+    are present
+  - Large constant sets MAY use categorized subsections (e.g.,
+    OVERLAY's Wire / Timing / Capacity / Flooding split)
+  - Table format: Constant | Value | Description | Section
+    - The `Section` column SHOULD link back to the body section
+      that defines the constant's role (e.g.,
+      `[8.3](#83-initial-capacity-grant)`), making Constants act
+      as an index back into the body
 
-## N-1. References
-  - Normative and Informative references
-  - Footnote-style Markdown link definitions at file bottom
+## N-1. References (REQUIRED — numbered top-level section)
+  - Numbered top-level `## N. References` placed AFTER Constants
+    and BEFORE Appendices
+  - Table form: `Reference | Description`
+  - Footnote-style link definitions (`[name]: <url>`) MAY be used
+    inline in the body; place all such definitions at the very end
+    of the file, AFTER the Appendices
 
 ## N. Appendices
   - Named alphabetically: Appendix A, Appendix B, ...
@@ -258,9 +306,10 @@ links. Use plain integers (1, 2, 3...), not hierarchical numbering
 **SEPARATORS**: a `---` horizontal rule between every top-level `##`
 section.
 
-**SUBSECTION NUMBERING**: `### 3.1 Title`, `### 3.2 Title`. No
-deeper than 3 levels in section numbers. Use bold inline headings or
-numbered lists for deeper nesting.
+**SUBSECTION NUMBERING**: `### 3.1 Title`, `### 3.2 Title`. Up to
+4 levels (`#### X.Y.Z`) MAY be used when natural subdivision exists
+(e.g., handshake substeps, per-step descriptions). 5+ levels SHOULD
+be avoided; use bold inline headings or numbered lists instead.
 
 ═══════════════════════════════════════════════════════════════════
 WRITING STYLE
@@ -303,12 +352,35 @@ Placement:
 CROSS-REFERENCING
 ═══════════════════════════════════════════════════════════════════
 
-- Reference other specs: `SPEC_NAME §N.N` (e.g., `HERDER_SPEC §12`,
-  `TX_SPEC §3`).
-- Each spec's Introduction MUST include a "Relationship to Other
-  Specifications" table showing how it connects to companion specs.
+- Reference other specs: plain-text `SPEC_NAME §N.N` notation
+  (e.g., `HERDER_SPEC §12`, `TX_SPEC §3`). Do not wrap in a markdown
+  link — section numbering is the stable anchor.
+- Each spec SHOULD include a "Relationship to Other Specifications"
+  table in §1 listing companion specs and the integration points.
+  Columns: `Specification | Relationship`.
 - External references use footnote-style Markdown link definitions
-  at file bottom.
+  (`[name]: <url>`) placed at the very end of the file, AFTER the
+  Appendices.
+
+═══════════════════════════════════════════════════════════════════
+PSEUDOCODE NOTATION
+═══════════════════════════════════════════════════════════════════
+
+For algorithms embedded in spec sections:
+
+- **Variables**: `camelCase` (e.g., `closeTime`, `txSetHash`).
+- **Functions**: `functionName()` (e.g., `getNodeWeight()`).
+- **XDR result codes**: `SCREAMING_SNAKE_CASE` (e.g.,
+  `MANAGE_SELL_OFFER_MALFORMED`).
+- **Protocol-version guards**: `@version(≥N)`, `@version(<N)`,
+  `@version(=N)` annotations on the conditional logic.
+- **Control flow**: standard `if`, `else`, `for each`, `while`,
+  `return`, indentation. Language-agnostic.
+
+Use prose with embedded pseudocode (the established style across
+the suite). Do not invent a custom DSL — there is no GUARD / MUTATE
+/ ASSERT / CONST keyword set. Where ordering of checks matters,
+either number them or describe the order explicitly in prose.
 
 ═══════════════════════════════════════════════════════════════════
 SPECIFIC CONTENT TO EXTRACT PER SPEC
