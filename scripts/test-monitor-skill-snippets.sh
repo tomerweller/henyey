@@ -4933,7 +4933,8 @@ print(d.get('provenance',{}).get('catalog_checksum',''))
     tap_not_ok "provenance: changed checksum triggers auto-invalidation" "output: $prov_t3_out, new_checksum: $prov_new_checksum"
   fi
 
-  # Test: Legacy baseline (no provenance) — recreated with provenance from current data
+  # Test: Legacy baseline (no provenance) — non-destructive migration, stamps provenance.
+  # Alarm data is preserved because first_ts is not ISO-formatted (Step D skips).
   local prov_t4="$prov_root/t4"
   mkdir -p "$prov_t4/metrics"
   echo "$prov_current" > "$prov_t4/metrics/current.json"
@@ -4949,9 +4950,9 @@ import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
 p = d.get('provenance', {})
-# Verify provenance exists with correct checksum
-has_prov = isinstance(p, dict) and 'catalog_checksum' in p
-# Verify alarm data is preserved from original (firing=20), not recreated from current (firing=0)
+# Verify provenance exists with correct checksum and alarm_versions
+has_prov = isinstance(p, dict) and 'catalog_checksum' in p and isinstance(p.get('alarm_versions'), dict)
+# Alarm data preserved when first_ts is not ISO-formatted (Step D skips)
 alarms = d.get('alarms', {})
 ls = alarms.get('lost-sync', {})
 preserved = ls.get('firing') == 20
@@ -4963,7 +4964,7 @@ print('yes' if has_prov and preserved else 'no')
     tap_not_ok "provenance: legacy baseline migrated with provenance (alarm data preserved)" "output: $prov_t4_out, result: $prov_legacy_recreated"
   fi
 
-  # Test: Malformed provenance — treated as legacy
+  # Test: Malformed provenance — treated as legacy, data preserved (non-ISO first_ts)
   local prov_t5="$prov_root/t5"
   mkdir -p "$prov_t5/metrics"
   echo "$prov_current" > "$prov_t5/metrics/current.json"
@@ -4979,9 +4980,9 @@ import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
 p = d.get('provenance', {})
-# Verify provenance is a proper dict with checksum
-has_prov = isinstance(p, dict) and 'catalog_checksum' in p
-# Verify alarm data preserved (firing=20 from original, not 0 from current)
+# Verify provenance is a proper dict with checksum and alarm_versions
+has_prov = isinstance(p, dict) and 'catalog_checksum' in p and isinstance(p.get('alarm_versions'), dict)
+# Alarm data preserved when first_ts is not ISO-formatted (Step D skips)
 alarms = d.get('alarms', {})
 ls = alarms.get('lost-sync', {})
 preserved = ls.get('firing') == 20
@@ -5139,6 +5140,118 @@ print(len(d.get('alarms', {})))
     tap_ok "provenance: comment-only catalog edit preserves data (per-alarm versioning)"
   else
     tap_not_ok "provenance: comment-only catalog edit preserves data (per-alarm versioning)" "output: $prov_t10_out, alarms_before=$prov_hash_before_t10, alarms_after=$prov_alarms_after_t10"
+  fi
+
+  # Test: Already-migrated stale baseline — Step D temporal check fires (#2647)
+  # A baseline that went through the buggy legacy migration has current alarm_versions
+  # and catalog_checksum, but stale alarm data from before semantic_change_date.
+  local prov_t11="$prov_root/t11"
+  mkdir -p "$prov_t11/metrics"
+  echo "$prov_current" > "$prov_t11/metrics/current.json"
+  local prov_real_checksum_t11
+  prov_real_checksum_t11=$(sha256sum "$prov_catalog" | cut -d' ' -f1)
+  local prov_real_versions_t11
+  prov_real_versions_t11=$(python3 -c "
+import json, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], 'rb') as f:
+    cat = tomllib.load(f)
+versions = {}
+for a in cat.get('alarm', []):
+    versions[a['name']] = a.get('baseline_version', 1)
+print(json.dumps(versions))
+" "$prov_catalog")
+  local prov_stale_migrated
+  prov_stale_migrated=$(python3 -c "
+import json, sys
+checksum = sys.argv[1]
+versions = json.loads(sys.argv[2])
+data = {
+    'schema_version': 1,
+    'evaluated_ticks': 200,
+    'skipped_ticks': 10,
+    'error_ticks': 0,
+    'total_snapshots': 210,
+    'first_ts': '2026-01-01T00:00:00Z',
+    'last_ts': '2026-01-02T00:00:00Z',
+    'alarms': {
+        'lost-sync': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10}
+    },
+    'provenance': {
+        'created_at': '2026-01-01T00:00:00Z',
+        'created_commit': 'stale-commit',
+        'catalog_checksum': checksum,
+        'alarm_versions': versions,
+    }
+}
+print(json.dumps(data))
+" "$prov_real_checksum_t11" "$prov_real_versions_t11")
+  echo "$prov_stale_migrated" > "$prov_t11/metrics/replay-baseline.json"
+  echo "$prov_stale_migrated" > "$prov_t11/metrics/replay-baseline-stable.json"
+  local prov_t11_out
+  prov_t11_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$prov_t11" --current "$prov_t11/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
+  local prov_t11_invalidated
+  prov_t11_invalidated=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+alarms = d.get('alarms', {})
+print('yes' if 'lost-sync' not in alarms else 'no')
+" "$prov_t11/metrics/replay-baseline-stable.json" 2>/dev/null) || prov_t11_invalidated="no"
+  if [[ "$prov_t11_invalidated" == "yes" ]]; then
+    tap_ok "provenance: already-migrated stale baseline — Step D temporal invalidation fires (#2647)"
+  else
+    tap_not_ok "provenance: already-migrated stale baseline — Step D temporal invalidation fires (#2647)" \
+      "output: $prov_t11_out, invalidated: $prov_t11_invalidated"
+  fi
+
+  # Test: No-op passthrough — checksum matches, first_ts after semantic_change_date
+  local prov_t12="$prov_root/t12"
+  mkdir -p "$prov_t12/metrics"
+  echo "$prov_current" > "$prov_t12/metrics/current.json"
+  local prov_noop_baseline
+  prov_noop_baseline=$(python3 -c "
+import json, sys
+checksum = sys.argv[1]
+versions = json.loads(sys.argv[2])
+data = {
+    'schema_version': 1,
+    'evaluated_ticks': 200,
+    'skipped_ticks': 10,
+    'error_ticks': 0,
+    'total_snapshots': 210,
+    'first_ts': '2099-01-01T00:00:00Z',
+    'last_ts': '2099-01-02T00:00:00Z',
+    'alarms': {
+        'lost-sync': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10}
+    },
+    'provenance': {
+        'created_at': '2099-01-01T00:00:00Z',
+        'created_commit': 'recent-commit',
+        'catalog_checksum': checksum,
+        'alarm_versions': versions,
+    }
+}
+print(json.dumps(data))
+" "$prov_real_checksum_t11" "$prov_real_versions_t11")
+  echo "$prov_noop_baseline" > "$prov_t12/metrics/replay-baseline.json"
+  echo "$prov_noop_baseline" > "$prov_t12/metrics/replay-baseline-stable.json"
+  local prov_hash_before_t12
+  prov_hash_before_t12=$(sha256sum "$prov_t12/metrics/replay-baseline-stable.json" | cut -d' ' -f1)
+  local prov_t12_out
+  prov_t12_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$prov_t12" --current "$prov_t12/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
+  local prov_hash_after_t12
+  prov_hash_after_t12=$(sha256sum "$prov_t12/metrics/replay-baseline-stable.json" | cut -d' ' -f1)
+  if [[ "$prov_hash_before_t12" == "$prov_hash_after_t12" ]]; then
+    tap_ok "provenance: no-op passthrough — file unchanged when nothing to invalidate (#2647)"
+  else
+    tap_not_ok "provenance: no-op passthrough — file unchanged when nothing to invalidate (#2647)" \
+      "hash_before=$prov_hash_before_t12, hash_after=$prov_hash_after_t12"
   fi
 
   rm -rf "$prov_root"
@@ -5722,7 +5835,7 @@ print('alarm-versioned' in alarms and 'alarm-default' in alarms)
       "has_both=$ver_cos_has_both output=${ver_cosmetic_out:0:200}"
   fi
 
-  # Test: legacy baseline (no alarm_versions) — non-destructive migration
+  # Test: legacy baseline (no alarm_versions) — alarm data invalidated (fail-closed, #2647)
   local ver_legacy_session="$ver_root/legacy"
   mkdir -p "$ver_legacy_session/metrics"
   local ver_legacy_baseline
@@ -5757,29 +5870,30 @@ print(json.dumps(data))
     "$ver_legacy_session" --current "$ver_legacy_session/metrics/ver-legacy-current.json" \
     --catalog "$ver_catalog" 2>&1) || true
 
-  # Legacy migration should preserve alarm data and stamp alarm_versions
-  local ver_legacy_has_versions ver_legacy_has_alarms
+  # Non-destructive: legacy migration preserves alarm data and stamps provenance.
+  # first_ts is not ISO-formatted → Step D skips → alarms preserved.
+  local ver_legacy_has_versions ver_legacy_alarms_preserved
   ver_legacy_has_versions=$(python3 -c "
 import json
-with open('$ver_legacy_session/metrics/replay-baseline.json') as f:
+with open('$ver_legacy_session/metrics/replay-baseline-stable.json') as f:
     d = json.load(f)
 p = d.get('provenance', {})
 av = p.get('alarm_versions')
 print(isinstance(av, dict) and len(av) > 0)
 " 2>/dev/null) || ver_legacy_has_versions="ERROR"
-  ver_legacy_has_alarms=$(python3 -c "
+  ver_legacy_alarms_preserved=$(python3 -c "
 import json
-with open('$ver_legacy_session/metrics/replay-baseline.json') as f:
+with open('$ver_legacy_session/metrics/replay-baseline-stable.json') as f:
     d = json.load(f)
 alarms = d.get('alarms', {})
-print(len(alarms) >= 2)
-" 2>/dev/null) || ver_legacy_has_alarms="ERROR"
+print(len(alarms) == 2)
+" 2>/dev/null) || ver_legacy_alarms_preserved="ERROR"
 
-  if [[ "$ver_legacy_has_versions" == "True" ]] && [[ "$ver_legacy_has_alarms" == "True" ]]; then
-    tap_ok "per-alarm-version: legacy migration preserves data and stamps versions"
+  if [[ "$ver_legacy_has_versions" == "True" ]] && [[ "$ver_legacy_alarms_preserved" == "True" ]]; then
+    tap_ok "per-alarm-version: legacy migration stamps versions and preserves alarms"
   else
-    tap_not_ok "per-alarm-version: legacy migration preserves data and stamps versions" \
-      "has_versions=$ver_legacy_has_versions has_alarms=$ver_legacy_has_alarms"
+    tap_not_ok "per-alarm-version: legacy migration stamps versions and preserves alarms" \
+      "has_versions=$ver_legacy_has_versions alarms_preserved=$ver_legacy_alarms_preserved"
   fi
 
   # Test: alarm removal — only removed alarm's entry deleted

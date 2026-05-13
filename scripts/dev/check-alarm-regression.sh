@@ -338,7 +338,9 @@ current_versions = json.loads(sys.argv[2])
 stored_checksum = data.get('catalog_checksum', '')
 stored_versions = data.get('alarm_versions')
 
-# Legacy: no alarm_versions present — non-destructive migration
+# Legacy: no alarm_versions present — fail closed (fixes #2647).
+# Treat all stored versions as unknown so version-bump and temporal
+# invalidation checks can run.
 if not isinstance(stored_versions, dict):
     if stored_checksum and stored_checksum != current_checksum:
         # Catalog changed with no version info — must wipe (legacy behavior)
@@ -346,36 +348,38 @@ if not isinstance(stored_versions, dict):
         if n > 0:
             print('Acknowledgment file invalidated: alarm catalog changed (legacy, was %s..., now %s...)' % (stored_checksum[:12], current_checksum[:12]), file=sys.stderr)
         data['alarms'] = {}
-    data['catalog_checksum'] = current_checksum
-    data['alarm_versions'] = current_versions
-    print(json.dumps(data))
-    sys.exit(0)
+        data['catalog_checksum'] = current_checksum
+        data['alarm_versions'] = current_versions
+        print(json.dumps(data))
+        sys.exit(0)
+    stored_versions = {}
+    # Fall through to version-bump + temporal checks
 
-# Fast path: checksum match means no change
-if stored_checksum == current_checksum:
-    print(json.dumps(data))
-    sys.exit(0)
+checksum_changed = (stored_checksum != current_checksum)
 
-# Per-alarm invalidation
+# Per-alarm invalidation (runs when checksum changed or legacy migration)
 alarms = data.get('alarms', {})
 current_names = set(current_versions.keys())
-stored_names = set(stored_versions.keys())
 invalidated = []
 
-# Remove acks for alarms removed from catalog
-for name in list(alarms.keys()):
-    if name not in current_names:
-        del alarms[name]
-        invalidated.append(name)
+if checksum_changed:
+    stored_names = set(stored_versions.keys())
 
-# Remove acks for alarms with version bumps
-for name in list(alarms.keys()):
-    if name in current_versions:
-        stored_v = stored_versions.get(name)
-        if stored_v is None or stored_v != current_versions[name]:
+    # Remove acks for alarms removed from catalog
+    for name in list(alarms.keys()):
+        if name not in current_names:
             del alarms[name]
             invalidated.append(name)
 
+    # Remove acks for alarms with version bumps
+    for name in list(alarms.keys()):
+        if name in current_versions:
+            stored_v = stored_versions.get(name)
+            if stored_v is None or stored_v != current_versions[name]:
+                del alarms[name]
+                invalidated.append(name)
+
+# Temporal check — always runs regardless of checksum match (fixes #2647).
 # Remove acks predating an alarm's semantic change (fail-closed: missing
 # or malformed acknowledged_at is treated as stale)
 import re
@@ -395,9 +399,12 @@ for name in list(alarms.keys()):
 if invalidated:
     print('Acknowledgments: per-alarm invalidation — removed %d ack(s): %s' % (len(invalidated), ', '.join(sorted(invalidated))), file=sys.stderr)
 
-data['alarms'] = alarms
-data['catalog_checksum'] = current_checksum
-data['alarm_versions'] = current_versions
+# Only update data if something changed
+if invalidated or checksum_changed:
+    data['alarms'] = alarms
+    data['catalog_checksum'] = current_checksum
+    data['alarm_versions'] = current_versions
+
 print(json.dumps(data))
 " "$CATALOG_CHECKSUM" "$ALARM_VERSIONS_JSON" "$ALARM_SEMANTIC_DATES_JSON"
 }
@@ -690,48 +697,43 @@ if not isinstance(provenance, dict):
 
 stored_versions = provenance.get('alarm_versions')
 
-# Step 0: Legacy check — alarm_versions missing or not a valid dict
-if not isinstance(stored_versions, dict):
-    # Non-destructive migration: preserve alarm data, stamp current provenance
+# Step 0: Legacy check — alarm_versions missing or not a valid dict.
+# Non-destructive migration: preserve alarm data, stamp current provenance,
+# but fall through to Step D (temporal check) instead of exiting.
+# Previously this exited immediately, bypassing temporal invalidation.
+# (Fixes #2647)
+is_legacy = not isinstance(stored_versions, dict)
+if is_legacy:
     print(f'Migrating {label} baseline: stamping per-alarm version provenance', file=sys.stderr)
-    data['provenance'] = {
-        'created_at': timestamp,
-        'created_commit': commit,
-        'catalog_checksum': current_checksum,
-        'alarm_versions': current_versions,
-    }
-    with open(sys.argv[7], 'w') as f:
-        json.dump(data, f)
-    sys.exit(0)
 
-stored_checksum = provenance.get('catalog_checksum', '')
+stored_checksum = provenance.get('catalog_checksum', '') if not is_legacy else current_checksum
+checksum_changed = (stored_checksum != current_checksum)
 
-# Step A: Fast path — checksum match means no catalog change at all
-if stored_checksum == current_checksum:
-    sys.exit(0)
-
-# Catalog changed — do per-alarm invalidation
-stored_names = set(stored_versions.keys())
 alarms = data.get('alarms', {})
 invalidated = []
 
-# Step B: Structural check — removed alarms
-removed = stored_names - current_names
-for name in removed:
-    if name in alarms:
-        del alarms[name]
-        invalidated.append(name)
+if checksum_changed:
+    stored_names = set((stored_versions or {}).keys())
 
-# Step C: Version check — version bumps
-for name, current_v in current_versions.items():
-    stored_v = stored_versions.get(name)
-    if stored_v is None or stored_v != current_v:
+    # Step B: Structural check — removed alarms
+    removed = stored_names - current_names
+    for name in removed:
         if name in alarms:
             del alarms[name]
             invalidated.append(name)
 
-# Step D: Temporal provenance — detect contaminated baselines whose replay
-# window predates an alarm's semantic change date.
+    # Step C: Version check — version bumps
+    for name, current_v in current_versions.items():
+        stored_v = (stored_versions or {}).get(name)
+        if stored_v is None or stored_v != current_v:
+            if name in alarms:
+                del alarms[name]
+                invalidated.append(name)
+
+# Step D: Temporal provenance — always runs regardless of checksum match.
+# Catches contaminated baselines whose replay window predates an alarm's
+# semantic_change_date (e.g. after a legacy migration stamped the current
+# checksum but preserved stale alarm data).  (Fixes #2647)
 import re
 ISO_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
 baseline_first_ts = data.get('first_ts', '')
@@ -745,6 +747,10 @@ if baseline_first_ts and ISO_RE.match(baseline_first_ts):
             del alarms[name]
             invalidated.append(name)
 
+# Only write when something actually changed — avoid disk churn on no-op.
+if not invalidated and not checksum_changed and not is_legacy:
+    sys.exit(0)
+
 data['alarms'] = alarms
 data['provenance'] = {
     'created_at': timestamp,
@@ -756,7 +762,7 @@ data['provenance'] = {
 if invalidated:
     inv_list = ', '.join(sorted(invalidated))
     print(f'{label} baseline: per-alarm invalidation — removed {len(invalidated)} alarm(s): {inv_list}', file=sys.stderr)
-else:
+elif checksum_changed:
     print(f'{label} baseline: catalog changed but no alarm versions differ — all data preserved', file=sys.stderr)
 
 with open(sys.argv[7], 'w') as f:
