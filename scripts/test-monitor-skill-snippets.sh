@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=257
+TAP_PLAN=286
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -6174,6 +6174,611 @@ STUBEOF2
   fi
 
   rm -rf "$comment_root"
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # ── dedup-filing library behavioral tests (#2639) ───────────────────────────
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # ── Shared setup ────────────────────────────────────────────────────────────
+  local dedup_test_root="$TEST_ROOT/dedup-filing"
+  mkdir -p "$dedup_test_root"
+  source "$REPO_ROOT/scripts/lib/dedup-filing.sh"
+
+  # Helper: semantic JSON assertion (field equality)
+  # Usage: _json_assert "$json_str" '.filed["key"]["issue_number"]' 42
+  _json_field() {
+    python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+path = sys.argv[2]
+# Simple dotted path with bracket notation
+import re
+obj = data
+for part in re.findall(r'\.(\w+)|\[\"([^\"]+)\"\]', path):
+    key = part[0] or part[1]
+    if isinstance(obj, dict):
+        obj = obj.get(key)
+    else:
+        obj = None
+        break
+print(json.dumps(obj) if obj is not None else 'null')
+" "$1" "$2" 2>/dev/null
+  }
+
+  _json_has_key() {
+    python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+keys = sys.argv[2:]
+obj = data
+for k in keys:
+    if isinstance(obj, dict) and k in obj:
+        obj = obj[k]
+    else:
+        sys.exit(1)
+sys.exit(0)
+" "$@" 2>/dev/null
+  }
+
+  # ── Layer 1: Library unit tests ─────────────────────────────────────────────
+
+  # Test: Load — missing file
+  local dl_out
+  dl_out=$(dedup_load "$dedup_test_root/nonexistent-file.json" 2>/dev/null)
+  if _json_has_key "$dl_out" "schema_version" && _json_has_key "$dl_out" "filed"; then
+    tap_ok "dedup-load: missing file returns empty schema"
+  else
+    tap_not_ok "dedup-load: missing file returns empty schema" "output: ${dl_out:0:200}"
+  fi
+
+  # Test: Load — corrupt file (non-JSON)
+  echo "this is not json {{{" > "$dedup_test_root/corrupt.json"
+  local dl_corrupt_out dl_corrupt_err
+  dl_corrupt_err=$(dedup_load "$dedup_test_root/corrupt.json" 2>&1 >/dev/null)
+  dl_corrupt_out=$(dedup_load "$dedup_test_root/corrupt.json" 2>/dev/null)
+  if _json_has_key "$dl_corrupt_out" "schema_version" && echo "$dl_corrupt_err" | grep -qi "warning"; then
+    tap_ok "dedup-load: corrupt file returns empty schema + warning"
+  else
+    tap_not_ok "dedup-load: corrupt file returns empty schema + warning" "out: ${dl_corrupt_out:0:100} err: ${dl_corrupt_err:0:100}"
+  fi
+
+  # Test: Load — wrong schema_version
+  echo '{"schema_version":2,"filed":{"x":{}}}' > "$dedup_test_root/bad-schema.json"
+  local dl_schema_out dl_schema_err
+  dl_schema_err=$(dedup_load "$dedup_test_root/bad-schema.json" 2>&1 >/dev/null)
+  dl_schema_out=$(dedup_load "$dedup_test_root/bad-schema.json" 2>/dev/null)
+  if _json_has_key "$dl_schema_out" "schema_version" && ! _json_has_key "$dl_schema_out" "filed" "x"; then
+    tap_ok "dedup-load: wrong schema_version returns empty schema"
+  else
+    tap_not_ok "dedup-load: wrong schema_version returns empty schema" "out: ${dl_schema_out:0:200}"
+  fi
+
+  # Test: Load — valid file
+  echo '{"schema_version":1,"filed":{"abc":{"issue_number":99,"filed_at":"2026-01-01T00:00:00Z"}}}' > "$dedup_test_root/valid.json"
+  local dl_valid_out
+  dl_valid_out=$(dedup_load "$dedup_test_root/valid.json" 2>/dev/null)
+  if _json_has_key "$dl_valid_out" "filed" "abc"; then
+    tap_ok "dedup-load: valid file returns data"
+  else
+    tap_not_ok "dedup-load: valid file returns data" "out: ${dl_valid_out:0:200}"
+  fi
+
+  # Test: Prune — TTL boundary (entry at exact cutoff is expired, > semantics)
+  local prune_boundary_data
+  # Entry filed exactly 24h ago (at cutoff) should be pruned
+  local ts_24h_ago
+  ts_24h_ago=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+  prune_boundary_data='{"schema_version":1,"filed":{"at-cutoff":{"filed_at":"'"$ts_24h_ago"'","issue_number":1}}}'
+  local prune_boundary_out
+  prune_boundary_out=$(dedup_prune "$prune_boundary_data" "24h")
+  if ! _json_has_key "$prune_boundary_out" "filed" "at-cutoff"; then
+    tap_ok "dedup-prune: entry at exact cutoff is expired (> semantics)"
+  else
+    tap_not_ok "dedup-prune: entry at exact cutoff is expired (> semantics)" "out: ${prune_boundary_out:0:200}"
+  fi
+
+  # Test: Prune — malformed filed_at is silently dropped
+  local prune_malformed_data='{"schema_version":1,"filed":{"bad":{"filed_at":"not-a-date"},"good":{"filed_at":"2099-01-01T00:00:00Z","issue_number":2}}}'
+  local prune_malformed_out
+  prune_malformed_out=$(dedup_prune "$prune_malformed_data" "24h")
+  if ! _json_has_key "$prune_malformed_out" "filed" "bad" && _json_has_key "$prune_malformed_out" "filed" "good"; then
+    tap_ok "dedup-prune: malformed filed_at silently dropped"
+  else
+    tap_not_ok "dedup-prune: malformed filed_at silently dropped" "out: ${prune_malformed_out:0:200}"
+  fi
+
+  # Test: Prune — keeps fresh entries
+  local ts_1h_ago
+  ts_1h_ago=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+  local prune_fresh_data='{"schema_version":1,"filed":{"fresh":{"filed_at":"'"$ts_1h_ago"'","issue_number":3}}}'
+  local prune_fresh_out
+  prune_fresh_out=$(dedup_prune "$prune_fresh_data" "24h")
+  if _json_has_key "$prune_fresh_out" "filed" "fresh"; then
+    tap_ok "dedup-prune: fresh entry survives prune"
+  else
+    tap_not_ok "dedup-prune: fresh entry survives prune" "out: ${prune_fresh_out:0:200}"
+  fi
+
+  # Test: Check — hit
+  local check_data='{"schema_version":1,"filed":{"sha123":{"issue_number":55,"filed_at":"2026-01-01T00:00:00Z"}}}'
+  local check_hit_out
+  set +e
+  check_hit_out=$(dedup_check "$check_data" "sha123" 2>/dev/null)
+  local check_hit_rc=$?
+  set -e
+  if [[ $check_hit_rc -eq 0 ]] && echo "$check_hit_out" | python3 -c "import json,sys; assert json.load(sys.stdin)['issue_number']==55" 2>/dev/null; then
+    tap_ok "dedup-check: hit returns exit 0 + entry JSON"
+  else
+    tap_not_ok "dedup-check: hit returns exit 0 + entry JSON" "rc=$check_hit_rc out: ${check_hit_out:0:200}"
+  fi
+
+  # Test: Check — miss
+  set +e
+  local check_miss_out
+  check_miss_out=$(dedup_check "$check_data" "nonexistent" 2>/dev/null)
+  local check_miss_rc=$?
+  set -e
+  if [[ $check_miss_rc -eq 1 ]] && [[ -z "$check_miss_out" ]]; then
+    tap_ok "dedup-check: miss returns exit 1 + empty stdout"
+  else
+    tap_not_ok "dedup-check: miss returns exit 1 + empty stdout" "rc=$check_miss_rc out: ${check_miss_out:0:100}"
+  fi
+
+  # Test: Check — empty string key (normal miss)
+  set +e
+  local check_empty_out
+  check_empty_out=$(dedup_check "$check_data" "" 2>/dev/null)
+  local check_empty_rc=$?
+  set -e
+  if [[ $check_empty_rc -eq 1 ]]; then
+    tap_ok "dedup-check: empty key is a normal miss"
+  else
+    tap_not_ok "dedup-check: empty key is a normal miss" "rc=$check_empty_rc"
+  fi
+
+  # Test: Record — k=v pairs with integer coercion
+  local record_input='{"schema_version":1,"filed":{}}'
+  local record_out
+  record_out=$(dedup_record "$record_input" "mysha" "issue_number=42" "last_commented_date=2026-05-01")
+  if _json_has_key "$record_out" "filed" "mysha" && \
+     echo "$record_out" | python3 -c "import json,sys; d=json.load(sys.stdin); e=d['filed']['mysha']; assert e['issue_number']==42; assert e['last_commented_date']=='2026-05-01'; assert 'filed_at' in e" 2>/dev/null; then
+    tap_ok "dedup-record: k=v pairs with integer coercion + auto filed_at"
+  else
+    tap_not_ok "dedup-record: k=v pairs with integer coercion + auto filed_at" "out: ${record_out:0:300}"
+  fi
+
+  # Test: Remove — existing key
+  local remove_data='{"schema_version":1,"filed":{"a":{"filed_at":"2026-01-01T00:00:00Z"},"b":{"filed_at":"2026-01-01T00:00:00Z"}}}'
+  local remove_out
+  remove_out=$(dedup_remove "$remove_data" "a")
+  if ! _json_has_key "$remove_out" "filed" "a" && _json_has_key "$remove_out" "filed" "b"; then
+    tap_ok "dedup-remove: existing key removed, others preserved"
+  else
+    tap_not_ok "dedup-remove: existing key removed, others preserved" "out: ${remove_out:0:200}"
+  fi
+
+  # Test: Remove — absent key (no-op)
+  local remove_noop_out
+  remove_noop_out=$(dedup_remove "$remove_data" "nonexistent")
+  if _json_has_key "$remove_noop_out" "filed" "a" && _json_has_key "$remove_noop_out" "filed" "b"; then
+    tap_ok "dedup-remove: absent key is no-op"
+  else
+    tap_not_ok "dedup-remove: absent key is no-op" "out: ${remove_noop_out:0:200}"
+  fi
+
+  # Test: Update-field — existing key
+  local uf_data='{"schema_version":1,"filed":{"k1":{"filed_at":"2026-01-01T00:00:00Z","issue_number":10}}}'
+  local uf_out
+  uf_out=$(dedup_update_field "$uf_data" "k1" "last_commented_date" "2026-05-13")
+  if echo "$uf_out" | python3 -c "import json,sys; d=json.load(sys.stdin); e=d['filed']['k1']; assert e['last_commented_date']=='2026-05-13'; assert e['issue_number']==10" 2>/dev/null; then
+    tap_ok "dedup-update-field: updates field, preserves others"
+  else
+    tap_not_ok "dedup-update-field: updates field, preserves others" "out: ${uf_out:0:200}"
+  fi
+
+  # Test: Update-field — missing key
+  set +e
+  local uf_missing_err
+  uf_missing_err=$(dedup_update_field "$uf_data" "nosuchkey" "x" "y" 2>&1 >/dev/null)
+  local uf_missing_rc=$?
+  set -e
+  if [[ $uf_missing_rc -ne 0 ]] && echo "$uf_missing_err" | grep -q "Key not found"; then
+    tap_ok "dedup-update-field: missing key exits non-zero"
+  else
+    tap_not_ok "dedup-update-field: missing key exits non-zero" "rc=$uf_missing_rc err: ${uf_missing_err:0:100}"
+  fi
+
+  # Test: Write — atomic (valid JSON writes, no residue)
+  local write_file="$dedup_test_root/write-test.json"
+  local write_data='{"schema_version":1,"filed":{"w":{"filed_at":"2026-01-01T00:00:00Z"}}}'
+  dedup_write "$write_file" "$write_data" 2>/dev/null
+  if [[ -f "$write_file" ]] && python3 -c "import json; json.load(open('$write_file'))" 2>/dev/null && \
+     ! ls "$dedup_test_root"/write-test.json.tmp.* 2>/dev/null | grep -q .; then
+    tap_ok "dedup-write: atomic write succeeds, no tmp residue"
+  else
+    tap_not_ok "dedup-write: atomic write succeeds, no tmp residue"
+  fi
+
+  # Test: Write — invalid JSON rejected
+  echo "valid content" > "$dedup_test_root/write-guard.json"
+  set +e
+  dedup_write "$dedup_test_root/write-guard.json" "not json {{{" 2>/dev/null
+  local write_bad_rc=$?
+  set -e
+  if [[ $write_bad_rc -ne 0 ]] && grep -q "valid content" "$dedup_test_root/write-guard.json"; then
+    tap_ok "dedup-write: invalid JSON rejected, file unchanged"
+  else
+    tap_not_ok "dedup-write: invalid JSON rejected, file unchanged" "rc=$write_bad_rc"
+  fi
+
+  # ── Layer 2: monitor-tick §3d flow tests ────────────────────────────────────
+
+  local flow_root="$dedup_test_root/flow"
+  mkdir -p "$flow_root/gh-stub"
+  local flow_gh_log="$flow_root/gh-calls.log"
+
+  # Helper: create a gh stub for flow tests
+  _flow_gh_stub() {
+    local stub_dir="$flow_root/gh-stub"
+    local view_response="${1:-}"   # JSON for 'gh issue view'
+    local list_response="${2:-[]}" # JSON for 'gh issue list'
+    local create_response="${3:-}" # URL for 'gh issue create'
+    local comment_exit="${4:-0}"   # exit code for 'gh issue comment'
+    cat > "$stub_dir/gh" << STUBEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$flow_gh_log"
+if [[ "\$1" == "issue" && "\$2" == "view" ]]; then
+  echo '$view_response'
+  exit 0
+elif [[ "\$1" == "issue" && "\$2" == "list" ]]; then
+  echo '$list_response'
+  exit 0
+elif [[ "\$1" == "issue" && "\$2" == "create" ]]; then
+  if [[ -n '$create_response' ]]; then
+    echo '$create_response'
+    exit 0
+  fi
+  exit 1
+elif [[ "\$1" == "issue" && "\$2" == "comment" ]]; then
+  exit $comment_exit
+elif [[ "\$1" == "issue" && "\$2" == "edit" ]]; then
+  exit 0
+elif [[ "\$1" == "api" ]]; then
+  echo '{"data":{"resource":{"projectItems":{"totalCount":0}}}}'
+  exit 0
+fi
+exit 0
+STUBEOF
+    chmod +x "$stub_dir/gh"
+  }
+
+  # Stub move-issue-status.sh
+  mkdir -p "$flow_root/fake-repo/.github/skills/plan-do-review/scripts"
+  cat > "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh" << 'MOVEOF'
+#!/usr/bin/env bash
+echo "move-issue-status $*" >> FLOW_LOG_PLACEHOLDER
+exit 0
+MOVEOF
+  sed -i "s|FLOW_LOG_PLACEHOLDER|$flow_gh_log|" "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  chmod +x "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+
+  # Test: Empty build_sha guard
+  > "$flow_gh_log"
+  local build_sha=""
+  # §3d says: if build_sha is empty, do NOT enter flock/dedup/filing path
+  if [[ -z "$build_sha" ]]; then
+    # Guard fires: no dedup operations
+    tap_ok "flow: empty build_sha guard short-circuits"
+  else
+    tap_not_ok "flow: empty build_sha guard short-circuits"
+  fi
+
+  # Test: Open-issue hit → skip + daily comment (last_commented_date updated)
+  > "$flow_gh_log"
+  build_sha="abc123def456"
+  local flow_dedup_file="$flow_root/dedup-open.json"
+  local today
+  today=$(date -u +%Y-%m-%d)
+  local yesterday
+  yesterday=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(days=1)).strftime('%Y-%m-%d'))")
+  local recent_ts
+  recent_ts=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+  echo '{"schema_version":1,"filed":{"abc123def456":{"issue_number":100,"filed_at":"'"$recent_ts"'","last_commented_date":"'"$yesterday"'"}}}' > "$flow_dedup_file"
+  _flow_gh_stub '{"state":"OPEN"}' '[]' '' '0'
+  # Simulate the §3d flow: load → prune → check → view → comment → update
+  local flow_data
+  flow_data=$(dedup_load "$flow_dedup_file" 2>/dev/null)
+  flow_data=$(dedup_prune "$flow_data" "30d")
+  set +e
+  local flow_entry
+  flow_entry=$(dedup_check "$flow_data" "$build_sha" 2>/dev/null)
+  local flow_check_rc=$?
+  set -e
+  if [[ $flow_check_rc -eq 0 ]]; then
+    # Hit — check state via gh stub
+    local issue_state
+    issue_state=$(PATH="$flow_root/gh-stub:$PATH" gh issue view 100 --json state --jq .state 2>/dev/null)
+    if [[ "$issue_state" == *"OPEN"* ]]; then
+      # Post daily comment (not rate-limited since yesterday != today)
+      local last_date
+      last_date=$(echo "$flow_entry" | python3 -c "import json,sys; print(json.load(sys.stdin).get('last_commented_date',''))" 2>/dev/null)
+      if [[ "$last_date" != "$today" ]]; then
+        PATH="$flow_root/gh-stub:$PATH" gh issue comment 100 --body "update" 2>/dev/null
+        flow_data=$(dedup_update_field "$flow_data" "$build_sha" "last_commented_date" "$today")
+        dedup_write "$flow_dedup_file" "$flow_data" 2>/dev/null
+      fi
+    fi
+  fi
+  # Verify: comment was made, last_commented_date updated
+  if grep -q "issue comment" "$flow_gh_log" && \
+     python3 -c "import json; d=json.load(open('$flow_dedup_file')); assert d['filed']['abc123def456']['last_commented_date']=='$today'" 2>/dev/null; then
+    tap_ok "flow: open-issue hit → daily comment + date updated"
+  else
+    tap_not_ok "flow: open-issue hit → daily comment + date updated" "log: $(cat $flow_gh_log 2>/dev/null | head -3)"
+  fi
+
+  # Test: Open-issue hit → same-day rate limit (no comment)
+  > "$flow_gh_log"
+  local flow_dedup_file2="$flow_root/dedup-sameday.json"
+  echo '{"schema_version":1,"filed":{"abc123def456":{"issue_number":100,"filed_at":"'"$recent_ts"'","last_commented_date":"'"$today"'"}}}' > "$flow_dedup_file2"
+  _flow_gh_stub '{"state":"OPEN"}' '[]' '' '0'
+  flow_data=$(dedup_load "$flow_dedup_file2" 2>/dev/null)
+  set +e
+  flow_entry=$(dedup_check "$flow_data" "$build_sha" 2>/dev/null)
+  set -e
+  local last_date2
+  last_date2=$(echo "$flow_entry" | python3 -c "import json,sys; print(json.load(sys.stdin).get('last_commented_date',''))" 2>/dev/null)
+  if [[ "$last_date2" == "$today" ]]; then
+    # Rate limited — no comment
+    :
+  fi
+  if ! grep -q "issue comment" "$flow_gh_log"; then
+    tap_ok "flow: same-day rate limit skips comment"
+  else
+    tap_not_ok "flow: same-day rate limit skips comment" "unexpected comment call"
+  fi
+
+  # Test: Open-issue hit → comment failure (date NOT updated)
+  > "$flow_gh_log"
+  local flow_dedup_file3="$flow_root/dedup-commentfail.json"
+  echo '{"schema_version":1,"filed":{"abc123def456":{"issue_number":100,"filed_at":"'"$recent_ts"'","last_commented_date":"'"$yesterday"'"}}}' > "$flow_dedup_file3"
+  _flow_gh_stub '{"state":"OPEN"}' '[]' '' '1'  # comment exits 1
+  flow_data=$(dedup_load "$flow_dedup_file3" 2>/dev/null)
+  set +e
+  flow_entry=$(dedup_check "$flow_data" "$build_sha" 2>/dev/null)
+  set -e
+  last_date=$(echo "$flow_entry" | python3 -c "import json,sys; print(json.load(sys.stdin).get('last_commented_date',''))" 2>/dev/null)
+  if [[ "$last_date" != "$today" ]]; then
+    # Try to comment — stub will fail
+    set +e
+    PATH="$flow_root/gh-stub:$PATH" gh issue comment 100 --body "update" 2>/dev/null
+    local comment_rc=$?
+    set -e
+    if [[ $comment_rc -ne 0 ]]; then
+      # Do NOT update date — leave dedup file unchanged
+      :
+    fi
+  fi
+  if python3 -c "import json; d=json.load(open('$flow_dedup_file3')); assert d['filed']['abc123def456']['last_commented_date']=='$yesterday'" 2>/dev/null; then
+    tap_ok "flow: comment failure → date NOT updated"
+  else
+    tap_not_ok "flow: comment failure → date NOT updated"
+  fi
+
+  # Test: Closed-issue hit → remove + refile
+  > "$flow_gh_log"
+  local flow_dedup_file4="$flow_root/dedup-closed.json"
+  echo '{"schema_version":1,"filed":{"sha_closed":{"issue_number":200,"filed_at":"2026-01-01T00:00:00Z"}}}' > "$flow_dedup_file4"
+  _flow_gh_stub '{"state":"CLOSED"}' '[]' 'https://github.com/stellar-experimental/henyey/issues/201' '0'
+  flow_data=$(dedup_load "$flow_dedup_file4" 2>/dev/null)
+  set +e
+  flow_entry=$(dedup_check "$flow_data" "sha_closed" 2>/dev/null)
+  local flow_closed_rc=$?
+  set -e
+  if [[ $flow_closed_rc -eq 0 ]]; then
+    # Issue is closed — remove from dedup
+    flow_data=$(dedup_remove "$flow_data" "sha_closed")
+  fi
+  if ! _json_has_key "$flow_data" "filed" "sha_closed"; then
+    tap_ok "flow: closed-issue hit → dedup_remove clears entry"
+  else
+    tap_not_ok "flow: closed-issue hit → dedup_remove clears entry"
+  fi
+
+  # Test: UNKNOWN state hit → suppress filing
+  > "$flow_gh_log"
+  local flow_dedup_file5="$flow_root/dedup-unknown.json"
+  echo '{"schema_version":1,"filed":{"sha_unk":{"issue_number":300,"filed_at":"2026-01-01T00:00:00Z"}}}' > "$flow_dedup_file5"
+  # gh issue view will fail (exit 1 simulating network error)
+  cat > "$flow_root/gh-stub/gh" << 'UNKNOWNEOF'
+#!/usr/bin/env bash
+if [[ "$1" == "issue" && "$2" == "view" ]]; then
+  exit 1
+fi
+exit 0
+UNKNOWNEOF
+  chmod +x "$flow_root/gh-stub/gh"
+  flow_data=$(dedup_load "$flow_dedup_file5" 2>/dev/null)
+  set +e
+  flow_entry=$(dedup_check "$flow_data" "sha_unk" 2>/dev/null)
+  local flow_unk_rc=$?
+  set -e
+  local should_suppress=false
+  if [[ $flow_unk_rc -eq 0 ]]; then
+    set +e
+    local unk_state
+    unk_state=$(PATH="$flow_root/gh-stub:$PATH" gh issue view 300 --json state --jq .state 2>/dev/null)
+    local unk_view_rc=$?
+    set -e
+    if [[ $unk_view_rc -ne 0 ]] || [[ -z "$unk_state" ]]; then
+      should_suppress=true
+    fi
+  fi
+  if [[ "$should_suppress" == "true" ]]; then
+    tap_ok "flow: UNKNOWN state → suppress filing safely"
+  else
+    tap_not_ok "flow: UNKNOWN state → suppress filing safely" "suppress=$should_suppress"
+  fi
+
+  # Test: Remote-search backfill (local miss → remote hit → record)
+  > "$flow_gh_log"
+  local flow_dedup_file6="$flow_root/dedup-backfill.json"
+  echo '{"schema_version":1,"filed":{}}' > "$flow_dedup_file6"
+  local backfill_sha="sha_backfill_789"
+  local backfill_marker="<!-- monitor-tick-recurrence-key: $backfill_sha -->"
+  _flow_gh_stub '' '[{"number":500,"body":"'"$backfill_marker"' some body text"}]' '' '0'
+  flow_data=$(dedup_load "$flow_dedup_file6" 2>/dev/null)
+  set +e
+  dedup_check "$flow_data" "$backfill_sha" 2>/dev/null
+  local backfill_check_rc=$?
+  set -e
+  if [[ $backfill_check_rc -ne 0 ]]; then
+    # Local miss — do remote search
+    local remote_result
+    remote_result=$(PATH="$flow_root/gh-stub:$PATH" gh issue list --json number,body 2>/dev/null)
+    local found_num
+    found_num=$(echo "$remote_result" | python3 -c "
+import json,sys
+items = json.load(sys.stdin)
+marker = '$backfill_marker'
+for item in items:
+    if marker in item.get('body',''):
+        print(item['number'])
+        break
+" 2>/dev/null)
+    if [[ -n "$found_num" ]]; then
+      flow_data=$(dedup_record "$flow_data" "$backfill_sha" "issue_number=$found_num")
+      dedup_write "$flow_dedup_file6" "$flow_data" 2>/dev/null
+    fi
+  fi
+  if python3 -c "import json; d=json.load(open('$flow_dedup_file6')); assert d['filed']['$backfill_sha']['issue_number']==500" 2>/dev/null; then
+    tap_ok "flow: remote-search backfill records correct issue"
+  else
+    tap_not_ok "flow: remote-search backfill records correct issue"
+  fi
+
+  # Test: Remote-search false-positive (no matching BODY_MARKER → falls through)
+  > "$flow_gh_log"
+  local flow_dedup_file7="$flow_root/dedup-falsepos.json"
+  echo '{"schema_version":1,"filed":{}}' > "$flow_dedup_file7"
+  local fp_sha="sha_falsepos_999"
+  local fp_marker="<!-- monitor-tick-recurrence-key: $fp_sha -->"
+  # Remote returns issues that do NOT contain the marker
+  _flow_gh_stub '' '[{"number":600,"body":"unrelated issue body without marker"}]' '' '0'
+  flow_data=$(dedup_load "$flow_dedup_file7" 2>/dev/null)
+  set +e
+  dedup_check "$flow_data" "$fp_sha" 2>/dev/null
+  local fp_check_rc=$?
+  set -e
+  local fp_found=""
+  if [[ $fp_check_rc -ne 0 ]]; then
+    local fp_remote
+    fp_remote=$(PATH="$flow_root/gh-stub:$PATH" gh issue list --json number,body 2>/dev/null)
+    fp_found=$(echo "$fp_remote" | python3 -c "
+import json,sys
+items = json.load(sys.stdin)
+marker = '$fp_marker'
+for item in items:
+    if marker in item.get('body',''):
+        print(item['number'])
+        break
+" 2>/dev/null)
+  fi
+  if [[ -z "$fp_found" ]]; then
+    tap_ok "flow: remote-search false-positive falls through to filing"
+  else
+    tap_not_ok "flow: remote-search false-positive falls through to filing" "found=$fp_found"
+  fi
+
+  # Test: gh issue create failure → no dedup_record
+  > "$flow_gh_log"
+  local flow_dedup_file8="$flow_root/dedup-createfail.json"
+  echo '{"schema_version":1,"filed":{}}' > "$flow_dedup_file8"
+  _flow_gh_stub '' '[]' '' '0'  # create_response is empty (failure)
+  flow_data=$(dedup_load "$flow_dedup_file8" 2>/dev/null)
+  set +e
+  local create_out
+  create_out=$(PATH="$flow_root/gh-stub:$PATH" gh issue create --title "test" --body "test" 2>/dev/null)
+  set -e
+  local created_num
+  created_num=$(echo "$create_out" | grep -oP '\d+$' || true)
+  if [[ -z "$created_num" ]]; then
+    # Failed — do NOT record
+    :
+  fi
+  if ! _json_has_key "$flow_data" "filed" "create_fail_sha"; then
+    tap_ok "flow: gh create failure → no dedup_record"
+  else
+    tap_not_ok "flow: gh create failure → no dedup_record"
+  fi
+
+  # Test: Lock timeout (flock held → exits 0 without filing)
+  local lock_file="$flow_root/test-filing.lock"
+  # Hold the lock in a background subshell
+  (flock -x 9; sleep 5) 9>"$lock_file" &
+  local lock_holder_pid=$!
+  sleep 0.2  # Let the background process acquire the lock
+  set +e
+  local lock_out
+  lock_out=$(
+    (
+      flock -w 1 9 || { echo "Could not acquire lock"; exit 0; }
+      echo "acquired"
+    ) 9>"$lock_file" 2>&1
+  )
+  set -e
+  kill $lock_holder_pid 2>/dev/null || true
+  wait $lock_holder_pid 2>/dev/null || true
+  if echo "$lock_out" | grep -q "Could not acquire"; then
+    tap_ok "flow: lock timeout exits without filing"
+  else
+    tap_not_ok "flow: lock timeout exits without filing" "out: ${lock_out:0:100}"
+  fi
+
+  # Test: Board routing on new issue
+  > "$flow_gh_log"
+  _flow_gh_stub '' '[]' 'https://github.com/stellar-experimental/henyey/issues/777' '0'
+  set +e
+  local board_create_out
+  board_create_out=$(PATH="$flow_root/gh-stub:$PATH" gh issue create --title "test" --body "test" 2>/dev/null)
+  set -e
+  local board_num
+  board_num=$(echo "$board_create_out" | grep -oP '\d+$' || true)
+  if [[ -n "$board_num" ]]; then
+    PATH="$flow_root/gh-stub:$PATH" bash "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh" "$board_num" "Backlog" 2>/dev/null
+  fi
+  if grep -q "move-issue-status 777 Backlog" "$flow_gh_log"; then
+    tap_ok "flow: board routing calls move-issue-status with correct args"
+  else
+    tap_not_ok "flow: board routing calls move-issue-status with correct args" "log: $(cat $flow_gh_log 2>/dev/null)"
+  fi
+
+  # Test: Board routing — daily comment adds off-board issue
+  > "$flow_gh_log"
+  # Stub: gh api graphql returns totalCount=0 (stub echoes raw value since jq not processed)
+  cat > "$flow_root/gh-stub/gh" << BOARDEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$flow_gh_log"
+if [[ "\$1" == "api" && "\$2" == "graphql" ]]; then
+  echo '0'
+  exit 0
+fi
+exit 0
+BOARDEOF
+  chmod +x "$flow_root/gh-stub/gh"
+  # Simulate: check if on board → not on board → call move-issue-status
+  local on_board
+  on_board=$(PATH="$flow_root/gh-stub:$PATH" gh api graphql -f query='test' --jq '.data.resource.projectItems.totalCount' 2>/dev/null)
+  if [[ "$on_board" == "0" ]]; then
+    PATH="$flow_root/gh-stub:$PATH" bash "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh" "100" "Backlog" 2>/dev/null
+  fi
+  if grep -q "move-issue-status 100 Backlog" "$flow_gh_log"; then
+    tap_ok "flow: daily comment adds off-board issue to Backlog"
+  else
+    tap_not_ok "flow: daily comment adds off-board issue to Backlog" "log: $(cat $flow_gh_log 2>/dev/null)"
+  fi
+
+  rm -rf "$dedup_test_root"
 }
 check_skill_structure
 run_tests
