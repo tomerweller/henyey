@@ -10915,4 +10915,80 @@ mod tests {
             "set_state(CatchingUp) alone should not increment lost_sync_count"
         );
     }
+
+    /// Integration test for #2613: verify the full wiring path from
+    /// SyncRecoveryManager tracking timeout → App::on_lost_sync() callback
+    /// → lost_sync_count increment. Unlike the #2612 regression tests above,
+    /// this test exercises the real timer expiration inside the manager.
+    #[tokio::test(start_paused = true)]
+    async fn test_sync_recovery_manager_tracking_timeout_increments_lost_sync_count() {
+        use henyey_herder::sync_recovery::CONSENSUS_STUCK_TIMEOUT;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        // Establish preconditions: Synced app with Tracking herder.
+        app.set_state(AppState::Synced).await;
+        app.herder.set_state(henyey_herder::HerderState::Tracking);
+        assert_eq!(app.lost_sync_count(), 0);
+        assert!(
+            !app.sync_recovery_pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "sync_recovery_pending should start false"
+        );
+
+        // Start the sync recovery manager via the production path.
+        app.start_sync_recovery();
+
+        // Arm the tracking timer.
+        {
+            let guard = app.sync_recovery_handle.read();
+            let handle = guard
+                .as_ref()
+                .expect("handle should be set after start_sync_recovery");
+            handle.start_tracking().await;
+        }
+        // Drain: let the manager process StartTracking and arm the deadline.
+        tokio::task::yield_now().await;
+
+        // Advance exactly past the tracking timeout (35s + 1ms buffer).
+        // Kept minimal to avoid entering the 10s recovery retry window.
+        tokio::time::advance(CONSENSUS_STUCK_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        // Verify the full timeout handler fired correctly.
+        assert_eq!(
+            app.lost_sync_count(),
+            1,
+            "tracking timeout should increment lost_sync_count exactly once"
+        );
+        assert_eq!(
+            app.herder.state(),
+            henyey_herder::HerderState::Syncing,
+            "on_lost_sync() should transition herder to Syncing"
+        );
+        assert!(
+            app.sync_recovery_pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "on_out_of_sync_recovery() should set sync_recovery_pending"
+        );
+
+        // Cleanup: shutdown the manager and await its task.
+        {
+            let guard = app.sync_recovery_handle.read();
+            if let Some(handle) = guard.as_ref() {
+                handle.shutdown().await;
+            }
+        }
+        {
+            let mut guard = app.sync_recovery_task.write();
+            if let Some(task) = guard.take() {
+                let _ = task.await;
+            }
+        }
+    }
 }
