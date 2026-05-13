@@ -144,7 +144,9 @@ pub mod upgrades;
 
 // Re-export main types
 pub use error::HerderError;
-pub use fetching_envelopes::{FetchingConfig, FetchingEnvelopes, FetchingStats, RecvResult};
+pub use fetching_envelopes::{
+    FetchingConfig, FetchingEnvelopes, FetchingStats, ReadyPath, RecvResult, ScpRelayEnvelope,
+};
 pub use herder::{
     EnvelopeState, Herder, HerderConfig, HerderStats, LastExternalizedLedger, LedgerCloseInfo,
     NextConsensusSlot, TimeoutOutcome, TriggerOutcome,

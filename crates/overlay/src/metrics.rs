@@ -510,6 +510,10 @@ pub struct OverlayMetrics {
     pub flood_unique_recv: Counter,
     /// Duplicate flood messages received (inbound, record_inbound_relay → on_repeated).
     pub flood_duplicate_recv: Counter,
+    /// SCP-only unique flood messages received (#2648 diagnostic).
+    pub scp_flood_unique_recv: Counter,
+    /// SCP-only duplicate flood messages received (#2648 diagnostic).
+    pub scp_flood_duplicate_recv: Counter,
 
     // ===== Fetch Metrics =====
     /// Unique fetch bytes received.
@@ -596,6 +600,8 @@ impl OverlayMetrics {
             flood_broadcast: self.flood_broadcast.get(),
             flood_unique_recv: self.flood_unique_recv.get(),
             flood_duplicate_recv: self.flood_duplicate_recv.get(),
+            scp_flood_unique_recv: self.scp_flood_unique_recv.get(),
+            scp_flood_duplicate_recv: self.scp_flood_duplicate_recv.get(),
 
             // Fetch metrics
             fetch_unique_bytes_recv: self.fetch_unique_bytes_recv.get(),
@@ -657,6 +663,8 @@ impl OverlayMetrics {
             &self.flood_broadcast,
             &self.flood_unique_recv,
             &self.flood_duplicate_recv,
+            &self.scp_flood_unique_recv,
+            &self.scp_flood_duplicate_recv,
             &self.fetch_unique_bytes_recv,
             &self.fetch_duplicate_bytes_recv,
             &self.item_fetcher_next_peer,
@@ -729,6 +737,8 @@ pub struct OverlayMetricsSnapshot {
     pub flood_broadcast: u64,
     pub flood_unique_recv: u64,
     pub flood_duplicate_recv: u64,
+    pub scp_flood_unique_recv: u64,
+    pub scp_flood_duplicate_recv: u64,
 
     // Fetch metrics
     pub fetch_unique_bytes_recv: u64,

@@ -180,6 +180,10 @@ pub struct PipelinedIntake {
     ///
     /// [`ScpScheduledCache`]: the app-level SCP scheduling cache
     pub inflight_token: Option<std::sync::Arc<()>>,
+    /// Overlay arrival time for receive-to-relay latency measurement.
+    /// `Some(Instant)` for overlay-received envelopes (carried from
+    /// `OverlayMessage.received_at`); `None` for local paths (catchup, tests).
+    pub received_at: Option<Instant>,
 }
 
 impl PipelinedIntake {
@@ -195,6 +199,7 @@ impl PipelinedIntake {
         peer_id: henyey_overlay::PeerId,
         flood_msg_hash: henyey_common::Hash256,
         inflight_token: std::sync::Arc<()>,
+        received_at: Instant,
     ) -> Self {
         Self {
             envelope,
@@ -204,6 +209,7 @@ impl PipelinedIntake {
             enqueue_at: Instant::now(),
             flood_msg_hash: Some(flood_msg_hash),
             inflight_token: Some(inflight_token),
+            received_at: Some(received_at),
         }
     }
 
@@ -220,6 +226,7 @@ impl PipelinedIntake {
             enqueue_at: Instant::now(),
             flood_msg_hash: None,
             inflight_token: None,
+            received_at: None,
         }
     }
 }

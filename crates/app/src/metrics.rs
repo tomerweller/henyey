@@ -620,6 +620,11 @@ metric_catalog! {
             => "Total duplicate flood messages received";
         OVERLAY_FLOOD_UNIQUE_RECV_TOTAL = "stellar_overlay_flood_unique_recv_total"
             => "Total unique flood messages received";
+        // Issue #2648: SCP-specific flood counters.
+        OVERLAY_SCP_FLOOD_UNIQUE_RECV_TOTAL = "henyey_overlay_scp_flood_unique_recv_total"
+            => "Total unique SCP flood messages received";
+        OVERLAY_SCP_FLOOD_DUPLICATE_RECV_TOTAL = "henyey_overlay_scp_flood_duplicate_recv_total"
+            => "Total duplicate SCP flood messages received";
         OVERLAY_FETCH_DUPLICATE_RECV_TOTAL = "stellar_overlay_fetch_duplicate_recv_total"
             => "Total duplicate/unsolicited fetch responses received";
         OVERLAY_FETCH_UNIQUE_RECV_TOTAL = "stellar_overlay_fetch_unique_recv_total"
@@ -884,6 +889,10 @@ metric_catalog! {
         SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_HIST_SECONDS = "stellar_scp_timing_first_to_self_externalize_hist_seconds"
             => "Time from first observed EXTERNALIZE to self-externalize (seconds, histogram)";
 
+        // Issue #2648: SCP receive-to-relay latency histogram.
+        SCP_RECEIVE_TO_RELAY_SECONDS = "henyey_scp_receive_to_relay_seconds"
+            => "Time from SCP envelope arrival at overlay to broadcast relay (seconds)";
+
         // Issue #2621 B4: Peer ping round-trip time histogram (event-site recording in overlay).
         OVERLAY_CONNECTION_LATENCY_SECONDS = "stellar_overlay_connection_latency_seconds"
             => "Peer ping round-trip time (seconds)";
@@ -1020,6 +1029,9 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         OVERLAY_FLOOD_BROADCAST_TOTAL.absolute(ov.flood_broadcast);
         OVERLAY_FLOOD_DUPLICATE_RECV_TOTAL.absolute(ov.flood_duplicate_recv);
         OVERLAY_FLOOD_UNIQUE_RECV_TOTAL.absolute(ov.flood_unique_recv);
+        // Issue #2648: SCP-specific flood counters.
+        OVERLAY_SCP_FLOOD_UNIQUE_RECV_TOTAL.absolute(ov.scp_flood_unique_recv);
+        OVERLAY_SCP_FLOOD_DUPLICATE_RECV_TOTAL.absolute(ov.scp_flood_duplicate_recv);
         OVERLAY_FETCH_DUPLICATE_RECV_TOTAL.absolute(ov.fetch_duplicate_recv);
         OVERLAY_FETCH_UNIQUE_RECV_TOTAL.absolute(ov.fetch_unique_recv);
         OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL.absolute(ov.item_fetcher_next_peer);
@@ -1315,6 +1327,12 @@ const SCP_TIMING_BUCKETS: &[f64] = &[
 /// Buckets for peer ping round-trip time.
 const PING_RTT_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0];
 
+/// Buckets for SCP receive-to-relay latency (issue #2648).
+/// Dense in the 10ms–2s range where relay latency concentrates.
+const SCP_RELAY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0,
+];
+
 /// Configure all histogram bucket overrides on a `PrometheusBuilder`.
 ///
 /// Shared between `install_recorder()` and `ensure_test_recorder()` so that
@@ -1397,6 +1415,12 @@ fn configure_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
             PING_RTT_BUCKETS,
         )
         .expect("valid ping RTT histogram buckets")
+        // SCP receive-to-relay histogram (issue #2648).
+        .set_buckets_for_metric(
+            Matcher::Full(SCP_RECEIVE_TO_RELAY_SECONDS.to_string()),
+            SCP_RELAY_BUCKETS,
+        )
+        .expect("valid scp relay histogram buckets")
 }
 
 // ── Test helper ────────────────────────────────────────────────────────

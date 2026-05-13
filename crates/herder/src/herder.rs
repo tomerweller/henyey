@@ -1456,6 +1456,7 @@ impl Herder {
         use crate::scp_verify::{PostVerifyReason, PreFilter, Verdict};
         let crate::scp_verify::VerifiedEnvelope { intake, verdict } = ve;
         let slot = intake.slot;
+        let received_at = intake.received_at;
 
         match verdict {
             Verdict::Ok => {}
@@ -1574,7 +1575,7 @@ impl Herder {
 
         // Process through unified FetchingEnvelopes intake. This handles
         // dep-fetching, relay, slot-aware routing, and EXTERNALIZE bypass.
-        let (state, recv_result) = self.process_scp_envelope(envelope);
+        let (state, recv_result) = self.process_scp_envelope(envelope, received_at);
         if let Some(crate::fetching_envelopes::RecvResult::FutureSlotsFull) = recv_result {
             let last_warned = self.pending_envelopes.last_buffer_full_warn_slot();
             if slot != last_warned {
@@ -1606,6 +1607,7 @@ impl Herder {
     fn process_scp_envelope(
         &self,
         envelope: ScpEnvelope,
+        received_at: Option<Instant>,
     ) -> (EnvelopeState, Option<crate::fetching_envelopes::RecvResult>) {
         let slot = envelope.statement.slot_index;
         let is_externalize = matches!(
@@ -1626,7 +1628,9 @@ impl Herder {
         // Use recv_envelope_validated since the envelope has already passed
         // network-level validation (pre-filter + signature verification).
         let envelope_clone = envelope.clone();
-        let result = self.fetching_envelopes.recv_envelope_validated(envelope);
+        let result = self
+            .fetching_envelopes
+            .recv_envelope_validated(envelope, received_at);
 
         let state = match result {
             RecvResult::Ready => {
@@ -1817,7 +1821,7 @@ impl Herder {
             );
             for env in envelopes {
                 before_process(&env);
-                let _ = self.process_scp_envelope(env);
+                let _ = self.process_scp_envelope(env, None);
             }
         }
     }
@@ -3741,7 +3745,7 @@ impl Herder {
     /// envelopes to all peers once `isFullyFetched()` is true.
     pub fn set_fetching_broadcast<F>(&self, f: F)
     where
-        F: Fn(&ScpEnvelope) + Send + Sync + 'static,
+        F: Fn(crate::fetching_envelopes::ScpRelayEnvelope) + Send + Sync + 'static,
     {
         self.fetching_envelopes.set_broadcast(f);
     }

@@ -782,10 +782,16 @@ impl OverlayManager {
                     || {
                         ctx.peer.record_flood_stats(true, message_size);
                         state.metrics.flood_unique_recv.inc();
+                        if matches!(message, StellarMessage::ScpMessage(_)) {
+                            state.metrics.scp_flood_unique_recv.inc();
+                        }
                     },
                     || {
                         ctx.peer.record_flood_stats(false, message_size);
                         state.metrics.flood_duplicate_recv.inc();
+                        if matches!(message, StellarMessage::ScpMessage(_)) {
+                            state.metrics.scp_flood_duplicate_recv.inc();
+                        }
                     },
                 );
                 // FloodGate-tracked messages (SCP and Transaction) are NEVER

@@ -22,8 +22,27 @@ use tracing::{debug, trace};
 /// Callback type for requesting items from peers.
 type AskPeerFn = Box<dyn Fn(&PeerId, &Hash, ItemType) + Send + Sync>;
 
+/// Relay payload carrying timing metadata from receive to overlay broadcast.
+pub struct ScpRelayEnvelope {
+    pub envelope: ScpEnvelope,
+    /// Overlay arrival time for receive-to-relay latency histogram (#2648).
+    /// `None` for locally-originated envelopes.
+    pub received_at: Option<Instant>,
+    /// Which readiness path produced this relay.
+    pub ready_path: ReadyPath,
+}
+
+/// Readiness path for an SCP envelope relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadyPath {
+    /// Dependencies satisfied on first recv — no fetch wait.
+    Immediate,
+    /// Parked in fetching, moved to ready after deps arrived.
+    Deferred,
+}
+
 /// Callback type for broadcasting ready envelopes to peers.
-type BroadcastFn = Box<dyn Fn(&ScpEnvelope) + Send + Sync>;
+type BroadcastFn = Box<dyn Fn(ScpRelayEnvelope) + Send + Sync>;
 
 /// Callback type for checking authoritative tx_set presence.
 ///
@@ -56,6 +75,14 @@ pub enum RecvResult {
     FutureSlotsFull,
 }
 
+/// Entry for an envelope parked in the fetching state, awaiting dependencies.
+struct FetchingEntry {
+    envelope: ScpEnvelope,
+    /// Overlay arrival time, carried from `PipelinedIntake::received_at`.
+    /// `None` for non-overlay paths.
+    received_at: Option<Instant>,
+}
+
 /// State of envelopes for a single slot.
 #[derive(Default)]
 pub struct SlotEnvelopes {
@@ -63,8 +90,8 @@ pub struct SlotEnvelopes {
     discarded: HashSet<Hash256>,
     /// Envelopes we have processed already.
     processed: HashSet<Hash256>,
-    /// Envelopes we are fetching right now (hash -> received time).
-    fetching: HashMap<Hash256, (ScpEnvelope, Instant)>,
+    /// Envelopes we are fetching right now.
+    fetching: HashMap<Hash256, FetchingEntry>,
     /// Envelopes that are ready to be processed.
     ready: Vec<ScpEnvelope>,
 }
@@ -254,7 +281,7 @@ impl FetchingEnvelopes {
     /// are satisfied in `PendingEnvelopes::startFetch()`.
     pub fn set_broadcast<F>(&self, f: F)
     where
-        F: Fn(&ScpEnvelope) + Send + Sync + 'static,
+        F: Fn(ScpRelayEnvelope) + Send + Sync + 'static,
     {
         *self.broadcast.write() = Some(Box::new(f));
     }
@@ -280,7 +307,7 @@ impl FetchingEnvelopes {
             return RecvResult::Discarded;
         }
 
-        self.recv_envelope_inner(envelope)
+        self.recv_envelope_inner(envelope, None)
     }
 
     /// Receive a pre-validated SCP envelope (skips StellarValue signed check).
@@ -288,9 +315,13 @@ impl FetchingEnvelopes {
     /// Use this for envelopes that have already passed network-level validation
     /// (pre-filter, signature verification) and are entering FetchingEnvelopes
     /// for dependency tracking, relay, and slot-aware queuing.
-    pub fn recv_envelope_validated(&self, envelope: ScpEnvelope) -> RecvResult {
+    pub fn recv_envelope_validated(
+        &self,
+        envelope: ScpEnvelope,
+        received_at: Option<Instant>,
+    ) -> RecvResult {
         self.stats.write().envelopes_received += 1;
-        self.recv_envelope_inner(envelope)
+        self.recv_envelope_inner(envelope, received_at)
     }
 
     /// Inner implementation shared by recv_envelope and recv_envelope_validated.
@@ -298,13 +329,17 @@ impl FetchingEnvelopes {
     /// Two-phase design (#2520):
     /// Phase 1 (write lock): admission checks + state mutation
     /// Phase 2 (lock dropped): I/O operations (broadcast, fetch)
-    fn recv_envelope_inner(&self, envelope: ScpEnvelope) -> RecvResult {
+    fn recv_envelope_inner(
+        &self,
+        envelope: ScpEnvelope,
+        received_at: Option<Instant>,
+    ) -> RecvResult {
         let slot = envelope.statement.slot_index;
         let env_hash = Self::compute_envelope_hash(&envelope);
 
         // Phase 1: Under write lock — admission, dedup, deps, insert.
         enum Action {
-            Broadcast(ScpEnvelope),
+            Broadcast(ScpEnvelope, Option<Instant>),
             Fetch {
                 need_tx_set: bool,
                 need_quorum_set: bool,
@@ -370,12 +405,16 @@ impl FetchingEnvelopes {
                 // All dependencies available — envelope is ready.
                 slot_state.ready.push(envelope.clone());
                 self.stats.write().envelopes_ready += 1;
-                (RecvResult::Ready, Action::Broadcast(envelope))
+                (RecvResult::Ready, Action::Broadcast(envelope, received_at))
             } else {
                 // Park envelope — will be moved to ready when deps arrive.
-                slot_state
-                    .fetching
-                    .insert(env_hash, (envelope.clone(), Instant::now()));
+                slot_state.fetching.insert(
+                    env_hash,
+                    FetchingEntry {
+                        envelope: envelope.clone(),
+                        received_at,
+                    },
+                );
                 (
                     RecvResult::Fetching,
                     Action::Fetch {
@@ -390,8 +429,8 @@ impl FetchingEnvelopes {
 
         // Phase 2: I/O operations outside the lock.
         match action {
-            Action::Broadcast(env) => {
-                self.broadcast_envelope(&env);
+            Action::Broadcast(env, recv_at) => {
+                self.broadcast_envelope(&env, recv_at, ReadyPath::Immediate);
             }
             Action::Fetch {
                 need_tx_set,
@@ -786,12 +825,12 @@ impl FetchingEnvelopes {
             let slots = self.slots.read();
             let mut result = Vec::new();
             for slot_state in slots.values() {
-                for (_, (env, _)) in slot_state.fetching.iter() {
-                    if Self::extract_tx_set_hashes(env)
+                for (_, entry) in slot_state.fetching.iter() {
+                    if Self::extract_tx_set_hashes(&entry.envelope)
                         .iter()
                         .any(|h| h == tx_set_hash)
                     {
-                        result.push(env.clone());
+                        result.push(entry.envelope.clone());
                     }
                 }
             }
@@ -811,9 +850,9 @@ impl FetchingEnvelopes {
             let slots = self.slots.read();
             let mut result = Vec::new();
             for slot_state in slots.values() {
-                for (_, (env, _)) in slot_state.fetching.iter() {
-                    if Self::extract_quorum_set_hash(env).as_ref() == Some(qs_hash) {
-                        result.push(env.clone());
+                for (_, entry) in slot_state.fetching.iter() {
+                    if Self::extract_quorum_set_hash(&entry.envelope).as_ref() == Some(qs_hash) {
+                        result.push(entry.envelope.clone());
                     }
                 }
             }
@@ -893,18 +932,26 @@ impl FetchingEnvelopes {
 
         if !need_tx_set && !need_quorum_set {
             // All dependencies available - move to ready.
-            // Mutate under write lock, broadcast after dropping.
-            {
+            // Mutate under write lock, extract received_at, broadcast after dropping.
+            let received_at = {
                 let mut slots = self.slots.write();
                 if let Some(slot_state) = slots.get_mut(&slot) {
-                    if slot_state.fetching.remove(&env_hash).is_some() {
+                    if let Some(entry) = slot_state.fetching.remove(&env_hash) {
                         slot_state.ready.push(envelope.clone());
                         debug!(slot, "Envelope ready after receiving dependencies");
+                        Some(entry.received_at)
+                    } else {
+                        // Already moved to ready by a prior check — no double-broadcast.
+                        None
                     }
+                } else {
+                    None
                 }
+            };
+            // Only broadcast on the actual fetching → ready transition (#2648).
+            if let Some(recv_at) = received_at {
+                self.broadcast_envelope(&envelope, recv_at, ReadyPath::Deferred);
             }
-            // Parity: broadcast to peers when dependencies are satisfied
-            self.broadcast_envelope(&envelope);
         } else {
             // Re-start fetching for any dependency that is not yet available.
             // Without this, the envelope would remain stranded in `fetching` forever.
@@ -940,9 +987,18 @@ impl FetchingEnvelopes {
     }
 
     /// Broadcast an envelope to peers if a broadcast callback is set.
-    fn broadcast_envelope(&self, envelope: &ScpEnvelope) {
+    fn broadcast_envelope(
+        &self,
+        envelope: &ScpEnvelope,
+        received_at: Option<Instant>,
+        ready_path: ReadyPath,
+    ) {
         if let Some(ref broadcast) = *self.broadcast.read() {
-            broadcast(envelope);
+            broadcast(ScpRelayEnvelope {
+                envelope: envelope.clone(),
+                received_at,
+                ready_path,
+            });
         }
     }
 
@@ -1870,7 +1926,13 @@ mod tests {
             .entry(slot)
             .or_default()
             .fetching
-            .insert(env_hash, (envelope, Instant::now()));
+            .insert(
+                env_hash,
+                FetchingEntry {
+                    envelope,
+                    received_at: None,
+                },
+            );
 
         assert_eq!(fetching.fetching_count(), 1);
         assert_eq!(fetching.ready_count(), 0);
@@ -1994,7 +2056,13 @@ mod tests {
             .entry(100)
             .or_default()
             .fetching
-            .insert(env_hash, (envelope, Instant::now()));
+            .insert(
+                env_hash,
+                FetchingEntry {
+                    envelope,
+                    received_at: None,
+                },
+            );
         assert_eq!(fetching.fetching_count(), 1);
 
         // on_tx_set_accepted should move it to ready
@@ -2371,15 +2439,15 @@ mod tests {
         let fetching = fetching_with_per_slot_cap(2);
 
         assert_eq!(
-            fetching.recv_envelope_validated(make_test_envelope(100, 1)),
+            fetching.recv_envelope_validated(make_test_envelope(100, 1), None),
             RecvResult::Fetching
         );
         assert_eq!(
-            fetching.recv_envelope_validated(make_test_envelope(100, 2)),
+            fetching.recv_envelope_validated(make_test_envelope(100, 2), None),
             RecvResult::Fetching
         );
         assert_eq!(
-            fetching.recv_envelope_validated(make_test_envelope(100, 3)),
+            fetching.recv_envelope_validated(make_test_envelope(100, 3), None),
             RecvResult::PerSlotFull
         );
     }

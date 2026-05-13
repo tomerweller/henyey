@@ -311,9 +311,9 @@ impl App {
         // Parity: stellar-core PendingEnvelopes::envelopeReady() broadcasts
         // once isFullyFetched() is true.
         let (fetching_relay_tx, mut fetching_relay_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ScpEnvelope>();
-        self.herder.set_fetching_broadcast(move |env| {
-            let _ = fetching_relay_tx.send(env.clone());
+            tokio::sync::mpsc::unbounded_channel::<henyey_herder::ScpRelayEnvelope>();
+        self.herder.set_fetching_broadcast(move |relay_env| {
+            let _ = fetching_relay_tx.send(relay_env);
         });
 
         // Main run loop
@@ -751,13 +751,30 @@ impl App {
                 // This is the sole relay path for all SCP envelopes — fires
                 // from FetchingEnvelopes (both immediate-ready and deferred-ready).
                 // Parity: stellar-core PendingEnvelopes::envelopeReady().
-                Some(env) = fetching_relay_rx.recv() => {
-                    let slot = env.statement.slot_index;
-                    let relay_msg = StellarMessage::ScpMessage(env);
+                Some(relay_env) = fetching_relay_rx.recv() => {
+                    let slot = relay_env.envelope.statement.slot_index;
+                    let received_at = relay_env.received_at;
+                    let ready_path = relay_env.ready_path;
+                    let relay_msg = StellarMessage::ScpMessage(relay_env.envelope);
                     if let Some(overlay) = self.overlay().await {
                         match overlay.broadcast(relay_msg).await {
                             Ok(count) => {
                                 tracing::debug!(slot, peers = count, "Relayed SCP envelope");
+                                // Record receive-to-relay latency (#2648).
+                                // Only sample on successful broadcast to ≥1 peer.
+                                if count > 0 {
+                                    if let Some(t) = received_at {
+                                        let label = match ready_path {
+                                            henyey_herder::ReadyPath::Immediate => "immediate",
+                                            henyey_herder::ReadyPath::Deferred => "deferred",
+                                        };
+                                        metrics::histogram!(
+                                            "henyey_scp_receive_to_relay_seconds",
+                                            "path" => label
+                                        )
+                                        .record(t.elapsed().as_secs_f64());
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(slot, error = %e, "Failed to relay SCP envelope");
@@ -2041,6 +2058,10 @@ impl App {
         // the inner ScpEnvelope.
         let flood_msg_hash = henyey_overlay::compute_message_hash(&scp_msg.message);
 
+        // Capture overlay arrival time before destructuring — used for
+        // receive-to-relay latency histogram (#2648).
+        let overlay_received_at = scp_msg.received_at;
+
         let envelope = match scp_msg.message {
             StellarMessage::ScpMessage(e) => e,
             other => {
@@ -2113,6 +2134,7 @@ impl App {
                                 from_peer,
                                 flood_msg_hash,
                                 inflight_token,
+                                overlay_received_at,
                             );
                             permit.send(intake);
                         }
