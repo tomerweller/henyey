@@ -379,8 +379,13 @@ def maybe_reset_counter_snapshot(
     """Reset counter snapshot state on non-evaluable ticks.
 
     Invariant: for counter-family alarms, any tick producing state="skipped"
-    resets stateful snapshot keys (prior_delta, streak, breach_streak, and
-    baselines) to prevent stale pre-skip state from carrying over.
+    resets stateful snapshot keys to prevent stale pre-skip state from
+    carrying over:
+    - counter-dynamic: deletes prior_delta (a delta, not cumulative — stale after gap)
+    - counter-ratio: zeros streak only (baselines are cumulative counters
+      that may be freshly updated by the evaluator on low-volume skips)
+    - counter-streak: zeros breach_streak only (baseline counter_value is
+      cumulative and may be freshly updated by the evaluator)
 
     Does NOT fire on "collecting_baseline" — that state means the evaluator
     wrote fresh baseline data that must be preserved for the next tick.
@@ -400,31 +405,17 @@ def maybe_reset_counter_snapshot(
     elif kind == "counter-ratio":
         snapshot_path = state_dir / "ratio_snapshot"
         snapshot = read_snapshot(snapshot_path)
-        changed = False
-        for suffix in ("_streak", "_numerator", "_denominator"):
-            key = f"{name}{suffix}"
-            if key in snapshot:
-                if suffix == "_streak":
-                    snapshot[key] = "0"
-                else:
-                    del snapshot[key]
-                changed = True
-        if changed:
+        streak_key = f"{name}_streak"
+        if streak_key in snapshot and snapshot[streak_key] != "0":
+            snapshot[streak_key] = "0"
             write_snapshot(snapshot_path, snapshot)
 
     elif kind == "counter-streak":
         snapshot_file = alarm.get("snapshot_file", "counter_streak_snapshot")
         snapshot_path = state_dir / snapshot_file
         snapshot = read_snapshot(snapshot_path)
-        changed = False
-        for key in ("breach_streak", "counter_value"):
-            if key in snapshot:
-                if key == "breach_streak":
-                    snapshot[key] = "0"
-                else:
-                    del snapshot[key]
-                changed = True
-        if changed:
+        if snapshot.get("breach_streak", "0") != "0":
+            snapshot["breach_streak"] = "0"
             write_snapshot(snapshot_path, snapshot)
 
 

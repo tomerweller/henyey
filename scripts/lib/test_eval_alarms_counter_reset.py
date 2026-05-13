@@ -92,8 +92,8 @@ def test_counter_dynamic_no_snapshot_file_no_error():
 
 # ── counter-ratio tests ──────────────────────────────────────────────────────
 
-def test_counter_ratio_skip_resets_streak_and_baselines():
-    """Skipped state zeros streak and deletes baseline keys."""
+def test_counter_ratio_skip_resets_streak_only():
+    """Skipped state zeros streak but preserves baselines."""
     with tempfile.TemporaryDirectory() as d:
         state_dir = Path(d)
         snap_path = state_dir / "ratio_snapshot"
@@ -112,8 +112,8 @@ def test_counter_ratio_skip_resets_streak_and_baselines():
 
         snap = read_snapshot(snap_path)
         assert snap["myalarm_streak"] == "0", f"streak should be 0, got {snap['myalarm_streak']}"
-        assert "myalarm_numerator" not in snap, "numerator baseline should be deleted"
-        assert "myalarm_denominator" not in snap, "denominator baseline should be deleted"
+        assert snap["myalarm_numerator"] == "100", "numerator baseline should be preserved"
+        assert snap["myalarm_denominator"] == "500", "denominator baseline should be preserved"
         # Other alarm's data should be preserved
         assert snap["other_alarm_streak"] == "2", "other alarm streak should be preserved"
         assert snap["version"] == "1", "version should be preserved"
@@ -140,8 +140,8 @@ def test_counter_ratio_no_reset_on_breach():
 
 # ── counter-streak tests ─────────────────────────────────────────────────────
 
-def test_counter_streak_skip_resets_streak_and_baseline():
-    """Skipped state zeros breach_streak and deletes counter_value."""
+def test_counter_streak_skip_resets_streak_only():
+    """Skipped state zeros breach_streak but preserves counter_value."""
     with tempfile.TemporaryDirectory() as d:
         state_dir = Path(d)
         snap_path = state_dir / "counter_streak_snapshot"
@@ -158,7 +158,7 @@ def test_counter_streak_skip_resets_streak_and_baseline():
 
         snap = read_snapshot(snap_path)
         assert snap["breach_streak"] == "0", f"breach_streak should be 0, got {snap['breach_streak']}"
-        assert "counter_value" not in snap, "counter_value baseline should be deleted"
+        assert snap["counter_value"] == "100", "counter_value baseline should be preserved"
         assert snap["version"] == "1", "version should be preserved"
 
 
@@ -181,7 +181,7 @@ def test_counter_streak_custom_snapshot_file():
 
         snap = read_snapshot(snap_path)
         assert snap["breach_streak"] == "0", "breach_streak should be reset"
-        assert "counter_value" not in snap, "counter_value should be deleted"
+        assert snap["counter_value"] == "50", "counter_value should be preserved"
 
 
 def test_counter_streak_no_reset_on_ok():
@@ -286,10 +286,62 @@ def test_end_to_end_counter_ratio_skip_no_false_fire():
         snap = read_snapshot(snap_path)
         assert snap["scp-accept-rate-low_streak"] == "0", \
             "streak should restart from 0 after skip gap"
-        assert "scp-accept-rate-low_numerator" not in snap, \
-            "numerator baseline should be cleared after skip gap"
-        assert "scp-accept-rate-low_denominator" not in snap, \
-            "denominator baseline should be cleared after skip gap"
+        assert snap["scp-accept-rate-low_numerator"] == "90", \
+            "numerator baseline should be preserved (cumulative counter)"
+        assert snap["scp-accept-rate-low_denominator"] == "100", \
+            "denominator baseline should be preserved (cumulative counter)"
+
+
+def test_counter_ratio_low_volume_preserves_baselines():
+    """Low-volume skip in eval_counter_ratio updates baselines; centralized
+    reset must NOT clobber them. Only streak should be zeroed (which the
+    evaluator already did)."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "ratio_snapshot"
+        # Simulate state after a low-volume skip: evaluator updated baselines
+        # to new values and reset streak to "0", then returned "skipped"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "123",
+            "start_ticks": "456",
+            "myalarm_streak": "0",  # already reset by evaluator
+            "myalarm_numerator": "200",  # freshly updated baseline
+            "myalarm_denominator": "1000",  # freshly updated baseline
+        })
+
+        alarm = _make_alarm("myalarm", kind="counter-ratio")
+        # Centralized reset fires because state == "skipped"
+        maybe_reset_counter_snapshot(alarm, "counter-ratio", "skipped", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert snap["myalarm_streak"] == "0", "streak should remain 0"
+        assert snap["myalarm_numerator"] == "200", \
+            "numerator baseline should be preserved after low-volume skip"
+        assert snap["myalarm_denominator"] == "1000", \
+            "denominator baseline should be preserved after low-volume skip"
+
+
+def test_counter_streak_skip_preserves_counter_value():
+    """Skipped counter-streak reset should zero breach_streak but preserve
+    counter_value (cumulative counter position)."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "123",
+            "start_ticks": "456",
+            "counter_value": "500",
+            "breach_streak": "3",
+        })
+
+        alarm = _make_alarm("stalled", kind="counter-streak")
+        maybe_reset_counter_snapshot(alarm, "counter-streak", "skipped", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert snap["breach_streak"] == "0", "breach_streak should be zeroed"
+        assert snap["counter_value"] == "500", "counter_value should be preserved"
 
 
 # ── Run tests ─────────────────────────────────────────────────────────────────
