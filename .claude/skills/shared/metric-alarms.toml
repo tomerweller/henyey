@@ -178,14 +178,14 @@ op = "<="
 threshold = 1
 for_ticks = 3
 severity = "WARN"
-gates = ["synced-only", "validator-only"]
+gates = ["synced-only", "validator-only", "warmup-2-ticks"]
 cooldown_key = "stellar_quorum_fail_at_low"
 cooldown_seconds = 1800
 filing_title = "metrics: stellar_quorum_fail_at — value={value} (quorum degraded)"
 filing_search = "metrics: stellar_quorum_fail_at"
 summary = "Quorum fail-at low (degraded quorum health)"
 details = "value={value} threshold={threshold}"
-notes = "Covers fail_at==1 (one failure causes v-blocking) and fail_at==0 (already v-blocked). Monitor-tick files issues; Grafana rules 3a/3b handle tiered paging. Short cooldown (30min) ensures fail_at=0 is not suppressed by prior fail_at=1 filing."
+notes = "Covers fail_at==1 (one failure causes v-blocking) and fail_at==0 (already v-blocked). Monitor-tick files issues; Grafana rules 3a/3b handle tiered paging. Short cooldown (30min) ensures fail_at=0 is not suppressed by prior fail_at=1 filing. warmup-2-ticks gate suppresses post-restart false positives while quorum health rebuilds (5 monitor ticks total before firing: 2 warmup + 3 for_ticks)."
 # NOTE: surface mirror, NOT threshold-identical. Monitor-tick uses per-tick
 # gauge <= 1 with 3-tick persistence; Grafana uses == 1 / < 1 with 5m for-duration.
 

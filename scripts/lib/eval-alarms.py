@@ -359,6 +359,20 @@ def make_result(
     return result
 
 
+def maybe_reset_gauge_persistence(
+    alarm: dict, kind: str, state: str, persistence_state: dict,
+):
+    """Reset gauge persistence on non-evaluable ticks to break consecutive chains.
+
+    Invariant: for persistent gauge-family alarms (for_ticks > 1), any tick
+    producing state="skipped" resets the persistence counter to 0. This prevents
+    stale pre-restart (or pre-gate) persistence from causing immediate firing
+    when the alarm becomes evaluable again.
+    """
+    if state == "skipped" and kind in ("gauge", "gauge-ratio") and alarm.get("for_ticks", 1) > 1:
+        persistence_state[f"gauge_persist_{alarm['name']}"] = "0"
+
+
 def eval_gauge(
     alarm: dict,
     current: dict,
@@ -1277,6 +1291,7 @@ def main() -> int:
             result = make_result(alarm, "skipped", skip_reason=f"exempt: {reason}",
                                  extra_values=default_extra_values(alarm, kind))
             results.append(result)
+            maybe_reset_gauge_persistence(alarm, kind, "skipped", persistence_state)
             print(f"# alarm={name} state=skipped reason=exempt", file=sys.stderr)
             continue
 
@@ -1289,6 +1304,7 @@ def main() -> int:
             result = make_result(alarm, "skipped", skip_reason=skip_reason,
                                  extra_values=default_extra_values(alarm, kind))
             results.append(result)
+            maybe_reset_gauge_persistence(alarm, kind, "skipped", persistence_state)
             # Telemetry
             metric = telemetry_metric(alarm, kind)
             n = count_series(current, metric) if metric else 0
@@ -1317,6 +1333,7 @@ def main() -> int:
             result = make_result(alarm, "skipped", skip_reason=f"unknown kind: {kind}")
 
         results.append(result)
+        maybe_reset_gauge_persistence(alarm, kind, result["state"], persistence_state)
 
         # Telemetry
         metric = telemetry_metric(alarm, kind)

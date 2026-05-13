@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=210
+TAP_PLAN=212
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -3372,6 +3372,228 @@ except:
   fi
   rm -f "$tick_prom" "$prev_prom"
   rm -rf "$state_dir"
+
+  # Test 148a: warmup gate + stale gauge persistence reset (#2614)
+  # Pre-seed persistence with count=2, then run a warmup tick (WARMUP_TICKS_REMAINING=1)
+  # with breaching value → alarm should be skipped AND persistence reset to 0.
+  # Then run with WARMUP_TICKS_REMAINING=0 → should get "breach" (count 1), not "firing".
+  local state_dir_148a
+  state_dir_148a=$(mktemp -d)
+  local tick_prom_148a prev_prom_148a
+  tick_prom_148a=$(mktemp)
+  prev_prom_148a=$(mktemp)
+  # Breaching value: quorum_fail_at = 0 (<= 1 threshold)
+  cat > "$tick_prom_148a" <<'TICK_PROM_148A'
+stellar_quorum_fail_at 0
+stellar_herder_state 2
+TICK_PROM_148A
+  cat > "$prev_prom_148a" <<'PREV_PROM_148A'
+stellar_quorum_fail_at 0
+stellar_herder_state 2
+PREV_PROM_148A
+  # Pre-seed stale persistence (as if 2 ticks had already breached before restart)
+  mkdir -p "$state_dir_148a"
+  echo "gauge_persist_quorum-fail-at-low=2" > "$state_dir_148a/gauge_persistence"
+  local t148a_pass=true
+  local t148a_detail=""
+  # Tick 1: warmup remaining=1 → should skip + reset persistence
+  local warmup_out
+  warmup_out=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=1 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$tick_prom_148a" \
+    --prev "$prev_prom_148a" \
+    --state-dir "$state_dir_148a" 2>/dev/null) || true
+  local warmup_state
+  warmup_state=$(echo "$warmup_out" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'quorum-fail-at-low':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+  if [[ "$warmup_state" != "skipped" ]]; then
+    t148a_pass=false
+    t148a_detail="warmup tick: expected skipped, got $warmup_state"
+  fi
+  # Verify persistence was reset to 0
+  if $t148a_pass; then
+    local persist_val
+    persist_val=$(grep 'gauge_persist_quorum-fail-at-low' "$state_dir_148a/gauge_persistence" 2>/dev/null | cut -d= -f2)
+    if [[ "$persist_val" != "0" ]]; then
+      t148a_pass=false
+      t148a_detail="persistence not reset: expected 0, got ${persist_val:-empty}"
+    fi
+  fi
+  # Tick 2: warmup=0, breaching → should be "breach" (count 1), NOT "firing" (stale count 3)
+  if $t148a_pass; then
+    local post_warmup_out
+    post_warmup_out=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+      python3 "$eval_script" \
+      --catalog "$catalog_file" \
+      --current "$tick_prom_148a" \
+      --prev "$prev_prom_148a" \
+      --state-dir "$state_dir_148a" 2>/dev/null) || true
+    local post_warmup_state
+    post_warmup_state=$(echo "$post_warmup_out" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'quorum-fail-at-low':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+    if [[ "$post_warmup_state" != "breach" ]]; then
+      t148a_pass=false
+      t148a_detail="post-warmup tick: expected breach, got $post_warmup_state"
+    fi
+  fi
+  # Ticks 3-4: continue breaching → breach then firing
+  if $t148a_pass; then
+    for expected_state in breach firing; do
+      local cont_out
+      cont_out=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+        python3 "$eval_script" \
+        --catalog "$catalog_file" \
+        --current "$tick_prom_148a" \
+        --prev "$prev_prom_148a" \
+        --state-dir "$state_dir_148a" 2>/dev/null) || true
+      local cont_state
+      cont_state=$(echo "$cont_out" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'quorum-fail-at-low':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+      if [[ "$cont_state" != "$expected_state" ]]; then
+        t148a_pass=false
+        t148a_detail="continuation: expected $expected_state, got $cont_state"
+        break
+      fi
+    done
+  fi
+  if $t148a_pass; then
+    tap_ok "eval-alarms: quorum-fail-at-low warmup gate resets stale persistence (#2614)"
+  else
+    tap_not_ok "eval-alarms: quorum-fail-at-low warmup gate resets stale persistence (#2614)" "$t148a_detail"
+  fi
+  rm -f "$tick_prom_148a" "$prev_prom_148a"
+  rm -rf "$state_dir_148a"
+
+  # Test 148b: metric-missing resets stale gauge persistence (#2614)
+  # Pre-seed persistence with count=2, run with metric absent → skipped + persistence reset.
+  local state_dir_148b
+  state_dir_148b=$(mktemp -d)
+  local tick_prom_148b prev_prom_148b
+  tick_prom_148b=$(mktemp)
+  prev_prom_148b=$(mktemp)
+  # Metric ABSENT from prom data — only herder_state present
+  cat > "$tick_prom_148b" <<'TICK_PROM_148B'
+stellar_herder_state 2
+TICK_PROM_148B
+  cat > "$prev_prom_148b" <<'PREV_PROM_148B'
+stellar_herder_state 2
+PREV_PROM_148B
+  mkdir -p "$state_dir_148b"
+  echo "gauge_persist_quorum-fail-at-low=2" > "$state_dir_148b/gauge_persistence"
+  local t148b_pass=true
+  local t148b_detail=""
+  # Tick with missing metric → should skip + reset persistence
+  local missing_out
+  missing_out=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$tick_prom_148b" \
+    --prev "$prev_prom_148b" \
+    --state-dir "$state_dir_148b" 2>/dev/null) || true
+  local missing_state
+  missing_state=$(echo "$missing_out" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'quorum-fail-at-low':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+  if [[ "$missing_state" != "skipped" ]]; then
+    t148b_pass=false
+    t148b_detail="metric-missing tick: expected skipped, got $missing_state"
+  fi
+  # Verify persistence was reset to 0
+  if $t148b_pass; then
+    local persist_val_b
+    persist_val_b=$(grep 'gauge_persist_quorum-fail-at-low' "$state_dir_148b/gauge_persistence" 2>/dev/null | cut -d= -f2)
+    if [[ "$persist_val_b" != "0" ]]; then
+      t148b_pass=false
+      t148b_detail="persistence not reset: expected 0, got ${persist_val_b:-empty}"
+    fi
+  fi
+  # Next tick with metric present + breaching → should be "breach" (count 1)
+  if $t148b_pass; then
+    cat > "$tick_prom_148b" <<'TICK_PROM_148B2'
+stellar_quorum_fail_at 0
+stellar_herder_state 2
+TICK_PROM_148B2
+    cat > "$prev_prom_148b" <<'PREV_PROM_148B2'
+stellar_quorum_fail_at 0
+stellar_herder_state 2
+PREV_PROM_148B2
+    local next_out
+    next_out=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+      python3 "$eval_script" \
+      --catalog "$catalog_file" \
+      --current "$tick_prom_148b" \
+      --prev "$prev_prom_148b" \
+      --state-dir "$state_dir_148b" 2>/dev/null) || true
+    local next_state
+    next_state=$(echo "$next_out" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'quorum-fail-at-low':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+    if [[ "$next_state" != "breach" ]]; then
+      t148b_pass=false
+      t148b_detail="post-missing tick: expected breach, got $next_state"
+    fi
+  fi
+  if $t148b_pass; then
+    tap_ok "eval-alarms: metric-missing resets stale gauge persistence (#2614)"
+  else
+    tap_not_ok "eval-alarms: metric-missing resets stale gauge persistence (#2614)" "$t148b_detail"
+  fi
+  rm -f "$tick_prom_148b" "$prev_prom_148b"
+  rm -rf "$state_dir_148b"
 
   # Test 149: alarm-surfaces.toml file-local invariants + mirrored UIDs
   #           resolve to real Grafana alert UIDs in henyey-slo-alerts.yaml.
