@@ -351,7 +351,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `recordMessageMetric()` | (via OverlayMetrics) | Full |
 | `getFlowControlBytesTotal()` | `FlowControlBytesConfig::bytes_total()` | Full |
 | `getFlowControlBytesBatch()` | `FlowControlBytesConfig::bytes_batch()` | Full |
-| `checkScheduledAndCache()` | None — reverted due to #2629 liveness regression; dedup at app level only | None |
+| `checkScheduledAndCache()` | `ScpScheduledCache` in henyey-app with RAII token lifetime (#2631) | Full |
 | `getOverlayThreadSnapshot()` | N/A | None |
 | `tick()` | `start_tick_loop()` (3s interval) | Full |
 | `updateTimerAndMaybeDropRandomPeer()` | `maybe_drop_random_peer()` | Full |

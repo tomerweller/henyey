@@ -156,6 +156,9 @@ impl<T> std::ops::IndexMut<PreFilterRejectReason> for PreFilterCounters<T> {
 
 /// Envelope intake payload carried from the event loop across the verifier
 /// channel. Contains everything `process_verified` needs downstream.
+///
+/// Construct via [`PipelinedIntake::from_overlay`] (overlay path with dedup
+/// token) or [`PipelinedIntake::from_local`] (test/catchup path without dedup).
 #[derive(Debug)]
 pub struct PipelinedIntake {
     pub envelope: ScpEnvelope,
@@ -169,6 +172,55 @@ pub struct PipelinedIntake {
     /// FloodGate key for `forget_flooded_msg` calls on discard.
     /// Set by `pump_scp_intake`; `None` for non-overlay paths (catchup, tests).
     pub flood_msg_hash: Option<henyey_common::Hash256>,
+    /// RAII dedup token that keeps the [`ScpScheduledCache`] entry alive while
+    /// this intake is in-flight. When this intake is dropped (processing
+    /// complete, channel closed, panic), the token drops and the cache entry
+    /// auto-expires. `None` for non-overlay paths (catchup, tests).
+    ///
+    /// [`ScpScheduledCache`]: the app-level SCP scheduling cache
+    pub inflight_token: Option<std::sync::Arc<()>>,
+}
+
+impl PipelinedIntake {
+    /// Construct an intake from the overlay path.
+    ///
+    /// Requires a dedup token (from `ScpScheduledCache::check_and_insert`),
+    /// the flood message hash, and the delivering peer. This makes it a
+    /// compile error to forget the token at the overlay call site.
+    pub fn from_overlay(
+        envelope: ScpEnvelope,
+        slot: u64,
+        is_externalize: bool,
+        peer_id: henyey_overlay::PeerId,
+        flood_msg_hash: henyey_common::Hash256,
+        inflight_token: std::sync::Arc<()>,
+    ) -> Self {
+        Self {
+            envelope,
+            slot,
+            is_externalize,
+            peer_id: Some(peer_id),
+            enqueue_at: Instant::now(),
+            flood_msg_hash: Some(flood_msg_hash),
+            inflight_token: Some(inflight_token),
+        }
+    }
+
+    /// Construct an intake from a local/non-overlay path (catchup, tests).
+    ///
+    /// No dedup token, flood hash, or peer — these paths bypass the
+    /// overlay scheduling cache intentionally.
+    pub fn from_local(envelope: ScpEnvelope, slot: u64, is_externalize: bool) -> Self {
+        Self {
+            envelope,
+            slot,
+            is_externalize,
+            peer_id: None,
+            enqueue_at: Instant::now(),
+            flood_msg_hash: None,
+            inflight_token: None,
+        }
+    }
 }
 
 /// Result of the pre-filter stage that runs on the event loop.
@@ -591,14 +643,7 @@ mod tests {
         let h = spawned.handle.clone();
         let mut verified_rx = spawned.verified_rx;
 
-        let intake = PipelinedIntake {
-            envelope: dummy_envelope(),
-            slot: 1,
-            is_externalize: false,
-            peer_id: None,
-            enqueue_at: Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(dummy_envelope(), 1, false);
         assert_eq!(h.state(), VerifierState::Running);
         h.tx.blocking_send(intake).unwrap();
 

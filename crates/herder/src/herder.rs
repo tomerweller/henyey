@@ -1271,14 +1271,7 @@ impl Herder {
         }
         // Record when we first observed activity for this slot (timing metrics).
         self.scp_driver.record_slot_activity(slot);
-        let intake = PipelinedIntake {
-            envelope,
-            slot,
-            is_externalize,
-            peer_id: None,
-            enqueue_at: Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(envelope, slot, is_externalize);
         self.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Ok,
@@ -1333,14 +1326,7 @@ impl Herder {
         }
         // Record when we first observed activity for this slot (timing metrics).
         self.scp_driver.record_slot_activity(slot);
-        let intake = PipelinedIntake {
-            envelope,
-            slot,
-            is_externalize,
-            peer_id: None,
-            enqueue_at: Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(envelope, slot, is_externalize);
         self.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Ok,
@@ -1445,14 +1431,11 @@ impl Herder {
             &envelope.statement.pledges,
             ScpStatementPledges::Externalize(_)
         );
-        PreFilter::Accept(PipelinedIntake {
-            envelope: envelope.clone(),
+        PreFilter::Accept(PipelinedIntake::from_local(
+            envelope.clone(),
             slot,
             is_externalize,
-            peer_id: None,
-            enqueue_at: Instant::now(),
-            flood_msg_hash: None,
-        })
+        ))
     }
 
     /// Post-verification processing.
@@ -7617,14 +7600,7 @@ mod scp_pipeline_tests {
         herder.pending_envelopes.set_current_slot(95);
 
         let env = make_unsigned_envelope(100, 1);
-        let intake = PipelinedIntake {
-            envelope: env,
-            slot: 100,
-            is_externalize: false,
-            peer_id: None,
-            enqueue_at: std::time::Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(env, 100, false);
         let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::InvalidSignature,
@@ -7638,14 +7614,7 @@ mod scp_pipeline_tests {
         let herder = make_test_herder();
         herder.start_syncing();
         let env = make_unsigned_envelope(100, 1);
-        let intake = PipelinedIntake {
-            envelope: env,
-            slot: 100,
-            is_externalize: false,
-            peer_id: None,
-            enqueue_at: std::time::Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(env, 100, false);
         let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Panic,
@@ -7678,14 +7647,7 @@ mod scp_pipeline_tests {
 
         // Build an envelope whose statement.node_id == the local node_id.
         let env = make_signed_test_envelope_outer(100, &herder, &secret);
-        let intake = PipelinedIntake {
-            envelope: env,
-            slot: 100,
-            is_externalize: false,
-            peer_id: None,
-            enqueue_at: std::time::Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(env, 100, false);
         let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Ok,
@@ -7717,14 +7679,7 @@ mod scp_pipeline_tests {
         // Build a Nominate envelope with a fresh, signed StellarValue so
         // close-time passes; slot=100 is far below min_ledger_seq (=9988).
         let env = make_signed_test_envelope_outer(100, &herder, &secret);
-        let intake = PipelinedIntake {
-            envelope: env,
-            slot: 100,
-            is_externalize: false,
-            peer_id: None,
-            enqueue_at: std::time::Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(env, 100, false);
         let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Ok,
@@ -7762,14 +7717,7 @@ mod scp_pipeline_tests {
         for seed_byte in 0..3u8 {
             let secret = SecretKey::from_seed(&[seed_byte + 10; 32]);
             let env = make_signed_test_envelope_outer(slot, &herder, &secret);
-            let intake = PipelinedIntake {
-                envelope: env,
-                slot,
-                is_externalize: false,
-                peer_id: None,
-                enqueue_at: std::time::Instant::now(),
-                flood_msg_hash: None,
-            };
+            let intake = PipelinedIntake::from_local(env, slot, false);
             let (state, reason) = herder.process_verified(VerifiedEnvelope {
                 intake,
                 verdict: Verdict::Ok,
@@ -7781,14 +7729,7 @@ mod scp_pipeline_tests {
         // 4th envelope exceeds the cap → PerSlotFull path.
         let secret = SecretKey::from_seed(&[99; 32]);
         let env = make_signed_test_envelope_outer(slot, &herder, &secret);
-        let intake = PipelinedIntake {
-            envelope: env,
-            slot,
-            is_externalize: false,
-            peer_id: None,
-            enqueue_at: std::time::Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(env, slot, false);
         let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Ok,
@@ -7820,14 +7761,7 @@ mod scp_pipeline_tests {
         for seed_byte in 0..3u8 {
             let secret = SecretKey::from_seed(&[seed_byte + 10; 32]);
             let env = make_signed_test_envelope_outer(slot, &herder, &secret);
-            let intake = PipelinedIntake {
-                envelope: env,
-                slot,
-                is_externalize: false,
-                peer_id: None,
-                enqueue_at: std::time::Instant::now(),
-                flood_msg_hash: None,
-            };
+            let intake = PipelinedIntake::from_local(env, slot, false);
             let (state, reason) = herder.process_verified(VerifiedEnvelope {
                 intake,
                 verdict: Verdict::Ok,
@@ -7839,14 +7773,7 @@ mod scp_pipeline_tests {
         // 4th envelope for the CURRENT slot exceeds the cap → rejected.
         let secret = SecretKey::from_seed(&[99; 32]);
         let env = make_signed_test_envelope_outer(slot, &herder, &secret);
-        let intake = PipelinedIntake {
-            envelope: env,
-            slot,
-            is_externalize: false,
-            peer_id: None,
-            enqueue_at: std::time::Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(env, slot, false);
         let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
             verdict: Verdict::Ok,
@@ -7904,14 +7831,7 @@ mod scp_pipeline_tests {
         let mut verified_rx = spawned.verified_rx;
         let join_handle = spawned.join_handle;
 
-        let intake = PipelinedIntake {
-            envelope: make_unsigned_envelope(1, 1),
-            slot: u64::MAX - 1,
-            is_externalize: false,
-            peer_id: None,
-            enqueue_at: std::time::Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(make_unsigned_envelope(1, 1), u64::MAX - 1, false);
         h.tx.blocking_send(intake).expect("send");
 
         let ve = verified_rx
@@ -7950,14 +7870,7 @@ mod scp_pipeline_tests {
 
         // Send one non-panic envelope so the worker processes it and hits
         // the failed send path.
-        let intake = PipelinedIntake {
-            envelope: make_unsigned_envelope(1, 1),
-            slot: 1,
-            is_externalize: false,
-            peer_id: None,
-            enqueue_at: std::time::Instant::now(),
-            flood_msg_hash: None,
-        };
+        let intake = PipelinedIntake::from_local(make_unsigned_envelope(1, 1), 1, false);
         h.tx.blocking_send(intake).expect("send");
 
         // Deterministically wait for the worker thread to exit.
@@ -7993,14 +7906,11 @@ mod scp_pipeline_tests {
         assert_eq!(handle.queue_len(), 0, "empty channel reports 0 used slots");
 
         for i in 0..3 {
-            tx.blocking_send(PipelinedIntake {
-                envelope: make_unsigned_envelope(i as u64, 1),
-                slot: i as u64,
-                is_externalize: false,
-                peer_id: None,
-                enqueue_at: std::time::Instant::now(),
-                flood_msg_hash: None,
-            })
+            tx.blocking_send(PipelinedIntake::from_local(
+                make_unsigned_envelope(i as u64, 1),
+                i as u64,
+                false,
+            ))
             .expect("send");
         }
 

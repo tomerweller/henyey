@@ -2051,13 +2051,13 @@ impl App {
         let from_peer = scp_msg.from_peer;
         let verifier = self.herder.scp_verifier_handle();
 
-        // Compute envelope hash for in-flight dedup check.
-        // Matches stellar-core's checkScheduledAndCache (Peer.cpp:1113-1117,
-        // OverlayManagerImpl.cpp:1190-1212).
-        let envelope_hash = super::scp_dedup::ScheduledEnvelopeSet::envelope_hash(&envelope);
-
-        // In-flight dedup: reject envelopes already dispatched to the verify worker.
-        let Some(dedup_slot) = self.scp_scheduled.check(&envelope_hash) else {
+        // In-flight dedup: reject envelopes already dispatched to the verify
+        // worker. Uses the full StellarMessage hash matching stellar-core's
+        // checkScheduledAndCache (Peer.cpp:1113-1117, OverlayManagerImpl.cpp:1190-1212).
+        // The returned Arc<()> token keeps the cache entry alive; dropping it
+        // (on pre-filter reject, channel close, or end of processing) auto-expires
+        // the entry.
+        let Some(inflight_token) = self.scp_scheduled.check_and_insert(flood_msg_hash) else {
             return;
         };
 
@@ -2085,7 +2085,7 @@ impl App {
                                 "scp-verify worker channel closed (worker likely dead); \
                                  dropping envelope"
                             );
-                            // DedupSlot dropped without commit — no cache poisoning.
+                            // Token dropped here — cache entry auto-expires.
                             return;
                         }
                     };
@@ -2101,9 +2101,11 @@ impl App {
                         PreFilter::Accept(mut intake) => {
                             intake.peer_id = Some(from_peer);
                             intake.flood_msg_hash = Some(flood_msg_hash);
-                            // Insert into in-flight set AFTER successful dispatch.
-                            // Pre-filter rejects do not poison the cache.
-                            dedup_slot.commit();
+                            // Move the token into the intake — it will live
+                            // as long as the intake, auto-expiring the cache
+                            // entry when processing completes or the intake
+                            // is dropped.
+                            intake.inflight_token = Some(inflight_token);
                             permit.send(intake);
                         }
                         PreFilter::Reject(reason) => {
@@ -2114,7 +2116,7 @@ impl App {
                             if let Some(overlay) = self.overlay().await {
                                 overlay.forget_flooded_msg(&flood_msg_hash);
                             }
-                            // DedupSlot dropped without commit — no cache poisoning.
+                            // Token dropped here — cache entry auto-expires.
                             drop(permit);
                         }
                     }
@@ -2135,8 +2137,9 @@ impl App {
         use henyey_herder::scp_verify::Verdict;
         self.set_phase(32); // 32 = scp_verified
 
-        // Remove from in-flight dedup set FIRST, before any early returns.
-        self.scp_scheduled.complete(&ve.intake.envelope);
+        // In-flight dedup cleanup is automatic: the `inflight_token` in
+        // `ve.intake` will be dropped when `ve` goes out of scope at the end
+        // of this function, auto-expiring the ScpScheduledCache entry.
 
         let slot = ve.intake.slot;
         let tracking = self.herder.tracking_slot().get();
@@ -2487,7 +2490,6 @@ mod pump_tests {
     use henyey_herder::scp_verify::{PipelinedIntake, Verdict, VerifiedEnvelope};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Instant;
     use stellar_xdr::curr::{
         NodeId, PublicKey as XdrPublicKey, ScpBallot, ScpEnvelope, ScpStatement,
         ScpStatementPledges, ScpStatementPrepare, Signature, Uint256, Value,
@@ -2513,17 +2515,14 @@ mod pump_tests {
             pledges,
         };
         VerifiedEnvelope {
-            intake: PipelinedIntake {
-                envelope: ScpEnvelope {
+            intake: PipelinedIntake::from_local(
+                ScpEnvelope {
                     statement,
                     signature: Signature(vec![0u8; 64].try_into().unwrap()),
                 },
                 slot,
-                is_externalize: false,
-                peer_id: None,
-                enqueue_at: Instant::now(),
-                flood_msg_hash: None,
-            },
+                false,
+            ),
             verdict: Verdict::Ok,
         }
     }
@@ -2619,17 +2618,16 @@ mod scp_dedup_pipeline_tests {
         }
     }
 
-    /// Pipeline test: pump_scp_intake rejects duplicates through real App wiring.
+    /// Pipeline test: pump_scp_intake handles pre-filter reject correctly.
     ///
     /// The herder is in Booting state (can't receive SCP), so the pre-filter
-    /// rejects. But the dedup check runs BEFORE the pre-filter, so we can
-    /// verify:
-    /// 1. First call: dedup check passes (new hash), pre-filter rejects → DedupSlot
-    ///    dropped → no cache entry created (no poisoning).
-    /// 2. Because no cache entry was created, a second call also passes the
-    ///    dedup check (and also gets pre-filter rejected).
-    /// 3. The dedup counter stays at 0 (no duplicates detected, since nothing
-    ///    was ever committed to the cache).
+    /// rejects. With the RAII token model:
+    /// 1. First call: check_and_insert passes (new hash), inserts entry, returns
+    ///    token. Pre-filter rejects → token dropped at end of pump_scp_intake →
+    ///    entry becomes a tombstone (Weak expired).
+    /// 2. Second call: check_and_insert finds expired Weak, cleans tombstone,
+    ///    re-inserts → passes again (no dedup rejection).
+    /// 3. The dedup counter stays at 0 (no live duplicates detected).
     #[tokio::test]
     async fn test_pump_scp_intake_no_poison_on_prefilter_reject() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2644,17 +2642,11 @@ mod scp_dedup_pipeline_tests {
         let envelope = make_test_envelope(100, 2_000_000_000);
         let msg = make_overlay_scp_msg(envelope);
 
-        // Herder is in Booting → pre-filter rejects → DedupSlot dropped.
+        // Herder is in Booting → pre-filter rejects → token dropped → tombstone.
         app.pump_scp_intake(msg.clone(), &mut verified_rx).await;
-        assert_eq!(
-            app.scp_scheduled.len(),
-            0,
-            "no cache entry after pre-filter reject"
-        );
 
-        // Second call: same envelope, dedup check passes again (not in cache).
+        // Second call: tombstone cleaned, re-inserts. No dedup rejection.
         app.pump_scp_intake(msg, &mut verified_rx).await;
-        assert_eq!(app.scp_scheduled.len(), 0, "still no cache entry");
         assert_eq!(app.scp_scheduled.dedup_count(), 0, "no dedup rejections");
     }
 
@@ -2662,10 +2654,10 @@ mod scp_dedup_pipeline_tests {
     ///
     /// Sets up herder in Tracking state with proper tracking slot so the
     /// pre-filter accepts envelopes. Tests:
-    /// 1. First pump_scp_intake: dispatches → hash in cache
-    /// 2. Second pump_scp_intake: dedup rejects → counter increments
-    /// 3. process_verified: hash removed from cache
-    /// 4. Third pump_scp_intake: re-dispatch succeeds
+    /// 1. First pump_scp_intake: dispatches → token stored in intake → entry live
+    /// 2. Second pump_scp_intake: dedup rejects (entry alive) → counter increments
+    /// 3. process_verified: intake dropped → token dropped → entry expires
+    /// 4. Third pump_scp_intake: re-dispatch succeeds (tombstone cleaned)
     #[tokio::test]
     async fn test_pump_scp_intake_dedup_full_dispatch() {
         use henyey_herder::HerderState;
@@ -2696,53 +2688,45 @@ mod scp_dedup_pipeline_tests {
         app.herder.set_test_clock_seconds(close_time + 5);
 
         // Build an envelope for the tracking slot with valid close time.
-        // The close time in the value should be > tracking close time (future slot case)
-        // to pass check_close_time. We use close_time + 5 which is plausible.
         let envelope = make_test_envelope(tracking_slot, close_time + 5);
         let msg = make_overlay_scp_msg(envelope.clone());
 
-        // --- 1. First dispatch: dedup passes, pre-filter accepts, hash enters cache ---
+        // --- 1. First dispatch: dedup passes, pre-filter accepts, token in intake ---
         app.pump_scp_intake(msg.clone(), &mut verified_rx).await;
         assert_eq!(
             app.scp_scheduled.len(),
             1,
-            "hash should be in cache after dispatch"
+            "entry should be in cache after dispatch"
         );
 
-        // --- 2. Second call: dedup rejects (hash in cache) ---
+        // --- 2. Second call: dedup rejects (token still alive in verifier channel) ---
         app.pump_scp_intake(msg.clone(), &mut verified_rx).await;
         assert_eq!(app.scp_scheduled.dedup_count(), 1, "one dedup rejection");
         assert_eq!(app.scp_scheduled.len(), 1, "cache unchanged");
 
         // --- 3. Drain verified_rx and call process_verified ---
-        // The verify worker should process the envelope and send a VerifiedEnvelope.
-        // Wait briefly for the worker to complete verification.
         let ve = tokio::time::timeout(std::time::Duration::from_secs(5), verified_rx.recv())
             .await
             .expect("timeout waiting for verified envelope")
             .expect("verified_rx closed");
 
-        // Before process_verified: hash is still in cache.
+        // Before process_verified: entry is still live (token in VerifiedEnvelope).
         assert_eq!(
             app.scp_scheduled.len(),
             1,
-            "hash still in cache before process_verified"
+            "entry still in cache before process_verified"
         );
 
-        // process_verified removes the hash at the START, before any other processing.
+        // process_verified consumes `ve` → intake dropped → token dropped →
+        // entry becomes a tombstone.
         app.process_verified(ve).await;
-        assert_eq!(
-            app.scp_scheduled.len(),
-            0,
-            "hash removed after process_verified"
-        );
 
-        // --- 4. Re-dispatch: same envelope passes dedup again ---
+        // --- 4. Re-dispatch: tombstone cleaned, new entry inserted ---
         app.pump_scp_intake(msg, &mut verified_rx).await;
         assert_eq!(
             app.scp_scheduled.len(),
             1,
-            "re-dispatch succeeds after completion"
+            "re-dispatch succeeds after token drop"
         );
         // Dedup count unchanged (still 1 from step 2).
         assert_eq!(

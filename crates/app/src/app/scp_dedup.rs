@@ -1,80 +1,76 @@
-//! In-flight SCP envelope dedup cache.
+//! In-flight SCP envelope dedup cache with RAII auto-expiring entries.
 //!
 //! Mirrors stellar-core's `mScheduledMessages`
-//! (`OverlayManagerImpl.cpp:326, 1190-1212`). Entries are inserted after
-//! successful pre-filter + dispatch to the verify worker and removed at
-//! the start of `process_verified`.
+//! (`OverlayManagerImpl.cpp:326, 1190-1212`). Uses a
+//! [`RandomEvictionCache`](henyey_crypto::RandomEvictionCache) with
+//! `Weak<()>` values that auto-expire when the associated `Arc<()>` token
+//! (stored in [`PipelinedIntake`](henyey_herder::scp_verify::PipelinedIntake))
+//! is dropped. No explicit removal API is needed — entry lifetime is tied
+//! to the intake's lifetime.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 use henyey_common::Hash256;
-use stellar_xdr::curr::{Limits, ScpEnvelope, WriteXdr};
+use henyey_crypto::RandomEvictionCache;
 
-/// In-flight SCP envelope dedup cache.
+/// Capacity matching stellar-core's `mScheduledMessages(100000)`
+/// (OverlayManagerImpl.cpp:326).
+const CAPACITY: usize = 100_000;
+
+/// In-flight SCP envelope scheduling cache with auto-expiring entries.
 ///
-/// Tracks envelope hashes that have been dispatched to the signature
-/// verification worker but not yet processed by [`super::App::process_verified`].
-/// Duplicate envelopes are rejected (and counted) so the verifier is not
-/// overwhelmed by repeated network deliveries of the same message.
-pub(crate) struct ScheduledEnvelopeSet {
-    cache: Mutex<HashSet<Hash256>>,
+/// Entries are inserted eagerly on `check_and_insert` (matching stellar-core's
+/// `checkScheduledAndCache` which calls `mScheduledMessages.put()` immediately).
+/// Each entry stores a `Weak<()>`; the corresponding `Arc<()>` lives in
+/// `PipelinedIntake::inflight_token`. When the intake is consumed or dropped
+/// (success, channel closure, panic), the `Arc` drops, the `Weak` expires,
+/// and subsequent lookups treat the entry as absent.
+pub(crate) struct ScpScheduledCache {
+    cache: Mutex<RandomEvictionCache<Hash256, Weak<()>>>,
     dedup_count: AtomicU64,
 }
 
-impl ScheduledEnvelopeSet {
+impl ScpScheduledCache {
     pub fn new() -> Self {
         Self {
-            cache: Mutex::new(HashSet::new()),
+            cache: Mutex::new(RandomEvictionCache::new(CAPACITY)),
             dedup_count: AtomicU64::new(0),
         }
     }
 
-    /// Compute the dedup hash for an SCP envelope.
+    /// Check whether `hash` is in-flight and insert if not.
     ///
-    /// Uses the same serialisation + blake2 scheme as stellar-core's
-    /// `checkScheduledAndCache` (Peer.cpp:1113-1117).
-    pub fn envelope_hash(envelope: &ScpEnvelope) -> Hash256 {
-        henyey_crypto::blake2(&envelope.to_xdr(Limits::none()).unwrap())
-    }
+    /// Returns `None` if the hash is already in-flight (duplicate) — the
+    /// caller should drop the envelope. Increments the dedup counter.
+    ///
+    /// Returns `Some(Arc<()>)` if the hash is new or its previous token
+    /// expired. The caller must store this `Arc` in `PipelinedIntake::inflight_token`
+    /// to keep the cache entry alive for the duration of processing.
+    ///
+    /// Matches stellar-core's `checkScheduledAndCache`
+    /// (OverlayManagerImpl.cpp:1190-1212): eager insert, weak-ref auto-expire.
+    pub fn check_and_insert(&self, hash: Hash256) -> Option<Arc<()>> {
+        let mut cache = self.cache.lock().unwrap();
 
-    /// Check whether `hash` is already in-flight.
-    ///
-    /// Returns `None` (and increments the dedup counter) if the hash is
-    /// already cached — the caller should drop the envelope.
-    ///
-    /// Returns `Some(DedupSlot)` if the hash is new. The caller must call
-    /// [`DedupSlot::commit`] after successful dispatch to the verify
-    /// worker, or simply drop the slot to abort without poisoning the
-    /// cache (matching the pre-filter-reject path).
-    ///
-    /// The check → commit gap is intentional: it mirrors the production
-    /// event-loop pattern where the pre-filter runs between check and
-    /// commit on the single event-loop task. No concurrent caller can
-    /// race between `check()` and `commit()`.
-    pub fn check(&self, hash: &Hash256) -> Option<DedupSlot<'_>> {
-        let guard = self.cache.lock().unwrap();
-        if guard.contains(hash) {
-            drop(guard);
-            self.dedup_count.fetch_add(1, Ordering::Relaxed);
-            return None;
+        // Check for existing live entry.
+        if let Some(weak) = cache.get(&hash) {
+            if weak.upgrade().is_some() {
+                // Token still alive → duplicate. get() already refreshed
+                // generation (recency), matching stellar-core's behavior.
+                drop(cache);
+                self.dedup_count.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            // Weak expired → tombstone. Remove before re-inserting.
+            cache.remove(&hash);
         }
-        drop(guard);
-        Some(DedupSlot {
-            set: self,
-            hash: *hash,
-        })
-    }
 
-    /// Remove an envelope from the in-flight set.
-    ///
-    /// Called at the **start** of `process_verified`, before any early
-    /// returns, so cleanup is guaranteed even for `InvalidSignature` or
-    /// `Panic` verdicts.
-    pub fn complete(&self, envelope: &ScpEnvelope) {
-        let hash = Self::envelope_hash(envelope);
-        self.cache.lock().unwrap().remove(&hash);
+        // Insert new entry with fresh Arc/Weak pair.
+        let arc = Arc::new(());
+        let weak = Arc::downgrade(&arc);
+        cache.put(hash, weak);
+        Some(arc)
     }
 
     /// Number of envelopes rejected by the dedup check since startup.
@@ -82,31 +78,11 @@ impl ScheduledEnvelopeSet {
         self.dedup_count.load(Ordering::Relaxed)
     }
 
-    /// Number of envelopes currently in the in-flight set.
+    /// Number of entries in the cache (includes expired tombstones not yet
+    /// evicted or cleaned on access).
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.cache.lock().unwrap().len()
-    }
-}
-
-/// A slot representing an envelope that passed the dedup check but has
-/// not yet been committed (dispatched) to the verify worker.
-///
-/// If dropped without calling [`commit`](DedupSlot::commit), no cache
-/// entry is created — matching the pre-filter reject and channel-closed
-/// paths where the envelope never reaches the worker.
-pub(crate) struct DedupSlot<'a> {
-    set: &'a ScheduledEnvelopeSet,
-    hash: Hash256,
-}
-
-impl DedupSlot<'_> {
-    /// Insert into the in-flight cache.
-    ///
-    /// Call this **after** successful dispatch (channel send) to the
-    /// verify worker.
-    pub fn commit(self) {
-        self.set.cache.lock().unwrap().insert(self.hash);
     }
 }
 
@@ -117,147 +93,107 @@ impl DedupSlot<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
-        NodeId, PublicKey as XdrPublicKey, ScpBallot, ScpStatement, ScpStatementPledges,
-        ScpStatementPrepare, Signature, Uint256, Value,
-    };
 
-    fn make_envelope(slot: u64, node_seed: u8) -> ScpEnvelope {
-        let node_id = NodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([node_seed; 32])));
-        let value = Value(vec![].try_into().unwrap());
-        ScpEnvelope {
-            statement: ScpStatement {
-                node_id,
-                slot_index: slot,
-                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
-                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    ballot: ScpBallot {
-                        counter: 1,
-                        value: value.clone(),
-                    },
-                    prepared: None,
-                    prepared_prime: None,
-                    n_c: 0,
-                    n_h: 0,
-                }),
-            },
-            signature: Signature(vec![0u8; 64].try_into().unwrap()),
-        }
+    fn hash(n: u8) -> Hash256 {
+        let mut h = [0u8; 32];
+        h[0] = n;
+        Hash256(h)
     }
 
     #[test]
-    fn test_dedup_rejects_inflight_duplicate() {
-        let set = ScheduledEnvelopeSet::new();
-        let env = make_envelope(100, 1);
-        let hash = ScheduledEnvelopeSet::envelope_hash(&env);
-
-        // First check: new envelope, returns Some.
-        let slot = set.check(&hash).expect("first check should pass");
-        slot.commit();
-
-        // Second check: duplicate, returns None.
-        assert!(set.check(&hash).is_none());
-        assert_eq!(set.dedup_count(), 1);
+    fn test_new_entry_returns_token() {
+        let cache = ScpScheduledCache::new();
+        let token = cache.check_and_insert(hash(1));
+        assert!(token.is_some());
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
-    fn test_dedup_allows_after_completion() {
-        let set = ScheduledEnvelopeSet::new();
-        let env = make_envelope(100, 1);
-        let hash = ScheduledEnvelopeSet::envelope_hash(&env);
+    fn test_duplicate_rejected_while_token_alive() {
+        let cache = ScpScheduledCache::new();
+        let _token = cache.check_and_insert(hash(1)).unwrap();
 
-        // Dispatch.
-        set.check(&hash).unwrap().commit();
-        assert_eq!(set.len(), 1);
-
-        // Complete (simulate process_verified).
-        set.complete(&env);
-        assert_eq!(set.len(), 0);
-
-        // Re-dispatch: passes again.
-        assert!(set.check(&hash).is_some());
+        // Same hash while token alive → rejected.
+        assert!(cache.check_and_insert(hash(1)).is_none());
+        assert_eq!(cache.dedup_count(), 1);
     }
 
     #[test]
-    fn test_dedup_no_poison_on_drop() {
-        let set = ScheduledEnvelopeSet::new();
-        let env = make_envelope(100, 1);
-        let hash = ScheduledEnvelopeSet::envelope_hash(&env);
+    fn test_token_drop_allows_reinsert() {
+        let cache = ScpScheduledCache::new();
+        let token = cache.check_and_insert(hash(1)).unwrap();
 
-        // Check passes but slot is dropped (pre-filter reject).
-        let slot = set.check(&hash).expect("check should pass");
-        drop(slot);
+        // Drop the token (simulates intake consumed/dropped).
+        drop(token);
 
-        // Cache is not poisoned.
-        assert_eq!(set.len(), 0);
-        assert!(set.check(&hash).is_some());
+        // Same hash now passes — entry expired.
+        let token2 = cache.check_and_insert(hash(1));
+        assert!(token2.is_some());
     }
 
     #[test]
-    fn test_dedup_cleanup_deterministic() {
-        let set = ScheduledEnvelopeSet::new();
-        let env = make_envelope(100, 1);
-        let hash = ScheduledEnvelopeSet::envelope_hash(&env);
+    fn test_prefilter_reject_no_poison() {
+        let cache = ScpScheduledCache::new();
+        // check_and_insert inserts eagerly, but if we drop the token
+        // immediately (pre-filter reject), the entry expires.
+        let token = cache.check_and_insert(hash(1)).unwrap();
+        drop(token);
 
-        set.check(&hash).unwrap().commit();
-        assert_eq!(set.len(), 1);
-
-        set.complete(&env);
-        assert_eq!(set.len(), 0);
+        // Not poisoned — next check passes.
+        assert!(cache.check_and_insert(hash(1)).is_some());
     }
 
     #[test]
-    fn test_dedup_distinct_envelopes() {
-        let set = ScheduledEnvelopeSet::new();
-        let env_a = make_envelope(100, 1);
-        let env_b = make_envelope(101, 2);
-        let hash_a = ScheduledEnvelopeSet::envelope_hash(&env_a);
-        let hash_b = ScheduledEnvelopeSet::envelope_hash(&env_b);
+    fn test_distinct_hashes_independent() {
+        let cache = ScpScheduledCache::new();
+        let _t1 = cache.check_and_insert(hash(1)).unwrap();
+        let _t2 = cache.check_and_insert(hash(2)).unwrap();
 
-        assert_ne!(hash_a, hash_b);
-
-        set.check(&hash_a).unwrap().commit();
-        set.check(&hash_b).unwrap().commit();
-
-        assert_eq!(set.len(), 2);
-        assert_eq!(set.dedup_count(), 0);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.dedup_count(), 0);
     }
 
     #[test]
-    fn test_dedup_hash_deterministic() {
-        let env = make_envelope(42, 7);
-        let h1 = ScheduledEnvelopeSet::envelope_hash(&env);
-        let h2 = ScheduledEnvelopeSet::envelope_hash(&env);
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn test_dedup_counter_multiple_duplicates() {
-        let set = ScheduledEnvelopeSet::new();
-        let env = make_envelope(100, 1);
-        let hash = ScheduledEnvelopeSet::envelope_hash(&env);
-
-        set.check(&hash).unwrap().commit();
+    fn test_multiple_duplicates_counted() {
+        let cache = ScpScheduledCache::new();
+        let _token = cache.check_and_insert(hash(1)).unwrap();
 
         for _ in 0..5 {
-            assert!(set.check(&hash).is_none());
+            assert!(cache.check_and_insert(hash(1)).is_none());
         }
-        assert_eq!(set.dedup_count(), 5);
+        assert_eq!(cache.dedup_count(), 5);
     }
 
     #[test]
-    fn test_dedup_channel_closed_leaves_set_clean() {
-        let set = ScheduledEnvelopeSet::new();
-        let env = make_envelope(100, 1);
-        let hash = ScheduledEnvelopeSet::envelope_hash(&env);
+    fn test_capacity_eviction() {
+        // Use a small-capacity cache to test eviction.
+        let cache = ScpScheduledCache {
+            cache: Mutex::new(RandomEvictionCache::new(5)),
+            dedup_count: AtomicU64::new(0),
+        };
 
-        // Check passes, but simulate channel-closed: drop slot without commit.
-        let slot = set.check(&hash).expect("check should pass");
-        // Simulating: permit_res = verifier.tx.reserve() => Err(_closed)
-        drop(slot);
+        // Insert 6 entries (exceeds capacity of 5).
+        let mut tokens = Vec::new();
+        for i in 0..6u8 {
+            tokens.push(cache.check_and_insert(hash(i)).unwrap());
+        }
 
-        assert_eq!(set.len(), 0);
-        // The envelope can be retried later.
-        assert!(set.check(&hash).is_some());
+        // One entry was evicted.
+        assert_eq!(cache.len(), 5);
+    }
+
+    #[test]
+    fn test_expired_tombstone_cleaned_on_access() {
+        let cache = ScpScheduledCache::new();
+        let token = cache.check_and_insert(hash(1)).unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Drop token — entry becomes a tombstone.
+        drop(token);
+
+        // Re-check same hash — tombstone is cleaned, new entry inserted.
+        let _token2 = cache.check_and_insert(hash(1)).unwrap();
+        // len() is 1 (tombstone was removed, fresh entry inserted).
+        assert_eq!(cache.len(), 1);
     }
 }
