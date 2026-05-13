@@ -15,11 +15,13 @@ One invocation = one Discussion post on `stellar-experimental/henyey`.
    long as one named below exists.
 2. `gh auth status` must be valid for the runtime user.
 3. The runtime user's GitHub token must have **Discussions: Write** scope.
-   The fine-grained PAT historically used by this monitor has lacked this
-   scope, causing `FORBIDDEN` errors on `createDiscussion`. Smoke-test
-   with the GraphQL `repository(...).viewerCanCreateDiscussions` query
-   (returns false if scope is missing). If the test fails, bail out with
-   a clear ERROR and do NOT post — operator must regenerate the token.
+   GitHub does not expose this on the `Repository` type, so the only
+   reliable test is to attempt `createDiscussion` itself: surface a
+   `FORBIDDEN`/`Discussions: Write` error as a fatal precondition failure
+   and instruct the operator to regenerate the fine-grained PAT with the
+   missing scope (the project's historical PAT has lacked it). Do not
+   silently retry — the post will fail every time until the token is
+   updated.
 4. `/home/tomer/data/monitor-loop.env` must exist (same env as
    `monitor-tick`). The skill loads it to find `MONITOR_SESSION_ID`,
    `MONITOR_ADMIN_PORT`, `MONITOR_RPC_PORT`.
@@ -90,12 +92,16 @@ fi
 Extract:
 - `state` (Validating / Catching Up / etc.) from `INFO`
 - `latestLedger - oldestLedger` from `HEALTH`, plus `age` and `status`
-- `quorum.agree` / `quorum.missing` / `quorum.fail_at` from `INFO`
-- `stellar_scp_timing_first_to_self_externalize_seconds` from `METRICS`
-  (mean of the rate over today using the histogram sum/count)
-- `stellar_scp_timing_externalized_seconds` (slot-cycle) likewise
+- `quorum.qset.{agree,missing,fail_at}` from `INFO` (nested under `qset`,
+  not at the top level of the quorum block; the quorum block also has
+  `node` and `transitive` children)
+- `stellar_scp_timing_first_to_self_externalize_seconds`,
+  `stellar_scp_timing_externalized_seconds`,
+  `stellar_scp_timing_nominated_seconds` from `METRICS` — these are scalar
+  gauges (current value), not histograms; just read the scalar
 - `henyey_jemalloc_fragmentation_pct` (current value)
-- Last `memory_report=true` (or `Memory report summary`) line for `heap_components_mb` trajectory
+- `henyey_jemalloc_allocated_bytes` (heap-allocated, current)
+- Last `memory_report=true` (or `Memory report summary`) line for `heap_components_mb` trajectory if available
 
 Build (uptime, deploys, RSS-GB, frag-pct) and emit:
 
