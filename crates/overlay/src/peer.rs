@@ -495,6 +495,20 @@ impl Peer {
     /// Receive and process the peer's HELLO message.
     async fn recv_hello(&mut self, timeout_secs: u64) -> Result<()> {
         let start = Instant::now();
+        let result = self.recv_hello_inner(timeout_secs).await;
+
+        // Parity: stellar-core mRecvHelloTimer (OverlayMetrics.h:46).
+        // Record on both success and failure — stellar-core uses an RAII timer scope.
+        metrics::histogram!(
+            "stellar_overlay_recv_message_seconds",
+            "message_type" => "hello"
+        )
+        .record(start.elapsed().as_secs_f64());
+
+        result
+    }
+
+    async fn recv_hello_inner(&mut self, timeout_secs: u64) -> Result<()> {
         let frame = self
             .connection
             .recv_timeout(timeout_secs)
@@ -518,13 +532,6 @@ impl Peer {
             }
         }
 
-        // Parity: stellar-core mRecvHelloTimer (OverlayMetrics.h:46).
-        metrics::histogram!(
-            "stellar_overlay_recv_message_seconds",
-            "message_type" => "hello"
-        )
-        .record(start.elapsed().as_secs_f64());
-
         Ok(())
     }
 
@@ -542,6 +549,20 @@ impl Peer {
     /// Receive and process the peer's AUTH message.
     async fn recv_auth(&mut self, timeout_secs: u64) -> Result<()> {
         let start = Instant::now();
+        let result = self.recv_auth_inner(timeout_secs).await;
+
+        // Parity: stellar-core mRecvAuthTimer (OverlayMetrics.h:47).
+        // Record on both success and failure — stellar-core uses an RAII timer scope.
+        metrics::histogram!(
+            "stellar_overlay_recv_message_seconds",
+            "message_type" => "auth"
+        )
+        .record(start.elapsed().as_secs_f64());
+
+        result
+    }
+
+    async fn recv_auth_inner(&mut self, timeout_secs: u64) -> Result<()> {
         let frame = self
             .connection
             .recv_timeout(timeout_secs)
@@ -577,13 +598,6 @@ impl Peer {
                 )));
             }
         }
-
-        // Parity: stellar-core mRecvAuthTimer (OverlayMetrics.h:47).
-        metrics::histogram!(
-            "stellar_overlay_recv_message_seconds",
-            "message_type" => "auth"
-        )
-        .record(start.elapsed().as_secs_f64());
 
         Ok(())
     }
