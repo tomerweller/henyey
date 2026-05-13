@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=220
+TAP_PLAN=224
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -4242,6 +4242,8 @@ except Exception as e:
   # ── check-alarm-regression.sh behavioral tests ─────────────────────────
 
   local catalog_for_reg="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
+  local catalog_for_reg_checksum
+  catalog_for_reg_checksum=$(sha256sum "$catalog_for_reg" | cut -d' ' -f1)
 
   # Test: no baseline → creates baseline, exits 0
   # Use real catalog alarm names so catalog validation passes
@@ -4318,7 +4320,13 @@ else:
   local reg_contaminated_session="$replay_root/reg-contaminated"
   mkdir -p "$reg_contaminated_session/metrics"
   # Baseline has both real (lost-sync) and fake (alarm_a) alarms firing
-  local reg_contaminated_baseline='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"alarm_a":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}'
+  local reg_contaminated_baseline
+  reg_contaminated_baseline=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2]}
+print(json.dumps(d))
+" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"alarm_a":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}' "$catalog_for_reg_checksum")
   echo "$reg_contaminated_baseline" > "$reg_contaminated_session/metrics/replay-baseline.json"
   # Current has neither firing
   local reg_contaminated_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"alarm_a":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
@@ -4854,7 +4862,7 @@ print(d.get('provenance',{}).get('catalog_checksum',''))
     tap_not_ok "provenance: changed checksum triggers auto-invalidation" "output: $prov_t3_out, new_checksum: $prov_new_checksum"
   fi
 
-  # Test: Legacy baseline (no provenance) — provenance injected
+  # Test: Legacy baseline (no provenance) — recreated with provenance from current data
   local prov_t4="$prov_root/t4"
   mkdir -p "$prov_t4/metrics"
   echo "$prov_current" > "$prov_t4/metrics/current.json"
@@ -4864,21 +4872,20 @@ print(d.get('provenance',{}).get('catalog_checksum',''))
   local prov_t4_out
   prov_t4_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
     "$prov_t4" --current "$prov_t4/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
-  local prov_legacy_migrated
-  prov_legacy_migrated=$(python3 -c "
+  local prov_legacy_recreated
+  prov_legacy_recreated=$(python3 -c "
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
 p = d.get('provenance', {})
-# Verify provenance was injected AND original alarm data preserved
+# Verify provenance exists with correct checksum (recreated from current data)
 has_prov = isinstance(p, dict) and 'catalog_checksum' in p
-has_alarm = 'lost-sync' in d.get('alarms', {})
-print('yes' if has_prov and has_alarm else 'no')
-" "$prov_t4/metrics/replay-baseline-stable.json" 2>/dev/null) || prov_legacy_migrated="no"
-  if echo "$prov_t4_out" | grep -q "Migrating legacy" && [[ "$prov_legacy_migrated" == "yes" ]]; then
-    tap_ok "provenance: legacy baseline migrated with provenance injected"
+print('yes' if has_prov else 'no')
+" "$prov_t4/metrics/replay-baseline-stable.json" 2>/dev/null) || prov_legacy_recreated="no"
+  if echo "$prov_t4_out" | grep -q "Recreating.*missing or invalid provenance" && [[ "$prov_legacy_recreated" == "yes" ]]; then
+    tap_ok "provenance: legacy baseline recreated with provenance"
   else
-    tap_not_ok "provenance: legacy baseline migrated with provenance injected" "output: $prov_t4_out, migrated: $prov_legacy_migrated"
+    tap_not_ok "provenance: legacy baseline recreated with provenance" "output: $prov_t4_out, recreated: $prov_legacy_recreated"
   fi
 
   # Test: Malformed provenance — treated as legacy
@@ -4938,6 +4945,107 @@ print('yes' if isinstance(p, dict) and 'catalog_checksum' in p else 'no')
     tap_not_ok "provenance: no .tmp files left behind after runs" "found $prov_tmpfiles tmp files"
   fi
 
+  # Test: Rolling baseline auto-invalidated on checksum change
+  local prov_t7="$prov_root/t7"
+  mkdir -p "$prov_t7/metrics"
+  echo "$prov_current" > "$prov_t7/metrics/current.json"
+  local prov_stale_rolling="{\"schema_version\":1,\"evaluated_ticks\":200,\"skipped_ticks\":10,\"error_ticks\":0,\"total_snapshots\":210,\"first_ts\":\"t1\",\"last_ts\":\"t2\",\"alarms\":{\"lost-sync\":{\"firing\":20,\"breach\":5,\"ok\":165,\"baseline\":0,\"skip\":10}},\"provenance\":{\"created_at\":\"2026-01-01T00:00:00Z\",\"created_commit\":\"abc123\",\"catalog_checksum\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}"
+  echo "$prov_stale_rolling" > "$prov_t7/metrics/replay-baseline.json"
+  # Stable has correct checksum — won't be invalidated
+  echo "$prov_baseline_with_prov" > "$prov_t7/metrics/replay-baseline-stable.json"
+  local prov_t7_out
+  prov_t7_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$prov_t7" --current "$prov_t7/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
+  local prov_rolling_new_cs
+  prov_rolling_new_cs=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+print(d.get('provenance',{}).get('catalog_checksum',''))
+" "$prov_t7/metrics/replay-baseline.json" 2>/dev/null) || prov_rolling_new_cs=""
+  if echo "$prov_t7_out" | grep -q "Rolling baseline auto-invalidated" && [[ "$prov_rolling_new_cs" == "$prov_real_checksum" ]]; then
+    tap_ok "provenance: rolling baseline auto-invalidated on checksum change"
+  else
+    tap_not_ok "provenance: rolling baseline auto-invalidated on checksum change" "output: $prov_t7_out, checksum: $prov_rolling_new_cs"
+  fi
+
+  # Test: Non-git fallback — created_commit is "unknown" when git fails
+  local prov_t8="$prov_root/t8"
+  mkdir -p "$prov_t8/metrics" "$prov_t8/bin"
+  echo "$prov_current" > "$prov_t8/metrics/current.json"
+  # Create a git stub that fails for rev-parse
+  cat > "$prov_t8/bin/git" << 'GIT_STUB'
+#!/bin/bash
+exit 1
+GIT_STUB
+  chmod +x "$prov_t8/bin/git"
+  local prov_t8_out
+  prov_t8_out=$(PATH="$prov_t8/bin:$PATH" "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$prov_t8" --current "$prov_t8/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
+  local prov_commit_val
+  prov_commit_val=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+print(d.get('provenance',{}).get('created_commit',''))
+" "$prov_t8/metrics/replay-baseline.json" 2>/dev/null) || prov_commit_val=""
+  if [[ "$prov_commit_val" == "unknown" ]]; then
+    tap_ok "provenance: non-git fallback sets created_commit to unknown"
+  else
+    tap_not_ok "provenance: non-git fallback sets created_commit to unknown" "got: $prov_commit_val"
+  fi
+
+  # Test: Failure-path safety — read-only dir preserves existing baseline
+  local prov_t9="$prov_root/t9"
+  mkdir -p "$prov_t9/metrics"
+  echo "$prov_current" > "$prov_t9/metrics/current.json"
+  # Create a valid baseline with stale checksum, then make dir read-only
+  echo "$prov_stale_rolling" > "$prov_t9/metrics/replay-baseline.json"
+  echo "$prov_stale_rolling" > "$prov_t9/metrics/replay-baseline-stable.json"
+  chmod a-w "$prov_t9/metrics"
+  local prov_t9_out
+  prov_t9_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$prov_t9" --current "$prov_t9/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
+  chmod u+w "$prov_t9/metrics"
+  # Baseline should still be intact (not truncated/corrupted)
+  local prov_t9_valid
+  prov_t9_valid=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+if d.get('schema_version') == 1 and isinstance(d.get('alarms'), dict):
+    print('yes')
+else:
+    print('no')
+" "$prov_t9/metrics/replay-baseline-stable.json" 2>/dev/null) || prov_t9_valid="no"
+  if [[ "$prov_t9_valid" == "yes" ]]; then
+    tap_ok "provenance: failure-path preserves existing baseline"
+  else
+    tap_not_ok "provenance: failure-path preserves existing baseline"
+  fi
+
+  # Test: Comment-only catalog edit triggers invalidation
+  local prov_t10="$prov_root/t10"
+  mkdir -p "$prov_t10/metrics"
+  echo "$prov_current" > "$prov_t10/metrics/current.json"
+  # Create a modified catalog with just a comment change
+  local prov_alt_catalog="$prov_root/alt-catalog.toml"
+  cp "$prov_catalog" "$prov_alt_catalog"
+  echo "# This comment changes the checksum" >> "$prov_alt_catalog"
+  local prov_alt_checksum
+  prov_alt_checksum=$(sha256sum "$prov_alt_catalog" | cut -d' ' -f1)
+  # Create baseline with the ORIGINAL catalog checksum
+  echo "$prov_baseline_with_prov" > "$prov_t10/metrics/replay-baseline.json"
+  echo "$prov_baseline_with_prov" > "$prov_t10/metrics/replay-baseline-stable.json"
+  local prov_t10_out
+  prov_t10_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$prov_t10" --current "$prov_t10/metrics/current.json" --catalog "$prov_alt_catalog" 2>&1) || true
+  if echo "$prov_t10_out" | grep -q "auto-invalidated"; then
+    tap_ok "provenance: comment-only catalog edit triggers invalidation"
+  else
+    tap_not_ok "provenance: comment-only catalog edit triggers invalidation" "output: $prov_t10_out"
+  fi
+
   rm -rf "$prov_root"
 
   # ── check-alarm-regression.sh dedup tests ──────────────────────────────────
@@ -4949,8 +5057,16 @@ print('yes' if isinstance(p, dict) and 'catalog_checksum' in p else 'no')
   local dedup_session="$dedup_root/session"
   mkdir -p "$dedup_session/metrics"
 
-  # Create a baseline where lost-sync was active
-  local dedup_baseline='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}'
+  # Create a baseline where lost-sync was active (with provenance to avoid recreation)
+  local dedup_catalog_checksum
+  dedup_catalog_checksum=$(sha256sum "$catalog_for_reg" | cut -d' ' -f1)
+  local dedup_baseline
+  dedup_baseline=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2]}
+print(json.dumps(d))
+" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}' "$dedup_catalog_checksum")
   echo "$dedup_baseline" > "$dedup_session/metrics/replay-baseline.json"
 
   # Current where lost-sync went silent → regression
