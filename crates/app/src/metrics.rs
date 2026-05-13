@@ -2089,6 +2089,84 @@ mod tests {
         }
     }
 
+    /// Regression test for #2626: verify close-cadence histograms render with
+    /// custom `CLOSE_CADENCE_BUCKETS` boundaries, not the defaults. Covers all
+    /// six close-cadence metrics.
+    #[test]
+    fn test_close_cadence_histogram_custom_buckets_rendered() {
+        const EXPECTED: &[f64] = &[
+            0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0, 8.0, 10.0, 15.0,
+            20.0, 30.0, 60.0,
+        ];
+
+        // Invariant: strictly increasing.
+        for w in EXPECTED.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "close-cadence buckets must be strictly increasing"
+            );
+        }
+        // Brackets the 5 s slot interval.
+        assert!(EXPECTED.first().copied().unwrap_or(f64::MAX) <= 0.5);
+        assert!(EXPECTED.last().copied().unwrap_or(0.0) >= 30.0);
+
+        let all_close_cadence_metrics: &[HistogramMetric] = &[
+            CLOSE_CYCLE_SECONDS,
+            SLOT_TO_CLOSE_LATENCY_SECONDS,
+            CLOSE_HANDLE_COMPLETE_SECONDS,
+            CLOSE_POST_COMPLETE_SECONDS,
+            CLOSE_DISPATCH_TO_JOIN_SECONDS,
+            PERSIST_DISPATCH_TO_JOIN_SECONDS,
+        ];
+
+        // Build a local recorder with the same bucket config as production.
+        let recorder = configure_histogram_buckets(PrometheusBuilder::new()).build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            for metric in all_close_cadence_metrics {
+                metric.record(5.1);
+            }
+        });
+
+        let output = handle.render();
+
+        /// Format a bucket boundary the way Prometheus renders it:
+        /// integers as `"5"`, non-integers as `"4.5"`.
+        fn format_le(v: f64) -> String {
+            if v.fract() == 0.0 {
+                format!("{:.0}", v)
+            } else {
+                format!("{}", v)
+            }
+        }
+
+        for metric in all_close_cadence_metrics {
+            let name = metric.name();
+            // Positive: every custom boundary is present.
+            for &boundary in EXPECTED {
+                let needle = format!("{}_bucket{{le=\"{}\"}}", name, format_le(boundary));
+                assert!(
+                    output.contains(&needle),
+                    "missing custom bucket boundary `{}` for metric `{}`.\nOutput:\n{}",
+                    needle,
+                    name,
+                    output,
+                );
+            }
+            // Negative: default-only boundaries must be absent.
+            for absent in &["0.001", "0.005"] {
+                let absent_needle = format!("{}_bucket{{le=\"{}\"}}", name, absent);
+                assert!(
+                    !output.contains(&absent_needle),
+                    "default-only boundary `{}` should NOT appear for metric `{}`",
+                    absent_needle,
+                    name,
+                );
+            }
+        }
+    }
+
     /// Regression test for #2350: metrics declared in the wrong catalog block
     /// (gauges vs counters) produce duplicate `# TYPE` lines in Prometheus
     /// exposition. Verify that the three formerly-misclassified metrics each

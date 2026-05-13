@@ -4006,6 +4006,94 @@ mod tests {
             .is_none());
     }
 
+    /// Regression test for #2626: verify SCP timing histograms are only emitted
+    /// on the first forward externalization — not on duplicates, retrograde
+    /// slots, or catchup (no slot_first_seen).
+    #[test]
+    fn test_scp_timing_histograms_only_on_first_forward_externalization() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        // Create the driver outside the local recorder scope — driver setup
+        // does not emit histograms.
+        let driver = make_test_driver();
+        let peer_node = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([1u8; 32]),
+        ));
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            // Set up slot 100 with full timing state.
+            driver.record_slot_activity(100);
+            driver.record_nomination_start(100);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            driver.record_ballot_start(100);
+            driver.record_peer_externalize_event(100, &peer_node);
+            let now = driver.record_self_externalize_event(100);
+
+            // First forward externalization: all three histograms emitted.
+            driver.record_externalized(100, Value::default(), Some(now));
+
+            let output = handle.render();
+            assert!(
+                output.contains("stellar_scp_timing_externalized_hist_seconds_count 1"),
+                "externalized histogram count should be 1.\nOutput:\n{}",
+                output,
+            );
+            assert!(
+                output.contains("stellar_scp_timing_nominated_hist_seconds_count 1"),
+                "nominated histogram count should be 1.\nOutput:\n{}",
+                output,
+            );
+            assert!(
+                output
+                    .contains("stellar_scp_timing_first_to_self_externalize_hist_seconds_count 1"),
+                "first_to_self histogram count should be 1.\nOutput:\n{}",
+                output,
+            );
+
+            // Duplicate: same slot again — NOT first, counts stay 1.
+            driver.record_externalized(100, Value::default(), None);
+            let output = handle.render();
+            assert!(
+                output.contains("stellar_scp_timing_externalized_hist_seconds_count 1"),
+                "duplicate should not increment externalized count.\nOutput:\n{}",
+                output,
+            );
+
+            // Retrograde: slot 99 — NOT forward (latest is 100), counts stay 1.
+            driver.record_externalized(99, Value::default(), None);
+            let output = handle.render();
+            assert!(
+                output.contains("stellar_scp_timing_externalized_hist_seconds_count 1"),
+                "retrograde should not increment externalized count.\nOutput:\n{}",
+                output,
+            );
+
+            // Catchup: slot 101 without record_slot_activity — no slot_first_seen,
+            // so no timing snapshot, no histogram emission.
+            driver.record_externalized(101, Value::default(), None);
+            let output = handle.render();
+            assert!(
+                output.contains("stellar_scp_timing_externalized_hist_seconds_count 1"),
+                "catchup should not increment externalized count.\nOutput:\n{}",
+                output,
+            );
+            assert!(
+                output.contains("stellar_scp_timing_nominated_hist_seconds_count 1"),
+                "catchup should not increment nominated count.\nOutput:\n{}",
+                output,
+            );
+            assert!(
+                output
+                    .contains("stellar_scp_timing_first_to_self_externalize_hist_seconds_count 1"),
+                "catchup should not increment first_to_self count.\nOutput:\n{}",
+                output,
+            );
+        });
+    }
+
     #[test]
     fn test_combine_single_value() {
         // A single valid candidate should be returned (possibly re-encoded)

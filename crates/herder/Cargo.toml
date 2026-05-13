@@ -50,6 +50,7 @@ test-utils = []
 test-support = []
 
 [dev-dependencies]
+metrics-exporter-prometheus.workspace = true
 tempfile.workspace = true
 henyey-bucket.workspace = true
 henyey-crypto.workspace = true

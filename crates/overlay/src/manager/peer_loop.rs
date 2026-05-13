@@ -1895,4 +1895,52 @@ mod tests {
             );
         }
     }
+
+    /// Regression test for #2626: verify `PingTracker::check_response` emits
+    /// the `stellar_overlay_connection_latency_seconds` histogram on match,
+    /// and does NOT emit on non-match or consumed ping.
+    #[test]
+    fn test_ping_rtt_histogram_emission() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let matching_hash = stellar_xdr::curr::Uint256([1u8; 32]);
+        let non_matching_hash = stellar_xdr::curr::Uint256([2u8; 32]);
+        let peer_id = PeerId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([0u8; 32]),
+        ));
+
+        metrics::with_local_recorder(&recorder, || {
+            let mut ping = PingTracker::new();
+            ping.record_sent(matching_hash.clone());
+
+            // Non-matching hash: no RTT, no histogram emission.
+            let rtt = ping.check_response(&non_matching_hash, &peer_id);
+            assert!(rtt.is_none(), "non-matching hash should return None");
+
+            // Matching hash: RTT recorded, histogram emitted.
+            let rtt = ping.check_response(&matching_hash, &peer_id);
+            assert!(rtt.is_some(), "matching hash should return Some(rtt)");
+
+            let output = handle.render();
+            assert!(
+                output.contains("stellar_overlay_connection_latency_seconds_count 1"),
+                "histogram count should be 1 after one matching response.\nOutput:\n{}",
+                output,
+            );
+
+            // Consumed ping: second check with same hash returns None, count stays 1.
+            let rtt = ping.check_response(&matching_hash, &peer_id);
+            assert!(rtt.is_none(), "consumed ping should return None");
+
+            let output = handle.render();
+            assert!(
+                output.contains("stellar_overlay_connection_latency_seconds_count 1"),
+                "histogram count should still be 1 after consumed ping.\nOutput:\n{}",
+                output,
+            );
+        });
+    }
 }
