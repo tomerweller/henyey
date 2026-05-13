@@ -32,7 +32,7 @@ filing_title = "metrics: stellar_herder_lost_sync_total — delta={value}"
 filing_search = "metrics: stellar_herder_lost_sync_total"
 summary = "Herder lost sync"
 details = "delta={value}"
-notes = ""
+notes = "Semantic change in #2612: counter only increments on tracking timeout (parity with stellar-core mLostSync.Mark). Baseline from pre-fix builds is stale."
 
 [[alarm]]
 name = "post-catchup-hard-reset"
