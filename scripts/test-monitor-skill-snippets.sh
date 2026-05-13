@@ -5819,6 +5819,10 @@ print(json.dumps(d))
   chmod +x "$xdedup_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
   mkdir -p "$xdedup_fake_repo/scripts/dev"
   cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$xdedup_fake_repo/scripts/dev/"
+  # Copy shared dedup-filing library (used by check-alarm-regression.sh)
+  mkdir -p "$xdedup_fake_repo/scripts/lib"
+  cp "$REPO_ROOT/scripts/lib/dedup-filing.py" "$xdedup_fake_repo/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/dedup-filing.sh" "$xdedup_fake_repo/scripts/lib/"
 
   # gh stub: no existing issues (allow filing), returns a fake issue URL
   cat > "$xdedup_gh_dir/gh" << 'STUBEOF'
@@ -6091,6 +6095,10 @@ print(json.dumps(d))
   chmod +x "$comment_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
   mkdir -p "$comment_fake_repo/scripts/dev"
   cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$comment_fake_repo/scripts/dev/"
+  # Copy shared dedup-filing library (used by check-alarm-regression.sh)
+  mkdir -p "$comment_fake_repo/scripts/lib"
+  cp "$REPO_ROOT/scripts/lib/dedup-filing.py" "$comment_fake_repo/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/dedup-filing.sh" "$comment_fake_repo/scripts/lib/"
 
   # gh stub: existing issue found (duplicate) + returns "0" for --jq comment check
   cat > "$comment_gh_dir/gh" << 'STUBEOF'
