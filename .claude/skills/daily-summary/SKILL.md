@@ -14,7 +14,13 @@ One invocation = one Discussion post on `stellar-experimental/henyey`.
    IDs are hardcoded — so renaming or swapping the category is fine as
    long as one named below exists.
 2. `gh auth status` must be valid for the runtime user.
-3. `/home/tomer/data/monitor-loop.env` must exist (same env as
+3. The runtime user's GitHub token must have **Discussions: Write** scope.
+   The fine-grained PAT historically used by this monitor has lacked this
+   scope, causing `FORBIDDEN` errors on `createDiscussion`. Smoke-test
+   with the GraphQL `repository(...).viewerCanCreateDiscussions` query
+   (returns false if scope is missing). If the test fails, bail out with
+   a clear ERROR and do NOT post — operator must regenerate the token.
+4. `/home/tomer/data/monitor-loop.env` must exist (same env as
    `monitor-tick`). The skill loads it to find `MONITOR_SESSION_ID`,
    `MONITOR_ADMIN_PORT`, `MONITOR_RPC_PORT`.
 
@@ -168,9 +174,12 @@ gh issue list --repo stellar-experimental/henyey \
 ```
 
 Bucket into:
-- **Filed today** — created in last 24h
-- **Closed today** — closed in last 24h (use `closed:>=...` search)
-- **Still open** — `--state open` filtered to those filed > 24h ago
+- **Filed today** — created in last 24h:
+  `gh issue list --search "created:>=$(date -u -d '24 hours ago' +%Y-%m-%d)" --state all`
+- **Closed today** — closed in last 24h:
+  `gh issue list --search "closed:>=$(date -u -d '24 hours ago' +%Y-%m-%d)" --state closed`
+- **Still open** — long-running open issues (filed > 24h ago, currently open):
+  `gh issue list --search "is:open created:<$(date -u -d '24 hours ago' +%Y-%m-%d)" --state open`
 
 For each line, prefix with severity indicator. **Precedence:** if both
 `urgent` and `not-ready` labels are present, render as `urgent` (🔴).
@@ -219,26 +228,69 @@ If the array is empty for the window, print `_(none)_`.
 
 ### 6. Tick aggregates
 
+The `tick-history.jsonl` schema evolved when monitor-tick was refactored
+to the TOML/evaluator catalog. Older rows (pre-refactor) use a top-level
+`status` field with values OK/ACTION/WARNING/OFFLINE; newer rows use
+`tick` (same values) and include an `evaluator` block with the alarm
+aggregate (`metrics`, `ratio`, `recovery_stalled` strings). The
+aggregator below reads either field and is forward-compatible.
+
 ```bash
 python3 - "$HIST" <<'PY'
-import sys, json
+import sys, json, re
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-ok = action = warning = offline = self_reflect = 0
-ledgers = []
+outcomes = Counter()
+self_reflect = 0
+firing_per_tick = []          # per-tick "N firing" counts from evaluator
+ratio_breaches = 0
+recovery_stall_events = 0
+ratio_skipped = 0
+total = 0
+
 with open(sys.argv[1]) as f:
     for ln in f:
         try: row = json.loads(ln)
         except Exception: continue
-        ts = datetime.fromisoformat(row["ts"].replace("Z","+00:00"))
+        try:
+            ts = datetime.fromisoformat(row["ts"].replace("Z","+00:00"))
+        except Exception: continue
         if ts < cutoff: continue
-        s = row.get("status","")
-        if s == "OK": ok += 1
-        elif s == "ACTION": action += 1
-        elif s == "WARNING": warning += 1
-        elif s == "OFFLINE": offline += 1
-        if row.get("self_reflect","clean") != "clean": self_reflect += 1
+        total += 1
+
+        # Outcome: prefer new "tick" field, fall back to legacy "status"
+        outcome = row.get("tick") or row.get("status") or ""
+        if outcome in ("OK","ACTION","WARNING","OFFLINE","DEPLOY"):
+            outcomes[outcome] += 1
+
+        # Legacy self-reflect tracking (post-refactor rows omit this)
+        if row.get("self_reflect","clean") != "clean":
+            self_reflect += 1
+
+        # Evaluator aggregate (new rows only)
+        ev = row.get("evaluator", {})
+        if ev:
+            m = re.search(r"(\d+)/\d+ firing", ev.get("metrics",""))
+            if m: firing_per_tick.append(int(m.group(1)))
+            r = ev.get("ratio","")
+            if "WARNING" in r or "breach" in r: ratio_breaches += 1
+            if "skipped" in r: ratio_skipped += 1
+            rs = ev.get("recovery_stalled","")
+            if "delta=" in rs and "delta=0" not in rs:
+                recovery_stall_events += 1
+
+print(json.dumps({
+    "total": total,
+    "outcomes": dict(outcomes),
+    "self_reflect": self_reflect,
+    "firing_alarms_total": sum(firing_per_tick),
+    "ticks_with_firing": sum(1 for n in firing_per_tick if n > 0),
+    "ratio_breaches": ratio_breaches,
+    "ratio_skipped": ratio_skipped,
+    "recovery_stall_events": recovery_stall_events,
+}, indent=2))
 PY
 ```
 
@@ -246,12 +298,17 @@ PY
 ## Tick aggregates (last 24h)
 
 - Cron: `<id>` (every 20m) — <expected> scheduled, <actual> fired
-- Outcomes: <N> OK / <N> ACTION / <N> WARNING / <N> OFFLINE
-- Self-reflection events: <N>
+- Outcomes: <N> OK / <N> ACTION / <N> WARNING / <N> OFFLINE / <N> DEPLOY
+- Alarm-firings: <ticks-with-firing> ticks with ≥1 firing alarm
+  (<firing-alarms-total> total alarm-firings across the window)
+- metrics_ratio: <ratio-breaches> ticks reported breach, <ratio-skipped> skipped
+- recovery_stalled: <events> non-zero-delta ticks
+- Self-reflection events: <N> (legacy field; 0 expected on post-refactor rows)
 - Skill commits today: <N> (<sha list>)
 ```
 
-Skill commits = `git log --since=24h --pretty=format:%h -- .claude/skills/`.
+Skill commits = `git log --since=24h --pretty=format:%h -- .claude/skills/ scripts/lib/eval-alarms.* .claude/skills/shared/`.
+
 Cron `id` = `gh ... ` not applicable; use the active CronList id resolved
 once at the top of the run (call CronList and pick the entry whose prompt
 starts with `Check the henyey mainnet monitor log`).
