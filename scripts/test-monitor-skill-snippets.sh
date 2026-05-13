@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=243
+TAP_PLAN=244
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -5390,6 +5390,18 @@ print(d['alarms']['lost-sync']['rationale'])
     tap_ok "ack: overwrite updates metadata"
   else
     tap_not_ok "ack: overwrite updates metadata" "rationale=$ack_overwrite_rat"
+  fi
+
+  # Test: malformed ack file during --revoke-acknowledgment exits 2
+  echo "NOT JSON" > "$ack_session/metrics/alarm-acknowledgments.json"
+  local ack_malformed_revoke_out
+  local ack_malformed_revoke_exit=0
+  ack_malformed_revoke_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --revoke-acknowledgment lost-sync --catalog "$catalog_for_ack" 2>&1) || ack_malformed_revoke_exit=$?
+  if [[ "$ack_malformed_revoke_exit" -eq 2 ]]; then
+    tap_ok "ack: malformed ack file during revoke exits 2"
+  else
+    tap_not_ok "ack: malformed ack file during revoke exits 2" "exit=$ack_malformed_revoke_exit"
   fi
 
   rm -rf "$ack_root"

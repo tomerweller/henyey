@@ -254,7 +254,8 @@ write_ack_file() {
 
 # Helper: check catalog provenance on ack data and invalidate if needed.
 # Reads ack JSON from stdin, prints (possibly invalidated) JSON to stdout.
-# If invalidation occurs, also writes the invalidated file (under flock from caller).
+# Pure transformation — does NOT write to disk. Caller is responsible for
+# persisting via write_ack_file() under flock.
 check_ack_provenance() {
   python3 -c "
 import json, sys
@@ -267,13 +268,10 @@ if stored_checksum and stored_checksum != current_checksum:
         print('Acknowledgment file invalidated: alarm catalog changed (was %s..., now %s...)' % (stored_checksum[:12], current_checksum[:12]), file=sys.stderr)
     data['alarms'] = {}
     data['catalog_checksum'] = current_checksum
-    # Write invalidated file
-    with open(sys.argv[2], 'w') as f:
-        json.dump(data, f)
 elif not stored_checksum:
     data['catalog_checksum'] = current_checksum
 print(json.dumps(data))
-" "$CATALOG_CHECKSUM" "$ACK_FILE"
+" "$CATALOG_CHECKSUM"
 }
 
 # Helper: validate alarm name exists in catalog. Exit 2 if not.
@@ -301,7 +299,8 @@ if [[ -n "$ACKNOWLEDGE_ALARM" ]]; then
   validate_catalog_alarm "$ACKNOWLEDGE_ALARM"
   (
     flock -w 30 9 || { echo "ERROR: Could not acquire acknowledgment lock" >&2; exit 2; }
-    ACK_JSON=$(load_ack_file | check_ack_provenance)
+    ACK_RAW=$(load_ack_file) || exit $?
+    ACK_JSON=$(echo "$ACK_RAW" | check_ack_provenance) || exit $?
     ACK_JSON=$(echo "$ACK_JSON" | python3 -c "
 import json, sys
 data = json.loads(sys.stdin.read())
@@ -334,7 +333,8 @@ if [[ -n "$REVOKE_ALARM" ]]; then
   fi
   (
     flock -w 30 9 || { echo "ERROR: Could not acquire acknowledgment lock" >&2; exit 2; }
-    ACK_JSON=$(load_ack_file | check_ack_provenance)
+    ACK_RAW=$(load_ack_file) || exit $?
+    ACK_JSON=$(echo "$ACK_RAW" | check_ack_provenance) || exit $?
     FOUND=$(echo "$ACK_JSON" | python3 -c "
 import json, sys
 data = json.loads(sys.stdin.read())
@@ -361,13 +361,18 @@ if [[ "$LIST_ACKS" == true ]]; then
     echo "No acknowledgments."
     exit 0
   fi
-  # Validate the ack file first (outside subshell so exit 2 propagates directly)
-  ACK_JSON=$(load_ack_file)
-  # Check provenance and write back if needed (under lock)
-  ACK_JSON=$(echo "$ACK_JSON" | (
-    flock -w 30 9 || { echo "ERROR: Could not acquire acknowledgment lock" >&2; exit 2; }
-    check_ack_provenance | tee >(write_ack_file) | cat
-  ) 9>"$ACK_LOCK")
+  # Load, validate, check provenance, and write back — all under lock
+  list_exit=0
+  ACK_JSON=$(
+    (
+      flock -w 30 9 || { echo "ERROR: Could not acquire acknowledgment lock" >&2; exit 2; }
+      ACK_DATA=$(load_ack_file) || exit $?
+      CHECKED=$(echo "$ACK_DATA" | check_ack_provenance) || exit $?
+      echo "$CHECKED" | write_ack_file
+      echo "$CHECKED"
+    ) 9>"$ACK_LOCK"
+  ) || list_exit=$?
+  [[ "$list_exit" -ne 0 ]] && exit "$list_exit"
   python3 -c "
 import json, sys
 data = json.loads(sys.stdin.read())
