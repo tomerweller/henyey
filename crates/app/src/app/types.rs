@@ -174,6 +174,10 @@ pub struct SimulationDebugStats {
     pub nomination_timeout_fires: u64,
     pub ballot_timeout_fires: u64,
     pub scp_messages_sent: u64,
+    /// SCP envelopes accepted past the in-flight dedup cache
+    /// (`scp_scheduled.check_and_insert`). Parity:
+    /// `HerderImpl.cpp:810 mSCPMetrics.mEnvelopeReceive.Mark()` — fires
+    /// after dedup, before validity checks.
     pub scp_messages_received: u64,
     pub consensus_trigger_attempts: u64,
     pub consensus_trigger_successes: u64,

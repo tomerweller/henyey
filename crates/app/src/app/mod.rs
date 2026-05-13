@@ -524,7 +524,11 @@ pub struct App {
     scp_prepare_sent: AtomicU64,
     scp_confirm_sent: AtomicU64,
     scp_externalize_sent: AtomicU64,
-    /// Count of SCP envelopes received by this node.
+    /// Count of SCP envelopes accepted past the in-flight dedup cache
+    /// (`scp_scheduled.check_and_insert`). Parity:
+    /// `HerderImpl.cpp:810 mSCPMetrics.mEnvelopeReceive.Mark()` — fires
+    /// after dedup, before validity checks (`checkCloseTime`, slot-range,
+    /// `verifyEnvelope`). See `pump_scp_intake` in `lifecycle.rs`.
     scp_messages_received: AtomicU64,
     /// SCP pre-filter rejections by reason (issue #1734 Phase B metrics).
     scp_prefilter_counters: henyey_herder::scp_verify::PreFilterCounters<AtomicU64>,

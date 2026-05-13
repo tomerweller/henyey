@@ -534,7 +534,8 @@ metric_catalog! {
         SCP_ENVELOPE_EMIT_TOTAL = "stellar_scp_envelope_emit_total"
             => "Total SCP envelopes emitted by the local node";
         SCP_ENVELOPE_RECEIVE_TOTAL = "stellar_scp_envelope_receive_total"
-            => "Total SCP envelopes received from peers";
+            => "Total SCP envelopes accepted past in-flight dedup \
+                (parity: HerderImpl.cpp:810 mEnvelopeReceive)";
         HERDER_LOST_SYNC_TOTAL = "stellar_herder_lost_sync_total"
             => "Total lost-sync events (transitions out of Tracking)";
         HERDER_PENDING_RECEIVED_TOTAL = "stellar_herder_pending_received_total"
