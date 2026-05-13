@@ -311,12 +311,12 @@ check_skill_structure() {
     echo "WARNING: monitor-tick/SKILL.md missing body marker for dedup remote search" >&2
     drift=true
   fi
-  if ! grep -q 'schema_version' "$tick_file"; then
-    echo "WARNING: monitor-tick/SKILL.md dedup file load missing schema_version check" >&2
+  if ! grep -q 'schema_version' "$tick_file" && ! grep -q 'dedup_load\|dedup-filing' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md dedup file load missing schema_version check or dedup-filing library" >&2
     drift=true
   fi
-  if ! grep -q 'write_dedup_file' "$tick_file"; then
-    echo "WARNING: monitor-tick/SKILL.md missing atomic write_dedup_file helper" >&2
+  if ! grep -q 'write_dedup_file\|dedup_write\|dedup-filing' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md missing atomic write helper (write_dedup_file or dedup_write)" >&2
     drift=true
   fi
   # Old pattern: must NOT use bare gh issue list --search without persistent dedup
@@ -5531,6 +5531,10 @@ STUBEOF
   cp "$dedup_skills_dir/move-issue-status.sh" "$dedup_fake_repo/.github/skills/plan-do-review/scripts/"
   mkdir -p "$dedup_fake_repo/scripts/dev"
   cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$dedup_fake_repo/scripts/dev/"
+  # Copy shared dedup-filing library (used by check-alarm-regression.sh)
+  mkdir -p "$dedup_fake_repo/scripts/lib"
+  cp "$REPO_ROOT/scripts/lib/dedup-filing.py" "$dedup_fake_repo/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/dedup-filing.sh" "$dedup_fake_repo/scripts/lib/"
 
   # Test 1: Existing-issue dedup (exact title match → skip filing)
   > "$dedup_gh_log"

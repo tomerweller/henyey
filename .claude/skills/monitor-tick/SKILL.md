@@ -527,51 +527,10 @@ BODY_MARKER="<!-- monitor-tick-recurrence-key: $build_sha -->"
     exit 0
   }
 
-  # --- Load dedup file (corruption-safe) ---
-  DEDUP_DATA="{}"
-  if [[ -f "$DEDUP_FILE" ]]; then
-    DEDUP_DATA=$(python3 -c "
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        data = json.load(f)
-    if not isinstance(data, dict) or data.get('schema_version') != 1:
-        print('{}')
-    else:
-        print(json.dumps(data))
-except (json.JSONDecodeError, ValueError, OSError):
-    print('{}')
-" "$DEDUP_FILE" 2>/dev/null) || DEDUP_DATA="{}"
-    if [[ "$DEDUP_DATA" == "{}" ]] && [[ -s "$DEDUP_FILE" ]]; then
-      echo "WARNING: Corrupt or invalid dedup file $DEDUP_FILE — treating as empty" >&2
-    fi
-  fi
-
-  # --- Prune entries older than 30 days (UTC) ---
-  DEDUP_DATA=$(python3 -c "
-import json, sys
-from datetime import datetime, timezone, timedelta
-data = json.loads(sys.argv[1])
-filed = data.get('filed', {})
-cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-pruned = {}
-for sha, info in filed.items():
-    try:
-        ts = datetime.fromisoformat(info['filed_at'].replace('Z', '+00:00'))
-        if ts > cutoff:
-            pruned[sha] = info
-    except (KeyError, ValueError):
-        pass
-data['filed'] = pruned
-print(json.dumps(data))
-" "$DEDUP_DATA" 2>/dev/null) || DEDUP_DATA="{}"
-
-  # --- Atomic write helper ---
-  write_dedup_file() {
-    local tmpf="${DEDUP_FILE}.tmp.$$"
-    echo "$1" > "$tmpf"
-    mv -f "$tmpf" "$DEDUP_FILE"
-  }
+  # --- Load and prune dedup file using shared library ---
+  source "$REPO_ROOT/scripts/lib/dedup-filing.sh"
+  DEDUP_DATA=$(dedup_load "$DEDUP_FILE")
+  DEDUP_DATA=$(dedup_prune "$DEDUP_DATA" "30d")
 
   # --- Helper: post rate-limited daily comment on existing issue ---
   post_daily_comment() {
@@ -600,12 +559,11 @@ print(json.dumps(data))
 
     # Fast check: last_commented_date in dedup entry
     local last_date
-    last_date=$(python3 -c "
-import json, sys
-data = json.loads(sys.argv[1])
-info = data.get('filed', {}).get(sys.argv[2], {})
-print(info.get('last_commented_date', ''))
-" "$DEDUP_DATA" "$build_sha" 2>/dev/null) || last_date=""
+    if entry_json=$(dedup_check "$DEDUP_DATA" "$build_sha" 2>/dev/null); then
+      last_date=$(echo "$entry_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("last_commented_date",""))' 2>/dev/null) || last_date=""
+    else
+      last_date=""
+    fi
     if [[ "$last_date" == "$today" ]]; then
       return 0
     fi
@@ -630,27 +588,18 @@ $update_marker"
     if gh issue comment "$issue_num" --body "$update_body" 2>/dev/null; then
       echo "Posted update on existing issue #$issue_num for ${build_sha:0:8}" >&2
       # Update last_commented_date in dedup
-      DEDUP_DATA=$(python3 -c "
-import json, sys
-data = json.loads(sys.argv[1])
-entry = data.get('filed', {}).get(sys.argv[2], {})
-entry['last_commented_date'] = sys.argv[3]
-data.setdefault('filed', {})[sys.argv[2]] = entry
-print(json.dumps(data))
-" "$DEDUP_DATA" "$build_sha" "$today")
-      write_dedup_file "$DEDUP_DATA"
+      DEDUP_DATA=$(dedup_update_field "$DEDUP_DATA" "$build_sha" "last_commented_date" "$today")
+      dedup_write "$DEDUP_FILE" "$DEDUP_DATA"
     else
       echo "WARNING: Failed to post update on #$issue_num" >&2
     fi
   }
 
   # --- Dedup check: local file ---
-  DEDUP_HIT_ISSUE=$(python3 -c "
-import json, sys
-data = json.loads(sys.argv[1])
-info = data.get('filed', {}).get(sys.argv[2])
-print(info.get('issue_number', '') if info else '')
-" "$DEDUP_DATA" "$build_sha" 2>/dev/null) || DEDUP_HIT_ISSUE=""
+  DEDUP_HIT_ISSUE=""
+  if dedup_entry=$(dedup_check "$DEDUP_DATA" "$build_sha" 2>/dev/null); then
+    DEDUP_HIT_ISSUE=$(echo "$dedup_entry" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("issue_number",""))' 2>/dev/null) || DEDUP_HIT_ISSUE=""
+  fi
 
   if [ -n "$DEDUP_HIT_ISSUE" ]; then
     ISSUE_STATE=$(gh issue view "$DEDUP_HIT_ISSUE" --json state \
@@ -664,12 +613,7 @@ print(info.get('issue_number', '') if info else '')
       CLOSED)
         echo "Issue #$DEDUP_HIT_ISSUE is CLOSED — will refile with reference" >&2
         CLOSED_PREDECESSOR="$DEDUP_HIT_ISSUE"
-        DEDUP_DATA=$(python3 -c "
-import json, sys
-data = json.loads(sys.argv[1])
-data.get('filed', {}).pop(sys.argv[2], None)
-print(json.dumps(data))
-" "$DEDUP_DATA" "$build_sha")
+        DEDUP_DATA=$(dedup_remove "$DEDUP_DATA" "$build_sha")
         # Fall through to remote search + filing
         ;;
       *)
@@ -703,19 +647,8 @@ print(json.dumps(data))
 
   if [ "$FOUND_DUP" = true ]; then
     echo "Remote search found existing issue #$DUP_ISSUE_NUMBER — backfilling dedup" >&2
-    DEDUP_DATA=$(python3 -c "
-import json, sys
-from datetime import datetime, timezone
-data = json.loads(sys.argv[1])
-data.setdefault('filed', {})[sys.argv[2]] = {
-    'filed_at': datetime.now(timezone.utc).isoformat(),
-    'issue_number': int(sys.argv[3]),
-    'last_commented_date': ''
-}
-data['schema_version'] = 1
-print(json.dumps(data, indent=2))
-" "$DEDUP_DATA" "$build_sha" "$DUP_ISSUE_NUMBER")
-    write_dedup_file "$DEDUP_DATA"
+    DEDUP_DATA=$(dedup_record "$DEDUP_DATA" "$build_sha" "issue_number=$DUP_ISSUE_NUMBER" "last_commented_date=")
+    dedup_write "$DEDUP_FILE" "$DEDUP_DATA"
     post_daily_comment "$DUP_ISSUE_NUMBER"
     exit 0
   fi
@@ -752,19 +685,8 @@ ${predecessor_ref}"
 
     # Record in dedup file
     TODAY=$(date -u +%Y-%m-%d)
-    DEDUP_DATA=$(python3 -c "
-import json, sys
-from datetime import datetime, timezone
-data = json.loads(sys.argv[1])
-data.setdefault('filed', {})[sys.argv[2]] = {
-    'filed_at': datetime.now(timezone.utc).isoformat(),
-    'issue_number': int(sys.argv[3]),
-    'last_commented_date': sys.argv[4]
-}
-data['schema_version'] = 1
-print(json.dumps(data, indent=2))
-" "$DEDUP_DATA" "$build_sha" "$N" "$TODAY")
-    write_dedup_file "$DEDUP_DATA"
+    DEDUP_DATA=$(dedup_record "$DEDUP_DATA" "$build_sha" "issue_number=$N" "last_commented_date=$TODAY")
+    dedup_write "$DEDUP_FILE" "$DEDUP_DATA"
   else
     echo "ERROR: Failed to create post-wipe recurrence issue — will retry next tick" >&2
     # Do NOT record in dedup — next tick will retry

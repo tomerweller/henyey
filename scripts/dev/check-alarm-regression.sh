@@ -785,52 +785,12 @@ else
 
     declare -A FILED_THIS_RUN
 
-    # Load persistent cross-invocation dedup record (repo-global, under flock).
+    # Load and prune persistent cross-invocation dedup record (repo-global, under flock).
+    # Uses shared dedup-filing library (scripts/lib/dedup-filing.sh).
     DEDUP_FILE="$REPO_ROOT/.alarm-regression-filed.json"
-    DEDUP_DATA="{}"
-    if [[ -f "$DEDUP_FILE" ]]; then
-      DEDUP_DATA=$(python3 -c "
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        data = json.load(f)
-    if not isinstance(data, dict) or data.get('schema_version') != 1:
-        print('{}')
-    else:
-        print(json.dumps(data))
-except (json.JSONDecodeError, ValueError, OSError):
-    print('{}')
-" "$DEDUP_FILE" 2>/dev/null) || DEDUP_DATA="{}"
-      if [[ "$DEDUP_DATA" == "{}" ]] && [[ -s "$DEDUP_FILE" ]]; then
-        echo "WARNING: Corrupt or invalid dedup file $DEDUP_FILE — treating as empty" >&2
-      fi
-    fi
-
-    # Prune entries older than 24 hours
-    DEDUP_DATA=$(python3 -c "
-import json, sys
-from datetime import datetime, timezone, timedelta
-data = json.loads(sys.argv[1])
-filed = data.get('filed', {})
-cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-pruned = {}
-for alarm, info in filed.items():
-    try:
-        ts = datetime.fromisoformat(info['filed_at'].replace('Z', '+00:00'))
-        if ts > cutoff:
-            pruned[alarm] = info
-    except (KeyError, ValueError):
-        pass
-data['filed'] = pruned
-print(json.dumps(data))
-" "$DEDUP_DATA" 2>/dev/null) || DEDUP_DATA="{}"
-
-    # Helper: write dedup file atomically
-    write_dedup_file() {
-      local tmpf="${DEDUP_FILE}.tmp.$$"
-      echo "$1" > "$tmpf"
-      mv -f "$tmpf" "$DEDUP_FILE"
-    }
+    source "$REPO_ROOT/scripts/lib/dedup-filing.sh"
+    DEDUP_DATA=$(dedup_load "$DEDUP_FILE")
+    DEDUP_DATA=$(dedup_prune "$DEDUP_DATA" "24h")
 
     while IFS= read -r regression_line; do
       [[ -z "$regression_line" ]] && continue
@@ -849,14 +809,7 @@ print(json.dumps(data))
       fi
 
       # Persistent cross-invocation dedup: skip if filed within the last 24 hours
-      DEDUP_HIT=$(python3 -c "
-import json, sys
-data = json.loads(sys.argv[1])
-filed = data.get('filed', {})
-info = filed.get(sys.argv[2])
-print('yes' if info else 'no')
-" "$DEDUP_DATA" "$ALARM_NAME" 2>/dev/null) || DEDUP_HIT="no"
-      if [[ "$DEDUP_HIT" == "yes" ]]; then
+      if dedup_check "$DEDUP_DATA" "$ALARM_NAME" >/dev/null 2>&1; then
         echo "Skipping cross-invocation duplicate (filed within 24h): $EXPECTED_TITLE" >&2
         continue
       fi
@@ -967,20 +920,8 @@ $INVESTIGATION_STEPS
       FILED_THIS_RUN["$ALARM_NAME"]=1
 
       # Write persistent cross-invocation dedup record
-      DEDUP_DATA=$(python3 -c "
-import json, sys
-from datetime import datetime, timezone
-data = json.loads(sys.argv[1])
-if 'filed' not in data:
-    data['filed'] = {}
-data['schema_version'] = 1
-data['filed'][sys.argv[2]] = {
-    'filed_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-    'issue_url': sys.argv[3]
-}
-print(json.dumps(data))
-" "$DEDUP_DATA" "$ALARM_NAME" "$NEW_ISSUE" 2>/dev/null) || true
-      write_dedup_file "$DEDUP_DATA"
+      DEDUP_DATA=$(dedup_record "$DEDUP_DATA" "$ALARM_NAME" "issue_url=$NEW_ISSUE") || true
+      dedup_write "$DEDUP_FILE" "$DEDUP_DATA"
 
       # Extract issue number and board-route
       ISSUE_NUM=$(echo "$NEW_ISSUE" | grep -oP '\d+$') || true
