@@ -1499,11 +1499,6 @@ impl App {
     pub(crate) async fn set_state(&self, state: AppState) {
         let mut current = self.state.write().await;
         if *current != state {
-            if matches!(*current, AppState::Synced | AppState::Validating)
-                && state == AppState::CatchingUp
-            {
-                self.lost_sync_count.fetch_add(1, Ordering::Relaxed);
-            }
             tracing::info!(from = %*current, to = %state, "State transition");
             *current = state;
         }
@@ -10858,5 +10853,66 @@ mod tests {
                 "Scenario F: after switching to Synced, onset should fire"
             );
         }
+    }
+
+    /// Regression test for #2612: calling `on_lost_sync()` followed by
+    /// `set_state(CatchingUp)` should increment `lost_sync_count` by exactly 1,
+    /// not 2. The double-count was caused by `set_state()` independently
+    /// incrementing the counter on `Synced|Validating → CatchingUp` transitions.
+    #[tokio::test]
+    async fn test_lost_sync_count_no_double_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Start in Synced state (simulating a running node).
+        app.set_state(AppState::Synced).await;
+        assert_eq!(app.lost_sync_count(), 0);
+
+        // Simulate a tracking-timeout sequence: on_lost_sync() fires first,
+        // then the app transitions to CatchingUp.
+        use henyey_herder::sync_recovery::SyncRecoveryCallback;
+        app.on_lost_sync();
+        app.set_state(AppState::CatchingUp).await;
+
+        // Must be exactly 1, not 2.
+        assert_eq!(
+            app.lost_sync_count(),
+            1,
+            "lost_sync_count should increment exactly once per sync-loss event"
+        );
+    }
+
+    /// Regression test for #2612: a `Synced → CatchingUp` state transition
+    /// without `on_lost_sync()` should NOT increment `lost_sync_count`.
+    /// State transitions alone are not sync-loss detection events.
+    #[tokio::test]
+    async fn test_set_state_catching_up_does_not_increment_lost_sync_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Start in Synced state.
+        app.set_state(AppState::Synced).await;
+        assert_eq!(app.lost_sync_count(), 0);
+
+        // Transition to CatchingUp without on_lost_sync() — e.g., a
+        // non-timeout catchup path like spawn_catchup from consensus.
+        app.set_state(AppState::CatchingUp).await;
+
+        // Counter must remain 0: no sync-loss event was detected.
+        assert_eq!(
+            app.lost_sync_count(),
+            0,
+            "set_state(CatchingUp) alone should not increment lost_sync_count"
+        );
     }
 }

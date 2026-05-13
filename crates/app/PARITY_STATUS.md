@@ -9,7 +9,7 @@
 
 | Area | Status | Notes |
 |------|--------|-------|
-| Application lifecycle and runtime wiring | Full | Init, run, catchup, shutdown, recovery loops |
+| Application lifecycle and runtime wiring | Full | Init, run, catchup, shutdown, recovery loops; `lost_sync_count` metric matches stellar-core single-site `mLostSync.Mark()` (#2612) |
 | Configuration loading and compat translation | Partial | Core TOML and captive-core translation work; many stellar-core helpers omitted |
 | HTTP admin and query surfaces | Partial | Core endpoints exist including generateLoad; several compat admin routes are stubbed or absent |
 | Catchup and restart recovery | Full | Archive catchup, replay, restart restore, publish flow wired |
