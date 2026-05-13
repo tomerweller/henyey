@@ -356,19 +356,20 @@ Per-tick histogram delta algorithm:
 4. Cumulative bucket delta at upper edge L is `sum(bucket_delta[le] for le <= L)`.
    Find smallest L where cumulative ≥ `0.99 * count_delta`. That L is the p99 upper bound.
 
-Bucket edges for close-path histograms: `{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 30, +Inf}`
-seconds (verified from live scrape).
+Bucket edges for close-path histograms (handle-complete, dispatch-to-join, post-complete):
+`{0.05, 0.1, 0.25, 0.5, 1, 2, 3, 4, 4.5, 5, 5.5, 6, 7, 8, 10, 15, 20, 30, 60, +Inf}` (CLOSE_CADENCE_BUCKETS).
+Other close-path histograms use DEFAULT_BUCKETS: `{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 30, +Inf}`.
 
 | Metric | p99 threshold | Severity | Rationale |
 |--------|---------------|----------|-----------|
-| `henyey_ledger_close_handle_complete_seconds` | > 0.5s bucket | WARN | Close-complete processing regression (metadata, persist-input prep, finalizer dispatch, overlay, tx queue) |
-| `henyey_ledger_close_dispatch_to_join_seconds` | > 5s bucket | WARN | Ledger close spawn_blocking wall-clock + tokio scheduler delay regression |
-| `henyey_ledger_close_post_complete_seconds` | > 0.5s bucket | WARN | Post-close lifecycle work regression (persist pipeline, history publish, consensus trigger, SCP/fetch drains) |
-| `henyey_ledger_close_tx_exec_seconds` | > 1s bucket | WARN | Tx execution regression |
-| `henyey_ledger_close_soroban_exec_seconds` | > 1s bucket | WARN | Soroban execution regression |
-| `henyey_ledger_close_commit_seconds` | > 0.5s bucket | WARN | Commit-phase regression |
-| `henyey_ledger_close_soroban_state_seconds` | > 0.5s bucket | WARN | Loaded-state prep regression |
-| `henyey_ledger_close_complete_tx_queue_seconds` | > 0.5s bucket | WARN | Tx-queue bookkeeping regression |
+| `henyey_ledger_close_handle_complete_seconds` | > 0.5s p99 (fires at ≥1s bucket) | WARN | Close-complete processing regression (metadata, persist-input prep, finalizer dispatch, overlay, tx queue) |
+| `henyey_ledger_close_dispatch_to_join_seconds` | > 7s p99 (fires at ≥8s bucket) | WARN | Ledger close spawn_blocking wall-clock + tokio scheduler delay regression |
+| `henyey_ledger_close_post_complete_seconds` | > 0.5s p99 (fires at ≥1s bucket) | WARN | Post-close lifecycle work regression (persist pipeline, history publish, consensus trigger, SCP/fetch drains) |
+| `henyey_ledger_close_tx_exec_seconds` | > 1s p99 (fires at ≥5s bucket) | WARN | Tx execution regression |
+| `henyey_ledger_close_soroban_exec_seconds` | > 1s p99 (fires at ≥5s bucket) | WARN | Soroban execution regression |
+| `henyey_ledger_close_commit_seconds` | > 0.5s p99 (fires at ≥1s bucket) | WARN | Commit-phase regression |
+| `henyey_ledger_close_soroban_state_seconds` | > 0.5s p99 (fires at ≥1s bucket) | WARN | Loaded-state prep regression |
+| `henyey_ledger_close_complete_tx_queue_seconds` | > 0.5s p99 (fires at ≥1s bucket) | WARN | Tx-queue bookkeeping regression |
 
 Mean check (`sum_delta / count_delta`) is a cheaper alternative; fire on
 whichever breaches. Coarse bucket-upper-bound avoids false positives from

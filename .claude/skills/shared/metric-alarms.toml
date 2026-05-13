@@ -461,10 +461,11 @@ notes = ""
 
 [[alarm]]
 name = "lc-dispatch-to-join-slow"
+baseline_version = 2  # bumped in #2641: p99_threshold adjusted for CLOSE_CADENCE_BUCKETS (dd202bd1)
 metric = "henyey_ledger_close_dispatch_to_join_seconds"
 kind = "histogram-p99"
 expected_suffixes = ["_bucket", "_sum", "_count"]
-p99_threshold = 5.0
+p99_threshold = 7.0
 mean_threshold = 5.0
 min_count_delta = 20
 severity = "WARN"
@@ -475,7 +476,7 @@ filing_title = "metrics: henyey_ledger_close_dispatch_to_join_seconds p99 — {v
 filing_search = "metrics: henyey_ledger_close_dispatch_to_join_seconds"
 summary = "Ledger close dispatch-to-join p99 too high"
 details = "p99={p99_value}s mean={mean_value}s threshold={threshold}s"
-notes = ""
+notes = "Threshold 7.0 fires at ≥8s bucket (strict >). Slot interval is ~5s; normal p99 is 5-6s. Fires indicate thread pool contention or I/O stalls."
 
 [[alarm]]
 name = "lc-post-complete-slow"
