@@ -1042,6 +1042,20 @@ def test_cli_main_hard_error(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "::error" in captured.out
 
+# ── Test 23: Malformed alarm shape → error ────────────────────────────────
+
+def test_malformed_alarm_shape(tmp_path):
+    """[alarm] (table) instead of [[alarm]] (array of tables) should error."""
+    old = _write_toml(tmp_path, "old.toml", "")
+    new = _write_toml(tmp_path, "new.toml", """\
+        [alarm]
+        name = "bad"
+        kind = "counter"
+    """)
+    errors, warnings, notices, hard = check_alarm_versions(old, new)
+    assert hard
+    assert any("array of tables" in e for e in errors)
+
 
 # ── Test: Real alarm file validates without unknown fields ────────────────
 

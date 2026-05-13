@@ -145,6 +145,18 @@ def check_alarm_versions(old_path: str, new_path: str) -> tuple[list[str], list[
     old_alarms = old_data.get("alarm", [])
     new_alarms = new_data.get("alarm", [])
 
+    # Validate alarm structure (must be list of dicts, i.e. [[alarm]] not [alarm])
+    for label, alarms in [("Old file", old_alarms), ("New file", new_alarms)]:
+        if not isinstance(alarms, list):
+            errors.append(f"{label}: 'alarm' must be an array of tables ([[alarm]]), got {type(alarms).__name__}")
+            continue
+        for i, entry in enumerate(alarms):
+            if not isinstance(entry, dict):
+                errors.append(f"{label}: alarm entry {i} is not a table (got {type(entry).__name__})")
+
+    if errors:
+        return (errors, warnings, notices, True)
+
     # Check for unknown fields in both old and new files
     for label, alarms in [("Old file", old_alarms), ("New file", new_alarms)]:
         unknown_errors = check_unknown_fields(alarms)
