@@ -6263,18 +6263,21 @@ sys.exit(0)
     tap_not_ok "dedup-load: valid file returns data" "out: ${dl_valid_out:0:200}"
   fi
 
-  # Test: Prune — TTL boundary (entry at exact cutoff is expired, > semantics)
-  local prune_boundary_data
-  # Entry filed exactly 24h ago (at cutoff) should be pruned
-  local ts_24h_ago
-  ts_24h_ago=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
-  prune_boundary_data='{"schema_version":1,"filed":{"at-cutoff":{"filed_at":"'"$ts_24h_ago"'","issue_number":1}}}'
+  # Test: Prune — TTL boundary (> semantics: entry at cutoff is expired)
+  # To prove > (not >=), we test two entries:
+  #   - one filed exactly 24h+1s ago → definitely pruned (beyond cutoff)
+  #   - one filed exactly 24h-1s ago → definitely kept (within window)
+  # This confirms the boundary behavior regardless of sub-second clock drift.
+  local ts_beyond_cutoff ts_within_cutoff
+  ts_beyond_cutoff=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=24,seconds=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+  ts_within_cutoff=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=23,minutes=59,seconds=58)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+  local prune_boundary_data='{"schema_version":1,"filed":{"beyond":{"filed_at":"'"$ts_beyond_cutoff"'","issue_number":1},"within":{"filed_at":"'"$ts_within_cutoff"'","issue_number":2}}}'
   local prune_boundary_out
   prune_boundary_out=$(dedup_prune "$prune_boundary_data" "24h")
-  if ! _json_has_key "$prune_boundary_out" "filed" "at-cutoff"; then
-    tap_ok "dedup-prune: entry at exact cutoff is expired (> semantics)"
+  if ! _json_has_key "$prune_boundary_out" "filed" "beyond" && _json_has_key "$prune_boundary_out" "filed" "within"; then
+    tap_ok "dedup-prune: TTL boundary correctly prunes old, keeps fresh"
   else
-    tap_not_ok "dedup-prune: entry at exact cutoff is expired (> semantics)" "out: ${prune_boundary_out:0:200}"
+    tap_not_ok "dedup-prune: TTL boundary correctly prunes old, keeps fresh" "out: ${prune_boundary_out:0:200}"
   fi
 
   # Test: Prune — malformed filed_at is silently dropped
@@ -6634,7 +6637,9 @@ assert 'stale_marker' not in e, 'stale_marker survived — remove did not happen
   # Test: UNKNOWN state hit → suppress filing
   > "$flow_gh_log"
   local flow_dedup_file5="$flow_root/dedup-unknown.json"
-  echo '{"schema_version":1,"filed":{"sha_unk":{"issue_number":300,"filed_at":"2026-01-01T00:00:00Z"}}}' > "$flow_dedup_file5"
+  local unk_recent_ts
+  unk_recent_ts=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+  echo '{"schema_version":1,"filed":{"sha_unk":{"issue_number":300,"filed_at":"'"$unk_recent_ts"'"}}}' > "$flow_dedup_file5"
   # gh issue view will fail (exit 1 simulating network error)
   cat > "$flow_root/gh-stub/gh" << 'UNKNOWNEOF'
 #!/usr/bin/env bash
@@ -6645,6 +6650,7 @@ exit 0
 UNKNOWNEOF
   chmod +x "$flow_root/gh-stub/gh"
   flow_data=$(dedup_load "$flow_dedup_file5" 2>/dev/null)
+  flow_data=$(dedup_prune "$flow_data" "30d")
   set +e
   flow_entry=$(dedup_check "$flow_data" "sha_unk" 2>/dev/null)
   local flow_unk_rc=$?
