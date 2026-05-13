@@ -1337,60 +1337,45 @@ def main() -> int:
         name = alarm["name"]
         kind = alarm["kind"]
 
-        # Exempt check — skip evaluation entirely
+        # --- Determine result (all branches fall through to post-processing) ---
         if alarm.get("exempt", False):
             reason = alarm.get("exempt_reason", "exempt")
             result = make_result(alarm, "skipped", skip_reason=f"exempt: {reason}",
                                  extra_values=default_extra_values(alarm, kind))
-            results.append(result)
-            maybe_reset_gauge_persistence(alarm, kind, "skipped", persistence_state)
-            maybe_reset_counter_snapshot(alarm, kind, "skipped", state_dir)
-            print(f"# alarm={name} state=skipped reason=exempt", file=sys.stderr)
-            continue
-
-        # Gate check
-        gates = alarm.get("gates", [])
-        passed, skip_reason = gates_pass(
-            gates, warmup_remaining, fresh_start, crash_recovery, uptime, monitor_mode,
-        )
-        if not passed:
-            result = make_result(alarm, "skipped", skip_reason=skip_reason,
-                                 extra_values=default_extra_values(alarm, kind))
-            results.append(result)
-            maybe_reset_gauge_persistence(alarm, kind, "skipped", persistence_state)
-            maybe_reset_counter_snapshot(alarm, kind, "skipped", state_dir)
-            # Telemetry
-            metric = telemetry_metric(alarm, kind)
-            n = count_series(current, metric) if metric else 0
-            print(f"# alarm={name} metric={metric} series_matched={n} state=skipped", file=sys.stderr)
-            continue
-
-        # Evaluate based on kind
-        if kind == "gauge":
-            result = eval_gauge(alarm, current, persistence_state, prev_prom_invalid)
-        elif kind == "gauge-ratio":
-            result = eval_gauge_ratio(alarm, current, persistence_state, prev_prom_invalid)
-        elif kind == "counter":
-            result = eval_counter(alarm, current, prev, prev_prom_invalid, warmup_remaining)
-        elif kind == "counter-dynamic":
-            result = eval_counter_dynamic(alarm, current, prev, state_dir, prev_prom_invalid, warmup_remaining)
-        elif kind == "histogram-p99":
-            result = eval_histogram_p99(alarm, current, prev, prev_prom_invalid)
-        elif kind == "counter-ratio":
-            result = eval_counter_ratio(
-                alarm, current, prev, state_dir, pid, start_ticks_val,
-                fresh_start, crash_recovery, uptime,
-            )
-        elif kind == "counter-streak":
-            result = eval_counter_streak(alarm, current, state_dir, pid, start_ticks_val)
         else:
-            result = make_result(alarm, "skipped", skip_reason=f"unknown kind: {kind}")
+            gates = alarm.get("gates", [])
+            passed, skip_reason = gates_pass(
+                gates, warmup_remaining, fresh_start, crash_recovery, uptime, monitor_mode,
+            )
+            if not passed:
+                result = make_result(alarm, "skipped", skip_reason=skip_reason,
+                                     extra_values=default_extra_values(alarm, kind))
+            elif kind == "gauge":
+                result = eval_gauge(alarm, current, persistence_state, prev_prom_invalid)
+            elif kind == "gauge-ratio":
+                result = eval_gauge_ratio(alarm, current, persistence_state, prev_prom_invalid)
+            elif kind == "counter":
+                result = eval_counter(alarm, current, prev, prev_prom_invalid, warmup_remaining)
+            elif kind == "counter-dynamic":
+                result = eval_counter_dynamic(alarm, current, prev, state_dir, prev_prom_invalid, warmup_remaining)
+            elif kind == "histogram-p99":
+                result = eval_histogram_p99(alarm, current, prev, prev_prom_invalid)
+            elif kind == "counter-ratio":
+                result = eval_counter_ratio(
+                    alarm, current, prev, state_dir, pid, start_ticks_val,
+                    fresh_start, crash_recovery, uptime,
+                )
+            elif kind == "counter-streak":
+                result = eval_counter_streak(alarm, current, state_dir, pid, start_ticks_val)
+            else:
+                result = make_result(alarm, "skipped", skip_reason=f"unknown kind: {kind}")
 
+        # --- Single converged post-processing ---
         results.append(result)
         maybe_reset_gauge_persistence(alarm, kind, result["state"], persistence_state)
         maybe_reset_counter_snapshot(alarm, kind, result["state"], state_dir)
 
-        # Telemetry
+        # Telemetry (unified format for all branches)
         metric = telemetry_metric(alarm, kind)
         n = count_series(current, metric) if metric else 0
         state = result["state"]
