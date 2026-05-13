@@ -393,17 +393,9 @@ impl App {
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(10));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // SCP message flow rate tracking.
-        //
-        // `scp_messages_received` is the post-cache atomic incremented inside
-        // `pump_scp_intake` (parity: `HerderImpl.cpp:810 mEnvelopeReceive`).
-        // The heartbeat snapshots it once per tick from
-        // `self.scp_messages_received`.
-        //
-        // `last_scp_message_at` is intentionally kept pre-cache here: it is
-        // the "we are still hearing SCP from peers" liveness signal feeding
-        // the no-quorum warn below, and in-flight duplicates should count
-        // as liveness.
+        // `scp_messages_received` is post-cache (bumped in `pump_scp_intake`);
+        // `last_scp_message_at` stays pre-cache so in-flight duplicates still
+        // count as liveness for the no-quorum warn.
         let mut scp_messages_last_heartbeat: u64 = 0;
         let mut last_scp_message_at = self.clock.now();
 
@@ -712,10 +704,6 @@ impl App {
                 Some(scp_msg) = scp_message_rx.recv() => {
                     self.set_phase(1); // 1 = scp_message
                     tracing::trace!(select_iteration, "BRANCH: scp_message_rx");
-                    // `scp_messages_received` is bumped post-cache inside
-                    // `pump_scp_intake` for parity with stellar-core's
-                    // `mEnvelopeReceive.Mark()` at `HerderImpl.cpp:810`. The
-                    // wire-level liveness signal stays pre-cache.
                     last_scp_message_at = self.clock.now();
                     let scp_slot = match &scp_msg.message {
                         StellarMessage::ScpMessage(env) => env.statement.slot_index,
@@ -2074,14 +2062,8 @@ impl App {
             return;
         };
 
-        // Parity: stellar-core `HerderImpl.cpp:810 mSCPMetrics.mEnvelopeReceive.Mark()`
-        // fires after dedup (`checkScheduledAndCache`) and before validity
-        // checks (`checkCloseTime`, slot-range, `verifyEnvelope`). The henyey
-        // analogue runs after `check_and_insert` and before
-        // `pre_filter_scp_envelope`, so this is the matching anchor. The
-        // counter therefore fires for envelopes that go on to be rejected
-        // by pre-filter or that hit the verifier-closed path below — matching
-        // stellar-core's behaviour of marking before any validity gate.
+        // Parity: HerderImpl.cpp:810 `mEnvelopeReceive.Mark()` — post-dedup,
+        // pre-validity (fires even for envelopes that pre-filter rejects).
         self.scp_messages_received.fetch_add(1, Ordering::Relaxed);
 
         let mut drained: usize = 0;
