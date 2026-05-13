@@ -92,6 +92,11 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL` | `stellar_overlay_item_fetcher_next_peer_total` | counter | Henyey-specific — `Tracker::try_next_peer` AskPeer selections. |
 | `OVERLAY_MEMORY_FLOOD_KNOWN` | `stellar_overlay_memory_flood_known` | gauge | Henyey-specific — current FloodGate known entries count (`FloodGate.records.len()`). |
 | `OVERLAY_SEND_TOTAL` | `stellar_overlay_send_total` | counter (labeled: `type`) | Replaces stellar-core's per-type `mSendXxxMeter` meters (19 groups, `Peer.cpp:830-897`). Henyey uses 21 individual labels (one per XDR variant) for finer granularity. Success-only semantics (post-wire-send), unlike stellar-core which counts pre-send. |
+| `OVERLAY_OUTBOUND_QUEUE_DROP_SCP_TOTAL` | `stellar_overlay_outbound_queue_drop_scp_total` | counter | Outbound SCP messages dropped during queue trimming. Counterpart: `stellar_core_overlay_outbound_queue_drop_scp`. |
+| `OVERLAY_OUTBOUND_QUEUE_DROP_TX_TOTAL` | `stellar_overlay_outbound_queue_drop_tx_total` | counter | Outbound transaction messages dropped during queue trimming. |
+| `OVERLAY_OUTBOUND_QUEUE_DROP_ADVERT_TOTAL` | `stellar_overlay_outbound_queue_drop_advert_total` | counter | Outbound flood advert tx-hashes dropped during queue trimming. |
+| `OVERLAY_OUTBOUND_QUEUE_DROP_DEMAND_TOTAL` | `stellar_overlay_outbound_queue_drop_demand_total` | counter | Outbound flood demand tx-hashes dropped during queue trimming. |
+| `OVERLAY_CONNECTION_LATENCY_SECONDS` | `stellar_overlay_connection_latency_seconds` | histogram | Peer ping round-trip time (seconds). Counterpart: `stellar_core_overlay_connection_latency_seconds`. Recorded at event site in `PingTracker::check_response`. |
 | `BUCKET_MERGE_COMPLETED_TOTAL` | `stellar_bucket_merge_completed_total` | counter | `BucketManager::mMergesCompleted` |
 | `BUCKET_MERGE_TIME_US_TOTAL` | `stellar_bucket_merge_time_us_total` | counter | Cumulative merge time μs |
 | `BUCKET_MERGE_NEW_LIVE_TOTAL` | `stellar_bucket_merge_new_live_total` | counter | Live entries produced by merges |
@@ -146,8 +151,11 @@ Metrics inspired by stellar-core but with different type, unit, or granularity.
 | Henyey constant | Prometheus name | Type | Notes |
 |---|---|---|---|
 | `LEDGER_CLOSE_DURATION_SECONDS` | `stellar_ledger_close_duration_seconds` | histogram | Derived from `stats.close_time_ms`. Histogram (seconds) vs stellar-core's gauge (ms). |
-| `SCP_TIMING_EXTERNALIZED_SECONDS` | `stellar_scp_timing_externalized_seconds` | histogram | SCP externalization latency — histogram in henyey vs timer in stellar-core. |
+| `SCP_TIMING_EXTERNALIZED_SECONDS` | `stellar_scp_timing_externalized_seconds` | gauge | SCP externalization latency — last-slot gauge (seconds). See also `stellar_scp_timing_externalized_hist_seconds` histogram for quantile queries across slots. |
 | `SCP_TIMING_NOMINATED_SECONDS` | `stellar_scp_timing_nominated_seconds` | gauge | SCP nomination phase duration (nomination start → ballot protocol start). Matches stellar-core's `mNominateToPrepare`. |
+| `SCP_TIMING_EXTERNALIZED_HIST_SECONDS` | `stellar_scp_timing_externalized_hist_seconds` | histogram | SCP externalization latency histogram — recorded at event site (one sample per forward externalization). |
+| `SCP_TIMING_NOMINATED_HIST_SECONDS` | `stellar_scp_timing_nominated_hist_seconds` | histogram | SCP nomination phase duration histogram (seconds). |
+| `SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_HIST_SECONDS` | `stellar_scp_timing_first_to_self_externalize_hist_seconds` | histogram | First-observed-EXTERNALIZE to self-externalize lag histogram (seconds). |
 | `LEDGER_APPLY_SUCCESS_TOTAL` | `stellar_ledger_apply_success_total` | counter | Cumulative successful tx applies — monotonic counter vs per-close gauge in stellar-core. |
 | `LEDGER_APPLY_FAILURE_TOTAL` | `stellar_ledger_apply_failure_total` | counter | Cumulative failed tx applies. |
 | `LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL` | `stellar_ledger_apply_soroban_success_total` | counter | Cumulative successful Soroban tx applies. |

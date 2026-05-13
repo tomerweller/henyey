@@ -2325,6 +2325,21 @@ impl ScpDriver {
                         nomination_duration,
                         first_to_self_externalize_lag: first_to_self,
                     });
+
+                    // Issue #2621 B3: Record SCP timing histograms at
+                    // externalization time (event-site, not scrape-time).
+                    metrics::histogram!("stellar_scp_timing_externalized_hist_seconds")
+                        .record(externalize_duration.as_secs_f64());
+                    if let Some(nom_dur) = nomination_duration {
+                        metrics::histogram!("stellar_scp_timing_nominated_hist_seconds")
+                            .record(nom_dur.as_secs_f64());
+                    }
+                    if let Some(lag) = first_to_self {
+                        metrics::histogram!(
+                            "stellar_scp_timing_first_to_self_externalize_hist_seconds"
+                        )
+                        .record(lag.as_secs_f64());
+                    }
                 } else {
                     // Catchup/fast-forward path: no slot_first_seen recorded.
                     // Clear stale timing so the gauge resets to 0.0.

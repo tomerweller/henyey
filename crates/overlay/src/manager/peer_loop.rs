@@ -397,6 +397,8 @@ impl PingTracker {
         self.last_rtt = Some(rtt);
         self.sent_time = None;
         self.hash = None;
+        // Issue #2621 B4: Record ping RTT histogram at event site.
+        metrics::histogram!("stellar_overlay_connection_latency_seconds").record(rtt.as_secs_f64());
         Some(rtt)
     }
 

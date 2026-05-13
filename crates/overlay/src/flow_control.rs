@@ -746,6 +746,8 @@ impl FlowControl {
                     state.outbound_queues[queue_idx].clear();
                     self.dropped_txs
                         .fetch_add(dropped as u64, Ordering::Relaxed);
+                    metrics::counter!("stellar_overlay_outbound_queue_drop_tx_total")
+                        .increment(dropped as u64);
                 }
             }
             MessagePriority::Scp => {
@@ -754,6 +756,8 @@ impl FlowControl {
                     dropped = Self::trim_scp_queue(queue, limit, &self.scp_callback);
                     self.dropped_scp
                         .fetch_add(dropped as u64, Ordering::Relaxed);
+                    metrics::counter!("stellar_overlay_outbound_queue_drop_scp_total")
+                        .increment(dropped as u64);
                 }
             }
             MessagePriority::FloodAdvert => {
@@ -763,6 +767,8 @@ impl FlowControl {
                     state.outbound_queues[queue_idx].clear();
                     self.dropped_adverts
                         .fetch_add(dropped as u64, Ordering::Relaxed);
+                    metrics::counter!("stellar_overlay_outbound_queue_drop_advert_total")
+                        .increment(dropped as u64);
                 }
             }
             MessagePriority::FloodDemand => {
@@ -772,6 +778,8 @@ impl FlowControl {
                     state.outbound_queues[queue_idx].clear();
                     self.dropped_demands
                         .fetch_add(dropped as u64, Ordering::Relaxed);
+                    metrics::counter!("stellar_overlay_outbound_queue_drop_demand_total")
+                        .increment(dropped as u64);
                 }
             }
         }

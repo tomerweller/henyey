@@ -624,6 +624,16 @@ metric_catalog! {
         OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL = "stellar_overlay_item_fetcher_next_peer_total"
             => "Total item fetcher next-peer selections";
 
+        // Issue #2621 B1: Per-type outbound queue drops.
+        OVERLAY_OUTBOUND_QUEUE_DROP_SCP_TOTAL = "stellar_overlay_outbound_queue_drop_scp_total"
+            => "Outbound SCP messages dropped (queue trim)";
+        OVERLAY_OUTBOUND_QUEUE_DROP_TX_TOTAL = "stellar_overlay_outbound_queue_drop_tx_total"
+            => "Outbound transaction messages dropped (queue trim)";
+        OVERLAY_OUTBOUND_QUEUE_DROP_ADVERT_TOTAL = "stellar_overlay_outbound_queue_drop_advert_total"
+            => "Outbound flood advert tx-hashes dropped (queue trim)";
+        OVERLAY_OUTBOUND_QUEUE_DROP_DEMAND_TOTAL = "stellar_overlay_outbound_queue_drop_demand_total"
+            => "Outbound flood demand tx-hashes dropped (queue trim)";
+
         // Herder pending envelope counters (Phase 2).
         HERDER_PENDING_ADDED_TOTAL = "stellar_herder_pending_added_total"
             => "Envelopes added to the pending pool";
@@ -862,6 +872,18 @@ metric_catalog! {
         // bucket schedule.
         HISTORY_PUBLISH_TIME_SECONDS = "stellar_history_publish_time_seconds"
             => "Wall-clock duration of a single checkpoint publish (seconds)";
+
+        // Issue #2621 B3: SCP timing histograms (event-site recording in herder).
+        SCP_TIMING_EXTERNALIZED_HIST_SECONDS = "stellar_scp_timing_externalized_hist_seconds"
+            => "Time from slot creation to externalize (seconds, histogram across slots)";
+        SCP_TIMING_NOMINATED_HIST_SECONDS = "stellar_scp_timing_nominated_hist_seconds"
+            => "Time from first nomination to ballot protocol start (seconds, histogram)";
+        SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_HIST_SECONDS = "stellar_scp_timing_first_to_self_externalize_hist_seconds"
+            => "Time from first observed EXTERNALIZE to self-externalize (seconds, histogram)";
+
+        // Issue #2621 B4: Peer ping round-trip time histogram (event-site recording in overlay).
+        OVERLAY_CONNECTION_LATENCY_SECONDS = "stellar_overlay_connection_latency_seconds"
+            => "Peer ping round-trip time (seconds)";
     }
 }
 
@@ -1256,31 +1278,67 @@ fn process_max_fds() -> Option<u64> {
     None
 }
 
-// ── Test helper ────────────────────────────────────────────────────────
+// ── Histogram bucket schedules ─────────────────────────────────────────
 
-/// Install the metrics recorder once per test process and return a handle.
-///
-/// The `metrics` global recorder is one-shot per process. Since Rust tests
-/// run in parallel within the same process, this helper ensures the recorder
-/// is installed exactly once. Subsequent calls return the same handle.
-pub fn ensure_test_recorder() -> &'static PrometheusHandle {
-    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-    HANDLE.get_or_init(|| {
-        PrometheusBuilder::new()
-            .set_buckets(&[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0])
-            .expect("valid histogram buckets")
-            .install_recorder()
-            .expect("metrics recorder should install successfully")
-    })
-}
+/// Default histogram buckets for general-purpose timing metrics.
+const DEFAULT_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0];
 
-/// Install the production metrics recorder.
+/// Buckets for close-cadence histograms (close_cycle, slot_to_close, etc.).
+/// Dense in the 4–8 s range where mainnet 5 s slot observations concentrate,
+/// avoiding the misleading 25 s interpolation gap of the default schedule.
+const CLOSE_CADENCE_BUCKETS: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0, 8.0, 10.0, 15.0, 20.0, 30.0,
+    60.0,
+];
+
+/// Buckets for SCP timing histograms (externalize, nominate, first-to-self lag).
+const SCP_TIMING_BUCKETS: &[f64] = &[
+    0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.0, 20.0, 30.0,
+];
+
+/// Buckets for peer ping round-trip time.
+const PING_RTT_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0];
+
+/// Configure all histogram bucket overrides on a `PrometheusBuilder`.
 ///
-/// Returns the `PrometheusHandle` for use by the `/metrics` endpoint.
-pub fn install_recorder() -> PrometheusHandle {
-    let handle = PrometheusBuilder::new()
-        .set_buckets(&[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0])
-        .expect("valid histogram buckets")
+/// Shared between `install_recorder()` and `ensure_test_recorder()` so that
+/// production and test bucket schedules cannot drift.
+fn configure_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {
+    builder
+        .set_buckets(DEFAULT_BUCKETS)
+        .expect("valid default histogram buckets")
+        // Close-cadence histograms — dense around the 5 s slot interval.
+        .set_buckets_for_metric(
+            Matcher::Full(CLOSE_CYCLE_SECONDS.to_string()),
+            CLOSE_CADENCE_BUCKETS,
+        )
+        .expect("valid close_cycle histogram buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(SLOT_TO_CLOSE_LATENCY_SECONDS.to_string()),
+            CLOSE_CADENCE_BUCKETS,
+        )
+        .expect("valid slot_to_close histogram buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(CLOSE_HANDLE_COMPLETE_SECONDS.to_string()),
+            CLOSE_CADENCE_BUCKETS,
+        )
+        .expect("valid close_handle_complete histogram buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(CLOSE_POST_COMPLETE_SECONDS.to_string()),
+            CLOSE_CADENCE_BUCKETS,
+        )
+        .expect("valid close_post_complete histogram buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(CLOSE_DISPATCH_TO_JOIN_SECONDS.to_string()),
+            CLOSE_CADENCE_BUCKETS,
+        )
+        .expect("valid close_dispatch_to_join histogram buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(PERSIST_DISPATCH_TO_JOIN_SECONDS.to_string()),
+            CLOSE_CADENCE_BUCKETS,
+        )
+        .expect("valid persist_dispatch_to_join histogram buckets")
+        // Existing per-metric overrides.
         .set_buckets_for_metric(
             Matcher::Full(LEDGER_CLOSE_DURATION_SECONDS.to_string()),
             &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0],
@@ -1296,14 +1354,56 @@ pub fn install_recorder() -> PrometheusHandle {
             &[1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0],
         )
         .expect("valid catchup duration histogram buckets")
-        // Stage E: publishes routinely take 30–50 s; the default bucket schedule
-        // tops out at 30 s. Use a publish-tuned schedule so durations are
-        // resolved across 1 s … 5 min.
         .set_buckets_for_metric(
             Matcher::Full(HISTORY_PUBLISH_TIME_SECONDS.to_string()),
             &[1.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 300.0],
         )
         .expect("valid history publish histogram buckets")
+        // SCP timing histograms — slot-cadence durations.
+        .set_buckets_for_metric(
+            Matcher::Full(SCP_TIMING_EXTERNALIZED_HIST_SECONDS.to_string()),
+            SCP_TIMING_BUCKETS,
+        )
+        .expect("valid scp externalized histogram buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(SCP_TIMING_NOMINATED_HIST_SECONDS.to_string()),
+            SCP_TIMING_BUCKETS,
+        )
+        .expect("valid scp nominated histogram buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_HIST_SECONDS.to_string()),
+            SCP_TIMING_BUCKETS,
+        )
+        .expect("valid scp first_to_self histogram buckets")
+        // Ping RTT histogram.
+        .set_buckets_for_metric(
+            Matcher::Full(OVERLAY_CONNECTION_LATENCY_SECONDS.to_string()),
+            PING_RTT_BUCKETS,
+        )
+        .expect("valid ping RTT histogram buckets")
+}
+
+// ── Test helper ────────────────────────────────────────────────────────
+
+/// Install the metrics recorder once per test process and return a handle.
+///
+/// The `metrics` global recorder is one-shot per process. Since Rust tests
+/// run in parallel within the same process, this helper ensures the recorder
+/// is installed exactly once. Subsequent calls return the same handle.
+pub fn ensure_test_recorder() -> &'static PrometheusHandle {
+    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+    HANDLE.get_or_init(|| {
+        configure_histogram_buckets(PrometheusBuilder::new())
+            .install_recorder()
+            .expect("metrics recorder should install successfully")
+    })
+}
+
+/// Install the production metrics recorder.
+///
+/// Returns the `PrometheusHandle` for use by the `/metrics` endpoint.
+pub fn install_recorder() -> PrometheusHandle {
+    let handle = configure_histogram_buckets(PrometheusBuilder::new())
         .install_recorder()
         .expect("metrics recorder should install successfully");
     describe_metrics();

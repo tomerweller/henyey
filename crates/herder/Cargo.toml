@@ -30,6 +30,9 @@ base64.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# Metrics (event-site histogram recording)
+metrics.workspace = true
+
 # Data structures
 dashmap.workspace = true
 parking_lot.workspace = true
