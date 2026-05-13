@@ -10,8 +10,9 @@
 #   - Stable baseline (replay-baseline-stable.json): frozen at creation time,
 #     never auto-updated. Catches gradual decay where an alarm that was
 #     historically active (≥5%) has silently drifted to 0% over successive
-#     rolling-baseline updates. To refresh the stable baseline after
-#     intentional alarm changes, delete replay-baseline-stable.json and re-run.
+#     rolling-baseline updates. The stable baseline is auto-invalidated and
+#     recreated when the alarm catalog (metric-alarms.toml) changes. To force
+#     a manual refresh, delete replay-baseline-stable.json and re-run.
 #
 # Only alarms present in the alarm catalog are considered; non-catalog alarm
 # names (e.g. from stale baselines or test contamination) are silently pruned.
@@ -120,6 +121,11 @@ if [[ ! -f "$CATALOG_FILE" ]]; then
   exit 2
 fi
 
+# Compute provenance values once per run (prevents drift between calls)
+CATALOG_CHECKSUM=$(sha256sum "$CATALOG_FILE" | cut -d' ' -f1)
+PROVENANCE_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")
+PROVENANCE_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
 # Get current replay JSON if not provided
 if [[ -z "$CURRENT_FILE" ]]; then
   CURRENT_JSON=$("$REPLAY_SCRIPT" "$SESSION_DIR" --replay --json 2>/dev/null) || {
@@ -184,9 +190,11 @@ if not isinstance(data.get('evaluated_ticks'), int) or data['evaluated_ticks'] <
   return 0
 }
 
-# Helper: create a catalog-pruned baseline from current replay data
+# Helper: create a catalog-pruned baseline from current replay data with provenance.
+# Uses atomic write (tmp + mv) to prevent corruption on failure.
 create_baseline() {
   local output_file="$1"
+  local tmpout="${output_file}.tmp.$$"
   python3 -c "
 import json, sys
 try:
@@ -195,6 +203,9 @@ except ImportError:
     import tomli as tomllib
 catalog_path = sys.argv[1]
 current_str = sys.argv[2]
+checksum = sys.argv[3]
+commit = sys.argv[4]
+timestamp = sys.argv[5]
 with open(catalog_path, 'rb') as f:
     catalog = tomllib.load(f)
 valid = {a['name'] for a in catalog.get('alarm', [])}
@@ -204,12 +215,82 @@ if not valid:
 data = json.loads(current_str)
 alarms = data.get('alarms', {})
 data['alarms'] = {k: v for k, v in alarms.items() if k in valid}
+data['provenance'] = {
+    'created_at': timestamp,
+    'created_commit': commit,
+    'catalog_checksum': checksum,
+}
 print(json.dumps(data))
-" "$CATALOG_FILE" "$CURRENT_JSON" > "$output_file" || {
+" "$CATALOG_FILE" "$CURRENT_JSON" "$CATALOG_CHECKSUM" "$PROVENANCE_COMMIT" "$PROVENANCE_TIMESTAMP" > "$tmpout" || {
     echo "ERROR: Failed to create baseline: $output_file" >&2
-    rm -f "$output_file"
+    rm -f "$tmpout"
     exit 2
   }
+  mv -f "$tmpout" "$output_file"
+}
+
+# Helper: extract catalog_checksum from a baseline's provenance.
+# Prints the checksum if valid, empty string otherwise.
+extract_catalog_checksum() {
+  python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+p = d.get('provenance')
+if isinstance(p, dict):
+    cs = p.get('catalog_checksum', '')
+    if isinstance(cs, str) and len(cs) > 0:
+        print(cs)
+" "$1" 2>/dev/null || true
+}
+
+# Helper: inject provenance into an existing baseline file (for legacy migration).
+# Preserves alarm data; only adds/replaces the provenance field.
+inject_provenance() {
+  local baseline_file="$1"
+  local tmpout="${baseline_file}.tmp.$$"
+  python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+data['provenance'] = {
+    'created_at': sys.argv[2],
+    'created_commit': sys.argv[3],
+    'catalog_checksum': sys.argv[4],
+}
+print(json.dumps(data))
+" "$baseline_file" "$PROVENANCE_TIMESTAMP" "$PROVENANCE_COMMIT" "$CATALOG_CHECKSUM" > "$tmpout" || {
+    echo "ERROR: Failed to inject provenance: $baseline_file" >&2
+    rm -f "$tmpout"
+    return 1
+  }
+  mv -f "$tmpout" "$baseline_file"
+}
+
+# Helper: check a baseline's catalog checksum and invalidate/migrate if needed.
+# $1 = baseline file path, $2 = label (for logging)
+maybe_invalidate_baseline() {
+  local baseline_file="$1"
+  local label="$2"
+  local stored_checksum
+  stored_checksum=$(extract_catalog_checksum "$baseline_file")
+
+  if [[ -n "$stored_checksum" ]]; then
+    if [[ "$stored_checksum" == "$CATALOG_CHECKSUM" ]]; then
+      # Checksums match — baseline is current
+      return 0
+    else
+      # Catalog changed — recreate from current data
+      echo "$label baseline auto-invalidated: alarm catalog changed (was ${stored_checksum:0:12}..., now ${CATALOG_CHECKSUM:0:12}...)" >&2
+      create_baseline "$baseline_file"
+      return 0
+    fi
+  else
+    # No provenance or malformed — inject provenance preserving existing alarm data
+    echo "Migrating legacy $label baseline: adding provenance metadata" >&2
+    inject_provenance "$baseline_file"
+    return 0
+  fi
 }
 
 # Determine baseline states
@@ -254,7 +335,11 @@ if [[ "$ROLLING_STATE" == "missing" && "$STABLE_STATE" == "valid" ]]; then
   echo "Rolling baseline re-established" >&2
 fi
 
-# Both baselines now exist and are valid — run dual comparison
+# Both baselines now exist and are valid — check provenance and auto-invalidate if needed
+maybe_invalidate_baseline "$BASELINE_FILE" "Rolling"
+maybe_invalidate_baseline "$STABLE_BASELINE_FILE" "Stable"
+
+# Run dual comparison
 set +e
 REGRESSION_OUTPUT=$(python3 -c "
 import json, sys
@@ -372,22 +457,7 @@ REGRESSION_COUNT=$(echo "$REGRESSION_OUTPUT" | python3 -c "import json,sys; prin
 
 if [[ "$REGRESSION_COUNT" == "0" ]]; then
   # No regressions from either baseline — update rolling (stable is never updated)
-  python3 -c "
-import json, sys
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib
-catalog_path = sys.argv[1]
-current_str = sys.argv[2]
-with open(catalog_path, 'rb') as f:
-    catalog = tomllib.load(f)
-valid = {a['name'] for a in catalog.get('alarm', [])}
-data = json.loads(current_str)
-alarms = data.get('alarms', {})
-data['alarms'] = {k: v for k, v in alarms.items() if k in valid}
-print(json.dumps(data))
-" "$CATALOG_FILE" "$CURRENT_JSON" > "$BASELINE_FILE"
+  create_baseline "$BASELINE_FILE"
   echo "No regressions found. Rolling baseline updated." >&2
 else
   # Regressions found — keep last-known-good rolling baseline
@@ -452,8 +522,9 @@ else
       # Build investigation steps based on baseline source
       if [[ "$BASELINE_SOURCE" == "stable" ]]; then
         INVESTIGATION_STEPS="1. Check if this alarm was intentionally removed or its threshold changed
-2. If intentional: delete \`replay-baseline-stable.json\` to refresh the stable baseline
-3. If unintentional: investigate why the alarm stopped firing — it was historically active"
+2. If the alarm catalog changed: the stable baseline should auto-invalidate on the next run
+3. If the alarm catalog did NOT change: investigate why the alarm stopped firing — it was historically active
+4. Manual fallback: delete \`replay-baseline-stable.json\` to force a refresh"
       else
         INVESTIGATION_STEPS="1. Check if the alarm was intentionally removed or its threshold changed
 2. Check if the underlying metric is still being emitted

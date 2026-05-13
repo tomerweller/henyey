@@ -332,8 +332,9 @@ After modifying alarm rules or the evaluator, verify no regressions:
 > a **rolling baseline** (updated each clean run, catches sudden regressions)
 > and a **frozen stable baseline** (never auto-updated, catches gradual decay
 > where an alarm silently drifts from active to silent over successive runs).
-> To refresh the stable baseline after intentional alarm changes, delete
-> `replay-baseline-stable.json` and re-run.
+> Both baselines carry provenance metadata including a catalog checksum;
+> when the alarm catalog changes, baselines are auto-invalidated and recreated.
+> To force a manual refresh, delete `replay-baseline-stable.json` and re-run.
 >
 > **Pre-refactor limitation.** Pre-#2566 runtime equivalence cannot be
 > proven — no pre-refactor snapshots or baseline exist. The original
