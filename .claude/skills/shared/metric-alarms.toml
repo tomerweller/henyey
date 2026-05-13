@@ -26,7 +26,7 @@ schema_version = 1
 [[alarm]]
 name = "lost-sync"
 baseline_version = 3  # bumped in #2642: force re-invalidation of stable baselines created during post-#2612 transition
-semantic_change_date = "2026-05-13T00:00:00Z"  # deployed via #2642 (c45e6c80)
+semantic_change_date = "2026-05-13T20:00:00Z"  # deployed via #2642 (c45e6c80, committed 19:52 UTC)
 metric = "stellar_herder_lost_sync_total"
 kind = "counter"
 extraction = "form1"

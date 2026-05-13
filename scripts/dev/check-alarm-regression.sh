@@ -377,7 +377,9 @@ for name in list(alarms.keys()):
             invalidated.append(name)
 
 # Remove acks predating an alarm's semantic change (fail-closed: missing
-# acknowledged_at is treated as stale)
+# or malformed acknowledged_at is treated as stale)
+import re
+ACK_ISO_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
 semantic_dates = json.loads(sys.argv[3])
 for name in list(alarms.keys()):
     if name in invalidated:
@@ -386,7 +388,7 @@ for name in list(alarms.keys()):
     if not change_date:
         continue
     ack_ts = alarms[name].get('acknowledged_at', '')
-    if not ack_ts or ack_ts < change_date:
+    if not ack_ts or not ACK_ISO_RE.match(ack_ts) or ack_ts < change_date:
         del alarms[name]
         invalidated.append(name)
 

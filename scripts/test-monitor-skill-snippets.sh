@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=286
+TAP_PLAN=300
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -6300,6 +6300,102 @@ print('alarm-no-date' in d.get('alarms', {}))
   else
     tap_not_ok "step-d: ack invalidation removes stale acknowledgment" \
       "dated=$stepd4_ack_dated undated=$stepd4_ack_undated output=${stepd_out4:0:200}"
+  fi
+
+  # Test 5: Ack with acknowledged_at >= semantic_change_date → preserved
+  local stepd_session5="$stepd_root/session5"
+  mkdir -p "$stepd_session5/metrics"
+
+  cat > "$stepd_session5/metrics/alarm-acknowledgments.json" << 'STEPD_ACK5_EOF'
+{"schema_version":1,"catalog_checksum":"old-ack-checksum5","alarm_versions":{"alarm-with-date":2,"alarm-no-date":1},"alarms":{"alarm-with-date":{"acknowledged_at":"2026-05-11T00:00:00Z","rationale":"post-change ack","acknowledged_by":"test"}}}
+STEPD_ACK5_EOF
+
+  echo "$stepd_baseline_post" > "$stepd_session5/metrics/replay-baseline-stable.json"
+  echo "$stepd_baseline_post" > "$stepd_session5/metrics/replay-baseline.json"
+  echo "$stepd_current" > "$stepd_session5/metrics/stepd-current.json"
+
+  local stepd_out5
+  stepd_out5=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$stepd_session5" --current "$stepd_session5/metrics/stepd-current.json" \
+    --catalog "$stepd_catalog" 2>&1) || true
+
+  local stepd5_ack_dated
+  stepd5_ack_dated=$(python3 -c "
+import json
+with open('$stepd_session5/metrics/alarm-acknowledgments.json') as f:
+    d = json.load(f)
+print('alarm-with-date' in d.get('alarms', {}))
+" 2>/dev/null) || stepd5_ack_dated="ERROR"
+
+  if [[ "$stepd5_ack_dated" == "True" ]]; then
+    tap_ok "step-d: ack with acknowledged_at >= semantic_change_date preserved"
+  else
+    tap_not_ok "step-d: ack with acknowledged_at >= semantic_change_date preserved" \
+      "dated=$stepd5_ack_dated output=${stepd_out5:0:200}"
+  fi
+
+  # Test 6: Ack with malformed acknowledged_at → removed (fail-closed)
+  local stepd_session6="$stepd_root/session6"
+  mkdir -p "$stepd_session6/metrics"
+
+  cat > "$stepd_session6/metrics/alarm-acknowledgments.json" << 'STEPD_ACK6_EOF'
+{"schema_version":1,"catalog_checksum":"old-ack-checksum6","alarm_versions":{"alarm-with-date":2,"alarm-no-date":1},"alarms":{"alarm-with-date":{"acknowledged_at":"not-a-valid-timestamp","rationale":"malformed","acknowledged_by":"test"}}}
+STEPD_ACK6_EOF
+
+  echo "$stepd_baseline_post" > "$stepd_session6/metrics/replay-baseline-stable.json"
+  echo "$stepd_baseline_post" > "$stepd_session6/metrics/replay-baseline.json"
+  echo "$stepd_current" > "$stepd_session6/metrics/stepd-current.json"
+
+  local stepd_out6
+  stepd_out6=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$stepd_session6" --current "$stepd_session6/metrics/stepd-current.json" \
+    --catalog "$stepd_catalog" 2>&1) || true
+
+  local stepd6_ack_dated
+  stepd6_ack_dated=$(python3 -c "
+import json
+with open('$stepd_session6/metrics/alarm-acknowledgments.json') as f:
+    d = json.load(f)
+print('alarm-with-date' in d.get('alarms', {}))
+" 2>/dev/null) || stepd6_ack_dated="ERROR"
+
+  if [[ "$stepd6_ack_dated" == "False" ]]; then
+    tap_ok "step-d: malformed acknowledged_at removed (fail-closed)"
+  else
+    tap_not_ok "step-d: malformed acknowledged_at removed (fail-closed)" \
+      "dated=$stepd6_ack_dated output=${stepd_out6:0:200}"
+  fi
+
+  # Test 7: Ack with missing acknowledged_at → removed (fail-closed)
+  local stepd_session7="$stepd_root/session7"
+  mkdir -p "$stepd_session7/metrics"
+
+  cat > "$stepd_session7/metrics/alarm-acknowledgments.json" << 'STEPD_ACK7_EOF'
+{"schema_version":1,"catalog_checksum":"old-ack-checksum7","alarm_versions":{"alarm-with-date":2,"alarm-no-date":1},"alarms":{"alarm-with-date":{"rationale":"no timestamp field","acknowledged_by":"test"}}}
+STEPD_ACK7_EOF
+
+  echo "$stepd_baseline_post" > "$stepd_session7/metrics/replay-baseline-stable.json"
+  echo "$stepd_baseline_post" > "$stepd_session7/metrics/replay-baseline.json"
+  echo "$stepd_current" > "$stepd_session7/metrics/stepd-current.json"
+
+  local stepd_out7
+  stepd_out7=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$stepd_session7" --current "$stepd_session7/metrics/stepd-current.json" \
+    --catalog "$stepd_catalog" 2>&1) || true
+
+  local stepd7_ack_dated
+  stepd7_ack_dated=$(python3 -c "
+import json
+with open('$stepd_session7/metrics/alarm-acknowledgments.json') as f:
+    d = json.load(f)
+print('alarm-with-date' in d.get('alarms', {}))
+" 2>/dev/null) || stepd7_ack_dated="ERROR"
+
+  if [[ "$stepd7_ack_dated" == "False" ]]; then
+    tap_ok "step-d: missing acknowledged_at removed (fail-closed)"
+  else
+    tap_not_ok "step-d: missing acknowledged_at removed (fail-closed)" \
+      "dated=$stepd7_ack_dated output=${stepd_out7:0:200}"
   fi
 
   rm -rf "$stepd_root"
