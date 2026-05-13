@@ -9,6 +9,7 @@ use crate::{
     codec::helpers,
     flood::compute_message_hash,
     flow_control::{msg_body_size, FlowControl},
+    metrics::OverlayMessageKind,
     peer::Peer,
     PeerId,
 };
@@ -939,6 +940,11 @@ impl OverlayManager {
                                 &mut last_stats_log,
                             );
 
+                            // Per-message-type recv timing.
+                            // Parity: stellar-core mRecv*Timer (OverlayMetrics.h:45-76).
+                            let recv_start = Instant::now();
+                            let msg_kind = OverlayMessageKind::from_stellar_message(&message);
+
                             let action = Self::handle_received_message(
                                 message,
                                 &peer_id,
@@ -955,6 +961,12 @@ impl OverlayManager {
                                 &state,
                                 is_validator,
                             ).await;
+
+                            metrics::histogram!(
+                                "stellar_overlay_recv_message_seconds",
+                                "message_type" => msg_kind.label()
+                            )
+                            .record(recv_start.elapsed().as_secs_f64());
                             if matches!(action, RecvAction::Break) {
                                 break;
                             }

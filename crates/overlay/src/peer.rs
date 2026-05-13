@@ -494,6 +494,7 @@ impl Peer {
 
     /// Receive and process the peer's HELLO message.
     async fn recv_hello(&mut self, timeout_secs: u64) -> Result<()> {
+        let start = Instant::now();
         let frame = self
             .connection
             .recv_timeout(timeout_secs)
@@ -516,6 +517,14 @@ impl Peer {
                 )));
             }
         }
+
+        // Parity: stellar-core mRecvHelloTimer (OverlayMetrics.h:46).
+        metrics::histogram!(
+            "stellar_overlay_recv_message_seconds",
+            "message_type" => "hello"
+        )
+        .record(start.elapsed().as_secs_f64());
+
         Ok(())
     }
 
@@ -532,6 +541,7 @@ impl Peer {
 
     /// Receive and process the peer's AUTH message.
     async fn recv_auth(&mut self, timeout_secs: u64) -> Result<()> {
+        let start = Instant::now();
         let frame = self
             .connection
             .recv_timeout(timeout_secs)
@@ -567,10 +577,16 @@ impl Peer {
                 )));
             }
         }
+
+        // Parity: stellar-core mRecvAuthTimer (OverlayMetrics.h:47).
+        metrics::histogram!(
+            "stellar_overlay_recv_message_seconds",
+            "message_type" => "auth"
+        )
+        .record(start.elapsed().as_secs_f64());
+
         Ok(())
     }
-
-    /// Process a received Hello message.
     fn process_hello(&mut self, hello: Hello) -> Result<()> {
         // State guard: reject if not in Handshaking state
         if self.state != PeerState::Handshaking {

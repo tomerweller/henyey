@@ -250,6 +250,24 @@ impl MessagePriority {
     /// Number of priority levels.
     pub const COUNT: usize = 4;
 
+    /// All priorities in discriminant (queue-index) order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Scp,
+        Self::Transaction,
+        Self::FloodDemand,
+        Self::FloodAdvert,
+    ];
+
+    /// Prometheus metric label (lowercase snake_case).
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Scp => "scp",
+            Self::Transaction => "transaction",
+            Self::FloodDemand => "demand",
+            Self::FloodAdvert => "advert",
+        }
+    }
+
     /// Get the priority for a message type.
     pub fn from_message(msg: &StellarMessage) -> Option<Self> {
         match msg {
@@ -674,9 +692,11 @@ impl FlowControl {
         if let StellarMessage::SendMoreExtended(send_more) = msg {
             let mut state = self.state.lock().unwrap();
 
-            if state.no_outbound_capacity.is_some() {
-                // Record throttle duration
-                state.no_outbound_capacity = None;
+            if let Some(start) = state.no_outbound_capacity.take() {
+                // Record throttle duration: time from capacity exhaustion to release.
+                // Parity: stellar-core mConnectionFloodThrottle (OverlayMetrics.h:41).
+                metrics::histogram!("stellar_overlay_flood_throttle_seconds")
+                    .record(start.elapsed().as_secs_f64());
             }
 
             state
@@ -939,6 +959,16 @@ impl FlowControl {
                 }
 
                 Self::dequeue_message_resources(&mut state, msg);
+
+                // Record queue delay: time from emplacement to successful send.
+                // Parity: stellar-core FlowControl::processSentMessages (FlowControl.cpp:239-252).
+                if let Some(queued) = state.outbound_queues[queue_idx].front() {
+                    metrics::histogram!(
+                        "stellar_overlay_outbound_queue_delay_seconds",
+                        "priority" => MessagePriority::ALL[queue_idx].label()
+                    )
+                    .record(queued.time_emplaced.elapsed().as_secs_f64());
+                }
 
                 state.outbound_queues[queue_idx].pop_front();
             }

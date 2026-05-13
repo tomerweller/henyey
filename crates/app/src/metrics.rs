@@ -886,6 +886,18 @@ metric_catalog! {
         // Issue #2621 B4: Peer ping round-trip time histogram (event-site recording in overlay).
         OVERLAY_CONNECTION_LATENCY_SECONDS = "stellar_overlay_connection_latency_seconds"
             => "Peer ping round-trip time (seconds)";
+
+        // Issue #2632: Overlay recv/queue/throttle/pull metrics.
+        OVERLAY_RECV_MESSAGE_SECONDS = "stellar_overlay_recv_message_seconds"
+            => "Per-message-type recv processing time (seconds)";
+        OVERLAY_OUTBOUND_QUEUE_DELAY_SECONDS = "stellar_overlay_outbound_queue_delay_seconds"
+            => "Outbound queue delay from emplacement to send (seconds)";
+        OVERLAY_FLOOD_THROTTLE_SECONDS = "stellar_overlay_flood_throttle_seconds"
+            => "Outbound flood throttle duration (seconds)";
+        OVERLAY_TX_PULL_LATENCY_SECONDS = "stellar_overlay_tx_pull_latency_seconds"
+            => "Global tx demand-to-fulfillment latency (seconds)";
+        OVERLAY_PEER_TX_PULL_LATENCY_SECONDS = "stellar_overlay_peer_tx_pull_latency_seconds"
+            => "Per-peer tx demand-to-fulfillment latency (seconds)";
     }
 }
 

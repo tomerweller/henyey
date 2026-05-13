@@ -476,12 +476,6 @@ pub struct OverlayMetrics {
     /// Straggler timeouts (peer too slow).
     pub timeouts_straggler: Counter,
 
-    // ===== Connection Metrics =====
-    /// Pending (unauthenticated) peer count.
-    pub pending_peers: Counter,
-    /// Authenticated peer count.
-    pub authenticated_peers: Counter,
-
     // ===== Send Counters =====
     /// Per-message-type send counters, indexed by [`OverlayMessageKind`].
     /// Incremented on successful wire send only.
@@ -583,10 +577,6 @@ impl OverlayMetrics {
             timeouts_idle: self.timeouts_idle.get(),
             timeouts_straggler: self.timeouts_straggler.get(),
 
-            // Connection metrics
-            pending_peers: self.pending_peers.get(),
-            authenticated_peers: self.authenticated_peers.get(),
-
             // Send counters
             send_by_type: std::array::from_fn(|i| self.send_by_type[i].get()),
 
@@ -654,8 +644,6 @@ impl OverlayMetrics {
             &self.errors_write,
             &self.timeouts_idle,
             &self.timeouts_straggler,
-            &self.pending_peers,
-            &self.authenticated_peers,
             &self.queue_drop_scp,
             &self.queue_drop_tx,
             &self.queue_drop_advert,
@@ -721,10 +709,6 @@ pub struct OverlayMetricsSnapshot {
     // Timeout metrics
     pub timeouts_idle: u64,
     pub timeouts_straggler: u64,
-
-    // Connection metrics
-    pub pending_peers: u64,
-    pub authenticated_peers: u64,
 
     // Send counts (indexed by OverlayMessageKind)
     pub send_by_type: [u64; OverlayMessageKind::COUNT],
@@ -894,7 +878,6 @@ mod tests {
         metrics.messages_written.add(50);
         metrics.bytes_read.add(10000);
         metrics.errors_read.inc();
-        metrics.authenticated_peers.set(5);
 
         let snapshot = metrics.snapshot();
 
@@ -902,7 +885,6 @@ mod tests {
         assert_eq!(snapshot.messages_written, 50);
         assert_eq!(snapshot.bytes_read, 10000);
         assert_eq!(snapshot.errors_read, 1);
-        assert_eq!(snapshot.authenticated_peers, 5);
     }
 
     #[test]

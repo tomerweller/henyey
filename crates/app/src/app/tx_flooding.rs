@@ -428,6 +428,9 @@ impl App {
         if !entry.latency_recorded {
             entry.latency_recorded = true;
             let delta = now.duration_since(entry.first_demanded);
+            // Parity: stellar-core mTxPullLatency (OverlayMetrics.h:115).
+            metrics::histogram!("stellar_overlay_tx_pull_latency_seconds")
+                .record(delta.as_secs_f64());
             tracing::debug!(
                 hash = %hash.to_hex(),
                 latency_ms = delta.as_millis(),
@@ -438,6 +441,9 @@ impl App {
 
         if let Some(peer_demanded) = entry.peers.get(peer) {
             let delta = now.duration_since(*peer_demanded);
+            // Parity: stellar-core mPeerTxPullLatency (OverlayMetrics.h:116).
+            metrics::histogram!("stellar_overlay_peer_tx_pull_latency_seconds")
+                .record(delta.as_secs_f64());
             tracing::debug!(
                 hash = %hash.to_hex(),
                 peer = %peer,
