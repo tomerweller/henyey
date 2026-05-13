@@ -579,6 +579,25 @@ print(json.dumps(data))
     local today
     today=$(date -u +%Y-%m-%d)
 
+    # Always ensure urgent label (idempotent, runs every hit regardless of rate limit)
+    gh issue edit "$issue_num" --add-label urgent 2>/dev/null || true
+
+    # Ensure issue is on project board (add-if-missing only, don't regress active status).
+    # Query whether the issue already has a project item; only add to Backlog if absent.
+    local on_board
+    on_board=$(gh api graphql -f query='
+      query($url: URI!) {
+        resource(url: $url) {
+          ... on Issue {
+            projectItems(first: 1) { totalCount }
+          }
+        }
+      }' -f url="https://github.com/stellar-experimental/henyey/issues/$issue_num" \
+      --jq '.data.resource.projectItems.totalCount' 2>/dev/null) || on_board=""
+    if [[ "$on_board" == "0" ]]; then
+      bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$issue_num" Backlog 2>/dev/null || true
+    fi
+
     # Fast check: last_commented_date in dedup entry
     local last_date
     last_date=$(python3 -c "
@@ -623,10 +642,6 @@ print(json.dumps(data))
     else
       echo "WARNING: Failed to post update on #$issue_num" >&2
     fi
-
-    # Ensure urgent label and board routing on existing issue
-    gh issue edit "$issue_num" --add-label urgent 2>/dev/null || true
-    bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$issue_num" Backlog 2>/dev/null || true
   }
 
   # --- Dedup check: local file ---
