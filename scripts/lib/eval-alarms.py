@@ -373,6 +373,61 @@ def maybe_reset_gauge_persistence(
         persistence_state[f"gauge_persist_{alarm['name']}"] = "0"
 
 
+def maybe_reset_counter_snapshot(
+    alarm: dict, kind: str, state: str, state_dir: Path,
+):
+    """Reset counter snapshot state on non-evaluable ticks.
+
+    Invariant: for counter-family alarms, any tick producing state="skipped"
+    resets stateful snapshot keys (prior_delta, streak, breach_streak, and
+    baselines) to prevent stale pre-skip state from carrying over.
+
+    Does NOT fire on "collecting_baseline" — that state means the evaluator
+    wrote fresh baseline data that must be preserved for the next tick.
+    """
+    if state != "skipped":
+        return
+    name = alarm["name"]
+
+    if kind == "counter-dynamic":
+        snapshot_path = state_dir / "counter_dynamic_snapshot"
+        snapshot = read_snapshot(snapshot_path)
+        key = f"prior_delta_{name}"
+        if key in snapshot:
+            del snapshot[key]
+            write_snapshot(snapshot_path, snapshot)
+
+    elif kind == "counter-ratio":
+        snapshot_path = state_dir / "ratio_snapshot"
+        snapshot = read_snapshot(snapshot_path)
+        changed = False
+        for suffix in ("_streak", "_numerator", "_denominator"):
+            key = f"{name}{suffix}"
+            if key in snapshot:
+                if suffix == "_streak":
+                    snapshot[key] = "0"
+                else:
+                    del snapshot[key]
+                changed = True
+        if changed:
+            write_snapshot(snapshot_path, snapshot)
+
+    elif kind == "counter-streak":
+        snapshot_file = alarm.get("snapshot_file", "counter_streak_snapshot")
+        snapshot_path = state_dir / snapshot_file
+        snapshot = read_snapshot(snapshot_path)
+        changed = False
+        for key in ("breach_streak", "counter_value"):
+            if key in snapshot:
+                if key == "breach_streak":
+                    snapshot[key] = "0"
+                else:
+                    del snapshot[key]
+                changed = True
+        if changed:
+            write_snapshot(snapshot_path, snapshot)
+
+
 def eval_gauge(
     alarm: dict,
     current: dict,
@@ -573,8 +628,7 @@ def eval_counter_dynamic(
     write_snapshot(snapshot_path, snapshot)
 
     if prior_delta_str is None:
-        return make_result(alarm, "skipped", skip_reason="collecting baseline (no prior delta)",
-                           extra_values=ev_default)
+        return make_result(alarm, "collecting_baseline", extra_values=ev_default)
 
     prior_delta = int(prior_delta_str)
     multiplier = alarm["multiplier"]
@@ -1292,6 +1346,7 @@ def main() -> int:
                                  extra_values=default_extra_values(alarm, kind))
             results.append(result)
             maybe_reset_gauge_persistence(alarm, kind, "skipped", persistence_state)
+            maybe_reset_counter_snapshot(alarm, kind, "skipped", state_dir)
             print(f"# alarm={name} state=skipped reason=exempt", file=sys.stderr)
             continue
 
@@ -1305,6 +1360,7 @@ def main() -> int:
                                  extra_values=default_extra_values(alarm, kind))
             results.append(result)
             maybe_reset_gauge_persistence(alarm, kind, "skipped", persistence_state)
+            maybe_reset_counter_snapshot(alarm, kind, "skipped", state_dir)
             # Telemetry
             metric = telemetry_metric(alarm, kind)
             n = count_series(current, metric) if metric else 0
@@ -1334,6 +1390,7 @@ def main() -> int:
 
         results.append(result)
         maybe_reset_gauge_persistence(alarm, kind, result["state"], persistence_state)
+        maybe_reset_counter_snapshot(alarm, kind, result["state"], state_dir)
 
         # Telemetry
         metric = telemetry_metric(alarm, kind)

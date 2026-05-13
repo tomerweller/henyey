@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Regression tests for stale counter snapshot state carryover (issue #2617).
+
+Tests verify that maybe_reset_counter_snapshot() correctly resets stateful
+snapshot keys on "skipped" ticks and preserves them on non-skipped ticks.
+Also tests the eval_counter_dynamic baseline state change from "skipped"
+to "collecting_baseline".
+"""
+
+import sys
+import tempfile
+from pathlib import Path
+
+# eval-alarms.py uses a hyphen, so we need importlib
+import importlib.util
+
+_spec = importlib.util.spec_from_file_location(
+    "eval_alarms",
+    Path(__file__).parent / "eval-alarms.py",
+)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+
+read_snapshot = _mod.read_snapshot
+write_snapshot = _mod.write_snapshot
+maybe_reset_counter_snapshot = _mod.maybe_reset_counter_snapshot
+eval_counter_dynamic = _mod.eval_counter_dynamic
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _make_alarm(name, kind="counter-dynamic", **kwargs):
+    """Create a minimal alarm dict for testing."""
+    alarm = {"name": name, "kind": kind}
+    alarm.update(kwargs)
+    return alarm
+
+
+# ── counter-dynamic tests ────────────────────────────────────────────────────
+
+def test_counter_dynamic_skip_resets_prior_delta():
+    """Skipped state deletes prior_delta key from counter_dynamic_snapshot."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_dynamic_snapshot"
+        write_snapshot(snap_path, {"prior_delta_spike-alarm": "42", "other_key": "1"})
+
+        alarm = _make_alarm("spike-alarm", kind="counter-dynamic")
+        maybe_reset_counter_snapshot(alarm, "counter-dynamic", "skipped", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert "prior_delta_spike-alarm" not in snap, f"prior_delta should be deleted, got {snap}"
+        assert snap["other_key"] == "1", "other keys should be preserved"
+
+
+def test_counter_dynamic_collecting_baseline_preserves():
+    """collecting_baseline state does NOT delete prior_delta."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_dynamic_snapshot"
+        write_snapshot(snap_path, {"prior_delta_spike-alarm": "42"})
+
+        alarm = _make_alarm("spike-alarm", kind="counter-dynamic")
+        maybe_reset_counter_snapshot(alarm, "counter-dynamic", "collecting_baseline", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert snap["prior_delta_spike-alarm"] == "42", "prior_delta should be preserved"
+
+
+def test_counter_dynamic_ok_preserves():
+    """ok state does NOT delete prior_delta."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_dynamic_snapshot"
+        write_snapshot(snap_path, {"prior_delta_spike-alarm": "42"})
+
+        alarm = _make_alarm("spike-alarm", kind="counter-dynamic")
+        maybe_reset_counter_snapshot(alarm, "counter-dynamic", "ok", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert snap["prior_delta_spike-alarm"] == "42", "prior_delta should be preserved"
+
+
+def test_counter_dynamic_no_snapshot_file_no_error():
+    """Skipped state with no existing snapshot file does not error."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        alarm = _make_alarm("spike-alarm", kind="counter-dynamic")
+        # Should not raise
+        maybe_reset_counter_snapshot(alarm, "counter-dynamic", "skipped", state_dir)
+
+
+# ── counter-ratio tests ──────────────────────────────────────────────────────
+
+def test_counter_ratio_skip_resets_streak_and_baselines():
+    """Skipped state zeros streak and deletes baseline keys."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "ratio_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "123",
+            "start_ticks": "456",
+            "myalarm_streak": "3",
+            "myalarm_numerator": "100",
+            "myalarm_denominator": "500",
+            "other_alarm_streak": "2",
+        })
+
+        alarm = _make_alarm("myalarm", kind="counter-ratio")
+        maybe_reset_counter_snapshot(alarm, "counter-ratio", "skipped", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert snap["myalarm_streak"] == "0", f"streak should be 0, got {snap['myalarm_streak']}"
+        assert "myalarm_numerator" not in snap, "numerator baseline should be deleted"
+        assert "myalarm_denominator" not in snap, "denominator baseline should be deleted"
+        # Other alarm's data should be preserved
+        assert snap["other_alarm_streak"] == "2", "other alarm streak should be preserved"
+        assert snap["version"] == "1", "version should be preserved"
+
+
+def test_counter_ratio_no_reset_on_breach():
+    """breach state does NOT reset streak or baselines."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "ratio_snapshot"
+        write_snapshot(snap_path, {
+            "myalarm_streak": "2",
+            "myalarm_numerator": "100",
+            "myalarm_denominator": "500",
+        })
+
+        alarm = _make_alarm("myalarm", kind="counter-ratio")
+        maybe_reset_counter_snapshot(alarm, "counter-ratio", "breach", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert snap["myalarm_streak"] == "2", "streak should be preserved on breach"
+        assert snap["myalarm_numerator"] == "100", "numerator should be preserved on breach"
+
+
+# ── counter-streak tests ─────────────────────────────────────────────────────
+
+def test_counter_streak_skip_resets_streak_and_baseline():
+    """Skipped state zeros breach_streak and deletes counter_value."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "123",
+            "start_ticks": "456",
+            "counter_value": "100",
+            "breach_streak": "5",
+        })
+
+        alarm = _make_alarm("stalled", kind="counter-streak")
+        maybe_reset_counter_snapshot(alarm, "counter-streak", "skipped", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert snap["breach_streak"] == "0", f"breach_streak should be 0, got {snap['breach_streak']}"
+        assert "counter_value" not in snap, "counter_value baseline should be deleted"
+        assert snap["version"] == "1", "version should be preserved"
+
+
+def test_counter_streak_custom_snapshot_file():
+    """Alarm with custom snapshot_file uses the correct file."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        sub = state_dir / "metrics"
+        sub.mkdir()
+        snap_path = sub / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "breach_streak": "3",
+            "counter_value": "50",
+        })
+
+        alarm = _make_alarm("stalled", kind="counter-streak",
+                            snapshot_file="metrics/counter_streak_snapshot")
+        maybe_reset_counter_snapshot(alarm, "counter-streak", "skipped", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert snap["breach_streak"] == "0", "breach_streak should be reset"
+        assert "counter_value" not in snap, "counter_value should be deleted"
+
+
+def test_counter_streak_no_reset_on_ok():
+    """ok state does NOT reset breach_streak or counter_value."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "breach_streak": "2",
+            "counter_value": "100",
+        })
+
+        alarm = _make_alarm("stalled", kind="counter-streak")
+        maybe_reset_counter_snapshot(alarm, "counter-streak", "ok", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert snap["breach_streak"] == "2", "breach_streak should be preserved on ok"
+        assert snap["counter_value"] == "100", "counter_value should be preserved on ok"
+
+
+# ── eval_counter_dynamic state change test ────────────────────────────────────
+
+def test_eval_counter_dynamic_baseline_uses_collecting_baseline():
+    """eval_counter_dynamic returns 'collecting_baseline' (not 'skipped') when no prior delta."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        alarm = _make_alarm(
+            "overlay-timeouts-spike",
+            kind="counter-dynamic",
+            metric_sum=["stellar_overlay_timeout_idle_total"],
+            extraction="form1",
+            multiplier=5,
+            min_absolute=5,
+            severity="WARN",
+        )
+        # Current has the metric, prev has the metric, so delta computes fine.
+        # But no prior_delta in snapshot → collecting baseline.
+        current = {"stellar_overlay_timeout_idle_total": [({}, 10.0)]}
+        prev = {"stellar_overlay_timeout_idle_total": [({}, 5.0)]}
+
+        result = eval_counter_dynamic(
+            alarm, current, prev, state_dir,
+            prev_prom_invalid=False, warmup_remaining=0,
+        )
+        assert result["state"] == "collecting_baseline", \
+            f"Expected 'collecting_baseline', got '{result['state']}'"
+
+
+def test_eval_counter_dynamic_skip_still_skipped():
+    """eval_counter_dynamic still returns 'skipped' for actual skip paths."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        alarm = _make_alarm(
+            "overlay-timeouts-spike",
+            kind="counter-dynamic",
+            metric_sum=["stellar_overlay_timeout_idle_total"],
+            extraction="form1",
+            multiplier=5,
+        )
+        # Metric not found in current → skipped
+        current = {}
+        prev = {"stellar_overlay_timeout_idle_total": [({}, 5.0)]}
+
+        result = eval_counter_dynamic(
+            alarm, current, prev, state_dir,
+            prev_prom_invalid=False, warmup_remaining=0,
+        )
+        assert result["state"] == "skipped", \
+            f"Expected 'skipped', got '{result['state']}'"
+
+
+# ── End-to-end test ──────────────────────────────────────────────────────────
+
+def test_end_to_end_counter_ratio_skip_no_false_fire():
+    """After a skip gap, counter-ratio streak restarts from 0.
+
+    Scenario:
+    1. Accumulate streak=2 in ratio_snapshot
+    2. Call maybe_reset on a "skipped" result
+    3. Verify streak is 0 and baselines are cleared
+    4. This means when the alarm resumes, it will collect baseline first,
+       then start counting breaches from 0.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "ratio_snapshot"
+        # Simulate accumulated state: 2 consecutive breaches, with baselines
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "123",
+            "start_ticks": "456",
+            "scp-accept-rate-low_streak": "2",
+            "scp-accept-rate-low_numerator": "90",
+            "scp-accept-rate-low_denominator": "100",
+        })
+
+        alarm = _make_alarm("scp-accept-rate-low", kind="counter-ratio")
+
+        # A skip gap occurs (e.g., FRESH_START)
+        maybe_reset_counter_snapshot(alarm, "counter-ratio", "skipped", state_dir)
+
+        snap = read_snapshot(snap_path)
+        assert snap["scp-accept-rate-low_streak"] == "0", \
+            "streak should restart from 0 after skip gap"
+        assert "scp-accept-rate-low_numerator" not in snap, \
+            "numerator baseline should be cleared after skip gap"
+        assert "scp-accept-rate-low_denominator" not in snap, \
+            "denominator baseline should be cleared after skip gap"
+
+
+# ── Run tests ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    passed = 0
+    failed = 0
+    for t in tests:
+        try:
+            t()
+            passed += 1
+            print(f"  PASS  {t.__name__}")
+        except Exception as e:
+            failed += 1
+            print(f"  FAIL  {t.__name__}: {e}")
+    print(f"\n{passed} passed, {failed} failed")
+    sys.exit(1 if failed else 0)
