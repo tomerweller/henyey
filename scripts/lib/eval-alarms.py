@@ -384,9 +384,10 @@ def maybe_reset_counter_snapshot(
     - counter-dynamic: deletes prior_delta (a delta, not cumulative — stale after gap)
     - counter-ratio: zeros streak only (baselines are cumulative and may be
       freshly updated by the evaluator on low-volume skips)
-    - counter-streak: zeros breach_streak AND deletes counter_value (unlike
-      counter-ratio, the evaluator does NOT update counter_value on skip paths,
-      so a preserved baseline spans the gap and causes false bursts)
+    - counter-streak: clears entire snapshot to force baseline re-collection
+      on resume (eval_counter_streak defaults missing counter_value to 0,
+      so partial deletion would cause the full counter value to appear as
+      a single-tick delta)
 
     Does NOT fire on "collecting_baseline" — that state means the evaluator
     wrote fresh baseline data that must be preserved for the next tick.
@@ -415,20 +416,14 @@ def maybe_reset_counter_snapshot(
         snapshot_file = alarm.get("snapshot_file", "counter_streak_snapshot")
         snapshot_path = state_dir / snapshot_file
         snapshot = read_snapshot(snapshot_path)
-        changed = False
-        # Zero breach_streak — streak must not carry across gaps
-        if snapshot.get("breach_streak", "0") != "0":
-            snapshot["breach_streak"] = "0"
-            changed = True
-        # Delete counter_value — unlike counter-ratio (which updates baselines
-        # on low-volume skip), counter-streak does NOT update counter_value on
-        # its skip path (metric not found). Preserving a stale baseline causes
-        # the resume delta to span the entire gap, triggering false bursts.
-        if "counter_value" in snapshot:
-            del snapshot["counter_value"]
-            changed = True
-        if changed:
-            write_snapshot(snapshot_path, snapshot)
+        if snapshot:
+            # Clear the entire snapshot to force a full "collecting_baseline"
+            # tick on resume. We cannot just delete counter_value because
+            # eval_counter_streak defaults missing counter_value to 0, which
+            # would make the entire current counter value appear as a delta.
+            # Clearing the snapshot triggers the `if not snapshot:` baseline
+            # collection path.
+            write_snapshot(snapshot_path, {})
 
 
 def eval_gauge(

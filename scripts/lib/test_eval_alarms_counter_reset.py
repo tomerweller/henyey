@@ -25,6 +25,7 @@ read_snapshot = _mod.read_snapshot
 write_snapshot = _mod.write_snapshot
 maybe_reset_counter_snapshot = _mod.maybe_reset_counter_snapshot
 eval_counter_dynamic = _mod.eval_counter_dynamic
+eval_counter_streak = _mod.eval_counter_streak
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -140,12 +141,14 @@ def test_counter_ratio_no_reset_on_breach():
 
 # ── counter-streak tests ─────────────────────────────────────────────────────
 
-def test_counter_streak_skip_resets_streak_and_baseline():
-    """Skipped state zeros breach_streak and deletes counter_value.
+def test_counter_streak_skip_clears_snapshot():
+    """Skipped state clears the entire counter-streak snapshot to force
+    baseline re-collection on resume.
     
-    Unlike counter-ratio (where the evaluator updates baselines on low-volume
-    skip), counter-streak does NOT update counter_value on its skip path,
-    so the baseline must be deleted to avoid false bursts on resume.
+    eval_counter_streak defaults missing counter_value to 0, so partial
+    deletion would make the full counter value appear as a delta.
+    Clearing the entire snapshot triggers the 'if not snapshot:' baseline
+    collection path on resume.
     """
     with tempfile.TemporaryDirectory() as d:
         state_dir = Path(d)
@@ -162,9 +165,7 @@ def test_counter_streak_skip_resets_streak_and_baseline():
         maybe_reset_counter_snapshot(alarm, "counter-streak", "skipped", state_dir)
 
         snap = read_snapshot(snap_path)
-        assert snap["breach_streak"] == "0", f"breach_streak should be 0, got {snap['breach_streak']}"
-        assert "counter_value" not in snap, "counter_value should be deleted to prevent false bursts"
-        assert snap["version"] == "1", "version should be preserved"
+        assert len(snap) == 0, f"snapshot should be empty, got {snap}"
 
 
 def test_counter_streak_custom_snapshot_file():
@@ -185,8 +186,7 @@ def test_counter_streak_custom_snapshot_file():
         maybe_reset_counter_snapshot(alarm, "counter-streak", "skipped", state_dir)
 
         snap = read_snapshot(snap_path)
-        assert snap["breach_streak"] == "0", "breach_streak should be reset"
-        assert "counter_value" not in snap, "counter_value should be deleted"
+        assert len(snap) == 0, "snapshot should be cleared"
 
 
 def test_counter_streak_no_reset_on_ok():
@@ -328,8 +328,8 @@ def test_counter_ratio_low_volume_preserves_baselines():
 
 
 def test_counter_streak_skip_prevents_false_burst():
-    """Skipped counter-streak reset should delete counter_value to prevent
-    the resume delta from spanning the entire gap and triggering false bursts."""
+    """After skip reset, eval_counter_streak should re-collect baseline instead
+    of computing a delta from a stale or zero counter_value."""
     with tempfile.TemporaryDirectory() as d:
         state_dir = Path(d)
         snap_path = state_dir / "counter_streak_snapshot"
@@ -344,10 +344,44 @@ def test_counter_streak_skip_prevents_false_burst():
         alarm = _make_alarm("stalled", kind="counter-streak")
         maybe_reset_counter_snapshot(alarm, "counter-streak", "skipped", state_dir)
 
+        # Snapshot should be empty, forcing baseline re-collection
         snap = read_snapshot(snap_path)
-        assert snap["breach_streak"] == "0", "breach_streak should be zeroed"
-        assert "counter_value" not in snap, \
-            "counter_value should be deleted to prevent false burst on resume"
+        assert len(snap) == 0, \
+            "snapshot should be empty to force baseline re-collection"
+
+
+def test_counter_streak_resume_after_skip_collects_baseline():
+    """End-to-end: after skip clears snapshot, eval_counter_streak returns
+    collecting_baseline on the next tick instead of computing a delta."""
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+
+        # Simulate state before skip: accumulated some breach streak
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "123",
+            "start_ticks": "456",
+            "counter_value": "100",
+            "breach_streak": "2",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            delta_threshold=1, streak_threshold=3,
+                            burst_threshold=10)
+
+        # Skip occurs → clear snapshot
+        maybe_reset_counter_snapshot(alarm, "counter-streak", "skipped", state_dir)
+
+        # Resume: metric is available at value 500 (big jump from 100)
+        current = {"recovery-stalled-metric": [({}, 500.0)]}
+        alarm["metric"] = "recovery-stalled-metric"
+
+        result = eval_counter_streak(alarm, current, state_dir, "123", "456")
+
+        # Should collect baseline, NOT fire or breach on the 400 delta
+        assert result["state"] == "collecting_baseline", \
+            f"Expected collecting_baseline after skip, got {result['state']}"
 
 
 # ── Run tests ─────────────────────────────────────────────────────────────────
