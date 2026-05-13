@@ -2738,8 +2738,7 @@ impl App {
 
     /// Send a heartbeat to the sync recovery manager.
     ///
-    /// This should be called whenever consensus makes progress (externalization,
-    /// new SCP messages, ledger close).
+    /// Currently called by the app layer after each ledger close.
     pub fn sync_recovery_heartbeat(&self) {
         if let Some(handle) = self.sync_recovery_handle.read().as_ref() {
             let _ = handle.try_tracking_heartbeat();

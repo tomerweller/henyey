@@ -9,10 +9,9 @@
 //!
 //! # Detection Flow
 //!
-//! 1. When tracking, the herder calls `tracking_heartbeat()` whenever:
-//!    - A new slot is externalized
-//!    - New SCP messages are processed
-//!    - Ledger application completes
+//! 1. When tracking, `tracking_heartbeat()` is called to reset the stuck timer.
+//!    Currently called by the app layer after each ledger close
+//!    (`crates/app/src/app/ledger_close.rs`).
 //!
 //! 2. The tracking timer is set for `CONSENSUS_STUCK_TIMEOUT` (35 seconds)
 //!
@@ -91,10 +90,8 @@ pub struct SyncRecoveryHandle {
 impl SyncRecoveryHandle {
     /// Signal that consensus is making progress.
     ///
-    /// This resets the consensus stuck timer. Should be called whenever:
-    /// - A new slot is externalized
-    /// - New SCP messages are received
-    /// - Ledger application completes
+    /// This resets the consensus stuck timer. Currently called by the app
+    /// layer after each ledger close.
     pub async fn tracking_heartbeat(&self) {
         let _ = self
             .sender
