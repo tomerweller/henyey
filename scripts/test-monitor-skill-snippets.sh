@@ -6465,22 +6465,30 @@ MOVEOF
   # Test: Empty build_sha guard — asserts no dedup or gh calls when build_sha is empty
   > "$flow_gh_log"
   local build_sha=""
-  _flow_gh_stub '{"state":"OPEN"}' '[]' '' '0'
+  _flow_gh_stub '{"state":"OPEN"}' '[]' 'https://github.com/stellar-experimental/henyey/issues/888' '0'
   local empty_sha_dedup_file="$flow_root/dedup-empty-sha.json"
-  echo '{"schema_version":1,"filed":{"somsha":{"issue_number":99,"filed_at":"2099-01-01T00:00:00Z"}}}' > "$empty_sha_dedup_file"
+  local empty_sha_original='{"schema_version":1,"filed":{"somsha":{"issue_number":99,"filed_at":"2099-01-01T00:00:00Z"}}}'
+  echo "$empty_sha_original" > "$empty_sha_dedup_file"
   # §3d says: if build_sha is empty, do NOT enter flock/dedup/filing path
+  # The else branch simulates what WOULD happen if the guard were missing
   if [[ -z "$build_sha" ]]; then
-    # Guard fires: verify no gh calls and dedup file untouched
+    # Guard fires correctly: skip all dedup/filing/gh operations
     :
   else
-    # Would enter dedup path — but we never should with empty sha
-    PATH="$flow_root/gh-stub:$PATH" gh issue view 99 --json state 2>/dev/null || true
+    # This path must NOT execute when build_sha is empty
+    flow_data=$(dedup_load "$empty_sha_dedup_file" 2>/dev/null)
+    PATH="$flow_root/gh-stub:$PATH" gh issue create --title "bad" --body "bad" 2>/dev/null
+    flow_data=$(dedup_record "$flow_data" "bad_key" "issue_number=999")
+    dedup_write "$empty_sha_dedup_file" "$flow_data" 2>/dev/null
   fi
-  if [[ -z "$build_sha" ]] && ! grep -q "." "$flow_gh_log" 2>/dev/null && \
-     python3 -c "import json; d=json.load(open('$empty_sha_dedup_file')); assert d['filed']['somsha']['issue_number']==99" 2>/dev/null; then
+  # Verify: gh log is completely empty AND dedup file byte-for-byte matches original
+  local empty_sha_current
+  empty_sha_current=$(cat "$empty_sha_dedup_file")
+  if ! grep -q "." "$flow_gh_log" 2>/dev/null && \
+     python3 -c "import json,sys; orig=json.loads(sys.argv[1]); cur=json.loads(sys.argv[2]); assert orig==cur" "$empty_sha_original" "$empty_sha_current" 2>/dev/null; then
     tap_ok "flow: empty build_sha guard short-circuits (no dedup/gh calls)"
   else
-    tap_not_ok "flow: empty build_sha guard short-circuits (no dedup/gh calls)" "gh_log=$(cat $flow_gh_log 2>/dev/null)"
+    tap_not_ok "flow: empty build_sha guard short-circuits (no dedup/gh calls)" "gh_log=$(cat $flow_gh_log 2>/dev/null) file_changed=$(diff <(echo '$empty_sha_original') <(echo '$empty_sha_current') 2>&1 | head -3)"
   fi
 
   # Test: Open-issue hit → skip + daily comment (last_commented_date updated)
@@ -6580,7 +6588,8 @@ MOVEOF
   local flow_dedup_file4="$flow_root/dedup-closed.json"
   local closed_recent_ts
   closed_recent_ts=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
-  echo '{"schema_version":1,"filed":{"sha_closed":{"issue_number":200,"filed_at":"'"$closed_recent_ts"'"}}}' > "$flow_dedup_file4"
+  # Seed with a unique stale_marker field to prove removal happened (record won't re-add it)
+  echo '{"schema_version":1,"filed":{"sha_closed":{"issue_number":200,"filed_at":"'"$closed_recent_ts"'","stale_marker":"must_disappear"}}}' > "$flow_dedup_file4"
   _flow_gh_stub '{"state":"CLOSED"}' '[]' 'https://github.com/stellar-experimental/henyey/issues/201' '0'
   flow_data=$(dedup_load "$flow_dedup_file4" 2>/dev/null)
   flow_data=$(dedup_prune "$flow_data" "30d")
@@ -6607,10 +6616,16 @@ MOVEOF
       fi
     fi
   fi
-  # Verify: old entry removed, new entry with refiled issue number, gh create called
+  # Verify: old entry removed (stale_marker gone), new entry with refiled issue number, gh create called
   if [[ -n "$closed_predecessor" ]] && \
      grep -q "issue create" "$flow_gh_log" && \
-     python3 -c "import json; d=json.load(open('$flow_dedup_file4')); assert d['filed']['sha_closed']['issue_number']==201" 2>/dev/null; then
+     python3 -c "
+import json
+d = json.load(open('$flow_dedup_file4'))
+e = d['filed']['sha_closed']
+assert e['issue_number'] == 201, f'wrong issue: {e[\"issue_number\"]}'
+assert 'stale_marker' not in e, 'stale_marker survived — remove did not happen'
+" 2>/dev/null; then
     tap_ok "flow: closed-issue hit → remove + refile with new issue"
   else
     tap_not_ok "flow: closed-issue hit → remove + refile with new issue" "log: $(cat $flow_gh_log 2>/dev/null | head -3)"
@@ -6764,17 +6779,20 @@ for item in items:
   lock_out=$(
     (
       flock -w 1 9 || { echo "Could not acquire lock"; exit 0; }
-      # If lock acquired, would do dedup + gh operations
+      # If lock acquired, would do full dedup + gh operations (all should be prevented)
       echo "acquired"
+      source "$REPO_ROOT/scripts/lib/dedup-filing.sh"
+      DEDUP_DATA=$(dedup_load "$lock_dedup_file" 2>/dev/null)
+      PATH="$flow_root/gh-stub:$PATH" gh issue view 999 --json state 2>/dev/null
       PATH="$flow_root/gh-stub:$PATH" gh issue create --title "should not happen" --body "test" 2>/dev/null
     ) 9>"$lock_file" 2>&1
   )
   set -e
   kill $lock_holder_pid 2>/dev/null || true
   wait $lock_holder_pid 2>/dev/null || true
-  # Verify: lock timed out, no gh calls made, dedup file untouched
+  # Verify: lock timed out, NO gh calls of any kind, dedup file untouched
   if echo "$lock_out" | grep -q "Could not acquire" && \
-     ! grep -q "issue create" "$flow_gh_log" 2>/dev/null && \
+     ! grep -q "." "$flow_gh_log" 2>/dev/null && \
      python3 -c "import json; d=json.load(open('$lock_dedup_file')); assert d=={'schema_version':1,'filed':{}}" 2>/dev/null; then
     tap_ok "flow: lock timeout → no dedup/gh operations"
   else
