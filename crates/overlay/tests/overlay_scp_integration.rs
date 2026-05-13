@@ -142,11 +142,12 @@ async fn test_overlay_scp_duplicate_is_forwarded_to_receiver() {
         .await
         .expect("broadcast duplicate");
 
-    // With the overlay-side SCP scheduling cache (#2622), the second
-    // broadcast of the same envelope IS now dropped at the overlay layer.
-    // Only the first copy reaches B's SCP subscriber — the duplicate is
-    // caught by `check_and_insert` and counted as `scp_overlay_dedup`.
-    // This mirrors stellar-core's checkScheduledAndCache.
+    // SCP messages are exempt from FloodGate-level dedup (see issue #2317
+    // and the comment in peer_loop.rs `route_received_message`). Both the
+    // unique and duplicate envelope must reach the SCP subscriber so that
+    // downstream layers (`scp_scheduled_envelopes` in-flight dedup, herder
+    // self-rejection) can see them and so that alternate peer provenance
+    // is not lost.
     let first = timeout(Duration::from_secs(5), async {
         scp_rx_b.recv().await.expect("recv first scp")
     })
@@ -154,13 +155,12 @@ async fn test_overlay_scp_duplicate_is_forwarded_to_receiver() {
     .expect("timeout waiting first scp");
     assert!(matches!(first.message, StellarMessage::ScpMessage(_)));
 
-    // Verify the duplicate was indeed dropped — the channel should be
-    // empty after receiving only the first copy.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        scp_rx_b.try_recv().is_err(),
-        "duplicate SCP should be dropped at the overlay scheduling cache (#2622)"
-    );
+    let second = timeout(Duration::from_secs(5), async {
+        scp_rx_b.recv().await.expect("recv second scp")
+    })
+    .await
+    .expect("timeout waiting second scp — duplicate SCP must be forwarded, not dropped");
+    assert!(matches!(second.message, StellarMessage::ScpMessage(_)));
 }
 
 /// Regression test for issue #2317.

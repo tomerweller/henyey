@@ -619,8 +619,6 @@ metric_catalog! {
             => "Total duplicate flood messages received";
         OVERLAY_FLOOD_UNIQUE_RECV_TOTAL = "stellar_overlay_flood_unique_recv_total"
             => "Total unique flood messages received";
-        OVERLAY_SCP_OVERLAY_DEDUP_TOTAL = "henyey_overlay_scp_scheduled_dedup_total"
-            => "SCP envelopes dropped by overlay scheduling cache (early dedup)";
         OVERLAY_FETCH_DUPLICATE_RECV_TOTAL = "stellar_overlay_fetch_duplicate_recv_total"
             => "Total duplicate/unsolicited fetch responses received";
         OVERLAY_FETCH_UNIQUE_RECV_TOTAL = "stellar_overlay_fetch_unique_recv_total"
@@ -1009,7 +1007,6 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         OVERLAY_FLOOD_BROADCAST_TOTAL.absolute(ov.flood_broadcast);
         OVERLAY_FLOOD_DUPLICATE_RECV_TOTAL.absolute(ov.flood_duplicate_recv);
         OVERLAY_FLOOD_UNIQUE_RECV_TOTAL.absolute(ov.flood_unique_recv);
-        OVERLAY_SCP_OVERLAY_DEDUP_TOTAL.absolute(ov.scp_overlay_dedup);
         OVERLAY_FETCH_DUPLICATE_RECV_TOTAL.absolute(ov.fetch_duplicate_recv);
         OVERLAY_FETCH_UNIQUE_RECV_TOTAL.absolute(ov.fetch_unique_recv);
         OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL.absolute(ov.item_fetcher_next_peer);

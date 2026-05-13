@@ -2568,7 +2568,6 @@ mod tests {
                 dial_cooldowns: Arc::new(DashMap::new()),
                 local_peer_id: local_id,
                 next_peer_generation: Arc::new(AtomicU64::new(0)),
-                scp_scheduled_cache: Arc::new(crate::scp_scheduled::ScpScheduledCache::new()),
             }
         }
 

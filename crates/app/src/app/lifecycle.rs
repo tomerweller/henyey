@@ -2058,11 +2058,6 @@ impl App {
 
         // In-flight dedup: reject envelopes already dispatched to the verify worker.
         let Some(dedup_slot) = self.scp_scheduled.check(&envelope_hash) else {
-            // Already in app-side dedup cache — clear the overlay scheduling
-            // cache so this hash doesn't permanently block future deliveries.
-            if let Some(overlay) = self.overlay().await {
-                overlay.clear_scp_scheduled(&flood_msg_hash);
-            }
             return;
         };
 
@@ -2091,10 +2086,6 @@ impl App {
                                  dropping envelope"
                             );
                             // DedupSlot dropped without commit — no cache poisoning.
-                            // Clear overlay scheduling cache so re-delivery is possible.
-                            if let Some(overlay) = self.overlay().await {
-                                overlay.clear_scp_scheduled(&flood_msg_hash);
-                            }
                             return;
                         }
                     };
@@ -2122,7 +2113,6 @@ impl App {
                             // as new (parity: Peer.cpp:1672-1678).
                             if let Some(overlay) = self.overlay().await {
                                 overlay.forget_flooded_msg(&flood_msg_hash);
-                                overlay.clear_scp_scheduled(&flood_msg_hash);
                             }
                             // DedupSlot dropped without commit — no cache poisoning.
                             drop(permit);
@@ -2147,14 +2137,6 @@ impl App {
 
         // Remove from in-flight dedup set FIRST, before any early returns.
         self.scp_scheduled.complete(&ve.intake.envelope);
-
-        // Clear overlay scheduling cache entry — this envelope is fully
-        // processed and any future copy from another peer is genuinely new.
-        if let Some(ref hash) = ve.intake.flood_msg_hash {
-            if let Some(overlay) = self.overlay().await {
-                overlay.clear_scp_scheduled(hash);
-            }
-        }
 
         let slot = ve.intake.slot;
         let tracking = self.herder.tracking_slot().get();
@@ -2612,7 +2594,6 @@ mod scp_dedup_pipeline_tests {
             from_peer: peer_id,
             message: StellarMessage::ScpMessage(envelope),
             received_at: std::time::Instant::now(),
-            scp_scheduled_hash: None,
         }
     }
 

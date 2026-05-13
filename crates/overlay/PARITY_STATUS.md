@@ -351,7 +351,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `recordMessageMetric()` | (via OverlayMetrics) | Full |
 | `getFlowControlBytesTotal()` | `FlowControlBytesConfig::bytes_total()` | Full |
 | `getFlowControlBytesBatch()` | `FlowControlBytesConfig::bytes_batch()` | Full |
-| `checkScheduledAndCache()` | (via FloodGate.has_seen) | Full |
+| `checkScheduledAndCache()` | None — reverted due to #2629 liveness regression; dedup at app level only | None |
 | `getOverlayThreadSnapshot()` | N/A | None |
 | `tick()` | `start_tick_loop()` (3s interval) | Full |
 | `updateTimerAndMaybeDropRandomPeer()` | `maybe_drop_random_peer()` | Full |
