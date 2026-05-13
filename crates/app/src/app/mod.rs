@@ -2412,6 +2412,7 @@ impl App {
                 // Sample live from the verifier handle so the gauge reflects
                 // the current moment instead of the last `pump_scp_intake` tick.
                 verify_input_backlog: self.herder.scp_verifier_handle().queue_len() as u64,
+                verify_input_backlog_peak: self.herder.scp_verifier_handle().backlog_peak() as u64,
                 verify_output_backlog: self.scp_verify_output_backlog.load(Ordering::Relaxed),
                 verifier_thread_state: self.herder.scp_verifier_handle().state() as u64,
                 verify_latency_us_sum: self.scp_verify_latency_us_sum.load(Ordering::Relaxed),
@@ -2454,6 +2455,7 @@ impl App {
                     self.scp_pv_counters[r].load(Ordering::Relaxed)
                 }),
                 verify_input_backlog: self.herder.scp_verifier_handle().queue_len() as u64,
+                verify_input_backlog_peak: self.herder.scp_verifier_handle().backlog_peak() as u64,
                 verify_output_backlog: self.scp_verify_output_backlog.load(Ordering::Relaxed),
                 verifier_thread_state: self.herder.scp_verifier_handle().state() as u64,
                 verify_latency_us_sum: self.scp_verify_latency_us_sum.load(Ordering::Relaxed),

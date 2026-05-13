@@ -303,6 +303,8 @@ metric_catalog! {
         // SCP verify pipeline gauges.
         SCP_VERIFY_INPUT_BACKLOG = "henyey_scp_verify_input_backlog"
             => "Current depth of the SCP signature-verify input channel (event-loop sampled)";
+        SCP_VERIFY_INPUT_BACKLOG_PEAK = "henyey_scp_verify_input_backlog_peak"
+            => "Monotonic high-water mark of verifier input backlog (worker sampled)";
         SCP_VERIFY_OUTPUT_BACKLOG = "henyey_scp_verify_output_backlog"
             => "Current depth of the verified-envelope output channel (envelopes awaiting the event loop)";
         SCP_VERIFIER_THREAD_STATE = "henyey_scp_verifier_thread_state"
@@ -617,6 +619,8 @@ metric_catalog! {
             => "Total duplicate flood messages received";
         OVERLAY_FLOOD_UNIQUE_RECV_TOTAL = "stellar_overlay_flood_unique_recv_total"
             => "Total unique flood messages received";
+        OVERLAY_SCP_OVERLAY_DEDUP_TOTAL = "henyey_overlay_scp_scheduled_dedup_total"
+            => "SCP envelopes dropped by overlay scheduling cache (early dedup)";
         OVERLAY_FETCH_DUPLICATE_RECV_TOTAL = "stellar_overlay_fetch_duplicate_recv_total"
             => "Total duplicate/unsolicited fetch responses received";
         OVERLAY_FETCH_UNIQUE_RECV_TOTAL = "stellar_overlay_fetch_unique_recv_total"
@@ -928,6 +932,7 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
 
     // SCP verify pipeline — gauges.
     SCP_VERIFY_INPUT_BACKLOG.set(sv.verify_input_backlog as f64);
+    SCP_VERIFY_INPUT_BACKLOG_PEAK.set(sv.verify_input_backlog_peak as f64);
     SCP_VERIFY_OUTPUT_BACKLOG.set(sv.verify_output_backlog as f64);
     SCP_VERIFIER_THREAD_STATE.set(sv.verifier_thread_state as f64);
     SCP_VERIFY_LATENCY_US_SUM.set(sv.verify_latency_us_sum as f64);
@@ -1004,6 +1009,7 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         OVERLAY_FLOOD_BROADCAST_TOTAL.absolute(ov.flood_broadcast);
         OVERLAY_FLOOD_DUPLICATE_RECV_TOTAL.absolute(ov.flood_duplicate_recv);
         OVERLAY_FLOOD_UNIQUE_RECV_TOTAL.absolute(ov.flood_unique_recv);
+        OVERLAY_SCP_OVERLAY_DEDUP_TOTAL.absolute(ov.scp_overlay_dedup);
         OVERLAY_FETCH_DUPLICATE_RECV_TOTAL.absolute(ov.fetch_duplicate_recv);
         OVERLAY_FETCH_UNIQUE_RECV_TOTAL.absolute(ov.fetch_unique_recv);
         OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL.absolute(ov.item_fetcher_next_peer);

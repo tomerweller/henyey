@@ -361,6 +361,10 @@ pub struct OverlayMessage {
     pub message: StellarMessage,
     /// When the message was received from the peer (before broadcast channel delivery).
     pub received_at: std::time::Instant,
+    /// The SCP scheduling cache hash for this message (if SCP). Set by the
+    /// peer loop after inserting into `ScpScheduledCache`; consumed by the
+    /// event loop to clear the cache entry after processing.
+    pub scp_scheduled_hash: Option<henyey_common::Hash256>,
 }
 
 /// A snapshot of a connected peer's info and statistics.
@@ -620,6 +624,11 @@ pub(super) struct SharedPeerState {
     pub(super) local_peer_id: PeerId,
     /// Monotonically-increasing counter for `PeerHandle::generation`.
     pub(super) next_peer_generation: Arc<AtomicU64>,
+    /// Overlay-side in-flight SCP scheduling cache. Mirrors stellar-core's
+    /// `mScheduledMessages` (OverlayManagerImpl.cpp:1190-1212). Separate
+    /// from FloodGate — used to drop duplicate SCP envelopes before they
+    /// reach the SCP subscriber channel.
+    pub(super) scp_scheduled_cache: Arc<crate::scp_scheduled::ScpScheduledCache>,
 }
 
 impl SharedPeerState {
@@ -685,6 +694,10 @@ impl SharedPeerState {
         if is_scp {
             if let Err(e) = self.scp_message_tx.send(msg.clone()) {
                 error!("SCP channel send FAILED for peer {}: {}", msg.from_peer, e);
+                // Clear the scheduling cache entry so re-delivery is possible.
+                if let Some(hash) = &msg.scp_scheduled_hash {
+                    self.scp_scheduled_cache.remove(hash);
+                }
             }
         }
 
@@ -865,6 +878,9 @@ pub struct OverlayManager {
     /// Monotonically-increasing counter for `PeerHandle::generation`.
     /// Shared with all `SharedPeerState` snapshots via `Arc`.
     pub(super) next_peer_generation: Arc<AtomicU64>,
+    /// Overlay-side in-flight SCP scheduling cache. Mirrors stellar-core's
+    /// `mScheduledMessages`. See [`crate::scp_scheduled::ScpScheduledCache`].
+    pub(super) scp_scheduled_cache: Arc<crate::scp_scheduled::ScpScheduledCache>,
 }
 
 impl OverlayManager {
@@ -974,6 +990,7 @@ impl OverlayManager {
             listen_addr: None,
             dial_cooldowns: Arc::new(DashMap::new()),
             next_peer_generation: Arc::new(AtomicU64::new(0)),
+            scp_scheduled_cache: Arc::new(crate::scp_scheduled::ScpScheduledCache::new()),
         })
     }
 
@@ -1013,6 +1030,7 @@ impl OverlayManager {
             dial_cooldowns: Arc::clone(&self.dial_cooldowns),
             local_peer_id: PeerId::from_xdr(self.local_node.xdr_public_key()),
             next_peer_generation: Arc::clone(&self.next_peer_generation),
+            scp_scheduled_cache: Arc::clone(&self.scp_scheduled_cache),
         }
     }
 
@@ -1515,6 +1533,16 @@ impl OverlayManager {
     ///   Added or Duplicate — parity with OverlayManagerImpl.cpp:1231-1236).
     pub fn forget_flooded_msg(&self, message_hash: &henyey_common::Hash256) {
         self.flood_gate.forget(message_hash);
+    }
+
+    /// Remove an entry from the overlay-side SCP scheduling cache.
+    ///
+    /// Called by the event loop after an SCP envelope has been processed
+    /// (or rejected) to allow re-delivery. Mirrors the lifetime of
+    /// stellar-core's `mScheduledMessages` entries, which expire when
+    /// the `CapacityTrackedMessage` shared_ptr is destroyed.
+    pub fn clear_scp_scheduled(&self, message_hash: &henyey_common::Hash256) {
+        self.scp_scheduled_cache.remove(message_hash);
     }
 
     /// Set the SCP queue callback for intelligent queue trimming.
@@ -2346,6 +2374,7 @@ mod tests {
             dial_cooldowns: Arc::new(DashMap::new()),
             local_peer_id: PeerId::from_bytes([0u8; 32]),
             next_peer_generation: Arc::new(AtomicU64::new(0)),
+            scp_scheduled_cache: Arc::new(crate::scp_scheduled::ScpScheduledCache::new()),
         }
     }
     fn insert_fake_peer(
@@ -2870,6 +2899,7 @@ mod tests {
             dial_cooldowns: Arc::new(DashMap::new()),
             local_peer_id: PeerId::from_bytes([0u8; 32]),
             next_peer_generation: Arc::new(AtomicU64::new(0)),
+            scp_scheduled_cache: Arc::new(crate::scp_scheduled::ScpScheduledCache::new()),
         };
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
@@ -2885,6 +2915,7 @@ mod tests {
                 from_peer: peer_id.clone(),
                 message: msg.clone(),
                 received_at: std::time::Instant::now(),
+                scp_scheduled_hash: None,
             };
             shared.route_to_subscribers(overlay_msg);
         }
@@ -2964,6 +2995,7 @@ mod tests {
             dial_cooldowns: Arc::new(DashMap::new()),
             local_peer_id: PeerId::from_bytes([0u8; 32]),
             next_peer_generation: Arc::new(AtomicU64::new(0)),
+            scp_scheduled_cache: Arc::new(crate::scp_scheduled::ScpScheduledCache::new()),
         };
         (shared, broadcast_rx, fetch_rx)
     }
@@ -3000,6 +3032,7 @@ mod tests {
                 from_peer: peer.clone(),
                 message: m,
                 received_at: std::time::Instant::now(),
+                scp_scheduled_hash: None,
             })
             .collect()
     }
@@ -3665,6 +3698,7 @@ mod tests {
             dial_cooldowns: Arc::new(DashMap::new()),
             local_peer_id: PeerId::from_bytes([0u8; 32]),
             next_peer_generation: Arc::new(AtomicU64::new(0)),
+            scp_scheduled_cache: Arc::new(crate::scp_scheduled::ScpScheduledCache::new()),
         };
 
         // Pool with capacity (max=10, current authenticated=0)
@@ -3734,6 +3768,7 @@ mod tests {
             dial_cooldowns: Arc::new(DashMap::new()),
             local_peer_id: PeerId::from_bytes([0u8; 32]),
             next_peer_generation: Arc::new(AtomicU64::new(0)),
+            scp_scheduled_cache: Arc::new(crate::scp_scheduled::ScpScheduledCache::new()),
         };
 
         // Pool with capacity — reserve a pending slot (required before promote)
