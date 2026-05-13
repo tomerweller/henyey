@@ -6462,15 +6462,25 @@ MOVEOF
   sed -i "s|FLOW_LOG_PLACEHOLDER|$flow_gh_log|" "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
   chmod +x "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
 
-  # Test: Empty build_sha guard
+  # Test: Empty build_sha guard — asserts no dedup or gh calls when build_sha is empty
   > "$flow_gh_log"
   local build_sha=""
+  _flow_gh_stub '{"state":"OPEN"}' '[]' '' '0'
+  local empty_sha_dedup_file="$flow_root/dedup-empty-sha.json"
+  echo '{"schema_version":1,"filed":{"somsha":{"issue_number":99,"filed_at":"2099-01-01T00:00:00Z"}}}' > "$empty_sha_dedup_file"
   # §3d says: if build_sha is empty, do NOT enter flock/dedup/filing path
   if [[ -z "$build_sha" ]]; then
-    # Guard fires: no dedup operations
-    tap_ok "flow: empty build_sha guard short-circuits"
+    # Guard fires: verify no gh calls and dedup file untouched
+    :
   else
-    tap_not_ok "flow: empty build_sha guard short-circuits"
+    # Would enter dedup path — but we never should with empty sha
+    PATH="$flow_root/gh-stub:$PATH" gh issue view 99 --json state 2>/dev/null || true
+  fi
+  if [[ -z "$build_sha" ]] && ! grep -q "." "$flow_gh_log" 2>/dev/null && \
+     python3 -c "import json; d=json.load(open('$empty_sha_dedup_file')); assert d['filed']['somsha']['issue_number']==99" 2>/dev/null; then
+    tap_ok "flow: empty build_sha guard short-circuits (no dedup/gh calls)"
+  else
+    tap_not_ok "flow: empty build_sha guard short-circuits (no dedup/gh calls)" "gh_log=$(cat $flow_gh_log 2>/dev/null)"
   fi
 
   # Test: Open-issue hit → skip + daily comment (last_commented_date updated)
@@ -6565,24 +6575,45 @@ MOVEOF
     tap_not_ok "flow: comment failure → date NOT updated"
   fi
 
-  # Test: Closed-issue hit → remove + refile
+  # Test: Closed-issue hit → remove + refile (verifies both dedup removal and issue creation)
   > "$flow_gh_log"
   local flow_dedup_file4="$flow_root/dedup-closed.json"
-  echo '{"schema_version":1,"filed":{"sha_closed":{"issue_number":200,"filed_at":"2026-01-01T00:00:00Z"}}}' > "$flow_dedup_file4"
+  local closed_recent_ts
+  closed_recent_ts=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+  echo '{"schema_version":1,"filed":{"sha_closed":{"issue_number":200,"filed_at":"'"$closed_recent_ts"'"}}}' > "$flow_dedup_file4"
   _flow_gh_stub '{"state":"CLOSED"}' '[]' 'https://github.com/stellar-experimental/henyey/issues/201' '0'
   flow_data=$(dedup_load "$flow_dedup_file4" 2>/dev/null)
+  flow_data=$(dedup_prune "$flow_data" "30d")
   set +e
   flow_entry=$(dedup_check "$flow_data" "sha_closed" 2>/dev/null)
   local flow_closed_rc=$?
   set -e
+  local closed_predecessor=""
   if [[ $flow_closed_rc -eq 0 ]]; then
-    # Issue is closed — remove from dedup
-    flow_data=$(dedup_remove "$flow_data" "sha_closed")
+    # Check state
+    local closed_state
+    closed_state=$(PATH="$flow_root/gh-stub:$PATH" gh issue view 200 --json state --jq .state 2>/dev/null)
+    if [[ "$closed_state" == *"CLOSED"* ]]; then
+      closed_predecessor="200"
+      flow_data=$(dedup_remove "$flow_data" "sha_closed")
+      # Fall through to filing (remote search + create)
+      local refile_result
+      refile_result=$(PATH="$flow_root/gh-stub:$PATH" gh issue create --title "OFFLINE: refile" --body "test" 2>/dev/null)
+      local refile_num
+      refile_num=$(echo "$refile_result" | grep -oP '\d+$' || true)
+      if [[ -n "$refile_num" ]]; then
+        flow_data=$(dedup_record "$flow_data" "sha_closed" "issue_number=$refile_num")
+        dedup_write "$flow_dedup_file4" "$flow_data" 2>/dev/null
+      fi
+    fi
   fi
-  if ! _json_has_key "$flow_data" "filed" "sha_closed"; then
-    tap_ok "flow: closed-issue hit → dedup_remove clears entry"
+  # Verify: old entry removed, new entry with refiled issue number, gh create called
+  if [[ -n "$closed_predecessor" ]] && \
+     grep -q "issue create" "$flow_gh_log" && \
+     python3 -c "import json; d=json.load(open('$flow_dedup_file4')); assert d['filed']['sha_closed']['issue_number']==201" 2>/dev/null; then
+    tap_ok "flow: closed-issue hit → remove + refile with new issue"
   else
-    tap_not_ok "flow: closed-issue hit → dedup_remove clears entry"
+    tap_not_ok "flow: closed-issue hit → remove + refile with new issue" "log: $(cat $flow_gh_log 2>/dev/null | head -3)"
   fi
 
   # Test: UNKNOWN state hit → suppress filing
@@ -6690,30 +6721,40 @@ for item in items:
     tap_not_ok "flow: remote-search false-positive falls through to filing" "found=$fp_found"
   fi
 
-  # Test: gh issue create failure → no dedup_record
+  # Test: gh issue create failure → no dedup_record (dedup file stays untouched)
   > "$flow_gh_log"
   local flow_dedup_file8="$flow_root/dedup-createfail.json"
   echo '{"schema_version":1,"filed":{}}' > "$flow_dedup_file8"
-  _flow_gh_stub '' '[]' '' '0'  # create_response is empty (failure)
+  local create_fail_sha="sha_that_should_not_be_recorded"
+  _flow_gh_stub '' '[]' '' '0'  # create_response is empty (stub exits 1 for create)
   flow_data=$(dedup_load "$flow_dedup_file8" 2>/dev/null)
   set +e
   local create_out
   create_out=$(PATH="$flow_root/gh-stub:$PATH" gh issue create --title "test" --body "test" 2>/dev/null)
+  local create_rc=$?
   set -e
   local created_num
   created_num=$(echo "$create_out" | grep -oP '\d+$' || true)
-  if [[ -z "$created_num" ]]; then
-    # Failed — do NOT record
-    :
+  if [[ -n "$created_num" ]]; then
+    # Would record — but we expect failure
+    flow_data=$(dedup_record "$flow_data" "$create_fail_sha" "issue_number=$created_num")
+    dedup_write "$flow_dedup_file8" "$flow_data" 2>/dev/null
   fi
-  if ! _json_has_key "$flow_data" "filed" "create_fail_sha"; then
-    tap_ok "flow: gh create failure → no dedup_record"
+  # Verify: dedup file has NO entry for this sha (create failed, so no record was made)
+  if ! python3 -c "import json; d=json.load(open('$flow_dedup_file8')); assert '$create_fail_sha' not in d['filed']" 2>/dev/null; then
+    tap_not_ok "flow: gh create failure → dedup file untouched" "sha was recorded despite failure"
+  elif python3 -c "import json; d=json.load(open('$flow_dedup_file8')); assert d=={'schema_version':1,'filed':{}}" 2>/dev/null; then
+    tap_ok "flow: gh create failure → dedup file untouched"
   else
-    tap_not_ok "flow: gh create failure → no dedup_record"
+    tap_not_ok "flow: gh create failure → dedup file untouched"
   fi
 
-  # Test: Lock timeout (flock held → exits 0 without filing)
+  # Test: Lock timeout (flock held → exits 0 without any dedup/gh operations)
+  > "$flow_gh_log"
   local lock_file="$flow_root/test-filing.lock"
+  local lock_dedup_file="$flow_root/dedup-lock-test.json"
+  echo '{"schema_version":1,"filed":{}}' > "$lock_dedup_file"
+  _flow_gh_stub '{"state":"OPEN"}' '[]' 'https://github.com/stellar-experimental/henyey/issues/999' '0'
   # Hold the lock in a background subshell
   (flock -x 9; sleep 5) 9>"$lock_file" &
   local lock_holder_pid=$!
@@ -6723,16 +6764,21 @@ for item in items:
   lock_out=$(
     (
       flock -w 1 9 || { echo "Could not acquire lock"; exit 0; }
+      # If lock acquired, would do dedup + gh operations
       echo "acquired"
+      PATH="$flow_root/gh-stub:$PATH" gh issue create --title "should not happen" --body "test" 2>/dev/null
     ) 9>"$lock_file" 2>&1
   )
   set -e
   kill $lock_holder_pid 2>/dev/null || true
   wait $lock_holder_pid 2>/dev/null || true
-  if echo "$lock_out" | grep -q "Could not acquire"; then
-    tap_ok "flow: lock timeout exits without filing"
+  # Verify: lock timed out, no gh calls made, dedup file untouched
+  if echo "$lock_out" | grep -q "Could not acquire" && \
+     ! grep -q "issue create" "$flow_gh_log" 2>/dev/null && \
+     python3 -c "import json; d=json.load(open('$lock_dedup_file')); assert d=={'schema_version':1,'filed':{}}" 2>/dev/null; then
+    tap_ok "flow: lock timeout → no dedup/gh operations"
   else
-    tap_not_ok "flow: lock timeout exits without filing" "out: ${lock_out:0:100}"
+    tap_not_ok "flow: lock timeout → no dedup/gh operations" "out: ${lock_out:0:100} log: $(cat $flow_gh_log 2>/dev/null)"
   fi
 
   # Test: Board routing on new issue
