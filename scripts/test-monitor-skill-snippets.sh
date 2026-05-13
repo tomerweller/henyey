@@ -5058,6 +5058,91 @@ else:
 
   rm -rf "$prov_root"
 
+  # ── check-alarm-regression.sh --force-baseline-update tests ──────────────
+  # Tests for issue #2616: add --force-baseline-update flag to acknowledge
+  # regressions as legitimate improvements and reset baselines.
+
+  local fbu_root
+  fbu_root=$(mktemp -d)
+  local fbu_session="$fbu_root/session"
+  mkdir -p "$fbu_session/metrics"
+
+  # Set up: create baselines with lost-sync firing at 10%
+  local fbu_active='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  local fbu_silent='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+
+  # Bootstrap baselines from active data
+  echo "$fbu_active" > "$fbu_session/metrics/fbu-active.json"
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$fbu_session" --current "$fbu_session/metrics/fbu-active.json" \
+    --catalog "$catalog_for_reg" >/dev/null 2>&1 || true
+
+  # Verify baselines exist
+  if [[ ! -f "$fbu_session/metrics/replay-baseline.json" ]] || \
+     [[ ! -f "$fbu_session/metrics/replay-baseline-stable.json" ]]; then
+    tap_not_ok "force-baseline-update: bootstrap failed"
+  else
+    # Test 1: Without --force-baseline-update, regressions freeze baselines
+    echo "$fbu_silent" > "$fbu_session/metrics/fbu-silent.json"
+    local fbu_rolling_before fbu_stable_before
+    fbu_rolling_before=$(md5sum "$fbu_session/metrics/replay-baseline.json" | cut -d' ' -f1)
+    fbu_stable_before=$(md5sum "$fbu_session/metrics/replay-baseline-stable.json" | cut -d' ' -f1)
+
+    local fbu_out1
+    fbu_out1=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+      "$fbu_session" --current "$fbu_session/metrics/fbu-silent.json" \
+      --catalog "$catalog_for_reg" 2>&1) || true
+
+    local fbu_rolling_after1 fbu_stable_after1
+    fbu_rolling_after1=$(md5sum "$fbu_session/metrics/replay-baseline.json" | cut -d' ' -f1)
+    fbu_stable_after1=$(md5sum "$fbu_session/metrics/replay-baseline-stable.json" | cut -d' ' -f1)
+
+    if echo "$fbu_out1" | grep -q "regression(s) found" && \
+       [[ "$fbu_rolling_before" == "$fbu_rolling_after1" ]] && \
+       [[ "$fbu_stable_before" == "$fbu_stable_after1" ]]; then
+      tap_ok "force-baseline-update: without flag, baselines NOT updated on regression"
+    else
+      tap_not_ok "force-baseline-update: without flag, baselines NOT updated on regression" \
+        "output: ${fbu_out1:0:200}"
+    fi
+
+    # Test 2: With --force-baseline-update, both baselines ARE updated
+    local fbu_out2
+    fbu_out2=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+      "$fbu_session" --current "$fbu_session/metrics/fbu-silent.json" \
+      --catalog "$catalog_for_reg" --force-baseline-update 2>&1) || true
+
+    local fbu_rolling_after2 fbu_stable_after2
+    fbu_rolling_after2=$(md5sum "$fbu_session/metrics/replay-baseline.json" | cut -d' ' -f1)
+    fbu_stable_after2=$(md5sum "$fbu_session/metrics/replay-baseline-stable.json" | cut -d' ' -f1)
+
+    if echo "$fbu_out2" | grep -q "Force-updating baselines" && \
+       [[ "$fbu_rolling_before" != "$fbu_rolling_after2" ]] && \
+       [[ "$fbu_stable_before" != "$fbu_stable_after2" ]]; then
+      tap_ok "force-baseline-update: with flag, both baselines updated"
+    else
+      tap_not_ok "force-baseline-update: with flag, both baselines updated" \
+        "output: ${fbu_out2:0:200} rolling_changed=$([[ $fbu_rolling_before != $fbu_rolling_after2 ]] && echo yes || echo no) stable_changed=$([[ $fbu_stable_before != $fbu_stable_after2 ]] && echo yes || echo no)"
+    fi
+
+    # Test 3: Subsequent run without flag shows no regressions (baseline took effect)
+    local fbu_out3
+    fbu_out3=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+      "$fbu_session" --current "$fbu_session/metrics/fbu-silent.json" \
+      --catalog "$catalog_for_reg" 2>&1) || true
+    local fbu_stdout3
+    fbu_stdout3=$(echo "$fbu_out3" | grep -v "^No regressions\|^Rolling baseline\|^Stable baseline\|^Baseline" | head -1)
+
+    if echo "$fbu_out3" | grep -q "No regressions" && [[ "$fbu_stdout3" == "[]" ]]; then
+      tap_ok "force-baseline-update: subsequent run shows no regressions"
+    else
+      tap_not_ok "force-baseline-update: subsequent run shows no regressions" \
+        "output: ${fbu_out3:0:200}"
+    fi
+  fi
+
+  rm -rf "$fbu_root"
+
   # ── check-alarm-regression.sh dedup tests ──────────────────────────────────
   # Tests for issue #2608: duplicate issue filing due to stale dedup snapshot.
   # Uses PATH-based gh stub to intercept GitHub API calls.

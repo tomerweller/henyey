@@ -8,23 +8,30 @@
 #   - Rolling baseline (replay-baseline.json): updated on each clean run.
 #     Catches sudden regressions from one run to the next.
 #   - Stable baseline (replay-baseline-stable.json): frozen at creation time,
-#     never auto-updated. Catches gradual decay where an alarm that was
-#     historically active (≥5%) has silently drifted to 0% over successive
-#     rolling-baseline updates. The stable baseline is auto-invalidated and
-#     recreated when the alarm catalog (metric-alarms.toml) changes. To force
-#     a manual refresh, delete replay-baseline-stable.json and re-run.
+#     never auto-updated (except on catalog changes). Catches gradual decay
+#     where an alarm that was historically active (≥5%) has silently drifted
+#     to 0% over successive rolling-baseline updates. The stable baseline is
+#     auto-invalidated and recreated when the alarm catalog (metric-alarms.toml)
+#     changes.
 #
 # Only alarms present in the alarm catalog are considered; non-catalog alarm
 # names (e.g. from stale baselines or test contamination) are silently pruned.
 #
 # Usage:
 #   scripts/dev/check-alarm-regression.sh SESSION_DIR [--current FILE] \
-#       [--baseline FILE] [--stable-baseline FILE] [--catalog FILE]
+#       [--baseline FILE] [--stable-baseline FILE] [--catalog FILE] \
+#       [--force-baseline-update]
 #
 # If --current is omitted, runs replay-alarms-on-history.sh --replay --json
 # internally. If --baseline is omitted, defaults to $METRICS_DIR/replay-baseline.json.
 # If --stable-baseline is omitted, defaults to $METRICS_DIR/replay-baseline-stable.json.
 # If --catalog is omitted, defaults to $REPO_ROOT/.claude/skills/shared/metric-alarms.toml.
+#
+# --force-baseline-update: Force-update both rolling and stable baselines from
+#   current replay data, even when regressions are detected. Issue filing is
+#   suppressed. Use after investigating a regression and confirming it reflects
+#   a legitimate improvement (e.g., alarm went silent because the underlying
+#   condition was fixed).
 #
 # Exit codes:
 #   0 — success (regressions are informational, not failures)
@@ -41,6 +48,7 @@ CURRENT_FILE=""
 BASELINE_FILE=""
 STABLE_BASELINE_FILE=""
 CATALOG_FILE=""
+FORCE_BASELINE_UPDATE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -75,6 +83,10 @@ while [[ $# -gt 0 ]]; do
       fi
       CATALOG_FILE="$2"
       shift 2
+      ;;
+    --force-baseline-update)
+      FORCE_BASELINE_UPDATE=true
+      shift
       ;;
     *)
       if [[ -z "$SESSION_DIR" ]]; then
@@ -461,6 +473,15 @@ if [[ "$REGRESSION_COUNT" == "0" ]]; then
   # No regressions from either baseline — update rolling (stable is never updated)
   create_baseline "$BASELINE_FILE"
   echo "No regressions found. Rolling baseline updated." >&2
+elif [[ "$FORCE_BASELINE_UPDATE" == true ]]; then
+  # Regressions found but operator explicitly requested baseline update.
+  # This acknowledges the regressions as legitimate (e.g., alarm went silent
+  # because the underlying condition was fixed) and resets both baselines to
+  # the current state. Issue filing is suppressed.
+  echo "$REGRESSION_COUNT regression(s) found. Force-updating baselines (rolling + stable)." >&2
+  create_baseline "$BASELINE_FILE"
+  create_baseline "$STABLE_BASELINE_FILE"
+  echo "Baselines force-updated. Regressions acknowledged." >&2
 else
   # Regressions found — keep last-known-good rolling baseline
   echo "$REGRESSION_COUNT regression(s) found. Rolling baseline NOT updated (preserving last-known-good)." >&2
