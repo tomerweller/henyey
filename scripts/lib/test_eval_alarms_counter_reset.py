@@ -140,8 +140,13 @@ def test_counter_ratio_no_reset_on_breach():
 
 # ── counter-streak tests ─────────────────────────────────────────────────────
 
-def test_counter_streak_skip_resets_streak_only():
-    """Skipped state zeros breach_streak but preserves counter_value."""
+def test_counter_streak_skip_resets_streak_and_baseline():
+    """Skipped state zeros breach_streak and deletes counter_value.
+    
+    Unlike counter-ratio (where the evaluator updates baselines on low-volume
+    skip), counter-streak does NOT update counter_value on its skip path,
+    so the baseline must be deleted to avoid false bursts on resume.
+    """
     with tempfile.TemporaryDirectory() as d:
         state_dir = Path(d)
         snap_path = state_dir / "counter_streak_snapshot"
@@ -158,7 +163,7 @@ def test_counter_streak_skip_resets_streak_only():
 
         snap = read_snapshot(snap_path)
         assert snap["breach_streak"] == "0", f"breach_streak should be 0, got {snap['breach_streak']}"
-        assert snap["counter_value"] == "100", "counter_value baseline should be preserved"
+        assert "counter_value" not in snap, "counter_value should be deleted to prevent false bursts"
         assert snap["version"] == "1", "version should be preserved"
 
 
@@ -181,7 +186,7 @@ def test_counter_streak_custom_snapshot_file():
 
         snap = read_snapshot(snap_path)
         assert snap["breach_streak"] == "0", "breach_streak should be reset"
-        assert snap["counter_value"] == "50", "counter_value should be preserved"
+        assert "counter_value" not in snap, "counter_value should be deleted"
 
 
 def test_counter_streak_no_reset_on_ok():
@@ -322,9 +327,9 @@ def test_counter_ratio_low_volume_preserves_baselines():
             "denominator baseline should be preserved after low-volume skip"
 
 
-def test_counter_streak_skip_preserves_counter_value():
-    """Skipped counter-streak reset should zero breach_streak but preserve
-    counter_value (cumulative counter position)."""
+def test_counter_streak_skip_prevents_false_burst():
+    """Skipped counter-streak reset should delete counter_value to prevent
+    the resume delta from spanning the entire gap and triggering false bursts."""
     with tempfile.TemporaryDirectory() as d:
         state_dir = Path(d)
         snap_path = state_dir / "counter_streak_snapshot"
@@ -341,7 +346,8 @@ def test_counter_streak_skip_preserves_counter_value():
 
         snap = read_snapshot(snap_path)
         assert snap["breach_streak"] == "0", "breach_streak should be zeroed"
-        assert snap["counter_value"] == "500", "counter_value should be preserved"
+        assert "counter_value" not in snap, \
+            "counter_value should be deleted to prevent false burst on resume"
 
 
 # ── Run tests ─────────────────────────────────────────────────────────────────
