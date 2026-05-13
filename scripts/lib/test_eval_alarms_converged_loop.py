@@ -382,7 +382,7 @@ def test_exempt_stderr_unified_format():
 # ── Test: exempt stderr does NOT produce ERROR_NO_SERIES when metric absent ──
 
 def test_exempt_no_error_no_series_when_metric_absent():
-    """Exempt alarm with absent metric should emit state=skipped, NOT ERROR_NO_SERIES."""
+    """Exempt alarm with absent metric should emit unified format with state=skipped, NOT ERROR_NO_SERIES."""
     catalog = {
         "schema_version": 1,
         "alarm": [{
@@ -405,9 +405,42 @@ def test_exempt_no_error_no_series_when_metric_absent():
     lines = [l for l in stderr.strip().split("\n") if "alarm=test-absent" in l]
     assert len(lines) == 1
     line = lines[0]
-    # state=skipped means we take the `else` branch in telemetry, NOT the ERROR_NO_SERIES branch
+    # Full unified contract: metric=, series_matched=, state=skipped
+    assert "metric=" in line, f"Missing 'metric=' in telemetry: {line}"
+    assert "series_matched=" in line, f"Missing 'series_matched=' in telemetry: {line}"
     assert "state=skipped" in line, f"Expected state=skipped, got: {line}"
     assert "ERROR_NO_SERIES" not in line, f"Unexpected ERROR_NO_SERIES for exempt+absent: {line}"
+
+
+# ── Test: gate-skip stderr uses unified telemetry format ─────────────────────
+
+def test_gate_skip_stderr_unified_format():
+    """Gate-skipped alarm stderr telemetry uses the documented unified format."""
+    catalog = {
+        "schema_version": 1,
+        "alarm": [{
+            "name": "test-gate-fmt",
+            "kind": "gauge",
+            "severity": "WARN",
+            "metric": "some_gauge",
+            "op": ">",
+            "threshold": 100,
+            "gates": ["warmup-2-ticks"],
+        }]
+    }
+
+    output, stderr, _ = _run_main(
+        catalog,
+        current_lines=["some_gauge 150"],
+        env_overrides={"WARMUP_TICKS_REMAINING": "3"},
+    )
+
+    lines = [l for l in stderr.strip().split("\n") if "alarm=test-gate-fmt" in l]
+    assert len(lines) == 1, f"Expected exactly one telemetry line, got {lines}"
+    line = lines[0]
+    assert "metric=" in line, f"Missing 'metric=' in telemetry: {line}"
+    assert "series_matched=" in line, f"Missing 'series_matched=' in telemetry: {line}"
+    assert "state=skipped" in line, f"Missing 'state=skipped' in telemetry: {line}"
 
 
 # ── Run tests ─────────────────────────────────────────────────────────────────
