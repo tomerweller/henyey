@@ -1475,7 +1475,7 @@ Otherwise enter the deploy path:
    ```
    If `needs_rebuild="no"` (all paths allowlisted), skip the rebuild + restart:
    run `git pull --rebase` only, then report
-   `DEPLOY SYNCED (no-binary-impact: docs/scripts only — pulled <N> commits, no restart)`.
+   `DEPLOY SYNCED (no-binary-impact: allowlisted paths only — pulled <N> commits, no restart)`.
    Do NOT update `BUILD_SHA_FILE` (the binary hasn't changed).
 
    The non-binary-impact allowlist is:
@@ -1483,6 +1483,7 @@ Otherwise enter the deploy path:
    - `.claude/`
    - `scripts/`
    - `docs/`
+   - `metrics/` (dashboards, alerts, observability docs — no runtime impact)
    - root-level `*.md` files, e.g. `README.md` or `CLAUDE.md`
    - `stellar-specs` / `stellar-specs/` submodule pointer changes only
 
