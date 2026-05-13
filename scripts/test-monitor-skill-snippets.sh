@@ -5554,6 +5554,7 @@ STUBEOF
 
   # Test 4: Clean filing (no existing issues → file once)
   > "$dedup_gh_log"
+  rm -f "$dedup_fake_repo/.alarm-regression-filed.json"
   create_gh_stub "$dedup_gh_dir" \
     '[]' \
     "https://github.com/stellar-experimental/henyey/issues/9999"
@@ -5573,6 +5574,7 @@ STUBEOF
 
   # Test 5: Lookup failure graceful degradation (gh issue list fails → still file)
   > "$dedup_gh_log"
+  rm -f "$dedup_fake_repo/.alarm-regression-filed.json"
   cat > "$dedup_gh_dir/gh" << 'FAILSTUBEOF'
 #!/usr/bin/env bash
 echo "$*" >> LOGFILE
@@ -5742,6 +5744,257 @@ print(len(leaks))
   rm -rf "$exempt_state_dir"
 
   rm -rf "$telemetry_state_dir"
+
+  # ── Cross-invocation dedup tests (Gap 1 of #2619) ──────────────────────
+  # Uses PATH-based gh stub (same approach as existing dedup tests above)
+  echo "# Cross-invocation dedup tests" >&2
+
+  local xdedup_root
+  xdedup_root=$(mktemp -d)
+  local xdedup_session="$xdedup_root/session"
+  mkdir -p "$xdedup_session/metrics"
+
+  local xdedup_catalog_checksum
+  xdedup_catalog_checksum=$(sha256sum "$catalog_for_reg" | cut -d' ' -f1)
+
+  # Create baselines with provenance (lost-sync active at 10%)
+  local xdedup_baseline
+  xdedup_baseline=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2]}
+print(json.dumps(d))
+" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}' "$xdedup_catalog_checksum")
+  echo "$xdedup_baseline" > "$xdedup_session/metrics/replay-baseline.json"
+  echo "$xdedup_baseline" > "$xdedup_session/metrics/replay-baseline-stable.json"
+
+  # Current where lost-sync went silent → regression
+  local xdedup_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$xdedup_current" > "$xdedup_session/metrics/xdedup-current.json"
+
+  local xdedup_gh_dir="$xdedup_root/gh-stub"
+  local xdedup_gh_log="$xdedup_root/gh-calls.log"
+  mkdir -p "$xdedup_gh_dir"
+
+  # Fake repo with stub move-issue-status.sh
+  local xdedup_fake_repo="$xdedup_root/fake-repo"
+  mkdir -p "$xdedup_fake_repo/.github/skills/plan-do-review/scripts"
+  echo '#!/usr/bin/env bash' > "$xdedup_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  echo 'exit 0' >> "$xdedup_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  chmod +x "$xdedup_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  mkdir -p "$xdedup_fake_repo/scripts/dev"
+  cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$xdedup_fake_repo/scripts/dev/"
+
+  # gh stub: no existing issues (allow filing), returns a fake issue URL
+  cat > "$xdedup_gh_dir/gh" << 'STUBEOF'
+#!/usr/bin/env bash
+echo "$*" >> LOGFILE
+if [[ "$1" == "issue" && "$2" == "list" ]]; then
+  echo '[]'
+  exit 0
+elif [[ "$1" == "issue" && "$2" == "create" ]]; then
+  echo 'https://github.com/stellar-experimental/henyey/issues/9999'
+  exit 0
+elif [[ "$1" == "issue" && "$2" == "view" ]]; then
+  echo '{"comments":[]}'
+  exit 0
+elif [[ "$1" == "label" ]]; then
+  exit 0
+fi
+exit 0
+STUBEOF
+  sed -i "s|LOGFILE|$xdedup_gh_log|g" "$xdedup_gh_dir/gh"
+  chmod +x "$xdedup_gh_dir/gh"
+
+  # Test 1: First run creates dedup record
+  > "$xdedup_gh_log"
+  set +e
+  PATH="$xdedup_gh_dir:$PATH" "$xdedup_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$xdedup_session" --current "$xdedup_session/metrics/xdedup-current.json" \
+    --catalog "$catalog_for_reg" >/dev/null 2>&1
+  set -e
+
+  local xdedup_file="$xdedup_fake_repo/.alarm-regression-filed.json"
+  if [[ -f "$xdedup_file" ]] && python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert 'lost-sync' in data.get('filed', {}), 'lost-sync not in dedup file'
+" "$xdedup_file" 2>/dev/null; then
+    tap_ok "dedup: first run records filed alarm in dedup file"
+  else
+    tap_not_ok "dedup: first run records filed alarm in dedup file" "dedup file: $(cat "$xdedup_file" 2>/dev/null || echo 'missing')"
+  fi
+
+  # Test 2: Second run should skip filing due to persistent dedup record
+  > "$xdedup_gh_log"
+  # Re-create baselines (they get updated on first run since no regression from rolling)
+  echo "$xdedup_baseline" > "$xdedup_session/metrics/replay-baseline.json"
+  echo "$xdedup_baseline" > "$xdedup_session/metrics/replay-baseline-stable.json"
+  local xdedup_out2
+  set +e
+  xdedup_out2=$(PATH="$xdedup_gh_dir:$PATH" "$xdedup_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$xdedup_session" --current "$xdedup_session/metrics/xdedup-current.json" \
+    --catalog "$catalog_for_reg" 2>&1)
+  set -e
+
+  if echo "$xdedup_out2" | grep -q "cross-invocation duplicate"; then
+    tap_ok "dedup: second run skips filing due to persistent dedup"
+  else
+    tap_not_ok "dedup: second run skips filing due to persistent dedup" "output: ${xdedup_out2:0:500}"
+  fi
+
+  # Test 3: Dedup pruning — set filed_at to 25 hours ago, should allow re-filing
+  if [[ -f "$xdedup_file" ]]; then
+    python3 -c "
+import json, sys
+from datetime import datetime, timezone, timedelta
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+old_time = (datetime.now(timezone.utc) - timedelta(hours=25)).strftime('%Y-%m-%dT%H:%M:%SZ')
+for alarm in data.get('filed', {}):
+    data['filed'][alarm]['filed_at'] = old_time
+with open(sys.argv[1], 'w') as f:
+    json.dump(data, f)
+" "$xdedup_file" 2>/dev/null
+
+    > "$xdedup_gh_log"
+    echo "$xdedup_baseline" > "$xdedup_session/metrics/replay-baseline.json"
+    echo "$xdedup_baseline" > "$xdedup_session/metrics/replay-baseline-stable.json"
+    set +e
+    local xdedup_out3
+    xdedup_out3=$(PATH="$xdedup_gh_dir:$PATH" "$xdedup_fake_repo/scripts/dev/check-alarm-regression.sh" \
+      "$xdedup_session" --current "$xdedup_session/metrics/xdedup-current.json" \
+      --catalog "$catalog_for_reg" 2>&1)
+    set -e
+
+    if ! echo "$xdedup_out3" | grep -q "cross-invocation duplicate"; then
+      tap_ok "dedup: expired entries pruned, re-filing allowed"
+    else
+      tap_not_ok "dedup: expired entries pruned, re-filing allowed" "output: ${xdedup_out3:0:500}"
+    fi
+  else
+    tap_not_ok "dedup: expired entries pruned, re-filing allowed" "dedup file missing"
+  fi
+
+  # Test 4: Corrupt dedup file treated as empty (no crash)
+  echo "NOT VALID JSON{{{" > "$xdedup_file"
+  > "$xdedup_gh_log"
+  echo "$xdedup_baseline" > "$xdedup_session/metrics/replay-baseline.json"
+  echo "$xdedup_baseline" > "$xdedup_session/metrics/replay-baseline-stable.json"
+  set +e
+  local xdedup_corrupt_out
+  xdedup_corrupt_out=$(PATH="$xdedup_gh_dir:$PATH" "$xdedup_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$xdedup_session" --current "$xdedup_session/metrics/xdedup-current.json" \
+    --catalog "$catalog_for_reg" 2>&1)
+  set -e
+
+  if echo "$xdedup_corrupt_out" | grep -q "Corrupt or invalid dedup file"; then
+    tap_ok "dedup: corrupt file treated as empty with warning"
+  else
+    tap_not_ok "dedup: corrupt file treated as empty with warning" "output: ${xdedup_corrupt_out:0:500}"
+  fi
+
+  rm -f "$xdedup_file"
+  rm -rf "$xdedup_root"
+
+  # ── refresh-stable-baseline.sh tests (Gap 2a of #2619) ─────────────────
+  echo "# refresh-stable-baseline.sh tests" >&2
+
+  local refresh_session="$replay_root/refresh-session"
+  mkdir -p "$refresh_session/metrics"
+
+  # Create baselines with two alarms
+  local refresh_baseline='{"schema_version":1,"evaluated_ticks":200,"alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"peer-count-low":{"firing":15,"breach":3,"ok":172,"baseline":0,"skip":10}},"provenance":{"catalog_checksum":"test","commit":"test","timestamp":"t"}}'
+  echo "$refresh_baseline" > "$refresh_session/metrics/replay-baseline.json"
+  echo "$refresh_baseline" > "$refresh_session/metrics/replay-baseline-stable.json"
+
+  # Refresh just lost-sync
+  local refresh_out
+  refresh_out=$("$REPO_ROOT/scripts/dev/refresh-stable-baseline.sh" \
+    "$refresh_session" lost-sync 2>&1) || true
+
+  # Verify lost-sync removed from stable baseline but peer-count-low kept
+  local stable_check
+  stable_check=$(python3 -c "
+import json
+with open('$refresh_session/metrics/replay-baseline-stable.json') as f:
+    data = json.load(f)
+has_ls = 'yes' if 'lost-sync' in data.get('alarms', {}) else 'no'
+has_pc = 'yes' if 'peer-count-low' in data.get('alarms', {}) else 'no'
+print(has_ls + ':' + has_pc)
+" 2>/dev/null) || stable_check="error"
+
+  if [[ "$stable_check" == "no:yes" ]]; then
+    tap_ok "refresh: removes alarm from stable baseline, keeps others"
+  else
+    tap_not_ok "refresh: removes alarm from stable baseline, keeps others" "result: $stable_check"
+  fi
+
+  # Verify lost-sync also removed from rolling baseline
+  local rolling_check
+  rolling_check=$(python3 -c "
+import json
+with open('$refresh_session/metrics/replay-baseline.json') as f:
+    data = json.load(f)
+print('yes' if 'lost-sync' in data.get('alarms', {}) else 'no')
+" 2>/dev/null) || rolling_check="error"
+
+  if [[ "$rolling_check" == "no" ]]; then
+    tap_ok "refresh: removes alarm from rolling baseline"
+  else
+    tap_not_ok "refresh: removes alarm from rolling baseline" "result: $rolling_check"
+  fi
+
+  # Test: refresh auto-revokes matching acknowledgment
+  echo '{"schema_version":1,"catalog_checksum":"","alarms":{"lost-sync":{"acknowledged_at":"2026-01-01T00:00:00Z","acknowledged_commit":"abc","rationale":"test"}}}' > "$refresh_session/metrics/alarm-acknowledgments.json"
+
+  # Re-create baselines for this test
+  echo "$refresh_baseline" > "$refresh_session/metrics/replay-baseline.json"
+  echo "$refresh_baseline" > "$refresh_session/metrics/replay-baseline-stable.json"
+
+  "$REPO_ROOT/scripts/dev/refresh-stable-baseline.sh" \
+    "$refresh_session" lost-sync 2>/dev/null || true
+
+  local ack_check
+  ack_check=$(python3 -c "
+import json
+with open('$refresh_session/metrics/alarm-acknowledgments.json') as f:
+    data = json.load(f)
+print('yes' if 'lost-sync' in data.get('alarms', {}) else 'no')
+" 2>/dev/null) || ack_check="error"
+
+  if [[ "$ack_check" == "no" ]]; then
+    tap_ok "refresh: auto-revokes matching acknowledgment"
+  else
+    tap_not_ok "refresh: auto-revokes matching acknowledgment" "result: $ack_check"
+  fi
+
+  # Test: refresh with invalid alarm name
+  local refresh_invalid_out
+  refresh_invalid_out=$("$REPO_ROOT/scripts/dev/refresh-stable-baseline.sh" \
+    "$refresh_session" "nonexistent-alarm" 2>&1) || true
+
+  if echo "$refresh_invalid_out" | grep -q "not found in catalog"; then
+    tap_ok "refresh: rejects alarm not in catalog"
+  else
+    tap_not_ok "refresh: rejects alarm not in catalog" "output: $refresh_invalid_out"
+  fi
+
+  # Test: refresh with missing baseline files → no error
+  local refresh_empty_session="$replay_root/refresh-empty"
+  mkdir -p "$refresh_empty_session/metrics"
+  local refresh_missing_out
+  refresh_missing_out=$("$REPO_ROOT/scripts/dev/refresh-stable-baseline.sh" \
+    "$refresh_empty_session" lost-sync 2>&1) || true
+
+  if echo "$refresh_missing_out" | grep -q "file not found"; then
+    tap_ok "refresh: missing baseline files handled gracefully"
+  else
+    tap_not_ok "refresh: missing baseline files handled gracefully" "output: $refresh_missing_out"
+  fi
+
+  rm -rf "$refresh_session" "$refresh_empty_session"
 }
 check_skill_structure
 run_tests

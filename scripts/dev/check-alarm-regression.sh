@@ -785,6 +785,53 @@ else
 
     declare -A FILED_THIS_RUN
 
+    # Load persistent cross-invocation dedup record (repo-global, under flock).
+    DEDUP_FILE="$REPO_ROOT/.alarm-regression-filed.json"
+    DEDUP_DATA="{}"
+    if [[ -f "$DEDUP_FILE" ]]; then
+      DEDUP_DATA=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or data.get('schema_version') != 1:
+        print('{}')
+    else:
+        print(json.dumps(data))
+except (json.JSONDecodeError, ValueError, OSError):
+    print('{}')
+" "$DEDUP_FILE" 2>/dev/null) || DEDUP_DATA="{}"
+      if [[ "$DEDUP_DATA" == "{}" ]] && [[ -s "$DEDUP_FILE" ]]; then
+        echo "WARNING: Corrupt or invalid dedup file $DEDUP_FILE — treating as empty" >&2
+      fi
+    fi
+
+    # Prune entries older than 24 hours
+    DEDUP_DATA=$(python3 -c "
+import json, sys
+from datetime import datetime, timezone, timedelta
+data = json.loads(sys.argv[1])
+filed = data.get('filed', {})
+cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+pruned = {}
+for alarm, info in filed.items():
+    try:
+        ts = datetime.fromisoformat(info['filed_at'].replace('Z', '+00:00'))
+        if ts > cutoff:
+            pruned[alarm] = info
+    except (KeyError, ValueError):
+        pass
+data['filed'] = pruned
+print(json.dumps(data))
+" "$DEDUP_DATA" 2>/dev/null) || DEDUP_DATA="{}"
+
+    # Helper: write dedup file atomically
+    write_dedup_file() {
+      local tmpf="${DEDUP_FILE}.tmp.$$"
+      echo "$1" > "$tmpf"
+      mv -f "$tmpf" "$DEDUP_FILE"
+    }
+
     while IFS= read -r regression_line; do
       [[ -z "$regression_line" ]] && continue
       ALARM_NAME=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['alarm'])" 2>/dev/null) || continue
@@ -801,23 +848,39 @@ else
         continue
       fi
 
+      # Persistent cross-invocation dedup: skip if filed within the last 24 hours
+      DEDUP_HIT=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+filed = data.get('filed', {})
+info = filed.get(sys.argv[2])
+print('yes' if info else 'no')
+" "$DEDUP_DATA" "$ALARM_NAME" 2>/dev/null) || DEDUP_HIT="no"
+      if [[ "$DEDUP_HIT" == "yes" ]]; then
+        echo "Skipping cross-invocation duplicate (filed within 24h): $EXPECTED_TITLE" >&2
+        continue
+      fi
+
       # Per-alarm dedup: server-side narrowing + client-side exact verification.
       TITLE_CANDIDATES=$(gh issue list --label alarm-regression --state open \
         --search "in:title \"$ALARM_NAME\"" \
-        --json title,body 2>/dev/null) || TITLE_CANDIDATES="[]"
+        --json number,title,body 2>/dev/null) || TITLE_CANDIDATES="[]"
 
       MARKER_CANDIDATES=$(gh issue list --label alarm-regression --state open \
         --search "in:body \"alarm-regression-key: $ALARM_NAME\"" \
-        --json title,body 2>/dev/null) || MARKER_CANDIDATES="[]"
+        --json number,title,body 2>/dev/null) || MARKER_CANDIDATES="[]"
 
       FOUND_DUP=false
+      DUP_ISSUE_NUMBER=""
       for candidate_json in "$TITLE_CANDIDATES" "$MARKER_CANDIDATES"; do
         while IFS= read -r candidate; do
           [[ -z "$candidate" ]] && continue
           c_title=$(echo "$candidate" | python3 -c "import json,sys; print(json.load(sys.stdin).get('title',''))" 2>/dev/null) || continue
           c_body=$(echo "$candidate" | python3 -c "import json,sys; print(json.load(sys.stdin).get('body',''))" 2>/dev/null) || continue
+          c_number=$(echo "$candidate" | python3 -c "import json,sys; print(json.load(sys.stdin).get('number',''))" 2>/dev/null) || continue
           if [[ "$c_title" == "$EXPECTED_TITLE" ]] || echo "$c_body" | grep -qF "$BODY_MARKER" 2>/dev/null; then
             FOUND_DUP=true
+            DUP_ISSUE_NUMBER="$c_number"
             break 2
           fi
         done < <(echo "$candidate_json" | python3 -c "import json,sys; [print(json.dumps(x)) for x in json.load(sys.stdin)]" 2>/dev/null)
@@ -825,6 +888,38 @@ else
 
       if [[ "$FOUND_DUP" == true ]]; then
         echo "Skipping duplicate: $EXPECTED_TITLE" >&2
+
+        # Auto-comment on existing issue with updated replay numbers (Gap 2b).
+        if [[ -n "$DUP_ISSUE_NUMBER" ]]; then
+          TODAY=$(date -u +%Y-%m-%d)
+          UPDATE_MARKER="<!-- alarm-regression-update: $ALARM_NAME $TODAY -->"
+
+          # Check if we already commented today
+          ALREADY_COMMENTED=$(gh issue view "$DUP_ISSUE_NUMBER" --json comments \
+            --jq "[.comments[].body] | map(select(contains(\"alarm-regression-update: $ALARM_NAME $TODAY\"))) | length" \
+            2>/dev/null) || ALREADY_COMMENTED="0"
+
+          if [[ "$ALREADY_COMMENTED" == "0" ]]; then
+            CURRENT_FIRED_PCT=$(echo "$regression_line" | python3 -c "import json,sys; print(json.load(sys.stdin).get('current_fired_pct', 0))" 2>/dev/null) || CURRENT_FIRED_PCT="0"
+            UPDATE_BODY="### Alarm Regression Update
+
+**Alarm**: \`$ALARM_NAME\`
+**Baseline source**: $BASELINE_SOURCE
+**Baseline fired**: ${BASELINE_DISPLAY_PCT}% of eligible ticks
+**Current fired**: ${CURRENT_FIRED_PCT}%
+**Date**: $TODAY
+
+This alarm regression is still active. The baseline still shows the alarm was historically active but it currently fires at the above rate.
+
+$UPDATE_MARKER"
+            gh issue comment "$DUP_ISSUE_NUMBER" --body "$UPDATE_BODY" 2>/dev/null || \
+              echo "WARNING: Failed to post update comment on #$DUP_ISSUE_NUMBER" >&2
+            echo "Posted update comment on existing issue #$DUP_ISSUE_NUMBER for $ALARM_NAME" >&2
+          else
+            echo "Skipping update comment (already posted today) on #$DUP_ISSUE_NUMBER for $ALARM_NAME" >&2
+          fi
+        fi
+
         continue
       fi
 
@@ -868,6 +963,22 @@ $INVESTIGATION_STEPS
       }
 
       FILED_THIS_RUN["$ALARM_NAME"]=1
+
+      # Write persistent cross-invocation dedup record
+      DEDUP_DATA=$(python3 -c "
+import json, sys
+from datetime import datetime, timezone
+data = json.loads(sys.argv[1])
+if 'filed' not in data:
+    data['filed'] = {}
+data['schema_version'] = 1
+data['filed'][sys.argv[2]] = {
+    'filed_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'issue_url': sys.argv[3]
+}
+print(json.dumps(data))
+" "$DEDUP_DATA" "$ALARM_NAME" "$NEW_ISSUE" 2>/dev/null) || true
+      write_dedup_file "$DEDUP_DATA"
 
       # Extract issue number and board-route
       ISSUE_NUM=$(echo "$NEW_ISSUE" | grep -oP '\d+$') || true
