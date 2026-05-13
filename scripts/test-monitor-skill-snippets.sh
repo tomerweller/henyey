@@ -4878,14 +4878,18 @@ import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
 p = d.get('provenance', {})
-# Verify provenance exists with correct checksum (recreated from current data)
+# Verify provenance exists with correct checksum
 has_prov = isinstance(p, dict) and 'catalog_checksum' in p
-print('yes' if has_prov else 'no')
+# Verify alarm data is preserved from original (firing=20), not recreated from current (firing=0)
+alarms = d.get('alarms', {})
+ls = alarms.get('lost-sync', {})
+preserved = ls.get('firing') == 20
+print('yes' if has_prov and preserved else 'no')
 " "$prov_t4/metrics/replay-baseline-stable.json" 2>/dev/null) || prov_legacy_recreated="no"
-  if echo "$prov_t4_out" | grep -q "Recreating.*missing or invalid provenance" && [[ "$prov_legacy_recreated" == "yes" ]]; then
-    tap_ok "provenance: legacy baseline recreated with provenance"
+  if echo "$prov_t4_out" | grep -q "Migrating.*injecting provenance" && [[ "$prov_legacy_recreated" == "yes" ]]; then
+    tap_ok "provenance: legacy baseline migrated with provenance (alarm data preserved)"
   else
-    tap_not_ok "provenance: legacy baseline recreated with provenance" "output: $prov_t4_out, recreated: $prov_legacy_recreated"
+    tap_not_ok "provenance: legacy baseline migrated with provenance (alarm data preserved)" "output: $prov_t4_out, result: $prov_legacy_recreated"
   fi
 
   # Test: Malformed provenance — treated as legacy
@@ -4904,12 +4908,18 @@ import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
 p = d.get('provenance', {})
-print('yes' if isinstance(p, dict) and 'catalog_checksum' in p else 'no')
+# Verify provenance is a proper dict with checksum
+has_prov = isinstance(p, dict) and 'catalog_checksum' in p
+# Verify alarm data preserved (firing=20 from original, not 0 from current)
+alarms = d.get('alarms', {})
+ls = alarms.get('lost-sync', {})
+preserved = ls.get('firing') == 20
+print('yes' if has_prov and preserved else 'no')
 " "$prov_t5/metrics/replay-baseline-stable.json" 2>/dev/null) || prov_malformed_fixed="no"
   if [[ "$prov_malformed_fixed" == "yes" ]]; then
-    tap_ok "provenance: malformed provenance treated as legacy and fixed"
+    tap_ok "provenance: malformed provenance treated as legacy and fixed (alarm data preserved)"
   else
-    tap_not_ok "provenance: malformed provenance treated as legacy and fixed" "output: $prov_t5_out"
+    tap_not_ok "provenance: malformed provenance treated as legacy and fixed (alarm data preserved)" "output: $prov_t5_out"
   fi
 
   # Test: Rolling baseline gets provenance on update

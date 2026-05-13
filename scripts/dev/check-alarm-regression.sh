@@ -244,6 +244,27 @@ if isinstance(p, dict):
 " "$1" 2>/dev/null || true
 }
 
+# Helper: inject provenance into an existing baseline file, preserving its
+# alarm data. Used for legacy/malformed baselines where the alarm payload is
+# still valid signal. Writes atomically via tmp+mv.
+inject_provenance() {
+  local baseline_file="$1"
+  local tmp_file="${baseline_file}.tmp.$$"
+  python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+d['provenance'] = {
+    'created_at': sys.argv[2],
+    'created_commit': sys.argv[3],
+    'catalog_checksum': sys.argv[4]
+}
+with open(sys.argv[5], 'w') as f:
+    json.dump(d, f)
+" "$baseline_file" "$PROVENANCE_TIMESTAMP" "$PROVENANCE_COMMIT" "$CATALOG_CHECKSUM" "$tmp_file"
+  mv -f "$tmp_file" "$baseline_file"
+}
+
 # Helper: check a baseline's catalog checksum and invalidate/migrate if needed.
 # $1 = baseline file path, $2 = label (for logging)
 maybe_invalidate_baseline() {
@@ -263,12 +284,13 @@ maybe_invalidate_baseline() {
       return 0
     fi
   else
-    # No provenance or malformed — cannot trust this baseline matches the
-    # current catalog. Recreate from current replay data to establish a
-    # known-good baseline. This is safer than preserving old alarm data
-    # that may reflect a different catalog version.
-    echo "Recreating $label baseline: missing or invalid provenance" >&2
-    create_baseline "$baseline_file"
+    # No provenance or malformed — legacy baseline with potentially valid alarm
+    # data. Preserve the alarm payload and stamp with current provenance to
+    # establish a known state going forward. If the catalog truly changed since
+    # this baseline was created, the next catalog change will trigger proper
+    # invalidation via the checksum-mismatch path above.
+    echo "Migrating $label baseline: injecting provenance into existing data" >&2
+    inject_provenance "$baseline_file"
     return 0
   fi
 }
