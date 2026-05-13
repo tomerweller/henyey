@@ -20,7 +20,8 @@
 # Usage:
 #   scripts/dev/check-alarm-regression.sh SESSION_DIR [--current FILE] \
 #       [--baseline FILE] [--stable-baseline FILE] [--catalog FILE] \
-#       [--force-baseline-update]
+#       [--force-baseline-update] [--acknowledge ALARM --ack-rationale TEXT] \
+#       [--revoke-acknowledgment ALARM] [--list-acknowledgments]
 #
 # If --current is omitted, runs replay-alarms-on-history.sh --replay --json
 # internally. If --baseline is omitted, defaults to $METRICS_DIR/replay-baseline.json.
@@ -33,9 +34,17 @@
 #   a legitimate improvement (e.g., alarm went silent because the underlying
 #   condition was fixed).
 #
+# --acknowledge ALARM_NAME: Record one alarm as acknowledged. Requires
+#   --ack-rationale. Optional: --ack-issue NUMBER.
+# --revoke-acknowledgment ALARM_NAME: Remove one acknowledgment.
+# --list-acknowledgments: Print current acknowledgments.
+#
+# These three modes are mutually exclusive with each other and with
+# --force-baseline-update. They short-circuit before replay/baseline logic.
+#
 # Exit codes:
 #   0 — success (regressions are informational, not failures)
-#   2 — fatal error (missing/invalid catalog, schema mismatch, corrupt baseline)
+#   2 — fatal error (missing/invalid catalog, schema mismatch, corrupt baseline/ack file)
 # Stdout: JSON array of regression objects (empty [] if none).
 
 set -euo pipefail
@@ -49,6 +58,11 @@ BASELINE_FILE=""
 STABLE_BASELINE_FILE=""
 CATALOG_FILE=""
 FORCE_BASELINE_UPDATE=false
+ACKNOWLEDGE_ALARM=""
+REVOKE_ALARM=""
+LIST_ACKS=false
+ACK_RATIONALE=""
+ACK_ISSUE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -88,6 +102,42 @@ while [[ $# -gt 0 ]]; do
       FORCE_BASELINE_UPDATE=true
       shift
       ;;
+    --acknowledge)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --acknowledge requires an alarm name argument" >&2
+        exit 1
+      fi
+      ACKNOWLEDGE_ALARM="$2"
+      shift 2
+      ;;
+    --revoke-acknowledgment)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --revoke-acknowledgment requires an alarm name argument" >&2
+        exit 1
+      fi
+      REVOKE_ALARM="$2"
+      shift 2
+      ;;
+    --list-acknowledgments)
+      LIST_ACKS=true
+      shift
+      ;;
+    --ack-rationale)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --ack-rationale requires a text argument" >&2
+        exit 1
+      fi
+      ACK_RATIONALE="$2"
+      shift 2
+      ;;
+    --ack-issue)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --ack-issue requires a number argument" >&2
+        exit 1
+      fi
+      ACK_ISSUE="$2"
+      shift 2
+      ;;
     *)
       if [[ -z "$SESSION_DIR" ]]; then
         SESSION_DIR="$1"
@@ -99,6 +149,32 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Mutual exclusion check for modes
+MODE_COUNT=0
+[[ "$FORCE_BASELINE_UPDATE" == true ]] && ((MODE_COUNT++)) || true
+[[ -n "$ACKNOWLEDGE_ALARM" ]] && ((MODE_COUNT++)) || true
+[[ -n "$REVOKE_ALARM" ]] && ((MODE_COUNT++)) || true
+[[ "$LIST_ACKS" == true ]] && ((MODE_COUNT++)) || true
+if [[ "$MODE_COUNT" -gt 1 ]]; then
+  echo "ERROR: --force-baseline-update, --acknowledge, --revoke-acknowledgment, and --list-acknowledgments are mutually exclusive" >&2
+  exit 1
+fi
+
+# Validate --acknowledge requirements
+if [[ -n "$ACKNOWLEDGE_ALARM" ]]; then
+  TRIMMED_RATIONALE=$(echo "$ACK_RATIONALE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  if [[ -z "$TRIMMED_RATIONALE" ]]; then
+    echo "ERROR: --acknowledge requires --ack-rationale with non-empty text" >&2
+    exit 1
+  fi
+  if [[ -n "$ACK_ISSUE" ]]; then
+    if ! [[ "$ACK_ISSUE" =~ ^[0-9]+$ ]] || [[ "$ACK_ISSUE" -le 0 ]]; then
+      echo "ERROR: --ack-issue must be a positive integer" >&2
+      exit 1
+    fi
+  fi
+fi
 
 if [[ -z "$SESSION_DIR" ]]; then
   echo "ERROR: SESSION_DIR is required as first positional argument" >&2
@@ -138,7 +214,177 @@ CATALOG_CHECKSUM=$(sha256sum "$CATALOG_FILE" | cut -d' ' -f1)
 PROVENANCE_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")
 PROVENANCE_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-# Get current replay JSON if not provided
+ACK_FILE="$METRICS_DIR/alarm-acknowledgments.json"
+ACK_LOCK="$METRICS_DIR/alarm-acknowledgments.lock"
+
+# Helper: load and validate the acknowledgment file.
+# Prints the JSON content to stdout. If the file is missing, prints empty default.
+# If malformed or wrong schema_version, exits 2.
+# Does NOT handle catalog provenance — caller must do that.
+load_ack_file() {
+  if [[ ! -f "$ACK_FILE" ]]; then
+    echo '{"schema_version":1,"catalog_checksum":"","alarms":{}}'
+    return 0
+  fi
+  python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+except (json.JSONDecodeError, ValueError, OSError):
+    print('ERROR: Acknowledgment file is not valid JSON: ' + sys.argv[1], file=sys.stderr)
+    sys.exit(2)
+if data.get('schema_version') != 1:
+    print('ERROR: Acknowledgment file has unexpected schema_version', file=sys.stderr)
+    sys.exit(2)
+if not isinstance(data.get('alarms'), dict):
+    print('ERROR: Acknowledgment file missing alarms object', file=sys.stderr)
+    sys.exit(2)
+print(json.dumps(data))
+" "$ACK_FILE" || exit 2
+}
+
+# Helper: write acknowledgment file atomically via tmp+mv.
+# Reads JSON from stdin.
+write_ack_file() {
+  local tmpout="${ACK_FILE}.tmp.$$"
+  cat > "$tmpout"
+  mv -f "$tmpout" "$ACK_FILE"
+}
+
+# Helper: check catalog provenance on ack data and invalidate if needed.
+# Reads ack JSON from stdin, prints (possibly invalidated) JSON to stdout.
+# If invalidation occurs, also writes the invalidated file (under flock from caller).
+check_ack_provenance() {
+  python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+current_checksum = sys.argv[1]
+stored_checksum = data.get('catalog_checksum', '')
+if stored_checksum and stored_checksum != current_checksum:
+    n = len(data.get('alarms', {}))
+    if n > 0:
+        print('Acknowledgment file invalidated: alarm catalog changed (was %s..., now %s...)' % (stored_checksum[:12], current_checksum[:12]), file=sys.stderr)
+    data['alarms'] = {}
+    data['catalog_checksum'] = current_checksum
+    # Write invalidated file
+    with open(sys.argv[2], 'w') as f:
+        json.dump(data, f)
+elif not stored_checksum:
+    data['catalog_checksum'] = current_checksum
+print(json.dumps(data))
+" "$CATALOG_CHECKSUM" "$ACK_FILE"
+}
+
+# Helper: validate alarm name exists in catalog. Exit 2 if not.
+validate_catalog_alarm() {
+  local alarm_name="$1"
+  python3 -c "
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], 'rb') as f:
+    catalog = tomllib.load(f)
+valid = {a['name'] for a in catalog.get('alarm', [])}
+if sys.argv[2] not in valid:
+    print('ERROR: Alarm \"%s\" not found in catalog' % sys.argv[2], file=sys.stderr)
+    sys.exit(2)
+" "$CATALOG_FILE" "$alarm_name" || exit 2
+}
+
+# ── Acknowledgment mode short-circuits ───────────────────────────────────
+
+if [[ -n "$ACKNOWLEDGE_ALARM" ]]; then
+  mkdir -p "$METRICS_DIR"
+  validate_catalog_alarm "$ACKNOWLEDGE_ALARM"
+  (
+    flock -w 30 9 || { echo "ERROR: Could not acquire acknowledgment lock" >&2; exit 2; }
+    ACK_JSON=$(load_ack_file | check_ack_provenance)
+    ACK_JSON=$(echo "$ACK_JSON" | python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+alarm_name = sys.argv[1]
+rationale = sys.argv[2]
+commit = sys.argv[3]
+timestamp = sys.argv[4]
+issue = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
+entry = {
+    'acknowledged_at': timestamp,
+    'acknowledged_commit': commit,
+    'rationale': rationale,
+}
+if issue:
+    entry['issue'] = int(issue)
+data['alarms'][alarm_name] = entry
+data['catalog_checksum'] = sys.argv[6]
+print(json.dumps(data))
+" "$ACKNOWLEDGE_ALARM" "$ACK_RATIONALE" "$PROVENANCE_COMMIT" "$PROVENANCE_TIMESTAMP" "$ACK_ISSUE" "$CATALOG_CHECKSUM")
+    echo "$ACK_JSON" | write_ack_file
+  ) 9>"$ACK_LOCK"
+  echo "Acknowledged alarm: $ACKNOWLEDGE_ALARM" >&2
+  exit 0
+fi
+
+if [[ -n "$REVOKE_ALARM" ]]; then
+  if [[ ! -d "$METRICS_DIR" ]] || [[ ! -f "$ACK_FILE" ]]; then
+    echo "No acknowledgment found for: $REVOKE_ALARM" >&2
+    exit 0
+  fi
+  (
+    flock -w 30 9 || { echo "ERROR: Could not acquire acknowledgment lock" >&2; exit 2; }
+    ACK_JSON=$(load_ack_file | check_ack_provenance)
+    FOUND=$(echo "$ACK_JSON" | python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+print('yes' if sys.argv[1] in data.get('alarms', {}) else 'no')
+" "$REVOKE_ALARM")
+    NEW_JSON=$(echo "$ACK_JSON" | python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+data['alarms'].pop(sys.argv[1], None)
+print(json.dumps(data))
+" "$REVOKE_ALARM")
+    echo "$NEW_JSON" | write_ack_file
+    if [[ "$FOUND" == "yes" ]]; then
+      echo "Revoked acknowledgment: $REVOKE_ALARM" >&2
+    else
+      echo "No acknowledgment found for: $REVOKE_ALARM" >&2
+    fi
+  ) 9>"$ACK_LOCK"
+  exit 0
+fi
+
+if [[ "$LIST_ACKS" == true ]]; then
+  if [[ ! -d "$METRICS_DIR" ]] || [[ ! -f "$ACK_FILE" ]]; then
+    echo "No acknowledgments."
+    exit 0
+  fi
+  # Validate the ack file first (outside subshell so exit 2 propagates directly)
+  ACK_JSON=$(load_ack_file)
+  # Check provenance and write back if needed (under lock)
+  ACK_JSON=$(echo "$ACK_JSON" | (
+    flock -w 30 9 || { echo "ERROR: Could not acquire acknowledgment lock" >&2; exit 2; }
+    check_ack_provenance | tee >(write_ack_file) | cat
+  ) 9>"$ACK_LOCK")
+  python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+alarms = data.get('alarms', {})
+if not alarms:
+    print('No acknowledgments.')
+    sys.exit(0)
+for name, meta in sorted(alarms.items()):
+    issue_str = ' (issue #%s)' % meta['issue'] if 'issue' in meta else ''
+    print('  %s: %s [%s, %s%s]' % (
+        name, meta.get('rationale', ''), meta.get('acknowledged_at', '?'),
+        meta.get('acknowledged_commit', '?')[:12], issue_str))
+" <<< "$ACK_JSON"
+  exit 0
+fi
+
+# ── Normal regression detection continues below ─────────────────────────
 if [[ -z "$CURRENT_FILE" ]]; then
   CURRENT_JSON=$("$REPLAY_SCRIPT" "$SESSION_DIR" --replay --json 2>/dev/null) || {
     echo "ERROR: Failed to run replay" >&2
@@ -353,6 +599,20 @@ fi
 maybe_invalidate_baseline "$BASELINE_FILE" "Rolling"
 maybe_invalidate_baseline "$STABLE_BASELINE_FILE" "Stable"
 
+# Load acknowledgments for regression filtering (read-only — no writes to ack file)
+ACK_SET_JSON="{}"
+if [[ -f "$ACK_FILE" ]]; then
+  ACK_DATA=$(load_ack_file) || exit 2
+  # Check catalog provenance: if mismatch, treat as empty (read-only, no write)
+  STORED_ACK_CHECKSUM=$(echo "$ACK_DATA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('catalog_checksum',''))" 2>/dev/null)
+  if [[ -n "$STORED_ACK_CHECKSUM" ]] && [[ "$STORED_ACK_CHECKSUM" != "$CATALOG_CHECKSUM" ]]; then
+    echo "Acknowledgment catalog mismatch — treating all acknowledgments as stale for this run" >&2
+    ACK_SET_JSON="{}"
+  else
+    ACK_SET_JSON=$(echo "$ACK_DATA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('alarms',{})))" 2>/dev/null) || ACK_SET_JSON="{}"
+  fi
+fi
+
 # Run dual comparison
 set +e
 REGRESSION_OUTPUT=$(python3 -c "
@@ -367,6 +627,7 @@ rolling_file = sys.argv[1]
 stable_file = sys.argv[2]
 current_json_str = sys.argv[3]
 catalog_path = sys.argv[4]
+ack_set_str = sys.argv[5]
 
 # Load alarm catalog
 with open(catalog_path, 'rb') as f:
@@ -375,6 +636,9 @@ valid_alarms = {a['name'] for a in catalog.get('alarm', [])}
 if not valid_alarms:
     print('ERROR: Catalog has no alarm entries', file=sys.stderr)
     sys.exit(2)
+
+# Load acknowledged alarms
+acknowledged = set(json.loads(ack_set_str).keys())
 
 with open(rolling_file) as f:
     rolling = json.load(f)
@@ -400,6 +664,9 @@ def compare_baseline(baseline_data, source_label):
 
     for alarm_name, b_counts in baseline_alarms.items():
         if alarm_name not in valid_alarms:
+            continue
+
+        if alarm_name in acknowledged:
             continue
 
         b_eligible = baseline_evaluated - b_counts.get('skip', 0) - b_counts.get('baseline', 0)
@@ -453,8 +720,13 @@ for r in rolling_regressions:
 for r in stable_regressions:
     merged[r['alarm']] = r  # stable wins
 
+# Log acknowledged alarms that were skipped (deduplicated across both baselines)
+if acknowledged:
+    for name in sorted(acknowledged):
+        print('Acknowledged alarm skipped: %s' % name, file=sys.stderr)
+
 print(json.dumps(list(merged.values())))
-" "$BASELINE_FILE" "$STABLE_BASELINE_FILE" "$CURRENT_JSON" "$CATALOG_FILE")
+" "$BASELINE_FILE" "$STABLE_BASELINE_FILE" "$CURRENT_JSON" "$CATALOG_FILE" "$ACK_SET_JSON")
 COMPARE_EXIT=$?
 set -e
 

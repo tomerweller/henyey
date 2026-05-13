@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=224
+TAP_PLAN=243
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -5142,6 +5142,257 @@ else:
   fi
 
   rm -rf "$fbu_root"
+
+  # ── check-alarm-regression.sh per-alarm acknowledgment tests (#2627) ────
+
+  local ack_root
+  ack_root=$(mktemp -d)
+  local ack_session="$ack_root/session"
+  mkdir -p "$ack_session/metrics"
+  local catalog_for_ack="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
+  local catalog_for_ack_checksum
+  catalog_for_ack_checksum=$(sha256sum "$catalog_for_ack" | cut -d' ' -f1)
+
+  # Create baseline with lost-sync firing
+  local ack_baseline
+  ack_baseline=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2]}
+print(json.dumps(d))
+" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}' "$catalog_for_ack_checksum")
+  echo "$ack_baseline" > "$ack_session/metrics/replay-baseline.json"
+  echo "$ack_baseline" > "$ack_session/metrics/replay-baseline-stable.json"
+
+  # Current where lost-sync has regressed to 0
+  local ack_regressed='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$ack_regressed" > "$ack_session/metrics/ack-regressed.json"
+
+  # Test: --acknowledge happy path
+  local ack_out1
+  ack_out1=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --acknowledge lost-sync --ack-rationale "Fixed in PR #2616" \
+    --catalog "$catalog_for_ack" 2>&1) || true
+  if echo "$ack_out1" | grep -q "Acknowledged alarm: lost-sync" && \
+     [[ -f "$ack_session/metrics/alarm-acknowledgments.json" ]]; then
+    tap_ok "ack: acknowledge happy path creates file"
+  else
+    tap_not_ok "ack: acknowledge happy path creates file" "output: $ack_out1"
+  fi
+
+  # Test: ack file has correct metadata
+  local ack_meta
+  ack_meta=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+a = d['alarms']['lost-sync']
+ok = (a.get('rationale') == 'Fixed in PR #2616' and
+      'acknowledged_at' in a and
+      'acknowledged_commit' in a and
+      d.get('schema_version') == 1)
+print('ok' if ok else 'fail')
+" "$ack_session/metrics/alarm-acknowledgments.json" 2>/dev/null) || ack_meta="error"
+  if [[ "$ack_meta" == "ok" ]]; then
+    tap_ok "ack: ack file contains correct metadata"
+  else
+    tap_not_ok "ack: ack file contains correct metadata" "meta=$ack_meta"
+  fi
+
+  # Test: --acknowledge with --ack-issue
+  local ack_out_issue
+  ack_out_issue=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --acknowledge lost-sync --ack-rationale "Updated" --ack-issue 2616 \
+    --catalog "$catalog_for_ack" 2>&1) || true
+  local ack_issue_val
+  ack_issue_val=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+print(d['alarms']['lost-sync'].get('issue', ''))
+" "$ack_session/metrics/alarm-acknowledgments.json" 2>/dev/null) || ack_issue_val=""
+  if [[ "$ack_issue_val" == "2616" ]]; then
+    tap_ok "ack: --ack-issue stores issue number"
+  else
+    tap_not_ok "ack: --ack-issue stores issue number" "got: $ack_issue_val"
+  fi
+
+  # Test: --acknowledge non-catalog alarm exits 2
+  local ack_out_bad
+  local ack_bad_exit=0
+  ack_out_bad=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --acknowledge fake-alarm-xyz --ack-rationale "test" \
+    --catalog "$catalog_for_ack" 2>&1) || ack_bad_exit=$?
+  if [[ "$ack_bad_exit" -eq 2 ]] && echo "$ack_out_bad" | grep -q "not found in catalog"; then
+    tap_ok "ack: non-catalog alarm exits 2"
+  else
+    tap_not_ok "ack: non-catalog alarm exits 2" "exit=$ack_bad_exit output: $ack_out_bad"
+  fi
+
+  # Test: --acknowledge without --ack-rationale exits 1
+  local ack_out_norat
+  local ack_norat_exit=0
+  ack_out_norat=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --acknowledge lost-sync \
+    --catalog "$catalog_for_ack" 2>&1) || ack_norat_exit=$?
+  if [[ "$ack_norat_exit" -eq 1 ]] && echo "$ack_out_norat" | grep -q "requires --ack-rationale"; then
+    tap_ok "ack: without rationale exits 1"
+  else
+    tap_not_ok "ack: without rationale exits 1" "exit=$ack_norat_exit output: $ack_out_norat"
+  fi
+
+  # Test: --acknowledge with empty rationale exits 1
+  local ack_out_empty
+  local ack_empty_exit=0
+  ack_out_empty=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --acknowledge lost-sync --ack-rationale "   " \
+    --catalog "$catalog_for_ack" 2>&1) || ack_empty_exit=$?
+  if [[ "$ack_empty_exit" -eq 1 ]]; then
+    tap_ok "ack: empty rationale exits 1"
+  else
+    tap_not_ok "ack: empty rationale exits 1" "exit=$ack_empty_exit"
+  fi
+
+  # Test: acknowledged alarm excluded from regression detection
+  local ack_detect_out
+  ack_detect_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --current "$ack_session/metrics/ack-regressed.json" \
+    --catalog "$catalog_for_ack" 2>&1) || true
+  local ack_detect_json
+  ack_detect_json=$(echo "$ack_detect_out" | grep '^\[' | head -1)
+  local ack_has_lostsync
+  ack_has_lostsync=$(echo "$ack_detect_json" | grep -c '"lost-sync"' 2>/dev/null) || ack_has_lostsync=0
+  if [[ "$ack_has_lostsync" -eq 0 ]] && echo "$ack_detect_out" | grep -q "Acknowledged alarm skipped: lost-sync"; then
+    tap_ok "ack: acknowledged alarm excluded from regression detection"
+  else
+    tap_not_ok "ack: acknowledged alarm excluded from regression detection" \
+      "lostsync=$ack_has_lostsync output: ${ack_detect_out:0:300}"
+  fi
+
+  # Test: --list-acknowledgments shows entry
+  local ack_list_out
+  ack_list_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --list-acknowledgments --catalog "$catalog_for_ack" 2>&1) || true
+  if echo "$ack_list_out" | grep -q "lost-sync" && echo "$ack_list_out" | grep -q "Updated"; then
+    tap_ok "ack: list shows alarm and rationale"
+  else
+    tap_not_ok "ack: list shows alarm and rationale" "output: $ack_list_out"
+  fi
+
+  # Test: --list-acknowledgments with no acks
+  local ack_list_empty_session="$ack_root/empty-session"
+  mkdir -p "$ack_list_empty_session/metrics"
+  local ack_list_empty_out
+  ack_list_empty_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_list_empty_session" --list-acknowledgments --catalog "$catalog_for_ack" 2>&1) || true
+  if echo "$ack_list_empty_out" | grep -q "No acknowledgments."; then
+    tap_ok "ack: list with no acks shows message"
+  else
+    tap_not_ok "ack: list with no acks shows message" "output: $ack_list_empty_out"
+  fi
+
+  # Test: --revoke-acknowledgment removes entry and re-enables detection
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --revoke-acknowledgment lost-sync --catalog "$catalog_for_ack" 2>/dev/null || true
+  local ack_revoke_detect_out
+  # Re-establish baselines (rolling was updated during earlier ack test)
+  echo "$ack_baseline" > "$ack_session/metrics/replay-baseline.json"
+  echo "$ack_baseline" > "$ack_session/metrics/replay-baseline-stable.json"
+  ack_revoke_detect_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --current "$ack_session/metrics/ack-regressed.json" \
+    --catalog "$catalog_for_ack" 2>&1) || true
+  local ack_revoke_json
+  ack_revoke_json=$(echo "$ack_revoke_detect_out" | grep '^\[' | head -1)
+  local ack_revoke_lostsync
+  ack_revoke_lostsync=$(echo "$ack_revoke_json" | grep -c '"lost-sync"' 2>/dev/null) || ack_revoke_lostsync=0
+  if [[ "$ack_revoke_lostsync" -ge 1 ]]; then
+    tap_ok "ack: revoke re-enables regression detection"
+  else
+    tap_not_ok "ack: revoke re-enables regression detection" \
+      "lostsync=$ack_revoke_lostsync output: ${ack_revoke_detect_out:0:300}"
+  fi
+
+  # Test: --revoke-acknowledgment not found
+  local ack_revoke_nf_out
+  ack_revoke_nf_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --revoke-acknowledgment nonexistent --catalog "$catalog_for_ack" 2>&1) || true
+  local ack_revoke_nf_exit=$?
+  if echo "$ack_revoke_nf_out" | grep -q "No acknowledgment found for: nonexistent"; then
+    tap_ok "ack: revoke not-found warns"
+  else
+    tap_not_ok "ack: revoke not-found warns" "output: $ack_revoke_nf_out"
+  fi
+
+  # Test: malformed ack file during detection exits 2
+  echo "NOT JSON" > "$ack_session/metrics/alarm-acknowledgments.json"
+  local ack_malformed_out
+  local ack_malformed_exit=0
+  ack_malformed_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --current "$ack_session/metrics/ack-regressed.json" \
+    --catalog "$catalog_for_ack" 2>&1) || ack_malformed_exit=$?
+  if [[ "$ack_malformed_exit" -eq 2 ]]; then
+    tap_ok "ack: malformed ack file exits 2"
+  else
+    tap_not_ok "ack: malformed ack file exits 2" "exit=$ack_malformed_exit output: ${ack_malformed_out:0:200}"
+  fi
+
+  # Test: malformed ack file during --list exits 2
+  local ack_malformed_list_out
+  local ack_malformed_list_exit=0
+  ack_malformed_list_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --list-acknowledgments --catalog "$catalog_for_ack" 2>&1) || ack_malformed_list_exit=$?
+  if [[ "$ack_malformed_list_exit" -eq 2 ]]; then
+    tap_ok "ack: malformed ack file during list exits 2"
+  else
+    tap_not_ok "ack: malformed ack file during list exits 2" "exit=$ack_malformed_list_exit"
+  fi
+
+  # Test: mutual exclusion --acknowledge + --force-baseline-update
+  local ack_mutex_out
+  local ack_mutex_exit=0
+  ack_mutex_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --acknowledge lost-sync --force-baseline-update \
+    --ack-rationale "test" --catalog "$catalog_for_ack" 2>&1) || ack_mutex_exit=$?
+  if [[ "$ack_mutex_exit" -eq 1 ]] && echo "$ack_mutex_out" | grep -q "mutually exclusive"; then
+    tap_ok "ack: mutual exclusion rejects combined flags"
+  else
+    tap_not_ok "ack: mutual exclusion rejects combined flags" "exit=$ack_mutex_exit output: $ack_mutex_out"
+  fi
+
+  # Test: catalog change invalidates acks
+  # Create ack file with a different catalog checksum
+  echo '{"schema_version":1,"catalog_checksum":"stale_checksum_000","alarms":{"lost-sync":{"acknowledged_at":"2026-01-01T00:00:00Z","acknowledged_commit":"abc","rationale":"old"}}}' \
+    > "$ack_session/metrics/alarm-acknowledgments.json"
+  local ack_stale_out
+  ack_stale_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --list-acknowledgments --catalog "$catalog_for_ack" 2>&1) || true
+  if echo "$ack_stale_out" | grep -q "No acknowledgments." || echo "$ack_stale_out" | grep -q "invalidated"; then
+    tap_ok "ack: catalog change invalidates acknowledgments"
+  else
+    tap_not_ok "ack: catalog change invalidates acknowledgments" "output: $ack_stale_out"
+  fi
+
+  # Test: overwrite existing ack updates metadata
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --acknowledge lost-sync --ack-rationale "First reason" \
+    --catalog "$catalog_for_ack" 2>/dev/null || true
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --acknowledge lost-sync --ack-rationale "Second reason" \
+    --catalog "$catalog_for_ack" 2>/dev/null || true
+  local ack_overwrite_rat
+  ack_overwrite_rat=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+print(d['alarms']['lost-sync']['rationale'])
+" "$ack_session/metrics/alarm-acknowledgments.json" 2>/dev/null) || ack_overwrite_rat=""
+  if [[ "$ack_overwrite_rat" == "Second reason" ]]; then
+    tap_ok "ack: overwrite updates metadata"
+  else
+    tap_not_ok "ack: overwrite updates metadata" "rationale=$ack_overwrite_rat"
+  fi
+
+  rm -rf "$ack_root"
 
   # ── check-alarm-regression.sh dedup tests ──────────────────────────────────
   # Tests for issue #2608: duplicate issue filing due to stale dedup snapshot.
