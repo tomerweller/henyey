@@ -11,12 +11,12 @@
 //! - **Byte metrics**: Bytes read and written
 //! - **Error metrics**: Read and write errors
 //! - **Timeout metrics**: Idle and straggler timeouts
-//! - **Connection metrics**: Connection latency and throttling
-//! - **Receive timers**: Processing time per message type
+//! - **Connection metrics**: Pending and authenticated peer counts
 //! - **Send counters**: Counts per message type sent
-//! - **Queue metrics**: Outbound queue delays and drops
+//! - **Queue metrics**: Outbound queue drops
 //! - **Flood metrics**: Transaction flooding statistics
-//! - **Pull metrics**: Transaction pull latency
+//! - **Fetch metrics**: Item fetcher statistics
+//! - **Pull metrics**: Demand timeouts and pulled transaction counts
 //!
 //! # Thread Safety
 //!
@@ -212,12 +212,6 @@ impl Drop for TimerGuard<'_> {
 fn reset_counters(counters: &[&Counter]) {
     for counter in counters {
         counter.reset();
-    }
-}
-
-fn reset_timers(timers: &[&Timer]) {
-    for timer in timers {
-        timer.reset();
     }
 }
 
@@ -483,52 +477,10 @@ pub struct OverlayMetrics {
     pub timeouts_straggler: Counter,
 
     // ===== Connection Metrics =====
-    /// Connection establishment latency.
-    pub connection_latency: Timer,
-    /// Time spent throttled on reads.
-    pub connection_read_throttle: Timer,
-    /// Time spent throttled on flood messages.
-    pub connection_flood_throttle: Timer,
     /// Pending (unauthenticated) peer count.
     pub pending_peers: Counter,
     /// Authenticated peer count.
     pub authenticated_peers: Counter,
-
-    // ===== Receive Timers =====
-    /// Time to process Error messages.
-    pub recv_error: Timer,
-    /// Time to process Hello messages.
-    pub recv_hello: Timer,
-    /// Time to process Auth messages.
-    pub recv_auth: Timer,
-    /// Time to process DontHave messages.
-    pub recv_dont_have: Timer,
-    /// Time to process Peers messages.
-    pub recv_peers: Timer,
-    /// Time to process GetTxSet messages.
-    pub recv_get_txset: Timer,
-    /// Time to process TxSet messages.
-    pub recv_txset: Timer,
-    /// Time to process Transaction messages.
-    pub recv_transaction: Timer,
-    /// Time to process GetScpQuorumSet messages.
-    pub recv_get_scp_qset: Timer,
-    /// Time to process ScpQuorumSet messages.
-    pub recv_scp_qset: Timer,
-    /// Time to process ScpMessage messages.
-    pub recv_scp_message: Timer,
-    /// Time to process GetScpState messages.
-    pub recv_get_scp_state: Timer,
-    /// Time to process SendMore messages.
-    pub recv_send_more: Timer,
-    /// Time to process FloodAdvert messages.
-    pub recv_flood_advert: Timer,
-    /// Time to process FloodDemand messages.
-    pub recv_flood_demand: Timer,
-    /// Time to process SurveyRequest messages.
-    pub recv_survey_request: Timer,
-    /// Time to process SurveyResponse messages.
-    pub recv_survey_response: Timer,
 
     // ===== Send Counters =====
     /// Per-message-type send counters, indexed by [`OverlayMessageKind`].
@@ -536,14 +488,6 @@ pub struct OverlayMetrics {
     pub send_by_type: [Counter; OverlayMessageKind::COUNT],
 
     // ===== Queue Metrics =====
-    /// Queue delay for SCP messages.
-    pub queue_delay_scp: Timer,
-    /// Queue delay for transaction messages.
-    pub queue_delay_tx: Timer,
-    /// Queue delay for advert messages.
-    pub queue_delay_advert: Timer,
-    /// Queue delay for demand messages.
-    pub queue_delay_demand: Timer,
     /// SCP messages dropped from queue.
     pub queue_drop_scp: Counter,
     /// Transaction messages dropped from queue.
@@ -588,10 +532,6 @@ pub struct OverlayMetrics {
     pub fetch_duplicate_recv: Counter,
 
     // ===== Pull Metrics =====
-    /// End-to-end transaction pull latency.
-    pub tx_pull_latency: Timer,
-    /// Per-peer transaction pull latency.
-    pub peer_tx_pull_latency: Timer,
     /// Demand timeouts (retry needed).
     pub demand_timeouts: Counter,
     /// Pulled transactions that were relevant.
@@ -644,17 +584,8 @@ impl OverlayMetrics {
             timeouts_straggler: self.timeouts_straggler.get(),
 
             // Connection metrics
-            connection_latency: self.connection_latency.snapshot(),
             pending_peers: self.pending_peers.get(),
             authenticated_peers: self.authenticated_peers.get(),
-
-            // Receive timers (just counts)
-            recv_hello_count: self.recv_hello.count(),
-            recv_auth_count: self.recv_auth.count(),
-            recv_transaction_count: self.recv_transaction.count(),
-            recv_scp_message_count: self.recv_scp_message.count(),
-            recv_flood_advert_count: self.recv_flood_advert.count(),
-            recv_flood_demand_count: self.recv_flood_demand.count(),
 
             // Send counters
             send_by_type: std::array::from_fn(|i| self.send_by_type[i].get()),
@@ -688,7 +619,6 @@ impl OverlayMetrics {
             flood_known_count: 0,
 
             // Pull metrics
-            tx_pull_latency: self.tx_pull_latency.snapshot(),
             demand_timeouts: self.demand_timeouts.get(),
             pulled_relevant_txs: self.pulled_relevant_txs.get(),
             pulled_irrelevant_txs: self.pulled_irrelevant_txs.get(),
@@ -754,35 +684,6 @@ impl OverlayMetrics {
         for counter in &self.send_by_type {
             counter.reset();
         }
-
-        reset_timers(&[
-            &self.connection_latency,
-            &self.connection_read_throttle,
-            &self.connection_flood_throttle,
-            &self.recv_error,
-            &self.recv_hello,
-            &self.recv_auth,
-            &self.recv_dont_have,
-            &self.recv_peers,
-            &self.recv_get_txset,
-            &self.recv_txset,
-            &self.recv_transaction,
-            &self.recv_get_scp_qset,
-            &self.recv_scp_qset,
-            &self.recv_scp_message,
-            &self.recv_get_scp_state,
-            &self.recv_send_more,
-            &self.recv_flood_advert,
-            &self.recv_flood_demand,
-            &self.recv_survey_request,
-            &self.recv_survey_response,
-            &self.queue_delay_scp,
-            &self.queue_delay_tx,
-            &self.queue_delay_advert,
-            &self.queue_delay_demand,
-            &self.tx_pull_latency,
-            &self.peer_tx_pull_latency,
-        ]);
     }
 }
 
@@ -822,17 +723,8 @@ pub struct OverlayMetricsSnapshot {
     pub timeouts_straggler: u64,
 
     // Connection metrics
-    pub connection_latency: TimerSnapshot,
     pub pending_peers: u64,
     pub authenticated_peers: u64,
-
-    // Receive counts
-    pub recv_hello_count: u64,
-    pub recv_auth_count: u64,
-    pub recv_transaction_count: u64,
-    pub recv_scp_message_count: u64,
-    pub recv_flood_advert_count: u64,
-    pub recv_flood_demand_count: u64,
 
     // Send counts (indexed by OverlayMessageKind)
     pub send_by_type: [u64; OverlayMessageKind::COUNT],
@@ -866,7 +758,6 @@ pub struct OverlayMetricsSnapshot {
     pub flood_known_count: u64,
 
     // Pull metrics
-    pub tx_pull_latency: TimerSnapshot,
     pub demand_timeouts: u64,
     pub pulled_relevant_txs: u64,
     pub pulled_irrelevant_txs: u64,
@@ -976,7 +867,6 @@ mod tests {
 
         assert_eq!(metrics.messages_read.get(), 0);
         assert_eq!(metrics.bytes_written.get(), 0);
-        assert_eq!(metrics.connection_latency.count(), 0);
     }
 
     #[test]
@@ -1021,13 +911,11 @@ mod tests {
 
         metrics.messages_read.add(100);
         metrics.bytes_read.add(10000);
-        metrics.connection_latency.record(Duration::from_millis(10));
 
         metrics.reset();
 
         assert_eq!(metrics.messages_read.get(), 0);
         assert_eq!(metrics.bytes_read.get(), 0);
-        assert_eq!(metrics.connection_latency.count(), 0);
     }
 
     #[test]
@@ -1056,22 +944,6 @@ mod tests {
         assert_eq!(snapshot.flood_unfulfilled_unknown, 2);
         assert_eq!(snapshot.flood_unique_bytes_recv, 50000);
         assert_eq!(snapshot.flood_duplicate_bytes_recv, 10000);
-    }
-
-    #[test]
-    fn test_pull_latency_metrics() {
-        let metrics = OverlayMetrics::new();
-
-        // Simulate pull latencies
-        metrics.tx_pull_latency.record(Duration::from_millis(100));
-        metrics.tx_pull_latency.record(Duration::from_millis(200));
-        metrics.tx_pull_latency.record(Duration::from_millis(150));
-
-        let snapshot = metrics.snapshot();
-
-        assert_eq!(snapshot.tx_pull_latency.count, 3);
-        assert!(snapshot.tx_pull_latency.min.as_millis() >= 99);
-        assert!(snapshot.tx_pull_latency.max.as_millis() >= 199);
     }
 
     #[test]
