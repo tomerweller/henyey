@@ -6033,6 +6033,277 @@ print('alarm-versioned' not in alarms and prov.get('alarm-versioned') == 3)
       "no_regression=$ver_contam_regressions stable_clean=$ver_contam_stable_clean output=${ver_contam_out:0:300}"
   fi
 
+  # ── Step D: Temporal provenance (semantic_change_date) tests (#2646) ────────
+
+  # Test catalog with semantic_change_date set on one alarm
+  local stepd_root
+  stepd_root=$(mktemp -d)
+  local stepd_session="$stepd_root/session"
+  mkdir -p "$stepd_session/metrics"
+
+  local stepd_catalog="$stepd_root/test-catalog.toml"
+  cat > "$stepd_catalog" << 'STEPD_CAT_EOF'
+schema_version = 1
+
+[[alarm]]
+name = "alarm-with-date"
+baseline_version = 2
+semantic_change_date = "2026-05-10T12:00:00Z"
+metric = "test_metric_a"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "test_metric_a"
+cooldown_seconds = 3600
+filing_title = "test a"
+filing_search = "test a"
+summary = "Test A"
+details = "delta={value}"
+notes = ""
+
+[[alarm]]
+name = "alarm-no-date"
+baseline_version = 1
+metric = "test_metric_b"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "test_metric_b"
+cooldown_seconds = 3600
+filing_title = "test b"
+filing_search = "test b"
+summary = "Test B"
+details = "delta={value}"
+notes = ""
+STEPD_CAT_EOF
+
+  local stepd_checksum
+  stepd_checksum=$(sha256sum "$stepd_catalog" | cut -d' ' -f1)
+
+  # Test 1: Baseline with first_ts BEFORE semantic_change_date → alarm invalidated
+  local stepd_baseline_pre
+  stepd_baseline_pre=$(python3 -c "
+import json
+data = {
+    'schema_version': 1,
+    'evaluated_ticks': 200,
+    'skipped_ticks': 10,
+    'error_ticks': 0,
+    'total_snapshots': 210,
+    'first_ts': '2026-05-09T00:00:00Z',
+    'last_ts': '2026-05-09T12:00:00Z',
+    'alarms': {
+        'alarm-with-date': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10},
+        'alarm-no-date': {'firing': 15, 'breach': 3, 'ok': 172, 'baseline': 0, 'skip': 10}
+    },
+    'provenance': {
+        'created_at': '2026-05-09T01:00:00Z',
+        'created_commit': 'abc123',
+        'catalog_checksum': 'old-checksum-mismatch',
+        'alarm_versions': {'alarm-with-date': 2, 'alarm-no-date': 1}
+    }
+}
+print(json.dumps(data))
+")
+  echo "$stepd_baseline_pre" > "$stepd_session/metrics/replay-baseline-stable.json"
+  echo "$stepd_baseline_pre" > "$stepd_session/metrics/replay-baseline.json"
+
+  # Current replay data (post-change)
+  local stepd_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"2026-05-11T00:00:00Z","last_ts":"2026-05-11T12:00:00Z","alarms":{"alarm-with-date":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"alarm-no-date":{"firing":15,"breach":3,"ok":172,"baseline":0,"skip":10}}}'
+  echo "$stepd_current" > "$stepd_session/metrics/stepd-current.json"
+
+  local stepd_out
+  stepd_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$stepd_session" --current "$stepd_session/metrics/stepd-current.json" \
+    --catalog "$stepd_catalog" 2>&1) || true
+
+  # stable baseline should have alarm-with-date removed (first_ts < semantic_change_date)
+  # but alarm-no-date preserved (no semantic_change_date)
+  local stepd_stable_has_dated stepd_stable_has_undated
+  stepd_stable_has_dated=$(python3 -c "
+import json
+with open('$stepd_session/metrics/replay-baseline-stable.json') as f:
+    d = json.load(f)
+print('alarm-with-date' in d.get('alarms', {}))
+" 2>/dev/null) || stepd_stable_has_dated="ERROR"
+  stepd_stable_has_undated=$(python3 -c "
+import json
+with open('$stepd_session/metrics/replay-baseline-stable.json') as f:
+    d = json.load(f)
+print('alarm-no-date' in d.get('alarms', {}))
+" 2>/dev/null) || stepd_stable_has_undated="ERROR"
+
+  if [[ "$stepd_stable_has_dated" == "False" ]] && [[ "$stepd_stable_has_undated" == "True" ]]; then
+    tap_ok "step-d: first_ts < semantic_change_date invalidates alarm"
+  else
+    tap_not_ok "step-d: first_ts < semantic_change_date invalidates alarm" \
+      "dated=$stepd_stable_has_dated undated=$stepd_stable_has_undated output=${stepd_out:0:200}"
+  fi
+
+  # Test 2: Baseline with first_ts >= semantic_change_date → alarm preserved
+  local stepd_session2="$stepd_root/session2"
+  mkdir -p "$stepd_session2/metrics"
+
+  local stepd_baseline_post
+  stepd_baseline_post=$(python3 -c "
+import json
+data = {
+    'schema_version': 1,
+    'evaluated_ticks': 200,
+    'skipped_ticks': 10,
+    'error_ticks': 0,
+    'total_snapshots': 210,
+    'first_ts': '2026-05-10T12:00:00Z',
+    'last_ts': '2026-05-11T00:00:00Z',
+    'alarms': {
+        'alarm-with-date': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10},
+        'alarm-no-date': {'firing': 15, 'breach': 3, 'ok': 172, 'baseline': 0, 'skip': 10}
+    },
+    'provenance': {
+        'created_at': '2026-05-10T13:00:00Z',
+        'created_commit': 'def456',
+        'catalog_checksum': 'old-checksum-mismatch2',
+        'alarm_versions': {'alarm-with-date': 2, 'alarm-no-date': 1}
+    }
+}
+print(json.dumps(data))
+")
+  echo "$stepd_baseline_post" > "$stepd_session2/metrics/replay-baseline-stable.json"
+  echo "$stepd_baseline_post" > "$stepd_session2/metrics/replay-baseline.json"
+  echo "$stepd_current" > "$stepd_session2/metrics/stepd-current.json"
+
+  local stepd_out2
+  stepd_out2=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$stepd_session2" --current "$stepd_session2/metrics/stepd-current.json" \
+    --catalog "$stepd_catalog" 2>&1) || true
+
+  # Both alarms should be preserved (first_ts == semantic_change_date for alarm-with-date)
+  local stepd2_stable_has_dated stepd2_stable_has_undated
+  stepd2_stable_has_dated=$(python3 -c "
+import json
+with open('$stepd_session2/metrics/replay-baseline-stable.json') as f:
+    d = json.load(f)
+print('alarm-with-date' in d.get('alarms', {}))
+" 2>/dev/null) || stepd2_stable_has_dated="ERROR"
+  stepd2_stable_has_undated=$(python3 -c "
+import json
+with open('$stepd_session2/metrics/replay-baseline-stable.json') as f:
+    d = json.load(f)
+print('alarm-no-date' in d.get('alarms', {}))
+" 2>/dev/null) || stepd2_stable_has_undated="ERROR"
+
+  if [[ "$stepd2_stable_has_dated" == "True" ]] && [[ "$stepd2_stable_has_undated" == "True" ]]; then
+    tap_ok "step-d: first_ts >= semantic_change_date preserves alarm"
+  else
+    tap_not_ok "step-d: first_ts >= semantic_change_date preserves alarm" \
+      "dated=$stepd2_stable_has_dated undated=$stepd2_stable_has_undated output=${stepd_out2:0:200}"
+  fi
+
+  # Test 3: Baseline without valid first_ts (legacy/malformed) → no Step D check
+  local stepd_session3="$stepd_root/session3"
+  mkdir -p "$stepd_session3/metrics"
+
+  local stepd_baseline_legacy
+  stepd_baseline_legacy=$(python3 -c "
+import json
+data = {
+    'schema_version': 1,
+    'evaluated_ticks': 200,
+    'skipped_ticks': 10,
+    'error_ticks': 0,
+    'total_snapshots': 210,
+    'first_ts': 'not-a-valid-ts',
+    'last_ts': 'also-invalid',
+    'alarms': {
+        'alarm-with-date': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10},
+        'alarm-no-date': {'firing': 15, 'breach': 3, 'ok': 172, 'baseline': 0, 'skip': 10}
+    },
+    'provenance': {
+        'created_at': '2026-05-09T01:00:00Z',
+        'created_commit': 'old',
+        'catalog_checksum': 'old-checksum-mismatch3',
+        'alarm_versions': {'alarm-with-date': 2, 'alarm-no-date': 1}
+    }
+}
+print(json.dumps(data))
+")
+  echo "$stepd_baseline_legacy" > "$stepd_session3/metrics/replay-baseline-stable.json"
+  echo "$stepd_baseline_legacy" > "$stepd_session3/metrics/replay-baseline.json"
+  echo "$stepd_current" > "$stepd_session3/metrics/stepd-current.json"
+
+  local stepd_out3
+  stepd_out3=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$stepd_session3" --current "$stepd_session3/metrics/stepd-current.json" \
+    --catalog "$stepd_catalog" 2>&1) || true
+
+  # Both alarms preserved — malformed first_ts skips Step D
+  local stepd3_stable_has_dated
+  stepd3_stable_has_dated=$(python3 -c "
+import json
+with open('$stepd_session3/metrics/replay-baseline-stable.json') as f:
+    d = json.load(f)
+print('alarm-with-date' in d.get('alarms', {}))
+" 2>/dev/null) || stepd3_stable_has_dated="ERROR"
+
+  if [[ "$stepd3_stable_has_dated" == "True" ]]; then
+    tap_ok "step-d: malformed first_ts skips temporal check"
+  else
+    tap_not_ok "step-d: malformed first_ts skips temporal check" \
+      "dated=$stepd3_stable_has_dated output=${stepd_out3:0:200}"
+  fi
+
+  # Test 4: Ack invalidation — acknowledged_at < semantic_change_date → removed
+  local stepd_session4="$stepd_root/session4"
+  mkdir -p "$stepd_session4/metrics"
+
+  # Create ack file with old acknowledgment
+  cat > "$stepd_session4/metrics/alarm-acknowledgments.json" << 'STEPD_ACK_EOF'
+{"schema_version":1,"catalog_checksum":"old-ack-checksum","alarm_versions":{"alarm-with-date":2,"alarm-no-date":1},"alarms":{"alarm-with-date":{"acknowledged_at":"2026-05-08T00:00:00Z","rationale":"old reason","acknowledged_by":"test"},"alarm-no-date":{"acknowledged_at":"2026-05-11T00:00:00Z","rationale":"recent reason","acknowledged_by":"test"}}}
+STEPD_ACK_EOF
+
+  # Need baselines for the script to run — use post-change ones
+  echo "$stepd_baseline_post" > "$stepd_session4/metrics/replay-baseline-stable.json"
+  echo "$stepd_baseline_post" > "$stepd_session4/metrics/replay-baseline.json"
+  echo "$stepd_current" > "$stepd_session4/metrics/stepd-current.json"
+
+  local stepd_out4
+  stepd_out4=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$stepd_session4" --current "$stepd_session4/metrics/stepd-current.json" \
+    --catalog "$stepd_catalog" 2>&1) || true
+
+  # Check ack file: alarm-with-date should be removed (ack predates change),
+  # alarm-no-date should be preserved (no semantic_change_date for that alarm)
+  local stepd4_ack_dated stepd4_ack_undated
+  stepd4_ack_dated=$(python3 -c "
+import json
+with open('$stepd_session4/metrics/alarm-acknowledgments.json') as f:
+    d = json.load(f)
+print('alarm-with-date' in d.get('alarms', {}))
+" 2>/dev/null) || stepd4_ack_dated="ERROR"
+  stepd4_ack_undated=$(python3 -c "
+import json
+with open('$stepd_session4/metrics/alarm-acknowledgments.json') as f:
+    d = json.load(f)
+print('alarm-no-date' in d.get('alarms', {}))
+" 2>/dev/null) || stepd4_ack_undated="ERROR"
+
+  if [[ "$stepd4_ack_dated" == "False" ]] && [[ "$stepd4_ack_undated" == "True" ]]; then
+    tap_ok "step-d: ack invalidation removes stale acknowledgment"
+  else
+    tap_not_ok "step-d: ack invalidation removes stale acknowledgment" \
+      "dated=$stepd4_ack_dated undated=$stepd4_ack_undated output=${stepd_out4:0:200}"
+  fi
+
+  rm -rf "$stepd_root"
+
   rm -rf "$ver_root"
 
   # ── check-alarm-regression.sh dedup tests ──────────────────────────────────

@@ -12,7 +12,9 @@
 #     where an alarm that was historically active (≥5%) has silently drifted
 #     to 0% over successive rolling-baseline updates. The stable baseline is
 #     auto-invalidated and recreated when the alarm catalog (metric-alarms.toml)
-#     changes.
+#     changes. Per-alarm invalidation via baseline_version bumps, catalog
+#     structural changes, and temporal provenance (semantic_change_date) ensures
+#     contaminated data from pre-change replay windows is automatically detected.
 #
 # Only alarms present in the alarm catalog are considered; non-catalog alarm
 # names (e.g. from stale baselines or test contamination) are silently pruned.
@@ -256,6 +258,34 @@ print(json.dumps(versions, sort_keys=True))
 # Compute per-alarm versions once per run
 ALARM_VERSIONS_JSON=$(compute_alarm_versions "$CATALOG_FILE") || exit $?
 
+# Extract per-alarm semantic_change_date timestamps (for temporal provenance checks)
+compute_alarm_semantic_dates() {
+  python3 -c "
+import sys, json
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+
+with open(sys.argv[1], 'rb') as f:
+    catalog = tomllib.load(f)
+
+import re
+ISO_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+dates = {}
+for a in catalog.get('alarm', []):
+    name = a.get('name', '')
+    d = a.get('semantic_change_date')
+    if d:
+        if not isinstance(d, str) or not ISO_RE.match(d):
+            print(f'ERROR: Invalid semantic_change_date for alarm {name}: {d!r} (must be YYYY-MM-DDTHH:MM:SSZ)', file=sys.stderr)
+            sys.exit(2)
+        dates[name] = d
+print(json.dumps(dates, sort_keys=True))
+" "$1"
+}
+ALARM_SEMANTIC_DATES_JSON=$(compute_alarm_semantic_dates "$CATALOG_FILE") || exit $?
+
 ACK_FILE="$METRICS_DIR/alarm-acknowledgments.json"
 ACK_LOCK="$METRICS_DIR/alarm-acknowledgments.lock"
 
@@ -346,6 +376,20 @@ for name in list(alarms.keys()):
             del alarms[name]
             invalidated.append(name)
 
+# Remove acks predating an alarm's semantic change (fail-closed: missing
+# acknowledged_at is treated as stale)
+semantic_dates = json.loads(sys.argv[3])
+for name in list(alarms.keys()):
+    if name in invalidated:
+        continue
+    change_date = semantic_dates.get(name)
+    if not change_date:
+        continue
+    ack_ts = alarms[name].get('acknowledged_at', '')
+    if not ack_ts or ack_ts < change_date:
+        del alarms[name]
+        invalidated.append(name)
+
 if invalidated:
     print('Acknowledgments: per-alarm invalidation — removed %d ack(s): %s' % (len(invalidated), ', '.join(sorted(invalidated))), file=sys.stderr)
 
@@ -353,7 +397,7 @@ data['alarms'] = alarms
 data['catalog_checksum'] = current_checksum
 data['alarm_versions'] = current_versions
 print(json.dumps(data))
-" "$CATALOG_CHECKSUM" "$ALARM_VERSIONS_JSON"
+" "$CATALOG_CHECKSUM" "$ALARM_VERSIONS_JSON" "$ALARM_SEMANTIC_DATES_JSON"
 }
 
 # Helper: validate alarm name exists in catalog. Exit 2 if not.
@@ -684,6 +728,21 @@ for name, current_v in current_versions.items():
             del alarms[name]
             invalidated.append(name)
 
+# Step D: Temporal provenance — detect contaminated baselines whose replay
+# window predates an alarm's semantic change date.
+import re
+ISO_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+baseline_first_ts = data.get('first_ts', '')
+if baseline_first_ts and ISO_RE.match(baseline_first_ts):
+    semantic_dates = json.loads(sys.argv[8])
+    for name in list(alarms.keys()):
+        if name in invalidated:
+            continue
+        change_date = semantic_dates.get(name)
+        if change_date and baseline_first_ts < change_date:
+            del alarms[name]
+            invalidated.append(name)
+
 data['alarms'] = alarms
 data['provenance'] = {
     'created_at': timestamp,
@@ -700,7 +759,7 @@ else:
 
 with open(sys.argv[7], 'w') as f:
     json.dump(data, f)
-" "$baseline_file" "$label" "$CATALOG_CHECKSUM" "$ALARM_VERSIONS_JSON" "$PROVENANCE_COMMIT" "$PROVENANCE_TIMESTAMP" "$tmp_file" || {
+" "$baseline_file" "$label" "$CATALOG_CHECKSUM" "$ALARM_VERSIONS_JSON" "$PROVENANCE_COMMIT" "$PROVENANCE_TIMESTAMP" "$tmp_file" "$ALARM_SEMANTIC_DATES_JSON" || {
     echo "ERROR: Failed to invalidate $label baseline" >&2
     rm -f "$tmp_file"
     exit 2

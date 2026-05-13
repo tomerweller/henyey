@@ -335,9 +335,13 @@ After modifying alarm rules or the evaluator, verify no regressions:
 > Both baselines carry provenance metadata including a catalog checksum and
 > per-alarm `alarm_versions` map; when the catalog changes, only alarms whose
 > `baseline_version` was bumped (semantic changes) are invalidated — other
-> alarms' baselines and acknowledgments are preserved. Cosmetic-only edits
+> alarms' baselines and acknowledgments are preserved. Additionally, alarms
+> with a `semantic_change_date` field are automatically invalidated if the
+> baseline's replay window (`first_ts`) predates the change date, preventing
+> post-bump contamination from stale replay data. Cosmetic-only edits
 > (notes, filing text, severity) trigger no invalidation. To force a manual
-> refresh, delete `replay-baseline-stable.json` and re-run.
+> refresh, use `refresh-stable-baseline.sh` or delete `replay-baseline-stable.json`
+> and re-run.
 >
 > **Pre-refactor limitation.** Pre-#2566 runtime equivalence cannot be
 > proven — no pre-refactor snapshots or baseline exist. The original

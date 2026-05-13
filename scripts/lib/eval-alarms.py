@@ -1213,6 +1213,13 @@ def validate_catalog(catalog: dict) -> list[str]:
             if not isinstance(baseline_version, int) or isinstance(baseline_version, bool) or baseline_version < 1:
                 errors.append(f"{name}: invalid baseline_version '{baseline_version}' (must be integer >= 1)")
 
+        # semantic_change_date validation (optional, ISO 8601 UTC)
+        semantic_change_date = alarm.get("semantic_change_date")
+        if semantic_change_date is not None:
+            import re
+            if not isinstance(semantic_change_date, str) or not re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$', semantic_change_date):
+                errors.append(f"{name}: invalid semantic_change_date '{semantic_change_date}' (must be YYYY-MM-DDTHH:MM:SSZ)")
+
         # Required fields
         kind = alarm.get("kind")
         if kind not in VALID_KINDS:

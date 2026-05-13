@@ -11,6 +11,13 @@
 # See .claude/skills/shared/ALARM_SURFACES.md for the policy on alarm surface
 # ownership, overlap, and reconciliation.
 #
+# semantic_change_date: Optional ISO 8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ)
+# per alarm. Records when the alarm's evaluation semantics last changed.
+# Setting this enables automatic invalidation of baselines whose replay window
+# (first_ts) predates the change, and invalidation of acknowledgments recorded
+# before this date. Set to the deployment date of the change or later (never
+# earlier — earlier risks missing contamination).
+#
 # Schema version — evaluator rejects unknown versions.
 schema_version = 1
 
@@ -19,6 +26,7 @@ schema_version = 1
 [[alarm]]
 name = "lost-sync"
 baseline_version = 3  # bumped in #2642: force re-invalidation of stable baselines created during post-#2612 transition
+semantic_change_date = "2026-05-13T00:00:00Z"  # deployed via #2642 (c45e6c80)
 metric = "stellar_herder_lost_sync_total"
 kind = "counter"
 extraction = "form1"
@@ -462,6 +470,7 @@ notes = ""
 [[alarm]]
 name = "lc-dispatch-to-join-slow"
 baseline_version = 2  # bumped in #2641: p99_threshold adjusted for CLOSE_CADENCE_BUCKETS (dd202bd1)
+semantic_change_date = "2026-05-13T06:00:00Z"  # deployed via #2641 (dd202bd1)
 metric = "henyey_ledger_close_dispatch_to_join_seconds"
 kind = "histogram-p99"
 expected_suffixes = ["_bucket", "_sum", "_count"]
