@@ -294,6 +294,37 @@ check_skill_structure() {
     drift=true
   fi
 
+  # monitor-tick must contain persistent dedup for post-wipe recurrence (#2630)
+  if ! grep -q 'monitor-tick-filed\.json' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not reference .monitor-tick-filed.json dedup file" >&2
+    drift=true
+  fi
+  if ! grep -q 'monitor-tick-filing\.lock' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not reference .monitor-tick-filing.lock flock" >&2
+    drift=true
+  fi
+  if ! grep -q 'flock -w 30' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md missing flock serialization for dedup filing" >&2
+    drift=true
+  fi
+  if ! grep -q 'monitor-tick-recurrence-key' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md missing body marker for dedup remote search" >&2
+    drift=true
+  fi
+  if ! grep -q 'schema_version' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md dedup file load missing schema_version check" >&2
+    drift=true
+  fi
+  if ! grep -q 'write_dedup_file' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md missing atomic write_dedup_file helper" >&2
+    drift=true
+  fi
+  # Old pattern: must NOT use bare gh issue list --search without persistent dedup
+  if grep -q 'If an open issue already names the same.*comment on it instead of filing' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md still uses old search-only dedup for post-wipe recurrence" >&2
+    drift=true
+  fi
+
   # monitor-label-policy.md: Deploy Regression Procedure must use quarantine helper
   local policy_file="$REPO_ROOT/scripts/lib/monitor-label-policy.md"
   local deploy_section

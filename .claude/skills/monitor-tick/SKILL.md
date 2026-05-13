@@ -124,6 +124,8 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | File | Purpose | Writer | Remover |
 |------|---------|--------|---------|
 | `deploy_quarantine.txt` | Commit SHAs blocked from rebuild/restart deploy; survives session wipes | Deploy regression policy (skill, during rollback) | Operator only (manual) |
+| `$REPO_ROOT/.monitor-tick-filed.json` | Persistent dedup for post-wipe recurrence issue filing; 30-day TTL with auto-prune | check 3d post-wipe recurrence (write) | Auto-pruned (30-day TTL) |
+| `$REPO_ROOT/.monitor-tick-filing.lock` | flock for serializing dedup file access during issue filing | check 3d | N/A (empty sentinel) |
 
 ## Session-dir-vanished detection
 
@@ -490,7 +492,272 @@ fi
 #    and `watch: ["determinism-suspect-binary"]`.
 ```
 
-File or comment on an `urgent` GH issue marking the binary as a determinism-suspect: include the build SHA, the wipe epoch from the marker, the latest crashed-log hash-mismatch evidence, and the cumulative downtime since wipe. Title pattern: `"OFFLINE: post-wipe recurrence on <sha:8> — binary quarantined"`. If an open issue already names the same `build_sha` as determinism-suspect, comment on it instead of filing a duplicate. Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+File or comment on an `urgent` GH issue marking the binary as a determinism-suspect.
+Title pattern: `"OFFLINE: post-wipe recurrence on <sha:8> — binary quarantined"`.
+Body marker for dedup: `<!-- monitor-tick-recurrence-key: <build_sha> -->`.
+Include the build SHA, the wipe epoch from the marker, the latest crashed-log
+hash-mismatch evidence, and the cumulative downtime since wipe
+(`$(date -u +%s) - wipe_epoch` seconds).
+
+**Persistent dedup** prevents duplicate issue filing across consecutive
+monitor-tick invocations (GitHub search index lag can cause races). The dedup
+file `.monitor-tick-filed.json` at `$REPO_ROOT` records which build SHAs have
+already had issues filed. This mirrors the alarm-regression dedup pattern in
+`check-alarm-regression.sh:778–833`.
+
+**Guard: empty build_sha.** If `build_sha` is empty or unreadable, do NOT
+file an issue (the title, body marker, and dedup key all depend on it).
+Report in tick output:
+`actions: ["post-wipe-recurrence", "auto-quarantined", "filing-skipped-no-sha"]`
+and `watch: ["build-sha-missing"]`. Do NOT enter the flock/dedup/filing path.
+
+**All dedup + filing logic runs inside a flock** to serialize concurrent
+tick invocations:
+
+```bash
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+DEDUP_FILE="$REPO_ROOT/.monitor-tick-filed.json"
+DEDUP_LOCK="$REPO_ROOT/.monitor-tick-filing.lock"
+EXPECTED_TITLE="OFFLINE: post-wipe recurrence on ${build_sha:0:8} — binary quarantined"
+BODY_MARKER="<!-- monitor-tick-recurrence-key: $build_sha -->"
+
+(
+  flock -w 30 9 || {
+    echo "Could not acquire monitor-tick filing lock after 30s; skipping." >&2
+    exit 0
+  }
+
+  # --- Load dedup file (corruption-safe) ---
+  DEDUP_DATA="{}"
+  if [[ -f "$DEDUP_FILE" ]]; then
+    DEDUP_DATA=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or data.get('schema_version') != 1:
+        print('{}')
+    else:
+        print(json.dumps(data))
+except (json.JSONDecodeError, ValueError, OSError):
+    print('{}')
+" "$DEDUP_FILE" 2>/dev/null) || DEDUP_DATA="{}"
+    if [[ "$DEDUP_DATA" == "{}" ]] && [[ -s "$DEDUP_FILE" ]]; then
+      echo "WARNING: Corrupt or invalid dedup file $DEDUP_FILE — treating as empty" >&2
+    fi
+  fi
+
+  # --- Prune entries older than 30 days (UTC) ---
+  DEDUP_DATA=$(python3 -c "
+import json, sys
+from datetime import datetime, timezone, timedelta
+data = json.loads(sys.argv[1])
+filed = data.get('filed', {})
+cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+pruned = {}
+for sha, info in filed.items():
+    try:
+        ts = datetime.fromisoformat(info['filed_at'].replace('Z', '+00:00'))
+        if ts > cutoff:
+            pruned[sha] = info
+    except (KeyError, ValueError):
+        pass
+data['filed'] = pruned
+print(json.dumps(data))
+" "$DEDUP_DATA" 2>/dev/null) || DEDUP_DATA="{}"
+
+  # --- Atomic write helper ---
+  write_dedup_file() {
+    local tmpf="${DEDUP_FILE}.tmp.$$"
+    echo "$1" > "$tmpf"
+    mv -f "$tmpf" "$DEDUP_FILE"
+  }
+
+  # --- Helper: post rate-limited daily comment on existing issue ---
+  post_daily_comment() {
+    local issue_num="$1"
+    local today
+    today=$(date -u +%Y-%m-%d)
+
+    # Fast check: last_commented_date in dedup entry
+    local last_date
+    last_date=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+info = data.get('filed', {}).get(sys.argv[2], {})
+print(info.get('last_commented_date', ''))
+" "$DEDUP_DATA" "$build_sha" 2>/dev/null) || last_date=""
+    if [[ "$last_date" == "$today" ]]; then
+      return 0
+    fi
+
+    local wipe_epoch downtime_sec downtime_hours
+    wipe_epoch=$(cat "$marker" 2>/dev/null | tr -dc '0-9')
+    downtime_sec=$(( $(date -u +%s) - ${wipe_epoch:-0} ))
+    downtime_hours=$(( downtime_sec / 3600 ))
+    local update_marker="<!-- monitor-tick-recurrence-update: $build_sha $today -->"
+
+    local update_body="### Post-wipe recurrence update (${today})
+
+**Build SHA**: \`$build_sha\`
+**Wipe epoch**: $(date -u -d @"${wipe_epoch:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "${wipe_epoch:-unknown}")
+**Cumulative downtime since wipe**: ${downtime_hours}h (${downtime_sec}s)
+**Latest crash log**: $(basename "${CRASH_LATEST_FILE:-unknown}")
+**Hash mismatch**: ${CRASH_HASH_MISMATCH:-unknown}
+
+Binary remains quarantined. Operator action required.
+
+$update_marker"
+    if gh issue comment "$issue_num" --body "$update_body" 2>/dev/null; then
+      echo "Posted update on existing issue #$issue_num for ${build_sha:0:8}" >&2
+      # Update last_commented_date in dedup
+      DEDUP_DATA=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+entry = data.get('filed', {}).get(sys.argv[2], {})
+entry['last_commented_date'] = sys.argv[3]
+data.setdefault('filed', {})[sys.argv[2]] = entry
+print(json.dumps(data))
+" "$DEDUP_DATA" "$build_sha" "$today")
+      write_dedup_file "$DEDUP_DATA"
+    else
+      echo "WARNING: Failed to post update on #$issue_num" >&2
+    fi
+
+    # Ensure urgent label and board routing
+    gh issue edit "$issue_num" --add-label urgent 2>/dev/null || true
+  }
+
+  # --- Dedup check: local file ---
+  DEDUP_HIT_ISSUE=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+info = data.get('filed', {}).get(sys.argv[2])
+print(info.get('issue_number', '') if info else '')
+" "$DEDUP_DATA" "$build_sha" 2>/dev/null) || DEDUP_HIT_ISSUE=""
+
+  if [ -n "$DEDUP_HIT_ISSUE" ]; then
+    ISSUE_STATE=$(gh issue view "$DEDUP_HIT_ISSUE" --json state \
+      --jq .state 2>/dev/null) || ISSUE_STATE="UNKNOWN"
+    case "$ISSUE_STATE" in
+      OPEN)
+        echo "Skipping: issue #$DEDUP_HIT_ISSUE already filed for ${build_sha:0:8}" >&2
+        post_daily_comment "$DEDUP_HIT_ISSUE"
+        exit 0
+        ;;
+      CLOSED)
+        echo "Issue #$DEDUP_HIT_ISSUE is CLOSED — will refile with reference" >&2
+        CLOSED_PREDECESSOR="$DEDUP_HIT_ISSUE"
+        DEDUP_DATA=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+data.get('filed', {}).pop(sys.argv[2], None)
+print(json.dumps(data))
+" "$DEDUP_DATA" "$build_sha")
+        # Fall through to remote search + filing
+        ;;
+      *)
+        echo "WARNING: Cannot verify issue #$DEDUP_HIT_ISSUE (state: $ISSUE_STATE) — suppressing filing" >&2
+        # Safe side: do not clear dedup, do not file duplicate
+        exit 0
+        ;;
+    esac
+  fi
+
+  # --- Remote search fallback (crash-safe: catches cases where dedup file was lost) ---
+  EXISTING=$(gh issue list --label urgent --state open \
+    --search "in:body \"monitor-tick-recurrence-key: $build_sha\"" \
+    --json number,body 2>/dev/null) || EXISTING="[]"
+
+  FOUND_DUP=false
+  DUP_ISSUE_NUMBER=""
+  while IFS= read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    c_body=$(echo "$candidate" | python3 -c \
+      "import json,sys; print(json.load(sys.stdin).get('body',''))" 2>/dev/null) || continue
+    c_number=$(echo "$candidate" | python3 -c \
+      "import json,sys; print(json.load(sys.stdin).get('number',''))" 2>/dev/null) || continue
+    if echo "$c_body" | grep -qF "$BODY_MARKER" 2>/dev/null; then
+      FOUND_DUP=true
+      DUP_ISSUE_NUMBER="$c_number"
+      break
+    fi
+  done < <(echo "$EXISTING" | python3 -c \
+    "import json,sys; [print(json.dumps(x)) for x in json.load(sys.stdin)]" 2>/dev/null)
+
+  if [ "$FOUND_DUP" = true ]; then
+    echo "Remote search found existing issue #$DUP_ISSUE_NUMBER — backfilling dedup" >&2
+    DEDUP_DATA=$(python3 -c "
+import json, sys
+from datetime import datetime, timezone
+data = json.loads(sys.argv[1])
+data.setdefault('filed', {})[sys.argv[2]] = {
+    'filed_at': datetime.now(timezone.utc).isoformat(),
+    'issue_number': int(sys.argv[3]),
+    'last_commented_date': ''
+}
+data['schema_version'] = 1
+print(json.dumps(data, indent=2))
+" "$DEDUP_DATA" "$build_sha" "$DUP_ISSUE_NUMBER")
+    write_dedup_file "$DEDUP_DATA"
+    post_daily_comment "$DUP_ISSUE_NUMBER"
+    exit 0
+  fi
+
+  # --- File new issue ---
+  wipe_epoch=$(cat "$marker" 2>/dev/null | tr -dc '0-9')
+  downtime_sec=$(( $(date -u +%s) - ${wipe_epoch:-0} ))
+  downtime_hours=$(( downtime_sec / 3600 ))
+  predecessor_ref=""
+  if [ -n "${CLOSED_PREDECESSOR:-}" ]; then
+    predecessor_ref="
+**Related to #$CLOSED_PREDECESSOR (closed)** — recurrence on same SHA."
+  fi
+
+  ISSUE_BODY="$BODY_MARKER
+## OFFLINE: post-wipe recurrence — binary quarantined
+
+**Build SHA**: \`$build_sha\`
+**Wipe epoch**: $(date -u -d @"${wipe_epoch:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "${wipe_epoch:-unknown}")
+**Cumulative downtime since wipe**: ${downtime_hours}h (${downtime_sec}s)
+**Latest crash log**: $(basename "${CRASH_LATEST_FILE:-unknown}")
+**Hash mismatch evidence**: ${CRASH_HASH_MISMATCH:-unknown}
+${predecessor_ref}"
+
+  N=$(gh issue create \
+    --title "$EXPECTED_TITLE" \
+    --body "$ISSUE_BODY" \
+    --label "urgent" \
+    2>/dev/null | grep -oP '\d+$') || N=""
+
+  if [ -n "$N" ]; then
+    echo "Filed post-wipe recurrence issue #$N for ${build_sha:0:8}" >&2
+    bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog
+
+    # Record in dedup file
+    TODAY=$(date -u +%Y-%m-%d)
+    DEDUP_DATA=$(python3 -c "
+import json, sys
+from datetime import datetime, timezone
+data = json.loads(sys.argv[1])
+data.setdefault('filed', {})[sys.argv[2]] = {
+    'filed_at': datetime.now(timezone.utc).isoformat(),
+    'issue_number': int(sys.argv[3]),
+    'last_commented_date': sys.argv[4]
+}
+data['schema_version'] = 1
+print(json.dumps(data, indent=2))
+" "$DEDUP_DATA" "$build_sha" "$N" "$TODAY")
+    write_dedup_file "$DEDUP_DATA"
+  else
+    echo "ERROR: Failed to create post-wipe recurrence issue — will retry next tick" >&2
+    # Do NOT record in dedup — next tick will retry
+  fi
+
+) 9>"$DEDUP_LOCK"
+```
+
+Board-route any newly filed issue to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 
 **Recovery from (3d) is operator-driven.** The deploy gate at section 10 step 3 (Quarantine gate) will continue to BLOCK redeploy of the quarantined SHA as long as it is reachable from `origin/main`. Operator action: revert/rollback the bad commit so it is no longer in `origin/main`'s ancestry; the next tick's deploy gate will then let the rebuild + relaunch proceed normally. The marker is cleared automatically by the recovery rule below — operators do not need to remove it manually.
 
