@@ -109,10 +109,22 @@ def test_p99_at_10_0_fires():
 
 
 def test_mean_fires_independently_of_p99():
-    """Mean > 5.0 should fire even when p99 ≤ 7.0."""
+    """Mean > 5.0 should fire even when p99 ≤ 7.0, with correct threshold in output."""
     current, prev = make_histogram_data(p99_bucket=5.5, mean=6.0)
     result = eval_histogram_p99(ALARM, current, prev, prev_prom_invalid=False)
     assert result["state"] == "firing", f"Expected 'firing' from mean breach, got '{result['state']}' (mean=6.0, mean_threshold=5.0)"
+    # Mean-only breach should report mean_threshold, not p99_threshold
+    assert result["threshold"] == 5.0, f"Expected threshold=5.0 (mean_threshold), got {result['threshold']}"
+    assert result["value"] == 6.0, f"Expected value=6.0 (mean_value), got {result['value']}"
+
+
+def test_p99_breach_reports_p99_threshold():
+    """P99 breach should report p99_threshold in output."""
+    current, prev = make_histogram_data(p99_bucket=8.0, mean=4.0)
+    result = eval_histogram_p99(ALARM, current, prev, prev_prom_invalid=False)
+    assert result["state"] == "firing"
+    assert result["threshold"] == 7.0, f"Expected threshold=7.0 (p99_threshold), got {result['threshold']}"
+    assert result["value"] == 8.0, f"Expected value=8.0 (p99 bucket), got {result['value']}"
 
 
 def test_mean_below_threshold_does_not_fire():
@@ -129,6 +141,29 @@ def test_prev_prom_invalid_skips():
     assert result["state"] == "skipped", f"Expected 'skipped', got '{result['state']}'"
 
 
+def test_catalog_alarm_semantics():
+    """Verify real catalog has correct threshold and baseline_version for lc-dispatch-to-join-slow."""
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+
+    catalog_path = Path(__file__).parent.parent.parent / ".claude" / "skills" / "shared" / "metric-alarms.toml"
+    with open(catalog_path, "rb") as f:
+        catalog = tomllib.load(f)
+
+    alarm = None
+    for a in catalog.get("alarm", []):
+        if a["name"] == "lc-dispatch-to-join-slow":
+            alarm = a
+            break
+
+    assert alarm is not None, "lc-dispatch-to-join-slow not found in catalog"
+    assert alarm["p99_threshold"] == 7.0, f"Expected p99_threshold=7.0, got {alarm['p99_threshold']}"
+    assert alarm["mean_threshold"] == 5.0, f"Expected mean_threshold=5.0, got {alarm['mean_threshold']}"
+    assert alarm.get("baseline_version", 1) == 2, f"Expected baseline_version=2, got {alarm.get('baseline_version', 1)}"
+
+
 if __name__ == "__main__":
     tests = [
         test_p99_at_5_5_does_not_fire,
@@ -137,8 +172,10 @@ if __name__ == "__main__":
         test_p99_at_8_0_fires,
         test_p99_at_10_0_fires,
         test_mean_fires_independently_of_p99,
+        test_p99_breach_reports_p99_threshold,
         test_mean_below_threshold_does_not_fire,
         test_prev_prom_invalid_skips,
+        test_catalog_alarm_semantics,
     ]
 
     passed = 0

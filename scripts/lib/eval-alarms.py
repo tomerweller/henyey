@@ -764,10 +764,16 @@ def eval_histogram_p99(
     }
 
     if p99_breach or mean_breach:
-        display_value = p99_value if p99_breach else mean_value
+        # Use the breached metric's value and threshold for display
+        if p99_breach:
+            display_value = p99_value
+            display_threshold = p99_threshold
+        else:
+            display_value = mean_value
+            display_threshold = mean_threshold
         return make_result(
             alarm, "firing", value=round(display_value, 4) if display_value else 0,
-            threshold=p99_threshold, for_ticks_elapsed=1, extra_values=ev,
+            threshold=display_threshold, for_ticks_elapsed=1, extra_values=ev,
         )
     return make_result(
         alarm, "ok",
