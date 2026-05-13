@@ -912,9 +912,11 @@ print('yes' if info else 'no')
 This alarm regression is still active. The baseline still shows the alarm was historically active but it currently fires at the above rate.
 
 $UPDATE_MARKER"
-            gh issue comment "$DUP_ISSUE_NUMBER" --body "$UPDATE_BODY" 2>/dev/null || \
+            if gh issue comment "$DUP_ISSUE_NUMBER" --body "$UPDATE_BODY" 2>/dev/null; then
+              echo "Posted update comment on existing issue #$DUP_ISSUE_NUMBER for $ALARM_NAME" >&2
+            else
               echo "WARNING: Failed to post update comment on #$DUP_ISSUE_NUMBER" >&2
-            echo "Posted update comment on existing issue #$DUP_ISSUE_NUMBER for $ALARM_NAME" >&2
+            fi
           else
             echo "Skipping update comment (already posted today) on #$DUP_ISSUE_NUMBER for $ALARM_NAME" >&2
           fi

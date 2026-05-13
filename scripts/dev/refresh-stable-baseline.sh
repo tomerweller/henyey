@@ -52,13 +52,20 @@ try:
     import tomllib
 except ImportError:
     import tomli as tomllib
-with open(sys.argv[1], 'rb') as f:
-    catalog = tomllib.load(f)
+try:
+    with open(sys.argv[1], 'rb') as f:
+        catalog = tomllib.load(f)
+except Exception as e:
+    print('ERROR: Failed to parse alarm catalog: ' + str(e), file=sys.stderr)
+    sys.exit(2)
 valid = {a['name'] for a in catalog.get('alarm', [])}
+if not valid:
+    print('ERROR: Catalog has no alarm entries', file=sys.stderr)
+    sys.exit(2)
 invalid = [name for name in sys.argv[2:] if name not in valid]
 if invalid:
     print(' '.join(invalid))
-" "$CATALOG_FILE" "${ALARM_NAMES[@]}" 2>/dev/null) || true
+" "$CATALOG_FILE" "${ALARM_NAMES[@]}") || exit 2
 
 if [[ -n "$INVALID_ALARMS" ]]; then
   echo "ERROR: Alarm(s) not found in catalog: $INVALID_ALARMS" >&2
@@ -127,34 +134,16 @@ try:
     with open(sys.argv[1]) as f:
         data = json.load(f)
 except (json.JSONDecodeError, ValueError, OSError):
-    data = {'schema_version': 1, 'catalog_checksum': '', 'alarms': {}}
+    print('ERROR: Acknowledgment file is not valid JSON: ' + sys.argv[1], file=sys.stderr)
+    sys.exit(2)
 if data.get('schema_version') != 1:
-    data = {'schema_version': 1, 'catalog_checksum': '', 'alarms': {}}
+    print('ERROR: Acknowledgment file has unexpected schema_version', file=sys.stderr)
+    sys.exit(2)
+if not isinstance(data.get('alarms'), dict):
+    print('ERROR: Acknowledgment file missing alarms object', file=sys.stderr)
+    sys.exit(2)
 print(json.dumps(data))
-" "$ACK_FILE" 2>/dev/null) || ACK_DATA='{"schema_version":1,"catalog_checksum":"","alarms":{}}'
-
-    REVOKED=$(python3 -c "
-import json, sys
-data = json.loads(sys.argv[1])
-alarms = data.get('alarms', {})
-revoked = []
-for name in sys.argv[2:]:
-    if name in alarms:
-        del alarms[name]
-        revoked.append(name)
-data['alarms'] = alarms
-print(json.dumps(data))
-print(','.join(revoked), file=sys.stderr)
-" "$ACK_DATA" "${ALARM_NAMES[@]}" 2>/dev/null)
-
-    # Separate stdout (JSON) and stderr (revoked list)
-    NEW_ACK_JSON=$(python3 -c "
-import json, sys
-data = json.loads(sys.argv[1])
-for name in sys.argv[2:]:
-    data.get('alarms', {}).pop(name, None)
-print(json.dumps(data))
-" "$ACK_DATA" "${ALARM_NAMES[@]}" 2>/dev/null)
+" "$ACK_FILE") || exit 2
 
     REVOKED_LIST=$(python3 -c "
 import json, sys
@@ -162,6 +151,14 @@ data = json.loads(sys.argv[1])
 revoked = [name for name in sys.argv[2:] if name in data.get('alarms', {})]
 print(','.join(revoked))
 " "$ACK_DATA" "${ALARM_NAMES[@]}" 2>/dev/null) || REVOKED_LIST=""
+
+    NEW_ACK_JSON=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+for name in sys.argv[2:]:
+    data.get('alarms', {}).pop(name, None)
+print(json.dumps(data))
+" "$ACK_DATA" "${ALARM_NAMES[@]}" 2>/dev/null)
 
     tmpout="${ACK_FILE}.tmp.$$"
     echo "$NEW_ACK_JSON" > "$tmpout"

@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=245
+TAP_PLAN=257
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -5995,6 +5995,142 @@ print('yes' if 'lost-sync' in data.get('alarms', {}) else 'no')
   fi
 
   rm -rf "$refresh_session" "$refresh_empty_session"
+
+  # Test: refresh with malformed ack file → exit 2 (fail closed)
+  local refresh_malformed_session="$replay_root/refresh-malformed"
+  mkdir -p "$refresh_malformed_session/metrics"
+  echo "$refresh_baseline" > "$refresh_malformed_session/metrics/replay-baseline.json"
+  echo "$refresh_malformed_session" > "$refresh_malformed_session/metrics/replay-baseline-stable.json"
+  echo "NOT VALID JSON{{{" > "$refresh_malformed_session/metrics/alarm-acknowledgments.json"
+  # Need valid baselines for the alarm removal to succeed first
+  echo "$refresh_baseline" > "$refresh_malformed_session/metrics/replay-baseline-stable.json"
+
+  set +e
+  local refresh_malformed_out
+  refresh_malformed_out=$("$REPO_ROOT/scripts/dev/refresh-stable-baseline.sh" \
+    "$refresh_malformed_session" lost-sync 2>&1)
+  local refresh_malformed_exit=$?
+  set -e
+
+  if [[ "$refresh_malformed_exit" -eq 2 ]]; then
+    tap_ok "refresh: malformed ack file exits 2 (fail closed)"
+  else
+    tap_not_ok "refresh: malformed ack file exits 2 (fail closed)" "exit=$refresh_malformed_exit output: $refresh_malformed_out"
+  fi
+
+  rm -rf "$refresh_malformed_session"
+
+  # ── Auto-comment dedup tests (Gap 2b of #2619) ─────────────────────────
+  echo "# Auto-comment dedup tests" >&2
+
+  local comment_root
+  comment_root=$(mktemp -d)
+  local comment_session="$comment_root/session"
+  mkdir -p "$comment_session/metrics"
+
+  local comment_catalog_checksum
+  comment_catalog_checksum=$(sha256sum "$catalog_for_reg" | cut -d' ' -f1)
+
+  # Create baselines with provenance
+  local comment_baseline
+  comment_baseline=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2]}
+print(json.dumps(d))
+" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}' "$comment_catalog_checksum")
+  echo "$comment_baseline" > "$comment_session/metrics/replay-baseline.json"
+  echo "$comment_baseline" > "$comment_session/metrics/replay-baseline-stable.json"
+
+  local comment_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$comment_current" > "$comment_session/metrics/comment-current.json"
+
+  local comment_gh_dir="$comment_root/gh-stub"
+  local comment_gh_log="$comment_root/gh-calls.log"
+  mkdir -p "$comment_gh_dir"
+
+  local comment_fake_repo="$comment_root/fake-repo"
+  mkdir -p "$comment_fake_repo/.github/skills/plan-do-review/scripts"
+  echo '#!/usr/bin/env bash' > "$comment_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  echo 'exit 0' >> "$comment_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  chmod +x "$comment_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  mkdir -p "$comment_fake_repo/scripts/dev"
+  cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$comment_fake_repo/scripts/dev/"
+
+  # gh stub: existing issue found (duplicate) + returns "0" for --jq comment check
+  cat > "$comment_gh_dir/gh" << 'STUBEOF'
+#!/usr/bin/env bash
+echo "$*" >> LOGFILE
+if [[ "$1" == "issue" && "$2" == "list" ]]; then
+  echo '[{"number":9999,"title":"Alarm regression: lost-sync","body":"<!-- alarm-regression-key: lost-sync -->"}]'
+  exit 0
+elif [[ "$1" == "issue" && "$2" == "view" ]]; then
+  # The script uses --jq to count matching comments; return "0" (no prior update today)
+  echo "0"
+  exit 0
+elif [[ "$1" == "issue" && "$2" == "comment" ]]; then
+  echo "https://github.com/stellar-experimental/henyey/issues/9999#comment-1"
+  exit 0
+elif [[ "$1" == "label" ]]; then
+  exit 0
+fi
+exit 0
+STUBEOF
+  sed -i "s|LOGFILE|$comment_gh_log|g" "$comment_gh_dir/gh"
+  chmod +x "$comment_gh_dir/gh"
+
+  > "$comment_gh_log"
+  set +e
+  local comment_out
+  comment_out=$(PATH="$comment_gh_dir:$PATH" "$comment_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$comment_session" --current "$comment_session/metrics/comment-current.json" \
+    --catalog "$catalog_for_reg" 2>&1)
+  set -e
+
+  if grep -q "issue comment" "$comment_gh_log" 2>/dev/null && echo "$comment_out" | grep -q "Posted update comment"; then
+    tap_ok "autocomment: posts update comment on existing duplicate issue"
+  else
+    tap_not_ok "autocomment: posts update comment on existing duplicate issue" "log: $(cat "$comment_gh_log") output: ${comment_out:0:500}"
+  fi
+
+  # Test same-day dedup: second run with same-day marker already present
+  # Stub returns comments with today's marker
+  TODAY=$(date -u +%Y-%m-%d)
+  cat > "$comment_gh_dir/gh" << STUBEOF2
+#!/usr/bin/env bash
+echo "\$*" >> "$comment_gh_log"
+if [[ "\$1" == "issue" && "\$2" == "list" ]]; then
+  echo '[{"number":9999,"title":"Alarm regression: lost-sync","body":"<!-- alarm-regression-key: lost-sync -->"}]'
+  exit 0
+elif [[ "\$1" == "issue" && "\$2" == "view" ]]; then
+  # Return "1" — already commented today
+  echo "1"
+  exit 0
+elif [[ "\$1" == "label" ]]; then
+  exit 0
+fi
+exit 0
+STUBEOF2
+  chmod +x "$comment_gh_dir/gh"
+
+  > "$comment_gh_log"
+  echo "$comment_baseline" > "$comment_session/metrics/replay-baseline.json"
+  echo "$comment_baseline" > "$comment_session/metrics/replay-baseline-stable.json"
+  rm -f "$comment_fake_repo/.alarm-regression-filed.json"
+  set +e
+  local comment_out2
+  comment_out2=$(PATH="$comment_gh_dir:$PATH" "$comment_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$comment_session" --current "$comment_session/metrics/comment-current.json" \
+    --catalog "$catalog_for_reg" 2>&1)
+  set -e
+
+  if echo "$comment_out2" | grep -q "already posted today"; then
+    tap_ok "autocomment: same-day dedup skips re-commenting"
+  else
+    tap_not_ok "autocomment: same-day dedup skips re-commenting" "output: ${comment_out2:0:500}"
+  fi
+
+  rm -rf "$comment_root"
 }
 check_skill_structure
 run_tests
