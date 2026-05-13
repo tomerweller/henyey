@@ -2928,4 +2928,136 @@ mod tests {
             "no more than max_future_slots slot entries"
         );
     }
+
+    // =========================================================================
+    // Issue #2648: ScpRelayEnvelope metadata tests
+    // =========================================================================
+
+    #[test]
+    fn test_broadcast_callback_immediate_ready() {
+        use std::sync::Mutex;
+
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        cache_test_quorum_set(&fetching);
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        fetching.set_broadcast(move |relay_env| {
+            cap.lock()
+                .unwrap()
+                .push((relay_env.received_at, relay_env.ready_path));
+        });
+
+        // Overlay path with received_at set.
+        let t0 = Instant::now();
+        fetching.recv_envelope_validated(make_test_envelope(100, 1), Some(t0));
+
+        let relays = captured.lock().unwrap();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].0, Some(t0));
+        assert_eq!(relays[0].1, ReadyPath::Immediate);
+    }
+
+    #[test]
+    fn test_broadcast_callback_deferred_ready() {
+        use std::sync::Mutex;
+
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        fetching.set_broadcast(move |relay_env| {
+            cap.lock()
+                .unwrap()
+                .push((relay_env.received_at, relay_env.ready_path));
+        });
+
+        // Submit envelope that needs quorum set (deferred path).
+        let t0 = Instant::now();
+        let envelope = make_test_envelope(100, 1);
+        let qs_hash = FetchingEnvelopes::extract_quorum_set_hash(&envelope).unwrap();
+        let result = fetching.recv_envelope_validated(envelope, Some(t0));
+        assert_eq!(result, RecvResult::Fetching);
+        assert!(captured.lock().unwrap().is_empty());
+
+        // Deliver dep → triggers deferred broadcast.
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        fetching.recv_quorum_set(qs_hash, quorum_set);
+
+        let relays = captured.lock().unwrap();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].0, Some(t0));
+        assert_eq!(relays[0].1, ReadyPath::Deferred);
+    }
+
+    #[test]
+    fn test_broadcast_callback_local_path() {
+        use std::sync::Mutex;
+
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        cache_test_quorum_set(&fetching);
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        fetching.set_broadcast(move |relay_env| {
+            cap.lock().unwrap().push(relay_env.received_at);
+        });
+
+        // Local path: received_at is None.
+        fetching.recv_envelope_validated(make_test_envelope(100, 1), None);
+
+        let relays = captured.lock().unwrap();
+        assert_eq!(relays.len(), 1);
+        assert!(
+            relays[0].is_none(),
+            "local path should have received_at=None"
+        );
+    }
+
+    #[test]
+    fn test_no_double_broadcast_on_multiple_dep_arrivals() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Envelope needs only quorum set (tx_set check uses `has_authoritative_tx_set`,
+        // which defaults to `|_| false`, but that means tx_set is "always needed" — so
+        // use a callback that says "always available" and test double-broadcast via
+        // quorum set delivery).
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| true));
+
+        let broadcast_count = Arc::new(AtomicU64::new(0));
+        let count_clone = broadcast_count.clone();
+        fetching.set_broadcast(move |_env| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Envelope needing quorum set only (not cached).
+        let envelope = make_test_envelope(100, 1);
+        let qs_hash = FetchingEnvelopes::extract_quorum_set_hash(&envelope).unwrap();
+        let result = fetching.recv_envelope_validated(envelope, Some(Instant::now()));
+        assert_eq!(result, RecvResult::Fetching);
+        assert_eq!(broadcast_count.load(Ordering::SeqCst), 0);
+
+        // Deliver quorum set — moves to ready, broadcast fires.
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        fetching.recv_quorum_set(qs_hash, quorum_set.clone());
+        assert_eq!(broadcast_count.load(Ordering::SeqCst), 1);
+
+        // Deliver quorum set again — envelope already moved to ready, no double-broadcast.
+        fetching.cache_quorum_set(qs_hash, quorum_set);
+        assert_eq!(
+            broadcast_count.load(Ordering::SeqCst),
+            1,
+            "duplicate dep arrival must not re-trigger broadcast"
+        );
+    }
 }
