@@ -145,10 +145,10 @@ def check_alarm_versions(old_path: str, new_path: str) -> tuple[list[str], list[
     old_alarms = old_data.get("alarm", [])
     new_alarms = new_data.get("alarm", [])
 
-    # Check for unknown fields in new file
-    unknown_errors = check_unknown_fields(new_alarms)
-    if unknown_errors:
-        errors.extend(unknown_errors)
+    # Check for unknown fields in both old and new files
+    for label, alarms in [("Old file", old_alarms), ("New file", new_alarms)]:
+        unknown_errors = check_unknown_fields(alarms)
+        errors.extend(f"{label}: {e}" for e in unknown_errors)
 
     # Build maps
     old_map, old_errs = build_alarm_map(old_alarms)

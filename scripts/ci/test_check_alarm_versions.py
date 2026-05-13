@@ -887,6 +887,162 @@ def test_exempt_field_added(tmp_path):
     assert "exempt" in warnings[0]
 
 
+# ── Test 19: Old-only unknown field → error ────────────────────────────────
+
+def test_unknown_field_in_old(tmp_path):
+    old = _write_toml(tmp_path, "old.toml", """\
+        [[alarm]]
+        name = "test-alarm"
+        kind = "counter"
+        metric = "foo"
+        extraction = "form1"
+        labels = []
+        op = ">="
+        threshold = 5
+        severity = "WARN"
+        gates = []
+        cooldown_key = "foo"
+        cooldown_seconds = 3600
+        filing_title = "t"
+        filing_search = "s"
+        summary = "s"
+        details = "d"
+        notes = ""
+        legacy_field = "old_value"
+    """)
+    new = _write_toml(tmp_path, "new.toml", """\
+        [[alarm]]
+        name = "test-alarm"
+        kind = "counter"
+        metric = "foo"
+        extraction = "form1"
+        labels = []
+        op = ">="
+        threshold = 5
+        severity = "WARN"
+        gates = []
+        cooldown_key = "foo"
+        cooldown_seconds = 3600
+        filing_title = "t"
+        filing_search = "s"
+        summary = "s"
+        details = "d"
+        notes = ""
+    """)
+    errors, warnings, notices, hard = check_alarm_versions(old, new)
+    assert hard
+    assert any("unknown field" in e for e in errors)
+
+
+# ── Test 20: CLI main() annotation output ─────────────────────────────────
+
+def test_cli_main_annotations(tmp_path, capsys):
+    old = _write_toml(tmp_path, "old.toml", """\
+        [[alarm]]
+        name = "test-alarm"
+        kind = "counter"
+        metric = "foo"
+        extraction = "form1"
+        labels = []
+        op = ">="
+        threshold = 5
+        severity = "WARN"
+        gates = []
+        cooldown_key = "foo"
+        cooldown_seconds = 3600
+        filing_title = "t"
+        filing_search = "s"
+        summary = "s"
+        details = "d"
+        notes = ""
+    """)
+    new = _write_toml(tmp_path, "new.toml", """\
+        [[alarm]]
+        name = "test-alarm"
+        kind = "counter"
+        metric = "foo"
+        extraction = "form1"
+        labels = []
+        op = ">="
+        threshold = 10
+        severity = "WARN"
+        gates = []
+        cooldown_key = "foo"
+        cooldown_seconds = 3600
+        filing_title = "t"
+        filing_search = "s"
+        summary = "s"
+        details = "d"
+        notes = ""
+    """)
+    # Patch sys.argv and run main()
+    import sys as _sys
+    old_argv = _sys.argv
+    try:
+        _sys.argv = ["check-alarm-versions.py", old, new]
+        exit_code = _mod.main()
+    finally:
+        _sys.argv = old_argv
+
+    assert exit_code == 0  # advisory
+    captured = capsys.readouterr()
+    assert "::warning" in captured.out
+    assert "threshold" in captured.out
+    assert "1 warning(s)" in captured.out
+
+
+def test_cli_main_hard_error(tmp_path, capsys):
+    old = _write_toml(tmp_path, "old.toml", "")
+    new = _write_toml(tmp_path, "new.toml", """\
+        [[alarm]]
+        name = "dupe"
+        kind = "counter"
+        metric = "foo"
+        extraction = "form1"
+        labels = []
+        op = ">="
+        threshold = 1
+        severity = "WARN"
+        gates = []
+        cooldown_key = "d"
+        cooldown_seconds = 3600
+        filing_title = "t"
+        filing_search = "s"
+        summary = "s"
+        details = "d"
+        notes = ""
+
+        [[alarm]]
+        name = "dupe"
+        kind = "counter"
+        metric = "bar"
+        extraction = "form1"
+        labels = []
+        op = ">="
+        threshold = 2
+        severity = "WARN"
+        gates = []
+        cooldown_key = "d2"
+        cooldown_seconds = 3600
+        filing_title = "t"
+        filing_search = "s"
+        summary = "s"
+        details = "d"
+        notes = ""
+    """)
+    import sys as _sys
+    old_argv = _sys.argv
+    try:
+        _sys.argv = ["check-alarm-versions.py", old, new]
+        exit_code = _mod.main()
+    finally:
+        _sys.argv = old_argv
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "::error" in captured.out
+
+
 # ── Test: Real alarm file validates without unknown fields ────────────────
 
 def test_real_alarm_file_no_unknown_fields():
