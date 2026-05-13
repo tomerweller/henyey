@@ -75,8 +75,7 @@ SECTIONS (in this canonical order):
     ### 1.1 Purpose and Scope
       - State what the spec covers and what is out of scope
       - Include: "This specification is **implementation agnostic**. It is derived
-        exclusively from the vetted stellar-core C++ implementation (v25.x) and
-        its pseudocode companion."
+        exclusively from the vetted stellar-core C++ implementation (v25.x)."
       - Explicit out-of-scope list
     ### 1.2 Conventions and Terminology
       - RFC 2119 boilerplate
