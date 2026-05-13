@@ -282,7 +282,6 @@ async function handle_overlay_message(msg):
     state = herder.receive_scp_envelope(envelope)
       REF: henyey_herder::Herder::receive_scp_envelope
     if state == Valid:
-      sync_recovery_heartbeat()
       if is_externalize:
         herder.scp_driver().request_tx_set(tx_set_hash, slot)
         if herder.needs_tx_set(tx_set_hash):
