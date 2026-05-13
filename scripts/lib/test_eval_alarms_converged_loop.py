@@ -405,9 +405,9 @@ def test_exempt_no_error_no_series_when_metric_absent():
     lines = [l for l in stderr.strip().split("\n") if "alarm=test-absent" in l]
     assert len(lines) == 1
     line = lines[0]
-    # Full unified contract: metric=, series_matched=, state=skipped
-    assert "metric=" in line, f"Missing 'metric=' in telemetry: {line}"
-    assert "series_matched=" in line, f"Missing 'series_matched=' in telemetry: {line}"
+    # Full unified contract with exact values
+    assert "metric=nonexistent_metric" in line, f"Wrong metric in telemetry: {line}"
+    assert "series_matched=0" in line, f"Expected series_matched=0 for absent metric: {line}"
     assert "state=skipped" in line, f"Expected state=skipped, got: {line}"
     assert "ERROR_NO_SERIES" not in line, f"Unexpected ERROR_NO_SERIES for exempt+absent: {line}"
 
@@ -438,8 +438,9 @@ def test_gate_skip_stderr_unified_format():
     lines = [l for l in stderr.strip().split("\n") if "alarm=test-gate-fmt" in l]
     assert len(lines) == 1, f"Expected exactly one telemetry line, got {lines}"
     line = lines[0]
-    assert "metric=" in line, f"Missing 'metric=' in telemetry: {line}"
-    assert "series_matched=" in line, f"Missing 'series_matched=' in telemetry: {line}"
+    # Exact values: metric matches alarm config, series_matched=1 (metric present in scrape)
+    assert "metric=some_gauge" in line, f"Wrong metric in telemetry: {line}"
+    assert "series_matched=1" in line, f"Expected series_matched=1: {line}"
     assert "state=skipped" in line, f"Missing 'state=skipped' in telemetry: {line}"
 
 
