@@ -1,0 +1,5 @@
+WARNING: monitor-loop/SKILL.md calls recover_session_from_stdout without fail-fast error handling
+WARNING: henyey stdout target deleted (out-of-band wipe). Process still alive.
+# Cross-invocation dedup tests
+# refresh-stable-baseline.sh tests
+# Auto-comment dedup tests

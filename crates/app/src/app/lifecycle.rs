@@ -2024,7 +2024,7 @@ impl App {
             henyey_herder::scp_verify::VerifiedEnvelope,
         >,
     ) {
-        use henyey_herder::scp_verify::PreFilter;
+        use henyey_herder::scp_verify::{PipelinedIntake, PreFilter};
 
         // Phase 31 marks time spent in this helper: pre-filtering, reserving
         // verifier-queue capacity (the backpressure park point), and draining
@@ -2098,14 +2098,17 @@ impl App {
                         "herder.pre_filter_scp_envelope",
                         || self.herder.pre_filter_scp_envelope(&envelope),
                     ) {
-                        PreFilter::Accept(mut intake) => {
-                            intake.peer_id = Some(from_peer);
-                            intake.flood_msg_hash = Some(flood_msg_hash);
-                            // Move the token into the intake — it will live
-                            // as long as the intake, auto-expiring the cache
-                            // entry when processing completes or the intake
-                            // is dropped.
-                            intake.inflight_token = Some(inflight_token);
+                        PreFilter::Accept(intake) => {
+                            // Reconstruct with overlay context via from_overlay,
+                            // which requires the inflight_token at compile time.
+                            let intake = PipelinedIntake::from_overlay(
+                                intake.envelope,
+                                intake.slot,
+                                intake.is_externalize,
+                                from_peer,
+                                flood_msg_hash,
+                                inflight_token,
+                            );
                             permit.send(intake);
                         }
                         PreFilter::Reject(reason) => {

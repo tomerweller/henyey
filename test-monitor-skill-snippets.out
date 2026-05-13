@@ -1,0 +1,293 @@
+WARNING: monitor-loop/SKILL.md calls recover_session_from_stdout without fail-fast error handling
+1..286
+ok 1 - session-wipe: process alive (exact binary)
+ok 2 - session-wipe: process alive (deleted binary)
+ok 3 - session-wipe: different binary not matched
+ok 4 - session-wipe: dead process, env fresh
+ok 5 - session-wipe: dead process, env stale (7201s)
+ok 6 - session-wipe: env at boundary (7200s passes)
+ok 7 - session-wipe: missing env file is stale
+WARNING: henyey stdout target deleted (out-of-band wipe). Process still alive.
+ok 8 - attach-mode: (deleted) stdout recovers session-id
+ok 9 - attach-mode: normal stdout recovers session-id (no side effects)
+ok 10 - attach-mode: malformed path (has /data/ but invalid) returns error
+ok 11 - attach-mode: no /data/ segment returns error
+ok 12 - cleanup-guard: refuses active session (layer 1)
+ok 13 - cleanup-guard: refuses recent .alive (3599s < 3600, layer 2)
+ok 14 - cleanup-guard: .alive at boundary (3600s) passes layer 2
+ok 15 - cleanup-guard: refuses running-process session (layer 3)
+ok 16 - mainnet-wiped: independent of SESSION_WIPED, detects missing dir
+ok 17 - session-wipe: stale env does NOT create recovery dirs
+ok 18 - attach-mode: (deleted) stdout emits warning to stderr
+ok 19 - cleanup-guard: no .alive file falls through to PASS
+ok 20 - session-wipe: session dir exists → not wiped
+ok 21 - _find_session_process: returns PID for matching binary
+ok 22 - _find_session_process: empty for non-matching binary
+ok 23 - _enumerate_henyey_processes: single run process
+ok 24 - _enumerate_henyey_processes: multiple sessions listed
+ok 25 - _enumerate_henyey_processes: (deleted) exe matched
+ok 26 - _enumerate_henyey_processes: empty proc root
+ok 27 - _enumerate_henyey_processes: non-henyey binary ignored
+ok 28 - _enumerate_henyey_processes: non-run cmdline ignored
+ok 29 - _enumerate_henyey_processes: missing cmdline ignored
+ok 30 - _parse_cmdline_config: -c path extracted
+ok 31 - _parse_cmdline_config: --config path extracted
+ok 32 - _parse_cmdline_config: --conf alias extracted
+ok 33 - _parse_cmdline_config: --config=value extracted
+ok 34 - _parse_cmdline_config: no config flag returns empty
+ok 35 - long-stale: session dir missing → not stale
+ok 36 - long-stale: .alive fresh (100s) → not stale
+ok 37 - long-stale: .alive stale + env stale + no process → return 1
+ok 38 - long-stale: process alive overrides stale markers
+ok 39 - long-stale: .alive at boundary (21600s) → not stale
+ok 40 - long-stale: .alive missing + env fresh → not stale
+ok 41 - long-stale: .alive missing + env stale + no process → return 1
+ok 42 - long-stale: env at boundary (86400s) → not stale
+ok 43 - long-stale: .alive stale + env fresh → not stale (env fallback)
+ok 44 - long-stale: different session process does not save
+ok 45 - long-stale: stderr message on refusal
+ok 46 - crash-detect: fatal_wipe_required=true in text log
+ok 47 - crash-detect: legacy prose 'State wipe required before restart'
+ok 48 - crash-detect: unrelated error → no hash mismatch
+ok 49 - crash-detect: all files older than 30 min → count=0
+ok 50 - crash-detect: empty log directory → count=0
+ok 51 - crash-detect: missing log directory → count=0
+ok 52 - crash-detect: 4 recent + 2 old → count=4, newest selected
+ok 53 - crash-detect: exact boundary (NOW-1800) excluded
+ok 54 - crash-detect: just inside boundary (NOW-1799) included
+ok 55 - crash-detect: newest non-fatal, older fatal → no mismatch
+ok 56 - crash-detect: colon separator (fatal_wipe_required: true)
+ok 57 - crash-detect: JSON format ("fatal_wipe_required":true)
+ok 58 - crash-detect: mtime tie-break → lexicographic-last path
+ok 59 - heartbeat: text format, tail-1 returns most recent
+ok 60 - heartbeat: colon separator matches
+ok 61 - heartbeat: JSON format matches
+ok 62 - heartbeat: prose-only Heartbeat does not match
+ok 63 - heartbeat: empty log → exit 1
+ok 64 - heartbeat: empty log with tail_count → exit 1
+ok 65 - heartbeat: missing file → non-zero exit
+ok 66 - metric-alarms: TOML exists and parseable (streak=3 burst=10 delta=1)
+ok 67 - check-12b-semantics: streak threshold (breach_streak >= 3)
+ok 68 - check-12b-semantics: burst threshold (delta >= 10)
+ok 69 - check-12b-semantics: uses metrics/counter_streak_snapshot (not ratio_snapshot)
+ok 70 - check-12b-semantics: watcher mode excludes Check 12b (mode=validator)
+ok 71 - check-12b-semantics: excluded from metrics aggregate (NOT counted)
+ok 72 - check-12b-semantics: recovery_stalled in output template
+ok 73 - check-12b-semantics: monitor-loop table row + snapshot match TOML
+ok 74 - check-12b-semantics: monitor-loop watcher excludes Check 12b + validator-only
+ok 75 - metric-alarms: reference link in both SKILL.md files
+ok 76 - check-12b-semantics: delta threshold cross-validated (delta >= 1)
+ok 77 - check-12b-semantics: metric name from TOML in both specs (henyey_recovery_stalled_tick_total)
+ok 78 - check-12b-semantics: metric label from TOML in both specs (reason="forcing_catchup_behind")
+ok 79 - soft-fail-detect: 20 messages spanning 600s → yes (duration=570)
+ok 80 - soft-fail-detect: 5 messages spanning 120s → no
+ok 81 - soft-fail-detect: 20 messages most recent 120s ago → no (stale)
+ok 82 - soft-fail-detect: missing log file → no
+ok 83 - soft-fail-detect: one message → no (duration=0)
+ok 84 - soft-fail-detect: all timestamps before PROC_START → no
+ok 85 - soft-fail-detect: mixed text+JSON → yes (duration=540)
+ok 86 - soft-fail-detect: WARN+DEBUG mix, only WARN counted → no (duration=30)
+ok 87 - fatal-wipe-evidence: crashed=yes active=yes neither=no
+ok 88 - consistency: SKILL.md references detect_soft_fail_blocked and has_fatal_wipe_evidence
+ok 89 - tick-history: quoted heredoc, no inline $(date), uses datetime.now
+ok 90 - tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew
+ok 91 - quarantine-parse: missing file returns 0 with empty outputs
+ok 92 - quarantine-parse: empty file returns 0 with empty outputs
+ok 93 - quarantine-parse: unreadable file returns 1 (fail-closed)
+ok 94 - quarantine-parse: comments-only file returns empty
+ok 95 - quarantine-parse: valid entries parsed correctly
+ok 96 - quarantine-parse: malformed entries produce warnings
+ok 97 - quarantine-parse: mixed file — valid entries + warnings
+ok 98 - quarantine-parse: tab-separated entry parsed
+ok 99 - quarantine-parse: CRLF stripped correctly
+ok 100 - quarantine-parse: bare SHA (no reason) is valid
+ok 101 - quarantine-ancestry: empty file returns 1 (clear)
+ok 102 - quarantine-ancestry: ancestor returns 0 (blocked)
+ok 103 - quarantine-ancestry: not ancestor returns 1 (clear)
+ok 104 - quarantine-ancestry: git error returns 0 (fail-closed)
+ok 105 - quarantine-ancestry: unreadable file returns 0 (fail-closed)
+ok 106 - quarantine-append: new entry appended
+ok 107 - quarantine-append: duplicate is no-op
+ok 108 - quarantine-append: invalid SHA returns 1
+ok 109 - quarantine-append: empty reason writes bare SHA (no trailing space)
+ok 110 - quarantine-remove: entry removed, others preserved
+ok 111 - quarantine-remove: missing file returns 0
+ok 112 - quarantine-remove: invalid SHA returns 1
+ok 113 - quarantine-append: reason sanitization (control chars stripped, truncated to 200)
+ok 114 - quarantine-append: I/O error (mkdir fails) returns 2
+ok 115 - quarantine-remove: I/O error (mv fails) returns 2, file unchanged, no .tmp
+ok 116 - watcher-ctl: status returns 1 with no watcher
+ok 117 - watcher-ctl: status adopts untracked watcher from proc scan
+ok 118 - watcher-ctl: status returns 0 for tracked running watcher
+ok 119 - watcher-ctl: status cleans stale PID file (wrong binary)
+ok 120 - watcher-ctl: rejects process without --watcher flag
+ok 121 - watcher-ctl: rejects process with wrong config
+ok 122 - watcher-ctl: shows usage on invalid command
+ok 123 - watcher-ctl: stop returns 0 when no watcher running
+ok 124 - watcher-ctl: stop happy path (process exits promptly)
+ok 125 - watcher-ctl: stop timeout detection (15s)
+ok 126 - watcher-ctl: stop kill failure returns 1
+ok 127 - watcher-ctl: start refuses when already running + adopts PID
+ok 128 - watcher-ctl: start fails when binary not found
+ok 129 - watcher-ctl: start detects startup crash
+ok 130 - watcher-ctl: start happy path succeeds
+ok 131 - watcher-ctl: restart sequencing (stop no-op then start fails)
+ok 132 - watcher-ctl: restart propagates stop failure (start not reached)
+ok 133 - watcher-ctl: restart success (stop no-op, start succeeds)
+ok 134 - watcher-ctl: restart full cycle (old stopped, new started)
+ok 135 - scrape-identity: file format fields documented (version=1, pid, start_ticks, timestamp)
+ok 136 - scrape-identity: PREV_PROM_INVALID invalidation rules (3 triggers documented)
+ok 137 - scrape-identity: persistence-reset gauges (3 gauges + reset semantics)
+ok 138 - scrape-identity: metrics status format includes baselines skipped + gauge alerts
+ok 139 - scrape-identity: state files table (current.prom, prev.prom, scrape_identity → check 12)
+ok 140 - pv-label-sync: canonical extraction (count=14, ALL size=14)
+ok 141 - pv-label-sync: TOML expected_labels match source (14)
+ok 142 - pv-label-sync: TOML label count matches source (14)
+ok 143 - pv-label-sync: monitor-loop inline labels (14)
+ok 144 - pv-label-sync: monitor-loop count refs (14)
+ok 145 - pv-label-sync: evaluator handles expected_labels
+ok 146 - eval-alarms: --validate-only passes (35 alarms)
+ok 147 - eval-alarms: all 43 alarm metrics found in source
+ok 148 - eval-alarms: exempt alarm passes --validate-only
+ok 149 - eval-alarms: exempt alarm runtime state=skipped with skip_reason
+ok 150 - eval-alarms: exempt=true without exempt_reason is rejected
+ok 151 - eval-alarms: ledger-invariant-failure fires on breach fixture
+ok 152 - eval-alarms: tx-internal-error fires on breach fixture
+ok 153 - eval-alarms: quorum-fail-at-low multi-tick persistence (breach→breach→firing→clear)
+ok 154 - eval-alarms: quorum-fail-at-low warmup gate resets stale persistence (#2614)
+ok 155 - eval-alarms: metric-missing resets stale gauge persistence (#2614)
+ok 156 - eval-alarms: all 16 mirrored UIDs resolve to Grafana alerts
+ok 157 - eval-alarms: all 12 mirrored toml_names resolve to alarms
+ok 158 - eval-alarms: all 19 Grafana UIDs classified (mirrored or grafana_only)
+ok 159 - eval-alarms: ALARM_SURFACES.md is up to date with alarm-surfaces.toml
+ok 160 - archive: directory structure and metadata.env created correctly
+ok 161 - archive: .tmp directories excluded from snapshot count
+ok 162 - archive: pruning keeps exactly 500 snapshots
+ok 163 - archive: chronological ordering by directory name
+ok 164 - archive: skipped-tick metadata.env correctly marks TICK_SKIPPED=true
+ok 165 - archive: validate_metadata rejects wrong ARCHIVE_VERSION
+ok 166 - archive: validate_metadata rejects missing UPTIME_SECONDS
+ok 167 - archive: validate_metadata rejects non-numeric UPTIME_SECONDS
+ok 168 - archive: validate_metadata detects missing key despite stale shell state
+ok 169 - archive: default mode reads metadata from latest archive snapshot
+ok 170 - archive: post-gap persistence — skipped tick counted, state preserved
+ok 171 - archive: retention boundary — oldest pruned, newest 2 kept
+ok 172 - replay: --json without --replay exits with error
+ok 173 - replay: --json with --window exits with error
+ok 174 - replay: --replay --json on empty archive returns zeroed schema
+ok 175 - replay: --replay --json parses multi-line evaluator JSON
+ok 176 - regression: no baseline creates both baselines
+ok 177 - regression: no regressions updates baseline
+ok 178 - regression: regressions found, baseline NOT updated
+ok 179 - regression: baseline_fired_pct_display present in output (10.53%)
+ok 180 - regression: non-catalog alarms filtered (alarm_a excluded, lost-sync kept)
+ok 181 - regression: baseline pruned on write (fake_alarm removed)
+ok 182 - regression: missing catalog exits 2
+ok 183 - regression: malformed catalog (no alarms) exits 2
+ok 184 - stable: initial run creates identical rolling and stable baselines
+ok 185 - stable: stable baseline NOT updated on clean run
+ok 186 - stable: gradual decay detected via stable baseline
+ok 187 - stable: no false positive when alarm still active
+ok 188 - stable: partial bootstrap — rolling exists, stable created
+ok 189 - stable: partial bootstrap — stable exists, rolling created
+ok 190 - stable: corrupt stable baseline exits 2
+ok 191 - stable: schema mismatch stable exits 2
+ok 192 - stable: absent alarm from stable reports regression
+ok 193 - stable: low-sample current skips alarm
+ok 194 - stable: dedup — stable wins with full object
+ok 195 - stable: --stable-baseline flag overrides path
+ok 196 - stable: stable-only regressions prevent rolling update
+ok 197 - stable: same-path rejection via realpath
+ok 198 - stable: invalid current replay exits 2
+ok 199 - stable: baseline_source field present in regression JSON
+ok 200 - stable: missing evaluated_ticks in stable exits 2
+ok 201 - stable: negative evaluated_ticks in rolling exits 2
+ok 202 - provenance: baselines contain provenance metadata
+ok 203 - provenance: stable baseline has provenance
+ok 204 - provenance: matching checksum — stable baseline not invalidated
+ok 205 - provenance: changed checksum triggers auto-invalidation
+ok 206 - provenance: legacy baseline migrated with provenance (alarm data preserved)
+ok 207 - provenance: malformed provenance treated as legacy and fixed (alarm data preserved)
+ok 208 - provenance: rolling baseline has provenance after update
+ok 209 - provenance: no .tmp files left behind after runs
+ok 210 - provenance: rolling baseline auto-invalidated on checksum change
+ok 211 - provenance: non-git fallback sets created_commit to unknown
+ok 212 - provenance: failure-path preserves existing baseline
+ok 213 - provenance: comment-only catalog edit triggers invalidation
+ok 214 - force-baseline-update: without flag, baselines NOT updated on regression
+ok 215 - force-baseline-update: with flag, both baselines updated
+ok 216 - force-baseline-update: subsequent run shows no regressions
+ok 217 - ack: acknowledge happy path creates file
+ok 218 - ack: ack file contains correct metadata
+ok 219 - ack: --ack-issue stores issue number
+ok 220 - ack: non-catalog alarm exits 2
+ok 221 - ack: without rationale exits 1
+ok 222 - ack: empty rationale exits 1
+ok 223 - ack: acknowledged alarm excluded from regression detection
+ok 224 - ack: list shows alarm and rationale
+ok 225 - ack: list with no acks shows message
+ok 226 - ack: revoke re-enables regression detection
+ok 227 - ack: revoke not-found warns
+ok 228 - ack: malformed ack file exits 2
+ok 229 - ack: malformed ack file during list exits 2
+ok 230 - ack: mutual exclusion rejects combined flags
+ok 231 - ack: catalog change invalidates acknowledgments
+[]
+ok 232 - ack: normal detection persists catalog invalidation to disk
+ok 233 - ack: overwrite updates metadata
+ok 234 - ack: malformed ack file during revoke exits 2
+ok 235 - regression dedup: existing issue (exact title) skips filing
+ok 236 - regression dedup: false-positive title rejected, issue filed
+ok 237 - regression dedup: body-marker fallback skips filing
+ok 238 - regression dedup: clean filing creates exactly one issue
+ok 239 - regression dedup: lookup failure still files issue (fail open)
+ok 240 - eval-alarms: no false ERROR_NO_SERIES in telemetry
+ok 241 - eval-alarms: counter-ratio numerator_sum metric resolved
+ok 242 - eval-alarms: no unresolved placeholders in results
+ok 243 - eval-alarms: no placeholder guard warnings on healthy fixtures
+ok 244 - eval-alarms: gauge-ratio telemetry uses numerator_metric
+ok 245 - eval-alarms: exempt skip path produces placeholder-free results
+# Cross-invocation dedup tests
+ok 246 - dedup: first run records filed alarm in dedup file
+ok 247 - dedup: second run skips filing due to persistent dedup
+ok 248 - dedup: expired entries pruned, re-filing allowed
+ok 249 - dedup: corrupt file treated as empty with warning
+# refresh-stable-baseline.sh tests
+ok 250 - refresh: removes alarm from stable baseline, keeps others
+ok 251 - refresh: removes alarm from rolling baseline
+ok 252 - refresh: auto-revokes matching acknowledgment
+ok 253 - refresh: rejects alarm not in catalog
+ok 254 - refresh: missing baseline files handled gracefully
+ok 255 - refresh: malformed ack file exits 2 (fail closed)
+# Auto-comment dedup tests
+ok 256 - autocomment: posts update comment on existing duplicate issue
+ok 257 - autocomment: same-day dedup skips re-commenting
+ok 258 - dedup-load: missing file returns empty schema
+ok 259 - dedup-load: corrupt file returns empty schema + warning
+ok 260 - dedup-load: wrong schema_version returns empty schema
+ok 261 - dedup-load: valid file returns data
+ok 262 - dedup-prune: entry at exact cutoff is expired (> semantics)
+ok 263 - dedup-prune: malformed filed_at silently dropped
+ok 264 - dedup-prune: fresh entry survives prune
+ok 265 - dedup-check: hit returns exit 0 + entry JSON
+ok 266 - dedup-check: miss returns exit 1 + empty stdout
+ok 267 - dedup-check: empty key is a normal miss
+ok 268 - dedup-record: k=v pairs with integer coercion + auto filed_at
+ok 269 - dedup-remove: existing key removed, others preserved
+ok 270 - dedup-remove: absent key is no-op
+ok 271 - dedup-update-field: updates field, preserves others
+ok 272 - dedup-update-field: missing key exits non-zero
+ok 273 - dedup-write: atomic write succeeds, no tmp residue
+ok 274 - dedup-write: invalid JSON rejected, file unchanged
+ok 275 - flow: empty build_sha guard short-circuits (no dedup/gh calls)
+ok 276 - flow: open-issue hit → daily comment + date updated
+ok 277 - flow: same-day rate limit skips comment
+ok 278 - flow: comment failure → date NOT updated
+ok 279 - flow: closed-issue hit → remove + refile with new issue
+ok 280 - flow: UNKNOWN state → suppress filing safely
+ok 281 - flow: remote-search backfill records correct issue
+ok 282 - flow: remote-search false-positive falls through to filing
+ok 283 - flow: gh create failure → dedup file untouched
+ok 284 - flow: lock timeout → no dedup/gh operations
+ok 285 - flow: board routing calls move-issue-status with correct args
+ok 286 - flow: daily comment adds off-board issue to Backlog

@@ -157,8 +157,9 @@ impl<T> std::ops::IndexMut<PreFilterRejectReason> for PreFilterCounters<T> {
 /// Envelope intake payload carried from the event loop across the verifier
 /// channel. Contains everything `process_verified` needs downstream.
 ///
-/// Construct via [`PipelinedIntake::from_overlay`] (overlay path with dedup
-/// token) or [`PipelinedIntake::from_local`] (test/catchup path without dedup).
+/// Construct via [`PipelinedIntake::from_overlay`] (overlay path — requires
+/// dedup token at compile time) or [`PipelinedIntake::from_local`]
+/// (test/catchup path without dedup).
 #[derive(Debug)]
 pub struct PipelinedIntake {
     pub envelope: ScpEnvelope,
