@@ -18,7 +18,7 @@ schema_version = 1
 
 [[alarm]]
 name = "lost-sync"
-baseline_version = 2  # bumped in #2612: counter only increments on tracking timeout
+baseline_version = 3  # bumped in #2642: force re-invalidation of stable baselines created during post-#2612 transition
 metric = "stellar_herder_lost_sync_total"
 kind = "counter"
 extraction = "form1"
@@ -33,7 +33,7 @@ filing_title = "metrics: stellar_herder_lost_sync_total — delta={value}"
 filing_search = "metrics: stellar_herder_lost_sync_total"
 summary = "Herder lost sync"
 details = "delta={value}"
-notes = "Semantic change in #2612: counter only increments on tracking timeout (parity with stellar-core mLostSync.Mark). Baseline from pre-fix builds is stale."
+notes = "Semantic change in #2612: counter only increments on tracking timeout (parity with stellar-core mLostSync.Mark). Version bumped again in #2642 to force-invalidate stable baselines that captured transitional data during post-#2612 rollout."
 
 [[alarm]]
 name = "post-catchup-hard-reset"

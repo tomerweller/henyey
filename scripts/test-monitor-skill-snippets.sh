@@ -5916,6 +5916,123 @@ print('alarm-default' in d.get('alarms', {}))
       "versioned=$ver_ack_has_versioned default=$ver_ack_has_default"
   fi
 
+  # Test: contaminated post-bump baseline — version matches but data is stale (#2642)
+  # Scenario: stable baseline was created AFTER version bump (provenance shows v2),
+  # but captured transitional firing data. Later, alarm goes silent → false regression.
+  # Bumping to v3 should invalidate and clear the false positive.
+  local ver_contam_session="$ver_root/contaminated"
+  mkdir -p "$ver_contam_session/metrics"
+
+  # Catalog with alarm-versioned at version 3 (simulating the fix bump)
+  local ver_catalog_v3="$ver_root/test-catalog-v3.toml"
+  cat > "$ver_catalog_v3" << 'VER_V3_EOF'
+schema_version = 1
+
+[[alarm]]
+name = "alarm-versioned"
+baseline_version = 3
+metric = "test_metric_a"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "test_metric_a"
+cooldown_seconds = 3600
+filing_title = "test a"
+filing_search = "test a"
+summary = "Test A"
+details = "delta={value}"
+notes = ""
+
+[[alarm]]
+name = "alarm-default"
+metric = "test_metric_b"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "test_metric_b"
+cooldown_seconds = 3600
+filing_title = "test b"
+filing_search = "test b"
+summary = "Test B"
+details = "delta={value}"
+notes = ""
+VER_V3_EOF
+
+  # Stable baseline: created post-v2 bump (provenance says v2), stale firing data
+  local ver_contam_baseline
+  ver_contam_baseline=$(python3 -c "
+import json
+data = {
+    'schema_version': 1,
+    'evaluated_ticks': 200,
+    'skipped_ticks': 10,
+    'error_ticks': 0,
+    'total_snapshots': 210,
+    'first_ts': 't1',
+    'last_ts': 't2',
+    'alarms': {
+        'alarm-versioned': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10},
+        'alarm-default': {'firing': 15, 'breach': 3, 'ok': 172, 'baseline': 0, 'skip': 10}
+    },
+    'provenance': {
+        'created_at': '2026-02-01T00:00:00Z',
+        'created_commit': 'post-bump-commit',
+        'catalog_checksum': 'old-post-bump-checksum',
+        'alarm_versions': {'alarm-versioned': 2, 'alarm-default': 1}
+    }
+}
+print(json.dumps(data))
+")
+  echo "$ver_contam_baseline" > "$ver_contam_session/metrics/replay-baseline.json"
+  echo "$ver_contam_baseline" > "$ver_contam_session/metrics/replay-baseline-stable.json"
+
+  # Current replay: alarm-versioned is now silent (0 firing), alarm-default still active
+  local ver_contam_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"alarm-versioned":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"alarm-default":{"firing":15,"breach":3,"ok":172,"baseline":0,"skip":10}}}'
+  echo "$ver_contam_current" > "$ver_contam_session/metrics/ver-contam-current.json"
+
+  # Run with v3 catalog — should invalidate alarm-versioned (stored v2 != current v3)
+  local ver_contam_out ver_contam_regressions
+  ver_contam_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ver_contam_session" --current "$ver_contam_session/metrics/ver-contam-current.json" \
+    --catalog "$ver_catalog_v3" 2>&1) || true
+  ver_contam_regressions=$(echo "$ver_contam_out" | grep -v '^[A-Z]' | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    # Check no regression for alarm-versioned
+    names = [r['alarm'] for r in data]
+    print('alarm-versioned' not in names)
+except:
+    print('ERROR')
+" 2>/dev/null) || ver_contam_regressions="ERROR"
+
+  # Verify stable baseline no longer contains alarm-versioned
+  local ver_contam_stable_clean
+  ver_contam_stable_clean=$(python3 -c "
+import json
+with open('$ver_contam_session/metrics/replay-baseline-stable.json') as f:
+    d = json.load(f)
+alarms = d.get('alarms', {})
+prov = d.get('provenance', {}).get('alarm_versions', {})
+# alarm-versioned should be removed from alarms, version updated to 3
+print('alarm-versioned' not in alarms and prov.get('alarm-versioned') == 3)
+" 2>/dev/null) || ver_contam_stable_clean="ERROR"
+
+  if [[ "$ver_contam_regressions" == "True" ]] && [[ "$ver_contam_stable_clean" == "True" ]]; then
+    tap_ok "per-alarm-version: contaminated post-bump baseline cleared by version bump (#2642)"
+  else
+    tap_not_ok "per-alarm-version: contaminated post-bump baseline cleared by version bump (#2642)" \
+      "no_regression=$ver_contam_regressions stable_clean=$ver_contam_stable_clean output=${ver_contam_out:0:300}"
+  fi
+
   rm -rf "$ver_root"
 
   # ── check-alarm-regression.sh dedup tests ──────────────────────────────────
