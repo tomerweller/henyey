@@ -604,14 +604,18 @@ fi
 maybe_invalidate_baseline "$BASELINE_FILE" "Rolling"
 maybe_invalidate_baseline "$STABLE_BASELINE_FILE" "Stable"
 
-# Load acknowledgments for regression filtering (read-only — no writes to ack file)
+# Load acknowledgments for regression filtering
 ACK_SET_JSON="{}"
 if [[ -f "$ACK_FILE" ]]; then
   ACK_DATA=$(load_ack_file) || exit 2
-  # Check catalog provenance: if mismatch, treat as empty (read-only, no write)
+  # Check catalog provenance: if mismatch, invalidate and persist the reset
   STORED_ACK_CHECKSUM=$(echo "$ACK_DATA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('catalog_checksum',''))" 2>/dev/null)
   if [[ -n "$STORED_ACK_CHECKSUM" ]] && [[ "$STORED_ACK_CHECKSUM" != "$CATALOG_CHECKSUM" ]]; then
-    echo "Acknowledgment catalog mismatch — treating all acknowledgments as stale for this run" >&2
+    echo "Acknowledgment catalog mismatch — invalidating stale acknowledgments" >&2
+    (
+      flock -w 30 9 || { echo "ERROR: Could not acquire acknowledgment lock" >&2; exit 2; }
+      echo '{"schema_version":1,"catalog_checksum":"","alarms":{}}' | write_ack_file
+    ) 9>"$ACK_LOCK"
     ACK_SET_JSON="{}"
   else
     ACK_SET_JSON=$(echo "$ACK_DATA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('alarms',{})))" 2>/dev/null) || ACK_SET_JSON="{}"

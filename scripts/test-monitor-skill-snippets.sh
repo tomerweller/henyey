@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=244
+TAP_PLAN=245
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -5370,6 +5370,35 @@ print(d['alarms']['lost-sync'].get('issue', ''))
     tap_ok "ack: catalog change invalidates acknowledgments"
   else
     tap_not_ok "ack: catalog change invalidates acknowledgments" "output: $ack_stale_out"
+  fi
+
+  # Test: normal detection persists catalog invalidation to disk
+  # After normal detection sees a catalog mismatch, the ack file should be reset
+  echo '{"schema_version":1,"catalog_checksum":"stale_checksum_001","alarms":{"lost-sync":{"acknowledged_at":"2026-01-01T00:00:00Z","acknowledged_commit":"abc","rationale":"old"}}}' \
+    > "$ack_session/metrics/alarm-acknowledgments.json"
+  # Create minimal baselines so normal detection reaches ack-loading code
+  local ack_catalog_cksum
+  ack_catalog_cksum=$(sha256sum "$catalog_for_ack" | cut -d' ' -f1)
+  local ack_baseline='{"schema_version":1,"alarms":{},"evaluated_ticks":10,"catalog_checksum":"'"$ack_catalog_cksum"'","provenance_commit":"abc","provenance_timestamp":"2026-01-01T00:00:00Z"}'
+  echo "$ack_baseline" > "$ack_session/metrics/replay-baseline.json"
+  echo "$ack_baseline" > "$ack_session/metrics/replay-baseline-stable.json"
+  # Run normal detection (provide a current JSON file so it doesn't try replay)
+  local ack_persist_dir="$ack_root/persist-test"
+  mkdir -p "$ack_persist_dir"
+  echo '{"schema_version":1,"alarms":{},"evaluated_ticks":10}' > "$ack_persist_dir/current.json"
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ack_session" --current "$ack_persist_dir/current.json" --catalog "$catalog_for_ack" 2>/dev/null || true
+  local ack_persist_alarms
+  ack_persist_alarms=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+print(json.dumps(d.get('alarms', {})))
+" "$ack_session/metrics/alarm-acknowledgments.json" 2>/dev/null) || ack_persist_alarms="FAIL"
+  if [[ "$ack_persist_alarms" == "{}" ]]; then
+    tap_ok "ack: normal detection persists catalog invalidation to disk"
+  else
+    tap_not_ok "ack: normal detection persists catalog invalidation to disk" "alarms=$ack_persist_alarms"
   fi
 
   # Test: overwrite existing ack updates metadata
