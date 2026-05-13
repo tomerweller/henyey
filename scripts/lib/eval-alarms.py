@@ -1201,6 +1201,12 @@ def validate_catalog(catalog: dict) -> list[str]:
         if not exempt and exempt_reason:
             errors.append(f"{name}: exempt_reason without exempt=true")
 
+        # baseline_version validation (optional, defaults to 1)
+        baseline_version = alarm.get("baseline_version")
+        if baseline_version is not None:
+            if not isinstance(baseline_version, int) or isinstance(baseline_version, bool) or baseline_version < 1:
+                errors.append(f"{name}: invalid baseline_version '{baseline_version}' (must be integer >= 1)")
+
         # Required fields
         kind = alarm.get("kind")
         if kind not in VALID_KINDS:

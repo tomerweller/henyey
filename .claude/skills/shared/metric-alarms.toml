@@ -18,6 +18,7 @@ schema_version = 1
 
 [[alarm]]
 name = "lost-sync"
+baseline_version = 2  # bumped in #2612: counter only increments on tracking timeout
 metric = "stellar_herder_lost_sync_total"
 kind = "counter"
 extraction = "form1"

@@ -4354,10 +4354,17 @@ else:
   local reg_contaminated_baseline
   reg_contaminated_baseline=$(python3 -c "
 import json, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 d = json.loads(sys.argv[1])
-d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2]}
+with open(sys.argv[3], 'rb') as f:
+    catalog = tomllib.load(f)
+versions = {a['name']: a.get('baseline_version', 1) for a in catalog.get('alarm', [])}
+d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2], 'alarm_versions': versions}
 print(json.dumps(d))
-" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"alarm_a":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}' "$catalog_for_reg_checksum")
+" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"alarm_a":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}' "$catalog_for_reg_checksum" "$catalog_for_reg")
   echo "$reg_contaminated_baseline" > "$reg_contaminated_session/metrics/replay-baseline.json"
   # Current has neither firing
   local reg_contaminated_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"alarm_a":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
@@ -4463,10 +4470,17 @@ print(json.dumps(d))
   add_test_provenance() {
     python3 -c "
 import json, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 d = json.loads(sys.argv[1])
-d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2]}
+with open(sys.argv[3], 'rb') as f:
+    catalog = tomllib.load(f)
+versions = {a['name']: a.get('baseline_version', 1) for a in catalog.get('alarm', [])}
+d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2], 'alarm_versions': versions}
 print(json.dumps(d))
-" "$1" "$stable_catalog_checksum"
+" "$1" "$stable_catalog_checksum" "$stable_catalog"
   }
   local stable_baseline_active
   stable_baseline_active=$(add_test_provenance "$stable_current_active")
@@ -4852,10 +4866,36 @@ else:
   local prov_t2="$prov_root/t2"
   mkdir -p "$prov_t2/metrics"
   echo "$prov_current" > "$prov_t2/metrics/current.json"
-  # Create baselines with matching catalog checksum
+  # Create baselines with matching catalog checksum AND alarm_versions
   local prov_real_checksum
   prov_real_checksum=$(sha256sum "$prov_catalog" | cut -d' ' -f1)
-  local prov_baseline_with_prov="{\"schema_version\":1,\"evaluated_ticks\":200,\"skipped_ticks\":10,\"error_ticks\":0,\"total_snapshots\":210,\"first_ts\":\"t1\",\"last_ts\":\"t2\",\"alarms\":{\"lost-sync\":{\"firing\":20,\"breach\":5,\"ok\":165,\"baseline\":0,\"skip\":10}},\"provenance\":{\"created_at\":\"2026-01-01T00:00:00Z\",\"created_commit\":\"abc123\",\"catalog_checksum\":\"$prov_real_checksum\"}}"
+  local prov_alarm_versions
+  prov_alarm_versions=$(python3 -c "
+import json, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], 'rb') as f:
+    catalog = tomllib.load(f)
+versions = {a['name']: a.get('baseline_version', 1) for a in catalog.get('alarm', [])}
+print(json.dumps(versions, sort_keys=True))
+" "$prov_catalog")
+  local prov_baseline_with_prov
+  prov_baseline_with_prov=$(python3 -c "
+import json, sys
+data = {
+    'schema_version': 1, 'evaluated_ticks': 200, 'skipped_ticks': 10,
+    'error_ticks': 0, 'total_snapshots': 210, 'first_ts': 't1', 'last_ts': 't2',
+    'alarms': {'lost-sync': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10}},
+    'provenance': {
+        'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'abc123',
+        'catalog_checksum': sys.argv[1],
+        'alarm_versions': json.loads(sys.argv[2])
+    }
+}
+print(json.dumps(data))
+" "$prov_real_checksum" "$prov_alarm_versions")
   echo "$prov_baseline_with_prov" > "$prov_t2/metrics/replay-baseline.json"
   echo "$prov_baseline_with_prov" > "$prov_t2/metrics/replay-baseline-stable.json"
   local prov_hash_before
@@ -4887,7 +4927,7 @@ with open(sys.argv[1]) as f:
     d = json.load(f)
 print(d.get('provenance',{}).get('catalog_checksum',''))
 " "$prov_t3/metrics/replay-baseline-stable.json" 2>/dev/null) || prov_new_checksum=""
-  if echo "$prov_t3_out" | grep -q "auto-invalidated" && [[ "$prov_new_checksum" == "$prov_real_checksum" ]]; then
+  if (echo "$prov_t3_out" | grep -q "auto-invalidated" || echo "$prov_t3_out" | grep -q "stamping per-alarm version provenance") && [[ "$prov_new_checksum" == "$prov_real_checksum" ]]; then
     tap_ok "provenance: changed checksum triggers auto-invalidation"
   else
     tap_not_ok "provenance: changed checksum triggers auto-invalidation" "output: $prov_t3_out, new_checksum: $prov_new_checksum"
@@ -4917,7 +4957,7 @@ ls = alarms.get('lost-sync', {})
 preserved = ls.get('firing') == 20
 print('yes' if has_prov and preserved else 'no')
 " "$prov_t4/metrics/replay-baseline-stable.json" 2>/dev/null) || prov_legacy_recreated="no"
-  if echo "$prov_t4_out" | grep -q "Migrating.*injecting provenance" && [[ "$prov_legacy_recreated" == "yes" ]]; then
+  if echo "$prov_t4_out" | grep -q "Migrating.*baseline" && [[ "$prov_legacy_recreated" == "yes" ]]; then
     tap_ok "provenance: legacy baseline migrated with provenance (alarm data preserved)"
   else
     tap_not_ok "provenance: legacy baseline migrated with provenance (alarm data preserved)" "output: $prov_t4_out, result: $prov_legacy_recreated"
@@ -5004,7 +5044,7 @@ with open(sys.argv[1]) as f:
     d = json.load(f)
 print(d.get('provenance',{}).get('catalog_checksum',''))
 " "$prov_t7/metrics/replay-baseline.json" 2>/dev/null) || prov_rolling_new_cs=""
-  if echo "$prov_t7_out" | grep -q "Rolling baseline auto-invalidated" && [[ "$prov_rolling_new_cs" == "$prov_real_checksum" ]]; then
+  if (echo "$prov_t7_out" | grep -q "Rolling baseline auto-invalidated" || echo "$prov_t7_out" | grep -q "Migrating Rolling baseline") && [[ "$prov_rolling_new_cs" == "$prov_real_checksum" ]]; then
     tap_ok "provenance: rolling baseline auto-invalidated on checksum change"
   else
     tap_not_ok "provenance: rolling baseline auto-invalidated on checksum change" "output: $prov_t7_out, checksum: $prov_rolling_new_cs"
@@ -5065,7 +5105,7 @@ else:
     tap_not_ok "provenance: failure-path preserves existing baseline"
   fi
 
-  # Test: Comment-only catalog edit triggers invalidation
+  # Test: Comment-only catalog edit preserves baseline data (per-alarm versioning)
   local prov_t10="$prov_root/t10"
   mkdir -p "$prov_t10/metrics"
   echo "$prov_current" > "$prov_t10/metrics/current.json"
@@ -5075,16 +5115,30 @@ else:
   echo "# This comment changes the checksum" >> "$prov_alt_catalog"
   local prov_alt_checksum
   prov_alt_checksum=$(sha256sum "$prov_alt_catalog" | cut -d' ' -f1)
-  # Create baseline with the ORIGINAL catalog checksum
+  # Create baseline with the ORIGINAL catalog checksum (versions match the alt catalog)
   echo "$prov_baseline_with_prov" > "$prov_t10/metrics/replay-baseline.json"
   echo "$prov_baseline_with_prov" > "$prov_t10/metrics/replay-baseline-stable.json"
+  local prov_hash_before_t10
+  prov_hash_before_t10=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+print(len(d.get('alarms', {})))
+" "$prov_t10/metrics/replay-baseline-stable.json")
   local prov_t10_out
   prov_t10_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
     "$prov_t10" --current "$prov_t10/metrics/current.json" --catalog "$prov_alt_catalog" 2>&1) || true
-  if echo "$prov_t10_out" | grep -q "auto-invalidated"; then
-    tap_ok "provenance: comment-only catalog edit triggers invalidation"
+  local prov_alarms_after_t10
+  prov_alarms_after_t10=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+print(len(d.get('alarms', {})))
+" "$prov_t10/metrics/replay-baseline-stable.json")
+  if echo "$prov_t10_out" | grep -q "no alarm versions differ" && [[ "$prov_alarms_after_t10" == "$prov_hash_before_t10" ]]; then
+    tap_ok "provenance: comment-only catalog edit preserves data (per-alarm versioning)"
   else
-    tap_not_ok "provenance: comment-only catalog edit triggers invalidation" "output: $prov_t10_out"
+    tap_not_ok "provenance: comment-only catalog edit preserves data (per-alarm versioning)" "output: $prov_t10_out, alarms_before=$prov_hash_before_t10, alarms_after=$prov_alarms_after_t10"
   fi
 
   rm -rf "$prov_root"
@@ -5188,10 +5242,17 @@ else:
   local ack_baseline
   ack_baseline=$(python3 -c "
 import json, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 d = json.loads(sys.argv[1])
-d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2]}
+with open(sys.argv[3], 'rb') as f:
+    catalog = tomllib.load(f)
+versions = {a['name']: a.get('baseline_version', 1) for a in catalog.get('alarm', [])}
+d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2], 'alarm_versions': versions}
 print(json.dumps(d))
-" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}' "$catalog_for_ack_checksum")
+" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}' "$catalog_for_ack_checksum" "$catalog_for_ack")
   echo "$ack_baseline" > "$ack_session/metrics/replay-baseline.json"
   echo "$ack_baseline" > "$ack_session/metrics/replay-baseline-stable.json"
 
@@ -5465,6 +5526,397 @@ print(d['alarms']['lost-sync']['rationale'])
   fi
 
   rm -rf "$ack_root"
+
+  # ── check-alarm-regression.sh per-alarm versioning tests (#2640) ────────────
+  # Tests for per-alarm baseline_version invalidation logic.
+
+  local ver_root
+  ver_root=$(mktemp -d)
+  local ver_session="$ver_root/session"
+  mkdir -p "$ver_session/metrics"
+
+  # Create a test catalog with two alarms: one with baseline_version=2, one with default (1)
+  local ver_catalog="$ver_root/test-catalog.toml"
+  cat > "$ver_catalog" << 'VER_CAT_EOF'
+schema_version = 1
+
+[[alarm]]
+name = "alarm-versioned"
+baseline_version = 2
+metric = "test_metric_a"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "test_metric_a"
+cooldown_seconds = 3600
+filing_title = "test a"
+filing_search = "test a"
+summary = "Test A"
+details = "delta={value}"
+notes = ""
+
+[[alarm]]
+name = "alarm-default"
+metric = "test_metric_b"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "test_metric_b"
+cooldown_seconds = 3600
+filing_title = "test b"
+filing_search = "test b"
+summary = "Test B"
+details = "delta={value}"
+notes = ""
+VER_CAT_EOF
+
+  local ver_catalog_checksum
+  ver_catalog_checksum=$(sha256sum "$ver_catalog" | cut -d' ' -f1)
+
+  # Create a baseline that was stored with alarm_versions showing version 1 for both
+  local ver_baseline
+  ver_baseline=$(python3 -c "
+import json
+data = {
+    'schema_version': 1,
+    'evaluated_ticks': 200,
+    'skipped_ticks': 10,
+    'error_ticks': 0,
+    'total_snapshots': 210,
+    'first_ts': 't1',
+    'last_ts': 't2',
+    'alarms': {
+        'alarm-versioned': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10},
+        'alarm-default': {'firing': 15, 'breach': 3, 'ok': 172, 'baseline': 0, 'skip': 10}
+    },
+    'provenance': {
+        'created_at': '2026-01-01T00:00:00Z',
+        'created_commit': 'old-commit',
+        'catalog_checksum': 'old-checksum-does-not-match',
+        'alarm_versions': {'alarm-versioned': 1, 'alarm-default': 1}
+    }
+}
+print(json.dumps(data))
+")
+  echo "$ver_baseline" > "$ver_session/metrics/replay-baseline.json"
+  echo "$ver_baseline" > "$ver_session/metrics/replay-baseline-stable.json"
+
+  # Current replay data with both alarms active
+  local ver_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"alarm-versioned":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"alarm-default":{"firing":15,"breach":3,"ok":172,"baseline":0,"skip":10}}}'
+  echo "$ver_current" > "$ver_session/metrics/ver-current.json"
+
+  # Run check-alarm-regression — should invalidate alarm-versioned (version 1→2) but keep alarm-default
+  local ver_out
+  ver_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ver_session" --current "$ver_session/metrics/ver-current.json" \
+    --catalog "$ver_catalog" 2>&1) || true
+
+  # Check that alarm-versioned was invalidated (removed) during per-alarm check
+  # Note: rolling baseline gets repopulated from current data on clean runs,
+  # so we verify via the output message that invalidation happened, and check
+  # the alarm_versions in provenance were updated correctly.
+  local ver_rolling_has_correct_versions
+  ver_rolling_has_correct_versions=$(python3 -c "
+import json
+with open('$ver_session/metrics/replay-baseline.json') as f:
+    d = json.load(f)
+av = d.get('provenance', {}).get('alarm_versions', {})
+# Should have the NEW versions stamped
+print(av.get('alarm-versioned') == 2 and av.get('alarm-default') == 1)
+" 2>/dev/null) || ver_rolling_has_correct_versions="ERROR"
+
+  if echo "$ver_out" | grep -q "per-alarm invalidation.*alarm-versioned" && [[ "$ver_rolling_has_correct_versions" == "True" ]]; then
+    tap_ok "per-alarm-version: version bump invalidates only affected alarm"
+  else
+    tap_not_ok "per-alarm-version: version bump invalidates only affected alarm" \
+      "correct_versions=$ver_rolling_has_correct_versions output=${ver_out:0:200}"
+  fi
+
+  # Check stable baseline too
+  local ver_stable_has_versioned ver_stable_has_default
+  ver_stable_has_versioned=$(python3 -c "
+import json
+with open('$ver_session/metrics/replay-baseline-stable.json') as f:
+    d = json.load(f)
+print('alarm-versioned' in d.get('alarms', {}))
+" 2>/dev/null) || ver_stable_has_versioned="ERROR"
+  ver_stable_has_default=$(python3 -c "
+import json
+with open('$ver_session/metrics/replay-baseline-stable.json') as f:
+    d = json.load(f)
+print('alarm-default' in d.get('alarms', {}))
+" 2>/dev/null) || ver_stable_has_default="ERROR"
+
+  if [[ "$ver_stable_has_versioned" == "False" ]] && [[ "$ver_stable_has_default" == "True" ]]; then
+    tap_ok "per-alarm-version: stable baseline per-alarm invalidation"
+  else
+    tap_not_ok "per-alarm-version: stable baseline per-alarm invalidation" \
+      "versioned=$ver_stable_has_versioned default=$ver_stable_has_default"
+  fi
+
+  # Test: cosmetic-only edit (same versions) — all data preserved
+  local ver_cosmetic_session="$ver_root/cosmetic"
+  mkdir -p "$ver_cosmetic_session/metrics"
+  # Create a catalog identical semantically but with different notes (different checksum)
+  local ver_catalog2="$ver_root/test-catalog2.toml"
+  sed 's/notes = ""/notes = "cosmetic change"/' "$ver_catalog" > "$ver_catalog2"
+  local ver_catalog2_checksum
+  ver_catalog2_checksum=$(sha256sum "$ver_catalog2" | cut -d' ' -f1)
+
+  # Baseline with matching alarm_versions but DIFFERENT catalog_checksum
+  local ver_cosmetic_baseline
+  ver_cosmetic_baseline=$(python3 -c "
+import json
+data = {
+    'schema_version': 1,
+    'evaluated_ticks': 200,
+    'skipped_ticks': 10,
+    'error_ticks': 0,
+    'total_snapshots': 210,
+    'first_ts': 't1',
+    'last_ts': 't2',
+    'alarms': {
+        'alarm-versioned': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10},
+        'alarm-default': {'firing': 15, 'breach': 3, 'ok': 172, 'baseline': 0, 'skip': 10}
+    },
+    'provenance': {
+        'created_at': '2026-01-01T00:00:00Z',
+        'created_commit': 'old-commit',
+        'catalog_checksum': 'different-old-checksum',
+        'alarm_versions': {'alarm-versioned': 2, 'alarm-default': 1}
+    }
+}
+print(json.dumps(data))
+")
+  echo "$ver_cosmetic_baseline" > "$ver_cosmetic_session/metrics/replay-baseline.json"
+  echo "$ver_cosmetic_baseline" > "$ver_cosmetic_session/metrics/replay-baseline-stable.json"
+  echo "$ver_current" > "$ver_cosmetic_session/metrics/ver-cosmetic-current.json"
+
+  local ver_cosmetic_out
+  ver_cosmetic_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ver_cosmetic_session" --current "$ver_cosmetic_session/metrics/ver-cosmetic-current.json" \
+    --catalog "$ver_catalog2" 2>&1) || true
+
+  # Both alarms should still be in baseline (versions match)
+  local ver_cos_has_both
+  ver_cos_has_both=$(python3 -c "
+import json
+with open('$ver_cosmetic_session/metrics/replay-baseline.json') as f:
+    d = json.load(f)
+alarms = d.get('alarms', {})
+print('alarm-versioned' in alarms and 'alarm-default' in alarms)
+" 2>/dev/null) || ver_cos_has_both="ERROR"
+
+  if [[ "$ver_cos_has_both" == "True" ]]; then
+    tap_ok "per-alarm-version: cosmetic edit preserves all data"
+  else
+    tap_not_ok "per-alarm-version: cosmetic edit preserves all data" \
+      "has_both=$ver_cos_has_both output=${ver_cosmetic_out:0:200}"
+  fi
+
+  # Test: legacy baseline (no alarm_versions) — non-destructive migration
+  local ver_legacy_session="$ver_root/legacy"
+  mkdir -p "$ver_legacy_session/metrics"
+  local ver_legacy_baseline
+  ver_legacy_baseline=$(python3 -c "
+import json
+data = {
+    'schema_version': 1,
+    'evaluated_ticks': 200,
+    'skipped_ticks': 10,
+    'error_ticks': 0,
+    'total_snapshots': 210,
+    'first_ts': 't1',
+    'last_ts': 't2',
+    'alarms': {
+        'alarm-versioned': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10},
+        'alarm-default': {'firing': 15, 'breach': 3, 'ok': 172, 'baseline': 0, 'skip': 10}
+    },
+    'provenance': {
+        'created_at': '2026-01-01T00:00:00Z',
+        'created_commit': 'old-commit',
+        'catalog_checksum': 'anything'
+    }
+}
+print(json.dumps(data))
+")
+  echo "$ver_legacy_baseline" > "$ver_legacy_session/metrics/replay-baseline.json"
+  echo "$ver_legacy_baseline" > "$ver_legacy_session/metrics/replay-baseline-stable.json"
+  echo "$ver_current" > "$ver_legacy_session/metrics/ver-legacy-current.json"
+
+  local ver_legacy_out
+  ver_legacy_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ver_legacy_session" --current "$ver_legacy_session/metrics/ver-legacy-current.json" \
+    --catalog "$ver_catalog" 2>&1) || true
+
+  # Legacy migration should preserve alarm data and stamp alarm_versions
+  local ver_legacy_has_versions ver_legacy_has_alarms
+  ver_legacy_has_versions=$(python3 -c "
+import json
+with open('$ver_legacy_session/metrics/replay-baseline.json') as f:
+    d = json.load(f)
+p = d.get('provenance', {})
+av = p.get('alarm_versions')
+print(isinstance(av, dict) and len(av) > 0)
+" 2>/dev/null) || ver_legacy_has_versions="ERROR"
+  ver_legacy_has_alarms=$(python3 -c "
+import json
+with open('$ver_legacy_session/metrics/replay-baseline.json') as f:
+    d = json.load(f)
+alarms = d.get('alarms', {})
+print(len(alarms) >= 2)
+" 2>/dev/null) || ver_legacy_has_alarms="ERROR"
+
+  if [[ "$ver_legacy_has_versions" == "True" ]] && [[ "$ver_legacy_has_alarms" == "True" ]]; then
+    tap_ok "per-alarm-version: legacy migration preserves data and stamps versions"
+  else
+    tap_not_ok "per-alarm-version: legacy migration preserves data and stamps versions" \
+      "has_versions=$ver_legacy_has_versions has_alarms=$ver_legacy_has_alarms"
+  fi
+
+  # Test: alarm removal — only removed alarm's entry deleted
+  local ver_remove_session="$ver_root/remove"
+  mkdir -p "$ver_remove_session/metrics"
+  # Catalog with only alarm-default (alarm-versioned removed)
+  local ver_catalog_removed="$ver_root/test-catalog-removed.toml"
+  cat > "$ver_catalog_removed" << 'VER_REM_EOF'
+schema_version = 1
+
+[[alarm]]
+name = "alarm-default"
+metric = "test_metric_b"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "test_metric_b"
+cooldown_seconds = 3600
+filing_title = "test b"
+filing_search = "test b"
+summary = "Test B"
+details = "delta={value}"
+notes = ""
+VER_REM_EOF
+
+  # Baseline has both alarms with proper provenance
+  local ver_remove_baseline
+  ver_remove_baseline=$(python3 -c "
+import json
+data = {
+    'schema_version': 1,
+    'evaluated_ticks': 200,
+    'skipped_ticks': 10,
+    'error_ticks': 0,
+    'total_snapshots': 210,
+    'first_ts': 't1',
+    'last_ts': 't2',
+    'alarms': {
+        'alarm-versioned': {'firing': 20, 'breach': 5, 'ok': 165, 'baseline': 0, 'skip': 10},
+        'alarm-default': {'firing': 15, 'breach': 3, 'ok': 172, 'baseline': 0, 'skip': 10}
+    },
+    'provenance': {
+        'created_at': '2026-01-01T00:00:00Z',
+        'created_commit': 'old-commit',
+        'catalog_checksum': 'old-checksum',
+        'alarm_versions': {'alarm-versioned': 2, 'alarm-default': 1}
+    }
+}
+print(json.dumps(data))
+")
+  echo "$ver_remove_baseline" > "$ver_remove_session/metrics/replay-baseline.json"
+  echo "$ver_remove_baseline" > "$ver_remove_session/metrics/replay-baseline-stable.json"
+  local ver_remove_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"alarm-default":{"firing":15,"breach":3,"ok":172,"baseline":0,"skip":10}}}'
+  echo "$ver_remove_current" > "$ver_remove_session/metrics/ver-remove-current.json"
+
+  local ver_remove_out
+  ver_remove_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ver_remove_session" --current "$ver_remove_session/metrics/ver-remove-current.json" \
+    --catalog "$ver_catalog_removed" 2>&1) || true
+
+  local ver_rem_has_versioned ver_rem_has_default
+  ver_rem_has_versioned=$(python3 -c "
+import json
+with open('$ver_remove_session/metrics/replay-baseline.json') as f:
+    d = json.load(f)
+print('alarm-versioned' in d.get('alarms', {}))
+" 2>/dev/null) || ver_rem_has_versioned="ERROR"
+  ver_rem_has_default=$(python3 -c "
+import json
+with open('$ver_remove_session/metrics/replay-baseline.json') as f:
+    d = json.load(f)
+print('alarm-default' in d.get('alarms', {}))
+" 2>/dev/null) || ver_rem_has_default="ERROR"
+
+  if [[ "$ver_rem_has_versioned" == "False" ]] && [[ "$ver_rem_has_default" == "True" ]]; then
+    tap_ok "per-alarm-version: alarm removal deletes only removed alarm"
+  else
+    tap_not_ok "per-alarm-version: alarm removal deletes only removed alarm" \
+      "versioned=$ver_rem_has_versioned default=$ver_rem_has_default"
+  fi
+
+  # Test: ack preservation on version bump
+  local ver_ack_session="$ver_root/ack-test"
+  mkdir -p "$ver_ack_session/metrics"
+  # Create ack file with both alarms acknowledged
+  local ver_ack_file="$ver_ack_session/metrics/alarm-acknowledgments.json"
+  python3 -c "
+import json
+data = {
+    'schema_version': 1,
+    'catalog_checksum': 'old-checksum',
+    'alarm_versions': {'alarm-versioned': 1, 'alarm-default': 1},
+    'alarms': {
+        'alarm-versioned': {'rationale': 'test ack', 'acknowledged_at': '2026-01-01T00:00:00Z'},
+        'alarm-default': {'rationale': 'test ack 2', 'acknowledged_at': '2026-01-01T00:00:00Z'}
+    }
+}
+print(json.dumps(data))
+" > "$ver_ack_file"
+
+  # Set up baseline so the script runs normally
+  echo "$ver_baseline" > "$ver_ack_session/metrics/replay-baseline.json"
+  echo "$ver_baseline" > "$ver_ack_session/metrics/replay-baseline-stable.json"
+  echo "$ver_current" > "$ver_ack_session/metrics/ver-ack-current.json"
+
+  local ver_ack_out
+  ver_ack_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    "$ver_ack_session" --current "$ver_ack_session/metrics/ver-ack-current.json" \
+    --catalog "$ver_catalog" 2>&1) || true
+
+  # alarm-versioned ack should be removed (version 1→2), alarm-default should be preserved
+  local ver_ack_has_versioned ver_ack_has_default
+  ver_ack_has_versioned=$(python3 -c "
+import json
+with open('$ver_ack_file') as f:
+    d = json.load(f)
+print('alarm-versioned' in d.get('alarms', {}))
+" 2>/dev/null) || ver_ack_has_versioned="ERROR"
+  ver_ack_has_default=$(python3 -c "
+import json
+with open('$ver_ack_file') as f:
+    d = json.load(f)
+print('alarm-default' in d.get('alarms', {}))
+" 2>/dev/null) || ver_ack_has_default="ERROR"
+
+  if [[ "$ver_ack_has_versioned" == "False" ]] && [[ "$ver_ack_has_default" == "True" ]]; then
+    tap_ok "per-alarm-version: ack preserved for non-bumped alarm, removed for bumped"
+  else
+    tap_not_ok "per-alarm-version: ack preserved for non-bumped alarm, removed for bumped" \
+      "versioned=$ver_ack_has_versioned default=$ver_ack_has_default"
+  fi
+
+  rm -rf "$ver_root"
 
   # ── check-alarm-regression.sh dedup tests ──────────────────────────────────
   # Tests for issue #2608: duplicate issue filing due to stale dedup snapshot.

@@ -214,6 +214,48 @@ CATALOG_CHECKSUM=$(sha256sum "$CATALOG_FILE" | cut -d' ' -f1)
 PROVENANCE_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")
 PROVENANCE_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+# Helper: compute per-alarm version map from catalog.
+# Outputs JSON object: {"alarm-name": version, ...}
+# Validates: positive integer >= 1, no duplicate names. Exits 2 on failure.
+compute_alarm_versions() {
+  python3 -c "
+import sys, json
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+
+catalog_path = sys.argv[1]
+with open(catalog_path, 'rb') as f:
+    catalog = tomllib.load(f)
+
+alarms = catalog.get('alarm', [])
+if not alarms:
+    print('ERROR: Catalog has no alarm entries', file=sys.stderr)
+    sys.exit(2)
+
+versions = {}
+for a in alarms:
+    name = a.get('name', '')
+    if not name:
+        print('ERROR: Alarm entry missing name field', file=sys.stderr)
+        sys.exit(2)
+    if name in versions:
+        print(f'ERROR: Duplicate alarm name in catalog: {name}', file=sys.stderr)
+        sys.exit(2)
+    v = a.get('baseline_version', 1)
+    if not isinstance(v, int) or v < 1:
+        print(f'ERROR: Invalid baseline_version for alarm {name}: {v!r} (must be integer >= 1)', file=sys.stderr)
+        sys.exit(2)
+    versions[name] = v
+
+print(json.dumps(versions, sort_keys=True))
+" "$1"
+}
+
+# Compute per-alarm versions once per run
+ALARM_VERSIONS_JSON=$(compute_alarm_versions "$CATALOG_FILE") || exit $?
+
 ACK_FILE="$METRICS_DIR/alarm-acknowledgments.json"
 ACK_LOCK="$METRICS_DIR/alarm-acknowledgments.lock"
 
@@ -261,17 +303,57 @@ check_ack_provenance() {
 import json, sys
 data = json.loads(sys.stdin.read())
 current_checksum = sys.argv[1]
+current_versions = json.loads(sys.argv[2])
+
 stored_checksum = data.get('catalog_checksum', '')
-if stored_checksum and stored_checksum != current_checksum:
-    n = len(data.get('alarms', {}))
-    if n > 0:
-        print('Acknowledgment file invalidated: alarm catalog changed (was %s..., now %s...)' % (stored_checksum[:12], current_checksum[:12]), file=sys.stderr)
-    data['alarms'] = {}
+stored_versions = data.get('alarm_versions')
+
+# Legacy: no alarm_versions present — non-destructive migration
+if not isinstance(stored_versions, dict):
+    if stored_checksum and stored_checksum != current_checksum:
+        # Catalog changed with no version info — must wipe (legacy behavior)
+        n = len(data.get('alarms', {}))
+        if n > 0:
+            print('Acknowledgment file invalidated: alarm catalog changed (legacy, was %s..., now %s...)' % (stored_checksum[:12], current_checksum[:12]), file=sys.stderr)
+        data['alarms'] = {}
     data['catalog_checksum'] = current_checksum
-elif not stored_checksum:
-    data['catalog_checksum'] = current_checksum
+    data['alarm_versions'] = current_versions
+    print(json.dumps(data))
+    sys.exit(0)
+
+# Fast path: checksum match means no change
+if stored_checksum == current_checksum:
+    print(json.dumps(data))
+    sys.exit(0)
+
+# Per-alarm invalidation
+alarms = data.get('alarms', {})
+current_names = set(current_versions.keys())
+stored_names = set(stored_versions.keys())
+invalidated = []
+
+# Remove acks for alarms removed from catalog
+for name in list(alarms.keys()):
+    if name not in current_names:
+        del alarms[name]
+        invalidated.append(name)
+
+# Remove acks for alarms with version bumps
+for name in list(alarms.keys()):
+    if name in current_versions:
+        stored_v = stored_versions.get(name)
+        if stored_v is None or stored_v != current_versions[name]:
+            del alarms[name]
+            invalidated.append(name)
+
+if invalidated:
+    print('Acknowledgments: per-alarm invalidation — removed %d ack(s): %s' % (len(invalidated), ', '.join(sorted(invalidated))), file=sys.stderr)
+
+data['alarms'] = alarms
+data['catalog_checksum'] = current_checksum
+data['alarm_versions'] = current_versions
 print(json.dumps(data))
-" "$CATALOG_CHECKSUM"
+" "$CATALOG_CHECKSUM" "$ALARM_VERSIONS_JSON"
 }
 
 # Helper: validate alarm name exists in catalog. Exit 2 if not.
@@ -469,6 +551,7 @@ current_str = sys.argv[2]
 checksum = sys.argv[3]
 commit = sys.argv[4]
 timestamp = sys.argv[5]
+alarm_versions_str = sys.argv[6]
 with open(catalog_path, 'rb') as f:
     catalog = tomllib.load(f)
 valid = {a['name'] for a in catalog.get('alarm', [])}
@@ -478,13 +561,15 @@ if not valid:
 data = json.loads(current_str)
 alarms = data.get('alarms', {})
 data['alarms'] = {k: v for k, v in alarms.items() if k in valid}
+alarm_versions = json.loads(alarm_versions_str)
 data['provenance'] = {
     'created_at': timestamp,
     'created_commit': commit,
     'catalog_checksum': checksum,
+    'alarm_versions': alarm_versions,
 }
 print(json.dumps(data))
-" "$CATALOG_FILE" "$CURRENT_JSON" "$CATALOG_CHECKSUM" "$PROVENANCE_COMMIT" "$PROVENANCE_TIMESTAMP" > "$tmpout" || {
+" "$CATALOG_FILE" "$CURRENT_JSON" "$CATALOG_CHECKSUM" "$PROVENANCE_COMMIT" "$PROVENANCE_TIMESTAMP" "$ALARM_VERSIONS_JSON" > "$tmpout" || {
     echo "ERROR: Failed to create baseline: $output_file" >&2
     rm -f "$tmpout"
     exit 2
@@ -517,14 +602,16 @@ inject_provenance() {
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
+alarm_versions = json.loads(sys.argv[5])
 d['provenance'] = {
     'created_at': sys.argv[2],
     'created_commit': sys.argv[3],
-    'catalog_checksum': sys.argv[4]
+    'catalog_checksum': sys.argv[4],
+    'alarm_versions': alarm_versions,
 }
-with open(sys.argv[5], 'w') as f:
+with open(sys.argv[6], 'w') as f:
     json.dump(d, f)
-" "$baseline_file" "$PROVENANCE_TIMESTAMP" "$PROVENANCE_COMMIT" "$CATALOG_CHECKSUM" "$tmp_file"
+" "$baseline_file" "$PROVENANCE_TIMESTAMP" "$PROVENANCE_COMMIT" "$CATALOG_CHECKSUM" "$ALARM_VERSIONS_JSON" "$tmp_file"
   mv -f "$tmp_file" "$baseline_file"
 }
 
@@ -533,28 +620,95 @@ with open(sys.argv[5], 'w') as f:
 maybe_invalidate_baseline() {
   local baseline_file="$1"
   local label="$2"
-  local stored_checksum
-  stored_checksum=$(extract_catalog_checksum "$baseline_file")
+  local tmp_file="${baseline_file}.tmp.$$"
 
-  if [[ -n "$stored_checksum" ]]; then
-    if [[ "$stored_checksum" == "$CATALOG_CHECKSUM" ]]; then
-      # Checksums match — baseline is current
-      return 0
-    else
-      # Catalog changed — recreate from current data
-      echo "$label baseline auto-invalidated: alarm catalog changed (was ${stored_checksum:0:12}..., now ${CATALOG_CHECKSUM:0:12}...)" >&2
-      create_baseline "$baseline_file"
-      return 0
-    fi
-  else
-    # No provenance or malformed — legacy baseline with potentially valid alarm
-    # data. Preserve the alarm payload and stamp with current provenance to
-    # establish a known state going forward. If the catalog truly changed since
-    # this baseline was created, the next catalog change will trigger proper
-    # invalidation via the checksum-mismatch path above.
-    echo "Migrating $label baseline: injecting provenance into existing data" >&2
-    inject_provenance "$baseline_file"
-    return 0
+  python3 -c "
+import json, sys
+
+baseline_path = sys.argv[1]
+label = sys.argv[2]
+current_checksum = sys.argv[3]
+current_versions_str = sys.argv[4]
+commit = sys.argv[5]
+timestamp = sys.argv[6]
+
+current_versions = json.loads(current_versions_str)
+current_names = set(current_versions.keys())
+
+with open(baseline_path) as f:
+    data = json.load(f)
+
+provenance = data.get('provenance')
+if not isinstance(provenance, dict):
+    provenance = {}
+
+stored_versions = provenance.get('alarm_versions')
+
+# Step 0: Legacy check — alarm_versions missing or not a valid dict
+if not isinstance(stored_versions, dict):
+    # Non-destructive migration: preserve alarm data, stamp current provenance
+    print(f'Migrating {label} baseline: stamping per-alarm version provenance', file=sys.stderr)
+    data['provenance'] = {
+        'created_at': timestamp,
+        'created_commit': commit,
+        'catalog_checksum': current_checksum,
+        'alarm_versions': current_versions,
+    }
+    with open(sys.argv[7], 'w') as f:
+        json.dump(data, f)
+    sys.exit(0)
+
+stored_checksum = provenance.get('catalog_checksum', '')
+
+# Step A: Fast path — checksum match means no catalog change at all
+if stored_checksum == current_checksum:
+    sys.exit(0)
+
+# Catalog changed — do per-alarm invalidation
+stored_names = set(stored_versions.keys())
+alarms = data.get('alarms', {})
+invalidated = []
+
+# Step B: Structural check — removed alarms
+removed = stored_names - current_names
+for name in removed:
+    if name in alarms:
+        del alarms[name]
+        invalidated.append(name)
+
+# Step C: Version check — version bumps
+for name, current_v in current_versions.items():
+    stored_v = stored_versions.get(name)
+    if stored_v is None or stored_v != current_v:
+        if name in alarms:
+            del alarms[name]
+            invalidated.append(name)
+
+data['alarms'] = alarms
+data['provenance'] = {
+    'created_at': timestamp,
+    'created_commit': commit,
+    'catalog_checksum': current_checksum,
+    'alarm_versions': current_versions,
+}
+
+if invalidated:
+    inv_list = ', '.join(sorted(invalidated))
+    print(f'{label} baseline: per-alarm invalidation — removed {len(invalidated)} alarm(s): {inv_list}', file=sys.stderr)
+else:
+    print(f'{label} baseline: catalog changed but no alarm versions differ — all data preserved', file=sys.stderr)
+
+with open(sys.argv[7], 'w') as f:
+    json.dump(data, f)
+" "$baseline_file" "$label" "$CATALOG_CHECKSUM" "$ALARM_VERSIONS_JSON" "$PROVENANCE_COMMIT" "$PROVENANCE_TIMESTAMP" "$tmp_file" || {
+    echo "ERROR: Failed to invalidate $label baseline" >&2
+    rm -f "$tmp_file"
+    exit 2
+  }
+
+  # If the python script wrote a tmp file, atomically replace
+  if [[ -f "$tmp_file" ]]; then
+    mv -f "$tmp_file" "$baseline_file"
   fi
 }
 
@@ -612,14 +766,13 @@ if [[ -f "$ACK_FILE" ]]; then
     (
       flock -w 30 9 || { echo "ERROR: Could not acquire acknowledgment lock" >&2; exit 2; }
       ACK_DATA=$(load_ack_file) || exit $?
-      STORED_ACK_CHECKSUM=$(echo "$ACK_DATA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('catalog_checksum',''))" 2>/dev/null)
-      if [[ -n "$STORED_ACK_CHECKSUM" ]] && [[ "$STORED_ACK_CHECKSUM" != "$CATALOG_CHECKSUM" ]]; then
-        echo "Acknowledgment catalog mismatch — invalidating stale acknowledgments" >&2
-        echo '{"schema_version":1,"catalog_checksum":"","alarms":{}}' | write_ack_file
-        echo "{}"
-      else
-        echo "$ACK_DATA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('alarms',{})))" 2>/dev/null || echo "{}"
+      # Use unified per-alarm invalidation (same as check_ack_provenance)
+      UPDATED=$(echo "$ACK_DATA" | check_ack_provenance) || exit $?
+      # Write back if changed
+      if [[ "$UPDATED" != "$ACK_DATA" ]]; then
+        echo "$UPDATED" | write_ack_file
       fi
+      echo "$UPDATED" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('alarms',{})))" 2>/dev/null || echo "{}"
     ) 9>"$ACK_LOCK"
   ) || ack_load_exit=$?
   if [[ "$ack_load_exit" -ne 0 ]]; then
@@ -937,6 +1090,22 @@ for r in json.load(sys.stdin):
 " 2>/dev/null)
 
   ) 9>"$LOCK_FILE"
+fi
+
+# Emit warning for catalog alarms with no rolling baseline coverage
+if [[ -f "$BASELINE_FILE" ]]; then
+  python3 -c "
+import json, sys
+alarm_versions = json.loads(sys.argv[1])
+with open(sys.argv[2]) as f:
+    baseline = json.load(f)
+baseline_alarms = set(baseline.get('alarms', {}).keys())
+catalog_alarms = set(alarm_versions.keys())
+uncovered = sorted(catalog_alarms - baseline_alarms)
+if uncovered:
+    print('WARNING: %d catalog alarm(s) have no rolling baseline coverage: %s' % (len(uncovered), ', '.join(uncovered)), file=sys.stderr)
+    print('  (Rolling baseline only updates on clean runs with zero regressions)', file=sys.stderr)
+" "$ALARM_VERSIONS_JSON" "$BASELINE_FILE" || true
 fi
 
 exit 0
