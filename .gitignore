@@ -92,5 +92,6 @@ crates/*/scp/[0-9a-f][0-9a-f]/
 crates/*/transactions/[0-9a-f][0-9a-f]/
 scripts/lib/__pycache__/
 .alarm-regression-filing.lock
+.alarm-regression-filed.json
 .monitor-tick-filed.json
 .monitor-tick-filing.lock

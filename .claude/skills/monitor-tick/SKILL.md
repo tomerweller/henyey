@@ -624,8 +624,9 @@ print(json.dumps(data))
       echo "WARNING: Failed to post update on #$issue_num" >&2
     fi
 
-    # Ensure urgent label and board routing
+    # Ensure urgent label and board routing on existing issue
     gh issue edit "$issue_num" --add-label urgent 2>/dev/null || true
+    bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$issue_num" Backlog 2>/dev/null || true
   }
 
   # --- Dedup check: local file ---
