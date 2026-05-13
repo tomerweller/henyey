@@ -7987,6 +7987,7 @@ mod scp_pipeline_tests {
             state: Arc::new(AtomicU8::new(VerifierState::Running as u8)),
             heartbeat: Arc::new(AtomicU64::new(0)),
             backlog: Arc::new(AtomicUsize::new(0)),
+            backlog_peak: Arc::new(AtomicUsize::new(0)),
         };
 
         assert_eq!(handle.queue_len(), 0, "empty channel reports 0 used slots");

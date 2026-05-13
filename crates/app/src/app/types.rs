@@ -416,6 +416,8 @@ pub struct ScpVerifyMetrics {
     pub pv_counters: henyey_herder::scp_verify::PostVerifyCounters<u64>,
     /// Currently used slots in the verifier input channel (event-loop sampled).
     pub verify_input_backlog: u64,
+    /// Monotonic high-water mark of the verifier input backlog (worker sampled).
+    pub verify_input_backlog_peak: u64,
     /// Sampled depth of the verified-output channel (envelopes awaiting the
     /// event loop). Captured by the event loop itself — unlike
     /// `verify_input_backlog` which is also sampled by the verifier worker

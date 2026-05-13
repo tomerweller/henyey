@@ -769,9 +769,36 @@ impl OverlayManager {
         }
 
         let message_size = msg_body_size(message);
+        // Pre-compute the StellarMessage hash for SCP — used by both the
+        // scheduling cache check and OverlayMessage for event-loop cleanup.
+        let scp_scheduled_hash = if matches!(message, StellarMessage::ScpMessage(_)) {
+            Some(compute_message_hash(message))
+        } else {
+            None
+        };
         if helpers::is_flood_message(message) {
             if helpers::is_flood_gate_tracked(message) {
-                let hash = compute_message_hash(message);
+                let hash = scp_scheduled_hash.unwrap_or_else(|| compute_message_hash(message));
+
+                // Overlay-side SCP scheduling cache: drop duplicate SCP
+                // envelopes before they reach the subscriber channel.
+                // Mirrors stellar-core's checkScheduledAndCache
+                // (Peer.cpp:1114, OverlayManagerImpl.cpp:1190-1212) which
+                // drops duplicates on the background thread before the
+                // main thread's recvSCPMessage is called.
+                //
+                // This is separate from FloodGate — FloodGate's RelayRecord
+                // is deliberately NOT used as a drop signal (#2317 invariant).
+                // Transaction messages are NOT affected (they go through
+                // herder's tx queue dedup, matching stellar-core).
+                if scp_scheduled_hash.is_some() {
+                    if !state.scp_scheduled_cache.check_and_insert(hash) {
+                        state.metrics.scp_overlay_dedup.inc();
+                        ctx.peer.record_flood_stats(false, message_size);
+                        return Some(false);
+                    }
+                }
+
                 let lcl = state.last_closed_ledger.load(Ordering::Relaxed);
                 state.flood_gate.record_inbound_relay(
                     hash,
@@ -791,15 +818,17 @@ impl OverlayManager {
                 //
                 // `record_inbound_relay` returns () — there is no relay status
                 // value to branch on, preventing the c6118f2c bug class.
-                // Actual dedup happens downstream:
+                // Actual downstream dedup:
                 // - SCP: `scp_scheduled_envelopes` in `pump_scp_intake`
+                //   (second line of defense after the overlay cache above)
                 // - Tx: herder `receive_transaction` / tx queue dedup
                 //
                 // stellar-core parity:
                 // - SCP: Peer.cpp:1667-1673 — unconditional recvSCPEnvelope
+                //   (after checkScheduledAndCache on background thread)
                 // - Tx:  OverlayManagerImpl.cpp:1215-1248 — unconditional
                 //   recvTransaction (Peer.cpp:1524-1533)
-                // See issues #2317, #2327.
+                // See issues #2317, #2327, #2622.
             } else {
                 // Pull-control messages (FloodAdvert/FloodDemand) use flow-control
                 // capacity but are NOT globally deduplicated or tracked in FloodGate.
@@ -820,6 +849,7 @@ impl OverlayManager {
             from_peer: peer_id.clone(),
             message: message.clone(),
             received_at: Instant::now(),
+            scp_scheduled_hash,
         };
         let is_scp = state.route_to_subscribers(overlay_msg);
         Some(is_scp)

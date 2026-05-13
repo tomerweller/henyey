@@ -374,6 +374,7 @@ pub struct SignatureVerifierHandle {
     pub state: Arc<AtomicU8>,
     pub heartbeat: Arc<AtomicU64>,
     pub backlog: Arc<AtomicUsize>,
+    pub backlog_peak: Arc<AtomicUsize>,
 }
 
 impl SignatureVerifierHandle {
@@ -387,6 +388,11 @@ impl SignatureVerifierHandle {
 
     pub fn backlog(&self) -> usize {
         self.backlog.load(Ordering::Relaxed)
+    }
+
+    /// Monotonic high-water mark of the verifier input backlog.
+    pub fn backlog_peak(&self) -> usize {
+        self.backlog_peak.load(Ordering::Relaxed)
     }
 
     /// Currently-used slots in the verifier input channel (approx queue depth).
@@ -424,10 +430,12 @@ pub fn spawn_scp_verifier(
     let state = Arc::new(AtomicU8::new(VerifierState::Running as u8));
     let heartbeat = Arc::new(AtomicU64::new(0));
     let backlog = Arc::new(AtomicUsize::new(0));
+    let backlog_peak = Arc::new(AtomicUsize::new(0));
 
     let state_worker = Arc::clone(&state);
     let heartbeat_worker = Arc::clone(&heartbeat);
     let backlog_worker = Arc::clone(&backlog);
+    let backlog_peak_worker = Arc::clone(&backlog_peak);
 
     let join_handle = std::thread::Builder::new()
         .name("scp-verify".into())
@@ -439,6 +447,7 @@ pub fn spawn_scp_verifier(
                 state_worker,
                 heartbeat_worker,
                 backlog_worker,
+                backlog_peak_worker,
                 scp_metrics,
             );
         })?;
@@ -449,6 +458,7 @@ pub fn spawn_scp_verifier(
             state,
             heartbeat,
             backlog,
+            backlog_peak,
         },
         verified_rx,
         join_handle,
@@ -458,6 +468,7 @@ pub fn spawn_scp_verifier(
 /// Worker body. XDR-serialises the signed payload and verifies the Ed25519
 /// signature for each incoming envelope, emitting [`VerifiedEnvelope`] results
 /// on `verified_tx`. Both stages run here (off the event loop).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scp_verify_worker(
     network_id: Hash256,
     mut rx: tokio::sync::mpsc::Receiver<PipelinedIntake>,
@@ -465,12 +476,15 @@ pub(crate) fn scp_verify_worker(
     state: Arc<AtomicU8>,
     heartbeat: Arc<AtomicU64>,
     backlog: Arc<AtomicUsize>,
+    backlog_peak: Arc<AtomicUsize>,
     scp_metrics: Arc<crate::metrics::ScpMetrics>,
 ) {
     // `blocking_recv` parks the std::thread until a new intake arrives. This is
     // appropriate because we are OUTSIDE the tokio runtime.
     while let Some(intake) = rx.blocking_recv() {
-        backlog.store(rx.len(), Ordering::Relaxed);
+        let current_backlog = rx.len();
+        backlog.store(current_backlog, Ordering::Relaxed);
+        backlog_peak.fetch_max(current_backlog, Ordering::Relaxed);
 
         let verdict = match catch_unwind(AssertUnwindSafe(|| {
             // Test-only deterministic panic trigger. Used by

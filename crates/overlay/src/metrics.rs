@@ -572,6 +572,10 @@ pub struct OverlayMetrics {
     pub flood_unique_recv: Counter,
     /// Duplicate flood messages received (inbound, record_inbound_relay → on_repeated).
     pub flood_duplicate_recv: Counter,
+    /// SCP envelopes dropped early by the overlay scheduling cache before
+    /// reaching the SCP subscriber channel. Mirrors stellar-core's
+    /// `checkScheduledAndCache` duplicate suppression.
+    pub scp_overlay_dedup: Counter,
 
     // ===== Fetch Metrics =====
     /// Unique fetch bytes received.
@@ -675,6 +679,7 @@ impl OverlayMetrics {
             flood_broadcast: self.flood_broadcast.get(),
             flood_unique_recv: self.flood_unique_recv.get(),
             flood_duplicate_recv: self.flood_duplicate_recv.get(),
+            scp_overlay_dedup: self.scp_overlay_dedup.get(),
 
             // Fetch metrics
             fetch_unique_bytes_recv: self.fetch_unique_bytes_recv.get(),
@@ -739,6 +744,7 @@ impl OverlayMetrics {
             &self.flood_broadcast,
             &self.flood_unique_recv,
             &self.flood_duplicate_recv,
+            &self.scp_overlay_dedup,
             &self.fetch_unique_bytes_recv,
             &self.fetch_duplicate_bytes_recv,
             &self.item_fetcher_next_peer,
@@ -853,6 +859,8 @@ pub struct OverlayMetricsSnapshot {
     pub flood_broadcast: u64,
     pub flood_unique_recv: u64,
     pub flood_duplicate_recv: u64,
+    /// SCP envelopes dropped by overlay scheduling cache.
+    pub scp_overlay_dedup: u64,
 
     // Fetch metrics
     pub fetch_unique_bytes_recv: u64,
