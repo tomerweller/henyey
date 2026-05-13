@@ -95,3 +95,4 @@ scripts/lib/__pycache__/
 .alarm-regression-filed.json
 .monitor-tick-filed.json
 .monitor-tick-filing.lock
+scripts/ci/__pycache__/

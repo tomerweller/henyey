@@ -1,0 +1,44 @@
+name: Alarm version check
+
+on:
+  pull_request:
+    paths:
+      - '.claude/skills/shared/metric-alarms.toml'
+      - 'scripts/ci/check-alarm-versions.py'
+      - 'scripts/ci/test_check_alarm_versions.py'
+      - '.github/workflows/alarm-version-check.yml'
+
+jobs:
+  check:
+    name: Validate baseline_version bumps
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install tomli
+      - name: Extract base version
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          git show "$BASE_SHA:.claude/skills/shared/metric-alarms.toml" > old-alarms.toml 2>/dev/null || echo '' > old-alarms.toml
+      - name: Check alarm version bumps
+        run: python3 scripts/ci/check-alarm-versions.py old-alarms.toml .claude/skills/shared/metric-alarms.toml
+
+  test:
+    name: Script self-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install tomli pytest
+      - name: Run tests
+        run: python3 -m pytest scripts/ci/test_check_alarm_versions.py -v
