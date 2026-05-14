@@ -19,9 +19,9 @@ async fn test_build_checkpoint_data_takes_state() {
         version: 2,
         server: None,
         current_ledger: 64,
-        network_passphrase: None,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
         current_buckets: Vec::new(),
-        hot_archive_buckets: None,
+        hot_archive_buckets: Some(Vec::new()),
     });
     work.bucket_dir = Some(tmp_dir.path().to_path_buf());
 

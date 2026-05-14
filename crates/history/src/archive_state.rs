@@ -501,14 +501,15 @@ impl HistoryArchiveState {
         Ok(has)
     }
 
-    /// Validate version-dependent invariants.
+    /// Validate version-dependent invariants during deserialization.
     ///
     /// - Version < 2: `hot_archive_buckets` must be absent (v1 format predates
     ///   hot archive support)
     ///
-    /// Note: version >= 2 MAY or MAY NOT have `hot_archive_buckets` — the v2
-    /// format was introduced for `networkPassphrase` and hot archive support
-    /// was added later within v2.
+    /// Note: version >= 2 MAY or MAY NOT have `hot_archive_buckets` here because
+    /// this is a lenient parse-time check — older v2 HAS files predate hot archive
+    /// support. The stricter invariant (v2 MUST have hotArchiveBuckets for current
+    /// protocol) is enforced by `verify::verify_has_structure()` during catchup.
     pub fn validate_version_invariants(&self) -> Result<(), HistoryError> {
         if self.version < 2 && self.hot_archive_buckets.is_some() {
             return Err(HistoryError::VerificationFailed(

@@ -129,13 +129,21 @@ async fn test_history_work_chain() {
             next: Default::default(),
         });
     }
+    let hot_archive_buckets: Vec<HASBucketLevel> = (0
+        ..henyey_bucket::HOT_ARCHIVE_BUCKET_LIST_LEVELS)
+        .map(|_| HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        })
+        .collect();
     let has = HistoryArchiveState {
         version: 2,
         server: Some("rs-stellar-core test".to_string()),
         current_ledger: checkpoint,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
         current_buckets,
-        hot_archive_buckets: None,
+        hot_archive_buckets: Some(hot_archive_buckets),
     };
 
     let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
