@@ -478,15 +478,19 @@ impl HistoryArchiveState {
     /// ```
     /// use henyey_history::archive_state::HistoryArchiveState;
     ///
-    /// // from_json() is lenient on bucket count; verify_has_structure()
-    /// // enforces exactly BUCKET_LIST_LEVELS (11) in production.
-    /// let json = r#"{
-    ///     "version": 1,
-    ///     "currentLedger": 12345,
-    ///     "currentBuckets": []
-    /// }"#;
+    /// // Structurally valid v1 HAS with BUCKET_LIST_LEVELS (11) zero-hash levels.
+    /// let zero = "0".repeat(64);
+    /// let zero_level = format!(
+    ///     r#"{{"curr":"{}","snap":"{}","next":{{"state":0}}}}"#,
+    ///     zero, zero
+    /// );
+    /// let levels: Vec<_> = (0..11).map(|_| zero_level.clone()).collect();
+    /// let json = format!(
+    ///     r#"{{"version":1,"currentLedger":12345,"currentBuckets":[{}]}}"#,
+    ///     levels.join(",")
+    /// );
     ///
-    /// let has = HistoryArchiveState::from_json(json).unwrap();
+    /// let has = HistoryArchiveState::from_json(&json).unwrap();
     /// assert_eq!(has.current_ledger, 12345);
     /// ```
     pub fn from_json(json: &str) -> Result<Self, HistoryError> {
