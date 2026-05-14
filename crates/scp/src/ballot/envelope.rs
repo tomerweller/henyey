@@ -138,6 +138,14 @@ impl BallotProtocol {
     /// 8. Advance slot (non-Externalize) or just record (Externalize)
     /// 9. Emit via `send_latest_envelope`
     pub(super) fn emit_current_state<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) {
+        // Matches stellar-core BallotProtocol.cpp:529
+        if let Err(e) = self.check_invariants() {
+            tracing::warn!(
+                slot = ctx.slot_index,
+                "Invariant violation at start of emit_current_state: {e}"
+            );
+        }
+
         // 1. Create and sign the self-envelope (phase-specific)
         let Some((statement, envelope, can_emit)) = (match self.phase {
             BallotPhase::Prepare => self.emit_prepare(ctx),

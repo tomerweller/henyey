@@ -336,7 +336,9 @@ impl<D: SCPDriver> SCP<D> {
     /// Removes slots older than `max_slot_index`, but keeps `slot_to_keep`
     /// even if it's below the threshold.
     ///
-    /// Matches stellar-core `SCP::purgeSlots(maxSlotIndex, slotToKeep)`.
+    /// Simplified variant of stellar-core's `SCP::purgeSlotsOutsideRange`
+    /// — only purges slots with index `< max_slot_index` (no min-bound
+    /// parameter). The full range-purge is not needed by current call sites.
     pub fn purge_slots(&self, max_slot_index: u64, slot_to_keep: Option<u64>) {
         self.slots.write().retain(|&slot_index, _| {
             slot_index >= max_slot_index || slot_to_keep == Some(slot_index)

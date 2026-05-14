@@ -793,19 +793,18 @@ impl Slot {
 
     /// Restore state from a saved envelope (for crash recovery).
     ///
-    /// This method is used to restore slot state from a previously saved envelope
-    /// when restarting after a crash. It routes the envelope to the appropriate
-    /// protocol (nomination or ballot) for state restoration.
+    /// Routes the envelope to the appropriate protocol (nomination or ballot)
+    /// for state restoration.
     ///
-    /// Matching stellar-core `Slot::setStateFromEnvelope`: validates that the envelope is
-    /// from the local node and for this slot, checks if it's a new node, and
-    /// calls `maybeSetGotVBlocking`.
+    /// Matching stellar-core `Slot::setStateFromEnvelope`: validates that the
+    /// envelope is from the local node and for this slot, checks if it's a new
+    /// node, and calls `maybeSetGotVBlocking`.
     ///
-    /// # Arguments
-    /// * `envelope` - The envelope to restore state from
-    ///
-    /// # Returns
-    /// True if state was successfully restored, false if the envelope is invalid.
+    /// # Panics
+    /// Panics if `BallotProtocol::set_state_from_envelope` returns an error
+    /// (i.e. ballot protocol already started). This matches stellar-core's
+    /// `throw runtime_error` semantics — it is a programming error, not a
+    /// recoverable condition.
     pub fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
         // stellar-core validates nodeID and slotIndex
         if envelope.statement.node_id != self.local_node_id
@@ -826,11 +825,11 @@ impl Slot {
             ScpStatementPledges::Prepare(_)
             | ScpStatementPledges::Confirm(_)
             | ScpStatementPledges::Externalize(_) => {
-                let result = self.ballot.set_state_from_envelope(envelope);
-                if result {
-                    self.sync_externalized_value_from_ballot();
-                }
-                result
+                self.ballot
+                    .set_state_from_envelope(envelope)
+                    .expect("Cannot set state after starting ballot protocol");
+                self.sync_externalized_value_from_ballot();
+                true
             }
         };
 

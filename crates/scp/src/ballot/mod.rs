@@ -67,6 +67,7 @@ mod statements;
 
 pub use statements::get_companion_quorum_set_hash;
 pub use statements::get_working_ballot;
+use statements::{are_ballots_less_and_compatible, are_ballots_less_and_incompatible};
 pub(crate) use statements::{ballot_compare, ballot_compatible, cmp_opt_ballot};
 
 /// The ballot protocol progresses through these phases in order.
@@ -384,43 +385,76 @@ impl BallotProtocol {
 
     /// Check protocol invariants for debugging.
     ///
+    /// Mirrors stellar-core `BallotProtocol::checkInvariants()`
+    /// (`BallotProtocol.cpp:642-681`).
+    ///
     /// Returns Ok(()) if invariants hold, Err with description otherwise.
     pub fn check_invariants(&self) -> Result<(), String> {
-        // In PREPARE phase, c == 0 (no commit yet)
-        if self.phase == BallotPhase::Prepare && self.commit.is_some() {
-            // Actually in prepare phase, c is only set when we have h set
-            // The invariant is: c != 0 => h != 0
-            if self.high_ballot.is_none() {
-                return Err("commit set but high_ballot not set in Prepare phase".to_string());
+        // Phase-specific: CONFIRM and EXTERNALIZE require all core fields
+        // (stellar-core:646-654)
+        match self.phase {
+            BallotPhase::Prepare => {}
+            BallotPhase::Confirm | BallotPhase::Externalize => {
+                if self.current_ballot.is_none() {
+                    return Err(format!("{:?} phase requires current_ballot", self.phase));
+                }
+                if self.prepared.is_none() {
+                    return Err(format!("{:?} phase requires prepared", self.phase));
+                }
+                if self.commit.is_none() {
+                    return Err(format!("{:?} phase requires commit", self.phase));
+                }
+                if self.high_ballot.is_none() {
+                    return Err(format!("{:?} phase requires high_ballot", self.phase));
+                }
             }
         }
 
-        // If we have prepared' it must be < prepared and incompatible
+        // current_ballot.counter != 0 (stellar-core:659-661)
+        if let Some(cb) = &self.current_ballot {
+            if cb.counter == 0 {
+                return Err("current_ballot.counter must not be 0".to_string());
+            }
+        }
+
+        // prepared_prime < prepared AND incompatible (stellar-core:663-666)
         if let (Some(prepared), Some(prepared_prime)) = (&self.prepared, &self.prepared_prime) {
-            if ballot_compare(prepared_prime, prepared) != std::cmp::Ordering::Less {
-                return Err("prepared_prime must be less than prepared".to_string());
-            }
-            if ballot_compatible(prepared_prime, prepared) {
-                return Err("prepared_prime must be incompatible with prepared".to_string());
-            }
-        }
-
-        // c <= h (commit counter <= high counter)
-        if let (Some(commit), Some(high)) = (&self.commit, &self.high_ballot) {
-            if commit.counter > high.counter {
-                return Err("commit counter exceeds high counter".to_string());
-            }
-            // c and h must have same value
-            if commit.value != high.value {
-                return Err("commit and high have different values".to_string());
+            if !are_ballots_less_and_incompatible(prepared_prime, prepared) {
+                return Err(
+                    "prepared_prime must be less than and incompatible with prepared".to_string(),
+                );
             }
         }
 
-        // In EXTERNALIZE, we must have commit and high
-        if self.phase == BallotPhase::Externalize
-            && (self.commit.is_none() || self.high_ballot.is_none())
-        {
-            return Err("externalize phase requires commit and high".to_string());
+        // high_ballot => current_ballot exists AND high <= current AND compatible
+        // (stellar-core:668-672)
+        if let Some(high) = &self.high_ballot {
+            let cb = self
+                .current_ballot
+                .as_ref()
+                .ok_or("high_ballot set but current_ballot is None".to_string())?;
+            if !are_ballots_less_and_compatible(high, cb) {
+                return Err("high_ballot must be <= current_ballot and compatible".to_string());
+            }
+        }
+
+        // commit => current_ballot exists AND commit <= high compatible AND
+        // high <= current compatible (stellar-core:674-680)
+        if let Some(commit) = &self.commit {
+            let high = self
+                .high_ballot
+                .as_ref()
+                .ok_or("commit set but high_ballot is None".to_string())?;
+            let cb = self
+                .current_ballot
+                .as_ref()
+                .ok_or("commit set but current_ballot is None".to_string())?;
+            if !are_ballots_less_and_compatible(commit, high) {
+                return Err("commit must be <= high_ballot and compatible".to_string());
+            }
+            if !are_ballots_less_and_compatible(high, cb) {
+                return Err("high_ballot must be <= current_ballot and compatible".to_string());
+            }
         }
 
         Ok(())
@@ -793,14 +827,28 @@ impl BallotProtocol {
     /// saved envelope when restarting after a crash. It sets up the internal state
     /// to match what it would have been after processing that envelope.
     ///
+    /// # Precondition
+    /// `current_ballot` must be `None` — recovery must happen before the ballot
+    /// protocol starts. Matches stellar-core `BallotProtocol.cpp:1735-1739`.
+    ///
     /// # Arguments
     /// * `envelope` - The envelope to restore state from
     ///
     /// # Returns
-    /// True if state was successfully restored, false if the envelope is invalid
-    /// for state restoration.
-    pub(crate) fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
-        let valid = match &envelope.statement.pledges {
+    /// `Ok(())` if state was successfully restored.
+    ///
+    /// # Errors
+    /// Returns `Err` if `current_ballot` is already set (protocol already started).
+    ///
+    /// # Panics
+    /// Panics if the envelope contains a non-ballot statement type (Nominate).
+    /// Callers must route nomination envelopes to the nomination protocol.
+    pub(crate) fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> Result<(), String> {
+        if self.current_ballot.is_some() {
+            return Err("Cannot set state after starting ballot protocol".into());
+        }
+
+        match &envelope.statement.pledges {
             ScpStatementPledges::Prepare(prep) => {
                 let value = prep.ballot.value.clone();
                 self.current_ballot = Some(prep.ballot.clone());
@@ -819,7 +867,6 @@ impl BallotProtocol {
                     });
                 }
                 self.phase = BallotPhase::Prepare;
-                true
             }
             ScpStatementPledges::Confirm(conf) => {
                 let value = conf.ballot.value.clone();
@@ -838,7 +885,6 @@ impl BallotProtocol {
                     value: value.clone(),
                 });
                 self.phase = BallotPhase::Confirm;
-                true
             }
             ScpStatementPledges::Externalize(ext) => {
                 let value = ext.commit.value.clone();
@@ -856,21 +902,20 @@ impl BallotProtocol {
                     value: value.clone(),
                 });
                 self.phase = BallotPhase::Externalize;
-                true
             }
-            _ => false,
-        };
-
-        if valid {
-            self.latest_envelopes
-                .insert(envelope.statement.node_id.clone(), envelope.clone());
-            self.last_envelope = Some(envelope.clone());
-            // Spec: SCP_SPEC §9.13 — set last_envelope_emit to prevent re-emission
-            // after crash recovery.
-            self.last_envelope_emit = Some(envelope.clone());
+            _ => unreachable!(
+                "BallotProtocol::set_state_from_envelope called with non-ballot statement"
+            ),
         }
 
-        valid
+        self.latest_envelopes
+            .insert(envelope.statement.node_id.clone(), envelope.clone());
+        self.last_envelope = Some(envelope.clone());
+        // Spec: SCP_SPEC §9.13 — set last_envelope_emit to prevent re-emission
+        // after crash recovery.
+        self.last_envelope_emit = Some(envelope.clone());
+
+        Ok(())
     }
 
     /// Bump the ballot to a specific counter value.
@@ -2307,7 +2352,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        assert!(ballot.set_state_from_envelope(&envelope));
+        ballot.set_state_from_envelope(&envelope).unwrap();
         assert_eq!(ballot.phase(), BallotPhase::Prepare);
         assert_eq!(ballot.current_ballot(), Some(&ballot_val));
         assert_eq!(ballot.prepared(), Some(&prepared));
@@ -2344,7 +2389,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        assert!(ballot.set_state_from_envelope(&envelope));
+        ballot.set_state_from_envelope(&envelope).unwrap();
         assert_eq!(ballot.phase(), BallotPhase::Confirm);
         assert_eq!(ballot.current_ballot(), Some(&ballot_val));
         assert_eq!(ballot.prepared().map(|b| b.counter), Some(8));
@@ -2379,7 +2424,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        assert!(ballot.set_state_from_envelope(&envelope));
+        ballot.set_state_from_envelope(&envelope).unwrap();
         assert_eq!(ballot.phase(), BallotPhase::Externalize);
         assert!(ballot.is_externalized());
         assert_eq!(ballot.commit(), Some(&commit));
@@ -2388,7 +2433,8 @@ mod tests {
     }
 
     #[test]
-    fn test_set_state_from_envelope_rejects_nomination() {
+    #[should_panic(expected = "non-ballot statement")]
+    fn test_set_state_from_envelope_panics_on_nomination() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let mut ballot = BallotProtocol::new();
@@ -2408,9 +2454,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        assert!(!ballot.set_state_from_envelope(&envelope));
-        assert_eq!(ballot.phase(), BallotPhase::Prepare);
-        assert!(ballot.current_ballot().is_none());
+        let _ = ballot.set_state_from_envelope(&envelope);
     }
 
     #[test]
@@ -2467,7 +2511,7 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        ballot.set_state_from_envelope(&envelope);
+        ballot.set_state_from_envelope(&envelope).unwrap();
 
         // Cannot bump when externalized
         assert!(!ballot.bump_state(&ctx!(&node, &quorum_set, &driver, 1), value.clone(), 10));
@@ -2543,6 +2587,344 @@ mod tests {
         });
 
         assert!(ballot.check_invariants().is_err());
+    }
+
+    #[test]
+    fn test_check_invariants_confirm_requires_prepared() {
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[1]);
+        ballot.phase = BallotPhase::Confirm;
+        ballot.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        ballot.commit = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        ballot.high_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        // prepared is None
+        assert!(ballot.check_invariants().is_err());
+    }
+
+    #[test]
+    fn test_check_invariants_confirm_requires_commit() {
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[1]);
+        ballot.phase = BallotPhase::Confirm;
+        ballot.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        ballot.prepared = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        ballot.high_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        // commit is None
+        assert!(ballot.check_invariants().is_err());
+    }
+
+    #[test]
+    fn test_check_invariants_externalize_requires_high_ballot() {
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[1]);
+        ballot.phase = BallotPhase::Externalize;
+        ballot.current_ballot = Some(ScpBallot {
+            counter: u32::MAX,
+            value: value.clone(),
+        });
+        ballot.prepared = Some(ScpBallot {
+            counter: u32::MAX,
+            value: value.clone(),
+        });
+        ballot.commit = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        // high_ballot is None
+        assert!(ballot.check_invariants().is_err());
+    }
+
+    #[test]
+    fn test_check_invariants_current_ballot_counter_not_zero() {
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[1]);
+        ballot.current_ballot = Some(ScpBallot { counter: 0, value });
+        assert!(ballot.check_invariants().is_err());
+    }
+
+    #[test]
+    fn test_check_invariants_high_must_be_compatible_with_current() {
+        let mut ballot = BallotProtocol::new();
+        let value_a = make_value(&[1]);
+        let value_b = make_value(&[2]);
+        ballot.current_ballot = Some(ScpBallot {
+            counter: 5,
+            value: value_a,
+        });
+        ballot.high_ballot = Some(ScpBallot {
+            counter: 3,
+            value: value_b,
+        });
+        assert!(ballot.check_invariants().is_err());
+    }
+
+    #[test]
+    fn test_check_invariants_high_must_not_exceed_current() {
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[1]);
+        ballot.current_ballot = Some(ScpBallot {
+            counter: 3,
+            value: value.clone(),
+        });
+        ballot.high_ballot = Some(ScpBallot { counter: 5, value });
+        assert!(ballot.check_invariants().is_err());
+    }
+
+    #[test]
+    fn test_check_invariants_commit_must_be_compatible_with_high() {
+        let mut ballot = BallotProtocol::new();
+        let value_a = make_value(&[1]);
+        let value_b = make_value(&[2]);
+        ballot.current_ballot = Some(ScpBallot {
+            counter: 5,
+            value: value_a.clone(),
+        });
+        ballot.high_ballot = Some(ScpBallot {
+            counter: 4,
+            value: value_a,
+        });
+        ballot.commit = Some(ScpBallot {
+            counter: 2,
+            value: value_b,
+        });
+        assert!(ballot.check_invariants().is_err());
+    }
+
+    #[test]
+    fn test_check_invariants_commit_must_not_exceed_high() {
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[1]);
+        ballot.current_ballot = Some(ScpBallot {
+            counter: 5,
+            value: value.clone(),
+        });
+        ballot.high_ballot = Some(ScpBallot {
+            counter: 3,
+            value: value.clone(),
+        });
+        ballot.commit = Some(ScpBallot { counter: 4, value });
+        assert!(ballot.check_invariants().is_err());
+    }
+
+    #[test]
+    fn test_check_invariants_valid_confirm_state() {
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[1]);
+        ballot.phase = BallotPhase::Confirm;
+        ballot.current_ballot = Some(ScpBallot {
+            counter: 5,
+            value: value.clone(),
+        });
+        ballot.prepared = Some(ScpBallot {
+            counter: 3,
+            value: value.clone(),
+        });
+        ballot.commit = Some(ScpBallot {
+            counter: 2,
+            value: value.clone(),
+        });
+        ballot.high_ballot = Some(ScpBallot { counter: 4, value });
+        assert!(ballot.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn test_check_invariants_valid_externalize_state() {
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[1]);
+        ballot.phase = BallotPhase::Externalize;
+        ballot.current_ballot = Some(ScpBallot {
+            counter: u32::MAX,
+            value: value.clone(),
+        });
+        ballot.prepared = Some(ScpBallot {
+            counter: u32::MAX,
+            value: value.clone(),
+        });
+        ballot.commit = Some(ScpBallot {
+            counter: 3,
+            value: value.clone(),
+        });
+        ballot.high_ballot = Some(ScpBallot { counter: 5, value });
+        assert!(ballot.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn test_set_state_from_envelope_precondition_rejects_when_started() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let mut bp = BallotProtocol::new();
+        let value = make_value(&[1, 2, 3]);
+
+        // Start the ballot protocol
+        bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+
+        // Save state before attempted restore
+        let phase_before = bp.phase;
+        let prepared_before = bp.prepared.clone();
+        let commit_before = bp.commit.clone();
+        let high_before = bp.high_ballot.clone();
+        let latest_before = bp.latest_envelopes.len();
+        let last_env_before = bp.last_envelope.clone();
+        let last_emit_before = bp.last_envelope_emit.clone();
+
+        let envelope = make_prepare_envelope(
+            node.clone(),
+            1,
+            &quorum_set,
+            ScpBallot { counter: 5, value },
+        );
+
+        let result = bp.set_state_from_envelope(&envelope);
+        assert!(result.is_err(), "Should reject when current_ballot is set");
+
+        // All state unchanged
+        assert_eq!(bp.current_ballot.as_ref().unwrap().counter, 1);
+        assert_eq!(bp.phase, phase_before);
+        assert_eq!(bp.prepared, prepared_before);
+        assert_eq!(bp.commit, commit_before);
+        assert_eq!(bp.high_ballot, high_before);
+        assert_eq!(bp.latest_envelopes.len(), latest_before);
+        assert_eq!(bp.last_envelope.is_some(), last_env_before.is_some());
+        assert_eq!(bp.last_envelope_emit.is_some(), last_emit_before.is_some());
+    }
+
+    #[test]
+    fn test_set_state_from_envelope_then_check_invariants() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let value = make_value(&[1, 2, 3]);
+
+        // PREPARE recovery → invariants hold
+        let mut bp = BallotProtocol::new();
+        let envelope = make_prepare_envelope_with_counters(
+            node.clone(),
+            1,
+            &quorum_set,
+            ScpBallot {
+                counter: 3,
+                value: value.clone(),
+            },
+            PrepareEnvelopeCounters {
+                prepared: Some(ScpBallot {
+                    counter: 2,
+                    value: value.clone(),
+                }),
+                prepared_prime: None,
+                n_h: 3,
+                n_c: 2,
+            },
+        );
+        bp.set_state_from_envelope(&envelope).unwrap();
+        assert!(
+            bp.check_invariants().is_ok(),
+            "PREPARE state should be valid"
+        );
+
+        // CONFIRM recovery → invariants hold
+        let mut bp = BallotProtocol::new();
+        let conf = ScpStatementConfirm {
+            ballot: ScpBallot {
+                counter: 5,
+                value: value.clone(),
+            },
+            n_prepared: 3,
+            n_commit: 2,
+            n_h: 4,
+            quorum_set_hash: hash_quorum_set(&quorum_set).into(),
+        };
+        let statement = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Confirm(conf),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        bp.set_state_from_envelope(&envelope).unwrap();
+        assert!(
+            bp.check_invariants().is_ok(),
+            "CONFIRM state should be valid"
+        );
+
+        // EXTERNALIZE recovery → invariants hold
+        let mut bp = BallotProtocol::new();
+        let ext = ScpStatementExternalize {
+            commit: ScpBallot {
+                counter: 3,
+                value: value.clone(),
+            },
+            n_h: 5,
+            commit_quorum_set_hash: hash_quorum_set(&quorum_set).into(),
+        };
+        let statement = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Externalize(ext),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        bp.set_state_from_envelope(&envelope).unwrap();
+        assert!(
+            bp.check_invariants().is_ok(),
+            "EXTERNALIZE state should be valid"
+        );
+    }
+
+    // ── Finding 2: has_vblocking_subset_strictly_ahead_of dead guard removal ──
+
+    #[test]
+    fn test_has_vblocking_subset_strictly_ahead_of_with_vblocking_ahead() {
+        let node = make_node_id(1);
+        let other = make_node_id(2);
+        // threshold=2 with 2 validators: blocking_threshold = 2-2+1 = 1
+        // So a single node is v-blocking
+        let quorum_set = make_quorum_set(vec![node.clone(), other.clone()], 2);
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[1, 2, 3]);
+
+        // Add a latest envelope from `other` at counter 5
+        let envelope = make_prepare_envelope(
+            other.clone(),
+            1,
+            &quorum_set,
+            ScpBallot {
+                counter: 5,
+                value: value.clone(),
+            },
+        );
+        bp.latest_envelopes.insert(other.clone(), envelope);
+
+        // Our counter is 1, other is at 5 — should be v-blocking ahead
+        assert!(
+            bp.has_vblocking_subset_strictly_ahead_of(1, &ctx!(&node, &quorum_set, &driver, 1)),
+            "should detect v-blocking set strictly ahead"
+        );
     }
 
     #[test]
@@ -3366,7 +3748,7 @@ mod tests {
             },
         );
 
-        assert!(bp.set_state_from_envelope(&envelope));
+        bp.set_state_from_envelope(&envelope).unwrap();
         assert_eq!(
             bp.last_envelope_emit.as_ref(),
             Some(&envelope),
@@ -3399,7 +3781,7 @@ mod tests {
             9,
         );
 
-        assert!(bp.set_state_from_envelope(&envelope));
+        bp.set_state_from_envelope(&envelope).unwrap();
         assert_eq!(
             bp.last_envelope_emit.as_ref(),
             Some(&envelope),
@@ -3425,7 +3807,7 @@ mod tests {
             5,
         );
 
-        assert!(bp.set_state_from_envelope(&envelope));
+        bp.set_state_from_envelope(&envelope).unwrap();
         assert_eq!(
             bp.last_envelope_emit.as_ref(),
             Some(&envelope),
@@ -3434,18 +3816,15 @@ mod tests {
     }
 
     #[test]
-    fn test_set_state_from_envelope_nomination_does_not_set_last_envelope_emit() {
+    #[should_panic(expected = "non-ballot statement")]
+    fn test_set_state_from_envelope_nomination_panics() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let mut bp = BallotProtocol::new();
 
         let envelope = make_nomination_envelope(node.clone(), 4, &quorum_set);
 
-        assert!(!bp.set_state_from_envelope(&envelope));
-        assert!(
-            bp.last_envelope_emit.is_none(),
-            "Nomination: last_envelope_emit must remain None"
-        );
+        let _ = bp.set_state_from_envelope(&envelope);
     }
 
     #[test]
@@ -3466,7 +3845,7 @@ mod tests {
             ScpBallot { counter: 1, value },
         );
 
-        bp.set_state_from_envelope(&envelope);
+        bp.set_state_from_envelope(&envelope).unwrap();
 
         let emit_before = driver.emit_count.load(Ordering::SeqCst);
         bp.send_latest_envelope(&driver);

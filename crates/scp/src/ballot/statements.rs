@@ -283,7 +283,6 @@ impl BallotProtocol {
             }
         }
         is_v_blocking(ctx.local_quorum_set, &nodes)
-            && !self.statement_quorum_set_map(ctx).is_empty()
     }
 
     fn statement_quorum_set_map<D: SCPDriver>(

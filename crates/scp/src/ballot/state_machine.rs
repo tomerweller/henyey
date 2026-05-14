@@ -494,15 +494,23 @@ impl BallotProtocol {
     }
 
     fn update_current_if_needed(&mut self, ballot: &ScpBallot) -> bool {
-        if self
+        let updated = if self
             .current_ballot
             .as_ref()
             .map(|b| ballot_compare(b, ballot) == Ordering::Less)
             .unwrap_or(true)
         {
-            return self.bump_to_ballot(ballot, true);
+            self.bump_to_ballot(ballot, true)
+        } else {
+            false
+        };
+
+        // Matches stellar-core BallotProtocol.cpp:442
+        if let Err(e) = self.check_invariants() {
+            tracing::warn!("Invariant violation after update_current_if_needed: {e}");
         }
-        false
+
+        updated
     }
 
     /// Update current value enforcing invariants (matches stellar-core updateCurrentValue).
