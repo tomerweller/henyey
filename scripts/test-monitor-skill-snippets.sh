@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=300
+TAP_PLAN=315
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -4509,6 +4509,208 @@ print(json.dumps(d))
   fi
 
   rm -rf "$nofile_root"
+
+  # ── check-alarm-regression.sh --no-file gh-stub test ───────────────────────
+  # Verifies --no-file makes zero GitHub API calls using a PATH-based gh stub.
+
+  local ghstub_root
+  ghstub_root=$(mktemp -d)
+  local ghstub_fake_repo="$ghstub_root/fake-repo"
+  local ghstub_session="$ghstub_root/session"
+  local ghstub_gh_dir="$ghstub_root/gh-stub"
+  local ghstub_gh_log="$ghstub_root/gh-calls.log"
+  mkdir -p "$ghstub_session/metrics" "$ghstub_gh_dir"
+  mkdir -p "$ghstub_fake_repo/scripts/dev" "$ghstub_fake_repo/scripts/lib"
+  mkdir -p "$ghstub_fake_repo/.github/skills/plan-do-review/scripts"
+  cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$ghstub_fake_repo/scripts/dev/"
+  cp "$REPO_ROOT/scripts/lib/dedup-filing.sh" "$ghstub_fake_repo/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/dedup-filing.py" "$ghstub_fake_repo/scripts/lib/"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$ghstub_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  chmod +x "$ghstub_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+
+  # Failing gh stub: logs invocation and exits 99
+  cat > "$ghstub_gh_dir/gh" << 'GHSTUBEOF'
+#!/usr/bin/env bash
+echo "$*" >> GHSTUB_LOG_PLACEHOLDER
+exit 99
+GHSTUBEOF
+  sed -i "s|GHSTUB_LOG_PLACEHOLDER|$ghstub_gh_log|" "$ghstub_gh_dir/gh"
+  chmod +x "$ghstub_gh_dir/gh"
+
+  # Create baseline with valid provenance (lost-sync active at 10%)
+  local ghstub_baseline
+  ghstub_baseline=$(python3 -c "
+import json, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+d = json.loads(sys.argv[1])
+with open(sys.argv[3], 'rb') as f:
+    catalog = tomllib.load(f)
+versions = {a['name']: a.get('baseline_version', 1) for a in catalog.get('alarm', [])}
+d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2], 'alarm_versions': versions}
+print(json.dumps(d))
+" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}' "$catalog_for_reg_checksum" "$catalog_for_reg")
+  echo "$ghstub_baseline" > "$ghstub_session/metrics/replay-baseline.json"
+  # Stable baseline too (to avoid recreation)
+  echo "$ghstub_baseline" > "$ghstub_session/metrics/replay-baseline-stable.json"
+
+  # Current where lost-sync went silent → regression
+  local ghstub_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$ghstub_current" > "$ghstub_session/metrics/ghstub-current.json"
+
+  # Pre-seed dedup file and save checksum
+  local ghstub_dedup_seed='{"schema_version":1,"filed":{"lost-sync":{"filed_at":"2099-01-01T00:00:00Z","issue_url":"https://example.com/1"}}}'
+  echo "$ghstub_dedup_seed" > "$ghstub_fake_repo/.alarm-regression-filed.json"
+  local ghstub_dedup_checksum
+  ghstub_dedup_checksum=$(sha256sum "$ghstub_fake_repo/.alarm-regression-filed.json" | cut -d' ' -f1)
+
+  # Run with --no-file
+  local ghstub_out
+  ghstub_out=$(PATH="$ghstub_gh_dir:$PATH" "$ghstub_fake_repo/scripts/dev/check-alarm-regression.sh" --no-file \
+    "$ghstub_session" --current "$ghstub_session/metrics/ghstub-current.json" \
+    --catalog "$catalog_for_reg" 2>&1) || true
+
+  # Assert: zero gh calls
+  if [[ ! -f "$ghstub_gh_log" ]] || [[ ! -s "$ghstub_gh_log" ]]; then
+    tap_ok "gh-stub: zero gh calls under --no-file"
+  else
+    tap_not_ok "gh-stub: zero gh calls under --no-file" "gh calls: $(cat "$ghstub_gh_log")"
+  fi
+
+  # Assert: regressions still detected
+  if echo "$ghstub_out" | grep -q "regression(s) found"; then
+    tap_ok "gh-stub: regressions still detected under --no-file"
+  else
+    tap_not_ok "gh-stub: regressions still detected under --no-file" "output: $ghstub_out"
+  fi
+
+  # Assert: filing suppressed message
+  if echo "$ghstub_out" | grep -q "Filing suppressed (--no-file)"; then
+    tap_ok "gh-stub: filing suppressed message under --no-file"
+  else
+    tap_not_ok "gh-stub: filing suppressed message under --no-file" "output: $ghstub_out"
+  fi
+
+  # Assert: dedup file unchanged (byte-identical)
+  local ghstub_dedup_after
+  ghstub_dedup_after=$(sha256sum "$ghstub_fake_repo/.alarm-regression-filed.json" 2>/dev/null | cut -d' ' -f1) || ghstub_dedup_after="MISSING"
+  if [[ "$ghstub_dedup_checksum" == "$ghstub_dedup_after" ]]; then
+    tap_ok "gh-stub: dedup file unchanged under --no-file"
+  else
+    tap_not_ok "gh-stub: dedup file unchanged under --no-file" \
+      "before=$ghstub_dedup_checksum after=$ghstub_dedup_after"
+  fi
+
+  rm -rf "$ghstub_root"
+
+  # ── check-alarm-regression.sh dedup catalog-pruning test ───────────────────
+  # Verifies non-catalog entries are pruned from .alarm-regression-filed.json.
+
+  local prune_root
+  prune_root=$(mktemp -d)
+  local prune_fake_repo="$prune_root/fake-repo"
+  local prune_session="$prune_root/session"
+  local prune_gh_dir="$prune_root/gh-stub"
+  local prune_gh_log="$prune_root/gh-calls.log"
+  mkdir -p "$prune_session/metrics" "$prune_gh_dir"
+  mkdir -p "$prune_fake_repo/scripts/dev" "$prune_fake_repo/scripts/lib"
+  mkdir -p "$prune_fake_repo/.github/skills/plan-do-review/scripts"
+  cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$prune_fake_repo/scripts/dev/"
+  cp "$REPO_ROOT/scripts/lib/dedup-filing.sh" "$prune_fake_repo/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/dedup-filing.py" "$prune_fake_repo/scripts/lib/"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$prune_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  chmod +x "$prune_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+
+  # Working gh stub: returns [] for issue list, fake URL for issue create
+  cat > "$prune_gh_dir/gh" << 'PRUNESTUBEOF'
+#!/usr/bin/env bash
+echo "$*" >> PRUNE_LOG_PLACEHOLDER
+if [[ "$1" == "issue" && "$2" == "list" ]]; then
+  echo '[]'
+  exit 0
+elif [[ "$1" == "issue" && "$2" == "create" ]]; then
+  echo 'https://github.com/stellar-experimental/henyey/issues/9999'
+  exit 0
+elif [[ "$1" == "label" ]]; then
+  exit 0
+fi
+exit 0
+PRUNESTUBEOF
+  sed -i "s|PRUNE_LOG_PLACEHOLDER|$prune_gh_log|" "$prune_gh_dir/gh"
+  chmod +x "$prune_gh_dir/gh"
+
+  # Create baseline with valid provenance (lost-sync active)
+  local prune_baseline
+  prune_baseline=$(python3 -c "
+import json, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+d = json.loads(sys.argv[1])
+with open(sys.argv[3], 'rb') as f:
+    catalog = tomllib.load(f)
+versions = {a['name']: a.get('baseline_version', 1) for a in catalog.get('alarm', [])}
+d['provenance'] = {'created_at': '2026-01-01T00:00:00Z', 'created_commit': 'test', 'catalog_checksum': sys.argv[2], 'alarm_versions': versions}
+print(json.dumps(d))
+" '{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}' "$catalog_for_reg_checksum" "$catalog_for_reg")
+  echo "$prune_baseline" > "$prune_session/metrics/replay-baseline.json"
+  echo "$prune_baseline" > "$prune_session/metrics/replay-baseline-stable.json"
+
+  # Current where lost-sync went silent → regression
+  local prune_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$prune_current" > "$prune_session/metrics/prune-current.json"
+
+  # Pre-seed dedup file with non-catalog + catalog entries (use filed_at, not ts)
+  local prune_dedup_seed='{"schema_version":1,"filed":{"stale-test-alarm":{"filed_at":"2099-01-01T00:00:00Z","issue_url":"https://example.com/stale"},"peer-count-low":{"filed_at":"2099-01-01T00:00:00Z","issue_url":"https://example.com/peer"}}}'
+  echo "$prune_dedup_seed" > "$prune_fake_repo/.alarm-regression-filed.json"
+
+  # Run WITHOUT --no-file
+  local prune_out
+  prune_out=$(PATH="$prune_gh_dir:$PATH" "$prune_fake_repo/scripts/dev/check-alarm-regression.sh" \
+    "$prune_session" --current "$prune_session/metrics/prune-current.json" \
+    --catalog "$catalog_for_reg" 2>&1) || true
+
+  # Assert: non-catalog entry removed
+  local prune_has_stale
+  prune_has_stale=$(grep -c '"stale-test-alarm"' "$prune_fake_repo/.alarm-regression-filed.json" 2>/dev/null) || true
+  if [[ "$prune_has_stale" -eq 0 ]]; then
+    tap_ok "dedup-prune: non-catalog entry removed (stale-test-alarm)"
+  else
+    tap_not_ok "dedup-prune: non-catalog entry removed (stale-test-alarm)" \
+      "still present: $(cat "$prune_fake_repo/.alarm-regression-filed.json")"
+  fi
+
+  # Assert: catalog entry preserved
+  local prune_has_peer
+  prune_has_peer=$(grep -c '"peer-count-low"' "$prune_fake_repo/.alarm-regression-filed.json" 2>/dev/null) || true
+  if [[ "$prune_has_peer" -ge 1 ]]; then
+    tap_ok "dedup-prune: catalog entry preserved (peer-count-low)"
+  else
+    tap_not_ok "dedup-prune: catalog entry preserved (peer-count-low)" \
+      "missing: $(cat "$prune_fake_repo/.alarm-regression-filed.json")"
+  fi
+
+  # Assert: newly filed alarm recorded
+  local prune_has_lostsync
+  prune_has_lostsync=$(grep -c '"lost-sync"' "$prune_fake_repo/.alarm-regression-filed.json" 2>/dev/null) || true
+  if [[ "$prune_has_lostsync" -ge 1 ]]; then
+    tap_ok "dedup-prune: newly filed alarm recorded (lost-sync)"
+  else
+    tap_not_ok "dedup-prune: newly filed alarm recorded (lost-sync)" \
+      "missing: $(cat "$prune_fake_repo/.alarm-regression-filed.json")"
+  fi
+
+  # Assert: pruning reported in stderr
+  if echo "$prune_out" | grep -q "Pruned non-catalog dedup entry: stale-test-alarm"; then
+    tap_ok "dedup-prune: stderr reports pruning of stale-test-alarm"
+  else
+    tap_not_ok "dedup-prune: stderr reports pruning of stale-test-alarm" "output: $prune_out"
+  fi
+
+  rm -rf "$prune_root"
 
   # ── check-alarm-regression.sh stable-baseline tests ────────────────────────
 
