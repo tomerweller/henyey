@@ -25,7 +25,7 @@ use crate::{
     auth::AuthContext,
     codec::helpers,
     connection::{Connection, ConnectionDirection},
-    flow_control::{msg_body_size, FlowControlConfig},
+    flow_control::msg_body_size,
     manager::PendingPeerEntry,
     metrics::{OverlayMessageKind, OverlayMetrics},
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
@@ -221,6 +221,9 @@ impl Peer {
     ///
     /// `initial_byte_grant` is the byte capacity sent in the initial
     /// SEND_MORE_EXTENDED — typically from [`FlowControlBytesConfig::bytes_total`].
+    /// `initial_message_grant` is the message-level flood reading capacity
+    /// (OVERLAY_SPEC §5.4.4, stellar-core `PEER_FLOOD_READING_CAPACITY`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect_with_connection(
         addr: &PeerAddress,
         connection: Connection,
@@ -228,6 +231,7 @@ impl Peer {
         auth_timeout_secs: u64,
         pending_peer_ids: Option<Arc<DashMap<PeerId, PendingPeerEntry>>>,
         initial_byte_grant: u32,
+        initial_message_grant: u32,
         metrics: Arc<OverlayMetrics>,
     ) -> Result<Self> {
         let auth = AuthContext::new(local_node, true);
@@ -256,6 +260,7 @@ impl Peer {
             None,
             pending_peer_ids,
             initial_byte_grant,
+            initial_message_grant,
         )
         .await?;
         Ok(peer)
@@ -265,6 +270,9 @@ impl Peer {
     ///
     /// `initial_byte_grant` is the byte capacity sent in the initial
     /// SEND_MORE_EXTENDED — typically from [`FlowControlBytesConfig::bytes_total`].
+    /// `initial_message_grant` is the message-level flood reading capacity
+    /// (OVERLAY_SPEC §5.4.4, stellar-core `PEER_FLOOD_READING_CAPACITY`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn accept(
         connection: Connection,
         local_node: LocalNode,
@@ -272,6 +280,7 @@ impl Peer {
         banned_peers: Arc<RwLock<HashSet<PeerId>>>,
         pending_peer_ids: Arc<DashMap<PeerId, PendingPeerEntry>>,
         initial_byte_grant: u32,
+        initial_message_grant: u32,
         metrics: Arc<OverlayMetrics>,
     ) -> Result<Self> {
         debug!("Accepting peer from: {}", connection.remote_addr());
@@ -304,6 +313,7 @@ impl Peer {
             Some(banned_peers),
             Some(pending_peer_ids),
             initial_byte_grant,
+            initial_message_grant,
         )
         .await?;
 
@@ -312,7 +322,7 @@ impl Peer {
 
     /// Perform the authenticated handshake with a peer.
     ///
-    /// OVERLAY_SPEC §4.2: The handshake ordering depends on direction:
+    /// OVERLAY_SPEC §5.4: The handshake ordering depends on direction:
     ///
     /// **Initiator (outbound)**: Send HELLO -> Receive HELLO -> Send AUTH -> Receive AUTH
     /// **Responder (inbound)**:  Receive HELLO -> Send HELLO -> Receive AUTH -> Send AUTH
@@ -325,6 +335,7 @@ impl Peer {
         banned_peers: Option<Arc<RwLock<HashSet<PeerId>>>>,
         pending_peer_ids: Option<Arc<DashMap<PeerId, PendingPeerEntry>>>,
         initial_byte_grant: u32,
+        initial_message_grant: u32,
     ) -> Result<()> {
         self.state = PeerState::Handshaking;
         let handshake_start = std::time::Instant::now();
@@ -456,11 +467,10 @@ impl Peer {
 
         // Send SEND_MORE_EXTENDED to enable flow control.
         // Matches stellar-core Peer::recvAuth() → sendSendMore().
-        // The byte grant is computed from max_tx_size by the caller via
-        // FlowControlBytesConfig::bytes_total() — must match the FlowControl
-        // initial capacity for this peer.
+        // Both grants are derived from configuration at overlay startup —
+        // OVERLAY_SPEC §5.4.4 / §7.2.
         let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
-            num_messages: FlowControlConfig::default().peer_flood_reading_capacity as u32,
+            num_messages: initial_message_grant,
             num_bytes: initial_byte_grant,
         });
         self.send(send_more).await?;
@@ -522,7 +532,12 @@ impl Peer {
 
         match message {
             StellarMessage::Hello(peer_hello) => {
-                self.process_hello(peer_hello)?;
+                if let Err(e) = self.process_hello(peer_hello) {
+                    // Best-effort ERR_CONF before dropping, matching
+                    // stellar-core Peer::recvHello() → sendErrorAndDrop().
+                    self.try_send_err_conf(&e).await;
+                    return Err(e);
+                }
             }
             other => {
                 return Err(OverlayError::InvalidMessage(format!(
@@ -533,6 +548,31 @@ impl Peer {
         }
 
         Ok(())
+    }
+
+    /// Best-effort send of ERR_CONF for HELLO failures.
+    /// Matches stellar-core Peer::recvHello() error paths that call
+    /// sendErrorAndDrop(ERR_CONF, ...) for: wrong network, version mismatch,
+    /// self-connection, bad address/port (Peer.cpp:1784-1962).
+    async fn try_send_err_conf(&mut self, err: &OverlayError) {
+        let reason = match err {
+            OverlayError::NetworkMismatch
+            | OverlayError::VersionMismatch(_)
+            | OverlayError::InvalidMessage(_) => err.to_string(),
+            _ => return,
+        };
+        let truncated = if reason.len() > 100 {
+            &reason[..100]
+        } else {
+            &reason
+        };
+        let msg = StellarMessage::ErrorMsg(stellar_xdr::curr::SError {
+            code: stellar_xdr::curr::ErrorCode::Conf,
+            msg: stellar_xdr::curr::StringM::try_from(truncated.to_string()).unwrap_or_default(),
+        });
+        if let Err(e) = self.send_raw(msg).await {
+            debug!("Failed to send ERR_CONF: {}", e);
+        }
     }
 
     /// Send AUTH message (authenticated with MAC, sequence 0).

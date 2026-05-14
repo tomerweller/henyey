@@ -367,6 +367,16 @@ impl AuthContext {
     /// - Auth certificate signature is invalid or expired
     /// - Key derivation fails
     pub fn process_hello(&mut self, hello: &Hello) -> Result<()> {
+        // State guard: process_hello is only valid in Initial or HelloSent states.
+        // Rejecting other states prevents MAC key clobbering from a duplicate HELLO
+        // (INV-O3) and enforces the handshake state machine (INV-O4).
+        if self.state != AuthState::Initial && self.state != AuthState::HelloSent {
+            return Err(OverlayError::AuthenticationFailed(format!(
+                "process_hello called in invalid state {:?} (expected Initial or HelloSent)",
+                self.state
+            )));
+        }
+
         // Check network ID
         let network_id_bytes = hello.network_id.0;
         if network_id_bytes != *self.local_node.network_id.as_bytes() {
@@ -542,7 +552,7 @@ impl AuthContext {
     pub fn hello_sent(&mut self) {
         // For the initiator, this transitions Initial → HelloSent.
         // For the responder (who receives Hello first), state is already
-        // HelloReceived so this is a no-op — that's correct per OVERLAY_SPEC §4.2.
+        // HelloReceived so this is a no-op — that's correct per OVERLAY_SPEC §5.4.
         if self.state == AuthState::Initial {
             self.state = AuthState::HelloSent;
         }
@@ -564,6 +574,15 @@ impl AuthContext {
     /// After this succeeds, the connection is fully authenticated and
     /// all messages will be verified with MACs.
     pub fn process_auth(&mut self) -> Result<()> {
+        // State guard: process_auth is only valid in HelloReceived or AuthSent states.
+        // Enforces the handshake state machine (INV-O4).
+        if self.state != AuthState::HelloReceived && self.state != AuthState::AuthSent {
+            return Err(OverlayError::AuthenticationFailed(format!(
+                "process_auth called in invalid state {:?} (expected HelloReceived or AuthSent)",
+                self.state
+            )));
+        }
+
         // AUTH messages consume sequence 0 on both sides
         // So first post-auth messages use sequence 1
         self.recv_sequence = 1;
@@ -672,7 +691,7 @@ impl AuthContext {
                         &expected_mac.mac[..8],
                         &v0.mac.mac[..8],
                     );
-                    // Spec: OVERLAY_SPEC §3.4 — MAC comparison MUST be constant-time
+                    // Spec: OVERLAY_SPEC §4.3 — MAC comparison MUST be constant-time
                     // to prevent timing side-channel attacks.
                     if !constant_time_eq(&expected_mac.mac, &v0.mac.mac) {
                         return Err(OverlayError::MacVerificationFailed);
@@ -1090,7 +1109,7 @@ mod tests {
         );
     }
 
-    // ── OVERLAY_SPEC §4.2: Auth state transitions ─────────────────────
+    // ── OVERLAY_SPEC §5.4: Auth state transitions ─────────────────────
 
     #[test]
     fn test_constant_time_eq_equal() {
@@ -1392,5 +1411,63 @@ mod tests {
             "expected MacVerificationFailed, got: {:?}",
             result
         );
+    }
+
+    // ---- INV-O3 / INV-O4: AuthContext state machine enforcement ----
+
+    #[test]
+    fn test_process_hello_rejects_duplicate_call() {
+        // INV-O3: A second process_hello must be rejected to prevent MAC key
+        // clobbering. After the first call, state is HelloReceived, which is
+        // not in {Initial, HelloSent}.
+        let secret_a = SecretKey::generate();
+        let secret_b = SecretKey::generate();
+        let node_a = LocalNode::new_testnet(secret_a);
+        let node_b = LocalNode::new_testnet(secret_b);
+
+        let mut ctx_a = AuthContext::new(node_a.clone(), true);
+        let mut ctx_b = AuthContext::new(node_b, false);
+
+        let hello_a = ctx_a.create_hello();
+        ctx_a.hello_sent();
+
+        ctx_b
+            .process_hello(&hello_a)
+            .expect("first process_hello should succeed");
+        assert_eq!(ctx_b.state(), AuthState::HelloReceived);
+
+        // Second call: create a new hello from a different context to avoid
+        // "ephemeral secret already used" — the guard should reject based on
+        // state before reaching key derivation.
+        let ctx_c = AuthContext::new(node_a, true);
+        let hello_c = ctx_c.create_hello();
+        let result = ctx_b.process_hello(&hello_c);
+        assert!(result.is_err(), "duplicate process_hello must be rejected");
+    }
+
+    #[test]
+    fn test_process_auth_rejects_before_hello() {
+        // INV-O4: process_auth must reject if called before process_hello
+        // (state is Initial, not in {HelloReceived, AuthSent}).
+        let secret = SecretKey::generate();
+        let node = LocalNode::new_testnet(secret);
+        let mut ctx = AuthContext::new(node, true);
+
+        assert_eq!(ctx.state(), AuthState::Initial);
+        let result = ctx.process_auth();
+        assert!(
+            result.is_err(),
+            "process_auth in Initial state must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_process_auth_rejects_after_authenticated() {
+        // INV-O4: process_auth must reject if called after already authenticated.
+        let (_, mut ctx_b) = complete_handshake();
+        assert_eq!(ctx_b.state(), AuthState::Authenticated);
+
+        let result = ctx_b.process_auth();
+        assert!(result.is_err(), "duplicate process_auth must be rejected");
     }
 }

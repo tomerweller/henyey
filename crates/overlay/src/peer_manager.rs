@@ -34,8 +34,15 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, trace};
 
-/// Maximum number of failures before a peer is considered unreliable.
+/// Maximum number of failures before a peer is considered unreliable for
+/// advertising to other peers. Matches stellar-core `PeerManager.cpp:80`.
 pub const MAX_FAILURES: u32 = 10;
+
+/// Failure threshold for "really dead" peer pruning on startup.
+/// Peers exceeding this threshold are removed from the database entirely.
+/// Matches stellar-core `Config::REALLY_DEAD_NUM_FAILURES_CUTOFF` (120).
+#[cfg(test)]
+pub const REALLY_DEAD_NUM_FAILURES_CUTOFF: u32 = 120;
 
 /// Seconds per backoff unit.
 const SECONDS_PER_BACKOFF: u64 = 10;
@@ -759,6 +766,58 @@ mod tests {
         manager.remove_peers_with_many_failures(3).unwrap();
 
         assert_eq!(manager.peer_count(), 2);
+    }
+
+    #[test]
+    fn test_really_dead_threshold_matches_stellar_core() {
+        // §13.4: REALLY_DEAD_NUM_FAILURES_CUTOFF = 120 matches stellar-core
+        // Config::REALLY_DEAD_NUM_FAILURES_CUTOFF. Peers with >120 failures
+        // are pruned by the app layer's maintain_peers() call.
+        assert_eq!(REALLY_DEAD_NUM_FAILURES_CUTOFF, 120);
+        // MAX_FAILURES = 10 matches stellar-core PeerManager.cpp:80 for
+        // filtering peers to advertise.
+        assert_eq!(MAX_FAILURES, 10);
+    }
+
+    #[test]
+    fn test_peers_between_max_failures_and_really_dead_are_loadable() {
+        // Peers with failure counts between MAX_FAILURES (10) and
+        // REALLY_DEAD_NUM_FAILURES_CUTOFF (120) should not be returned
+        // by queries with max_num_failures=MAX_FAILURES, but should not
+        // be pruned from the database.
+        let manager = PeerManager::new_in_memory();
+        let addr = PeerAddress::new("1.2.3.4".to_string(), 11625);
+        manager.ensure_exists(&addr).unwrap();
+
+        // Add 15 failures (between MAX_FAILURES=10 and REALLY_DEAD=120)
+        for _ in 0..15 {
+            manager
+                .update_backoff(&addr, BackOffUpdate::Increase)
+                .unwrap();
+        }
+
+        // Should NOT appear in peers-to-send (MAX_FAILURES=10 filter)
+        let query = PeerQuery {
+            type_filter: PeerTypeFilter::AnyOutbound,
+            max_num_failures: Some(MAX_FAILURES),
+            ..PeerQuery::default()
+        };
+        let peers = manager.load_random_peers(&query, 10);
+        assert!(
+            peers.is_empty(),
+            "peer with 15 failures should be filtered by MAX_FAILURES=10"
+        );
+
+        // Should still exist in DB (not pruned by REALLY_DEAD=120)
+        assert_eq!(manager.peer_count(), 1);
+        manager
+            .remove_peers_with_many_failures(REALLY_DEAD_NUM_FAILURES_CUTOFF)
+            .unwrap();
+        assert_eq!(
+            manager.peer_count(),
+            1,
+            "peer with 15 failures should not be pruned by REALLY_DEAD=120"
+        );
     }
 
     #[test]

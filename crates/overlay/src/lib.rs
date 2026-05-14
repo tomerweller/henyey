@@ -271,6 +271,12 @@ pub struct OverlayConfig {
     /// values are auto-computed from max tx size. When [`Fixed`](FlowControlBytesConfig::Fixed),
     /// operator-supplied overrides are used directly.
     pub flow_control_bytes_config: FlowControlBytesConfig,
+
+    /// Initial message-level flood reading capacity sent in the first
+    /// SEND_MORE_EXTENDED to each peer and used as the FlowControl starting
+    /// capacity. Matches stellar-core's `PEER_FLOOD_READING_CAPACITY`
+    /// (default 200). Must be ≥ `flow_control_send_more_batch_size`.
+    pub peer_flood_reading_capacity: u32,
 }
 
 /// Peer connection events emitted by the overlay.
@@ -314,6 +320,7 @@ impl Default for OverlayConfig {
             version_string: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
             peer_event_tx: None,
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            peer_flood_reading_capacity: 200,
         }
     }
 }

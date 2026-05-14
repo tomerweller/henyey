@@ -41,15 +41,15 @@ use tracing::{debug, info, warn};
 const MAX_COLLECTING_PHASE_DURATION: Duration = Duration::from_secs(30 * 60);
 
 /// Maximum phase duration for reporting (default: 3 hours).
-/// Spec: OVERLAY_SPEC §8.3 — MAX_REPORTING_PHASE_DURATION = 3 hours.
+/// Spec: OVERLAY_SPEC §11 — MAX_REPORTING_PHASE_DURATION = 3 hours.
 const MAX_REPORTING_PHASE_DURATION: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Number of ledgers before survey messages are ignored.
-/// Spec: OVERLAY_SPEC §8.3 — NUM_LEDGERS_BEFORE_IGNORE = 6.
+/// Spec: OVERLAY_SPEC §11 — NUM_LEDGERS_BEFORE_IGNORE = 6.
 const NUM_LEDGERS_BEFORE_IGNORE: u32 = 6;
 
 /// Maximum requests per ledger from a single surveyor.
-/// Spec: OVERLAY_SPEC §8.3 — MAX_REQUEST_LIMIT_PER_LEDGER = 10.
+/// Spec: OVERLAY_SPEC §11 — MAX_REQUEST_LIMIT_PER_LEDGER = 10.
 const MAX_REQUEST_LIMIT_PER_LEDGER: u32 = 10;
 
 /// Throttle timeout multiplier for survey requests.
@@ -1104,7 +1104,7 @@ mod tests {
         assert_eq!(data.initial_lost_sync_count, 5);
     }
 
-    // ── OVERLAY_SPEC §8.3: Survey constants ──────────────────────────
+    // ── OVERLAY_SPEC §11: Survey constants ──────────────────────────
 
     #[test]
     fn test_max_reporting_phase_duration_is_3_hours() {
@@ -1112,7 +1112,7 @@ mod tests {
         assert_eq!(
             config.max_reporting_duration,
             Duration::from_secs(3 * 60 * 60),
-            "OVERLAY_SPEC §8.3: MAX_REPORTING_PHASE_DURATION must be 3 hours"
+            "OVERLAY_SPEC §11: MAX_REPORTING_PHASE_DURATION must be 3 hours"
         );
     }
 
@@ -1121,7 +1121,7 @@ mod tests {
         let config = SurveyConfig::default();
         assert_eq!(
             config.num_ledgers_before_ignore, 6,
-            "OVERLAY_SPEC §8.3: NUM_LEDGERS_BEFORE_IGNORE must be 6"
+            "OVERLAY_SPEC §11: NUM_LEDGERS_BEFORE_IGNORE must be 6"
         );
     }
 
@@ -1130,7 +1130,7 @@ mod tests {
         let config = SurveyConfig::default();
         assert_eq!(
             config.max_request_limit_per_ledger, 10,
-            "OVERLAY_SPEC §8.3: MAX_REQUEST_LIMIT_PER_LEDGER must be 10"
+            "OVERLAY_SPEC §11: MAX_REQUEST_LIMIT_PER_LEDGER must be 10"
         );
     }
 
@@ -1140,7 +1140,7 @@ mod tests {
         assert_eq!(
             config.max_collecting_duration,
             Duration::from_secs(30 * 60),
-            "OVERLAY_SPEC §8.3: MAX_COLLECTING_PHASE_DURATION must be 30 minutes"
+            "OVERLAY_SPEC §11: MAX_COLLECTING_PHASE_DURATION must be 30 minutes"
         );
     }
 
@@ -1148,7 +1148,7 @@ mod tests {
     fn test_survey_throttle_timeout_mult_is_3() {
         assert_eq!(
             SURVEY_THROTTLE_TIMEOUT_MULT, 3,
-            "OVERLAY_SPEC §8.3: SURVEY_THROTTLE_TIMEOUT_MULT must be 3"
+            "OVERLAY_SPEC §11: SURVEY_THROTTLE_TIMEOUT_MULT must be 3"
         );
     }
 

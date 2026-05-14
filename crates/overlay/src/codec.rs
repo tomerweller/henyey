@@ -27,11 +27,11 @@ use stellar_xdr::curr::{AuthenticatedMessage, Limits, ReadXdr, WriteXdr};
 use tokio_util::codec::{Decoder, Encoder};
 
 /// Maximum message size (16 MB) - prevents memory exhaustion.
-/// Spec: OVERLAY_SPEC §3.1 — MAX_MESSAGE_SIZE = 16,777,216 bytes.
+/// Spec: OVERLAY_SPEC §3.3 — MAX_MESSAGE_SIZE = 16,777,216 bytes.
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Maximum message size before authentication completes.
-/// Spec: OVERLAY_SPEC §3.1 — unauthenticated messages (Hello/Auth) MUST NOT exceed 4,096 bytes.
+/// Spec: OVERLAY_SPEC §3.3 — unauthenticated messages (Hello/Auth) MUST NOT exceed 4,096 bytes.
 const MAX_UNAUTHENTICATED_MESSAGE_SIZE: usize = 4096;
 
 /// Minimum message size - must fit at least the authenticated message header.
@@ -115,7 +115,7 @@ impl MessageCodec {
     /// Mark the codec as authenticated, allowing full-size messages.
     ///
     /// Before this is called, incoming messages are limited to 4,096 bytes
-    /// per OVERLAY_SPEC §3.1.
+    /// per OVERLAY_SPEC §3.3.
     pub fn set_authenticated(&mut self) {
         self.authenticated = true;
     }
@@ -177,6 +177,14 @@ impl Decoder for MessageCodec {
                     let len = (raw_len & 0x7FFFFFFF) as usize;
 
                     // Validate length
+                    // OVERLAY_SPEC §3.3: len==0 is handled distinctly as
+                    // "error during read", matching stellar-core
+                    // TCPPeer.cpp:690-700.
+                    if len == 0 {
+                        return Err(OverlayError::Message(
+                            "error during read: zero-length message".into(),
+                        ));
+                    }
                     if len < MIN_MESSAGE_SIZE {
                         return Err(OverlayError::Message(format!(
                             "message too small: {} bytes",
@@ -184,7 +192,7 @@ impl Decoder for MessageCodec {
                         )));
                     }
                     // Enforce size limit based on authentication state.
-                    // Spec: OVERLAY_SPEC §3.1 — before auth completes, limit to 4,096 bytes.
+                    // Spec: OVERLAY_SPEC §3.3 — before auth completes, limit to 4,096 bytes.
                     let max_size = if self.authenticated {
                         MAX_MESSAGE_SIZE
                     } else {
@@ -502,7 +510,7 @@ mod tests {
         );
     }
 
-    // ── OVERLAY_SPEC §3.1: Message size constants ─────────────────────
+    // ── OVERLAY_SPEC §3.3: Message size constants ─────────────────────
 
     #[test]
     fn test_max_message_size_is_16_mib() {
@@ -538,6 +546,25 @@ mod tests {
         assert!(
             err.contains("too small"),
             "error should mention 'too small': {err}"
+        );
+    }
+
+    #[test]
+    fn test_decoder_rejects_zero_length_message() {
+        // OVERLAY_SPEC §3.3: zero-length messages produce a distinct
+        // "error during read" error, matching stellar-core TCPPeer.cpp:690-700.
+        let mut codec = MessageCodec::new();
+        let len: u32 = 0;
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 16]);
+
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err(), "zero-length message must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("error during read"),
+            "error should mention 'error during read': {err}"
         );
     }
 

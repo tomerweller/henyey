@@ -252,6 +252,7 @@ impl OverlayManager {
             FlowControlConfig {
                 flow_control_bytes_batch_size: shared.flow_control_bytes_config.bytes_batch()
                     as u64,
+                peer_flood_reading_capacity: shared.peer_flood_reading_capacity as u64,
                 ..FlowControlConfig::default()
             },
             initial_byte_grant,
@@ -547,12 +548,13 @@ impl OverlayManager {
                                 let peer_handle = tokio::spawn(async move {
                                     let remote_addr = connection.remote_addr();
                                     let pending_peer_ids = Arc::clone(&shared.pending_connections.by_peer_id);
-                                    // Single snapshot: compute the initial byte grant once
+                                    // Single snapshot: compute initial grants once
                                     // and reuse for both SEND_MORE_EXTENDED and FlowControl.
                                     let initial_byte_grant = shared.flow_control_bytes_config.bytes_total(
                                         shared.max_tx_size_bytes.load(Ordering::Relaxed),
                                     );
-                                    match Peer::accept(connection, local_node, auth_timeout, Arc::clone(&shared.banned_peers), pending_peer_ids, initial_byte_grant, Arc::clone(&shared.metrics)).await {
+                                    let initial_message_grant = shared.peer_flood_reading_capacity;
+                                    match Peer::accept(connection, local_node, auth_timeout, Arc::clone(&shared.banned_peers), pending_peer_ids, initial_byte_grant, initial_message_grant, Arc::clone(&shared.metrics)).await {
                                         Ok(peer) => {
                                             Self::handle_accepted_inbound_peer(peer, shared, pool, initial_byte_grant).await;
                                         }
@@ -643,11 +645,12 @@ impl OverlayManager {
             }
         };
 
-        // Single snapshot: compute the initial byte grant once and reuse for
+        // Single snapshot: compute initial grants once and reuse for
         // both SEND_MORE_EXTENDED and FlowControl.
         let initial_byte_grant = shared
             .flow_control_bytes_config
             .bytes_total(shared.max_tx_size_bytes.load(Ordering::Relaxed));
+        let initial_message_grant = shared.peer_flood_reading_capacity;
 
         let pending_peer_ids = Some(Arc::clone(&shared.pending_connections.by_peer_id));
         let mut peer = match Peer::connect_with_connection(
@@ -657,6 +660,7 @@ impl OverlayManager {
             timeouts.auth_secs,
             pending_peer_ids,
             initial_byte_grant,
+            initial_message_grant,
             Arc::clone(&shared.metrics),
         )
         .await
@@ -1001,6 +1005,7 @@ pub(super) async fn connect_to_explicit_peer(
     let initial_byte_grant = shared
         .flow_control_bytes_config
         .bytes_total(shared.max_tx_size_bytes.load(Ordering::Relaxed));
+    let initial_message_grant = shared.peer_flood_reading_capacity;
 
     let pending_peer_ids = Some(Arc::clone(&shared.pending_connections.by_peer_id));
     let mut peer = match Peer::connect_with_connection(
@@ -1010,6 +1015,7 @@ pub(super) async fn connect_to_explicit_peer(
         timeouts.auth_secs,
         pending_peer_ids,
         initial_byte_grant,
+        initial_message_grant,
         Arc::clone(&shared.metrics),
     )
     .await
@@ -2564,6 +2570,7 @@ mod tests {
                     crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
                 )),
                 flow_control_bytes_config: FlowControlBytesConfig::default(),
+                peer_flood_reading_capacity: 200,
                 outbound_channel_capacity: 256,
                 dial_cooldowns: Arc::new(DashMap::new()),
                 local_peer_id: local_id,

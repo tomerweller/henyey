@@ -356,7 +356,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `tick()` | `start_tick_loop()` (3s interval) | Full |
 | `updateTimerAndMaybeDropRandomPeer()` | `maybe_drop_random_peer()` | Full |
 | `storeConfigPeers()` | In `start()` — stores known+preferred peers | Full |
-| `purgeDeadPeers()` | In `start()` — `remove_peers_with_many_failures(120)` | Full |
+| `purgeDeadPeers()` | App layer `maintain_peers()` — `remove_peers_with_failures(120)` | Full |
 | `triggerPeerResolution()` | DNS backoff in tick loop | Full |
 | `resolvePeers()` | DNS resolution with exponential backoff; results update both known peers and `PreferredPeerSet` (resolved IPs → inbound pool) | Full |
 | `storePeerList()` | In `start()` and tick loop | Full |

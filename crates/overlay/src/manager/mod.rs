@@ -604,6 +604,9 @@ pub(super) struct SharedPeerState {
     /// Flow control byte parameters (initial grant and batch size).
     /// Immutable after initialization — no atomic needed.
     pub(super) flow_control_bytes_config: FlowControlBytesConfig,
+    /// Initial message-level flood reading capacity for SEND_MORE_EXTENDED and
+    /// FlowControl. Matches stellar-core's `PEER_FLOOD_READING_CAPACITY`.
+    pub(super) peer_flood_reading_capacity: u32,
     /// Per-peer outbound channel capacity. Sourced from the `ConnectionFactory`
     /// so OverLoopback can use a larger value than TCP. See issue #2356.
     pub(super) outbound_channel_capacity: usize,
@@ -1009,6 +1012,7 @@ impl OverlayManager {
             query_rate_limit_window_secs: Arc::clone(&self.query_rate_limit_window_secs),
             max_tx_size_bytes: Arc::clone(&self.max_tx_size_bytes),
             flow_control_bytes_config: self.config.flow_control_bytes_config,
+            peer_flood_reading_capacity: self.config.peer_flood_reading_capacity,
             outbound_channel_capacity: self.connection_factory.outbound_channel_capacity(),
             dial_cooldowns: Arc::clone(&self.dial_cooldowns),
             local_peer_id: PeerId::from_xdr(self.local_node.xdr_public_key()),
@@ -2135,6 +2139,37 @@ mod tests {
         assert!(!manager.add_known_peer(addr));
     }
 
+    /// INV-O11: IPv6 peers must be excluded from PEERS messages.
+    /// `ResolvedPeerAddr::try_from_peer_address` returns None for IPv6,
+    /// so `build_peers_message` skips them. This regression test ensures
+    /// the exclusion holds even when IPv6 peers are mixed with IPv4.
+    #[test]
+    fn test_build_peers_message_excludes_ipv6() {
+        let ipv4_peer = PeerAddress::new("93.184.216.34", 11625);
+        let ipv6_peer = PeerAddress::new("::1", 11625);
+        let ipv6_full = PeerAddress::new("2001:db8::1", 11625);
+
+        // Only IPv6
+        let msg =
+            OverlayManager::build_peers_message(&[], &[ipv6_peer.clone(), ipv6_full.clone()], None);
+        assert!(
+            msg.is_none(),
+            "pure-IPv6 list should produce no PEERS message"
+        );
+
+        // Mix of IPv4 and IPv6
+        let msg = OverlayManager::build_peers_message(
+            &[ipv4_peer.clone()],
+            &[ipv6_peer, ipv6_full],
+            None,
+        );
+        let peers = match msg.unwrap() {
+            StellarMessage::Peers(p) => p.to_vec(),
+            other => panic!("expected Peers, got {:?}", other),
+        };
+        assert_eq!(peers.len(), 1, "only the IPv4 peer should be included");
+    }
+
     #[test]
     fn test_pending_connections_address_dedup() {
         use std::net::{Ipv4Addr, SocketAddrV4};
@@ -2342,6 +2377,7 @@ mod tests {
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,
             dial_cooldowns: Arc::new(DashMap::new()),
             local_peer_id: PeerId::from_bytes([0u8; 32]),
@@ -2866,6 +2902,7 @@ mod tests {
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,
             dial_cooldowns: Arc::new(DashMap::new()),
             local_peer_id: PeerId::from_bytes([0u8; 32]),
@@ -2960,6 +2997,7 @@ mod tests {
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,
             dial_cooldowns: Arc::new(DashMap::new()),
             local_peer_id: PeerId::from_bytes([0u8; 32]),
@@ -3661,6 +3699,7 @@ mod tests {
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,
             dial_cooldowns: Arc::new(DashMap::new()),
             local_peer_id: PeerId::from_bytes([0u8; 32]),
@@ -3730,6 +3769,7 @@ mod tests {
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,
             dial_cooldowns: Arc::new(DashMap::new()),
             local_peer_id: PeerId::from_bytes([0u8; 32]),

@@ -550,7 +550,7 @@ impl OverlayManager {
     ) -> bool {
         const PEER_TIMEOUT: Duration = Duration::from_secs(30);
         const PEER_STRAGGLER_TIMEOUT: Duration = Duration::from_secs(120);
-        // OVERLAY_SPEC §8.5 — drop peer if no SEND_MORE_EXTENDED for this long.
+        // OVERLAY_SPEC §5.6 — drop peer if no SEND_MORE_EXTENDED for this long.
         const PEER_SEND_MODE_IDLE_TIMEOUT_SECS: u64 = 60;
 
         let now = Instant::now();
@@ -686,7 +686,7 @@ impl OverlayManager {
 
         let msg_type = helpers::message_type_name(message);
 
-        // OVERLAY_SPEC §7.2: PEERS message validation.
+        // OVERLAY_SPEC §9.4: PEERS message validation.
         match validate_incoming_peers(ctx.peer.direction(), *ctx.received_peers, message) {
             PeersValidation::NotPeers => {}
             PeersValidation::AcceptFirst => {
@@ -694,14 +694,14 @@ impl OverlayManager {
             }
             PeersValidation::RejectWrongDirection => {
                 warn!(
-                    "Peer {} sent PEERS but we are the responder — dropping (OVERLAY_SPEC §7.2)",
+                    "Peer {} sent PEERS but we are the responder — dropping (OVERLAY_SPEC §9.4)",
                     peer_id
                 );
                 return None; // signal break
             }
             PeersValidation::RejectDuplicate => {
                 warn!(
-                    "Peer {} sent duplicate PEERS — dropping (OVERLAY_SPEC §7.2)",
+                    "Peer {} sent duplicate PEERS — dropping (OVERLAY_SPEC §9.4)",
                     peer_id
                 );
                 return None; // signal break
@@ -724,6 +724,24 @@ impl OverlayManager {
         if !is_validator && helpers::is_watcher_droppable(message) {
             trace!("Watcher: dropping {} from {}", msg_type, peer_id);
             return Some(false);
+        }
+
+        // INV-O14: Drop FloodAdvert/FloodDemand when not tracking consensus.
+        // Defense-in-depth alongside app-layer gating in lifecycle.rs.
+        // Transactions are NOT gated here — the app layer handles them
+        // differently (herder returns TryAgainLater).
+        if !state.is_tracking.load(Ordering::Relaxed) {
+            if matches!(
+                message,
+                StellarMessage::FloodAdvert(_) | StellarMessage::FloodDemand(_)
+            ) {
+                trace!(
+                    "Dropping {} from {}: not tracking consensus",
+                    msg_type,
+                    peer_id
+                );
+                return Some(false);
+            }
         }
 
         // Per-peer query rate limit (parity: Peer.cpp:1423-1438, 1686).
@@ -866,7 +884,7 @@ impl OverlayManager {
         let mut periodic_interval = tokio::time::interval(Duration::from_secs(1));
         let mut ticks_since_ping: u32 = 0;
 
-        // OVERLAY_SPEC §7.2: Track whether we've received a PEERS message
+        // OVERLAY_SPEC §9.4: Track whether we've received a PEERS message
         // from this peer. At most one is allowed; duplicates cause a drop.
         let mut received_peers = false;
         let mut query_limiter = QueryRateLimiter::new();
