@@ -25,8 +25,9 @@ schema_version = 1
 
 [[alarm]]
 name = "lost-sync"
-baseline_version = 3  # bumped in #2642: force re-invalidation of stable baselines created during post-#2612 transition
+baseline_version = 4  # bumped in #2661: clear stale baselines; alarm legitimately silent on healthy node
 semantic_change_date = "2026-05-13T20:00:00Z"  # deployed via #2642 (c45e6c80, committed 19:52 UTC)
+silence_expected = true  # healthy node should not lose sync; 0% firing is normal operation
 metric = "stellar_herder_lost_sync_total"
 kind = "counter"
 extraction = "form1"
@@ -41,7 +42,7 @@ filing_title = "metrics: stellar_herder_lost_sync_total — delta={value}"
 filing_search = "metrics: stellar_herder_lost_sync_total"
 summary = "Herder lost sync"
 details = "delta={value}"
-notes = "Semantic change in #2612: counter only increments on tracking timeout (parity with stellar-core mLostSync.Mark). Version bumped again in #2642 to force-invalidate stable baselines that captured transitional data during post-#2612 rollout."
+notes = "Semantic change in #2612: counter only increments on tracking timeout (parity with stellar-core mLostSync.Mark). Version bumped in #2642/#2661. silence_expected=true: a healthy node never loses sync, so 0% firing is expected — regression detector should not flag this as a regression."
 
 [[alarm]]
 name = "post-catchup-hard-reset"

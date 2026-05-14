@@ -1220,6 +1220,12 @@ def validate_catalog(catalog: dict) -> list[str]:
             if not isinstance(semantic_change_date, str) or not re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$', semantic_change_date):
                 errors.append(f"{name}: invalid semantic_change_date '{semantic_change_date}' (must be YYYY-MM-DDTHH:MM:SSZ)")
 
+        # silence_expected validation (optional, must be boolean)
+        silence_expected = alarm.get("silence_expected")
+        if silence_expected is not None:
+            if not isinstance(silence_expected, bool):
+                errors.append(f"{name}: invalid silence_expected '{silence_expected}' (must be boolean)")
+
         # Required fields
         kind = alarm.get("kind")
         if kind not in VALID_KINDS:

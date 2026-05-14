@@ -4272,7 +4272,10 @@ except Exception as e:
 
   # ── check-alarm-regression.sh behavioral tests ─────────────────────────
 
-  local catalog_for_reg="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
+  # Create a test-specific catalog that strips silence_expected so existing
+  # regression tests continue to detect lost-sync regressions as expected.
+  local catalog_for_reg="$TEST_ROOT/test-catalog-no-silence.toml"
+  sed '/^silence_expected/d' "$REPO_ROOT/.claude/skills/shared/metric-alarms.toml" > "$catalog_for_reg"
   local catalog_for_reg_checksum
   catalog_for_reg_checksum=$(sha256sum "$catalog_for_reg" | cut -d' ' -f1)
 
@@ -4716,7 +4719,8 @@ print(json.dumps(d))
 
   local stable_root
   stable_root=$(mktemp -d)
-  local stable_catalog="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
+  local stable_catalog="$stable_root/test-catalog-no-silence.toml"
+  sed '/^silence_expected/d' "$REPO_ROOT/.claude/skills/shared/metric-alarms.toml" > "$stable_catalog"
   local stable_catalog_checksum
   stable_catalog_checksum=$(sha256sum "$stable_catalog" | cut -d' ' -f1)
 
@@ -5612,7 +5616,8 @@ print(json.dumps(data))
   ack_root=$(mktemp -d)
   local ack_session="$ack_root/session"
   mkdir -p "$ack_session/metrics"
-  local catalog_for_ack="$REPO_ROOT/.claude/skills/shared/metric-alarms.toml"
+  local catalog_for_ack="$ack_root/test-catalog-no-silence.toml"
+  sed '/^silence_expected/d' "$REPO_ROOT/.claude/skills/shared/metric-alarms.toml" > "$catalog_for_ack"
   local catalog_for_ack_checksum
   catalog_for_ack_checksum=$(sha256sum "$catalog_for_ack" | cut -d' ' -f1)
 
@@ -5904,6 +5909,107 @@ print(d['alarms']['lost-sync']['rationale'])
   fi
 
   rm -rf "$ack_root"
+
+  # ── check-alarm-regression.sh silence_expected tests (#2661) ────────────────
+  # Tests for the silence_expected catalog field that suppresses false-positive
+  # regressions for alarms that legitimately go to 0% on a healthy node.
+
+  local se_root="$replay_root/silence-expected"
+  mkdir -p "$se_root/session/metrics"
+
+  # Create a minimal catalog with one silence_expected alarm and one normal alarm
+  local se_catalog="$se_root/catalog.toml"
+  cat > "$se_catalog" << 'SE_CAT'
+schema_version = 1
+
+[[alarm]]
+name = "lost-sync"
+silence_expected = true
+metric = "stellar_herder_lost_sync_total"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "SYNC"
+gates = ["warmup-2-ticks"]
+cooldown_key = "stellar_herder_lost_sync_total"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_herder_lost_sync_total — delta={value}"
+filing_search = "metrics: stellar_herder_lost_sync_total"
+summary = "Herder lost sync"
+details = "delta={value}"
+
+[[alarm]]
+name = "peer-count-low"
+metric = "stellar_overlay_peer_count"
+kind = "gauge"
+extraction = "form2"
+labels = []
+op = "<"
+threshold = 3
+severity = "OVERLAY"
+gates = ["warmup-2-ticks"]
+cooldown_key = "stellar_overlay_peer_count"
+cooldown_seconds = 600
+filing_title = "metrics: stellar_overlay_peer_count — value={value}"
+filing_search = "metrics: stellar_overlay_peer_count"
+summary = "Peer count low"
+details = "value={value}"
+SE_CAT
+
+  # Baseline: lost-sync fires 15%, peer-count-low fires 10%
+  local se_baseline='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":30,"breach":5,"ok":155,"baseline":0,"skip":10},"peer-count-low":{"firing":20,"breach":0,"ok":170,"baseline":0,"skip":10}}}'
+  local se_baseline_prov
+  se_baseline_prov=$(echo "$se_baseline" | python3 -c "
+import json, sys, hashlib
+d = json.load(sys.stdin)
+catalog_cksum = hashlib.sha256(open(sys.argv[1], 'rb').read()).hexdigest()
+d['provenance'] = {'created_at':'2026-01-01T00:00:00Z','created_commit':'test','catalog_checksum':catalog_cksum,'alarm_versions':{'lost-sync':1,'peer-count-low':1}}
+print(json.dumps(d))
+" "$se_catalog")
+  echo "$se_baseline_prov" > "$se_root/session/metrics/replay-baseline.json"
+  echo "$se_baseline_prov" > "$se_root/session/metrics/replay-baseline-stable.json"
+
+  # Current: both alarms at 0% firing
+  local se_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10},"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$se_current" > "$se_root/session/metrics/se-current.json"
+
+  # Test: silence_expected alarm (lost-sync) does NOT produce regression,
+  # but normal alarm (peer-count-low) DOES produce regression
+  local se_out
+  se_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
+    "$se_root/session" --current "$se_root/session/metrics/se-current.json" \
+    --catalog "$se_catalog" 2>&1) || true
+  local se_has_peer se_has_lost
+  se_has_peer=$(echo "$se_out" | grep -c "peer-count-low" || true)
+  se_has_lost=$(echo "$se_out" | grep -c "lost-sync" || true)
+  if [[ "$se_has_peer" -gt 0 ]] && [[ "$se_has_lost" -eq 0 ]]; then
+    tap_ok "silence_expected: suppresses 0%-firing regression for marked alarm"
+  else
+    tap_not_ok "silence_expected: suppresses 0%-firing regression for marked alarm" \
+      "peer=$se_has_peer lost=$se_has_lost output: ${se_out:0:300}"
+  fi
+
+  # Test: silence_expected alarm ABSENT from current → regression IS emitted
+  # (catalog drift detection preserved)
+  local se_absent_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t3","last_ts":"t4","alarms":{"peer-count-low":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$se_absent_current" > "$se_root/session/metrics/se-absent-current.json"
+
+  local se_absent_out
+  se_absent_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
+    "$se_root/session" --current "$se_root/session/metrics/se-absent-current.json" \
+    --catalog "$se_catalog" 2>&1) || true
+  local se_absent_has_lost
+  se_absent_has_lost=$(echo "$se_absent_out" | grep -c "lost-sync" || true)
+  if [[ "$se_absent_has_lost" -gt 0 ]]; then
+    tap_ok "silence_expected: absent-from-replay still produces regression"
+  else
+    tap_not_ok "silence_expected: absent-from-replay still produces regression" \
+      "lost=$se_absent_has_lost output: ${se_absent_out:0:300}"
+  fi
+
+  rm -rf "$se_root"
 
   # ── check-alarm-regression.sh per-alarm versioning tests (#2640) ────────────
   # Tests for per-alarm baseline_version invalidation logic.

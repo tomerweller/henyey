@@ -44,6 +44,7 @@ NON_SEMANTIC_FIELDS = frozenset({
     "notes", "filing_title", "filing_search", "summary", "details",
     "severity", "cooldown_key", "cooldown_seconds",
     "baseline_version", "semantic_change_date",
+    "silence_expected",
 })
 
 ALL_KNOWN_FIELDS = SEMANTIC_FIELDS | NON_SEMANTIC_FIELDS

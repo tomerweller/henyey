@@ -882,6 +882,17 @@ if not valid_alarms:
     print('ERROR: Catalog has no alarm entries', file=sys.stderr)
     sys.exit(2)
 
+# Build silence_expected set — alarms where going to 0% is not a regression
+silence_expected = set()
+for a in catalog.get('alarm', []):
+    se = a.get('silence_expected')
+    if se is True:
+        silence_expected.add(a['name'])
+    elif se is not None and se is not False:
+        aname = a['name']
+        print(f'ERROR: alarm {aname}: silence_expected must be boolean, got {se!r}', file=sys.stderr)
+        sys.exit(2)
+
 # Load acknowledged alarms
 acknowledged = set(json.loads(ack_set_str).keys())
 
@@ -942,6 +953,8 @@ def compare_baseline(baseline_data, source_label):
 
         c_firing = c_counts.get('firing', 0)
         if c_firing == 0:
+            if alarm_name in silence_expected:
+                continue
             results.append({
                 'alarm': alarm_name,
                 'baseline_source': source_label,
