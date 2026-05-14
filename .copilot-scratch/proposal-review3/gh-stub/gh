@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+echo "$*" >> /home/tomer/henyey-3/.copilot-scratch/proposal-review3/gh.log
+if [[ "$1" == "issue" && "$2" == "list" ]]; then
+  echo '[]'
+  exit 0
+elif [[ "$1" == "issue" && "$2" == "create" ]]; then
+  echo 'https://github.com/stellar-experimental/henyey/issues/9999'
+  exit 0
+elif [[ "$1" == "label" ]]; then
+  exit 0
+fi
+exit 0

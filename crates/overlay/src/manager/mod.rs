@@ -2170,6 +2170,23 @@ mod tests {
         assert_eq!(peers.len(), 1, "only the IPv4 peer should be included");
     }
 
+    /// Verify non-default peer_flood_reading_capacity propagates from config
+    /// to SharedPeerState, ensuring the SEND_MORE_EXTENDED message grant
+    /// uses the configured value (not the hardcoded default).
+    #[test]
+    fn test_peer_flood_reading_capacity_propagates_from_config() {
+        let mut config = OverlayConfig::default();
+        config.peer_flood_reading_capacity = 500; // non-default
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        let shared = manager.shared_state();
+        assert_eq!(
+            shared.peer_flood_reading_capacity, 500,
+            "peer_flood_reading_capacity must propagate from OverlayConfig to SharedPeerState"
+        );
+    }
+
     #[test]
     fn test_pending_connections_address_dedup() {
         use std::net::{Ipv4Addr, SocketAddrV4};
