@@ -16,12 +16,12 @@ async fn test_build_checkpoint_data_takes_state() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let mut work = HistoryWorkState::default();
     work.has = Some(HistoryArchiveState {
-        version: 2,
+        version: 1,
         server: None,
         current_ledger: 64,
-        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        network_passphrase: None,
         current_buckets: Vec::new(),
-        hot_archive_buckets: Some(Vec::new()),
+        hot_archive_buckets: None,
     });
     work.bucket_dir = Some(tmp_dir.path().to_path_buf());
 
