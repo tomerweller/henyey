@@ -1343,6 +1343,33 @@ impl App {
             return None;
         }
 
+        // Defense-in-depth (#2664): skip hard reset when the node is at-tip
+        // (latest_ext == current_ledger, both non-zero). There is nothing to
+        // catch up to — any spawned catchup would fail with "archive not
+        // ahead of min_ledger." Clear coupled stale state so callers don't
+        // immediately retry. Excludes startup (latest_ext == 0) where
+        // Ahead-no-ext semantics require escalation.
+        //
+        // Positioned before the livelock breaker: spurious resets should not
+        // contribute to the fatal-shutdown timeout.
+        if latest_ext > 0 && latest_ext == current_ledger as u64 {
+            self.archive_confirmed_behind.store(false, Ordering::SeqCst);
+            {
+                let mut guard = self.archive_behind_until.write().await;
+                *guard = None;
+            }
+            self.archive_checkpoint_cache.set_urgent(false);
+            self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
+            tracing::debug!(
+                current_ledger,
+                latest_externalized = latest_ext,
+                ?reason,
+                "Hard reset skipped: node is at-tip (latest_ext == current_ledger > 0), \
+                 cleared stale recovery state (#2664)"
+            );
+            return None;
+        }
+
         // Circuit breaker: hard-reset livelock detection (#2389).
         // Check BEFORE clearing state so the fatal path does not leave
         // partially-reset state.
@@ -5371,6 +5398,151 @@ mod tests {
             app.hard_reset_livelock_start.load(Ordering::Relaxed),
             0,
             "tracking should be cleared after progress"
+        );
+    }
+
+    // ================================================================
+    // Tests for #2664: at-tip hard-reset suppression
+    // ================================================================
+
+    /// When the node is at-tip (latest_ext == current_ledger > 0), the guard
+    /// should skip the hard reset and clear stale archive-behind state.
+    #[tokio::test]
+    async fn test_hard_reset_skipped_at_tip_nonzero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // Set latest_externalized to match current_ledger.
+        app.herder.scp_driver().record_externalized(
+            current_ledger as u64,
+            Default::default(),
+            None,
+        );
+
+        // Arm stale archive-behind state.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        {
+            let mut guard = app.archive_behind_until.write().await;
+            *guard = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        }
+        app.archive_checkpoint_cache.set_urgent(true);
+        app.hard_reset_livelock_start.store(42, Ordering::Relaxed);
+
+        // Backdate start_instant so cooldown doesn't block.
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let counter_before = app.post_catchup_hard_reset_total.load(Ordering::Relaxed);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        // Should return None (guard fired).
+        assert!(result.is_none(), "at-tip guard should return None");
+
+        // Counter should NOT have incremented.
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            counter_before,
+            "counter must not increment when at-tip guard fires"
+        );
+
+        // All coupled state should be cleared.
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "archive_confirmed_behind must be cleared"
+        );
+        assert!(
+            app.archive_behind_until.read().await.is_none(),
+            "archive_behind_until must be cleared"
+        );
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            0,
+            "livelock_start must be cleared"
+        );
+    }
+
+    /// When latest_ext == current_ledger == 0 (startup), the guard must NOT
+    /// fire — this is the Ahead-no-ext state where escalation is legitimate.
+    #[tokio::test]
+    async fn test_hard_reset_proceeds_at_tip_zero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 0;
+        // latest_externalized is None → unwrap_or(0), so latest_ext == 0.
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        // Should NOT early-exit — proceeds past the guard.
+        // (Returns None anyway on test app without self_arc, but the guard
+        // should not have fired.)
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        // On test apps without self_arc, force_post_catchup_hard_reset
+        // proceeds past the guard but returns None from spawn_catchup.
+        // The key assertion: the counter DID increment (guard didn't fire).
+        assert!(result.is_none());
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "counter should increment (guard must not fire at startup)"
+        );
+    }
+
+    /// When latest_ext > current_ledger (Behind), hard reset proceeds normally.
+    #[tokio::test]
+    async fn test_hard_reset_proceeds_when_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // Set latest_externalized ahead of current_ledger (Behind state).
+        app.herder
+            .scp_driver()
+            .record_externalized(5_010, Default::default(), None);
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        // Returns None on test app, but counter should increment (guard didn't fire).
+        assert!(result.is_none());
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "counter should increment when Behind (guard must not fire)"
         );
     }
 }

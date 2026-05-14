@@ -277,6 +277,31 @@ impl App {
                 self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
             }
         }
+
+        // Root cause fix for #2664: when the node is at-tip with
+        // current_ledger > 0 and the progress detection didn't fire
+        // (baseline == current_ledger from a prior tick), clear all stale
+        // recovery/escalation state. Prevents the callers below from seeing a
+        // stale archive_confirmed_behind flag and escalating to a pointless
+        // hard reset.
+        if !did_full_reset && matches!(relation, LedgerRelation::AtTip) && current_ledger > 0 {
+            let was_behind = self.archive_confirmed_behind.load(Ordering::SeqCst);
+            if was_behind {
+                self.reset_recovery_attempts(RecoveryResetMode::Full);
+                did_full_reset = true;
+                self.archive_confirmed_behind.store(false, Ordering::SeqCst);
+                let mut guard = self.archive_behind_until.write().await;
+                *guard = None;
+                self.archive_checkpoint_cache.set_urgent(false);
+                self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
+                tracing::debug!(
+                    current_ledger,
+                    "Cleared stale archive-behind state: node is at-tip without \
+                     baseline progress — full recovery reset applied (#2664)"
+                );
+            }
+        }
+
         let attempts = self
             .recovery_attempts_without_progress
             .fetch_add(1, Ordering::SeqCst);

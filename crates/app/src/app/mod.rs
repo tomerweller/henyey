@@ -10124,6 +10124,70 @@ mod tests {
         );
     }
 
+    /// #2664: When the node is at-tip (current_ledger > 0, relation == AtTip)
+    /// with a stale archive_confirmed_behind flag and no baseline progress,
+    /// out_of_sync_recovery must clear the stale state on entry.
+    #[tokio::test]
+    async fn test_stale_archive_behind_cleared_at_tip_no_baseline_progress() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 100u32;
+
+        // Set up AtTip: latest_externalized == current_ledger.
+        app.herder.scp_driver().record_externalized(
+            current_ledger as u64,
+            Default::default(),
+            None,
+        );
+
+        // Arm stale archive-behind state.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+
+        // Set baseline == current_ledger (no progress to detect).
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+
+        // Low attempts so no escalation fires.
+        app.recovery_attempts_without_progress
+            .store(0, Ordering::SeqCst);
+        app.scp_messages_received.store(0, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        // The #2664 fix should clear the stale flag.
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "stale archive_confirmed_behind must be cleared at AtTip (#2664)"
+        );
+    }
+
+    /// #2664: At startup (current_ledger == 0, AtTip), the archive_confirmed_behind
+    /// flag must NOT be cleared — it may be freshly armed.
+    #[tokio::test]
+    async fn test_stale_archive_behind_not_cleared_at_startup() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 0u32;
+        // latest_externalized is None → AtTip (0 == 0).
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        app.recovery_attempts_without_progress
+            .store(0, Ordering::SeqCst);
+        app.scp_messages_received.store(0, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        // At startup (current_ledger == 0), flag must NOT be cleared.
+        assert!(
+            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "archive_confirmed_behind must NOT be cleared at startup (current_ledger == 0)"
+        );
+    }
+
     // ---- survey_local_ledger parity tests ----
 
     #[tokio::test]
