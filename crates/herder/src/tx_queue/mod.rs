@@ -1746,6 +1746,7 @@ impl TransactionQueue {
         seq_source_key: &[u8],
         new_seq: i64,
         is_fee_bump: bool,
+        candidate_is_soroban: bool,
     ) -> std::result::Result<Option<QueuedTransaction>, TxQueueResult> {
         let account_states = self.account_states.read();
         if let Some(state) = account_states.get(seq_source_key) {
@@ -1762,6 +1763,17 @@ impl TransactionQueue {
                     return Err(TxQueueResult::Invalid(Some(
                         henyey_tx::TxResultCode::TxBadSeq,
                     )));
+                }
+
+                // Parity: stellar-core HerderImpl.cpp:627-642 rejects
+                // submissions when the account has a pending tx of the
+                // opposite type (classic vs soroban). This must precede
+                // fee-bump / RBF checks so that cross-type submissions
+                // always get TryAgainLater, never FeeTooLow.
+                let current_is_soroban =
+                    henyey_tx::envelope_utils::is_soroban_envelope(&current_tx.envelope);
+                if current_is_soroban != candidate_is_soroban {
+                    return Err(TxQueueResult::TryAgainLater);
                 }
 
                 if !is_fee_bump {
@@ -1920,6 +1932,16 @@ impl TransactionQueue {
         let mut pending_eviction_list: Vec<QueuedTransaction> = Vec::new();
 
         if !candidate.is_soroban {
+            // Parity: stellar-core TxQueueLimiter.cpp:133-136 asserts
+            // oldTx->isSoroban() == newTx->isSoroban(). The cross-type
+            // case is rejected in check_account_limit; assert here as
+            // defense-in-depth.
+            assert!(
+                replaced_tx
+                    .map(|tx| !henyey_tx::envelope_utils::is_soroban_envelope(&tx.envelope))
+                    .unwrap_or(true),
+                "cross-type replaced_tx in classic eviction pass"
+            );
             if let Some(lane_config) = self.build_classic_lane_config() {
                 store.ensure_classic_queue(lane_config.clone(), candidate.ledger_version);
                 let exclusion = build_eviction_exclusion(
@@ -1958,6 +1980,14 @@ impl TransactionQueue {
         }
 
         if candidate.is_soroban {
+            // Parity: stellar-core TxQueueLimiter.cpp:133-136 asserts
+            // oldTx->isSoroban() == newTx->isSoroban().
+            assert!(
+                replaced_tx
+                    .map(|tx| henyey_tx::envelope_utils::is_soroban_envelope(&tx.envelope))
+                    .unwrap_or(true),
+                "cross-type replaced_tx in soroban eviction pass"
+            );
             if let Some(limit) = self.effective_queue_soroban_resources() {
                 store.ensure_soroban_queue(limit.clone(), candidate.ledger_version);
                 let exclusion = build_eviction_exclusion(
@@ -2135,11 +2165,16 @@ impl TransactionQueue {
         let is_fee_bump = is_fee_bump_envelope(&queued.envelope);
         let new_fee_source_key = fee_source_key(&queued.envelope);
 
-        let replaced_tx =
-            match self.check_account_limit(&queued, &seq_source_key, new_seq, is_fee_bump) {
-                Ok(replaced) => replaced,
-                Err(result) => return result,
-            };
+        let replaced_tx = match self.check_account_limit(
+            &queued,
+            &seq_source_key,
+            new_seq,
+            is_fee_bump,
+            queued_is_soroban,
+        ) {
+            Ok(replaced) => replaced,
+            Err(result) => return result,
+        };
 
         let candidate = EvictionCandidate {
             queued: &queued,
@@ -7782,6 +7817,138 @@ mod tests {
             parallel.base_fee, None,
             "empty surge-priced Soroban phase must have base_fee=None (stellar-core parity)"
         );
+    }
+
+    /// Regression test for #2690: cross-type RBF (soroban pending, classic
+    /// fee-bump submitted) must return TryAgainLater, not panic.
+    #[test]
+    fn test_cross_type_rbf_soroban_to_classic_rejected() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a soroban tx from account seed 42, seq 1.
+        let mut soroban = make_soroban_envelope(200);
+        set_source(&mut soroban, 42);
+        if let TransactionEnvelope::Tx(env) = &mut soroban {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        assert_eq!(queue.try_add(soroban.clone()), TxQueueResult::Added);
+        let soroban_hash = full_hash(&soroban);
+
+        // Build a classic fee-bump wrapping a classic inner tx from the same
+        // account (seed 42), same seq 1, with 10x fee.
+        let mut inner = match make_test_envelope(100, 1) {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx"),
+        };
+        inner.tx.source_account = MuxedAccount::Ed25519(Uint256([42; 32]));
+        inner.tx.seq_num = SequenceNumber(1);
+        let classic_bump = make_fee_bump_envelope(inner, 42, 10000);
+
+        // Cross-type submission must be rejected (parity: HerderImpl.cpp:627-642).
+        let result = queue.try_add(classic_bump);
+        assert_eq!(result, TxQueueResult::TryAgainLater);
+
+        // Original soroban tx must remain queued.
+        assert!(queue.contains(&soroban_hash));
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// Symmetric case of #2690: classic pending, soroban submitted.
+    #[test]
+    fn test_cross_type_rbf_classic_to_soroban_rejected() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a classic tx from account seed 42, seq 1.
+        let mut classic = make_test_envelope(200, 1);
+        set_source(&mut classic, 42);
+        if let TransactionEnvelope::Tx(env) = &mut classic {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        assert_eq!(queue.try_add(classic.clone()), TxQueueResult::Added);
+        let classic_hash = full_hash(&classic);
+
+        // Submit a soroban tx from the same account, same seq.
+        // Not a fee-bump, so it would normally get TryAgainLater from
+        // the !is_fee_bump check. But the cross-type check fires first.
+        let mut soroban = make_soroban_envelope(2000);
+        set_source(&mut soroban, 42);
+        if let TransactionEnvelope::Tx(env) = &mut soroban {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+
+        let result = queue.try_add(soroban);
+        assert_eq!(result, TxQueueResult::TryAgainLater);
+
+        // Original classic tx must remain queued.
+        assert!(queue.contains(&classic_hash));
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// Cross-type rejection must win over FeeTooLow: even with insufficient
+    /// fee, the result is TryAgainLater (not FeeTooLow) because the type
+    /// check precedes fee evaluation.
+    #[test]
+    fn test_cross_type_low_fee_returns_try_again_not_fee_too_low() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a soroban tx from account seed 42, seq 1, fee 200.
+        let mut soroban = make_soroban_envelope(200);
+        set_source(&mut soroban, 42);
+        if let TransactionEnvelope::Tx(env) = &mut soroban {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        assert_eq!(queue.try_add(soroban), TxQueueResult::Added);
+
+        // Build a classic fee-bump with fee that passes the LCL base fee
+        // check but would fail the RBF 10x requirement.
+        let mut inner = match make_test_envelope(100, 1) {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx"),
+        };
+        inner.tx.source_account = MuxedAccount::Ed25519(Uint256([42; 32]));
+        inner.tx.seq_num = SequenceNumber(1);
+        // Outer fee = 300 passes global base fee check (100 per op * 2 ops = 200),
+        // but fee_rate = 300/2 = 150, far below 10x of soroban's 200 fee_rate.
+        // Without cross-type guard this would reach can_replace_by_fee → FeeTooLow.
+        let classic_bump = make_fee_bump_envelope(inner, 42, 300);
+
+        let result = queue.try_add(classic_bump);
+        assert_eq!(
+            result,
+            TxQueueResult::TryAgainLater,
+            "cross-type check must precede fee check"
+        );
+    }
+
+    /// Same-type classic RBF still works after the cross-type guard.
+    #[test]
+    fn test_same_type_classic_rbf_still_works() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a classic tx from account seed 42, seq 1, fee 200.
+        let mut classic = make_test_envelope(200, 1);
+        set_source(&mut classic, 42);
+        if let TransactionEnvelope::Tx(env) = &mut classic {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        assert_eq!(queue.try_add(classic.clone()), TxQueueResult::Added);
+        let old_hash = full_hash(&classic);
+
+        // Fee-bump with same type (classic), same account, same seq, 10x+ fee.
+        let mut inner = match make_test_envelope(100, 1) {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx"),
+        };
+        inner.tx.source_account = MuxedAccount::Ed25519(Uint256([42; 32]));
+        inner.tx.seq_num = SequenceNumber(1);
+        let bump = make_fee_bump_envelope(inner, 42, 10000);
+
+        let result = queue.try_add(bump.clone());
+        assert_eq!(result, TxQueueResult::Added);
+
+        // Old tx should be replaced.
+        assert!(!queue.contains(&old_hash));
+        assert_eq!(queue.len(), 1);
     }
 }
 

@@ -132,6 +132,12 @@ impl SurgePricingLaneConfig for DexLimitingLaneConfig {
     }
 
     fn tx_resources(&self, env: &TransactionEnvelope, ledger_version: u32) -> Resource {
+        // Parity: stellar-core SurgePricingUtils.cpp:654-658 —
+        // DexLimitingLaneConfig only handles classic transactions.
+        assert!(
+            !is_soroban_envelope(env),
+            "soroban tx in classic DexLimitingLaneConfig::tx_resources"
+        );
         resources_from_envelope(env, self.use_byte_limit, ledger_version)
     }
 
@@ -170,6 +176,12 @@ impl SurgePricingLaneConfig for SorobanGenericLaneConfig {
     }
 
     fn tx_resources(&self, env: &TransactionEnvelope, ledger_version: u32) -> Resource {
+        // Parity: stellar-core SurgePricingUtils.cpp:704-708 —
+        // SorobanGenericLaneConfig only handles soroban transactions.
+        assert!(
+            is_soroban_envelope(env),
+            "non-soroban tx in SorobanGenericLaneConfig::tx_resources"
+        );
         resources_from_envelope(env, false, ledger_version)
     }
 
