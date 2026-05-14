@@ -2127,10 +2127,11 @@ impl App {
                         PreFilter::Accept(intake) => {
                             // Reconstruct with overlay context via from_overlay,
                             // which requires the inflight_token at compile time.
+                            let (envelope, slot, is_externalize) = intake.into_parts();
                             let intake = PipelinedIntake::from_overlay(
-                                intake.envelope,
-                                intake.slot,
-                                intake.is_externalize,
+                                envelope,
+                                slot,
+                                is_externalize,
                                 from_peer,
                                 flood_msg_hash,
                                 inflight_token,
@@ -2171,17 +2172,17 @@ impl App {
         // `ve.intake` will be dropped when `ve` goes out of scope at the end
         // of this function, auto-expiring the ScpScheduledCache entry.
 
-        let slot = ve.intake.slot;
+        let slot = ve.intake.slot();
         let tracking = self.herder.tracking_slot().get();
-        let is_externalize = ve.intake.is_externalize;
+        let is_externalize = ve.intake.is_externalize();
         // Extract the FloodGate message hash (if set by pump_scp_intake) before
         // the VerifiedEnvelope is consumed by herder.process_verified().
-        let flood_msg_hash = ve.intake.flood_msg_hash;
+        let flood_msg_hash = ve.intake.flood_msg_hash().copied();
 
         // Record verify latency (enqueue → post-verify dispatch) into the
         // poor-man's histogram (sum + count) so the average can be read
         // from the /metrics endpoint.
-        let verify_latency_us = ve.intake.enqueue_at.elapsed().as_micros() as u64;
+        let verify_latency_us = ve.intake.enqueue_at().elapsed().as_micros() as u64;
         self.scp_verify_latency_us_sum
             .fetch_add(verify_latency_us, Ordering::Relaxed);
         self.scp_verify_latency_count
@@ -2217,8 +2218,7 @@ impl App {
         if !matches!(ve.verdict, Verdict::Ok) {
             let peer = ve
                 .intake
-                .peer_id
-                .as_ref()
+                .peer_id()
                 .map(|p| format!("{}", p))
                 .unwrap_or_else(|| "<unknown>".into());
             match ve.verdict {
@@ -2234,7 +2234,7 @@ impl App {
             // (pre-filter drop reasons are not re-run here; the Herder's
             // `process_verified` handles the InvalidSignature/Panic cases
             // without running downstream logic).
-            let node_id = ve.intake.envelope.statement.node_id.clone();
+            let node_id = ve.intake.envelope().statement.node_id.clone();
             let (envelope_result, reason) = self.herder.process_verified(ve);
             self.record_post_verify_reason(reason);
             // Forget the FloodGate record when the outcome is DISCARDED
@@ -2259,8 +2259,8 @@ impl App {
             return;
         }
 
-        let envelope = ve.intake.envelope.clone();
-        let from_peer_opt = ve.intake.peer_id.clone();
+        let envelope = ve.intake.envelope().clone();
+        let from_peer_opt = ve.intake.peer_id().cloned();
 
         let tx_set_hash = if is_externalize {
             match &envelope.statement.pledges {

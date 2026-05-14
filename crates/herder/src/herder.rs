@@ -1455,8 +1455,8 @@ impl Herder {
     ) -> (EnvelopeState, crate::scp_verify::PostVerifyReason) {
         use crate::scp_verify::{PostVerifyReason, PreFilter, Verdict};
         let crate::scp_verify::VerifiedEnvelope { intake, verdict } = ve;
-        let slot = intake.slot;
-        let received_at = intake.received_at;
+        let slot = intake.slot();
+        let received_at = intake.received_at();
 
         match verdict {
             Verdict::Ok => {}
@@ -1473,7 +1473,7 @@ impl Herder {
             }
         }
 
-        let envelope = intake.envelope;
+        let (envelope, _, _) = intake.into_parts();
 
         // Re-check mutable gates (state may have drifted during verify).
         match self.pre_filter_scp_envelope(&envelope) {
@@ -7557,8 +7557,8 @@ mod scp_pipeline_tests {
         let env = make_signed_test_envelope_outer(100, &herder, &secret);
         match herder.pre_filter_scp_envelope(&env) {
             PreFilter::Accept(intake) => {
-                assert_eq!(intake.slot, 100);
-                assert!(!intake.is_externalize);
+                assert_eq!(intake.slot(), 100);
+                assert!(!intake.is_externalize());
             }
             PreFilter::Reject(r) => panic!("expected Accept, got Reject({:?})", r),
         }
@@ -8047,7 +8047,7 @@ mod scp_pipeline_tests {
         let secret = SecretKey::from_seed(&[1u8; 32]);
         let env = make_signed_test_envelope_outer(95, &herder, &secret);
         match herder.pre_filter_scp_envelope(&env) {
-            PreFilter::Accept(intake) => assert_eq!(intake.slot, 95),
+            PreFilter::Accept(intake) => assert_eq!(intake.slot(), 95),
             PreFilter::Reject(r) => panic!(
                 "expected Accept for post-LCL slot in retained window, got Reject({:?})",
                 r
@@ -8067,7 +8067,7 @@ mod scp_pipeline_tests {
         let secret = SecretKey::from_seed(&[2u8; 32]);
         let env = make_signed_test_envelope_outer(95, &herder, &secret);
         match herder.pre_filter_scp_envelope(&env) {
-            PreFilter::Accept(intake) => assert_eq!(intake.slot, 95),
+            PreFilter::Accept(intake) => assert_eq!(intake.slot(), 95),
             PreFilter::Reject(r) => panic!(
                 "expected Accept when lcl == tracking_slot, got Reject({:?})",
                 r
@@ -8083,7 +8083,7 @@ mod scp_pipeline_tests {
         let secret = SecretKey::from_seed(&[3u8; 32]);
         let env = make_signed_test_envelope_outer(88, &herder, &secret);
         match herder.pre_filter_scp_envelope(&env) {
-            PreFilter::Accept(intake) => assert_eq!(intake.slot, 88),
+            PreFilter::Accept(intake) => assert_eq!(intake.slot(), 88),
             PreFilter::Reject(r) => panic!(
                 "slot at min_ledger_seq must be accepted, got Reject({:?})",
                 r
@@ -8121,7 +8121,7 @@ mod scp_pipeline_tests {
         let secret = SecretKey::from_seed(&[5u8; 32]);
         let env = make_signed_test_envelope_outer(64, &herder, &secret);
         match herder.pre_filter_scp_envelope(&env) {
-            PreFilter::Accept(intake) => assert_eq!(intake.slot, 64),
+            PreFilter::Accept(intake) => assert_eq!(intake.slot(), 64),
             PreFilter::Reject(r) => panic!(
                 "checkpoint slot below min_ledger_seq must be accepted via checkpoint exception, got Reject({:?})",
                 r

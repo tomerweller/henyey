@@ -162,28 +162,29 @@ impl<T> std::ops::IndexMut<PreFilterRejectReason> for PreFilterCounters<T> {
 /// (test/catchup path without dedup).
 #[derive(Debug)]
 pub struct PipelinedIntake {
-    pub envelope: ScpEnvelope,
-    pub slot: u64,
-    pub is_externalize: bool,
+    envelope: ScpEnvelope,
+    slot: u64,
+    is_externalize: bool,
     /// Peer that delivered this envelope (for metrics and fetch routing).
-    pub peer_id: Option<henyey_overlay::PeerId>,
+    peer_id: Option<henyey_overlay::PeerId>,
     /// Enqueue timestamp for latency histograms.
-    pub enqueue_at: Instant,
+    enqueue_at: Instant,
     /// BLAKE2 hash of the full `StellarMessage::ScpMessage(envelope)`.
     /// FloodGate key for `forget_flooded_msg` calls on discard.
     /// Set by `pump_scp_intake`; `None` for non-overlay paths (catchup, tests).
-    pub flood_msg_hash: Option<henyey_common::Hash256>,
+    flood_msg_hash: Option<henyey_common::Hash256>,
     /// RAII dedup token that keeps the [`ScpScheduledCache`] entry alive while
     /// this intake is in-flight. When this intake is dropped (processing
     /// complete, channel closed, panic), the token drops and the cache entry
     /// auto-expires. `None` for non-overlay paths (catchup, tests).
     ///
     /// [`ScpScheduledCache`]: the app-level SCP scheduling cache
-    pub inflight_token: Option<std::sync::Arc<()>>,
+    #[allow(dead_code)] // Held for RAII drop behavior, never read directly.
+    inflight_token: Option<std::sync::Arc<()>>,
     /// Overlay arrival time for receive-to-relay latency measurement.
     /// `Some(Instant)` for overlay-received envelopes (carried from
     /// `OverlayMessage.received_at`); `None` for local paths (catchup, tests).
-    pub received_at: Option<Instant>,
+    received_at: Option<Instant>,
 }
 
 impl PipelinedIntake {
@@ -228,6 +229,42 @@ impl PipelinedIntake {
             inflight_token: None,
             received_at: None,
         }
+    }
+
+    /// Consume self and return `(envelope, slot, is_externalize)`.
+    ///
+    /// Used by the overlay path in `pump_scp_intake` to reconstruct a
+    /// full `PipelinedIntake` via [`Self::from_overlay`] after pre-filtering.
+    pub fn into_parts(self) -> (ScpEnvelope, u64, bool) {
+        (self.envelope, self.slot, self.is_externalize)
+    }
+
+    pub fn envelope(&self) -> &ScpEnvelope {
+        &self.envelope
+    }
+
+    pub fn slot(&self) -> u64 {
+        self.slot
+    }
+
+    pub fn is_externalize(&self) -> bool {
+        self.is_externalize
+    }
+
+    pub fn peer_id(&self) -> Option<&henyey_overlay::PeerId> {
+        self.peer_id.as_ref()
+    }
+
+    pub fn enqueue_at(&self) -> Instant {
+        self.enqueue_at
+    }
+
+    pub fn flood_msg_hash(&self) -> Option<&henyey_common::Hash256> {
+        self.flood_msg_hash.as_ref()
+    }
+
+    pub fn received_at(&self) -> Option<Instant> {
+        self.received_at
     }
 }
 
@@ -408,12 +445,12 @@ pub fn verify_envelope_sync(
     match pf {
         PreFilter::Reject(reason) => Err(reason),
         PreFilter::Accept(intake) => {
-            let verdict = match ScpDriver::build_signed_bytes(network_id, &intake.envelope) {
+            let verdict = match ScpDriver::build_signed_bytes(network_id, intake.envelope()) {
                 Ok(signed_bytes) => {
                     match ScpDriver::verify_signed_bytes(
                         &signed_bytes,
-                        &intake.envelope.statement.node_id,
-                        &intake.envelope.signature,
+                        &intake.envelope().statement.node_id,
+                        &intake.envelope().signature,
                     ) {
                         Ok(()) => Verdict::Ok,
                         Err(_) => Verdict::InvalidSignature,
@@ -551,14 +588,14 @@ pub(crate) fn scp_verify_worker(
             // `test_worker_panics_marks_dead` to assert the catch_unwind +
             // Dead-state path without relying on real undefined behavior.
             #[cfg(test)]
-            if intake.slot == u64::MAX - 1 {
+            if intake.slot() == u64::MAX - 1 {
                 panic!("test panic trigger");
             }
-            let signed_bytes = ScpDriver::build_signed_bytes(&network_id, &intake.envelope)?;
+            let signed_bytes = ScpDriver::build_signed_bytes(&network_id, intake.envelope())?;
             ScpDriver::verify_signed_bytes(
                 &signed_bytes,
-                &intake.envelope.statement.node_id,
-                &intake.envelope.signature,
+                &intake.envelope().statement.node_id,
+                &intake.envelope().signature,
             )
         })) {
             Ok(Ok(())) => Verdict::Ok,
