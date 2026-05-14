@@ -633,6 +633,7 @@ fn compare_entries<T: ComparableEntry>(local: &[T], reference: &[T]) -> Vec<Mism
 mod tests {
     use super::*;
     use crate::archive_state::{HASBucketLevel, HASBucketNext};
+    use henyey_bucket::BUCKET_LIST_LEVELS;
     use stellar_xdr::curr::{
         Hash, TransactionHistoryEntryExt, TransactionHistoryResultEntryExt, TransactionResultSet,
         TransactionSet,
@@ -701,18 +702,26 @@ mod tests {
         }
     }
 
+    // v1: these tests don't exercise v2 features (hot archive, passphrase validation).
     fn make_has(ledger: u32, curr_hashes: &[&str]) -> HistoryArchiveState {
-        let levels: Vec<HASBucketLevel> = curr_hashes
+        let zero = "0000000000000000000000000000000000000000000000000000000000000000";
+        let mut levels: Vec<HASBucketLevel> = curr_hashes
             .iter()
             .map(|h| HASBucketLevel {
                 curr: h.to_string(),
-                snap: "0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
+                snap: zero.to_string(),
                 next: HASBucketNext::default(),
             })
             .collect();
+        while levels.len() < BUCKET_LIST_LEVELS {
+            levels.push(HASBucketLevel {
+                curr: zero.to_string(),
+                snap: zero.to_string(),
+                next: HASBucketNext::default(),
+            });
+        }
         HistoryArchiveState {
-            version: 2,
+            version: 1,
             server: None,
             current_ledger: ledger,
             network_passphrase: None,
@@ -748,8 +757,39 @@ mod tests {
 
     #[test]
     fn test_has_level_count_mismatch() {
-        let a = make_has(63, &["aaaa", "bbbb"]);
-        let b = make_has(63, &["aaaa"]);
+        // Intentionally malformed: testing comparison of HAS with mismatched level counts.
+        let zero = "0000000000000000000000000000000000000000000000000000000000000000";
+        let a = HistoryArchiveState {
+            version: 1,
+            server: None,
+            current_ledger: 63,
+            network_passphrase: None,
+            current_buckets: vec![
+                HASBucketLevel {
+                    curr: "aaaa".to_string(),
+                    snap: zero.to_string(),
+                    next: HASBucketNext::default(),
+                },
+                HASBucketLevel {
+                    curr: "bbbb".to_string(),
+                    snap: zero.to_string(),
+                    next: HASBucketNext::default(),
+                },
+            ],
+            hot_archive_buckets: None,
+        };
+        let b = HistoryArchiveState {
+            version: 1,
+            server: None,
+            current_ledger: 63,
+            network_passphrase: None,
+            current_buckets: vec![HASBucketLevel {
+                curr: "aaaa".to_string(),
+                snap: zero.to_string(),
+                next: HASBucketNext::default(),
+            }],
+            hot_archive_buckets: None,
+        };
         let mismatches = compare_has(&a, &b);
         assert_eq!(mismatches.len(), 1);
         assert!(mismatches[0].detail.contains("bucket level count"));

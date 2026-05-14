@@ -345,26 +345,37 @@ impl PublishQueue {
 mod tests {
     use super::*;
     use crate::archive_state::{HASBucketLevel, HASBucketNext};
+    use henyey_bucket::BUCKET_LIST_LEVELS;
 
     fn create_test_db() -> Arc<Database> {
         Arc::new(Database::open_in_memory().expect("Failed to create test database"))
     }
 
     fn create_test_has(ledger_seq: u32) -> HistoryArchiveState {
-        // Create valid 64-character hex hashes based on ledger_seq
+        // v1: this test doesn't exercise v2 features (hot archive, passphrase validation).
         let curr_hash = format!("{:064x}", ledger_seq as u128 * 2);
         let snap_hash = format!("{:064x}", ledger_seq as u128 * 2 + 1);
+        let zero = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        let mut levels = vec![HASBucketLevel {
+            curr: curr_hash,
+            snap: snap_hash,
+            next: HASBucketNext::default(),
+        }];
+        while levels.len() < BUCKET_LIST_LEVELS {
+            levels.push(HASBucketLevel {
+                curr: zero.to_string(),
+                snap: zero.to_string(),
+                next: HASBucketNext::default(),
+            });
+        }
 
         HistoryArchiveState {
-            version: 2,
+            version: 1,
             server: Some("test".to_string()),
             current_ledger: ledger_seq,
             network_passphrase: Some("Test Network".to_string()),
-            current_buckets: vec![HASBucketLevel {
-                curr: curr_hash,
-                snap: snap_hash,
-                next: HASBucketNext::default(),
-            }],
+            current_buckets: levels,
             hot_archive_buckets: None,
         }
     }

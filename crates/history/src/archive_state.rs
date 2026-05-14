@@ -1237,9 +1237,11 @@ mod tests {
 
     // ── differing_bucket_hashes tests ──────────────────────────────────
 
-    /// Helper: create a minimal HAS with given bucket levels (curr, snap pairs).
+    /// Helper: create a minimal valid v1 HAS with given bucket levels (curr, snap pairs),
+    /// padded to BUCKET_LIST_LEVELS with zero-hash defaults.
     fn make_has(levels: Vec<(&str, &str)>) -> HistoryArchiveState {
-        let buckets = levels
+        let zero = ZERO_HASH;
+        let mut buckets: Vec<HASBucketLevel> = levels
             .into_iter()
             .map(|(curr, snap)| HASBucketLevel {
                 curr: curr.to_string(),
@@ -1247,8 +1249,15 @@ mod tests {
                 next: HASBucketNext::default(),
             })
             .collect();
+        while buckets.len() < BUCKET_LIST_LEVELS {
+            buckets.push(HASBucketLevel {
+                curr: zero.to_string(),
+                snap: zero.to_string(),
+                next: HASBucketNext::default(),
+            });
+        }
         HistoryArchiveState {
-            version: 2,
+            version: 1,
             server: None,
             current_ledger: 100,
             network_passphrase: None,
@@ -1464,7 +1473,7 @@ mod tests {
             version: 2,
             server: Some("test".to_string()),
             current_ledger: 7,
-            network_passphrase: None,
+            network_passphrase: Some("Test Network".to_string()),
             current_buckets: levels.clone(),
             hot_archive_buckets: Some(levels),
         };
@@ -1532,7 +1541,7 @@ mod tests {
             version: 2,
             server: Some("test".to_string()),
             current_ledger: 7,
-            network_passphrase: None,
+            network_passphrase: Some("Test Network".to_string()),
             current_buckets: levels.clone(),
             hot_archive_buckets: Some(levels.clone()),
         };
@@ -1593,7 +1602,8 @@ mod tests {
     const ZERO_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     fn make_has_with_next(next: HASBucketNext) -> HistoryArchiveState {
-        let levels = vec![
+        // v1: these tests exercise next-state parsing, not v2 features.
+        let mut levels = vec![
             HASBucketLevel {
                 curr: ZERO_HEX.to_string(),
                 snap: ZERO_HEX.to_string(),
@@ -1610,8 +1620,15 @@ mod tests {
                 next: HASBucketNext::default(),
             },
         ];
+        while levels.len() < BUCKET_LIST_LEVELS {
+            levels.push(HASBucketLevel {
+                curr: ZERO_HEX.to_string(),
+                snap: ZERO_HEX.to_string(),
+                next: HASBucketNext::default(),
+            });
+        }
         HistoryArchiveState {
-            version: 2,
+            version: 1,
             server: None,
             current_ledger: 100,
             network_passphrase: None,
