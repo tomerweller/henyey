@@ -4284,7 +4284,7 @@ except Exception as e:
   echo "$reg_current" > "$reg_session/metrics/reg-current.json"
 
   local reg_out
-  reg_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  reg_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$reg_session" --current "$reg_session/metrics/reg-current.json" \
     --catalog "$catalog_for_reg" 2>&1) || true
   if [[ -f "$reg_session/metrics/replay-baseline.json" ]] && \
@@ -4298,7 +4298,7 @@ except Exception as e:
   # Test: baseline + no regressions → baseline updated, exits 0
   # Same current as baseline → no regressions
   local reg_out2
-  reg_out2=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  reg_out2=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$reg_session" --current "$reg_session/metrics/reg-current.json" \
     --catalog "$catalog_for_reg" 2>&1) || true
   local reg_stdout2
@@ -4318,7 +4318,7 @@ except Exception as e:
   sleep 1  # ensure mtime difference if updated
 
   local reg_out3
-  reg_out3=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  reg_out3=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$reg_session" --current "$reg_session/metrics/reg-regressed.json" \
     --catalog "$catalog_for_reg" 2>&1) || true
   local baseline_after
@@ -4333,7 +4333,7 @@ except Exception as e:
 
   # Test: regression JSON contains correct baseline_fired_pct_display (percentage)
   local pct_display
-  pct_display=$(echo "$reg_out3" | grep -v "regression(s) found" | head -1 | python3 -c "
+  pct_display=$(echo "$reg_out3" | grep -v "regression(s) found\|Filing suppressed" | head -1 | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 if data and 'baseline_fired_pct_display' in data[0]:
@@ -4371,7 +4371,7 @@ print(json.dumps(d))
   echo "$reg_contaminated_current" > "$reg_contaminated_session/metrics/reg-contaminated-current.json"
 
   local reg_contam_out
-  reg_contam_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  reg_contam_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$reg_contaminated_session" \
     --current "$reg_contaminated_session/metrics/reg-contaminated-current.json" \
     --catalog "$catalog_for_reg" 2>&1) || true
@@ -4393,7 +4393,7 @@ print(json.dumps(d))
   local reg_prune_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10},"fake_alarm":{"firing":15,"breach":3,"ok":172,"baseline":0,"skip":10}}}'
   echo "$reg_prune_current" > "$reg_prune_session/metrics/reg-prune-current.json"
 
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$reg_prune_session" --current "$reg_prune_session/metrics/reg-prune-current.json" \
     --catalog "$catalog_for_reg" >/dev/null 2>&1 || true
   # Check that baseline file does not contain fake_alarm
@@ -4411,7 +4411,7 @@ print(json.dumps(d))
   # Test: missing catalog → exit 2
   local reg_missing_cat_out
   set +e
-  reg_missing_cat_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  reg_missing_cat_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$reg_session" --current "$reg_session/metrics/reg-current.json" \
     --catalog "/nonexistent/catalog.toml" 2>&1)
   local reg_missing_cat_exit=$?
@@ -4433,7 +4433,7 @@ print(json.dumps(d))
 
   local reg_malformed_out
   set +e
-  reg_malformed_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  reg_malformed_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$reg_malformed_session" --current "$reg_malformed_session/metrics/reg-current.json" \
     --catalog "$malformed_catalog" 2>&1)
   local reg_malformed_exit=$?
@@ -4446,6 +4446,69 @@ print(json.dumps(d))
   fi
 
   rm -rf "$replay_root"
+
+  # ── check-alarm-regression.sh --no-file tests ─────────────────────────────
+
+  local nofile_root
+  nofile_root=$(mktemp -d)
+  local nofile_session="$nofile_root/nofile-session"
+  mkdir -p "$nofile_session/metrics"
+
+  # Create baseline with active alarm, then test with silent alarm
+  local nofile_active='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":20,"breach":5,"ok":165,"baseline":0,"skip":10}}}'
+  local nofile_silent='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":0,"breach":0,"ok":190,"baseline":0,"skip":10}}}'
+  echo "$nofile_active" > "$nofile_session/metrics/nofile-active.json"
+  echo "$nofile_silent" > "$nofile_session/metrics/nofile-silent.json"
+
+  # Bootstrap baseline
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
+    "$nofile_session" --current "$nofile_session/metrics/nofile-active.json" \
+    --catalog "$catalog_for_reg" >/dev/null 2>&1 || true
+
+  # Run with regressions + --no-file
+  local nofile_out
+  nofile_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
+    "$nofile_session" --current "$nofile_session/metrics/nofile-silent.json" \
+    --catalog "$catalog_for_reg" 2>&1) || true
+
+  # Verify: regressions detected in output
+  if echo "$nofile_out" | grep -q "regression(s) found"; then
+    tap_ok "--no-file: regressions still detected"
+  else
+    tap_not_ok "--no-file: regressions still detected" "output: $nofile_out"
+  fi
+
+  # Verify: filing suppressed message present
+  if echo "$nofile_out" | grep -q "Filing suppressed (--no-file)"; then
+    tap_ok "--no-file: filing suppressed message emitted"
+  else
+    tap_not_ok "--no-file: filing suppressed message emitted" "output: $nofile_out"
+  fi
+
+  # Verify: no dedup file created (repo-global side effect suppressed)
+  if [[ ! -f "$nofile_root/.alarm-regression-filed.json" ]]; then
+    tap_ok "--no-file: no dedup file created"
+  else
+    tap_not_ok "--no-file: no dedup file created" "file exists: $(cat "$nofile_root/.alarm-regression-filed.json")"
+  fi
+
+  # Verify: no lock file created
+  if [[ ! -f "$nofile_root/.alarm-regression-filing.lock" ]]; then
+    tap_ok "--no-file: no lock file created"
+  else
+    tap_not_ok "--no-file: no lock file created"
+  fi
+
+  # Verify: JSON regression output still present on stdout
+  local nofile_json
+  nofile_json=$(echo "$nofile_out" | grep -v "regression(s)\|Filing suppressed\|Baseline\|Rolling" | head -1)
+  if echo "$nofile_json" | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d)>0" 2>/dev/null; then
+    tap_ok "--no-file: regression JSON still emitted"
+  else
+    tap_not_ok "--no-file: regression JSON still emitted" "json: $nofile_json"
+  fi
+
+  rm -rf "$nofile_root"
 
   # ── check-alarm-regression.sh stable-baseline tests ────────────────────────
 
@@ -4496,7 +4559,7 @@ print(json.dumps(d))
   local sb_t1="$stable_root/t1"
   mkdir -p "$sb_t1/metrics"
   echo "$stable_current_active" > "$sb_t1/metrics/current.json"
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t1" --current "$sb_t1/metrics/current.json" --catalog "$stable_catalog" >/dev/null 2>&1 || true
   if diff -q "$sb_t1/metrics/replay-baseline.json" "$sb_t1/metrics/replay-baseline-stable.json" >/dev/null 2>&1; then
     tap_ok "stable: initial run creates identical rolling and stable baselines"
@@ -4508,7 +4571,7 @@ print(json.dumps(d))
   local stable_mtime_before
   stable_mtime_before=$(stat -c %Y "$sb_t1/metrics/replay-baseline-stable.json" 2>/dev/null) || stable_mtime_before=0
   sleep 1
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t1" --current "$sb_t1/metrics/current.json" --catalog "$stable_catalog" >/dev/null 2>&1 || true
   local stable_mtime_after
   stable_mtime_after=$(stat -c %Y "$sb_t1/metrics/replay-baseline-stable.json" 2>/dev/null) || stable_mtime_after=0
@@ -4527,7 +4590,7 @@ print(json.dumps(d))
   echo "$stable_baseline_decayed" > "$sb_t3/metrics/replay-baseline.json"
   echo "$stable_current_silent" > "$sb_t3/metrics/current.json"
   local sb_t3_out
-  sb_t3_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t3_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t3" --current "$sb_t3/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
   if echo "$sb_t3_out" | grep -q "gradually decayed to silent"; then
     tap_ok "stable: gradual decay detected via stable baseline"
@@ -4542,7 +4605,7 @@ print(json.dumps(d))
   echo "$stable_baseline_active" > "$sb_t4/metrics/replay-baseline.json"
   echo "$stable_current_active" > "$sb_t4/metrics/current.json"
   local sb_t4_out
-  sb_t4_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t4_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t4" --current "$sb_t4/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
   local sb_t4_json
   sb_t4_json=$(echo "$sb_t4_out" | grep -v "^No regressions\|^Rolling\|^Stable\|^Baseline" | head -1)
@@ -4558,7 +4621,7 @@ print(json.dumps(d))
   echo "$stable_baseline_active" > "$sb_t5/metrics/replay-baseline.json"
   echo "$stable_current_active" > "$sb_t5/metrics/current.json"
   local sb_t5_out
-  sb_t5_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t5_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t5" --current "$sb_t5/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
   if [[ -f "$sb_t5/metrics/replay-baseline-stable.json" ]] && echo "$sb_t5_out" | grep -q "Stable baseline established"; then
     tap_ok "stable: partial bootstrap — rolling exists, stable created"
@@ -4572,7 +4635,7 @@ print(json.dumps(d))
   echo "$stable_baseline_active" > "$sb_t6/metrics/replay-baseline-stable.json"
   echo "$stable_current_active" > "$sb_t6/metrics/current.json"
   local sb_t6_out
-  sb_t6_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t6_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t6" --current "$sb_t6/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
   if [[ -f "$sb_t6/metrics/replay-baseline.json" ]] && echo "$sb_t6_out" | grep -q "Rolling baseline re-established"; then
     tap_ok "stable: partial bootstrap — stable exists, rolling created"
@@ -4588,7 +4651,7 @@ print(json.dumps(d))
   echo "$stable_current_active" > "$sb_t7/metrics/current.json"
   local sb_t7_out
   set +e
-  sb_t7_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t7_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t7" --current "$sb_t7/metrics/current.json" --catalog "$stable_catalog" 2>&1)
   local sb_t7_exit=$?
   set -e
@@ -4606,7 +4669,7 @@ print(json.dumps(d))
   echo "$stable_current_active" > "$sb_t8/metrics/current.json"
   local sb_t8_out
   set +e
-  sb_t8_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t8_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t8" --current "$sb_t8/metrics/current.json" --catalog "$stable_catalog" 2>&1)
   local sb_t8_exit=$?
   set -e
@@ -4623,7 +4686,7 @@ print(json.dumps(d))
   echo "$stable_baseline_active" > "$sb_t9/metrics/replay-baseline.json"
   echo "$stable_current_absent" > "$sb_t9/metrics/current.json"
   local sb_t9_out
-  sb_t9_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t9_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t9" --current "$sb_t9/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
   if echo "$sb_t9_out" | grep -q "gradual drift"; then
     tap_ok "stable: absent alarm from stable reports regression"
@@ -4638,7 +4701,7 @@ print(json.dumps(d))
   echo "$stable_baseline_active" > "$sb_t10/metrics/replay-baseline.json"
   echo "$stable_current_low" > "$sb_t10/metrics/current.json"
   local sb_t10_out
-  sb_t10_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t10_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t10" --current "$sb_t10/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
   local sb_t10_json
   sb_t10_json=$(echo "$sb_t10_out" | grep -v "^No regressions\|^Rolling\|^Stable\|^Baseline" | head -1)
@@ -4658,7 +4721,7 @@ print(json.dumps(d))
   echo "$(add_test_provenance "$rolling_8pct")" > "$sb_t11/metrics/replay-baseline.json"
   echo "$stable_current_silent" > "$sb_t11/metrics/current.json"
   local sb_t11_out
-  sb_t11_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t11_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t11" --current "$sb_t11/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
   # Should have stable source and stable's percentage (10%, not 8%)
   local sb_t11_source
@@ -4684,7 +4747,7 @@ else:
   local custom_stable_path="$sb_t12/metrics/custom-stable.json"
   # First create rolling baseline so we trigger the partial-bootstrap path
   echo "$stable_baseline_active" > "$sb_t12/metrics/replay-baseline.json"
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t12" --current "$sb_t12/metrics/current.json" \
     --stable-baseline "$custom_stable_path" \
     --catalog "$stable_catalog" >/dev/null 2>&1 || true
@@ -4704,7 +4767,7 @@ else:
   local rolling_mtime_before
   rolling_mtime_before=$(stat -c %Y "$sb_t13/metrics/replay-baseline.json" 2>/dev/null) || rolling_mtime_before=0
   sleep 1
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t13" --current "$sb_t13/metrics/current.json" --catalog "$stable_catalog" >/dev/null 2>&1 || true
   local rolling_mtime_after
   rolling_mtime_after=$(stat -c %Y "$sb_t13/metrics/replay-baseline.json" 2>/dev/null) || rolling_mtime_after=0
@@ -4722,7 +4785,7 @@ else:
   echo "$stable_baseline_active" > "$sb_t14/metrics/replay-baseline.json"
   set +e
   local sb_t14_out
-  sb_t14_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t14_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t14" --current "$sb_t14/metrics/current.json" \
     --baseline "$sb_t14/metrics/replay-baseline.json" \
     --stable-baseline "$sb_t14/metrics/replay-baseline.json" \
@@ -4741,7 +4804,7 @@ else:
   echo "INVALID JSON" > "$sb_t15/metrics/current.json"
   set +e
   local sb_t15_out
-  sb_t15_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t15_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t15" --current "$sb_t15/metrics/current.json" \
     --catalog "$stable_catalog" 2>&1)
   local sb_t15_exit=$?
@@ -4759,7 +4822,7 @@ else:
   echo "$stable_baseline_active" > "$sb_t16/metrics/replay-baseline.json"
   echo "$stable_current_silent" > "$sb_t16/metrics/current.json"
   local sb_t16_out
-  sb_t16_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t16_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t16" --current "$sb_t16/metrics/current.json" --catalog "$stable_catalog" 2>&1) || true
   local sb_t16_has_source
   sb_t16_has_source=$(echo "$sb_t16_out" | grep -v "regression(s)" | head -1 | python3 -c "
@@ -4784,7 +4847,7 @@ else:
   echo "$stable_current_active" > "$sb_t17/metrics/current.json"
   local sb_t17_out
   set +e
-  sb_t17_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t17_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t17" --current "$sb_t17/metrics/current.json" --catalog "$stable_catalog" 2>&1)
   local sb_t17_exit=$?
   set -e
@@ -4802,7 +4865,7 @@ else:
   echo "$stable_current_active" > "$sb_t18/metrics/current.json"
   local sb_t18_out
   set +e
-  sb_t18_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  sb_t18_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$sb_t18" --current "$sb_t18/metrics/current.json" --catalog "$stable_catalog" 2>&1)
   local sb_t18_exit=$?
   set -e
@@ -4825,7 +4888,7 @@ else:
   local prov_t1="$prov_root/t1"
   mkdir -p "$prov_t1/metrics"
   echo "$prov_current" > "$prov_t1/metrics/current.json"
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t1" --current "$prov_t1/metrics/current.json" --catalog "$prov_catalog" >/dev/null 2>&1 || true
   local prov_has_fields
   prov_has_fields=$(python3 -c "
@@ -4900,7 +4963,7 @@ print(json.dumps(data))
   echo "$prov_baseline_with_prov" > "$prov_t2/metrics/replay-baseline-stable.json"
   local prov_hash_before
   prov_hash_before=$(sha256sum "$prov_t2/metrics/replay-baseline-stable.json" | cut -d' ' -f1)
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t2" --current "$prov_t2/metrics/current.json" --catalog "$prov_catalog" >/dev/null 2>&1 || true
   local prov_hash_after
   prov_hash_after=$(sha256sum "$prov_t2/metrics/replay-baseline-stable.json" | cut -d' ' -f1)
@@ -4918,7 +4981,7 @@ print(json.dumps(data))
   echo "$prov_stale_baseline" > "$prov_t3/metrics/replay-baseline.json"
   echo "$prov_stale_baseline" > "$prov_t3/metrics/replay-baseline-stable.json"
   local prov_t3_out
-  prov_t3_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  prov_t3_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t3" --current "$prov_t3/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
   local prov_new_checksum
   prov_new_checksum=$(python3 -c "
@@ -4942,7 +5005,7 @@ print(d.get('provenance',{}).get('catalog_checksum',''))
   echo "$prov_legacy" > "$prov_t4/metrics/replay-baseline.json"
   echo "$prov_legacy" > "$prov_t4/metrics/replay-baseline-stable.json"
   local prov_t4_out
-  prov_t4_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  prov_t4_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t4" --current "$prov_t4/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
   local prov_legacy_recreated
   prov_legacy_recreated=$(python3 -c "
@@ -4972,7 +5035,7 @@ print('yes' if has_prov and preserved else 'no')
   echo "$prov_malformed" > "$prov_t5/metrics/replay-baseline.json"
   echo "$prov_malformed" > "$prov_t5/metrics/replay-baseline-stable.json"
   local prov_t5_out
-  prov_t5_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  prov_t5_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t5" --current "$prov_t5/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
   local prov_malformed_fixed
   prov_malformed_fixed=$(python3 -c "
@@ -4999,10 +5062,10 @@ print('yes' if has_prov and preserved else 'no')
   mkdir -p "$prov_t6/metrics"
   echo "$prov_current" > "$prov_t6/metrics/current.json"
   # Bootstrap first
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t6" --current "$prov_t6/metrics/current.json" --catalog "$prov_catalog" >/dev/null 2>&1 || true
   # Run again (should update rolling with provenance)
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t6" --current "$prov_t6/metrics/current.json" --catalog "$prov_catalog" >/dev/null 2>&1 || true
   local prov_rolling_has_prov
   prov_rolling_has_prov=$(python3 -c "
@@ -5036,7 +5099,7 @@ print('yes' if isinstance(p, dict) and 'catalog_checksum' in p else 'no')
   # Stable has correct checksum — won't be invalidated
   echo "$prov_baseline_with_prov" > "$prov_t7/metrics/replay-baseline-stable.json"
   local prov_t7_out
-  prov_t7_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  prov_t7_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t7" --current "$prov_t7/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
   local prov_rolling_new_cs
   prov_rolling_new_cs=$(python3 -c "
@@ -5062,7 +5125,7 @@ exit 1
 GIT_STUB
   chmod +x "$prov_t8/bin/git"
   local prov_t8_out
-  prov_t8_out=$(PATH="$prov_t8/bin:$PATH" "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  prov_t8_out=$(PATH="$prov_t8/bin:$PATH" "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t8" --current "$prov_t8/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
   local prov_commit_val
   prov_commit_val=$(python3 -c "
@@ -5086,7 +5149,7 @@ print(d.get('provenance',{}).get('created_commit',''))
   echo "$prov_stale_rolling" > "$prov_t9/metrics/replay-baseline-stable.json"
   chmod a-w "$prov_t9/metrics"
   local prov_t9_out
-  prov_t9_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  prov_t9_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t9" --current "$prov_t9/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
   chmod u+w "$prov_t9/metrics"
   # Baseline should still be intact (not truncated/corrupted)
@@ -5127,7 +5190,7 @@ with open(sys.argv[1]) as f:
 print(len(d.get('alarms', {})))
 " "$prov_t10/metrics/replay-baseline-stable.json")
   local prov_t10_out
-  prov_t10_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  prov_t10_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t10" --current "$prov_t10/metrics/current.json" --catalog "$prov_alt_catalog" 2>&1) || true
   local prov_alarms_after_t10
   prov_alarms_after_t10=$(python3 -c "
@@ -5192,7 +5255,7 @@ print(json.dumps(data))
   echo "$prov_stale_migrated" > "$prov_t11/metrics/replay-baseline.json"
   echo "$prov_stale_migrated" > "$prov_t11/metrics/replay-baseline-stable.json"
   local prov_t11_out
-  prov_t11_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  prov_t11_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t11" --current "$prov_t11/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
   local prov_t11_invalidated
   prov_t11_invalidated=$(python3 -c "
@@ -5243,7 +5306,7 @@ print(json.dumps(data))
   local prov_hash_before_t12
   prov_hash_before_t12=$(sha256sum "$prov_t12/metrics/replay-baseline-stable.json" | cut -d' ' -f1)
   local prov_t12_out
-  prov_t12_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  prov_t12_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$prov_t12" --current "$prov_t12/metrics/current.json" --catalog "$prov_catalog" 2>&1) || true
   local prov_hash_after_t12
   prov_hash_after_t12=$(sha256sum "$prov_t12/metrics/replay-baseline-stable.json" | cut -d' ' -f1)
@@ -5271,7 +5334,7 @@ print(json.dumps(data))
 
   # Bootstrap baselines from active data
   echo "$fbu_active" > "$fbu_session/metrics/fbu-active.json"
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$fbu_session" --current "$fbu_session/metrics/fbu-active.json" \
     --catalog "$catalog_for_reg" >/dev/null 2>&1 || true
 
@@ -5287,7 +5350,7 @@ print(json.dumps(data))
     fbu_stable_before=$(md5sum "$fbu_session/metrics/replay-baseline-stable.json" | cut -d' ' -f1)
 
     local fbu_out1
-    fbu_out1=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    fbu_out1=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
       "$fbu_session" --current "$fbu_session/metrics/fbu-silent.json" \
       --catalog "$catalog_for_reg" 2>&1) || true
 
@@ -5306,7 +5369,7 @@ print(json.dumps(data))
 
     # Test 2: With --force-baseline-update, both baselines ARE updated
     local fbu_out2
-    fbu_out2=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    fbu_out2=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
       "$fbu_session" --current "$fbu_session/metrics/fbu-silent.json" \
       --catalog "$catalog_for_reg" --force-baseline-update 2>&1) || true
 
@@ -5325,7 +5388,7 @@ print(json.dumps(data))
 
     # Test 3: Subsequent run without flag shows no regressions (baseline took effect)
     local fbu_out3
-    fbu_out3=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+    fbu_out3=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
       "$fbu_session" --current "$fbu_session/metrics/fbu-silent.json" \
       --catalog "$catalog_for_reg" 2>&1) || true
     local fbu_stdout3
@@ -5375,7 +5438,7 @@ print(json.dumps(d))
 
   # Test: --acknowledge happy path
   local ack_out1
-  ack_out1=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_out1=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --acknowledge lost-sync --ack-rationale "Fixed in PR #2616" \
     --catalog "$catalog_for_ack" 2>&1) || true
   if echo "$ack_out1" | grep -q "Acknowledged alarm: lost-sync" && \
@@ -5406,7 +5469,7 @@ print('ok' if ok else 'fail')
 
   # Test: --acknowledge with --ack-issue
   local ack_out_issue
-  ack_out_issue=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_out_issue=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --acknowledge lost-sync --ack-rationale "Updated" --ack-issue 2616 \
     --catalog "$catalog_for_ack" 2>&1) || true
   local ack_issue_val
@@ -5425,7 +5488,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
   # Test: --acknowledge non-catalog alarm exits 2
   local ack_out_bad
   local ack_bad_exit=0
-  ack_out_bad=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_out_bad=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --acknowledge fake-alarm-xyz --ack-rationale "test" \
     --catalog "$catalog_for_ack" 2>&1) || ack_bad_exit=$?
   if [[ "$ack_bad_exit" -eq 2 ]] && echo "$ack_out_bad" | grep -q "not found in catalog"; then
@@ -5437,7 +5500,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
   # Test: --acknowledge without --ack-rationale exits 1
   local ack_out_norat
   local ack_norat_exit=0
-  ack_out_norat=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_out_norat=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --acknowledge lost-sync \
     --catalog "$catalog_for_ack" 2>&1) || ack_norat_exit=$?
   if [[ "$ack_norat_exit" -eq 1 ]] && echo "$ack_out_norat" | grep -q "requires --ack-rationale"; then
@@ -5449,7 +5512,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
   # Test: --acknowledge with empty rationale exits 1
   local ack_out_empty
   local ack_empty_exit=0
-  ack_out_empty=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_out_empty=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --acknowledge lost-sync --ack-rationale "   " \
     --catalog "$catalog_for_ack" 2>&1) || ack_empty_exit=$?
   if [[ "$ack_empty_exit" -eq 1 ]]; then
@@ -5460,7 +5523,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
 
   # Test: acknowledged alarm excluded from regression detection
   local ack_detect_out
-  ack_detect_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_detect_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --current "$ack_session/metrics/ack-regressed.json" \
     --catalog "$catalog_for_ack" 2>&1) || true
   local ack_detect_json
@@ -5476,7 +5539,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
 
   # Test: --list-acknowledgments shows entry
   local ack_list_out
-  ack_list_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_list_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --list-acknowledgments --catalog "$catalog_for_ack" 2>&1) || true
   if echo "$ack_list_out" | grep -q "lost-sync" && echo "$ack_list_out" | grep -q "Updated"; then
     tap_ok "ack: list shows alarm and rationale"
@@ -5488,7 +5551,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
   local ack_list_empty_session="$ack_root/empty-session"
   mkdir -p "$ack_list_empty_session/metrics"
   local ack_list_empty_out
-  ack_list_empty_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_list_empty_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_list_empty_session" --list-acknowledgments --catalog "$catalog_for_ack" 2>&1) || true
   if echo "$ack_list_empty_out" | grep -q "No acknowledgments."; then
     tap_ok "ack: list with no acks shows message"
@@ -5497,13 +5560,13 @@ print(d['alarms']['lost-sync'].get('issue', ''))
   fi
 
   # Test: --revoke-acknowledgment removes entry and re-enables detection
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --revoke-acknowledgment lost-sync --catalog "$catalog_for_ack" 2>/dev/null || true
   local ack_revoke_detect_out
   # Re-establish baselines (rolling was updated during earlier ack test)
   echo "$ack_baseline" > "$ack_session/metrics/replay-baseline.json"
   echo "$ack_baseline" > "$ack_session/metrics/replay-baseline-stable.json"
-  ack_revoke_detect_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_revoke_detect_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --current "$ack_session/metrics/ack-regressed.json" \
     --catalog "$catalog_for_ack" 2>&1) || true
   local ack_revoke_json
@@ -5519,7 +5582,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
 
   # Test: --revoke-acknowledgment not found
   local ack_revoke_nf_out
-  ack_revoke_nf_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_revoke_nf_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --revoke-acknowledgment nonexistent --catalog "$catalog_for_ack" 2>&1) || true
   local ack_revoke_nf_exit=$?
   if echo "$ack_revoke_nf_out" | grep -q "No acknowledgment found for: nonexistent"; then
@@ -5532,7 +5595,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
   echo "NOT JSON" > "$ack_session/metrics/alarm-acknowledgments.json"
   local ack_malformed_out
   local ack_malformed_exit=0
-  ack_malformed_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_malformed_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --current "$ack_session/metrics/ack-regressed.json" \
     --catalog "$catalog_for_ack" 2>&1) || ack_malformed_exit=$?
   if [[ "$ack_malformed_exit" -eq 2 ]]; then
@@ -5544,7 +5607,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
   # Test: malformed ack file during --list exits 2
   local ack_malformed_list_out
   local ack_malformed_list_exit=0
-  ack_malformed_list_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_malformed_list_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --list-acknowledgments --catalog "$catalog_for_ack" 2>&1) || ack_malformed_list_exit=$?
   if [[ "$ack_malformed_list_exit" -eq 2 ]]; then
     tap_ok "ack: malformed ack file during list exits 2"
@@ -5555,7 +5618,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
   # Test: mutual exclusion --acknowledge + --force-baseline-update
   local ack_mutex_out
   local ack_mutex_exit=0
-  ack_mutex_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_mutex_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --acknowledge lost-sync --force-baseline-update \
     --ack-rationale "test" --catalog "$catalog_for_ack" 2>&1) || ack_mutex_exit=$?
   if [[ "$ack_mutex_exit" -eq 1 ]] && echo "$ack_mutex_out" | grep -q "mutually exclusive"; then
@@ -5569,7 +5632,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
   echo '{"schema_version":1,"catalog_checksum":"stale_checksum_000","alarms":{"lost-sync":{"acknowledged_at":"2026-01-01T00:00:00Z","acknowledged_commit":"abc","rationale":"old"}}}' \
     > "$ack_session/metrics/alarm-acknowledgments.json"
   local ack_stale_out
-  ack_stale_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_stale_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --list-acknowledgments --catalog "$catalog_for_ack" 2>&1) || true
   if echo "$ack_stale_out" | grep -q "No acknowledgments." || echo "$ack_stale_out" | grep -q "invalidated"; then
     tap_ok "ack: catalog change invalidates acknowledgments"
@@ -5591,7 +5654,7 @@ print(d['alarms']['lost-sync'].get('issue', ''))
   local ack_persist_dir="$ack_root/persist-test"
   mkdir -p "$ack_persist_dir"
   echo '{"schema_version":1,"alarms":{},"evaluated_ticks":10}' > "$ack_persist_dir/current.json"
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --current "$ack_persist_dir/current.json" --catalog "$catalog_for_ack" 2>/dev/null || true
   local ack_persist_alarms
   ack_persist_alarms=$(python3 -c "
@@ -5607,10 +5670,10 @@ print(json.dumps(d.get('alarms', {})))
   fi
 
   # Test: overwrite existing ack updates metadata
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --acknowledge lost-sync --ack-rationale "First reason" \
     --catalog "$catalog_for_ack" 2>/dev/null || true
-  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --acknowledge lost-sync --ack-rationale "Second reason" \
     --catalog "$catalog_for_ack" 2>/dev/null || true
   local ack_overwrite_rat
@@ -5630,7 +5693,7 @@ print(d['alarms']['lost-sync']['rationale'])
   echo "NOT JSON" > "$ack_session/metrics/alarm-acknowledgments.json"
   local ack_malformed_revoke_out
   local ack_malformed_revoke_exit=0
-  ack_malformed_revoke_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ack_malformed_revoke_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ack_session" --revoke-acknowledgment lost-sync --catalog "$catalog_for_ack" 2>&1) || ack_malformed_revoke_exit=$?
   if [[ "$ack_malformed_revoke_exit" -eq 2 ]]; then
     tap_ok "ack: malformed ack file during revoke exits 2"
@@ -5728,7 +5791,7 @@ print(json.dumps(data))
 
   # Run check-alarm-regression — should invalidate alarm-versioned (version 1→2) but keep alarm-default
   local ver_out
-  ver_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ver_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ver_session" --current "$ver_session/metrics/ver-current.json" \
     --catalog "$ver_catalog" 2>&1) || true
 
@@ -5814,7 +5877,7 @@ print(json.dumps(data))
   echo "$ver_current" > "$ver_cosmetic_session/metrics/ver-cosmetic-current.json"
 
   local ver_cosmetic_out
-  ver_cosmetic_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ver_cosmetic_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ver_cosmetic_session" --current "$ver_cosmetic_session/metrics/ver-cosmetic-current.json" \
     --catalog "$ver_catalog2" 2>&1) || true
 
@@ -5866,7 +5929,7 @@ print(json.dumps(data))
   echo "$ver_current" > "$ver_legacy_session/metrics/ver-legacy-current.json"
 
   local ver_legacy_out
-  ver_legacy_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ver_legacy_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ver_legacy_session" --current "$ver_legacy_session/metrics/ver-legacy-current.json" \
     --catalog "$ver_catalog" 2>&1) || true
 
@@ -5954,7 +6017,7 @@ print(json.dumps(data))
   echo "$ver_remove_current" > "$ver_remove_session/metrics/ver-remove-current.json"
 
   local ver_remove_out
-  ver_remove_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ver_remove_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ver_remove_session" --current "$ver_remove_session/metrics/ver-remove-current.json" \
     --catalog "$ver_catalog_removed" 2>&1) || true
 
@@ -6004,7 +6067,7 @@ print(json.dumps(data))
   echo "$ver_current" > "$ver_ack_session/metrics/ver-ack-current.json"
 
   local ver_ack_out
-  ver_ack_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ver_ack_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ver_ack_session" --current "$ver_ack_session/metrics/ver-ack-current.json" \
     --catalog "$ver_catalog" 2>&1) || true
 
@@ -6114,7 +6177,7 @@ print(json.dumps(data))
 
   # Run with v3 catalog — should invalidate alarm-versioned (stored v2 != current v3)
   local ver_contam_out ver_contam_regressions
-  ver_contam_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  ver_contam_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$ver_contam_session" --current "$ver_contam_session/metrics/ver-contam-current.json" \
     --catalog "$ver_catalog_v3" 2>&1) || true
   ver_contam_regressions=$(echo "$ver_contam_out" | grep -v '^[A-Z]' | python3 -c "
@@ -6235,7 +6298,7 @@ print(json.dumps(data))
   echo "$stepd_current" > "$stepd_session/metrics/stepd-current.json"
 
   local stepd_out
-  stepd_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  stepd_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$stepd_session" --current "$stepd_session/metrics/stepd-current.json" \
     --catalog "$stepd_catalog" 2>&1) || true
 
@@ -6295,7 +6358,7 @@ print(json.dumps(data))
   echo "$stepd_current" > "$stepd_session2/metrics/stepd-current.json"
 
   local stepd_out2
-  stepd_out2=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  stepd_out2=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$stepd_session2" --current "$stepd_session2/metrics/stepd-current.json" \
     --catalog "$stepd_catalog" 2>&1) || true
 
@@ -6354,7 +6417,7 @@ print(json.dumps(data))
   echo "$stepd_current" > "$stepd_session3/metrics/stepd-current.json"
 
   local stepd_out3
-  stepd_out3=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  stepd_out3=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$stepd_session3" --current "$stepd_session3/metrics/stepd-current.json" \
     --catalog "$stepd_catalog" 2>&1) || true
 
@@ -6389,7 +6452,7 @@ STEPD_ACK_EOF
   echo "$stepd_current" > "$stepd_session4/metrics/stepd-current.json"
 
   local stepd_out4
-  stepd_out4=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  stepd_out4=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$stepd_session4" --current "$stepd_session4/metrics/stepd-current.json" \
     --catalog "$stepd_catalog" 2>&1) || true
 
@@ -6429,7 +6492,7 @@ STEPD_ACK5_EOF
   echo "$stepd_current" > "$stepd_session5/metrics/stepd-current.json"
 
   local stepd_out5
-  stepd_out5=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  stepd_out5=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$stepd_session5" --current "$stepd_session5/metrics/stepd-current.json" \
     --catalog "$stepd_catalog" 2>&1) || true
 
@@ -6461,7 +6524,7 @@ STEPD_ACK6_EOF
   echo "$stepd_current" > "$stepd_session6/metrics/stepd-current.json"
 
   local stepd_out6
-  stepd_out6=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  stepd_out6=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$stepd_session6" --current "$stepd_session6/metrics/stepd-current.json" \
     --catalog "$stepd_catalog" 2>&1) || true
 
@@ -6493,7 +6556,7 @@ STEPD_ACK7_EOF
   echo "$stepd_current" > "$stepd_session7/metrics/stepd-current.json"
 
   local stepd_out7
-  stepd_out7=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" \
+  stepd_out7=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
     "$stepd_session7" --current "$stepd_session7/metrics/stepd-current.json" \
     --catalog "$stepd_catalog" 2>&1) || true
 

@@ -22,7 +22,8 @@
 # Usage:
 #   scripts/dev/check-alarm-regression.sh SESSION_DIR [--current FILE] \
 #       [--baseline FILE] [--stable-baseline FILE] [--catalog FILE] \
-#       [--force-baseline-update] [--acknowledge ALARM --ack-rationale TEXT] \
+#       [--force-baseline-update] [--no-file] \
+#       [--acknowledge ALARM --ack-rationale TEXT] \
 #       [--revoke-acknowledgment ALARM] [--list-acknowledgments]
 #
 # If --current is omitted, runs replay-alarms-on-history.sh --replay --json
@@ -35,6 +36,11 @@
 #   suppressed. Use after investigating a regression and confirming it reflects
 #   a legitimate improvement (e.g., alarm went silent because the underlying
 #   condition was fixed).
+#
+# --no-file: Suppress all GitHub side effects (issue filing, comments, label
+#   creation) and dedup file reads/writes. Regression JSON is still emitted to
+#   stdout and baselines are still created/updated. Use in tests and local
+#   reproductions to avoid accidentally filing real issues.
 #
 # --acknowledge ALARM_NAME: Record one alarm as acknowledged. Requires
 #   --ack-rationale. Optional: --ack-issue NUMBER.
@@ -60,6 +66,7 @@ BASELINE_FILE=""
 STABLE_BASELINE_FILE=""
 CATALOG_FILE=""
 FORCE_BASELINE_UPDATE=false
+NO_FILE=false
 ACKNOWLEDGE_ALARM=""
 REVOKE_ALARM=""
 LIST_ACKS=false
@@ -102,6 +109,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --force-baseline-update)
       FORCE_BASELINE_UPDATE=true
+      shift
+      ;;
+    --no-file)
+      NO_FILE=true
       shift
       ;;
     --acknowledge)
@@ -992,6 +1003,10 @@ else
   # Regressions found — keep last-known-good rolling baseline
   echo "$REGRESSION_COUNT regression(s) found. Rolling baseline NOT updated (preserving last-known-good)." >&2
 
+  if [[ "$NO_FILE" == true ]]; then
+    echo "Filing suppressed (--no-file): $REGRESSION_COUNT regression(s) detected" >&2
+  else
+
   # Ensure alarm-regression label exists
   gh label create alarm-regression --description "Alarm regression detected by replay" --color "d93f0b" 2>/dev/null || true
 
@@ -1011,6 +1026,25 @@ else
     source "$REPO_ROOT/scripts/lib/dedup-filing.sh"
     DEDUP_DATA=$(dedup_load "$DEDUP_FILE")
     DEDUP_DATA=$(dedup_prune "$DEDUP_DATA" "24h")
+
+    # Prune entries for alarms not in the current catalog (test contamination defense).
+    DEDUP_BEFORE_CATALOG_PRUNE="$DEDUP_DATA"
+    DEDUP_DATA=$(printf '%s' "$DEDUP_DATA" | python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+valid = set(json.loads(sys.argv[1]).keys())
+filed = data.get('filed', {})
+pruned = [k for k in filed if k not in valid]
+for k in pruned:
+    del filed[k]
+    print('Pruned non-catalog dedup entry: %s' % k, file=sys.stderr)
+data['filed'] = filed
+print(json.dumps(data))
+" "$ALARM_VERSIONS_JSON")
+    # Write back if catalog pruning removed entries
+    if [[ "$DEDUP_DATA" != "$DEDUP_BEFORE_CATALOG_PRUNE" ]]; then
+      dedup_write "$DEDUP_FILE" "$DEDUP_DATA"
+    fi
 
     while IFS= read -r regression_line; do
       [[ -z "$regression_line" ]] && continue
@@ -1157,6 +1191,8 @@ for r in json.load(sys.stdin):
 " 2>/dev/null)
 
   ) 9>"$LOCK_FILE"
+
+  fi  # end --no-file guard
 fi
 
 # Emit warning for catalog alarms with no rolling baseline coverage
