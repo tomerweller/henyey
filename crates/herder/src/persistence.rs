@@ -890,6 +890,40 @@ mod tests {
             "Orphan tx set should be purged from storage"
         );
     }
+    #[test]
+    fn test_purge_skips_corrupt_state_preserves_valid_refs() {
+        let manager = ScpPersistenceManager::in_memory();
+
+        // Slot 100: valid envelope referencing tx_hash_a
+        let tx_hash_a = Hash([0xAA; 32]);
+        let env = make_envelope_with_tx_set_hash(100, tx_hash_a.clone());
+        manager
+            .persist_scp_state(100, &[env], &[(tx_hash_a.clone(), vec![10])], &[])
+            .unwrap();
+
+        // Slot 101: inject a corrupt SCP state (invalid envelope bytes)
+        // Also store tx_hash_b which is only "referenced" by the corrupt state
+        let tx_hash_b = Hash([0xBB; 32]);
+        manager.storage.save_tx_set(&tx_hash_b, &[20]).unwrap();
+        let mut corrupt_state = PersistedSlotState::new();
+        corrupt_state.envelopes.push(vec![0xFF, 0xFF, 0xFF]); // invalid XDR
+        manager.storage.save_scp_state(101, &corrupt_state).unwrap();
+
+        // Purge should succeed without panicking.
+        // tx_hash_a survives (referenced by valid slot 100).
+        // tx_hash_b is deleted — the corrupt state can't prove it's referenced.
+        // This matches stellar-core behavior where corrupt states are logged and skipped.
+        manager.purge_unreferenced_tx_sets().unwrap();
+
+        assert!(
+            manager.storage.has_tx_set(&tx_hash_a).unwrap(),
+            "Referenced tx set should survive"
+        );
+        assert!(
+            !manager.storage.has_tx_set(&tx_hash_b).unwrap(),
+            "Unreferenced tx set from corrupt state should be purged"
+        );
+    }
 }
 
 // ============================================================================
