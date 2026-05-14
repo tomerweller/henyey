@@ -341,6 +341,14 @@ pub struct ScpPersistenceManager {
     last_slot_saved: parking_lot::RwLock<u64>,
 }
 
+impl std::fmt::Debug for ScpPersistenceManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScpPersistenceManager")
+            .field("last_slot_saved", &*self.last_slot_saved.read())
+            .finish()
+    }
+}
+
 impl ScpPersistenceManager {
     /// Create a new persistence manager with the given storage backend.
     pub fn new(storage: Box<dyn ScpStatePersistence>) -> Self {
@@ -358,6 +366,12 @@ impl ScpPersistenceManager {
     /// Get the last slot that was persisted.
     pub fn last_slot_saved(&self) -> u64 {
         *self.last_slot_saved.read()
+    }
+
+    /// Update the last slot saved (used during restore).
+    pub fn update_last_slot_saved(&self, slot: u64) {
+        let mut last = self.last_slot_saved.write();
+        *last = (*last).max(slot);
     }
 
     /// Persist SCP state for a slot.
@@ -655,6 +669,162 @@ mod tests {
         let hash = get_quorum_set_hash(&envelope);
         assert!(hash.is_some());
         assert_eq!(hash.unwrap(), Hash([0u8; 32]));
+    }
+
+    #[test]
+    fn test_update_last_slot_saved() {
+        let manager = ScpPersistenceManager::in_memory();
+        assert_eq!(manager.last_slot_saved(), 0);
+
+        manager.update_last_slot_saved(50);
+        assert_eq!(manager.last_slot_saved(), 50);
+
+        // Should take the max
+        manager.update_last_slot_saved(30);
+        assert_eq!(manager.last_slot_saved(), 50);
+
+        manager.update_last_slot_saved(100);
+        assert_eq!(manager.last_slot_saved(), 100);
+    }
+
+    #[test]
+    fn test_get_tx_set_hashes_nominate() {
+        // Create a StellarValue and encode it
+        let sv = StellarValue {
+            tx_set_hash: Hash([42u8; 32]),
+            close_time: TimePoint(1000),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let value_bytes = sv.to_xdr(Limits::none()).unwrap();
+        let value = Value(value_bytes.try_into().unwrap());
+
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                slot_index: 100,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: Hash([0u8; 32]),
+                    votes: vec![value].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: Signature::default(),
+        };
+
+        let hashes = get_tx_set_hashes(&envelope);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0], Hash([42u8; 32]));
+    }
+
+    #[test]
+    fn test_get_tx_set_hashes_empty_nominate() {
+        let envelope = make_test_envelope(100);
+        let hashes = get_tx_set_hashes(&envelope);
+        assert!(hashes.is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_removes_old_state() {
+        let manager = ScpPersistenceManager::in_memory();
+
+        let env1 = make_test_envelope(100);
+        let env2 = make_test_envelope(200);
+
+        manager.persist_scp_state(100, &[env1], &[], &[]).unwrap();
+        manager.persist_scp_state(200, &[env2], &[], &[]).unwrap();
+
+        // Cleanup below 150 should remove slot 100
+        manager.cleanup(150).unwrap();
+
+        let restored = manager.restore_scp_state().unwrap();
+        assert_eq!(restored.envelopes.len(), 1);
+        assert_eq!(restored.envelopes[0].0, 200);
+    }
+
+    #[test]
+    fn test_persist_restore_full_roundtrip() {
+        // Test persist→restore with envelopes, tx sets, and quorum sets.
+        let manager = ScpPersistenceManager::in_memory();
+
+        let sv = StellarValue {
+            tx_set_hash: Hash([42u8; 32]),
+            close_time: TimePoint(1000),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let value_bytes = sv.to_xdr(Limits::none()).unwrap();
+        let value = Value(value_bytes.try_into().unwrap());
+
+        let qs = make_test_quorum_set();
+        let qs_hash = Hash(*henyey_common::Hash256::hash_xdr(&qs).as_bytes());
+
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([5u8; 32]))),
+                slot_index: 100,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: qs_hash.clone(),
+                    votes: vec![value].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: Signature::default(),
+        };
+
+        let tx_hash = Hash([42u8; 32]);
+        let tx_data = vec![1, 2, 3, 4, 5];
+
+        manager
+            .persist_scp_state(
+                100,
+                &[envelope.clone()],
+                &[(tx_hash.clone(), tx_data.clone())],
+                &[(qs_hash.clone(), qs.clone())],
+            )
+            .unwrap();
+
+        // Restore and verify all components
+        let restored = manager.restore_scp_state().unwrap();
+
+        assert_eq!(restored.envelopes.len(), 1);
+        assert_eq!(restored.envelopes[0].0, 100);
+        assert_eq!(
+            restored.envelopes[0].1.statement.node_id,
+            envelope.statement.node_id
+        );
+
+        assert_eq!(restored.tx_sets.len(), 1);
+        assert_eq!(restored.tx_sets[0].0, tx_hash);
+        assert_eq!(restored.tx_sets[0].1, tx_data);
+
+        assert_eq!(restored.quorum_sets.len(), 1);
+        assert_eq!(restored.quorum_sets[0].1.threshold, qs.threshold);
+
+        assert_eq!(manager.last_slot_saved(), 100);
+    }
+
+    #[test]
+    fn test_restore_handles_corrupt_quorum_set() {
+        // Simulate corrupt quorum set data in persisted state.
+        let mut state = PersistedSlotState::new();
+        let envelope = make_test_envelope(100);
+        state.add_envelope(&envelope).unwrap();
+        // Add invalid quorum set bytes (not valid XDR)
+        state.quorum_sets.push(vec![0xFF, 0xFF, 0xFF]);
+
+        let json = state.to_json().unwrap();
+        let restored = PersistedSlotState::from_json(&json).unwrap();
+
+        // Corrupt quorum set should fail to decode but not crash
+        let qs_results = restored.get_quorum_sets();
+        assert_eq!(qs_results.len(), 1);
+        assert!(qs_results[0].is_err());
+
+        // Envelope should still be fine
+        let env_results = restored.get_envelopes();
+        assert_eq!(env_results.len(), 1);
+        assert!(env_results[0].is_ok());
     }
 }
 

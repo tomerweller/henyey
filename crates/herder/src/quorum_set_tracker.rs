@@ -296,6 +296,28 @@ impl QuorumSetTracker {
         self.inner.lock().unwrap().pending.len()
     }
 
+    /// Store a quorum set by hash only, without a node association.
+    ///
+    /// Used during SCP state restore to populate the by-hash index before
+    /// envelopes are replayed. Node→qset associations are rebuilt from the
+    /// restored envelopes in a second pass via `store()`.
+    pub fn store_by_hash(&self, hash: Hash256, qset: ScpQuorumSet) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.by_hash.put(hash, qset);
+    }
+
+    /// Rebuild quorum tracker state.
+    ///
+    /// Matches stellar-core's `PendingEnvelopes::rebuildQuorumTrackerState()`.
+    /// Currently a no-op placeholder — the quorum tracker is rebuilt naturally
+    /// as envelopes arrive. If more sophisticated rebuild logic is needed
+    /// (e.g., re-expanding the transitive quorum map from restored nodes),
+    /// implement it here.
+    pub fn rebuild(&self) {
+        // No-op for now. The quorum tracker is populated via store() during
+        // restore and expanded as new envelopes arrive.
+    }
+
     #[cfg(test)]
     fn pending_get(&self, hash: &Hash256) -> Option<PendingQuorumSet> {
         self.inner.lock().unwrap().pending.get(hash).cloned()

@@ -493,6 +493,9 @@ pub struct ScpDriver {
     deferred_slots: Mutex<HashMap<SlotIndex, DeferredCauses>>,
     /// Shared SCP metrics counters (sign, verify, validate, combine).
     scp_metrics: Arc<crate::metrics::ScpMetrics>,
+    /// Slots that need SCP state persisted after SCP lock is released.
+    /// Populated by `emit()`, drained by `Herder::drain_persist_slots()`.
+    pending_persist_slots: Mutex<Vec<u64>>,
 }
 
 /// Causes that are deferring full validation for a slot.
@@ -588,6 +591,7 @@ impl ScpDriver {
             externalize_lag: RwLock::new(ExternalizeLagTracker::new()),
             deferred_slots: Mutex::new(HashMap::new()),
             scp_metrics,
+            pending_persist_slots: Mutex::new(Vec::new()),
         }
     }
 
@@ -643,6 +647,31 @@ impl ScpDriver {
         F: Fn(ScpEnvelope) + Send + Sync + 'static,
     {
         let _ = self.envelope_sender.set(Box::new(sender));
+    }
+
+    /// Drain pending persist slots queued by `emit()`.
+    ///
+    /// Returns the slot indices that need SCP state persistence. Must be
+    /// called after every SCP operation that can emit envelopes.
+    pub fn take_pending_persist_slots(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.pending_persist_slots.lock().unwrap())
+    }
+
+    /// Store a quorum set by hash only (no node association).
+    ///
+    /// Used during SCP state restore to populate the by-hash index before
+    /// envelopes are replayed. Node→qset associations are rebuilt from the
+    /// restored envelopes in a second pass.
+    pub fn store_quorum_set_by_hash(&self, hash: Hash256, qset: ScpQuorumSet) {
+        self.qset_tracker.store_by_hash(hash, qset);
+    }
+
+    /// Rebuild quorum tracker state from the current quorum set tracker.
+    ///
+    /// Matches stellar-core's `mPendingEnvelopes.rebuildQuorumTrackerState()`
+    /// called after SCP state restore.
+    pub fn rebuild_quorum_tracker_state(&self) {
+        self.qset_tracker.rebuild();
     }
 
     /// Clear the tx set validity cache (call on ledger close).
@@ -2435,6 +2464,14 @@ impl ScpDriver {
 
     /// Emit an envelope to the network.
     fn emit(&self, envelope: ScpEnvelope) {
+        // Record slot for deferred persistence. Done unconditionally (even when
+        // suppress_scp is set) to match stellar-core which persists before the
+        // suppress check (HerderImpl.cpp:609).
+        self.pending_persist_slots
+            .lock()
+            .unwrap()
+            .push(envelope.statement.slot_index);
+
         // Parity: stellar-core HerderImpl.cpp:567-578 — suppress broadcast
         // in standalone manual-close mode (suppress_scp derived from
         // manual_close && run_standalone in HerderConfig).

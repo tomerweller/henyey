@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -57,13 +58,15 @@ use henyey_crypto::{PublicKey, SecretKey};
 use henyey_ledger::LedgerManager;
 use henyey_scp::{BallotPhase, SlotIndex, SCP};
 use stellar_xdr::curr::{
-    EnvelopeType, LedgerCloseValueSignature, LedgerHeader, LedgerUpgrade, Limits, NodeId, ReadXdr,
-    ScpEnvelope, ScpQuorumSet, ScpStatementPledges, Signature as XdrSignature, StellarValue,
-    StellarValueExt, TimePoint, TransactionEnvelope, Uint256, UpgradeType, Value, WriteXdr,
+    EnvelopeType, Hash, LedgerCloseValueSignature, LedgerHeader, LedgerUpgrade, Limits, NodeId,
+    ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatementPledges, Signature as XdrSignature,
+    StellarValue, StellarValueExt, TimePoint, TransactionEnvelope, Uint256, UpgradeType, Value,
+    WriteXdr,
 };
 
 use crate::error::HerderError;
 use crate::fetching_envelopes::{FetchingEnvelopes, FetchingStats};
+use crate::persistence::{get_quorum_set_hash, ScpPersistenceManager};
 
 #[cfg(test)]
 use crate::pending::PendingResult;
@@ -488,6 +491,9 @@ pub struct Herder {
     >,
     /// Shared SCP metrics counters.
     scp_metrics: Arc<crate::metrics::ScpMetrics>,
+    /// SCP state persistence manager for crash recovery.
+    /// Wired post-construction via `set_persistence_manager()`.
+    persistence_manager: OnceLock<Arc<ScpPersistenceManager>>,
 }
 
 impl Herder {
@@ -682,6 +688,7 @@ impl Herder {
             scp_verifier_handle,
             verified_rx: std::sync::Mutex::new(verified_rx),
             scp_metrics,
+            persistence_manager: OnceLock::new(),
         }
     }
 
@@ -1828,10 +1835,8 @@ impl Herder {
 
         let result = self.scp.receive_envelope(envelope.clone());
 
-        match result {
-            henyey_scp::EnvelopeState::Invalid => {
-                return EnvelopeState::Invalid;
-            }
+        let state = match result {
+            henyey_scp::EnvelopeState::Invalid => EnvelopeState::Invalid,
             henyey_scp::EnvelopeState::Valid | henyey_scp::EnvelopeState::ValidNew => {
                 // Record peer externalize lag for EXTERNALIZE envelopes.
                 // Matches stellar-core HerderImpl.cpp:1116-1119 which records
@@ -1846,39 +1851,45 @@ impl Herder {
 
                 if result == henyey_scp::EnvelopeState::Valid {
                     // Valid but not new
-                    return EnvelopeState::Duplicate;
-                }
-
-                // ValidNew path
-                if self.heard_from_quorum(slot) {
-                    debug!(slot, "Heard from quorum");
-                }
-                // Check if this slot is now externalized
-                if self.scp.is_slot_externalized(slot) {
-                    if let Some(value) = self.scp.get_externalized_value(slot) {
-                        debug!(slot, "Slot externalized via SCP consensus");
-
-                        // Request the tx_set so we can close this ledger.
-                        // During rapid catch-up the node may externalize
-                        // via SCP without having participated in NOMINATE
-                        // /PREPARE, so the tx_set might not be cached.
-                        if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
-                            let tx_set_hash = sv.tx_set_hash;
-                            self.scp_driver.request_tx_set(tx_set_hash.into(), slot);
-                        }
-
-                        self.scp_driver
-                            .record_externalized(slot, value.clone(), None);
-                        self.scp_driver
-                            .cleanup_externalized(self.config.max_externalized_slots);
-
-                        // Advance tracking then publish (closes #2695 race window)
-                        self.complete_externalization(slot);
+                    EnvelopeState::Duplicate
+                } else {
+                    // ValidNew path
+                    if self.heard_from_quorum(slot) {
+                        debug!(slot, "Heard from quorum");
                     }
+                    // Check if this slot is now externalized
+                    if self.scp.is_slot_externalized(slot) {
+                        if let Some(value) = self.scp.get_externalized_value(slot) {
+                            debug!(slot, "Slot externalized via SCP consensus");
+
+                            // Request the tx_set so we can close this ledger.
+                            // During rapid catch-up the node may externalize
+                            // via SCP without having participated in NOMINATE
+                            // /PREPARE, so the tx_set might not be cached.
+                            if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
+                                let tx_set_hash = sv.tx_set_hash;
+                                self.scp_driver.request_tx_set(tx_set_hash.into(), slot);
+                            }
+
+                            self.scp_driver
+                                .record_externalized(slot, value.clone(), None);
+                            self.scp_driver
+                                .cleanup_externalized(self.config.max_externalized_slots);
+
+                            // Advance tracking then publish (closes #2695 race window)
+                            self.complete_externalization(slot);
+                        }
+                    }
+                    EnvelopeState::Valid
                 }
-                return EnvelopeState::Valid;
             }
-        }
+        };
+
+        // Persist SCP state for any slots that emitted envelopes during
+        // receive_envelope processing.
+        self.drain_persist_slots();
+
+        state
     }
 
     /// Drain all pending envelopes up to and including `slot` and process them
@@ -2213,6 +2224,9 @@ impl Herder {
         // externalized and advance tracking + publish in the correct order (#2695).
         self.complete_externalization(slot);
 
+        // Persist SCP state for any slots that emitted envelopes.
+        self.drain_persist_slots();
+
         Ok(TriggerOutcome::Triggered)
     }
 
@@ -2229,6 +2243,170 @@ impl Herder {
         F: Fn(ScpEnvelope) + Send + Sync + 'static,
     {
         self.scp_driver.set_envelope_sender(sender);
+    }
+
+    /// Set the SCP state persistence manager for crash recovery.
+    ///
+    /// Must be called once after construction. Enables SCP state persistence
+    /// on envelope emission and restoration on startup.
+    pub fn set_persistence_manager(&self, pm: Arc<ScpPersistenceManager>) {
+        self.persistence_manager
+            .set(pm)
+            .expect("persistence manager already set");
+    }
+
+    /// Drain pending persist slots and persist SCP state for each.
+    ///
+    /// Called after every SCP operation that can emit envelopes (receive_envelope,
+    /// nominate, nominate_timeout). The deferred approach avoids deadlock —
+    /// SCP holds `slots.write()` during emit callbacks, and `get_latest_messages_send()`
+    /// needs `slots.read()`.
+    fn drain_persist_slots(&self) {
+        let slots = self.scp_driver.take_pending_persist_slots();
+        if slots.is_empty() {
+            return;
+        }
+        let Some(pm) = self.persistence_manager.get() else {
+            return;
+        };
+        for slot in slots {
+            if let Err(e) = self.persist_scp_state_for_slot(pm, slot) {
+                warn!(slot, error = %e, "Failed to persist SCP state");
+            }
+        }
+    }
+
+    /// Persist SCP state for a single slot.
+    ///
+    /// Gathers the slot's latest emitted envelopes, referenced tx sets, and
+    /// quorum sets, then writes them to persistent storage. Matches stellar-core's
+    /// `HerderImpl::persistSCPState(slot)` (HerderImpl.cpp:2125-2188).
+    fn persist_scp_state_for_slot(
+        &self,
+        pm: &ScpPersistenceManager,
+        slot: u64,
+    ) -> crate::Result<()> {
+        let envelopes = self.scp.get_latest_messages_send(slot);
+        if envelopes.is_empty() {
+            return Ok(());
+        }
+
+        // Gather referenced tx sets and quorum sets
+        let mut tx_sets: Vec<(Hash, Vec<u8>)> = Vec::new();
+        let mut quorum_sets: Vec<(Hash, ScpQuorumSet)> = Vec::new();
+        let mut seen_tx_hashes = std::collections::HashSet::new();
+        let mut seen_qs_hashes = std::collections::HashSet::new();
+
+        for env in &envelopes {
+            // Gather tx set hashes from StellarValues in the envelope
+            for sv_hash in crate::persistence::get_tx_set_hashes(env) {
+                let h256 = Hash256::from_bytes(sv_hash.0);
+                if seen_tx_hashes.insert(h256) {
+                    if let Some(tx_set) = self.scp_driver.get_tx_set(&h256) {
+                        let stored = tx_set.to_xdr_stored_set();
+                        if let Ok(bytes) =
+                            stellar_xdr::curr::WriteXdr::to_xdr(&stored, Limits::none())
+                        {
+                            tx_sets.push((sv_hash, bytes));
+                        }
+                    }
+                }
+            }
+
+            // Gather quorum set
+            if let Some(qs_hash) = get_quorum_set_hash(env) {
+                let h256 = Hash256::from_bytes(qs_hash.0);
+                if seen_qs_hashes.insert(h256) {
+                    if let Some(qs) = self.scp_driver.get_quorum_set_by_hash(&h256) {
+                        quorum_sets.push((qs_hash, qs));
+                    }
+                }
+            }
+        }
+
+        pm.persist_scp_state(slot, &envelopes, &tx_sets, &quorum_sets)
+    }
+
+    /// Restore persisted SCP state after a crash.
+    ///
+    /// Called once during startup (not from `bootstrap()`). Loads persisted
+    /// envelopes, tx sets, and quorum sets from the database and feeds them
+    /// back into SCP, matching stellar-core's `restoreSCPState()`
+    /// (HerderImpl.cpp:2189-2262).
+    ///
+    /// Error handling matches stellar-core: individual corrupt records are
+    /// logged and skipped; the overall restore is best-effort.
+    pub fn restore_persisted_scp_state(&self) -> crate::Result<()> {
+        let Some(pm) = self.persistence_manager.get() else {
+            return Ok(()); // No persistence configured (test mode)
+        };
+
+        // Purge old state (matches purgeOldPersistedTxSets)
+        let min_slot = self.get_min_ledger_seq_to_remember();
+        if let Err(e) = pm.cleanup(min_slot) {
+            warn!(error = %e, "Failed to clean up old persisted SCP state");
+        }
+
+        // Load restored state
+        let restored = pm.restore_scp_state()?;
+
+        // Restore tx sets into ScpDriver cache
+        for (hash, tx_set_bytes) in &restored.tx_sets {
+            match stellar_xdr::curr::StoredTransactionSet::from_xdr(tx_set_bytes, Limits::none()) {
+                Ok(stored) => match TransactionSet::from_xdr_stored_set(&stored) {
+                    Ok(tx_set) => {
+                        self.scp_driver.cache_tx_set(tx_set);
+                    }
+                    Err(e) => {
+                        warn!(hash = ?hash, error = %e, "Failed to restore tx set, skipping");
+                    }
+                },
+                Err(e) => {
+                    warn!(hash = ?hash, error = %e, "Failed to decode stored tx set, skipping");
+                }
+            }
+        }
+
+        // Restore quorum sets by hash
+        for (hash, qset) in &restored.quorum_sets {
+            let h256 = Hash256::from_bytes(hash.0);
+            self.scp_driver.store_quorum_set_by_hash(h256, qset.clone());
+        }
+
+        // Restore SCP state from envelopes
+        for (_slot, envelope) in &restored.envelopes {
+            let recovered = self.scp.set_state_from_envelope(envelope);
+            if !recovered {
+                debug!(
+                    slot = envelope.statement.slot_index,
+                    "set_state_from_envelope returned false, skipping"
+                );
+            }
+
+            // Rebuild node→quorum_set association
+            if let Some(qs_hash) = get_quorum_set_hash(envelope) {
+                let h256 = Hash256::from_bytes(qs_hash.0);
+                if let Some(qset) = self.scp_driver.get_quorum_set_by_hash(&h256) {
+                    self.scp_driver
+                        .store_quorum_set(&envelope.statement.node_id, qset);
+                }
+            }
+
+            // Update last slot saved
+            pm.update_last_slot_saved(envelope.statement.slot_index);
+        }
+
+        // Rebuild quorum tracker state
+        self.scp_driver.rebuild_quorum_tracker_state();
+
+        info!(
+            envelopes = restored.envelopes.len(),
+            tx_sets = restored.tx_sets.len(),
+            quorum_sets = restored.quorum_sets.len(),
+            "Restored persisted SCP state"
+        );
+
+        Ok(())
     }
 
     /// Get the SCP instance.
@@ -2504,10 +2682,12 @@ impl Herder {
                 debug!(slot, "Re-nominated after timeout");
                 // SCP may have externalized synchronously; complete if so (#2695).
                 self.complete_externalization(slot);
+                self.drain_persist_slots();
                 return TimeoutOutcome::Renominated;
             }
             // Even on no-op, SCP state may have advanced to externalized.
             self.complete_externalization(slot);
+            self.drain_persist_slots();
             return TimeoutOutcome::NoOp;
         }
         TimeoutOutcome::NoOp
@@ -2534,6 +2714,7 @@ impl Herder {
         }
         // SCP may have externalized synchronously; complete if so (#2695).
         self.complete_externalization(slot);
+        self.drain_persist_slots();
     }
 
     /// Get the current nomination timeout.

@@ -1490,6 +1490,14 @@ impl App {
                 tracing::warn!(error = %err, "Failed to store local quorum set");
             }
         }
+
+        // Wire SCP persistence for crash recovery (#2667).
+        let scp_persistence = henyey_herder::SqliteScpPersistence::new(db.clone());
+        let pm = std::sync::Arc::new(henyey_herder::ScpPersistenceManager::new(Box::new(
+            scp_persistence,
+        )));
+        herder.set_persistence_manager(pm);
+
         herder
     }
 
