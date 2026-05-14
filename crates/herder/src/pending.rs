@@ -115,19 +115,22 @@ impl Default for PendingConfig {
 }
 
 /// A pending SCP envelope with metadata.
+///
+/// Fields are private to enforce the invariant that `hash` is always
+/// `Hash256::hash_xdr(&envelope)`. Use accessor methods to read fields.
 #[derive(Debug, Clone)]
-pub struct PendingEnvelope {
+struct PendingEnvelope {
     /// The SCP envelope.
-    pub envelope: ScpEnvelope,
+    envelope: ScpEnvelope,
     /// When this envelope was received.
-    pub received_at: Instant,
+    received_at: Instant,
     /// Hash of the envelope for deduplication.
-    pub hash: Hash256,
+    hash: Hash256,
 }
 
 impl PendingEnvelope {
     /// Create a new pending envelope.
-    pub fn new(envelope: ScpEnvelope) -> Self {
+    fn new(envelope: ScpEnvelope) -> Self {
         // Compute envelope hash for deduplication
         let hash = Hash256::hash_xdr(&envelope);
         Self {
@@ -137,8 +140,18 @@ impl PendingEnvelope {
         }
     }
 
+    /// Returns the precomputed hash of this envelope.
+    fn hash(&self) -> Hash256 {
+        self.hash
+    }
+
+    /// Consumes the pending envelope, returning the inner SCP envelope.
+    fn into_envelope(self) -> ScpEnvelope {
+        self.envelope
+    }
+
     /// Check if this envelope has expired.
-    pub fn is_expired(&self, max_age: Duration) -> bool {
+    fn is_expired(&self, max_age: Duration) -> bool {
         self.received_at.elapsed() > max_age
     }
 }
@@ -266,7 +279,7 @@ impl PendingEnvelopes {
         // Atomically check-and-insert to prevent TOCTOU race on duplicates.
         // Using entry() ensures that concurrent submissions of the same hash
         // cannot both pass the duplicate check.
-        match self.seen_hashes.entry(pending.hash) {
+        match self.seen_hashes.entry(pending.hash()) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
                 self.stats.write().duplicates += 1;
                 return PendingResult::Duplicate;
@@ -290,7 +303,7 @@ impl PendingEnvelopes {
             let expired_hashes: Vec<Hash256> = existing
                 .iter()
                 .filter(|e| e.is_expired(max_age))
-                .map(|e| e.hash)
+                .map(|e| e.hash())
                 .collect();
             if !expired_hashes.is_empty() {
                 existing.retain(|e| !e.is_expired(max_age));
@@ -305,7 +318,7 @@ impl PendingEnvelopes {
                 && existing.len() >= self.config.max_envelopes_per_slot
             {
                 // Clean up the eagerly-claimed hash since envelope is rejected.
-                self.seen_hashes.remove(&pending.hash);
+                self.seen_hashes.remove(&pending.hash());
                 self.stats.write().per_slot_full += 1;
                 return PendingResult::PerSlotFull;
             }
@@ -325,7 +338,7 @@ impl PendingEnvelopes {
             Self::evict_old_slots_inner(&mut slots, current, &self.seen_hashes, &self.stats);
             if slots.len() >= self.config.max_slots {
                 // Clean up the eagerly-claimed hash since envelope is rejected.
-                self.seen_hashes.remove(&pending.hash);
+                self.seen_hashes.remove(&pending.hash());
                 self.stats.write().buffer_full += 1;
                 return PendingResult::BufferFull;
             }
@@ -360,14 +373,14 @@ impl PendingEnvelopes {
 
             // Remove from seen hashes
             for env in &envelopes {
-                self.seen_hashes.remove(&env.hash);
+                self.seen_hashes.remove(&env.hash());
             }
 
             envelopes
                 .into_iter()
                 .rev()
                 .filter(|e| !e.is_expired(self.config.max_age))
-                .map(|e| e.envelope)
+                .map(|e| e.into_envelope())
                 .collect()
         } else {
             Vec::new()
@@ -397,14 +410,14 @@ impl PendingEnvelopes {
             self.stats.write().released += count;
 
             for env in &envelopes {
-                self.seen_hashes.remove(&env.hash);
+                self.seen_hashes.remove(&env.hash());
             }
 
             let filtered: Vec<ScpEnvelope> = envelopes
                 .into_iter()
                 .rev()
                 .filter(|e| !e.is_expired(max_age))
-                .map(|e| e.envelope)
+                .map(|e| e.into_envelope())
                 .collect();
 
             if !filtered.is_empty() {
@@ -432,7 +445,7 @@ impl PendingEnvelopes {
             if let Some(envelopes) = slots.remove(&slot) {
                 total_evicted += envelopes.len() as u64;
                 for env in envelopes {
-                    seen_hashes.remove(&env.hash);
+                    seen_hashes.remove(&env.hash());
                 }
             }
         }
@@ -456,7 +469,7 @@ impl PendingEnvelopes {
                 // Collect hashes of expired envelopes
                 for e in envelopes.iter() {
                     if e.is_expired(max_age) {
-                        expired_hashes.push(e.hash);
+                        expired_hashes.push(e.hash());
                     }
                 }
 
@@ -547,7 +560,7 @@ impl PendingEnvelopes {
         for (_, envelopes) in removed {
             total_evicted += envelopes.len() as u64;
             for env in envelopes {
-                self.seen_hashes.remove(&env.hash);
+                self.seen_hashes.remove(&env.hash());
             }
         }
         if total_evicted > 0 {
