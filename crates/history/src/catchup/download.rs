@@ -588,12 +588,24 @@ mod tests {
     #[test]
     fn test_load_local_has_valid() {
         let mgr = make_test_catchup_manager();
-        let has_json = r#"{"version":2,"currentLedger":100,"currentBuckets":[]}"#;
+        // Structurally valid v1 HAS with BUCKET_LIST_LEVELS zero-hash levels.
+        let zero = "0".repeat(64);
+        let zero_level = format!(
+            r#"{{"curr":"{}","snap":"{}","next":{{"state":0}}}}"#,
+            zero, zero
+        );
+        let levels: Vec<_> = (0..henyey_bucket::BUCKET_LIST_LEVELS)
+            .map(|_| zero_level.clone())
+            .collect();
+        let has_json = format!(
+            r#"{{"version":1,"currentLedger":100,"currentBuckets":[{}]}}"#,
+            levels.join(",")
+        );
         mgr.db
             .with_connection(|conn| {
                 conn.set_state(
                     henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE,
-                    has_json,
+                    &has_json,
                 )
             })
             .expect("set_state");

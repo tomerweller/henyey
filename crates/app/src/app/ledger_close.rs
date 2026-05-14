@@ -2955,6 +2955,24 @@ mod extract_contract_events_tests {
 mod restore_result_tests {
     use super::*;
 
+    /// Build a structurally valid v1 HAS JSON with the given currentLedger,
+    /// padded to BUCKET_LIST_LEVELS with zero-hash entries.
+    fn make_valid_has_json(ledger: u32) -> String {
+        let zero = "0".repeat(64);
+        let zero_level = format!(
+            r#"{{"curr":"{}","snap":"{}","next":{{"state":0}}}}"#,
+            zero, zero
+        );
+        let levels: Vec<_> = (0..henyey_bucket::BUCKET_LIST_LEVELS)
+            .map(|_| zero_level.clone())
+            .collect();
+        format!(
+            r#"{{"version":1,"currentLedger":{},"currentBuckets":[{}]}}"#,
+            ledger,
+            levels.join(",")
+        )
+    }
+
     /// Helper: create a minimal App for load_last_known_ledger tests.
     async fn test_app() -> (Arc<App>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -3031,11 +3049,10 @@ mod restore_result_tests {
             db.with_connection(|conn| {
                 use henyey_db::queries::StateQueries;
                 conn.set_last_closed_ledger(100)?;
-                // Minimal HAS JSON with current_ledger=50.
-                let has_json = r#"{"version":1,"currentLedger":50,"currentBuckets":[]}"#;
+                let has_json = make_valid_has_json(50);
                 conn.set_state(
                     henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE,
-                    has_json,
+                    &has_json,
                 )
             })
             .map_err(Into::into)
@@ -3118,18 +3135,9 @@ mod restore_result_tests {
             db.with_connection(|conn| {
                 use henyey_db::queries::{PublishQueueQueries, StateQueries};
                 conn.set_last_closed_ledger(256)?;
-                conn.enqueue_publish(
-                    64,
-                    r#"{"version":1,"currentLedger":64,"currentBuckets":[]}"#,
-                )?;
-                conn.enqueue_publish(
-                    128,
-                    r#"{"version":1,"currentLedger":128,"currentBuckets":[]}"#,
-                )?;
-                conn.enqueue_publish(
-                    192,
-                    r#"{"version":1,"currentLedger":192,"currentBuckets":[]}"#,
-                )?;
+                conn.enqueue_publish(64, &make_valid_has_json(64))?;
+                conn.enqueue_publish(128, &make_valid_has_json(128))?;
+                conn.enqueue_publish(192, &make_valid_has_json(192))?;
                 Ok::<_, henyey_db::DbError>(())
             })
             .map_err(Into::into)
@@ -3175,10 +3183,7 @@ mod restore_result_tests {
             db.with_connection(|conn| {
                 use henyey_db::queries::{PublishQueueQueries, StateQueries};
                 conn.set_last_closed_ledger(128)?;
-                conn.enqueue_publish(
-                    64,
-                    r#"{"version":1,"currentLedger":64,"currentBuckets":[]}"#,
-                )?;
+                conn.enqueue_publish(64, &make_valid_has_json(64))?;
                 Ok::<_, henyey_db::DbError>(())
             })
             .map_err(Into::into)
@@ -3209,10 +3214,7 @@ mod restore_result_tests {
             db.with_connection(|conn| {
                 use henyey_db::queries::{PublishQueueQueries, StateQueries};
                 conn.set_last_closed_ledger(128)?;
-                conn.enqueue_publish(
-                    64,
-                    r#"{"version":1,"currentLedger":64,"currentBuckets":[]}"#,
-                )?;
+                conn.enqueue_publish(64, &make_valid_has_json(64))?;
                 Ok::<_, henyey_db::DbError>(())
             })
             .map_err(Into::into)

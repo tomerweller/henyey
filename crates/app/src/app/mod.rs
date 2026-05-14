@@ -9600,17 +9600,25 @@ mod tests {
         assert!(sched.next_action >= now + Duration::from_secs(59));
     }
 
-    /// Build a minimal HAS JSON with one bucket level containing the given
-    /// curr/snap hex hashes.
+    /// Build a structurally valid v1 HAS JSON with one custom bucket level
+    /// containing the given curr/snap hex hashes, padded to BUCKET_LIST_LEVELS.
     fn make_has_json(ledger: u32, curr_hex: &str, snap_hex: &str) -> String {
+        let zero = "0".repeat(64);
+        let zero_level = serde_json::json!({
+            "curr": zero, "snap": zero, "next": { "state": 0 }
+        });
+        let mut levels = vec![serde_json::json!({
+            "curr": curr_hex,
+            "snap": snap_hex,
+            "next": { "state": 0 }
+        })];
+        while levels.len() < henyey_bucket::BUCKET_LIST_LEVELS {
+            levels.push(zero_level.clone());
+        }
         serde_json::json!({
-            "version": 2,
+            "version": 1,
             "currentLedger": ledger,
-            "currentBuckets": [{
-                "curr": curr_hex,
-                "snap": snap_hex,
-                "next": { "state": 0 }
-            }]
+            "currentBuckets": levels
         })
         .to_string()
     }

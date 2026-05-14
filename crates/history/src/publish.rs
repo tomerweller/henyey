@@ -1237,7 +1237,13 @@ mod tests {
             server: None,
             current_ledger: 64,
             network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
-            current_buckets: vec![],
+            current_buckets: (0..BUCKET_LIST_LEVELS)
+                .map(|_| HASBucketLevel {
+                    curr: Hash256::ZERO.to_hex(),
+                    snap: Hash256::ZERO.to_hex(),
+                    next: HASBucketNext::default(),
+                })
+                .collect(),
             hot_archive_buckets: None,
         };
 

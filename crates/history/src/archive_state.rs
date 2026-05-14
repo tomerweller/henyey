@@ -478,18 +478,12 @@ impl HistoryArchiveState {
     /// ```
     /// use henyey_history::archive_state::HistoryArchiveState;
     ///
+    /// // from_json() is lenient on bucket count; verify_has_structure()
+    /// // enforces exactly BUCKET_LIST_LEVELS (11) in production.
     /// let json = r#"{
-    ///     "version": 2,
-    ///     "server": "stellar-core 25.0.1",
+    ///     "version": 1,
     ///     "currentLedger": 12345,
-    ///     "networkPassphrase": "Test SDF Network ; September 2015",
-    ///     "currentBuckets": [
-    ///         {
-    ///             "curr": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd",
-    ///             "snap": "0000000000000000000000000000000000000000000000000000000000000000",
-    ///             "next": { "state": 0 }
-    ///         }
-    ///     ]
+    ///     "currentBuckets": []
     /// }"#;
     ///
     /// let has = HistoryArchiveState::from_json(json).unwrap();
@@ -873,36 +867,90 @@ impl HistoryArchiveState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use henyey_bucket::HOT_ARCHIVE_BUCKET_LIST_LEVELS;
 
-    fn sample_has_json() -> &'static str {
-        r#"{
+    /// Build a structurally valid v1 HAS JSON for tests.
+    /// Custom levels are placed first; remaining slots are zero-hash padded to BUCKET_LIST_LEVELS.
+    fn make_v1_has_json(ledger: u32, custom_levels: Vec<serde_json::Value>) -> String {
+        let zero_level = serde_json::json!({
+            "curr": ZERO_HASH, "snap": ZERO_HASH, "next": { "state": 0 }
+        });
+        let mut levels = custom_levels;
+        while levels.len() < BUCKET_LIST_LEVELS {
+            levels.push(zero_level.clone());
+        }
+        serde_json::to_string(&serde_json::json!({
+            "version": 1,
+            "currentLedger": ledger,
+            "currentBuckets": levels
+        }))
+        .unwrap()
+    }
+
+    /// Build a structurally valid v2 HAS JSON for tests.
+    fn make_v2_has_json(
+        ledger: u32,
+        live_levels: Vec<serde_json::Value>,
+        hot_levels: Vec<serde_json::Value>,
+    ) -> String {
+        let zero_level = serde_json::json!({
+            "curr": ZERO_HASH, "snap": ZERO_HASH, "next": { "state": 0 }
+        });
+        let mut live = live_levels;
+        while live.len() < BUCKET_LIST_LEVELS {
+            live.push(zero_level.clone());
+        }
+        let mut hot = hot_levels;
+        while hot.len() < HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+            hot.push(zero_level.clone());
+        }
+        serde_json::to_string(&serde_json::json!({
+            "version": 2,
+            "currentLedger": ledger,
+            "networkPassphrase": "Test SDF Network ; September 2015",
+            "currentBuckets": live,
+            "hotArchiveBuckets": hot
+        }))
+        .unwrap()
+    }
+
+    fn sample_has_json() -> String {
+        let zero = ZERO_HASH;
+        let zero_level = serde_json::json!({
+            "curr": zero, "snap": zero, "next": { "state": 0 }
+        });
+        let mut live_levels = vec![
+            serde_json::json!({
+                "curr": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd",
+                "next": { "state": 0 },
+                "snap": "02441d532a2aa2bbc5e2b025438572f5ea2e25205442c002e2c6e7636a54b0ef"
+            }),
+            serde_json::json!({
+                "curr": "a8a0ed4b478cda48066d06aff6f7ff9b089bbfb3effd3a6e52ce93caa71f0e1a",
+                "next": { "state": 0 },
+                "snap": "d5550575dff797042a61dd86adae42df96b0db9176fdf137e680c2dbac45ede9"
+            }),
+        ];
+        while live_levels.len() < BUCKET_LIST_LEVELS {
+            live_levels.push(zero_level.clone());
+        }
+        let hot_levels: Vec<_> = (0..HOT_ARCHIVE_BUCKET_LIST_LEVELS)
+            .map(|_| zero_level.clone())
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({
             "version": 2,
             "server": "stellar-core 25.0.1.rc1 (ac5427a148203e8269294cf50866200cbe4ec1d3)",
             "currentLedger": 212735,
             "networkPassphrase": "Test SDF Network ; September 2015",
-            "currentBuckets": [
-                {
-                    "curr": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd",
-                    "next": { "state": 0 },
-                    "snap": "02441d532a2aa2bbc5e2b025438572f5ea2e25205442c002e2c6e7636a54b0ef"
-                },
-                {
-                    "curr": "a8a0ed4b478cda48066d06aff6f7ff9b089bbfb3effd3a6e52ce93caa71f0e1a",
-                    "next": { "state": 0 },
-                    "snap": "d5550575dff797042a61dd86adae42df96b0db9176fdf137e680c2dbac45ede9"
-                },
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "next": { "state": 0 },
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000"
-                }
-            ]
-        }"#
+            "currentBuckets": live_levels,
+            "hotArchiveBuckets": hot_levels
+        }))
+        .unwrap()
     }
 
     #[test]
     fn test_parse_has() {
-        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        let has = HistoryArchiveState::from_json(&sample_has_json()).unwrap();
 
         assert_eq!(has.version, 2);
         assert_eq!(has.current_ledger, 212735);
@@ -911,12 +959,12 @@ mod tests {
             Some("Test SDF Network ; September 2015")
         );
         assert!(has.server().unwrap().contains("stellar-core"));
-        assert_eq!(has.bucket_level_count(), 3);
+        assert_eq!(has.bucket_level_count(), BUCKET_LIST_LEVELS);
     }
 
     #[test]
     fn test_all_bucket_hashes() {
-        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        let has = HistoryArchiveState::from_json(&sample_has_json()).unwrap();
         let hashes = has.all_bucket_hashes();
 
         // Should have 4 non-zero hashes (2 levels x 2 buckets each)
@@ -932,19 +980,16 @@ mod tests {
     #[test]
     fn test_unique_bucket_hashes() {
         // Create HAS with duplicate hashes
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 100,
-            "currentBuckets": [
-                {
-                    "curr": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd",
-                    "snap": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd",
-                    "next": { "state": 0 }
-                }
-            ]
-        }"#;
+        let json = make_v1_has_json(
+            100,
+            vec![serde_json::json!({
+                "curr": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd",
+                "snap": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd",
+                "next": { "state": 0 }
+            })],
+        );
 
-        let has = HistoryArchiveState::from_json(json).unwrap();
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         let unique = has.unique_bucket_hashes();
 
         // Should deduplicate to 1
@@ -953,7 +998,7 @@ mod tests {
 
     #[test]
     fn test_bucket_hashes_at_level() {
-        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        let has = HistoryArchiveState::from_json(&sample_has_json()).unwrap();
 
         // Level 0 should have both hashes
         let (curr, snap) = has.bucket_hashes_at_level(0).unwrap();
@@ -965,13 +1010,13 @@ mod tests {
         assert!(curr.is_none());
         assert!(snap.is_none());
 
-        // Level 10 doesn't exist
-        assert!(has.bucket_hashes_at_level(10).is_none());
+        // Level 11 doesn't exist (indices 0-10)
+        assert!(has.bucket_hashes_at_level(11).is_none());
     }
 
     #[test]
     fn test_serialize_has() {
-        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        let has = HistoryArchiveState::from_json(&sample_has_json()).unwrap();
         let json = has.to_json().unwrap();
 
         // Re-parse and verify
@@ -982,14 +1027,9 @@ mod tests {
 
     #[test]
     fn test_minimal_has() {
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 63,
-            "currentBuckets": []
-        }"#;
-
-        let has = HistoryArchiveState::from_json(json).unwrap();
-        assert_eq!(has.version, 2);
+        let json = make_v1_has_json(63, vec![]);
+        let has = HistoryArchiveState::from_json(&json).unwrap();
+        assert_eq!(has.version, 1);
         assert_eq!(has.current_ledger, 63);
         assert!(has.network_passphrase().is_none());
         assert!(has.server().is_none());
@@ -1011,14 +1051,14 @@ mod tests {
     // Item 2: contains_valid_buckets tests
     #[test]
     fn test_contains_valid_buckets_all_present() {
-        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        let has = HistoryArchiveState::from_json(&sample_has_json()).unwrap();
         let known: HashSet<Hash256> = has.all_bucket_hashes().into_iter().collect();
         assert!(has.contains_valid_buckets(&known).is_ok());
     }
 
     #[test]
     fn test_contains_valid_buckets_missing_hash() {
-        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        let has = HistoryArchiveState::from_json(&sample_has_json()).unwrap();
         // Empty set — no known hashes
         let known: HashSet<Hash256> = HashSet::new();
         assert!(has.contains_valid_buckets(&known).is_err());
@@ -1026,18 +1066,15 @@ mod tests {
 
     #[test]
     fn test_contains_valid_buckets_level0_not_clear() {
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 127,
-            "currentBuckets": [
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
-                }
-            ]
-        }"#;
-        let has = HistoryArchiveState::from_json(json).unwrap();
+        let json = make_v1_has_json(
+            127,
+            vec![serde_json::json!({
+                "curr": ZERO_HASH,
+                "snap": ZERO_HASH,
+                "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
+            })],
+        );
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         let known: HashSet<Hash256> = has.all_bucket_hashes().into_iter().collect();
         let result = has.contains_valid_buckets(&known);
         assert!(result.is_err());
@@ -1046,27 +1083,26 @@ mod tests {
 
     #[test]
     fn test_contains_valid_buckets_state2_missing_inputs() {
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 127,
-            "currentBuckets": [
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+        let json = make_v1_has_json(
+            127,
+            vec![
+                serde_json::json!({
+                    "curr": ZERO_HASH,
+                    "snap": ZERO_HASH,
                     "next": { "state": 0 }
-                },
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                }),
+                serde_json::json!({
+                    "curr": ZERO_HASH,
+                    "snap": ZERO_HASH,
                     "next": {
                         "state": 2,
                         "curr": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                         "snap": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                     }
-                }
-            ]
-        }"#;
-        let has = HistoryArchiveState::from_json(json).unwrap();
+                }),
+            ],
+        );
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         // Only provide main hashes, not the future input hashes
         let known: HashSet<Hash256> = HashSet::new();
         let result = has.contains_valid_buckets(&known);
@@ -1076,85 +1112,75 @@ mod tests {
     // Item 6: FutureBucket resolution method tests
     #[test]
     fn test_futures_all_clear() {
-        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        let has = HistoryArchiveState::from_json(&sample_has_json()).unwrap();
         assert!(has.futures_all_clear());
     }
 
     #[test]
     fn test_futures_all_clear_with_pending() {
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 127,
-            "currentBuckets": [
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
-                }
-            ]
-        }"#;
-        let has = HistoryArchiveState::from_json(json).unwrap();
+        let json = make_v1_has_json(
+            127,
+            vec![serde_json::json!({
+                "curr": ZERO_HASH,
+                "snap": ZERO_HASH,
+                "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
+            })],
+        );
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         assert!(!has.futures_all_clear());
     }
 
     #[test]
     fn test_futures_all_resolved() {
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 127,
-            "currentBuckets": [
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
-                }
-            ]
-        }"#;
-        let has = HistoryArchiveState::from_json(json).unwrap();
+        let json = make_v1_has_json(
+            127,
+            vec![serde_json::json!({
+                "curr": ZERO_HASH,
+                "snap": ZERO_HASH,
+                "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
+            })],
+        );
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         assert!(has.futures_all_resolved()); // state <= 1 is resolved
     }
 
     #[test]
     fn test_futures_not_all_resolved_with_state2() {
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 127,
-            "currentBuckets": [
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "next": { "state": 2, "curr": "aaaa", "snap": "bbbb" }
-                }
-            ]
-        }"#;
-        let has = HistoryArchiveState::from_json(json).unwrap();
+        let json = make_v1_has_json(
+            127,
+            vec![serde_json::json!({
+                "curr": ZERO_HASH,
+                "snap": ZERO_HASH,
+                "next": { "state": 2, "curr": "aaaa", "snap": "bbbb" }
+            })],
+        );
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         assert!(!has.futures_all_resolved()); // state 2 is not resolved
     }
 
     #[test]
     fn test_resolve_all_futures() {
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 127,
-            "currentBuckets": [
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+        let json = make_v1_has_json(
+            127,
+            vec![
+                serde_json::json!({
+                    "curr": ZERO_HASH,
+                    "snap": ZERO_HASH,
                     "next": { "state": 0 }
-                },
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                }),
+                serde_json::json!({
+                    "curr": ZERO_HASH,
+                    "snap": ZERO_HASH,
                     "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
-                },
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                }),
+                serde_json::json!({
+                    "curr": ZERO_HASH,
+                    "snap": ZERO_HASH,
                     "next": { "state": 2, "curr": "aaaa", "snap": "bbbb" }
-                }
-            ]
-        }"#;
-        let mut has = HistoryArchiveState::from_json(json).unwrap();
+                }),
+            ],
+        );
+        let mut has = HistoryArchiveState::from_json(&json).unwrap();
         has.resolve_all_futures();
 
         // state 0 stays 0, state 1 becomes 0, state 2 stays 2
@@ -1165,23 +1191,22 @@ mod tests {
 
     #[test]
     fn test_contains_valid_buckets_state1_unknown_output() {
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 127,
-            "currentBuckets": [
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+        let json = make_v1_has_json(
+            127,
+            vec![
+                serde_json::json!({
+                    "curr": ZERO_HASH,
+                    "snap": ZERO_HASH,
                     "next": { "state": 0 }
-                },
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                }),
+                serde_json::json!({
+                    "curr": ZERO_HASH,
+                    "snap": ZERO_HASH,
                     "next": { "state": 1, "output": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
-                }
-            ]
-        }"#;
-        let has = HistoryArchiveState::from_json(json).unwrap();
+                }),
+            ],
+        );
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         // Provide empty set — output hash is unknown
         let known: HashSet<Hash256> = HashSet::new();
         let result = has.contains_valid_buckets(&known);
@@ -1192,41 +1217,30 @@ mod tests {
     #[test]
     fn test_contains_valid_buckets_zero_hashes_only() {
         // HAS with only zero hashes should pass (zero hashes are skipped)
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 127,
-            "currentBuckets": [
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "next": { "state": 0 }
-                }
-            ]
-        }"#;
-        let has = HistoryArchiveState::from_json(json).unwrap();
+        let json = make_v1_has_json(127, vec![]);
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         let known: HashSet<Hash256> = HashSet::new();
         assert!(has.contains_valid_buckets(&known).is_ok());
     }
 
     #[test]
     fn test_clear_all_futures() {
-        let json = r#"{
-            "version": 2,
-            "currentLedger": 127,
-            "currentBuckets": [
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+        let json = make_v1_has_json(
+            127,
+            vec![
+                serde_json::json!({
+                    "curr": ZERO_HASH,
+                    "snap": ZERO_HASH,
                     "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
-                },
-                {
-                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                }),
+                serde_json::json!({
+                    "curr": ZERO_HASH,
+                    "snap": ZERO_HASH,
                     "next": { "state": 2, "curr": "aaaa", "snap": "bbbb" }
-                }
-            ]
-        }"#;
-        let mut has = HistoryArchiveState::from_json(json).unwrap();
+                }),
+            ],
+        );
+        let mut has = HistoryArchiveState::from_json(&json).unwrap();
         has.clear_all_futures();
 
         assert!(has.futures_all_clear());
@@ -1796,19 +1810,30 @@ mod tests {
 
     #[test]
     fn test_validate_version_invariants_v2_with_hot() {
-        let has = HistoryArchiveState::from_json(r#"{
-            "version": 2,
-            "currentLedger": 100,
-            "currentBuckets": [],
-            "hotArchiveBuckets": [{"curr": "0000000000000000000000000000000000000000000000000000000000000000", "snap": "0000000000000000000000000000000000000000000000000000000000000000", "next": {"state": 0}}]
-        }"#).unwrap();
+        let json = make_v2_has_json(100, vec![], vec![]);
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         assert!(has.validate_version_invariants().is_ok());
     }
 
     #[test]
     fn test_validate_version_invariants_v2_without_hot() {
-        // v2 without hot archive is valid (hot archive was added later in v2)
-        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        // Intentionally omits hotArchiveBuckets to test that
+        // validate_version_invariants() (the lenient parse-time check) accepts v2
+        // without hot archive. This would NOT pass verify_has_structure().
+        let zero_level = serde_json::json!({
+            "curr": ZERO_HASH, "snap": ZERO_HASH, "next": { "state": 0 }
+        });
+        let levels: Vec<_> = (0..BUCKET_LIST_LEVELS)
+            .map(|_| zero_level.clone())
+            .collect();
+        let json = serde_json::to_string(&serde_json::json!({
+            "version": 2,
+            "currentLedger": 100,
+            "networkPassphrase": "Test SDF Network ; September 2015",
+            "currentBuckets": levels
+        }))
+        .unwrap();
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         assert_eq!(has.version, 2);
         assert!(has.hot_archive_buckets.is_none());
         assert!(has.validate_version_invariants().is_ok());
@@ -1816,79 +1841,76 @@ mod tests {
 
     #[test]
     fn test_validate_version_invariants_v1_with_hot() {
-        let json = r#"{
+        // v1 with hotArchiveBuckets must be rejected by validate_version_invariants().
+        // Uses raw JSON since make_v1_has_json can't add hot archive.
+        let zero_level = serde_json::json!({
+            "curr": ZERO_HASH, "snap": ZERO_HASH, "next": { "state": 0 }
+        });
+        let levels: Vec<_> = (0..BUCKET_LIST_LEVELS)
+            .map(|_| zero_level.clone())
+            .collect();
+        let hot: Vec<_> = (0..HOT_ARCHIVE_BUCKET_LIST_LEVELS)
+            .map(|_| zero_level.clone())
+            .collect();
+        let json = serde_json::to_string(&serde_json::json!({
             "version": 1,
             "currentLedger": 100,
-            "currentBuckets": [],
-            "hotArchiveBuckets": []
-        }"#;
-        assert!(HistoryArchiveState::from_json(json).is_err());
+            "currentBuckets": levels,
+            "hotArchiveBuckets": hot
+        }))
+        .unwrap();
+        assert!(HistoryArchiveState::from_json(&json).is_err());
     }
 
     #[test]
     fn test_validate_version_invariants_v1_without_hot() {
-        let json = r#"{
-            "version": 1,
-            "currentLedger": 100,
-            "currentBuckets": []
-        }"#;
-        let has = HistoryArchiveState::from_json(json).unwrap();
+        let json = make_v1_has_json(100, vec![]);
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         assert!(has.validate_version_invariants().is_ok());
     }
 
     #[test]
     fn test_hot_archive_levels_accessor_v2() {
-        let has = HistoryArchiveState::from_json(r#"{
-            "version": 2,
-            "currentLedger": 100,
-            "currentBuckets": [],
-            "hotArchiveBuckets": [{"curr": "abc123", "snap": "0000000000000000000000000000000000000000000000000000000000000000", "next": {"state": 0}}]
-        }"#).unwrap();
+        let json = make_v2_has_json(
+            100,
+            vec![],
+            vec![serde_json::json!({
+                "curr": "abc123",
+                "snap": ZERO_HASH,
+                "next": { "state": 0 }
+            })],
+        );
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         let levels = has.hot_archive_levels();
-        assert_eq!(levels.len(), 1);
+        assert_eq!(levels.len(), HOT_ARCHIVE_BUCKET_LIST_LEVELS);
         assert_eq!(levels[0].curr, "abc123");
     }
 
     #[test]
     fn test_hot_archive_levels_accessor_v1() {
-        let json = r#"{
-            "version": 1,
-            "currentLedger": 100,
-            "currentBuckets": []
-        }"#;
-        let has = HistoryArchiveState::from_json(json).unwrap();
+        let json = make_v1_has_json(100, vec![]);
+        let has = HistoryArchiveState::from_json(&json).unwrap();
         let levels = has.hot_archive_levels();
         assert!(levels.is_empty());
     }
 
     #[test]
     fn test_hot_archive_levels_mut_v2() {
-        let mut has = HistoryArchiveState::from_json(
-            r#"{
-            "version": 2,
-            "currentLedger": 100,
-            "currentBuckets": [],
-            "hotArchiveBuckets": []
-        }"#,
-        )
-        .unwrap();
+        let json = make_v2_has_json(100, vec![], vec![]);
+        let mut has = HistoryArchiveState::from_json(&json).unwrap();
         assert!(has.hot_archive_levels_mut().is_some());
     }
 
     #[test]
     fn test_hot_archive_levels_mut_v1() {
-        let json = r#"{
-            "version": 1,
-            "currentLedger": 100,
-            "currentBuckets": []
-        }"#;
-        let mut has = HistoryArchiveState::from_json(json).unwrap();
+        let json = make_v1_has_json(100, vec![]);
+        let mut has = HistoryArchiveState::from_json(&json).unwrap();
         assert!(has.hot_archive_levels_mut().is_none());
     }
 
     #[test]
     fn test_contains_valid_buckets_validates_hot_archive() {
-        let mut has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        let mut has = HistoryArchiveState::from_json(&sample_has_json()).unwrap();
         // Add hot archive with a non-zero hash that is NOT in known_hashes
         has.hot_archive_buckets = Some(vec![HASBucketLevel {
             curr: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),

@@ -20,7 +20,13 @@ async fn test_build_checkpoint_data_takes_state() {
         server: None,
         current_ledger: 64,
         network_passphrase: None,
-        current_buckets: Vec::new(),
+        current_buckets: (0..henyey_bucket::BUCKET_LIST_LEVELS)
+            .map(|_| henyey_history::archive_state::HASBucketLevel {
+                curr: "0".repeat(64),
+                snap: "0".repeat(64),
+                next: Default::default(),
+            })
+            .collect(),
         hot_archive_buckets: None,
     });
     work.bucket_dir = Some(tmp_dir.path().to_path_buf());
