@@ -7270,6 +7270,7 @@ mod tests {
             let hash = [*hash_byte; 32];
             let xdr = mk_stellar_value_xdr(hash);
             driver.record_externalized(*slot, mk_value(xdr), None);
+            driver.publish_externalized(*slot);
         }
 
         // Seed the syncing_ledgers buffer with pre-existing entries (no
@@ -7375,6 +7376,7 @@ mod tests {
             let hash = [(slot & 0xff) as u8; 32];
             let xdr = mk_stellar_value_xdr(hash);
             driver.record_externalized(slot, mk_value(xdr), None);
+            driver.publish_externalized(slot);
         }
         *app.last_processed_slot.write().await = n;
 
@@ -7427,6 +7429,7 @@ mod tests {
         let driver = app.herder.scp_driver();
         let xdr = mk_stellar_value_xdr([0xaa; 32]);
         driver.record_externalized(n + 5, mk_value(xdr), None);
+        driver.publish_externalized(n + 5);
 
         // Pre-seed buffer with an entry at `missing_slot` that has a hash
         // but no tx_set.
@@ -7519,6 +7522,7 @@ mod tests {
         // check_ledger_close will find the cached tx_set_b and return it.
         let xdr = mk_stellar_value_xdr(hash_b.0);
         driver.record_externalized(mismatch_slot, mk_value(xdr), None);
+        driver.publish_externalized(mismatch_slot);
 
         *app.last_processed_slot.write().await = n;
 
@@ -9843,8 +9847,8 @@ mod tests {
             let hash = [*hash_byte; 32];
             let xdr = mk_stellar_value_xdr(hash);
             driver.record_externalized(*slot, mk_value(xdr), None);
+            driver.publish_externalized(*slot);
         }
-
         *app.last_processed_slot.write().await = n;
 
         let _pending = app.process_externalized_slots().await;
@@ -9882,6 +9886,7 @@ mod tests {
             let hash = [slot as u8; 32];
             let xdr = mk_stellar_value_xdr(hash);
             driver.record_externalized(slot, mk_value(xdr), None);
+            driver.publish_externalized(slot);
         }
 
         // Pre-seed the buffer with first_buffered only
@@ -9965,6 +9970,7 @@ mod tests {
         let xdr = mk_stellar_value_xdr(tx_set_hash_bytes);
         let driver = app.herder.scp_driver();
         driver.record_externalized(slot, mk_value(xdr), None);
+        driver.publish_externalized(slot);
 
         let result = app.buffer_externalized_tx_set(&tx_set).await;
         assert!(result, "should return true when slot is found");
@@ -10442,6 +10448,9 @@ mod tests {
             Default::default(),
             None,
         );
+        app.herder
+            .scp_driver()
+            .publish_externalized(current_ledger as u64);
 
         // Arm stale archive-behind state.
         app.archive_confirmed_behind.store(true, Ordering::SeqCst);

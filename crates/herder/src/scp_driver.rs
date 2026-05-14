@@ -2336,11 +2336,14 @@ impl ScpDriver {
         };
 
         // Monotonic guard: only update timing for strictly forward externalizations.
-        // Uses latest_externalized as the self-contained proxy — it is updated within
-        // this same function, so it reflects all prior externalizations by the next call.
+        // Uses the externalized map as the self-contained proxy — checked before
+        // insert, so it reflects all prior externalizations.
         // Prevents retrograde slots from overwriting timing of a newer slot.
-        let current_latest = *tracked_read(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized);
-        let is_forward = current_latest.map(|l| slot > l).unwrap_or(true);
+        let current_max = tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized)
+            .keys()
+            .max()
+            .copied();
+        let is_forward = current_max.map(|m| slot > m).unwrap_or(true);
         let is_first = !tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).contains_key(&slot);
         if is_first && is_forward {
             let first_to_self = self
@@ -2393,11 +2396,9 @@ impl ScpDriver {
 
         tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized).insert(slot, externalized);
 
-        // Update latest
-        let mut latest = tracked_write(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized);
-        if latest.map(|l| slot > l).unwrap_or(true) {
-            *latest = Some(slot);
-        }
+        // Publication of latest_externalized is deferred to
+        // Herder::complete_externalization, which advances tracking first.
+        // Catchup callers must call publish_externalized explicitly.
 
         // Clean up old per-slot timing entries (keep only recent slots). Keep 100 slots
         // to ensure close-complete can still find timestamps during backlog (EXTERNALIZEs
@@ -2408,6 +2409,21 @@ impl ScpDriver {
         }
 
         debug!("Externalized slot {} with close time {}", slot, close_time);
+    }
+
+    /// Publish the given slot as the latest externalized slot.
+    ///
+    /// Separated from [`record_externalized`] so the herder can advance
+    /// tracking state *before* publication, closing the race window where
+    /// `latest_externalized > tracking` was briefly observable (#2695).
+    ///
+    /// Catchup callers should call this directly after `record_externalized`.
+    /// Consensus callers go through `Herder::complete_externalization`.
+    pub fn publish_externalized(&self, slot: SlotIndex) {
+        let mut latest = tracked_write(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized);
+        if latest.map(|l| slot > l).unwrap_or(true) {
+            *latest = Some(slot);
+        }
     }
 
     /// Get the close time of an externalized slot.
@@ -3837,12 +3853,16 @@ mod tests {
         assert!(driver.latest_externalized_slot().is_none());
 
         driver.record_externalized(100, Value::default(), None);
+        // record_externalized no longer publishes; explicit publish needed.
+        driver.publish_externalized(100);
         assert_eq!(driver.latest_externalized_slot(), Some(100));
 
         driver.record_externalized(99, Value::default(), None); // older slot
+        driver.publish_externalized(99);
         assert_eq!(driver.latest_externalized_slot(), Some(100)); // still 100
 
         driver.record_externalized(101, Value::default(), None);
+        driver.publish_externalized(101);
         assert_eq!(driver.latest_externalized_slot(), Some(101));
     }
 
@@ -3931,6 +3951,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         driver.record_ballot_start(101);
         driver.record_externalized(101, Value::default(), None);
+        driver.publish_externalized(101);
 
         let snapshot_before = driver.last_externalize_timing().unwrap();
         assert_eq!(snapshot_before.slot, 101);
@@ -3943,6 +3964,7 @@ mod tests {
         driver.record_nomination_start(99);
         driver.record_ballot_start(99);
         driver.record_externalized(99, Value::default(), None);
+        driver.publish_externalized(99);
 
         // Timing snapshot must still reflect slot 101, not regress to 99.
         let snapshot_after = driver.last_externalize_timing().unwrap();

@@ -3324,6 +3324,7 @@ mod refresh_stale_buffer_tests {
         app.herder
             .scp_driver()
             .record_externalized(slot, value, None);
+        app.herder.scp_driver().publish_externalized(slot);
 
         // Seed syncing_ledgers with tx_set=None (simulating the race).
         {
@@ -3385,6 +3386,7 @@ mod refresh_stale_buffer_tests {
         app.herder
             .scp_driver()
             .record_externalized(slot, value, None);
+        app.herder.scp_driver().publish_externalized(slot);
         app.herder.scp_driver().cache_tx_set(tx_set);
 
         // Seed syncing_ledgers with a DIFFERENT tx_set_hash (simulating mismatch).

@@ -1125,6 +1125,8 @@ impl App {
 
                         // All validations passed - record this externalized slot
                         scp_driver.record_externalized(slot, value, None);
+                        // Catchup publishes directly (no tracking to advance).
+                        scp_driver.publish_externalized(slot);
                         recorded_externalized += 1;
                         tracing::debug!(slot, "Recorded externalized slot during catchup");
 
@@ -4267,6 +4269,7 @@ mod tests {
         app.herder
             .scp_driver()
             .record_externalized(50, mk_value_for_slot(xdr), None);
+        app.herder.scp_driver().publish_externalized(50);
 
         // 2. syncing_ledgers: one entry at slot 50 (no tx_set).
         //    50 % 64 ≠ 0 → not checkpoint boundary → can_trigger_immediate=false.
@@ -5415,6 +5418,9 @@ mod tests {
             Default::default(),
             None,
         );
+        app.herder
+            .scp_driver()
+            .publish_externalized(current_ledger as u64);
 
         // Arm stale archive-behind state.
         app.archive_confirmed_behind.store(true, Ordering::SeqCst);
@@ -5521,6 +5527,7 @@ mod tests {
         app.herder
             .scp_driver()
             .record_externalized(5_010, Default::default(), None);
+        app.herder.scp_driver().publish_externalized(5_010);
 
         app.archive_confirmed_behind.store(true, Ordering::SeqCst);
         app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);

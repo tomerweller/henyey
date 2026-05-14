@@ -864,14 +864,12 @@ impl Herder {
             return;
         }
         let lcl_seq = self.ledger_manager.current_ledger_seq() as u64;
-        // Allow lcl_seq == tracking: this is reachable transiently when the
-        // async close pipeline advances LCL before advance_tracking_slot runs
-        // (the value_externalized callback publishes latest_externalized
-        // before process_scp_envelope can advance tracking). lcl > tracking
-        // means LCL has passed the *next* consensus slot — genuine corruption.
+        // Strict bound: tracking is always advanced before latest_externalized
+        // is published (#2695), so lcl_seq < tracking must hold in all
+        // consensus paths. lcl_seq == tracking is unreachable by construction.
         assert!(
-            lcl_seq <= tracking,
-            "INV-H2 FATAL: LCL ({lcl_seq}) is ahead of tracking consensus slot \
+            lcl_seq < tracking,
+            "INV-H2 FATAL: LCL ({lcl_seq}) is at or ahead of tracking consensus slot \
              ({tracking}). Unrecoverable state divergence between consensus \
              and ledger-manager."
         );
@@ -1874,8 +1872,8 @@ impl Herder {
                         self.scp_driver
                             .cleanup_externalized(self.config.max_externalized_slots);
 
-                        // Advance tracking slot
-                        self.advance_tracking_slot(slot);
+                        // Advance tracking then publish (closes #2695 race window)
+                        self.complete_externalization(slot);
                     }
                 }
                 return EnvelopeState::Valid;
@@ -1917,6 +1915,31 @@ impl Herder {
         F: FnMut(&ScpEnvelope),
     {
         self.drain_and_process_pending_impl(slot, |env| before_process(env));
+    }
+
+    /// Post-SCP-operation handler: if the given slot was externalized by SCP,
+    /// advance tracking and then publish `latest_externalized` — in that order.
+    ///
+    /// This is the single sequencing point for all herder entry points that can
+    /// trigger externalization via SCP callbacks (`process_scp_envelope_with_tx_set`,
+    /// `trigger_next_ledger`, `handle_nomination_timeout`, `handle_ballot_timeout`).
+    ///
+    /// Uses `scp.is_slot_externalized(slot)` as the witness (not the
+    /// `scp_driver.externalized` map, which may be populated by catchup/tests).
+    ///
+    /// Mirrors stellar-core's `valueExternalized` advancing tracking via
+    /// `setTrackingSCPState` before returning to the caller.
+    fn complete_externalization(&self, slot: SlotIndex) {
+        if !self.scp.is_slot_externalized(slot) {
+            return;
+        }
+        // Idempotency: if tracking already advanced past this slot, just publish.
+        if self.tracking_slot().get() > slot {
+            self.scp_driver.publish_externalized(slot);
+            return;
+        }
+        self.advance_tracking_slot(slot);
+        self.scp_driver.publish_externalized(slot);
     }
 
     /// Advance tracking slot after externalization.
@@ -2187,10 +2210,8 @@ impl Herder {
 
         // For solo validators (1-of-1 quorum), the nomination→ballot→externalization
         // happens synchronously within self.scp.nominate(). Check if the slot was
-        // externalized and advance tracking state accordingly.
-        if self.scp_driver.latest_externalized_slot() == Some(slot) {
-            self.advance_tracking_slot(slot);
-        }
+        // externalized and advance tracking + publish in the correct order (#2695).
+        self.complete_externalization(slot);
 
         Ok(TriggerOutcome::Triggered)
     }
@@ -2392,8 +2413,8 @@ impl Herder {
 
         // INV-H2 (parity: HerderImpl.cpp:1228-1229 lastClosedLedgerIncreased):
         // After all close bookkeeping, verify LCL hasn't overtaken tracking.
-        // Uses `<=` form (not strict equality) because during multi-slot apply
-        // bursts, tracking may be ahead of LCL for intermediate slots.
+        // Strict bound (lcl < tracking) holds because tracking was advanced
+        // by complete_externalization before the close pipeline ran (#2695).
         self.assert_lcl_consistency();
     }
 
@@ -2481,8 +2502,12 @@ impl Herder {
 
             if self.scp.nominate_timeout(slot, value, &prev_value) {
                 debug!(slot, "Re-nominated after timeout");
+                // SCP may have externalized synchronously; complete if so (#2695).
+                self.complete_externalization(slot);
                 return TimeoutOutcome::Renominated;
             }
+            // Even on no-op, SCP state may have advanced to externalized.
+            self.complete_externalization(slot);
             return TimeoutOutcome::NoOp;
         }
         TimeoutOutcome::NoOp
@@ -2507,6 +2532,8 @@ impl Herder {
         if self.scp.bump_ballot(slot) {
             debug!(slot, "Bumped ballot after timeout");
         }
+        // SCP may have externalized synchronously; complete if so (#2695).
+        self.complete_externalization(slot);
     }
 
     /// Get the current nomination timeout.
@@ -7295,11 +7322,13 @@ mod inv_h2_lcl_guard_tests {
     }
 
     #[test]
-    fn test_assert_lcl_consistency_passes_in_post_close_race_window() {
-        // LCL=6, tracking_slot=6 → LCL == tracking → OK (race window:
-        // async close pipeline advanced LCL before advance_tracking_slot)
+    #[should_panic(expected = "INV-H2 FATAL")]
+    fn test_assert_lcl_consistency_fires_when_lcl_equals_tracking() {
+        // LCL=6, tracking_slot=6 → LCL == tracking → PANIC
+        // Race window closed by #2695: tracking is always advanced before
+        // latest_externalized is published, so lcl == tracking is unreachable.
         let herder = make_tracking_herder_at(6, 6);
-        herder.assert_lcl_consistency(); // should not panic
+        herder.assert_lcl_consistency();
     }
 
     #[test]
