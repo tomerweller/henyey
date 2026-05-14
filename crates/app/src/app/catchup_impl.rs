@@ -5470,6 +5470,10 @@ mod tests {
             0,
             "livelock_start must be cleared"
         );
+        assert!(
+            !app.archive_checkpoint_cache.is_urgent(),
+            "urgent polling must be disarmed"
+        );
     }
 
     /// When latest_ext == current_ledger == 0 (startup), the guard must NOT

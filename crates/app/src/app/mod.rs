@@ -10160,6 +10160,14 @@ mod tests {
             !app.archive_confirmed_behind.load(Ordering::SeqCst),
             "stale archive_confirmed_behind must be cleared at AtTip (#2664)"
         );
+        // Full reset should also zero recovery_attempts_without_progress
+        // (the fetch_add(1) after the clear will make it 1, not high).
+        assert!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst)
+                <= 1,
+            "recovery_attempts must be reset at AtTip with stale flag (#2664)"
+        );
     }
 
     /// #2664: At startup (current_ledger == 0, AtTip), the archive_confirmed_behind
