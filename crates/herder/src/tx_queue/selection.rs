@@ -508,14 +508,14 @@ impl TransactionQueue {
 
         let mut transactions = Vec::new();
         transactions.extend(
-            classic_selected.into_iter().map(|tx| {
-                crate::tx_set_utils::HashedTx::from_prehashed(tx.hash, tx.envelope.clone())
-            }),
+            classic_selected
+                .iter()
+                .map(crate::tx_set_utils::HashedTx::from),
         );
         transactions.extend(
-            soroban_selected.into_iter().map(|tx| {
-                crate::tx_set_utils::HashedTx::from_prehashed(tx.hash, tx.envelope.clone())
-            }),
+            soroban_selected
+                .iter()
+                .map(crate::tx_set_utils::HashedTx::from),
         );
 
         SelectedTxs {

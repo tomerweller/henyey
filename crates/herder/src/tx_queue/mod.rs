@@ -1305,7 +1305,7 @@ impl TransactionQueue {
         let store = self.store.read();
         store
             .values()
-            .map(|qt| crate::tx_set_utils::HashedTx::from_prehashed(qt.hash, qt.envelope.clone()))
+            .map(crate::tx_set_utils::HashedTx::from)
             .collect()
     }
 

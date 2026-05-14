@@ -231,7 +231,7 @@ impl KnownPeerSet {
     /// with `config_entries`. On `Some(addr)`: updates resolution. On `None`:
     /// preserves last-good (does NOT clear).
     pub(super) fn update_resolved(&mut self, results: &[Option<PeerAddress>]) {
-        debug_assert_eq!(
+        assert_eq!(
             results.len(),
             self.config_entries.len(),
             "resolve results length must match config_entries"
@@ -4064,6 +4064,30 @@ mod tests {
         assert_eq!(set.resolved[0].as_ref().unwrap().host, "10.0.0.1");
         // Updated on success
         assert_eq!(set.resolved[1].as_ref().unwrap().host, "10.0.0.99");
+    }
+
+    #[test]
+    #[should_panic(expected = "resolve results length must match config_entries")]
+    fn test_known_peer_set_update_resolved_panics_too_long() {
+        let config = vec![PeerAddress::new("stellar.example.com", 11625)];
+        let mut set = KnownPeerSet::from_config(config);
+        // Too many results — must panic
+        set.update_resolved(&[
+            Some(PeerAddress::new("10.0.0.1", 11625)),
+            Some(PeerAddress::new("10.0.0.2", 11625)),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "resolve results length must match config_entries")]
+    fn test_known_peer_set_update_resolved_panics_too_short() {
+        let config = vec![
+            PeerAddress::new("stellar.example.com", 11625),
+            PeerAddress::new("peer2.example.com", 11625),
+        ];
+        let mut set = KnownPeerSet::from_config(config);
+        // Too few results — must panic
+        set.update_resolved(&[Some(PeerAddress::new("10.0.0.1", 11625))]);
     }
 
     #[test]

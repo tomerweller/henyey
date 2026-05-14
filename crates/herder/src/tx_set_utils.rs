@@ -27,7 +27,7 @@ use stellar_xdr::curr::{
 };
 use tracing::debug;
 
-use crate::tx_queue::{AccountProvider, FeeBalanceProvider};
+use crate::tx_queue::{AccountProvider, FeeBalanceProvider, QueuedTransaction};
 
 /// A transaction envelope paired with its pre-computed hash.
 ///
@@ -55,8 +55,12 @@ impl HashedTx {
 
     /// Create a `HashedTx` from a pre-computed hash and an `Arc`'d envelope.
     ///
-    /// Avoids redundant hashing when the caller already has the hash
-    /// (e.g. from `QueuedTransaction`).
+    /// # Safety invariant
+    /// The caller MUST guarantee that `hash == Hash256::hash_xdr(&envelope)`.
+    /// This is enforced by `debug_assert_eq!` in debug builds. In release builds,
+    /// prefer using `HashedTx::from(&QueuedTransaction)` which guarantees
+    /// correctness by construction.
+    #[cfg(test)]
     pub fn from_prehashed(hash: Hash256, envelope: Arc<TransactionEnvelope>) -> Self {
         debug_assert_eq!(
             hash,
@@ -80,6 +84,21 @@ impl HashedTx {
 
     pub fn into_envelope(self) -> TransactionEnvelope {
         Arc::unwrap_or_clone(self.envelope)
+    }
+}
+
+/// Convert a `QueuedTransaction` into a `HashedTx` without rehashing.
+///
+/// This is safe because `QueuedTransaction::new()` computes the hash from the
+/// envelope at construction time, and the fields are never mutated afterward.
+/// Using this conversion instead of `from_prehashed` makes the invariant
+/// (hash matches envelope) enforced by construction rather than by runtime check.
+impl From<&QueuedTransaction> for HashedTx {
+    fn from(qt: &QueuedTransaction) -> Self {
+        Self {
+            hash: qt.hash,
+            envelope: qt.envelope.clone(),
+        }
     }
 }
 
@@ -5410,5 +5429,22 @@ mod tests {
         // The frozen config affects a different account; the source account's
         // key is not in the frozen set, so the frozen check would pass.
         // (Full pipeline test not possible without real signatures.)
+    }
+
+    #[test]
+    fn test_hashed_tx_from_queued_transaction() {
+        let envelope = make_valid_envelope(100, 1);
+        let qt = QueuedTransaction::new(envelope.clone()).unwrap();
+        let hashed: HashedTx = HashedTx::from(&qt);
+        assert_eq!(hashed.hash(), Hash256::hash_xdr(&envelope));
+        assert_eq!(hashed.envelope(), &envelope);
+    }
+
+    #[test]
+    #[should_panic(expected = "hash does not match envelope")]
+    fn test_hashed_tx_from_prehashed_panics_on_mismatch() {
+        let envelope = make_valid_envelope(100, 1);
+        let wrong_hash = Hash256::hash_xdr(&make_valid_envelope(200, 2));
+        HashedTx::from_prehashed(wrong_hash, Arc::new(envelope));
     }
 }

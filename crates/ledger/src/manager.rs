@@ -4187,6 +4187,27 @@ impl LedgerCloseContext<'_> {
         // Store the executor back for reuse on the next ledger close
         *self.manager.executor.lock() = executor;
 
+        // Verify TxSetResult structural invariant: all result vectors must have
+        // the same length as the input transaction count. A violation here
+        // indicates a fundamental bug in the transaction execution pipeline.
+        // Ref: stellar-core releaseAssert(numTxs == mutableTxResults.size())
+        // at LedgerManagerImpl.cpp:2529.
+        assert_eq!(
+            tx_set_result.results.len(),
+            tx_set_result.tx_results.len(),
+            "TxSetResult: results and tx_results length mismatch"
+        );
+        assert_eq!(
+            tx_set_result.results.len(),
+            tx_set_result.tx_result_metas.len(),
+            "TxSetResult: results and tx_result_metas length mismatch"
+        );
+        assert_eq!(
+            tx_set_result.results.len(),
+            prepared.all_txs.len(),
+            "TxSetResult: results length does not match input tx count"
+        );
+
         let post_exec_start = std::time::Instant::now();
         // Prepend fee events for classic event emission.
         // Use the pre-refund fee (fee_charged + fee_refund) to match stellar-core's
@@ -4195,11 +4216,6 @@ impl LedgerCloseContext<'_> {
         // TransactionResult.feeCharged (the post-refund value).
         // Ref: stellar-core LedgerManagerImpl.cpp:2679, MutableTransactionResult.cpp:432
         if classic_events.events_enabled(self.prev_header.ledger_version) {
-            debug_assert_eq!(
-                tx_set_result.results.len(),
-                tx_set_result.tx_results.len(),
-                "results and tx_results must have same length"
-            );
             for (idx, meta) in tx_set_result.tx_result_metas.iter_mut().enumerate() {
                 if idx >= tx_set_result.results.len() || idx >= prepared.tx_meta.len() {
                     break;
