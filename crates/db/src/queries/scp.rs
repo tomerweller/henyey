@@ -342,10 +342,11 @@ pub trait ScpStatePersistenceQueries {
     /// Check if a transaction set exists.
     fn has_tx_set_data(&self, hash: &Hash) -> Result<bool, DbError>;
 
-    /// Delete old transaction set data.
-    /// Note: Currently a no-op since tx sets aren't directly linked to slots.
-    /// Use a separate cleanup mechanism.
-    fn delete_old_tx_set_data(&self, slot: u64) -> Result<(), DbError>;
+    /// Return the hashes of all persisted transaction sets.
+    fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>, DbError>;
+
+    /// Delete persisted transaction sets by their hashes.
+    fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<(), DbError>;
 }
 
 impl ScpStatePersistenceQueries for Connection {
@@ -452,11 +453,47 @@ impl ScpStatePersistenceQueries for Connection {
         Ok(count > 0)
     }
 
-    fn delete_old_tx_set_data(&self, _slot: u64) -> Result<(), DbError> {
-        // In a more sophisticated implementation, we would track which slots
-        // reference which tx sets. For now, this is a no-op.
-        // TX sets will be cleaned up when they're no longer referenced by any
-        // persisted slot state.
+    fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>, DbError> {
+        let mut stmt = self.prepare("SELECT statename FROM storestate WHERE statename LIKE ?1")?;
+        let pattern = format!("{TX_SET_KEY_PREFIX}%");
+        let rows = stmt.query_map(params![pattern], |row| {
+            let key: String = row.get(0)?;
+            Ok(key)
+        })?;
+
+        let mut hashes = Vec::new();
+        for row in rows {
+            let key = row?;
+            let Some(hash_hex) = key.strip_prefix(TX_SET_KEY_PREFIX) else {
+                tracing::warn!(key, "Skipping malformed tx set key");
+                continue;
+            };
+            let Ok(hash_bytes) = hex::decode(hash_hex) else {
+                tracing::warn!(key, "Skipping tx set key with invalid hex");
+                continue;
+            };
+            let Ok(hash_arr): Result<[u8; 32], _> = hash_bytes.try_into() else {
+                tracing::warn!(key, "Skipping tx set key with wrong hash length");
+                continue;
+            };
+            hashes.push(Hash(hash_arr));
+        }
+        Ok(hashes)
+    }
+
+    fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<(), DbError> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
+        let keys: Vec<String> = hashes.iter().map(|h| tx_set_key(h)).collect();
+        let placeholders = super::sql_placeholder_list(keys.len());
+        let sql = format!("DELETE FROM storestate WHERE statename IN ({placeholders})");
+        let params: Vec<&dyn rusqlite::types::ToSql> = keys
+            .iter()
+            .map(|k| k as &dyn rusqlite::types::ToSql)
+            .collect();
+        self.execute(&sql, params.as_slice())?;
         Ok(())
     }
 }
@@ -548,6 +585,66 @@ mod tests {
         // Load all
         let all = conn.load_all_tx_set_data().unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_get_all_tx_set_hashes() {
+        let conn = setup_db();
+
+        // Empty DB
+        let hashes = conn.get_all_tx_set_hashes().unwrap();
+        assert!(hashes.is_empty());
+
+        // Save some tx sets
+        let hash1 = Hash([1u8; 32]);
+        let hash2 = Hash([2u8; 32]);
+        let hash3 = Hash([3u8; 32]);
+        conn.save_tx_set_data(&hash1, &[10]).unwrap();
+        conn.save_tx_set_data(&hash2, &[20]).unwrap();
+        conn.save_tx_set_data(&hash3, &[30]).unwrap();
+
+        let mut hashes = conn.get_all_tx_set_hashes().unwrap();
+        hashes.sort_by_key(|h| h.0);
+        assert_eq!(hashes.len(), 3);
+        assert_eq!(hashes[0], hash1);
+        assert_eq!(hashes[1], hash2);
+        assert_eq!(hashes[2], hash3);
+    }
+
+    #[test]
+    fn test_delete_tx_sets_by_hashes() {
+        let conn = setup_db();
+
+        let hash1 = Hash([1u8; 32]);
+        let hash2 = Hash([2u8; 32]);
+        let hash3 = Hash([3u8; 32]);
+        conn.save_tx_set_data(&hash1, &[10]).unwrap();
+        conn.save_tx_set_data(&hash2, &[20]).unwrap();
+        conn.save_tx_set_data(&hash3, &[30]).unwrap();
+
+        // Delete only hash1 and hash3
+        conn.delete_tx_sets_by_hashes(&[hash1.clone(), hash3.clone()])
+            .unwrap();
+
+        // hash2 should remain
+        let remaining = conn.get_all_tx_set_hashes().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0], hash2);
+        assert!(conn.has_tx_set_data(&hash2).unwrap());
+        assert!(!conn.has_tx_set_data(&hash1).unwrap());
+        assert!(!conn.has_tx_set_data(&hash3).unwrap());
+    }
+
+    #[test]
+    fn test_delete_tx_sets_by_hashes_empty() {
+        let conn = setup_db();
+
+        let hash1 = Hash([1u8; 32]);
+        conn.save_tx_set_data(&hash1, &[10]).unwrap();
+
+        // Delete with empty list should be a no-op
+        conn.delete_tx_sets_by_hashes(&[]).unwrap();
+        assert!(conn.has_tx_set_data(&hash1).unwrap());
     }
 
     #[test]

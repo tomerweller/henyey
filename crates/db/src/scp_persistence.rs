@@ -97,12 +97,14 @@ impl SqliteScpPersistence {
         self.with_connection(|conn| conn.has_tx_set_data(hash))
     }
 
-    /// Delete transaction sets for slots below the given threshold.
-    pub fn delete_tx_sets_below(&self, slot: u64) -> Result<(), String> {
-        self.with_connection(|conn| {
-            conn.delete_old_tx_set_data(slot)?;
-            Ok(())
-        })
+    /// Return the hashes of all persisted transaction sets.
+    pub fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>, String> {
+        self.with_connection(|conn| conn.get_all_tx_set_hashes())
+    }
+
+    /// Delete persisted transaction sets by their hashes.
+    pub fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<(), String> {
+        self.with_connection(|conn| conn.delete_tx_sets_by_hashes(hashes))
     }
 }
 

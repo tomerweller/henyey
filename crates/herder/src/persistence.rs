@@ -182,8 +182,11 @@ pub trait ScpStatePersistence: Send + Sync {
     /// Check if a transaction set exists.
     fn has_tx_set(&self, hash: &Hash) -> Result<bool>;
 
-    /// Delete transaction sets for slots below the given threshold.
-    fn delete_tx_sets_below(&self, slot: u64) -> Result<()>;
+    /// Return the hashes of all persisted transaction sets.
+    fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>>;
+
+    /// Delete persisted transaction sets by their hashes.
+    fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<()>;
 }
 
 /// In-memory implementation of SCP state persistence for testing.
@@ -256,9 +259,15 @@ impl ScpStatePersistence for InMemoryScpPersistence {
         Ok(self.tx_sets.read().contains_key(hash))
     }
 
-    fn delete_tx_sets_below(&self, _slot: u64) -> Result<()> {
-        // In-memory persistence doesn't track which tx sets belong to which slots
-        // This is a limitation of the in-memory implementation
+    fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>> {
+        Ok(self.tx_sets.read().keys().cloned().collect())
+    }
+
+    fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<()> {
+        let mut tx_sets = self.tx_sets.write();
+        for hash in hashes {
+            tx_sets.remove(hash);
+        }
         Ok(())
     }
 }
@@ -407,8 +416,13 @@ impl ScpPersistenceManager {
 
     /// Restore SCP state from persistence.
     ///
-    /// Returns the loaded states which should be used to restore SCP state.
+    /// Purges unreferenced tx sets before loading, matching stellar-core's
+    /// behavior where `purgeOldPersistedTxSets()` runs during `restoreSCPState()`.
     pub fn restore_scp_state(&self) -> Result<RestoredScpState> {
+        // Purge stale tx sets before loading them into memory.
+        // Parity: stellar-core HerderImpl.cpp:2189-2197.
+        self.purge_unreferenced_tx_sets()?;
+
         let mut restored = RestoredScpState::default();
 
         // Load transaction sets
@@ -464,12 +478,68 @@ impl ScpPersistenceManager {
 
     /// Clean up old persisted state.
     ///
-    /// Deletes SCP state and transaction sets for slots below the given threshold.
+    /// Deletes SCP state for slots below the given threshold, then purges
+    /// transaction sets no longer referenced by any remaining SCP state.
     pub fn cleanup(&self, min_slot: u64) -> Result<()> {
         self.storage.delete_scp_state_below(min_slot)?;
-        self.storage.delete_tx_sets_below(min_slot)?;
+        self.purge_unreferenced_tx_sets()?;
         debug!("Cleaned up SCP state below slot {}", min_slot);
         Ok(())
+    }
+
+    /// Purge persisted tx sets not referenced by any persisted SCP state.
+    ///
+    /// Mirrors stellar-core's `purgeOldPersistedTxSets()` (`HerderImpl.cpp:2448-2487`).
+    /// Error handling is per-state: if a state fails to decode, we skip it
+    /// (preserving its tx set hashes as potentially referenced) and continue.
+    pub fn purge_unreferenced_tx_sets(&self) -> Result<()> {
+        let all_hashes: std::collections::HashSet<Hash> =
+            self.storage.get_all_tx_set_hashes()?.into_iter().collect();
+        if all_hashes.is_empty() {
+            return Ok(());
+        }
+
+        let mut referenced = std::collections::HashSet::new();
+
+        // Per-state error handling: skip entire state on error.
+        // Matches stellar-core HerderImpl.cpp:2456-2478 per-state try/catch.
+        for (slot, state) in self.storage.load_all_scp_states()? {
+            match Self::extract_tx_set_hashes_from_state(&state) {
+                Ok(hashes) => {
+                    referenced.extend(hashes);
+                }
+                Err(e) => {
+                    warn!(
+                        slot,
+                        "Error extracting tx set hashes from persisted state, skipping: {}", e
+                    );
+                }
+            }
+        }
+
+        let unreferenced: Vec<Hash> = all_hashes.difference(&referenced).cloned().collect();
+        if !unreferenced.is_empty() {
+            debug!(
+                count = unreferenced.len(),
+                "Purging unreferenced persisted tx sets"
+            );
+            self.storage.delete_tx_sets_by_hashes(&unreferenced)?;
+        }
+
+        Ok(())
+    }
+
+    /// Extract all tx set hashes from a persisted slot state.
+    ///
+    /// Returns an error if any envelope in the state cannot be decoded,
+    /// allowing the caller to skip the entire state (per-state error granularity).
+    fn extract_tx_set_hashes_from_state(state: &PersistedSlotState) -> Result<Vec<Hash>> {
+        let mut hashes = Vec::new();
+        for env_result in state.get_envelopes() {
+            let envelope = env_result?;
+            hashes.extend(get_tx_set_hashes(&envelope));
+        }
+        Ok(hashes)
     }
 }
 
@@ -606,11 +676,13 @@ mod tests {
     fn test_persistence_manager() {
         let manager = ScpPersistenceManager::in_memory();
 
-        let envelope = make_test_envelope(100);
         let quorum_set = make_test_quorum_set();
         let qs_hash = Hash([1u8; 32]);
         let tx_hash = Hash([2u8; 32]);
         let tx_set = vec![1, 2, 3];
+
+        // Use an envelope that references the tx set hash
+        let envelope = make_envelope_with_tx_set_hash(100, tx_hash.clone());
 
         // Persist
         manager
@@ -624,7 +696,7 @@ mod tests {
 
         assert_eq!(manager.last_slot_saved(), 100);
 
-        // Restore
+        // Restore (purges unreferenced tx sets, but tx_hash IS referenced)
         let restored = manager.restore_scp_state().unwrap();
         assert_eq!(restored.envelopes.len(), 1);
         assert_eq!(restored.tx_sets.len(), 1);
@@ -655,6 +727,168 @@ mod tests {
         let hash = get_quorum_set_hash(&envelope);
         assert!(hash.is_some());
         assert_eq!(hash.unwrap(), Hash([0u8; 32]));
+    }
+
+    /// Create an envelope whose NOMINATE ballot references a known tx set hash.
+    fn make_envelope_with_tx_set_hash(slot: u64, tx_set_hash: Hash) -> ScpEnvelope {
+        let stellar_value = StellarValue {
+            tx_set_hash: tx_set_hash.clone(),
+            close_time: TimePoint(0),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let value = stellar_value.to_xdr(Limits::none()).unwrap();
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: Hash([0u8; 32]),
+                    votes: vec![Value(value.try_into().unwrap())].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: Signature::default(),
+        }
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_empty_db() {
+        let manager = ScpPersistenceManager::in_memory();
+        // No tx sets at all — should be a no-op.
+        manager.purge_unreferenced_tx_sets().unwrap();
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_deletes_orphans() {
+        let manager = ScpPersistenceManager::in_memory();
+
+        let referenced_hash = Hash([1u8; 32]);
+        let orphan_hash = Hash([2u8; 32]);
+
+        // Persist an SCP state referencing `referenced_hash`
+        let env = make_envelope_with_tx_set_hash(100, referenced_hash.clone());
+        manager
+            .persist_scp_state(100, &[env], &[(referenced_hash.clone(), vec![10])], &[])
+            .unwrap();
+
+        // Also store an orphan tx set not referenced by any envelope
+        manager.storage.save_tx_set(&orphan_hash, &[20]).unwrap();
+
+        // Purge should delete only the orphan
+        manager.purge_unreferenced_tx_sets().unwrap();
+
+        assert!(manager.storage.has_tx_set(&referenced_hash).unwrap());
+        assert!(
+            !manager.storage.has_tx_set(&orphan_hash).unwrap(),
+            "Orphan tx set should have been purged"
+        );
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_all_referenced() {
+        let manager = ScpPersistenceManager::in_memory();
+
+        let hash = Hash([1u8; 32]);
+        let env = make_envelope_with_tx_set_hash(100, hash.clone());
+        manager
+            .persist_scp_state(100, &[env], &[(hash.clone(), vec![10])], &[])
+            .unwrap();
+
+        // No orphans — purge should be a no-op
+        manager.purge_unreferenced_tx_sets().unwrap();
+        assert!(manager.storage.has_tx_set(&hash).unwrap());
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_no_scp_states() {
+        let manager = ScpPersistenceManager::in_memory();
+
+        // Store tx sets but no SCP states — all are orphans
+        let hash = Hash([1u8; 32]);
+        manager.storage.save_tx_set(&hash, &[10]).unwrap();
+
+        manager.purge_unreferenced_tx_sets().unwrap();
+        assert!(
+            !manager.storage.has_tx_set(&hash).unwrap(),
+            "Tx set should be purged when no SCP states reference it"
+        );
+    }
+
+    #[test]
+    fn test_purge_shared_tx_set_across_slots() {
+        let manager = ScpPersistenceManager::in_memory();
+
+        let shared_hash = Hash([1u8; 32]);
+
+        // Two slots reference the same tx set
+        let env1 = make_envelope_with_tx_set_hash(100, shared_hash.clone());
+        let env2 = make_envelope_with_tx_set_hash(101, shared_hash.clone());
+        manager
+            .persist_scp_state(100, &[env1], &[(shared_hash.clone(), vec![10])], &[])
+            .unwrap();
+        manager.persist_scp_state(101, &[env2], &[], &[]).unwrap();
+
+        // Delete slot 100's SCP state
+        manager.storage.delete_scp_state_below(101).unwrap();
+
+        // Purge: the tx set is still referenced by slot 101
+        manager.purge_unreferenced_tx_sets().unwrap();
+        assert!(
+            manager.storage.has_tx_set(&shared_hash).unwrap(),
+            "Shared tx set should not be purged while still referenced"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_deletes_states_and_purges_tx_sets() {
+        let manager = ScpPersistenceManager::in_memory();
+
+        let hash1 = Hash([1u8; 32]);
+        let hash2 = Hash([2u8; 32]);
+
+        // Slot 100 references hash1, slot 200 references hash2
+        let env1 = make_envelope_with_tx_set_hash(100, hash1.clone());
+        let env2 = make_envelope_with_tx_set_hash(200, hash2.clone());
+        manager
+            .persist_scp_state(100, &[env1], &[(hash1.clone(), vec![10])], &[])
+            .unwrap();
+        manager
+            .persist_scp_state(200, &[env2], &[(hash2.clone(), vec![20])], &[])
+            .unwrap();
+
+        // Cleanup with min_slot=200 deletes slot 100's state
+        manager.cleanup(200).unwrap();
+
+        // hash1 is now orphaned (slot 100 state was deleted), hash2 is still referenced
+        assert!(
+            !manager.storage.has_tx_set(&hash1).unwrap(),
+            "hash1 should be purged after its slot state was deleted"
+        );
+        assert!(
+            manager.storage.has_tx_set(&hash2).unwrap(),
+            "hash2 should remain referenced"
+        );
+    }
+
+    #[test]
+    fn test_restore_scp_state_purges_stale_tx_sets() {
+        let manager = ScpPersistenceManager::in_memory();
+
+        // Store a tx set but no SCP state referencing it
+        let orphan_hash = Hash([1u8; 32]);
+        manager.storage.save_tx_set(&orphan_hash, &[10]).unwrap();
+
+        // Restore should purge the orphan before loading
+        let restored = manager.restore_scp_state().unwrap();
+        assert!(
+            restored.tx_sets.is_empty(),
+            "Orphan tx set should not be loaded"
+        );
+        assert!(
+            !manager.storage.has_tx_set(&orphan_hash).unwrap(),
+            "Orphan tx set should be purged from storage"
+        );
     }
 }
 
@@ -756,9 +990,15 @@ impl ScpStatePersistence for SqliteScpPersistence {
         self.inner.has_tx_set(hash).map_err(HerderError::Internal)
     }
 
-    fn delete_tx_sets_below(&self, slot: u64) -> Result<()> {
+    fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>> {
         self.inner
-            .delete_tx_sets_below(slot)
+            .get_all_tx_set_hashes()
+            .map_err(HerderError::Internal)
+    }
+
+    fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<()> {
+        self.inner
+            .delete_tx_sets_by_hashes(hashes)
             .map_err(HerderError::Internal)
     }
 }

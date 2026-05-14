@@ -119,6 +119,14 @@ const DEFAULT_CHECKPOINT_FREQUENCY: u64 = 64;
 /// nodes to fetch historical sets they missed.
 const PENDING_TX_SET_MAX_AGE_SECS: u64 = 120;
 
+/// Interval for garbage-collecting unreferenced persisted transaction sets.
+///
+/// Parity: stellar-core `Herder.cpp:22` — `TX_SET_GC_DELAY = 1 minute`.
+/// Not yet used by a runtime timer (persistence manager is not wired into
+/// the production lifecycle loop). Defined here for parity documentation.
+#[allow(dead_code)]
+pub const TX_SET_GC_DELAY_SECS: u64 = 60;
+
 /// Result of receiving an SCP envelope.
 ///
 /// Indicates what happened when the Herder processed an incoming SCP envelope.

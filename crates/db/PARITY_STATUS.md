@@ -123,7 +123,7 @@ Corresponds to: `PersistentState.h` SCP-state methods
 | `getTxSetHashesForAllSlots()` | Derived by loading full tx sets | Partial |
 | `setSCPStateV1ForSlot()` | `save_scp_slot_state()` + `save_tx_set_data()` | Full |
 | `hasTxSet()` | `ScpStatePersistenceQueries::has_tx_set_data()` | Full |
-| `deleteTxSets()` | `delete_old_tx_set_data()` no-op | Partial |
+| `deleteTxSets()` | `delete_tx_sets_by_hashes()` | Full |
 
 ### peer records (`src/queries/peers.rs`, `src/database/network.rs`)
 
@@ -189,7 +189,7 @@ Features not yet implemented. These ARE counted against parity %.
 |------------------------|----------|-------|
 | `HerderPersistence::getNodeQuorumSet()` | Medium | Missing `quoruminfo`-style node-to-quorum-set lookup |
 | `PersistentState::getTxSetHashesForAllSlots()` | Low | Requires loading full tx sets instead of a hash-only query |
-| `PersistentState::deleteTxSets()` | Low | Current cleanup hook is a no-op |
+| ~~`PersistentState::deleteTxSets()`~~ | ~~Low~~ | ~~Implemented via `delete_tx_sets_by_hashes()`~~ |
 
 ## Architectural Differences
 

@@ -126,7 +126,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `verifyEnvelope()` | `scp_driver.verify_envelope()` | Full |
 | `signEnvelope()` | `scp_driver.sign_envelope()` | Full |
 | `verifyStellarValueSignature()` | `scp_driver.verify_stellar_value_signature()` | Full |
-| `startTxSetGCTimer()` | _(handled differently)_ | None |
+| `startTxSetGCTimer()` | `ScpPersistenceManager::purge_unreferenced_tx_sets()` | Partial |
 | `recomputeKeysToFilter()` | _(not implemented)_ | None |
 
 ### SCP Driver (`scp_driver.rs`)
@@ -515,7 +515,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `maxScaledLedgerResources()` | Low | Removed during simplification; re-add if needed |
 | `getTotalResourcesToFlood()` | Low | Flood resource tracking |
 | `stateChanged()` | Low | SCP state change callback |
-| `startTxSetGCTimer()` | Low | Tx set garbage collection |
+| `startTxSetGCTimer()` | Medium | GC logic implemented; periodic timer not yet wired |
 
 ## Architectural Differences
 
