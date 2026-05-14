@@ -819,6 +819,32 @@ impl Herder {
         LastExternalizedLedger::new(self.tracking_slot().get().saturating_sub(1))
     }
 
+    /// INV-H2: Assert that the ledger manager's LCL is not ahead of consensus tracking.
+    ///
+    /// Panics (process-fatal in release via `panic = "abort"`) if violated.
+    /// Mirrors stellar-core's `trackingConsensusLedgerIndex()` (HerderImpl.cpp:170-178)
+    /// which throws on `lcl > mTrackingSCP.mConsensusIndex`.
+    ///
+    /// No-op when not in Tracking state or at genesis (tracking_slot == 0), since
+    /// during Booting/Syncing/catchup the LM legitimately advances before tracking.
+    fn assert_lcl_consistency(&self) {
+        if !self.is_tracking() {
+            return;
+        }
+        let tracking = self.tracking_slot().get();
+        if tracking == 0 {
+            return;
+        }
+        let consensus_idx = tracking - 1;
+        let lcl_seq = self.ledger_manager.current_ledger_seq() as u64;
+        assert!(
+            lcl_seq <= consensus_idx,
+            "INV-H2 FATAL: LCL ({lcl_seq}) is ahead of tracking consensus index \
+             ({consensus_idx}). Unrecoverable state divergence between consensus \
+             and ledger-manager."
+        );
+    }
+
     /// Get the tracking consensus close time.
     /// Matches stellar-core `HerderImpl::trackingConsensusCloseTime()`.
     pub fn tracking_consensus_close_time(&self) -> u64 {
@@ -2037,6 +2063,10 @@ impl Herder {
         // equivalent condition; henyey evaluates it earlier (pre-build) AND
         // post-build to cover both "stale at entry" and "LCL advanced during
         // build" cases. LM=None proceeds (preserves existing tests).
+        //
+        // INV-H2 (parity: HerderImpl.cpp:1246-1248 setupTriggerNextLedger):
+        // Fatal if LCL has overtaken tracking consensus index.
+        self.assert_lcl_consistency();
         if !self.lcl_matches_slot(slot) {
             tracing::warn!(
                 requested_slot = slot,
@@ -2325,6 +2355,12 @@ impl Herder {
 
         // Purge stale pending envelopes for slots behind the closed ledger.
         self.pending_envelopes.purge_slots_below(slot);
+
+        // INV-H2 (parity: HerderImpl.cpp:1228-1229 lastClosedLedgerIncreased):
+        // After all close bookkeeping, verify LCL hasn't overtaken tracking.
+        // Uses `<=` form (not strict equality) because during multi-slot apply
+        // bursts, tracking may be ahead of LCL for intermediate slots.
+        self.assert_lcl_consistency();
     }
 
     /// Clear the closing gate and discard buffered envelopes.
@@ -2357,6 +2393,9 @@ impl Herder {
         // Defensive entry check: if LCL is not at `slot - 1`, the slot is
         // stale before we even consult the cache or rebuild. Mirrors the
         // pre-build entry check in `trigger_next_ledger`.
+        //
+        // INV-H2: Fatal if LCL has overtaken tracking consensus index.
+        self.assert_lcl_consistency();
         if !self.lcl_matches_slot(slot) {
             tracing::warn!(
                 slot,
@@ -7069,6 +7108,166 @@ mod tests {
              is_current_ledger path returns FullyValidated which does not \
              clear the slot's fully_validated flag"
         );
+    }
+}
+
+#[cfg(test)]
+mod inv_h2_lcl_guard_tests {
+    use super::*;
+    use henyey_crypto::SecretKey;
+
+    fn make_lm_at_seq(ledger_seq: u32) -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
+    fn make_tracking_herder_at(lm_seq: u32, tracking_slot: u64) -> Herder {
+        let lm = make_lm_at_seq(lm_seq);
+        let config = HerderConfig::default();
+        let herder = Herder::new(config, lm);
+        // Set to Tracking state with given consensus_index
+        {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
+            *state = HerderState::Tracking;
+        }
+        {
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &herder.tracking_state);
+            ts.is_tracking = true;
+            ts.consensus_index = tracking_slot;
+        }
+        herder
+    }
+
+    #[test]
+    fn test_assert_lcl_consistency_passes_when_lcl_equals_tracking() {
+        // LCL=5, tracking_slot=6 (consensus_idx=5) → LCL == consensus_idx → OK
+        let herder = make_tracking_herder_at(5, 6);
+        herder.assert_lcl_consistency(); // should not panic
+    }
+
+    #[test]
+    fn test_assert_lcl_consistency_passes_when_lcl_behind_tracking() {
+        // LCL=3, tracking_slot=6 (consensus_idx=5) → LCL < consensus_idx → OK
+        let herder = make_tracking_herder_at(3, 6);
+        herder.assert_lcl_consistency(); // should not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "INV-H2 FATAL")]
+    fn test_assert_lcl_consistency_fires_when_lcl_ahead_of_tracking() {
+        // LCL=6, tracking_slot=6 (consensus_idx=5) → LCL > consensus_idx → PANIC
+        let herder = make_tracking_herder_at(6, 6);
+        herder.assert_lcl_consistency();
+    }
+
+    #[test]
+    fn test_assert_lcl_consistency_skips_when_not_tracking() {
+        // Herder in Booting state — assertion should be a no-op even with bad values
+        let lm = make_lm_at_seq(10);
+        let config = HerderConfig::default();
+        let herder = Herder::new(config, lm);
+        // State is Booting by default, tracking_slot=0
+        herder.assert_lcl_consistency(); // should not panic
+    }
+
+    #[test]
+    fn test_assert_lcl_consistency_skips_at_genesis() {
+        // Tracking state but tracking_slot=0 (genesis sentinel)
+        let lm = make_lm_at_seq(5);
+        let config = HerderConfig::default();
+        let herder = Herder::new(config, lm);
+        {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
+            *state = HerderState::Tracking;
+        }
+        {
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &herder.tracking_state);
+            ts.is_tracking = true;
+            ts.consensus_index = 0;
+        }
+        herder.assert_lcl_consistency(); // should not panic (genesis sentinel)
+    }
+
+    #[test]
+    fn test_assert_lcl_consistency_in_trigger_next_ledger_normal() {
+        // Verify that trigger_next_ledger calls assert_lcl_consistency without
+        // panicking in normal operation (LCL=5, tracking=6, trigger slot=6).
+        let seed = [42u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let node_id = node_id_from_public_key(&public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let lm = make_lm_at_seq(5);
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(config, secret, lm);
+        {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
+            *state = HerderState::Tracking;
+        }
+        {
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &herder.tracking_state);
+            ts.is_tracking = true;
+            ts.consensus_index = 6;
+        }
+        // trigger_next_ledger(6) should pass the INV-H2 check (LCL=5, consensus_idx=5)
+        // It will proceed past the assertion and hit lcl_matches_slot (LCL+1=6==slot=6 → true)
+        // Then it will try to build nomination value (which may return None in test context)
+        let _ = herder.trigger_next_ledger(6);
+        // If we get here without panic, INV-H2 assertion passed
     }
 }
 
