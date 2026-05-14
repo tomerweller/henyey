@@ -260,6 +260,10 @@ for a in alarms:
     if not isinstance(v, int) or v < 1:
         print(f'ERROR: Invalid baseline_version for alarm {name}: {v!r} (must be integer >= 1)', file=sys.stderr)
         sys.exit(2)
+    se = a.get('silence_expected')
+    if se is not None and not isinstance(se, bool):
+        print(f'ERROR: Invalid silence_expected for alarm {name}: {se!r} (must be boolean)', file=sys.stderr)
+        sys.exit(2)
     versions[name] = v
 
 print(json.dumps(versions, sort_keys=True))

@@ -6009,6 +6009,46 @@ print(json.dumps(d))
       "lost=$se_absent_has_lost output: ${se_absent_out:0:300}"
   fi
 
+  # Test: malformed silence_expected (non-boolean) exits 2
+  local se_bad_root="$replay_root/silence-expected-bad"
+  mkdir -p "$se_bad_root/session/metrics"
+  local se_bad_catalog="$se_bad_root/bad-catalog.toml"
+  cat > "$se_bad_catalog" << 'SE_BAD_CAT'
+schema_version = 1
+
+[[alarm]]
+name = "lost-sync"
+silence_expected = "yes"
+metric = "stellar_herder_lost_sync_total"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "SYNC"
+gates = ["warmup-2-ticks"]
+cooldown_key = "stellar_herder_lost_sync_total"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_herder_lost_sync_total — delta={value}"
+filing_search = "metrics: stellar_herder_lost_sync_total"
+summary = "Herder lost sync"
+details = "delta={value}"
+SE_BAD_CAT
+  local se_bad_current='{"schema_version":1,"evaluated_ticks":200,"skipped_ticks":10,"error_ticks":0,"total_snapshots":210,"first_ts":"t1","last_ts":"t2","alarms":{"lost-sync":{"firing":10,"breach":0,"ok":180,"baseline":0,"skip":10}}}'
+  echo "$se_bad_current" > "$se_bad_root/session/metrics/current.json"
+  local se_bad_exit=0
+  local se_bad_out
+  se_bad_out=$("$REPO_ROOT/scripts/dev/check-alarm-regression.sh" --no-file \
+    "$se_bad_root/session" --current "$se_bad_root/session/metrics/current.json" \
+    --catalog "$se_bad_catalog" 2>&1) || se_bad_exit=$?
+  if [[ "$se_bad_exit" -eq 2 ]] && echo "$se_bad_out" | grep -qi "silence_expected"; then
+    tap_ok "silence_expected: malformed value (string) exits 2"
+  else
+    tap_not_ok "silence_expected: malformed value (string) exits 2" \
+      "exit=$se_bad_exit output: ${se_bad_out:0:300}"
+  fi
+  rm -rf "$se_bad_root"
+
   rm -rf "$se_root"
 
   # ── check-alarm-regression.sh per-alarm versioning tests (#2640) ────────────
