@@ -421,7 +421,7 @@ impl TransactionSet {
     fn prepare_generalized_for_apply(
         gen: &GeneralizedTransactionSet,
     ) -> std::result::Result<Self, String> {
-        validate_generalized_tx_set_xdr_structure(gen)?;
+        validate_generalized_tx_set_xdr_structure(gen).map_err(|e| e.to_string())?;
 
         let GeneralizedTransactionSet::V1(v1) = gen;
 
@@ -580,19 +580,73 @@ impl PreparedTransactionSet {
 /// Maximum allowed Soroban resource fee (2^50), matching upstream MAX_RESOURCE_FEE.
 const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
 
+/// Typed error for structural XDR validation of generalized transaction sets.
+///
+/// Covers the structural validation path (`validate_generalized_tx_set_xdr_structure`
+/// and sub-validators). Content-level validation uses [`TxSetValidationResult`]
+/// instead.
+///
+/// Parity: mirrors the structural subset of stellar-core's validation result
+/// codes in `TxSetFrame.h`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxSetStructureError {
+    /// Expected exactly 2 phases (classic + Soroban).
+    WrongPhaseCount { actual: usize },
+    /// Parallel phase found at non-Soroban position.
+    NonSorobanParallelPhase { phase_index: usize },
+    /// Component with no transactions in sequential phase.
+    EmptyComponent,
+    /// Components not in ascending base-fee order, or duplicate base fees.
+    IncorrectComponentOrder,
+    /// Component has a negative base fee.
+    NegativeBaseFee,
+    /// Empty execution stage in parallel phase.
+    EmptyStage,
+    /// Empty cluster in parallel phase.
+    EmptyCluster,
+    /// Clusters within a stage not in canonical order.
+    ClusterOrderViolation,
+    /// Stages not in canonical order.
+    StageOrderViolation,
+}
+
+impl std::fmt::Display for TxSetStructureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongPhaseCount { actual } => {
+                write!(f, "WRONG_PHASE_COUNT: expected 2, got {actual}")
+            }
+            Self::NonSorobanParallelPhase { phase_index } => {
+                write!(
+                    f,
+                    "NON_SOROBAN_PARALLEL_PHASE: parallel phase at index {phase_index}"
+                )
+            }
+            Self::EmptyComponent => write!(f, "EMPTY_COMPONENT"),
+            Self::IncorrectComponentOrder => write!(f, "INCORRECT_COMPONENT_ORDER"),
+            Self::NegativeBaseFee => write!(f, "NEGATIVE_BASE_FEE"),
+            Self::EmptyStage => write!(f, "EMPTY_STAGE"),
+            Self::EmptyCluster => write!(f, "EMPTY_CLUSTER"),
+            Self::ClusterOrderViolation => write!(f, "CLUSTER_ORDER_VIOLATION"),
+            Self::StageOrderViolation => write!(f, "STAGE_ORDER_VIOLATION"),
+        }
+    }
+}
+
+impl std::error::Error for TxSetStructureError {}
+
 /// Validate the XDR structure of a GeneralizedTransactionSet.
 ///
 /// Mirrors upstream `validateTxSetXDRStructure`.
 fn validate_generalized_tx_set_xdr_structure(
     gen: &GeneralizedTransactionSet,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), TxSetStructureError> {
     let GeneralizedTransactionSet::V1(v1) = gen;
 
     if v1.phases.len() != 2 {
-        return Err(format!(
-            "Expected exactly 2 phases, got {}",
-            v1.phases.len()
-        ));
+        return Err(TxSetStructureError::WrongPhaseCount {
+            actual: v1.phases.len(),
+        });
     }
 
     for (phase_id, phase) in v1.phases.iter().enumerate() {
@@ -602,7 +656,9 @@ fn validate_generalized_tx_set_xdr_structure(
             }
             TransactionPhase::V1(parallel) => {
                 if phase_id != 1 {
-                    return Err(format!("Non-Soroban parallel phase at index {}", phase_id));
+                    return Err(TxSetStructureError::NonSorobanParallelPhase {
+                        phase_index: phase_id,
+                    });
                 }
                 validate_parallel_component(parallel)?;
             }
@@ -615,7 +671,7 @@ fn validate_generalized_tx_set_xdr_structure(
 /// Validate the XDR structure of a sequential (V0) phase.
 fn validate_sequential_phase_xdr_structure(
     components: &[TxSetComponent],
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), TxSetStructureError> {
     let is_sorted = components.windows(2).all(|pair| {
         let fee_a = match &pair[0] {
             TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => c.base_fee,
@@ -631,19 +687,19 @@ fn validate_sequential_phase_xdr_structure(
         }
     });
     if !is_sorted {
-        return Err("Incorrect component order or duplicate base fees".to_string());
+        return Err(TxSetStructureError::IncorrectComponentOrder);
     }
 
     for component in components {
         match component {
             TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
                 if comp.txs.is_empty() {
-                    return Err("Empty component in sequential phase".to_string());
+                    return Err(TxSetStructureError::EmptyComponent);
                 }
                 // Reject negative base fees (parity: TxSetFrame.cpp:1442)
                 if let Some(fee) = comp.base_fee {
                     if fee < 0 {
-                        return Err("Component has negative base fee".to_string());
+                        return Err(TxSetStructureError::NegativeBaseFee);
                     }
                 }
             }
@@ -656,20 +712,20 @@ fn validate_sequential_phase_xdr_structure(
 /// Validate the structure of a parallel (V1) phase component.
 fn validate_parallel_component(
     parallel: &stellar_xdr::curr::ParallelTxsComponent,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), TxSetStructureError> {
     // Reject negative base fees (parity: TxSetFrame.cpp:1480)
     if let Some(fee) = parallel.base_fee {
         if fee < 0 {
-            return Err("Parallel component has negative base fee".to_string());
+            return Err(TxSetStructureError::NegativeBaseFee);
         }
     }
     for stage in parallel.execution_stages.iter() {
         if stage.is_empty() {
-            return Err("Empty stage in parallel phase".to_string());
+            return Err(TxSetStructureError::EmptyStage);
         }
         for cluster in stage.iter() {
             if cluster.is_empty() {
-                return Err("Empty cluster in parallel phase".to_string());
+                return Err(TxSetStructureError::EmptyCluster);
             }
         }
     }
@@ -679,15 +735,11 @@ fn validate_parallel_component(
     // (Matches C++ std::is_sorted with hashTxSorter strict-less-than comparator.)
     for stage in parallel.execution_stages.iter() {
         if !is_nondecreasing_by_xdr_hash(stage.as_slice(), |cluster| &cluster[0]) {
-            return Err(
-                "Clusters within stage are not in canonical order (by first-TX hash)".to_string(),
-            );
+            return Err(TxSetStructureError::ClusterOrderViolation);
         }
     }
     if !is_nondecreasing_by_xdr_hash(parallel.execution_stages.as_slice(), |stage| &stage[0][0]) {
-        return Err(
-            "Stages are not in canonical order (by first-TX-of-first-cluster hash)".to_string(),
-        );
+        return Err(TxSetStructureError::StageOrderViolation);
     }
 
     Ok(())
@@ -1205,7 +1257,10 @@ mod tests {
         )]);
         let result = validate_generalized_tx_set_xdr_structure(&one_phase);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("2 phases"));
+        assert!(matches!(
+            result.unwrap_err(),
+            TxSetStructureError::WrongPhaseCount { actual: 1 }
+        ));
 
         // 3 phases → should fail
         let three_phases = make_gen_tx_set(vec![
@@ -1244,7 +1299,10 @@ mod tests {
         ]);
         let result = validate_generalized_tx_set_xdr_structure(&gen);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Non-Soroban parallel phase"));
+        assert!(matches!(
+            result.unwrap_err(),
+            TxSetStructureError::NonSorobanParallelPhase { phase_index: 0 }
+        ));
     }
 
     // =========================================================================
@@ -1262,7 +1320,10 @@ mod tests {
         };
         let result = validate_parallel_component(&parallel);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Empty stage"));
+        assert!(matches!(
+            result.unwrap_err(),
+            TxSetStructureError::EmptyStage
+        ));
     }
 
     #[test]
@@ -1280,7 +1341,10 @@ mod tests {
         };
         let result = validate_parallel_component(&parallel);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Empty cluster"));
+        assert!(matches!(
+            result.unwrap_err(),
+            TxSetStructureError::EmptyCluster
+        ));
     }
 
     #[test]
@@ -1307,9 +1371,10 @@ mod tests {
 
         let result = validate_parallel_component(&parallel);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Clusters within stage are not in canonical order"));
+        assert!(matches!(
+            result.unwrap_err(),
+            TxSetStructureError::ClusterOrderViolation
+        ));
     }
 
     #[test]
@@ -1332,9 +1397,10 @@ mod tests {
 
         let result = validate_parallel_component(&parallel);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Stages are not in canonical order"));
+        assert!(matches!(
+            result.unwrap_err(),
+            TxSetStructureError::StageOrderViolation
+        ));
     }
 
     #[test]
@@ -1410,7 +1476,7 @@ mod tests {
         let result = validate_sequential_phase_xdr_structure(&components);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("negative base fee"),
+            matches!(result.unwrap_err(), TxSetStructureError::NegativeBaseFee),
             "should reject negative base fee"
         );
     }
@@ -1433,7 +1499,7 @@ mod tests {
         let result = validate_parallel_component(&parallel);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("negative base fee"),
+            matches!(result.unwrap_err(), TxSetStructureError::NegativeBaseFee),
             "should reject negative base fee"
         );
     }
@@ -1464,7 +1530,10 @@ mod tests {
         ]);
         let result = validate_generalized_tx_set_xdr_structure(&gen);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("negative base fee"));
+        assert!(matches!(
+            result.unwrap_err(),
+            TxSetStructureError::NegativeBaseFee
+        ));
     }
 
     // =========================================================================

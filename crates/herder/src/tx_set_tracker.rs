@@ -278,8 +278,23 @@ impl TxSetTracker {
     }
 
     /// Store a validity result. Uses random-two-choice eviction at capacity.
-    pub fn store_valid(&self, key: (Hash256, Hash256, u64), valid: bool) {
-        self.valid_cache.lock().put(key, valid);
+    ///
+    /// Returns the previous cached value for this key, if any.
+    /// Emits a warning when a previously-invalid entry is overwritten with valid
+    /// (false→true flip), per HERDER_SPEC INV-H8 detection.
+    pub fn store_valid(&self, key: (Hash256, Hash256, u64), valid: bool) -> Option<bool> {
+        let mut cache = self.valid_cache.lock();
+        let previous = cache.get(&key).copied();
+        if let Some(false) = previous {
+            if valid {
+                warn!(
+                    ?key,
+                    "tx set valid cache flip: false→true (INV-H8 detection)"
+                );
+            }
+        }
+        cache.put(key, valid);
+        previous
     }
 
     /// Clear validity cache. Called on externalization, NOT during trim.
@@ -578,6 +593,26 @@ mod tests {
         assert_eq!(tracker.sizes().valid_cache, TXSET_VALID_CACHE_SIZE);
         // Verify the overwritten value is accessible
         assert_eq!(tracker.check_valid(&(lcl, first_key_hash, 0)), Some(false));
+    }
+
+    #[test]
+    fn test_store_valid_returns_previous_value() {
+        let tracker = TxSetTracker::new(256);
+        let lcl = Hash256::from_bytes([0; 32]);
+        let key_hash = Hash256::from_bytes([1; 32]);
+        let key = (lcl, key_hash, 0u64);
+
+        // First store: no previous value
+        assert_eq!(tracker.store_valid(key, true), None);
+
+        // Overwrite true→true: previous is true
+        assert_eq!(tracker.store_valid(key, true), Some(true));
+
+        // Overwrite true→false: previous is true
+        assert_eq!(tracker.store_valid(key, false), Some(true));
+
+        // Overwrite false→true (INV-H8 flip): previous is false
+        assert_eq!(tracker.store_valid(key, true), Some(false));
     }
 
     /// Regression test for AUDIT-080: unsolicited tx sets must not be cached.

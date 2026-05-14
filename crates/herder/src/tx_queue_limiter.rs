@@ -58,6 +58,10 @@ fn scale_resource(resource: &Resource, multiplier: i64) -> Resource {
 
 /// Computes the minimum fee needed to beat a previously evicted transaction.
 ///
+/// Parity: mirrors stellar-core `TxQueueLimiter::computeBetterFee` in
+/// `TxQueueLimiter.cpp:17-27`. Uses strict fee-rate comparison (not
+/// FEE_MULTIPLIER, which belongs to replace-by-fee in TransactionQueue).
+///
 /// Returns 0 if the new transaction already has a better fee rate than the evicted one.
 fn compute_better_fee(evicted_fee: &FeeRate, new_fee_rate: &FeeRate) -> i64 {
     if evicted_fee.op_count() == 0 {

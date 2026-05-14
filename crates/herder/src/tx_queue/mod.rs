@@ -511,7 +511,7 @@ impl AccountState {
 const FEE_MULTIPLIER: u64 = 10;
 
 /// Default pending depth (number of ledgers before auto-ban).
-/// Spec: HERDER_SPEC §16 — TRANSACTION_QUEUE_TIMEOUT_LEDGERS = 4.
+/// Spec: HERDER_SPEC §17 — TRANSACTION_QUEUE_TIMEOUT_LEDGERS = 4.
 const DEFAULT_PENDING_DEPTH: u32 = 4;
 
 pub(super) fn envelope_fee_per_op(envelope: &TransactionEnvelope) -> Option<(u64, FeeRate)> {
@@ -2699,6 +2699,8 @@ impl TransactionQueue {
         // Invalidate all eviction state (seed + queues + thresholds) for the
         // new ledger. Parity: stellar-core regenerates mBroadcastSeed in shift()
         // and calls resetBestFeeTxs() with the new seed.
+        // HERDER_SPEC §12.4: mBroadcastSeed reseeding on shift() — covered here
+        // by invalidate_all_eviction_state() which regenerates the seed.
         self.invalidate_all_eviction_state(&mut store);
 
         // Clean up seen set for evicted transactions

@@ -1217,6 +1217,12 @@ pub enum TxSetValidationResult {
 
     // Individual transaction validation
     TxValidationFailed,
+
+    // Missing spec codes — added for HERDER_SPEC §9 parity.
+    /// Previous ledger hash does not match the expected LCL hash.
+    PreviousLedgerHashMismatch,
+    /// Multiple transactions from the same source account in the set.
+    MultipleTxsPerSourceAccount,
 }
 
 impl std::fmt::Display for TxSetValidationResult {
@@ -1248,6 +1254,10 @@ impl std::fmt::Display for TxSetValidationResult {
             Self::ComponentBaseFeeTooLow => write!(f, "COMPONENT_BASE_FEE_TOO_LOW"),
             Self::TxFeeBidTooLow => write!(f, "TX_FEE_BID_TOO_LOW"),
             Self::TxValidationFailed => write!(f, "TX_VALIDATION_FAILED"),
+            Self::PreviousLedgerHashMismatch => write!(f, "PREVIOUS_LEDGER_HASH_MISMATCH"),
+            Self::MultipleTxsPerSourceAccount => {
+                write!(f, "MULTIPLE_TXS_PER_SOURCE_ACCOUNT")
+            }
         }
     }
 }

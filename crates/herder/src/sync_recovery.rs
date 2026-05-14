@@ -59,11 +59,13 @@ use henyey_scp::SlotIndex;
 pub const CONSENSUS_STUCK_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Interval for out-of-sync recovery attempts.
-/// Spec: HERDER_SPEC §16 — OUT_OF_SYNC_RECOVERY_TIMER = 10 seconds.
+/// Spec: HERDER_SPEC §17 — OUT_OF_SYNC_RECOVERY_TIMER = 10 seconds.
 pub const OUT_OF_SYNC_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Maximum number of slots to keep ahead when purging during recovery.
-/// Spec: HERDER_SPEC §16 — LEDGER_VALIDITY_BRACKET = 100.
+/// Spec: HERDER_SPEC §17 — LEDGER_VALIDITY_BRACKET = 100.
+/// Note: the spec text says 64, but stellar-core uses 100 (verified in
+/// Herder.h:LEDGER_VALIDITY_BRACKET). The spec value is a known spec bug.
 pub const LEDGER_VALIDITY_BRACKET: u64 = 100;
 
 /// Commands sent to the sync recovery manager.
@@ -576,7 +578,7 @@ mod tests {
         assert_eq!(
             OUT_OF_SYNC_RECOVERY_INTERVAL,
             Duration::from_secs(10),
-            "HERDER_SPEC §3.4: OUT_OF_SYNC_RECOVERY_INTERVAL must be 10 seconds"
+            "HERDER_SPEC §17: OUT_OF_SYNC_RECOVERY_INTERVAL must be 10 seconds"
         );
     }
 
@@ -584,7 +586,7 @@ mod tests {
     fn test_ledger_validity_bracket_is_100() {
         assert_eq!(
             LEDGER_VALIDITY_BRACKET, 100,
-            "HERDER_SPEC §3.4: LEDGER_VALIDITY_BRACKET must be 100"
+            "HERDER_SPEC §17: LEDGER_VALIDITY_BRACKET must be 100 (spec text says 64, but stellar-core uses 100)"
         );
     }
 }

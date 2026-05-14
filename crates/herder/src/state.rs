@@ -76,7 +76,7 @@ impl HerderState {
 
     /// Check if a transition from the current state to `new_state` is allowed.
     ///
-    /// Spec: HERDER_SPEC §3.2 — forbidden transitions:
+    /// Spec: HERDER_SPEC §4 — forbidden transitions:
     /// - TRACKING → BOOTING
     /// - SYNCING → BOOTING
     pub fn can_transition_to(&self, new_state: HerderState) -> bool {
