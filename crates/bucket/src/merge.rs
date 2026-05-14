@@ -799,6 +799,8 @@ fn is_shadowed(entry: &BucketEntry, cursors: &mut [ShadowCursor<'_>]) -> Result<
 ///
 /// Returns `Ok(Some(entry))` if the entry should be emitted, or `Ok(None)` if shadowed.
 /// When `shadow_cursors` is empty, this always returns `Some(entry)`.
+///
+/// Spec: BUCKETLISTDB_SPEC §6.3 — shadow-aware entry filtering.
 fn maybe_put(
     entry: BucketEntry,
     shadow_cursors: &mut [ShadowCursor<'_>],
@@ -819,6 +821,8 @@ fn maybe_put(
 }
 
 /// Check if an entry should be kept in the merged output.
+///
+/// Spec: BUCKETLISTDB_SPEC §6.6 — tombstone elision.
 fn should_keep_entry(entry: &BucketEntry, keep_dead_entries: DeadEntryPolicy) -> bool {
     match entry {
         BucketEntry::Deadentry(_) => keep_dead_entries.should_keep(),
@@ -848,6 +852,8 @@ fn maybe_normalize_entry(entry: BucketEntry, normalize: InitEntryPolicy) -> Buck
 /// Merge two entries with the same key.
 ///
 /// Returns the merged entry, or None if the entry should be removed.
+///
+/// Spec: BUCKETLISTDB_SPEC §6.4 — merge two entries with same key per CAP-0020.
 ///
 /// Merge semantics per CAP-0020:
 /// - INITENTRY + DEADENTRY → Both annihilated (nothing output)
@@ -1057,10 +1063,11 @@ fn extract_metadata(entries: &[BucketEntry]) -> Option<BucketMetadata> {
 ///   Matches stellar-core's `LiveBucket::mergeInMemory` (`LiveBucket.cpp:569`).
 ///   Used for level-0 merges.
 ///
-/// NOTE (BUCKETLISTDB_SPEC §7.2): stellar-core also includes shadow bucket
-/// versions in the max calculation. Since shadow filtering was removed in
-/// protocol 12, and henyey only supports protocol 24+, shadow versions are
-/// never present and can be safely ignored here.
+/// NOTE (BUCKETLISTDB_SPEC §6.1 / §7.2 / INV-B4): stellar-core also includes
+/// shadow bucket versions in the max calculation. Since shadow filtering was
+/// removed in protocol 12, and henyey only supports protocol 24+, shadow
+/// versions are never present and can be safely ignored here. Textually
+/// divergent from spec but correct under P24+ scope.
 fn build_output_metadata(
     old_meta: Option<&BucketMetadata>,
     new_meta: Option<&BucketMetadata>,

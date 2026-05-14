@@ -68,6 +68,15 @@ pub enum FutureBucketState {
 /// Key identifying a unique merge operation.
 ///
 /// Used to deduplicate concurrent merge requests for the same inputs.
+///
+/// Spec: BUCKETLISTDB_SPEC §7.3 — MergeKey intentionally omits shadowHashes,
+/// normalize_init, and protocol_version fields present in stellar-core's MergeKey.
+/// Shadow buckets were removed in protocol 12; henyey supports P24+ only, so shadow
+/// vectors are always empty and excluded from merge identity. The normalize_init and
+/// protocol_version fields are predictable under P24+ scope. This P24+ scope waiver
+/// applies to all merge-key consumers: FutureBucket::merge_key(),
+/// prepare_with_normalization, and HAS restart paths.
+/// See also: bucket_list.rs shadow_buckets construction (merge filtering only).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MergeKey {
     /// Whether tombstone entries are kept (level < 10).
@@ -396,7 +405,7 @@ impl FutureBucket {
                 let hash = Hash256::from_hex(&output_hash).map_err(|e| {
                     BucketError::Serialization(format!("invalid output hash: {}", e))
                 })?;
-                Ok(Self {
+                let fb = Self {
                     state: FutureBucketState::HashOutput,
                     input_curr: None,
                     input_snap: None,
@@ -408,7 +417,9 @@ impl FutureBucket {
                     protocol_version: 0,
                     keep_tombstones: DeadEntryPolicy::Keep,
                     normalize_init: InitEntryPolicy::Preserve,
-                })
+                };
+                fb.check_state()?;
+                Ok(fb)
             }
             FutureBucketState::HashInputs => {
                 let curr_hash = snapshot
@@ -421,7 +432,7 @@ impl FutureBucket {
                     .map_err(|e| BucketError::Serialization(format!("invalid curr hash: {}", e)))?;
                 let snap = Hash256::from_hex(&snap_hash)
                     .map_err(|e| BucketError::Serialization(format!("invalid snap hash: {}", e)))?;
-                Ok(Self {
+                let fb = Self {
                     state: FutureBucketState::HashInputs,
                     input_curr: None,
                     input_snap: None,
@@ -433,7 +444,9 @@ impl FutureBucket {
                     protocol_version: 0,
                     keep_tombstones: DeadEntryPolicy::Keep,
                     normalize_init: InitEntryPolicy::Preserve,
-                })
+                };
+                fb.check_state()?;
+                Ok(fb)
             }
             _ => Err(BucketError::Serialization(format!(
                 "invalid deserialized state: {:?}",
@@ -445,6 +458,113 @@ impl FutureBucket {
     /// Get the current state.
     pub fn state(&self) -> FutureBucketState {
         self.state
+    }
+
+    /// Validate internal field invariants for the current state.
+    ///
+    /// Spec: BUCKETLISTDB_SPEC §7.1 — FutureBucket state validation.
+    /// Enforces the state-field invariant matrix:
+    ///
+    /// | State       | input_curr | input_snap | output | merge_handle | curr_hash | snap_hash | output_hash |
+    /// |-------------|-----------|-----------|--------|-------------|----------|----------|-------------|
+    /// | Clear       | None      | None      | None   | None         | None     | None     | None        |
+    /// | HashOutput  | None      | None      | None   | None         | None     | None     | Some        |
+    /// | HashInputs  | None      | None      | None   | None         | Some     | Some     | None        |
+    /// | LiveOutput  | None      | None      | Some   | None         | *        | *        | Some        |
+    /// | LiveInputs  | Some      | Some      | None   | *            | Some     | Some     | None        |
+    pub fn check_state(&self) -> Result<()> {
+        match self.state {
+            FutureBucketState::Clear => {
+                if self.input_curr.is_some()
+                    || self.input_snap.is_some()
+                    || self.output.is_some()
+                    || self.merge_handle.is_some()
+                    || self.input_curr_hash.is_some()
+                    || self.input_snap_hash.is_some()
+                    || self.output_hash.is_some()
+                {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in Clear state has non-None fields".to_string(),
+                    ));
+                }
+            }
+            FutureBucketState::HashOutput => {
+                if self.input_curr.is_some()
+                    || self.input_snap.is_some()
+                    || self.output.is_some()
+                    || self.merge_handle.is_some()
+                    || self.input_curr_hash.is_some()
+                    || self.input_snap_hash.is_some()
+                {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in HashOutput state has unexpected non-None fields"
+                            .to_string(),
+                    ));
+                }
+                if self.output_hash.is_none() {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in HashOutput state missing output_hash".to_string(),
+                    ));
+                }
+            }
+            FutureBucketState::HashInputs => {
+                if self.input_curr.is_some()
+                    || self.input_snap.is_some()
+                    || self.output.is_some()
+                    || self.merge_handle.is_some()
+                    || self.output_hash.is_some()
+                {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in HashInputs state has unexpected non-None fields"
+                            .to_string(),
+                    ));
+                }
+                if self.input_curr_hash.is_none() || self.input_snap_hash.is_none() {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in HashInputs state missing input hashes".to_string(),
+                    ));
+                }
+            }
+            FutureBucketState::LiveOutput => {
+                if self.input_curr.is_some()
+                    || self.input_snap.is_some()
+                    || self.merge_handle.is_some()
+                {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in LiveOutput state has unexpected input/handle fields"
+                            .to_string(),
+                    ));
+                }
+                if self.output.is_none() {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in LiveOutput state missing output bucket".to_string(),
+                    ));
+                }
+                if self.output_hash.is_none() {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in LiveOutput state missing output_hash".to_string(),
+                    ));
+                }
+            }
+            FutureBucketState::LiveInputs => {
+                if self.output.is_some() || self.output_hash.is_some() {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in LiveInputs state has unexpected output fields".to_string(),
+                    ));
+                }
+                if self.input_curr.is_none() || self.input_snap.is_none() {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in LiveInputs state missing input buckets".to_string(),
+                    ));
+                }
+                if self.input_curr_hash.is_none() || self.input_snap_hash.is_none() {
+                    return Err(BucketError::Merge(
+                        "FutureBucket in LiveInputs state missing input hashes".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Check if this FutureBucket is in a live state (has bucket references).
@@ -603,6 +723,11 @@ impl FutureBucket {
         self.output_hash = Some(hash);
         self.state = FutureBucketState::LiveOutput;
 
+        debug_assert!(
+            self.check_state().is_ok(),
+            "FutureBucket state invalid after finalize_merge"
+        );
+
         bucket
     }
 
@@ -672,6 +797,7 @@ impl FutureBucket {
                 let bucket = load_and_verify(hash, &load_bucket)?;
                 self.output = Some(Arc::new(bucket));
                 self.state = FutureBucketState::LiveOutput;
+                self.check_state()?;
                 Ok(())
             }
             FutureBucketState::HashInputs => {
@@ -714,6 +840,7 @@ impl FutureBucket {
                 self.keep_tombstones = keep_tombstones;
                 self.normalize_init = normalize_init;
                 self.state = FutureBucketState::LiveInputs;
+                self.check_state()?;
                 Ok(())
             }
             FutureBucketState::Clear => Ok(()), // Nothing to do
@@ -1577,6 +1704,164 @@ mod tests {
             fb.state(),
             FutureBucketState::Clear,
             "failed resolve_blocking must transition to Clear"
+        );
+    }
+
+    // ========================================================================
+    // check_state validation tests
+    // ========================================================================
+
+    #[test]
+    fn test_check_state_clear_valid() {
+        let fb = FutureBucket::clear();
+        fb.check_state().expect("Clear state should be valid");
+    }
+
+    #[test]
+    fn test_check_state_hash_output_valid() {
+        let fb = FutureBucket {
+            state: FutureBucketState::HashOutput,
+            input_curr: None,
+            input_snap: None,
+            output: None,
+            merge_handle: None,
+            input_curr_hash: None,
+            input_snap_hash: None,
+            output_hash: Some(Hash256::default()),
+            protocol_version: 0,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
+        };
+        fb.check_state().expect("HashOutput state should be valid");
+    }
+
+    #[test]
+    fn test_check_state_hash_inputs_valid() {
+        let fb = FutureBucket {
+            state: FutureBucketState::HashInputs,
+            input_curr: None,
+            input_snap: None,
+            output: None,
+            merge_handle: None,
+            input_curr_hash: Some(Hash256::default()),
+            input_snap_hash: Some(Hash256::default()),
+            output_hash: None,
+            protocol_version: 0,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
+        };
+        fb.check_state().expect("HashInputs state should be valid");
+    }
+
+    #[test]
+    fn test_check_state_live_output_valid() {
+        let bucket = Bucket::from_entries(vec![]).unwrap();
+        let fb = FutureBucket::from_output(Arc::new(bucket));
+        fb.check_state().expect("LiveOutput state should be valid");
+    }
+
+    #[test]
+    fn test_check_state_clear_with_output_invalid() {
+        let fb = FutureBucket {
+            state: FutureBucketState::Clear,
+            input_curr: None,
+            input_snap: None,
+            output: Some(Arc::new(Bucket::from_entries(vec![]).unwrap())),
+            merge_handle: None,
+            input_curr_hash: None,
+            input_snap_hash: None,
+            output_hash: None,
+            protocol_version: 0,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
+        };
+        assert!(
+            fb.check_state().is_err(),
+            "Clear with output should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_check_state_hash_output_missing_hash() {
+        let fb = FutureBucket {
+            state: FutureBucketState::HashOutput,
+            input_curr: None,
+            input_snap: None,
+            output: None,
+            merge_handle: None,
+            input_curr_hash: None,
+            input_snap_hash: None,
+            output_hash: None,
+            protocol_version: 0,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
+        };
+        assert!(
+            fb.check_state().is_err(),
+            "HashOutput without output_hash should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_check_state_hash_inputs_missing_snap_hash() {
+        let fb = FutureBucket {
+            state: FutureBucketState::HashInputs,
+            input_curr: None,
+            input_snap: None,
+            output: None,
+            merge_handle: None,
+            input_curr_hash: Some(Hash256::default()),
+            input_snap_hash: None,
+            output_hash: None,
+            protocol_version: 0,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
+        };
+        assert!(
+            fb.check_state().is_err(),
+            "HashInputs without snap_hash should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_check_state_live_output_missing_bucket() {
+        let fb = FutureBucket {
+            state: FutureBucketState::LiveOutput,
+            input_curr: None,
+            input_snap: None,
+            output: None,
+            merge_handle: None,
+            input_curr_hash: None,
+            input_snap_hash: None,
+            output_hash: Some(Hash256::default()),
+            protocol_version: 0,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
+        };
+        assert!(
+            fb.check_state().is_err(),
+            "LiveOutput without output bucket should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_check_state_live_inputs_missing_curr() {
+        let fb = FutureBucket {
+            state: FutureBucketState::LiveInputs,
+            input_curr: None,
+            input_snap: Some(Arc::new(Bucket::from_entries(vec![]).unwrap())),
+            output: None,
+            merge_handle: None,
+            input_curr_hash: Some(Hash256::default()),
+            input_snap_hash: Some(Hash256::default()),
+            output_hash: None,
+            protocol_version: 0,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
+        };
+        assert!(
+            fb.check_state().is_err(),
+            "LiveInputs without curr bucket should be invalid"
         );
     }
 }

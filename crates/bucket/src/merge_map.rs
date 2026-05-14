@@ -134,6 +134,10 @@ impl BucketMergeMap {
 
     /// Removes all merge records for outputs not in the given set.
     ///
+    /// Spec: BUCKETLISTDB_SPEC §8.2 (analogue) — retains only merge outputs referenced
+    /// by the current bucket list. Henyey's GC model differs from stellar-core's
+    /// refcount-based approach.
+    ///
     /// This is used for garbage collection when buckets are removed.
     pub fn retain_outputs(&mut self, keep: &HashSet<Hash256>) {
         // Find merge keys to remove
@@ -151,6 +155,9 @@ impl BucketMergeMap {
     }
 
     /// Removes all merge records that produce the given output hash.
+    ///
+    /// Spec: BUCKETLISTDB_SPEC §8.2 (analogue) — removes merge map entries producing
+    /// a given output hash.
     ///
     /// Returns the set of merge keys that were removed.
     /// This is the Rust equivalent of stellar-core `forgetAllMergesProducing`.
@@ -195,6 +202,12 @@ impl BucketMergeMap {
 // ============================================================================
 
 /// Tracks in-progress merge operations for reattachment.
+///
+/// Spec: BUCKETLISTDB_SPEC §7.3 — In-flight merge dedup map.
+/// This type implements the spec's `Hash<MergeKey, shared_future>` pattern but is
+/// not currently wired into the production merge path. Production merges use
+/// `BucketLevel::prepare_with_normalization` → `PendingMerge::Async(AsyncMergeHandle)`
+/// → `BucketMergeMap` for output caching. In-flight dedup is a future optimization.
 ///
 /// This structure holds references to `FutureBucket` instances that are
 /// currently merging, allowing new requests for the same merge to reattach

@@ -705,6 +705,10 @@ impl BucketManager {
 
     /// Delete all bucket files not in the given set of hashes.
     ///
+    /// Spec: BUCKETLISTDB_SPEC §8.2 (analogue) — GC unreferenced buckets.
+    /// Henyey's GC model differs from stellar-core's refcount-based approach
+    /// (BucketManager.cpp:952-1024).
+    ///
     /// This is useful for garbage collection. When `persist_index` is enabled,
     /// also cleans up orphaned `.index` files.
     pub fn retain_buckets(&self, keep: &[Hash256]) -> Result<usize> {
@@ -1306,6 +1310,10 @@ impl BucketManager {
     }
 
     /// Clean up unreferenced merge temp files from the bucket directory.
+    ///
+    /// This is an FS-level supplement to §8.2 (`retain_buckets` + `BucketMergeMap`
+    /// methods are the primary GC path). This method handles stale temp files from
+    /// interrupted merges, not the logical bucket/merge-map GC.
     ///
     /// This method removes `merge-tmp-*.xdr` files that are not in the provided
     /// set of referenced file paths. This is useful for garbage collection during

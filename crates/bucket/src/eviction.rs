@@ -548,6 +548,8 @@ pub fn update_starting_eviction_iterator(
 /// and `BucketListSnapshot::scan_bucket_region`. The `lookup` closure abstracts
 /// over the different entry-lookup methods (`BucketList::get` vs
 /// `BucketListSnapshot::get_result`).
+///
+/// Spec: BUCKETLISTDB_SPEC §12 — eviction scanning.
 pub(crate) fn scan_bucket_region(
     bucket: &Bucket,
     iter: &mut EvictionIterator,
@@ -616,6 +618,10 @@ pub(crate) fn scan_bucket_region(
             }
 
             // Entry is expired — collect as eviction candidate.
+            // Spec: BUCKETLISTDB_SPEC §12.4 — Newest-version replacement for persistent
+            // entries during eviction. Spec says P24+ only (pre-P24 preserved the
+            // older-version bug). Henyey applies unconditionally — correct under P24+
+            // scope. If pre-P24 support were ever added, a version guard would be needed.
             // For persistent entries, archive the NEWEST version from the bucket list.
             let is_temp = is_temporary_entry(live_entry);
             let entry_for_candidate = if !is_temp {

@@ -317,6 +317,14 @@ impl BucketApplicator {
             counters.record_processed();
 
             match entry {
+                // Spec: BUCKETLISTDB_SPEC INV-B12 / §13.1 — In BucketListDB mode, LIVE and
+                // INIT entries are semantically equivalent for catchup apply (both become
+                // Upsert). This is an intentional model divergence from stellar-core's
+                // relational DB applicator, which distinguishes deepest-level LIVE entries
+                // (BucketApplicator.cpp:165-196) and restricts to OFFER-range entries in
+                // non-BucketListDB mode (BucketApplicator.cpp:42-57). Henyey operates
+                // exclusively in BucketListDB mode where all entry types are materialized
+                // from the bucket list.
                 BucketEntry::Liveentry(ledger_entry) | BucketEntry::Initentry(ledger_entry) => {
                     let key = henyey_common::entry_to_key(ledger_entry);
                     // Skip if already seen
