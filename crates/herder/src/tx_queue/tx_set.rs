@@ -526,9 +526,11 @@ impl PreparedTransactionSet {
     /// - Legacy set on protocol >= V20: returns `false` (not valid post-V20)
     /// - Legacy set on protocol < V20: returns `true` (fully validated by
     ///   `prepare_for_apply`)
+    #[allow(clippy::too_many_arguments)]
     pub fn check_valid(
         &self,
         lcl_header: &stellar_xdr::curr::LedgerHeader,
+        lcl_hash: &henyey_common::Hash256,
         close_time_offset: u64,
         network_id: NetworkId,
         soroban_info: Option<&henyey_ledger::SorobanNetworkInfo>,
@@ -550,6 +552,7 @@ impl PreparedTransactionSet {
                 crate::tx_set_utils::check_tx_set_valid(
                     gen,
                     lcl_header,
+                    lcl_hash,
                     close_time_offset,
                     network_id,
                     soroban_info,
@@ -1886,6 +1889,7 @@ mod tests {
             prepared
                 .check_valid(
                     &header,
+                    &Hash256::ZERO,
                     0,
                     NetworkId::testnet(),
                     Some(&soroban_info),
@@ -1918,7 +1922,15 @@ mod tests {
 
         assert!(
             prepared
-                .check_valid(&header, 0, NetworkId::testnet(), None, None, None)
+                .check_valid(
+                    &header,
+                    &Hash256::ZERO,
+                    0,
+                    NetworkId::testnet(),
+                    None,
+                    None,
+                    None
+                )
                 .is_err(),
             "generalized set on protocol 19 should be rejected by check_valid"
         );
@@ -1940,7 +1952,15 @@ mod tests {
 
         assert!(
             prepared
-                .check_valid(&header, 0, NetworkId::testnet(), None, None, None)
+                .check_valid(
+                    &header,
+                    &Hash256::ZERO,
+                    0,
+                    NetworkId::testnet(),
+                    None,
+                    None,
+                    None
+                )
                 .is_err(),
             "legacy set on protocol 24 should be rejected by check_valid"
         );
@@ -1963,7 +1983,15 @@ mod tests {
 
         assert!(
             prepared
-                .check_valid(&header, 0, NetworkId::testnet(), None, None, None)
+                .check_valid(
+                    &header,
+                    &Hash256::ZERO,
+                    0,
+                    NetworkId::testnet(),
+                    None,
+                    None,
+                    None
+                )
                 .is_ok(),
             "legacy set on protocol 19 should pass check_valid"
         );

@@ -1735,6 +1735,22 @@ fn collect_phase_txs(phase: &TransactionPhase) -> Vec<&TransactionEnvelope> {
     txs
 }
 
+/// Extract the ed25519 public key bytes from a transaction envelope's source account.
+///
+/// For fee-bump transactions, uses the *inner* transaction source (matching stellar-core's
+/// `getSourceID()` which returns the inner source for fee bumps).
+fn source_account_ed25519(env: &TransactionEnvelope) -> [u8; 32] {
+    match env {
+        TransactionEnvelope::TxV0(e) => e.tx.source_account_ed25519.0,
+        TransactionEnvelope::Tx(e) => henyey_tx::muxed_to_ed25519(&e.tx.source_account).0,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                henyey_tx::muxed_to_ed25519(&inner.tx.source_account).0
+            }
+        },
+    }
+}
+
 /// Orchestrate full TX set content validation.
 ///
 /// Mirrors stellar-core's `ApplicableTxSetFrame::checkValidInternalWithResult()`
@@ -1742,21 +1758,21 @@ fn collect_phase_txs(phase: &TransactionPhase) -> Vec<&TransactionEnvelope> {
 /// (TxSetFrame.cpp:1742-1799).
 ///
 /// Performs:
-/// 1. Verify generalized vs legacy matches protocol version
-/// 2. For generalized sets: verify no duplicate source accounts across ALL phases
-/// 3. Per-phase: fee map validation, phase-type checks, phase-specific limits
-/// 4. Per-TX content validation (time bounds, fees) via `get_invalid_tx_list_with_fee_map`
+/// 1. Verify previousLedgerHash matches the LCL hash
+/// 2. Verify generalized vs legacy matches protocol version
+/// 3. Verify no duplicate source accounts across ALL phases
+/// 4. Per-phase: fee map validation, phase-type checks, phase-specific limits
+/// 5. Per-TX content validation (time bounds, fees) via `get_invalid_tx_list_with_fee_map`
 ///
 /// For Phase 1, `fee_balance_provider` may be `None` to skip per-account balance checks.
 ///
-/// Note: cross-phase duplicate-source-account checking is performed by
-/// `prepare_for_apply` (in `tx_set.rs`), NOT by this function.
-///
 /// **Prefer [`PreparedTransactionSet::check_valid()`]** for production call sites.
 /// This function is `pub(crate)` for unit testing only.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_tx_set_valid(
     gen_tx_set: &GeneralizedTransactionSet,
     lcl_header: &LedgerHeader,
+    lcl_hash: &Hash256,
     close_time_offset: u64,
     network_id: NetworkId,
     soroban_info: Option<&SorobanNetworkInfo>,
@@ -1764,6 +1780,19 @@ pub(crate) fn check_tx_set_valid(
     account_provider: Option<&dyn AccountProvider>,
 ) -> Result<(), TxSetValidationError> {
     let GeneralizedTransactionSet::V1(v1) = gen_tx_set;
+
+    // Parity: stellar-core TxSetFrame.cpp:2115-2121
+    // Check previousLedgerHash matches the LCL hash first.
+    let previous_ledger_hash = Hash256::from_bytes(v1.previous_ledger_hash.0);
+    if previous_ledger_hash != *lcl_hash {
+        debug!(
+            "Got bad txSet: previousLedgerHash {} != LCL {}",
+            previous_ledger_hash, lcl_hash
+        );
+        return Err(TxSetValidationError::new(
+            TxSetValidationResult::PreviousLedgerHashMismatch,
+        ));
+    }
 
     // Verify generalized tx set is expected for this protocol
     let need_generalized =
@@ -1779,6 +1808,23 @@ pub(crate) fn check_tx_set_valid(
         return Err(TxSetValidationError::new(
             TxSetValidationResult::WrongPhaseCount,
         ));
+    }
+
+    // Parity: stellar-core TxSetFrame.cpp:2149-2165
+    // Ensure no duplicate source accounts across all phases.
+    {
+        let mut seen_sources: HashSet<[u8; 32]> = HashSet::new();
+        for phase in v1.phases.iter() {
+            for tx in collect_phase_txs(phase) {
+                let source_key = source_account_ed25519(tx);
+                if !seen_sources.insert(source_key) {
+                    debug!("Got bad txSet: multiple txs per source account");
+                    return Err(TxSetValidationError::new(
+                        TxSetValidationResult::MultipleTxsPerSourceAccount,
+                    ));
+                }
+            }
+        }
     }
 
     // Cross-phase fee map handling (Protocol 26+)
@@ -2964,8 +3010,17 @@ mod tests {
         let header = make_soroban_lcl_header(25);
         let network_id = NetworkId::testnet();
 
-        let err =
-            check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None).unwrap_err();
+        let err = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            &Hash256::ZERO,
+            0,
+            network_id,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.result, TxSetValidationResult::ComponentBaseFeeTooLow);
         assert_eq!(err.phase_idx, Some(0));
         assert_eq!(err.invalid_tx_count, None);
@@ -2986,6 +3041,7 @@ mod tests {
         let err = check_tx_set_valid(
             &gen_tx_set,
             &header,
+            &Hash256::ZERO,
             0,
             network_id,
             None,
@@ -3008,8 +3064,17 @@ mod tests {
         let header = make_soroban_lcl_header(25);
         let network_id = NetworkId::testnet();
 
-        let err =
-            check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None).unwrap_err();
+        let err = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            &Hash256::ZERO,
+            0,
+            network_id,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.result, TxSetValidationResult::SorobanConfigUnavailable);
         assert_eq!(err.phase_idx, Some(1));
     }
@@ -3026,8 +3091,17 @@ mod tests {
         let header = make_soroban_lcl_header(25);
         let network_id = NetworkId::testnet();
 
-        let err =
-            check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None).unwrap_err();
+        let err = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            &Hash256::ZERO,
+            0,
+            network_id,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.result, TxSetValidationResult::WrongPhaseCount);
         assert_eq!(err.phase_idx, None);
     }
@@ -3049,10 +3123,147 @@ mod tests {
         header.ledger_version = 19;
         let network_id = NetworkId::testnet();
 
-        let err =
-            check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None).unwrap_err();
+        let err = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            &Hash256::ZERO,
+            0,
+            network_id,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.result, TxSetValidationResult::GeneralizedTxsetMismatch);
         assert_eq!(err.phase_idx, None);
+    }
+
+    /// Parity: stellar-core TxSetFrame.cpp:2115-2121.
+    /// check_tx_set_valid must reject tx sets whose previousLedgerHash
+    /// does not match the LCL hash.
+    #[test]
+    fn test_check_tx_set_valid_previous_ledger_hash_mismatch() {
+        use stellar_xdr::curr::{Hash, TransactionSetV1};
+
+        let gen_tx_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![
+                TransactionPhase::V0(vec![].try_into().unwrap()),
+                TransactionPhase::V0(vec![].try_into().unwrap()),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+        let wrong_lcl = Hash256::from_bytes([1u8; 32]);
+
+        let err = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            &wrong_lcl,
+            0,
+            network_id,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.result,
+            TxSetValidationResult::PreviousLedgerHashMismatch
+        );
+    }
+
+    /// Parity: stellar-core TxSetFrame.cpp:2149-2165.
+    /// check_tx_set_valid must reject tx sets that have duplicate source
+    /// accounts across phases.
+    #[test]
+    fn test_check_tx_set_valid_duplicate_source_account() {
+        // Two txs with the same source account ([0u8; 32]) — one in each phase.
+        let classic_tx = make_valid_envelope(200, 1);
+        let soroban_tx = make_valid_envelope(200, 2); // same source
+        let gen_tx_set = make_gen_tx_set(vec![classic_tx], vec![soroban_tx]);
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+
+        let err = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            &Hash256::ZERO,
+            0,
+            network_id,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.result,
+            TxSetValidationResult::MultipleTxsPerSourceAccount
+        );
+    }
+
+    /// Control: distinct source accounts across phases must pass.
+    #[test]
+    fn test_check_tx_set_valid_distinct_sources_passes() {
+        // classic_tx source = [0u8; 32], a different source for soroban
+        let classic_tx = make_valid_envelope(200, 1);
+
+        // Build soroban tx with different source [5u8; 32]
+        let different_source = MuxedAccount::Ed25519(Uint256([5u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: MuxedAccount::Ed25519(Uint256([6u8; 32])),
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+        let tx = Transaction {
+            source_account: different_source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let different_source_tx = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        let gen_tx_set = make_gen_tx_set(vec![classic_tx], vec![different_source_tx]);
+        let header = make_soroban_lcl_header(25);
+        let network_id = NetworkId::testnet();
+        let soroban_info = make_soroban_network_info();
+
+        // Should not fail on duplicate source — may fail on other checks (sequence/sig)
+        // but should NOT be MultipleTxsPerSourceAccount
+        let result = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            &Hash256::ZERO,
+            0,
+            network_id,
+            Some(&soroban_info),
+            None,
+            None,
+        );
+        // If it errors, it must not be MultipleTxsPerSourceAccount
+        if let Err(ref e) = result {
+            assert_ne!(
+                e.result,
+                TxSetValidationResult::MultipleTxsPerSourceAccount,
+                "distinct sources should not trigger MultipleTxsPerSourceAccount"
+            );
+        }
     }
 
     // --- AUDIT-033: check_valid_classic tests ---
@@ -3857,6 +4068,7 @@ mod tests {
         let result = check_tx_set_valid(
             &gen_tx_set,
             &header,
+            &Hash256::ZERO,
             0,
             network_id,
             None, // no soroban config
@@ -3890,6 +4102,7 @@ mod tests {
         let result = check_tx_set_valid(
             &gen_tx_set,
             &header,
+            &Hash256::ZERO,
             0,
             network_id,
             None,
@@ -3945,6 +4158,7 @@ mod tests {
         let result = check_tx_set_valid(
             &gen_tx_set,
             &header,
+            &Hash256::ZERO,
             0,
             network_id,
             None,
@@ -3976,7 +4190,16 @@ mod tests {
         let header = make_soroban_lcl_header(25);
         let network_id = NetworkId::testnet();
 
-        let result = check_tx_set_valid(&gen_tx_set, &header, 0, network_id, None, None, None);
+        let result = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            &Hash256::ZERO,
+            0,
+            network_id,
+            None,
+            None,
+            None,
+        );
         let err = result.unwrap_err();
         assert_eq!(
             err.result,
@@ -4008,8 +4231,16 @@ mod tests {
         let info = make_soroban_network_info();
         let network_id = NetworkId::testnet();
 
-        let result =
-            check_tx_set_valid(&gen_tx_set, &header, 0, network_id, Some(&info), None, None);
+        let result = check_tx_set_valid(
+            &gen_tx_set,
+            &header,
+            &Hash256::ZERO,
+            0,
+            network_id,
+            Some(&info),
+            None,
+            None,
+        );
         let err = result.unwrap_err();
         assert_eq!(
             err.result,

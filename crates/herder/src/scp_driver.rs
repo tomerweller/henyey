@@ -719,6 +719,7 @@ impl ScpDriver {
                 prepared
                     .check_valid(
                         lcl_header,
+                        &lcl_hash,
                         close_time_offset,
                         network_id,
                         soroban_info.as_ref(),

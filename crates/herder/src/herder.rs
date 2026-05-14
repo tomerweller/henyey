@@ -2753,6 +2753,7 @@ impl Herder {
         if let Err(reason) = self.self_validate_nomination_tx_set(
             tx_set,
             header,
+            &previous_hash,
             close_time_offset,
             soroban_info,
             snapshot_providers,
@@ -2815,6 +2816,7 @@ impl Herder {
         &self,
         tx_set: &TransactionSet,
         header: &LedgerHeader,
+        lcl_hash: &Hash256,
         close_time_offset: u64,
         soroban_info: Option<&henyey_ledger::SorobanNetworkInfo>,
         snapshot_providers: Option<&crate::tx_queue::SnapshotProviders>,
@@ -2860,6 +2862,7 @@ impl Herder {
         prepared
             .check_valid(
                 header,
+                lcl_hash,
                 close_time_offset,
                 NetworkId(self.scp_driver.network_id()),
                 soroban_info,
@@ -8593,7 +8596,14 @@ mod advance_tracking_slot_tests {
         let soroban_info = henyey_ledger::SorobanNetworkInfo::default();
         assert!(
             herder
-                .self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,)
+                .self_validate_nomination_tx_set(
+                    &tx_set,
+                    &header,
+                    &Hash256::ZERO,
+                    0,
+                    Some(&soroban_info),
+                    None,
+                )
                 .is_ok(),
             "empty 2-phase generalized V0 tx set on v22 must pass self-validation"
         );
@@ -8609,7 +8619,7 @@ mod advance_tracking_slot_tests {
         let header = v24_header();
         assert!(
             herder
-                .self_validate_nomination_tx_set(&tx_set, &header, 0, None, None)
+                .self_validate_nomination_tx_set(&tx_set, &header, &Hash256::ZERO, 0, None, None)
                 .is_err(),
             "legacy tx set on v24 must be rejected by self-validation"
         );
@@ -8627,7 +8637,7 @@ mod advance_tracking_slot_tests {
         let header = v24_header();
         assert!(
             herder
-                .self_validate_nomination_tx_set(&tx_set, &header, 0, None, None)
+                .self_validate_nomination_tx_set(&tx_set, &header, &Hash256::ZERO, 0, None, None)
                 .is_err(),
             "3-phase generalized tx set must be rejected by prepare_for_apply"
         );
@@ -8644,7 +8654,7 @@ mod advance_tracking_slot_tests {
         header.ledger_version = 19;
         assert!(
             herder
-                .self_validate_nomination_tx_set(&tx_set, &header, 0, None, None)
+                .self_validate_nomination_tx_set(&tx_set, &header, &Hash256::ZERO, 0, None, None)
                 .is_ok(),
             "self-validation must be skipped on protocol < 20"
         );
@@ -8910,7 +8920,14 @@ mod advance_tracking_slot_tests {
 
         assert!(
             herder
-                .self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,)
+                .self_validate_nomination_tx_set(
+                    &tx_set,
+                    &header,
+                    &Hash256::ZERO,
+                    0,
+                    Some(&soroban_info),
+                    None,
+                )
                 .is_err(),
             "tx set with same source in classic and Soroban phases must be rejected"
         );
@@ -8934,7 +8951,14 @@ mod advance_tracking_slot_tests {
 
         assert!(
             herder
-                .self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,)
+                .self_validate_nomination_tx_set(
+                    &tx_set,
+                    &header,
+                    &Hash256::ZERO,
+                    0,
+                    Some(&soroban_info),
+                    None,
+                )
                 .is_ok(),
             "tx set with distinct sources across phases must pass self-validation"
         );
@@ -9050,8 +9074,15 @@ mod advance_tracking_slot_tests {
         let prepared_stale = tx_set_stale
             .prepare_for_apply(network_id)
             .expect("prepare_for_apply should succeed");
-        let result_stale =
-            prepared_stale.check_valid(&header, 0, network_id, Some(&soroban_info), None, None);
+        let result_stale = prepared_stale.check_valid(
+            &header,
+            &Hash256::ZERO,
+            0,
+            network_id,
+            Some(&soroban_info),
+            None,
+            None,
+        );
         assert!(
             result_stale.is_err(),
             "Stale base_fee (100) should fail check_fee_map against header base_fee (200), \
@@ -9094,8 +9125,15 @@ mod advance_tracking_slot_tests {
         let prepared_fixed = tx_set_fixed
             .prepare_for_apply(network_id)
             .expect("prepare_for_apply should succeed");
-        let result_fixed =
-            prepared_fixed.check_valid(&header, 0, network_id, Some(&soroban_info), None, None);
+        let result_fixed = prepared_fixed.check_valid(
+            &header,
+            &Hash256::ZERO,
+            0,
+            network_id,
+            Some(&soroban_info),
+            None,
+            None,
+        );
         assert!(
             result_fixed.is_ok(),
             "Nomination context (base_fee=200) should pass check_fee_map against header \
