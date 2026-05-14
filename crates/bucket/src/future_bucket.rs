@@ -361,7 +361,7 @@ impl FutureBucket {
             let _ = sender.send(result);
         });
 
-        Self {
+        let fb = Self {
             state: FutureBucketState::LiveInputs,
             input_curr: Some(curr),
             input_snap: Some(snap),
@@ -373,7 +373,12 @@ impl FutureBucket {
             protocol_version,
             keep_tombstones,
             normalize_init,
-        }
+        };
+        debug_assert!(
+            fb.check_state().is_ok(),
+            "FutureBucket state invalid after start_merge"
+        );
+        fb
     }
 
     /// Create a FutureBucket from a completed merge (already has output).
@@ -640,6 +645,8 @@ impl FutureBucket {
                         self.state = FutureBucketState::Clear;
                         self.input_curr = None;
                         self.input_snap = None;
+                        self.input_curr_hash = None;
+                        self.input_snap_hash = None;
                         Err(e)
                     }
                 }
@@ -672,6 +679,8 @@ impl FutureBucket {
                             self.merge_handle = None;
                             self.input_curr = None;
                             self.input_snap = None;
+                            self.input_curr_hash = None;
+                            self.input_snap_hash = None;
                             return Err(e);
                         }
                     }
@@ -1758,6 +1767,26 @@ mod tests {
         let bucket = Bucket::from_entries(vec![]).unwrap();
         let fb = FutureBucket::from_output(Arc::new(bucket));
         fb.check_state().expect("LiveOutput state should be valid");
+    }
+
+    #[test]
+    fn test_check_state_live_inputs_valid() {
+        let bucket1 = Arc::new(Bucket::from_entries(vec![]).unwrap());
+        let bucket2 = Arc::new(Bucket::from_entries(vec![]).unwrap());
+        let fb = FutureBucket {
+            state: FutureBucketState::LiveInputs,
+            input_curr: Some(bucket1.clone()),
+            input_snap: Some(bucket2.clone()),
+            output: None,
+            merge_handle: None,
+            input_curr_hash: Some(bucket1.hash()),
+            input_snap_hash: Some(bucket2.hash()),
+            output_hash: None,
+            protocol_version: 24,
+            keep_tombstones: DeadEntryPolicy::Keep,
+            normalize_init: InitEntryPolicy::Preserve,
+        };
+        fb.check_state().expect("LiveInputs state should be valid");
     }
 
     #[test]
