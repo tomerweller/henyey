@@ -1371,6 +1371,9 @@ mod tests {
 
     #[test]
     fn test_differing_buckets_hot_archive() {
+        // Intentionally non-standard: v1 HAS with hot_archive_buckets to test
+        // differing_bucket_hashes() differential logic on hot archive levels.
+        // This would fail verify_has_structure() (v1 must not have hot archive).
         let mut remote = make_has(vec![(HASH_A, HASH_B)]);
         remote.hot_archive_buckets = Some(vec![HASBucketLevel {
             curr: HASH_C.to_string(),
@@ -1385,6 +1388,8 @@ mod tests {
 
     #[test]
     fn test_all_differing_bucket_hashes() {
+        // Intentionally non-standard: v1 HAS with hot_archive_buckets to test
+        // all_differing_bucket_hashes() combined differential logic.
         let mut remote = make_has(vec![(HASH_A, HASH_B)]);
         remote.hot_archive_buckets = Some(vec![HASBucketLevel {
             curr: HASH_C.to_string(),
