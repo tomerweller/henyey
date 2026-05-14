@@ -863,12 +863,16 @@ impl Herder {
         if tracking == 0 {
             return;
         }
-        let consensus_idx = tracking - 1;
         let lcl_seq = self.ledger_manager.current_ledger_seq() as u64;
+        // Allow lcl_seq == tracking: this is reachable transiently when the
+        // async close pipeline advances LCL before advance_tracking_slot runs
+        // (the value_externalized callback publishes latest_externalized
+        // before process_scp_envelope can advance tracking). lcl > tracking
+        // means LCL has passed the *next* consensus slot — genuine corruption.
         assert!(
-            lcl_seq <= consensus_idx,
-            "INV-H2 FATAL: LCL ({lcl_seq}) is ahead of tracking consensus index \
-             ({consensus_idx}). Unrecoverable state divergence between consensus \
+            lcl_seq <= tracking,
+            "INV-H2 FATAL: LCL ({lcl_seq}) is ahead of tracking consensus slot \
+             ({tracking}). Unrecoverable state divergence between consensus \
              and ledger-manager."
         );
     }
@@ -7291,10 +7295,26 @@ mod inv_h2_lcl_guard_tests {
     }
 
     #[test]
+    fn test_assert_lcl_consistency_passes_in_post_close_race_window() {
+        // LCL=6, tracking_slot=6 → LCL == tracking → OK (race window:
+        // async close pipeline advanced LCL before advance_tracking_slot)
+        let herder = make_tracking_herder_at(6, 6);
+        herder.assert_lcl_consistency(); // should not panic
+    }
+
+    #[test]
     #[should_panic(expected = "INV-H2 FATAL")]
     fn test_assert_lcl_consistency_fires_when_lcl_ahead_of_tracking() {
-        // LCL=6, tracking_slot=6 (consensus_idx=5) → LCL > consensus_idx → PANIC
-        let herder = make_tracking_herder_at(6, 6);
+        // LCL=7, tracking_slot=6 → LCL > tracking → PANIC (genuine divergence)
+        let herder = make_tracking_herder_at(7, 6);
+        herder.assert_lcl_consistency();
+    }
+
+    #[test]
+    #[should_panic(expected = "INV-H2 FATAL")]
+    fn test_assert_lcl_consistency_fires_when_lcl_exceeds_tracking() {
+        // LCL=8, tracking_slot=6 → LCL > tracking by 2 → PANIC (multi-slot divergence)
+        let herder = make_tracking_herder_at(8, 6);
         herder.assert_lcl_consistency();
     }
 
