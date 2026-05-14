@@ -183,7 +183,12 @@ pub fn verify_header_chain(
     prev_header_hash: &Hash256,
     current_header: &LedgerHeader,
 ) -> Result<()> {
-    let expected_seq = prev_header.ledger_seq + 1;
+    let expected_seq = prev_header.ledger_seq.checked_add(1).ok_or_else(|| {
+        LedgerError::InvalidSequence {
+            expected: 0, // overflow
+            actual: prev_header.ledger_seq,
+        }
+    })?;
     if current_header.ledger_seq != expected_seq {
         return Err(LedgerError::InvalidSequence {
             expected: expected_seq,
@@ -276,8 +281,13 @@ pub fn create_next_header(
     prev_header: &LedgerHeader,
     prev_header_hash: Hash256,
     fields: NextHeaderFields,
-) -> LedgerHeader {
-    let new_seq = prev_header.ledger_seq + 1;
+) -> Result<LedgerHeader> {
+    let new_seq = prev_header.ledger_seq.checked_add(1).ok_or_else(|| {
+        LedgerError::InvalidSequence {
+            expected: 0, // overflow
+            actual: prev_header.ledger_seq,
+        }
+    })?;
 
     let mut header = LedgerHeader {
         ledger_version: prev_header.ledger_version,
@@ -304,7 +314,11 @@ pub fn create_next_header(
 
     header.skip_list = calculate_skip_values(&header);
 
-    header
+    // Validate the constructed header fields (LEDGER_SPEC §15).
+    henyey_common::header_validation::validate_header_fields(&header)
+        .map_err(LedgerError::Internal)?;
+
+    Ok(header)
 }
 
 /// Extract the ledger close time from a header.
@@ -408,5 +422,78 @@ mod tests {
         assert_eq!(skip_list_target_seq(8, 1), Some(4));
         assert_eq!(skip_list_target_seq(10, 1), Some(8));
         assert_eq!(skip_list_target_seq(0, 0), None);
+    }
+
+    #[test]
+    fn test_create_next_header_overflow_at_u32_max() {
+        let prev = create_test_header(u32::MAX);
+        let prev_hash = compute_header_hash(&prev).unwrap();
+        let result = create_next_header(
+            &prev,
+            prev_hash,
+            NextHeaderFields {
+                close_time: 2000,
+                tx_set_hash: Hash256::ZERO,
+                bucket_list_hash: Hash256::ZERO,
+                tx_set_result_hash: Hash256::ZERO,
+                total_coins: 100_000_000_000_000_000,
+                fee_pool: 0,
+                inflation_seq: 0,
+                stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+            },
+        );
+        assert!(result.is_err(), "Should fail on ledger_seq overflow");
+    }
+
+    #[test]
+    fn test_create_next_header_success() {
+        let prev = create_test_header(100);
+        let prev_hash = compute_header_hash(&prev).unwrap();
+        let result = create_next_header(
+            &prev,
+            prev_hash,
+            NextHeaderFields {
+                close_time: 2000,
+                tx_set_hash: Hash256::ZERO,
+                bucket_list_hash: Hash256::ZERO,
+                tx_set_result_hash: Hash256::ZERO,
+                total_coins: 100_000_000_000_000_000,
+                fee_pool: 0,
+                inflation_seq: 0,
+                stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().ledger_seq, 101);
+    }
+
+    #[test]
+    fn test_create_next_header_negative_fee_pool_fails() {
+        let prev = create_test_header(100);
+        let prev_hash = compute_header_hash(&prev).unwrap();
+        let result = create_next_header(
+            &prev,
+            prev_hash,
+            NextHeaderFields {
+                close_time: 2000,
+                tx_set_hash: Hash256::ZERO,
+                bucket_list_hash: Hash256::ZERO,
+                tx_set_result_hash: Hash256::ZERO,
+                total_coins: 100_000_000_000_000_000,
+                fee_pool: -1,
+                inflation_seq: 0,
+                stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+            },
+        );
+        assert!(result.is_err(), "Should fail on negative fee_pool");
+    }
+
+    #[test]
+    fn test_verify_header_chain_overflow_at_u32_max() {
+        let prev = create_test_header(u32::MAX);
+        let prev_hash = compute_header_hash(&prev).unwrap();
+        let current = create_test_header(0); // any header
+        let result = verify_header_chain(&prev, &prev_hash, &current);
+        assert!(result.is_err(), "Should fail on ledger_seq overflow");
     }
 }

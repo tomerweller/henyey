@@ -2066,6 +2066,8 @@ impl LedgerManager {
 
     /// Begin closing a new ledger (internal).
     ///
+    /// LEDGER_SPEC §4.1 — value externalized entry point.
+    ///
     /// Returns a LedgerCloseContext for applying transactions and
     /// committing the ledger. This is called by `close_ledger`.
     fn begin_close(&self, close_data: LedgerCloseData) -> Result<LedgerCloseContext<'_>> {
@@ -2094,8 +2096,13 @@ impl LedgerManager {
             );
         }
 
-        // Validate sequence
-        let expected_seq = state.header.ledger_seq + 1;
+        // Validate sequence (checked arithmetic to prevent overflow — LEDGER_SPEC §15.2)
+        let expected_seq = state.header.ledger_seq.checked_add(1).ok_or_else(|| {
+            LedgerError::Internal(format!(
+                "ledger_seq overflow at {}",
+                state.header.ledger_seq
+            ))
+        })?;
         if close_data.ledger_seq != expected_seq {
             return Err(LedgerError::InvalidSequence {
                 expected: expected_seq,
@@ -2875,6 +2882,11 @@ impl LedgerManager {
 }
 
 /// Internal context for closing a single ledger.
+///
+/// LEDGER_SPEC §2.3 / Appendix C — apply state phases: N/A.
+/// Henyey uses a single-writer design; Rust's ownership model provides
+/// compile-time thread safety without an explicit phase machine.
+/// See `crates/ledger/PARITY_STATUS.md` for rationale.
 ///
 /// This struct is used internally by [`LedgerManager::close_ledger`] to
 /// process transactions and finalize the ledger.
@@ -3873,6 +3885,8 @@ impl LedgerCloseContext<'_> {
 
     /// Apply transactions from the transaction set.
     ///
+    /// LEDGER_SPEC §5.2 — transaction application.
+    ///
     /// This executes all transactions in order, recording state changes
     /// to the delta and collecting results.
     ///
@@ -4574,6 +4588,8 @@ impl LedgerCloseContext<'_> {
 
     /// Create the new ledger header and compute its hash.
     ///
+    /// LEDGER_SPEC §3.3 — ledger header construction.
+    ///
     /// Applies upgrades to header fields, encodes raw upgrade types for
     /// correct header hash, and sets the id_pool.
     fn build_and_hash_header(
@@ -4583,9 +4599,29 @@ impl LedgerCloseContext<'_> {
         config_state_archival_changed: bool,
         config_memory_cost_params_changed: bool,
     ) -> Result<(LedgerHeader, Hash256)> {
-        // Log all inputs to create_next_header for debugging header mismatch
-        let total_coins = self.prev_header.total_coins + self.ltx.total_coins_delta();
-        let fee_pool = self.prev_header.fee_pool + self.ltx.fee_pool_delta();
+        // Checked arithmetic for total_coins and fee_pool deltas (LEDGER_SPEC §15).
+        let total_coins = self
+            .prev_header
+            .total_coins
+            .checked_add(self.ltx.total_coins_delta())
+            .ok_or_else(|| {
+                LedgerError::Internal(format!(
+                    "total_coins overflow: {} + {}",
+                    self.prev_header.total_coins,
+                    self.ltx.total_coins_delta()
+                ))
+            })?;
+        let fee_pool = self
+            .prev_header
+            .fee_pool
+            .checked_add(self.ltx.fee_pool_delta())
+            .ok_or_else(|| {
+                LedgerError::Internal(format!(
+                    "fee_pool overflow: {} + {}",
+                    self.prev_header.fee_pool,
+                    self.ltx.fee_pool_delta()
+                ))
+            })?;
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             prev_header_hash = %self.prev_header_hash.to_hex(),
@@ -4622,7 +4658,7 @@ impl LedgerCloseContext<'_> {
                 inflation_seq: self.prev_header.inflation_seq,
                 stellar_value_ext: self.close_data.stellar_value_ext.clone(),
             },
-        );
+        )?;
 
         // Apply upgrades to header fields (e.g., ledger_version, base_fee)
         self.upgrade_ctx.apply_to_header(&mut new_header);
@@ -4689,7 +4725,7 @@ impl LedgerCloseContext<'_> {
 
     /// Commit the ledger close: finalize state, update bucket list, build header.
     ///
-    /// LEDGER_SPEC §6 defines an 8-step commit sequence:
+    /// LEDGER_SPEC §4.2 / §15.13 / Appendix E — commit sequence:
     ///   1. Compute tx result hash
     ///   2. Apply upgrades
     ///   3. Update bucket list with delta
@@ -5764,6 +5800,12 @@ impl LedgerCloseContext<'_> {
         };
 
         let meta_start = std::time::Instant::now();
+
+        // LEDGER_SPEC §12.2 — meta version selection.
+        // Henyey always produces V2 meta. In production the protocol is 24+,
+        // satisfying the V2 requirement (protocol >= 20). Simulation may
+        // bootstrap from genesis (protocol 0); the meta format is unused there.
+
         // Move tx_set and scp_history out of close_data to avoid cloning 50K envelopes
         let empty_tx_set = TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash([0; 32]),
@@ -5889,6 +5931,10 @@ struct LedgerCloseMetaInputs {
     soroban_fee_write_1kb: i64,
 }
 
+/// LEDGER_SPEC §12.2 — meta version selection.
+///
+/// Henyey supports protocol 24+ only, which always uses V2 meta.
+/// The caller asserts `header.ledger_version >= 20` before invoking this.
 fn build_ledger_close_meta(inputs: LedgerCloseMetaInputs) -> LedgerCloseMeta {
     let LedgerCloseMetaInputs {
         tx_set_variant,
@@ -5923,7 +5969,7 @@ fn build_ledger_close_meta(inputs: LedgerCloseMetaInputs) -> LedgerCloseMeta {
         LedgerCloseMetaExt::V0
     };
 
-    // NOTE: The spec (LEDGER_SPEC §8.1) branches on `initialLedgerVers` to
+    // NOTE: The spec (LEDGER_SPEC §12.2 / §15.11) branches on `initialLedgerVers` to
     // select V0/V1/V2 meta format. Henyey supports protocol 24+ only, which
     // always uses V2, so we unconditionally produce V2 meta here.
     LedgerCloseMeta::V2(LedgerCloseMetaV2 {

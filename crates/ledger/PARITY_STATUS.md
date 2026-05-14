@@ -99,7 +99,7 @@ Corresponds to: `LedgerManager.h`, `LedgerManagerImpl.h`
 | `LedgerManagerImpl::applySorobanStageClustersInParallel()` | `execute_stage_clusters()` (tokio parallel) | Full |
 | `LedgerManagerImpl::applyThread()` | `execute_single_cluster()` (per-cluster executor) | Full |
 | `LedgerManagerImpl::prefetchTransactionData()` | Not implemented | None |
-| `LedgerManagerImpl::ApplyState` (phase machine) | Not implemented | None |
+| `LedgerManagerImpl::ApplyState` (phase machine) | Intentionally N/A | LEDGER_SPEC §2.3 / Appendix C — Rust ownership model provides compile-time safety; no explicit phase machine needed |
 
 ### header.rs (`header.rs`)
 
@@ -107,7 +107,7 @@ Corresponds to: `LedgerHeaderUtils.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `LedgerHeaderUtils::isValid()` | `verify_header_chain()` | Full |
+| `LedgerHeaderUtils::isValid()` | `validate_header_fields()` in `henyey-common` + `verify_header_chain()` | Full |
 | `LedgerHeaderUtils::decodeFromData()` | Via XDR deserialization | Full |
 | `LedgerHeaderUtils::getFlags()` | Via direct field access | Full |
 | Header hash computation | `compute_header_hash()` | Full |
@@ -333,7 +333,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `LedgerManager::ledgerAbbrev()` | Logging helper, not protocol behavior |
 | Postgres-specific code (`USE_POSTGRES` blocks) | SQLite only per project guidelines |
 | `CheckpointRange.h/.cpp` | History checkpoint utilities, handled by history crate |
-| `LedgerManager::isApplying()` / `markApplyStateReset()` | Single-threaded; no apply phase machine needed |
+| `LedgerManager::isApplying()` / `markApplyStateReset()` | LEDGER_SPEC §2.3 / Appendix C — single-writer design; Rust ownership provides compile-time safety |
 | `LedgerManager::partiallyLoadLastKnownLedgerForUtils()` | Diagnostic utility, not protocol behavior |
 | `LedgerManager::moveToSynced()` / `beginApply()` / state machine | App-level state managed by app crate |
 | `LedgerManager::getLastClosedSnapshot()` / `getLastClosedLedgerHAS()` | Exposed via `LedgerManager` methods with different signatures |
@@ -351,7 +351,6 @@ Features not yet implemented. These ARE counted against parity %.
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
 | `SharedModuleCacheCompiler` (multi-threaded compilation) | Low | Single-threaded `rebuild_module_cache()` exists; lacks parallel compilation |
-| `LedgerManagerImpl::ApplyState` phase machine | Medium | Multi-threaded apply coordination |
 | `SorobanMetrics` class | Low | Observability, not correctness |
 | `LedgerManager::getExpectedLedgerCloseTime()` | Low | Timing utility |
 | `LedgerManager::secondsSinceLastLedgerClose()` | Low | Timing utility |
@@ -437,6 +436,28 @@ The ledger crate has been verified against testnet for ledger close correctness.
 
 The 139 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (28, including `commonPreApply`/`preParallelApply`/`parallelApply` and all v20-v26 network-config synthesis paths), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7), CloseLedgerState merged reads with `EntryReader` (1), module cache rebuild (1 — partial, not counted here).
 
-The 9 gap items include: timing utilities (2), metrics methods (2), ApplyState phase machine (1), multi-threaded module cache compilation (1 Partial), CompleteConstLedgerState (1 Partial), prefetch (1), and meta streaming (1).
+The 8 gap items include: timing utilities (2), metrics methods (2), multi-threaded module cache compilation (1 Partial), CompleteConstLedgerState (1 Partial), prefetch (1), and meta streaming (1).
 
 The 30 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (P23HotArchiveBug, FlushAndRotateMetaDebugWork), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant, LedgerEntryScope), features handled by other crates (catchup, checkpoint ranges, app state machine).
+
+## Spec Adherence Notes
+
+### INV-L13: HAS/LCL `ledgerSeq` agreement on reload
+**Status: Full.** Checked in `load_last_known_ledger()` at `crates/app/src/app/ledger_close.rs:597`.
+The `bootstrap_from_db()` path is force-SCP only and does not use HAS.
+
+### INV-L4: Total-coins conservation
+**Status: Partial.** Delta tracking infrastructure exists (`delta.rs:420`), but
+enforcement depends on the `ConservationOfLumens` invariant in `crates/invariant/`,
+which is deferred (see `crates/invariant/PARITY_STATUS.md:25`). The invariant wiring
+passes `None` for header fields at `crates/ledger/src/execution/apply.rs:805`.
+
+### INV-L7 / INV-L9: Header field validity bounds
+**Status: Full.** `validate_header_fields()` in `henyey-common` checks `fee_pool >= 0`,
+`ledger_seq <= i32::MAX`, `id_pool <= i64::MAX`, `close_time <= i64::MAX`. Called on
+header construction (`create_next_header`), commit (`build_and_hash_header`), and
+DB store/load/stream paths. Matches stellar-core `LedgerHeaderUtils::isValid()`.
+
+### INV-L10: TxSet rooting
+**Status: Full.** `assert_eq!` in `LedgerCloseData::new()` at
+`crates/herder/src/ledger_close_data.rs:88`. Release-mode assertion matching stellar-core.

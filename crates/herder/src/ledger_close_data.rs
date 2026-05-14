@@ -84,8 +84,9 @@ impl LedgerCloseData {
         value: StellarValue,
         expected_ledger_hash: Option<Hash256>,
     ) -> Self {
-        // Verify the tx set hash matches the value's tx_set_hash
-        debug_assert_eq!(
+        // Verify the tx set hash matches the value's tx_set_hash.
+        // INV-L10 / LEDGER_SPEC §15.5 — release-mode assertion matching stellar-core.
+        assert_eq!(
             tx_set.hash().0,
             value.tx_set_hash.0,
             "Transaction set hash mismatch"
@@ -110,7 +111,8 @@ impl LedgerCloseData {
         expected_ledger_hash: Option<Hash256>,
         expected_results: Option<TransactionResultSet>,
     ) -> Self {
-        debug_assert_eq!(
+        // INV-L10 / LEDGER_SPEC §15.5 — release-mode assertion matching stellar-core.
+        assert_eq!(
             tx_set.hash().0,
             value.tx_set_hash.0,
             "Transaction set hash mismatch"

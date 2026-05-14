@@ -109,11 +109,22 @@ impl LedgerQueries for Connection {
             .optional()?;
 
         result
-            .map(|data| LedgerHeader::from_xdr(&data, Limits::none()).map_err(DbError::from))
+            .map(|data| {
+                let header =
+                    LedgerHeader::from_xdr(&data, Limits::none()).map_err(DbError::from)?;
+                // LEDGER_SPEC §15 — validate header field invariants on load.
+                henyey_common::header_validation::validate_header_fields(&header)
+                    .map_err(DbError::Integrity)?;
+                Ok(header)
+            })
             .transpose()
     }
 
     fn store_ledger_header(&self, header: &LedgerHeader, data: &[u8]) -> Result<(), DbError> {
+        // LEDGER_SPEC §15 — validate header field invariants before persisting.
+        henyey_common::header_validation::validate_header_fields(header)
+            .map_err(DbError::Integrity)?;
+
         let ledger_hash = Hash256::hash(data);
         let prev_hash = Hash256::from_bytes(header.previous_ledger_hash.0);
         let bucket_list_hash = Hash256::from_bytes(header.bucket_list_hash.0);
@@ -173,7 +184,14 @@ impl LedgerQueries for Connection {
             .optional()?;
 
         result
-            .map(|data| LedgerHeader::from_xdr(&data, Limits::none()).map_err(DbError::from))
+            .map(|data| {
+                let header =
+                    LedgerHeader::from_xdr(&data, Limits::none()).map_err(DbError::from)?;
+                // LEDGER_SPEC §15 — validate header field invariants on load.
+                henyey_common::header_validation::validate_header_fields(&header)
+                    .map_err(DbError::Integrity)?;
+                Ok(header)
+            })
             .transpose()
     }
 
@@ -198,6 +216,9 @@ impl LedgerQueries for Connection {
         for row in rows {
             let (_seq, hash_hex, data) = row?;
             let header = LedgerHeader::from_xdr(&data, Limits::none())?;
+            // LEDGER_SPEC §15 — validate header field invariants before streaming.
+            henyey_common::header_validation::validate_header_fields(&header)
+                .map_err(DbError::Integrity)?;
             let hash_bytes = Hash256::from_hex(&hash_hex)
                 .map_err(|e| DbError::Integrity(format!("Invalid ledger hash: {}", e)))?;
             let entry = LedgerHeaderHistoryEntry {
@@ -619,5 +640,53 @@ mod tests {
     fn test_get_oldest_ledger_info_empty() {
         let conn = setup_db();
         assert!(conn.get_oldest_ledger_info().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_store_header_with_negative_fee_pool_fails() {
+        let conn = setup_db();
+        let mut header = create_test_header(100);
+        header.fee_pool = -1;
+        let data = header.to_xdr(Limits::none()).unwrap();
+        let result = conn.store_ledger_header(&header, &data);
+        assert!(
+            result.is_err(),
+            "Should reject header with negative fee_pool"
+        );
+    }
+
+    #[test]
+    fn test_load_corrupted_header_from_db_fails() {
+        let conn = setup_db();
+
+        // Store a valid header first
+        let header = create_test_header(100);
+        let data = header.to_xdr(Limits::none()).unwrap();
+        conn.store_ledger_header(&header, &data).unwrap();
+
+        // Corrupt the fee_pool in the DB by inserting raw XDR with negative fee_pool
+        let mut bad_header = create_test_header(200);
+        bad_header.fee_pool = -100;
+        let bad_data = bad_header.to_xdr(Limits::none()).unwrap();
+        let hash = henyey_common::Hash256::hash(&bad_data);
+        // Insert directly via raw SQL to bypass store validation
+        conn.execute(
+            "INSERT INTO ledgerheaders (ledgerhash, prevhash, bucketlisthash, ledgerseq, closetime, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                hash.to_hex(),
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                200u32,
+                1234567890u64,
+                bad_data,
+            ],
+        ).unwrap();
+
+        // Loading should fail with integrity error
+        let result = conn.load_ledger_header(200);
+        assert!(
+            result.is_err(),
+            "Should reject corrupted header loaded from DB"
+        );
     }
 }

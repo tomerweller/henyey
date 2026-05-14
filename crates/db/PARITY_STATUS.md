@@ -12,7 +12,7 @@
 | Connection pool and initialization | Full | r2d2/rusqlite covers open, pool, schema bootstrap |
 | Schema migrations | Full | Independent SQLite schema versioning through v8 |
 | Persistent state (`storestate`) | Full | Key-value reads, writes, deletes, and LCL helpers |
-| Ledger header storage | Full | Store/load/hash/stream/delete operations implemented |
+| Ledger header storage | Full | Store/load/hash/stream/delete + field validation matching `LedgerHeaderUtils::isValid()` |
 | Transaction history storage | Full | Tx rows, txsets, txresults, range queries, cleanup |
 | SCP history and quorum sets | Partial | Missing node-to-qset lookup (`quoruminfo`) |
 | SCP crash recovery state | Partial | Hash listing and tx-set cleanup remain incomplete |
