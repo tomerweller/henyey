@@ -1042,23 +1042,24 @@ mod tests {
 
     fn make_test_has(passphrase: Option<&str>) -> HistoryArchiveState {
         use crate::archive_state::{HASBucketLevel, HASBucketNext};
+        let level = HASBucketLevel {
+            curr: "00".repeat(32),
+            snap: "00".repeat(32),
+            next: HASBucketNext {
+                state: 0,
+                output: None,
+                curr: None,
+                snap: None,
+                shadow: None,
+            },
+        };
         HistoryArchiveState {
             version: 2,
             server: None,
             current_ledger: 63,
             network_passphrase: passphrase.map(|s| s.to_string()),
-            current_buckets: vec![HASBucketLevel {
-                curr: "00".repeat(32),
-                snap: "00".repeat(32),
-                next: HASBucketNext {
-                    state: 0,
-                    output: None,
-                    curr: None,
-                    snap: None,
-                    shadow: None,
-                },
-            }],
-            hot_archive_buckets: None,
+            current_buckets: vec![level.clone(); BUCKET_LIST_LEVELS],
+            hot_archive_buckets: Some(vec![level; HOT_ARCHIVE_BUCKET_LIST_LEVELS]),
         }
     }
 
