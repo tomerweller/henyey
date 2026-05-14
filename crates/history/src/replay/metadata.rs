@@ -38,9 +38,12 @@ pub(crate) fn replay_ledger(
     config: &ReplayConfig,
 ) -> Result<LedgerReplayResult> {
     // Verify the transaction set hash matches the header
-    if config.verify_results {
+    if config.verify_tx_set {
         verify::verify_tx_set(header, tx_set)?;
+    }
 
+    // Verify the transaction result set hash matches the header
+    if config.verify_tx_results {
         let result_set = TransactionResultSet {
             results: tx_results
                 .to_vec()
@@ -182,7 +185,9 @@ mod tests {
         let tx_metas = vec![];
 
         let config = ReplayConfig {
-            verify_results: false, // Skip verification for test
+            verify_header_chain: false,
+            verify_tx_set: false,
+            verify_tx_results: false, // Skip verification for test
             verify_bucket_list: false,
             verify_header_hash: false,
             emit_classic_events: false,
@@ -217,9 +222,11 @@ mod tests {
         let tx_set_hash = verify::compute_tx_set_hash(&tx_set).expect("tx set hash");
         let header = make_header_with_hashes(100, Hash([1u8; 32]), Hash(*tx_set_hash.as_bytes()));
 
-        // Must enable verify_results to test tx_set hash validation
+        // Must enable verify_tx_set to test tx_set hash validation
         let config = ReplayConfig {
-            verify_results: true,
+            verify_header_chain: true,
+            verify_tx_set: true,
+            verify_tx_results: true,
             ..ReplayConfig::default()
         };
         let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config);
@@ -236,9 +243,11 @@ mod tests {
 
         let header = make_header_with_hashes(100, Hash(*tx_set_hash.as_bytes()), Hash([2u8; 32]));
 
-        // Must enable verify_results to test tx_result hash validation
+        // Must enable verify_tx_results to test tx_result hash validation
         let config = ReplayConfig {
-            verify_results: true,
+            verify_header_chain: true,
+            verify_tx_set: true,
+            verify_tx_results: true,
             ..ReplayConfig::default()
         };
         let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config);

@@ -132,13 +132,29 @@ pub struct LedgerReplayResult {
 /// and whether optional features like event emission are enabled.
 #[derive(Debug, Clone)]
 pub struct ReplayConfig {
-    /// Verify that computed transaction results match header hashes.
+    /// Verify ledger header chain integrity and trust anchors.
+    ///
+    /// When enabled, verifies that downloaded headers form a valid hash
+    /// chain and connect to externally trusted state (checkpoint header
+    /// hash, LCL hash). Should always be true during catchup; may be
+    /// false only in synthetic tests that bypass chain integrity checks.
+    pub verify_header_chain: bool,
+
+    /// Verify that transaction set hashes match header.scpValue.txSetHash.
+    ///
+    /// When enabled, the replay will fail if the tx-set hash does not
+    /// match the header. Should be true whenever tx sets are available
+    /// (both catchup and offline verification).
+    pub verify_tx_set: bool,
+
+    /// Verify that transaction result set hashes match header.txSetResultHash.
     ///
     /// When enabled, the replay will fail if the transaction result set
     /// hash does not match `header.tx_set_result_hash`. This is disabled
     /// by default because re-execution may produce different result codes
-    /// than the original execution (especially for Soroban).
-    pub verify_results: bool,
+    /// than the original execution (especially for Soroban). Only enable
+    /// in offline verification mode where archived results are available.
+    pub verify_tx_results: bool,
 
     /// Verify that bucket list hash matches header at checkpoints.
     ///
@@ -207,13 +223,20 @@ pub struct ReplayExecutionContext<'a> {
 impl Default for ReplayConfig {
     fn default() -> Self {
         Self {
-            // Transaction result verification is disabled by default because during
-            // replay we re-execute transactions without TransactionMeta from archives.
-            // Our execution may produce slightly different result codes than
-            // stellar-core, especially for Soroban contracts (e.g., Trapped vs
-            // ResourceLimitExceeded). The bucket list hash at checkpoints is the
-            // authoritative verification of correct ledger state.
-            verify_results: false,
+            // Header chain verification is enabled by default — it validates
+            // hash linkage between consecutive ledger headers and trust anchor
+            // connections to externally-trusted state.
+            verify_header_chain: true,
+            // Tx-set hash verification is enabled by default — the tx-set
+            // hash should always match the header when tx sets are available.
+            verify_tx_set: true,
+            // Transaction result verification is disabled by default because
+            // during replay we re-execute transactions without TransactionMeta
+            // from archives. Our execution may produce slightly different result
+            // codes than stellar-core, especially for Soroban contracts (e.g.,
+            // Trapped vs ResourceLimitExceeded). The bucket list hash at
+            // checkpoints is the authoritative verification of correct ledger state.
+            verify_tx_results: false,
             verify_bucket_list: true,
             verify_header_hash: true,
             emit_classic_events: false,
@@ -393,9 +416,12 @@ pub(crate) mod tests {
     #[test]
     fn test_replay_config_default() {
         let config = ReplayConfig::default();
-        // verify_results is disabled by default because replay without TransactionMeta
-        // produces different results than stellar-core
-        assert!(!config.verify_results);
+        // Header chain and tx-set verification are always on by default
+        assert!(config.verify_header_chain);
+        assert!(config.verify_tx_set);
+        // Tx-result verification is disabled by default because replay without
+        // TransactionMeta produces different results than stellar-core
+        assert!(!config.verify_tx_results);
         assert!(config.verify_bucket_list);
     }
 }

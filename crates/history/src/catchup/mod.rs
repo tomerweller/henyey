@@ -1325,7 +1325,9 @@ impl CatchupManagerBuilder {
         }
 
         manager.replay_config = ReplayConfig {
-            verify_results: self.options.verify_headers,
+            verify_header_chain: self.options.verify_headers,
+            verify_tx_set: true,
+            verify_tx_results: false,
             verify_bucket_list: self.options.verify_buckets,
             verify_header_hash: self.options.verify_headers,
             emit_classic_events: false,

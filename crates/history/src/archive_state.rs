@@ -353,6 +353,113 @@ impl HASBucketNext {
     pub fn has_output_hash(&self) -> bool {
         self.state == HAS_NEXT_STATE_OUTPUT && self.output.is_some()
     }
+
+    /// Check if this future bucket is clear (no pending merge).
+    pub fn is_clear(&self) -> bool {
+        self.state == HAS_NEXT_STATE_CLEAR
+    }
+}
+
+/// Per-level bucket version info for structural validation.
+///
+/// Used by `validate_bucket_list_structure` to check version monotonicity
+/// and protocol-dependent `next` field validity.
+pub struct BucketLevelVersionInfo {
+    /// Protocol version of the snap bucket (0 if empty/zero-hash).
+    pub snap_version: u32,
+    /// Protocol version of the curr bucket (0 if empty/zero-hash).
+    pub curr_version: u32,
+    /// The `next` field from the corresponding HAS level.
+    pub next: HASBucketNext,
+}
+
+/// First protocol version where bucket shadows were removed.
+/// Matches stellar-core's `LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED`.
+const FIRST_PROTOCOL_SHADOWS_REMOVED: u32 = 12;
+
+/// Validate bucket list structure and version monotonicity.
+///
+/// Mirrors stellar-core's `validateBucketListHelper` (HistoryArchive.cpp:340-446).
+/// Walks from deepest level (highest index) to level 0, checking:
+/// - Bucket count matches `expected_level_count`
+/// - Snap then curr version at each level >= running `min_bucket_version`
+/// - Level 0 `next` must be clear
+/// - Level i>0: if `prev_snap` (level i-1) version >= FIRST_PROTOCOL_SHADOWS_REMOVED,
+///   then `next` must be clear; otherwise `next` must have a resolved output hash
+///
+/// Empty buckets have version 0 and are skipped until the first non-empty bucket
+/// is seen (bottom-up). After a non-empty bucket, all higher-level buckets
+/// must satisfy the version constraint.
+pub fn validate_bucket_list_structure(
+    levels: &[BucketLevelVersionInfo],
+    expected_level_count: usize,
+) -> Result<(), HistoryError> {
+    if levels.len() != expected_level_count {
+        return Err(HistoryError::VerificationFailed(format!(
+            "bucket list size mismatch: expected {} levels, got {}",
+            expected_level_count,
+            levels.len()
+        )));
+    }
+
+    let mut non_empty_seen = false;
+    let mut min_bucket_version: u32 = 0;
+
+    // Walk from deepest level (highest index) to 0
+    for j in (0..expected_level_count).rev() {
+        let level = &levels[j];
+
+        // snap is always older than curr, processed first
+        // (mirrors stellar-core's ordering in validateBucketListHelper)
+        for &version in &[level.snap_version, level.curr_version] {
+            if version > 0 {
+                non_empty_seen = true;
+            }
+            if version < min_bucket_version {
+                return Err(HistoryError::VerificationFailed(format!(
+                    "incompatible bucket versions: expected version {} or higher, got {}",
+                    min_bucket_version, version
+                )));
+            }
+            min_bucket_version = version;
+        }
+
+        // Level 0: next must be clear
+        if j == 0 {
+            if !level.next.is_clear() {
+                return Err(HistoryError::VerificationFailed(
+                    "invalid HAS: next must be clear at level 0".to_string(),
+                ));
+            }
+            break;
+        }
+
+        // Use previous level (j-1) snap to determine "next" validity
+        let prev_snap_version = levels[j - 1].snap_version;
+        if prev_snap_version > 0 {
+            non_empty_seen = true;
+        }
+
+        if !non_empty_seen {
+            // Haven't seen any non-empty bucket yet (from bottom up),
+            // skip next-field check for default-initialized levels
+            continue;
+        } else if prev_snap_version >= FIRST_PROTOCOL_SHADOWS_REMOVED {
+            if !level.next.is_clear() {
+                return Err(HistoryError::VerificationFailed(format!(
+                    "invalid HAS: future must be cleared at level {} (prev snap version {})",
+                    j, prev_snap_version
+                )));
+            }
+        } else if !level.next.has_output_hash() {
+            return Err(HistoryError::VerificationFailed(format!(
+                "invalid HAS: future must have resolved output at level {} (prev snap version {})",
+                j, prev_snap_version
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 impl HistoryArchiveState {
@@ -389,7 +496,45 @@ impl HistoryArchiveState {
     /// assert_eq!(has.current_ledger, 12345);
     /// ```
     pub fn from_json(json: &str) -> Result<Self, HistoryError> {
-        serde_json::from_str(json).map_err(HistoryError::Json)
+        let has: Self = serde_json::from_str(json).map_err(HistoryError::Json)?;
+        has.validate_version_invariants()?;
+        Ok(has)
+    }
+
+    /// Validate version-dependent invariants.
+    ///
+    /// - Version < 2: `hot_archive_buckets` must be absent (v1 format predates
+    ///   hot archive support)
+    ///
+    /// Note: version >= 2 MAY or MAY NOT have `hot_archive_buckets` — the v2
+    /// format was introduced for `networkPassphrase` and hot archive support
+    /// was added later within v2.
+    pub fn validate_version_invariants(&self) -> Result<(), HistoryError> {
+        if self.version < 2 && self.hot_archive_buckets.is_some() {
+            return Err(HistoryError::VerificationFailed(
+                "HAS version < 2 must not include hotArchiveBuckets".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Get hot archive bucket levels (version-gated).
+    ///
+    /// Returns the hot archive bucket levels for version >= 2 HAS,
+    /// or an empty slice for version < 2.
+    pub fn hot_archive_levels(&self) -> &[HASBucketLevel] {
+        match &self.hot_archive_buckets {
+            Some(levels) => levels,
+            None => &[],
+        }
+    }
+
+    /// Get mutable access to hot archive bucket levels (version-gated).
+    ///
+    /// Returns `Some` for version >= 2 HAS with populated hot archive,
+    /// `None` for version < 2 or missing hot archive data.
+    pub fn hot_archive_levels_mut(&mut self) -> Option<&mut Vec<HASBucketLevel>> {
+        self.hot_archive_buckets.as_mut()
     }
 
     /// Serialize the History Archive State to JSON.
@@ -595,16 +740,34 @@ impl HistoryArchiveState {
         &self,
         known_hashes: &HashSet<Hash256>,
     ) -> Result<(), HistoryError> {
+        // Validate live bucket list
+        Self::validate_bucket_level_hashes(&self.current_buckets, known_hashes, "live")?;
+
+        // Validate hot archive bucket list (if present)
+        if let Some(ref hot_levels) = self.hot_archive_buckets {
+            Self::validate_bucket_level_hashes(hot_levels, known_hashes, "hot_archive")?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate bucket level hashes for a single bucket list (live or hot archive).
+    fn validate_bucket_level_hashes(
+        levels: &[HASBucketLevel],
+        known_hashes: &HashSet<Hash256>,
+        list_name: &str,
+    ) -> Result<(), HistoryError> {
         // Level 0 next must be clear
-        if let Some(level0) = self.current_buckets.first() {
+        if let Some(level0) = levels.first() {
             if level0.next.state != HAS_NEXT_STATE_CLEAR {
-                return Err(HistoryError::VerificationFailed(
-                    "level 0 next is not clear in HAS".to_string(),
-                ));
+                return Err(HistoryError::VerificationFailed(format!(
+                    "{} level 0 next is not clear in HAS",
+                    list_name,
+                )));
             }
         }
 
-        for (i, level) in self.current_buckets.iter().enumerate() {
+        for (i, level) in levels.iter().enumerate() {
             validate_known_hash(known_hashes, i, "curr", &level.curr)?;
             validate_known_hash(known_hashes, i, "snap", &level.snap)?;
             validate_future_bucket_hashes(known_hashes, i, &level.next)?;
@@ -1606,5 +1769,255 @@ mod tests {
             states[1].is_none(),
             "zero-hash output should be canonicalized to None"
         );
+    }
+
+    #[test]
+    fn test_validate_version_invariants_v2_with_hot() {
+        let has = HistoryArchiveState::from_json(r#"{
+            "version": 2,
+            "currentLedger": 100,
+            "currentBuckets": [],
+            "hotArchiveBuckets": [{"curr": "0000000000000000000000000000000000000000000000000000000000000000", "snap": "0000000000000000000000000000000000000000000000000000000000000000", "next": {"state": 0}}]
+        }"#).unwrap();
+        assert!(has.validate_version_invariants().is_ok());
+    }
+
+    #[test]
+    fn test_validate_version_invariants_v2_without_hot() {
+        // v2 without hot archive is valid (hot archive was added later in v2)
+        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        assert_eq!(has.version, 2);
+        assert!(has.hot_archive_buckets.is_none());
+        assert!(has.validate_version_invariants().is_ok());
+    }
+
+    #[test]
+    fn test_validate_version_invariants_v1_with_hot() {
+        let json = r#"{
+            "version": 1,
+            "currentLedger": 100,
+            "currentBuckets": [],
+            "hotArchiveBuckets": []
+        }"#;
+        assert!(HistoryArchiveState::from_json(json).is_err());
+    }
+
+    #[test]
+    fn test_validate_version_invariants_v1_without_hot() {
+        let json = r#"{
+            "version": 1,
+            "currentLedger": 100,
+            "currentBuckets": []
+        }"#;
+        let has = HistoryArchiveState::from_json(json).unwrap();
+        assert!(has.validate_version_invariants().is_ok());
+    }
+
+    #[test]
+    fn test_hot_archive_levels_accessor_v2() {
+        let has = HistoryArchiveState::from_json(r#"{
+            "version": 2,
+            "currentLedger": 100,
+            "currentBuckets": [],
+            "hotArchiveBuckets": [{"curr": "abc123", "snap": "0000000000000000000000000000000000000000000000000000000000000000", "next": {"state": 0}}]
+        }"#).unwrap();
+        let levels = has.hot_archive_levels();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].curr, "abc123");
+    }
+
+    #[test]
+    fn test_hot_archive_levels_accessor_v1() {
+        let json = r#"{
+            "version": 1,
+            "currentLedger": 100,
+            "currentBuckets": []
+        }"#;
+        let has = HistoryArchiveState::from_json(json).unwrap();
+        let levels = has.hot_archive_levels();
+        assert!(levels.is_empty());
+    }
+
+    #[test]
+    fn test_hot_archive_levels_mut_v2() {
+        let mut has = HistoryArchiveState::from_json(
+            r#"{
+            "version": 2,
+            "currentLedger": 100,
+            "currentBuckets": [],
+            "hotArchiveBuckets": []
+        }"#,
+        )
+        .unwrap();
+        assert!(has.hot_archive_levels_mut().is_some());
+    }
+
+    #[test]
+    fn test_hot_archive_levels_mut_v1() {
+        let json = r#"{
+            "version": 1,
+            "currentLedger": 100,
+            "currentBuckets": []
+        }"#;
+        let mut has = HistoryArchiveState::from_json(json).unwrap();
+        assert!(has.hot_archive_levels_mut().is_none());
+    }
+
+    #[test]
+    fn test_contains_valid_buckets_validates_hot_archive() {
+        let mut has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        // Add hot archive with a non-zero hash that is NOT in known_hashes
+        has.hot_archive_buckets = Some(vec![HASBucketLevel {
+            curr: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            snap: ZERO_HASH.to_string(),
+            next: HASBucketNext::default(),
+        }]);
+        let known: HashSet<Hash256> = has
+            .current_buckets
+            .iter()
+            .flat_map(|l| {
+                [&l.curr, &l.snap]
+                    .into_iter()
+                    .filter_map(|h| Hash256::from_hex(h).ok())
+            })
+            .collect();
+        // Should fail because hot archive curr hash is not in known_hashes
+        assert!(has.contains_valid_buckets(&known).is_err());
+    }
+
+    // --- validate_bucket_list_structure tests ---
+
+    fn make_level(
+        snap: u32,
+        curr: u32,
+        next_state: u32,
+        output: Option<&str>,
+    ) -> BucketLevelVersionInfo {
+        BucketLevelVersionInfo {
+            snap_version: snap,
+            curr_version: curr,
+            next: HASBucketNext {
+                state: next_state,
+                output: output.map(String::from),
+                curr: None,
+                snap: None,
+                shadow: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_validate_bucket_list_valid_monotonic() {
+        // 11 levels: deepest (index 10) has lowest version, top (index 0) highest.
+        // Iteration goes bottom-up: 10, 9, ..., 0. Each must be >= previous.
+        let levels: Vec<_> = (0..11u32)
+            .map(|i| make_level(22 - i, 22 - i, HAS_NEXT_STATE_CLEAR, None))
+            .collect();
+        assert!(validate_bucket_list_structure(&levels, 11).is_ok());
+    }
+
+    #[test]
+    fn test_validate_bucket_list_size_mismatch() {
+        let levels: Vec<_> = (0..10)
+            .map(|i| make_level(12 + i, 12 + i, HAS_NEXT_STATE_CLEAR, None))
+            .collect();
+        let err = validate_bucket_list_structure(&levels, 11).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::VerificationFailed(ref msg) if msg.contains("size mismatch"))
+        );
+    }
+
+    #[test]
+    fn test_validate_bucket_list_decreasing_version() {
+        // All levels at version 24, except level 8 has version 30.
+        // Walk bottom-up: j=10 (24), j=9 (24), j=8 (30→min=30), j=7 (24<30) → fail
+        let mut levels: Vec<_> = (0..11u32)
+            .map(|_| make_level(24, 24, HAS_NEXT_STATE_CLEAR, None))
+            .collect();
+        levels[8].snap_version = 30;
+        levels[8].curr_version = 30;
+        let err = validate_bucket_list_structure(&levels, 11).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::VerificationFailed(ref msg) if msg.contains("incompatible bucket versions"))
+        );
+    }
+
+    #[test]
+    fn test_validate_bucket_list_all_empty() {
+        // All empty (version 0) — valid (no non-empty seen)
+        let levels: Vec<_> = (0..11)
+            .map(|_| make_level(0, 0, HAS_NEXT_STATE_CLEAR, None))
+            .collect();
+        assert!(validate_bucket_list_structure(&levels, 11).is_ok());
+    }
+
+    #[test]
+    fn test_validate_bucket_list_level0_next_not_clear() {
+        let mut levels: Vec<_> = (0..11u32)
+            .map(|i| make_level(22 - i, 22 - i, HAS_NEXT_STATE_CLEAR, None))
+            .collect();
+        levels[0].next.state = HAS_NEXT_STATE_OUTPUT;
+        levels[0].next.output = Some("abc".to_string());
+        let err = validate_bucket_list_structure(&levels, 11).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::VerificationFailed(ref msg) if msg.contains("level 0"))
+        );
+    }
+
+    #[test]
+    fn test_validate_bucket_list_post_shadows_removed_next_not_clear() {
+        // prev (level j-1) snap version >= 12, so level j next must be clear
+        let mut levels: Vec<_> = (0..11u32)
+            .map(|i| make_level(22 - i, 22 - i, HAS_NEXT_STATE_CLEAR, None))
+            .collect();
+        // Level 1 has a non-clear next; prev is level 0 with snap=22 >= 12
+        levels[1].next.state = HAS_NEXT_STATE_OUTPUT;
+        levels[1].next.output = Some("hash".to_string());
+        let err = validate_bucket_list_structure(&levels, 11).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::VerificationFailed(ref msg) if msg.contains("future must be cleared"))
+        );
+    }
+
+    #[test]
+    fn test_validate_bucket_list_pre_shadows_needs_output() {
+        // prev (level 0) snap version = 11 (< 12), so level 1 next must have output hash
+        let levels: Vec<_> = (0..11)
+            .map(|_| make_level(11, 11, HAS_NEXT_STATE_CLEAR, None))
+            .collect();
+        // Level 1 next is clear but should have output (pre-shadows-removed)
+        let err = validate_bucket_list_structure(&levels, 11).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::VerificationFailed(ref msg) if msg.contains("must have resolved output"))
+        );
+    }
+
+    #[test]
+    fn test_validate_bucket_list_pre_shadows_with_output_ok() {
+        // prev (level 0) snap = 11, level 1+ next has output hash — valid
+        let mut levels: Vec<_> = (0..11)
+            .map(|_| make_level(11, 11, HAS_NEXT_STATE_OUTPUT, Some("deadbeef")))
+            .collect();
+        // Level 0 must be clear
+        levels[0].next.state = HAS_NEXT_STATE_CLEAR;
+        levels[0].next.output = None;
+        assert!(validate_bucket_list_structure(&levels, 11).is_ok());
+    }
+
+    #[test]
+    fn test_validate_bucket_list_empty_levels_skipped() {
+        // Bottom levels empty, top levels have versions — valid
+        // nonEmptySeen only becomes true when we hit a non-empty bucket
+        let mut levels: Vec<_> = (0..11)
+            .map(|_| make_level(0, 0, HAS_NEXT_STATE_CLEAR, None))
+            .collect();
+        // Only top 3 levels have data (levels 0, 1, 2)
+        levels[0].snap_version = 24;
+        levels[0].curr_version = 24;
+        levels[1].snap_version = 24;
+        levels[1].curr_version = 24;
+        levels[2].snap_version = 24;
+        levels[2].curr_version = 24;
+        assert!(validate_bucket_list_structure(&levels, 11).is_ok());
     }
 }

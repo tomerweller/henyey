@@ -136,6 +136,7 @@ pub(crate) mod tracing_test_support;
 pub use archive::HistoryArchive;
 pub use archive_state::HistoryArchiveState;
 pub use archive_state::MAX_HISTORY_ARCHIVE_BUCKET_SIZE;
+pub use archive_state::{validate_bucket_list_structure, BucketLevelVersionInfo};
 pub use catchup::{
     CatchupManager, CatchupOptions, CatchupProgress, CatchupStatus, CheckpointData,
     ExistingBucketState, LedgerData, LedgerTxData,

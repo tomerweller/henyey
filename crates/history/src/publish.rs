@@ -60,7 +60,68 @@ use std::path::{Path, PathBuf};
 use stellar_xdr::curr::{
     LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use crate::checkpoint::DEFAULT_CHECKPOINT_FREQUENCY;
+
+/// Maximum number of checkpoints to clean up in a single `delete_published_files` pass.
+///
+/// Matches stellar-core's `MAX_CHECKPOINTS` in `deletePublishedFiles`
+/// (HistoryManagerImpl.cpp:532).
+pub const MAX_DELETE_CHECKPOINTS: u32 = 100;
+
+/// Delete local checkpoint files that have been successfully published and uploaded.
+///
+/// After a checkpoint is published to a remote archive, the local staging files
+/// written by `CheckpointBuilder` are no longer needed. This function walks
+/// backwards from `checkpoint` removing ledger, transaction, and result files,
+/// stopping at `MAX_DELETE_CHECKPOINTS` or when no files exist for a checkpoint.
+///
+/// This mirrors stellar-core's `HistoryManager::deletePublishedFiles`
+/// (HistoryManagerImpl.cpp:523-580).
+///
+/// Returns the number of checkpoints whose files were cleaned up.
+pub fn delete_published_files(checkpoint: u32, publish_dir: &Path) -> u32 {
+    let mut cleaned = 0u32;
+    let mut seq = checkpoint;
+
+    while cleaned < MAX_DELETE_CHECKPOINTS {
+        let mut any_exist = false;
+
+        for category in &["ledger", "transactions", "results"] {
+            // Final file
+            let rel_path = paths::checkpoint_path(category, seq, "xdr.gz");
+            let path = publish_dir.join(&rel_path);
+            if path.exists() {
+                any_exist = true;
+                if let Err(e) = std::fs::remove_file(&path) {
+                    warn!(path = %path.display(), error = %e, "Failed to remove published file");
+                }
+            }
+
+            // Dirty file (shouldn't exist post-finalize, but clean up defensively)
+            let dirty_rel = paths::checkpoint_path_dirty(category, seq, "xdr.gz");
+            let dirty_path = publish_dir.join(&dirty_rel);
+            if dirty_path.exists() {
+                any_exist = true;
+                let _ = std::fs::remove_file(&dirty_path);
+            }
+        }
+
+        if !any_exist {
+            break;
+        }
+
+        cleaned += 1;
+
+        if seq < DEFAULT_CHECKPOINT_FREQUENCY {
+            break;
+        }
+        seq -= DEFAULT_CHECKPOINT_FREQUENCY;
+    }
+
+    cleaned
+}
 
 /// Configuration for history publishing.
 #[derive(Debug, Clone)]
@@ -1775,5 +1836,94 @@ mod tests {
             "expected ordering error, got: {:?}",
             err
         );
+    }
+
+    #[test]
+    fn test_delete_published_files_removes_files() {
+        let tmp = TempDir::new().unwrap();
+        let publish_dir = tmp.path();
+
+        // Create checkpoint files for ledger 64 (first checkpoint)
+        let ledger_path = publish_dir.join(paths::checkpoint_path("ledger", 64, "xdr.gz"));
+        let tx_path = publish_dir.join(paths::checkpoint_path("transactions", 64, "xdr.gz"));
+        let results_path = publish_dir.join(paths::checkpoint_path("results", 64, "xdr.gz"));
+
+        for path in [&ledger_path, &tx_path, &results_path] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"test").unwrap();
+        }
+
+        let cleaned = delete_published_files(64, publish_dir);
+        assert_eq!(cleaned, 1);
+        assert!(!ledger_path.exists());
+        assert!(!tx_path.exists());
+        assert!(!results_path.exists());
+    }
+
+    #[test]
+    fn test_delete_published_files_stops_on_missing() {
+        let tmp = TempDir::new().unwrap();
+        let publish_dir = tmp.path();
+
+        // Create files for checkpoint 128 only (not 64)
+        let ledger_path = publish_dir.join(paths::checkpoint_path("ledger", 128, "xdr.gz"));
+        std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+        std::fs::write(&ledger_path, b"test").unwrap();
+
+        // Start at 128, should clean 128 then stop at 64 (no files)
+        let cleaned = delete_published_files(128, publish_dir);
+        assert_eq!(cleaned, 1);
+        assert!(!ledger_path.exists());
+    }
+
+    #[test]
+    fn test_delete_published_files_caps_at_max() {
+        let tmp = TempDir::new().unwrap();
+        let publish_dir = tmp.path();
+
+        // Create files for 101 checkpoints (64, 128, ..., 64*101=6464)
+        for i in 1..=101u32 {
+            let seq = i * 64;
+            let path = publish_dir.join(paths::checkpoint_path("ledger", seq, "xdr.gz"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"test").unwrap();
+        }
+
+        // Start at highest checkpoint
+        let cleaned = delete_published_files(101 * 64, publish_dir);
+        assert_eq!(cleaned, MAX_DELETE_CHECKPOINTS);
+        // The first checkpoint (64) should still exist
+        let first = publish_dir.join(paths::checkpoint_path("ledger", 64, "xdr.gz"));
+        assert!(first.exists());
+    }
+
+    #[test]
+    fn test_delete_published_files_handles_first_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let publish_dir = tmp.path();
+
+        // Create file at the first checkpoint
+        let path = publish_dir.join(paths::checkpoint_path("ledger", 64, "xdr.gz"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"test").unwrap();
+
+        // Should clean and not underflow
+        let cleaned = delete_published_files(64, publish_dir);
+        assert_eq!(cleaned, 1);
+    }
+
+    #[test]
+    fn test_delete_published_files_also_removes_dirty() {
+        let tmp = TempDir::new().unwrap();
+        let publish_dir = tmp.path();
+
+        // Create a .dirty file
+        let dirty_path = publish_dir.join(paths::checkpoint_path_dirty("ledger", 64, "xdr.gz"));
+        std::fs::create_dir_all(dirty_path.parent().unwrap()).unwrap();
+        std::fs::write(&dirty_path, b"test").unwrap();
+
+        let cleaned = delete_published_files(64, publish_dir);
+        assert_eq!(cleaned, 1);
+        assert!(!dirty_path.exists());
     }
 }

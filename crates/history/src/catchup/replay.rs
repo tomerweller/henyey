@@ -60,10 +60,9 @@ impl CatchupManager {
         // Extract headers for chain verification
         let headers: Vec<_> = ledger_data.iter().map(|d| d.header().clone()).collect();
 
-        // Skip header chain and trust anchor verification when verify_results
-        // is false (maps from CatchupOptions::verify_headers). This allows
-        // synthetic tests to bypass chain integrity checks.
-        if self.replay_config.verify_results {
+        // Skip header chain and trust anchor verification when verify_header_chain
+        // is false. This allows synthetic tests to bypass chain integrity checks.
+        if self.replay_config.verify_header_chain {
             verify::verify_header_chain(&headers)?;
 
             // Verify trust anchors (spec §9.2–§9.5): ensures the chain connects

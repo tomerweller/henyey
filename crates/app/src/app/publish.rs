@@ -136,6 +136,14 @@ impl App {
                     if let Err(e) = app.db.remove_publish(checkpoint) {
                         tracing::warn!(checkpoint, error = %e, "Failed to dequeue published checkpoint");
                     }
+                    // Clean up local checkpoint files that are no longer needed
+                    // after successful upload (mirrors stellar-core's deletePublishedFiles).
+                    let publish_dir = app.bucket_manager.bucket_dir().join("history");
+                    let cleaned =
+                        henyey_history::publish::delete_published_files(checkpoint, &publish_dir);
+                    if cleaned > 0 {
+                        tracing::debug!(checkpoint, cleaned, "Deleted local published files");
+                    }
                     tracing::info!(checkpoint, "Checkpoint published successfully");
                 }
                 Err(e) => {

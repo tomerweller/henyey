@@ -521,7 +521,7 @@ pub fn replay_ledger_with_execution(
         offer_entries,
     } = context;
 
-    if config.verify_results {
+    if config.verify_tx_set {
         verify::verify_tx_set(header, tx_set)?;
     }
 
@@ -665,7 +665,7 @@ pub fn replay_ledger_with_execution(
         }
     }
 
-    if config.verify_results {
+    if config.verify_tx_results {
         let result_set =
             TransactionResultSet {
                 results: tx_set_result.tx_results.clone().try_into().map_err(|_| {
@@ -1250,7 +1250,9 @@ mod tests {
         let mut hot_archive = HotArchiveBucketList::new();
 
         let config = ReplayConfig {
-            verify_results: false,
+            verify_header_chain: false,
+            verify_tx_set: false,
+            verify_tx_results: false,
             verify_bucket_list: true,
             verify_header_hash: true,
             emit_classic_events: false,
@@ -1299,7 +1301,9 @@ mod tests {
         let mut bucket_list = BucketList::new();
         let mut hot_archive = HotArchiveBucketList::new();
         let config = ReplayConfig {
-            verify_results: true,
+            verify_header_chain: true,
+            verify_tx_set: true,
+            verify_tx_results: true,
             verify_bucket_list: false,
             verify_header_hash: false,
             emit_classic_events: false,
@@ -1341,7 +1345,9 @@ mod tests {
         let mut bucket_list = BucketList::new();
         let mut hot_archive = HotArchiveBucketList::new();
         let config = ReplayConfig {
-            verify_results: true,
+            verify_header_chain: true,
+            verify_tx_set: true,
+            verify_tx_results: true,
             verify_bucket_list: false,
             verify_header_hash: false,
             emit_classic_events: false,
@@ -2056,7 +2062,9 @@ mod tests {
         });
 
         let config = ReplayConfig {
-            verify_results: false,
+            verify_header_chain: false,
+            verify_tx_set: false,
+            verify_tx_results: false,
             verify_bucket_list: false,
             verify_header_hash: false,
             emit_classic_events: true,
@@ -2261,7 +2269,9 @@ mod tests {
         let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
 
         let config = ReplayConfig {
-            verify_results: false,
+            verify_header_chain: false,
+            verify_tx_set: false,
+            verify_tx_results: false,
             verify_bucket_list: false,
             verify_header_hash: false,
             emit_classic_events: false,
@@ -2416,7 +2426,9 @@ mod tests {
         let mut hot_archive = HotArchiveBucketList::new();
 
         let config = ReplayConfig {
-            verify_results: false,
+            verify_header_chain: false,
+            verify_tx_set: false,
+            verify_tx_results: false,
             verify_bucket_list: true,
             verify_header_hash: false,
             emit_classic_events: false,

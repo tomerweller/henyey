@@ -350,7 +350,9 @@ async fn test_catchup_replay_bucket_hash_verification() {
     // verification is tested end-to-end on testnet.
     manager.set_replay_config(henyey_history::ReplayConfig {
         verify_bucket_list: false,
-        verify_results: false,
+        verify_header_chain: false,
+        verify_tx_set: false,
+        verify_tx_results: false,
         verify_header_hash: false,
         ..Default::default()
     });
@@ -571,7 +573,9 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
 
     manager.set_replay_config(henyey_history::ReplayConfig {
         verify_bucket_list: false,
-        verify_results: false,
+        verify_header_chain: false,
+        verify_tx_set: false,
+        verify_tx_results: false,
         verify_header_hash: false,
         ..Default::default()
     });
@@ -901,7 +905,9 @@ async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
 
     manager.set_replay_config(henyey_history::ReplayConfig {
         verify_bucket_list: false,
-        verify_results: false,
+        verify_header_chain: false,
+        verify_tx_set: false,
+        verify_tx_results: false,
         verify_header_hash: false,
         ..Default::default()
     });
@@ -1139,7 +1145,9 @@ async fn test_replay_hash_mismatch_produces_replay_hash_mismatch_error() {
     // Enable only header hash verification to isolate the ReplayHashMismatch path.
     manager.set_replay_config(henyey_history::ReplayConfig {
         verify_bucket_list: false,
-        verify_results: false,
+        verify_header_chain: false,
+        verify_tx_set: false,
+        verify_tx_results: false,
         verify_header_hash: true,
         ..Default::default()
     });
@@ -1426,7 +1434,9 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
     // validate_bucket_hash check is exercised.
     manager.set_replay_config(henyey_history::ReplayConfig {
         verify_bucket_list: false,
-        verify_results: false,
+        verify_header_chain: false,
+        verify_tx_set: false,
+        verify_tx_results: false,
         verify_header_hash: false,
         ..Default::default()
     });
