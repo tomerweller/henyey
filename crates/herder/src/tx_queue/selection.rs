@@ -164,6 +164,10 @@ impl TransactionQueue {
                         network_id: self.config.network_id,
                         ledger_flags: vc.ledger_flags,
                         soroban_resource_limits: vc.soroban_resource_limits.clone(),
+                        frozen_key_config: vc
+                            .frozen_key_config
+                            .clone()
+                            .unwrap_or_else(henyey_tx::frozen_keys::FrozenKeyConfig::empty),
                     }),
                 )
             }

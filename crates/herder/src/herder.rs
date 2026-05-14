@@ -2457,6 +2457,7 @@ impl Herder {
             snapshot_providers,
             config_ctx,
             soroban_info,
+            frozen_key_config,
         ) = {
             // ONE snapshot for the entire nomination pass: tx set building,
             // seq map, config upgrade context, and self-validation providers
@@ -2488,6 +2489,23 @@ impl Herder {
             // eliminating the TOCTOU race with commit_close().
             let soroban_info = snap.soroban_network_info().cloned();
             let soroban_max = soroban_info.as_ref().map(|info| info.ledger_max_tx_count);
+
+            // Load CAP-77 frozen key config from the same snapshot.
+            // Pre-V26 returns empty config (no frozen keys).
+            let frozen_key_config = match henyey_ledger::execution::load_frozen_key_config(
+                &snap,
+                header.ledger_version,
+            ) {
+                Ok(config) => Some(config),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to load frozen key config for nomination; \
+                         frozen key checks will be skipped"
+                    );
+                    None
+                }
+            };
 
             // Build seq map from the snapshot (borrows).
             let seq = self.build_starting_seq_map(&snap, ledger_seq);
@@ -2526,6 +2544,7 @@ impl Herder {
                 Some(sp),
                 cfg_ctx,
                 soroban_info,
+                frozen_key_config,
             )
         };
 
@@ -2574,6 +2593,9 @@ impl Herder {
             );
             if let Some(info) = soroban_info.as_ref() {
                 validation_ctx.soroban_resource_limits = Some(info.to_resource_limits());
+            }
+            if let Some(fk) = frozen_key_config.as_ref() {
+                validation_ctx.frozen_key_config = fk.clone();
             }
             let nomination_ctx = crate::tx_queue::NominationBuildContext {
                 base_fee: header.base_fee as i64,
@@ -2859,6 +2881,10 @@ impl Herder {
 
         // Step 2: content validation against the same snapshot used to build
         // the set. Parity: stellar-core `checkValidInternal` step.
+        let frozen_key_config = snapshot_providers.and_then(|sp| {
+            henyey_ledger::execution::load_frozen_key_config(sp.snapshot(), header.ledger_version)
+                .ok()
+        });
         prepared
             .check_valid(
                 header,
@@ -2868,6 +2894,7 @@ impl Herder {
                 soroban_info,
                 snapshot_providers.map(|sp| sp as &dyn crate::tx_queue::FeeBalanceProvider),
                 snapshot_providers.map(|sp| sp as &dyn crate::tx_queue::AccountProvider),
+                frozen_key_config.as_ref(),
             )
             .map_err(|e| e.to_string())
     }
@@ -9082,6 +9109,7 @@ mod advance_tracking_slot_tests {
             Some(&soroban_info),
             None,
             None,
+            None,
         );
         assert!(
             result_stale.is_err(),
@@ -9131,6 +9159,7 @@ mod advance_tracking_slot_tests {
             0,
             network_id,
             Some(&soroban_info),
+            None,
             None,
             None,
         );

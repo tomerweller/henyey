@@ -2505,6 +2505,7 @@ impl App {
                     network_id,
                     ledger_flags,
                     soroban_resource_limits,
+                    frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::empty(),
                 };
                 // Build ONE snapshot for the whole re-validation pass.
                 //

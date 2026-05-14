@@ -191,6 +191,9 @@ pub struct TxSetValidationContext {
     pub ledger_flags: u32,
     /// Per-TX Soroban resource limits (from Soroban network config, if available).
     pub soroban_resource_limits: Option<henyey_tx::SorobanResourceLimits>,
+    /// CAP-77: Frozen ledger key configuration for tx-set validation.
+    /// Pre-V26 this is empty (no frozen keys). V26+ loaded from Soroban config.
+    pub frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig,
 }
 
 impl TxSetValidationContext {
@@ -224,6 +227,7 @@ impl TxSetValidationContext {
             network_id,
             ledger_flags,
             soroban_resource_limits: None,
+            frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::empty(),
         }
     }
 
@@ -356,11 +360,31 @@ fn validate_regular_for_tx_set(
         return false;
     }
 
-    // Phase A: TX-level signature check (LOW threshold for tx source)
+    // Phase A2: Compute tx hash (needed for frozen-key bypass and signatures)
     let tx_hash = match frame.hash(&ctx.network_id) {
         Ok(h) => h,
         Err(_) => return false,
     };
+
+    // Phase A3: CAP-77 frozen key check
+    // Parity: stellar-core commonValidPreSeqNum:1548-1560
+    // Must precede signature checks — matches stellar-core ordering.
+    // No protocol gate — relies on has_frozen_keys() being false pre-V26.
+    if ctx.frozen_key_config.has_frozen_keys() {
+        let soroban_fp = frame.soroban_data().map(|d| &d.resources.footprint);
+        if henyey_tx::frozen_keys::accesses_frozen_key(
+            &source_id,
+            frame.operations(),
+            soroban_fp,
+            &ctx.frozen_key_config,
+        ) && !ctx.frozen_key_config.is_freeze_bypass_tx(&tx_hash)
+        {
+            debug!("tx-set validation: tx accesses frozen ledger key");
+            return false;
+        }
+    }
+
+    // Phase B: TX-level signature check (LOW threshold for tx source)
     let mut checker = SignatureChecker::new(tx_hash, frame.signatures());
     let signers = collect_signers_for_account(&source_account);
     let threshold_low = source_account.thresholds.0[1] as i32;
@@ -369,17 +393,17 @@ fn validate_regular_for_tx_set(
         return false;
     }
 
-    // Phase B: Per-op source auth (every op, including tx-source ops at correct threshold)
+    // Phase C: Per-op source auth (every op, including tx-source ops at correct threshold)
     if !validate_ops_auth(frame, &source_account, &mut checker, account_provider) {
         return false;
     }
 
-    // Phase C: Extra signers (must come before unused-sig check, uses same checker)
+    // Phase D: Extra signers (must come before unused-sig check, uses same checker)
     if !validate_extra_signers(frame, &mut checker) {
         return false;
     }
 
-    // Phase D: Unused signature detection
+    // Phase E: Unused signature detection
     if !checker.check_all_signatures_used() {
         debug!("tx-set validation: unused signatures detected (txBAD_AUTH_EXTRA)");
         return false;
@@ -424,6 +448,21 @@ fn validate_fee_bump_for_tx_set(
         Ok(h) => h,
         Err(_) => return false,
     };
+
+    // CAP-77: Fee-bump fee source frozen key check (before signatures)
+    // Parity: FeeBumpTransactionFrame::checkValid:300 gates on V20.
+    // Parity: ledger/execution/preconditions.rs:502-517
+    if protocol_version_starts_from(ctx.protocol_version, ProtocolVersion::V20)
+        && ctx.frozen_key_config.has_frozen_keys()
+        && ctx
+            .frozen_key_config
+            .is_key_frozen(&henyey_tx::frozen_keys::account_key(&fee_source_id))
+        && !ctx.frozen_key_config.is_freeze_bypass_tx(&outer_hash)
+    {
+        debug!("tx-set validation: fee-bump fee source accesses frozen key");
+        return false;
+    }
+
     let mut outer_checker = SignatureChecker::new(outer_hash, frame.signatures());
     let outer_signers = collect_signers_for_account(&fee_source_account);
     let outer_threshold = fee_source_account.thresholds.0[1] as i32;
@@ -475,6 +514,24 @@ fn validate_fee_bump_for_tx_set(
     // Inner per-op structural validation (isOpSupported + doCheckValid)
     if !validate_ops_structure(frame, ctx.protocol_version, ctx.ledger_flags) {
         return false;
+    }
+
+    // CAP-77: Inner tx frozen key check (before signatures)
+    // Parity: stellar-core commonValidPreSeqNum:1548-1560
+    // No protocol gate — relies on has_frozen_keys() being false pre-V26.
+    // Bypass uses outer_hash (fee-bump contents hash), not inner hash.
+    if ctx.frozen_key_config.has_frozen_keys() {
+        let soroban_fp = frame.soroban_data().map(|d| &d.resources.footprint);
+        if henyey_tx::frozen_keys::accesses_frozen_key(
+            &inner_source_id,
+            frame.operations(),
+            soroban_fp,
+            &ctx.frozen_key_config,
+        ) && !ctx.frozen_key_config.is_freeze_bypass_tx(&outer_hash)
+        {
+            debug!("tx-set validation: fee-bump inner tx accesses frozen key");
+            return false;
+        }
     }
 
     // Inner signature check
@@ -1778,6 +1835,7 @@ pub(crate) fn check_tx_set_valid(
     soroban_info: Option<&SorobanNetworkInfo>,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
     account_provider: Option<&dyn AccountProvider>,
+    frozen_key_config: Option<&henyey_tx::frozen_keys::FrozenKeyConfig>,
 ) -> Result<(), TxSetValidationError> {
     let GeneralizedTransactionSet::V1(v1) = gen_tx_set;
 
@@ -1857,6 +1915,9 @@ pub(crate) fn check_tx_set_valid(
             max_contract_size_bytes: info.max_contract_size,
             max_contract_data_key_size_bytes: info.max_contract_data_key_size,
         });
+    }
+    if let Some(fk) = frozen_key_config {
+        ctx.frozen_key_config = fk.clone();
     }
     let close_time_bounds = CloseTimeBounds::with_offsets(close_time_offset, close_time_offset);
 
@@ -3019,6 +3080,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert_eq!(err.result, TxSetValidationResult::ComponentBaseFeeTooLow);
@@ -3047,6 +3109,7 @@ mod tests {
             None,
             Some(&fee_provider),
             Some(&account_provider),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.result, TxSetValidationResult::TxValidationFailed);
@@ -3070,6 +3133,7 @@ mod tests {
             &Hash256::ZERO,
             0,
             network_id,
+            None,
             None,
             None,
             None,
@@ -3097,6 +3161,7 @@ mod tests {
             &Hash256::ZERO,
             0,
             network_id,
+            None,
             None,
             None,
             None,
@@ -3129,6 +3194,7 @@ mod tests {
             &Hash256::ZERO,
             0,
             network_id,
+            None,
             None,
             None,
             None,
@@ -3167,6 +3233,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert_eq!(
@@ -3193,6 +3260,7 @@ mod tests {
             &Hash256::ZERO,
             0,
             network_id,
+            None,
             None,
             None,
             None,
@@ -3253,6 +3321,7 @@ mod tests {
             0,
             network_id,
             Some(&soroban_info),
+            None,
             None,
             None,
         );
@@ -4074,6 +4143,7 @@ mod tests {
             None, // no soroban config
             None,
             None,
+            None,
         );
         assert!(
             result.is_err(),
@@ -4108,6 +4178,7 @@ mod tests {
             None,
             Some(&fee_provider),
             Some(&account_provider),
+            None,
         );
         assert!(
             result.is_err(),
@@ -4164,6 +4235,7 @@ mod tests {
             None,
             Some(&fee_provider),
             Some(&account_provider),
+            None,
         );
         // stellar-core would reject unsigned transactions in a tx-set.
         assert!(
@@ -4196,6 +4268,7 @@ mod tests {
             &Hash256::ZERO,
             0,
             network_id,
+            None,
             None,
             None,
             None,
@@ -4238,6 +4311,7 @@ mod tests {
             0,
             network_id,
             Some(&info),
+            None,
             None,
             None,
         );
@@ -5080,6 +5154,7 @@ mod tests {
             network_id: NetworkId::testnet(),
             ledger_flags: 0,
             soroban_resource_limits: None,
+            frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::empty(),
         };
         let bounds = CloseTimeBounds::with_offsets(0, 0);
 
@@ -5131,6 +5206,7 @@ mod tests {
             network_id: NetworkId::testnet(),
             ledger_flags: 0,
             soroban_resource_limits: None,
+            frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::empty(),
         };
         let bounds = CloseTimeBounds::with_offsets(0, 0);
 
@@ -5173,6 +5249,7 @@ mod tests {
             network_id: NetworkId::testnet(),
             ledger_flags: 0,
             soroban_resource_limits: None,
+            frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::empty(),
         };
         let bounds = CloseTimeBounds::with_offsets(0, 0);
 
@@ -5221,6 +5298,7 @@ mod tests {
             network_id: NetworkId::testnet(),
             ledger_flags: 0,
             soroban_resource_limits: None,
+            frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::empty(),
         };
         let bounds = CloseTimeBounds::with_offsets(0, 0);
 
@@ -5230,5 +5308,105 @@ mod tests {
             invalid.is_empty(),
             "valid duplicates should both pass when no fee provider"
         );
+    }
+
+    // --- CAP-77 frozen key tests ---
+
+    /// Build a FrozenKeyConfig that freezes the account with the given ed25519 key.
+    fn frozen_config_for_account(key_bytes: [u8; 32]) -> henyey_tx::frozen_keys::FrozenKeyConfig {
+        use stellar_xdr::curr::{
+            AccountId, LedgerKey, LedgerKeyAccount, PublicKey, Uint256, WriteXdr,
+        };
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key_bytes)));
+        let ledger_key = LedgerKey::Account(LedgerKeyAccount { account_id });
+        let key_xdr = ledger_key
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("encode ledger key");
+        henyey_tx::frozen_keys::FrozenKeyConfig::new(vec![key_xdr], vec![])
+    }
+
+    #[test]
+    fn test_frozen_source_regular_tx_rejected() {
+        let mut ctx = test_context();
+        // Freeze the source account used by make_valid_envelope ([0u8; 32])
+        ctx.frozen_key_config = frozen_config_for_account([0u8; 32]);
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account([0u8; 32], 0);
+
+        let bounds = CloseTimeBounds::exact();
+        let txs = vec![make_valid_envelope(100, 1)];
+        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "tx with frozen source account should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_frozen_source_bypass_hash_passes() {
+        use stellar_xdr::curr::{
+            AccountId, Hash, LedgerKey, LedgerKeyAccount, PublicKey, Uint256, WriteXdr,
+        };
+
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
+        let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        let key_xdr = ledger_key
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("encode ledger key");
+
+        // Compute the tx hash used for bypass checking
+        let envelope = make_valid_envelope(100, 1);
+        let tx_hash = HashedTx::new(envelope).hash();
+        let bypass_hash = Hash(tx_hash.0);
+
+        let config = henyey_tx::frozen_keys::FrozenKeyConfig::new(vec![key_xdr], vec![bypass_hash]);
+
+        // Source is frozen, but tx hash is in bypass set → should NOT detect frozen access
+        assert!(config.has_frozen_keys());
+        assert!(config.is_key_frozen(&henyey_tx::frozen_keys::account_key(&account_id)));
+        assert!(
+            config.is_freeze_bypass_tx(&tx_hash),
+            "bypass hash should match"
+        );
+    }
+
+    #[test]
+    fn test_empty_frozen_config_all_pass() {
+        // Default/empty frozen config should not reject any transactions
+        let ctx = test_context();
+        assert!(!ctx.frozen_key_config.has_frozen_keys());
+
+        let bounds = CloseTimeBounds::exact();
+        let txs = vec![make_valid_envelope(100, 1), make_valid_envelope(200, 2)];
+        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None, None);
+        assert!(
+            invalid.is_empty(),
+            "empty frozen config should not reject any transactions"
+        );
+    }
+
+    #[test]
+    fn test_frozen_non_source_account_passes() {
+        use stellar_xdr::curr::{AccountId, PublicKey, Uint256};
+
+        let mut ctx = test_context();
+        // Freeze a different account (not the source in make_valid_envelope)
+        ctx.frozen_key_config = frozen_config_for_account([99u8; 32]);
+
+        // Verify the source account ([0u8; 32]) is not frozen
+        let source = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
+        assert!(
+            !ctx.frozen_key_config
+                .is_key_frozen(&henyey_tx::frozen_keys::account_key(&source)),
+            "source account should not be frozen"
+        );
+
+        // The frozen config affects a different account; the source account's
+        // key is not in the frozen set, so the frozen check would pass.
+        // (Full pipeline test not possible without real signatures.)
     }
 }

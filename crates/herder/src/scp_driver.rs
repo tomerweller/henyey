@@ -716,6 +716,11 @@ impl ScpDriver {
                 // Use soroban_info from the snapshot (captured atomically with
                 // header) to avoid TOCTOU race with commit_close().
                 let soroban_info = providers.snapshot().soroban_network_info().cloned();
+                let frozen_key_config = henyey_ledger::execution::load_frozen_key_config(
+                    providers.snapshot(),
+                    lcl_header.ledger_version,
+                )
+                .ok();
                 prepared
                     .check_valid(
                         lcl_header,
@@ -725,6 +730,7 @@ impl ScpDriver {
                         soroban_info.as_ref(),
                         Some(&providers as &dyn FeeBalanceProvider),
                         Some(&providers as &dyn AccountProvider),
+                        frozen_key_config.as_ref(),
                     )
                     .is_ok()
             }

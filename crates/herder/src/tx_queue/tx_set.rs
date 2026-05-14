@@ -536,6 +536,7 @@ impl PreparedTransactionSet {
         soroban_info: Option<&henyey_ledger::SorobanNetworkInfo>,
         fee_balance_provider: Option<&dyn FeeBalanceProvider>,
         account_provider: Option<&dyn AccountProvider>,
+        frozen_key_config: Option<&henyey_tx::frozen_keys::FrozenKeyConfig>,
     ) -> std::result::Result<(), crate::tx_set_utils::TxSetValidationError> {
         use crate::tx_set_utils::{TxSetValidationError, TxSetValidationResult};
         use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
@@ -558,6 +559,7 @@ impl PreparedTransactionSet {
                     soroban_info,
                     fee_balance_provider,
                     account_provider,
+                    frozen_key_config,
                 )
             }
             (true, false) => {
@@ -1894,7 +1896,8 @@ mod tests {
                     NetworkId::testnet(),
                     Some(&soroban_info),
                     None,
-                    None
+                    None,
+                    None,
                 )
                 .is_ok(),
             "empty generalized set on V22 should pass check_valid"
@@ -1929,7 +1932,8 @@ mod tests {
                     NetworkId::testnet(),
                     None,
                     None,
-                    None
+                    None,
+                    None,
                 )
                 .is_err(),
             "generalized set on protocol 19 should be rejected by check_valid"
@@ -1959,7 +1963,8 @@ mod tests {
                     NetworkId::testnet(),
                     None,
                     None,
-                    None
+                    None,
+                    None,
                 )
                 .is_err(),
             "legacy set on protocol 24 should be rejected by check_valid"
@@ -1990,7 +1995,8 @@ mod tests {
                     NetworkId::testnet(),
                     None,
                     None,
-                    None
+                    None,
+                    None,
                 )
                 .is_ok(),
             "legacy set on protocol 19 should pass check_valid"

@@ -318,6 +318,9 @@ pub struct ValidationContext {
     pub soroban_limits: Option<SorobanTxLimits>,
     /// Per-TX Soroban resource limits for check_valid_pre_seq_num validation.
     pub soroban_resource_limits: Option<henyey_tx::SorobanResourceLimits>,
+    /// CAP-77: Frozen ledger key configuration (from Soroban network config).
+    /// Pre-V26 this is None (no frozen keys).
+    pub frozen_key_config: Option<henyey_tx::frozen_keys::FrozenKeyConfig>,
 }
 
 /// Per-transaction Soroban resource limits from network config.
@@ -354,6 +357,7 @@ impl Default for ValidationContext {
             expected_close_time: Duration::from_secs(5),
             soroban_limits: None,
             soroban_resource_limits: None,
+            frozen_key_config: None,
         }
     }
 }
