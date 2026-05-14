@@ -1445,6 +1445,7 @@ impl App {
             validator_weight_config: config.validator_weight_config.clone(),
             force_old_style_leader_election: config.node.force_old_style_leader_election,
             manual_close: config.node.manual_close,
+            run_standalone: config.testing.run_standalone,
         }
     }
 

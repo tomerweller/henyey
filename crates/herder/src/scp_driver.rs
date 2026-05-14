@@ -320,8 +320,8 @@ pub struct ScpDriverConfig {
     /// regardless of protocol version.
     pub force_old_style_leader_election: bool,
     /// When true, suppress outgoing SCP envelope broadcasts.
-    /// Parity: stellar-core `Config::MANUAL_CLOSE`.
-    pub manual_close: bool,
+    /// Derived from `HerderConfig::suppress_scp()` (`manual_close && run_standalone`).
+    pub suppress_scp: bool,
 }
 
 impl Default for ScpDriverConfig {
@@ -333,7 +333,7 @@ impl Default for ScpDriverConfig {
             local_quorum_set: None,
             validator_weight_config: None,
             force_old_style_leader_election: false,
-            manual_close: false,
+            suppress_scp: false,
         }
     }
 }
@@ -2420,8 +2420,9 @@ impl ScpDriver {
     /// Emit an envelope to the network.
     fn emit(&self, envelope: ScpEnvelope) {
         // Parity: stellar-core HerderImpl.cpp:567-578 — suppress broadcast
-        // when MANUAL_CLOSE is set.
-        if self.config.manual_close {
+        // in standalone manual-close mode (suppress_scp derived from
+        // manual_close && run_standalone in HerderConfig).
+        if self.config.suppress_scp {
             return;
         }
         if let Some(sender) = self.envelope_sender.get() {
@@ -2705,7 +2706,7 @@ mod manual_close_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let config = ScpDriverConfig {
-            manual_close: true,
+            suppress_scp: true,
             ..ScpDriverConfig::default()
         };
         let tracking = Arc::new(RwLock::new(SharedTrackingState::default()));
@@ -2726,7 +2727,7 @@ mod manual_close_tests {
             count_clone.fetch_add(1, Ordering::SeqCst);
         });
 
-        // Calling emit should NOT invoke the sender when manual_close is true.
+        // Calling emit should NOT invoke the sender when suppress_scp is true.
         let dummy_env = stellar_xdr::curr::ScpEnvelope {
             statement: stellar_xdr::curr::ScpStatement {
                 node_id: stellar_xdr::curr::NodeId(
@@ -2750,11 +2751,66 @@ mod manual_close_tests {
     }
 
     #[test]
+    fn test_emit_allowed_when_scp_not_suppressed() {
+        // manual_close=true but run_standalone=false means suppress_scp=false
+        // in HerderConfig. When ScpDriverConfig::suppress_scp is false,
+        // emit should invoke the sender callback normally.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let config = ScpDriverConfig {
+            suppress_scp: false,
+            ..ScpDriverConfig::default()
+        };
+        let tracking = Arc::new(RwLock::new(SharedTrackingState::default()));
+        let metrics = Arc::new(crate::metrics::ScpMetrics::new());
+        let upgrades = Arc::new(RwLock::new(Upgrades::default()));
+        let driver = ScpDriver::new(
+            config,
+            Hash256::ZERO,
+            make_default_lm(),
+            tracking,
+            metrics,
+            upgrades,
+        );
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&call_count);
+        driver.set_envelope_sender(move |_| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let dummy_env = stellar_xdr::curr::ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: stellar_xdr::curr::NodeId(
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                        [0; 32],
+                    )),
+                ),
+                slot_index: 1,
+                pledges: stellar_xdr::curr::ScpStatementPledges::Nominate(
+                    stellar_xdr::curr::ScpNomination {
+                        quorum_set_hash: stellar_xdr::curr::Hash([0; 32]),
+                        votes: vec![].try_into().unwrap(),
+                        accepted: vec![].try_into().unwrap(),
+                    },
+                ),
+            },
+            signature: stellar_xdr::curr::Signature::default(),
+        };
+        driver.emit(dummy_env);
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "emit should invoke sender when suppress_scp=false (simulation mode)"
+        );
+    }
+
+    #[test]
     fn test_emit_works_without_manual_close() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let config = ScpDriverConfig {
-            manual_close: false,
+            suppress_scp: false,
             ..ScpDriverConfig::default()
         };
         let tracking = Arc::new(RwLock::new(SharedTrackingState::default()));

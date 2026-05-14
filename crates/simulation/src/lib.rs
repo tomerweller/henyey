@@ -272,6 +272,11 @@ impl Simulation {
                 secret_key,
                 quorum_set,
                 is_validator: true,
+                // Henyey simulation uses MANUAL_CLOSE=true with real SCP
+                // consensus, unlike stellar-core simulation which sets
+                // MANUAL_CLOSE=false (Simulation.cpp:99). This requires
+                // run_standalone=false (the default) so that SCP envelope
+                // exchange is not suppressed by HerderConfig::suppress_scp().
                 manual_close: true,
                 data_dir: None,
                 peer_port: None,

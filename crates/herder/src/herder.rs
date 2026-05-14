@@ -140,7 +140,8 @@ pub enum EnvelopeState {
     InvalidSignature,
     /// Envelope is structurally invalid or failed validation.
     Invalid,
-    /// Envelope was discarded without processing (manual_close mode).
+    /// Envelope was discarded without processing (standalone manual-close
+    /// mode: `manual_close + run_standalone`).
     /// Parity: stellar-core `ENVELOPE_STATUS_DISCARDED`.
     Discarded,
     /// Envelope was buffered by the closing gate because its slot is
@@ -341,8 +342,16 @@ pub struct HerderConfig {
     pub force_old_style_leader_election: bool,
 
     /// When true, incoming SCP envelopes are discarded and outgoing broadcasts
-    /// are suppressed. Parity: stellar-core `Config::MANUAL_CLOSE`.
+    /// are suppressed — but **only** when combined with `run_standalone`
+    /// (see `suppress_scp()`). When `manual_close` is true but
+    /// `run_standalone` is false (simulation/test mode), SCP operates normally.
+    /// Parity: stellar-core `Config::MANUAL_CLOSE`.
     pub manual_close: bool,
+
+    /// When true, the node is running without a network (standalone mode).
+    /// Combined with `manual_close`, this enables SCP suppression via
+    /// `suppress_scp()`. Parity: stellar-core `Config::RUN_STANDALONE`.
+    pub run_standalone: bool,
 }
 
 const DEFAULT_MAX_EXTERNALIZED_SLOTS: usize = 12;
@@ -366,7 +375,26 @@ impl Default for HerderConfig {
             validator_weight_config: None,
             force_old_style_leader_election: false,
             manual_close: false,
+            run_standalone: false,
         }
+    }
+}
+
+impl HerderConfig {
+    /// Whether SCP envelope I/O should be suppressed.
+    ///
+    /// Returns `true` when both `manual_close` and `run_standalone` are set,
+    /// i.e. standalone manual-close mode. In this mode there is no network,
+    /// so broadcasting and receiving SCP envelopes is pointless.
+    ///
+    /// Henyey simulation tests use `manual_close=true, run_standalone=false`
+    /// to drive multi-node consensus via `manual_close_until` — SCP must
+    /// operate normally in that mode.
+    ///
+    /// Parity: stellar-core gates `startOutOfSyncTimer` on
+    /// `MANUAL_CLOSE && RUN_STANDALONE` (`HerderImpl.cpp:584-588`).
+    pub fn suppress_scp(&self) -> bool {
+        self.manual_close && self.run_standalone
     }
 }
 
@@ -516,7 +544,7 @@ impl Herder {
             local_quorum_set: config.local_quorum_set.clone(),
             validator_weight_config: config.validator_weight_config.clone(),
             force_old_style_leader_election: config.force_old_style_leader_election,
-            manual_close: config.manual_close,
+            suppress_scp: config.suppress_scp(),
         };
 
         let tracking_state = Arc::new(RwLock::new(SharedTrackingState::default()));
@@ -1402,9 +1430,11 @@ impl Herder {
     pub fn pre_filter_scp_envelope(&self, envelope: &ScpEnvelope) -> crate::scp_verify::PreFilter {
         use crate::scp_verify::{PipelinedIntake, PreFilter, PreFilterRejectReason};
 
-        // Parity: stellar-core HerderImpl.cpp:805-808 — discard all envelopes
-        // in MANUAL_CLOSE mode before any processing.
-        if self.config.manual_close {
+        // Parity: stellar-core HerderImpl.cpp:805-808 gates on MANUAL_CLOSE.
+        // Henyey gates on suppress_scp() (manual_close && run_standalone)
+        // because henyey simulation uses MANUAL_CLOSE=true with real SCP,
+        // while stellar-core simulation sets MANUAL_CLOSE=false (Simulation.cpp:99).
+        if self.config.suppress_scp() {
             return PreFilter::Reject(PreFilterRejectReason::ManualClose);
         }
 
@@ -5001,11 +5031,13 @@ mod tests {
 
     #[test]
     fn test_receive_scp_envelope_discarded_in_manual_close_mode() {
-        // When manual_close is true, all envelopes should be discarded
-        // without any processing. Parity: stellar-core HerderImpl.cpp:805-808.
+        // When both manual_close and run_standalone are true (standalone
+        // manual-close mode), all envelopes should be discarded without any
+        // processing. Parity: stellar-core HerderImpl.cpp:805-808.
         let config = HerderConfig {
             is_validator: true,
             manual_close: true,
+            run_standalone: true,
             ..HerderConfig::default()
         };
         let herder = Herder::new(config, make_default_lm());
@@ -5023,6 +5055,7 @@ mod tests {
         let config = HerderConfig {
             is_validator: true,
             manual_close: true,
+            run_standalone: true,
             ..HerderConfig::default()
         };
         let herder = Herder::new(config, make_default_lm());
@@ -5040,6 +5073,7 @@ mod tests {
 
         let config = HerderConfig {
             manual_close: true,
+            run_standalone: true,
             ..HerderConfig::default()
         };
         let herder = Herder::new(config, make_default_lm());
@@ -5051,6 +5085,67 @@ mod tests {
             result,
             PreFilter::Reject(PreFilterRejectReason::ManualClose)
         ));
+    }
+
+    #[test]
+    fn test_pre_filter_accepts_in_manual_close_without_standalone() {
+        use crate::scp_verify::PreFilter;
+
+        // manual_close=true but run_standalone=false (simulation mode):
+        // pre_filter should NOT reject envelopes.
+        let config = HerderConfig {
+            is_validator: true,
+            manual_close: true,
+            run_standalone: false,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_default_lm());
+        herder.bootstrap(100);
+
+        let env = make_nomination_envelope_with_close_time(101, 100);
+        let result = herder.pre_filter_scp_envelope(&env);
+        assert!(
+            !matches!(result, PreFilter::Reject(_)),
+            "pre_filter should not reject when manual_close=true but run_standalone=false"
+        );
+    }
+
+    #[test]
+    fn test_suppress_scp_helper() {
+        // Verify the 4-combination truth table of suppress_scp().
+        let base = HerderConfig::default();
+
+        // (false, false) -> false
+        let c = HerderConfig {
+            manual_close: false,
+            run_standalone: false,
+            ..base.clone()
+        };
+        assert!(!c.suppress_scp());
+
+        // (false, true) -> false
+        let c = HerderConfig {
+            manual_close: false,
+            run_standalone: true,
+            ..base.clone()
+        };
+        assert!(!c.suppress_scp());
+
+        // (true, false) -> false (simulation mode)
+        let c = HerderConfig {
+            manual_close: true,
+            run_standalone: false,
+            ..base.clone()
+        };
+        assert!(!c.suppress_scp());
+
+        // (true, true) -> true (standalone manual-close)
+        let c = HerderConfig {
+            manual_close: true,
+            run_standalone: true,
+            ..base
+        };
+        assert!(c.suppress_scp());
     }
 
     #[test]
