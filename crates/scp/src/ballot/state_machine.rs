@@ -494,23 +494,15 @@ impl BallotProtocol {
     }
 
     fn update_current_if_needed(&mut self, ballot: &ScpBallot) -> bool {
-        let updated = if self
+        if self
             .current_ballot
             .as_ref()
             .map(|b| ballot_compare(b, ballot) == Ordering::Less)
             .unwrap_or(true)
         {
-            self.bump_to_ballot(ballot, true)
-        } else {
-            false
-        };
-
-        // Matches stellar-core BallotProtocol.cpp:442
-        if let Err(e) = self.check_invariants() {
-            tracing::warn!("Invariant violation after update_current_if_needed: {e}");
+            return self.bump_to_ballot(ballot, true);
         }
-
-        updated
+        false
     }
 
     /// Update current value enforcing invariants (matches stellar-core updateCurrentValue).
@@ -522,27 +514,30 @@ impl BallotProtocol {
             return false;
         }
 
-        if self.current_ballot.is_none() {
+        let updated = if self.current_ballot.is_none() {
             self.bump_to_ballot(ballot, true);
-            return true;
-        }
-
-        // If we have a commit and the new ballot is incompatible, reject
-        if let Some(ref commit) = self.commit {
-            if !ballot_compatible(commit, ballot) {
-                return false;
+            true
+        } else {
+            // If we have a commit and the new ballot is incompatible, reject
+            if let Some(ref commit) = self.commit {
+                if !ballot_compatible(commit, ballot) {
+                    return false;
+                }
             }
-        }
 
-        let comp = ballot_compare(self.current_ballot.as_ref().unwrap(), ballot);
-
-        match comp {
-            Ordering::Less => {
-                self.bump_to_ballot(ballot, true);
-                true
+            let comp = ballot_compare(self.current_ballot.as_ref().unwrap(), ballot);
+            match comp {
+                Ordering::Less => self.bump_to_ballot(ballot, true),
+                _ => false,
             }
-            _ => false,
+        };
+
+        // Matches stellar-core BallotProtocol.cpp:442
+        if let Err(e) = self.check_invariants() {
+            tracing::warn!("Invariant violation after update_current_value: {e}");
         }
+
+        updated
     }
 
     pub(super) fn bump_to_ballot(&mut self, ballot: &ScpBallot, check: bool) -> bool {
