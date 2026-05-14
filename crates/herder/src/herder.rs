@@ -140,6 +140,9 @@ pub enum EnvelopeState {
     InvalidSignature,
     /// Envelope is structurally invalid or failed validation.
     Invalid,
+    /// Envelope was discarded without processing (manual_close mode).
+    /// Parity: stellar-core `ENVELOPE_STATUS_DISCARDED`.
+    Discarded,
     /// Envelope was buffered by the closing gate because its slot is
     /// currently being applied. It will be re-processed after
     /// `ledger_closed` advances LCL.
@@ -336,6 +339,10 @@ pub struct HerderConfig {
     /// regardless of protocol version. Matches stellar-core's
     /// `FORCE_OLD_STYLE_LEADER_ELECTION`.
     pub force_old_style_leader_election: bool,
+
+    /// When true, incoming SCP envelopes are discarded and outgoing broadcasts
+    /// are suppressed. Parity: stellar-core `Config::MANUAL_CLOSE`.
+    pub manual_close: bool,
 }
 
 const DEFAULT_MAX_EXTERNALIZED_SLOTS: usize = 12;
@@ -358,6 +365,7 @@ impl Default for HerderConfig {
             checkpoint_frequency: DEFAULT_CHECKPOINT_FREQUENCY,
             validator_weight_config: None,
             force_old_style_leader_election: false,
+            manual_close: false,
         }
     }
 }
@@ -508,6 +516,7 @@ impl Herder {
             local_quorum_set: config.local_quorum_set.clone(),
             validator_weight_config: config.validator_weight_config.clone(),
             force_old_style_leader_election: config.force_old_style_leader_election,
+            manual_close: config.manual_close,
         };
 
         let tracking_state = Arc::new(RwLock::new(SharedTrackingState::default()));
@@ -1261,6 +1270,7 @@ impl Herder {
                 );
                 return match reason {
                     R::Range => EnvelopeState::TooOld,
+                    R::ManualClose => EnvelopeState::Discarded,
                     R::CannotReceiveScp | R::CloseTime => EnvelopeState::Invalid,
                 };
             }
@@ -1314,6 +1324,10 @@ impl Herder {
                         EnvelopeState::Invalid,
                         PostVerifyReason::GateDriftCannotReceive,
                     ),
+                    R::ManualClose => (
+                        EnvelopeState::Discarded,
+                        PostVerifyReason::GateDriftManualClose,
+                    ),
                 };
             }
         }
@@ -1361,6 +1375,13 @@ impl Herder {
     /// returned as a [`PipelinedIntake`] carrying metadata needed downstream.
     pub fn pre_filter_scp_envelope(&self, envelope: &ScpEnvelope) -> crate::scp_verify::PreFilter {
         use crate::scp_verify::{PipelinedIntake, PreFilter, PreFilterRejectReason};
+
+        // Parity: stellar-core HerderImpl.cpp:805-808 — discard all envelopes
+        // in MANUAL_CLOSE mode before any processing.
+        if self.config.manual_close {
+            return PreFilter::Reject(PreFilterRejectReason::ManualClose);
+        }
+
         let state = self.state();
         let slot = envelope.statement.slot_index;
         let current_slot = self.tracking_slot().get();
@@ -1491,6 +1512,10 @@ impl Herder {
                     R::CannotReceiveScp => (
                         EnvelopeState::Invalid,
                         PostVerifyReason::GateDriftCannotReceive,
+                    ),
+                    R::ManualClose => (
+                        EnvelopeState::Discarded,
+                        PostVerifyReason::GateDriftManualClose,
                     ),
                 };
                 return (state, post);
@@ -4933,6 +4958,60 @@ mod tests {
         // So for exact match: envelope must be for slot 99 with close_time = now
         let env = make_nomination_envelope_with_close_time(99, now);
         assert!(herder.check_envelope_close_time(&env, false));
+    }
+
+    #[test]
+    fn test_receive_scp_envelope_discarded_in_manual_close_mode() {
+        // When manual_close is true, all envelopes should be discarded
+        // without any processing. Parity: stellar-core HerderImpl.cpp:805-808.
+        let config = HerderConfig {
+            is_validator: true,
+            manual_close: true,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_default_lm());
+        herder.bootstrap(100);
+
+        let env = make_nomination_envelope_with_close_time(101, 100);
+        let result = herder.receive_scp_envelope(env);
+        assert_eq!(result, EnvelopeState::Discarded);
+    }
+
+    #[test]
+    fn test_receive_scp_envelope_detailed_discarded_in_manual_close_mode() {
+        use crate::scp_verify::PostVerifyReason;
+
+        let config = HerderConfig {
+            is_validator: true,
+            manual_close: true,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_default_lm());
+        herder.bootstrap(100);
+
+        let env = make_nomination_envelope_with_close_time(101, 100);
+        let (state, reason) = herder.receive_scp_envelope_detailed(env);
+        assert_eq!(state, EnvelopeState::Discarded);
+        assert_eq!(reason, PostVerifyReason::GateDriftManualClose);
+    }
+
+    #[test]
+    fn test_pre_filter_rejects_manual_close() {
+        use crate::scp_verify::{PreFilter, PreFilterRejectReason};
+
+        let config = HerderConfig {
+            manual_close: true,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_default_lm());
+        herder.bootstrap(100);
+
+        let env = make_nomination_envelope_with_close_time(101, 100);
+        let result = herder.pre_filter_scp_envelope(&env);
+        assert!(matches!(
+            result,
+            PreFilter::Reject(PreFilterRejectReason::ManualClose)
+        ));
     }
 
     #[test]

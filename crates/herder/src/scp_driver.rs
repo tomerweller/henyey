@@ -319,6 +319,9 @@ pub struct ScpDriverConfig {
     /// When true, always use the old quorum-position weight algorithm
     /// regardless of protocol version.
     pub force_old_style_leader_election: bool,
+    /// When true, suppress outgoing SCP envelope broadcasts.
+    /// Parity: stellar-core `Config::MANUAL_CLOSE`.
+    pub manual_close: bool,
 }
 
 impl Default for ScpDriverConfig {
@@ -330,6 +333,7 @@ impl Default for ScpDriverConfig {
             local_quorum_set: None,
             validator_weight_config: None,
             force_old_style_leader_election: false,
+            manual_close: false,
         }
     }
 }
@@ -2415,6 +2419,11 @@ impl ScpDriver {
 
     /// Emit an envelope to the network.
     fn emit(&self, envelope: ScpEnvelope) {
+        // Parity: stellar-core HerderImpl.cpp:567-578 — suppress broadcast
+        // when MANUAL_CLOSE is set.
+        if self.config.manual_close {
+            return;
+        }
         if let Some(sender) = self.envelope_sender.get() {
             sender(envelope);
         }
@@ -2636,6 +2645,156 @@ impl ScpDriver {
     /// Get our node ID.
     pub fn node_id(&self) -> &PublicKey {
         &self.config.node_id
+    }
+}
+
+#[cfg(test)]
+mod manual_close_tests {
+    use super::*;
+
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
+    #[test]
+    fn test_emit_suppressed_in_manual_close_mode() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let config = ScpDriverConfig {
+            manual_close: true,
+            ..ScpDriverConfig::default()
+        };
+        let tracking = Arc::new(RwLock::new(SharedTrackingState::default()));
+        let metrics = Arc::new(crate::metrics::ScpMetrics::new());
+        let upgrades = Arc::new(RwLock::new(Upgrades::default()));
+        let driver = ScpDriver::new(
+            config,
+            Hash256::ZERO,
+            make_default_lm(),
+            tracking,
+            metrics,
+            upgrades,
+        );
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&call_count);
+        driver.set_envelope_sender(move |_| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Calling emit should NOT invoke the sender when manual_close is true.
+        let dummy_env = stellar_xdr::curr::ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: stellar_xdr::curr::NodeId(
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                        [0; 32],
+                    )),
+                ),
+                slot_index: 1,
+                pledges: stellar_xdr::curr::ScpStatementPledges::Nominate(
+                    stellar_xdr::curr::ScpNomination {
+                        quorum_set_hash: stellar_xdr::curr::Hash([0; 32]),
+                        votes: vec![].try_into().unwrap(),
+                        accepted: vec![].try_into().unwrap(),
+                    },
+                ),
+            },
+            signature: stellar_xdr::curr::Signature::default(),
+        };
+        driver.emit(dummy_env);
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_emit_works_without_manual_close() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let config = ScpDriverConfig {
+            manual_close: false,
+            ..ScpDriverConfig::default()
+        };
+        let tracking = Arc::new(RwLock::new(SharedTrackingState::default()));
+        let metrics = Arc::new(crate::metrics::ScpMetrics::new());
+        let upgrades = Arc::new(RwLock::new(Upgrades::default()));
+        let driver = ScpDriver::new(
+            config,
+            Hash256::ZERO,
+            make_default_lm(),
+            tracking,
+            metrics,
+            upgrades,
+        );
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&call_count);
+        driver.set_envelope_sender(move |_| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let dummy_env = stellar_xdr::curr::ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: stellar_xdr::curr::NodeId(
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                        [0; 32],
+                    )),
+                ),
+                slot_index: 1,
+                pledges: stellar_xdr::curr::ScpStatementPledges::Nominate(
+                    stellar_xdr::curr::ScpNomination {
+                        quorum_set_hash: stellar_xdr::curr::Hash([0; 32]),
+                        votes: vec![].try_into().unwrap(),
+                        accepted: vec![].try_into().unwrap(),
+                    },
+                ),
+            },
+            signature: stellar_xdr::curr::Signature::default(),
+        };
+        driver.emit(dummy_env);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 }
 

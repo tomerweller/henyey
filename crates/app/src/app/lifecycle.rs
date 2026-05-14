@@ -137,9 +137,14 @@ fn should_forget_flood_record(
 
     // Duplicate: stellar-core returns ENVELOPE_STATUS_PROCESSED (not
     // DISCARDED) — keep the flood record so relay accounting is preserved.
+    // Discarded (manual_close): stellar-core Peer.cpp:1672-1678 calls
+    // forgetFloodedMsg on ENVELOPE_STATUS_DISCARDED.
     matches!(
         state,
-        EnvelopeState::TooOld | EnvelopeState::InvalidSignature | EnvelopeState::Invalid
+        EnvelopeState::TooOld
+            | EnvelopeState::InvalidSignature
+            | EnvelopeState::Invalid
+            | EnvelopeState::Discarded
     )
 }
 
@@ -2505,6 +2510,10 @@ impl App {
                 }
                 self.request_pending_tx_sets().await;
             }
+            EnvelopeState::Discarded => {
+                // Manual-close mode: silently dropped (no metrics, no logging at info level).
+                tracing::trace!(slot, "SCP envelope discarded (manual_close mode)");
+            }
         }
     }
 
@@ -2988,6 +2997,7 @@ mod forget_flood_record_tests {
             EnvelopeState::TooOld,
             EnvelopeState::InvalidSignature,
             EnvelopeState::Invalid,
+            EnvelopeState::Discarded,
         ] {
             for reason in R::ALL {
                 if matches!(reason, R::SelfMessage) {

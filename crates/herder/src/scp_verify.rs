@@ -78,12 +78,18 @@ pub enum PreFilterRejectReason {
     CannotReceiveScp = 0,
     CloseTime = 1,
     Range = 2,
+    ManualClose = 3,
 }
 
 impl PreFilterRejectReason {
     /// All variants in discriminant order. This is the single source of truth
     /// for iteration, counter allocation, and Prometheus label generation.
-    pub const ALL: [Self; 3] = [Self::CannotReceiveScp, Self::CloseTime, Self::Range];
+    pub const ALL: [Self; 4] = [
+        Self::CannotReceiveScp,
+        Self::CloseTime,
+        Self::Range,
+        Self::ManualClose,
+    ];
 
     /// Prometheus metric label for this reason.
     pub const fn label(&self) -> &'static str {
@@ -91,6 +97,7 @@ impl PreFilterRejectReason {
             Self::CannotReceiveScp => "cannot_receive",
             Self::CloseTime => "close_time",
             Self::Range => "range",
+            Self::ManualClose => "manual_close",
         }
     }
 }
@@ -102,7 +109,7 @@ const _: () = {
         assert!(PreFilterRejectReason::ALL[i] as usize == i);
         i += 1;
     }
-    assert!(PreFilterRejectReason::ALL.len() == PreFilterRejectReason::Range as usize + 1);
+    assert!(PreFilterRejectReason::ALL.len() == PreFilterRejectReason::ManualClose as usize + 1);
 };
 
 /// Fixed-size counter array indexed by [`PreFilterRejectReason`].
@@ -323,12 +330,13 @@ pub enum PostVerifyReason {
     PendingAddProcessedDirectly = 11,
     PendingAddPerSlotFull = 12,
     Accepted = 13,
+    GateDriftManualClose = 14,
 }
 
 impl PostVerifyReason {
     /// All variants in discriminant order. This is the single source of truth
     /// for iteration, counter allocation, and Prometheus label generation.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::InvalidSignature,
         Self::PanicVerdict,
         Self::GateDriftRange,
@@ -343,6 +351,7 @@ impl PostVerifyReason {
         Self::PendingAddProcessedDirectly,
         Self::PendingAddPerSlotFull,
         Self::Accepted,
+        Self::GateDriftManualClose,
     ];
 
     /// Prometheus metric label for this reason.
@@ -362,6 +371,7 @@ impl PostVerifyReason {
             Self::PendingAddProcessedDirectly => "processed_directly",
             Self::PendingAddPerSlotFull => "per_slot_full",
             Self::Accepted => "accepted",
+            Self::GateDriftManualClose => "drift_manual_close",
         }
     }
 }
@@ -374,7 +384,7 @@ const _: () = {
         i += 1;
     }
     // Last discriminant + 1 == ALL.len() — catches a variant added but not in ALL.
-    assert!(PostVerifyReason::ALL.len() == PostVerifyReason::Accepted as usize + 1);
+    assert!(PostVerifyReason::ALL.len() == PostVerifyReason::GateDriftManualClose as usize + 1);
 };
 
 /// Fixed-size counter array indexed by [`PostVerifyReason`].

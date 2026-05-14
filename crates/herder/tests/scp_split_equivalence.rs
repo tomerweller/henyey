@@ -322,6 +322,10 @@ fn run_split(network_id: Hash256, envelope: ScpEnvelope) -> (EnvelopeState, Post
                     EnvelopeState::Invalid,
                     PostVerifyReason::GateDriftCannotReceive,
                 ),
+                R::ManualClose => (
+                    EnvelopeState::Discarded,
+                    PostVerifyReason::GateDriftManualClose,
+                ),
             }
         }
         Ok(ve) => {
