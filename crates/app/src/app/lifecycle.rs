@@ -2088,10 +2088,6 @@ impl App {
             return;
         };
 
-        // Parity: HerderImpl.cpp:810 `mEnvelopeReceive.Mark()` — post-dedup,
-        // pre-validity (fires even for envelopes that pre-filter rejects).
-        self.scp_messages_received.fetch_add(1, Ordering::Relaxed);
-
         let mut drained: usize = 0;
         loop {
             tokio::select! {
@@ -2130,6 +2126,10 @@ impl App {
                         || self.herder.pre_filter_scp_envelope(&envelope),
                     ) {
                         PreFilter::Accept(intake) => {
+                            // Parity: HerderImpl.cpp:810 `mEnvelopeReceive.Mark()`
+                            // — fires post-MANUAL_CLOSE gate, pre-validity.
+                            self.scp_messages_received
+                                .fetch_add(1, Ordering::Relaxed);
                             // Reconstruct with overlay context via from_overlay,
                             // which requires the inflight_token at compile time.
                             let (envelope, slot, is_externalize) = intake.into_parts();
@@ -2145,6 +2145,14 @@ impl App {
                             permit.send(intake);
                         }
                         PreFilter::Reject(reason) => {
+                            use henyey_herder::scp_verify::PreFilterRejectReason;
+                            // Parity: HerderImpl.cpp:810 — counter fires for all
+                            // rejects except ManualClose (which returns before the
+                            // Mark() call at line 805-808).
+                            if !matches!(reason, PreFilterRejectReason::ManualClose) {
+                                self.scp_messages_received
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             self.record_prefilter_reject(reason);
                             // Pre-filter rejects are terminal — forget the
                             // FloodGate record so a re-delivered copy is treated
