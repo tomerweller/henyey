@@ -674,7 +674,10 @@ impl HistoryArchiveManager {
             current_ledger: 0,
             network_passphrase: Some(self.network_passphrase.clone()),
             current_buckets: vec![empty_level.clone(); henyey_bucket::BUCKET_LIST_LEVELS],
-            hot_archive_buckets: None,
+            hot_archive_buckets: Some(vec![
+                empty_level;
+                henyey_bucket::HOT_ARCHIVE_BUCKET_LIST_LEVELS
+            ]),
         };
 
         // Serialize to JSON

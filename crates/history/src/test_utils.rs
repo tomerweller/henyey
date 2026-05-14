@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
 use flate2::{write::GzEncoder, Compression};
-use henyey_bucket::{Bucket, BucketList, HotArchiveBucketList};
+use henyey_bucket::{Bucket, BucketList, HotArchiveBucketList, HOT_ARCHIVE_BUCKET_LIST_LEVELS};
 use henyey_common::Hash256;
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
@@ -240,13 +240,21 @@ pub async fn build_single_checkpoint_archive(
         }
     }
 
+    let hot_archive_buckets: Vec<HASBucketLevel> = (0..HOT_ARCHIVE_BUCKET_LIST_LEVELS)
+        .map(|_| HASBucketLevel {
+            curr: zero_hash.clone(),
+            snap: zero_hash.clone(),
+            next: Default::default(),
+        })
+        .collect();
+
     let has = HistoryArchiveState {
         version: 2,
         server: Some("henyey-history test_utils".to_string()),
         current_ledger: checkpoint,
         network_passphrase: Some(DEFAULT_FIXTURE_PASSPHRASE.to_string()),
         current_buckets,
-        hot_archive_buckets: None,
+        hot_archive_buckets: Some(hot_archive_buckets),
     };
     let has_json = has.to_json().expect("has json");
 

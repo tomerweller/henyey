@@ -460,17 +460,17 @@ impl CatchupManager {
         )
         .await?;
 
-        self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
-
-        // Spec: CATCHUP_SPEC §8.5 — verify HAS/header seq agreement before
-        // initializing. This guards the `catchup_to_ledger_with_checkpoint_data`
-        // path where HAS and header are supplied externally.
+        // Spec: CATCHUP_SPEC §8.5 — verify HAS/header seq agreement before any
+        // persistent side effects. Guards `catchup_to_ledger_with_checkpoint_data`
+        // where HAS and header are supplied externally.
         if has.current_ledger != checkpoint_header.ledger_seq {
             return Err(HistoryError::VerificationFailed(format!(
                 "HAS current_ledger {} != checkpoint header ledger_seq {}",
                 has.current_ledger, checkpoint_header.ledger_seq
             )));
         }
+
+        self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
         if ledger_manager.is_initialized() {
             ledger_manager.reset();

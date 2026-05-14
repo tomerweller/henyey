@@ -485,24 +485,30 @@ pub fn verify_has_structure(has: &HistoryArchiveState) -> Result<()> {
         ));
     }
 
-    // Spec: CATCHUP_SPEC §4.4 — when hotArchiveBuckets is present, it must have
-    // exactly HOT_ARCHIVE_BUCKET_LIST_LEVELS entries. For version 2, the field
-    // is expected but not strictly required (some v2 archives predate hot archive).
-    if let Some(hot_buckets) = &has.hot_archive_buckets {
-        if has.version == 1 {
-            // Version 1 must NOT have hotArchiveBuckets — presence indicates corruption
-            // or a version mismatch (forward-incompatible extension without version bump).
+    // Spec: CATCHUP_SPEC §4.4 — version 2 introduced hotArchiveBuckets.
+    // When present, it must have exactly HOT_ARCHIVE_BUCKET_LIST_LEVELS entries.
+    // Version 1 must NOT have hotArchiveBuckets.
+    // Version 2 MUST have hotArchiveBuckets (stellar-core deserializes it
+    // unconditionally for v2; see HistoryArchive.h:157-160,211-214).
+    match (has.version, &has.hot_archive_buckets) {
+        (1, Some(_)) => {
             return Err(HistoryError::VerificationFailed(
                 "HAS version 1 must not contain hotArchiveBuckets field".to_string(),
             ));
         }
-        if hot_buckets.len() != HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+        (2, None) => {
+            return Err(HistoryError::VerificationFailed(
+                "HAS version 2 requires hotArchiveBuckets field".to_string(),
+            ));
+        }
+        (2, Some(hot_buckets)) if hot_buckets.len() != HOT_ARCHIVE_BUCKET_LIST_LEVELS => {
             return Err(HistoryError::VerificationFailed(format!(
                 "hotArchiveBuckets has {} levels, expected {}",
                 hot_buckets.len(),
                 HOT_ARCHIVE_BUCKET_LIST_LEVELS
             )));
         }
+        _ => {}
     }
 
     Ok(())
@@ -1185,10 +1191,12 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_has_structure_v2_without_hot_archive_is_valid() {
-        // Version 2 with passphrase but no hotArchiveBuckets — valid (field is optional).
+    fn test_verify_has_structure_v2_requires_hot_archive_buckets() {
+        // Version 2 with passphrase but no hotArchiveBuckets — must fail.
         let has = make_has_with_levels(11, 2, Some("Test SDF Network ; September 2015"));
-        assert!(verify_has_structure(&has).is_ok());
+        let result = verify_has_structure(&has);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("hotArchiveBuckets"));
     }
 
     #[test]

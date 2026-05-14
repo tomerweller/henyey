@@ -8,7 +8,9 @@ use axum::{
     Router,
 };
 use flate2::{write::GzEncoder, Compression};
-use henyey_bucket::{Bucket, BucketList, HotArchiveBucketList, BUCKET_LIST_LEVELS};
+use henyey_bucket::{
+    Bucket, BucketList, HotArchiveBucketList, BUCKET_LIST_LEVELS, HOT_ARCHIVE_BUCKET_LIST_LEVELS,
+};
 use henyey_common::Hash256;
 use henyey_db::Database;
 use henyey_history::{
@@ -32,6 +34,19 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
     encoder.write_all(data).expect("gzip write");
     encoder.finish().expect("gzip finish")
+}
+
+/// Create a valid hot_archive_buckets field for v2 HAS in tests.
+fn make_test_hot_archive_buckets() -> Option<Vec<HASBucketLevel>> {
+    Some(
+        (0..HOT_ARCHIVE_BUCKET_LIST_LEVELS)
+            .map(|_| HASBucketLevel {
+                curr: "0".repeat(64),
+                snap: "0".repeat(64),
+                next: Default::default(),
+            })
+            .collect(),
+    )
 }
 
 fn record_marked(entries: &[Vec<u8>]) -> Vec<u8> {
@@ -232,7 +247,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
         current_ledger: checkpoint,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
         current_buckets: levels,
-        hot_archive_buckets: None,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
     };
 
     let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
@@ -487,7 +502,7 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
         current_ledger: bucket_apply_at,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
         current_buckets: levels,
-        hot_archive_buckets: None,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
     };
     fixtures.insert(
         checkpoint_path("history", bucket_apply_at, "json"),
@@ -817,7 +832,7 @@ async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
         current_ledger: checkpoint,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
         current_buckets: levels,
-        hot_archive_buckets: None,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
     };
     fixtures.insert(
         checkpoint_path("history", checkpoint, "json"),
@@ -1029,7 +1044,7 @@ async fn test_replay_hash_mismatch_produces_replay_hash_mismatch_error() {
         current_ledger: checkpoint,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
         current_buckets: levels,
-        hot_archive_buckets: None,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
     };
 
     let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
@@ -1313,7 +1328,7 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
         current_ledger: checkpoint,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
         current_buckets: levels,
-        hot_archive_buckets: None,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
     };
 
     let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
