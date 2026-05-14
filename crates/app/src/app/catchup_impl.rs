@@ -1353,13 +1353,8 @@ impl App {
         // Positioned before the livelock breaker: spurious resets should not
         // contribute to the fatal-shutdown timeout.
         if latest_ext > 0 && latest_ext == current_ledger as u64 {
-            self.archive_confirmed_behind.store(false, Ordering::SeqCst);
-            {
-                let mut guard = self.archive_behind_until.write().await;
-                *guard = None;
-            }
-            self.archive_checkpoint_cache.set_urgent(false);
-            self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
+            self.clear_archive_recovery_state(ArchiveRecoveryClear::DefenseSkip)
+                .await;
             tracing::debug!(
                 current_ledger,
                 latest_externalized = latest_ext,
@@ -1398,13 +1393,9 @@ impl App {
         // (matches existing precedent at consensus.rs trigger_recovery_catchup).
 
         // 1. Clear archive-behind backoff and confirmed-behind signal (#1867).
-        self.archive_confirmed_behind.store(false, Ordering::SeqCst);
-        let archive_behind_until_was_armed = {
-            let mut guard = self.archive_behind_until.write().await;
-            let was = guard.is_some();
-            *guard = None;
-            was
-        };
+        let archive_behind_until_was_armed = self
+            .clear_archive_recovery_state(ArchiveRecoveryClear::HardResetExec)
+            .await;
 
         // 2. Evict leading contiguous no-tx_set entries from syncing_ledgers.
         let evicted_syncing_entries = {

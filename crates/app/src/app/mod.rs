@@ -274,6 +274,32 @@ pub(super) enum RecoveryResetMode {
     Partial { seed: u64 },
 }
 
+/// The scope of archive-recovery state to clear.
+///
+/// Each variant encapsulates a specific recovery scenario, ensuring callers
+/// cannot accidentally mix incompatible operations (e.g., clearing the livelock
+/// tracker during a hard-reset execution).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ArchiveRecoveryClear {
+    /// Ledger progress detected (full or at-tip): full reset of recovery attempts,
+    /// clear all signals, disable urgency, clear livelock tracker.
+    FullProgress,
+    /// Partial progress detected: reset recovery attempts with partial seed,
+    /// clear all signals, ENABLE urgency for faster re-confirmation, clear livelock.
+    PartialProgress { seed: u64 },
+    /// Hard-reset skipped (defense-in-depth): clear signals, disable urgency,
+    /// clear livelock. No recovery-attempt reset.
+    DefenseSkip,
+    /// Hard-reset executing: clear only the behind flag and backoff timer.
+    /// Preserves livelock tracker (must persist across hard-reset executions to
+    /// detect stuck loops) and does not touch urgency (about to re-query anyway).
+    HardResetExec,
+    /// Archive confirmed current (cache shows latest >= next_cp): clear behind
+    /// flag and backoff, disable urgency. Preserves livelock tracker (node is
+    /// not resetting; tracker is irrelevant here).
+    ArchiveConfirmedCurrent,
+}
+
 /// Tracks whether the current recovery episode's onset diagnostic has been
 /// emitted. Reset only on `RecoveryResetMode::Full` (node reached tip or
 /// completed catchup). This ensures exactly one info-level onset log per
@@ -1910,6 +1936,66 @@ impl App {
                     .fetch_max(seed, Ordering::SeqCst);
             }
         }
+    }
+
+    /// Clear archive-behind recovery state according to the given mode.
+    ///
+    /// Always clears: `archive_confirmed_behind`, `archive_behind_until`.
+    /// Other operations depend on the variant (see [`ArchiveRecoveryClear`] docs).
+    ///
+    /// Returns whether `archive_behind_until` was previously armed (`Some`).
+    /// Most callers ignore this; [`ArchiveRecoveryClear::HardResetExec`] uses it
+    /// for logging.
+    ///
+    /// # Lock ordering
+    ///
+    /// This method acquires `archive_behind_until` (write). Callers MUST NOT
+    /// hold `syncing_ledgers` or `consensus_stuck_state` when calling — those
+    /// locks rank below `archive_behind_until` per the documented lock order.
+    pub(crate) async fn clear_archive_recovery_state(&self, mode: ArchiveRecoveryClear) -> bool {
+        // 1. Recovery attempt reset (only for progress variants).
+        match &mode {
+            ArchiveRecoveryClear::FullProgress => {
+                self.reset_recovery_attempts(RecoveryResetMode::Full);
+            }
+            ArchiveRecoveryClear::PartialProgress { seed } => {
+                self.reset_recovery_attempts(RecoveryResetMode::Partial { seed: *seed });
+            }
+            _ => {}
+        }
+
+        // 2. Always: clear the confirmed-behind flag and backoff timer.
+        self.archive_confirmed_behind.store(false, Ordering::SeqCst);
+        let was_armed = {
+            let mut guard = self.archive_behind_until.write().await;
+            let was = guard.is_some();
+            *guard = None;
+            was
+        };
+
+        // 3. Urgency control (variant-dependent).
+        match mode {
+            ArchiveRecoveryClear::HardResetExec => {} // preserve current urgency
+            ArchiveRecoveryClear::PartialProgress { .. } => {
+                self.archive_checkpoint_cache.set_urgent(true);
+            }
+            _ => {
+                self.archive_checkpoint_cache.set_urgent(false);
+            }
+        }
+
+        // 4. Livelock tracker (only cleared when ledger made progress or reset skipped).
+        match mode {
+            ArchiveRecoveryClear::FullProgress
+            | ArchiveRecoveryClear::PartialProgress { .. }
+            | ArchiveRecoveryClear::DefenseSkip => {
+                self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
+            }
+            ArchiveRecoveryClear::HardResetExec | ArchiveRecoveryClear::ArchiveConfirmedCurrent => {
+            }
+        }
+
+        was_armed
     }
 
     /// Get Soroban network configuration information.
@@ -8780,6 +8866,222 @@ mod tests {
             app.max_verified_scp_slot.load(Ordering::Relaxed),
             500,
             "Partial must preserve max_verified_scp_slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_archive_recovery_full_progress() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Pre-arm state.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        *app.archive_behind_until.write().await = Some(Instant::now());
+        app.archive_checkpoint_cache.set_urgent(true);
+        app.hard_reset_livelock_start.store(42, Ordering::Relaxed);
+        app.recovery_attempts_without_progress
+            .store(5, Ordering::SeqCst);
+
+        let was_armed = app
+            .clear_archive_recovery_state(ArchiveRecoveryClear::FullProgress)
+            .await;
+
+        assert!(
+            was_armed,
+            "was_armed should be true when archive_behind_until was Some"
+        );
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "archive_confirmed_behind must be cleared"
+        );
+        assert!(
+            app.archive_behind_until.read().await.is_none(),
+            "archive_behind_until must be cleared"
+        );
+        assert!(
+            !app.archive_checkpoint_cache.is_urgent(),
+            "urgent must be disabled for FullProgress"
+        );
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            0,
+            "livelock_start must be cleared for FullProgress"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            0,
+            "recovery_attempts must be reset (Full)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_archive_recovery_partial_progress() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Pre-arm state.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        *app.archive_behind_until.write().await = Some(Instant::now());
+        app.archive_checkpoint_cache.set_urgent(false);
+        app.hard_reset_livelock_start.store(77, Ordering::Relaxed);
+
+        let was_armed = app
+            .clear_archive_recovery_state(ArchiveRecoveryClear::PartialProgress { seed: 10 })
+            .await;
+
+        assert!(was_armed);
+        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
+        assert!(app.archive_behind_until.read().await.is_none());
+        assert!(
+            app.archive_checkpoint_cache.is_urgent(),
+            "urgent must be ENABLED for PartialProgress"
+        );
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            0,
+            "livelock_start must be cleared for PartialProgress"
+        );
+        // Partial re-seeds: fetch_max(10) from 0 → 10.
+        assert!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst)
+                >= 10,
+            "recovery_attempts must be re-seeded (Partial)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_archive_recovery_defense_skip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Pre-arm state.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        *app.archive_behind_until.write().await = Some(Instant::now());
+        app.archive_checkpoint_cache.set_urgent(true);
+        app.hard_reset_livelock_start.store(55, Ordering::Relaxed);
+        app.recovery_attempts_without_progress
+            .store(3, Ordering::SeqCst);
+
+        let was_armed = app
+            .clear_archive_recovery_state(ArchiveRecoveryClear::DefenseSkip)
+            .await;
+
+        assert!(was_armed);
+        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
+        assert!(app.archive_behind_until.read().await.is_none());
+        assert!(
+            !app.archive_checkpoint_cache.is_urgent(),
+            "urgent must be disabled for DefenseSkip"
+        );
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            0,
+            "livelock_start must be cleared for DefenseSkip"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            3,
+            "recovery_attempts must NOT be reset for DefenseSkip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_archive_recovery_hard_reset_exec() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Pre-arm state: urgent=true, livelock active.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        *app.archive_behind_until.write().await = Some(Instant::now());
+        app.archive_checkpoint_cache.set_urgent(true);
+        app.hard_reset_livelock_start.store(88, Ordering::Relaxed);
+        app.recovery_attempts_without_progress
+            .store(7, Ordering::SeqCst);
+
+        let was_armed = app
+            .clear_archive_recovery_state(ArchiveRecoveryClear::HardResetExec)
+            .await;
+
+        assert!(was_armed, "was_armed must be true");
+        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
+        assert!(app.archive_behind_until.read().await.is_none());
+        assert!(
+            app.archive_checkpoint_cache.is_urgent(),
+            "urgent must be PRESERVED (not touched) for HardResetExec"
+        );
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            88,
+            "livelock_start must be PRESERVED for HardResetExec"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            7,
+            "recovery_attempts must NOT be reset for HardResetExec"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_archive_recovery_archive_confirmed_current() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Pre-arm state.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        *app.archive_behind_until.write().await = None; // not armed
+        app.archive_checkpoint_cache.set_urgent(true);
+        app.hard_reset_livelock_start.store(33, Ordering::Relaxed);
+        app.recovery_attempts_without_progress
+            .store(2, Ordering::SeqCst);
+
+        let was_armed = app
+            .clear_archive_recovery_state(ArchiveRecoveryClear::ArchiveConfirmedCurrent)
+            .await;
+
+        assert!(
+            !was_armed,
+            "was_armed must be false when archive_behind_until was None"
+        );
+        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
+        assert!(app.archive_behind_until.read().await.is_none());
+        assert!(
+            !app.archive_checkpoint_cache.is_urgent(),
+            "urgent must be disabled for ArchiveConfirmedCurrent"
+        );
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            33,
+            "livelock_start must be PRESERVED for ArchiveConfirmedCurrent"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            2,
+            "recovery_attempts must NOT be reset for ArchiveConfirmedCurrent"
         );
     }
 

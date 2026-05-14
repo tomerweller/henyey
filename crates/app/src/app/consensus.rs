@@ -249,17 +249,10 @@ impl App {
                 // is still significantly behind verified peers. Re-seed the
                 // attempt counter high for faster re-escalation (~30s instead
                 // of ~120s). See RecoveryResetMode::Partial docs.
-                self.reset_recovery_attempts(RecoveryResetMode::Partial {
+                self.clear_archive_recovery_state(ArchiveRecoveryClear::PartialProgress {
                     seed: PARTIAL_PROGRESS_RESEED,
-                });
-                // Clear stale archive signals — they were relative to the
-                // old next_checkpoint. Urgent polling re-confirms quickly.
-                self.archive_confirmed_behind.store(false, Ordering::SeqCst);
-                let mut guard = self.archive_behind_until.write().await;
-                *guard = None;
-                self.archive_checkpoint_cache.set_urgent(true);
-                // Clear livelock tracker — ledger advanced.
-                self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
+                })
+                .await;
                 tracing::info!(
                     current_ledger,
                     peer_gap,
@@ -268,13 +261,9 @@ impl App {
             } else {
                 // Full progress: node is at or near the tip. Clear all
                 // escalation state (#1867).
-                self.reset_recovery_attempts(RecoveryResetMode::Full);
+                self.clear_archive_recovery_state(ArchiveRecoveryClear::FullProgress)
+                    .await;
                 did_full_reset = true;
-                self.archive_confirmed_behind.store(false, Ordering::SeqCst);
-                let mut guard = self.archive_behind_until.write().await;
-                *guard = None;
-                self.archive_checkpoint_cache.set_urgent(false);
-                self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
             }
         }
 
@@ -287,13 +276,9 @@ impl App {
         if !did_full_reset && matches!(relation, LedgerRelation::AtTip) && current_ledger > 0 {
             let was_behind = self.archive_confirmed_behind.load(Ordering::SeqCst);
             if was_behind {
-                self.reset_recovery_attempts(RecoveryResetMode::Full);
+                self.clear_archive_recovery_state(ArchiveRecoveryClear::FullProgress)
+                    .await;
                 did_full_reset = true;
-                self.archive_confirmed_behind.store(false, Ordering::SeqCst);
-                let mut guard = self.archive_behind_until.write().await;
-                *guard = None;
-                self.archive_checkpoint_cache.set_urgent(false);
-                self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
                 tracing::debug!(
                     current_ledger,
                     "Cleared stale archive-behind state: node is at-tip without \
@@ -1362,10 +1347,10 @@ impl App {
                 CacheResult::Fresh(latest) | CacheResult::Stale(latest) if latest >= next_cp => {
                     // Archive is current enough — clear any prior backoff,
                     // urgent mode, and the confirmed-behind signal (#1867).
-                    self.archive_confirmed_behind.store(false, Ordering::SeqCst);
-                    let mut guard = self.archive_behind_until.write().await;
-                    *guard = None;
-                    self.archive_checkpoint_cache.set_urgent(false);
+                    self.clear_archive_recovery_state(
+                        ArchiveRecoveryClear::ArchiveConfirmedCurrent,
+                    )
+                    .await;
                     Some(latest)
                 }
                 CacheResult::Fresh(latest) | CacheResult::Stale(latest) => {
