@@ -340,35 +340,15 @@ fn validate_regular_for_tx_set(
         }
     };
 
-    // Phase A: Sequence validation (mirrors isBadSeq)
-    if !validate_sequence(frame, &source_account, ctx.next_ledger_seq) {
-        return false;
-    }
-
-    // Phase A: Min seq age/gap (mirrors isTooEarlyForAccount)
-    if !validate_min_seq_age_gap(
-        frame,
-        &source_account,
-        lower_close_time,
-        ctx.next_ledger_seq,
-    ) {
-        return false;
-    }
-
-    // Phase A: Per-op structural validation (isOpSupported + doCheckValid)
-    if !validate_ops_structure(frame, ctx.protocol_version, ctx.ledger_flags) {
-        return false;
-    }
-
-    // Phase A2: Compute tx hash (needed for frozen-key bypass and signatures)
+    // Compute tx hash (needed for frozen-key bypass and signatures)
     let tx_hash = match frame.hash(&ctx.network_id) {
         Ok(h) => h,
         Err(_) => return false,
     };
 
-    // Phase A3: CAP-77 frozen key check
+    // CAP-77 frozen key check (last step of commonValidPreSeqNum)
     // Parity: stellar-core commonValidPreSeqNum:1548-1560
-    // Must precede signature checks — matches stellar-core ordering.
+    // Runs after source account load but before sequence/signature checks.
     // No protocol gate — relies on has_frozen_keys() being false pre-V26.
     if ctx.frozen_key_config.has_frozen_keys() {
         let soroban_fp = frame.soroban_data().map(|d| &d.resources.footprint);
@@ -384,7 +364,27 @@ fn validate_regular_for_tx_set(
         }
     }
 
-    // Phase B: TX-level signature check (LOW threshold for tx source)
+    // Sequence validation (mirrors isBadSeq)
+    if !validate_sequence(frame, &source_account, ctx.next_ledger_seq) {
+        return false;
+    }
+
+    // Min seq age/gap (mirrors isTooEarlyForAccount)
+    if !validate_min_seq_age_gap(
+        frame,
+        &source_account,
+        lower_close_time,
+        ctx.next_ledger_seq,
+    ) {
+        return false;
+    }
+
+    // Per-op structural validation (isOpSupported + doCheckValid)
+    if !validate_ops_structure(frame, ctx.protocol_version, ctx.ledger_flags) {
+        return false;
+    }
+
+    // TX-level signature check (LOW threshold for tx source)
     let mut checker = SignatureChecker::new(tx_hash, frame.signatures());
     let signers = collect_signers_for_account(&source_account);
     let threshold_low = source_account.thresholds.0[1] as i32;
@@ -393,17 +393,17 @@ fn validate_regular_for_tx_set(
         return false;
     }
 
-    // Phase C: Per-op source auth (every op, including tx-source ops at correct threshold)
+    // Per-op source auth (every op, including tx-source ops at correct threshold)
     if !validate_ops_auth(frame, &source_account, &mut checker, account_provider) {
         return false;
     }
 
-    // Phase D: Extra signers (must come before unused-sig check, uses same checker)
+    // Extra signers (must come before unused-sig check, uses same checker)
     if !validate_extra_signers(frame, &mut checker) {
         return false;
     }
 
-    // Phase E: Unused signature detection
+    // Unused signature detection
     if !checker.check_all_signatures_used() {
         debug!("tx-set validation: unused signatures detected (txBAD_AUTH_EXTRA)");
         return false;
@@ -449,9 +449,17 @@ fn validate_fee_bump_for_tx_set(
         Err(_) => return false,
     };
 
-    // CAP-77: Fee-bump fee source frozen key check (before signatures)
-    // Parity: FeeBumpTransactionFrame::checkValid:300 gates on V20.
-    // Parity: ledger/execution/preconditions.rs:502-517
+    let mut outer_checker = SignatureChecker::new(outer_hash, frame.signatures());
+    let outer_signers = collect_signers_for_account(&fee_source_account);
+    let outer_threshold = fee_source_account.thresholds.0[1] as i32;
+    if !outer_checker.check_signature(&outer_signers, outer_threshold) {
+        debug!("tx-set validation: fee-bump outer auth failed");
+        return false;
+    }
+
+    // CAP-77: Fee-bump fee source frozen key check (after outer auth)
+    // Parity: FeeBumpTransactionFrame::checkValid:300-302 — runs after
+    // commonValid (which includes outer auth) but before checkAllSignaturesUsed.
     if protocol_version_starts_from(ctx.protocol_version, ProtocolVersion::V20)
         && ctx.frozen_key_config.has_frozen_keys()
         && ctx
@@ -463,13 +471,6 @@ fn validate_fee_bump_for_tx_set(
         return false;
     }
 
-    let mut outer_checker = SignatureChecker::new(outer_hash, frame.signatures());
-    let outer_signers = collect_signers_for_account(&fee_source_account);
-    let outer_threshold = fee_source_account.thresholds.0[1] as i32;
-    if !outer_checker.check_signature(&outer_signers, outer_threshold) {
-        debug!("tx-set validation: fee-bump outer auth failed");
-        return false;
-    }
     if !outer_checker.check_all_signatures_used() {
         debug!("tx-set validation: fee-bump outer unused signatures (txBAD_AUTH_EXTRA)");
         return false;
@@ -496,6 +497,25 @@ fn validate_fee_bump_for_tx_set(
         }
     };
 
+    // CAP-77: Inner tx frozen key check (last step of commonValidPreSeqNum)
+    // Parity: stellar-core commonValidPreSeqNum:1548-1560
+    // Runs after inner source load, before sequence/signature checks.
+    // No protocol gate — relies on has_frozen_keys() being false pre-V26.
+    // Bypass uses outer_hash (fee-bump contents hash), not inner hash.
+    if ctx.frozen_key_config.has_frozen_keys() {
+        let soroban_fp = frame.soroban_data().map(|d| &d.resources.footprint);
+        if henyey_tx::frozen_keys::accesses_frozen_key(
+            &inner_source_id,
+            frame.operations(),
+            soroban_fp,
+            &ctx.frozen_key_config,
+        ) && !ctx.frozen_key_config.is_freeze_bypass_tx(&outer_hash)
+        {
+            debug!("tx-set validation: fee-bump inner tx accesses frozen key");
+            return false;
+        }
+    }
+
     // Inner sequence
     if !validate_sequence(frame, &inner_source_account, ctx.next_ledger_seq) {
         return false;
@@ -514,24 +534,6 @@ fn validate_fee_bump_for_tx_set(
     // Inner per-op structural validation (isOpSupported + doCheckValid)
     if !validate_ops_structure(frame, ctx.protocol_version, ctx.ledger_flags) {
         return false;
-    }
-
-    // CAP-77: Inner tx frozen key check (before signatures)
-    // Parity: stellar-core commonValidPreSeqNum:1548-1560
-    // No protocol gate — relies on has_frozen_keys() being false pre-V26.
-    // Bypass uses outer_hash (fee-bump contents hash), not inner hash.
-    if ctx.frozen_key_config.has_frozen_keys() {
-        let soroban_fp = frame.soroban_data().map(|d| &d.resources.footprint);
-        if henyey_tx::frozen_keys::accesses_frozen_key(
-            &inner_source_id,
-            frame.operations(),
-            soroban_fp,
-            &ctx.frozen_key_config,
-        ) && !ctx.frozen_key_config.is_freeze_bypass_tx(&outer_hash)
-        {
-            debug!("tx-set validation: fee-bump inner tx accesses frozen key");
-            return false;
-        }
     }
 
     // Inner signature check
