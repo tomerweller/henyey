@@ -96,3 +96,5 @@ scripts/lib/__pycache__/
 .monitor-tick-filed.json
 .monitor-tick-filing.lock
 scripts/ci/__pycache__/
+.copilot-scratch/
+stellar-core-pc/
