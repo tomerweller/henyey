@@ -462,6 +462,16 @@ impl CatchupManager {
 
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
+        // Spec: CATCHUP_SPEC §8.5 — verify HAS/header seq agreement before
+        // initializing. This guards the `catchup_to_ledger_with_checkpoint_data`
+        // path where HAS and header are supplied externally.
+        if has.current_ledger != checkpoint_header.ledger_seq {
+            return Err(HistoryError::VerificationFailed(format!(
+                "HAS current_ledger {} != checkpoint header ledger_seq {}",
+                has.current_ledger, checkpoint_header.ledger_seq
+            )));
+        }
+
         if ledger_manager.is_initialized() {
             ledger_manager.reset();
         }
@@ -1095,11 +1105,14 @@ impl LedgerData {
                 }
             }
             (None, None) => {
-                debug_assert_eq!(
-                    &header.previous_ledger_hash,
-                    lcl.lcl_hash(),
-                    "LclContext hash mismatch: header.previous_ledger_hash != lcl.lcl_hash()"
-                );
+                if header.previous_ledger_hash != *lcl.lcl_hash() {
+                    return Err(HistoryError::VerificationFailed(format!(
+                        "LCL stitching failed at ledger {}: previous_hash {} != expected lcl_hash {}",
+                        header.ledger_seq,
+                        header.previous_ledger_hash,
+                        lcl.lcl_hash(),
+                    )));
+                }
                 let tx_set = make_empty_tx_set(lcl);
                 LedgerTxData::Absent { tx_set }
             }

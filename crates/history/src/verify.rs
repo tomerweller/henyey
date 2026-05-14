@@ -35,7 +35,7 @@
 use crate::{
     archive_state::HistoryArchiveState, checkpoint, HistoryError, Result, GENESIS_LEDGER_SEQ,
 };
-use henyey_bucket::BUCKET_LIST_LEVELS;
+use henyey_bucket::{BUCKET_LIST_LEVELS, HOT_ARCHIVE_BUCKET_LIST_LEVELS};
 use henyey_common::Hash256;
 use henyey_crypto::Sha256Hasher;
 use henyey_ledger::TransactionSetVariant;
@@ -483,6 +483,26 @@ pub fn verify_has_structure(has: &HistoryArchiveState) -> Result<()> {
         return Err(HistoryError::VerificationFailed(
             "HAS version 2 requires networkPassphrase field".to_string(),
         ));
+    }
+
+    // Spec: CATCHUP_SPEC §4.4 — when hotArchiveBuckets is present, it must have
+    // exactly HOT_ARCHIVE_BUCKET_LIST_LEVELS entries. For version 2, the field
+    // is expected but not strictly required (some v2 archives predate hot archive).
+    if let Some(hot_buckets) = &has.hot_archive_buckets {
+        if has.version == 1 {
+            // Version 1 must NOT have hotArchiveBuckets — presence indicates corruption
+            // or a version mismatch (forward-incompatible extension without version bump).
+            return Err(HistoryError::VerificationFailed(
+                "HAS version 1 must not contain hotArchiveBuckets field".to_string(),
+            ));
+        }
+        if hot_buckets.len() != HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+            return Err(HistoryError::VerificationFailed(format!(
+                "hotArchiveBuckets has {} levels, expected {}",
+                hot_buckets.len(),
+                HOT_ARCHIVE_BUCKET_LIST_LEVELS
+            )));
+        }
     }
 
     Ok(())
@@ -1103,8 +1123,21 @@ mod tests {
 
     #[test]
     fn test_verify_has_structure_valid_v2_with_passphrase() {
-        // Version 2 with 11 levels and passphrase — valid.
-        let has = make_has_with_levels(11, 2, Some("Test SDF Network ; September 2015"));
+        use crate::archive_state::{HASBucketLevel, HASBucketNext};
+        // Version 2 with 11 levels, passphrase, and hotArchiveBuckets — valid.
+        let level = HASBucketLevel {
+            curr: "00".repeat(32),
+            snap: "00".repeat(32),
+            next: HASBucketNext {
+                state: 0,
+                output: None,
+                curr: None,
+                snap: None,
+                shadow: None,
+            },
+        };
+        let mut has = make_has_with_levels(11, 2, Some("Test SDF Network ; September 2015"));
+        has.hot_archive_buckets = Some(vec![level; HOT_ARCHIVE_BUCKET_LIST_LEVELS]);
         assert!(verify_has_structure(&has).is_ok());
     }
 
@@ -1149,6 +1182,87 @@ mod tests {
         // Version 1 without passphrase — should be fine.
         let has = make_has_with_levels(11, 1, None);
         assert!(verify_has_structure(&has).is_ok());
+    }
+
+    #[test]
+    fn test_verify_has_structure_v2_without_hot_archive_is_valid() {
+        // Version 2 with passphrase but no hotArchiveBuckets — valid (field is optional).
+        let has = make_has_with_levels(11, 2, Some("Test SDF Network ; September 2015"));
+        assert!(verify_has_structure(&has).is_ok());
+    }
+
+    #[test]
+    fn test_verify_has_structure_v2_wrong_hot_archive_count() {
+        use crate::archive_state::{HASBucketLevel, HASBucketNext};
+        // Version 2 with wrong number of hotArchiveBuckets — must fail.
+        let level = HASBucketLevel {
+            curr: "00".repeat(32),
+            snap: "00".repeat(32),
+            next: HASBucketNext {
+                state: 0,
+                output: None,
+                curr: None,
+                snap: None,
+                shadow: None,
+            },
+        };
+        let mut has = make_has_with_levels(11, 2, Some("Test SDF Network ; September 2015"));
+        has.hot_archive_buckets = Some(vec![level.clone(); 5]); // wrong count
+        let result = verify_has_structure(&has);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("hotArchiveBuckets"));
+    }
+
+    #[test]
+    fn test_verify_has_structure_v2_empty_hot_archive_vec() {
+        // Version 2 with Some(vec![]) — must fail (0 != 11).
+        let mut has = make_has_with_levels(11, 2, Some("Test SDF Network ; September 2015"));
+        has.hot_archive_buckets = Some(vec![]);
+        let result = verify_has_structure(&has);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("hotArchiveBuckets"));
+    }
+
+    #[test]
+    fn test_verify_has_structure_v2_correct_hot_archive_count() {
+        use crate::archive_state::{HASBucketLevel, HASBucketNext};
+        // Version 2 with correct 11 hotArchiveBuckets — valid.
+        let level = HASBucketLevel {
+            curr: "00".repeat(32),
+            snap: "00".repeat(32),
+            next: HASBucketNext {
+                state: 0,
+                output: None,
+                curr: None,
+                snap: None,
+                shadow: None,
+            },
+        };
+        let mut has = make_has_with_levels(11, 2, Some("Test SDF Network ; September 2015"));
+        has.hot_archive_buckets = Some(vec![level; HOT_ARCHIVE_BUCKET_LIST_LEVELS]);
+        assert!(verify_has_structure(&has).is_ok());
+    }
+
+    #[test]
+    fn test_verify_has_structure_v1_with_hot_archive_buckets_rejected() {
+        use crate::archive_state::{HASBucketLevel, HASBucketNext};
+        // Version 1 with hotArchiveBuckets present — must fail.
+        let level = HASBucketLevel {
+            curr: "00".repeat(32),
+            snap: "00".repeat(32),
+            next: HASBucketNext {
+                state: 0,
+                output: None,
+                curr: None,
+                snap: None,
+                shadow: None,
+            },
+        };
+        let mut has = make_has_with_levels(11, 1, None);
+        has.hot_archive_buckets = Some(vec![level; 11]);
+        let result = verify_has_structure(&has);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("version 1"));
     }
 
     // --- Direct producer tests for VerificationHashMismatch migration ---
