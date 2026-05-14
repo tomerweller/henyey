@@ -310,7 +310,7 @@ pub(crate) struct QueueEntry {
 
 impl QueueEntry {
     pub(crate) fn new(tx: QueuedTransaction, seed: u64) -> Self {
-        let mut tie_breaker = tx.hash.0;
+        let mut tie_breaker = tx.hash().0;
         if seed != 0 {
             let mut seed_bytes = seed.to_be_bytes();
             for (idx, byte) in seed_bytes.iter_mut().enumerate() {
@@ -318,9 +318,9 @@ impl QueueEntry {
             }
         }
         Self {
-            fee_rate: tx.fee_rate,
+            fee_rate: *tx.fee_rate(),
             tie_breaker,
-            hash: tx.hash.0,
+            hash: tx.hash().0,
             tx,
         }
     }
@@ -463,8 +463,8 @@ impl SurgePricingPriorityQueue {
     }
 
     pub(crate) fn add(&mut self, tx: QueuedTransaction, ledger_version: u32) {
-        let lane = self.lane_config.get_lane(&tx.envelope);
-        let resources = self.lane_config.tx_resources(&tx.envelope, ledger_version);
+        let lane = self.lane_config.get_lane(tx.envelope());
+        let resources = self.lane_config.tx_resources(tx.envelope(), ledger_version);
         let inserted = self
             .lanes
             .get_mut(lane)
@@ -491,7 +491,7 @@ impl SurgePricingPriorityQueue {
         };
         let resources = self
             .lane_config
-            .tx_resources(&stored.tx.envelope, ledger_version);
+            .tx_resources(stored.tx.envelope(), ledger_version);
         assert!(
             resources.leq(&self.lane_current_count[lane]),
             "erase: resources exceed lane current count"
@@ -587,7 +587,7 @@ impl SurgePricingPriorityQueue {
 
             let resources = self
                 .lane_config
-                .tx_resources(&entry.tx.envelope, ledger_version);
+                .tx_resources(entry.tx.envelope(), ledger_version);
             let exceeds_lane = any_greater(&resources, &lane_left_until_limit[lane]);
             let exceeds_generic = any_greater(&resources, &lane_left_until_limit[GENERIC_LANE]);
 
@@ -624,8 +624,8 @@ impl SurgePricingPriorityQueue {
         ledger_version: u32,
         exclusion: Option<&EvictionExclusion>,
     ) -> Option<Vec<(QueuedTransaction, bool)>> {
-        let lane = self.lane_config.get_lane(&tx.envelope);
-        let mut tx_resources = self.lane_config.tx_resources(&tx.envelope, ledger_version);
+        let lane = self.lane_config.get_lane(tx.envelope());
+        let mut tx_resources = self.lane_config.tx_resources(tx.envelope(), ledger_version);
         if let Some(discount) = tx_discount {
             tx_resources = subtract_non_negative(&tx_resources, &discount);
         }
@@ -759,7 +759,7 @@ impl SurgePricingPriorityQueue {
                 break (evict_lane, entry);
             };
 
-            if entry.fee_rate.cmp_rate(&tx.fee_rate) != Ordering::Less {
+            if entry.fee_rate.cmp_rate(tx.fee_rate()) != Ordering::Less {
                 return None;
             }
 
@@ -769,7 +769,7 @@ impl SurgePricingPriorityQueue {
 
             let evict_resources = self
                 .lane_config
-                .tx_resources(&entry.tx.envelope, ledger_version);
+                .tx_resources(entry.tx.envelope(), ledger_version);
             evictions.push((entry.tx.clone(), evicted_due_to_lane_limit));
 
             needed_total = subtract_non_negative(&needed_total, &evict_resources);
@@ -887,15 +887,14 @@ mod tests {
             .try_into()
             .unwrap(),
         });
-        let queued = QueuedTransaction {
-            envelope: Arc::new(envelope),
-            hash: henyey_common::Hash256::from_bytes([1u8; 32]),
-            total_fee: 100,
-            fee_rate: FeeRate::new(henyey_tx::InclusionFee::new(100), 1),
-            fee_per_op: 100,
-            received_at: std::time::Instant::now(),
-            is_dex: false,
-        };
+        let queued = QueuedTransaction::new_for_test(
+            Arc::new(envelope),
+            henyey_common::Hash256::from_bytes([1u8; 32]),
+            FeeRate::new(henyey_tx::InclusionFee::new(100), 1),
+            100,
+            100,
+            false,
+        );
 
         // Add the transaction (lane_current_count[0] becomes Resource([1])).
         queue.add(queued.clone(), 22);

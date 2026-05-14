@@ -674,10 +674,8 @@ impl App {
         for hash in demand.tx_hashes.0.iter() {
             let hash256 = Hash256::from(hash.clone());
             if let Some(tx) = self.herder.tx_queue().get(&hash256) {
-                match overlay.try_send_to(
-                    peer_id,
-                    StellarMessage::Transaction(Arc::unwrap_or_clone(tx.envelope)),
-                ) {
+                match overlay.try_send_to(peer_id, StellarMessage::Transaction(tx.into_envelope()))
+                {
                     Ok(()) => sent += 1,
                     Err(_) => {
                         dropped += 1;

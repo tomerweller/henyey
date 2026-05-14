@@ -254,7 +254,7 @@ impl TxQueueLimiter {
     /// the limiter configuration.
     pub fn add_transaction(&mut self, tx: &QueuedTransaction, ledger_version: u32) {
         assert_eq!(
-            henyey_tx::envelope_utils::is_soroban_envelope(&tx.envelope),
+            henyey_tx::envelope_utils::is_soroban_envelope(tx.envelope()),
             self.is_soroban,
             "Transaction type mismatch"
         );
@@ -274,7 +274,7 @@ impl TxQueueLimiter {
         let lane = self
             .lane_config
             .as_ref()
-            .map(|c| c.get_lane(&tx.envelope))
+            .map(|c| c.get_lane(tx.envelope()))
             .unwrap_or(GENERIC_LANE);
 
         if let Some(ref mut txs) = self.txs {
@@ -312,11 +312,11 @@ impl TxQueueLimiter {
         ledger_version: u32,
         broadcast_seed: u64,
     ) -> (bool, i64) {
-        let new_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&new_tx.envelope);
+        let new_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(new_tx.envelope());
         assert_eq!(new_is_soroban, self.is_soroban, "Transaction type mismatch");
 
         if let Some(old) = old_tx {
-            let old_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&old.envelope);
+            let old_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(old.envelope());
             assert_eq!(
                 old_is_soroban, new_is_soroban,
                 "Old and new transaction type mismatch"
@@ -329,7 +329,7 @@ impl TxQueueLimiter {
         let lane = self
             .lane_config
             .as_ref()
-            .map(|c| c.get_lane(&new_tx.envelope))
+            .map(|c| c.get_lane(new_tx.envelope()))
             .unwrap_or(GENERIC_LANE);
 
         // Check if the new transaction beats any evicted fees
@@ -345,14 +345,14 @@ impl TxQueueLimiter {
             .unwrap_or(None);
 
         let min_fee_to_beat_lane =
-            compute_better_fee_opt(evicted_lane_fee.as_ref(), &new_tx.fee_rate);
+            compute_better_fee_opt(evicted_lane_fee.as_ref(), new_tx.fee_rate());
         let min_fee_to_beat_generic =
-            compute_better_fee_opt(evicted_generic_fee.as_ref(), &new_tx.fee_rate);
+            compute_better_fee_opt(evicted_generic_fee.as_ref(), new_tx.fee_rate());
         let min_inclusion_fee = min_fee_to_beat_lane.max(min_fee_to_beat_generic);
 
         if min_inclusion_fee > 0 {
             let resource_fee_discount =
-                (new_tx.total_fee as i64).saturating_sub(new_tx.inclusion_fee_i64());
+                (new_tx.total_fee() as i64).saturating_sub(new_tx.inclusion_fee_i64());
             return (
                 false,
                 min_inclusion_fee.saturating_add(resource_fee_discount),
@@ -363,7 +363,7 @@ impl TxQueueLimiter {
         let old_tx_discount = old_tx.map(|old| {
             self.lane_config
                 .as_ref()
-                .map(|c| c.tx_resources(&old.envelope, ledger_version))
+                .map(|c| c.tx_resources(old.envelope(), ledger_version))
                 .unwrap_or_else(|| Resource::new(vec![old.op_count() as i64]))
         });
 
@@ -405,28 +405,28 @@ impl TxQueueLimiter {
         let tx_to_fit_lane = self
             .lane_config
             .as_ref()
-            .map(|c| c.get_lane(&tx_to_fit.envelope))
+            .map(|c| c.get_lane(tx_to_fit.envelope()))
             .unwrap_or(GENERIC_LANE);
 
         let resources_to_fit = self
             .lane_config
             .as_ref()
-            .map(|c| c.tx_resources(&tx_to_fit.envelope, ledger_version))
+            .map(|c| c.tx_resources(tx_to_fit.envelope(), ledger_version))
             .unwrap_or_else(|| Resource::new(vec![tx_to_fit.op_count() as i64]));
 
         for (tx, evicted_due_to_lane_limit) in txs_to_evict {
             let evict_lane = self
                 .lane_config
                 .as_ref()
-                .map(|c| c.get_lane(&tx.envelope))
+                .map(|c| c.get_lane(tx.envelope()))
                 .unwrap_or(GENERIC_LANE);
 
             if *evicted_due_to_lane_limit {
                 // Record in the specific lane
-                self.lane_evicted_inclusion_fee[evict_lane] = Some(tx.fee_rate);
+                self.lane_evicted_inclusion_fee[evict_lane] = Some(*tx.fee_rate());
             } else {
                 // Record in generic lane
-                self.lane_evicted_inclusion_fee[GENERIC_LANE] = Some(tx.fee_rate);
+                self.lane_evicted_inclusion_fee[GENERIC_LANE] = Some(*tx.fee_rate());
             }
 
             evict(tx);
@@ -543,15 +543,14 @@ mod tests {
         hash[0] = seq as u8;
         hash[1] = (fee % 256) as u8;
 
-        QueuedTransaction {
-            envelope: Arc::new(envelope),
-            hash: Hash256::from_bytes(hash),
-            total_fee: fee,
-            fee_rate: FeeRate::new(henyey_tx::InclusionFee::new(fee as i64), ops),
-            fee_per_op: if ops > 0 { fee / ops as u64 } else { 0 },
-            received_at: std::time::Instant::now(),
-            is_dex: false,
-        }
+        QueuedTransaction::new_for_test(
+            Arc::new(envelope),
+            Hash256::from_bytes(hash),
+            FeeRate::new(henyey_tx::InclusionFee::new(fee as i64), ops),
+            if ops > 0 { fee / ops as u64 } else { 0 },
+            fee,
+            false,
+        )
     }
 
     #[test]
@@ -650,7 +649,7 @@ mod tests {
         limiter
             .visit_top_txs(
                 |tx| {
-                    visited.push(tx.hash);
+                    visited.push(tx.hash());
                     VisitTxResult::Processed
                 },
                 &mut remaining,
@@ -659,7 +658,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(visited, vec![tx.hash]);
+        assert_eq!(visited, vec![tx.hash()]);
         assert_eq!(remaining, vec![Resource::new(vec![0])]);
     }
 

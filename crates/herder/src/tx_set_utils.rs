@@ -96,8 +96,8 @@ impl HashedTx {
 impl From<&QueuedTransaction> for HashedTx {
     fn from(qt: &QueuedTransaction) -> Self {
         Self {
-            hash: qt.hash,
-            envelope: qt.envelope.clone(),
+            hash: qt.hash(),
+            envelope: qt.arc_envelope().clone(),
         }
     }
 }

@@ -363,22 +363,29 @@ impl Default for ValidationContext {
 }
 
 /// A transaction in the queue with metadata.
+///
+/// All fields are private to enforce invariants established by `new()`:
+/// - `hash == Hash256::hash_xdr(&envelope)`
+/// - `fee_rate` correctly reflects inclusion fee and op count
+/// - `fee_per_op` is correctly derived from `fee_rate`
+/// - `total_fee` matches the envelope's declared fee
+/// - `is_dex` correctly reflects envelope operations
 #[derive(Debug, Clone)]
 pub struct QueuedTransaction {
     /// The transaction envelope (shared via Arc to avoid deep-cloning).
-    pub envelope: Arc<TransactionEnvelope>,
+    envelope: Arc<TransactionEnvelope>,
     /// Hash of the transaction.
-    pub hash: Hash256,
+    hash: Hash256,
     /// When this transaction was received.
-    pub received_at: Instant,
+    received_at: Instant,
     /// Declared fee per operation used for queue-admission minimum fee checks.
-    pub fee_per_op: u64,
+    fee_per_op: u64,
     /// Fee rate (bundles inclusion_fee + op_count) for surge pricing and replacement decisions.
-    pub fee_rate: FeeRate,
+    fee_rate: FeeRate,
     /// Declared full fee.
-    pub total_fee: u64,
+    total_fee: u64,
     /// Whether this transaction contains DEX operations (cached at admission).
-    pub is_dex: bool,
+    is_dex: bool,
 }
 
 impl QueuedTransaction {
@@ -475,6 +482,91 @@ impl QueuedTransaction {
             Ordering::Greater => true,
             Ordering::Less => false,
             Ordering::Equal => self.hash.0 < entry.hash.0,
+        }
+    }
+
+    /// Get the transaction envelope.
+    #[inline]
+    pub fn envelope(&self) -> &TransactionEnvelope {
+        &self.envelope
+    }
+
+    /// Get the Arc-wrapped envelope (for cloning the Arc).
+    #[inline]
+    pub fn arc_envelope(&self) -> &Arc<TransactionEnvelope> {
+        &self.envelope
+    }
+
+    /// Get the transaction hash.
+    #[inline]
+    pub fn hash(&self) -> Hash256 {
+        self.hash
+    }
+
+    /// Get the time this transaction was received.
+    #[inline]
+    pub fn received_at(&self) -> Instant {
+        self.received_at
+    }
+
+    /// Get the declared fee per operation.
+    #[inline]
+    pub fn fee_per_op(&self) -> u64 {
+        self.fee_per_op
+    }
+
+    /// Get the fee rate.
+    #[inline]
+    pub fn fee_rate(&self) -> &FeeRate {
+        &self.fee_rate
+    }
+
+    /// Get the declared full fee.
+    #[inline]
+    pub fn total_fee(&self) -> u64 {
+        self.total_fee
+    }
+
+    /// Whether this transaction contains DEX operations.
+    #[inline]
+    pub fn is_dex(&self) -> bool {
+        self.is_dex
+    }
+
+    /// Consume self and return the inner envelope, unwrapping the Arc if possible.
+    #[inline]
+    pub fn into_envelope(self) -> TransactionEnvelope {
+        Arc::unwrap_or_clone(self.envelope)
+    }
+
+    /// Set the received_at timestamp (test-only).
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn set_received_at(&mut self, t: Instant) {
+        self.received_at = t;
+    }
+
+    /// Construct a QueuedTransaction with explicit field values (test-only).
+    ///
+    /// Tests use synthetic hashes for deterministic ordering; they cannot use
+    /// `new()` which computes the real hash from the envelope.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        envelope: Arc<TransactionEnvelope>,
+        hash: Hash256,
+        fee_rate: FeeRate,
+        fee_per_op: u64,
+        total_fee: u64,
+        is_dex: bool,
+    ) -> Self {
+        Self {
+            envelope,
+            hash,
+            received_at: Instant::now(),
+            fee_per_op,
+            fee_rate,
+            total_fee,
+            is_dex,
         }
     }
 }
