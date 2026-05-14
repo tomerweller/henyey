@@ -534,6 +534,25 @@ mod tests {
     }
 
     #[test]
+    fn test_ledger_data_new_lcl_stitching_mismatch_returns_error() {
+        // Regression test: LCL stitching check must be a hard error in release builds.
+        // When (None, None) arms are hit, previous_ledger_hash must match lcl_hash.
+        let mut header = make_header(300);
+        // Set previous_ledger_hash to something non-zero
+        header.previous_ledger_hash = Hash([0xAB; 32]);
+        // LCL hash is all zeros (pre_genesis), which differs from 0xAB
+        let lcl = LclContext::new(20, henyey_common::Hash256::from_bytes([0x00; 32]));
+        let result = LedgerData::new(header, None, None, &lcl);
+        assert!(result.is_err(), "LCL hash mismatch should return Err");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("LCL stitching failed"),
+            "error should mention LCL stitching: {}",
+            err_msg
+        );
+    }
+
+    #[test]
     fn test_persist_ledger_history_empty_ledger() {
         let manager = make_test_catchup_manager();
         let network_id = test_network_id();
