@@ -100,27 +100,43 @@ parse_quarantine_file() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# check_quarantine_ancestry QUARANTINE_FILE
+# check_quarantine_active QUARANTINE_FILE
 #
-# Read-only + git subprocess. Determines if any quarantined SHA is reachable
-# from origin/main. Fail-closed on file-unreadable and git errors.
+# Read-only + git subprocess. Determines if any quarantined SHA's *content*
+# is still present in origin/main HEAD. Fail-closed on file-unreadable and
+# git errors.
 #
-# Return convention: 0 = blocked (quarantine active), 1 = clear.
+# Semantics differ from a pure ancestry check: a quarantined SHA only blocks
+# deploy if its diff is still applied to origin/main. Once the offending
+# changes are reverted, refactored away, or otherwise no longer present at
+# the same lines, the gate auto-clears for that entry. This means a normal
+# `git revert` (which adds a revert commit but leaves the bad SHA in
+# ancestry) unblocks deploys without operator intervention.
+#
+# Algorithm per entry:
+#   1. If SHA is NOT an ancestor of origin/main → not deployed, skip.
+#   2. If SHA IS an ancestor → emit its diff via `git diff sha^..sha` and
+#      test reverse-apply via `git apply --check --reverse`. Success means
+#      the bad lines are still in the tree (BLOCK). Failure (rejected hunks,
+#      missing files, context mismatch) means the bad code has been removed
+#      or moved (CLEAR for this entry).
+#   3. Hard git errors (rc>=128 from merge-base, rc>=128 from `git diff`
+#      itself, missing parent) fail-closed: BLOCK with a warning.
 #
 # Arguments:
 #   QUARANTINE_FILE - Path to deploy_quarantine.txt
 #
 # Sets globals:
-#   QUARANTINE_STATUS  - Machine-readable: blocked_unreadable | blocked_ancestor
+#   QUARANTINE_STATUS  - Machine-readable: blocked_unreadable | blocked_active
 #                        | blocked_git_error | clear
 #   QUARANTINED_MATCH  - Matched SHA, "UNREADABLE", or "" (empty if clear)
-#   QUARANTINE_WARNINGS - Accumulated warnings from parse + ancestry checks
+#   QUARANTINE_WARNINGS - Accumulated warnings from parse + checks
 #
 # Returns:
 #   0 — quarantined (deploy should be blocked)
 #   1 — clear (no quarantine match, safe to proceed)
 # ─────────────────────────────────────────────────────────────────────────────
-check_quarantine_ancestry() {
+check_quarantine_active() {
   local file="$1"
   QUARANTINE_STATUS="clear"
   QUARANTINED_MATCH=""
@@ -141,21 +157,17 @@ check_quarantine_ancestry() {
     return 1
   fi
 
-  # Check each SHA for ancestry
-  local sha merge_base_rc
+  local sha merge_base_rc apply_rc
   while IFS= read -r sha; do
     [[ -z "$sha" ]] && continue
 
+    # Step 1: ancestry check. If SHA isn't reachable, its content can't
+    # be in origin/main HEAD → skip.
     merge_base_rc=0
     git merge-base --is-ancestor "$sha" origin/main 2>/dev/null || merge_base_rc=$?
 
-    if [[ "$merge_base_rc" -eq 0 ]]; then
-      # SHA is ancestor of origin/main — quarantined
-      QUARANTINE_STATUS="blocked_ancestor"
-      QUARANTINED_MATCH="$sha"
-      return 0
-    elif [[ "$merge_base_rc" -ge 128 ]]; then
-      # Git error — fail-closed
+    if [[ "$merge_base_rc" -ge 128 ]]; then
+      # Git error on ancestry check — fail-closed
       local warning="ancestry-check-error: ${sha:0:8} (rc=$merge_base_rc)"
       if [[ -n "$QUARANTINE_WARNINGS" ]]; then
         QUARANTINE_WARNINGS+=", $warning"
@@ -166,12 +178,40 @@ check_quarantine_ancestry() {
       QUARANTINED_MATCH="$sha"
       return 0
     fi
-    # rc=1: not ancestor — skip, continue to next
+    if [[ "$merge_base_rc" -eq 1 ]]; then
+      # Not in ancestry — content cannot be present. Skip.
+      continue
+    fi
+
+    # Step 2: content check. The SHA is an ancestor; ask whether its diff
+    # would still reverse-apply cleanly. If YES, the offending lines are
+    # in the current tree → BLOCK. If NO (rejected hunks, missing files,
+    # context drift) the bad code is no longer present → CLEAR for this
+    # entry.
+    apply_rc=0
+    git diff "${sha}^..${sha}" 2>/dev/null | git apply --check --reverse 2>/dev/null || apply_rc=$?
+
+    if [[ "$apply_rc" -eq 0 ]]; then
+      # Reverse-apply works → content still present → BLOCK
+      QUARANTINE_STATUS="blocked_active"
+      QUARANTINED_MATCH="$sha"
+      return 0
+    fi
+    # rc != 0: bad code has been reverted or otherwise removed. Skip.
   done <<< "$QUARANTINE_ENTRIES"
 
-  # No match
+  # No active match
   QUARANTINE_STATUS="clear"
   return 1
+}
+
+# Backward-compat alias: monitor-tick previously called
+# `check_quarantine_ancestry`. The new content-aware check is a strict
+# improvement (only blocks when the bad commit's diff is still applied),
+# so the alias points at the new function. Existing call sites continue
+# to work without modification.
+check_quarantine_ancestry() {
+  check_quarantine_active "$@"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

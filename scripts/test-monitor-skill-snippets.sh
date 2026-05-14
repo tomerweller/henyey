@@ -2037,42 +2037,67 @@ except Exception as e:
       "rc=$rc76 status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
   fi
 
-  # ── Test 77: check_quarantine_ancestry — ancestor match ────────────────────
+  # ── Test 77: check_quarantine_active — ancestor + content still applied ────
+  # New semantics: ancestor by itself is not enough; the bad commit's diff
+  # must still reverse-apply cleanly. Mock both git calls to return 0
+  # (ancestor: true, apply: clean).
   printf '%s regression\n' "$sha1" > "$qdir/ancestor.txt"
-  git() { return 0; }  # mock: always ancestor
+  git() { return 0; }
   local rc77=0
   check_quarantine_ancestry "$qdir/ancestor.txt" || rc77=$?
   unset -f git
-  if [[ $rc77 -eq 0 && "$QUARANTINE_STATUS" == "blocked_ancestor" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
-    tap_ok "quarantine-ancestry: ancestor returns 0 (blocked)"
+  if [[ $rc77 -eq 0 && "$QUARANTINE_STATUS" == "blocked_active" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-active: ancestor + content-applied returns 0 (blocked)"
   else
-    tap_not_ok "quarantine-ancestry: ancestor returns 0 (blocked)" \
+    tap_not_ok "quarantine-active: ancestor + content-applied returns 0 (blocked)" \
       "rc=$rc77 status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
   fi
 
-  # ── Test 78: check_quarantine_ancestry — not ancestor (clear) ──────────────
+  # ── Test 78: check_quarantine_active — not ancestor (clear) ────────────────
   printf '%s regression\n' "$sha1" > "$qdir/not_ancestor.txt"
-  git() { return 1; }  # mock: not ancestor
+  git() { return 1; }  # mock: merge-base says NOT ancestor
   local rc78=0
   check_quarantine_ancestry "$qdir/not_ancestor.txt" || rc78=$?
   unset -f git
   if [[ $rc78 -eq 1 && "$QUARANTINE_STATUS" == "clear" && -z "$QUARANTINED_MATCH" ]]; then
-    tap_ok "quarantine-ancestry: not ancestor returns 1 (clear)"
+    tap_ok "quarantine-active: not ancestor returns 1 (clear)"
   else
-    tap_not_ok "quarantine-ancestry: not ancestor returns 1 (clear)" \
+    tap_not_ok "quarantine-active: not ancestor returns 1 (clear)" \
       "rc=$rc78 status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
   fi
 
-  # ── Test 79: check_quarantine_ancestry — git error (fail-closed) ───────────
+  # ── Test 78b: check_quarantine_active — ancestor but content reverted ──────
+  # Ancestor (rc=0) but apply --check --reverse fails (rc=1) → CLEAR.
+  # Mock dispatches on first arg: merge-base returns 0, apply returns 1.
+  printf '%s regression\n' "$sha1" > "$qdir/reverted.txt"
+  git() {
+    case "$1" in
+      merge-base) return 0 ;;  # ancestor
+      diff)       return 0 ;;  # diff command emits output (pipe through)
+      apply)      return 1 ;;  # patch rejected → content gone
+      *)          return 0 ;;
+    esac
+  }
+  local rc78b=0
+  check_quarantine_ancestry "$qdir/reverted.txt" || rc78b=$?
+  unset -f git
+  if [[ $rc78b -eq 1 && "$QUARANTINE_STATUS" == "clear" && -z "$QUARANTINED_MATCH" ]]; then
+    tap_ok "quarantine-active: ancestor + content-reverted returns 1 (auto-clear)"
+  else
+    tap_not_ok "quarantine-active: ancestor + content-reverted returns 1 (auto-clear)" \
+      "rc=$rc78b status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 79: check_quarantine_active — git error on ancestry (fail-closed) ─
   printf '%s regression\n' "$sha1" > "$qdir/git_error.txt"
-  git() { return 128; }  # mock: git error
+  git() { return 128; }  # mock: git error on merge-base
   local rc79=0
   check_quarantine_ancestry "$qdir/git_error.txt" || rc79=$?
   unset -f git
   if [[ $rc79 -eq 0 && "$QUARANTINE_STATUS" == "blocked_git_error" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
-    tap_ok "quarantine-ancestry: git error returns 0 (fail-closed)"
+    tap_ok "quarantine-active: git error returns 0 (fail-closed)"
   else
-    tap_not_ok "quarantine-ancestry: git error returns 0 (fail-closed)" \
+    tap_not_ok "quarantine-active: git error returns 0 (fail-closed)" \
       "rc=$rc79 status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
   fi
 

@@ -123,7 +123,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 
 | File | Purpose | Writer | Remover |
 |------|---------|--------|---------|
-| `deploy_quarantine.txt` | Commit SHAs blocked from rebuild/restart deploy; survives session wipes | Deploy regression policy (skill, during rollback) | Operator only (manual) |
+| `deploy_quarantine.txt` | Commit SHAs that triggered a regression; auto-cleared by the deploy gate when their diff is no longer present in `origin/main`. Survives session wipes. | Deploy regression policy (skill, during rollback) | Auto-cleared on revert/refactor; operator can manually `quarantine_remove` |
 | `$REPO_ROOT/.monitor-tick-filed.json` | Persistent dedup for post-wipe recurrence issue filing; 30-day TTL with auto-prune | check 3d post-wipe recurrence (write) | Auto-pruned (30-day TTL) |
 | `$REPO_ROOT/.monitor-tick-filing.lock` | flock for serializing dedup file access during issue filing | check 3d | N/A (empty sentinel) |
 
@@ -697,7 +697,7 @@ ${predecessor_ref}"
 
 Board-route any newly filed issue to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
 
-**Recovery from (3d) is operator-driven.** The deploy gate at section 10 step 3 (Quarantine gate) will continue to BLOCK redeploy of the quarantined SHA as long as it is reachable from `origin/main`. Operator action: revert/rollback the bad commit so it is no longer in `origin/main`'s ancestry; the next tick's deploy gate will then let the rebuild + relaunch proceed normally. The marker is cleared automatically by the recovery rule below — operators do not need to remove it manually.
+**Recovery from (3d) is operator-driven by way of landing a revert/fix.** The deploy gate (section 10 step 3) blocks redeploy of the quarantined SHA only while its diff is still applied to `origin/main`. Operator action: revert or refactor the offending changes on `origin/main`; the next tick's gate auto-clears once the bad content is gone from HEAD, and rebuild + relaunch proceeds normally. The marker is cleared automatically by the recovery rule below — operators do not need to remove it manually.
 
 **Marker-clear rule** — runs each tick when the process is alive. Clear `wipe_attempted_at` only when the binary has demonstrably stabilized:
 
@@ -720,7 +720,7 @@ if [ -s "$marker" ] && [ -n "${PID:-}" ]; then
 fi
 ```
 
-All four conditions (alive, uptime > 30m, no `fatal_wipe_required` since proc start, last_ledger advanced) must hold simultaneously to clear the marker. Quarantine entries are NOT auto-removed — operators clear them deliberately per the Quarantine Clearance procedure (section 10).
+All four conditions (alive, uptime > 30m, no `fatal_wipe_required` since proc start, last_ledger advanced) must hold simultaneously to clear the marker. Quarantine entries persist in the file, but the deploy gate auto-clears them once the bad commit's diff is no longer applied to `origin/main` (see Quarantine Clearance in section 10). Operators can manually `quarantine_remove` if needed.
 
 **(3c) Soft-fail state-wipe trigger** — defense-in-depth for the case where
 `trigger_fatal_shutdown()` signals exit but the process fails to terminate,
@@ -1495,15 +1495,15 @@ Otherwise enter the deploy path:
    ```bash
    # --- Quarantine gate ---
    source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
-   check_quarantine_ancestry "$HOME/data/deploy_quarantine.txt"
+   check_quarantine_active "$HOME/data/deploy_quarantine.txt"
    if [ $? -eq 0 ]; then
      case "$QUARANTINE_STATUS" in
        blocked_unreadable)
          deploy_report="BLOCKED (quarantine file unreadable — fail-closed)" ;;
        blocked_git_error)
          deploy_report="BLOCKED (quarantine ancestry check failed for ${QUARANTINED_MATCH:0:8} — fail-closed)" ;;
-       blocked_ancestor)
-         deploy_report="DEFERRED (quarantined: ${QUARANTINED_MATCH:0:8} reachable from origin/main — see ~/data/deploy_quarantine.txt)" ;;
+       blocked_active)
+         deploy_report="DEFERRED (quarantined: ${QUARANTINED_MATCH:0:8}'s diff still applied to origin/main — see ~/data/deploy_quarantine.txt)" ;;
      esac
      [ -n "$QUARANTINE_WARNINGS" ] && deploy_report="$deploy_report [WARN: $QUARANTINE_WARNINGS]"
      # Skip to status report with this deploy_report. Do not continue.
@@ -1512,6 +1512,20 @@ Otherwise enter the deploy path:
    If quarantined, report the appropriate status and exit the deploy path.
    Do NOT proceed to CI check, build, or restart. Parse/check warnings are
    appended to the `deploy:` status line regardless of outcome.
+
+   **Content-aware semantics** (changed from the legacy ancestor-only check):
+   `check_quarantine_active` blocks only when a quarantined SHA's *diff is
+   still applied* to `origin/main`'s HEAD. The check uses
+   `git diff <sha>^..<sha> | git apply --check --reverse`: if the diff
+   reverse-applies cleanly the offending lines are still in the tree (BLOCK);
+   if it fails (rejected hunks, missing files, context drift from a revert
+   or refactor) the bad code has been removed (CLEAR for that entry).
+   The legacy `check_quarantine_ancestry` name still works (it now aliases
+   to `check_quarantine_active`), and the on-disk file format is unchanged.
+
+   Consequence: a normal `git revert` (which adds a revert commit but leaves
+   the quarantined SHA in ancestry) auto-clears the gate on the next tick.
+   Operator no longer needs to manually `quarantine_remove` reverted SHAs.
 4. Check CI status on origin/main: `gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'`.
    If any recent run has conclusion `failure`, do NOT deploy — route the failure
    through check (11) and wait.
@@ -1723,22 +1737,33 @@ watchdog data). Board-route to Backlog:
 (d) Restart the node on the last known-good binary (rebuild from the
 previous commit) while waiting for the fix. Do NOT revert commits inline.
 
-The quarantine gate (section 10, step 3) will now block re-deployment as
-long as the quarantined SHA is reachable from origin/main. The quarantine
-does NOT auto-lift — see "Quarantine Clearance" below.
+The quarantine gate (section 10, step 3) blocks re-deployment as long as
+the quarantined SHA's *diff is still applied* to `origin/main`. Once a
+`git revert` or refactor removes the offending content from HEAD, the
+gate auto-clears on the next tick. No operator action required for the
+common case.
 
 ### Quarantine Clearance
 
-The deploy quarantine is a safety lock. The monitor skill NEVER removes
-entries. Clearance is an explicit operator decision.
+The deploy quarantine auto-clears for any entry whose content is no longer
+present in `origin/main` HEAD. The typical flow is:
 
-**When to clear**: After ALL of:
-1. The linked issue (in the reason field) is CLOSED with a fix merged.
-2. CI on origin/main is green (the fix passes all tests).
-3. The operator has reviewed the fix commit and is confident the
-   regression is resolved.
+1. Bad commit lands → monitor-tick's deploy-regression policy appends the
+   SHA to `~/data/deploy_quarantine.txt` and files an `urgent` issue.
+2. Operator (or a follow-up PR) reverts/refactors the bad changes on
+   `origin/main`.
+3. Next monitor-tick re-evaluates the gate: the bad commit's diff no
+   longer reverse-applies cleanly → gate clears → rebuild + restart
+   proceeds on the next eligible cycle (subject to cool-down, CI green,
+   binary-relevance).
 
-**How to clear** (using the deploy-quarantine helper):
+Entries stay in the file as a historical log; they're harmless once their
+content is gone. The file can grow unboundedly over time if you want a
+deploy audit trail; trim it manually whenever convenient.
+
+**Manual removal** (still supported, occasionally useful — e.g. an entry
+that the content check can't decide cleanly because of a malformed diff
+or a binary file):
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
@@ -1749,9 +1774,20 @@ if [ $rc -ne 0 ]; then
 fi
 ```
 
-**Operator reminders**: The `deploy:` status line reports
-`DEFERRED (quarantined: ...)` every tick (~20 minutes). This is a
-persistent, automatic reminder that requires no separate notification.
+**When the gate blocks unexpectedly** (e.g., a fix is partial or the
+content-check has a false-positive on edge-case diffs), the `deploy:`
+status line reports `DEFERRED (quarantined: <sha>'s diff still applied
+to origin/main — ...)` every tick. The fastest way to investigate is:
+
+```bash
+# Show what the gate sees as "still applied"
+cd ~/henyey-1
+git diff <sha>^..<sha> | git apply --check --reverse 2>&1 | head -30
+```
+
+If the check is firing on a genuine remaining-application of the bad
+code, complete the revert. If it's firing on an unrelated file (binary
+or moved/renamed), use `quarantine_remove` to force-clear that entry.
 
 **Emergency override**: To force deploy despite quarantine:
 
