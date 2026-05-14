@@ -2621,6 +2621,10 @@ impl App {
         // EXTERNALIZE messages without going through SCP — the
         // tracking_slot stalls unless we update it here.
         self.herder.bootstrap(pending.ledger_seq);
+        // Re-arm overlay tracking after watcher re-bootstrap.
+        if let Some(flag) = self.overlay_tracking.lock().unwrap().as_ref() {
+            flag.store(true, Ordering::Relaxed);
+        }
 
         // Update bucket snapshots for the query server.
         self.update_bucket_snapshot();

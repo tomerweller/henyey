@@ -229,6 +229,14 @@ impl App {
         self.herder.bootstrap(ledger_seq);
         tracing::info!(ledger_seq, "Herder bootstrapped");
 
+        // Wire overlay tracking state to herder. The herder is now syncing,
+        // so the overlay's maybe_drop_random_peer() should know the node is
+        // tracking (parity: stellar-core Config::REALLY_DEAD_NUM_FAILURES_CUTOFF
+        // peer rotation only fires when !isSynced).
+        if let Some(overlay) = self.overlay().await {
+            overlay.set_tracking(true);
+        }
+
         // Populate the initial bucket snapshot for the query server.
         self.update_bucket_snapshot();
 
@@ -1441,6 +1449,11 @@ impl App {
         tracing::info!(peer_count, "Overlay network started");
 
         *self.overlay.write().await = Some(Arc::new(overlay));
+
+        // Grab the tracking flag handle so synchronous callbacks can update it.
+        if let Some(ref om) = *self.overlay.read().await {
+            *self.overlay_tracking.lock().unwrap() = Some(om.tracking_flag());
+        }
         Ok(())
     }
 

@@ -451,6 +451,12 @@ pub struct App {
     /// event loop during slow network operations.
     overlay: RwLock<Option<Arc<OverlayManager>>>,
 
+    /// Shared handle to the overlay's tracking flag. Allows synchronous
+    /// callbacks (e.g., `SyncRecoveryCallback::on_lost_sync`) to update
+    /// the overlay's tracking state without async overlay access.
+    /// Populated by `start_overlay()`; `None` until the overlay starts.
+    overlay_tracking: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+
     /// Pre-bound TCP listener for the overlay, injected by the simulation
     /// harness to use OS-assigned ephemeral ports.  Set once before
     /// `start_overlay()` and consumed (taken) during overlay startup.
@@ -1148,6 +1154,7 @@ impl App {
             query_is_ready: Arc::new(AtomicBool::new(false)),
             ledger_manager,
             overlay: RwLock::new(None),
+            overlay_tracking: std::sync::Mutex::new(None),
             pre_bound_listener: std::sync::Mutex::new(None),
             herder,
             shutdown_tx,

@@ -726,24 +726,6 @@ impl OverlayManager {
             return Some(false);
         }
 
-        // INV-O14: Drop FloodAdvert/FloodDemand when not tracking consensus.
-        // Defense-in-depth alongside app-layer gating in lifecycle.rs.
-        // Transactions are NOT gated here — the app layer handles them
-        // differently (herder returns TryAgainLater).
-        if !state.is_tracking.load(Ordering::Relaxed) {
-            if matches!(
-                message,
-                StellarMessage::FloodAdvert(_) | StellarMessage::FloodDemand(_)
-            ) {
-                trace!(
-                    "Dropping {} from {}: not tracking consensus",
-                    msg_type,
-                    peer_id
-                );
-                return Some(false);
-            }
-        }
-
         // Per-peer query rate limit (parity: Peer.cpp:1423-1438, 1686).
         // stellar-core's window = expectedLedgerCloseTime * MAX_SLOTS_TO_REMEMBER,
         // recomputed dynamically. The app layer updates the atomic after each

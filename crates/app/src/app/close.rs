@@ -112,6 +112,10 @@ impl SyncRecoveryCallback for App {
         self.lost_sync_count.fetch_add(1, Ordering::Relaxed);
         // Update herder state to syncing
         self.herder.set_state(henyey_herder::HerderState::Syncing);
+        // Tell the overlay we're no longer tracking so it can rotate peers.
+        if let Some(flag) = self.overlay_tracking.lock().unwrap().as_ref() {
+            flag.store(false, Ordering::Relaxed);
+        }
     }
 
     fn on_out_of_sync_recovery(&self) {

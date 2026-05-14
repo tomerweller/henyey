@@ -2301,6 +2301,10 @@ impl App {
                     *self.last_processed_slot.write().await = result.ledger_seq as u64;
                     self.clear_tx_advert_history(result.ledger_seq).await;
                     self.herder.bootstrap(result.ledger_seq);
+                    // Re-arm overlay tracking after catchup recovery.
+                    if let Some(flag) = self.overlay_tracking.lock().unwrap().as_ref() {
+                        flag.store(true, Ordering::Relaxed);
+                    }
                     self.herder.purge_slots_below(result.ledger_seq as u64);
                     let cleaned = self
                         .herder

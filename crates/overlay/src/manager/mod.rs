@@ -1556,6 +1556,15 @@ impl OverlayManager {
         self.is_tracking.load(Ordering::Relaxed)
     }
 
+    /// Returns a shared handle to the tracking flag.
+    ///
+    /// The app layer can clone this and update it directly from synchronous
+    /// callbacks (e.g., `SyncRecoveryCallback::on_lost_sync`) without going
+    /// through the overlay manager's async accessor.
+    pub fn tracking_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.is_tracking)
+    }
+
     /// Clear per-ledger state for ledgers below the given sequence.
     ///
     /// Mirrors upstream `OverlayManagerImpl::clearLedgersBelow()` which is
