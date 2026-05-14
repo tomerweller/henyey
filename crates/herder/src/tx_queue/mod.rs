@@ -1755,6 +1755,17 @@ impl TransactionQueue {
                     return Err(TxQueueResult::Duplicate);
                 }
 
+                // Parity: stellar-core HerderImpl.cpp:627-642 rejects
+                // submissions when the account has a pending tx of the
+                // opposite type (classic vs soroban). This fires before
+                // all queue-local checks (seq, fee-bump, RBF fee) so
+                // that cross-type submissions always get TryAgainLater.
+                let current_is_soroban =
+                    henyey_tx::envelope_utils::is_soroban_envelope(&current_tx.envelope);
+                if current_is_soroban != candidate_is_soroban {
+                    return Err(TxQueueResult::TryAgainLater);
+                }
+
                 let current_seq = envelope_sequence_number(&current_tx.envelope);
                 if new_seq < current_seq {
                     // Parity: stellar-core TransactionQueue::canAdd returns
@@ -1763,17 +1774,6 @@ impl TransactionQueue {
                     return Err(TxQueueResult::Invalid(Some(
                         henyey_tx::TxResultCode::TxBadSeq,
                     )));
-                }
-
-                // Parity: stellar-core HerderImpl.cpp:627-642 rejects
-                // submissions when the account has a pending tx of the
-                // opposite type (classic vs soroban). This must precede
-                // fee-bump / RBF checks so that cross-type submissions
-                // always get TryAgainLater, never FeeTooLow.
-                let current_is_soroban =
-                    henyey_tx::envelope_utils::is_soroban_envelope(&current_tx.envelope);
-                if current_is_soroban != candidate_is_soroban {
-                    return Err(TxQueueResult::TryAgainLater);
                 }
 
                 if !is_fee_bump {
@@ -7877,6 +7877,41 @@ mod tests {
         }
 
         let result = queue.try_add(soroban);
+        assert_eq!(result, TxQueueResult::TryAgainLater);
+
+        // Original classic tx must remain queued.
+        assert!(queue.contains(&classic_hash));
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// Symmetric case of #2690: classic pending, soroban fee-bump submitted.
+    /// This is the true symmetric regression test — uses a fee-bump
+    /// (unlike test_cross_type_rbf_classic_to_soroban_rejected which
+    /// uses a plain tx that would hit !is_fee_bump → TryAgainLater anyway).
+    #[test]
+    fn test_cross_type_soroban_fee_bump_over_classic_rejected() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a classic tx from account seed 42, seq 1.
+        let mut classic = make_test_envelope(200, 1);
+        set_source(&mut classic, 42);
+        if let TransactionEnvelope::Tx(env) = &mut classic {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        assert_eq!(queue.try_add(classic.clone()), TxQueueResult::Added);
+        let classic_hash = full_hash(&classic);
+
+        // Build a soroban fee-bump wrapping a soroban inner from the same
+        // account (seed 42), same seq 1, with 10x fee.
+        let mut soroban_inner = match make_soroban_envelope(100) {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx"),
+        };
+        soroban_inner.tx.source_account = MuxedAccount::Ed25519(Uint256([42; 32]));
+        soroban_inner.tx.seq_num = SequenceNumber(1);
+        let soroban_bump = make_fee_bump_envelope(soroban_inner, 42, 10000);
+
+        let result = queue.try_add(soroban_bump);
         assert_eq!(result, TxQueueResult::TryAgainLater);
 
         // Original classic tx must remain queued.
