@@ -7405,13 +7405,10 @@ mod inv_h2_lcl_guard_tests {
 
     #[test]
     fn test_assert_lcl_consistency_in_ledger_closed_catchup_path() {
-        // Regression test for #2708/#2712: Verify that ledger_closed does NOT
-        // panic when advance_tracking_to is called before it (the proper fix).
-        //
-        // Setup: LCL=5, tracking_slot=6. Simulate the catchup rapid-close path:
-        // advance_tracking_to(6, close_time) advances tracking to 7, then
-        // ledger_closed(6) runs INV-H2 with LCL=6, tracking=7 → strict OK.
-        let lm = make_lm_at_seq(5);
+        // Regression test for #2708/#2712: The proper fix sequence for catchup.
+        // LCL=6 (already applied), tracking=6 (stale). advance_tracking_to(6)
+        // moves tracking to 7, then ledger_closed sees LCL=6 < tracking=7 → OK.
+        let lm = make_lm_at_seq(6); // LCL already at closing slot
         let config = HerderConfig::default();
         let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
         {
@@ -7423,13 +7420,10 @@ mod inv_h2_lcl_guard_tests {
             ts.is_tracking = true;
             ts.consensus_index = 6;
         }
-        // Simulate: advance_tracking_to(6, ...) before ledger_closed(6)
-        // This advances tracking to 7.
+        // Fix: advance tracking before ledger_closed
         herder.advance_tracking_to(6, 1000);
         assert_eq!(herder.tracking_slot().get(), 7);
-        // Now ledger_closed: LCL advances to 6 internally via the assert check.
-        // But LCL is still 5 in the LM (we didn't actually close). So INV-H2
-        // checks LCL=5 < tracking=7 → passes.
+        // Now LCL=6 < tracking=7 — INV-H2 passes
         herder.ledger_closed(6, &[], &[], 1000);
     }
 
@@ -7468,10 +7462,10 @@ mod inv_h2_lcl_guard_tests {
     #[test]
     fn test_advance_tracking_to_before_ledger_closed_regression() {
         // Regression test for #2712: the full sequence that previously panicked.
-        // Simulates catchup rapid-close: tracking=6, close slot 6.
-        // Without advance_tracking_to, ledger_closed would see LCL=6==tracking=6 → panic.
-        // With advance_tracking_to(6), tracking becomes 7, then LCL=5 < 7 → OK.
-        let lm = make_lm_at_seq(5);
+        // Simulates catchup rapid-close where LCL has already advanced to the
+        // closing slot (LCL=6, tracking=6). Without advance_tracking_to, INV-H2
+        // would see lcl(6) >= tracking(6) → panic. With it, tracking becomes 7.
+        let lm = make_lm_at_seq(6); // LCL = 6 (already advanced by apply)
         let config = HerderConfig::default();
         let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
         {
@@ -7481,13 +7475,35 @@ mod inv_h2_lcl_guard_tests {
         {
             let mut ts = tracked_write(LOCK_TRACKING_STATE, &herder.tracking_state);
             ts.is_tracking = true;
-            ts.consensus_index = 6; // tracking_slot = 6
+            ts.consensus_index = 6; // tracking_slot = 6 (stale, not advanced)
         }
-        // This is the fix: advance tracking BEFORE ledger_closed
+        // Before fix: ledger_closed(6) would panic here (LCL=6 == tracking=6).
+        // Fix: advance tracking BEFORE ledger_closed.
         herder.advance_tracking_to(6, 1000);
         assert_eq!(herder.tracking_slot().get(), 7);
 
-        // ledger_closed should not panic (LCL=5 < tracking=7)
+        // Now ledger_closed succeeds: LCL=6 < tracking=7
+        herder.ledger_closed(6, &[], &[], 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "INV-H2 FATAL")]
+    fn test_ledger_closed_panics_without_advance_tracking_to() {
+        // Proves the original bug: without advance_tracking_to, ledger_closed
+        // panics when LCL == tracking_slot (the catchup rapid-close scenario).
+        let lm = make_lm_at_seq(6); // LCL = 6
+        let config = HerderConfig::default();
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
+        {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
+            *state = HerderState::Tracking;
+        }
+        {
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &herder.tracking_state);
+            ts.is_tracking = true;
+            ts.consensus_index = 6; // tracking_slot = 6 (stale)
+        }
+        // Without advance_tracking_to: LCL=6 == tracking=6 → PANIC
         herder.ledger_closed(6, &[], &[], 1000);
     }
 }
