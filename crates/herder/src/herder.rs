@@ -1213,30 +1213,45 @@ impl Herder {
     /// (HerderImpl.cpp:2406-2411).
     pub fn advance_tracking_to(&self, slot: u64, close_time: u64) {
         let next = slot + 1;
-        {
+
+        // Idempotent consensus-index advance: don't regress.
+        let already_advanced = {
             let mut ts = tracked_write(LOCK_TRACKING_STATE, &self.tracking_state);
             if next <= ts.consensus_index {
-                return; // Already at or past this slot — idempotent no-op
+                true
+            } else {
+                ts.is_tracking = true;
+                ts.consensus_index = next;
+                ts.consensus_close_time = close_time;
+                false
             }
-            ts.is_tracking = true;
-            ts.consensus_index = next;
-            ts.consensus_close_time = close_time;
+        };
+
+        if !already_advanced {
+            // Update pending and fetching envelopes current slot
+            self.pending_envelopes.set_current_slot(next);
+            self.fetching_envelopes.set_current_slot(next);
         }
 
-        // Update pending and fetching envelopes current slot
-        self.pending_envelopes.set_current_slot(next);
-        self.fetching_envelopes.set_current_slot(next);
-
-        // Transition to Tracking state if not already
-        {
+        // UNCONDITIONAL: Always ensure Tracking state. The caller declares
+        // the node is synced — state transition must not be gated by whether
+        // the consensus_index needed to advance.
+        // Parity: stellar-core setTrackingSCPState (HerderImpl.cpp:150-162)
+        // sets tracking unconditionally.
+        let was_not_tracking = {
             let mut state = tracked_write(LOCK_HERDER_STATE, &self.state);
             if *state != HerderState::Tracking {
                 info!(slot, "Transitioning to Tracking on advance_tracking_to");
                 *state = HerderState::Tracking;
+                true
+            } else {
+                false
             }
-        }
+        };
 
-        *self.tracking_started_at.write() = Some(Instant::now());
+        if was_not_tracking {
+            *self.tracking_started_at.write() = Some(Instant::now());
+        }
     }
 
     pub fn bootstrap(&self, ledger_seq: u32) {
@@ -2046,22 +2061,31 @@ impl Herder {
                 .set_current_slot(externalized_slot + 1);
             self.fetching_envelopes
                 .set_current_slot(externalized_slot + 1);
+        }
 
-            // Transition to Tracking on successful externalization.
-            // Matches stellar-core's setTrackingSCPState(slotIndex, b, true)
-            // in HerderSCPDriver::valueExternalized which always sets
-            // HERDER_TRACKING_NETWORK_STATE on externalization.
-            {
-                let mut state = tracked_write(LOCK_HERDER_STATE, &self.state);
-                if *state != HerderState::Tracking {
-                    info!(
-                        slot = externalized_slot,
-                        "Transitioning to Tracking on externalization"
-                    );
-                    *state = HerderState::Tracking;
-                }
+        // UNCONDITIONAL: Always ensure Tracking state on externalization.
+        // Parity: stellar-core setTrackingSCPState(slotIndex, b, true)
+        // in HerderSCPDriver::valueExternalized always sets
+        // HERDER_TRACKING_NETWORK_STATE.
+        let was_not_tracking = {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &self.state);
+            if *state != HerderState::Tracking {
+                info!(
+                    slot = externalized_slot,
+                    "Transitioning to Tracking on externalization"
+                );
+                *state = HerderState::Tracking;
+                true
+            } else {
+                false
             }
+        };
 
+        if was_not_tracking {
+            *self.tracking_started_at.write() = Some(Instant::now());
+        }
+
+        if should_advance {
             // NOTE: Pending envelope drain is NOT performed here.
             // stellar-core's `newSlotExternalized` defers the drain via
             // `safelyProcessSCPQueue(false)` → `postOnMainThread`
@@ -7448,6 +7472,44 @@ mod inv_h2_lcl_guard_tests {
         let herder = make_tracking_herder_at(3, 10); // tracking=10
         herder.advance_tracking_to(5, 2000); // slot+1=6 < 10 → no-op
         assert_eq!(herder.tracking_slot().get(), 10);
+    }
+
+    #[test]
+    fn test_advance_tracking_to_idempotent_still_transitions_to_tracking() {
+        // Regression test for #2714: advance_tracking_to must transition to
+        // Tracking even when consensus_index is already at the target value.
+        // This reproduces the exact fixture_tracking() setup that triggered
+        // the CI failure: consensus_index pre-set, state = Syncing, then
+        // advance_tracking_to called with the same target.
+        let lm = make_lm_at_seq(3);
+        let config = HerderConfig::default();
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
+
+        // Pre-set consensus_index = 101 (simulates Fixture::new()'s
+        // set_tracking_for_testing call).
+        {
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &herder.tracking_state);
+            ts.is_tracking = true;
+            ts.consensus_index = 101;
+            ts.consensus_close_time = 5000;
+        }
+
+        // Set state to Syncing (simulates start_syncing() in fixture_tracking).
+        *tracked_write(LOCK_HERDER_STATE, &herder.state) = HerderState::Syncing;
+        assert!(!herder.state().is_tracking());
+
+        // Call advance_tracking_to with slot=100 → next=101 == consensus_index.
+        // Before the fix, this early-returned without transitioning to Tracking.
+        herder.advance_tracking_to(100, 5000);
+
+        // State MUST be Tracking now.
+        assert!(
+            herder.state().is_tracking(),
+            "advance_tracking_to must transition to Tracking even when \
+             consensus_index is already at the target (idempotent case)"
+        );
+        // consensus_index unchanged (idempotent — not regressed)
+        assert_eq!(herder.tracking_slot().get(), 101);
     }
 
     #[test]
