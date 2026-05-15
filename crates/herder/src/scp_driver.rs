@@ -3603,7 +3603,22 @@ impl SCPDriver for HerderScpCallback {
         })
     }
 
+    /// Compute the SCP timeout for a given round number.
+    ///
+    /// Parity: `HerderSCPDriver::computeTimeout` (HerderSCPDriver.cpp:574-609).
+    /// Formula: `initial + (round - 1) * increment`, capped at 30 minutes.
+    /// Pre-protocol-23: initial = 1000ms, increment = 1000ms (linear backoff).
+    /// Protocol 23+: reads initial/increment from `ScpTiming` network config.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `round == 0`. Callers must pass `round >= 1` (nomination
+    /// round numbers start at 1 after increment; ballot counters start at 1).
     fn compute_timeout(&self, round: u32, is_nomination: bool) -> std::time::Duration {
+        assert!(
+            round > 0,
+            "compute_timeout: round must be > 0 (parity: HerderSCPDriver.cpp:576)"
+        );
         const MAX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
         let mut initial_ms: u64 = 1000;
         let mut increment_ms: u64 = 1000;
@@ -3623,7 +3638,7 @@ impl SCPDriver for HerderScpCallback {
                 }
             }
         }
-        let round = round.max(1) as u64;
+        let round = round as u64;
         let timeout_ms = initial_ms.saturating_add((round - 1).saturating_mul(increment_ms));
         std::time::Duration::from_millis(timeout_ms.min(MAX_TIMEOUT_MS))
     }
@@ -7612,6 +7627,160 @@ mod compare_tx_sets_tests {
             "Should read nomination_timeout_limit from Upgrades"
         );
     }
+
+    // ─── compute_timeout parity tests (issue #2669) ───────────────────────
+
+    fn make_driver_with_lm(lm: Arc<henyey_ledger::LedgerManager>) -> ScpDriver {
+        ScpDriver::new(
+            make_config(),
+            Hash256::ZERO,
+            lm,
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
+        )
+    }
+
+    /// Parity: pre-p23 linear backoff for nomination and ballot.
+    /// stellar-core: 1000 + (round-1)*1000, capped at 30 min.
+    #[test]
+    fn test_compute_timeout_pre_p23_linear() {
+        let driver = make_driver();
+        let callback = super::HerderScpCallback::new(Arc::new(driver));
+
+        // Round 1: initial only (1000ms)
+        assert_eq!(
+            callback.compute_timeout(1, true),
+            std::time::Duration::from_millis(1000)
+        );
+        assert_eq!(
+            callback.compute_timeout(1, false),
+            std::time::Duration::from_millis(1000)
+        );
+
+        // Round 5: 1000 + 4*1000 = 5000ms
+        assert_eq!(
+            callback.compute_timeout(5, true),
+            std::time::Duration::from_millis(5000)
+        );
+        assert_eq!(
+            callback.compute_timeout(5, false),
+            std::time::Duration::from_millis(5000)
+        );
+
+        // Round 100: 1000 + 99*1000 = 100_000ms
+        assert_eq!(
+            callback.compute_timeout(100, true),
+            std::time::Duration::from_millis(100_000)
+        );
+    }
+
+    /// Parity: timeout caps at MAX_TIMEOUT_MS (30 min = 1,800,000ms).
+    #[test]
+    fn test_compute_timeout_pre_p23_max_cap() {
+        let driver = make_driver();
+        let callback = super::HerderScpCallback::new(Arc::new(driver));
+
+        // Round 1801 would be 1000 + 1800*1000 = 1,801,000 > 1,800,000
+        assert_eq!(
+            callback.compute_timeout(1801, true),
+            std::time::Duration::from_millis(1_800_000)
+        );
+        // Round 2000: well above cap
+        assert_eq!(
+            callback.compute_timeout(2000, false),
+            std::time::Duration::from_millis(1_800_000)
+        );
+    }
+
+    /// Parity: protocol 23+ reads custom timing from soroban network config.
+    #[test]
+    fn test_compute_timeout_post_p23_nomination() {
+        use henyey_ledger::execution::SorobanNetworkInfo;
+
+        let lm = make_default_lm();
+        lm.set_header_version_for_test(23);
+        let mut info = SorobanNetworkInfo::default();
+        info.nomination_timeout_initial_ms = 2000;
+        info.nomination_timeout_increment_ms = 500;
+        info.ballot_timeout_initial_ms = 3000;
+        info.ballot_timeout_increment_ms = 700;
+        lm.set_soroban_network_info_for_test(info);
+
+        let driver = make_driver_with_lm(lm);
+        let callback = super::HerderScpCallback::new(Arc::new(driver));
+
+        // Nomination: 2000 + (round-1)*500
+        assert_eq!(
+            callback.compute_timeout(1, true),
+            std::time::Duration::from_millis(2000)
+        );
+        assert_eq!(
+            callback.compute_timeout(5, true),
+            std::time::Duration::from_millis(4000) // 2000 + 4*500
+        );
+    }
+
+    /// Parity: protocol 23+ reads custom timing for ballot path.
+    #[test]
+    fn test_compute_timeout_post_p23_ballot() {
+        use henyey_ledger::execution::SorobanNetworkInfo;
+
+        let lm = make_default_lm();
+        lm.set_header_version_for_test(23);
+        let mut info = SorobanNetworkInfo::default();
+        info.nomination_timeout_initial_ms = 2000;
+        info.nomination_timeout_increment_ms = 500;
+        info.ballot_timeout_initial_ms = 3000;
+        info.ballot_timeout_increment_ms = 700;
+        lm.set_soroban_network_info_for_test(info);
+
+        let driver = make_driver_with_lm(lm);
+        let callback = super::HerderScpCallback::new(Arc::new(driver));
+
+        // Ballot: 3000 + (round-1)*700
+        assert_eq!(
+            callback.compute_timeout(1, false),
+            std::time::Duration::from_millis(3000)
+        );
+        assert_eq!(
+            callback.compute_timeout(5, false),
+            std::time::Duration::from_millis(5800) // 3000 + 4*700
+        );
+    }
+
+    /// Protocol 23+ with soroban_network_info == None falls back to 1000ms defaults.
+    #[test]
+    fn test_compute_timeout_soroban_info_none_uses_defaults() {
+        let lm = make_default_lm();
+        // Set protocol to 23 but don't set soroban_network_info
+        // (it remains None from initialization with protocol 0, then version override)
+        lm.set_header_version_for_test(23);
+
+        let driver = make_driver_with_lm(lm);
+        let callback = super::HerderScpCallback::new(Arc::new(driver));
+
+        // Should use defaults: 1000 + (round-1)*1000
+        assert_eq!(
+            callback.compute_timeout(1, true),
+            std::time::Duration::from_millis(1000)
+        );
+        assert_eq!(
+            callback.compute_timeout(5, false),
+            std::time::Duration::from_millis(5000)
+        );
+    }
+
+    /// Parity: round=0 panics (matches stellar-core releaseAssertOrThrow).
+    #[test]
+    #[should_panic(expected = "compute_timeout: round must be > 0")]
+    fn test_compute_timeout_round_zero_panics() {
+        let driver = make_driver();
+        let callback = super::HerderScpCallback::new(Arc::new(driver));
+        callback.compute_timeout(0, true);
+    }
+
+    // ─── end compute_timeout parity tests ───────────────────────────────
 
     /// Helper: create a fee-bump transaction with an i64 outer fee.
     /// Enables near-i64::MAX fee values for saturation tests.
