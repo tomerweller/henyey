@@ -10451,6 +10451,74 @@ mod tests {
         );
     }
 
+    /// Regression test for #2723: when the peer-ahead escalation path fires
+    /// but the archive cache is Fresh at/below current_ledger, the #2713
+    /// suppression guard in `force_post_catchup_hard_reset` must suppress the
+    /// hard reset instead of proceeding. This is the mirror image of
+    /// `test_trigger_recovery_archive_behind_peer_ahead_fires_hard_reset`.
+    ///
+    /// Call chain exercised:
+    ///   out_of_sync_recovery → fast-track → trigger_recovery_catchup
+    ///   → peer-ahead escalation → force_post_catchup_hard_reset
+    ///   → #2713 suppression guard (returns None)
+    #[tokio::test]
+    async fn test_trigger_recovery_archive_behind_peer_ahead_suppressed_by_fresh_cache() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 100u32;
+
+        // Arm archive-behind status.
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
+        // Seed Fresh archive cache at current_ledger — this arms the #2713
+        // suppression guard in force_post_catchup_hard_reset.
+        app.archive_checkpoint_cache.seed(current_ledger);
+
+        app.max_verified_scp_slot.store(110, Ordering::Relaxed); // peer_gap = 10
+
+        // fetch_add(1) returns old value, so `attempts` == threshold when evaluated.
+        app.recovery_attempts_without_progress
+            .store(RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS, Ordering::SeqCst);
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+
+        // SCP traffic since reset → fast-track fires.
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let result = app.out_of_sync_recovery(current_ledger).await;
+
+        // Suppression guard returns None — no PendingCatchup spawned.
+        assert!(
+            result.is_none(),
+            "suppression guard should suppress hard reset"
+        );
+
+        // archive_recovery_status must remain ConfirmedBehind (suppression
+        // does NOT clear it, unlike a successful hard reset).
+        assert!(
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "suppression must NOT clear confirmed-behind status"
+        );
+
+        // max_verified_scp_slot must remain at the seeded value (suppression
+        // does NOT call reset_recovery_attempts, unlike the fire path).
+        assert_eq!(
+            app.max_verified_scp_slot.load(Ordering::Relaxed),
+            110,
+            "suppression must NOT clear max_verified_scp_slot"
+        );
+
+        // Cooldown must be armed by the suppression guard.
+        assert!(
+            app.last_hard_reset_offset.load(Ordering::Relaxed) > 0,
+            "suppression must arm cooldown (last_hard_reset_offset > 0)"
+        );
+    }
+
     /// Boundary: attempts just below threshold should NOT fire hard reset.
     /// The fast-track path enters trigger_recovery_catchup but the
     /// peer-ahead escalation check fails on attempts.
