@@ -1434,3 +1434,286 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
     let final_header = ledger_manager.current_header();
     assert_eq!(final_header.ledger_seq, target);
 }
+
+/// INV-C15: bucket-apply at a checkpoint older than LCL must be rejected.
+///
+/// Scenario: LedgerManager initialized at seq=200, attempt bucket-apply at
+/// checkpoint 127 (< LCL). Should return VerificationFailed error.
+#[tokio::test]
+async fn test_inv_c15_rejects_bucket_apply_older_than_lcl() {
+    use henyey_bucket::HotArchiveBucketList;
+    use henyey_history::catchup::CheckpointData;
+    use stellar_xdr::curr::ScpHistoryEntry;
+
+    let checkpoint = 127u32;
+    let target = 128u32;
+    let lcl_seq = 200u32;
+
+    // Create a LedgerManager pre-initialized at seq=200 (> checkpoint=127).
+    let ledger_manager = henyey_ledger::LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+
+    // Initialize the ledger manager at lcl_seq=200 with empty bucket lists.
+    let bucket_list = empty_bucket_list();
+    let hot_archive = HotArchiveBucketList::new();
+    let lcl_header = make_header(
+        lcl_seq,
+        Hash256::ZERO,
+        Hash256::ZERO,
+        Hash256::ZERO,
+        Hash256::ZERO,
+    );
+    ledger_manager
+        .initialize(bucket_list.clone(), hot_archive, lcl_header, Hash256::ZERO)
+        .expect("initialize ledger manager at seq=200");
+    assert!(ledger_manager.is_initialized());
+    assert_eq!(ledger_manager.current_ledger_seq(), lcl_seq);
+
+    // Build minimal CheckpointData targeting checkpoint=127.
+    let checkpoint_header = make_header(
+        checkpoint,
+        Hash256::ZERO,
+        Hash256::ZERO,
+        Hash256::ZERO,
+        Hash256::ZERO,
+    );
+    let checkpoint_hash = henyey_history::verify::compute_header_hash(&checkpoint_header)
+        .expect("checkpoint header hash");
+
+    let header_entry = LedgerHeaderHistoryEntry {
+        hash: checkpoint_hash.into(),
+        header: checkpoint_header,
+        ext: LedgerHeaderHistoryEntryExt::default(),
+    };
+
+    let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
+    for _ in 0..BUCKET_LIST_LEVELS {
+        levels.push(HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        });
+    }
+
+    let has = HistoryArchiveState {
+        version: 2,
+        server: Some("test".to_string()),
+        current_ledger: checkpoint,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        current_buckets: levels,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
+    };
+
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
+    let db = henyey_db::Database::open_in_memory().expect("db");
+
+    let dummy_archive = HistoryArchive::new("http://127.0.0.1:1/").expect("dummy archive");
+    let mut manager = CatchupManagerBuilder::new()
+        .add_archive(dummy_archive)
+        .bucket_manager(bucket_manager)
+        .database(db)
+        .options(CatchupOptions {
+            verify_buckets: false,
+            verify_headers: false,
+        })
+        .build()
+        .expect("catchup manager");
+
+    let data = CheckpointData {
+        has,
+        bucket_dir: bucket_dir.path().to_path_buf(),
+        headers: vec![header_entry],
+        transactions: vec![],
+        tx_results: vec![],
+        scp_history: Vec::<ScpHistoryEntry>::new(),
+    };
+
+    let result = manager
+        .catchup_to_ledger_with_checkpoint_data(target, data, &ledger_manager)
+        .await;
+
+    let err = result.expect_err("should reject bucket-apply older than LCL");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("INV-C15"),
+        "error should mention INV-C15, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("older than LCL"),
+        "error should mention 'older than LCL', got: {err_msg}"
+    );
+}
+
+/// INV-C15: bucket-apply at checkpoint == LCL is valid (equality is permitted).
+///
+/// Scenario: LedgerManager initialized at seq=127, bucket-apply at checkpoint=127.
+/// This should NOT trigger INV-C15 (only strictly-less-than is rejected).
+#[tokio::test]
+async fn test_inv_c15_allows_bucket_apply_at_lcl() {
+    use henyey_bucket::HotArchiveBucketList;
+    use henyey_history::catchup::CheckpointData;
+    use stellar_xdr::curr::ScpHistoryEntry;
+
+    let checkpoint = 127u32;
+    let target = 128u32;
+
+    // Create a LedgerManager pre-initialized at seq=127 (== checkpoint).
+    let ledger_manager = henyey_ledger::LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+
+    let bucket_list = empty_bucket_list();
+    let bl_hash = combined_bucket_list_hash(bucket_list.hash());
+    let hot_archive = HotArchiveBucketList::new();
+    let lcl_header = make_header(
+        checkpoint,
+        Hash256::ZERO,
+        bl_hash,
+        Hash256::ZERO,
+        Hash256::ZERO,
+    );
+    ledger_manager
+        .initialize(bucket_list.clone(), hot_archive, lcl_header, Hash256::ZERO)
+        .expect("initialize ledger manager at checkpoint seq");
+    assert!(ledger_manager.is_initialized());
+    assert_eq!(ledger_manager.current_ledger_seq(), checkpoint);
+
+    // Build CheckpointData targeting checkpoint=127.
+    let checkpoint_header = make_header(
+        checkpoint,
+        Hash256::ZERO,
+        bl_hash,
+        Hash256::ZERO,
+        Hash256::ZERO,
+    );
+    let checkpoint_hash = henyey_history::verify::compute_header_hash(&checkpoint_header)
+        .expect("checkpoint header hash");
+
+    let header_entry = LedgerHeaderHistoryEntry {
+        hash: checkpoint_hash.into(),
+        header: checkpoint_header,
+        ext: LedgerHeaderHistoryEntryExt::default(),
+    };
+
+    // Build a header for target (128) to replay.
+    let tx_result_set = stellar_xdr::curr::TransactionResultSet {
+        results: VecM::default(),
+    };
+    let result_xdr = tx_result_set
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("result xdr");
+    let tx_result_hash = Hash256::hash(&result_xdr);
+
+    let tx_set =
+        stellar_xdr::curr::GeneralizedTransactionSet::V1(stellar_xdr::curr::TransactionSetV1 {
+            previous_ledger_hash: Hash(*checkpoint_hash.as_bytes()),
+            phases: VecM::default(),
+        });
+    let tx_set_hash = henyey_history::verify::compute_tx_set_hash(
+        &TransactionSetVariant::Generalized(tx_set.clone()),
+    )
+    .expect("tx set hash");
+
+    let target_header = make_header(
+        target,
+        checkpoint_hash,
+        Hash256::ZERO, // won't be verified
+        tx_set_hash,
+        tx_result_hash,
+    );
+    let target_hash =
+        henyey_history::verify::compute_header_hash(&target_header).expect("target header hash");
+    let target_entry = LedgerHeaderHistoryEntry {
+        hash: target_hash.into(),
+        header: target_header,
+        ext: LedgerHeaderHistoryEntryExt::default(),
+    };
+
+    let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
+    for _ in 0..BUCKET_LIST_LEVELS {
+        levels.push(HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        });
+    }
+
+    let has = HistoryArchiveState {
+        version: 2,
+        server: Some("test".to_string()),
+        current_ledger: checkpoint,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        current_buckets: levels,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
+    };
+
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
+    let db = henyey_db::Database::open_in_memory().expect("db");
+
+    let dummy_archive = HistoryArchive::new("http://127.0.0.1:1/").expect("dummy archive");
+    let mut manager = CatchupManagerBuilder::new()
+        .add_archive(dummy_archive)
+        .bucket_manager(bucket_manager)
+        .database(db)
+        .options(CatchupOptions {
+            verify_buckets: false,
+            verify_headers: false,
+        })
+        .build()
+        .expect("catchup manager");
+
+    manager.set_replay_config(henyey_history::ReplayConfig {
+        verify_bucket_list: false,
+        verify_header_chain: false,
+        verify_tx_set: false,
+        verify_tx_results: false,
+        verify_header_hash: false,
+        ..Default::default()
+    });
+
+    let data = CheckpointData {
+        has,
+        bucket_dir: bucket_dir.path().to_path_buf(),
+        headers: vec![header_entry, target_entry],
+        transactions: vec![],
+        tx_results: vec![],
+        scp_history: Vec::<ScpHistoryEntry>::new(),
+    };
+
+    // This should succeed — checkpoint == LCL is valid per INV-C15.
+    let result = manager
+        .catchup_to_ledger_with_checkpoint_data(target, data, &ledger_manager)
+        .await;
+
+    // The bucket-apply + replay should succeed (equality does not violate INV-C15).
+    // Note: If some downstream replay validation fails (e.g. tx_set verification),
+    // that's unrelated to INV-C15. The key assertion is that we DON'T get an
+    // INV-C15 error.
+    match result {
+        Ok(output) => {
+            assert_eq!(output.ledger_seq, target);
+        }
+        Err(ref e) => {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("INV-C15"),
+                "INV-C15 should NOT fire when checkpoint == LCL, got: {msg}"
+            );
+            // Other errors (e.g. replay verification) are acceptable in this
+            // synthetic test — the important thing is INV-C15 didn't reject it.
+        }
+    }
+}

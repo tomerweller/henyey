@@ -245,10 +245,10 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: Uses `PublishManager`, `PublishQueue`, and structured logs without a scheduler callback layer.
    - **Rationale**: Core file generation is implemented first; operational polish is still pending.
 
-6. **CatchupRange Case 1: replay-budget optimization for Recent(N) and Minimal**
+6. **~~CatchupRange Case 1: replay-budget optimization for Recent(N) and Minimal~~** *(RESOLVED)*
    - **stellar-core**: Case 1 (`lcl > genesis`) unconditionally replays from `lcl+1` to target regardless of mode or count (`CatchupRange.cpp:52-57`).
-   - **Rust**: Case 1 uses a per-mode "replay budget" to decide whether to replay or download a checkpoint. `Complete` always replays; `Minimal` replays gaps ≤ 1,000; `Recent(N)` replays gaps ≤ N. Larger gaps fall through to checkpoint download (Case 5).
-   - **Rationale**: For large gaps (e.g., 9000-ledger post-wedge recovery with `Recent(500)`), downloading a checkpoint + replaying ~500 ledgers is far faster than replaying all 9000. The final ledger state is identical; only the recovery path differs. This extends the existing Minimal-mode optimization (introduced for startup gaps) to also cover `Recent(N)`. See #1908.
+   - **Rust**: Now matches stellar-core exactly — Case 1 unconditionally replays from `lcl+1` when `lcl > genesis`. The per-mode replay-budget optimization was removed to enforce INV-C15 (no bucket-apply older than LCL). See #2677.
+   - **Status**: Parity achieved.
 
 7. **Empty tx set synthesis uses LCL protocol version**
    - **stellar-core**: `TxSetXDRFrame::makeEmpty(lclHeader)` (`TxSetFrame.cpp:958-979`) uses `lclHeader.header.ledgerVersion` to choose between Classic and Generalized format.

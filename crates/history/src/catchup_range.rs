@@ -3,17 +3,17 @@
 //! This module implements the stellar-core algorithm for determining
 //! which ledgers to download and replay during catchup operations.
 //!
-//! The algorithm handles five cases based on the current LCL (Last Closed Ledger),
+//! The algorithm handles cases based on the current LCL (Last Closed Ledger),
 //! target ledger, and requested replay count:
 //!
 //! | Case | Condition | Action |
 //! |------|-----------|--------|
-//! | 1 | LCL > genesis, gap within replay budget | Replay from LCL+1 to target (no buckets) |
-//! | 1b | LCL > genesis, gap exceeds replay budget | Fall through to checkpoint download |
-//! | 2 | count >= full replay count | Full replay from genesis+1 |
+//! | 0 | Complete mode, LCL == genesis | Replay from genesis+1 to target |
+//! | 1 | LCL > genesis | Replay from LCL+1 to target (no buckets) |
+//! | 2 | count >= full replay count, LCL > genesis | Full replay from LCL+1 |
 //! | 3 | count=0 AND target is checkpoint | Buckets only, no replay |
 //! | 4 | target start in first checkpoint | Full replay from genesis+1 |
-//! | 5 | default | Apply buckets at prior checkpoint, replay from there |
+//! | 5 | default (LCL == genesis) | Apply buckets at prior checkpoint, replay from there |
 
 use crate::checkpoint::{
     first_ledger_in_checkpoint_containing, is_checkpoint_ledger,
