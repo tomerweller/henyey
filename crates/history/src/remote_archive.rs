@@ -105,6 +105,15 @@ impl RemoteArchive {
         self.config.is_readable()
     }
 
+    /// Check if this archive has a mkdir command configured.
+    ///
+    /// Callers that want to skip mkdir entirely when no command is set
+    /// (rather than receiving `HistoryError::RemoteNotConfigured` from
+    /// [`Self::mkdir`]) should gate on this accessor.
+    pub fn has_mkdir(&self) -> bool {
+        self.config.mkdir_cmd.is_some()
+    }
+
     /// Format a command template by replacing placeholders.
     ///
     /// Placeholders are `{0}`, `{1}`, etc.

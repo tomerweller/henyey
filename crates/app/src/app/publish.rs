@@ -107,6 +107,13 @@ impl App {
             "Publishing checkpoint to history archive (background)"
         );
 
+        // Capture the runtime handle so the blocking task can drive the
+        // async upload path via `Handle::block_on`. `spawn_blocking` runs on
+        // the runtime's blocking pool, where `Handle::current()` is valid,
+        // but threading the handle explicitly makes the dependency visible
+        // and works from non-async test entry points too.
+        let rt = tokio::runtime::Handle::current();
+
         // Spawn the publish as a background task to avoid blocking the
         // event loop. Publishing involves gzip compression of XDR files
         // and shell command execution (cp/mkdir), which can take 30-50
@@ -128,7 +135,7 @@ impl App {
             // the process (release builds use `panic = "abort"`) and are not
             // counted here.
             let publish_started = std::time::Instant::now();
-            match app.publish_single_checkpoint(checkpoint, &command_archives) {
+            match app.publish_single_checkpoint(checkpoint, &command_archives, &rt) {
                 Ok(()) => {
                     let elapsed = publish_started.elapsed();
                     crate::metrics::HISTORY_PUBLISH_SUCCESS_TOTAL.increment(1);
@@ -173,6 +180,7 @@ impl App {
         &self,
         checkpoint: u32,
         archives: &[&crate::config::HistoryArchiveEntry],
+        rt: &tokio::runtime::Handle,
     ) -> anyhow::Result<()> {
         #[cfg(test)]
         if self.publish_panic_inject.swap(false, Ordering::SeqCst) {
@@ -342,8 +350,17 @@ impl App {
         // skip bucket files already present. Falls back to full upload on error.
         let base_plan = henyey_history::upload::UploadPlan::from_staging_dir(&publish_dir)?;
         for archive in archives {
-            let put_cmd = archive.put.as_ref().unwrap();
-            let mkdir_cmd = archive.mkdir.as_deref();
+            // Build a `RemoteArchive` per command-based archive. `put` is
+            // guaranteed `Some` here by the caller's filter
+            // (`a.put_enabled && a.put.is_some()`); `get_cmd` is `None`
+            // because publish is write-only.
+            let remote_archive =
+                henyey_history::RemoteArchive::new(henyey_history::RemoteArchiveConfig {
+                    name: archive.name.clone(),
+                    put_cmd: archive.put.clone(),
+                    mkdir_cmd: archive.mkdir.clone(),
+                    get_cmd: None,
+                });
 
             let plan = match henyey_history::archive::fetch_root_has_blocking(&archive.url) {
                 Ok(remote_has) => {
@@ -375,7 +392,11 @@ impl App {
                 }
             };
 
-            plan.execute(put_cmd, mkdir_cmd)?;
+            // Drive the async upload path from this blocking task via the
+            // captured runtime handle. `Handle::block_on` is the documented
+            // correct pattern from a `spawn_blocking` worker (no nested
+            // runtime is created).
+            rt.block_on(plan.execute(&remote_archive))?;
         }
 
         // Clean up staging directory (TempDir drops silently on error paths;
