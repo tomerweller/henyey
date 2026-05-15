@@ -100,6 +100,17 @@ impl LedgerRelation {
     }
 }
 
+/// Determine whether checkpoint SCP messages should be delayed when responding
+/// to a `GetScpState` request.
+///
+/// Parity: stellar-core `HerderImpl::sendSCPStateToPeer` (HerderImpl.cpp:1007-1028).
+/// Returns `true` when there is a gap between the most recent checkpoint and
+/// the first sequential slot, meaning the receiver needs time to establish
+/// tracking before processing checkpoint envelopes.
+pub(super) fn should_delay_checkpoint(checkpoint: u64, first_sequential_ledger: u64) -> bool {
+    checkpoint < first_sequential_ledger
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger (validators only).
     ///
@@ -899,7 +910,7 @@ impl App {
     async fn broadcast_recovery_scp_state(&self, current_ledger: u32) {
         let from_slot = current_ledger.saturating_sub(5) as u64;
         tracing::debug!(from_slot, "Getting SCP state for recovery");
-        let (envelopes, _quorum_set) = self.herder.get_scp_state(from_slot);
+        let envelopes = self.herder.get_scp_state(from_slot);
         tracing::debug!(
             envelope_count = envelopes.len(),
             "Got SCP state for recovery"
@@ -974,32 +985,83 @@ impl App {
     }
 
     /// Send SCP state to a peer in response to GetScpState.
+    ///
+    /// Parity: stellar-core `HerderImpl::sendSCPStateToPeer` (HerderImpl.cpp:984-1070).
+    /// When a gap exists between the most recent checkpoint and the first
+    /// sequential slot, checkpoint messages are delayed by
+    /// `SEND_LATEST_CHECKPOINT_DELAY` to give the receiver time to establish
+    /// `trackingConsensusLedgerIndex` before processing checkpoint envelopes
+    /// (which require it for close-time drift validation).
     pub(super) async fn send_scp_state(&self, peer_id: &henyey_overlay::PeerId, from_ledger: u32) {
+        /// Delay before sending checkpoint SCP messages to a syncing peer.
+        /// Matches stellar-core `Herder::SEND_LATEST_CHECKPOINT_DELAY` (2s).
+        /// See stellar-core/src/herder/Herder.cpp:13-14.
+        const SEND_LATEST_CHECKPOINT_DELAY: Duration = Duration::from_secs(2);
+
         let from_slot = from_ledger as u64;
-        let (envelopes, quorum_set) = self.herder.get_scp_state(from_slot);
+        let envelopes = self.herder.get_scp_state(from_slot);
 
         let Some(overlay) = self.overlay().await else {
             return;
         };
 
-        // Send our quorum set first if we have one configured
-        if let Some(qs) = quorum_set {
-            let msg = StellarMessage::ScpQuorumset(qs);
-            if let Err(e) = overlay.try_send_to(peer_id, msg) {
-                tracing::debug!(peer = %peer_id, error = %e, "Failed to send quorum set");
+        // Parity: stellar-core delays the checkpoint ledger's messages when
+        // there is a gap between the checkpoint and the first sequential slot.
+        let checkpoint = self.herder.get_most_recent_checkpoint_seq();
+        let first_sequential = self.herder.get_min_ledger_seq_to_remember();
+        let delay_checkpoint = should_delay_checkpoint(checkpoint, first_sequential);
+
+        if delay_checkpoint {
+            // Send non-checkpoint envelopes immediately
+            for envelope in &envelopes {
+                if envelope.statement.slot_index == checkpoint {
+                    continue; // Skip checkpoint slot — delayed below
+                }
+                let msg = StellarMessage::ScpMessage(envelope.clone());
+                if let Err(e) = overlay.try_send_to(peer_id, msg) {
+                    tracing::debug!(peer = %peer_id, error = %e, "Failed to send SCP envelope");
+                    break;
+                }
+            }
+
+            // Spawn a delayed task to send checkpoint envelopes after the delay.
+            // Re-fetches at fire time (not snapshot) matching stellar-core's
+            // processCurrentState(checkpoint, ...) in the delayed callback.
+            let herder = Arc::clone(&self.herder);
+            let overlay_weak = Arc::downgrade(&overlay);
+            let peer_id = peer_id.clone();
+            henyey_common::spawn_observed("send_scp_state_checkpoint_delay", async move {
+                tokio::time::sleep(SEND_LATEST_CHECKPOINT_DELAY).await;
+
+                let Some(overlay) = overlay_weak.upgrade() else {
+                    return; // Overlay gone — peer disconnected or shutdown
+                };
+
+                let checkpoint_envelopes = herder.get_scp_envelopes(checkpoint);
+                for envelope in checkpoint_envelopes {
+                    let msg = StellarMessage::ScpMessage(envelope);
+                    if let Err(e) = overlay.try_send_to(&peer_id, msg) {
+                        tracing::debug!(
+                            peer = %peer_id,
+                            error = %e,
+                            "Failed to send delayed checkpoint SCP envelope"
+                        );
+                        break;
+                    }
+                }
+            });
+        } else {
+            // No gap — send all envelopes immediately
+            for envelope in envelopes {
+                let msg = StellarMessage::ScpMessage(envelope);
+                if let Err(e) = overlay.try_send_to(peer_id, msg) {
+                    tracing::debug!(peer = %peer_id, error = %e, "Failed to send SCP envelope");
+                    break;
+                }
             }
         }
 
-        // Send SCP envelopes for recent slots
-        for envelope in envelopes {
-            let msg = StellarMessage::ScpMessage(envelope);
-            if let Err(e) = overlay.try_send_to(peer_id, msg) {
-                tracing::debug!(peer = %peer_id, error = %e, "Failed to send SCP envelope");
-                break; // Stop if we can't send (channel full)
-            }
-        }
-
-        tracing::debug!(peer = %peer_id, from_ledger, "Sent SCP state response");
+        tracing::debug!(peer = %peer_id, from_ledger, delay_checkpoint, "Sent SCP state response");
     }
 
     /// Respond to a GetScpQuorumset message.
@@ -1789,5 +1851,42 @@ mod tests {
     fn test_ahead_no_ext_false_for_behind() {
         let rel = LedgerRelation::from_ledgers(50, 100);
         assert!(!rel.is_ahead_without_externalization(100));
+    }
+
+    // ── should_delay_checkpoint tests ───────────────────────────────────
+
+    use super::should_delay_checkpoint;
+
+    /// When checkpoint is below first_sequential (gap exists), delay is needed.
+    /// Example: checkpoint=64, first_sequential=89 (tracking=100, MAX_SLOTS_TO_REMEMBER=12)
+    #[test]
+    fn test_should_delay_checkpoint_gap_exists() {
+        assert!(should_delay_checkpoint(64, 89));
+    }
+
+    /// When checkpoint equals first_sequential, no gap — no delay.
+    #[test]
+    fn test_should_delay_checkpoint_at_boundary() {
+        assert!(!should_delay_checkpoint(89, 89));
+    }
+
+    /// When checkpoint is above first_sequential, no gap — no delay.
+    /// Example: checkpoint=128, first_sequential=89
+    #[test]
+    fn test_should_delay_checkpoint_no_gap() {
+        assert!(!should_delay_checkpoint(128, 89));
+    }
+
+    /// Early ledgers: checkpoint=1 (genesis), first_sequential=1 — no delay.
+    #[test]
+    fn test_should_delay_checkpoint_early_ledgers() {
+        assert!(!should_delay_checkpoint(1, 1));
+    }
+
+    /// Checkpoint at 1 with first_sequential > 1 — gap exists.
+    /// This happens when the node is tracking well beyond the first checkpoint.
+    #[test]
+    fn test_should_delay_checkpoint_first_checkpoint_behind() {
+        assert!(should_delay_checkpoint(1, 5));
     }
 }

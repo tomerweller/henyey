@@ -3153,14 +3153,10 @@ impl Herder {
 
     /// Get SCP state envelopes for responding to peers.
     ///
-    /// Returns SCP envelopes for slots starting from `from_slot`, along with
-    /// our local quorum set if configured.
-    pub fn get_scp_state(&self, from_slot: u64) -> (Vec<ScpEnvelope>, Option<ScpQuorumSet>) {
-        let envelopes = self.scp.get_scp_state(from_slot);
-
-        let quorum_set = self.scp_driver.get_local_quorum_set();
-
-        (envelopes, quorum_set)
+    /// Returns SCP envelopes for slots starting from `from_slot`, sorted by
+    /// slot index (ascending).
+    pub fn get_scp_state(&self, from_slot: u64) -> Vec<ScpEnvelope> {
+        self.scp.get_scp_state(from_slot)
     }
 
     /// Get all SCP envelopes recorded for a slot.
