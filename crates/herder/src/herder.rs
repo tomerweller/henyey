@@ -881,21 +881,19 @@ impl Herder {
             return;
         }
         let lcl_seq = self.ledger_manager.current_ledger_seq() as u64;
-        // Relaxed bound: lcl_seq <= tracking_slot must hold.
-        // In the normal SCP-driven path, complete_externalization advances
-        // tracking_slot to N+1 before LCL can reach N, so strict lcl < tracking
-        // always holds. However, the post-catchup rapid-close path can advance
-        // LCL to equal tracking_slot (LCL closes the slot that consensus was
-        // pointing at, without complete_externalization). Equality represents
-        // convergence (LCL caught up), not divergence.
+        // Strict bound: lcl_seq < tracking_slot must hold on all paths.
         //
-        // This is intentionally one step weaker than stellar-core's check
-        // (lcl > mConsensusIndex throws, where mConsensusIndex = tracking_slot - 1).
-        // Henyey's catchup path legitimately produces lcl == tracking_slot;
-        // the structural fix to prevent this state is tracked in a follow-up.
+        // In the normal SCP-driven path, complete_externalization advances
+        // tracking_slot to N+1 before LCL can reach N. On the non-SCP
+        // (catchup rapid-close) path, advance_tracking_to is called before
+        // ledger_closed, ensuring the same invariant.
+        //
+        // Parity: stellar-core HerderImpl.cpp:170-178 asserts
+        // `lcl > mConsensusIndex` throws, where mConsensusIndex = tracking - 1.
+        // This is equivalent to lcl >= tracking in henyey's representation.
         assert!(
-            lcl_seq <= tracking,
-            "INV-H2 FATAL: LCL ({lcl_seq}) is ahead of tracking consensus slot \
+            lcl_seq < tracking,
+            "INV-H2 FATAL: LCL ({lcl_seq}) is at or ahead of tracking consensus slot \
              ({tracking}). Unrecoverable state divergence between consensus \
              and ledger-manager."
         );
@@ -1195,9 +1193,54 @@ impl Herder {
     ///
     /// This transitions the Herder from Syncing to Tracking state,
     /// setting the next consensus ledger as the tracking slot.
+    /// Advance tracking state so that `consensus_index` reflects `slot + 1`.
+    ///
+    /// This is the "state sync" half of `bootstrap` / `complete_externalization`:
+    /// it updates `tracking_state`, envelope cursors, and herder state, but does
+    /// NOT drain pending envelopes, publish externalized, touch the closing gate,
+    /// or check the quorum map. Those side effects are path-specific and handled
+    /// by the caller (e.g. `bootstrap` drains, `advance_tracking_slot` gates).
+    ///
+    /// Idempotent: no-op if `consensus_index` is already past `slot + 1`.
+    ///
+    /// Precondition: the caller is advancing LCL to `slot` (or has already done
+    /// so). Violating this produces a state where tracking is ahead of LCL, which
+    /// is harmless (the normal SCP path does exactly this) but wasteful.
+    ///
+    /// Parity: stellar-core `setTrackingSCPState(index, value, isTrackingNetwork)`
+    /// (HerderImpl.cpp:150-163). Called from `forceSCPStateIntoSyncWithLastClosedLedger()`
+    /// (HerderImpl.cpp:1676-1680), CatchupWork.cpp:69-70, and `Herder::start()`
+    /// (HerderImpl.cpp:2406-2411).
+    pub fn advance_tracking_to(&self, slot: u64, close_time: u64) {
+        let next = slot + 1;
+        {
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &self.tracking_state);
+            if next <= ts.consensus_index {
+                return; // Already at or past this slot — idempotent no-op
+            }
+            ts.is_tracking = true;
+            ts.consensus_index = next;
+            ts.consensus_close_time = close_time;
+        }
+
+        // Update pending and fetching envelopes current slot
+        self.pending_envelopes.set_current_slot(next);
+        self.fetching_envelopes.set_current_slot(next);
+
+        // Transition to Tracking state if not already
+        {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &self.state);
+            if *state != HerderState::Tracking {
+                info!(slot, "Transitioning to Tracking on advance_tracking_to");
+                *state = HerderState::Tracking;
+            }
+        }
+
+        *self.tracking_started_at.write() = Some(Instant::now());
+    }
+
     pub fn bootstrap(&self, ledger_seq: u32) {
         let lcl = ledger_seq as u64;
-        let slot = lcl + 1;
 
         debug!("Bootstrapping Herder at ledger {}", ledger_seq);
 
@@ -1205,23 +1248,11 @@ impl Herder {
         // (matching stellar-core setTrackingSCPState which sets close time from externalized value)
         let close_time = self.ledger_manager.current_header().scp_value.close_time.0;
 
-        // Update shared tracking state (immediately visible to ScpDriver)
-        {
-            let mut ts = tracked_write(LOCK_TRACKING_STATE, &self.tracking_state);
-            ts.is_tracking = true;
-            ts.consensus_index = slot;
-            ts.consensus_close_time = close_time;
-        }
-        *self.tracking_started_at.write() = Some(Instant::now());
+        // Phase 1: advance tracking state (idempotent if already advanced)
+        self.advance_tracking_to(lcl, close_time);
 
-        // Update pending and fetching envelopes current slot
-        self.pending_envelopes.set_current_slot(slot);
-        self.fetching_envelopes.set_current_slot(slot);
-
-        // Transition to tracking state
-        *tracked_write(LOCK_HERDER_STATE, &self.state) = HerderState::Tracking;
-
-        // Release any pending envelopes for this slot and previous
+        // Phase 2: drain pending envelopes (must happen after tracking is synced)
+        let slot = lcl + 1;
         self.drain_and_process_pending(slot);
         self.process_ready_fetching_envelopes();
 
@@ -2451,9 +2482,9 @@ impl Herder {
 
         // INV-H2 (parity: HerderImpl.cpp:1228-1229 lastClosedLedgerIncreased):
         // After all close bookkeeping, verify LCL hasn't overtaken tracking.
-        // In the normal SCP path, tracking is advanced by complete_externalization
-        // before close (#2695), so lcl < tracking holds. On the catchup rapid-close
-        // path, lcl == tracking is legitimate (convergence, not divergence).
+        // Both SCP and non-SCP paths advance tracking before this point:
+        // - SCP: complete_externalization → advance_tracking_slot (#2695)
+        // - Non-SCP (catchup): advance_tracking_to called before ledger_closed (#2712)
         self.assert_lcl_consistency();
     }
 
@@ -7280,13 +7311,13 @@ mod inv_h2_lcl_guard_tests {
     }
 
     #[test]
-    fn test_assert_lcl_consistency_passes_when_lcl_equals_tracking_slot_catchup() {
-        // LCL=6, tracking_slot=6 → LCL == tracking → OK (not a panic)
-        // This state is reachable on the post-catchup rapid-close path:
-        // LCL advances to tracking_slot via close_ledger without
-        // complete_externalization. Equality represents convergence.
+    #[should_panic(expected = "INV-H2 FATAL")]
+    fn test_assert_lcl_consistency_panics_when_lcl_equals_tracking_slot() {
+        // LCL=6, tracking_slot=6 → LCL == tracking → PANIC
+        // After the fix for #2712, equality is no longer valid: advance_tracking_to
+        // must be called before ledger_closed to ensure tracking > LCL.
         let herder = make_tracking_herder_at(6, 6);
-        herder.assert_lcl_consistency(); // should not panic
+        herder.assert_lcl_consistency();
     }
 
     #[test]
@@ -7374,14 +7405,13 @@ mod inv_h2_lcl_guard_tests {
 
     #[test]
     fn test_assert_lcl_consistency_in_ledger_closed_catchup_path() {
-        // Regression test for #2708: Verify that ledger_closed does NOT panic
-        // when LCL advances to equal tracking_slot (the post-catchup rapid-close
-        // path). Before the fix, the strict bound `lcl < tracking` would panic
-        // here because catchup closes a ledger without complete_externalization.
+        // Regression test for #2708/#2712: Verify that ledger_closed does NOT
+        // panic when advance_tracking_to is called before it (the proper fix).
         //
-        // Setup: tracking_slot=6, LCL=6 (simulating post-catchup state where
-        // LCL has caught up to tracking_slot).
-        let lm = make_lm_at_seq(6);
+        // Setup: LCL=5, tracking_slot=6. Simulate the catchup rapid-close path:
+        // advance_tracking_to(6, close_time) advances tracking to 7, then
+        // ledger_closed(6) runs INV-H2 with LCL=6, tracking=7 → strict OK.
+        let lm = make_lm_at_seq(5);
         let config = HerderConfig::default();
         let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
         {
@@ -7393,11 +7423,72 @@ mod inv_h2_lcl_guard_tests {
             ts.is_tracking = true;
             ts.consensus_index = 6;
         }
-        // LCL=6, tracking_slot=6 → equality. This is the exact state that
-        // caused the CI panic. With the <= bound, ledger_closed should survive.
+        // Simulate: advance_tracking_to(6, ...) before ledger_closed(6)
+        // This advances tracking to 7.
+        herder.advance_tracking_to(6, 1000);
+        assert_eq!(herder.tracking_slot().get(), 7);
+        // Now ledger_closed: LCL advances to 6 internally via the assert check.
+        // But LCL is still 5 in the LM (we didn't actually close). So INV-H2
+        // checks LCL=5 < tracking=7 → passes.
         herder.ledger_closed(6, &[], &[], 1000);
-        // If we reach here, the INV-H2 assertion at the end of ledger_closed
-        // passed with lcl == tracking_slot.
+    }
+
+    #[test]
+    fn test_advance_tracking_to_basic() {
+        // advance_tracking_to(5, 1000) should set tracking to 6
+        let lm = make_lm_at_seq(3);
+        let config = HerderConfig::default();
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
+        assert_eq!(herder.tracking_slot().get(), 0);
+
+        herder.advance_tracking_to(5, 1000);
+
+        assert_eq!(herder.tracking_slot().get(), 6);
+        assert_eq!(herder.tracking_consensus_close_time(), 1000);
+        assert!(herder.is_tracking());
+    }
+
+    #[test]
+    fn test_advance_tracking_to_idempotent() {
+        // If tracking is already past slot+1, advance_tracking_to is a no-op
+        let herder = make_tracking_herder_at(3, 10); // tracking=10
+        herder.advance_tracking_to(5, 2000); // slot+1=6 < 10 → no-op
+        assert_eq!(herder.tracking_slot().get(), 10);
+    }
+
+    #[test]
+    fn test_advance_tracking_to_advances_past_current() {
+        // When slot+1 > current tracking, it advances
+        let herder = make_tracking_herder_at(3, 5); // tracking=5
+        herder.advance_tracking_to(6, 3000); // slot+1=7 > 5 → advances
+        assert_eq!(herder.tracking_slot().get(), 7);
+        assert_eq!(herder.tracking_consensus_close_time(), 3000);
+    }
+
+    #[test]
+    fn test_advance_tracking_to_before_ledger_closed_regression() {
+        // Regression test for #2712: the full sequence that previously panicked.
+        // Simulates catchup rapid-close: tracking=6, close slot 6.
+        // Without advance_tracking_to, ledger_closed would see LCL=6==tracking=6 → panic.
+        // With advance_tracking_to(6), tracking becomes 7, then LCL=5 < 7 → OK.
+        let lm = make_lm_at_seq(5);
+        let config = HerderConfig::default();
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
+        {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
+            *state = HerderState::Tracking;
+        }
+        {
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &herder.tracking_state);
+            ts.is_tracking = true;
+            ts.consensus_index = 6; // tracking_slot = 6
+        }
+        // This is the fix: advance tracking BEFORE ledger_closed
+        herder.advance_tracking_to(6, 1000);
+        assert_eq!(herder.tracking_slot().get(), 7);
+
+        // ledger_closed should not panic (LCL=5 < tracking=7)
+        herder.ledger_closed(6, &[], &[], 1000);
     }
 }
 

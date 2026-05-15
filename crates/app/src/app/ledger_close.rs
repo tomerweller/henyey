@@ -2468,6 +2468,12 @@ impl App {
 
             crate::metrics::CLOSE_TX_QUEUE_PREP_SECONDS.record(prep_start.elapsed().as_secs_f64());
 
+            // Advance tracking state BEFORE ledger_closed so INV-H2 strict bound
+            // holds. For validators, complete_externalization already advanced tracking
+            // (this is idempotent). For watchers/catchup rapid-close, this is the
+            // non-SCP tracking advance that prevents lcl == tracking_slot.
+            herder.advance_tracking_to(ledger_seq as u64, close_time);
+
             // === Sub-phase 1: herder.ledger_closed + ban failed txs ==========
             let phase1_start = std::time::Instant::now();
             herder.ledger_closed(
