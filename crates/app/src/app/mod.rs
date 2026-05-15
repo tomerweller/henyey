@@ -300,6 +300,54 @@ pub(crate) enum ArchiveRecoveryClear {
     ArchiveConfirmedCurrent,
 }
 
+/// Unified archive-recovery status. Replaces the split `archive_confirmed_behind`
+/// (AtomicBool) + `archive_behind_until` (RwLock<Option<Instant>>) with a single
+/// source of truth. See #2721.
+///
+/// Design invariants:
+/// - "Backoff without confirmed-behind" is impossible by construction.
+/// - `ConfirmedBehind { backoff_until: Some(expired) }` is still confirmed-behind
+///   but backoff has lapsed (queries allowed again).
+/// - `Unknown` is the only cleared state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveRecoveryStatus {
+    /// No confirmed information about archive state. Initial/cleared state.
+    Unknown,
+    /// Archive authoritatively observed as behind (latest < next_checkpoint).
+    /// `backoff_until` optionally suppresses redundant archive queries.
+    ConfirmedBehind { backoff_until: Option<Instant> },
+}
+
+/// Point-in-time snapshot of [`ArchiveRecoveryStatus`]. All predicates evaluate
+/// against the same observation, eliminating TOCTOU races between the flag and
+/// backoff timer that existed with split state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArchiveRecoverySnapshot {
+    pub status: ArchiveRecoveryStatus,
+}
+
+impl ArchiveRecoverySnapshot {
+    /// Is the archive confirmed behind (regardless of backoff state)?
+    pub fn is_confirmed_behind(&self) -> bool {
+        matches!(self.status, ArchiveRecoveryStatus::ConfirmedBehind { .. })
+    }
+
+    /// Is the query-suppression backoff currently active?
+    pub fn is_backoff_active(&self, now: Instant) -> bool {
+        matches!(
+            self.status,
+            ArchiveRecoveryStatus::ConfirmedBehind { backoff_until: Some(deadline) }
+            if now < deadline
+        )
+    }
+
+    /// Combined: is the archive behind? Equivalent to the old
+    /// `archive_confirmed_behind.load() || archive_behind_until.read().is_some_and(...)`.
+    pub fn is_behind(&self) -> bool {
+        self.is_confirmed_behind()
+    }
+}
+
 /// Tracks whether the current recovery episode's onset diagnostic has been
 /// emitted. Reset only on `RecoveryResetMode::Full` (node reached tip or
 /// completed catchup). This ensures exactly one info-level onset log per
@@ -664,23 +712,14 @@ pub struct App {
     /// synchronously awaited the archive HTTP fetch — the root cause of
     /// the 89 s event-loop freeze in issue #1784.
     archive_checkpoint_cache: Arc<archive_cache::ArchiveCheckpointCache>,
-    /// Instant at which the archive-behind backoff expires.
+    /// Unified archive-recovery status. Encodes both the "confirmed behind"
+    /// flag and the query-suppression backoff timer as a single enum.
+    /// See [`ArchiveRecoveryStatus`] and #2721.
     ///
-    /// Set when `trigger_recovery_catchup` observes the archive's latest
-    /// checkpoint is still behind the one we need. Until this instant passes,
-    /// subsequent recovery ticks skip the archive query entirely (the result
-    /// cannot meaningfully change during the archive's publish cadence).
-    ///
-    /// Cleared on successful catchup spawn and on heartbeat-driven progress.
-    /// See `ARCHIVE_BEHIND_BACKOFF_SECS`.
-    archive_behind_until: RwLock<Option<Instant>>,
-    /// True when `trigger_recovery_catchup` has authoritatively observed
-    /// `archive_latest < next_checkpoint` via a cache read.  Read by the
-    /// stuck state machine in `maybe_start_buffered_catchup` to derive
-    /// `archive_behind` without depending on the query-suppression backoff
-    /// in `archive_behind_until`.  Cleared on ledger progress, successful
-    /// catchup completion, and HardReset.  See #1867.
-    archive_confirmed_behind: AtomicBool,
+    /// Lock ordering: same rank as the former `archive_behind_until`. Callers
+    /// MUST NOT hold `syncing_ledgers` or `consensus_stuck_state` when
+    /// acquiring a write lock.
+    archive_recovery_status: RwLock<ArchiveRecoveryStatus>,
     /// SCP latency samples for surveys.
     scp_latency: RwLock<ScpLatencyTracker>,
 
@@ -1295,8 +1334,7 @@ impl App {
             consensus_stuck_state: RwLock::new(None),
             last_catchup_completed_at: RwLock::new(None),
             archive_checkpoint_cache,
-            archive_behind_until: RwLock::new(None),
-            archive_confirmed_behind: AtomicBool::new(false),
+            archive_recovery_status: RwLock::new(ArchiveRecoveryStatus::Unknown),
             scp_latency: RwLock::new(ScpLatencyTracker::default()),
             survey_scheduler: TokioMutex::new(SurveyScheduler::new(now)),
             survey_nonce: RwLock::new(1),
@@ -1956,33 +1994,44 @@ impl App {
     ///
     /// Uses `fetch_max` (not `store`) so that a counter already past the
     /// threshold is never regressed — see issue #1843.
-    /// Escalate recovery to archive-catchup mode AND switch the archive
-    /// checkpoint cache to urgent polling (10 s TTL).
     ///
+    /// Also switches the archive checkpoint cache to urgent polling (10 s TTL).
     /// This is the only production API for escalation — it couples the two
-    /// signals that must always move together.  A raw counter bump without
+    /// signals that must always move together. A raw counter bump without
     /// urgent mode is what caused the 5-minute wedge in #2073: the node
-    /// Mark the archive as confirmed behind AND activate urgent polling.
-    ///
-    /// Call this only from code paths that have **confirmed** the archive is
-    /// behind via a `Fresh`/`Stale` cache observation (not cold-cache or
-    /// escalation-only paths). These two signals are semantically coupled
-    /// (see #2073): setting `archive_confirmed_behind` without urgent polling
-    /// delays detection of newly published checkpoints by up to 60 s.
-    pub(super) fn mark_archive_confirmed_behind(&self) {
-        self.archive_confirmed_behind.store(true, Ordering::SeqCst);
-        self.archive_checkpoint_cache.set_urgent(true);
-    }
-
     /// was in catchup mode but still polling the archive at the 60 s
-    /// normal cadence, delaying detection of the newly published
-    /// checkpoint.
+    /// normal cadence, delaying detection of the newly published checkpoint.
     pub(super) fn escalate_recovery_to_catchup(&self) {
         self.recovery_attempts_without_progress
             .fetch_max(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
         self.archive_checkpoint_cache.set_urgent(true);
     }
 
+    /// Mark the archive as confirmed behind AND activate urgent polling.
+    ///
+    /// Call this only from code paths that have **confirmed** the archive is
+    /// behind via a `Fresh`/`Stale` cache observation (not cold-cache or
+    /// escalation-only paths). These two signals are semantically coupled
+    /// (see #2073): setting confirmed-behind without urgent polling
+    /// delays detection of newly published checkpoints by up to 60 s.
+    pub(super) async fn mark_archive_confirmed_behind(&self) {
+        {
+            let mut guard = self.archive_recovery_status.write().await;
+            match *guard {
+                ArchiveRecoveryStatus::ConfirmedBehind { .. } => {
+                    // Already confirmed behind — preserve existing backoff.
+                }
+                ArchiveRecoveryStatus::Unknown => {
+                    *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                        backoff_until: None,
+                    };
+                }
+            }
+        }
+        self.archive_checkpoint_cache.set_urgent(true);
+    }
+
+    /// was in catchup mode but still polling the archive at the 60 s
     /// Gap between the highest verified SCP slot from peers and our current
     /// ledger. Returns 0 when no peer traffic has been observed.
     pub(super) fn effective_peer_gap(&self, current_ledger: u32) -> u64 {
@@ -2039,18 +2088,19 @@ impl App {
 
     /// Clear archive-behind recovery state according to the given mode.
     ///
-    /// Always clears: `archive_confirmed_behind`, `archive_behind_until`.
+    /// Always clears: `archive_recovery_status` → `Unknown`.
     /// Other operations depend on the variant (see [`ArchiveRecoveryClear`] docs).
     ///
-    /// Returns whether `archive_behind_until` was previously armed (`Some`).
+    /// Returns whether a backoff deadline was previously armed (i.e., the old
+    /// state was `ConfirmedBehind { backoff_until: Some(_) }`).
     /// Most callers ignore this; [`ArchiveRecoveryClear::HardResetExec`] uses it
     /// for logging.
     ///
     /// # Lock ordering
     ///
-    /// This method acquires `archive_behind_until` (write). Callers MUST NOT
+    /// This method acquires `archive_recovery_status` (write). Callers MUST NOT
     /// hold `syncing_ledgers` or `consensus_stuck_state` when calling — those
-    /// locks rank below `archive_behind_until` per the documented lock order.
+    /// locks rank below `archive_recovery_status` per the documented lock order.
     pub(crate) async fn clear_archive_recovery_state(&self, mode: ArchiveRecoveryClear) -> bool {
         // 1. Recovery attempt reset (only for progress variants).
         match &mode {
@@ -2063,12 +2113,16 @@ impl App {
             _ => {}
         }
 
-        // 2. Always: clear the confirmed-behind flag and backoff timer.
-        self.archive_confirmed_behind.store(false, Ordering::SeqCst);
+        // 2. Always: clear the recovery status to Unknown.
         let was_armed = {
-            let mut guard = self.archive_behind_until.write().await;
-            let was = guard.is_some();
-            *guard = None;
+            let mut guard = self.archive_recovery_status.write().await;
+            let was = matches!(
+                *guard,
+                ArchiveRecoveryStatus::ConfirmedBehind {
+                    backoff_until: Some(_)
+                }
+            );
+            *guard = ArchiveRecoveryStatus::Unknown;
             was
         };
 
@@ -2095,6 +2149,18 @@ impl App {
         }
 
         was_armed
+    }
+
+    /// Take a point-in-time snapshot of archive recovery status.
+    ///
+    /// The RwLock read guard is held only for the `Copy`; callers compute
+    /// predicates on the returned [`ArchiveRecoverySnapshot`] without holding
+    /// any lock. This satisfies lock-ordering requirements and eliminates
+    /// TOCTOU races between the confirmed-behind flag and backoff timer.
+    pub(crate) async fn archive_recovery_snapshot(&self) -> ArchiveRecoverySnapshot {
+        ArchiveRecoverySnapshot {
+            status: *self.archive_recovery_status.read().await,
+        }
     }
 
     /// Get Soroban network configuration information.
@@ -5812,16 +5878,15 @@ mod tests {
     /// Scenario: node has fallen slightly behind. tx_sets are evicted from
     /// peers. Recovery escalates every 10s (OUT_OF_SYNC_RECOVERY_TIMER_SECS).
     ///
-    /// The `archive_behind_until` backoff suppresses redundant archive
+    /// The archive-behind backoff suppresses redundant archive
     /// queries. It is armed by the buffered-catchup validation paths in
-    /// `catchup_impl.rs` (see `arm_archive_behind_backoff`).  Note that
-    /// `trigger_recovery_catchup` itself no longer arms this backoff
-    /// (see #1847) — it relies on the cache TTL and urgent mode instead.
+    /// `catchup_impl.rs` (see `arm_archive_behind_backoff`).
     ///
-    /// This test exercises the backoff lifecycle directly on an `App`:
-    ///   1. Initially backoff is None — query is allowed.
-    ///   2. After arming, backoff is Some(future) — query is suppressed.
-    ///   3. Clearing (progress/catchup) restores the pre-stall state.
+    /// This test exercises the backoff lifecycle via the unified
+    /// `ArchiveRecoveryStatus` enum:
+    ///   1. Initially status is Unknown — no backoff, query allowed.
+    ///   2. After arming, status is ConfirmedBehind { backoff } — suppressed.
+    ///   3. Clearing restores Unknown.
     #[tokio::test]
     async fn test_archive_behind_backoff_skips_redundant_queries() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5831,60 +5896,50 @@ mod tests {
             .build();
         let app = App::new(config).await.unwrap();
 
-        // Invariant 1: fresh app has no backoff armed.
-        {
-            let guard = app.archive_behind_until.read().await;
-            assert!(guard.is_none(), "fresh app should have no backoff armed");
-        }
+        // Invariant 1: fresh app has Unknown status.
+        let snap = app.archive_recovery_snapshot().await;
+        assert!(
+            !snap.is_confirmed_behind(),
+            "fresh app should not be confirmed behind"
+        );
+        assert!(
+            !snap.is_backoff_active(app.clock.now()),
+            "fresh app has no backoff"
+        );
 
         // Arm the backoff (simulates observing archive_latest < next_cp).
         let deadline = app.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
         {
-            let mut guard = app.archive_behind_until.write().await;
-            *guard = Some(deadline);
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: Some(deadline),
+            };
         }
 
-        // Invariant 2: backoff is active and the deadline is in the future.
+        // Invariant 2: backoff is active.
+        let snap = app.archive_recovery_snapshot().await;
+        assert!(snap.is_confirmed_behind(), "should be confirmed behind");
+        assert!(
+            snap.is_backoff_active(app.clock.now()),
+            "backoff must be active during the window"
+        );
+
+        // Progress clears the state.
         {
-            let guard = app.archive_behind_until.read().await;
-            let armed = guard.expect("backoff should be armed");
-            assert!(
-                armed > app.clock.now(),
-                "backoff deadline ({:?}) must be in the future relative to clock ({:?})",
-                armed,
-                app.clock.now(),
-            );
-            // Confirm: within the window the recovery code would observe
-            // backoff_active=true and skip the archive lookup entirely.
-            let backoff_active = app.clock.now() < armed;
-            assert!(
-                backoff_active,
-                "during the backoff window, archive queries must be suppressed"
-            );
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::Unknown;
         }
 
-        // Progress clears the backoff (simulates `current_ledger > baseline`).
-        {
-            let mut guard = app.archive_behind_until.write().await;
-            *guard = None;
-        }
-
-        // Invariant 3: after clearing, the next tick is free to re-query.
-        {
-            let guard = app.archive_behind_until.read().await;
-            assert!(
-                guard.is_none(),
-                "after progress the backoff must be cleared so the next \
-                 tick can re-query the archive"
-            );
-        }
+        // Invariant 3: after clearing, query allowed again.
+        let snap = app.archive_recovery_snapshot().await;
+        assert!(!snap.is_confirmed_behind(), "after progress, not behind");
+        assert!(
+            !snap.is_backoff_active(app.clock.now()),
+            "no backoff after clear"
+        );
 
         // Sanity: at the 10s tick cadence, one backoff window of 60s covers
-        // 6 recovery ticks. Before the fix, each of those ticks issued an
-        // archive query; after the fix, the first one arms the backoff and
-        // the remaining 5 skip. That is a ≥6x reduction in archive load
-        // during a stall, with no behavior change once the archive catches
-        // up (first tick after the window queries fresh).
+        // 6 recovery ticks.
         let ticks_per_window = ARCHIVE_BEHIND_BACKOFF_SECS / OUT_OF_SYNC_RECOVERY_TIMER_SECS;
         assert!(
             ticks_per_window >= 6,
@@ -5897,28 +5952,28 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // #1867 archive_confirmed_behind signal tests
+    // #1867 archive recovery status signal tests
     // -------------------------------------------------------------------
 
-    /// Fresh app has `archive_confirmed_behind = false`.
+    /// Fresh app has `ArchiveRecoveryStatus::Unknown`.
     #[tokio::test]
-    async fn test_archive_confirmed_behind_initially_false() {
+    async fn test_archive_recovery_status_initially_unknown() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
             .database_path(db_path)
             .build();
         let app = App::new(config).await.unwrap();
+        let snap = app.archive_recovery_snapshot().await;
         assert!(
-            !app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "fresh app should have archive_confirmed_behind=false"
+            !snap.is_confirmed_behind(),
+            "fresh app should have Unknown status"
         );
     }
 
-    /// Setting the flag makes the stuck machine's `archive_behind`
-    /// derivation return true even when `archive_behind_until` is unarmed.
+    /// Setting confirmed-behind makes `is_behind()` return true even without backoff.
     #[tokio::test]
-    async fn test_archive_confirmed_behind_or_with_deadline() {
+    async fn test_archive_recovery_confirmed_behind_without_backoff() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -5926,51 +5981,72 @@ mod tests {
             .build();
         let app = App::new(config).await.unwrap();
 
-        // Neither signal active → archive_behind = false.
-        let behind_via_deadline = app
-            .archive_behind_until
-            .read()
-            .await
-            .is_some_and(|d| app.clock.now() < d);
-        let behind = app.archive_confirmed_behind.load(Ordering::SeqCst) || behind_via_deadline;
-        assert!(!behind, "no signal → archive_behind must be false");
+        // Neither signal active → not behind.
+        let snap = app.archive_recovery_snapshot().await;
+        assert!(!snap.is_behind(), "no signal → not behind");
 
-        // Set only the AtomicBool → archive_behind = true.
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
-        let behind_via_deadline = app
-            .archive_behind_until
-            .read()
-            .await
-            .is_some_and(|d| app.clock.now() < d);
-        let behind = app.archive_confirmed_behind.load(Ordering::SeqCst) || behind_via_deadline;
+        // Mark confirmed behind (no backoff) → behind.
+        app.mark_archive_confirmed_behind().await;
+        let snap = app.archive_recovery_snapshot().await;
         assert!(
-            behind,
-            "archive_confirmed_behind=true → archive_behind must be true"
+            snap.is_behind(),
+            "confirmed behind → is_behind must be true"
+        );
+        assert!(
+            !snap.is_backoff_active(app.clock.now()),
+            "no backoff armed yet"
         );
 
-        // Set only the deadline → archive_behind = true (even after
-        // clearing the AtomicBool).
-        app.archive_confirmed_behind.store(false, Ordering::SeqCst);
+        // Arm backoff too → still behind, backoff active.
         {
-            let mut guard = app.archive_behind_until.write().await;
-            *guard = Some(app.clock.now() + Duration::from_secs(60));
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: Some(app.clock.now() + Duration::from_secs(60)),
+            };
         }
-        let behind_via_deadline = app
-            .archive_behind_until
-            .read()
-            .await
-            .is_some_and(|d| app.clock.now() < d);
-        let behind = app.archive_confirmed_behind.load(Ordering::SeqCst) || behind_via_deadline;
+        let snap = app.archive_recovery_snapshot().await;
         assert!(
-            behind,
-            "archive_behind_until armed → archive_behind must be true"
+            snap.is_behind(),
+            "confirmed behind with backoff → is_behind"
+        );
+        assert!(snap.is_backoff_active(app.clock.now()), "backoff is active");
+    }
+
+    /// Progress clears the recovery status to Unknown.
+    #[tokio::test]
+    async fn test_archive_recovery_status_cleared_on_progress() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Simulate archive-behind state with backoff.
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: Some(app.clock.now() + Duration::from_secs(60)),
+            };
+        }
+
+        // Clear via clear_archive_recovery_state.
+        let was_armed = app
+            .clear_archive_recovery_state(ArchiveRecoveryClear::FullProgress)
+            .await;
+        assert!(was_armed, "should report was_armed=true");
+
+        let snap = app.archive_recovery_snapshot().await;
+        assert!(!snap.is_confirmed_behind(), "progress must clear status");
+        assert!(
+            !snap.is_backoff_active(app.clock.now()),
+            "progress must clear backoff"
         );
     }
 
-    /// Progress clears `archive_confirmed_behind` alongside the
-    /// existing `archive_behind_until` clear.
+    /// Catchup success clears the recovery status.
     #[tokio::test]
-    async fn test_archive_confirmed_behind_cleared_on_progress() {
+    async fn test_archive_recovery_status_cleared_on_catchup_success() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -5979,33 +6055,22 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         // Simulate archive-behind state.
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
-        {
-            let mut guard = app.archive_behind_until.write().await;
-            *guard = Some(app.clock.now() + Duration::from_secs(60));
-        }
+        app.mark_archive_confirmed_behind().await;
+        assert!(app.archive_recovery_snapshot().await.is_confirmed_behind());
 
-        // Simulate progress: clear both signals (mirrors out_of_sync_recovery
-        // progress branch).
-        app.archive_confirmed_behind.store(false, Ordering::SeqCst);
-        {
-            let mut guard = app.archive_behind_until.write().await;
-            *guard = None;
-        }
+        // Simulate catchup completion: write Unknown directly (mirrors catchup_impl.rs).
+        *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::Unknown;
 
+        let snap = app.archive_recovery_snapshot().await;
         assert!(
-            !app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "progress must clear archive_confirmed_behind"
-        );
-        assert!(
-            app.archive_behind_until.read().await.is_none(),
-            "progress must clear archive_behind_until"
+            !snap.is_confirmed_behind(),
+            "catchup completion must clear status"
         );
     }
 
-    /// Successful catchup completion clears `archive_confirmed_behind`.
+    /// Cold cache must not change the recovery status.
     #[tokio::test]
-    async fn test_archive_confirmed_behind_cleared_on_catchup_success() {
+    async fn test_archive_recovery_status_unchanged_on_cold_cache() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -6013,39 +6078,15 @@ mod tests {
             .build();
         let app = App::new(config).await.unwrap();
 
-        // Simulate archive-behind state.
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        // Status starts Unknown. Cold cache should not change it.
+        assert!(!app.archive_recovery_snapshot().await.is_confirmed_behind());
 
-        // Simulate what catchup completion does: clear the flag.
-        app.archive_confirmed_behind.store(false, Ordering::SeqCst);
-
+        // Mark behind and confirm cold cache doesn't clear it.
+        app.mark_archive_confirmed_behind().await;
+        // (Simulating the Cold branch: no write happens.)
         assert!(
-            !app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "catchup completion must clear archive_confirmed_behind"
-        );
-    }
-
-    /// Cold cache (`CacheResult::Cold`) must not change `archive_confirmed_behind`.
-    #[tokio::test]
-    async fn test_archive_confirmed_behind_unchanged_on_cold_cache() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("rs-stellar-test.db");
-        let config = crate::config::ConfigBuilder::new()
-            .database_path(db_path)
-            .build();
-        let app = App::new(config).await.unwrap();
-
-        // The flag starts false. A cold cache should not set it.
-        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
-
-        // The `Cold` branch in trigger_recovery_catchup does NOT touch
-        // archive_confirmed_behind. Verify by setting it true and
-        // confirming it stays true (cold cache doesn't clear it either).
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
-        // (Simulating the Cold branch: no store happens.)
-        assert!(
-            app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "cold cache must not change archive_confirmed_behind"
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "cold cache must not change recovery status"
         );
     }
 
@@ -8168,16 +8209,16 @@ mod tests {
             RECOVERY_ESCALATION_CATCHUP,
             "attempt counter must be raised to threshold"
         );
-        // escalate_recovery_to_catchup must NOT set archive_confirmed_behind
+        // escalate_recovery_to_catchup must NOT set confirmed-behind
         // (escalation is a pre-confirmation path — see #2075).
         assert!(
-            !app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "escalate_recovery_to_catchup must not set archive_confirmed_behind (#2075)"
+            !app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "escalate_recovery_to_catchup must not set confirmed-behind (#2075)"
         );
     }
 
-    /// The `mark_archive_confirmed_behind()` helper must set both the atomic
-    /// bool and activate urgent mode on the archive checkpoint cache.
+    /// The `mark_archive_confirmed_behind()` helper must set the status to
+    /// ConfirmedBehind and activate urgent mode on the archive checkpoint cache.
     #[tokio::test]
     async fn test_mark_archive_confirmed_behind_sets_both_signals() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -8188,14 +8229,14 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         // Pre-conditions.
-        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
+        assert!(!app.archive_recovery_snapshot().await.is_confirmed_behind());
         assert!(!app.archive_checkpoint_cache.is_urgent());
 
-        app.mark_archive_confirmed_behind();
+        app.mark_archive_confirmed_behind().await;
 
         assert!(
-            app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "mark_archive_confirmed_behind must set archive_confirmed_behind"
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "mark_archive_confirmed_behind must set ConfirmedBehind status"
         );
         assert!(
             app.archive_checkpoint_cache.is_urgent(),
@@ -8975,8 +9016,12 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         // Pre-arm state.
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
-        *app.archive_behind_until.write().await = Some(Instant::now());
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: Some(Instant::now()),
+            };
+        }
         app.archive_checkpoint_cache.set_urgent(true);
         app.hard_reset_livelock_start.store(42, Ordering::Relaxed);
         app.recovery_attempts_without_progress
@@ -8988,15 +9033,13 @@ mod tests {
 
         assert!(
             was_armed,
-            "was_armed should be true when archive_behind_until was Some"
+            "was_armed should be true when backoff_until was Some"
         );
+        let snap = app.archive_recovery_snapshot().await;
+        assert!(!snap.is_confirmed_behind(), "status must be cleared");
         assert!(
-            !app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "archive_confirmed_behind must be cleared"
-        );
-        assert!(
-            app.archive_behind_until.read().await.is_none(),
-            "archive_behind_until must be cleared"
+            !snap.is_backoff_active(app.clock.now()),
+            "backoff must be cleared"
         );
         assert!(
             !app.archive_checkpoint_cache.is_urgent(),
@@ -9025,8 +9068,12 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         // Pre-arm state.
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
-        *app.archive_behind_until.write().await = Some(Instant::now());
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: Some(Instant::now()),
+            };
+        }
         app.archive_checkpoint_cache.set_urgent(false);
         app.hard_reset_livelock_start.store(77, Ordering::Relaxed);
 
@@ -9035,8 +9082,7 @@ mod tests {
             .await;
 
         assert!(was_armed);
-        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
-        assert!(app.archive_behind_until.read().await.is_none());
+        assert!(!app.archive_recovery_snapshot().await.is_confirmed_behind());
         assert!(
             app.archive_checkpoint_cache.is_urgent(),
             "urgent must be ENABLED for PartialProgress"
@@ -9065,8 +9111,12 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         // Pre-arm state.
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
-        *app.archive_behind_until.write().await = Some(Instant::now());
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: Some(Instant::now()),
+            };
+        }
         app.archive_checkpoint_cache.set_urgent(true);
         app.hard_reset_livelock_start.store(55, Ordering::Relaxed);
         app.recovery_attempts_without_progress
@@ -9077,8 +9127,7 @@ mod tests {
             .await;
 
         assert!(was_armed);
-        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
-        assert!(app.archive_behind_until.read().await.is_none());
+        assert!(!app.archive_recovery_snapshot().await.is_confirmed_behind());
         assert!(
             !app.archive_checkpoint_cache.is_urgent(),
             "urgent must be disabled for DefenseSkip"
@@ -9106,8 +9155,12 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         // Pre-arm state: urgent=true, livelock active.
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
-        *app.archive_behind_until.write().await = Some(Instant::now());
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: Some(Instant::now()),
+            };
+        }
         app.archive_checkpoint_cache.set_urgent(true);
         app.hard_reset_livelock_start.store(88, Ordering::Relaxed);
         app.recovery_attempts_without_progress
@@ -9118,8 +9171,7 @@ mod tests {
             .await;
 
         assert!(was_armed, "was_armed must be true");
-        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
-        assert!(app.archive_behind_until.read().await.is_none());
+        assert!(!app.archive_recovery_snapshot().await.is_confirmed_behind());
         assert!(
             app.archive_checkpoint_cache.is_urgent(),
             "urgent must be PRESERVED (not touched) for HardResetExec"
@@ -9146,9 +9198,13 @@ mod tests {
             .build();
         let app = App::new(config).await.unwrap();
 
-        // Pre-arm state.
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
-        *app.archive_behind_until.write().await = None; // not armed
+        // Pre-arm state: confirmed behind but no backoff armed.
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
         app.archive_checkpoint_cache.set_urgent(true);
         app.hard_reset_livelock_start.store(33, Ordering::Relaxed);
         app.recovery_attempts_without_progress
@@ -9160,10 +9216,9 @@ mod tests {
 
         assert!(
             !was_armed,
-            "was_armed must be false when archive_behind_until was None"
+            "was_armed must be false when backoff_until was None"
         );
-        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
-        assert!(app.archive_behind_until.read().await.is_none());
+        assert!(!app.archive_recovery_snapshot().await.is_confirmed_behind());
         assert!(
             !app.archive_checkpoint_cache.is_urgent(),
             "urgent must be disabled for ArchiveConfirmedCurrent"
@@ -10316,7 +10371,11 @@ mod tests {
         let current_ledger = 100u32;
 
         // Set up the stall condition:
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
         app.max_verified_scp_slot.store(110, Ordering::Relaxed); // peer_gap = 10
 
         // Set attempts so that after fetch_add(1) in out_of_sync_recovery,
@@ -10342,10 +10401,10 @@ mod tests {
             0,
             "hard reset must clear max_verified_scp_slot"
         );
-        // archive_confirmed_behind is cleared by force_post_catchup_hard_reset:
+        // confirmed-behind status is cleared by force_post_catchup_hard_reset:
         assert!(
-            !app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "hard reset must clear archive_confirmed_behind"
+            !app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "hard reset must clear confirmed-behind status"
         );
     }
 
@@ -10357,7 +10416,11 @@ mod tests {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
         let current_ledger = 100u32;
 
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
         app.max_verified_scp_slot.store(110, Ordering::Relaxed);
         // After fetch_add(1), attempts will be ESCALATION - 1 = 10.
         app.recovery_attempts_without_progress.store(
@@ -10372,9 +10435,9 @@ mod tests {
 
         let _result = app.out_of_sync_recovery(current_ledger).await;
 
-        // Should NOT have fired hard reset (archive_confirmed_behind still set).
+        // Should NOT have fired hard reset (confirmed-behind status still set).
         assert!(
-            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
             "low attempts must NOT trigger hard reset"
         );
     }
@@ -10386,7 +10449,11 @@ mod tests {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
         let current_ledger = 100u32;
 
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
         app.max_verified_scp_slot.store(102, Ordering::Relaxed); // peer_gap = 2
         app.recovery_attempts_without_progress
             .store(RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS, Ordering::SeqCst);
@@ -10399,7 +10466,7 @@ mod tests {
         let _result = app.out_of_sync_recovery(current_ledger).await;
 
         assert!(
-            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
             "peer_gap below threshold must NOT trigger hard reset"
         );
     }
@@ -10411,7 +10478,7 @@ mod tests {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
         let current_ledger = 100u32;
 
-        // archive_confirmed_behind defaults to false (cold cache)
+        // recovery status defaults to Unknown (cold cache)
         app.max_verified_scp_slot.store(200, Ordering::Relaxed);
         app.recovery_attempts_without_progress
             .store(50, Ordering::SeqCst);
@@ -10424,7 +10491,7 @@ mod tests {
         let _result = app.out_of_sync_recovery(current_ledger).await;
 
         assert!(
-            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            !app.archive_recovery_snapshot().await.is_confirmed_behind(),
             "cold cache must NOT trigger hard reset"
         );
     }
@@ -10437,7 +10504,11 @@ mod tests {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
         let current_ledger = 0u32;
 
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
         app.max_verified_scp_slot.store(20, Ordering::Relaxed); // peer_gap = 20
                                                                 // After fetch_add(1), attempts = 17 (= threshold).
         app.recovery_attempts_without_progress.store(
@@ -10454,10 +10525,10 @@ mod tests {
         let result = app.out_of_sync_recovery(current_ledger).await;
 
         assert!(result.is_none());
-        // Hard reset clears archive_confirmed_behind:
+        // Hard reset clears confirmed-behind status:
         assert!(
-            !app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "no-SCP hard reset must clear archive_confirmed_behind"
+            !app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "no-SCP hard reset must clear confirmed-behind status"
         );
     }
 
@@ -10468,7 +10539,11 @@ mod tests {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
         let current_ledger = 0u32;
 
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
         app.max_verified_scp_slot.store(20, Ordering::Relaxed);
         // After fetch_add(1), attempts = 16 (one below 17 threshold).
         app.recovery_attempts_without_progress.store(
@@ -10484,7 +10559,7 @@ mod tests {
         let _result = app.out_of_sync_recovery(current_ledger).await;
 
         assert!(
-            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
             "low attempts must NOT trigger no-SCP hard reset"
         );
     }
@@ -10495,7 +10570,11 @@ mod tests {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
         let current_ledger = 100u32;
 
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
         app.max_verified_scp_slot.store(110, Ordering::Relaxed);
         app.recovery_attempts_without_progress
             .store(RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS, Ordering::SeqCst);
@@ -10517,13 +10596,13 @@ mod tests {
 
         // Cooldown active → should NOT have fired hard reset.
         assert!(
-            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
             "cooldown must block hard reset"
         );
     }
 
     /// Verify that a single far-ahead non-quorum envelope does NOT cause
-    /// escalation by itself (needs archive_confirmed_behind + attempts).
+    /// escalation by itself (needs confirmed-behind status + attempts).
     #[tokio::test]
     async fn test_single_far_ahead_non_quorum_insufficient_for_hard_reset() {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
@@ -10531,7 +10610,7 @@ mod tests {
 
         // Simulate a single far-ahead envelope updating max_verified_scp_slot.
         app.max_verified_scp_slot.store(999, Ordering::Relaxed);
-        // archive_confirmed_behind is FALSE (default) → 4-way guard fails.
+        // recovery status is Unknown (default) → 4-way guard fails.
         app.recovery_attempts_without_progress
             .store(RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS, Ordering::SeqCst);
         app.recovery_baseline_ledger
@@ -10542,9 +10621,9 @@ mod tests {
 
         let _result = app.out_of_sync_recovery(current_ledger).await;
 
-        // archive_confirmed_behind was never set → no hard reset.
+        // confirmed-behind status was never set → no hard reset.
         assert!(
-            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            !app.archive_recovery_snapshot().await.is_confirmed_behind(),
             "single far-ahead envelope without archive_behind must NOT trigger reset"
         );
         // max_verified_scp_slot should remain untouched (no reset happened).
@@ -10556,7 +10635,7 @@ mod tests {
     }
 
     /// #2664: When the node is at-tip (current_ledger > 0, relation == AtTip)
-    /// with a stale archive_confirmed_behind flag and no baseline progress,
+    /// with a stale confirmed-behind status and no baseline progress,
     /// out_of_sync_recovery must clear the stale state on entry.
     #[tokio::test]
     async fn test_stale_archive_behind_cleared_at_tip_no_baseline_progress() {
@@ -10574,7 +10653,11 @@ mod tests {
             .publish_externalized(current_ledger as u64);
 
         // Arm stale archive-behind state.
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
 
         // Set baseline == current_ledger (no progress to detect).
         app.recovery_baseline_ledger
@@ -10589,10 +10672,10 @@ mod tests {
 
         let _result = app.out_of_sync_recovery(current_ledger).await;
 
-        // The #2664 fix should clear the stale flag.
+        // The #2664 fix should clear the stale recovery status.
         assert!(
-            !app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "stale archive_confirmed_behind must be cleared at AtTip (#2664)"
+            !app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "stale confirmed-behind status must be cleared at AtTip (#2664)"
         );
         // Full reset should also zero recovery_attempts_without_progress
         // (the fetch_add(1) after the clear will make it 1, not high).
@@ -10604,15 +10687,19 @@ mod tests {
         );
     }
 
-    /// #2664: At startup (current_ledger == 0, AtTip), the archive_confirmed_behind
-    /// flag must NOT be cleared — it may be freshly armed.
+    /// #2664: At startup (current_ledger == 0, AtTip), the confirmed-behind
+    /// status must NOT be cleared — it may be freshly armed.
     #[tokio::test]
     async fn test_stale_archive_behind_not_cleared_at_startup() {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
         let current_ledger = 0u32;
         // latest_externalized is None → AtTip (0 == 0).
 
-        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
         app.recovery_baseline_ledger
             .store(current_ledger as u64, Ordering::SeqCst);
         app.recovery_attempts_without_progress
@@ -10623,10 +10710,10 @@ mod tests {
 
         let _result = app.out_of_sync_recovery(current_ledger).await;
 
-        // At startup (current_ledger == 0), flag must NOT be cleared.
+        // At startup (current_ledger == 0), recovery status must NOT be cleared.
         assert!(
-            app.archive_confirmed_behind.load(Ordering::SeqCst),
-            "archive_confirmed_behind must NOT be cleared at startup (current_ledger == 0)"
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "confirmed-behind status must NOT be cleared at startup (current_ledger == 0)"
         );
     }
 

@@ -282,10 +282,9 @@ impl App {
         // current_ledger > 0 and the progress detection didn't fire
         // (baseline == current_ledger from a prior tick), clear all stale
         // recovery/escalation state. Prevents the callers below from seeing a
-        // stale archive_confirmed_behind flag and escalating to a pointless
-        // hard reset.
+        // stale archive-behind flag and escalating to a pointless hard reset.
         if !did_full_reset && matches!(relation, LedgerRelation::AtTip) && current_ledger > 0 {
-            let was_behind = self.archive_confirmed_behind.load(Ordering::SeqCst);
+            let was_behind = self.archive_recovery_snapshot().await.is_confirmed_behind();
             if was_behind {
                 self.clear_archive_recovery_state(ArchiveRecoveryClear::FullProgress)
                     .await;
@@ -556,7 +555,7 @@ impl App {
                 // hard reset. Uses a higher threshold than the fast-track
                 // path because absence of SCP traffic is weaker evidence.
                 let archive_is_confirmed_behind =
-                    self.archive_confirmed_behind.load(Ordering::SeqCst);
+                    self.archive_recovery_snapshot().await.is_confirmed_behind();
                 let peer_gap = self.effective_peer_gap(current_ledger);
                 if archive_is_confirmed_behind
                     && attempts >= RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP
@@ -1289,13 +1288,10 @@ impl App {
 
         // Read backoff state early so the entry log can be demoted (#1843).
         self.set_phase_sub(super::phase::PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ);
-        let backoff_active = {
-            let guard = self.archive_behind_until.read().await;
-            match *guard {
-                Some(deadline) => self.clock.now() < deadline,
-                None => false,
-            }
-        };
+        let backoff_active = self
+            .archive_recovery_snapshot()
+            .await
+            .is_backoff_active(self.clock.now());
 
         if backoff_active {
             crate::metrics::RECOVERY_STALLED_TICK_TOTAL.increment("backoff_active", 1);
@@ -1390,7 +1386,7 @@ impl App {
                 }
                 CacheResult::Fresh(latest) | CacheResult::Stale(latest) => {
                     // Archive responded but is still behind the next
-                    // checkpoint.  Do NOT arm `archive_behind_until` here:
+                    // checkpoint.  Do NOT arm backoff here:
                     // the cache's own TTL already throttles actual HTTP
                     // queries, and adding a 15–60 s backoff on top prevents
                     // this function from even reading the cache for that
@@ -1398,12 +1394,12 @@ impl App {
                     // checkpoint by up to 120 s (see #1847).
                     //
                     // Instead, signal the stuck state machine via the
-                    // dedicated `archive_confirmed_behind` flag (#1867)
-                    // so it can see `archive_behind=true` on the next
-                    // evaluation without waiting for the slower
-                    // TriggerCatchup→validation→backoff pipeline.
+                    // archive recovery status (#1867) so it can see
+                    // `archive_behind=true` on the next evaluation without
+                    // waiting for the slower TriggerCatchup→validation→backoff
+                    // pipeline.
                     //
-                    self.mark_archive_confirmed_behind();
+                    self.mark_archive_confirmed_behind().await;
                     tracing::debug!(
                         archive_latest = latest,
                         next_checkpoint = next_cp,
@@ -1414,10 +1410,10 @@ impl App {
                 CacheResult::Cold => {
                     // Cache cold — a background refresh has been spawned
                     // and will complete within a few seconds. Do NOT arm
-                    // `archive_behind_until`: that backoff exists to
-                    // suppress redundant queries against a known-behind
-                    // archive, and `Cold` is a transient state (refresh in
-                    // flight), not a confirmed "archive behind" signal.
+                    // backoff: that suppression exists to prevent redundant
+                    // queries against a known-behind archive, and `Cold` is
+                    // a transient state (refresh in flight), not a confirmed
+                    // "archive behind" signal.
                     // Armoring 60s would force a skip across ~5 recovery
                     // ticks even after the refresh completes on tick 2.
                     // Fall through to peer-SCP fallback; the next tick
@@ -1443,7 +1439,7 @@ impl App {
                 // are ahead by a meaningful gap AND we've been stuck for
                 // enough recovery ticks, escalate to hard reset.
                 let archive_is_confirmed_behind =
-                    self.archive_confirmed_behind.load(Ordering::SeqCst);
+                    self.archive_recovery_snapshot().await.is_confirmed_behind();
                 let peer_gap = self.effective_peer_gap(current_ledger);
                 if archive_is_confirmed_behind
                     && peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD

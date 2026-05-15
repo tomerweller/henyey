@@ -107,7 +107,7 @@ pub(crate) const PHASE_13_3_BUFFERED_CONSENSUS_STUCK_WRITE: u32 = 3;
 pub(crate) const PHASE_13_4_BUFFERED_LAST_CATCHUP_COMPLETED_READ: u32 = 4;
 
 /// `maybe_start_buffered_catchup`: about to read
-/// `archive_behind_until.read().await` for archive-behind check.
+/// `archive_recovery_status` for archive-behind check.
 pub(crate) const PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ: u32 = 5;
 
 /// `out_of_sync_recovery`: about to acquire
