@@ -122,7 +122,7 @@ If we lose the race, exit cleanly — the next `/project-tick` will pick a diffe
 
 ### Step 5 — Dispatch
 
-Based on the issue's status, invoke the specialist skill **as a sub-agent** so its work stays in its own context window. Use the `general-purpose` agent type with explicit instructions to run the slash command.
+Based on the issue's status, invoke the specialist skill **as a foreground sub-agent** so its work stays in its own context window AND the parent waits for it. Use the `general-purpose` agent type with explicit instructions to run the slash command.
 
 | Status | Sub-agent invocation |
 |---|---|
@@ -131,7 +131,9 @@ Based on the issue's status, invoke the specialist skill **as a sub-agent** so i
 | `ready-for-doing` | `Run /do $ISSUE. Report the final state transition.` |
 | `in-review` | `Run /review-pr $ISSUE. Report the final state transition.` |
 
-Wait for the sub-agent to complete. Do not try to summarize or second-guess its work — the specialist's commit history, issue comments, and PR reviews are the audit trail.
+**Critical: the sub-agent MUST run in the foreground.** Do not set `run_in_background: true` on the Agent tool call. The dispatcher's job is to block until the specialist either completes the full state transition OR posts a failure marker (`## Blocked`, `## Plan: ...`, etc.) — anything less leaves work orphaned mid-flight (commit pushed but no PR open, etc.).
+
+Wait for the sub-agent to complete. Do not try to summarize or second-guess its work — the specialist's commit history, issue comments, and PR reviews are the audit trail. After the sub-agent returns, report a one-line summary of the state transition it accomplished and exit.
 
 ### Step 6 — Cleanup
 
