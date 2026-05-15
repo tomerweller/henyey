@@ -223,8 +223,8 @@ Source file references use the format `file.rs:line`.
 | Resolve pending merges before accessing curr/snap | ✅ | `bucket_list.rs`: Merges resolved before bucket access |
 | MergeKey for identifying unique merge operations | ✅ | `future_bucket.rs`: `MergeKey` struct for merge identity |
 | FutureBucket serialization for HAS (HistoryArchiveState) | ✅ | `future_bucket.rs`: Full serialization/deserialization support |
-| `getMergeFuture()` — reuse in-progress merge | ⚠️ | `merge_map.rs`: `BucketMergeMap`/`LiveMergeFutures` implemented but not wired into merge workflow |
-| `putMergeFuture()` — register merge for reuse | ⚠️ | Same as above — implemented but not connected |
+| `getMergeFuture()` — reuse in-progress merge | ⚠️ | `merge_map.rs`: `BucketMergeMap` tracks completed merges; in-flight dedup not yet implemented |
+| `putMergeFuture()` — register merge for reuse | ⚠️ | Same as above — completed-merge cache exists but in-flight reattachment is missing |
 | Merge deduplication across concurrent operations | ❌ | Without wired merge map, duplicate merges may be scheduled during catchup/restart |
 
 **Assessment: High adherence.** The FutureBucket state machine and async merge scheduling are fully implemented. The one notable gap is the merge future deduplication cache (`getMergeFuture`/`putMergeFuture`) — the data structures exist in `merge_map.rs` but are not wired into the active merge workflow. This means duplicate merges may occur during catchup or restart scenarios, wasting compute but not affecting correctness.
@@ -552,10 +552,10 @@ The v26 changes are overwhelmingly concurrency fixes for C++ shared-mutable-stat
 
 ## 7. Recommendations
 
-### Priority 1: Wire BucketMergeMap into Merge Workflow
-- **What:** Connect `BucketMergeMap`/`LiveMergeFutures` (already implemented in `merge_map.rs`) to `BucketManager` so that `getMergeFuture()`/`putMergeFuture()` are called during merge scheduling
+### Priority 1: Implement In-Flight Merge Dedup
+- **What:** Implement in-flight merge deduplication in `BucketManager` so that `getMergeFuture()`/`putMergeFuture()` semantics are covered during merge scheduling. `BucketMergeMap` handles completed-merge caching; in-flight reattachment needs new design.
 - **Why:** Prevents duplicate merges during catchup and restart, improving recovery time
-- **Effort:** Medium — the data structures exist, need integration points
+- **Effort:** Medium — requires designing integration with the actual merge scheduling path
 
 ### Priority 2: Complete Partial Implementations
 - **What:** Finish `loadCompleteHotArchiveState()`, `scheduleVerifyReferencedBucketsWork()`, and `BucketInputIterator::seek()`

@@ -19,7 +19,7 @@
 | Hot archive indexing | Partial | Lookup exists, but no dedicated `HotArchiveBucketIndex` API |
 | Bucket input/output iterators | Partial | Legacy gzip wrappers differ from upstream uncompressed iterators; malformed record marks now match `readOne` EOF/error semantics |
 | Bucket applicator and live iteration | Full | Catchup application and live-entry scans implemented |
-| Merge deduplication | Partial | Completed-merge cache wired; in-flight dedup tracker unused |
+| Merge deduplication | Partial | Completed-merge cache wired; in-flight dedup not yet implemented |
 
 ## File Mapping
 
@@ -289,8 +289,8 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rationale**: Production performance work moved to the disk-bucket path first, leaving the legacy iterator API behind.
 
 5. **Merge deduplication scope**
-   - **stellar-core**: `BucketManager` deduplicates both finished merges and merges still running.
-   - **Rust**: `BucketMergeMap` is wired for completed merges, but `LiveMergeFutures` is not yet used in the manager path.
+   - **stellar-core**: `BucketManager` deduplicates both finished merges and merges still running (`BucketManager.cpp:getMergeFuture()`/`putMergeFuture()`).
+   - **Rust**: `BucketMergeMap` is wired for completed merges. In-flight merge dedup (concurrent reattachment) is not yet implemented.
    - **Rationale**: Completed-merge reuse covers restart and replay reuse, but concurrent reattachment parity is still missing.
 
 ## Test Coverage

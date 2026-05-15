@@ -13,7 +13,7 @@ Rust: `crates/henyey-bucket/` (286 tests across 21 modules + 3 integration test 
 | `BucketManager` (singleton) | `BucketManager` (shared ownership) |
 | `BucketIndex` / `BucketListDB` | `LiveBucketIndex` + `DiskIndex` + `InMemoryIndex` |
 | `BucketOutputIterator` | `BucketOutputIterator` |
-| `FutureBucket` (async merge) | `FutureBucket` + `LiveMergeFutures` |
+| `FutureBucket` (async merge) | `FutureBucket` |
 | `EvictionIterator` | `EvictionIterator` |
 | `SearchableBucketListSnapshot` | `SearchableBucketListSnapshot` |
 | `BucketMergeMap` | `BucketMergeMap` |

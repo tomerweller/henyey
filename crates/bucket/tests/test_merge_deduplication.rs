@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use henyey_bucket::{BucketMergeMap, DeadEntryPolicy, FutureBucket, LiveMergeFutures, MergeKey};
+use henyey_bucket::{BucketMergeMap, DeadEntryPolicy, MergeKey};
 use henyey_common::Hash256;
 
 /// Creates a unique hash from a byte value.
@@ -190,72 +190,6 @@ fn test_keep_tombstones_affects_identity() {
     assert_eq!(bmm.get_output(&m1), Some(&out1));
     assert_eq!(bmm.get_output(&m2), Some(&out2));
     assert_eq!(bmm.len(), 2);
-}
-
-/// Test live merge futures tracker for deduplication.
-#[test]
-fn test_live_merge_futures_deduplication() {
-    let tracker = LiveMergeFutures::new();
-
-    let key = make_merge_key(1, 2, DeadEntryPolicy::Keep);
-    let future = FutureBucket::clear();
-
-    // First insertion creates new
-    let f1 = tracker.get_or_insert(key.clone(), future);
-    assert_eq!(tracker.len(), 1);
-
-    // Getting should return same Arc and increment reattach count
-    let f2 = tracker.get(&key).unwrap();
-    assert!(std::sync::Arc::ptr_eq(&f1, &f2));
-
-    // Inserting again should return existing
-    let f3 = tracker.get_or_insert(key.clone(), FutureBucket::clear());
-    assert!(std::sync::Arc::ptr_eq(&f1, &f3));
-
-    let stats = tracker.stats();
-    assert_eq!(stats.merges_started, 1);
-    assert_eq!(stats.merges_reattached, 2); // get + second get_or_insert
-
-    // Remove should mark as completed
-    tracker.remove(&key);
-    assert!(tracker.is_empty());
-
-    let stats = tracker.stats();
-    assert_eq!(stats.merges_completed, 1);
-}
-
-/// Test concurrent access to live merge futures.
-#[test]
-fn test_live_merge_futures_concurrent() {
-    use std::sync::Arc;
-    use std::thread;
-
-    let tracker = Arc::new(LiveMergeFutures::new());
-
-    // Spawn multiple threads that try to get_or_insert the same key
-    let handles: Vec<_> = (0..10)
-        .map(|_| {
-            let tracker = Arc::clone(&tracker);
-            thread::spawn(move || {
-                let key = make_merge_key(1, 2, DeadEntryPolicy::Keep);
-                tracker.get_or_insert(key, FutureBucket::clear())
-            })
-        })
-        .collect();
-
-    // Collect all futures
-    let futures: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-    // All should point to the same underlying future
-    for i in 1..futures.len() {
-        assert!(std::sync::Arc::ptr_eq(&futures[0], &futures[i]));
-    }
-
-    // Only one merge should have been started
-    let stats = tracker.stats();
-    assert_eq!(stats.merges_started, 1);
-    // 9 reattachments (first one starts, rest reattach)
-    assert_eq!(stats.merges_reattached, 9);
 }
 
 /// Test retain_outputs garbage collection.

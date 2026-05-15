@@ -241,7 +241,7 @@ pub use cache::{CacheStats, RandomEvictionCache};
 // Merge deduplication
 // ============================================================================
 
-pub use merge_map::{BucketMergeMap, LiveMergeFutures, MergeFuturesStats};
+pub use merge_map::BucketMergeMap;
 
 // ============================================================================
 // Bucket applicator (catchup)

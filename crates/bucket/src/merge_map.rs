@@ -1,21 +1,15 @@
 //! Merge deduplication for bucket merging.
 //!
-//! This module provides tracking for bucket merge operations to enable
-//! deduplication and reattachment of in-progress merges. When the same
-//! merge is requested multiple times (same inputs), the existing merge
-//! can be reattached rather than starting a new one.
+//! This module provides a completed-merge output cache (`BucketMergeMap`) that
+//! tracks the relationship between merge inputs and their output buckets,
+//! enabling reuse of previously computed merge results.
 //!
-//! # Deduplication Strategy
+//! # Merge Key
 //!
 //! Merges are identified by their [`MergeKey`], which consists of:
 //! - The hash of the curr bucket
 //! - The hash of the snap bucket
 //! - Whether tombstones are kept (affects merge behavior)
-//!
-//! When a merge is requested:
-//! 1. Check if a merge with the same key is already in progress
-//! 2. If so, return the existing future (reattachment)
-//! 3. If not, start a new merge and register it
 //!
 //! # Memory Management
 //!
@@ -26,12 +20,10 @@
 //! When outputs are no longer referenced, their entries can be cleaned up.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use henyey_common::Hash256;
-use parking_lot::RwLock;
 
-use crate::future_bucket::{FutureBucket, MergeKey};
+use crate::future_bucket::MergeKey;
 
 // ============================================================================
 // Bucket Merge Map
@@ -197,156 +189,6 @@ impl BucketMergeMap {
     }
 }
 
-// ============================================================================
-// Live Merge Futures Tracker
-// ============================================================================
-
-/// Tracks in-progress merge operations for reattachment.
-///
-/// Spec: BUCKETLISTDB_SPEC §7.3 — In-flight merge dedup map.
-/// This type implements the spec's `Hash<MergeKey, shared_future>` pattern but is
-/// not currently wired into the production merge path. Production merges use
-/// `BucketLevel::prepare_with_normalization` → `PendingMerge::Async(AsyncMergeHandle)`
-/// → `BucketMergeMap` for output caching. In-flight dedup is a future optimization.
-///
-/// This structure holds references to `FutureBucket` instances that are
-/// currently merging, allowing new requests for the same merge to reattach
-/// to the existing operation.
-pub struct LiveMergeFutures {
-    /// Maps merge keys to in-progress futures.
-    futures: RwLock<HashMap<MergeKey, Arc<RwLock<FutureBucket>>>>,
-    /// Statistics about merge operations.
-    stats: RwLock<MergeFuturesStats>,
-}
-
-/// Statistics about merge future operations.
-#[derive(Debug, Clone, Default)]
-pub struct MergeFuturesStats {
-    /// Number of new merges started.
-    pub merges_started: u64,
-    /// Number of merge reattachments (deduplication hits).
-    pub merges_reattached: u64,
-    /// Number of merges completed.
-    pub merges_completed: u64,
-}
-
-impl LiveMergeFutures {
-    /// Creates a new futures tracker.
-    pub fn new() -> Self {
-        Self {
-            futures: RwLock::new(HashMap::new()),
-            stats: RwLock::new(MergeFuturesStats::default()),
-        }
-    }
-
-    /// Gets an existing merge future for the given key.
-    ///
-    /// Returns `Some` if a merge with this key is already in progress.
-    pub fn get(&self, merge_key: &MergeKey) -> Option<Arc<RwLock<FutureBucket>>> {
-        let futures = self.futures.read();
-        if let Some(future) = futures.get(merge_key) {
-            self.stats.write().merges_reattached += 1;
-            Some(Arc::clone(future))
-        } else {
-            None
-        }
-    }
-
-    /// Registers a new merge future.
-    ///
-    /// If a future with this key already exists, returns the existing one.
-    /// Otherwise, inserts the new future and returns it.
-    pub fn get_or_insert(
-        &self,
-        merge_key: MergeKey,
-        future: FutureBucket,
-    ) -> Arc<RwLock<FutureBucket>> {
-        let mut futures = self.futures.write();
-
-        // Check if already exists
-        if let Some(existing) = futures.get(&merge_key) {
-            self.stats.write().merges_reattached += 1;
-            return Arc::clone(existing);
-        }
-
-        // Insert new
-        let future = Arc::new(RwLock::new(future));
-        futures.insert(merge_key, Arc::clone(&future));
-        self.stats.write().merges_started += 1;
-        future
-    }
-
-    /// Removes a completed merge future.
-    pub fn remove(&self, merge_key: &MergeKey) -> Option<Arc<RwLock<FutureBucket>>> {
-        let mut futures = self.futures.write();
-        if let Some(future) = futures.remove(merge_key) {
-            self.stats.write().merges_completed += 1;
-            Some(future)
-        } else {
-            None
-        }
-    }
-
-    /// Returns the number of in-progress merges.
-    pub fn len(&self) -> usize {
-        self.futures.read().len()
-    }
-
-    /// Checks if there are no in-progress merges.
-    pub fn is_empty(&self) -> bool {
-        self.futures.read().is_empty()
-    }
-
-    /// Returns statistics about merge operations.
-    pub fn stats(&self) -> MergeFuturesStats {
-        self.stats.read().clone()
-    }
-
-    /// Clears all tracked futures.
-    pub fn clear(&self) {
-        self.futures.write().clear();
-    }
-
-    /// Removes all completed futures.
-    ///
-    /// A future is considered completed if it's in the `LiveOutput` state.
-    pub fn cleanup_completed(&self) {
-        let mut futures = self.futures.write();
-        let keys_to_remove: Vec<MergeKey> = futures
-            .iter()
-            .filter_map(|(key, future)| {
-                let fb = future.read();
-                if fb.merge_complete() {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut stats = self.stats.write();
-        for key in keys_to_remove {
-            futures.remove(&key);
-            stats.merges_completed += 1;
-        }
-    }
-}
-
-impl Default for LiveMergeFutures {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Debug for LiveMergeFutures {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LiveMergeFutures")
-            .field("count", &self.len())
-            .field("stats", &self.stats())
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,43 +258,6 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert!(!map.has_output(&key1));
         assert!(map.has_output(&key2));
-    }
-
-    #[test]
-    fn test_live_merge_futures_basic() {
-        let tracker = LiveMergeFutures::new();
-        assert!(tracker.is_empty());
-
-        let key = make_merge_key(1, 2, DeadEntryPolicy::Keep);
-        let future = FutureBucket::clear();
-
-        let f1 = tracker.get_or_insert(key.clone(), future);
-        assert_eq!(tracker.len(), 1);
-
-        // Getting again should return same Arc
-        let f2 = tracker.get(&key).unwrap();
-        assert!(Arc::ptr_eq(&f1, &f2));
-
-        let stats = tracker.stats();
-        assert_eq!(stats.merges_started, 1);
-        assert_eq!(stats.merges_reattached, 1);
-    }
-
-    #[test]
-    fn test_live_merge_futures_remove() {
-        let tracker = LiveMergeFutures::new();
-
-        let key = make_merge_key(1, 2, DeadEntryPolicy::Keep);
-        let future = FutureBucket::clear();
-
-        tracker.get_or_insert(key.clone(), future);
-        assert_eq!(tracker.len(), 1);
-
-        tracker.remove(&key);
-        assert!(tracker.is_empty());
-
-        let stats = tracker.stats();
-        assert_eq!(stats.merges_completed, 1);
     }
 
     #[test]
