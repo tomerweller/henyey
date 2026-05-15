@@ -371,6 +371,72 @@ pub enum HistoryError {
         info: Box<TxSetHashMismatchInfo>,
     },
 
+    /// Catchup knit-to-LCL: archive entry at LCL-1 disagrees with LCL's
+    /// `previousLedgerHash` (§11.2 case 2).
+    ///
+    /// Triggered when the catchup replay pipeline reads a header history
+    /// entry whose sequence is `lcl.seq - 1` and whose own hash does not
+    /// match `lcl.previousLedgerHash`. Mirrors stellar-core
+    /// `ApplyCheckpointWork::getNextLedgerCloseData()` "replay failed to
+    /// connect on hash of LCL predecessor". Classified as fatal.
+    #[error(
+        "knit-to-LCL failed at LCL predecessor (ledger {ledger}): expected {expected}, got {actual}"
+    )]
+    KnitLclPredecessorHashMismatch {
+        /// The ledger sequence of the predecessor (lcl.seq - 1).
+        ledger: u32,
+        /// LCL's previousLedgerHash (hex-encoded).
+        expected: String,
+        /// Archive entry's own hash (hex-encoded).
+        actual: String,
+    },
+
+    /// Catchup knit-to-LCL: archive entry at LCL has a hash that disagrees
+    /// with the local LCL hash (§11.2 case 3).
+    ///
+    /// Mirrors stellar-core "replay at LCL X disagreed on hash". Classified
+    /// as fatal.
+    #[error("knit-to-LCL failed at LCL: expected {expected}, got {actual}")]
+    KnitLclHashMismatch {
+        /// LCL hash held locally (hex-encoded).
+        expected: String,
+        /// Archive entry's own hash at LCL (hex-encoded).
+        actual: String,
+    },
+
+    /// Catchup knit-to-LCL: archive entry at LCL+1 disagrees with LCL's
+    /// hash via its `previousLedgerHash` (§11.2 case 4 prev-hash check).
+    ///
+    /// Mirrors stellar-core "replay at current ledger X disagreed on LCL
+    /// hash". Distinct from [`KnitLclHashMismatch`] because the comparison
+    /// is on `entry.header.previousLedgerHash`, not `entry.hash`. Classified
+    /// as fatal.
+    #[error(
+        "knit-to-LCL failed at LCL+1 (ledger {ledger}): \
+         entry.previousLedgerHash {actual} != lcl.hash {expected}"
+    )]
+    KnitCurrentLedgerPrevHashMismatch {
+        /// The ledger sequence at LCL+1.
+        ledger: u32,
+        /// LCL hash held locally (hex-encoded).
+        expected: String,
+        /// Entry's previousLedgerHash (hex-encoded).
+        actual: String,
+    },
+
+    /// Catchup knit-to-LCL: archive entry's sequence is more than one past
+    /// LCL (§11.2 case 5 overshoot).
+    ///
+    /// Mirrors stellar-core "replay overshot current ledger". Classified as
+    /// fatal.
+    #[error("knit-to-LCL overshot: entry seq {entry_seq} > lcl seq {lcl_seq} + 1")]
+    KnitOvershot {
+        /// The archive entry's ledger sequence.
+        entry_seq: u32,
+        /// Local Last Closed Ledger sequence.
+        lcl_seq: u32,
+    },
+
     /// Ledger hash mismatch during catchup replay.
     ///
     /// Returned only by the replay path (`replay_via_close_ledger`) when
@@ -487,6 +553,10 @@ impl HistoryError {
                 | HistoryError::InvalidSequence { .. }
                 | HistoryError::CorruptHeader { .. }
                 | HistoryError::ReplayHashMismatch { .. }
+                | HistoryError::KnitLclPredecessorHashMismatch { .. }
+                | HistoryError::KnitLclHashMismatch { .. }
+                | HistoryError::KnitCurrentLedgerPrevHashMismatch { .. }
+                | HistoryError::KnitOvershot { .. }
                 | HistoryError::FatalChainDisagreement
                 | HistoryError::UnsupportedLedgerVersion { .. }
                 | HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. })

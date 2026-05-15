@@ -314,30 +314,51 @@ impl CatchupManager {
     /// # Arguments
     ///
     /// * `from_ledger` — sequence number of the Last Closed Ledger (the most
-    ///   recently applied ledger). Download starts at `from_ledger + 1`.
+    ///   recently applied ledger). The knit-prefix entries (at LCL and,
+    ///   when in the same checkpoint as LCL+1, at LCL-1) are extracted from
+    ///   the same checkpoint file as LCL+1 and returned separately for the
+    ///   §11.2 knit-to-LCL decision matrix. Apply entries cover
+    ///   `[from_ledger + 1, to_ledger]`.
     /// * `to_ledger` — inclusive upper bound of the range to download.
     /// * `initial_lcl` — context from the LCL at the start of this replay batch.
     ///   Used for empty tx set synthesis when archives omit tx entries for
     ///   ledgers with no transactions.
+    ///
+    /// Returns `(apply_data, knit_entries, archive_name)`. `knit_entries`
+    /// is empty when `from_ledger == 0` (genesis), when LCL sits on a
+    /// checkpoint boundary (LCL-1 in a prior file, no overlap), or when
+    /// there is no work to do.
     pub(super) async fn download_ledger_data(
         &mut self,
         from_ledger: u32,
         to_ledger: u32,
         initial_lcl: LclContext,
-    ) -> Result<(Vec<LedgerData>, String)> {
+    ) -> Result<(Vec<LedgerData>, Vec<LedgerHeaderHistoryEntry>, String)> {
         let mut data = Vec::new();
+        let mut knit_entries: Vec<LedgerHeaderHistoryEntry> = Vec::new();
         let mut checkpoint_cache: HashMap<u32, CheckpointLedgerData> = HashMap::new();
         // Track the last archive that served data; used for metric attribution.
         // Initialized to "none" — only set to an actual archive when a download occurs.
         let mut last_archive_name = "none".to_owned();
 
-        // We need to download data for ledgers (from_ledger+1) to to_ledger.
-        // The from_ledger's state is already in the bucket list.
-        let start = from_ledger + 1;
+        // CATCHUP_SPEC §11.2: stellar-core checks knit-to-LCL against headers
+        // already present in the current checkpoint file (the one containing
+        // LCL+1). We mirror that by extending the iteration backwards to
+        // include LCL and (when in the same checkpoint file as LCL+1) LCL-1.
+        // We never fetch a prior checkpoint just to validate LCL-1 — it is
+        // skipped in that case. For genesis (from_ledger == 0) there is no
+        // LCL header to inspect; iteration starts at ledger 1.
+        let apply_start = from_ledger.saturating_add(1);
+        let knit_start = if from_ledger == 0 {
+            apply_start
+        } else {
+            let apply_ckpt_start = crate::checkpoint::checkpoint_start(apply_start);
+            std::cmp::max(apply_ckpt_start, from_ledger.saturating_sub(1))
+        };
 
-        if start > to_ledger {
+        if apply_start > to_ledger {
             // No ledgers to replay, we're at the checkpoint
-            return Ok((data, last_archive_name));
+            return Ok((data, knit_entries, last_archive_name));
         }
 
         // Resolve the LCL context from the archive when from_ledger > 0.
@@ -353,7 +374,7 @@ impl CatchupManager {
             initial_lcl
         };
 
-        for seq in start..=to_ledger {
+        for seq in knit_start..=to_ledger {
             self.progress.current_ledger = seq;
             let checkpoint = checkpoint::checkpoint_containing(seq);
 
@@ -369,16 +390,30 @@ impl CatchupManager {
                 HistoryError::CatchupFailed(format!("missing checkpoint cache for {}", checkpoint))
             })?;
 
-            let header_entry = cache
-                .headers
-                .iter()
-                .find(|h| h.header.ledger_seq == seq)
-                .ok_or_else(|| {
-                    HistoryError::CatchupFailed(format!(
-                        "ledger {} not found in checkpoint headers",
-                        seq
-                    ))
-                })?;
+            let header_entry_opt = cache.headers.iter().find(|h| h.header.ledger_seq == seq);
+
+            // Knit-prefix entries (seq <= LCL): collected as raw archive
+            // entries for the §11.2 decision matrix. They are NOT replayed
+            // and must not feed into the chain-verify / tx-set pipeline,
+            // which assumes a contiguous LCL → target chain.
+            //
+            // Stellar-core only consults headers already present in the
+            // current checkpoint file (`ApplyCheckpointWork::getNextLedgerCloseData()`).
+            // If a knit-prefix entry is absent from the archive, that's
+            // expected — we silently skip it instead of erroring.
+            if seq < apply_start {
+                if let Some(entry) = header_entry_opt {
+                    knit_entries.push(entry.clone());
+                }
+                continue;
+            }
+
+            let header_entry = header_entry_opt.ok_or_else(|| {
+                HistoryError::CatchupFailed(format!(
+                    "ledger {} not found in checkpoint headers",
+                    seq
+                ))
+            })?;
 
             let header = header_entry.header.clone();
             let header_hash = Hash256(header_entry.hash.0);
@@ -406,7 +441,7 @@ impl CatchupManager {
             current_lcl = LclContext::new(header.ledger_version, header_hash);
         }
 
-        Ok((data, last_archive_name))
+        Ok((data, knit_entries, last_archive_name))
     }
 
     /// Download ledger headers, transactions, and results for a checkpoint.

@@ -397,7 +397,8 @@ Source file references use the format `file.rs:line`.
 | Read `LedgerHeaderHistoryEntry` from header file | ✅ | `catchup.rs:1566-1577` — finds header by sequence |
 | Read transaction set from transaction file | ✅ | `catchup.rs:1579-1625` — extracts tx set with protocol-aware empty set creation |
 | Verify tx set hash matches header's `scpValue.txSetHash` | ✅ | `catchup.rs:1703-1719` — `verify::verify_tx_set()` |
-| Verify `previousLedgerHash` matches LCL hash | ✅ | Verified during `replay_via_close_ledger()` |
+| Verify `previousLedgerHash` matches LCL hash | ✅ | `catchup/replay.rs::knit_to_lcl_decision` (case 4) — explicit pre-apply check, fatal on mismatch |
+| Knit-to-LCL 5-case decision matrix | ✅ | `catchup/replay.rs::knit_to_lcl_decision` — cases 1/2/3/4/5 mirror `ApplyCheckpointWork::getNextLedgerCloseData()` (stellar-core/src/catchup/ApplyCheckpointWork.cpp:205-262); case 5 (overshoot) and case 2/3 hash checks raise dedicated fatal variants (`KnitOvershot`, `KnitLclPredecessorHashMismatch`, `KnitLclHashMismatch`, `KnitCurrentLedgerPrevHashMismatch`) |
 | Apply via normal ledger close pipeline | ✅ | `replay.rs` — `replay_ledger_with_execution()` uses `execute_transaction_set()` |
 | Verify resulting ledger hash matches expected | ✅ | `replay.rs` — post-execution hash verification |
 | Cleanup: delete temporary files | ❌ | No explicit cleanup of downloaded checkpoint files |
