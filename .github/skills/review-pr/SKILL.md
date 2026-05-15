@@ -4,8 +4,10 @@ description: |
   Run two parallel adversarial PR reviewers and combine their verdicts with CI
   state into a merge decision. Reviewers post structured comment verdicts (since
   the agent is the PR author and cannot self-approve via GH native review).
-  Operates on issues in `in-review`. Auto-merges with --admin on triple-green;
-  bounces to `ready-for-doing` on any request-changes or CI red; blocks after 3
+  Operates on issues in `in-review`. Auto-merges with --admin on triple-green
+  (after filing follow-up issues for any unaddressed inline review comments,
+  so non-critical feedback is preserved as backlog instead of dropped); bounces
+  to `ready-for-doing` on any request-changes or CI red; blocks after 3
   bounce-back cycles. Use when invoked by /project-tick with an issue in
   in-review, or manually as /review-pr <issue>.
 ---
@@ -97,6 +99,8 @@ Keep under 400 lines.>
 ```
 
 Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <tmpfile>` so multi-line bodies survive intact. Reviewers MAY also post inline line comments via `gh api repos/.../pulls/$PR_NUM/comments` for specific concerns — those don't count toward the verdict; only the top-level structured comment does.
+
+**Inline-comment convention:** if a reviewer's concern is non-blocking (would be a `MINOR` note), they should APPROVE at the top level AND leave the concern as an inline comment. `/review-pr` will auto-file a follow-up issue for every unaddressed inline comment at merge time (see Step 7.2), so non-critical feedback is preserved as actionable backlog without blocking the merge. If a concern is blocking, use `**Verdict:** CHANGES_REQUESTED` at the top level; `/do` Mode B will address every inline in that case.
 
 ### Reviewer A — Correctness (always)
 
@@ -220,7 +224,78 @@ If failures reference code in the PR's diff → diff-attributable. If failures l
 
 ### Auto-merge path
 
-The pipeline gates merges on its OWN signals (parsed verdicts + CI state), not GitHub's review-approval count. The reviewer comments are advisory metadata only — GitHub does not "know" they're approvals, because GitHub disallows author self-approval. So we merge with `--admin` to bypass GitHub's review-required gate (CI gates still apply via branch protection if configured):
+The pipeline gates merges on its OWN signals (parsed verdicts + CI state), not GitHub's review-approval count. The reviewer comments are advisory metadata only — GitHub does not "know" they're approvals, because GitHub disallows author self-approval. So we merge with `--admin` to bypass GitHub's review-required gate (CI gates still apply via branch protection if configured).
+
+**Before merging**, file follow-up issues for any UNADDRESSED inline (line-level) review comments. Reviewers can flag non-critical concerns inline without blocking the merge with `CHANGES_REQUESTED` — those concerns must be preserved as actionable backlog, not lost.
+
+#### 7.1 Identify unaddressed inline comments
+
+Fetch all inline-review threads via GraphQL (REST doesn't expose `isResolved`):
+
+```bash
+gh api graphql -f query='
+query($owner: String!, $repo: String!, $pr: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          comments(first: 50) {
+            nodes {
+              databaseId
+              author { login }
+              body
+              path
+              line
+              url
+            }
+          }
+        }
+      }
+    }
+  }
+}' -f owner=stellar-experimental -f repo=henyey -F pr=$PR_NUM \
+  --jq '.data.repository.pullRequest.reviewThreads.nodes'
+```
+
+For each thread, classify it as **addressed** if any of:
+
+- `isResolved == true` (GitHub-side thread resolution).
+- The thread has at least one reply after the original comment AND the reply body contains any of: `Addressed in `, `Fixed in `, `Done in `, or a `<commit-sha>` reference.
+
+Otherwise, classify as **unaddressed**.
+
+#### 7.2 File one follow-up issue per unaddressed thread
+
+For each unaddressed thread, create an issue:
+
+```bash
+gh issue create --repo stellar-experimental/henyey \
+  --title "<short summary derived from first line of comment body, ≤80 chars>" \
+  --body "$(cat <<EOF
+Follow-up from PR #$PR_NUM (issue #$ISSUE). Non-critical inline review comment that was not addressed before merge.
+
+## Concern
+
+\`<path>:<line>\` — <full original comment body, indented or as-is>
+
+## Source
+
+[Original review comment](<thread.comments.nodes[0].url>) on PR #$PR_NUM.
+
+## Severity
+
+Low / non-blocking — reviewer chose to APPROVE rather than request changes. Filing as backlog so the concern isn't lost.
+EOF
+)" \
+  --label "enhancement,low,follow-up"
+```
+
+If the comment's `path` matches a known crate prefix (`crates/<name>/...`), also add the `crate:<name>` label.
+
+Collect the list of newly-filed issue numbers — they'll be referenced in the merge comment.
+
+#### 7.3 Merge
 
 ```bash
 gh pr merge $PR_NUM --repo stellar-experimental/henyey --squash --admin
@@ -228,7 +303,7 @@ gh pr merge $PR_NUM --repo stellar-experimental/henyey --squash --admin
 
 The `--admin` flag means the agent must be authenticated as a repo admin. If your token doesn't have admin, the merge will fail — at which point operator intervention is needed (file a follow-up issue documenting the merge-permission gap; do NOT downgrade to non-admin merge that might silently bypass CI).
 
-After merge, move state and clean up:
+#### 7.4 Clean up
 
 ```bash
 bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE done
@@ -241,7 +316,19 @@ git worktree prune
 # If session id is recoverable from a sidecar file, also rm -rf ~/data/<sid>/do-$ISSUE
 ```
 
-Post a `## ✅ Merged` comment with the merge commit SHA. Exit.
+Post a `## ✅ Merged` comment with the merge commit SHA AND the list of follow-up issues filed:
+
+```markdown
+## ✅ Merged
+
+**Commit:** <merge-commit-sha>
+
+**Follow-up issues filed for unaddressed inline review comments:** #N1, #N2
+
+(none if all inline comments were addressed)
+```
+
+Exit.
 
 ### Wait path
 
