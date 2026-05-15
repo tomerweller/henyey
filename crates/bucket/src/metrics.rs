@@ -32,8 +32,6 @@ pub struct MergeCounters {
     pub pre_init_entry_protocol_merges: AtomicU64,
     /// Merges where both buckets support INITENTRY.
     pub post_init_entry_protocol_merges: AtomicU64,
-    /// Number of running merges that were reattached (deduplication hits).
-    pub running_merge_reattachments: AtomicU64,
     /// New metadata entries created during merges.
     pub new_meta_entries: AtomicU64,
     /// New init entries created during merges.
@@ -67,12 +65,6 @@ impl MergeCounters {
     /// Records a post-INITENTRY protocol merge.
     pub fn record_post_init_entry_merge(&self) {
         self.post_init_entry_protocol_merges
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records a merge reattachment (deduplication hit).
-    pub fn record_reattachment(&self) {
-        self.running_merge_reattachments
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -111,7 +103,6 @@ impl MergeCounters {
             post_init_entry_protocol_merges: self
                 .post_init_entry_protocol_merges
                 .load(Ordering::Relaxed),
-            running_merge_reattachments: self.running_merge_reattachments.load(Ordering::Relaxed),
             new_meta_entries: self.new_meta_entries.load(Ordering::Relaxed),
             new_init_entries: self.new_init_entries.load(Ordering::Relaxed),
             new_live_entries: self.new_live_entries.load(Ordering::Relaxed),
@@ -129,7 +120,6 @@ impl MergeCounters {
             .store(0, Ordering::Relaxed);
         self.post_init_entry_protocol_merges
             .store(0, Ordering::Relaxed);
-        self.running_merge_reattachments.store(0, Ordering::Relaxed);
         self.new_meta_entries.store(0, Ordering::Relaxed);
         self.new_init_entries.store(0, Ordering::Relaxed);
         self.new_live_entries.store(0, Ordering::Relaxed);
@@ -159,7 +149,6 @@ pub enum EntryCountType {
 pub struct MergeCountersSnapshot {
     pub pre_init_entry_protocol_merges: u64,
     pub post_init_entry_protocol_merges: u64,
-    pub running_merge_reattachments: u64,
     pub new_meta_entries: u64,
     pub new_init_entries: u64,
     pub new_live_entries: u64,
@@ -433,7 +422,6 @@ mod tests {
         counters.record_pre_init_entry_merge();
         counters.record_post_init_entry_merge();
         counters.record_post_init_entry_merge();
-        counters.record_reattachment();
         counters.record_new_entry(EntryCountType::Live);
         counters.record_new_entry(EntryCountType::Live);
         counters.record_new_entry(EntryCountType::Dead);
@@ -444,7 +432,6 @@ mod tests {
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.pre_init_entry_protocol_merges, 1);
         assert_eq!(snapshot.post_init_entry_protocol_merges, 2);
-        assert_eq!(snapshot.running_merge_reattachments, 1);
         assert_eq!(snapshot.new_live_entries, 2);
         assert_eq!(snapshot.new_dead_entries, 1);
         assert_eq!(snapshot.old_entries_shadowed, 1);

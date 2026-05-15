@@ -58,7 +58,7 @@ The bucket crate is at **84% function-level parity** (see `crates/bucket/PARITY_
 | **Hot Archive BucketList** | **Full** | 11 levels, proper ARCHIVED/LIVE merge semantics, V1 metadata |
 | **Eviction** | **Full** | EvictionIterator, TTL-based scanning, state archival settings |
 | **Catchup & State Reconstruction** | **Full** | BucketApplicator with chunked processing, dedup via seen keys |
-| **Serialization & Persistence** | **High** | FutureBucket serialization works; BucketMergeMap implemented but not wired into workflow |
+| **Serialization & Persistence** | **High** | FutureBucket serialization works; BucketMergeMap caches completed merges; in-flight dedup not yet implemented |
 | **Invariants & Safety Properties** | **Full** | Key safety properties enforced (sort order, merge correctness, hash determinism) |
 | **Constants** | **Full** | All protocol constants match spec |
 | **Metrics & Observability** | **Low** | Merge counters present; bloom miss meters, eviction cycle metrics missing |
@@ -225,9 +225,9 @@ Source file references use the format `file.rs:line`.
 | FutureBucket serialization for HAS (HistoryArchiveState) | ✅ | `future_bucket.rs`: Full serialization/deserialization support |
 | `getMergeFuture()` — reuse in-progress merge | ⚠️ | `merge_map.rs`: `BucketMergeMap` tracks completed merges; in-flight dedup not yet implemented |
 | `putMergeFuture()` — register merge for reuse | ⚠️ | Same as above — completed-merge cache exists but in-flight reattachment is missing |
-| Merge deduplication across concurrent operations | ❌ | Without wired merge map, duplicate merges may be scheduled during catchup/restart |
+| Merge deduplication across concurrent operations | ❌ | In-flight merge dedup not yet implemented; duplicate merges may be scheduled during catchup/restart |
 
-**Assessment: High adherence.** The FutureBucket state machine and async merge scheduling are fully implemented. The one notable gap is the merge future deduplication cache (`getMergeFuture`/`putMergeFuture`) — the data structures exist in `merge_map.rs` but are not wired into the active merge workflow. This means duplicate merges may occur during catchup or restart scenarios, wasting compute but not affecting correctness.
+**Assessment: High adherence.** The FutureBucket state machine and async merge scheduling are fully implemented. The one notable gap is the in-flight merge deduplication (`getMergeFuture`/`putMergeFuture`) — `BucketMergeMap` caches completed merge outputs but in-flight reattachment is not yet implemented. This means duplicate merges may occur during catchup or restart scenarios, wasting compute but not affecting correctness.
 
 ---
 
@@ -379,7 +379,7 @@ Source file references use the format `file.rs:line`.
 | FutureBucket serialization to HAS JSON | ✅ | `future_bucket.rs`: Full serialization/deserialization of 5-state FutureBucket |
 | FutureBucket deserialization and state reconstruction | ✅ | `future_bucket.rs`: Can reconstruct merge state from persisted HAS |
 | `MergeKey` serialization | ✅ | `future_bucket.rs`: MergeKey properly serialized |
-| `BucketMergeMap` persistence | ⚠️ | `merge_map.rs`: Data structure implemented but not wired into active merge workflow for persist/restore |
+| `BucketMergeMap` persistence | ⚠️ | `merge_map.rs`: Completed-merge cache is used at runtime but not persisted across restarts |
 | Index file serialization (save to disk) | ✅ | `index_persistence.rs`: Bincode-based serialization (architectural departure from C++ Cereal, functionally equivalent) |
 | Index file deserialization (load from disk) | ✅ | `index_persistence.rs`: Load and validate persisted indexes |
 | Bucket file gzip compression | ✅ | `iterator.rs`: Gzip compression for disk bucket files |
@@ -459,7 +459,7 @@ None. All consensus-critical behavior (merge algorithm, BucketList structure, ha
 
 | Gap | Spec Section | Impact | Difficulty |
 |-----|-------------|--------|------------|
-| Merge future deduplication not wired (`getMergeFuture`/`putMergeFuture`) | §7, §8 | Duplicate merges during catchup/restart waste compute; no correctness impact | Medium — data structures exist in `merge_map.rs`, need to wire into `BucketManager` and merge workflow |
+| Merge future deduplication not wired (`getMergeFuture`/`putMergeFuture`) | §7, §8 | Duplicate merges during catchup/restart waste compute; no correctness impact | Medium — requires designing in-flight dedup integration with BucketManager merge scheduling |
 
 ### Minor Gaps
 

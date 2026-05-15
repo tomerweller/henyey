@@ -29,13 +29,15 @@ use crate::future_bucket::MergeKey;
 // Bucket Merge Map
 // ============================================================================
 
-/// Tracks merge operations for deduplication.
+/// Tracks completed merge operations for output reuse.
 ///
 /// This structure maintains the relationship between merge inputs and outputs,
 /// enabling:
-/// - Deduplication of concurrent merge requests
-/// - Reattachment to in-progress merges
+/// - Reuse of previously computed merge results (completed-merge cache)
 /// - Garbage collection of completed merge records
+///
+/// Note: In-flight merge dedup (reattachment to running merges) is not yet
+/// implemented. See stellar-core `BucketManager.cpp` getMergeFuture/putMergeFuture.
 #[derive(Debug, Default)]
 pub struct BucketMergeMap {
     /// Maps merge keys to output bucket hashes (for completed merges).
