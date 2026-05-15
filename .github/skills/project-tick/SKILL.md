@@ -97,29 +97,61 @@ Order actionable items by:
 
 Pick the head of the sorted list. If the list is empty, print `no actionable issues` and exit 0.
 
-### Step 4 — Acquire the issue
+### Step 4 — Acquire the issue (sentinel-comment lock)
 
-Race-safe assignment:
+The assignee field alone is NOT enough to detect a race when multiple loops run as the same GitHub user — both can self-assign and both think they won (see #2739). The fix is a **sentinel-comment lock**: each tick posts a uniquely-tagged comment, then verifies via comment ordering that its comment was the earliest one posted within a short grace window.
 
 ```bash
-# Attempt assignment.
+# Generate a unique tick ID. Includes PID and nanosecond timestamp so two
+# ticks in the same second still differ.
+TICK_ID="tick-$(date +%s%N)-$$"
+
+# Self-assign. This is necessary (so /project-tick filters us out of future
+# picker runs) but no longer SUFFICIENT for race detection.
 gh issue edit "$ISSUE" --repo stellar-experimental/henyey --add-assignee @me
 
-# Read back the assignee list.
-ASSIGNEES=$(gh issue view "$ISSUE" --repo stellar-experimental/henyey \
-  --json assignees --jq '.assignees | map(.login) | join(",")')
+# Post the sentinel comment. Capture the comment ID so we can clean it up.
+SENTINEL_ID=$(gh api "repos/stellar-experimental/henyey/issues/$ISSUE/comments" \
+  --method POST \
+  -f body="## 🔒 acquired-by:$TICK_ID
 
-# We win only if we are the sole assignee.
-ME=$(gh api user --jq .login)
-if [ "$ASSIGNEES" != "$ME" ]; then
-  echo "race lost on #$ISSUE (assignees: $ASSIGNEES) — exiting"
-  # Remove ourselves to clean up (someone else may have raced first)
+posted=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), host=$(hostname), pid=$$" \
+  --jq '.id')
+
+if [ -z "$SENTINEL_ID" ]; then
+  echo "Sentinel post failed — backing off"
   gh issue edit "$ISSUE" --repo stellar-experimental/henyey --remove-assignee @me 2>/dev/null || true
   exit 0
 fi
+
+# Grace window — sleep long enough for any concurrent tick to also post
+# its sentinel. 5 seconds is enough; the cost is bounded per tick.
+sleep 5
+
+# Fetch all recent sentinel comments and find the earliest one within the
+# past 60 seconds. Tie-break by comment ID (which is monotonic at the API
+# level). If our sentinel is the earliest, we won.
+WINNER_TICK=$(gh api "repos/stellar-experimental/henyey/issues/$ISSUE/comments" \
+  --paginate \
+  --jq '[.[] | select(.body | startswith("## 🔒 acquired-by:")) |
+    select(.created_at | fromdate > (now - 60)) |
+    {id, created_at, tick: (.body | split("\n")[0] | sub("^## 🔒 acquired-by:"; ""))}] |
+    sort_by(.created_at, .id) | .[0].tick // ""')
+
+if [ "$WINNER_TICK" != "$TICK_ID" ]; then
+  echo "race lost on #$ISSUE (winner: $WINNER_TICK, us: $TICK_ID) — exiting"
+  # Clean up our sentinel and unassign.
+  gh api "repos/stellar-experimental/henyey/issues/comments/$SENTINEL_ID" --method DELETE 2>/dev/null || true
+  gh issue edit "$ISSUE" --repo stellar-experimental/henyey --remove-assignee @me 2>/dev/null || true
+  exit 0
+fi
+
+echo "Won race on #$ISSUE (sentinel $TICK_ID is earliest). Proceeding."
 ```
 
 If we lose the race, exit cleanly — the next `/project-tick` will pick a different issue.
+
+**Sentinel cleanup** is important to avoid issues accumulating dozens of `## 🔒` comments over time. The losing tick deletes its sentinel immediately. The winning tick MUST delete its sentinel after the specialist returns (or on any exit path) — see Step 6.
 
 ### Step 5 — Dispatch
 
@@ -144,7 +176,13 @@ The specialist is responsible for:
 - Unassigning itself on completion (`gh issue edit --remove-assignee @me`).
 - Posting any required artifacts (triage report, converged plan, PR, review).
 
-`/project-tick` itself does no cleanup — exit 0 after the sub-agent returns. If the sub-agent fails (non-zero exit), leave the issue as-is with us still assigned — the next tick will see we're still assigned and skip it. The operator will see the stuck assignment in the daily summary / loop log.
+`/project-tick` IS responsible for one cleanup: **deleting its sentinel-lock comment** (from Step 4). Always run this, regardless of the specialist's exit status:
+
+```bash
+gh api "repos/stellar-experimental/henyey/issues/comments/$SENTINEL_ID" --method DELETE 2>/dev/null || true
+```
+
+If the sub-agent fails (non-zero exit), leave the issue's state and assignee as-is — the next tick will see we're still assigned and skip it. The operator will see the stuck assignment in the daily summary / loop log. The sentinel still gets deleted so it doesn't pollute future race detection.
 
 ## Flags
 
