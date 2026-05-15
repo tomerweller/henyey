@@ -3525,12 +3525,19 @@ impl Herder {
     /// directly.
     pub async fn drain_ready_envelopes_blocking(self: &Arc<Self>, context: &str) -> usize {
         let herder = Arc::clone(self);
-        crate::spawn::spawn_blocking_logged(context, move || {
-            herder.process_ready_fetching_envelopes()
-        })
-        .await
-        .ok()
-        .unwrap_or(0)
+        let ctx = context.to_owned();
+        let handle = tokio::task::spawn_blocking(move || herder.process_ready_fetching_envelopes());
+        // Yield so co-scheduled async tasks (heartbeats, timers) can run
+        // while the drain executes on the blocking pool. On current_thread,
+        // yield_now places this task at the back of the FIFO ready queue —
+        // peers are polled first. On multi_thread (production), this is a
+        // near-free re-schedule that improves fairness when the drain returns
+        // instantly (e.g., empty ready queue). (#2716)
+        tokio::task::yield_now().await;
+        crate::spawn::await_blocking_logged(&ctx, handle)
+            .await
+            .ok()
+            .unwrap_or(0)
     }
 
     /// Run [`handle_nomination_timeout`](Self::handle_nomination_timeout) on
@@ -6585,10 +6592,12 @@ mod tests {
 
         // Drain via spawn_blocking — mirroring handle_quorum_set()
         let herder_for_drain = Arc::clone(&herder);
-        let join_result = tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             herder_for_drain.process_ready_fetching_envelopes()
-        })
-        .await;
+        });
+        // Yield so heartbeat runs while drain executes on pool thread (#2716).
+        tokio::task::yield_now().await;
+        let join_result = handle.await;
         assert!(join_result.is_ok(), "spawn_blocking drain must not panic");
 
         let count_after = heartbeat_count.load(Ordering::Relaxed);
@@ -6764,6 +6773,51 @@ mod tests {
              blocked during the drain — the spawn_blocking off-load \
              was lost",
             ticks_during_drain,
+        );
+    }
+
+    /// Regression test for #2716: `drain_ready_envelopes_blocking` must yield
+    /// to peer tasks even when the ready queue is empty (fast return from
+    /// spawn_blocking). Without the yield_now between spawn and await, the
+    /// JoinHandle resolves synchronously and peers are never polled.
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn test_issue_2716_drain_yields_even_when_empty() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let herder = Arc::new(make_test_herder());
+
+        // No envelopes in the ready queue — drain will return 0 instantly.
+        assert!(
+            herder.fetching_envelopes.ready_slots().is_empty(),
+            "pre-condition: no ready envelopes"
+        );
+
+        let heartbeat_count = Arc::new(AtomicU64::new(0));
+        let hb = Arc::clone(&heartbeat_count);
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::task::yield_now().await;
+                hb.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let before = heartbeat_count.load(Ordering::Relaxed);
+
+        Arc::clone(&herder)
+            .drain_ready_envelopes_blocking("empty drain")
+            .await;
+
+        let after = heartbeat_count.load(Ordering::Relaxed);
+        heartbeat_handle.abort();
+
+        let ticks = after.saturating_sub(before);
+        assert!(
+            ticks >= 1,
+            "#2716: drain must yield even when queue is empty (observed {} ticks)",
+            ticks,
         );
     }
 
