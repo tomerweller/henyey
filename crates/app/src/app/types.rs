@@ -1061,23 +1061,6 @@ pub(super) enum SchedulerAction {
     RequestSent { peers: Vec<PeerId>, nonce: u32 },
 }
 
-#[derive(Debug)]
-pub(super) struct ScpTimeoutState {
-    pub slot: u64,
-    pub next_nomination: Option<Instant>,
-    pub next_ballot: Option<Instant>,
-}
-
-impl ScpTimeoutState {
-    pub fn new() -> Self {
-        Self {
-            slot: 0,
-            next_nomination: None,
-            next_ballot: None,
-        }
-    }
-}
-
 // Adapter from the app's Herder to the overlay's ScpQueueCallback trait.
 // Bridges herder SCP state into overlay flow control for slot-age-aware trimming.
 pub(super) struct HerderScpCallback {

@@ -340,7 +340,6 @@ impl App {
         let mut survey_interval = tokio::time::interval(Duration::from_secs(1));
         let mut survey_phase_interval = tokio::time::interval(Duration::from_secs(5));
         let mut survey_request_interval = tokio::time::interval(Duration::from_secs(1));
-        let mut scp_timeout_interval = tokio::time::interval(Duration::from_millis(500));
         let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
         let mut peer_maintenance_interval = tokio::time::interval(Duration::from_secs(10));
         peer_maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -351,6 +350,9 @@ impl App {
 
         // Get mutable access to SCP envelope receiver
         let mut scp_rx = self.scp_envelope_rx.lock().await;
+
+        // Get mutable access to SCP timer event receiver
+        let mut scp_timer_rx = self.scp_timer_rx.lock().await;
 
         // Process any externalized slots recorded during catchup BEFORE entering the main loop.
         // This ensures we buffer LedgerCloseInfo before new EXTERNALIZE messages trigger cleanup
@@ -1064,10 +1066,10 @@ impl App {
                     self.update_survey_phase().await;
                 }
 
-                // SCP nomination/ballot timeouts
-                _ = scp_timeout_interval.tick() => {
+                // SCP nomination/ballot timeouts (single-shot via TimerManager)
+                Some(event) = scp_timer_rx.recv() => {
                     self.set_phase(26); // 26 = scp_timeout
-                    self.check_scp_timeouts().await;
+                    self.handle_scp_timer_event(event).await;
                 }
 
                 // Ping peers for latency measurements
@@ -1893,6 +1895,13 @@ impl App {
             let _ = task.await;
         }
 
+        // Shut down the SCP timer manager: send Shutdown command, then
+        // await the task handle for clean ordering.
+        self.timer_manager_handle.shutdown().await;
+        if let Some(task) = self.timer_manager_join.lock().await.take() {
+            let _ = task.await;
+        }
+
         // Explicitly flush and close the meta stream before shutting down
         // overlay connections. This ensures all streamed LedgerCloseMeta frames
         // are written to the pipe/file before the process exits. The stream
@@ -2539,6 +2548,16 @@ impl App {
                     "SCP envelope discarded (standalone manual-close mode)"
                 );
             }
+        }
+
+        // Reconcile SCP timers after processing — SCP state may have advanced.
+        if matches!(
+            envelope_result,
+            EnvelopeState::Valid | EnvelopeState::Pending
+        ) {
+            let current_ledger = self.current_ledger_seq() as u64;
+            let active_slot = self.herder.tracking_slot().get().max(current_ledger + 1);
+            self.reconcile_scp_timers(active_slot).await;
         }
     }
 

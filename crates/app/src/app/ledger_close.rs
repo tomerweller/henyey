@@ -1436,6 +1436,13 @@ impl App {
 
             *self.last_processed_slot.write().await = advance_to;
 
+            // Purge SCP timers for slots that have been externalized.
+            // advance_to is the highest fully-processed slot; timers for it
+            // and all earlier slots are stale.
+            self.timer_manager_handle
+                .purge_old_slots(advance_to + 1)
+                .await;
+
             if missing_tx_set {
                 self.request_pending_tx_sets().await;
             }
@@ -2612,6 +2619,12 @@ impl App {
         // Update current ledger tracking.
         self.set_phase_sub(phase::PHASE_6_7_LAST_PROCESSED_SLOT_WRITE);
         *self.last_processed_slot.write().await = pending.ledger_seq as u64;
+
+        // Purge SCP timers for closed slots after catchup/close.
+        self.timer_manager_handle
+            .purge_old_slots(pending.ledger_seq as u64 + 1)
+            .await;
+
         self.set_phase_sub(phase::PHASE_6_8_CLEAR_TX_ADVERT_HISTORY);
         self.clear_tx_advert_history(pending.ledger_seq).await;
 

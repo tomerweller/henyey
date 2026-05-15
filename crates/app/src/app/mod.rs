@@ -366,6 +366,7 @@ mod persist;
 mod phase;
 mod publish;
 mod scp_dedup;
+mod scp_timer_bridge;
 mod survey_impl;
 mod tracked_lock;
 mod tx_flooding;
@@ -695,8 +696,12 @@ pub struct App {
     survey_throttle: Duration,
     /// Survey reporting backlog state (surveyor-side).
     survey_reporting: RwLock<SurveyReportingState>,
-    /// SCP timeout scheduling state.
-    scp_timeouts: RwLock<ScpTimeoutState>,
+    /// SCP timer manager handle for scheduling/cancelling timers.
+    timer_manager_handle: henyey_herder::TimerManagerHandle,
+    /// SCP timer event receiver for the main loop.
+    scp_timer_rx: TokioMutex<tokio::sync::mpsc::UnboundedReceiver<scp_timer_bridge::ScpTimerEvent>>,
+    /// JoinHandle for the timer manager background task.
+    timer_manager_join: TokioMutex<Option<tokio::task::JoinHandle<()>>>,
 
     /// Metadata output stream manager for emitting LedgerCloseMeta.
     meta_stream: std::sync::Mutex<Option<MetaStreamManager>>,
@@ -1153,6 +1158,14 @@ impl App {
             ledger_manager.clone(),
         ));
 
+        // Create SCP timer manager for precise single-shot timeout delivery.
+        // Replaces the 500ms polling interval with exact-expiry timers
+        // matching stellar-core's VirtualTimer pattern.
+        let (scp_timer_tx, scp_timer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let timer_bridge = std::sync::Arc::new(scp_timer_bridge::ScpTimerBridge::new(scp_timer_tx));
+        let (timer_manager_handle, timer_manager) = henyey_herder::TimerManager::new(timer_bridge);
+        let timer_manager_join = tokio::spawn(timer_manager.run());
+
         Ok(Self {
             is_validator,
             config,
@@ -1236,7 +1249,9 @@ impl App {
             survey_results: RwLock::new(HashMap::new()),
             survey_throttle,
             survey_reporting: RwLock::new(SurveyReportingState::new(now)),
-            scp_timeouts: RwLock::new(ScpTimeoutState::new()),
+            timer_manager_handle,
+            scp_timer_rx: TokioMutex::new(scp_timer_rx),
+            timer_manager_join: TokioMutex::new(Some(timer_manager_join)),
             meta_stream: std::sync::Mutex::new(meta_stream_for_mutex),
             meta_writer,
             drift_tracker: std::sync::Mutex::new(CloseTimeDriftTracker::new()),
@@ -2093,7 +2108,11 @@ impl App {
 
         match outcome {
             henyey_herder::TriggerOutcome::Triggered
-            | henyey_herder::TriggerOutcome::AlreadyNominating => Ok(next_ledger),
+            | henyey_herder::TriggerOutcome::AlreadyNominating => {
+                // Reconcile SCP timers — nomination may have started.
+                self.reconcile_scp_timers(next_ledger as u64).await;
+                Ok(next_ledger)
+            }
             henyey_herder::TriggerOutcome::SkippedStale => Err(anyhow::anyhow!(
                 "manual close: LCL advanced during build_nomination_value; \
                  caller should retry with refreshed ledger seq"

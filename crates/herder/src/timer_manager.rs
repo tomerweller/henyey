@@ -64,6 +64,8 @@ pub enum TimerCommand {
     CancelBallotTimer { slot: SlotIndex },
     /// Purge timers for slots older than the given slot.
     PurgeOldSlots { min_slot: SlotIndex },
+    /// Cancel all active timers regardless of slot.
+    CancelAllTimers,
     /// Shutdown the timer manager.
     Shutdown,
 }
@@ -151,6 +153,11 @@ impl TimerManagerHandle {
         self.sender
             .try_send(TimerCommand::CancelSlotTimers { slot })
             .is_ok()
+    }
+
+    /// Cancel all active timers regardless of slot.
+    pub async fn cancel_all_timers(&self) {
+        let _ = self.sender.send(TimerCommand::CancelAllTimers).await;
     }
 }
 
@@ -241,6 +248,12 @@ impl<C: TimerCallback> TimerManager<C> {
                         }
                         Some(TimerCommand::PurgeOldSlots { min_slot }) => {
                             self.purge_old_slots(min_slot);
+                        }
+                        Some(TimerCommand::CancelAllTimers) => {
+                            if !self.timers.is_empty() {
+                                debug!(count = self.timers.len(), "Cancelled all timers");
+                                self.timers.clear();
+                            }
                         }
                         Some(TimerCommand::Shutdown) | None => {
                             info!("Timer manager shutting down");
@@ -403,6 +416,12 @@ impl<C: TimerCallback> TimerManagerWithStats<C> {
                         }
                         Some(TimerCommand::PurgeOldSlots { min_slot }) => {
                             self.inner.purge_old_slots(min_slot);
+                        }
+                        Some(TimerCommand::CancelAllTimers) => {
+                            if !self.inner.timers.is_empty() {
+                                debug!(count = self.inner.timers.len(), "Cancelled all timers");
+                                self.inner.timers.clear();
+                            }
                         }
                         Some(TimerCommand::Shutdown) | None => {
                             info!("Timer manager shutting down");

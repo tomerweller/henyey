@@ -207,6 +207,9 @@ impl App {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
+
+            // Reconcile SCP timers after trigger — nomination may have started.
+            self.reconcile_scp_timers(next_slot as u64).await;
         }
     }
 
@@ -1147,74 +1150,78 @@ impl App {
         }))
     }
 
-    pub(super) async fn check_scp_timeouts(&self) {
+    /// Handle a single SCP timer event from the TimerManager.
+    ///
+    /// This replaces the 500ms polling `check_scp_timeouts()` with precise
+    /// single-shot timer delivery matching stellar-core's VirtualTimer pattern.
+    pub(super) async fn handle_scp_timer_event(&self, event: scp_timer_bridge::ScpTimerEvent) {
+        // Gate: only validators process SCP timeouts
         if !self.is_validator {
             return;
         }
+        // Gate: must be in a state that can receive SCP messages
         if !self.herder.state().can_receive_scp() {
             return;
         }
+
+        // Staleness guard: compute the active slot exactly as the old
+        // check_scp_timeouts did (consensus.rs:1157-1158).
         let current_ledger = self.current_ledger_seq() as u64;
-        let slot = self.herder.tracking_slot().get().max(current_ledger + 1);
-        let now = self.clock.now();
+        let active_slot = self.herder.tracking_slot().get().max(current_ledger + 1);
+        if event.slot != active_slot {
+            // Stale event — slot advanced past this timer
+            return;
+        }
 
-        // Phase 1: decide which timeouts fired, clear them, drop guard.
-        let (fire_nomination, fire_ballot) = {
-            let mut timeouts = self.scp_timeouts.write().await;
-            if timeouts.slot != slot {
-                timeouts.slot = slot;
-                timeouts.next_nomination = None;
-                timeouts.next_ballot = None;
-            }
-
-            let nom = match timeouts.next_nomination {
-                Some(next) if now >= next => {
-                    self.nomination_timeout_fires
-                        .fetch_add(1, Ordering::Relaxed);
-                    timeouts.next_nomination = None;
-                    true
-                }
-                _ => false,
-            };
-
-            let bal = match timeouts.next_ballot {
-                Some(next) if now >= next => {
-                    self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
-                    timeouts.next_ballot = None;
-                    true
-                }
-                _ => false,
-            };
-
-            (nom, bal)
-        }; // guard dropped
-
-        // Phase 2: execute handlers without holding the guard.
-        // Nomination timeout runs on spawn_blocking because the cache-miss
-        // fallback calls build_nomination_value → cache_tx_set, which can
-        // stall the event loop (#1922).
-        if fire_nomination {
-            let outcome = self.herder.handle_nomination_timeout_blocking(slot).await;
-            if matches!(outcome, henyey_herder::TimeoutOutcome::SkippedStale) {
-                self.nomination_timeout_skipped_stale
+        // Fire the timeout handler, preserving counters and spawn_blocking
+        // for nomination (parity with the removed check_scp_timeouts).
+        match event.timer_type {
+            henyey_herder::TimerType::Nomination => {
+                self.nomination_timeout_fires
                     .fetch_add(1, Ordering::Relaxed);
+                let outcome = self
+                    .herder
+                    .handle_nomination_timeout_blocking(event.slot)
+                    .await;
+                if matches!(outcome, henyey_herder::TimeoutOutcome::SkippedStale) {
+                    self.nomination_timeout_skipped_stale
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
-        }
-        if fire_ballot {
-            self.herder.handle_ballot_timeout(slot);
+            henyey_herder::TimerType::Ballot => {
+                self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
+                self.herder.handle_ballot_timeout(event.slot);
+            }
         }
 
-        // Phase 3: reschedule next timeouts (re-acquire guard).
-        // Done after handlers execute so get_*_timeout() sees updated SCP state.
-        let mut timeouts = self.scp_timeouts.write().await;
-        if timeouts.next_nomination.is_none() {
-            if let Some(timeout) = self.herder.get_nomination_timeout(slot) {
-                timeouts.next_nomination = Some(now + timeout);
+        // Reconcile timers after state change
+        self.reconcile_scp_timers(active_slot).await;
+    }
+
+    /// Query the herder for desired SCP timeout durations and reconcile with
+    /// the TimerManager. Schedules timers when the herder wants one, cancels
+    /// when it doesn't. Called after every SCP state mutation.
+    pub(super) async fn reconcile_scp_timers(&self, slot: u64) {
+        match self.herder.get_nomination_timeout(slot) {
+            Some(dur) => {
+                self.timer_manager_handle
+                    .schedule_nomination_timeout(slot, dur)
+                    .await;
+            }
+            None => {
+                self.timer_manager_handle
+                    .cancel_nomination_timer(slot)
+                    .await;
             }
         }
-        if timeouts.next_ballot.is_none() {
-            if let Some(timeout) = self.herder.get_ballot_timeout(slot) {
-                timeouts.next_ballot = Some(now + timeout);
+        match self.herder.get_ballot_timeout(slot) {
+            Some(dur) => {
+                self.timer_manager_handle
+                    .schedule_ballot_timeout(slot, dur)
+                    .await;
+            }
+            None => {
+                self.timer_manager_handle.cancel_ballot_timer(slot).await;
             }
         }
     }
@@ -1535,6 +1542,9 @@ impl App {
             self.herder.clear_pending_tx_sets();
             self.reset_tx_set_tracking().await;
             self.reset_recovery_attempts(RecoveryResetMode::Full);
+            // Cancel all SCP timers — recovery catchup resets consensus
+            // state so any pending timers are stale.
+            self.timer_manager_handle.cancel_all_timers().await;
         }
 
         result
