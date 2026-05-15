@@ -1,4 +1,4 @@
-//! Archive upload with ordering guarantees.
+//! Archive upload with ordering guarantees and differential filtering.
 //!
 //! When publishing a checkpoint to a remote history archive, the upload order
 //! matters for atomicity: data files (buckets, ledgers, transactions, results,
@@ -10,43 +10,78 @@
 //!
 //! # Upload Ordering
 //!
-//! Files are classified into three kinds and uploaded in this order:
+//! Files are classified into four kinds and uploaded in this order:
 //!
-//! 1. **Data** — bucket files, ledger headers, transactions, results, SCP messages
+//! 1. **Bucket** / **CheckpointData** — bucket files (with hash identity) and
+//!    non-bucket data (ledger headers, transactions, results, SCP messages).
+//!    Both share upload priority 0.
 //! 2. **CheckpointHas** — permanent HAS at `history/XX/YY/ZZ/history-{hex}.json`
 //! 3. **RootHas** — `.well-known/stellar-history.json` (the commit point)
 //!
-//! Within each kind, files are sorted by remote path for deterministic ordering.
+//! Within each priority tier, files are sorted by remote path for deterministic
+//! ordering.
+//!
+//! # Differential Upload
+//!
+//! [`UploadPlan::with_differential_filter`] compares the local HAS against a
+//! remote archive's HAS and removes bucket files the remote already has. This
+//! mirrors stellar-core's `StateSnapshot::differingHASFiles()` (StateSnapshot.cpp:110).
 //!
 //! # Failure Semantics
 //!
-//! If any Data or CheckpointHas upload fails, execution stops immediately and
+//! If any data or CheckpointHas upload fails, execution stops immediately and
 //! the RootHas is never attempted. This prevents clients from seeing a HAS
 //! that references files not yet present on the archive.
 
+use crate::archive_state::HistoryArchiveState;
 use crate::{paths, HistoryError, Result};
+use henyey_common::Hash256;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Classification of a file for upload ordering.
+/// Classification of a file for upload ordering and differential filtering.
 ///
-/// The `Ord` derivation encodes the upload order: `Data < CheckpointHas < RootHas`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// `Bucket` and `CheckpointData` share upload priority 0 (both are data files
+/// that must precede HAS uploads). `Bucket` entries carry a [`Hash256`] for
+/// differential filtering — only differing buckets need uploading when the
+/// remote archive already has some.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UploadFileKind {
-    /// Bucket files, ledger headers, transactions, results, SCP messages.
-    /// Uploaded first.
-    Data,
+    /// Bucket data file with its hash for differential filtering.
+    /// Uploaded in priority tier 0 (same as `CheckpointData`).
+    Bucket(Hash256),
+    /// Non-bucket data: ledger headers, transactions, results, SCP messages.
+    /// Uploaded in priority tier 0 (same as `Bucket`).
+    CheckpointData,
     /// Permanent HAS at `history/XX/YY/ZZ/history-{hex}.json`.
-    /// Uploaded after all data files.
+    /// Uploaded after all data files (priority tier 1).
     CheckpointHas,
     /// Root HAS at `.well-known/stellar-history.json`.
-    /// The commit point — uploaded last.
+    /// The commit point — uploaded last (priority tier 2).
     RootHas,
 }
 
 impl UploadFileKind {
+    /// Sort priority for upload ordering. Lower values upload first.
+    /// `Bucket` and `CheckpointData` share priority 0.
+    pub fn sort_priority(&self) -> u8 {
+        match self {
+            Self::Bucket(_) | Self::CheckpointData => 0,
+            Self::CheckpointHas => 1,
+            Self::RootHas => 2,
+        }
+    }
+
+    /// Returns `true` if this is a data file (bucket or checkpoint data).
+    pub fn is_data(&self) -> bool {
+        self.sort_priority() == 0
+    }
+
     /// Classify a file by its relative path within the staging directory.
     ///
     /// The path must be a normalized relative path (no leading `/` or `.`).
+    /// Bucket files matching `bucket/XX/YY/ZZ/bucket-{64hex}.xdr.gz` are
+    /// classified as `Bucket(hash)`; all other data files are `CheckpointData`.
     pub fn classify(relative_path: &Path) -> Self {
         let path_str = path_to_unix_string(relative_path);
 
@@ -64,35 +99,67 @@ impl UploadFileKind {
             }
         }
 
-        // Everything else is data (including unexpected files — conservative choice).
-        Self::Data
+        // Bucket files: bucket/XX/YY/ZZ/bucket-{64hex}.xdr.gz
+        if let Some(hash) = extract_bucket_hash(&path_str) {
+            return Self::Bucket(hash);
+        }
+
+        // Everything else is non-bucket data.
+        Self::CheckpointData
     }
 }
 
+/// Extract a bucket hash from a path like `bucket/XX/YY/ZZ/bucket-{64hex}.xdr.gz`.
+/// Returns `None` if the path doesn't match the bucket pattern.
+fn extract_bucket_hash(path: &str) -> Option<Hash256> {
+    // Must start with "bucket/" and contain "/bucket-"
+    if !path.starts_with("bucket/") {
+        return None;
+    }
+    let file_name = path.rsplit('/').next()?;
+    let hex = file_name.strip_prefix("bucket-")?.strip_suffix(".xdr.gz")?;
+    if hex.len() != 64 {
+        return None;
+    }
+    Hash256::from_hex(hex).ok()
+}
+
 /// A single file entry in an upload plan.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UploadEntry {
     /// Absolute path to the local file.
     pub local_path: PathBuf,
     /// Relative path used as the remote destination.
     pub remote_path: String,
-    /// Classification determining upload order.
+    /// Classification determining upload order and differential filtering.
     pub kind: UploadFileKind,
 }
 
 /// An ordered upload plan for a checkpoint staging directory.
 ///
-/// Entries are sorted by `(kind, remote_path)` to guarantee:
-/// - All `Data` files upload before any `CheckpointHas` files
+/// Entries are sorted by `(kind.sort_priority(), remote_path)` to guarantee:
+/// - All `Bucket` and `CheckpointData` files upload before any `CheckpointHas`
 /// - All `CheckpointHas` files upload before `RootHas`
-/// - Within each kind, files are in deterministic alphabetical order
+/// - Within each priority tier, files are in deterministic alphabetical order
+///
+/// # Differential Upload
+///
+/// Use [`with_differential_filter`](UploadPlan::with_differential_filter) to
+/// create a filtered plan that skips bucket files already present on the remote
+/// archive.
 ///
 /// # Testing
 ///
 /// Use [`entries()`](UploadPlan::entries) to inspect the plan without executing
 /// any shell commands.
+#[derive(Clone)]
 pub struct UploadPlan {
     entries: Vec<UploadEntry>,
+}
+
+/// Sort key for upload entries: `(sort_priority, remote_path)`.
+fn entry_sort_key(entry: &UploadEntry) -> (u8, &str) {
+    (entry.kind.sort_priority(), &entry.remote_path)
 }
 
 impl UploadPlan {
@@ -119,14 +186,43 @@ impl UploadPlan {
             })
             .collect();
 
-        // Sort by (kind, remote_path) for deterministic, correctly-ordered upload.
-        entries.sort_by(|a, b| {
-            a.kind
-                .cmp(&b.kind)
-                .then_with(|| a.remote_path.cmp(&b.remote_path))
-        });
+        entries.sort_by(|a, b| entry_sort_key(a).cmp(&entry_sort_key(b)));
 
         Ok(Self { entries })
+    }
+
+    /// Create a filtered upload plan that only includes bucket files the remote
+    /// archive is missing, plus all non-bucket files unconditionally.
+    ///
+    /// Computes `local_has.all_differing_bucket_hashes(remote_has)` to find
+    /// which buckets the local state has that the remote does not, then keeps
+    /// only those `Bucket` entries. All `CheckpointData`, `CheckpointHas`, and
+    /// `RootHas` entries pass through unchanged.
+    ///
+    /// This mirrors stellar-core's `StateSnapshot::differingHASFiles()`
+    /// (StateSnapshot.cpp:110-145) which computes per-archive differential
+    /// uploads in `PutFilesWork`.
+    pub fn with_differential_filter(
+        &self,
+        local_has: &HistoryArchiveState,
+        remote_has: &HistoryArchiveState,
+    ) -> Self {
+        let needed: HashSet<Hash256> = local_has
+            .all_differing_bucket_hashes(remote_has)
+            .into_iter()
+            .collect();
+
+        let entries = self
+            .entries
+            .iter()
+            .filter(|e| match &e.kind {
+                UploadFileKind::Bucket(hash) => needed.contains(hash),
+                _ => true,
+            })
+            .cloned()
+            .collect();
+
+        Self { entries }
     }
 
     /// Access the ordered entries for inspection or testing.
@@ -222,20 +318,23 @@ mod tests {
     use super::*;
     use std::fs;
 
+    // Full 64-hex hashes for bucket test files.
+    const BUCKET_HASH_A: &str = "aabbccdd00000000000000000000000000000000000000000000000000000000";
+    const BUCKET_HASH_B: &str = "1122334400000000000000000000000000000000000000000000000000000000";
+
     /// Create a staging directory with representative checkpoint files.
     fn create_staging_dir(dir: &Path) {
-        // Data files
         let files = [
-            "bucket/aa/bb/cc/bucket-aabbccdd.xdr.gz",
-            "bucket/11/22/33/bucket-11223344.xdr.gz",
-            "ledger/00/00/00/ledger-0000003f.xdr.gz",
-            "transactions/00/00/00/transactions-0000003f.xdr.gz",
-            "results/00/00/00/results-0000003f.xdr.gz",
-            "scp/00/00/00/scp-0000003f.xdr.gz",
+            format!("bucket/aa/bb/cc/bucket-{BUCKET_HASH_A}.xdr.gz"),
+            format!("bucket/11/22/33/bucket-{BUCKET_HASH_B}.xdr.gz"),
+            "ledger/00/00/00/ledger-0000003f.xdr.gz".to_string(),
+            "transactions/00/00/00/transactions-0000003f.xdr.gz".to_string(),
+            "results/00/00/00/results-0000003f.xdr.gz".to_string(),
+            "scp/00/00/00/scp-0000003f.xdr.gz".to_string(),
             // Permanent HAS
-            "history/00/00/00/history-0000003f.json",
+            "history/00/00/00/history-0000003f.json".to_string(),
             // Root HAS (commit point)
-            ".well-known/stellar-history.json",
+            ".well-known/stellar-history.json".to_string(),
         ];
         for f in &files {
             let path = dir.join(f);
@@ -257,9 +356,16 @@ mod tests {
     }
 
     #[test]
-    fn classify_data_files() {
+    fn classify_bucket_extracts_hash() {
+        let path_str = format!("bucket/aa/bb/cc/bucket-{BUCKET_HASH_A}.xdr.gz");
+        let kind = UploadFileKind::classify(Path::new(&path_str));
+        let expected_hash = Hash256::from_hex(BUCKET_HASH_A).unwrap();
+        assert_eq!(kind, UploadFileKind::Bucket(expected_hash));
+    }
+
+    #[test]
+    fn classify_non_bucket_data() {
         for path in [
-            "bucket/aa/bb/cc/bucket-aabbccdd.xdr.gz",
             "ledger/00/00/00/ledger-0000003f.xdr.gz",
             "transactions/00/00/00/transactions-0000003f.xdr.gz",
             "results/00/00/00/results-0000003f.xdr.gz",
@@ -267,23 +373,47 @@ mod tests {
         ] {
             assert_eq!(
                 UploadFileKind::classify(Path::new(path)),
-                UploadFileKind::Data,
-                "expected Data for {path}"
+                UploadFileKind::CheckpointData,
+                "expected CheckpointData for {path}"
             );
         }
     }
 
     #[test]
-    fn classify_unexpected_file_as_data() {
+    fn classify_unexpected_file_as_checkpoint_data() {
         let p = Path::new("some/unexpected/file.txt");
-        assert_eq!(UploadFileKind::classify(p), UploadFileKind::Data);
+        assert_eq!(UploadFileKind::classify(p), UploadFileKind::CheckpointData);
     }
 
     #[test]
     fn classify_history_file_not_under_history_dir() {
-        // A file named history-*.json but not under history/ should be Data
+        // A file named history-*.json but not under history/ should be CheckpointData
         let p = Path::new("other/history-0000003f.json");
-        assert_eq!(UploadFileKind::classify(p), UploadFileKind::Data);
+        assert_eq!(UploadFileKind::classify(p), UploadFileKind::CheckpointData);
+    }
+
+    #[test]
+    fn classify_bucket_short_hash_is_checkpoint_data() {
+        // Bucket path with too-short hash should not be Bucket
+        let p = Path::new("bucket/aa/bb/cc/bucket-aabbccdd.xdr.gz");
+        assert_eq!(UploadFileKind::classify(p), UploadFileKind::CheckpointData);
+    }
+
+    #[test]
+    fn extract_bucket_hash_valid() {
+        let path = format!("bucket/aa/bb/cc/bucket-{BUCKET_HASH_A}.xdr.gz");
+        let hash = extract_bucket_hash(&path).unwrap();
+        assert_eq!(hash, Hash256::from_hex(BUCKET_HASH_A).unwrap());
+    }
+
+    #[test]
+    fn extract_bucket_hash_non_bucket() {
+        assert!(extract_bucket_hash("ledger/00/00/00/ledger-0000003f.xdr.gz").is_none());
+    }
+
+    #[test]
+    fn extract_bucket_hash_short_hex() {
+        assert!(extract_bucket_hash("bucket/aa/bb/cc/bucket-aabbccdd.xdr.gz").is_none());
     }
 
     #[test]
@@ -294,19 +424,17 @@ mod tests {
         let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
         let entries = plan.entries();
 
-        // Verify all Data entries come first, then CheckpointHas, then RootHas
-        let kinds: Vec<_> = entries.iter().map(|e| e.kind).collect();
+        // Verify all data entries come first, then CheckpointHas, then RootHas
+        let priorities: Vec<_> = entries.iter().map(|e| e.kind.sort_priority()).collect();
 
-        let last_data = kinds.iter().rposition(|k| *k == UploadFileKind::Data);
-        let first_checkpoint_has = kinds
-            .iter()
-            .position(|k| *k == UploadFileKind::CheckpointHas);
-        let first_root_has = kinds.iter().position(|k| *k == UploadFileKind::RootHas);
+        let last_data = priorities.iter().rposition(|p| *p == 0);
+        let first_checkpoint_has = priorities.iter().position(|p| *p == 1);
+        let first_root_has = priorities.iter().position(|p| *p == 2);
 
         if let (Some(ld), Some(fch)) = (last_data, first_checkpoint_has) {
             assert!(
                 ld < fch,
-                "last Data entry (index {ld}) must come before first CheckpointHas (index {fch})"
+                "last data entry (index {ld}) must come before first CheckpointHas (index {fch})"
             );
         }
         if let (Some(fch), Some(frh)) = (first_checkpoint_has, first_root_has) {
@@ -322,14 +450,10 @@ mod tests {
             UploadFileKind::RootHas,
             "root HAS must be the last entry"
         );
-        assert_eq!(
-            entries.last().unwrap().remote_path,
-            ".well-known/stellar-history.json"
-        );
     }
 
     #[test]
-    fn plan_deterministic_within_kind() {
+    fn plan_deterministic_within_priority() {
         let dir = tempfile::tempdir().unwrap();
         create_staging_dir(dir.path());
 
@@ -337,17 +461,134 @@ mod tests {
         let data_paths: Vec<_> = plan
             .entries()
             .iter()
-            .filter(|e| e.kind == UploadFileKind::Data)
+            .filter(|e| e.kind.is_data())
             .map(|e| e.remote_path.as_str())
             .collect();
 
-        // Must be sorted
         let mut sorted = data_paths.clone();
         sorted.sort();
         assert_eq!(
             data_paths, sorted,
             "Data entries must be sorted by remote_path"
         );
+    }
+
+    #[test]
+    fn differential_filter_removes_present_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        create_staging_dir(dir.path());
+        let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
+
+        // Count bucket entries in base plan
+        let bucket_count = plan
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.kind, UploadFileKind::Bucket(_)))
+            .count();
+        assert_eq!(bucket_count, 2);
+
+        // Create a local HAS with only bucket A and a remote HAS with bucket A
+        // → differential should yield 0 needed buckets if both have the same
+        // But here we test: remote has all buckets → filtered plan has 0 buckets
+        let hash_a = Hash256::from_hex(BUCKET_HASH_A).unwrap();
+        let hash_b = Hash256::from_hex(BUCKET_HASH_B).unwrap();
+
+        // Build HAS where local has A+B, remote has A+B (identical)
+        let local_has = test_has_with_buckets(&[hash_a, hash_b]);
+        let remote_has = test_has_with_buckets(&[hash_a, hash_b]);
+
+        let filtered = plan.with_differential_filter(&local_has, &remote_has);
+        let filtered_bucket_count = filtered
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.kind, UploadFileKind::Bucket(_)))
+            .count();
+        assert_eq!(
+            filtered_bucket_count, 0,
+            "identical states should yield no bucket uploads"
+        );
+
+        // Non-bucket entries should all be present
+        let non_bucket_base = plan
+            .entries()
+            .iter()
+            .filter(|e| !matches!(e.kind, UploadFileKind::Bucket(_)))
+            .count();
+        let non_bucket_filtered = filtered
+            .entries()
+            .iter()
+            .filter(|e| !matches!(e.kind, UploadFileKind::Bucket(_)))
+            .count();
+        assert_eq!(non_bucket_base, non_bucket_filtered);
+    }
+
+    #[test]
+    fn differential_filter_keeps_needed_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        create_staging_dir(dir.path());
+        let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
+
+        let hash_a = Hash256::from_hex(BUCKET_HASH_A).unwrap();
+        let hash_b = Hash256::from_hex(BUCKET_HASH_B).unwrap();
+
+        // Local has A+B, remote has only A → B is needed
+        let local_has = test_has_with_buckets(&[hash_a, hash_b]);
+        let remote_has = test_has_with_buckets(&[hash_a]);
+
+        let filtered = plan.with_differential_filter(&local_has, &remote_has);
+        let filtered_buckets: Vec<_> = filtered
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                UploadFileKind::Bucket(h) => Some(*h),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(filtered_buckets.len(), 1);
+        assert_eq!(filtered_buckets[0], hash_b);
+    }
+
+    #[test]
+    fn differential_filter_empty_remote_keeps_all() {
+        let dir = tempfile::tempdir().unwrap();
+        create_staging_dir(dir.path());
+        let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
+
+        let hash_a = Hash256::from_hex(BUCKET_HASH_A).unwrap();
+        let hash_b = Hash256::from_hex(BUCKET_HASH_B).unwrap();
+
+        // Local has A+B, remote is empty → all needed
+        let local_has = test_has_with_buckets(&[hash_a, hash_b]);
+        let remote_has = test_has_with_buckets(&[]);
+
+        let filtered = plan.with_differential_filter(&local_has, &remote_has);
+        assert_eq!(filtered.entries().len(), plan.entries().len());
+    }
+
+    /// Build a minimal HAS with specific bucket hashes for testing differential logic.
+    fn test_has_with_buckets(hashes: &[Hash256]) -> HistoryArchiveState {
+        use crate::archive_state::HASBucketLevel;
+        let zero = Hash256::ZERO.to_hex();
+        let mut levels = Vec::new();
+        for (i, chunk) in hashes.chunks(2).enumerate() {
+            let curr = if !chunk.is_empty() {
+                chunk[0].to_hex()
+            } else {
+                zero.clone()
+            };
+            let snap = if chunk.len() > 1 {
+                chunk[1].to_hex()
+            } else {
+                zero.clone()
+            };
+            levels.push(HASBucketLevel::new_from_hashes(curr, snap));
+            let _ = i;
+        }
+        // Pad to 11 levels (standard bucket list depth)
+        while levels.len() < 11 {
+            levels.push(HASBucketLevel::new_from_hashes(zero.clone(), zero.clone()));
+        }
+        HistoryArchiveState::new_for_testing(63, levels)
     }
 
     #[test]
@@ -358,14 +599,12 @@ mod tests {
 
         let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
 
-        // put command that logs the remote path
         let put_cmd = format!("echo {{1}} >> {}", log_file.display());
         plan.execute(&put_cmd, None).unwrap();
 
         let log = fs::read_to_string(&log_file).unwrap();
         let uploaded: Vec<&str> = log.lines().collect();
 
-        // Find indices
         let root_has_idx = uploaded
             .iter()
             .position(|p| *p == ".well-known/stellar-history.json")
@@ -375,7 +614,6 @@ mod tests {
             .position(|p| p.starts_with("history/") && p.contains("history-"))
             .expect("checkpoint HAS must be uploaded");
 
-        // All data files must come before checkpoint HAS
         for (i, path) in uploaded.iter().enumerate() {
             if *path != ".well-known/stellar-history.json"
                 && !(path.starts_with("history/") && path.contains("history-"))
@@ -387,7 +625,6 @@ mod tests {
             }
         }
 
-        // Root HAS must be last
         assert_eq!(
             root_has_idx,
             uploaded.len() - 1,
@@ -403,15 +640,13 @@ mod tests {
 
         let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
 
-        // Find a data file to fail on
         let fail_path = plan
             .entries()
             .iter()
-            .find(|e| e.kind == UploadFileKind::Data)
+            .find(|e| e.kind.is_data())
             .map(|e| e.remote_path.clone())
             .unwrap();
 
-        // put command that fails on the specific file, logs otherwise
         let put_cmd = format!(
             "if [ \"{{1}}\" = \"{}\" ]; then exit 1; fi; echo {{1}} >> {}",
             fail_path,
@@ -421,7 +656,6 @@ mod tests {
         let result = plan.execute(&put_cmd, None);
         assert!(result.is_err(), "upload should fail");
 
-        // Root HAS must not have been attempted
         if log_file.exists() {
             let log = fs::read_to_string(&log_file).unwrap();
             assert!(
@@ -447,7 +681,6 @@ mod tests {
         let log = fs::read_to_string(&log_file).unwrap();
         let lines: Vec<&str> = log.lines().collect();
 
-        // For each PUT, verify its parent MKDIR came before it
         for (i, line) in lines.iter().enumerate() {
             if let Some(remote_path) = line.strip_prefix("PUT ") {
                 if let Some(parent) = Path::new(remote_path).parent() {

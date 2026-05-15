@@ -868,6 +868,35 @@ impl HistoryArchiveState {
     }
 }
 
+impl HASBucketLevel {
+    /// Create a bucket level from curr/snap hex hashes (for testing and
+    /// programmatic HAS construction).
+    pub fn new_from_hashes(curr: String, snap: String) -> Self {
+        Self {
+            curr,
+            snap,
+            next: HASBucketNext::default(),
+        }
+    }
+}
+
+impl HistoryArchiveState {
+    /// Build a minimal HAS for testing with specified bucket levels.
+    /// The levels vector should have exactly `BUCKET_LIST_LEVELS` entries
+    /// for a fully valid HAS, but fewer levels are accepted for focused tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_testing(ledger: u32, current_buckets: Vec<HASBucketLevel>) -> Self {
+        Self {
+            version: 1,
+            server: None,
+            current_ledger: ledger,
+            network_passphrase: None,
+            current_buckets,
+            hot_archive_buckets: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

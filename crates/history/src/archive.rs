@@ -475,6 +475,89 @@ pub mod mainnet {
     pub const NETWORK_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
 }
 
+/// Fetch the root History Archive State from a URL, blocking.
+///
+/// Supports HTTP/HTTPS URLs, `file://` URLs, and bare local paths.
+/// This is used in the synchronous publish path (`spawn_blocking`) to
+/// enable differential bucket uploads.
+///
+/// # Arguments
+///
+/// * `url` - The archive base URL (e.g., `https://history.stellar.org/...`,
+///   `file:///path/to/archive`, or `/path/to/archive`)
+///
+/// # Returns
+///
+/// The parsed `HistoryArchiveState`, or an error if fetching/parsing fails.
+/// The caller is responsible for deciding fallback behavior on error.
+pub fn fetch_root_has_blocking(url: &str) -> Result<HistoryArchiveState, HistoryError> {
+    use std::time::Duration;
+
+    let root_has = root_has_path();
+
+    // Try to parse as a URL first.
+    match Url::parse(url) {
+        Ok(parsed) => match parsed.scheme() {
+            "http" | "https" => {
+                let mut base = parsed;
+                if !base.path().ends_with('/') {
+                    base.set_path(&format!("{}/", base.path()));
+                }
+                let full_url = base
+                    .join(root_has)
+                    .map_err(|e| HistoryError::DownloadFailed(e.to_string()))?;
+
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .map_err(|e| HistoryError::DownloadFailed(e.to_string()))?;
+
+                let resp = client
+                    .get(full_url.as_str())
+                    .send()
+                    .map_err(|e| HistoryError::DownloadFailed(e.to_string()))?;
+
+                if !resp.status().is_success() {
+                    return Err(HistoryError::DownloadFailed(format!(
+                        "{}: HTTP {}",
+                        full_url,
+                        resp.status()
+                    )));
+                }
+
+                let text = resp
+                    .text()
+                    .map_err(|e| HistoryError::InvalidResponse(e.to_string()))?;
+
+                HistoryArchiveState::from_json(&text)
+            }
+            "file" => {
+                let path = parsed.to_file_path().map_err(|_| {
+                    HistoryError::DownloadFailed(format!("Invalid file URL: {}", url))
+                })?;
+                read_has_from_path(&path)
+            }
+            scheme => Err(HistoryError::DownloadFailed(format!(
+                "Unsupported URL scheme: {}",
+                scheme
+            ))),
+        },
+        // Not a valid URL — treat as a bare local path.
+        Err(_) => {
+            let path = std::path::PathBuf::from(url);
+            read_has_from_path(&path)
+        }
+    }
+}
+
+/// Read the root HAS from a local filesystem path.
+fn read_has_from_path(base_path: &std::path::Path) -> Result<HistoryArchiveState, HistoryError> {
+    let has_path = base_path.join(root_has_path());
+    let text = std::fs::read_to_string(&has_path)
+        .map_err(|e| HistoryError::DownloadFailed(format!("{}: {}", has_path.display(), e)))?;
+    HistoryArchiveState::from_json(&text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,5 +706,60 @@ mod tests {
         let archive =
             HistoryArchive::new("https://history.stellar.org/prd/core-live/core_live_003").unwrap();
         assert_eq!(archive.name(), "core_live_003");
+    }
+
+    /// Helper to create a minimal valid HAS JSON for testing.
+    fn minimal_has_json(ledger: u32) -> String {
+        let zero = "0000000000000000000000000000000000000000000000000000000000000000";
+        let zero_level = format!(
+            r#"{{"curr":"{}","snap":"{}","next":{{"state":0}}}}"#,
+            zero, zero
+        );
+        let levels = std::iter::repeat(zero_level.as_str())
+            .take(11)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"version":1,"currentLedger":{},"currentBuckets":[{}]}}"#,
+            ledger, levels
+        )
+    }
+
+    #[test]
+    fn test_fetch_root_has_blocking_bare_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let well_known = dir.path().join(".well-known");
+        std::fs::create_dir_all(&well_known).unwrap();
+        std::fs::write(
+            well_known.join("stellar-history.json"),
+            minimal_has_json(63),
+        )
+        .unwrap();
+
+        let has = fetch_root_has_blocking(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(has.current_ledger(), 63);
+    }
+
+    #[test]
+    fn test_fetch_root_has_blocking_file_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let well_known = dir.path().join(".well-known");
+        std::fs::create_dir_all(&well_known).unwrap();
+        std::fs::write(
+            well_known.join("stellar-history.json"),
+            minimal_has_json(127),
+        )
+        .unwrap();
+
+        let url = format!("file://{}", dir.path().display());
+        let has = fetch_root_has_blocking(&url).unwrap();
+        assert_eq!(has.current_ledger(), 127);
+    }
+
+    #[test]
+    fn test_fetch_root_has_blocking_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = fetch_root_has_blocking(dir.path().to_str().unwrap());
+        assert!(result.is_err());
     }
 }

@@ -338,10 +338,44 @@ impl App {
 
         // Upload to each command-based archive.
         // Uses UploadPlan to guarantee data-before-HAS ordering (see upload module).
-        let plan = henyey_history::upload::UploadPlan::from_staging_dir(&publish_dir)?;
+        // For each archive, attempt differential upload: fetch the remote HAS and
+        // skip bucket files already present. Falls back to full upload on error.
+        let base_plan = henyey_history::upload::UploadPlan::from_staging_dir(&publish_dir)?;
         for archive in archives {
             let put_cmd = archive.put.as_ref().unwrap();
             let mkdir_cmd = archive.mkdir.as_deref();
+
+            let plan = match henyey_history::archive::fetch_root_has_blocking(&archive.url) {
+                Ok(remote_has) => {
+                    if remote_has.current_ledger() >= has.current_ledger() {
+                        tracing::info!(
+                            archive = %archive.name,
+                            remote_ledger = remote_has.current_ledger(),
+                            local_ledger = has.current_ledger(),
+                            "Remote archive is ahead or equal; skipping upload"
+                        );
+                        continue;
+                    }
+                    let filtered = base_plan
+                        .clone()
+                        .with_differential_filter(&has, &remote_has);
+                    tracing::info!(
+                        archive = %archive.name,
+                        total = base_plan.entries().len(),
+                        filtered = filtered.entries().len(),
+                        "Differential upload: skipping already-present buckets"
+                    );
+                    filtered
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        archive = %archive.name,
+                        error = %e,
+                        "Failed to fetch remote HAS; uploading all files"
+                    );
+                    base_plan.clone()
+                }
+            };
 
             plan.execute(put_cmd, mkdir_cmd)?;
         }
