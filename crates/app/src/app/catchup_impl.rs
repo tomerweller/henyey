@@ -2341,10 +2341,6 @@ impl App {
                     if let Some(flag) = self.overlay_tracking.lock().unwrap().as_ref() {
                         flag.store(true, Ordering::Relaxed);
                     }
-                    // Re-arm overlay synced — node is back in sync after catchup.
-                    if let Some(flag) = self.overlay_synced.lock().unwrap().as_ref() {
-                        flag.store(true, Ordering::Relaxed);
-                    }
                     self.herder.purge_slots_below(result.ledger_seq as u64);
                     let cleaned = self
                         .herder

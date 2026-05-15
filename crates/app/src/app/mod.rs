@@ -1688,6 +1688,10 @@ impl App {
         } else {
             self.set_state(AppState::Synced).await;
         }
+        // Re-arm overlay flood acceptance now that the node is operational.
+        if let Some(flag) = self.overlay_synced.lock().unwrap().as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         // Reset log throttles so a fresh sync-loss episode produces fresh
         // info/warn-level logs.
         self.recovery_throttles.reset_all();
