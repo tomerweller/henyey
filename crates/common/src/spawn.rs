@@ -21,6 +21,14 @@ use tracing::{error, warn};
 ///
 /// Callers that need domain-specific context (e.g., `ledger_seq`) should log
 /// an additional line when handling the `Err` case.
+///
+/// # Fairness-sensitive callers
+///
+/// This is the split-await building block for callers that need a yield point
+/// between spawn and await. To insert that yield point, the **caller** must
+/// call `tokio::task::yield_now().await` before invoking this helper — this
+/// function does not yield on its own. See [`spawn_blocking_logged`] docs for
+/// the full pattern.
 pub async fn await_blocking_logged<T>(
     context: &str,
     handle: JoinHandle<T>,
@@ -43,6 +51,30 @@ pub async fn await_blocking_logged<T>(
 /// Convenience wrapper: spawns on the blocking pool and immediately awaits.
 /// Use [`await_blocking_logged`] when you need to do work between spawn and
 /// await (e.g., setting a phase marker).
+///
+/// # Fairness
+///
+/// This helper provides no guaranteed yield point between spawn and await. If
+/// the `JoinHandle` is already ready on first poll (e.g., the blocking closure
+/// returned quickly), the calling task continues in the same poll cycle without
+/// yielding to the executor. In repeated or hot-path calls this can prevent
+/// co-scheduled async tasks from being polled.
+///
+/// For **one-shot or infrequent** calls (maintenance endpoints, startup code,
+/// once-per-ledger operations) this is fine — use this helper for simplicity.
+///
+/// For **hot-path or fairness-sensitive** calls where co-scheduled tasks must
+/// make progress during the blocking work, split the spawn from the await and
+/// insert a yield point:
+///
+/// ```ignore
+/// let handle = tokio::task::spawn_blocking(move || { /* work */ });
+/// tokio::task::yield_now().await; // guarantee a scheduling point
+/// await_blocking_logged("context", handle).await
+/// ```
+///
+/// See <https://github.com/stellar-experimental/henyey/issues/2716> for the
+/// motivating incident.
 pub async fn spawn_blocking_logged<T, F>(context: &str, f: F) -> Result<T, tokio::task::JoinError>
 where
     T: Send + 'static,
