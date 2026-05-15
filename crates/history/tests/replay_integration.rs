@@ -369,25 +369,27 @@ async fn test_catchup_replay_bucket_hash_verification() {
     assert_eq!(final_header.ledger_seq, target);
 }
 
-/// Test that Recent(N) with a gap larger than N triggers the bucket-apply +
-/// short-replay path (Case 1b → Case 5 in CatchupRange).
+/// Test that Recent(N) with a gap larger than N now replays from LCL+1
+/// (stellar-core parity / INV-C15). Previously this triggered bucket-apply +
+/// short-replay (Case 1b), but that optimization was removed because it
+/// violated the INV-C15 invariant that bucket-apply must not target a ledger
+/// older than LCL.
 ///
 /// Scenario: LCL=100, target=200, Recent(50) → gap=100 > 50
-/// Expected: apply_buckets at checkpoint 127, replay 128..200 (73 ledgers)
+/// Expected: ReplayOnly from LCL+1=101 to target=200 (100 ledgers)
+///
+/// Since replay requires an initialized ledger manager (existing state at LCL),
+/// this test verifies that catchup with mode=Recent and lcl>genesis works when
+/// the ledger manager is pre-initialized.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_catchup_recent_large_gap_bucket_apply() {
+async fn test_catchup_recent_large_gap_replays_with_parity() {
     use henyey_history::CatchupMode;
     use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase, TransactionSetV1};
 
-    let bucket_apply_at = 127u32; // checkpoint where buckets are applied
     let target = 200u32;
     let lcl = 100u32;
 
-    // Compute the empty bucket list hash for the checkpoint header.
-    let bucket_list = empty_bucket_list();
-    let checkpoint_bucket_hash = combined_bucket_list_hash(bucket_list.hash());
-
-    // Pre-compute the empty tx result hash (same for every ledger).
+    // Pre-compute empty tx result hash.
     let empty_result_set = TransactionResultSet {
         results: VecM::default(),
     };
@@ -397,7 +399,6 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
     let empty_tx_result_hash = Hash256::hash(&empty_result_xdr);
 
     // Helper: compute the generalized empty tx set hash for a given prev_hash.
-    // This must match what `make_empty_tx_set` produces for lcl_protocol >= 23.
     let compute_empty_gen_tx_set_hash = |prev_hash: &Hash256| -> Hash256 {
         let classic_phase = TransactionPhase::V0(VecM::default());
         let soroban_phase = henyey_tx::tx_set_xdr::empty_soroban_phase();
@@ -411,31 +412,29 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
         henyey_history::verify::compute_tx_set_hash(&gen_set_variant).expect("tx set hash")
     };
 
-    // Build a header chain from ledger 127 (bucket-apply checkpoint) to 200 (target).
-    // Ledger 127 is the checkpoint header; 128..200 are replayed.
+    // Build a header chain from ledger 100 (LCL) to 200 (target).
+    // Ledger 100 is the LCL; 101..200 are replayed.
     let mut headers: Vec<(u32, LedgerHeader, Hash256)> = Vec::new();
 
-    // Ledger 127: checkpoint header
-    // Use Hash256::ZERO for prev_hash (we don't verify chain anchors in this test).
-    // tx_set_hash is not verified for the checkpoint header itself (only for replayed ledgers).
-    let header_127 = make_header(
-        bucket_apply_at,
+    // Ledger 100: LCL header (used for ledger manager init)
+    let header_100 = make_header(
+        lcl,
         Hash256::ZERO,
-        checkpoint_bucket_hash,
-        Hash256::ZERO, // tx_set_hash not checked for checkpoint header
-        Hash256::ZERO, // tx_result_hash not checked for checkpoint header
+        Hash256::ZERO, // bucket_list_hash
+        Hash256::ZERO, // tx_set_hash not checked
+        Hash256::ZERO, // tx_result_hash not checked
     );
-    let hash_127 = verify::compute_header_hash(&header_127).expect("header hash 127");
-    headers.push((bucket_apply_at, header_127, hash_127));
+    let hash_100 = verify::compute_header_hash(&header_100).expect("header hash 100");
+    headers.push((lcl, header_100.clone(), hash_100));
 
-    // Ledgers 128..200: replayed ledgers with correct hash chain
-    let mut prev_hash = hash_127;
-    for seq in (bucket_apply_at + 1)..=target {
+    // Ledgers 101..200: replayed ledgers with correct hash chain
+    let mut prev_hash = hash_100;
+    for seq in (lcl + 1)..=target {
         let tx_set_hash = compute_empty_gen_tx_set_hash(&prev_hash);
         let header = make_header(
             seq,
             prev_hash,
-            Hash256::ZERO, // bucket_list_hash not verified (verify_bucket_list=false)
+            Hash256::ZERO, // bucket_list_hash not verified
             tx_set_hash,
             empty_tx_result_hash,
         );
@@ -445,12 +444,11 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
     }
 
     // Group headers into checkpoint files.
-    // Checkpoint 127: ledgers 64-127 (we only have 127)
+    // Checkpoint 127: ledgers 64-127 (we have 100-127)
     // Checkpoint 191: ledgers 128-191
     // Checkpoint 255: ledgers 192-255 (we only have 192-200)
     let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
 
-    // Build header XDR per checkpoint
     for &checkpoint in &[127u32, 191, 255] {
         let entries: Vec<Vec<u8>> = headers
             .iter()
@@ -476,9 +474,8 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
         }
     }
 
-    // Empty transaction and result files for checkpoints 191 and 255
-    // (download_ledger_data only downloads from checkpoint_seq+1 = 128 to target = 200)
-    for &checkpoint in &[191u32, 255] {
+    // Empty transaction and result files for checkpoints that contain replayed ledgers
+    for &checkpoint in &[127u32, 191, 255] {
         fixtures.insert(
             checkpoint_path("transactions", checkpoint, "xdr.gz"),
             gzip_bytes(&[]),
@@ -488,28 +485,6 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
             gzip_bytes(&[]),
         );
     }
-
-    // HAS at checkpoint 127
-    let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
-    for _ in 0..BUCKET_LIST_LEVELS {
-        levels.push(HASBucketLevel {
-            curr: "0".repeat(64),
-            snap: "0".repeat(64),
-            next: Default::default(),
-        });
-    }
-    let has = HistoryArchiveState {
-        version: 2,
-        server: Some("henyey test".to_string()),
-        current_ledger: bucket_apply_at,
-        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
-        current_buckets: levels,
-        hot_archive_buckets: make_test_hot_archive_buckets(),
-    };
-    fixtures.insert(
-        checkpoint_path("history", bucket_apply_at, "json"),
-        has.to_json().unwrap().into_bytes(),
-    );
 
     // Serve fixtures via Axum
     let fixtures = Arc::new(fixtures);
@@ -560,6 +535,13 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
         },
     );
 
+    // Initialize ledger manager at LCL (required for replay-only path).
+    let bucket_list = empty_bucket_list();
+    let hot_archive = henyey_bucket::HotArchiveBucketList::default();
+    ledger_manager
+        .initialize(bucket_list, hot_archive, header_100, hash_100)
+        .expect("initialize ledger manager at LCL");
+
     let mut manager = CatchupManagerBuilder::new()
         .add_archive(archive)
         .bucket_manager(bucket_manager)
@@ -581,18 +563,17 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
     });
 
     // Call catchup_to_ledger_with_mode with Recent(50) and lcl=100.
-    // Since apply_buckets=true (gap 100 > 50) and existing_state=None,
-    // this can only succeed via the bucket-apply path.
+    // With stellar-core parity (INV-C15), this now replays from LCL+1.
     let output = manager
         .catchup_to_ledger_with_mode(target, CatchupMode::Recent(50), lcl, None, &ledger_manager)
         .await
-        .expect("catchup with Recent(50) and large gap should succeed");
+        .expect("catchup with Recent(50) and large gap should replay from LCL+1");
 
-    // Verify the bucket-apply + replay path was taken with correct values.
+    // Verify the replay-only path was taken.
     assert_eq!(output.ledger_seq, target, "should reach target ledger");
     assert_eq!(
-        output.ledgers_applied, 73,
-        "should replay 73 ledgers (128..200)"
+        output.ledgers_applied, 100,
+        "should replay 100 ledgers (101..200)"
     );
     let final_header = ledger_manager.current_header();
     assert_eq!(

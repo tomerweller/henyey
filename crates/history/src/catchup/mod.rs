@@ -470,6 +470,21 @@ impl CatchupManager {
             )));
         }
 
+        // INV-C15: bucket-apply point must not be older than current LCL.
+        // Mirrors stellar-core CatchupWork::assertBucketState() (CatchupWork.cpp:265-270).
+        // When ledger_manager is not yet initialized (fresh node from genesis),
+        // bucket-apply is always valid — skip the check.
+        if ledger_manager.is_initialized() {
+            let lcl_seq = ledger_manager.current_ledger_seq();
+            if checkpoint_header.ledger_seq < lcl_seq {
+                return Err(HistoryError::VerificationFailed(format!(
+                    "INV-C15: bucket-apply at ledger {} is older than LCL {}; \
+                     refusing to clobber newer state",
+                    checkpoint_header.ledger_seq, lcl_seq
+                )));
+            }
+        }
+
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
         if ledger_manager.is_initialized() {

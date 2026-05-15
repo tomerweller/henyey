@@ -226,41 +226,22 @@ impl CatchupRange {
             return Self::replay_only(replay);
         }
 
-        // Case 1: LCL is past genesis — replay from LCL+1 if the gap fits within
-        // the mode's "replay budget"; otherwise fall through to checkpoint download.
+        // Case 1: LCL is past genesis — unconditionally replay from LCL+1.
         //
-        // Each mode defines how many ledgers it is willing to replay before
-        // preferring a fresh checkpoint download:
-        //   - Complete:   unlimited — always replays the full gap.
-        //   - Recent(N):  N — replays up to N ledgers; downloads a checkpoint
-        //                 for anything older.
-        //   - Minimal:    MINIMAL_BUCKET_DOWNLOAD_THRESHOLD — replays small gaps
-        //                 where bucket download overhead exceeds replay cost.
-        //
-        // NOTE: This is an intentional divergence from stellar-core, which
-        // unconditionally replays from lcl+1 in Case 1 (CatchupRange.cpp:52-57).
-        // We optimize large gaps by downloading a checkpoint + short replay
-        // instead of replaying the entire gap.
-        const MINIMAL_BUCKET_DOWNLOAD_THRESHOLD: u32 = 1_000;
+        // This matches stellar-core CatchupRange.cpp:52-57 exactly: when
+        // LCL > genesis, always replay the full gap. This structurally
+        // guarantees INV-C15 (bucket-apply never targets a ledger older
+        // than LCL) because bucket-apply only occurs on the genesis path.
         if lcl > GENESIS_LEDGER_SEQ {
-            let should_replay_only = match mode {
-                CatchupMode::Complete => true,
-                CatchupMode::Minimal => full_replay_count <= MINIMAL_BUCKET_DOWNLOAD_THRESHOLD,
-                CatchupMode::Recent(n) => full_replay_count <= n,
-            };
-
-            if should_replay_only {
-                let replay = LedgerRange::new(lcl + 1, full_replay_count);
-                return Self::replay_only(replay);
-            }
-            // Fall through: gap exceeds replay budget → checkpoint download below.
+            let replay = LedgerRange::new(lcl + 1, full_replay_count);
+            return Self::replay_only(replay);
         }
 
-        // Remaining cases: lcl == genesis, OR lcl > genesis with Minimal mode + large gap.
-        // full_replay covers from lcl+1 to target in both situations.
+        // Remaining cases: lcl == genesis (Case 1 above handles lcl > genesis).
+        // full_replay covers from lcl+1 (genesis+1) to target.
         let full_replay = LedgerRange::new(lcl + 1, full_replay_count);
 
-        // Case 2: count >= full replay count — full replay from current state.
+        // Case 2: count >= full replay count — full replay from genesis.
         //
         // When lcl == genesis, prefer bucket-apply over full replay. Replaying
         // through protocol upgrades from genesis (e.g. 0→25) produces different
@@ -269,6 +250,8 @@ impl CatchupRange {
         // live upgrade path. stellar-core handles this the same way: online
         // catchup always involves a bucket-apply step, never raw replay from
         // genesis.
+        // Note: lcl == genesis at this point (Case 1 returns for lcl > genesis),
+        // so this case is unreachable. Kept for documentation/safety.
         if count >= full_replay_count && lcl > GENESIS_LEDGER_SEQ {
             return Self::replay_only(full_replay);
         }
@@ -471,11 +454,14 @@ mod tests {
     #[test]
     fn test_minimal_mainnet_scenario() {
         // Startup scenario: persisted at L61529351, target L61551615 (checkpoint).
-        // Gap=22264 > threshold → download checkpoint, not replay 22k ledgers.
+        // With stellar-core parity (Case 1), LCL > genesis always replays.
+        // Previously this used bucket-download optimization; now it replays
+        // the full gap to maintain INV-C15.
         let range = CatchupRange::calculate(61529351, 61551615, CatchupMode::Minimal);
-        assert!(range.apply_buckets());
-        assert!(!range.replay_ledgers());
-        assert_eq!(range.bucket_apply_ledger(), 61551615);
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 61529352);
+        assert_eq!(range.replay_count(), 22264); // 61551615 - 61529351
     }
 
     #[test]
@@ -614,13 +600,10 @@ mod tests {
     }
 
     #[test]
-    fn test_case4_lcl_past_genesis_target_in_first_checkpoint() {
-        // Case 4: lcl > GENESIS, target in first checkpoint.
-        // Should do a full replay (not bucket-apply) since we already have
-        // post-upgrade state.
+    fn test_case1_lcl_past_genesis_target_in_first_checkpoint() {
+        // LCL > genesis, target in first checkpoint.
+        // Case 1 now unconditionally replays from LCL+1 (stellar-core parity).
         let range = CatchupRange::calculate(2, 50, CatchupMode::Recent(10));
-        // target_start = 50 - 10 + 1 = 41, first_in_checkpoint(41) = 1 <= GENESIS
-        // lcl > GENESIS -> Case 4 returns replay_only
         assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
         assert_eq!(range.replay_first(), 3);
@@ -660,45 +643,35 @@ mod tests {
 
     #[test]
     fn test_minimal_large_gap_non_checkpoint_target() {
-        // Minimal mode from a non-genesis LCL with a gap > 10_000 to a
-        // non-checkpoint target. Falls through Case 1 (large gap) into
-        // Case 5: bucket-apply at the prior checkpoint, then replay.
+        // Minimal mode from a non-genesis LCL with a large gap. With
+        // stellar-core parity (Case 1), LCL > genesis always replays —
+        // bucket-apply optimization was removed to enforce INV-C15.
         let range = CatchupRange::calculate(50000, 70000, CatchupMode::Minimal);
-        assert!(range.apply_buckets());
+        assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
-        // target_start = 70001, checkpoint_start(70001) = 69952
-        // apply_buckets_at = 69951
-        assert_eq!(range.bucket_apply_ledger(), 69951);
-        assert_eq!(range.replay_first(), 69952);
-        assert_eq!(range.replay_count(), 49); // 70000 - 69951 = 49
+        assert_eq!(range.replay_first(), 50001);
+        assert_eq!(range.replay_count(), 20000); // 70000 - 50000
     }
 
     // ── Recent(N) Case 1 regression tests ──────────────────────────────
-    // These tests verify the fix for #1908: Recent(N) with lcl > genesis
-    // now falls through to checkpoint download when the gap exceeds N.
+    // These tests verify stellar-core parity: LCL > genesis always replays.
+    // (Previously these tested the Case 1b optimization removed for INV-C15.)
 
     #[test]
-    fn test_recent_500_large_gap_bucket_applies() {
-        // Recent(500), lcl=100, target=10_000 → gap=9900 > 500.
-        // Should bucket-apply at checkpoint before target_start=9501, replay ~529.
+    fn test_recent_500_large_gap_replays_with_parity() {
+        // Recent(500), lcl=100, target=10_000 → gap=9900.
+        // With stellar-core parity, LCL > genesis always replays from LCL+1.
         let range = CatchupRange::calculate(100, 10_000, CatchupMode::Recent(500));
-        assert!(
-            range.apply_buckets(),
-            "Recent(500) with gap=9900 should bucket-apply, not replay all 9900"
-        );
+        assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
-        // target_start = 10000 - 500 + 1 = 9501
-        // first_in_checkpoint(9501) = 9472
-        // apply_buckets_at = last_before_checkpoint(9501) = 9471
-        assert_eq!(range.bucket_apply_ledger(), 9471);
-        assert_eq!(range.replay_first(), 9472);
-        assert_eq!(range.replay_count(), 529); // 10000 - 9471 = 529
+        assert_eq!(range.replay_first(), 101);
+        assert_eq!(range.replay_count(), 9900);
     }
 
     #[test]
     fn test_recent_10000_small_gap_replays() {
-        // Recent(10_000), lcl=100, target=5000 → gap=4900 ≤ 10_000.
-        // Gap within budget → replay from lcl+1.
+        // Recent(10_000), lcl=100, target=5000 → gap=4900.
+        // LCL > genesis → replay from lcl+1.
         let range = CatchupRange::calculate(100, 5000, CatchupMode::Recent(10_000));
         assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
@@ -708,8 +681,8 @@ mod tests {
 
     #[test]
     fn test_recent_500_buffered_catchup_replays() {
-        // Recent(500), lcl=61_551_871, target=61_551_964 → gap=93 ≤ 500.
-        // Small gap within budget → replay from lcl+1.
+        // Recent(500), lcl=61_551_871, target=61_551_964 → gap=93.
+        // LCL > genesis → replay from lcl+1.
         let range = CatchupRange::calculate(61_551_871, 61_551_964, CatchupMode::Recent(500));
         assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
@@ -720,7 +693,7 @@ mod tests {
     #[test]
     fn test_recent_boundary_gap_equals_n() {
         // Recent(100), lcl=100, target=200 → gap=100 = N.
-        // Gap equals budget → replay (budget check is <=).
+        // LCL > genesis → replay from lcl+1 regardless of count.
         let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(100));
         assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
@@ -731,41 +704,30 @@ mod tests {
     #[test]
     fn test_recent_boundary_gap_exceeds_n_by_one() {
         // Recent(99), lcl=100, target=200 → gap=100 > 99.
-        // Gap exceeds budget by 1 → checkpoint download.
+        // With stellar-core parity, LCL > genesis always replays from LCL+1.
+        // (Previously this fell through to checkpoint download — INV-C15 violation.)
         let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(99));
-        assert!(
-            range.apply_buckets(),
-            "Recent(99) with gap=100 should fall through to checkpoint download"
-        );
+        assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
-        // target_start = 200 - 99 + 1 = 102
-        // first_in_checkpoint(102) = 65
-        // apply_buckets_at = last_before_checkpoint(102) = 63 (not 64!)
-        assert_eq!(range.bucket_apply_ledger(), 63);
-        assert_eq!(range.replay_first(), 64);
-        assert_eq!(range.replay_count(), 137); // 200 - 63 = 137
+        assert_eq!(range.replay_first(), 101);
+        assert_eq!(range.replay_count(), 100);
     }
 
     #[test]
     fn test_recent_large_gap_checkpoint_target() {
         // Recent(500), lcl=100, target=10_047 (non-checkpoint) → gap > 500.
-        // Verifies Case 5 path with non-checkpoint target.
+        // With stellar-core parity, LCL > genesis always replays from LCL+1.
         let range = CatchupRange::calculate(100, 10_047, CatchupMode::Recent(500));
-        assert!(range.apply_buckets());
+        assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
-        // target_start = 10047 - 500 + 1 = 9548
-        // first_in_checkpoint(9548) = 9536
-        // apply_buckets_at = last_before_checkpoint(9548) = 9535
-        assert_eq!(range.bucket_apply_ledger(), 9535);
-        assert_eq!(range.replay_first(), 9536);
-        assert_eq!(range.replay_count(), 512); // 10047 - 9535 = 512
+        assert_eq!(range.replay_first(), 101);
+        assert_eq!(range.replay_count(), 9947); // 10047 - 100
     }
 
     #[test]
     fn test_recent_large_gap_target_start_in_first_checkpoint() {
-        // Recent(150), lcl=2, target=200 → gap=198 > 150.
-        // Falls through Case 1, target_start = 51, first_in_checkpoint(51) = 1 ≤ GENESIS.
-        // lcl > GENESIS → Case 4 returns replay_only(full_replay).
+        // Recent(150), lcl=2, target=200 → gap=198.
+        // LCL > genesis → Case 1 returns replay_only.
         let range = CatchupRange::calculate(2, 200, CatchupMode::Recent(150));
         assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
@@ -774,20 +736,14 @@ mod tests {
     }
 
     #[test]
-    fn test_recent_0_always_downloads_checkpoint() {
-        // Recent(0), lcl=100, target=200 → gap=100 > 0.
-        // Always falls through since no gap is ≤ 0. Hits Case 5.
+    fn test_recent_0_lcl_past_genesis_replays() {
+        // Recent(0), lcl=100, target=200 → gap=100.
+        // With stellar-core parity, LCL > genesis always replays from LCL+1.
+        // (Previously this fell through to checkpoint download.)
         let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(0));
-        assert!(
-            range.apply_buckets(),
-            "Recent(0) should always download checkpoint, never replay"
-        );
+        assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
-        // count=0, target_start = 201 (saturating_sub(0)+1), but actually
-        // target_start = 200 - 0 + 1 = 201. first_in_checkpoint(201) = 192.
-        // apply_buckets_at = last_before_checkpoint(201) = 191.
-        assert_eq!(range.bucket_apply_ledger(), 191);
-        assert_eq!(range.replay_first(), 192);
-        assert_eq!(range.replay_count(), 9); // 200 - 191 = 9
+        assert_eq!(range.replay_first(), 101);
+        assert_eq!(range.replay_count(), 100);
     }
 }
