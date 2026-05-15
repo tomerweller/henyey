@@ -356,9 +356,7 @@ impl App {
                         );
                         continue;
                     }
-                    let filtered = base_plan
-                        .clone()
-                        .with_differential_filter(&has, &remote_has);
+                    let filtered = base_plan.with_differential_filter(&has, &remote_has);
                     tracing::info!(
                         archive = %archive.name,
                         total = base_plan.entries().len(),
