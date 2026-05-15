@@ -51,8 +51,8 @@ The bucket crate is at **84% function-level parity** (see `crates/bucket/PARITY_
 | **BucketList Structure** | **Full** | 11 levels, level size formulas, curr/snap/next structure, hash computation |
 | **Bucket Lifecycle** | **Full** | Create, populate, finalize flow; in-memory and disk-backed buckets |
 | **Merge Algorithm** | **Full** | Two-pointer sorted merge, CAP-0020 INITENTRY rules, shadow cursor support |
-| **Async Merge Management** | **High** | Async merges via tokio spawn_blocking; FutureBucket 5-state machine; merge future cache not wired |
-| **BucketManager** | **Medium** | Core bucket management works; `getMergeFuture()`/`putMergeFuture()` not wired; some metrics missing |
+| **Async Merge Management** | **High** | Async merges via tokio spawn_blocking; FutureBucket 5-state machine; in-flight merge dedup not yet implemented |
+| **BucketManager** | **Medium** | Core bucket management works; completed-merge cache wired; in-flight `getMergeFuture()`/`putMergeFuture()` not implemented; some metrics missing |
 | **Indexing** | **Full** | DiskIndex (page-based + bloom filter), InMemoryIndex, index persistence |
 | **Snapshot & Query Layer** | **Full** | BucketListSnapshot with Arc-based cloning, BucketSnapshotManager with RwLock, full query API |
 | **Hot Archive BucketList** | **Full** | 11 levels, proper ARCHIVED/LIVE merge semantics, V1 metadata |
@@ -242,7 +242,7 @@ Source file references use the format `file.rs:line`.
 | Temp directory for in-progress merges | ✅ | Temporary files for merge output |
 | Bucket adoption (add finalized bucket to managed set) | ✅ | Buckets adopted by hash after merge completion |
 | Bucket sharing (reuse existing bucket by hash) | ✅ | Hash-based lookup prevents duplicate storage |
-| `getMergeFuture()`/`putMergeFuture()` merge cache | ❌ | Not wired — merge map exists but BucketManager does not use it for deduplication |
+| `getMergeFuture()`/`putMergeFuture()` merge cache | ❌ | In-flight merge dedup not yet implemented; completed-merge cache (BucketMergeMap) is wired but reattachment to running merges is missing |
 | `scheduleVerifyReferencedBucketsWork()` | ⚠️ | Partial implementation per PARITY_STATUS.md |
 | Publish queue integration | ✅ | Buckets referenced by publish queue during history archival |
 | Garbage collection of unreferenced buckets | ✅ | Unreferenced bucket files cleaned up |
@@ -384,7 +384,7 @@ Source file references use the format `file.rs:line`.
 | Index file deserialization (load from disk) | ✅ | `index_persistence.rs`: Load and validate persisted indexes |
 | Bucket file gzip compression | ✅ | `iterator.rs`: Gzip compression for disk bucket files |
 
-**Assessment: High adherence.** Serialization and persistence works correctly for FutureBucket state, indexes, and bucket files. The BucketMergeMap not being wired means merge deduplication state is not persisted across restarts, but this affects efficiency rather than correctness.
+**Assessment: High adherence.** Serialization and persistence works correctly for FutureBucket state, indexes, and bucket files. BucketMergeMap is used at runtime for completed-merge output caching but is not persisted across restarts, meaning merge reuse only works within a single process lifetime. This affects efficiency rather than correctness.
 
 ---
 
