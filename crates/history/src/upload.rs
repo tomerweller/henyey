@@ -35,7 +35,7 @@
 
 use crate::archive_state::HistoryArchiveState;
 use crate::remote_archive::RemoteArchive;
-use crate::{paths, Result};
+use crate::{paths, HistoryError, Result};
 use henyey_common::Hash256;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -246,7 +246,19 @@ impl UploadPlan {
     /// (not [`HistoryError::RemoteCommandFailed`]) if a staged local file is
     /// missing. In production this is unreachable because staging directories
     /// always contain the files referenced by the plan.
+    ///
+    /// Fast-fails with [`HistoryError::RemoteNotConfigured`] if the archive
+    /// is not writable (no `put_cmd` configured), before creating any remote
+    /// directories. This matches the message emitted by
+    /// [`RemoteArchive::put_file`] but avoids side-effects on a partially
+    /// configured archive (e.g. `mkdir_cmd` set, `put_cmd` not set).
     pub async fn execute(&self, archive: &RemoteArchive) -> Result<()> {
+        if !archive.can_write() {
+            return Err(HistoryError::RemoteNotConfigured(
+                "put command not configured".to_string(),
+            ));
+        }
+
         let mut created_dirs: HashSet<String> = HashSet::new();
         let mkdir_enabled = archive.has_mkdir();
 
@@ -767,6 +779,29 @@ mod tests {
         assert!(
             !log_file.exists(),
             "no entry should be uploaded after the pre-check failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_fails_fast_when_put_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        create_staging_dir(dir.path());
+        let mkdir_log = dir.path().join("mkdir.log");
+        let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
+
+        // mkdir is configured but put is not. The execute guard must fire
+        // before any mkdir side-effect occurs.
+        let mkdir_cmd = format!("echo {{0}} >> {}", mkdir_log.display());
+        let archive = test_archive(None, Some(&mkdir_cmd));
+        let err = plan.execute(&archive).await.expect_err("should fail");
+        assert!(
+            matches!(err, HistoryError::RemoteNotConfigured(_)),
+            "expected HistoryError::RemoteNotConfigured, got {err:?}"
+        );
+
+        assert!(
+            !mkdir_log.exists(),
+            "no mkdir command should run when put is unconfigured"
         );
     }
 }
