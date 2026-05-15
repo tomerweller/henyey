@@ -749,9 +749,20 @@ mod tests {
 
     #[test]
     fn test_knit_lcl_at_checkpoint_boundary() {
-        // When LCL is the LAST ledger of its checkpoint (seq == 63, 127, ...),
-        // LCL-1 lives in the same checkpoint, so it IS available in the
-        // current download. Case 2 fires normally.
+        // This test exercises the pure decision function only — it has no
+        // checkpoint awareness, so any LCL seq is a valid input. LCL=127
+        // is chosen here for convenience; we are NOT asserting anything
+        // about which checkpoint file LCL-1 actually lives in.
+        //
+        // Separate note about the surrounding download path (not exercised
+        // here): with checkpoint frequency 64, LCL-1 is only visible in the
+        // LCL+1 download when LCL and LCL-1 share the LCL+1 checkpoint
+        // file. That holds for e.g. LCL=100 ([64..127], LCL+1=101 still in
+        // the same checkpoint), but NOT for LCL=127 — there LCL=127 is the
+        // last ledger of checkpoint K=127 ([64..127]) and LCL+1=128 starts
+        // a new checkpoint K=191 ([128..191]), so neither LCL nor LCL-1
+        // appear in the LCL+1 download file. The decision function still
+        // returns Skip for the case 2 input regardless.
         let lcl = make_test_lcl(127, h(0x10), h(0x09));
         let entry_at_lcl_minus_1 = make_test_entry(126, h(0x09), h(0x08));
         assert_eq!(
