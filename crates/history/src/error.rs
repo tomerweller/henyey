@@ -36,6 +36,9 @@ pub enum VerifyHashKind {
     /// Computed header hash at the LCL sequence doesn't match the local LCL
     /// hash (local state corruption).
     Lcl,
+    /// Highest checkpoint's last header hash doesn't match the trusted
+    /// top-of-chain anchor (§9.2 reverse-walk trust establishment).
+    TopAnchor,
 }
 
 impl std::fmt::Display for VerifyHashKind {
@@ -48,6 +51,7 @@ impl std::fmt::Display for VerifyHashKind {
             Self::TrustedHeader => write!(f, "trusted header"),
             Self::BottomAnchor => write!(f, "bottom anchor"),
             Self::Lcl => write!(f, "LCL"),
+            Self::TopAnchor => write!(f, "top anchor"),
         }
     }
 }
@@ -437,6 +441,24 @@ pub enum HistoryError {
     /// Archive not found by name.
     #[error("archive not found: {0}")]
     ArchiveNotFound(String),
+
+    /// Fatal failure: ledger chain disagrees with local state and trust came
+    /// from SCP consensus (§9.5). The node MUST NOT retry catchup.
+    #[error("fatal: ledger chain disagrees with local state (§9.5 fatal failure)")]
+    FatalChainDisagreement,
+
+    /// Unsupported ledger version detected during chain verification (§9.3 step 2e).
+    #[error("unsupported ledger version {version} at ledger {ledger} (supported: {min}..={max})")]
+    UnsupportedLedgerVersion {
+        /// The ledger sequence with the unsupported version.
+        ledger: u32,
+        /// The ledger version found.
+        version: u32,
+        /// Minimum supported version.
+        min: u32,
+        /// Maximum supported version.
+        max: u32,
+    },
 }
 
 impl HistoryError {
@@ -465,6 +487,8 @@ impl HistoryError {
                 | HistoryError::InvalidSequence { .. }
                 | HistoryError::CorruptHeader { .. }
                 | HistoryError::ReplayHashMismatch { .. }
+                | HistoryError::FatalChainDisagreement
+                | HistoryError::UnsupportedLedgerVersion { .. }
                 | HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. })
         )
     }

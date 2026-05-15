@@ -192,7 +192,197 @@ pub fn verify_chain_anchors(headers: &[LedgerHeader], anchors: &ChainTrustAnchor
     Ok(())
 }
 
-/// Verify that a bucket's content matches its expected hash.
+// ─── Reverse-Walk Verification (§9.2–§9.5) ─────────────────────────────────
+
+/// Trust source for the highest ledger in the verification range (§9.2).
+///
+/// Determines whether local-state disagreement is fatal (non-retriable) or
+/// merely indicates a potentially corrupt archive (retriable).
+#[derive(Debug, Clone)]
+pub enum TrustSource {
+    /// Hash from SCP consensus — enables fatal failure detection (§9.5).
+    /// If the verified chain disagrees with local state, the node must halt.
+    Scp { seq: u32, hash: Hash256 },
+    /// No trusted top hash. Verification checks internal consistency and
+    /// LCL agreement, but LCL disagreement is not flagged as fatal.
+    None,
+}
+
+/// Configuration for reverse-walk verification.
+///
+/// This is catchup-specific and should NOT be added to the generic `ReplayConfig`.
+#[derive(Debug, Clone)]
+pub struct ReverseWalkConfig {
+    /// Trust source for the highest ledger.
+    pub trust_source: TrustSource,
+    /// LCL (seq, hash) for §9.3 step 2d comparison.
+    /// Obtain from `LedgerManager::header_snapshot()` for atomicity.
+    pub lcl: Option<(u32, Hash256)>,
+    /// Maximum supported protocol version (§9.3 step 2e).
+    pub max_supported_version: u32,
+    /// Minimum supported protocol version.
+    pub min_supported_version: u32,
+}
+
+/// Result of reverse-walk verification (returned on structural success).
+#[derive(Debug, Clone)]
+pub struct ReverseWalkResult {
+    /// Fatal failure (§9.5): local state disagrees with an SCP-anchored chain.
+    /// The node MUST NOT retry catchup.
+    pub fatal_failure: bool,
+}
+
+/// Verify a chain of ledger headers using the reverse-walk algorithm (§9.2–§9.5).
+///
+/// Headers must be in ascending order by sequence number. Internally, this
+/// function partitions them into checkpoints and processes from highest to
+/// lowest, threading trust from the top-level anchor.
+///
+/// **Prerequisite**: Each header's content hash was verified against the
+/// archive's advertised hash during download (per-checkpoint
+/// `verify_header_chain_from_entries`). This function verifies chain links
+/// and trust anchors, NOT individual header integrity.
+///
+/// # Returns
+/// - `Ok(result)` — chain verified; check `result.fatal_failure`
+/// - `Err(InvalidPreviousHash)` — broken hash link (retriable)
+/// - `Err(InvalidSequence)` — sequence gap (retriable)
+/// - `Err(VerificationHashMismatch(TopAnchor))` — trust anchor mismatch (retriable)
+/// - `Err(UnsupportedLedgerVersion)` — version outside supported range (fatal)
+/// - `Err(FatalChainDisagreement)` — LCL disagrees + SCP trust (fatal)
+pub fn verify_reverse_walk(
+    headers: &[LedgerHeader],
+    config: &ReverseWalkConfig,
+) -> Result<ReverseWalkResult> {
+    if headers.is_empty() {
+        return Ok(ReverseWalkResult {
+            fatal_failure: false,
+        });
+    }
+
+    // Check protocol versions for all headers first (§9.3 step 2e).
+    for header in headers {
+        if header.ledger_version > config.max_supported_version
+            || header.ledger_version < config.min_supported_version
+        {
+            return Err(HistoryError::UnsupportedLedgerVersion {
+                ledger: header.ledger_seq,
+                version: header.ledger_version,
+                min: config.min_supported_version,
+                max: config.max_supported_version,
+            });
+        }
+    }
+
+    // Partition headers into checkpoint groups.
+    // Each group contains headers belonging to the same checkpoint, in ascending order.
+    let mut checkpoint_groups: Vec<&[LedgerHeader]> = Vec::new();
+    let mut group_start = 0;
+    for i in 1..headers.len() {
+        let prev_cp = checkpoint::checkpoint_containing(headers[i - 1].ledger_seq);
+        let curr_cp = checkpoint::checkpoint_containing(headers[i].ledger_seq);
+        if curr_cp != prev_cp {
+            checkpoint_groups.push(&headers[group_start..i]);
+            group_start = i;
+        }
+    }
+    checkpoint_groups.push(&headers[group_start..]);
+
+    // Process from highest checkpoint to lowest (reverse order).
+    checkpoint_groups.reverse();
+
+    // State threaded between checkpoints: the incoming hash link from the
+    // higher checkpoint. For the highest checkpoint, this comes from TrustSource.
+    let mut incoming_hash: Option<(u32, Hash256)> = match &config.trust_source {
+        TrustSource::Scp { seq, hash } => Some((*seq, *hash)),
+        TrustSource::None => Option::None,
+    };
+
+    let mut local_state_disagrees = false;
+
+    for group in &checkpoint_groups {
+        // Verify internal chain links within this checkpoint (forward).
+        for i in 1..group.len() {
+            let prev = &group[i - 1];
+            let curr = &group[i];
+
+            // Sequence continuity.
+            if curr.ledger_seq != prev.ledger_seq + 1 {
+                return Err(HistoryError::InvalidSequence {
+                    expected: prev.ledger_seq + 1,
+                    got: curr.ledger_seq,
+                });
+            }
+
+            // Hash chain link.
+            let prev_hash = compute_header_hash(prev)?;
+            let expected_prev_hash = Hash256::from(curr.previous_ledger_hash.clone());
+            if prev_hash != expected_prev_hash {
+                return Err(HistoryError::InvalidPreviousHash {
+                    ledger: curr.ledger_seq,
+                });
+            }
+        }
+
+        // Verify last header in this checkpoint against the incoming hash link.
+        if let Some((expected_seq, expected_hash)) = &incoming_hash {
+            let last = group.last().unwrap();
+            if last.ledger_seq == *expected_seq {
+                let last_hash = compute_header_hash(last)?;
+                if last_hash != *expected_hash {
+                    return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
+                        crate::error::VerifyHashKind::TopAnchor,
+                        Some(last.ledger_seq),
+                        *expected_hash,
+                        last_hash,
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // Record outgoing link: (first_entry.seq - 1, first_entry.previous_ledger_hash).
+        let first = &group[0];
+        incoming_hash = Some((
+            first.ledger_seq - 1,
+            Hash256::from(first.previous_ledger_hash.clone()),
+        ));
+
+        // LCL+1 comparison (§9.3 step 2d): if the first header in this group
+        // is at lcl_seq + 1, verify its previous_ledger_hash matches lcl_hash.
+        if let Some((lcl_seq, lcl_hash)) = &config.lcl {
+            for header in group.iter() {
+                if header.ledger_seq == lcl_seq + 1 {
+                    let prev_hash = Hash256::from(header.previous_ledger_hash.clone());
+                    if prev_hash != *lcl_hash {
+                        local_state_disagrees = true;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // §9.5: Fatal failure determination.
+    if local_state_disagrees {
+        match &config.trust_source {
+            TrustSource::Scp { .. } => {
+                return Err(HistoryError::FatalChainDisagreement);
+            }
+            TrustSource::None => {
+                // Without SCP trust, LCL disagreement is treated as a broken
+                // chain link (possibly corrupt archive data).
+                return Err(HistoryError::InvalidPreviousHash {
+                    ledger: config.lcl.map(|(s, _)| s + 1).unwrap_or(0),
+                });
+            }
+        }
+    }
+
+    Ok(ReverseWalkResult {
+        fatal_failure: false,
+    })
+}
 ///
 /// # Arguments
 ///
@@ -1549,5 +1739,273 @@ mod tests {
             events.is_empty(),
             "genesis fast-path should not emit any tracing events"
         );
+    }
+
+    // ─── Reverse-Walk Tests ─────────────────────────────────────────────────
+
+    /// Helper: build a valid chain of headers with correct hash links.
+    /// Returns headers with ledger_version set to the given version.
+    fn make_chain(start_seq: u32, count: u32, version: u32) -> Vec<LedgerHeader> {
+        let mut headers = Vec::with_capacity(count as usize);
+        let mut prev_hash = Hash256::ZERO;
+        for i in 0..count {
+            let mut h = make_test_header(start_seq + i, prev_hash);
+            h.ledger_version = version;
+            prev_hash = compute_header_hash(&h).unwrap();
+            headers.push(h);
+        }
+        headers
+    }
+
+    #[test]
+    fn test_reverse_walk_valid_multi_checkpoint() {
+        // Build a chain spanning 3 checkpoints: ledgers 1..=191
+        // checkpoint_containing(1)=63, checkpoint_containing(64)=127, checkpoint_containing(128)=191
+        let headers = make_chain(1, 191, 25);
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let result = verify_reverse_walk(&headers, &config).unwrap();
+        assert!(!result.fatal_failure);
+    }
+
+    #[test]
+    fn test_reverse_walk_broken_cross_checkpoint_link() {
+        // Build a valid chain, then tamper with the first header of the second
+        // checkpoint so its previous_ledger_hash is wrong. This corrupts the
+        // content of header at seq 64, making the link FROM seq 65 invalid.
+        let mut headers = make_chain(1, 128, 25);
+        // Tamper with header at seq 64 (first in second checkpoint).
+        headers[63].previous_ledger_hash = Hash256::ZERO.into();
+
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        // The error is detected at ledger 65, which tries to link back to
+        // the tampered header 64.
+        assert!(
+            matches!(err, HistoryError::InvalidPreviousHash { ledger: 65 }),
+            "expected InvalidPreviousHash at ledger 65, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reverse_walk_sequence_gap() {
+        let mut headers = make_chain(1, 10, 25);
+        // Create a gap: change seq 5 to seq 7
+        headers[4].ledger_seq = 7;
+
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(matches!(
+            err,
+            HistoryError::InvalidSequence {
+                expected: 5,
+                got: 7
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reverse_walk_lcl_plus_one_mismatch_with_scp_trust() {
+        // Build a valid chain starting at ledger 10 (LCL is 9).
+        let headers = make_chain(10, 5, 25);
+        let last_hash = compute_header_hash(headers.last().unwrap()).unwrap();
+
+        // LCL hash doesn't match the first header's previous_ledger_hash
+        let wrong_lcl_hash = Hash256([0xAA; 32]);
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::Scp {
+                seq: 14,
+                hash: last_hash,
+            },
+            lcl: Some((9, wrong_lcl_hash)),
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::FatalChainDisagreement),
+            "expected FatalChainDisagreement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reverse_walk_lcl_plus_one_mismatch_no_trust() {
+        // Same as above but with TrustSource::None — should be InvalidPreviousHash.
+        let headers = make_chain(10, 5, 25);
+        let wrong_lcl_hash = Hash256([0xAA; 32]);
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: Some((9, wrong_lcl_hash)),
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::InvalidPreviousHash { .. }),
+            "expected InvalidPreviousHash, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reverse_walk_lcl_matches() {
+        // LCL hash matches the first header's previous_ledger_hash — no error.
+        let headers = make_chain(10, 5, 25);
+        let lcl_hash = Hash256::from(headers[0].previous_ledger_hash.clone());
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: Some((9, lcl_hash)),
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let result = verify_reverse_walk(&headers, &config).unwrap();
+        assert!(!result.fatal_failure);
+    }
+
+    #[test]
+    fn test_reverse_walk_unsupported_version_high() {
+        let headers = make_chain(1, 5, 30); // version 30 > max 26
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(matches!(
+            err,
+            HistoryError::UnsupportedLedgerVersion {
+                version: 30,
+                min: 24,
+                max: 26,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reverse_walk_unsupported_version_low() {
+        let headers = make_chain(1, 5, 20); // version 20 < min 24
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(matches!(
+            err,
+            HistoryError::UnsupportedLedgerVersion {
+                version: 20,
+                min: 24,
+                max: 26,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reverse_walk_single_checkpoint() {
+        // All headers within one checkpoint (1..=63)
+        let headers = make_chain(1, 10, 25);
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let result = verify_reverse_walk(&headers, &config).unwrap();
+        assert!(!result.fatal_failure);
+    }
+
+    #[test]
+    fn test_reverse_walk_partial_checkpoint() {
+        // Start at ledger 50 (mid-checkpoint), end at ledger 80 (mid-next-checkpoint)
+        let full_chain = make_chain(1, 80, 25);
+        let partial = &full_chain[49..80]; // ledgers 50..=80
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let result = verify_reverse_walk(partial, &config).unwrap();
+        assert!(!result.fatal_failure);
+    }
+
+    #[test]
+    fn test_reverse_walk_genesis_boundary() {
+        // First header is ledger 1 — outgoing link seq is 0
+        let headers = make_chain(1, 5, 25);
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let result = verify_reverse_walk(&headers, &config).unwrap();
+        assert!(!result.fatal_failure);
+    }
+
+    #[test]
+    fn test_reverse_walk_trust_anchor_mismatch() {
+        let headers = make_chain(1, 10, 25);
+        let wrong_hash = Hash256([0xFF; 32]);
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::Scp {
+                seq: 10, // last header
+                hash: wrong_hash,
+            },
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::VerificationHashMismatch(_)),
+            "expected VerificationHashMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reverse_walk_trust_anchor_valid() {
+        let headers = make_chain(1, 10, 25);
+        let last_hash = compute_header_hash(&headers[9]).unwrap();
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::Scp {
+                seq: 10,
+                hash: last_hash,
+            },
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let result = verify_reverse_walk(&headers, &config).unwrap();
+        assert!(!result.fatal_failure);
+    }
+
+    #[test]
+    fn test_reverse_walk_empty_headers() {
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let result = verify_reverse_walk(&[], &config).unwrap();
+        assert!(!result.fatal_failure);
     }
 }

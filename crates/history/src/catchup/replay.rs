@@ -47,11 +47,11 @@ pub(super) fn decode_upgrades_from_header(header: &LedgerHeader) -> Vec<LedgerUp
 }
 
 impl CatchupManager {
-    /// Verify the downloaded ledger data.
+    /// Verify the downloaded ledger data using reverse-walk chain verification (§9.2–§9.5).
     pub(super) fn verify_downloaded_data(
         &self,
         ledger_data: &[LedgerData],
-        anchors: &verify::ChainTrustAnchors,
+        lcl_snapshot: &HeaderSnapshot,
     ) -> Result<()> {
         if ledger_data.is_empty() {
             return Ok(());
@@ -63,11 +63,19 @@ impl CatchupManager {
         // Skip header chain and trust anchor verification when verify_header_chain
         // is false. This allows synthetic tests to bypass chain integrity checks.
         if self.replay_config.verify_header_chain {
-            verify::verify_header_chain(&headers)?;
-
-            // Verify trust anchors (spec §9.2–§9.5): ensures the chain connects
-            // to externally trusted state (checkpoint header hash, LCL hash).
-            verify::verify_chain_anchors(&headers, anchors)?;
+            // Reverse-walk verification (§9.2–§9.5): processes checkpoints
+            // from highest to lowest, threading trust from the top anchor.
+            // Individual header integrity was already verified during download
+            // (per-checkpoint verify_header_chain_from_entries).
+            let config = verify::ReverseWalkConfig {
+                // TrustSource::None until SCP consensus hash plumbing is added.
+                // Internal consistency and LCL comparison are still verified.
+                trust_source: verify::TrustSource::None,
+                lcl: Some((lcl_snapshot.header.ledger_seq, lcl_snapshot.hash)),
+                max_supported_version: henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION,
+                min_supported_version: henyey_common::protocol::MIN_LEDGER_PROTOCOL_VERSION,
+            };
+            verify::verify_reverse_walk(&headers, &config)?;
         }
 
         // Verify transaction sets and result sets match header hashes.
@@ -239,12 +247,8 @@ impl CatchupManager {
         // `apply_ledger_chain_*` counters: a single outer success can include
         // multiple verify failures from prior attempts.
         self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
-        let anchor_hash = ledger_manager.current_header_hash();
-        let anchors = verify::ChainTrustAnchors {
-            previous_ledger_hash: Some(anchor_hash),
-            ..Default::default()
-        };
-        match self.verify_downloaded_data(&ledger_data, &anchors) {
+        let lcl_snapshot = ledger_manager.header_snapshot();
+        match self.verify_downloaded_data(&ledger_data, &lcl_snapshot) {
             Ok(()) => {
                 metrics::counter!(
                     "stellar_history_verify_ledger_chain_success_total",
