@@ -17,7 +17,7 @@
 | Checkpoint builder | Full | Crash-safe dirty-file recovery implemented |
 | Publish queue persistence | Full | SQLite-backed queue replaces filesystem queue |
 | Publish orchestration | Partial | Missing some callbacks, metrics, cleanup helpers |
-| State snapshot publishing | Partial | No SCP snapshot file or differential HAS upload |
+| State snapshot publishing | Partial | No differential HAS upload; upload ordering now matches stellar-core (data-before-HAS) |
 | Verification | Full | Header entry hash, header chain, bucket, tx-set, tx-result checks implemented |
 | Catchup and replay | Full | Rust-native orchestration covers core flow |
 | Metrics and status plumbing | None | No Medida/StatusManager equivalent yet |
@@ -171,6 +171,16 @@ Corresponds to: `StateSnapshot.h`
 | `writeSCPMessages()` | -- | None |
 | `differingHASFiles()` | -- | None |
 | `takeSnapshotAndPublish()` | `publish_checkpoint()` | Full |
+
+### upload.rs (`upload.rs`)
+
+Corresponds to: `PutSnapshotFilesWork.cpp`, `PutHistoryArchiveStateWork.cpp`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `PutSnapshotFilesWork` data-before-HAS ordering | `UploadPlan` with `UploadFileKind` enum | Full |
+| `PutHistoryArchiveStateWork` permanent+`.well-known` upload | `CheckpointHas` → `RootHas` ordering | Full (intentional strengthening: sequential vs parallel) |
+| `PutFilesWork` differential upload | -- | None (follow-up) |
 
 ### replay modules (`replay/*.rs`, `catchup/replay.rs`)
 

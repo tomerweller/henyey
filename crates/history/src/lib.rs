@@ -119,6 +119,7 @@ pub mod checkpoint_builder;
 pub mod publish;
 pub mod publish_queue;
 pub mod remote_archive;
+pub mod upload;
 
 // Error handling
 pub mod error;

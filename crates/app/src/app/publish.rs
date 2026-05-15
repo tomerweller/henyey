@@ -336,12 +336,14 @@ impl App {
         }
         henyey_common::fs_utils::atomic_write_bytes(&root_path, has_json.as_bytes())?;
 
-        // Upload to each command-based archive
+        // Upload to each command-based archive.
+        // Uses UploadPlan to guarantee data-before-HAS ordering (see upload module).
+        let plan = henyey_history::upload::UploadPlan::from_staging_dir(&publish_dir)?;
         for archive in archives {
             let put_cmd = archive.put.as_ref().unwrap();
             let mkdir_cmd = archive.mkdir.as_deref();
 
-            upload_publish_directory(put_cmd, mkdir_cmd, &publish_dir)?;
+            plan.execute(put_cmd, mkdir_cmd)?;
         }
 
         // Clean up staging directory (TempDir drops silently on error paths;
@@ -427,85 +429,6 @@ fn write_scp_history_file(
     }
     henyey_common::fs_utils::atomic_gzip_xdr_write_slice(&path, entries)?;
     Ok(())
-}
-
-/// Upload all files from a publish directory to a remote archive using shell commands.
-fn upload_publish_directory(
-    put_cmd: &str,
-    mkdir_cmd: Option<&str>,
-    publish_dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    use std::collections::HashSet;
-
-    let mut files = collect_files(publish_dir)?;
-    files.sort();
-
-    let mut created_dirs = HashSet::new();
-    for file in files {
-        let rel = file
-            .strip_prefix(publish_dir)
-            .map_err(|e| anyhow::anyhow!("invalid publish path: {}", e))?;
-        let rel_str = path_to_unix_string(rel);
-
-        if let Some(mkdir) = mkdir_cmd {
-            if let Some(parent) = rel.parent() {
-                if !parent.as_os_str().is_empty() {
-                    let remote_dir = path_to_unix_string(parent);
-                    if created_dirs.insert(remote_dir.clone()) {
-                        let cmd = mkdir.replace("{0}", &remote_dir);
-                        run_shell_command(&cmd)?;
-                    }
-                }
-            }
-        }
-
-        let cmd = put_cmd
-            .replace("{0}", file.to_string_lossy().as_ref())
-            .replace("{1}", &rel_str);
-        run_shell_command(&cmd)?;
-    }
-
-    Ok(())
-}
-
-/// Recursively collect all files under a directory.
-fn collect_files(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
-    let mut files = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                files.push(path);
-            }
-        }
-    }
-
-    Ok(files)
-}
-
-/// Convert a path to a Unix-style string with forward slashes.
-fn path_to_unix_string(path: &std::path::Path) -> String {
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Execute a shell command and return an error if it fails.
-fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
-    use std::process::Command;
-
-    let status = Command::new("sh").arg("-c").arg(cmd).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("command failed (exit {}): {}", status, cmd);
-    }
 }
 
 #[cfg(test)]
@@ -1356,7 +1279,7 @@ mod tests {
                 put_enabled: true,
                 put: Some(put_cmd),
                 // No-op mkdir: exercises the "mkdir command present" branch
-                // in upload_publish_directory without validating substitution.
+                // in UploadPlan::execute without validating substitution.
                 mkdir: Some("true".to_string()),
             }];
         })

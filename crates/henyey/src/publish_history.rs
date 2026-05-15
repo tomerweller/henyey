@@ -316,8 +316,9 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
 
         if let Some((ref publish_dir, _)) = command_publish_dir {
             write_scp_history_file(publish_dir, checkpoint, &scp_entries)?;
+            let plan = henyey_history::upload::UploadPlan::from_staging_dir(publish_dir)?;
             for archive in &command_targets {
-                upload_publish_directory(archive, publish_dir)?;
+                plan.execute(&archive.put, archive.mkdir.as_deref())?;
                 println!("OK (command: {})", archive.name);
                 published_any = true;
             }
@@ -444,97 +445,6 @@ struct CommandArchiveTarget {
     put: String,
     /// Optional shell command template for creating directories ({0} = remote dir).
     mkdir: Option<String>,
-}
-
-/// Uploads a local publish directory to a remote archive using shell commands.
-///
-/// Iterates through all files in the directory, creating remote directories
-/// as needed, then uploads each file using the configured put command.
-fn upload_publish_directory(
-    target: &CommandArchiveTarget,
-    publish_dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    use std::collections::HashSet;
-
-    let mut files = collect_files(publish_dir)?;
-    files.sort();
-
-    let mut created_dirs = HashSet::new();
-    for file in files {
-        let rel = file
-            .strip_prefix(publish_dir)
-            .map_err(|e| anyhow::anyhow!("invalid publish path: {}", e))?;
-        let rel_str = path_to_unix_string(rel);
-
-        if let Some(ref mkdir_cmd) = target.mkdir {
-            if let Some(parent) = rel.parent() {
-                if !parent.as_os_str().is_empty() {
-                    let remote_dir = path_to_unix_string(parent);
-                    if created_dirs.insert(remote_dir.clone()) {
-                        let cmd = render_mkdir_command(mkdir_cmd, &remote_dir);
-                        run_shell_command(&cmd)?;
-                    }
-                }
-            }
-        }
-
-        let cmd = render_put_command(&target.put, &file, &rel_str);
-        run_shell_command(&cmd)?;
-    }
-
-    Ok(())
-}
-
-/// Recursively collects all files under a directory.
-fn collect_files(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
-    let mut files = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                files.push(path);
-            }
-        }
-    }
-
-    Ok(files)
-}
-
-/// Converts a path to a Unix-style string with forward slashes.
-fn path_to_unix_string(path: &std::path::Path) -> String {
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Renders a put command template with local and remote paths.
-fn render_put_command(template: &str, local_path: &std::path::Path, remote_path: &str) -> String {
-    template
-        .replace("{0}", local_path.to_string_lossy().as_ref())
-        .replace("{1}", remote_path)
-}
-
-/// Renders a mkdir command template with the remote directory.
-fn render_mkdir_command(template: &str, remote_dir: &str) -> String {
-    template.replace("{0}", remote_dir)
-}
-
-/// Executes a shell command and returns an error if it fails.
-fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
-    use std::process::Command;
-
-    let status = Command::new("sh").arg("-c").arg(cmd).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("command failed (exit {}): {}", status, cmd);
-    }
 }
 
 #[cfg(test)]
