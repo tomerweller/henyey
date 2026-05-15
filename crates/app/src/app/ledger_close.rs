@@ -512,11 +512,12 @@ impl App {
     ///
     /// - `Ok(RestoreResult::Restored)` — state was successfully restored from disk.
     /// - `Ok(RestoreResult::NoState)` — no persisted state exists (fresh node,
-    ///   no LCL in DB). The caller should proceed to catchup or genesis bootstrap.
+    ///   no LCL in DB), **or** persisted state was found but bucket files are
+    ///   missing (stale DB from a previous run). In the latter case the stale
+    ///   DB state is cleared so the next restart starts cleanly. The caller
+    ///   should proceed to catchup or genesis bootstrap.
     /// - `Err(...)` — persisted state is corrupt or inconsistent (e.g., LCL exists
-    ///   but HAS is missing, LCL/HAS mismatch, missing bucket files). The caller
-    ///   **must not** continue — this matches stellar-core's fatal throw in
-    ///   `loadLastKnownLedger`.
+    ///   but HAS is missing, LCL/HAS mismatch). The caller **must not** continue.
     pub async fn load_last_known_ledger(&self) -> anyhow::Result<RestoreResult> {
         // Step 1: Read LCL sequence from DB (offloaded to blocking pool)
         let lcl_seq = self
@@ -673,19 +674,36 @@ impl App {
 
         let missing = self.bucket_manager.verify_buckets_exist(&essential_hashes);
         if !missing.is_empty() {
-            anyhow::bail!(
-                "{} bucket(s) are missing from bucket directory (first: {}). \
-                 Bucket directory is corrupt.",
+            // Parity divergence: stellar-core throws fatal here
+            // (LedgerManagerImpl.cpp:555-560). We intentionally recover by
+            // clearing the stale DB state and falling through to catchup.
+            // This handles captive-core restarts against a stale file-backed
+            // DB where bucket files were cleaned up between runs (#2705).
+            tracing::warn!(
+                missing_count = missing.len(),
+                first = %missing[0].to_hex(),
+                lcl_seq,
+                "{} bucket(s) are missing from bucket directory. \
+                 Clearing stale persisted state and falling back to catchup.",
                 missing.len(),
-                missing[0].to_hex(),
             );
+            self.db_blocking("clear-stale-persisted-state", |db| {
+                db.with_connection(|conn| {
+                    conn.delete_state(state_keys::LAST_CLOSED_LEDGER)?;
+                    conn.delete_state(state_keys::HISTORY_ARCHIVE_STATE)?;
+                    Ok::<_, henyey_db::error::DbError>(())
+                })
+                .map_err(Into::into)
+            })
+            .await?;
+            return Ok(RestoreResult::NoState);
         }
 
         // Step 6: Reconstruct bucket lists with overlapped cache scan.
         //
-        // Parity: stellar-core fails hard on missing buckets (validated above).
-        // No silent downgrade of pending merge state — all HAS-referenced files
-        // are guaranteed present by the preflight check.
+        // All HAS-referenced files are guaranteed present by the Step 5 check
+        // (missing buckets trigger a NoState fallback above).
+        // No silent downgrade of pending merge state.
         //
         // The scan runs concurrently with merge restart because it only reads
         // level.curr and level.snap (via Arc clones) while restart_merges_from_has
@@ -3246,6 +3264,116 @@ mod restore_result_tests {
         assert_eq!(
             count, 1,
             "publish queue should be preserved when can_publish is true"
+        );
+    }
+
+    /// Regression test for #2705: missing bucket files should trigger graceful
+    /// recovery (return NoState) instead of a fatal error. This handles the
+    /// captive-core restart scenario where a stale file-backed DB has bucket
+    /// references but the actual bucket files were cleaned up.
+    #[tokio::test]
+    async fn test_missing_buckets_returns_no_state_and_clears_db() {
+        let (app, _dir) = test_app().await;
+
+        // Build a HAS with one non-zero bucket hash (curr of level 0).
+        let fake_hash = "a".repeat(64);
+        let zero = "0".repeat(64);
+        let level_with_bucket = format!(
+            r#"{{"curr":"{}","snap":"{}","next":{{"state":0}}}}"#,
+            fake_hash, zero
+        );
+        let zero_level = format!(
+            r#"{{"curr":"{}","snap":"{}","next":{{"state":0}}}}"#,
+            zero, zero
+        );
+        let mut levels = vec![level_with_bucket];
+        for _ in 1..henyey_bucket::BUCKET_LIST_LEVELS {
+            levels.push(zero_level.clone());
+        }
+        let has_json = format!(
+            r#"{{"version":1,"currentLedger":100,"currentBuckets":[{}]}}"#,
+            levels.join(",")
+        );
+
+        // Seed DB: LCL=100, matching HAS, and a ledger header at seq 100.
+        app.db_blocking("seed-db", move |db| {
+            db.with_connection(|conn| {
+                use henyey_db::queries::{LedgerQueries, StateQueries};
+                conn.set_last_closed_ledger(100)?;
+                conn.set_state(
+                    henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE,
+                    &has_json,
+                )?;
+                // Store a minimal ledger header at seq 100.
+                let header = stellar_xdr::curr::LedgerHeader {
+                    ledger_version: 20,
+                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    scp_value: stellar_xdr::curr::StellarValue {
+                        tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                        close_time: stellar_xdr::curr::TimePoint(1234567890),
+                        upgrades: vec![].try_into().unwrap(),
+                        ext: stellar_xdr::curr::StellarValueExt::Basic,
+                    },
+                    tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    bucket_list_hash: stellar_xdr::curr::Hash([1u8; 32]),
+                    ledger_seq: 100,
+                    total_coins: 100_000_000_000_000_000,
+                    fee_pool: 0,
+                    inflation_seq: 0,
+                    id_pool: 0,
+                    base_fee: 100,
+                    base_reserve: 5_000_000,
+                    max_tx_set_size: 100,
+                    skip_list: std::array::from_fn(|_| stellar_xdr::curr::Hash([0u8; 32])),
+                    ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                };
+                use stellar_xdr::curr::WriteXdr;
+                let data = header.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+                conn.store_ledger_header(&header, &data)?;
+                Ok::<_, henyey_db::DbError>(())
+            })
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+
+        // No bucket file exists on disk for fake_hash → should trigger recovery.
+        let result = app.load_last_known_ledger().await.unwrap();
+        assert_eq!(
+            result,
+            RestoreResult::NoState,
+            "Missing buckets should return NoState, not error"
+        );
+
+        // Verify the stale DB state was cleared so subsequent restarts start fresh.
+        let lcl = app
+            .db_blocking("check-lcl-cleared", |db| {
+                db.with_connection(|conn| {
+                    use henyey_db::queries::StateQueries;
+                    conn.get_last_closed_ledger()
+                })
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert!(
+            lcl.is_none(),
+            "LCL should be cleared after missing-bucket recovery"
+        );
+
+        let has = app
+            .db_blocking("check-has-cleared", |db| {
+                db.with_connection(|conn| {
+                    use henyey_db::queries::StateQueries;
+                    conn.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)
+                })
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert!(
+            has.is_none(),
+            "HAS should be cleared after missing-bucket recovery"
         );
     }
 }

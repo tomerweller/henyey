@@ -1789,6 +1789,9 @@ async fn cmd_run(
     // Set in-memory mode on the config so it flows through to App::new.
     let mut config = config;
     config.database.in_memory = in_memory;
+    if in_memory {
+        tracing::info!("In-memory mode requested via --in-memory flag");
+    }
 
     let rpc_enabled = config.rpc.enabled;
     let rpc_port = config.rpc.port;
