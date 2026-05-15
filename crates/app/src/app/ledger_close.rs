@@ -2085,6 +2085,16 @@ impl App {
         timer.mark("join_match_ms");
         record_phase_histogram(crate::metrics::CLOSE_COMPLETE_JOIN_MATCH_SECONDS, &timer);
 
+        // Synchronize herder tracking state with the just-closed ledger.
+        //
+        // MUST happen before any `.await` in this function. The close task
+        // already published LCL=N (manager.rs:2552-2555); without this,
+        // concurrent spawn_blocking tasks (SCP nomination timeouts,
+        // trigger_next_ledger) can observe LCL=N with tracking still at the
+        // previous value, violating INV-H2 (`lcl < tracking`). See #2720.
+        self.herder
+            .advance_tracking_to(pending.ledger_seq as u64, pending.close_time);
+
         // Store last-close stats and perf for metrics reporting.
         *self.last_close_stats.write() = result.stats.clone();
         *self.last_close_perf.write() = result.perf.clone();
@@ -2468,11 +2478,12 @@ impl App {
 
             crate::metrics::CLOSE_TX_QUEUE_PREP_SECONDS.record(prep_start.elapsed().as_secs_f64());
 
-            // Advance tracking state BEFORE ledger_closed so INV-H2 strict bound
-            // holds. For validators, complete_externalization already advanced tracking
-            // (this is idempotent). For watchers/catchup rapid-close, this is the
-            // non-SCP tracking advance that prevents lcl == tracking_slot.
-            herder.advance_tracking_to(ledger_seq as u64, close_time);
+            // NOTE: advance_tracking_to is called BEFORE this spawn_blocking,
+            // immediately after the close task join succeeds (see #2720). By the
+            // time this closure runs, tracking is already at ledger_seq+1. The
+            // call was moved to close the race window where .await points between
+            // close completion and this spawn_blocking allowed concurrent tasks to
+            // observe stale tracking state.
 
             // === Sub-phase 1: herder.ledger_closed + ban failed txs ==========
             let phase1_start = std::time::Instant::now();

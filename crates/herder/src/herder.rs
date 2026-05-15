@@ -885,12 +885,14 @@ impl Herder {
         //
         // In the normal SCP-driven path, complete_externalization advances
         // tracking_slot to N+1 before LCL can reach N. On the non-SCP
-        // (catchup rapid-close) path, advance_tracking_to is called before
-        // ledger_closed, ensuring the same invariant.
+        // (catchup rapid-close) path, advance_tracking_to is called in
+        // handle_close_complete_inner immediately after the close task joins
+        // (before any .await), ensuring tracking is visible before any
+        // concurrent task can observe the new LCL. See #2720.
         //
-        // Parity: stellar-core HerderImpl.cpp:170-178 asserts
-        // `lcl > mConsensusIndex` throws, where mConsensusIndex = tracking - 1.
-        // This is equivalent to lcl >= tracking in henyey's representation.
+        // Parity: stellar-core HerderImpl.cpp:1227-1248 asserts
+        // mTrackingSCP->mConsensusIndex > lcl in lastClosedLedgerIncreased.
+        // This is equivalent to lcl < tracking in henyey's representation.
         assert!(
             lcl_seq < tracking,
             "INV-H2 FATAL: LCL ({lcl_seq}) is at or ahead of tracking consensus slot \
@@ -2510,11 +2512,12 @@ impl Herder {
         // Purge stale pending envelopes for slots behind the closed ledger.
         self.pending_envelopes.purge_slots_below(slot);
 
-        // INV-H2 (parity: HerderImpl.cpp:1228-1229 lastClosedLedgerIncreased):
+        // INV-H2 (parity: HerderImpl.cpp:1227-1248 lastClosedLedgerIncreased):
         // After all close bookkeeping, verify LCL hasn't overtaken tracking.
         // Both SCP and non-SCP paths advance tracking before this point:
         // - SCP: complete_externalization → advance_tracking_slot (#2695)
-        // - Non-SCP (catchup): advance_tracking_to called before ledger_closed (#2712)
+        // - Non-SCP (catchup/watcher): advance_tracking_to called in
+        //   handle_close_complete_inner before any .await (#2720)
         self.assert_lcl_consistency();
     }
 
@@ -7592,6 +7595,43 @@ mod inv_h2_lcl_guard_tests {
         assert_eq!(herder.tracking_slot().get(), 7);
         // Now LCL=6 < tracking=7 — INV-H2 passes
         herder.ledger_closed(6, &[], &[], 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "INV-H2 FATAL")]
+    fn test_assert_lcl_consistency_panics_lcl_ahead_by_one_2720() {
+        // Regression test for #2720: fast-tracking catchup burst-close race.
+        //
+        // Scenario: Close of ledger N-1 advanced tracking to N. Then close of
+        // ledger N completes (LCL=N), but advance_tracking_to(N) hasn't fired
+        // yet. A concurrent task calls assert_lcl_consistency and observes
+        // LCL=N, tracking=N → panic (N < N is false).
+        //
+        // This is the exact state observed in production: LCL=62579903,
+        // tracking=62579903 (consensus_index=62579903, tracking_slot()=62579903).
+        // The previous close set tracking to N, then the current close advanced
+        // LCL to N without first calling advance_tracking_to(N) to push
+        // tracking to N+1.
+        let herder = make_tracking_herder_at(10, 10); // LCL=10, tracking=10
+        herder.assert_lcl_consistency(); // should panic: 10 < 10 is false
+    }
+
+    #[test]
+    fn test_advance_tracking_to_fixes_lcl_ahead_race_2720() {
+        // Companion to the panic test above: proves that calling
+        // advance_tracking_to(N) before any assertion restores the invariant.
+        //
+        // This is the fix applied in handle_close_complete_inner (#2720):
+        // advance_tracking_to fires immediately after close success, before
+        // any .await where concurrent tasks could check the invariant.
+        let herder = make_tracking_herder_at(10, 10); // LCL=10, tracking=10
+
+        // Fix: advance tracking for the just-closed ledger
+        herder.advance_tracking_to(10, 5000);
+        assert_eq!(herder.tracking_slot().get(), 11);
+
+        // Now the invariant holds: LCL=10 < tracking=11
+        herder.assert_lcl_consistency(); // should not panic
     }
 
     #[test]
