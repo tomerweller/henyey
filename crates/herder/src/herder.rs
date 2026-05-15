@@ -6821,6 +6821,89 @@ mod tests {
         );
     }
 
+    /// Regression test for #2718: `drain_ready_envelopes_blocking` must yield
+    /// even when all ready envelopes are filtered by `tracking_slot`. When
+    /// tracking at slot N, envelopes at slot > N are skipped (the `continue`
+    /// path in `process_ready_fetching_envelopes`), making the drain
+    /// effectively zero-work despite a non-empty ready queue. This exercises
+    /// the same yield_now fix as #2716 but via the filtering path.
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn test_issue_2718_drain_yields_when_all_slots_filtered_by_tracking() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let herder = Arc::new(make_test_herder());
+
+        // Set up Tracking state with tracking_slot = 1.
+        // advance_tracking_to(0, 100) sets consensus_index = 0+1 = 1 and
+        // transitions HerderState to Tracking.
+        herder.advance_tracking_to(0, 100);
+        assert_eq!(
+            herder.state(),
+            HerderState::Tracking,
+            "pre-condition: herder must be in Tracking state"
+        );
+        assert_eq!(
+            herder.tracking_slot().get(),
+            1,
+            "pre-condition: tracking_slot must be 1"
+        );
+
+        // Insert a ready envelope at slot 2 (> tracking_slot = 1).
+        // This will be filtered by process_ready_fetching_envelopes.
+        let envelope = make_test_envelope(2);
+        herder
+            .fetching_envelopes
+            .test_insert_ready(2, vec![envelope]);
+        assert_eq!(
+            herder.fetching_envelopes.ready_slots(),
+            vec![2],
+            "pre-condition: slot 2 envelope must be in ready queue"
+        );
+
+        let heartbeat_count = Arc::new(AtomicU64::new(0));
+        let hb = Arc::clone(&heartbeat_count);
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::task::yield_now().await;
+                hb.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let before = heartbeat_count.load(Ordering::Relaxed);
+
+        let processed = Arc::clone(&herder)
+            .drain_ready_envelopes_blocking("filtered drain")
+            .await;
+
+        let after = heartbeat_count.load(Ordering::Relaxed);
+        heartbeat_handle.abort();
+
+        // The drain must have processed 0 envelopes (all filtered).
+        assert_eq!(
+            processed, 0,
+            "#2718: drain must process 0 envelopes when all are filtered by tracking_slot"
+        );
+
+        // The heartbeat must have advanced (yield happened).
+        let ticks = after.saturating_sub(before);
+        assert!(
+            ticks >= 1,
+            "#2718: drain must yield even when all envelopes are filtered \
+             (observed {} ticks)",
+            ticks,
+        );
+
+        // Postcondition: the filtered envelope must remain queued.
+        assert_eq!(
+            herder.fetching_envelopes.ready_slots(),
+            vec![2],
+            "#2718: filtered envelope must remain in ready queue for future consumption"
+        );
+    }
+
     /// Regression test for #2066: unsolicited TxSets must NOT be accepted
     /// by the tracker. With the read-through callback design (#2070), there
     /// is no private cache to poison — the callback queries scp_driver
