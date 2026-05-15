@@ -213,12 +213,40 @@ If failures reference code in the PR's diff → diff-attributable. If failures l
 |---|---|---|---|
 | APPROVE | APPROVE | red (unrelated) | Bounce with note. `/do` will rebase on `origin/main` and retry. If still red after rebase, the next `/review-pr` will mark `blocked`. |
 
-### Block (cycle cap or CI stuck)
+### Block (cycle cap or CI genuinely stuck)
 
 | A | B | CI | Action |
 |---|---|---|---|
-| APPROVE | APPROVE | running for >3 ticks | `blocked` — CI is stuck (see Step 2 for cycle counting; CI-stuck counts as a separate failure mode). |
+| APPROVE | APPROVE | running > **CI_STUCK_AFTER_MINUTES** (default 60) wall-clock since the oldest in-progress check started | `blocked` — CI is genuinely stuck (see Step 6.0 for the wall-clock check). |
 | (any) | (any) | (any) | If this would be the 4th bounce → `blocked` (handled at Step 2). |
+
+**Why wall-clock, not tick count:** henyey integration tests routinely take 25+ minutes. A tick-count threshold (e.g. "3 ticks") is too aggressive when the tick rate is faster than CI completion — it produces false-positive blocks on perfectly healthy slow CI. Use the actual start time of the oldest still-in-progress CI check; only block if the run has exceeded a generous wall-clock budget.
+
+#### Step 6.0 — Compute CI age before applying the matrix
+
+If CI is in the **running** bucket (Step 5), determine its wall-clock age via the oldest in-progress check's `startedAt`:
+
+```bash
+HEAD_REF=$(gh pr view $PR_NUM --repo stellar-experimental/henyey --json headRefName --jq '.headRefName')
+
+CI_OLDEST_START=$(gh run list --repo stellar-experimental/henyey \
+  --branch "$HEAD_REF" --limit 20 \
+  --json startedAt,conclusion,status \
+  --jq '[.[] | select(.status != "completed")] | min_by(.startedAt) | .startedAt // ""')
+
+CI_AGE_MIN=0
+if [ -n "$CI_OLDEST_START" ]; then
+  NOW_EPOCH=$(date -u +%s)
+  CI_START_EPOCH=$(date -u -d "$CI_OLDEST_START" +%s)
+  CI_AGE_MIN=$(( (NOW_EPOCH - CI_START_EPOCH) / 60 ))
+fi
+
+# Default budget. Override with CI_STUCK_AFTER_MINUTES env var if running ops
+# tests for short-budget environments. Production budget is 60 min.
+CI_STUCK_AFTER_MINUTES="${CI_STUCK_AFTER_MINUTES:-60}"
+```
+
+Apply to the matrix: if `CI_AGE_MIN > CI_STUCK_AFTER_MINUTES` AND both reviewers APPROVE AND CI is still running → block. Otherwise → wait (re-pick next tick).
 
 ## Step 7 — Execute the decision
 
@@ -338,6 +366,7 @@ Post:
 ## Review: Waiting on CI
 
 CI is still running (checks: <names>). Re-picking this PR on the next tick.
+CI age: <CI_AGE_MIN> min / budget <CI_STUCK_AFTER_MINUTES> min.
 Bounce-back count: <N>/3.
 ```
 
