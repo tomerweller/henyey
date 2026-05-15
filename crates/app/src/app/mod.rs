@@ -353,7 +353,7 @@ fn hard_reset_fatal_timeout_secs() -> u64 {
 pub(crate) const HEALTH_STALL_SECS: u64 = 60;
 
 mod archive_cache;
-mod bootstrap;
+pub mod bootstrap;
 mod catchup_impl;
 mod close;
 mod close_pipeline;
@@ -992,6 +992,18 @@ impl App {
 
         // Initialize database
         let db = Self::init_database(&config)?;
+
+        // For in-memory databases, initialize genesis state so the node starts
+        // with a valid LCL=1. Mirrors stellar-core's newDB() → startNewLedger()
+        // for in-memory DBs (ApplicationImpl.cpp:248-249, 325-328).
+        if config.database.in_memory {
+            bootstrap::initialize_genesis(
+                &db,
+                Some(&config.buckets.directory),
+                &config.network.passphrase,
+                config.testing.genesis_test_account_count,
+            )?;
+        }
 
         // Ensure network passphrase matches stored state.
         Self::ensure_network_passphrase(&db, &config.network.passphrase)?;
@@ -10073,6 +10085,29 @@ mod tests {
             !app.query_is_ready.load(Ordering::Relaxed),
             "query_is_ready must remain false when ledger manager is uninitialized"
         );
+    }
+
+    /// In-memory App::new() initializes genesis state so the DB has LCL=1.
+    /// This is the fix for #2701: query server 404 in captive-core mode.
+    #[tokio::test]
+    async fn test_in_memory_app_has_genesis_lcl() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        // DB should have LCL=1 from genesis initialization.
+        let lcl = app
+            .db_blocking("test-lcl", |db| {
+                db.with_connection(|conn| conn.get_last_closed_ledger())
+                    .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(lcl, Some(1), "in-memory DB should have genesis LCL=1");
     }
 
     /// AUDIT-226: `check_catchup_persist_pending` returns true when the

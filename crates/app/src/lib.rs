@@ -67,6 +67,7 @@ pub mod metrics;
 pub mod run_cmd;
 pub mod survey;
 
+pub use app::bootstrap::initialize_genesis;
 pub use app::{
     App, AppState, CatchupResult, CatchupTarget, FallbackCatchup, LedgerInfo, LedgerSummary,
     RestoreResult, ScpSlotDebugStats, SimulationDebugStats, SurveyReport,

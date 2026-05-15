@@ -2375,6 +2375,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable or disable in-memory database mode.
+    pub fn in_memory(mut self, in_memory: bool) -> Self {
+        self.config.database.in_memory = in_memory;
+        self
+    }
+
     /// Set the peer port.
     pub fn peer_port(mut self, port: u16) -> Self {
         self.config.overlay.peer_port = port;

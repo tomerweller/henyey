@@ -26,7 +26,6 @@ use tokio::task::JoinHandle;
 
 mod loadgen;
 mod loopback;
-use loadgen::deterministic_seed;
 use loopback::LoopbackNetwork;
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1954,186 +1953,13 @@ pub fn initialize_genesis_ledger(
     config: &AppConfig,
     network_passphrase: &str,
 ) -> anyhow::Result<()> {
-    use henyey_bucket::BucketList;
-    use henyey_db::queries::{BucketListQueries, HistoryQueries, LedgerQueries, StateQueries};
-    use henyey_db::schema::state_keys;
-    use henyey_history::build_history_archive_state;
-    use henyey_ledger::{calculate_skip_values, compute_header_hash};
-    use stellar_xdr::curr::{
-        AccountId, BucketListType, Hash, LedgerHeader, LedgerHeaderExt, Limits, PublicKey,
-        StellarValue, StellarValueExt, TimePoint, TransactionHistoryEntry,
-        TransactionHistoryEntryExt, TransactionHistoryResultEntry,
-        TransactionHistoryResultEntryExt, TransactionResultSet, TransactionSet, Uint256, VecM,
-        WriteXdr,
-    };
-
-    let genesis_test_account_count = config.testing.genesis_test_account_count;
-
     let db = henyey_db::Database::open(&config.database.path)?;
-
-    // Defense-in-depth: verify the database is genuinely empty before writing
-    // genesis state. Catches state leaks from stale or reused database files.
-    db.with_connection(|conn| {
-        use henyey_db::queries::{LedgerQueries, StateQueries};
-        let existing_lcl = conn.get_last_closed_ledger()?;
-        if existing_lcl.is_some() {
-            return Err(henyey_db::DbError::Integrity(format!(
-                "SIMULATION STATE LEAK: database at {:?} already has LCL={:?}. \
-                 Expected empty database for genesis initialization.",
-                config.database.path, existing_lcl,
-            )));
-        }
-        let latest_header = conn.get_latest_ledger_seq()?;
-        if latest_header.is_some() {
-            return Err(henyey_db::DbError::Integrity(format!(
-                "SIMULATION STATE LEAK: database at {:?} has ledger headers \
-                 (latest={:?}) but no LCL. Expected empty database.",
-                config.database.path, latest_header,
-            )));
-        }
-        Ok(())
-    })?;
-
-    let network_id = NetworkId::from_passphrase(network_passphrase);
-    let root_secret = SecretKey::from_seed(network_id.as_bytes());
-    let root_public = root_secret.public_key();
-    let root_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-        *root_public.as_bytes(),
-    )));
-
-    let total_coins: i64 = 1_000_000_000_000_000_000;
-    let genesis_entries =
-        build_genesis_entries(root_account_id, total_coins, genesis_test_account_count);
-
-    let mut bucket_list = BucketList::new();
-    bucket_list
-        .add_batch(1, 0, BucketListType::Live, genesis_entries, vec![], vec![])
-        .map_err(|e| anyhow::anyhow!("Failed to add genesis entries to bucket list: {}", e))?;
-
-    let bucket_list_hash = bucket_list.hash();
-    let mut header = LedgerHeader {
-        ledger_version: 0,
-        previous_ledger_hash: Hash([0u8; 32]),
-        scp_value: StellarValue {
-            tx_set_hash: Hash([0u8; 32]),
-            close_time: TimePoint(0),
-            upgrades: VecM::default(),
-            ext: StellarValueExt::Basic,
-        },
-        tx_set_result_hash: Hash([0u8; 32]),
-        bucket_list_hash: Hash(*bucket_list_hash.as_bytes()),
-        ledger_seq: 1,
-        total_coins,
-        fee_pool: 0,
-        inflation_seq: 0,
-        id_pool: 0,
-        base_fee: 100,
-        base_reserve: 100_000_000,
-        max_tx_set_size: 100,
-        skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-        ext: LedgerHeaderExt::V0,
-    };
-    calculate_skip_values(&mut header);
-    let header_xdr = header.to_xdr(Limits::none())?;
-    let has =
-        build_history_archive_state(1, &bucket_list, None, Some(network_passphrase.to_string()))
-            .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
-    let has_json = has.to_json()?;
-    let bucket_levels: Vec<(Hash256, Hash256)> = bucket_list
-        .levels()
-        .iter()
-        .map(|level| (level.curr.hash(), level.snap.hash()))
-        .collect();
-    let genesis_tx_history = TransactionHistoryEntry {
-        ledger_seq: 1,
-        tx_set: TransactionSet {
-            previous_ledger_hash: Hash(Hash256::ZERO.0),
-            txs: VecM::default(),
-        },
-        ext: TransactionHistoryEntryExt::V0,
-    };
-    let genesis_tx_result = TransactionHistoryResultEntry {
-        ledger_seq: 1,
-        tx_result_set: TransactionResultSet {
-            results: VecM::default(),
-        },
-        ext: TransactionHistoryResultEntryExt::default(),
-    };
-
-    db.with_connection(|conn| {
-        conn.store_ledger_header(&header, &header_xdr)?;
-        conn.store_tx_history_entry(1, &genesis_tx_history)?;
-        conn.store_tx_result_entry(1, &genesis_tx_result)?;
-        conn.store_bucket_list(1, &bucket_levels)?;
-        conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-        conn.set_state(state_keys::NETWORK_PASSPHRASE, network_passphrase)?;
-        conn.set_last_closed_ledger(1)?;
-        Ok::<_, henyey_db::DbError>(())
-    })?;
-
-    let _ = compute_header_hash(&header)?;
-    Ok(())
-}
-
-/// Build genesis ledger entries: root account + optional test accounts.
-fn build_genesis_entries(
-    root_account_id: stellar_xdr::curr::AccountId,
-    total_coins: i64,
-    test_account_count: u32,
-) -> Vec<stellar_xdr::curr::LedgerEntry> {
-    use stellar_xdr::curr::{
-        AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-        PublicKey, SequenceNumber, Thresholds, Uint256, VecM,
-    };
-
-    // Compute per-account balance: split evenly, root gets the remainder.
-    let (root_balance, test_balance) = if test_account_count > 0 {
-        let total_accounts = test_account_count as i64 + 1;
-        let base = total_coins / total_accounts;
-        let remainder = total_coins % total_accounts;
-        (base + remainder, base)
-    } else {
-        (total_coins, 0i64)
-    };
-
-    let make_account_entry = |account_id: AccountId, balance: i64| LedgerEntry {
-        last_modified_ledger_seq: 1,
-        data: LedgerEntryData::Account(AccountEntry {
-            account_id,
-            balance,
-            seq_num: SequenceNumber(0),
-            num_sub_entries: 0,
-            inflation_dest: None,
-            flags: 0,
-            home_domain: stellar_xdr::curr::String32::default(),
-            thresholds: Thresholds([1, 0, 0, 0]),
-            signers: VecM::default(),
-            ext: AccountEntryExt::V0,
-        }),
-        ext: LedgerEntryExt::V0,
-    };
-
-    let mut entries = vec![make_account_entry(root_account_id, root_balance)];
-
-    for i in 0..test_account_count {
-        let name = format!("TestAccount-{}", i);
-        let seed = deterministic_seed(&name);
-        let secret = SecretKey::from_seed(&seed);
-        let public = secret.public_key();
-        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*public.as_bytes())));
-        entries.push(make_account_entry(account_id, test_balance));
-    }
-
-    if test_account_count > 0 {
-        tracing::info!(
-            count = test_account_count,
-            balance_per_account = test_balance,
-            root_balance = root_balance,
-            "Creating genesis test accounts"
-        );
-    }
-
-    entries
+    henyey_app::initialize_genesis(
+        &db,
+        None,
+        network_passphrase,
+        config.testing.genesis_test_account_count,
+    )
 }
 
 fn root_secret(network_passphrase: &str) -> SecretKey {
@@ -2537,7 +2363,7 @@ mod genesis_freshness_tests {
         let result = initialize_genesis_ledger(&config, "Test SDF Network ; September 2015");
         assert!(result.is_err(), "should reject pre-populated database");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("STATE LEAK"), "error: {err}");
+        assert!(err.contains("Cannot initialize genesis"), "error: {err}");
     }
 
     #[test]
@@ -2560,7 +2386,7 @@ mod genesis_freshness_tests {
         let result = initialize_genesis_ledger(&config, "Test SDF Network ; September 2015");
         assert!(result.is_err(), "should reject database with LCL=0");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("STATE LEAK"), "error: {err}");
+        assert!(err.contains("Cannot initialize genesis"), "error: {err}");
     }
 
     #[test]
@@ -2618,7 +2444,7 @@ mod genesis_freshness_tests {
             "should reject database with stale headers but no LCL"
         );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("STATE LEAK"), "error: {err}");
+        assert!(err.contains("Cannot initialize genesis"), "error: {err}");
     }
 
     #[test]

@@ -88,6 +88,7 @@ use henyey_app::{
     logging, run_catchup, run_node, App, AppConfig, CatchupMode as CatchupModeInternal,
     CatchupOptions, LogConfig, LogFormat, RunMode, RunOptions,
 };
+#[cfg(test)]
 use henyey_common::deterministic_seed;
 
 // ---------------------------------------------------------------------------
@@ -1875,263 +1876,19 @@ async fn cmd_new_db(
 
 /// Initialize the genesis ledger (ledger 1) in the database.
 ///
-/// This mirrors stellar-core's `startNewLedger()`: creates a genesis header with
-/// protocol version 0, a root account holding 100 billion XLM, an empty bucket
-/// list with the root account entry, and persists everything to the database.
-///
-/// Build genesis account entries: root account + optional test accounts.
-///
-/// Returns (total_coins, genesis_entries) where total_coins is the fixed total supply
-/// and genesis_entries contains the root account followed by any test accounts.
-fn build_genesis_accounts(
-    network_passphrase: &str,
-    genesis_test_account_count: u32,
-) -> (i64, Vec<stellar_xdr::curr::LedgerEntry>) {
-    use henyey_common::NetworkId;
-    use stellar_xdr::curr::{
-        AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-        PublicKey, SequenceNumber, Thresholds, Uint256, VecM,
-    };
-
-    let network_id = NetworkId::from_passphrase(network_passphrase);
-    let root_secret = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
-    let root_public = root_secret.public_key();
-    let root_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-        *root_public.as_bytes(),
-    )));
-
-    let total_coins: i64 = 1_000_000_000_000_000_000; // 100B XLM in stroops
-
-    let (root_balance, test_balance) = if genesis_test_account_count > 0 {
-        let total_accounts = genesis_test_account_count as i64 + 1;
-        let base = total_coins / total_accounts;
-        let remainder = total_coins % total_accounts;
-        (base + remainder, base)
-    } else {
-        (total_coins, 0i64)
-    };
-
-    let root_entry = LedgerEntry {
-        last_modified_ledger_seq: 1,
-        data: LedgerEntryData::Account(AccountEntry {
-            account_id: root_account_id,
-            balance: root_balance,
-            seq_num: SequenceNumber(0),
-            num_sub_entries: 0,
-            inflation_dest: None,
-            flags: 0,
-            home_domain: stellar_xdr::curr::String32::default(),
-            thresholds: Thresholds([1, 0, 0, 0]),
-            signers: VecM::default(),
-            ext: AccountEntryExt::V0,
-        }),
-        ext: LedgerEntryExt::V0,
-    };
-
-    let mut genesis_entries = vec![root_entry];
-
-    for i in 0..genesis_test_account_count {
-        let name = format!("TestAccount-{i}");
-        let seed = deterministic_seed(&name);
-        let secret = henyey_crypto::SecretKey::from_seed(&seed);
-        let public = secret.public_key();
-        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*public.as_bytes())));
-
-        genesis_entries.push(LedgerEntry {
-            last_modified_ledger_seq: 1,
-            data: LedgerEntryData::Account(AccountEntry {
-                account_id,
-                balance: test_balance,
-                seq_num: SequenceNumber(0),
-                num_sub_entries: 0,
-                inflation_dest: None,
-                flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
-                thresholds: Thresholds([1, 0, 0, 0]),
-                signers: VecM::default(),
-                ext: AccountEntryExt::V0,
-            }),
-            ext: LedgerEntryExt::V0,
-        });
-    }
-
-    if genesis_test_account_count > 0 {
-        tracing::info!(
-            count = genesis_test_account_count,
-            balance_per_account = test_balance,
-            root_balance = root_balance,
-            "Creating genesis test accounts"
-        );
-    }
-
-    (total_coins, genesis_entries)
-}
-
-/// Persist non-empty bucket files to disk so that `load_last_known_ledger`
-/// can restore state on the next `run` startup.
-fn persist_genesis_buckets(
-    bucket_list: &henyey_bucket::BucketList,
-    bucket_dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    std::fs::create_dir_all(bucket_dir)?;
-    for level in bucket_list.levels() {
-        for bucket in [&level.curr, &level.snap] {
-            if !bucket.hash().is_zero() {
-                let path =
-                    bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
-                if !path.exists() {
-                    bucket
-                        .save_to_xdr_file(&path)
-                        .map_err(|e| anyhow::anyhow!("Failed to persist genesis bucket: {e}"))?;
-                    tracing::debug!(
-                        hash = %bucket.hash().to_hex(),
-                        "Persisted genesis bucket file"
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// When `genesis_test_account_count > 0`, creates that many additional accounts
-/// named `"TestAccount-0"` through `"TestAccount-{N-1}"` with deterministic
-/// keys (name padded with `'.'` to 32 bytes, used as Ed25519 seed). The total
-/// coins are split evenly among root + test accounts, with root receiving the
-/// remainder from integer division.
-///
-/// The root account's public key is derived from SHA-256(network_passphrase),
-/// matching stellar-core's `SecretKey::fromSeed(networkID).getPublicKey()`.
+/// Delegates to the shared implementation in `henyey_app::initialize_genesis`.
 fn initialize_genesis_ledger(
     db: &henyey_db::Database,
     bucket_dir: Option<&std::path::Path>,
     network_passphrase: &str,
     genesis_test_account_count: u32,
 ) -> anyhow::Result<()> {
-    use henyey_bucket::BucketList;
-    use henyey_db::schema::state_keys;
-    use henyey_history::build_history_archive_state;
-    use henyey_ledger::{calculate_skip_values, compute_header_hash};
-    use stellar_xdr::curr::{
-        BucketListType, Hash, LedgerHeader, LedgerHeaderExt, Limits, StellarValue, StellarValueExt,
-        TimePoint, VecM, WriteXdr,
-    };
-
-    // 1-2. Build genesis account entries (root + optional test accounts)
-    let (total_coins, genesis_entries) =
-        build_genesis_accounts(network_passphrase, genesis_test_account_count);
-
-    // 3. Create bucket list and add all genesis entries
-    let mut bucket_list = BucketList::new();
-    bucket_list
-        .add_batch(
-            1, // ledger_seq
-            0, // protocol_version (genesis is v0)
-            BucketListType::Live,
-            genesis_entries, // init_entries
-            vec![],          // live_entries
-            vec![],          // dead_entries
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to add genesis entries to bucket list: {}", e))?;
-
-    // 3b. Persist non-empty bucket files to disk
-    if let Some(bucket_dir) = bucket_dir {
-        persist_genesis_buckets(&bucket_list, bucket_dir)?;
-    }
-
-    // 4. Compute bucket list hash (protocol 0 = just the live hash, no hot archive)
-    let bucket_list_hash = bucket_list.hash();
-
-    // 5. Build genesis header
-    let mut header = LedgerHeader {
-        ledger_version: 0,
-        previous_ledger_hash: Hash([0u8; 32]),
-        scp_value: StellarValue {
-            tx_set_hash: Hash([0u8; 32]),
-            close_time: TimePoint(0),
-            upgrades: VecM::default(),
-            ext: StellarValueExt::Basic,
-        },
-        tx_set_result_hash: Hash([0u8; 32]),
-        bucket_list_hash: Hash(*bucket_list_hash.as_bytes()),
-        ledger_seq: 1,
-        total_coins,
-        fee_pool: 0,
-        inflation_seq: 0,
-        id_pool: 0,
-        base_fee: 100,
-        base_reserve: 100_000_000, // 10 XLM
-        max_tx_set_size: 100,
-        skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-        ext: LedgerHeaderExt::V0,
-    };
-
-    // 6. Calculate skip values (no-op for ledger 1, but call for correctness)
-    calculate_skip_values(&mut header);
-
-    // 7. Compute header hash and serialize
-    let header_hash = compute_header_hash(&header)?;
-    let header_xdr = header.to_xdr(Limits::none())?;
-
-    // 8. Build HAS (HistoryArchiveState) for genesis
-    let has = build_history_archive_state(
-        1,
-        &bucket_list,
-        None, // no hot archive at protocol 0
-        Some(network_passphrase.to_string()),
+    henyey_app::initialize_genesis(
+        db,
+        bucket_dir,
+        network_passphrase,
+        genesis_test_account_count,
     )
-    .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
-    let has_json = has.to_json()?;
-
-    // 9. Build bucket level hashes for DB storage
-    let bucket_levels: Vec<(henyey_common::Hash256, henyey_common::Hash256)> = bucket_list
-        .levels()
-        .iter()
-        .map(|level| (level.curr.hash(), level.snap.hash()))
-        .collect();
-
-    // 10. Build empty tx history / tx result entries for genesis (needed by
-    //     history archive publishing — the first checkpoint includes ledger 1).
-    let empty_tx_set = stellar_xdr::curr::TransactionSet {
-        previous_ledger_hash: Hash(henyey_common::Hash256::ZERO.0),
-        txs: VecM::default(),
-    };
-    let genesis_tx_history = stellar_xdr::curr::TransactionHistoryEntry {
-        ledger_seq: 1,
-        tx_set: empty_tx_set,
-        ext: stellar_xdr::curr::TransactionHistoryEntryExt::V0,
-    };
-    let genesis_tx_result = stellar_xdr::curr::TransactionHistoryResultEntry {
-        ledger_seq: 1,
-        tx_result_set: stellar_xdr::curr::TransactionResultSet {
-            results: VecM::default(),
-        },
-        ext: stellar_xdr::curr::TransactionHistoryResultEntryExt::default(),
-    };
-
-    // 11. Persist everything to the database
-    db.with_connection(|conn| {
-        use henyey_db::queries::HistoryQueries;
-        use henyey_db::queries::{BucketListQueries, LedgerQueries, StateQueries};
-
-        conn.store_ledger_header(&header, &header_xdr)?;
-        conn.store_tx_history_entry(1, &genesis_tx_history)?;
-        conn.store_tx_result_entry(1, &genesis_tx_result)?;
-        conn.store_bucket_list(1, &bucket_levels)?;
-        conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-        conn.set_state(state_keys::NETWORK_PASSPHRASE, network_passphrase)?;
-        conn.set_last_closed_ledger(1)?;
-        Ok(())
-    })?;
-
-    tracing::info!(
-        ledger_seq = 1,
-        header_hash = %header_hash,
-        bucket_list_hash = %bucket_list_hash,
-        "Genesis ledger initialized with root account"
-    );
-
-    Ok(())
 }
 
 /// Apply-load command handler.

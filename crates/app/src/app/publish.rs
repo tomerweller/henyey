@@ -773,7 +773,7 @@ mod tests {
 
         // Build genesis bucket list
         let passphrase = app.config.network.passphrase.clone();
-        let genesis_entries = App::build_genesis_entries(&passphrase, 0, TOTAL_COINS);
+        let genesis_entries = super::bootstrap::build_genesis_entries(&passphrase, 0, TOTAL_COINS);
         let live_probe_header = make_header(
             1,
             Hash256::ZERO,
@@ -801,9 +801,25 @@ mod tests {
             bucket_list_hash: Hash(live_hash.0),
             ..live_probe_header
         };
-        let mut bucket_list =
-            App::create_genesis_bucket_list(&custom_bucket_dir, genesis_entries, &live_header)
-                .unwrap();
+        let mut bucket_list = {
+            let mut bl = BucketList::new();
+            bl.set_bucket_dir(custom_bucket_dir.clone());
+            bl.add_batch(
+                1,
+                0,
+                stellar_xdr::curr::BucketListType::Live,
+                genesis_entries,
+                vec![],
+                vec![],
+            )
+            .unwrap();
+            super::bootstrap::persist_genesis_buckets(&bl, &custom_bucket_dir).unwrap();
+            // Verify hash matches
+            let computed = bl.hash();
+            let expected = Hash256::from_bytes(live_header.bucket_list_hash.0);
+            assert_eq!(computed, expected, "genesis bucket list hash mismatch");
+            bl
+        };
         bucket_list.set_ledger_seq(CHECKPOINT);
         let has = build_history_archive_state(
             CHECKPOINT,
