@@ -4,11 +4,117 @@ use crate::{verify, HistoryError, Result};
 use std::sync::Arc;
 
 use henyey_common::protocol::LclContext;
+use henyey_common::Hash256;
 use henyey_ledger::{HeaderSnapshot, LedgerCloseData, LedgerManager};
-use stellar_xdr::curr::{LedgerHeader, LedgerUpgrade, Limits, ReadXdr, WriteXdr};
+use stellar_xdr::curr::{
+    LedgerHeader, LedgerHeaderHistoryEntry, LedgerUpgrade, Limits, ReadXdr, WriteXdr,
+};
 use tracing::{debug, info, warn};
 
 use super::{CatchupManager, CatchupStatus, LedgerData};
+
+/// Decision returned by [`knit_to_lcl_decision`] for a single archive
+/// `LedgerHeaderHistoryEntry`, mirroring the five-case decision matrix in
+/// stellar-core `ApplyCheckpointWork::getNextLedgerCloseData()`
+/// (CATCHUP_SPEC §11.2):
+///
+/// | Case | Condition | Result |
+/// |------|-----------|--------|
+/// | 1 (skip-old) | `entry.seq + 1 < lcl.seq` | `Ok(Skip)` |
+/// | 2 (LCL predecessor knit) | `entry.seq + 1 == lcl.seq`, hashes match | `Ok(Skip)` |
+/// | 3 (LCL overlap knit) | `entry.seq == lcl.seq`, hashes match | `Ok(Skip)` |
+/// | 4 (apply) | `entry.seq == lcl.seq + 1`, prev-hash matches | `Ok(Apply)` |
+/// | 5 (overshoot) | `entry.seq > lcl.seq + 1` | `Err(KnitOvershot)` |
+///
+/// Hash mismatches in cases 2/3/4 return the appropriate fatal
+/// [`HistoryError`] variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KnitDecision {
+    /// Drop the entry: it's at or below LCL and (where required) its hash
+    /// agrees with the local LCL chain. The entry must not be replayed.
+    Skip,
+    /// Apply the entry: it is exactly `lcl + 1` and its
+    /// `previousLedgerHash` matches the local LCL hash.
+    Apply,
+}
+
+/// Apply the §11.2 5-case knit-to-LCL decision matrix to a single archive
+/// header entry.
+///
+/// Mirrors stellar-core `ApplyCheckpointWork::getNextLedgerCloseData()` at
+/// the pinned `stellar-core/v26.0.1` submodule. The comparison order
+/// (case 1 → 2 → 3 → 5 → 4) is preserved exactly, as are the per-case
+/// field selections (`entry.hash` vs `entry.header.previous_ledger_hash`).
+///
+/// Returns:
+/// - `Ok(Skip)` for cases 1/2/3 when hashes agree.
+/// - `Ok(Apply)` for case 4 when the previous-hash check succeeds.
+/// - `Err(KnitLclPredecessorHashMismatch)` for case 2 mismatch.
+/// - `Err(KnitLclHashMismatch)` for case 3 mismatch.
+/// - `Err(KnitCurrentLedgerPrevHashMismatch)` for case 4 prev-hash
+///   mismatch. Distinct from case 3 to match stellar-core's two distinct
+///   error messages.
+/// - `Err(KnitOvershot)` for case 5.
+pub(super) fn knit_to_lcl_decision(
+    entry: &LedgerHeaderHistoryEntry,
+    lcl: &HeaderSnapshot,
+) -> Result<KnitDecision> {
+    let entry_seq = entry.header.ledger_seq;
+    let lcl_seq = lcl.header.ledger_seq;
+
+    // Case 1: entry.seq + 1 < lcl.seq — well before LCL, drop silently.
+    if entry_seq.saturating_add(1) < lcl_seq {
+        debug!(entry_seq, lcl_seq, "Knit: case 1 (skip-old)");
+        return Ok(KnitDecision::Skip);
+    }
+
+    // Case 2: entry.seq + 1 == lcl.seq — must match lcl.previousLedgerHash.
+    if entry_seq.saturating_add(1) == lcl_seq {
+        let expected = Hash256::from(lcl.header.previous_ledger_hash.clone());
+        let actual = Hash256::from(entry.hash.clone());
+        if expected != actual {
+            return Err(HistoryError::KnitLclPredecessorHashMismatch {
+                ledger: entry_seq,
+                expected: expected.to_hex(),
+                actual: actual.to_hex(),
+            });
+        }
+        debug!(entry_seq, "Knit: case 2 (LCL predecessor) hash matches");
+        return Ok(KnitDecision::Skip);
+    }
+
+    // Case 3: entry.seq == lcl.seq — must match lcl.hash.
+    if entry_seq == lcl_seq {
+        let actual = Hash256::from(entry.hash.clone());
+        if actual != lcl.hash {
+            return Err(HistoryError::KnitLclHashMismatch {
+                expected: lcl.hash.to_hex(),
+                actual: actual.to_hex(),
+            });
+        }
+        debug!(entry_seq, "Knit: case 3 (LCL overlap) hash matches");
+        return Ok(KnitDecision::Skip);
+    }
+
+    // Case 5: entry.seq > lcl.seq + 1 — overshoot (checked before case 4 to
+    // match stellar-core's branch order at ApplyCheckpointWork.cpp:246).
+    if entry_seq != lcl_seq.saturating_add(1) {
+        return Err(HistoryError::KnitOvershot { entry_seq, lcl_seq });
+    }
+
+    // Case 4: entry.seq == lcl.seq + 1 — entry.header.previousLedgerHash
+    // must match lcl.hash.
+    let entry_prev = Hash256::from(entry.header.previous_ledger_hash.clone());
+    if entry_prev != lcl.hash {
+        return Err(HistoryError::KnitCurrentLedgerPrevHashMismatch {
+            ledger: entry_seq,
+            expected: lcl.hash.to_hex(),
+            actual: entry_prev.to_hex(),
+        });
+    }
+    debug!(entry_seq, "Knit: case 4 (apply) prev-hash matches");
+    Ok(KnitDecision::Apply)
+}
 
 /// Maximum number of retry attempts for the download-and-replay pipeline.
 ///
@@ -47,6 +153,64 @@ pub(super) fn decode_upgrades_from_header(header: &LedgerHeader) -> Vec<LedgerUp
 }
 
 impl CatchupManager {
+    /// Apply the §11.2 5-case decision matrix to the knit-prefix entries
+    /// (entries at or below LCL drawn from the same checkpoint file as
+    /// LCL+1) and to the first apply entry. Returns the apply entries that
+    /// must be replayed (i.e. `Apply`-classified entries), in the same
+    /// order as `apply_data`.
+    ///
+    /// `knit_entries` carries the raw `LedgerHeaderHistoryEntry` records
+    /// (as found in the archive checkpoint file) for ledgers in
+    /// `[knit_start, lcl_seq]`. They are validated against `lcl` and
+    /// dropped from replay; mismatches surface as the case-specific fatal
+    /// variants on [`HistoryError`].
+    ///
+    /// `apply_data` carries the per-ledger `LedgerData` for ledgers in
+    /// `[lcl_seq + 1, target]`. Its first entry is checked for cases 4 and
+    /// 5 (apply-link to LCL or overshoot). Remaining entries are validated
+    /// by the chain check downstream.
+    pub(super) fn verify_knit_to_lcl(
+        &self,
+        knit_entries: &[LedgerHeaderHistoryEntry],
+        apply_data: &[LedgerData],
+        lcl: &HeaderSnapshot,
+    ) -> Result<()> {
+        for entry in knit_entries {
+            let decision = knit_to_lcl_decision(entry, lcl)?;
+            debug_assert_eq!(
+                decision,
+                KnitDecision::Skip,
+                "knit-prefix entries must classify as Skip"
+            );
+        }
+        if let Some(first) = apply_data.first() {
+            let header = first.header().clone();
+            let entry_hash = henyey_ledger::compute_header_hash(&header).map_err(|e| {
+                HistoryError::CatchupFailed(format!(
+                    "Failed to compute header hash for ledger {}: {}",
+                    header.ledger_seq, e
+                ))
+            })?;
+            let virtual_entry = LedgerHeaderHistoryEntry {
+                hash: entry_hash.into(),
+                header,
+                ext: Default::default(),
+            };
+            let decision = knit_to_lcl_decision(&virtual_entry, lcl)?;
+            debug_assert_eq!(
+                decision,
+                KnitDecision::Apply,
+                "first apply entry must classify as Apply"
+            );
+        }
+        info!(
+            knit_entries = knit_entries.len(),
+            apply_entries = apply_data.len(),
+            "Knit-to-LCL decision matrix validated"
+        );
+        Ok(())
+    }
+
     /// Verify the downloaded ledger data using reverse-walk chain verification (§9.2–§9.5).
     pub(super) fn verify_downloaded_data(
         &self,
@@ -236,9 +400,17 @@ impl CatchupManager {
             4,
             "Downloading ledger data",
         );
-        let (ledger_data, archive_name) = self
+        let (ledger_data, knit_entries, archive_name) = self
             .download_ledger_data(download_from, target, lcl)
             .await?;
+
+        // CATCHUP_SPEC §11.2: apply the 5-case knit-to-LCL decision matrix
+        // before chain verification. This catches case-2/3/4/5 hash and
+        // sequencing failures with their specific fatal error variants
+        // (mirroring stellar-core ApplyCheckpointWork::getNextLedgerCloseData())
+        // rather than letting them surface as generic chain-link errors.
+        let lcl_snapshot = ledger_manager.header_snapshot();
+        self.verify_knit_to_lcl(&knit_entries, &ledger_data, &lcl_snapshot)?;
 
         // Verify the header chain.
         //
@@ -247,7 +419,6 @@ impl CatchupManager {
         // `apply_ledger_chain_*` counters: a single outer success can include
         // multiple verify failures from prior attempts.
         self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
-        let lcl_snapshot = ledger_manager.header_snapshot();
         match self.verify_downloaded_data(&ledger_data, &lcl_snapshot) {
             Ok(()) => {
                 metrics::counter!(
@@ -422,6 +593,209 @@ mod tests {
     use crate::HistoryError;
     use henyey_common::Hash256;
 
+    /// Construct a synthetic [`HeaderSnapshot`] for the §11.2 knit tests.
+    /// `lcl_seq` is the LCL ledger sequence, `lcl_hash` is the LCL's own
+    /// hash, and `lcl_prev_hash` is what the LCL header's
+    /// `previous_ledger_hash` field carries (i.e. the hash of LCL-1).
+    fn make_test_lcl(lcl_seq: u32, lcl_hash: Hash256, lcl_prev_hash: Hash256) -> HeaderSnapshot {
+        use stellar_xdr::curr::LedgerHeader;
+        let mut header = LedgerHeader::default();
+        header.ledger_seq = lcl_seq;
+        header.previous_ledger_hash = stellar_xdr::curr::Hash(lcl_prev_hash.0);
+        HeaderSnapshot {
+            header,
+            hash: lcl_hash,
+            soroban_network_info: None,
+        }
+    }
+
+    /// Construct a synthetic [`LedgerHeaderHistoryEntry`].
+    /// `entry_hash` is the entry's own `hash` field (case 2/3 check) and
+    /// `entry_prev` populates `header.previous_ledger_hash` (case 4 check).
+    fn make_test_entry(
+        seq: u32,
+        entry_hash: Hash256,
+        entry_prev: Hash256,
+    ) -> stellar_xdr::curr::LedgerHeaderHistoryEntry {
+        use stellar_xdr::curr::{LedgerHeader, LedgerHeaderHistoryEntry};
+        let mut header = LedgerHeader::default();
+        header.ledger_seq = seq;
+        header.previous_ledger_hash = stellar_xdr::curr::Hash(entry_prev.0);
+        LedgerHeaderHistoryEntry {
+            hash: stellar_xdr::curr::Hash(entry_hash.0),
+            header,
+            ext: Default::default(),
+        }
+    }
+
+    fn h(byte: u8) -> Hash256 {
+        Hash256::from_bytes([byte; 32])
+    }
+
+    #[test]
+    fn test_knit_case_1_skip_old() {
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        let entry = make_test_entry(80, h(0x99), h(0x88)); // hashes irrelevant
+        assert_eq!(
+            knit_to_lcl_decision(&entry, &lcl).unwrap(),
+            KnitDecision::Skip
+        );
+    }
+
+    #[test]
+    fn test_knit_case_2_lcl_predecessor_match() {
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        // Entry at LCL-1 whose own hash equals lcl.previousLedgerHash.
+        let entry = make_test_entry(99, h(0x09), h(0x08));
+        assert_eq!(
+            knit_to_lcl_decision(&entry, &lcl).unwrap(),
+            KnitDecision::Skip
+        );
+    }
+
+    #[test]
+    fn test_knit_case_2_lcl_predecessor_mismatch() {
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        let entry = make_test_entry(99, h(0xAA), h(0x08));
+        let err = knit_to_lcl_decision(&entry, &lcl).unwrap_err();
+        match err {
+            HistoryError::KnitLclPredecessorHashMismatch { ledger, .. } => {
+                assert_eq!(ledger, 99);
+            }
+            other => panic!("expected KnitLclPredecessorHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_knit_case_3_lcl_overlap_match() {
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        // Entry at LCL whose own hash matches lcl.hash.
+        let entry = make_test_entry(100, h(0x10), h(0x09));
+        assert_eq!(
+            knit_to_lcl_decision(&entry, &lcl).unwrap(),
+            KnitDecision::Skip
+        );
+    }
+
+    #[test]
+    fn test_knit_case_3_lcl_overlap_mismatch() {
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        let entry = make_test_entry(100, h(0xBB), h(0x09));
+        let err = knit_to_lcl_decision(&entry, &lcl).unwrap_err();
+        assert!(matches!(err, HistoryError::KnitLclHashMismatch { .. }));
+    }
+
+    #[test]
+    fn test_knit_case_4_apply_match() {
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        // LCL+1 whose previousLedgerHash matches lcl.hash.
+        let entry = make_test_entry(101, h(0xCC), h(0x10));
+        assert_eq!(
+            knit_to_lcl_decision(&entry, &lcl).unwrap(),
+            KnitDecision::Apply
+        );
+    }
+
+    #[test]
+    fn test_knit_case_4_apply_prev_hash_mismatch() {
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        // LCL+1 but previousLedgerHash != lcl.hash.
+        let entry = make_test_entry(101, h(0xCC), h(0xEE));
+        let err = knit_to_lcl_decision(&entry, &lcl).unwrap_err();
+        match err {
+            HistoryError::KnitCurrentLedgerPrevHashMismatch { ledger, .. } => {
+                assert_eq!(ledger, 101);
+            }
+            other => panic!("expected KnitCurrentLedgerPrevHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_knit_case_5_overshoot() {
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        let entry = make_test_entry(105, h(0xCC), h(0xDD));
+        let err = knit_to_lcl_decision(&entry, &lcl).unwrap_err();
+        match err {
+            HistoryError::KnitOvershot { entry_seq, lcl_seq } => {
+                assert_eq!(entry_seq, 105);
+                assert_eq!(lcl_seq, 100);
+            }
+            other => panic!("expected KnitOvershot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_knit_at_genesis() {
+        // Synthetic pre-genesis LCL (seq=0, zero hashes), as used by henyey
+        // when the local LedgerManager is at synthetic genesis.
+        let lcl = make_test_lcl(0, Hash256::ZERO, Hash256::ZERO);
+        // Entry at ledger 1 with previousLedgerHash == lcl.hash (zero):
+        // classifies as case 4 (apply).
+        let entry = make_test_entry(1, h(0xAB), Hash256::ZERO);
+        assert_eq!(
+            knit_to_lcl_decision(&entry, &lcl).unwrap(),
+            KnitDecision::Apply
+        );
+        // Entry at ledger 2 → overshoot.
+        let entry2 = make_test_entry(2, h(0xCD), Hash256::ZERO);
+        assert!(matches!(
+            knit_to_lcl_decision(&entry2, &lcl).unwrap_err(),
+            HistoryError::KnitOvershot {
+                entry_seq: 2,
+                lcl_seq: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn test_knit_lcl_at_checkpoint_boundary() {
+        // When LCL is the LAST ledger of its checkpoint (seq == 63, 127, ...),
+        // LCL-1 lives in the same checkpoint, so it IS available in the
+        // current download. Case 2 fires normally.
+        let lcl = make_test_lcl(127, h(0x10), h(0x09));
+        let entry_at_lcl_minus_1 = make_test_entry(126, h(0x09), h(0x08));
+        assert_eq!(
+            knit_to_lcl_decision(&entry_at_lcl_minus_1, &lcl).unwrap(),
+            KnitDecision::Skip
+        );
+        // When LCL is the FIRST ledger of its checkpoint (seq == 64, 128, ...),
+        // LCL-1 lives in a prior checkpoint and is NOT downloaded — the knit
+        // pass simply doesn't see it. We exercise only LCL itself (case 3) and
+        // LCL+1 (case 4).
+        let lcl_boundary = make_test_lcl(64, h(0x20), h(0x1F));
+        let entry_at_lcl = make_test_entry(64, h(0x20), h(0x1F));
+        assert_eq!(
+            knit_to_lcl_decision(&entry_at_lcl, &lcl_boundary).unwrap(),
+            KnitDecision::Skip
+        );
+        let entry_at_lcl_plus_1 = make_test_entry(65, h(0xAB), h(0x20));
+        assert_eq!(
+            knit_to_lcl_decision(&entry_at_lcl_plus_1, &lcl_boundary).unwrap(),
+            KnitDecision::Apply
+        );
+    }
+
+    #[test]
+    fn test_knit_after_retry_advances_lcl() {
+        // Simulate a partial-progress retry: LCL has advanced past the
+        // earliest entry in the original batch. Older entries must
+        // classify as case 1 (skip-old), not be re-applied.
+        let lcl = make_test_lcl(110, h(0xFE), h(0xFD));
+        let old_entry = make_test_entry(105, h(0x11), h(0x10));
+        assert_eq!(
+            knit_to_lcl_decision(&old_entry, &lcl).unwrap(),
+            KnitDecision::Skip
+        );
+        // And the entry at LCL still classifies as case 3 (overlap) and
+        // requires the hash to match — protecting against an attacker
+        // replaying older but tampered history.
+        let entry_at_lcl_tampered = make_test_entry(110, h(0xBA), h(0xFD));
+        assert!(matches!(
+            knit_to_lcl_decision(&entry_at_lcl_tampered, &lcl).unwrap_err(),
+            HistoryError::KnitLclHashMismatch { .. }
+        ));
+    }
+
     /// Verify REPLAY_RETRY_COUNT matches stellar-core's RETRY_A_FEW = 5.
     #[test]
     fn test_replay_retry_count_matches_stellar_core() {
@@ -459,6 +833,24 @@ mod tests {
                 ledger: 100,
                 expected: "abc".into(),
                 actual: "def".into(),
+            },
+            HistoryError::KnitLclPredecessorHashMismatch {
+                ledger: 99,
+                expected: "abc".into(),
+                actual: "def".into(),
+            },
+            HistoryError::KnitLclHashMismatch {
+                expected: "abc".into(),
+                actual: "def".into(),
+            },
+            HistoryError::KnitCurrentLedgerPrevHashMismatch {
+                ledger: 101,
+                expected: "abc".into(),
+                actual: "def".into(),
+            },
+            HistoryError::KnitOvershot {
+                entry_seq: 105,
+                lcl_seq: 100,
             },
         ];
         for err in &fatal_errors {

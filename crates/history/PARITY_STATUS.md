@@ -19,7 +19,7 @@
 | Publish orchestration | Partial | Missing some callbacks, metrics, cleanup helpers |
 | State snapshot publishing | Partial | No differential HAS upload; upload ordering now matches stellar-core (data-before-HAS) |
 | Verification | Full | Header entry hash, header chain, bucket, tx-set, tx-result checks implemented |
-| Catchup and replay | Full | Rust-native orchestration covers core flow |
+| Catchup and replay | Full | Rust-native orchestration covers core flow; §11.2 5-case knit-to-LCL decision matrix matches stellar-core |
 | Metrics and status plumbing | None | No Medida/StatusManager equivalent yet |
 
 ## File Mapping
