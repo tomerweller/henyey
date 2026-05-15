@@ -2031,7 +2031,6 @@ impl App {
         self.archive_checkpoint_cache.set_urgent(true);
     }
 
-    /// was in catchup mode but still polling the archive at the 60 s
     /// Gap between the highest verified SCP slot from peers and our current
     /// ledger. Returns 0 when no peer traffic has been observed.
     pub(super) fn effective_peer_gap(&self, current_ledger: u32) -> u64 {
@@ -6088,6 +6087,50 @@ mod tests {
             app.archive_recovery_snapshot().await.is_confirmed_behind(),
             "cold cache must not change recovery status"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // #2713 snapshot-independence regression test
+    // -------------------------------------------------------------------
+
+    /// Verify that `ArchiveRecoverySnapshot` is independent of subsequent state
+    /// mutations — taking a snapshot before a clear must reflect the pre-clear
+    /// state even after the clear completes.
+    #[tokio::test]
+    async fn test_archive_recovery_snapshot_independent_of_clear() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Mark confirmed behind and arm backoff.
+        app.mark_archive_confirmed_behind().await;
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: Some(Instant::now() + Duration::from_secs(60)),
+            };
+        }
+
+        // Take a snapshot BEFORE clearing state.
+        let snapshot_before = app.archive_recovery_snapshot().await;
+        assert!(snapshot_before.is_confirmed_behind());
+
+        // Clear state.
+        app.clear_archive_recovery_state(ArchiveRecoveryClear::FullProgress)
+            .await;
+
+        // Snapshot taken before clear still reflects pre-clear state.
+        assert!(
+            snapshot_before.is_confirmed_behind(),
+            "snapshot must be independent of subsequent state mutations"
+        );
+
+        // New snapshot reflects the cleared state.
+        let snapshot_after = app.archive_recovery_snapshot().await;
+        assert!(!snapshot_after.is_confirmed_behind());
     }
 
     // -------------------------------------------------------------------
