@@ -402,6 +402,20 @@ pub fn verify_reverse_walk(
         }
     }
 
+    // If the trust anchor was never consumed, it refers to a seq below our
+    // lowest header — we cannot verify it.
+    if let Some((anchor_seq, _)) = pending_trust_anchor {
+        let lowest_seq = checkpoint_groups
+            .last()
+            .and_then(|g| g.first())
+            .map(|h| h.ledger_seq)
+            .unwrap_or(0);
+        return Err(HistoryError::InvalidSequence {
+            expected: anchor_seq,
+            got: lowest_seq,
+        });
+    }
+
     // §9.5: Fatal failure determination.
     if local_state_disagrees {
         match &config.trust_source {
@@ -2197,6 +2211,33 @@ mod tests {
         assert!(
             matches!(err, HistoryError::VerificationHashMismatch(_)),
             "expected cross-checkpoint hash mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reverse_walk_trust_anchor_below_lowest_header() {
+        // Trust anchor at seq 5, but headers start at seq 10.
+        // The anchor can never be verified — should error.
+        let headers = make_chain(10, 20, 25);
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::Scp {
+                seq: 5,
+                hash: Hash256([0xEE; 32]),
+            },
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HistoryError::InvalidSequence {
+                    expected: 5,
+                    got: 10
+                }
+            ),
+            "expected InvalidSequence for below-range anchor, got: {err}"
         );
     }
 }
