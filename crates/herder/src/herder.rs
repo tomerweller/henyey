@@ -55,7 +55,7 @@ use henyey_common::protocol::{protocol_version_starts_from, LclContext, Protocol
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::{PublicKey, SecretKey};
 use henyey_ledger::LedgerManager;
-use henyey_scp::{BallotPhase, SlotIndex, SCP};
+use henyey_scp::{SlotIndex, SCP};
 use stellar_xdr::curr::{
     EnvelopeType, LedgerCloseValueSignature, LedgerHeader, LedgerUpgrade, Limits, NodeId, ReadXdr,
     ScpEnvelope, ScpQuorumSet, ScpStatementPledges, Signature as XdrSignature, StellarValue,
@@ -73,6 +73,7 @@ use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig, SharedTrackingState};
 use crate::state::HerderState;
 use crate::sync_recovery::LEDGER_VALIDITY_BRACKET;
+use crate::timer_manager::TimerManagerHandle;
 use crate::tx_queue::{
     account_key_from_account_id, TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult,
     TxQueueStats,
@@ -500,8 +501,12 @@ pub struct Herder {
 
 impl Herder {
     /// Create a new Herder (observer mode, no secret key).
-    pub fn new(config: HerderConfig, ledger_manager: Arc<LedgerManager>) -> Self {
-        Self::build(config, None, ledger_manager)
+    pub fn new(
+        config: HerderConfig,
+        ledger_manager: Arc<LedgerManager>,
+        timer_handle: TimerManagerHandle,
+    ) -> Self {
+        Self::build(config, None, ledger_manager, timer_handle)
     }
 
     /// Create a new Herder with a secret key for validation.
@@ -509,8 +514,9 @@ impl Herder {
         config: HerderConfig,
         secret_key: SecretKey,
         ledger_manager: Arc<LedgerManager>,
+        timer_handle: TimerManagerHandle,
     ) -> Self {
-        Self::build(config, Some(secret_key), ledger_manager)
+        Self::build(config, Some(secret_key), ledger_manager, timer_handle)
     }
 
     /// Shared constructor logic for both observer and validator modes.
@@ -518,6 +524,7 @@ impl Herder {
         mut config: HerderConfig,
         secret_key: Option<SecretKey>,
         ledger_manager: Arc<LedgerManager>,
+        timer_handle: TimerManagerHandle,
     ) -> Self {
         // Normalize the local quorum set up front, before it fans out to
         // SCP::new, ScpDriverConfig, FetchingEnvelopes, QuorumSetTracker,
@@ -570,6 +577,7 @@ impl Herder {
                 Arc::clone(&tracking_state),
                 Arc::clone(&scp_metrics),
                 Arc::clone(&runtime_upgrades),
+                timer_handle,
             )
         } else {
             ScpDriver::new(
@@ -579,6 +587,7 @@ impl Herder {
                 Arc::clone(&tracking_state),
                 Arc::clone(&scp_metrics),
                 Arc::clone(&runtime_upgrades),
+                timer_handle,
             )
         });
 
@@ -2544,30 +2553,6 @@ impl Herder {
         self.complete_externalization(slot);
     }
 
-    /// Get the current nomination timeout.
-    pub fn get_nomination_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
-        if let Some(state) = self.scp.get_slot_state(slot) {
-            if state.is_nominating {
-                return Some(self.scp.get_nomination_timeout(state.nomination_round));
-            }
-        }
-        None
-    }
-
-    /// Get the current ballot timeout.
-    pub fn get_ballot_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
-        if let Some(state) = self.scp.get_slot_state(slot) {
-            if let Some(round) = state.ballot_round {
-                if state.heard_from_quorum
-                    && !matches!(state.ballot_phase, BallotPhase::Externalize)
-                {
-                    return Some(self.scp.get_ballot_timeout(round));
-                }
-            }
-        }
-        None
-    }
-
     /// Build a nomination-ready SCP `Value`: transaction set + signed StellarValue.
     ///
     /// Called by `trigger_next_ledger` to build the initial nomination value. Steps:
@@ -4037,7 +4022,7 @@ mod tests {
 
     fn make_test_herder() -> Herder {
         let config = HerderConfig::default();
-        Herder::new(config, make_default_lm())
+        Herder::new(config, make_default_lm(), TimerManagerHandle::no_op())
     }
 
     fn make_validator_herder() -> (Herder, SecretKey) {
@@ -4059,7 +4044,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, secret_for_herder, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            secret_for_herder,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         let secret_for_signing = SecretKey::from_seed(&seed);
 
         (herder, secret_for_signing)
@@ -4275,7 +4265,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret.clone(), make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret.clone(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -4373,7 +4368,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -4436,7 +4436,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -4494,7 +4499,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -4543,7 +4553,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -4604,151 +4619,6 @@ mod tests {
             "expected TryAgainLater when not tracking, got {:?}",
             result
         );
-    }
-
-    #[test]
-    fn test_nomination_timeout_requires_started() {
-        // Use a 2-node quorum so that nomination doesn't immediately cascade
-        // to externalization (which would stop nomination and cancel the timer).
-        let seed = [7u8; 32];
-        let secret_for_herder = SecretKey::from_seed(&seed);
-        let public = secret_for_herder.public_key();
-        let local_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*public.as_bytes()),
-        ));
-
-        let other_secret = SecretKey::from_seed(&[8u8; 32]);
-        let other_public = other_secret.public_key();
-        let other_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*other_public.as_bytes()),
-        ));
-
-        let quorum_set = ScpQuorumSet {
-            threshold: 2,
-            validators: vec![local_node_id.clone(), other_node_id.clone()]
-                .try_into()
-                .unwrap(),
-            inner_sets: vec![].try_into().unwrap(),
-        };
-
-        let config = HerderConfig {
-            is_validator: true,
-            node_public_key: public,
-            local_quorum_set: Some(quorum_set),
-            ..HerderConfig::default()
-        };
-
-        let herder = Herder::with_secret_key(config, secret_for_herder, make_default_lm());
-        let secret = SecretKey::from_seed(&seed);
-        let slot = 1u64;
-
-        assert!(herder.get_nomination_timeout(slot).is_none());
-
-        let value = make_valid_value_with_cached_tx_set(&herder, &secret);
-        let prev_value = value.clone();
-        assert!(herder.scp().nominate(slot, value, &prev_value));
-
-        assert!(herder.get_nomination_timeout(slot).is_some());
-    }
-
-    #[test]
-    fn test_ballot_timeout_requires_heard_from_quorum() {
-        // Use a 2-node quorum (threshold 2) so that the local node's self-envelope
-        // cannot cascade all the way to externalization via recursive self-processing.
-        // We then send a PREPARE from the second node so heard_from_quorum is satisfied.
-        let seed = [7u8; 32];
-        let secret_for_herder = SecretKey::from_seed(&seed);
-        let public = secret_for_herder.public_key();
-        let local_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*public.as_bytes()),
-        ));
-
-        // Second node
-        let other_secret = SecretKey::from_seed(&[8u8; 32]);
-        let other_public = other_secret.public_key();
-        let other_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*other_public.as_bytes()),
-        ));
-
-        let quorum_set = ScpQuorumSet {
-            threshold: 2,
-            validators: vec![local_node_id.clone(), other_node_id.clone()]
-                .try_into()
-                .unwrap(),
-            inner_sets: vec![].try_into().unwrap(),
-        };
-
-        let config = HerderConfig {
-            is_validator: true,
-            node_public_key: public,
-            local_quorum_set: Some(quorum_set.clone()),
-            ..HerderConfig::default()
-        };
-
-        let herder = Herder::with_secret_key(config, secret_for_herder, make_default_lm());
-        let secret = SecretKey::from_seed(&seed);
-        let slot = 1u64;
-
-        assert!(herder.get_ballot_timeout(slot).is_none());
-
-        // Create a valid value and start ballot protocol via bump_state
-        let value = make_valid_value_with_cached_tx_set(&herder, &secret);
-        assert!(herder.scp().bump_state(slot, value.clone(), 1));
-
-        // Ballot started but no quorum heard yet (only local node's PREPARE)
-        assert!(
-            herder.get_ballot_timeout(slot).is_none(),
-            "should not have ballot timeout without quorum"
-        );
-
-        // Send a PREPARE from the second node to form quorum.
-        // Use the normalized hash — Herder::build normalizes the local quorum
-        // set, so SCP statements use the canonical hash.
-        let mut normalized_qs = quorum_set.clone();
-        henyey_scp::normalize_quorum_set(&mut normalized_qs);
-        let qs_hash = hash_quorum_set(&normalized_qs);
-        let ballot = ScpBallot {
-            counter: 1,
-            value: value.clone(),
-        };
-        let prepare = ScpStatementPrepare {
-            quorum_set_hash: qs_hash.into(),
-            ballot: ballot.clone(),
-            prepared: None,
-            prepared_prime: None,
-            n_c: 0,
-            n_h: 0,
-        };
-        let statement = ScpStatement {
-            node_id: other_node_id,
-            slot_index: slot,
-            pledges: ScpStatementPledges::Prepare(prepare),
-        };
-        let env = sign_statement(&statement, &herder, &other_secret);
-        herder.scp().receive_envelope(env);
-
-        // Now we should have heard from quorum (local + other = 2, threshold = 2)
-        assert!(herder.get_ballot_timeout(slot).is_some());
-    }
-
-    #[test]
-    fn test_timeouts_none_for_non_validator() {
-        let herder = make_test_herder();
-        let slot = 1u64;
-
-        assert!(herder.get_nomination_timeout(slot).is_none());
-        assert!(herder.get_ballot_timeout(slot).is_none());
-    }
-
-    #[test]
-    fn test_ballot_timeout_none_when_externalized() {
-        let (herder, secret) = make_validator_herder();
-        let slot = 1u64;
-
-        let value = make_valid_value_with_cached_tx_set(&herder, &secret);
-        herder.scp().force_externalize(slot, value);
-
-        assert!(herder.get_ballot_timeout(slot).is_none());
     }
 
     // =========================================================================
@@ -4818,7 +4688,12 @@ mod tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         // (a) SCP must store the normalized form.
         let scp_stored = herder.scp().local_quorum_set();
@@ -5079,7 +4954,7 @@ mod tests {
             run_standalone: true,
             ..HerderConfig::default()
         };
-        let herder = Herder::new(config, make_default_lm());
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
         herder.bootstrap(100);
 
         let env = make_nomination_envelope_with_close_time(101, 100);
@@ -5097,7 +4972,7 @@ mod tests {
             run_standalone: true,
             ..HerderConfig::default()
         };
-        let herder = Herder::new(config, make_default_lm());
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
         herder.bootstrap(100);
 
         let env = make_nomination_envelope_with_close_time(101, 100);
@@ -5115,7 +4990,7 @@ mod tests {
             run_standalone: true,
             ..HerderConfig::default()
         };
-        let herder = Herder::new(config, make_default_lm());
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
         herder.bootstrap(100);
 
         let env = make_nomination_envelope_with_close_time(101, 100);
@@ -5138,7 +5013,7 @@ mod tests {
             run_standalone: false,
             ..HerderConfig::default()
         };
-        let herder = Herder::new(config, make_default_lm());
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
         herder.bootstrap(100);
 
         let env = make_nomination_envelope_with_close_time(101, 100);
@@ -5360,7 +5235,12 @@ mod tests {
         };
         // Set runtime upgrades matching ALL proposed upgrades (required for
         // nomination validation) plus an additional BaseReserve.
-        let herder = Herder::with_secret_key(config, secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         let upgrade_params = crate::upgrades::UpgradeParameters {
             upgrade_time: 0,
             protocol_version: Some(25),
@@ -5464,7 +5344,12 @@ mod tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.bootstrap(0);
 
         // First trigger: starts nomination, round should be 1.
@@ -5599,8 +5484,12 @@ mod tests {
             ..HerderConfig::default()
         };
         const STALE_SLOT: u32 = 5;
-        let herder =
-            Herder::with_secret_key(config, secret, make_lm_at_seq_for_stale_test(STALE_SLOT));
+        let herder = Herder::with_secret_key(
+            config,
+            secret,
+            make_lm_at_seq_for_stale_test(STALE_SLOT),
+            TimerManagerHandle::no_op(),
+        );
 
         herder.bootstrap(STALE_SLOT);
 
@@ -5646,8 +5535,12 @@ mod tests {
             ..HerderConfig::default()
         };
         const STALE_SLOT: u32 = 7;
-        let herder =
-            Herder::with_secret_key(config, secret, make_lm_at_seq_for_stale_test(STALE_SLOT));
+        let herder = Herder::with_secret_key(
+            config,
+            secret,
+            make_lm_at_seq_for_stale_test(STALE_SLOT),
+            TimerManagerHandle::no_op(),
+        );
 
         herder.bootstrap(STALE_SLOT);
 
@@ -5690,7 +5583,12 @@ mod tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret, make_lm_at_seq_for_stale_test(10));
+        let herder = Herder::with_secret_key(
+            config,
+            secret,
+            make_lm_at_seq_for_stale_test(10),
+            TimerManagerHandle::no_op(),
+        );
 
         // LM at seq=10: verify match (slot=11) and
         // mismatch (slot=10, slot=5, slot=12).
@@ -5827,8 +5725,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder =
-            Herder::with_secret_key(config, SecretKey::from_seed(&[7u8; 32]), make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&[7u8; 32]),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.start_syncing();
         herder.bootstrap(0);
 
@@ -5997,7 +5899,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -6088,7 +5995,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -6200,7 +6112,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         // Store quorum sets for both nodes (simulates having learned them
         // from SCP message exchange before the purge).
@@ -6277,7 +6194,12 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         herder.store_quorum_set(&local_node_id, quorum_set.clone());
         herder.store_quorum_set(&remote_node_id, quorum_set.clone());
@@ -6892,6 +6814,7 @@ mod tests {
             config,
             local_secret,
             make_default_lm(),
+            TimerManagerHandle::no_op(),
         ));
         herder.bootstrap(100);
 
@@ -7301,7 +7224,7 @@ mod inv_h2_lcl_guard_tests {
     fn make_tracking_herder_at(lm_seq: u32, tracking_slot: u64) -> Herder {
         let lm = make_lm_at_seq(lm_seq);
         let config = HerderConfig::default();
-        let herder = Herder::new(config, lm);
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
         // Set to Tracking state with given consensus_index
         {
             let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
@@ -7360,7 +7283,7 @@ mod inv_h2_lcl_guard_tests {
         // Herder in Booting state — assertion should be a no-op even with bad values
         let lm = make_lm_at_seq(10);
         let config = HerderConfig::default();
-        let herder = Herder::new(config, lm);
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
         // State is Booting by default, tracking_slot=0
         herder.assert_lcl_consistency(); // should not panic
     }
@@ -7370,7 +7293,7 @@ mod inv_h2_lcl_guard_tests {
         // Tracking state but tracking_slot=0 (genesis sentinel)
         let lm = make_lm_at_seq(5);
         let config = HerderConfig::default();
-        let herder = Herder::new(config, lm);
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
         {
             let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
             *state = HerderState::Tracking;
@@ -7405,7 +7328,7 @@ mod inv_h2_lcl_guard_tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret, lm);
+        let herder = Herder::with_secret_key(config, secret, lm, TimerManagerHandle::no_op());
         {
             let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
             *state = HerderState::Tracking;
@@ -7479,7 +7402,11 @@ mod closing_gate_tests {
     }
 
     fn make_test_herder() -> Herder {
-        Herder::new(HerderConfig::default(), make_default_lm())
+        Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        )
     }
 
     fn make_test_envelope(slot: u64) -> ScpEnvelope {
@@ -7743,7 +7670,11 @@ mod set_state_tests {
     }
 
     fn make_test_herder() -> Herder {
-        Herder::new(HerderConfig::default(), make_default_lm())
+        Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        )
     }
 
     // =========================================================================
@@ -7939,7 +7870,11 @@ mod scp_pipeline_tests {
     }
 
     fn make_test_herder() -> Herder {
-        Herder::new(HerderConfig::default(), make_default_lm())
+        Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        )
     }
 
     fn make_unsigned_envelope(slot: u64, node_seed: u8) -> ScpEnvelope {
@@ -8105,7 +8040,12 @@ mod scp_pipeline_tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret.clone(), make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            secret.clone(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.start_syncing();
         herder.pending_envelopes.set_current_slot(95);
 
@@ -8169,7 +8109,7 @@ mod scp_pipeline_tests {
             },
             ..Default::default()
         };
-        let herder = Herder::new(config, make_default_lm());
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
         herder.start_syncing();
         herder.pending_envelopes.set_current_slot(95);
 
@@ -8215,7 +8155,7 @@ mod scp_pipeline_tests {
             },
             ..Default::default()
         };
-        let herder = Herder::new(config, make_default_lm());
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
         herder.start_syncing();
         herder.pending_envelopes.set_current_slot(100);
 
@@ -8452,7 +8392,11 @@ mod scp_pipeline_tests {
     /// tracking_slot set to `tracking_slot`. Returns the herder ready for
     /// `pre_filter_scp_envelope` exercise.
     fn herder_with_lcl_and_tracking(lcl: u32, tracking_slot: u64) -> Herder {
-        let herder = Herder::new(HerderConfig::default(), make_ledger_manager_at_seq(lcl));
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_ledger_manager_at_seq(lcl),
+            TimerManagerHandle::no_op(),
+        );
         herder.start_syncing();
         // Set tracking_slot directly (we're inside the crate, so private
         // fields are accessible). is_tracking is set so the
@@ -8660,7 +8604,11 @@ mod advance_tracking_slot_tests {
     /// but does NOT drain pending envelopes (they remain buffered).
     #[test]
     fn test_advance_tracking_slot_drains_intermediate_pending() {
-        let herder = Herder::new(HerderConfig::default(), make_default_lm());
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         // Set initial tracking state: consensus_index = 100
         {
@@ -8700,7 +8648,11 @@ mod advance_tracking_slot_tests {
     /// stellar-core's `safelyProcessSCPQueue(false)`.
     #[test]
     fn test_ledger_closed_drains_pending_envelopes() {
-        let herder = Herder::new(HerderConfig::default(), make_default_lm());
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         // Set current_slot low so envelopes are accepted by add()
         herder.pending_envelopes.set_current_slot(101);
@@ -8733,7 +8685,11 @@ mod advance_tracking_slot_tests {
     /// before ledger_closed, each ledger_closed drains up to its slot + 1.
     #[test]
     fn test_ledger_closed_multi_slot_sequencing() {
-        let herder = Herder::new(HerderConfig::default(), make_default_lm());
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         // Set current_slot low so envelopes are accepted by add()
         herder.pending_envelopes.set_current_slot(104);
@@ -8777,7 +8733,11 @@ mod advance_tracking_slot_tests {
     /// `processSCPQueueUpToIndex`. This test checks slot-local ordering only.
     #[test]
     fn test_drain_and_process_pending_uses_lifo_within_slot() {
-        let herder = Herder::new(HerderConfig::default(), make_default_lm());
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.pending_envelopes.set_current_slot(100);
 
         assert_eq!(
@@ -8925,7 +8885,12 @@ mod advance_tracking_slot_tests {
         .expect("init");
 
         let lm = Arc::new(lm);
-        let herder = Herder::with_secret_key(config, secret_for_herder, lm.clone());
+        let herder = Herder::with_secret_key(
+            config,
+            secret_for_herder,
+            lm.clone(),
+            TimerManagerHandle::no_op(),
+        );
 
         // Populate the tx queue with N transactions from distinct accounts.
         let n_txs = 20u8;
@@ -8981,7 +8946,11 @@ mod advance_tracking_slot_tests {
     /// Build a `Herder` (observer mode) with default config — sufficient for
     /// helper-level tests that don't exercise nomination signing.
     fn make_herder_for_self_validate_tests() -> Herder {
-        Herder::new(HerderConfig::default(), make_default_lm())
+        Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        )
     }
 
     /// Build a v24 `LedgerHeader` with a non-zero `max_tx_set_size`. Mirrors
@@ -9675,7 +9644,12 @@ mod advance_tracking_slot_tests {
         // builder produces an empty V1 parallel phase that has no resource
         // demand to compare against.
         lm.set_soroban_network_info_for_test(henyey_ledger::SorobanNetworkInfo::default());
-        let herder = Herder::with_secret_key(herder_config, secret_for_herder, Arc::new(lm));
+        let herder = Herder::with_secret_key(
+            herder_config,
+            secret_for_herder,
+            Arc::new(lm),
+            TimerManagerHandle::no_op(),
+        );
         herder.bootstrap(10);
 
         // Empty tx queue → empty 2-phase tx set → passes self-validation.
@@ -9712,7 +9686,11 @@ mod advance_tracking_slot_tests {
     /// applied must have its `fully_validated` flag flipped back to true.
     #[test]
     fn test_ledger_closed_restores_apply_lag_deferred_slots() {
-        let herder = Herder::new(HerderConfig::default(), make_default_lm());
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         // Initial tracking state: LCL = 99, tracking_index = 100.
         {
@@ -9753,7 +9731,11 @@ mod advance_tracking_slot_tests {
     /// remain deferred until the LCL advances enough.
     #[test]
     fn test_ledger_closed_does_not_restore_future_apply_lag() {
-        let herder = Herder::new(HerderConfig::default(), make_default_lm());
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         // Two future slots: 100 (next_index after this close = 99) and 105.
         herder.scp.test_clear_slot_fully_validated(100);
@@ -9896,8 +9878,12 @@ mod quorum_health_tests {
             ..HerderConfig::default()
         };
 
-        let herder =
-            Herder::with_secret_key(config, SecretKey::from_seed(&[10u8; 32]), make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&[10u8; 32]),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         // Register each peer's quorum set so that is_statement_sane can
         // resolve the quorum_set_hash in PREPARE/CONFIRM envelopes.
@@ -10003,7 +9989,11 @@ mod quorum_health_tests {
 
     #[test]
     fn test_quorum_health_returns_none_when_not_tracking() {
-        let herder = Herder::new(HerderConfig::default(), make_default_lm());
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         assert_eq!(herder.tracking_slot().get(), 0);
         assert!(herder.quorum_health().is_none());
     }
@@ -10193,8 +10183,12 @@ mod quorum_health_tests {
             local_quorum_set: Some(quorum_set.clone()),
             ..HerderConfig::default()
         };
-        let herder =
-            Herder::with_secret_key(config, SecretKey::from_seed(&[50u8; 32]), make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&[50u8; 32]),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         for key in &keys[1..] {
             let peer_node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
@@ -10548,8 +10542,12 @@ mod quorum_intersection_deadlock_tests {
             ..HerderConfig::default()
         };
 
-        let herder =
-            Herder::with_secret_key(config, SecretKey::from_seed(&[50u8; 32]), make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&[50u8; 32]),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         // Expand the transitive quorum tracker with all peers.
         for key in keys.iter().skip(1) {
@@ -10788,7 +10786,7 @@ mod dynamic_close_time_tests {
             ..HerderConfig::default()
         };
         let lm = Arc::new(make_ledger_manager_with_protocol(22));
-        let herder = Herder::new(config, lm);
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
 
         // Protocol 22: should return pre-v23 default (5000ms)
         assert_eq!(herder.ledger_close_duration(), Duration::from_secs(5));
@@ -10810,7 +10808,7 @@ mod dynamic_close_time_tests {
         }
 
         let lm = Arc::new(lm);
-        let herder = Herder::new(config, lm);
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
 
         assert_eq!(herder.ledger_close_duration(), Duration::from_millis(4000));
     }
@@ -10823,7 +10821,7 @@ mod dynamic_close_time_tests {
         };
         // Protocol 23 but no soroban_network_info populated
         let lm = Arc::new(make_ledger_manager_with_protocol(23));
-        let herder = Herder::new(config, lm);
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
 
         // Falls back to 5000ms pre-v23 constant
         assert_eq!(herder.ledger_close_duration(), Duration::from_secs(5));
@@ -10873,7 +10871,7 @@ mod dynamic_close_time_tests {
             let mut info = SorobanNetworkInfo::default();
             info.ledger_target_close_time_ms = ms;
             lm.set_soroban_network_info_for_test(info);
-            let herder = Herder::new(config, Arc::new(lm));
+            let herder = Herder::new(config, Arc::new(lm), TimerManagerHandle::no_op());
 
             assert_eq!(
                 herder.ledger_close_duration(),
@@ -10885,7 +10883,11 @@ mod dynamic_close_time_tests {
 
     #[test]
     fn test_max_queue_size_soroban_ops_defaults_to_zero() {
-        let herder = Herder::new(HerderConfig::default(), make_default_lm());
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         assert_eq!(herder.max_queue_size_soroban_ops(), 0);
     }
 
@@ -10896,13 +10898,17 @@ mod dynamic_close_time_tests {
             Some(henyey_common::Resource::new(vec![
                 7, 200, 300, 400, 500, 600, 700,
             ]));
-        let herder = Herder::new(config, make_default_lm());
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
         assert_eq!(herder.max_queue_size_soroban_ops(), 7);
     }
 
     #[test]
     fn test_max_queue_size_soroban_ops_prefers_dynamic() {
-        let herder = Herder::new(HerderConfig::default(), make_default_lm());
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
         herder.tx_queue().update_soroban_resource_limits(
             henyey_common::Resource::soroban_ledger_limits(17, 1, 1, 1, 1, 1, 1),
         );
@@ -11029,7 +11035,7 @@ mod previous_value_tests {
         let lcl_sv = make_stellar_value(99);
         let expected = stellar_value_to_scp_value(&lcl_sv);
         let lm = make_lm_with_scp_value(10, lcl_sv);
-        let herder = Herder::new(HerderConfig::default(), lm);
+        let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
 
         // get_previous_value should return LCL value
         let result = herder.get_previous_value();
@@ -11172,8 +11178,12 @@ mod previous_value_tests {
             ..HerderConfig::default()
         };
 
-        let herder =
-            Herder::with_secret_key(config, SecretKey::from_seed(&[7u8; 32]), make_default_lm());
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&[7u8; 32]),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
 
         herder.start_syncing();
         herder.bootstrap(100); // tracking slot = 101
@@ -11312,7 +11322,7 @@ mod required_lm_behavioral_tests {
     #[test]
     fn test_bootstrap_derives_state_from_lm() {
         let lm = make_ledger_manager_at_seq(42);
-        let herder = Herder::new(HerderConfig::default(), lm);
+        let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
 
         herder.start_syncing();
         herder.bootstrap(42);
@@ -11329,7 +11339,7 @@ mod required_lm_behavioral_tests {
     #[test]
     fn test_get_min_ledger_seq_to_ask_peers_uses_lm() {
         let lm = make_ledger_manager_at_seq(100);
-        let herder = Herder::new(HerderConfig::default(), lm);
+        let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
 
         let min_seq = herder.get_min_ledger_seq_to_ask_peers();
         // lcl = 100, low = 101, window = min(max_externalized_slots, 3)
@@ -11342,7 +11352,11 @@ mod required_lm_behavioral_tests {
     #[test]
     fn test_ledger_close_duration_reads_from_lm() {
         let lm = make_ledger_manager_at_seq(1);
-        let herder = Herder::new(HerderConfig::default(), lm.clone());
+        let herder = Herder::new(
+            HerderConfig::default(),
+            lm.clone(),
+            TimerManagerHandle::no_op(),
+        );
 
         let duration = herder.ledger_close_duration();
         let expected = lm.expected_ledger_close_duration();
@@ -11403,7 +11417,11 @@ mod fetching_envelopes_routing_tests {
             header_hash,
         )
         .expect("init");
-        Herder::new(HerderConfig::default(), Arc::new(lm))
+        Herder::new(
+            HerderConfig::default(),
+            Arc::new(lm),
+            TimerManagerHandle::no_op(),
+        )
     }
 
     /// Helper: make a simple test envelope for FetchingEnvelopes tests.

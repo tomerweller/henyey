@@ -2549,16 +2549,6 @@ impl App {
                 );
             }
         }
-
-        // Reconcile SCP timers after processing — SCP state may have advanced.
-        if matches!(
-            envelope_result,
-            EnvelopeState::Valid | EnvelopeState::Pending
-        ) {
-            let current_ledger = self.current_ledger_seq() as u64;
-            let active_slot = self.herder.tracking_slot().get().max(current_ledger + 1);
-            self.reconcile_scp_timers(active_slot).await;
-        }
     }
 
     /// Increment the per-reason post-verify counter.

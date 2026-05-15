@@ -33,7 +33,7 @@ use henyey_crypto::SecretKey;
 use henyey_herder::scp_verify::{
     self, PostVerifyReason, PreFilter, PreFilterRejectReason, VerifiedEnvelope,
 };
-use henyey_herder::{Herder, HerderConfig, HerderState};
+use henyey_herder::{Herder, HerderConfig, HerderState, TimerManagerHandle};
 use henyey_ledger::{LedgerManager, LedgerManagerConfig};
 use stellar_xdr::curr::{
     Hash as XdrHash, Limits, NodeId as XdrNodeId, PublicKey as XdrPublicKey, ScpBallot,
@@ -165,7 +165,12 @@ impl Fixture {
         };
 
         let lm = make_default_lm();
-        let herder = Arc::new(Herder::with_secret_key(config, local_secret.clone(), lm));
+        let herder = Arc::new(Herder::with_secret_key(
+            config,
+            local_secret.clone(),
+            lm,
+            TimerManagerHandle::no_op(),
+        ));
         herder.set_test_clock_seconds(NOW);
         herder.set_tracking_for_testing(TRACKING_SLOT, TRACKING_CLOSE_TIME);
         herder.set_pending_current_slot_for_testing(TRACKING_SLOT);
@@ -578,7 +583,12 @@ fn row_12_precedence_self_message_beats_non_quorum() {
         ..HerderConfig::default()
     };
     let lm = make_default_lm();
-    let herder = Arc::new(Herder::with_secret_key(config, local_secret.clone(), lm));
+    let herder = Arc::new(Herder::with_secret_key(
+        config,
+        local_secret.clone(),
+        lm,
+        TimerManagerHandle::no_op(),
+    ));
     herder.set_test_clock_seconds(NOW);
     herder.start_syncing();
     herder.bootstrap((TRACKING_SLOT - 1) as u32);

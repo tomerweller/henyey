@@ -37,7 +37,7 @@ use std::sync::Arc;
 use henyey_common::Hash256;
 use henyey_crypto::SecretKey;
 use henyey_herder::scp_verify::{self, PostVerifyReason, PreFilter};
-use henyey_herder::{EnvelopeState, Herder, HerderConfig};
+use henyey_herder::{EnvelopeState, Herder, HerderConfig, TimerManagerHandle};
 use henyey_ledger::{LedgerManager, LedgerManagerConfig};
 use stellar_xdr::curr::{
     Hash as XdrHash, Limits, NodeId as XdrNodeId, PublicKey as XdrPublicKey, ScpBallot,
@@ -172,7 +172,12 @@ fn build_herder(network_id: Hash256) -> Arc<Herder> {
         ..HerderConfig::default()
     };
     let lm = make_default_lm();
-    let herder = Arc::new(Herder::with_secret_key(config, local, lm));
+    let herder = Arc::new(Herder::with_secret_key(
+        config,
+        local,
+        lm,
+        TimerManagerHandle::no_op(),
+    ));
     herder.set_test_clock_seconds(NOW);
     herder.start_syncing();
     herder.bootstrap((TRACKING_SLOT - 1) as u32);

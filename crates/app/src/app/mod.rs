@@ -1108,12 +1108,27 @@ impl App {
         let ledger_manager = Arc::new(ledger_manager);
         tracing::info!("Ledger manager initialized");
 
+        // Create SCP timer manager for precise single-shot timeout delivery.
+        // Replaces the 500ms polling interval with exact-expiry timers
+        // matching stellar-core's VirtualTimer pattern.
+        let (scp_timer_tx, scp_timer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let timer_bridge = std::sync::Arc::new(scp_timer_bridge::ScpTimerBridge::new(scp_timer_tx));
+        let (timer_manager_handle, timer_manager) = henyey_herder::TimerManager::new(timer_bridge);
+        let timer_manager_join = tokio::spawn(timer_manager.run());
+
         let herder_config = Self::build_herder_config(&config, &keypair, local_quorum_set);
 
         // Create herder (with or without secret key for signing)
         let survey_throttle = Duration::from_secs(herder_config.ledger_close_time as u64 * 3);
 
-        let herder = Self::init_herder(herder_config, &config, &keypair, &ledger_manager, &db);
+        let herder = Self::init_herder(
+            herder_config,
+            &config,
+            &keypair,
+            &ledger_manager,
+            &db,
+            timer_manager_handle.clone(),
+        );
 
         let meta_stream = Self::init_meta_stream(&config, &bucket_dir)?;
 
@@ -1169,14 +1184,6 @@ impl App {
             herder.clone(),
             ledger_manager.clone(),
         ));
-
-        // Create SCP timer manager for precise single-shot timeout delivery.
-        // Replaces the 500ms polling interval with exact-expiry timers
-        // matching stellar-core's VirtualTimer pattern.
-        let (scp_timer_tx, scp_timer_rx) = tokio::sync::mpsc::unbounded_channel();
-        let timer_bridge = std::sync::Arc::new(scp_timer_bridge::ScpTimerBridge::new(scp_timer_tx));
-        let (timer_manager_handle, timer_manager) = henyey_herder::TimerManager::new(timer_bridge);
-        let timer_manager_join = tokio::spawn(timer_manager.run());
 
         Ok(Self {
             is_validator,
@@ -1508,15 +1515,17 @@ impl App {
         keypair: &henyey_crypto::SecretKey,
         ledger_manager: &Arc<LedgerManager>,
         db: &henyey_db::Database,
+        timer_handle: henyey_herder::TimerManagerHandle,
     ) -> Arc<Herder> {
         let herder = if app_config.node.is_validator {
             Arc::new(Herder::with_secret_key(
                 config,
                 keypair.clone(),
                 ledger_manager.clone(),
+                timer_handle,
             ))
         } else {
-            Arc::new(Herder::new(config, ledger_manager.clone()))
+            Arc::new(Herder::new(config, ledger_manager.clone(), timer_handle))
         };
         herder
             .tx_queue()
@@ -2120,11 +2129,7 @@ impl App {
 
         match outcome {
             henyey_herder::TriggerOutcome::Triggered
-            | henyey_herder::TriggerOutcome::AlreadyNominating => {
-                // Reconcile SCP timers — nomination may have started.
-                self.reconcile_scp_timers(next_ledger as u64).await;
-                Ok(next_ledger)
-            }
+            | henyey_herder::TriggerOutcome::AlreadyNominating => Ok(next_ledger),
             henyey_herder::TriggerOutcome::SkippedStale => Err(anyhow::anyhow!(
                 "manual close: LCL advanced during build_nomination_value; \
                  caller should retry with refreshed ledger seq"

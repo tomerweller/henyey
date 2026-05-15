@@ -56,10 +56,6 @@ pub enum TimerCommand {
     ScheduleNominationTimeout { slot: SlotIndex, duration: Duration },
     /// Schedule a ballot timeout for a slot (overwrites existing timer).
     ScheduleBallotTimeout { slot: SlotIndex, duration: Duration },
-    /// Ensure a nomination timeout exists for a slot (no-op if already armed).
-    EnsureNominationTimeout { slot: SlotIndex, duration: Duration },
-    /// Ensure a ballot timeout exists for a slot (no-op if already armed).
-    EnsureBallotTimeout { slot: SlotIndex, duration: Duration },
     /// Cancel all timers for a slot.
     CancelSlotTimers { slot: SlotIndex },
     /// Cancel the nomination timer for a slot (but keep ballot timer).
@@ -77,115 +73,122 @@ pub enum TimerCommand {
 /// Handle for sending commands to the timer manager.
 #[derive(Clone)]
 pub struct TimerManagerHandle {
-    sender: mpsc::Sender<TimerCommand>,
+    sender: mpsc::UnboundedSender<TimerCommand>,
 }
 
 impl TimerManagerHandle {
-    /// Schedule a nomination timeout for a slot.
+    /// Create a no-op handle for tests.
     ///
-    /// When the timeout expires, `Herder::handle_nomination_timeout` will be called.
+    /// Commands are accepted but never processed. The receiver is leaked
+    /// to prevent `Closed` errors during the test lifetime.
+    pub fn no_op() -> Self {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        // Leak the receiver so the channel stays open.
+        std::mem::forget(receiver);
+        Self { sender }
+    }
+
+    /// Schedule a nomination timeout for a slot.
     pub async fn schedule_nomination_timeout(&self, slot: SlotIndex, duration: Duration) {
         let _ = self
             .sender
-            .send(TimerCommand::ScheduleNominationTimeout { slot, duration })
-            .await;
+            .send(TimerCommand::ScheduleNominationTimeout { slot, duration });
     }
 
     /// Schedule a ballot timeout for a slot.
-    ///
-    /// When the timeout expires, `Herder::handle_ballot_timeout` will be called.
     pub async fn schedule_ballot_timeout(&self, slot: SlotIndex, duration: Duration) {
         let _ = self
             .sender
-            .send(TimerCommand::ScheduleBallotTimeout { slot, duration })
-            .await;
+            .send(TimerCommand::ScheduleBallotTimeout { slot, duration });
     }
 
     /// Cancel all timers for a slot (both nomination and ballot).
     pub async fn cancel_slot_timers(&self, slot: SlotIndex) {
-        let _ = self
-            .sender
-            .send(TimerCommand::CancelSlotTimers { slot })
-            .await;
+        let _ = self.sender.send(TimerCommand::CancelSlotTimers { slot });
     }
 
     /// Cancel only the nomination timer for a slot.
     pub async fn cancel_nomination_timer(&self, slot: SlotIndex) {
         let _ = self
             .sender
-            .send(TimerCommand::CancelNominationTimer { slot })
-            .await;
+            .send(TimerCommand::CancelNominationTimer { slot });
     }
 
     /// Cancel only the ballot timer for a slot.
     pub async fn cancel_ballot_timer(&self, slot: SlotIndex) {
-        let _ = self
-            .sender
-            .send(TimerCommand::CancelBallotTimer { slot })
-            .await;
+        let _ = self.sender.send(TimerCommand::CancelBallotTimer { slot });
     }
 
     /// Purge timers for slots older than the given slot.
     pub async fn purge_old_slots(&self, min_slot: SlotIndex) {
-        let _ = self
-            .sender
-            .send(TimerCommand::PurgeOldSlots { min_slot })
-            .await;
+        let _ = self.sender.send(TimerCommand::PurgeOldSlots { min_slot });
     }
 
     /// Shutdown the timer manager.
     pub async fn shutdown(&self) {
-        let _ = self.sender.send(TimerCommand::Shutdown).await;
-    }
-
-    /// Try to schedule a nomination timeout (non-blocking).
-    pub fn try_schedule_nomination_timeout(&self, slot: SlotIndex, duration: Duration) -> bool {
-        self.sender
-            .try_send(TimerCommand::ScheduleNominationTimeout { slot, duration })
-            .is_ok()
-    }
-
-    /// Try to schedule a ballot timeout (non-blocking).
-    pub fn try_schedule_ballot_timeout(&self, slot: SlotIndex, duration: Duration) -> bool {
-        self.sender
-            .try_send(TimerCommand::ScheduleBallotTimeout { slot, duration })
-            .is_ok()
-    }
-
-    /// Try to cancel slot timers (non-blocking).
-    pub fn try_cancel_slot_timers(&self, slot: SlotIndex) -> bool {
-        self.sender
-            .try_send(TimerCommand::CancelSlotTimers { slot })
-            .is_ok()
+        let _ = self.sender.send(TimerCommand::Shutdown);
     }
 
     /// Cancel all active timers regardless of slot.
     pub async fn cancel_all_timers(&self) {
-        let _ = self.sender.send(TimerCommand::CancelAllTimers).await;
+        let _ = self.sender.send(TimerCommand::CancelAllTimers);
     }
 
-    /// Ensure a nomination timeout exists for a slot (no-op if already armed).
-    ///
-    /// Unlike `schedule_nomination_timeout`, this does not overwrite an existing
-    /// timer's deadline. Used by reconciliation to avoid resetting timers on
-    /// every SCP envelope receipt.
-    pub async fn ensure_nomination_timeout(&self, slot: SlotIndex, duration: Duration) {
-        let _ = self
+    // --- Non-blocking methods for use from synchronous (spawn_blocking) contexts ---
+
+    /// Schedule a nomination timeout (non-blocking, infallible while channel open).
+    pub fn schedule_nomination_timeout_nonblocking(&self, slot: SlotIndex, duration: Duration) {
+        if self
             .sender
-            .send(TimerCommand::EnsureNominationTimeout { slot, duration })
-            .await;
+            .send(TimerCommand::ScheduleNominationTimeout { slot, duration })
+            .is_err()
+        {
+            tracing::warn!(slot, "timer channel closed: schedule nomination dropped");
+        }
     }
 
-    /// Ensure a ballot timeout exists for a slot (no-op if already armed).
-    ///
-    /// Unlike `schedule_ballot_timeout`, this does not overwrite an existing
-    /// timer's deadline. Used by reconciliation to avoid resetting timers on
-    /// every SCP envelope receipt.
-    pub async fn ensure_ballot_timeout(&self, slot: SlotIndex, duration: Duration) {
-        let _ = self
+    /// Schedule a ballot timeout (non-blocking, infallible while channel open).
+    pub fn schedule_ballot_timeout_nonblocking(&self, slot: SlotIndex, duration: Duration) {
+        if self
             .sender
-            .send(TimerCommand::EnsureBallotTimeout { slot, duration })
-            .await;
+            .send(TimerCommand::ScheduleBallotTimeout { slot, duration })
+            .is_err()
+        {
+            tracing::warn!(slot, "timer channel closed: schedule ballot dropped");
+        }
+    }
+
+    /// Cancel all timers for a slot (non-blocking).
+    pub fn cancel_slot_timers_nonblocking(&self, slot: SlotIndex) {
+        if self
+            .sender
+            .send(TimerCommand::CancelSlotTimers { slot })
+            .is_err()
+        {
+            tracing::warn!(slot, "timer channel closed: cancel slot timers dropped");
+        }
+    }
+
+    /// Cancel the nomination timer for a slot (non-blocking).
+    pub fn cancel_nomination_timer_nonblocking(&self, slot: SlotIndex) {
+        if self
+            .sender
+            .send(TimerCommand::CancelNominationTimer { slot })
+            .is_err()
+        {
+            tracing::warn!(slot, "timer channel closed: cancel nomination dropped");
+        }
+    }
+
+    /// Cancel the ballot timer for a slot (non-blocking).
+    pub fn cancel_ballot_timer_nonblocking(&self, slot: SlotIndex) {
+        if self
+            .sender
+            .send(TimerCommand::CancelBallotTimer { slot })
+            .is_err()
+        {
+            tracing::warn!(slot, "timer channel closed: cancel ballot dropped");
+        }
     }
 }
 
@@ -220,7 +223,7 @@ struct ActiveTimer {
 /// The timer manager that runs as a background task.
 pub struct TimerManager<C: TimerCallback> {
     callback: Arc<C>,
-    receiver: mpsc::Receiver<TimerCommand>,
+    receiver: mpsc::UnboundedReceiver<TimerCommand>,
     /// Active timers indexed by (slot, timer_type)
     timers: HashMap<(SlotIndex, TimerType), ActiveTimer>,
     /// Generation counter for timer identification
@@ -233,7 +236,7 @@ impl<C: TimerCallback> TimerManager<C> {
     /// Returns a handle for sending commands and the manager itself which should
     /// be spawned as a tokio task.
     pub fn new(callback: Arc<C>) -> (TimerManagerHandle, Self) {
-        let (sender, receiver) = mpsc::channel(256);
+        let (sender, receiver) = mpsc::unbounded_channel();
         let handle = TimerManagerHandle { sender };
         let manager = Self {
             callback,
@@ -252,56 +255,63 @@ impl<C: TimerCallback> TimerManager<C> {
         info!("Timer manager started");
 
         loop {
-            // Find the next timer to expire
             let next_timeout = self.next_timeout();
 
             tokio::select! {
-                // Handle incoming commands
                 cmd = self.receiver.recv() => {
                     match cmd {
-                        Some(TimerCommand::ScheduleNominationTimeout { slot, duration }) => {
-                            self.schedule_timer(slot, TimerType::Nomination, duration);
-                        }
-                        Some(TimerCommand::ScheduleBallotTimeout { slot, duration }) => {
-                            self.schedule_timer(slot, TimerType::Ballot, duration);
-                        }
-                        Some(TimerCommand::EnsureNominationTimeout { slot, duration }) => {
-                            self.ensure_timer(slot, TimerType::Nomination, duration);
-                        }
-                        Some(TimerCommand::EnsureBallotTimeout { slot, duration }) => {
-                            self.ensure_timer(slot, TimerType::Ballot, duration);
-                        }
-                        Some(TimerCommand::CancelSlotTimers { slot }) => {
-                            self.cancel_slot_timers(slot);
-                        }
-                        Some(TimerCommand::CancelNominationTimer { slot }) => {
-                            self.cancel_timer(slot, TimerType::Nomination);
-                        }
-                        Some(TimerCommand::CancelBallotTimer { slot }) => {
-                            self.cancel_timer(slot, TimerType::Ballot);
-                        }
-                        Some(TimerCommand::PurgeOldSlots { min_slot }) => {
-                            self.purge_old_slots(min_slot);
-                        }
-                        Some(TimerCommand::CancelAllTimers) => {
-                            if !self.timers.is_empty() {
-                                debug!(count = self.timers.len(), "Cancelled all timers");
-                                self.timers.clear();
+                        Some(cmd) => {
+                            if !self.handle_command(cmd) {
+                                break;
                             }
                         }
-                        Some(TimerCommand::Shutdown) | None => {
-                            info!("Timer manager shutting down");
+                        None => {
+                            info!("Timer manager shutting down (channel closed)");
                             break;
                         }
                     }
                 }
 
-                // Handle timer expiration
                 _ = crate::herder_utils::sleep_until_or_forever(next_timeout) => {
                     self.fire_expired_timers();
                 }
             }
         }
+    }
+
+    /// Handle a single timer command. Returns `false` on Shutdown.
+    pub(crate) fn handle_command(&mut self, cmd: TimerCommand) -> bool {
+        match cmd {
+            TimerCommand::ScheduleNominationTimeout { slot, duration } => {
+                self.schedule_timer(slot, TimerType::Nomination, duration);
+            }
+            TimerCommand::ScheduleBallotTimeout { slot, duration } => {
+                self.schedule_timer(slot, TimerType::Ballot, duration);
+            }
+            TimerCommand::CancelSlotTimers { slot } => {
+                self.cancel_slot_timers(slot);
+            }
+            TimerCommand::CancelNominationTimer { slot } => {
+                self.cancel_timer(slot, TimerType::Nomination);
+            }
+            TimerCommand::CancelBallotTimer { slot } => {
+                self.cancel_timer(slot, TimerType::Ballot);
+            }
+            TimerCommand::PurgeOldSlots { min_slot } => {
+                self.purge_old_slots(min_slot);
+            }
+            TimerCommand::CancelAllTimers => {
+                if !self.timers.is_empty() {
+                    debug!(count = self.timers.len(), "Cancelled all timers");
+                    self.timers.clear();
+                }
+            }
+            TimerCommand::Shutdown => {
+                info!("Timer manager shutting down");
+                return false;
+            }
+        }
+        true
     }
 
     /// Schedule a timer for a slot (overwrites any existing timer).
@@ -324,17 +334,6 @@ impl<C: TimerCallback> TimerManager<C> {
         );
 
         self.timers.insert((slot, timer_type), timer);
-    }
-
-    /// Schedule a timer only if one does not already exist for this (slot, type).
-    ///
-    /// Used by reconciliation to avoid resetting an already-armed timer's deadline
-    /// on every SCP envelope receipt.
-    fn ensure_timer(&mut self, slot: SlotIndex, timer_type: TimerType, duration: Duration) {
-        if self.timers.contains_key(&(slot, timer_type)) {
-            return;
-        }
-        self.schedule_timer(slot, timer_type, duration);
     }
 
     /// Cancel all timers for a slot.
@@ -436,7 +435,6 @@ impl<C: TimerCallback> TimerManagerWithStats<C> {
         info!("Timer manager with stats started");
 
         loop {
-            // Update stats
             self.update_stats();
 
             let next_timeout = self.inner.next_timeout();
@@ -444,38 +442,13 @@ impl<C: TimerCallback> TimerManagerWithStats<C> {
             tokio::select! {
                 cmd = self.inner.receiver.recv() => {
                     match cmd {
-                        Some(TimerCommand::ScheduleNominationTimeout { slot, duration }) => {
-                            self.inner.schedule_timer(slot, TimerType::Nomination, duration);
-                        }
-                        Some(TimerCommand::ScheduleBallotTimeout { slot, duration }) => {
-                            self.inner.schedule_timer(slot, TimerType::Ballot, duration);
-                        }
-                        Some(TimerCommand::EnsureNominationTimeout { slot, duration }) => {
-                            self.inner.ensure_timer(slot, TimerType::Nomination, duration);
-                        }
-                        Some(TimerCommand::EnsureBallotTimeout { slot, duration }) => {
-                            self.inner.ensure_timer(slot, TimerType::Ballot, duration);
-                        }
-                        Some(TimerCommand::CancelSlotTimers { slot }) => {
-                            self.inner.cancel_slot_timers(slot);
-                        }
-                        Some(TimerCommand::CancelNominationTimer { slot }) => {
-                            self.inner.cancel_timer(slot, TimerType::Nomination);
-                        }
-                        Some(TimerCommand::CancelBallotTimer { slot }) => {
-                            self.inner.cancel_timer(slot, TimerType::Ballot);
-                        }
-                        Some(TimerCommand::PurgeOldSlots { min_slot }) => {
-                            self.inner.purge_old_slots(min_slot);
-                        }
-                        Some(TimerCommand::CancelAllTimers) => {
-                            if !self.inner.timers.is_empty() {
-                                debug!(count = self.inner.timers.len(), "Cancelled all timers");
-                                self.inner.timers.clear();
+                        Some(cmd) => {
+                            if !self.inner.handle_command(cmd) {
+                                break;
                             }
                         }
-                        Some(TimerCommand::Shutdown) | None => {
-                            info!("Timer manager shutting down");
+                        None => {
+                            info!("Timer manager shutting down (channel closed)");
                             break;
                         }
                     }
@@ -648,59 +621,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_timer_does_not_reset_deadline() {
-        let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
-
-        let manager_task = tokio::spawn(manager.run());
-
-        // Schedule a 50ms nomination timeout via ensure
-        handle
-            .ensure_nomination_timeout(42, Duration::from_millis(50))
-            .await;
-
-        // Wait 20ms, then call ensure again with a fresh 200ms duration.
-        // If ensure resets the deadline, the timer wouldn't fire for another 200ms.
-        // If ensure is correctly a no-op, the original 50ms deadline is preserved.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        handle
-            .ensure_nomination_timeout(42, Duration::from_millis(200))
-            .await;
-
-        // Wait another 40ms (total 60ms > original 50ms deadline)
-        tokio::time::sleep(Duration::from_millis(40)).await;
-
-        // Timer should have fired at ~50ms despite the second ensure call
-        assert_eq!(callback.nomination_fired.load(Ordering::SeqCst), 42);
-
-        // Shutdown
-        handle.shutdown().await;
-        let _ = timeout(Duration::from_millis(100), manager_task).await;
-    }
-
-    #[tokio::test]
-    async fn test_ensure_schedules_when_no_timer_exists() {
-        let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
-
-        let manager_task = tokio::spawn(manager.run());
-
-        // ensure with no existing timer should schedule normally
-        handle
-            .ensure_nomination_timeout(42, Duration::from_millis(50))
-            .await;
-
-        // Wait for it to fire
-        tokio::time::sleep(Duration::from_millis(80)).await;
-
-        assert_eq!(callback.nomination_fired.load(Ordering::SeqCst), 42);
-
-        // Shutdown
-        handle.shutdown().await;
-        let _ = timeout(Duration::from_millis(100), manager_task).await;
-    }
-
-    #[tokio::test]
     async fn test_purge_old_slots() {
         let callback = Arc::new(TestCallback::new());
         let (handle, manager) = TimerManager::new(callback.clone());
@@ -731,5 +651,99 @@ mod tests {
         // Shutdown
         handle.shutdown().await;
         let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_nonblocking_schedule_nomination() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        handle.schedule_nomination_timeout_nonblocking(55, Duration::from_millis(50));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(callback.nomination_fired.load(Ordering::SeqCst), 55);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_nonblocking_schedule_ballot() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        handle.schedule_ballot_timeout_nonblocking(77, Duration::from_millis(50));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(callback.ballot_fired.load(Ordering::SeqCst), 77);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_nonblocking_cancel_nomination() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        handle.schedule_nomination_timeout_nonblocking(42, Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.cancel_nomination_timer_nonblocking(42);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(callback.nomination_fired.load(Ordering::SeqCst), 0);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_nonblocking_cancel_ballot() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        handle.schedule_ballot_timeout_nonblocking(42, Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.cancel_ballot_timer_nonblocking(42);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(callback.ballot_fired.load(Ordering::SeqCst), 0);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_nonblocking_cancel_slot_timers() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        handle.schedule_nomination_timeout_nonblocking(42, Duration::from_millis(100));
+        handle.schedule_ballot_timeout_nonblocking(42, Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.cancel_slot_timers_nonblocking(42);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(callback.nomination_fired.load(Ordering::SeqCst), 0);
+        assert_eq!(callback.ballot_fired.load(Ordering::SeqCst), 0);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[test]
+    fn test_no_op_handle_accepts_commands() {
+        let handle = TimerManagerHandle::no_op();
+        // These should not panic — the channel is open (receiver leaked)
+        handle.schedule_nomination_timeout_nonblocking(1, Duration::from_secs(1));
+        handle.schedule_ballot_timeout_nonblocking(1, Duration::from_secs(1));
+        handle.cancel_slot_timers_nonblocking(1);
+        handle.cancel_nomination_timer_nonblocking(1);
+        handle.cancel_ballot_timer_nonblocking(1);
     }
 }

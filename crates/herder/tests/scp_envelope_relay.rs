@@ -27,7 +27,7 @@ use std::sync::Arc;
 use henyey_common::Hash256;
 use henyey_crypto::SecretKey;
 use henyey_herder::scp_verify::PostVerifyReason;
-use henyey_herder::{EnvelopeState, Herder, HerderConfig};
+use henyey_herder::{EnvelopeState, Herder, HerderConfig, TimerManagerHandle};
 use henyey_ledger::{LedgerManager, LedgerManagerConfig};
 use stellar_xdr::curr::{
     Hash as XdrHash, Limits, NodeId as XdrNodeId, PublicKey as XdrPublicKey, ScpEnvelope,
@@ -147,7 +147,12 @@ impl Fixture {
         };
 
         let lm = make_default_lm();
-        let herder = Arc::new(Herder::with_secret_key(config, local_secret.clone(), lm));
+        let herder = Arc::new(Herder::with_secret_key(
+            config,
+            local_secret.clone(),
+            lm,
+            TimerManagerHandle::no_op(),
+        ));
 
         // Transition to a state that can receive SCP envelopes.
         herder.start_syncing();

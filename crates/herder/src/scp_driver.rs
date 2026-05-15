@@ -53,6 +53,7 @@ use stellar_xdr::curr::{
 
 use crate::error::HerderError;
 use crate::quorum_set_tracker::QuorumSetTracker;
+use crate::timer_manager::TimerManagerHandle;
 use crate::tx_queue::{AccountProvider, FeeBalanceProvider, SnapshotProviders, TransactionSet};
 use crate::tx_set_tracker::TxSetTracker;
 use crate::upgrades::Upgrades;
@@ -493,6 +494,8 @@ pub struct ScpDriver {
     deferred_slots: Mutex<HashMap<SlotIndex, DeferredCauses>>,
     /// Shared SCP metrics counters (sign, verify, validate, combine).
     scp_metrics: Arc<crate::metrics::ScpMetrics>,
+    /// Handle for sending timer commands to the timer manager (non-blocking).
+    timer_handle: TimerManagerHandle,
 }
 
 /// Causes that are deferring full validation for a slot.
@@ -564,6 +567,7 @@ impl ScpDriver {
         tracking_state: Arc<RwLock<SharedTrackingState>>,
         scp_metrics: Arc<crate::metrics::ScpMetrics>,
         upgrades: Arc<RwLock<Upgrades>>,
+        timer_handle: TimerManagerHandle,
     ) -> Self {
         let local_quorum_set = config.local_quorum_set.clone();
         let local_node_key = *config.node_id.as_bytes();
@@ -588,6 +592,21 @@ impl ScpDriver {
             externalize_lag: RwLock::new(ExternalizeLagTracker::new()),
             deferred_slots: Mutex::new(HashMap::new()),
             scp_metrics,
+            timer_handle,
+        }
+    }
+
+    /// Get the tracking consensus ledger index.
+    ///
+    /// Returns the consensus index from the shared tracking state, or 0 if not
+    /// yet tracking. Used by the stale-slot guard in `setup_timer`/`stop_timer`
+    /// to match stellar-core's `HerderSCPDriver::setupTimer` slot check.
+    pub(crate) fn tracking_consensus_ledger_index(&self) -> u64 {
+        let state = tracked_read(LOCK_TRACKING_STATE, &self.tracking_state);
+        if state.is_tracking {
+            state.consensus_index
+        } else {
+            0
         }
     }
 
@@ -616,6 +635,7 @@ impl ScpDriver {
     }
 
     /// Create a new SCP driver with a secret key for signing.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_secret_key(
         config: ScpDriverConfig,
         network_id: Hash256,
@@ -624,6 +644,7 @@ impl ScpDriver {
         tracking_state: Arc<RwLock<SharedTrackingState>>,
         scp_metrics: Arc<crate::metrics::ScpMetrics>,
         upgrades: Arc<RwLock<Upgrades>>,
+        timer_handle: TimerManagerHandle,
     ) -> Self {
         let mut driver = Self::new(
             config,
@@ -632,6 +653,7 @@ impl ScpDriver {
             tracking_state,
             scp_metrics,
             upgrades,
+            timer_handle,
         );
         driver.secret_key = Some(secret_key);
         driver
@@ -2735,6 +2757,7 @@ mod manual_close_tests {
             tracking,
             metrics,
             upgrades,
+            TimerManagerHandle::no_op(),
         );
 
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -2787,6 +2810,7 @@ mod manual_close_tests {
             tracking,
             metrics,
             upgrades,
+            TimerManagerHandle::no_op(),
         );
 
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -2839,6 +2863,7 @@ mod manual_close_tests {
             tracking,
             metrics,
             upgrades,
+            TimerManagerHandle::no_op(),
         );
 
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -2953,6 +2978,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
         let first = make_tx_set(1);
         let second = make_tx_set(2);
@@ -2973,6 +2999,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
         let tx_set = make_tx_set(3);
         let slot = 12u64;
@@ -2997,6 +3024,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
         let tx_set = make_tx_set(4);
         let bad_hash = Hash256::from_bytes([9; 32]);
@@ -3020,6 +3048,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
         let tx_set_a = make_tx_set(5);
         let tx_set_b = make_tx_set(6);
@@ -3043,6 +3072,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
         let tx_set = make_tx_set(7);
         driver.request_tx_set(*tx_set.hash(), 20);
@@ -3077,6 +3107,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
 
         // Create a test node_id for the request
@@ -3117,6 +3148,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
 
         // Externalize some slots (manually insert into the map for testing)
@@ -3154,6 +3186,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
 
         // Externalize some slots with gaps
@@ -3190,6 +3223,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
 
         // Add pending tx_sets for various slots
@@ -3243,6 +3277,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
         let tx_set_a = make_tx_set(10);
         let tx_set_b = make_tx_set(11);
@@ -3267,6 +3302,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
         assert!(driver.get_pending_tx_sets().is_empty());
 
@@ -3284,6 +3320,7 @@ mod cache_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
         let tx_set = make_tx_set(20);
 
@@ -3369,6 +3406,7 @@ mod cache_tests {
             tracking,
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
 
         let now = std::time::SystemTime::now()
@@ -3643,6 +3681,52 @@ impl SCPDriver for HerderScpCallback {
         std::time::Duration::from_millis(timeout_ms.min(MAX_TIMEOUT_MS))
     }
 
+    fn setup_timer(
+        &self,
+        slot_index: u64,
+        timer_type: henyey_scp::SCPTimerType,
+        timeout: std::time::Duration,
+    ) {
+        // Stale-slot guard: erase ALL timers for already-closed slots.
+        // Matches stellar-core HerderSCPDriver::setupTimer mSCPTimers.erase(slotIndex).
+        // In henyey, consensus_index = LCL + 1 (the active slot), so we use
+        // strict-less-than to allow timers for the active slot while canceling
+        // timers for older already-closed slots.
+        if slot_index < self.driver.tracking_consensus_ledger_index() {
+            self.driver
+                .timer_handle
+                .cancel_slot_timers_nonblocking(slot_index);
+            return;
+        }
+        match timer_type {
+            henyey_scp::SCPTimerType::Nomination => {
+                self.driver
+                    .timer_handle
+                    .schedule_nomination_timeout_nonblocking(slot_index, timeout);
+            }
+            henyey_scp::SCPTimerType::Ballot => {
+                self.driver
+                    .timer_handle
+                    .schedule_ballot_timeout_nonblocking(slot_index, timeout);
+            }
+        }
+    }
+
+    fn stop_timer(&self, slot_index: u64, timer_type: henyey_scp::SCPTimerType) {
+        match timer_type {
+            henyey_scp::SCPTimerType::Nomination => {
+                self.driver
+                    .timer_handle
+                    .cancel_nomination_timer_nonblocking(slot_index);
+            }
+            henyey_scp::SCPTimerType::Ballot => {
+                self.driver
+                    .timer_handle
+                    .cancel_ballot_timer_nonblocking(slot_index);
+            }
+        }
+    }
+
     fn sign_envelope(&self, envelope: &mut ScpEnvelope) {
         if let Some(sig) = self.driver.sign_envelope(&envelope.statement) {
             envelope.signature =
@@ -3760,6 +3844,7 @@ mod tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         )
     }
 
@@ -3802,6 +3887,7 @@ mod tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         );
         (driver, secret_key)
     }
@@ -4753,6 +4839,7 @@ mod tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             upgrades,
+            TimerManagerHandle::no_op(),
         );
         let lcl_hash = driver.ledger_manager.current_header_hash();
 
@@ -4815,6 +4902,7 @@ mod tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             upgrades,
+            TimerManagerHandle::no_op(),
         );
         let lcl_hash = driver.ledger_manager.current_header_hash();
 
@@ -4876,6 +4964,7 @@ mod tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             upgrades,
+            TimerManagerHandle::no_op(),
         );
         let lcl_hash = driver.ledger_manager.current_header_hash();
 
@@ -4943,6 +5032,7 @@ mod tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             upgrades,
+            TimerManagerHandle::no_op(),
         );
         let lcl_hash = driver.ledger_manager.current_header_hash();
 
@@ -5809,6 +5899,7 @@ mod tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             upgrades,
+            TimerManagerHandle::no_op(),
         );
 
         // Create a StellarValue with a base_fee=500 upgrade (wrong value)
@@ -7188,6 +7279,7 @@ mod compare_tx_sets_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         )
     }
 
@@ -7618,6 +7710,7 @@ mod compare_tx_sets_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             upgrades,
+            TimerManagerHandle::no_op(),
         );
 
         let callback = super::HerderScpCallback::new(Arc::new(driver));
@@ -7638,6 +7731,7 @@ mod compare_tx_sets_tests {
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
             make_default_upgrades(),
+            TimerManagerHandle::no_op(),
         )
     }
 

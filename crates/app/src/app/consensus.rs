@@ -207,9 +207,6 @@ impl App {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
-
-            // Reconcile SCP timers after trigger — nomination may have started.
-            self.reconcile_scp_timers(next_slot as u64).await;
         }
     }
 
@@ -1191,38 +1188,6 @@ impl App {
             henyey_herder::TimerType::Ballot => {
                 self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
                 self.herder.handle_ballot_timeout(event.slot);
-            }
-        }
-
-        // Reconcile timers after state change
-        self.reconcile_scp_timers(active_slot).await;
-    }
-
-    /// Query the herder for desired SCP timeout durations and reconcile with
-    /// the TimerManager. Ensures timers exist when the herder wants one (without
-    /// resetting already-armed deadlines), cancels when it doesn't.
-    /// Called after every SCP state mutation.
-    pub(super) async fn reconcile_scp_timers(&self, slot: u64) {
-        match self.herder.get_nomination_timeout(slot) {
-            Some(dur) => {
-                self.timer_manager_handle
-                    .ensure_nomination_timeout(slot, dur)
-                    .await;
-            }
-            None => {
-                self.timer_manager_handle
-                    .cancel_nomination_timer(slot)
-                    .await;
-            }
-        }
-        match self.herder.get_ballot_timeout(slot) {
-            Some(dur) => {
-                self.timer_manager_handle
-                    .ensure_ballot_timeout(slot, dur)
-                    .await;
-            }
-            None => {
-                self.timer_manager_handle.cancel_ballot_timer(slot).await;
             }
         }
     }

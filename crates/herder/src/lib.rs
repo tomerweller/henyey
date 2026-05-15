@@ -348,14 +348,14 @@ mod tests {
     #[test]
     fn test_herder_creation() {
         let config = HerderConfig::default();
-        let herder = Herder::new(config, make_default_lm());
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
         assert_eq!(herder.state(), HerderState::Booting);
     }
 
     #[test]
     fn test_state_transitions() {
         let config = HerderConfig::default();
-        let herder = Herder::new(config, make_default_lm());
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
 
         assert_eq!(herder.state(), HerderState::Booting);
 
