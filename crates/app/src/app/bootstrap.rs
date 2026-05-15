@@ -27,9 +27,9 @@ const GENESIS_TOTAL_COINS: i64 = 1_000_000_000_000_000_000;
 ///
 /// # What it writes
 ///
-/// All SQLite writes are performed in a single transaction. Bucket files are
-/// persisted to `bucket_dir` before the DB commit (orphan files are harmless
-/// if the transaction fails).
+/// Bucket files are persisted to `bucket_dir` before the DB transaction.
+/// All SQLite writes (emptiness check + state persistence) are performed
+/// in a single transaction to ensure atomicity.
 ///
 /// - Genesis ledger entries (root account + optional test accounts)
 /// - Genesis bucket list + bucket files in `bucket_dir`
@@ -46,7 +46,6 @@ pub fn initialize_genesis(
     network_passphrase: &str,
     genesis_test_account_count: u32,
 ) -> anyhow::Result<()> {
-    use henyey_db::queries::LedgerQueries;
     use henyey_db::schema::state_keys;
     use henyey_history::build_history_archive_state;
     use henyey_ledger::{calculate_skip_values, compute_header_hash};
@@ -56,29 +55,6 @@ pub fn initialize_genesis(
         TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
         TransactionSet, VecM, WriteXdr,
     };
-
-    // Defense-in-depth: verify the database is genuinely empty before writing
-    // genesis state. Checks both LCL and ledger headers to catch partial/corrupt
-    // state from stale or reused database files.
-    db.with_connection(|conn| {
-        let existing_lcl = conn.get_last_closed_ledger()?;
-        if existing_lcl.is_some() {
-            return Err(henyey_db::DbError::Integrity(format!(
-                "Cannot initialize genesis: database already has LCL={:?}. \
-                 Expected empty database.",
-                existing_lcl,
-            )));
-        }
-        let latest_header = conn.get_latest_ledger_seq()?;
-        if latest_header.is_some() {
-            return Err(henyey_db::DbError::Integrity(format!(
-                "Cannot initialize genesis: database has ledger headers \
-                 (latest={:?}) but no LCL. Expected empty database.",
-                latest_header,
-            )));
-        }
-        Ok(())
-    })?;
 
     // Build genesis account entries (root + optional test accounts).
     let genesis_entries = build_genesis_entries(
@@ -158,17 +134,39 @@ pub fn initialize_genesis(
         ext: TransactionHistoryResultEntryExt::default(),
     };
 
-    // Persist everything to the database in a single transaction.
-    db.with_connection(|conn| {
-        use henyey_db::queries::{BucketListQueries, HistoryQueries};
+    // Verify emptiness and persist everything in a single transaction.
+    // This eliminates TOCTOU between the check and the writes, and ensures
+    // all DB state is committed atomically.
+    db.transaction(|tx| {
+        use henyey_db::queries::{BucketListQueries, HistoryQueries, LedgerQueries, StateQueries};
 
-        conn.store_ledger_header(&header, &header_xdr)?;
-        conn.store_tx_history_entry(1, &genesis_tx_history)?;
-        conn.store_tx_result_entry(1, &genesis_tx_result)?;
-        conn.store_bucket_list(1, &bucket_levels)?;
-        conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-        conn.set_state(state_keys::NETWORK_PASSPHRASE, network_passphrase)?;
-        conn.set_last_closed_ledger(1)?;
+        // Defense-in-depth: verify the database is genuinely empty before writing
+        // genesis state. Checks both LCL and ledger headers to catch partial/corrupt
+        // state from stale or reused database files.
+        let existing_lcl = tx.get_last_closed_ledger()?;
+        if existing_lcl.is_some() {
+            return Err(henyey_db::DbError::Integrity(format!(
+                "Cannot initialize genesis: database already has LCL={:?}. \
+                 Expected empty database.",
+                existing_lcl,
+            )));
+        }
+        let latest_header = tx.get_latest_ledger_seq()?;
+        if latest_header.is_some() {
+            return Err(henyey_db::DbError::Integrity(format!(
+                "Cannot initialize genesis: database has ledger headers \
+                 (latest={:?}) but no LCL. Expected empty database.",
+                latest_header,
+            )));
+        }
+
+        tx.store_ledger_header(&header, &header_xdr)?;
+        tx.store_tx_history_entry(1, &genesis_tx_history)?;
+        tx.store_tx_result_entry(1, &genesis_tx_result)?;
+        tx.store_bucket_list(1, &bucket_levels)?;
+        tx.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
+        tx.set_state(state_keys::NETWORK_PASSPHRASE, network_passphrase)?;
+        tx.set_last_closed_ledger(1)?;
         Ok(())
     })?;
 
