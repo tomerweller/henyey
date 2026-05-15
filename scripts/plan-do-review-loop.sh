@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# DEPRECATED 2026-05-15 — superseded by scripts/project-tick-loop.sh.
+#
+# This script is kept in tree for one release cycle as a fallback while teams
+# migrate to the modular pipeline (/project-tick orchestrating /triage, /plan,
+# /do, /review-pr). Do not start new automation against this loop. Plan doc:
+# /home/tomer/.claude/plans/our-current-project-management-calm-biscuit.md
+#
 # plan-do-review-loop.sh — endless worker that selects up to N eligible GitHub
 # issues, assigns them, then runs a single copilot session that processes all N
 # issues in parallel via background agents. If no eligible issues exist, it
@@ -140,7 +147,7 @@ select_issues() {
 mark_failed() {
   local issue="$1"
   log "Moving issue #${issue} to Blocked (failed)"
-  bash "$(dirname "$0")/../.github/skills/plan-do-review/scripts/move-issue-status.sh" \
+  bash "$(dirname "$0")/../.github/skills/shared/scripts/move-issue-status.sh" \
     "$issue" Blocked 2>/dev/null \
     || log "WARNING: could not move issue #${issue} to Blocked"
   local me
@@ -254,7 +261,7 @@ while true; do
   # Best-effort: archive any closed project items older than LOOP_ARCHIVE_DAYS.
   # Idempotent and cheap (one paginated GraphQL query if nothing is stale).
   # Failure is logged but does not break the loop.
-  archive_script="$(dirname "$0")/../.github/skills/plan-do-review/scripts/archive-stale-done.sh"
+  archive_script="$(dirname "$0")/../.github/skills/shared/scripts/archive-stale-done.sh"
   if [[ -x "$archive_script" ]]; then
     set +e
     archive_out="$(bash "$archive_script" "$LOOP_ARCHIVE_DAYS" 2>&1)"

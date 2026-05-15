@@ -1,8 +1,22 @@
 ---
 name: plan-do-review
-description: Review a proposal issue with adversarial critics, converge on a plan, execute it, and iterate review-fix until clean. Drives the henyey project board (Backlog → in plan → In progress → In review → Done; Blocked on failure).
+description: "[DEPRECATED — superseded 2026-05-15 by /project-tick + /triage + /plan + /do + /review-pr] Review a proposal issue with adversarial critics, converge on a plan, execute it, and iterate review-fix until clean. Drives the henyey project board (Backlog → in plan → In progress → In review → Done; Blocked on failure)."
 argument-hint: "[issue-number] [--model <model>] [--max-proposal-rounds N] [--max-review-rounds N]"
 ---
+
+> **⚠️ DEPRECATED — 2026-05-15.** This skill is superseded by the modular pipeline:
+>
+> - `/triage` — backlog gate
+> - `/plan` — adversarial plan drafting (parallel critics)
+> - `/do` — implementation (two-mode)
+> - `/review-pr` — adversarial PR review with auto-merge
+> - `/project-tick` — orchestrator that dispatches to the right specialist
+>
+> Driver loop: `scripts/project-tick-loop.sh`. Plan document:
+> `/home/tomer/.claude/plans/our-current-project-management-calm-biscuit.md`.
+>
+> This skill remains in tree for one release cycle as a fallback. Do not call
+> it from new workflows. After the cycle, this file will be removed.
 
 Parse `$ARGUMENTS`:
 - The first positional argument, if present, is a GitHub issue number.
@@ -128,7 +142,7 @@ Step 1.
    failure and re-triage by moving it back to `Backlog`. Auto-select
    never picks Blocked items, so this also prevents infinite retry loops:
    ```bash
-   bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" Blocked
+   bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" Blocked
    ```
 This releases the lock so other workers can see the issue is no longer in
 progress.
@@ -274,7 +288,7 @@ Before triaging readiness, check whether the issue has **unmet dependencies**
 3. If any open blocker(s) exist, the issue has unmet dependencies. **Stop**:
    1. Move the issue to `Blocked`:
       ```bash
-      bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" Blocked
+      bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" Blocked
       ```
    2. Post a comment listing the blockers:
       ```bash
@@ -304,7 +318,7 @@ If the issue is **not ready**:
 
 1. Move the issue to `Blocked`:
    ```bash
-   bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" Blocked
+   bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" Blocked
    ```
 2. Post a comment explaining why the issue is not ready and what is needed:
    ```bash
@@ -391,7 +405,7 @@ idempotent on resume: a prior run may have already moved it here, in which
 case this is a no-op.
 
 ```bash
-bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" "in plan"
+bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" "in plan"
 ```
 
 Repeat until `VERDICT: APPROVED` or `proposal_round >= max_proposal_rounds`:
@@ -612,7 +626,7 @@ rm -f "$tmpfile"
 **Move the issue to `In progress`** — proposal converged, execution begins:
 
 ```bash
-bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" "In progress"
+bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" "In progress"
 ```
 
 ---
@@ -752,7 +766,7 @@ git branch -d "$WORKTREE_BRANCH"
 review-fix loop is about to start:
 
 ```bash
-bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" "In review"
+bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" "In review"
 ```
 
 If the push fails repeatedly (branch protection blocks direct pushes,
@@ -916,7 +930,7 @@ rm -f "$tmpfile"
 Only after the comment is successfully posted, move the issue and unassign:
 
 ```bash
-bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" Done
+bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" Done
 gh issue edit $ISSUE --remove-assignee @me
 ```
 

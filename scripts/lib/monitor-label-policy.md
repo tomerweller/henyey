@@ -62,10 +62,10 @@ column on project #2).
 
 ```bash
 # New issue — route to Backlog (urgent or no-label):
-bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE_NUM" Backlog
+bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE_NUM" backlog
 
 # New issue — route to Blocked (not-ready):
-bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE_NUM" Blocked
+bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE_NUM" blocked
 
 # Existing issue — only add if not already on project:
 ITEM_ID=$(gh api graphql -f query='
@@ -83,7 +83,7 @@ ITEM_ID=$(gh api graphql -f query='
 
 if [ -z "$ITEM_ID" ]; then
   # Not on project — add with appropriate status
-  bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE_NUM" Backlog
+  bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE_NUM" backlog
 fi
 # else: already on project, preserve current status (no-op)
 ```

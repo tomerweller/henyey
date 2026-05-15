@@ -454,7 +454,7 @@ date -u +%s > /home/tomer/data/$MONITOR_SESSION_ID/wipe_attempted_at
 
 Then Relaunch. The next tick will see `FRESH_START=yes` (mainnet.db absent), apply the 20m sync deadline, and let the node fresh-catchup from network archive (typically ~10–15 min to validating, observed ~9 min on 2026-05-09).
 
-File a new `urgent` GH issue documenting the wipe with the count of crashed rotations, the hash-mismatch evidence from the latest crashed log, and the cumulative downtime — this is a data point for whether the underlying recovery code path needs further hardening even though the immediate cause was already fixed. Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+File a new `urgent` GH issue documenting the wipe with the count of crashed rotations, the hash-mismatch evidence from the latest crashed log, and the cumulative downtime — this is a data point for whether the underlying recovery code path needs further hardening even though the immediate cause was already fixed. Board-route to Backlog: `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
 
 The 3-in-30-min trigger is self-rate-limiting only when the underlying fault is local state corruption — after a successful wipe + fresh-catchup, new `.crashed-*` rotations stop. **(3d) Post-wipe recurrence guard** below catches the alternate failure mode where the freshly-rebuilt state trips the same `fatal_wipe_required` signal — proof that the bug is in the apply path itself, not on disk — and prevents an infinite wipe→catchup→crash loop.
 
@@ -554,7 +554,7 @@ BODY_MARKER="<!-- monitor-tick-recurrence-key: $build_sha -->"
       }' -f url="https://github.com/stellar-experimental/henyey/issues/$issue_num" \
       --jq '.data.resource.projectItems.totalCount' 2>/dev/null) || on_board=""
     if [[ "$on_board" == "0" ]]; then
-      bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$issue_num" Backlog 2>/dev/null || true
+      bash .github/skills/shared/scripts/move-issue-status.sh "$issue_num" Backlog 2>/dev/null || true
     fi
 
     # Fast check: last_commented_date in dedup entry
@@ -681,7 +681,7 @@ ${predecessor_ref}"
 
   if [ -n "$N" ]; then
     echo "Filed post-wipe recurrence issue #$N for ${build_sha:0:8}" >&2
-    bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog
+    bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog
 
     # Record in dedup file
     TODAY=$(date -u +%Y-%m-%d)
@@ -695,7 +695,7 @@ ${predecessor_ref}"
 ) 9>"$DEDUP_LOCK"
 ```
 
-Board-route any newly filed issue to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+Board-route any newly filed issue to Backlog: `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
 
 **Recovery from (3d) is operator-driven by way of landing a revert/fix.** The deploy gate (section 10 step 3) blocks redeploy of the quarantined SHA only while its diff is still applied to `origin/main`. Operator action: revert or refactor the offending changes on `origin/main`; the next tick's gate auto-clears once the bad content is gone from HEAD, and rebuild + relaunch proceeds normally. The marker is cleared automatically by the recovery rule below — operators do not need to remove it manually.
 
@@ -779,7 +779,7 @@ duration (`SOFT_FAIL_BLOCKED_DURATION_SEC`), evidence source
 (`FATAL_WIPE_SOURCE`), and cumulative downtime. Use title pattern:
 `"Soft-fail state wipe: fatal_state_failure stuck for {N}m"`. Always a new
 issue (no dedup — each wipe is a distinct incident). Known prior incidents: #2363.
-Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+Board-route to Backlog: `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
 
 Self-limiting: after wipe, `FRESH_START=yes` blocks condition (3); new process
 has no `fatal_state_failure` so condition (1) fails; log rotation removes old
@@ -799,7 +799,7 @@ Flag WEDGE when BOTH:
 
 On WEDGE: Stop-PID, Rotate-log with suffix `frozen`, then Relaunch.
 Always file a new `urgent`-labeled issue (wedge blocks validator operation).
-Board-route to Backlog: `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+Board-route to Backlog: `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
 Recurrence-after-fix → NEW issue, not a comment on a closed one. Known prior
 incidents: #1904, #1873, #1921, #1949.
 
@@ -1309,7 +1309,7 @@ For each firing alert:
      - Body: current/prev values, delta, threshold, ledger, binary sha, related
        sibling metrics, file:line citation from `grep -n "<metric_name_without_prefix>" crates/ -r`,
        and a suggested fix.
-     **Board-route:** `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+     **Board-route:** `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
 4. Update `anomaly_cooldown.json` with `{"<metric>": <now>}`.
 5. For SYNC-tier alerts, ALSO update the `sync:` line in the status report
    (not just `metrics:`).
@@ -1598,9 +1598,9 @@ Only act on failures from the last 2 hours (compare `createdAt` with
    (`gh issue edit <N> --add-label urgent`) — failing CI on origin/main
    blocks deploy and meets the urgent criteria.
    **Board-route:** if NOT on project board, add to Backlog:
-   `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+   `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
 5. Otherwise, file a new issue: `gh issue create --label urgent --title "<workflow>: <short signature>" --body "..."` with investigation findings.
-   **Board-route:** `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+   **Board-route:** `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
 6. Do NOT commit a fix. Report: `CI ISSUE FILED — <workflow> failed on <sha>, filed/commented #<N>`.
 
 ## Bug filing workflow
@@ -1679,7 +1679,7 @@ When creating or commenting on issues:
    new evidence, and apply the `urgent` label only if the recurrence meets
    the urgent criteria above.
    **Board-route:** if the issue is NOT on the project board, add it:
-   `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+   `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
    (or `Blocked` if labeled `not-ready`). If already on board, preserve
    current status. STOP.
 4. If no OPEN match, file a new issue with `gh issue create` — append
@@ -1687,7 +1687,7 @@ When creating or commenting on issues:
    otherwise omit the label. Body is a self-contained proposal (symptom,
    evidence, suspected root cause, fix sketch with file:line references).
    **Board-route:** add to project board:
-   `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+   `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
    (or `Blocked` if labeled `not-ready`).
 5. Do NOT spawn agents. Do NOT edit the main checkout. The next redeploy tick
    (check 10) will pick up whatever lands on main.
@@ -1732,7 +1732,7 @@ fi
 (c) File or comment on a GitHub issue (label `urgent` since validator
 operation is impacted) with the regression details (commit range, symptoms,
 watchdog data). Board-route to Backlog:
-`bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+`bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
 
 (d) Restart the node on the last known-good binary (rebuild from the
 previous commit) while waiting for the fix. Do NOT revert commits inline.

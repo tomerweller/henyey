@@ -1197,7 +1197,7 @@ $INVESTIGATION_STEPS
       # Extract issue number and board-route
       ISSUE_NUM=$(echo "$NEW_ISSUE" | grep -oP '\d+$') || true
       if [[ -n "$ISSUE_NUM" ]]; then
-        bash "$REPO_ROOT/.github/skills/plan-do-review/scripts/move-issue-status.sh" "$ISSUE_NUM" Backlog 2>/dev/null || true
+        bash "$REPO_ROOT/.github/skills/shared/scripts/move-issue-status.sh" "$ISSUE_NUM" backlog 2>/dev/null || true
       fi
 
       echo "Filed: $NEW_ISSUE" >&2

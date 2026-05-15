@@ -57,8 +57,8 @@ and drives them to completion.
 - `--label not-ready` — needs operator decision before code change.
 
 **Board routing after filing/commenting:**
-- New issues (`urgent` or no-label): `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
-- New issues (`not-ready`): `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Blocked`
+- New issues (`urgent` or no-label): `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
+- New issues (`not-ready`): `bash .github/skills/shared/scripts/move-issue-status.sh "$N" blocked`
 - Existing issues already on project: no status change (preserve current).
 - Existing issues NOT on project: add to Backlog (or Blocked if `not-ready`).
 
@@ -436,7 +436,7 @@ identically (file a GH issue with severity label; add to project board).
      operation-blocking, escalate:
      `gh issue edit <N> --add-label urgent`.
    - **Board-route:** if the issue is NOT on the project board, add it:
-     `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+     `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
      (or `Blocked` if labeled `not-ready`). If already on the board,
      do nothing (preserve current status).
 3. **Otherwise, file a new issue** using `gh issue create`:
@@ -448,7 +448,7 @@ identically (file a GH issue with severity label; add to project board).
      evidence, suspected root cause, concrete fix sketch with file:line
      references).
    - **Board-route:** add the new issue to the project board:
-     `bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$N" Backlog`
+     `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
      (or `Blocked` if labeled `not-ready`).
    - Capture the issue number `N` for the status report.
 4. **Do NOT spawn an agent.** The downstream process (`plan-do-review`)

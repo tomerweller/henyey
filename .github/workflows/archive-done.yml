@@ -1,0 +1,43 @@
+name: Archive Done Project Items
+
+on:
+  schedule:
+    # Daily at 07:00 UTC (offset from history-publish at 08:00 and verify-execution at 06:00).
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Archive closed items older than N days (default 2)"
+        required: false
+        type: string
+        default: "2"
+      dry_run:
+        description: "Print what would be archived without acting"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: archive-done
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  repository-projects: write
+
+jobs:
+  archive:
+    name: Archive stale done items
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run archive-stale-done.sh
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          DAYS="${{ inputs.days || '2' }}"
+          DRY_RUN="${{ inputs.dry_run && '--dry-run' || '' }}"
+          bash .github/skills/shared/scripts/archive-stale-done.sh $DRY_RUN "$DAYS"

@@ -4549,12 +4549,12 @@ print(json.dumps(d))
   local ghstub_gh_log="$ghstub_root/gh-calls.log"
   mkdir -p "$ghstub_session/metrics" "$ghstub_gh_dir"
   mkdir -p "$ghstub_fake_repo/scripts/dev" "$ghstub_fake_repo/scripts/lib"
-  mkdir -p "$ghstub_fake_repo/.github/skills/plan-do-review/scripts"
+  mkdir -p "$ghstub_fake_repo/.github/skills/shared/scripts"
   cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$ghstub_fake_repo/scripts/dev/"
   cp "$REPO_ROOT/scripts/lib/dedup-filing.sh" "$ghstub_fake_repo/scripts/lib/"
   cp "$REPO_ROOT/scripts/lib/dedup-filing.py" "$ghstub_fake_repo/scripts/lib/"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$ghstub_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
-  chmod +x "$ghstub_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$ghstub_fake_repo/.github/skills/shared/scripts/move-issue-status.sh"
+  chmod +x "$ghstub_fake_repo/.github/skills/shared/scripts/move-issue-status.sh"
 
   # Failing gh stub: logs invocation and exits 99
   cat > "$ghstub_gh_dir/gh" << 'GHSTUBEOF'
@@ -4644,12 +4644,12 @@ print(json.dumps(d))
   local prune_gh_log="$prune_root/gh-calls.log"
   mkdir -p "$prune_session/metrics" "$prune_gh_dir"
   mkdir -p "$prune_fake_repo/scripts/dev" "$prune_fake_repo/scripts/lib"
-  mkdir -p "$prune_fake_repo/.github/skills/plan-do-review/scripts"
+  mkdir -p "$prune_fake_repo/.github/skills/shared/scripts"
   cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$prune_fake_repo/scripts/dev/"
   cp "$REPO_ROOT/scripts/lib/dedup-filing.sh" "$prune_fake_repo/scripts/lib/"
   cp "$REPO_ROOT/scripts/lib/dedup-filing.py" "$prune_fake_repo/scripts/lib/"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$prune_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
-  chmod +x "$prune_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$prune_fake_repo/.github/skills/shared/scripts/move-issue-status.sh"
+  chmod +x "$prune_fake_repo/.github/skills/shared/scripts/move-issue-status.sh"
 
   # Working gh stub: returns [] for issue list, fake URL for issue create
   cat > "$prune_gh_dir/gh" << 'PRUNESTUBEOF'
@@ -7004,7 +7004,7 @@ STUBEOF
   }
 
   # Also stub move-issue-status.sh to be a no-op
-  local dedup_skills_dir="$dedup_root/fake-skills/plan-do-review/scripts"
+  local dedup_skills_dir="$dedup_root/fake-skills/shared/scripts"
   mkdir -p "$dedup_skills_dir"
   echo '#!/usr/bin/env bash' > "$dedup_skills_dir/move-issue-status.sh"
   echo 'exit 0' >> "$dedup_skills_dir/move-issue-status.sh"
@@ -7013,8 +7013,8 @@ STUBEOF
   # We need a fake REPO_ROOT that points to our stub skills dir
   # but still has the real script. Symlink approach:
   local dedup_fake_repo="$dedup_root/fake-repo"
-  mkdir -p "$dedup_fake_repo/.github/skills/plan-do-review/scripts"
-  cp "$dedup_skills_dir/move-issue-status.sh" "$dedup_fake_repo/.github/skills/plan-do-review/scripts/"
+  mkdir -p "$dedup_fake_repo/.github/skills/shared/scripts"
+  cp "$dedup_skills_dir/move-issue-status.sh" "$dedup_fake_repo/.github/skills/shared/scripts/"
   mkdir -p "$dedup_fake_repo/scripts/dev"
   cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$dedup_fake_repo/scripts/dev/"
   # Copy shared dedup-filing library (used by check-alarm-regression.sh)
@@ -7299,10 +7299,10 @@ print(json.dumps(d))
 
   # Fake repo with stub move-issue-status.sh
   local xdedup_fake_repo="$xdedup_root/fake-repo"
-  mkdir -p "$xdedup_fake_repo/.github/skills/plan-do-review/scripts"
-  echo '#!/usr/bin/env bash' > "$xdedup_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
-  echo 'exit 0' >> "$xdedup_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
-  chmod +x "$xdedup_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  mkdir -p "$xdedup_fake_repo/.github/skills/shared/scripts"
+  echo '#!/usr/bin/env bash' > "$xdedup_fake_repo/.github/skills/shared/scripts/move-issue-status.sh"
+  echo 'exit 0' >> "$xdedup_fake_repo/.github/skills/shared/scripts/move-issue-status.sh"
+  chmod +x "$xdedup_fake_repo/.github/skills/shared/scripts/move-issue-status.sh"
   mkdir -p "$xdedup_fake_repo/scripts/dev"
   cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$xdedup_fake_repo/scripts/dev/"
   # Copy shared dedup-filing library (used by check-alarm-regression.sh)
@@ -7575,10 +7575,10 @@ print(json.dumps(d))
   mkdir -p "$comment_gh_dir"
 
   local comment_fake_repo="$comment_root/fake-repo"
-  mkdir -p "$comment_fake_repo/.github/skills/plan-do-review/scripts"
-  echo '#!/usr/bin/env bash' > "$comment_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
-  echo 'exit 0' >> "$comment_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
-  chmod +x "$comment_fake_repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  mkdir -p "$comment_fake_repo/.github/skills/shared/scripts"
+  echo '#!/usr/bin/env bash' > "$comment_fake_repo/.github/skills/shared/scripts/move-issue-status.sh"
+  echo 'exit 0' >> "$comment_fake_repo/.github/skills/shared/scripts/move-issue-status.sh"
+  chmod +x "$comment_fake_repo/.github/skills/shared/scripts/move-issue-status.sh"
   mkdir -p "$comment_fake_repo/scripts/dev"
   cp "$REPO_ROOT/scripts/dev/check-alarm-regression.sh" "$comment_fake_repo/scripts/dev/"
   # Copy shared dedup-filing library (used by check-alarm-regression.sh)
@@ -7942,14 +7942,14 @@ STUBEOF
   }
 
   # Stub move-issue-status.sh
-  mkdir -p "$flow_root/fake-repo/.github/skills/plan-do-review/scripts"
-  cat > "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh" << 'MOVEOF'
+  mkdir -p "$flow_root/fake-repo/.github/skills/shared/scripts"
+  cat > "$flow_root/fake-repo/.github/skills/shared/scripts/move-issue-status.sh" << 'MOVEOF'
 #!/usr/bin/env bash
 echo "move-issue-status $*" >> FLOW_LOG_PLACEHOLDER
 exit 0
 MOVEOF
-  sed -i "s|FLOW_LOG_PLACEHOLDER|$flow_gh_log|" "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
-  chmod +x "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh"
+  sed -i "s|FLOW_LOG_PLACEHOLDER|$flow_gh_log|" "$flow_root/fake-repo/.github/skills/shared/scripts/move-issue-status.sh"
+  chmod +x "$flow_root/fake-repo/.github/skills/shared/scripts/move-issue-status.sh"
 
   # Test: Empty build_sha guard — asserts no dedup or gh calls when build_sha is empty
   > "$flow_gh_log"
@@ -8301,7 +8301,7 @@ for item in items:
   local board_num
   board_num=$(echo "$board_create_out" | grep -oP '\d+$' || true)
   if [[ -n "$board_num" ]]; then
-    PATH="$flow_root/gh-stub:$PATH" bash "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh" "$board_num" "Backlog" 2>/dev/null
+    PATH="$flow_root/gh-stub:$PATH" bash "$flow_root/fake-repo/.github/skills/shared/scripts/move-issue-status.sh" "$board_num" "Backlog" 2>/dev/null
   fi
   if grep -q "move-issue-status 777 Backlog" "$flow_gh_log"; then
     tap_ok "flow: board routing calls move-issue-status with correct args"
@@ -8326,7 +8326,7 @@ BOARDEOF
   local on_board
   on_board=$(PATH="$flow_root/gh-stub:$PATH" gh api graphql -f query='test' --jq '.data.resource.projectItems.totalCount' 2>/dev/null)
   if [[ "$on_board" == "0" ]]; then
-    PATH="$flow_root/gh-stub:$PATH" bash "$flow_root/fake-repo/.github/skills/plan-do-review/scripts/move-issue-status.sh" "100" "Backlog" 2>/dev/null
+    PATH="$flow_root/gh-stub:$PATH" bash "$flow_root/fake-repo/.github/skills/shared/scripts/move-issue-status.sh" "100" "Backlog" 2>/dev/null
   fi
   if grep -q "move-issue-status 100 Backlog" "$flow_gh_log"; then
     tap_ok "flow: daily comment adds off-board issue to Backlog"
