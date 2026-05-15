@@ -2,10 +2,12 @@
 name: review-pr
 description: |
   Run two parallel adversarial PR reviewers and combine their verdicts with CI
-  state into a merge decision. Operates on issues in `in-review`. Auto-merges on
-  triple-green; bounces to `ready-for-doing` on any request-changes or CI red;
-  blocks after 3 bounce-back cycles. Use when invoked by /project-tick with an
-  issue in in-review, or manually as /review-pr <issue>.
+  state into a merge decision. Reviewers post structured comment verdicts (since
+  the agent is the PR author and cannot self-approve via GH native review).
+  Operates on issues in `in-review`. Auto-merges with --admin on triple-green;
+  bounces to `ready-for-doing` on any request-changes or CI red; blocks after 3
+  bounce-back cycles. Use when invoked by /project-tick with an issue in
+  in-review, or manually as /review-pr <issue>.
 ---
 
 # /review-pr <issue> — adversarial PR review
@@ -72,21 +74,38 @@ Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
 ## Step 4 — Spawn 2 reviewers in parallel
 
-Launch both as `general-purpose` sub-agents. Do not wait between them.
+Launch both as `general-purpose` foreground sub-agents. Do not wait between them.
+
+**Why structured comments, not `gh pr review --approve`:** the authenticated GH user is the PR author (the same user opened the PR via `/do` and now reviews it). GitHub disallows author self-approval, so `gh pr review --approve` is silently downgraded to a comment by `gh`. Instead, each reviewer posts a structured comment with a verdict marker that `/review-pr` parses in Step 6.
+
+**Verdict comment format** — each reviewer MUST post exactly one comment with this exact shape:
+
+```markdown
+## 🔍 Reviewer: <Correctness|Parity|Risk>
+
+**Verdict:** APPROVE | CHANGES_REQUESTED
+
+**Summary:** <one or two lines>
+
+<details>
+<summary>Full review</summary>
+
+<bulleted list of concerns, inline references, alternate approaches.
+For CHANGES_REQUESTED, list every specific change `/do` Mode B should make.
+Keep under 400 lines.>
+</details>
+```
+
+Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <tmpfile>` so multi-line bodies survive intact. Reviewers MAY also post inline line comments via `gh api repos/.../pulls/$PR_NUM/comments` for specific concerns — those don't count toward the verdict; only the top-level structured comment does.
 
 ### Reviewer A — Correctness (always)
 
 > Invoke /review on PR #$PR_NUM in stellar-experimental/henyey. Focus on:
-> correctness of the diff, test coverage, readability, error handling. Use
-> `gh pr review` to post your verdict:
->
-> - `gh pr review $PR_NUM --approve --body "..."` if you have no blocking concerns
-> - `gh pr review $PR_NUM --request-changes --body "..."` if you do
->
-> Include inline line comments via `gh api` for specific issues. Be specific —
-> name files and lines. Keep the top-level review body to a short summary plus
-> a bulleted list of concerns. Do NOT use --comment (we need an actual review
-> verdict, not a comment).
+> correctness of the diff, test coverage, readability, error handling. Post
+> your verdict as a single PR-level comment using `gh pr comment`, headed
+> `## 🔍 Reviewer: Correctness`, with `**Verdict:** APPROVE` or
+> `**Verdict:** CHANGES_REQUESTED` on its own line. Inline line comments
+> via `gh api` are welcome for specific concerns.
 
 ### Reviewer B — Parity OR Risk (auto-detected)
 
@@ -95,17 +114,19 @@ Launch both as `general-purpose` sub-agents. Do not wait between them.
 > Invoke /spec-adhere style audit on PR #$PR_NUM in stellar-experimental/henyey.
 > Focus on: does the change match stellar-core's behavior on this path?
 > Consult the `stellar-core/` submodule for the matching C++ implementation.
-> Identify any divergence in semantics, edge cases, or sequencing. Use
-> `gh pr review` to post APPROVE or REQUEST_CHANGES. Reviewer A is doing
-> correctness; you focus only on parity. Keep the body tight.
+> Identify any divergence in semantics, edge cases, or sequencing. Post your
+> verdict as a single PR-level comment via `gh pr comment`, headed
+> `## 🔍 Reviewer: Parity`, with `**Verdict:**` on its own line. Reviewer A
+> is doing correctness; you focus only on parity.
 
 **If non-parity (risk lens):**
 
 > Review PR #$PR_NUM in stellar-experimental/henyey for risk: regressions in
 > existing behavior, performance impact, breaking changes to APIs or data
 > formats, security implications, operational concerns (config, migrations).
-> Reviewer A is doing correctness; you focus only on risk. Use `gh pr review`
-> to post APPROVE or REQUEST_CHANGES.
+> Reviewer A is doing correctness; you focus only on risk. Post your verdict
+> as a single PR-level comment via `gh pr comment`, headed
+> `## 🔍 Reviewer: Risk`, with `**Verdict:**` on its own line.
 
 Wait for both reviewers to post.
 
@@ -126,10 +147,29 @@ CI state buckets:
 
 ## Step 6 — Decide
 
-Look up all three signals:
+### 6.1 Parse the reviewer verdicts from PR comments
 
-- **Reviewer A verdict:** APPROVE / CHANGES_REQUESTED.
-- **Reviewer B verdict:** APPROVE / CHANGES_REQUESTED.
+Fetch all PR-level comments and find the latest one matching each reviewer header. Use the most recent comment per reviewer (in case a reviewer posted, then re-posted):
+
+```bash
+gh api repos/stellar-experimental/henyey/issues/$PR_NUM/comments \
+  --paginate --jq '.[] | select(.body | startswith("## 🔍 Reviewer:")) |
+                   {created_at, body}' | jq -s 'sort_by(.created_at)'
+```
+
+For each comment, extract the reviewer name from the first line (`## 🔍 Reviewer: Correctness` etc.) and the verdict from the `**Verdict:**` line. Keep only the LATEST comment per reviewer name. The two reviewers we expect:
+
+- `Correctness` (always)
+- `Parity` or `Risk` (depending on parity-critical detection from Step 3)
+
+If only one verdict is found, treat the missing one as **pending** (Wait). If both are present, use them. If a reviewer posted twice (e.g. revised verdict), the latest comment wins.
+
+### 6.2 Combine with CI
+
+Three signals — Reviewer A verdict, Reviewer B verdict, CI state.
+
+- **Reviewer A verdict:** APPROVE / CHANGES_REQUESTED / pending.
+- **Reviewer B verdict:** APPROVE / CHANGES_REQUESTED / pending.
 - **CI state:** green / red / running.
 
 Apply the outcome matrix:
@@ -180,13 +220,13 @@ If failures reference code in the PR's diff → diff-attributable. If failures l
 
 ### Auto-merge path
 
-Branch protection should require: 2 approving reviews + green CI + up-to-date. If those are in place, the merge will happen automatically once both reviewers approve. Force the merge to confirm:
+The pipeline gates merges on its OWN signals (parsed verdicts + CI state), not GitHub's review-approval count. The reviewer comments are advisory metadata only — GitHub does not "know" they're approvals, because GitHub disallows author self-approval. So we merge with `--admin` to bypass GitHub's review-required gate (CI gates still apply via branch protection if configured):
 
 ```bash
-gh pr merge $PR_NUM --repo stellar-experimental/henyey --squash --auto
+gh pr merge $PR_NUM --repo stellar-experimental/henyey --squash --admin
 ```
 
-If branch protection is not yet configured (operator hasn't done that step), `--auto` will still queue the merge but may not gate properly. The skill should still call it; the branch-protection setup is a separate operator task.
+The `--admin` flag means the agent must be authenticated as a repo admin. If your token doesn't have admin, the merge will fail — at which point operator intervention is needed (file a follow-up issue documenting the merge-permission gap; do NOT downgrade to non-admin merge that might silently bypass CI).
 
 After merge, move state and clean up:
 
@@ -273,28 +313,29 @@ Exit.
 
 ## What you do NOT do
 
-- **Do not** post a review yourself. Spawn sub-agents that post reviews — you only orchestrate and combine.
-- **Do not** override or summarize the reviewers' verdicts. Their `--approve` / `--request-changes` is the verdict. You read it; you don't rewrite it.
+- **Do not** post a review yourself. Spawn sub-agents that post their own structured comments — you only orchestrate and combine.
+- **Do not** override or summarize the reviewers' verdicts. Their `**Verdict:**` line is the verdict. You read it; you don't rewrite it.
 - **Do not** merge if any of the three signals is not green. The matrix is the rule.
 - **Do not** wait synchronously on long-running CI. If CI is `running`, unassign and exit — the next tick re-picks the issue.
-- **Do not** use `gh pr review --comment` instead of `--approve`/`--request-changes`. Comments don't count as review verdicts.
+- **Do not** use `gh pr review --approve` — GH silently downgrades it to a comment because the agent is the PR author. Use structured PR comments via `gh pr comment` instead.
 
 ## Failure handling
 
 | Failure | Action |
 |---|---|
 | Reviewer sub-agent fails to post | Retry once. If still failing, treat as `CHANGES_REQUESTED` and bounce. |
+| Reviewer's comment doesn't match the expected header/verdict shape | Treat as `pending`; if it stays malformed after Step 4 completes, bounce with a `## Review: Malformed Verdict` note. |
 | No PR linked | Bounce to `ready-for-doing` with `## Review: No PR Linked`. |
-| Branch protection not configured (auto-merge doesn't gate) | Skill still runs; operator's responsibility to set up branch protection. |
+| `gh pr merge --admin` fails (token lacks admin) | Leave the issue in `in-review`; file a follow-up issue documenting the gap; do NOT degrade to a non-admin merge that might bypass CI gates. |
 | GH API failure | Retry once after 5s; if still failing, leave assigned and exit non-zero. |
 
-## Branch protection (operator setup, referenced here)
+## Branch protection
 
-For auto-merge to work as designed, `main` must require:
+Because the pipeline gates merges on its own parsed verdicts (not GH-recognized approvals), `main` branch protection should NOT require pull-request approvals — that gate is impossible to satisfy when the agent is the PR author. Recommended branch protection:
 
-- 2 approving reviews from required reviewers (or just 2 approvals if no required-reviewers config).
-- All required status checks green.
-- Branch up-to-date with base.
-- `pdr-managed` label on the PR (optional — if you want to restrict auto-merge to managed PRs).
+- **Required:** all CI checks green (the names of every check in `.github/workflows/ci.yml`).
+- **Required:** branch up-to-date with base.
+- **Required approvals:** **0** — the pipeline's own reviewer verdicts gate merge.
+- The agent's token must have `Pull requests: Read and write` and the user must be a repo admin for `--admin` merges to succeed.
 
-If branch protection is not configured, this skill's `gh pr merge --auto` call still runs but may merge prematurely. The skill is correct; the protection layer is the safety net.
+The `pdr-managed` label on every pipeline-created PR distinguishes them from human PRs if you want to scope additional automation to managed ones only.
