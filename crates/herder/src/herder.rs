@@ -3164,6 +3164,15 @@ impl Herder {
         self.scp.get_slot_envelopes(slot)
     }
 
+    /// Get the current sendable SCP state for a specific slot.
+    ///
+    /// Returns envelopes that should be sent to peers, matching stellar-core's
+    /// `processCurrentState(slot, ..., false)` semantics. Only includes
+    /// envelopes from fully-validated slots.
+    pub fn get_current_state_for_slot(&self, slot: u64) -> Vec<ScpEnvelope> {
+        self.scp.get_current_state_for_slot(slot)
+    }
+
     pub fn get_slot_state(&self, slot: u64) -> Option<henyey_scp::SlotState> {
         self.scp.get_slot_state(slot)
     }

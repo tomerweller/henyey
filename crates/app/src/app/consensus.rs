@@ -1037,7 +1037,7 @@ impl App {
                     return; // Overlay gone — peer disconnected or shutdown
                 };
 
-                let checkpoint_envelopes = herder.get_scp_envelopes(checkpoint);
+                let checkpoint_envelopes = herder.get_current_state_for_slot(checkpoint);
                 for envelope in checkpoint_envelopes {
                     let msg = StellarMessage::ScpMessage(envelope);
                     if let Err(e) = overlay.try_send_to(&peer_id, msg) {

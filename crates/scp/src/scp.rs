@@ -519,6 +519,28 @@ impl<D: SCPDriver> SCP<D> {
         slot.get_latest_messages_send()
     }
 
+    /// Get the current sendable state for a specific slot.
+    ///
+    /// Returns all envelopes from the slot's current state that would be sent
+    /// to peers. This matches stellar-core's `processCurrentState(slot, ..., false)`
+    /// semantics — only includes envelopes from fully-validated slots.
+    pub fn get_current_state_for_slot(&self, slot_index: u64) -> Vec<ScpEnvelope> {
+        let slots = self.slots.read();
+        let Some(slot) = slots.get(&slot_index) else {
+            return Vec::new();
+        };
+
+        let mut envelopes = Vec::new();
+        slot.process_current_state(
+            |env| {
+                envelopes.push(env.clone());
+                true
+            },
+            false,
+        );
+        envelopes
+    }
+
     /// Process slots in ascending order starting from a given slot.
     ///
     /// # Arguments
