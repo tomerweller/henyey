@@ -1193,6 +1193,45 @@ impl Herder {
     ///
     /// This transitions the Herder from Syncing to Tracking state,
     /// setting the next consensus ledger as the tracking slot.
+    /// Ensure the herder is in Tracking state, updating `tracking_started_at`
+    /// on actual transition.
+    ///
+    /// This is the single canonical point for HerderState → Tracking transitions
+    /// in production code. Both `advance_tracking_to` and `advance_tracking_slot`
+    /// call this unconditionally after updating SharedTrackingState.
+    ///
+    /// Precondition: `SharedTrackingState.is_tracking` is already `true` when
+    /// this is called. This is guaranteed because:
+    /// - On the advancing path, the caller just set `ts.is_tracking = true`
+    /// - On the idempotent path, a prior advancing call already set it
+    ///
+    /// Postcondition: `HerderState == Tracking` and `tracking_started_at`
+    /// reflects the wall-clock time of the first Tracking transition.
+    ///
+    /// Parity: stellar-core `setTrackingSCPState(slotIndex, value, true)` sets
+    /// `HERDER_TRACKING_NETWORK_STATE` unconditionally when `isTrackingNetwork=true`.
+    /// Both our callers correspond to the `isTrackingNetwork=true` path:
+    /// - `advance_tracking_to`: mirrors `forceSCPStateIntoSyncWithLastClosedLedger`
+    ///   (HerderImpl.cpp:1676-1680)
+    /// - `advance_tracking_slot`: mirrors `valueExternalized` for the latest slot
+    ///   (HerderSCPDriver.cpp:883-913)
+    fn ensure_tracking_state(&self, context: &str, slot: u64) {
+        let was_not_tracking = {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &self.state);
+            if *state != HerderState::Tracking {
+                info!(slot, "Transitioning to Tracking on {}", context);
+                *state = HerderState::Tracking;
+                true
+            } else {
+                false
+            }
+        };
+
+        if was_not_tracking {
+            *self.tracking_started_at.write() = Some(Instant::now());
+        }
+    }
+
     /// Advance tracking state so that `consensus_index` reflects `slot + 1`.
     ///
     /// This is the "state sync" half of `bootstrap` / `complete_externalization`:
@@ -1233,25 +1272,9 @@ impl Herder {
             self.fetching_envelopes.set_current_slot(next);
         }
 
-        // UNCONDITIONAL: Always ensure Tracking state. The caller declares
-        // the node is synced — state transition must not be gated by whether
-        // the consensus_index needed to advance.
-        // Parity: stellar-core setTrackingSCPState (HerderImpl.cpp:150-162)
-        // sets tracking unconditionally.
-        let was_not_tracking = {
-            let mut state = tracked_write(LOCK_HERDER_STATE, &self.state);
-            if *state != HerderState::Tracking {
-                info!(slot, "Transitioning to Tracking on advance_tracking_to");
-                *state = HerderState::Tracking;
-                true
-            } else {
-                false
-            }
-        };
-
-        if was_not_tracking {
-            *self.tracking_started_at.write() = Some(Instant::now());
-        }
+        // UNCONDITIONAL: Always ensure Tracking state.
+        // Parity: stellar-core setTrackingSCPState (HerderImpl.cpp:150-162).
+        self.ensure_tracking_state("advance_tracking_to", slot);
     }
 
     pub fn bootstrap(&self, ledger_seq: u32) {
@@ -2065,25 +2088,8 @@ impl Herder {
 
         // UNCONDITIONAL: Always ensure Tracking state on externalization.
         // Parity: stellar-core setTrackingSCPState(slotIndex, b, true)
-        // in HerderSCPDriver::valueExternalized always sets
-        // HERDER_TRACKING_NETWORK_STATE.
-        let was_not_tracking = {
-            let mut state = tracked_write(LOCK_HERDER_STATE, &self.state);
-            if *state != HerderState::Tracking {
-                info!(
-                    slot = externalized_slot,
-                    "Transitioning to Tracking on externalization"
-                );
-                *state = HerderState::Tracking;
-                true
-            } else {
-                false
-            }
-        };
-
-        if was_not_tracking {
-            *self.tracking_started_at.write() = Some(Instant::now());
-        }
+        // in HerderSCPDriver::valueExternalized.
+        self.ensure_tracking_state("externalization", externalized_slot);
 
         if should_advance {
             // NOTE: Pending envelope drain is NOT performed here.
@@ -7510,6 +7516,33 @@ mod inv_h2_lcl_guard_tests {
         );
         // consensus_index unchanged (idempotent — not regressed)
         assert_eq!(herder.tracking_slot().get(), 101);
+    }
+
+    #[test]
+    fn test_ensure_tracking_state_idempotent_does_not_update_started_at() {
+        // Verify that repeated advance_tracking_to calls (already in Tracking)
+        // do NOT update tracking_started_at — only the first transition sets it.
+        let lm = make_lm_at_seq(3);
+        let config = HerderConfig::default();
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
+
+        // First call: transitions Booting → Tracking, sets tracking_started_at.
+        herder.advance_tracking_to(5, 1000);
+        assert!(herder.state().is_tracking());
+        let first_started_at = *herder.tracking_started_at.read();
+        assert!(first_started_at.is_some());
+
+        // Small delay to ensure Instant::now() would differ.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        // Second call: already Tracking, tracking_started_at must NOT change.
+        herder.advance_tracking_to(7, 2000);
+        assert!(herder.state().is_tracking());
+        let second_started_at = *herder.tracking_started_at.read();
+        assert_eq!(
+            first_started_at, second_started_at,
+            "tracking_started_at must not be updated on repeated transitions"
+        );
     }
 
     #[test]
