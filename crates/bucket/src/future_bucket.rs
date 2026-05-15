@@ -271,14 +271,6 @@ fn blocking_recv_compat(
     }
 }
 
-/// Merge configuration needed to restart or execute a merge.
-#[derive(Debug, Clone)]
-struct MergeConfig {
-    protocol_version: u32,
-    keep_tombstones: DeadEntryPolicy,
-    normalize_init: InitEntryPolicy,
-}
-
 /// Private inner state enum — each variant carries only its valid fields,
 /// making invalid states unrepresentable at compile time.
 ///
@@ -311,7 +303,7 @@ enum FutureBucketInner {
         curr_hash: Hash256,
         snap_hash: Hash256,
         merge_handle: MergeHandle,
-        config: MergeConfig,
+        keep_tombstones: DeadEntryPolicy,
     },
 }
 
@@ -380,11 +372,7 @@ impl FutureBucket {
                 curr_hash,
                 snap_hash,
                 merge_handle: MergeHandle::new(receiver),
-                config: MergeConfig {
-                    protocol_version,
-                    keep_tombstones,
-                    normalize_init,
-                },
+                keep_tombstones,
             },
         }
     }
@@ -596,11 +584,7 @@ impl FutureBucket {
                 Ok(output)
             }
             FutureBucketInner::LiveMerging {
-                mut merge_handle,
-                curr,
-                snap,
-                config,
-                ..
+                mut merge_handle, ..
             } => {
                 // inner is now Clear (fail-closed)
                 match merge_handle.resolve_blocking() {
@@ -613,25 +597,9 @@ impl FutureBucket {
                         };
                         Ok(output)
                     }
-                    Err(_) => {
-                        // Fallback: synchronous merge from inputs
-                        let result = merge_buckets(
-                            &curr,
-                            &snap,
-                            &MergeOptions {
-                                keep_dead_entries: config.keep_tombstones,
-                                max_protocol_version: config.protocol_version,
-                                normalize_init_entries: config.normalize_init,
-                                ..Default::default()
-                            },
-                        )?;
-                        let output = Arc::new(result);
-                        let output_hash = output.hash();
-                        self.inner = FutureBucketInner::LiveOutput {
-                            output: output.clone(),
-                            output_hash,
-                        };
-                        Ok(output)
+                    Err(e) => {
+                        // inner stays Clear — no sync fallback
+                        Err(e)
                     }
                 }
             }
@@ -781,11 +749,7 @@ impl FutureBucket {
                     curr_hash: ch,
                     snap_hash: sh,
                     merge_handle: MergeHandle::new(receiver),
-                    config: MergeConfig {
-                        protocol_version,
-                        keep_tombstones,
-                        normalize_init,
-                    },
+                    keep_tombstones,
                 };
                 Ok(())
             }
@@ -803,13 +767,9 @@ impl FutureBucket {
             FutureBucketInner::LiveMerging {
                 curr_hash,
                 snap_hash,
-                config,
+                keep_tombstones,
                 ..
-            } => Some(MergeKey::new(
-                config.keep_tombstones,
-                *curr_hash,
-                *snap_hash,
-            )),
+            } => Some(MergeKey::new(*keep_tombstones, *curr_hash, *snap_hash)),
             FutureBucketInner::HashInputs {
                 curr_hash,
                 snap_hash,
@@ -863,6 +823,28 @@ impl std::fmt::Debug for FutureBucket {
                 .field("curr_hash", &curr_hash.to_hex())
                 .field("snap_hash", &snap_hash.to_hex())
                 .finish(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl FutureBucket {
+    /// Test-only constructor for creating a FutureBucket in LiveMerging state
+    /// with a pre-built merge handle (bypasses start_merge's spawn_blocking).
+    fn from_test_merge_handle(
+        curr: Arc<Bucket>,
+        snap: Arc<Bucket>,
+        merge_handle: MergeHandle,
+    ) -> Self {
+        FutureBucket {
+            inner: FutureBucketInner::LiveMerging {
+                curr_hash: curr.hash(),
+                snap_hash: snap.hash(),
+                curr,
+                snap,
+                merge_handle,
+                keep_tombstones: DeadEntryPolicy::Keep,
+            },
         }
     }
 }
@@ -1550,21 +1532,8 @@ mod tests {
 
         sender.send(Ok(merged)).unwrap();
 
-        // Construct via internal helper for test purposes
-        let mut fb = FutureBucket {
-            inner: FutureBucketInner::LiveMerging {
-                curr: bucket1,
-                snap: bucket2,
-                curr_hash: Hash256::ZERO,
-                snap_hash: Hash256::ZERO,
-                merge_handle: MergeHandle::new(receiver),
-                config: MergeConfig {
-                    protocol_version: 25,
-                    keep_tombstones: DeadEntryPolicy::Keep,
-                    normalize_init: InitEntryPolicy::Preserve,
-                },
-            },
-        };
+        let mut fb =
+            FutureBucket::from_test_merge_handle(bucket1, bucket2, MergeHandle::new(receiver));
 
         let result = fb.resolve_blocking();
         assert!(
@@ -1588,27 +1557,16 @@ mod tests {
         // Drop sender to simulate cancelled merge
         drop(sender);
 
-        let mut fb = FutureBucket {
-            inner: FutureBucketInner::LiveMerging {
-                curr: bucket1,
-                snap: bucket2,
-                curr_hash: Hash256::ZERO,
-                snap_hash: Hash256::ZERO,
-                merge_handle: MergeHandle::new(receiver),
-                config: MergeConfig {
-                    protocol_version: 25,
-                    keep_tombstones: DeadEntryPolicy::Keep,
-                    normalize_init: InitEntryPolicy::Preserve,
-                },
-            },
-        };
+        let mut fb =
+            FutureBucket::from_test_merge_handle(bucket1, bucket2, MergeHandle::new(receiver));
 
         let result = fb.resolve_blocking();
-        // With the sync merge fallback, this should actually succeed since
-        // we have live curr/snap buckets. The fallback re-merges from inputs.
-        // This is different from the old behavior that would transition to Clear.
-        // If the sync merge also fails, then it transitions to Clear.
-        assert!(result.is_ok() || fb.state() == FutureBucketState::Clear);
+        assert!(result.is_err(), "cancelled merge should fail");
+        assert_eq!(
+            fb.state(),
+            FutureBucketState::Clear,
+            "failed resolve_blocking must transition to Clear"
+        );
     }
 
     // ========================================================================
