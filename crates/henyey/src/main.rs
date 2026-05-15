@@ -819,8 +819,9 @@ enum Commands {
         #[arg(long, hide = true)]
         wait_for_consensus: bool,
 
-        /// Deprecated: accepted for stellar-core compatibility, ignored.
-        #[arg(long, hide = true)]
+        /// Use an in-memory database (captive-core mode).
+        /// State is not persisted across restarts.
+        #[arg(long)]
         in_memory: bool,
 
         /// Deprecated: accepted for stellar-core compatibility, ignored.
@@ -1281,7 +1282,7 @@ async fn main() -> anyhow::Result<()> {
             force_catchup,
             local,
             wait_for_consensus: _,
-            in_memory: _,
+            in_memory,
             start_at_ledger: _,
             start_at_hash: _,
             disable_bucket_gc: _,
@@ -1296,7 +1297,15 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 RunMode::Full
             };
-            cmd_run(config, mode, force_catchup, local, prometheus_handle).await
+            cmd_run(
+                config,
+                mode,
+                force_catchup,
+                local,
+                in_memory,
+                prometheus_handle,
+            )
+            .await
         }
 
         Commands::Catchup {
@@ -1567,6 +1576,7 @@ fn local_config() -> AppConfig {
         database: DatabaseConfig {
             path: data_dir.join("stellar.db"),
             pool_size: 10,
+            in_memory: false,
         },
         buckets: BucketConfig {
             directory: data_dir.join("buckets"),
@@ -1709,8 +1719,14 @@ async fn cmd_run(
     mode: RunMode,
     force_catchup: bool,
     local: bool,
+    in_memory: bool,
     prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> anyhow::Result<()> {
+    // Reject mutually exclusive flags before local bootstrap writes to disk.
+    if local && in_memory {
+        anyhow::bail!("--local and --in-memory are mutually exclusive");
+    }
+
     // In local mode, auto-initialize database and history if needed.
     let config = if local {
         let db_path = &config.database.path;
@@ -1768,6 +1784,10 @@ async fn cmd_run(
     } else {
         config
     };
+
+    // Set in-memory mode on the config so it flows through to App::new.
+    let mut config = config;
+    config.database.in_memory = in_memory;
 
     let rpc_enabled = config.rpc.enabled;
     let rpc_port = config.rpc.port;

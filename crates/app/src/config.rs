@@ -787,6 +787,11 @@ pub struct DatabaseConfig {
     /// Connection pool size.
     #[serde(default = "default_pool_size")]
     pub pool_size: u32,
+
+    /// Use an ephemeral in-memory database (captive-core / `--in-memory` mode).
+    /// Runtime-only flag, never serialized.
+    #[serde(skip)]
+    pub in_memory: bool,
 }
 
 impl Default for DatabaseConfig {
@@ -794,6 +799,7 @@ impl Default for DatabaseConfig {
         Self {
             path: default_db_path(),
             pool_size: default_pool_size(),
+            in_memory: false,
         }
     }
 }

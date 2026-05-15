@@ -972,6 +972,19 @@ impl App {
 
         let db_lock = Self::acquire_db_lock(&config)?;
 
+        // In-memory mode: delete and recreate the bucket directory so stale
+        // bucket files from a previous run don't cause "persisted state is
+        // corrupt" errors.  Matches stellar-core's
+        // BucketManager::maybeDropAndCreateNew() (BucketManager.cpp:122-127).
+        if config.database.in_memory {
+            let bucket_dir = &config.buckets.directory;
+            if bucket_dir.exists() {
+                tracing::info!(?bucket_dir, "In-memory mode: cleaning bucket directory");
+                std::fs::remove_dir_all(bucket_dir)?;
+            }
+            std::fs::create_dir_all(bucket_dir)?;
+        }
+
         // Initialize database
         let db = Self::init_database(&config)?;
 
@@ -1362,18 +1375,23 @@ impl App {
 
     /// Initialize the database.
     fn init_database(config: &AppConfig) -> anyhow::Result<henyey_db::Database> {
-        tracing::info!(path = ?config.database.path, "Opening database");
+        if config.database.in_memory {
+            tracing::info!("In-memory mode: using ephemeral database");
+            Ok(henyey_db::Database::open_in_memory()?)
+        } else {
+            tracing::info!(path = ?config.database.path, "Opening database");
 
-        // Ensure parent directory exists
-        if let Some(parent) = config.database.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+            // Ensure parent directory exists
+            if let Some(parent) = config.database.path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
             }
-        }
 
-        let db = henyey_db::Database::open(&config.database.path)?;
-        tracing::debug!("Database opened successfully");
-        Ok(db)
+            let db = henyey_db::Database::open(&config.database.path)?;
+            tracing::debug!("Database opened successfully");
+            Ok(db)
+        }
     }
 
     fn acquire_db_lock(config: &AppConfig) -> anyhow::Result<File> {

@@ -67,13 +67,24 @@ impl Database {
         Ok(db)
     }
 
-    /// Opens an in-memory database, primarily for testing.
+    /// Opens an in-memory database.
     ///
+    /// Used for captive-core / `--in-memory` mode as well as tests.
     /// The database is initialized with the current schema but data is not
     /// persisted across restarts. The connection pool size is limited to 1
     /// since in-memory databases are connection-specific.
     pub fn open_in_memory() -> Result<Self> {
-        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory().with_init(|conn| {
+            conn.execute_batch(&format!(
+                "PRAGMA busy_timeout = {};\
+                 PRAGMA synchronous = FULL;\
+                 PRAGMA foreign_keys = ON;\
+                 PRAGMA cache_size = {};\
+                 PRAGMA temp_store = MEMORY;",
+                BUSY_TIMEOUT_MS, CACHE_SIZE_KIB
+            ))?;
+            Ok(())
+        });
         let pool = r2d2::Pool::builder().max_size(1).build(manager)?;
 
         let db = Self { pool };
@@ -187,5 +198,51 @@ impl Database {
             use queries::StateQueries;
             conn.set_state(schema::state_keys::NETWORK_PASSPHRASE, passphrase)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_open_in_memory_applies_pragmas() {
+        let db = Database::open_in_memory().unwrap();
+        db.with_connection(|conn| {
+            let fk: bool = conn
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap();
+            assert!(fk, "foreign_keys should be ON");
+
+            let cache: i64 = conn
+                .query_row("PRAGMA cache_size", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(cache, CACHE_SIZE_KIB as i64);
+
+            let busy: u32 = conn
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(busy, BUSY_TIMEOUT_MS);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_open_in_memory_initializes_schema() {
+        let db = Database::open_in_memory().unwrap();
+        db.with_connection(|conn| {
+            let tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='storestate'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(tables, 1);
+            Ok(())
+        })
+        .unwrap();
     }
 }
