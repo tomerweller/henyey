@@ -3,7 +3,7 @@
 #
 # Accepts both legacy and new state names:
 #   Legacy: Backlog, "in plan", "In progress", "In review", Done, Blocked
-#   New:    backlog, ready-for-planning, ready-for-doing, in-review, done, blocked
+#   New:    backlog, ready-for-planning, ready-for-doing, doing, in-review, done, blocked
 #
 # Idempotent: adds the issue to the henyey project if missing, then sets its
 # Status field. Exits 0 on success, non-zero on any failure.
@@ -25,6 +25,7 @@ case "$STATUS_NORM" in
   backlog)                          OPTION_ID="f75ad846" ;;
   "in plan"|ready-for-planning)     OPTION_ID="61e4505c" ;;
   "in progress"|ready-for-doing)    OPTION_ID="47fc9ee4" ;;
+  doing)                            OPTION_ID="5d3fca3e" ;;
   "in review"|in-review)            OPTION_ID="df73e18b" ;;
   done)                             OPTION_ID="98236657" ;;
   blocked)                          OPTION_ID="53ce269e" ;;

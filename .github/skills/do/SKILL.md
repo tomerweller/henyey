@@ -3,10 +3,11 @@ name: do
 description: |
   Implement a planned change in the henyey project. Two-mode skill — Mode A is
   fresh implementation from a converged plan; Mode B addresses PR review comments
-  on an existing PR. Operates on issues in `ready-for-doing`. Advances to
-  `in-review` on PR open (Mode A) or re-review request (Mode B); `blocked` on
-  unrecoverable failure. Use when invoked by /project-tick with an issue in
-  ready-for-doing, or manually as /do <issue>.
+  on an existing PR. Picks up issues in `ready-for-doing`, transitions them to
+  `doing` while actively implementing, then to `in-review` on PR open (Mode A)
+  or re-review request (Mode B). `blocked` on unrecoverable failure. Use when
+  invoked by /project-tick with an issue in ready-for-doing, or manually as
+  /do <issue>.
 ---
 
 # /do <issue> — implementation
@@ -31,6 +32,16 @@ PR_NUM=$(gh issue view $ISSUE --repo stellar-experimental/henyey \
 
 - **Mode A (fresh implementation):** `PR_NUM` is empty.
 - **Mode B (fix after review):** `PR_NUM` is set.
+
+## Step 0.5 — Transition to `doing`
+
+Immediately after acquiring the issue (assignee race already won by the orchestrator), move the issue from `ready-for-doing` to `doing`. This signals on the board that an implementation is actively running — important because `/do` is the slowest step in the pipeline.
+
+```bash
+bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE doing
+```
+
+Skip this if the issue is already in `doing` (e.g. a previous `/do` attempt crashed and the operator manually unblocked it).
 
 ---
 
