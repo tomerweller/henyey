@@ -1008,7 +1008,7 @@ impl App {
         // Parity: stellar-core delays the checkpoint ledger's messages when
         // there is a gap between the checkpoint and the first sequential slot.
         let checkpoint = self.herder.get_most_recent_checkpoint_seq();
-        let first_sequential = self.herder.get_min_ledger_seq_to_remember();
+        let first_sequential = self.herder.get_first_sequential_ledger_for_send();
         let delay_checkpoint = should_delay_checkpoint(checkpoint, first_sequential);
 
         if delay_checkpoint {
@@ -1858,23 +1858,23 @@ mod tests {
     use super::should_delay_checkpoint;
 
     /// When checkpoint is below first_sequential (gap exists), delay is needed.
-    /// Example: checkpoint=64, first_sequential=89 (tracking=100, MAX_SLOTS_TO_REMEMBER=12)
+    /// Example: checkpoint=64, first_sequential=88 (tracking=100, MAX_SLOTS_TO_REMEMBER=12)
     #[test]
     fn test_should_delay_checkpoint_gap_exists() {
-        assert!(should_delay_checkpoint(64, 89));
+        assert!(should_delay_checkpoint(64, 88));
     }
 
     /// When checkpoint equals first_sequential, no gap — no delay.
     #[test]
     fn test_should_delay_checkpoint_at_boundary() {
-        assert!(!should_delay_checkpoint(89, 89));
+        assert!(!should_delay_checkpoint(88, 88));
     }
 
     /// When checkpoint is above first_sequential, no gap — no delay.
-    /// Example: checkpoint=128, first_sequential=89
+    /// Example: checkpoint=128, first_sequential=88
     #[test]
     fn test_should_delay_checkpoint_no_gap() {
-        assert!(!should_delay_checkpoint(128, 89));
+        assert!(!should_delay_checkpoint(128, 88));
     }
 
     /// Early ledgers: checkpoint=1 (genesis), first_sequential=1 — no delay.

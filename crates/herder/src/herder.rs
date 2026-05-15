@@ -960,6 +960,18 @@ impl Herder {
         }
     }
 
+    /// Returns the first sequential ledger as computed inline in
+    /// stellar-core's `sendSCPStateToPeer`. This differs from
+    /// `get_min_ledger_seq_to_remember()` by omitting the `+1`.
+    pub fn get_first_sequential_ledger_for_send(&self) -> u64 {
+        let current_slot = self.tracking_consensus_ledger_index().get();
+        if current_slot > MAX_SLOTS_TO_REMEMBER {
+            current_slot - MAX_SLOTS_TO_REMEMBER
+        } else {
+            1
+        }
+    }
+
     /// Compute the minimum ledger sequence to ask peers for SCP state.
     pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
         let lcl = self.ledger_manager.current_ledger_seq();
