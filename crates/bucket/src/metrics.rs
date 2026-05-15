@@ -48,6 +48,12 @@ pub struct MergeCounters {
     pub merges_completed: AtomicU64,
     /// Total merge time in microseconds.
     pub merge_time_us: AtomicU64,
+    /// Reattachments to running (in-flight) merges.
+    /// Matches stellar-core `mRunningMergeReattachments`.
+    pub running_merge_reattachments: AtomicU64,
+    /// Reattachments to finished (completed-cache) merges.
+    /// Matches stellar-core `mFinishedMergeReattachments`.
+    pub finished_merge_reattachments: AtomicU64,
 }
 
 impl MergeCounters {
@@ -94,6 +100,18 @@ impl MergeCounters {
         self.merge_time_us.fetch_add(duration_us, Ordering::Relaxed);
     }
 
+    /// Records a reattachment to a running (in-flight) merge.
+    pub fn record_running_reattachment(&self) {
+        self.running_merge_reattachments
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a reattachment to a finished (completed-cache) merge.
+    pub fn record_finished_reattachment(&self) {
+        self.finished_merge_reattachments
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Returns a snapshot of the counters.
     pub fn snapshot(&self) -> MergeCountersSnapshot {
         MergeCountersSnapshot {
@@ -111,6 +129,8 @@ impl MergeCounters {
             entries_annihilated: self.entries_annihilated.load(Ordering::Relaxed),
             merges_completed: self.merges_completed.load(Ordering::Relaxed),
             merge_time_us: self.merge_time_us.load(Ordering::Relaxed),
+            running_merge_reattachments: self.running_merge_reattachments.load(Ordering::Relaxed),
+            finished_merge_reattachments: self.finished_merge_reattachments.load(Ordering::Relaxed),
         }
     }
 
@@ -128,6 +148,9 @@ impl MergeCounters {
         self.entries_annihilated.store(0, Ordering::Relaxed);
         self.merges_completed.store(0, Ordering::Relaxed);
         self.merge_time_us.store(0, Ordering::Relaxed);
+        self.running_merge_reattachments.store(0, Ordering::Relaxed);
+        self.finished_merge_reattachments
+            .store(0, Ordering::Relaxed);
     }
 }
 
@@ -157,6 +180,8 @@ pub struct MergeCountersSnapshot {
     pub entries_annihilated: u64,
     pub merges_completed: u64,
     pub merge_time_us: u64,
+    pub running_merge_reattachments: u64,
+    pub finished_merge_reattachments: u64,
 }
 
 impl MergeCountersSnapshot {

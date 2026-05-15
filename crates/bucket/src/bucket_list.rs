@@ -168,6 +168,7 @@ pub(crate) fn bl_should_merge_with_empty_curr(
 /// This supports two modes matching stellar-core:
 /// - `InMemory`: Synchronous merge result (used for level 0)
 /// - `Async`: Background merge in progress (used for levels 1+)
+/// - `Shared`: Reattached to an in-flight merge started elsewhere
 ///
 /// The async mode allows merges to run in background threads while the
 /// main thread continues processing, significantly reducing ledger close time.
@@ -178,6 +179,9 @@ pub enum PendingMerge {
     /// Asynchronous merge in progress (levels 1+).
     /// The merge runs in a background thread and the result is retrieved when commit() is called.
     Async(AsyncMergeHandle),
+    /// Reattached to an in-flight merge started elsewhere.
+    /// Used for in-flight merge dedup (stellar-core getMergeFuture parity).
+    Shared(SharedMergeHandle),
 }
 
 /// Describes the serializable state of a pending merge for HAS persistence.
@@ -217,6 +221,10 @@ impl std::fmt::Debug for PendingMerge {
                 .field("hash", &b.hash().to_hex())
                 .finish(),
             PendingMerge::Async(h) => f.debug_struct("Async").field("level", &h.level).finish(),
+            PendingMerge::Shared(h) => f
+                .debug_struct("Shared")
+                .field("level", &h.metadata.level)
+                .finish(),
         }
     }
 }
@@ -226,6 +234,7 @@ impl PendingMerge {
     ///
     /// For InMemory, returns the bucket hash directly.
     /// For Async, returns the cached result hash if resolved, otherwise returns a placeholder.
+    /// For Shared, returns the cached result hash if resolved, otherwise zero.
     pub fn hash(&self) -> Hash256 {
         match self {
             PendingMerge::InMemory(bucket) => bucket.hash(),
@@ -235,6 +244,13 @@ impl PendingMerge {
                     bucket.hash()
                 } else {
                     // Return zero hash to indicate unresolved or failed async merge
+                    Hash256::default()
+                }
+            }
+            PendingMerge::Shared(handle) => {
+                if let Some(Ok(ref bucket)) = handle.cached_result {
+                    bucket.hash()
+                } else {
                     Hash256::default()
                 }
             }
@@ -572,6 +588,135 @@ fn blocking_recv_oneshot(
     }
 }
 
+// ============================================================================
+// SharedMergeHandle — consumer side of in-flight merge dedup
+// ============================================================================
+
+use crate::merge_map::{MergeResult, SharedMergeMetadata};
+use tokio::sync::watch;
+
+/// Handle to a shared in-flight merge. Created when a merge reattaches to
+/// an existing running merge (in-flight dedup).
+///
+/// The consumer side: resolve() blocks until the producer signals completion.
+/// Does NOT own the merge lifetime — dropping this handle does not cancel the merge.
+pub struct SharedMergeHandle {
+    receiver: watch::Receiver<Option<MergeResult>>,
+    pub(crate) metadata: SharedMergeMetadata,
+    pub(crate) cached_result: Option<MergeResult>,
+}
+
+impl SharedMergeHandle {
+    /// Create a new shared merge handle.
+    pub fn new(
+        receiver: watch::Receiver<Option<MergeResult>>,
+        metadata: SharedMergeMetadata,
+    ) -> Self {
+        Self {
+            receiver,
+            metadata,
+            cached_result: None,
+        }
+    }
+
+    /// Resolve the shared merge, blocking until the result is available.
+    ///
+    /// Uses the same runtime-aware blocking strategy as AsyncMergeHandle::resolve().
+    pub fn resolve(&mut self) -> Result<Arc<Bucket>> {
+        if let Some(ref result) = self.cached_result {
+            return result
+                .clone()
+                .map_err(|e| BucketError::Merge(e.to_string()));
+        }
+
+        let result = blocking_recv_watch(&mut self.receiver)?;
+        self.cached_result = Some(result.clone());
+        result.map_err(|e| BucketError::Merge(e.to_string()))
+    }
+}
+
+/// Block on a watch receiver until the value becomes Some, using the same
+/// runtime-detection strategy as blocking_recv_oneshot.
+fn blocking_recv_watch(receiver: &mut watch::Receiver<Option<MergeResult>>) -> Result<MergeResult> {
+    // Check if value is already available
+    {
+        let current = receiver.borrow().clone();
+        if let Some(result) = current {
+            return Ok(result);
+        }
+    }
+
+    // Block until value changes to Some
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                tokio::task::block_in_place(|| {
+                    // Use blocking wait for watch
+                    loop {
+                        if receiver.has_changed().unwrap_or(true) {
+                            let val = receiver.borrow_and_update().clone();
+                            if let Some(result) = val {
+                                return Ok(result);
+                            }
+                        }
+                        // Check if sender is dropped
+                        if receiver.has_changed().is_err() {
+                            return Err(BucketError::Merge(
+                                "shared merge channel closed".to_string(),
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                })
+            } else {
+                // Current-thread runtime: use helper thread
+                let mut rx = receiver.clone();
+                let result = std::thread::spawn(move || -> Result<MergeResult> {
+                    loop {
+                        if rx.has_changed().unwrap_or(true) {
+                            let val = rx.borrow_and_update().clone();
+                            if let Some(result) = val {
+                                return Ok(result);
+                            }
+                        }
+                        if rx.has_changed().is_err() {
+                            return Err(BucketError::Merge(
+                                "shared merge channel closed".to_string(),
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                })
+                .join()
+                .map_err(|_| {
+                    BucketError::Merge("shared merge helper thread panicked".to_string())
+                })??;
+                Ok(result)
+            }
+        }
+        Err(_) => {
+            // No runtime — poll directly
+            loop {
+                if receiver.has_changed().unwrap_or(true) {
+                    let val = receiver.borrow_and_update().clone();
+                    if let Some(result) = val {
+                        return Ok(result);
+                    }
+                }
+                if receiver.has_changed().is_err() {
+                    return Err(BucketError::Merge(
+                        "shared merge channel closed".to_string(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 /// A single level in the BucketList, containing `curr` and `snap` buckets.
 ///
 /// Each level maintains two buckets:
@@ -607,6 +752,9 @@ pub struct BucketLevel {
     next: Option<PendingMerge>,
     /// The level number (0-10).
     level: usize,
+    /// Guard for in-flight merge dedup tracking. When a new merge is started
+    /// via get_or_start, this guard signals completion to any reattached consumers.
+    in_flight_guard: Option<crate::merge_map::InFlightGuard>,
 }
 
 impl BucketLevel {
@@ -617,6 +765,7 @@ impl BucketLevel {
             snap: Arc::new(Bucket::empty()),
             next: None,
             level,
+            in_flight_guard: None,
         }
     }
 
@@ -662,14 +811,29 @@ impl BucketLevel {
             match pending {
                 PendingMerge::InMemory(bucket) => {
                     self.curr = Arc::new(bucket);
+                    // Guard (if any) was already signaled in prepare for sync merges
+                    self.in_flight_guard = None;
                     Ok(None)
                 }
                 PendingMerge::Async(mut handle) => {
                     let merge_key = handle.merge_key.clone();
                     let bucket = handle.resolve()?;
                     let output_hash = bucket.hash();
+                    // Signal in-flight guard so reattached consumers get the result
+                    if let Some(guard) = self.in_flight_guard.take() {
+                        guard.complete(Arc::clone(&bucket));
+                    }
                     self.curr = bucket;
                     Ok(Some((merge_key, output_hash)))
+                }
+                PendingMerge::Shared(mut handle) => {
+                    // Resolve the shared merge. The InFlightGuard (owned by the
+                    // producer) already recorded in the completed cache, so we
+                    // return None to avoid double-recording.
+                    let bucket = handle.resolve()?;
+                    self.curr = bucket;
+                    self.in_flight_guard = None;
+                    Ok(None)
                 }
             }
         } else {
@@ -719,24 +883,48 @@ impl BucketLevel {
                     })
                 }
             }
+            Some(PendingMerge::Shared(handle)) => {
+                if let Some(Ok(ref bucket)) = handle.cached_result {
+                    // Shared merge resolved; emit state 1 (output) if non-empty
+                    let h = bucket.hash();
+                    if h.is_zero() {
+                        None
+                    } else {
+                        Some(PendingMergeState::Output(h))
+                    }
+                } else {
+                    // Still in progress; emit state 2 (input hashes)
+                    Some(PendingMergeState::Inputs {
+                        curr: handle.metadata.input_curr_hash,
+                        snap: handle.metadata.input_snap_hash,
+                    })
+                }
+            }
         }
     }
 
-    /// Resolve any pending async merge without committing it.
+    /// Resolve any pending async or shared merge without committing it.
     ///
-    /// This ensures that if this level has an async merge in progress,
+    /// This ensures that if this level has an async/shared merge in progress,
     /// we wait for it to complete and cache its result. This is necessary
-    /// before cloning the bucket list, as unresolved async merges would be
+    /// before cloning the bucket list, as unresolved merges would be
     /// lost during cloning.
     ///
     /// Merge failures are propagated as errors (matching stellar-core's
     /// fatal behavior for merge failures).
     pub fn resolve_pending_merge(&mut self) -> Result<()> {
-        if let Some(PendingMerge::Async(ref mut handle)) = self.next {
-            if matches!(handle.state, MergeRecvState::Pending(_)) {
-                // Resolve the async merge, which caches the result in the handle
-                handle.resolve()?;
+        match &mut self.next {
+            Some(PendingMerge::Async(ref mut handle)) => {
+                if matches!(handle.state, MergeRecvState::Pending(_)) {
+                    handle.resolve()?;
+                }
             }
+            Some(PendingMerge::Shared(ref mut handle)) => {
+                if handle.cached_result.is_none() {
+                    handle.resolve()?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -752,6 +940,13 @@ impl BucketLevel {
             Some(PendingMerge::Async(handle)) => {
                 // For async, only return if we have a cached successful result
                 if let MergeRecvState::Ready(Ok(ref bucket)) = handle.state {
+                    Some(bucket.as_ref())
+                } else {
+                    None
+                }
+            }
+            Some(PendingMerge::Shared(handle)) => {
+                if let Some(Ok(ref bucket)) = handle.cached_result {
                     Some(bucket.as_ref())
                 } else {
                     None
@@ -826,59 +1021,132 @@ impl BucketLevel {
             "prepare_with_normalization: about to merge"
         );
 
-        // Check merge map for a cached result before starting a new merge.
-        // If this exact merge (same inputs + keep_dead_entries) was previously
-        // completed, reuse the output instead of re-computing.
+        // Unified merge dedup: check completed cache → in-flight → start new.
+        // This replaces the old completed-cache-only check and adds in-flight dedup
+        // (parity with stellar-core getMergeFuture/putMergeFuture).
         if let Some(merge_map) = ctx.merge_map {
             let curr_hash = curr_for_merge.hash();
             let snap_hash = incoming.hash();
             let key = MergeKey::new(ctx.keep_dead_entries, curr_hash, snap_hash);
-            if let Some(output_hash) = merge_map.read().unwrap().get_output(&key).copied() {
-                if !output_hash.is_zero() {
-                    if let Some(dir) = ctx.bucket_dir {
-                        let path = dir.join(canonical_bucket_filename(&output_hash));
+
+            let metadata = crate::merge_map::SharedMergeMetadata {
+                merge_key: key.clone(),
+                input_curr_hash: curr_hash,
+                input_snap_hash: snap_hash,
+                input_file_paths: {
+                    let mut paths = Vec::new();
+                    if let Some(path) = curr_for_merge.backing_file_path() {
+                        paths.push(path.to_path_buf());
+                    }
+                    if let Some(path) = incoming.backing_file_path() {
+                        paths.push(path.to_path_buf());
+                    }
+                    paths
+                },
+                level: self.level,
+            };
+
+            let bucket_dir_clone = ctx.bucket_dir.map(|p| p.to_path_buf());
+            let slot = merge_map.write().unwrap().get_or_start(
+                &key,
+                metadata,
+                Arc::clone(merge_map),
+                |output_hash| {
+                    // Load completed merge result from disk
+                    if let Some(ref dir) = bucket_dir_clone {
+                        let path = dir.join(canonical_bucket_filename(output_hash));
                         if path.exists() {
                             match Bucket::from_xdr_file_disk_backed(&path) {
+                                Ok(bucket) if bucket.hash() == *output_hash => {
+                                    return Some(Arc::new(bucket));
+                                }
                                 Ok(bucket) => {
-                                    if bucket.hash() != output_hash {
-                                        tracing::warn!(
-                                            level = self.level,
-                                            expected = %output_hash,
-                                            actual = %bucket.hash(),
-                                            "Merge-map cached result hash mismatch, \
-                                             falling through to new merge"
-                                        );
-                                    } else {
-                                        tracing::debug!(
-                                            level = self.level,
-                                            output_hash = %output_hash,
-                                            "Reusing cached merge result from merge map"
-                                        );
-                                        self.next = Some(PendingMerge::InMemory(bucket));
-                                        return Ok(());
-                                    }
+                                    tracing::warn!(
+                                        expected = %output_hash,
+                                        actual = %bucket.hash(),
+                                        "Merge-map cached result hash mismatch"
+                                    );
                                 }
                                 Err(e) => {
                                     tracing::warn!(
-                                        level = self.level,
                                         error = %e,
-                                        "Failed to load cached merge result, falling through to new merge"
+                                        "Failed to load cached merge result"
                                     );
                                 }
                             }
                         }
                     }
+                    None
+                },
+            );
+
+            match slot {
+                crate::merge_map::MergeSlot::Completed(bucket) => {
+                    if let Some(ref counters) = ctx.merge_counters {
+                        counters.record_finished_reattachment();
+                    }
+                    tracing::debug!(
+                        level = self.level,
+                        output_hash = %bucket.hash(),
+                        "Reusing completed merge result from merge map"
+                    );
+                    self.next = Some(PendingMerge::InMemory((*bucket).clone()));
+                    return Ok(());
+                }
+                crate::merge_map::MergeSlot::InFlight { receiver, metadata } => {
+                    if let Some(ref counters) = ctx.merge_counters {
+                        counters.record_running_reattachment();
+                    }
+                    tracing::debug!(level = self.level, "Reattaching to in-flight merge (dedup)");
+                    self.next = Some(PendingMerge::Shared(SharedMergeHandle::new(
+                        receiver, metadata,
+                    )));
+                    return Ok(());
+                }
+                crate::merge_map::MergeSlot::New { guard } => {
+                    // Start merge with guard for in-flight dedup tracking.
+                    // The guard will signal completion when the merge finishes.
+                    if self.level >= 1 {
+                        let handle = AsyncMergeHandle::start_merge(AsyncMergeRequest {
+                            curr: curr_for_merge,
+                            snap: incoming,
+                            keep_dead_entries: ctx.keep_dead_entries,
+                            protocol_version,
+                            normalize_init: ctx.normalize_init,
+                            shadow_buckets: shadow_buckets.to_vec(),
+                            level: self.level,
+                            bucket_dir: ctx.bucket_dir.map(|p| p.to_path_buf()),
+                            counters: ctx.merge_counters,
+                        });
+                        // Store the guard alongside the handle so it signals on commit.
+                        self.next = Some(PendingMerge::Async(handle));
+                        // Store guard for later signaling when merge commits.
+                        // We attach it to the handle's merge_key for lookup.
+                        self.in_flight_guard = Some(guard);
+                    } else {
+                        // Level 0 sync merge
+                        let merged = merge_buckets(
+                            &curr_for_merge,
+                            &incoming,
+                            &MergeOptions {
+                                keep_dead_entries: ctx.keep_dead_entries,
+                                max_protocol_version: protocol_version,
+                                normalize_init_entries: ctx.normalize_init,
+                                shadow_buckets,
+                                counters: ctx.merge_counters.as_deref(),
+                                metadata_policy: MetadataPolicy::CurrentProtocol,
+                            },
+                        )?;
+                        // Signal guard completion immediately for sync merge
+                        guard.complete(Arc::new(merged.clone()));
+                        self.next = Some(PendingMerge::InMemory(merged));
+                    }
+                    return Ok(());
                 }
             }
         }
 
-        // For levels 1+, use async merging to run merges in background threads.
-        // This matches stellar-core's FutureBucket design where merges for
-        // higher levels (which have larger buckets) start immediately and run
-        // concurrently with other operations. The merge result is retrieved when
-        // commit() is called, blocking only if the merge hasn't finished yet.
-        //
-        // Level 0 uses synchronous in-memory merging (handled in prepare_first_level).
+        // Fallback: no merge_map set → start merge without dedup (test paths)
         if self.level >= 1 {
             let handle = AsyncMergeHandle::start_merge(AsyncMergeRequest {
                 curr: curr_for_merge,
@@ -894,7 +1162,6 @@ impl BucketLevel {
             self.next = Some(PendingMerge::Async(handle));
         } else {
             // Level 0 should use prepare_first_level, but if called here, do sync merge.
-            // Use CurrentProtocol metadata policy to match stellar-core level-0 semantics.
             let merged = merge_buckets(
                 &curr_for_merge,
                 &incoming,
@@ -907,14 +1174,6 @@ impl BucketLevel {
                     metadata_policy: MetadataPolicy::CurrentProtocol,
                 },
             )?;
-
-            tracing::debug!(
-                level = self.level,
-                merged_hash = %merged.hash(),
-                merged_entries = merged.len(),
-                "prepare_with_normalization: merge complete"
-            );
-
             self.next = Some(PendingMerge::InMemory(merged));
         }
         Ok(())
@@ -1012,7 +1271,7 @@ impl Default for BucketLevel {
 impl Clone for BucketLevel {
     fn clone(&self) -> Self {
         // For the `next` field, we can only clone InMemory variants.
-        // Async variants would need to be resolved first, but since Clone
+        // Async/Shared variants would need to be resolved first, but since Clone
         // takes &self (not &mut self), we can't resolve them here.
         // Instead, we only clone the cached result if available.
         let cloned_next = match &self.next {
@@ -1033,6 +1292,19 @@ impl Clone for BucketLevel {
                     None
                 }
             }
+            Some(PendingMerge::Shared(handle)) => {
+                // If the shared merge has resolved, clone as InMemory.
+                // Otherwise, skip (same as Async).
+                if let Some(Ok(ref bucket)) = handle.cached_result {
+                    Some(PendingMerge::InMemory((**bucket).clone()))
+                } else {
+                    tracing::warn!(
+                        level = self.level,
+                        "Cloning BucketLevel with unresolved shared merge - merge will be lost"
+                    );
+                    None
+                }
+            }
         };
 
         Self {
@@ -1040,6 +1312,7 @@ impl Clone for BucketLevel {
             snap: self.snap.clone(),
             next: cloned_next,
             level: self.level,
+            in_flight_guard: None, // Guards are not cloneable; cloned levels don't own merges
         }
     }
 }
@@ -2237,6 +2510,13 @@ impl BucketList {
                             hashes.push(result.hash());
                         }
                     }
+                    PendingMerge::Shared(handle) => {
+                        hashes.push(handle.metadata.input_curr_hash);
+                        hashes.push(handle.metadata.input_snap_hash);
+                        if let Some(Ok(ref bucket)) = handle.cached_result {
+                            hashes.push(bucket.hash());
+                        }
+                    }
                 }
             }
         }
@@ -2282,6 +2562,17 @@ impl BucketList {
                         // If the merge has completed, also add the result's backing file
                         if let MergeRecvState::Ready(Ok(ref result)) = handle.state {
                             if let Some(path) = result.backing_file_path() {
+                                paths.insert(path.to_path_buf());
+                            }
+                        }
+                    }
+                    PendingMerge::Shared(handle) => {
+                        // Add input bucket files referenced by shared merge
+                        for path in &handle.metadata.input_file_paths {
+                            paths.insert(path.clone());
+                        }
+                        if let Some(Ok(ref bucket)) = handle.cached_result {
+                            if let Some(path) = bucket.backing_file_path() {
                                 paths.insert(path.to_path_buf());
                             }
                         }
