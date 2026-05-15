@@ -185,14 +185,12 @@ impl CatchupManager {
         }
         if let Some(first) = apply_data.first() {
             let header = first.header().clone();
-            let entry_hash = henyey_ledger::compute_header_hash(&header).map_err(|e| {
-                HistoryError::CatchupFailed(format!(
-                    "Failed to compute header hash for ledger {}: {}",
-                    header.ledger_seq, e
-                ))
-            })?;
+            // `knit_to_lcl_decision` only reads `header.previous_ledger_hash` on
+            // the case-4 (Apply) branch exercised here, so the entry hash is
+            // unused. Use a zero placeholder rather than recomputing the header
+            // hash for a synthetic entry that we discard immediately.
             let virtual_entry = LedgerHeaderHistoryEntry {
-                hash: entry_hash.into(),
+                hash: stellar_xdr::curr::Hash([0; 32]),
                 header,
                 ext: Default::default(),
             };

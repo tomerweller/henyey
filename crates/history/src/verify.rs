@@ -2204,7 +2204,7 @@ mod tests {
         // doesn't match hash(lower[126]).
         upper[0].previous_ledger_hash = stellar_xdr::curr::Hash([0xDD; 32]);
 
-        let mut headers: Vec<_> = lower.into_iter().chain(upper.into_iter()).collect();
+        let mut headers: Vec<_> = lower.into_iter().chain(upper).collect();
         // Re-compute internal chain for upper group: header 129's prev must
         // match hash of (tampered) header 128, etc. Use make_chain's approach.
         for i in 128..headers.len() {
