@@ -25,14 +25,15 @@ Multiple `/project-tick` invocations run in parallel safely. The GitHub assignee
 - Repo: `stellar-experimental/henyey`
 - Project: number `2`, ID `PVT_kwDOD-vqsM4BWQnL`
 - Status field ID: `PVTSSF_lADOD-vqsM4BWQnLzhRmYgI`
-- States (lowercase): `backlog`, `ready-for-planning`, `ready-for-doing`, `doing`, `in-review`, `done`, `blocked`
+- States (lowercase): `backlog`, `ready-for-planning`, `planning`, `ready-for-doing`, `doing`, `in-review`, `done`, `blocked`
 
 ## Dispatch table
 
 | Status | Specialist | What it does |
 |---|---|---|
 | `backlog` | `/triage` | Validates the issue, labels it, advances to `ready-for-planning` (or `ready-for-doing` if trivial, or `blocked`) |
-| `ready-for-planning` | `/plan` | Adversarial plan drafting with parallel critics; advances to `ready-for-doing` |
+| `ready-for-planning` | `/plan` | Picks up the work; transitions to `planning` while drafting with parallel critics, then to `ready-for-doing` on convergence |
+| `planning` | (no-op — actively assigned) | A `/plan` agent is currently drafting + running critics. Items in `planning` are always assigned; ticks filter them out automatically. |
 | `ready-for-doing` | `/do` | Picks up the work; transitions to `doing` while implementing, then to `in-review` when PR is open |
 | `doing` | (no-op — actively assigned) | A `/do` agent is currently implementing. Items in `doing` are always assigned; ticks filter them out automatically. |
 | `in-review` | `/review-pr` | Two parallel reviewers + CI; auto-merges on triple-green; bounces back or blocks otherwise |
@@ -84,13 +85,13 @@ An item is **actionable** if all of:
 - `fieldValueByName.name ∈ { backlog, ready-for-planning, ready-for-doing, in-review }`
 - `assignees.nodes` is empty (nobody is working on it)
 
-Skip items where any check fails. Skip items whose status is `doing` (always assigned), `done`, or `blocked`.
+Skip items where any check fails. Skip items whose status is `planning` (always assigned), `doing` (always assigned), `done`, or `blocked`.
 
 ### Step 3 — Pick one issue
 
 Order actionable items by:
 
-1. **Close-WIP-first state priority** — descending: `in-review` > `ready-for-doing` > `ready-for-planning` > `backlog`. Reason: prevents PRs from rotting in review while fresh backlog items pile up. (`doing` items are never picked — they are always assigned and filtered out.)
+1. **Close-WIP-first state priority** — descending: `in-review` > `ready-for-doing` > `ready-for-planning` > `backlog`. Reason: prevents PRs from rotting in review while fresh backlog items pile up. (`planning` and `doing` items are never picked — they are always assigned and filtered out.)
 2. **Label priority** within state — descending: `urgent` > `high` > `medium` > `low` > (no priority label).
 3. **Age** within priority tier — oldest `createdAt` first.
 

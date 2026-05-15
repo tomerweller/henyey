@@ -2,9 +2,10 @@
 name: plan
 description: |
   Draft an implementation plan for a triaged henyey issue, validated by three
-  independent critics in parallel. Operates on issues in `ready-for-planning`.
-  Advances to `ready-for-doing` on convergence, or `blocked` if critics still
-  disagree after two rounds. Use when invoked by /project-tick with an issue in
+  independent critics in parallel. Picks up issues in `ready-for-planning`,
+  transitions them to `planning` while actively drafting, then to
+  `ready-for-doing` on convergence (or `blocked` if critics still disagree
+  after two rounds). Use when invoked by /project-tick with an issue in
   ready-for-planning, or manually as /plan <issue>.
 ---
 
@@ -33,9 +34,19 @@ Read the `## Triage Report` comment. Confirm:
 
 If triage looks wrong (e.g. issue is actually a duplicate, or actually trivial), post a `## Plan: Triage Disagreement` comment explaining, move the issue back to `backlog`, and unassign yourself. Exit. The handoff-verification pattern catches bad triage at this point — cheaper than letting it through.
 
+## Step 1.5 — Transition to `planning`
+
+Immediately after acquiring the issue (assignee race already won by the orchestrator), move the issue from `ready-for-planning` to `planning`. This signals on the board that a plan is actively being drafted with critics — important for transparency since `/plan` takes 5–10 minutes of parallel-critic work.
+
+```bash
+bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE planning
+```
+
+Skip this if the issue is already in `planning` (e.g. a previous `/plan` attempt crashed and the operator manually unblocked it).
+
 ## Step 2 — Round 1: Draft
 
-Move the issue to `ready-for-planning` if not already there (idempotent). Then explore the codebase to ground your plan:
+Then explore the codebase to ground your plan:
 
 - Read the relevant crate's source files: at least the module-level docs, the function you'd be changing, and the surrounding context.
 - Read the most relevant existing tests in `crates/<crate>/tests/` to understand the testing patterns.
