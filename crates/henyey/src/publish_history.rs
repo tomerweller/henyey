@@ -318,7 +318,14 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
             write_scp_history_file(publish_dir, checkpoint, &scp_entries)?;
             let plan = henyey_history::upload::UploadPlan::from_staging_dir(publish_dir)?;
             for archive in &command_targets {
-                plan.execute(&archive.put, archive.mkdir.as_deref())?;
+                let remote_archive =
+                    henyey_history::RemoteArchive::new(henyey_history::RemoteArchiveConfig {
+                        name: archive.name.clone(),
+                        put_cmd: Some(archive.put.clone()),
+                        mkdir_cmd: archive.mkdir.clone(),
+                        get_cmd: None,
+                    });
+                plan.execute(&remote_archive).await?;
                 println!("OK (command: {})", archive.name);
                 published_any = true;
             }

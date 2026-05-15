@@ -34,7 +34,8 @@
 //! that references files not yet present on the archive.
 
 use crate::archive_state::HistoryArchiveState;
-use crate::{paths, HistoryError, Result};
+use crate::remote_archive::RemoteArchive;
+use crate::{paths, Result};
 use henyey_common::Hash256;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -230,39 +231,40 @@ impl UploadPlan {
         &self.entries
     }
 
-    /// Execute the upload plan via shell commands.
+    /// Execute the upload plan against a [`RemoteArchive`].
     ///
-    /// For each entry, creates the remote parent directory (if `mkdir_cmd` is
-    /// provided) and uploads the file using `put_cmd`.
-    ///
-    /// Command templates use positional placeholders:
-    /// - `put_cmd`: `{0}` = local path, `{1}` = remote path
-    /// - `mkdir_cmd`: `{0}` = remote directory
+    /// For each entry, creates the remote parent directory (if the archive
+    /// has a mkdir command configured) and uploads the file using the
+    /// archive's put command. Parent directories created during this plan
+    /// are deduplicated via an internal `HashSet`.
     ///
     /// If any upload fails, execution stops immediately. Because entries are
     /// sorted with `RootHas` last, a failure in any earlier file guarantees
     /// the root HAS is never uploaded.
-    pub fn execute(&self, put_cmd: &str, mkdir_cmd: Option<&str>) -> Result<()> {
-        use std::collections::HashSet;
-        let mut created_dirs = HashSet::new();
+    ///
+    /// Note: [`RemoteArchive::put_file`] returns [`HistoryError::NotFound`]
+    /// (not [`HistoryError::RemoteCommandFailed`]) if a staged local file is
+    /// missing. In production this is unreachable because staging directories
+    /// always contain the files referenced by the plan.
+    pub async fn execute(&self, archive: &RemoteArchive) -> Result<()> {
+        let mut created_dirs: HashSet<String> = HashSet::new();
+        let mkdir_enabled = archive.has_mkdir();
 
         for entry in &self.entries {
-            // Create remote parent directory if needed.
-            if let Some(mkdir) = mkdir_cmd {
+            // Create remote parent directory if needed (and configured).
+            if mkdir_enabled {
                 if let Some(parent) = Path::new(&entry.remote_path).parent() {
                     let parent_str = path_to_unix_string(parent);
                     if !parent_str.is_empty() && created_dirs.insert(parent_str.clone()) {
-                        let cmd = mkdir.replace("{0}", &parent_str);
-                        run_shell_command(&cmd)?;
+                        archive.mkdir(&parent_str).await?;
                     }
                 }
             }
 
             // Upload the file.
-            let cmd = put_cmd
-                .replace("{0}", entry.local_path.to_string_lossy().as_ref())
-                .replace("{1}", &entry.remote_path);
-            run_shell_command(&cmd)?;
+            archive
+                .put_file(&entry.local_path, &entry.remote_path)
+                .await?;
         }
 
         Ok(())
@@ -297,26 +299,22 @@ pub fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Execute a shell command and return an error if it fails.
-fn run_shell_command(cmd: &str) -> Result<()> {
-    use std::process::Command;
-
-    let output = Command::new("sh").arg("-c").arg(cmd).output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(HistoryError::RemoteCommandFailed {
-            command: cmd.to_string(),
-            exit_code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_archive::RemoteArchiveConfig;
+    use crate::HistoryError;
     use std::fs;
+
+    /// Build a `RemoteArchive` from raw shell command templates for tests.
+    fn test_archive(put_cmd: Option<&str>, mkdir_cmd: Option<&str>) -> RemoteArchive {
+        RemoteArchive::new(RemoteArchiveConfig {
+            name: "test".to_string(),
+            put_cmd: put_cmd.map(str::to_string),
+            mkdir_cmd: mkdir_cmd.map(str::to_string),
+            get_cmd: None,
+        })
+    }
 
     // Full 64-hex hashes for bucket test files.
     const BUCKET_HASH_A: &str = "aabbccdd00000000000000000000000000000000000000000000000000000000";
@@ -591,8 +589,8 @@ mod tests {
         HistoryArchiveState::new_for_testing(63, levels)
     }
 
-    #[test]
-    fn execute_uploads_in_correct_order() {
+    #[tokio::test]
+    async fn execute_uploads_in_correct_order() {
         let dir = tempfile::tempdir().unwrap();
         create_staging_dir(dir.path());
         let log_file = dir.path().join("upload-order.log");
@@ -600,7 +598,8 @@ mod tests {
         let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
 
         let put_cmd = format!("echo {{1}} >> {}", log_file.display());
-        plan.execute(&put_cmd, None).unwrap();
+        let archive = test_archive(Some(&put_cmd), None);
+        plan.execute(&archive).await.unwrap();
 
         let log = fs::read_to_string(&log_file).unwrap();
         let uploaded: Vec<&str> = log.lines().collect();
@@ -632,8 +631,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn execute_failure_prevents_root_has_upload() {
+    #[tokio::test]
+    async fn execute_failure_prevents_root_has_upload() {
         let dir = tempfile::tempdir().unwrap();
         create_staging_dir(dir.path());
         let log_file = dir.path().join("upload-order.log");
@@ -653,7 +652,8 @@ mod tests {
             log_file.display()
         );
 
-        let result = plan.execute(&put_cmd, None);
+        let archive = test_archive(Some(&put_cmd), None);
+        let result = plan.execute(&archive).await;
         assert!(result.is_err(), "upload should fail");
 
         if log_file.exists() {
@@ -665,8 +665,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn execute_creates_directories_before_upload() {
+    #[tokio::test]
+    async fn execute_creates_directories_before_upload() {
         let dir = tempfile::tempdir().unwrap();
         create_staging_dir(dir.path());
         let log_file = dir.path().join("cmd-order.log");
@@ -676,7 +676,8 @@ mod tests {
         let put_cmd = format!("echo PUT {{1}} >> {}", log_file.display());
         let mkdir_cmd = format!("echo MKDIR {{0}} >> {}", log_file.display());
 
-        plan.execute(&put_cmd, Some(&mkdir_cmd)).unwrap();
+        let archive = test_archive(Some(&put_cmd), Some(&mkdir_cmd));
+        plan.execute(&archive).await.unwrap();
 
         let log = fs::read_to_string(&log_file).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -699,5 +700,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn execute_propagates_remote_archive_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        create_staging_dir(dir.path());
+        let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
+
+        // put_cmd always fails with exit 7. The local files exist (so the
+        // pre-check in `put_file` passes) and the shell command propagates
+        // its exit code through `HistoryError::RemoteCommandFailed`.
+        let archive = test_archive(Some("exit 7"), None);
+        let err = plan.execute(&archive).await.expect_err("should fail");
+        match err {
+            HistoryError::RemoteCommandFailed { exit_code, .. } => {
+                assert_eq!(exit_code, Some(7));
+            }
+            other => panic!("expected RemoteCommandFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_skips_mkdir_when_unconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        create_staging_dir(dir.path());
+        let log_file = dir.path().join("upload.log");
+        let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
+        let expected_uploads = plan.entries().len();
+
+        // No mkdir command — every entry must still upload without error.
+        let put_cmd = format!("echo {{1}} >> {}", log_file.display());
+        let archive = test_archive(Some(&put_cmd), None);
+        plan.execute(&archive).await.unwrap();
+
+        let log = fs::read_to_string(&log_file).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.len(),
+            expected_uploads,
+            "all entries must be uploaded even when mkdir is unconfigured"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_reports_missing_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        create_staging_dir(dir.path());
+        let log_file = dir.path().join("upload.log");
+        let plan = UploadPlan::from_staging_dir(dir.path()).unwrap();
+
+        // Delete the first entry's local file. RemoteArchive::put_file's
+        // pre-check fires before the shell command runs, returning
+        // `HistoryError::NotFound`. No subsequent entry should be uploaded.
+        let victim = plan.entries().first().expect("plan is non-empty");
+        fs::remove_file(&victim.local_path).unwrap();
+
+        let put_cmd = format!("echo {{1}} >> {}", log_file.display());
+        let archive = test_archive(Some(&put_cmd), None);
+        let err = plan.execute(&archive).await.expect_err("should fail");
+        assert!(
+            matches!(err, HistoryError::NotFound(_)),
+            "expected HistoryError::NotFound, got {err:?}"
+        );
+
+        assert!(
+            !log_file.exists(),
+            "no entry should be uploaded after the pre-check failure"
+        );
     }
 }
