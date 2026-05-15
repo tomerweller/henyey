@@ -261,9 +261,12 @@ pub fn verify_reverse_walk(
     }
 
     // Check protocol versions for all headers first (§9.3 step 2e).
+    // Version 0 is allowed: it's the genesis protocol state before any upgrade,
+    // always present in CATCHUP_COMPLETE histories. Mirrors begin_close's gate.
     for header in headers {
-        if header.ledger_version > config.max_supported_version
-            || header.ledger_version < config.min_supported_version
+        if header.ledger_version != 0
+            && (header.ledger_version > config.max_supported_version
+                || header.ledger_version < config.min_supported_version)
         {
             return Err(HistoryError::UnsupportedLedgerVersion {
                 ledger: header.ledger_seq,
@@ -1968,6 +1971,21 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Regression test for #2724: genesis headers have ledger_version=0 which must
+    /// pass verification (mirrors begin_close's version-0 exception).
+    #[test]
+    fn test_reverse_walk_allows_genesis_protocol_version() {
+        let headers = make_chain(1, 5, 0); // version 0 = genesis
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let result = verify_reverse_walk(&headers, &config).unwrap();
+        assert!(!result.fatal_failure);
     }
 
     #[test]
