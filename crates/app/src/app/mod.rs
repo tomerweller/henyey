@@ -906,6 +906,42 @@ fn collect_db_referenced_bucket_hashes(db: &henyey_db::Database) -> anyhow::Resu
     .map_err(Into::into)
 }
 
+/// Collect the complete set of GC roots for bucket file cleanup.
+///
+/// Resolves all pending merges, then enumerates every bucket hash referenced by:
+/// 1. Live + hot archive bucket lists (curr/snap + pending merge inputs/outputs)
+/// 2. Snapshot manager (current + historical snapshots for RPC readers)
+/// 3. DB references (authoritative HAS + publish-queue HAS bucket hashes)
+///
+/// Returns `None` if DB access fails (caller should skip GC in that case).
+///
+/// See `retain_buckets()` doc comment for the full GC safety contract and
+/// `PARITY_STATUS.md` §6 for the divergence rationale vs stellar-core's
+/// refcount-based approach.
+fn collect_gc_roots(
+    lm: &henyey_ledger::LedgerManager,
+    sm: &BucketSnapshotManager,
+    db: &henyey_db::Database,
+) -> Option<Vec<Hash256>> {
+    lm.resolve_pending_bucket_merges();
+
+    let mut hashes = lm.all_referenced_bucket_hashes();
+    hashes.extend(sm.all_referenced_hashes());
+
+    match collect_db_referenced_bucket_hashes(db) {
+        Ok(extra) => hashes.extend(extra),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Skipping bucket cleanup: failed to load DB references"
+            );
+            return None;
+        }
+    }
+
+    Some(hashes)
+}
+
 /// Collect bucket hashes referenced only by publish-queue HAS entries.
 ///
 /// Used during startup to verify that all buckets needed by pending publishes
@@ -2396,47 +2432,40 @@ impl App {
         crate::maintainer::run_maintenance(&self.db, lcl, min_queued, rpc_retention_window, count);
     }
 
-    /// Delete bucket files on disk that are no longer referenced by the live
-    /// or hot archive bucket lists. Prevents unbounded disk growth.
-    /// Matches stellar-core's cleanupStaleFiles() + forgetUnreferencedBuckets().
+    /// Delete bucket files on disk that are no longer referenced by any component.
     ///
-    /// Must resolve all pending async merges first: background merge threads may
-    /// have already written output files to disk, but the result hasn't been
-    /// polled yet (handle.result == None). Without resolution, the output hash
-    /// won't appear in the referenced set and the file would be deleted while
-    /// the DiskBacked bucket still points to it. This is analogous to
-    /// stellar-core tracking all merge outputs in mSharedLiveBuckets.
+    /// Spec: BUCKETLISTDB_SPEC §8.2 — bucket lifecycle / garbage collection.
     ///
-    /// Spawns the cleanup on tokio's blocking thread pool so that
-    /// `resolve_pending_bucket_merges()` (which may block waiting for
-    /// in-flight async merges) does not stall the async event loop.
+    /// # GC Algorithm (resolve-first + set-membership)
+    ///
+    /// Unlike stellar-core's refcount-based approach (`use_count() == 1`), Henyey
+    /// resolves all pending merges first, then computes a complete GC root set and
+    /// deletes any on-disk file not in that set. This eliminates race windows
+    /// between GC and merge threads at the cost of a brief blocking wait.
+    ///
+    /// GC roots collected:
+    /// 1. Live + hot archive bucket lists (curr/snap + pending merge inputs/outputs)
+    /// 2. Snapshot manager (current + historical snapshots for RPC readers)
+    /// 3. DB references (authoritative HAS + publish-queue HAS bucket hashes)
+    ///
+    /// # Safety
+    ///
+    /// `resolve_pending_bucket_merges()` must run first: background merge threads
+    /// may have written output files to disk whose hashes haven't been polled yet.
+    /// Without resolution, those outputs would not appear in `all_referenced_hashes()`
+    /// and could be prematurely deleted while a `DiskBucket` still references the path.
+    ///
+    /// Spawns on tokio's blocking thread pool so that merge resolution (which may
+    /// block) does not stall the async event loop.
     pub(crate) fn cleanup_stale_bucket_files_background(&self) {
         let lm = self.ledger_manager.clone();
         let bm = self.bucket_manager.clone();
         let db = self.db.clone();
         let sm = self.bucket_snapshot_manager.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            lm.resolve_pending_bucket_merges();
-
-            let mut hashes = lm.all_referenced_bucket_hashes();
-
-            // Add bucket hashes from the snapshot manager (current + historical
-            // snapshots may reference files not in the live bucket list).
-            hashes.extend(sm.all_referenced_hashes());
-
-            // Add bucket hashes from the DB-stored HAS and publish queue.
-            // If DB access fails, skip cleanup entirely to avoid deleting
-            // still-referenced bucket files (fail-closed).
-            match collect_db_referenced_bucket_hashes(&db) {
-                Ok(extra) => hashes.extend(extra),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Skipping bucket cleanup: failed to load DB references"
-                    );
-                    return;
-                }
-            }
+            let Some(hashes) = collect_gc_roots(&lm, &sm, &db) else {
+                return;
+            };
 
             match bm.retain_buckets(&hashes) {
                 Ok(deleted) => {

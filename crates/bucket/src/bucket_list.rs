@@ -5585,6 +5585,43 @@ mod tests {
         assert_eq!(hashes, vec![&h1, &h2]);
     }
 
+    /// Regression test for §8.2 GC safety: `all_referenced_hashes()` must include
+    /// pending merge output hashes so they are not GC'd before resolution.
+    #[test]
+    fn test_all_referenced_hashes_includes_pending_merge_output() {
+        let entry_curr = make_account_entry([1u8; 32], 100);
+        let entry_out = make_account_entry([9u8; 32], 999);
+
+        let bucket_curr =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_curr)]).unwrap();
+        let bucket_out = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_out)]).unwrap();
+
+        let hc = bucket_curr.hash();
+        let ho = bucket_out.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (hc, Hash256::ZERO);
+
+        let mut next_states = vec![None; BUCKET_LIST_LEVELS];
+        next_states[0] = Some(PendingMergeState::Output(ho));
+
+        let loader = make_loader(vec![bucket_curr, bucket_out]);
+        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+
+        let referenced = bl.all_referenced_hashes();
+
+        // The pending merge output hash must be in the referenced set
+        assert!(
+            referenced.contains(&ho),
+            "all_referenced_hashes() must include pending merge output hash for GC safety"
+        );
+        // The curr hash must also be present
+        assert!(
+            referenced.contains(&hc),
+            "all_referenced_hashes() must include curr bucket hash"
+        );
+    }
+
     #[test]
     fn test_restore_from_has_zero_hash_output_treated_as_clear() {
         // Passing Output(Hash256::ZERO) directly to restore_from_has should

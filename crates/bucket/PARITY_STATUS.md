@@ -132,7 +132,7 @@ Corresponds to: `BucketManager.h`
 | `bucketIndexFilename()` / `getBucketDir()` | `index_path_for_bucket()` / `bucket_dir()` | Full |
 | `getBucketIfExists()` / `getBucketByHash()` | `bucket_exists()` / `load_bucket()` | Full |
 | `adoptFileAsBucket()` / `noteEmptyMergeOutput()` | Temp promotion and empty-bucket handling in `merge()` | Full |
-| `forgetUnreferencedBuckets()` | `retain_buckets()` | Full |
+| `forgetUnreferencedBuckets()` | `retain_buckets()` | Full (mechanism diverges: set-based GC vs refcount; see §6 in Architectural Differences) |
 | `addLiveBatch()` / `addHotArchiveBatch()` | `BucketList::add_batch()` / `HotArchiveBucketList::add_batch()` | Full |
 | `snapshotLedger()` / `assumeState()` | `snapshot_ledger()` / `assume_state()` | Full |
 | `loadCompleteLedgerState()` / `loadCompleteHotArchiveState()` | Same-named Rust methods | Full |
@@ -292,6 +292,11 @@ Features not yet implemented. These ARE counted against parity %.
    - **stellar-core**: `BucketManager` deduplicates both finished merges and merges still running (`BucketManager.cpp:getMergeFuture()`/`putMergeFuture()`).
    - **Rust**: `BucketMergeMap` is wired for completed merges. In-flight merge dedup (concurrent reattachment) is not yet implemented.
    - **Rationale**: Completed-merge reuse covers restart and replay reuse, but concurrent reattachment parity is still missing.
+
+6. **Bucket GC: set-based vs refcount-based (§8.2)**
+   - **stellar-core**: `forgetUnreferencedBuckets()` (`BucketManager.cpp:936-1035`) uses `shared_ptr::use_count() == 1` as an implicit refcount to determine when no worker thread or in-progress structure holds a reference to a bucket before deleting its file. It also projects publish-queue bucket hashes through the finished-merge map to retain cached merge outputs (`BucketManager.cpp:883-886`).
+   - **Rust**: `retain_buckets()` computes the complete set of GC roots (live bucket list, pending merge inputs/outputs, hot archive, snapshot manager, DB-stored HAS, publish queue) and deletes any on-disk file not in that set. The critical prerequisite is `resolve_pending_bucket_merges()` which blocks until all in-flight async merges complete before GC runs.
+   - **Rationale**: The "resolve-first" approach eliminates the need for refcount-based GC. After merge resolution, no worker thread holds bucket references, so a complete point-in-time set-membership check is sufficient. This trades a brief blocking wait at GC time for architectural simplicity — no `use_count()` heuristics, no race windows between GC and merge threads. The publish-queue merge-map projection is intentionally omitted: after resolution, merge outputs are already in the live bucket list; not retaining cached outputs for future resynthesis means at worst a merge re-run on restart (performance cost, not correctness).
 
 ## Test Coverage
 

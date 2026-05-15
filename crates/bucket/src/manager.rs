@@ -706,11 +706,31 @@ impl BucketManager {
     /// Delete all bucket files not in the given set of hashes.
     ///
     /// Spec: BUCKETLISTDB_SPEC §8.2 (analogue) — GC unreferenced buckets.
-    /// Henyey's GC model differs from stellar-core's refcount-based approach
-    /// (BucketManager.cpp:952-1024).
     ///
-    /// This is useful for garbage collection. When `persist_index` is enabled,
-    /// also cleans up orphaned `.index` files.
+    /// # GC Safety Contract
+    ///
+    /// The caller is responsible for providing a **complete** keep-set containing
+    /// every bucket hash that any component might still open by path. The GC
+    /// roots are:
+    /// - Live bucket list: curr/snap at every level + pending merge inputs/outputs
+    /// - Hot archive bucket list (same pattern)
+    /// - Snapshot manager: current + historical `BucketListSnapshot`s
+    /// - DB references: authoritative HAS + publish-queue HAS bucket hashes
+    ///
+    /// The caller must also ensure no in-flight merges are reading bucket files
+    /// (typically by calling `resolve_pending_bucket_merges()` first).
+    ///
+    /// # Divergence from stellar-core
+    ///
+    /// stellar-core's `forgetUnreferencedBuckets()` uses `shared_ptr::use_count() == 1`
+    /// as an implicit refcount, allowing GC to run concurrently with merges.
+    /// Henyey instead resolves all pending merges first, then uses set-membership
+    /// to determine what to delete — trading a brief blocking wait for
+    /// architectural simplicity (no refcount tracking, no race windows).
+    ///
+    /// Also cleans up merge-map entries whose outputs are no longer retained
+    /// (housekeeping, not a safety mechanism) and orphaned `.index` files when
+    /// `persist_index` is enabled.
     pub fn retain_buckets(&self, keep: &[Hash256]) -> Result<usize> {
         let keep_set: std::collections::HashSet<_> = keep.iter().collect();
         let all_buckets = self.list_buckets()?;

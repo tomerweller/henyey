@@ -357,8 +357,7 @@ impl App {
         // Garbage collect bucket files no longer referenced after catchup.
         // Matches stellar-core's cleanupStaleFiles() in assumeState().
         // Run on the blocking thread pool: resolve_pending_bucket_merges() inside
-        // cleanup_stale_bucket_files() uses block_in_place() to wait for in-flight
-        // async merges, which would freeze the tokio event loop if run inline.
+        // collect_gc_roots() may block waiting for in-flight async merges.
         {
             let lm = self.ledger_manager.clone();
             let bm = self.bucket_manager.clone();
@@ -367,24 +366,9 @@ impl App {
             // Log but don't propagate errors — cleanup is best-effort after
             // catchup has already succeeded.
             let _ = henyey_common::spawn_blocking_logged("catchup-bucket-cleanup", move || {
-                lm.resolve_pending_bucket_merges();
-
-                let mut hashes = lm.all_referenced_bucket_hashes();
-
-                // Add snapshot manager references
-                hashes.extend(sm.all_referenced_hashes());
-
-                // Add DB HAS and publish queue references
-                match super::collect_db_referenced_bucket_hashes(&db) {
-                    Ok(extra) => hashes.extend(extra),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Skipping bucket cleanup: failed to load DB references"
-                        );
-                        return;
-                    }
-                }
+                let Some(hashes) = super::collect_gc_roots(&lm, &sm, &db) else {
+                    return;
+                };
 
                 match bm.retain_buckets(&hashes) {
                     Ok(deleted) => {

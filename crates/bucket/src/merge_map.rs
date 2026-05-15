@@ -316,11 +316,13 @@ impl BucketMergeMap {
 
     /// Removes all merge records for outputs not in the given set.
     ///
-    /// Spec: BUCKETLISTDB_SPEC §8.2 (analogue) — retains only merge outputs referenced
-    /// by the current bucket list. Henyey's GC model differs from stellar-core's
-    /// refcount-based approach.
+    /// Spec: BUCKETLISTDB_SPEC §8.2 (analogue) — housekeeping for the merge map.
     ///
-    /// This is used for garbage collection when buckets are removed.
+    /// This is called by `retain_buckets()` after bucket files are deleted, to
+    /// remove stale merge-map entries that reference deleted outputs. This is a
+    /// consistency/memory-hygiene measure, NOT a GC safety mechanism — GC
+    /// correctness depends solely on the keep-set being complete (see
+    /// `retain_buckets` doc comment for the safety contract).
     pub fn retain_outputs(&mut self, keep: &HashSet<Hash256>) {
         // Find merge keys to remove
         let keys_to_remove: Vec<MergeKey> = self
