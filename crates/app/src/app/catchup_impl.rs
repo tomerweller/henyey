@@ -61,6 +61,12 @@ impl App {
 
         self.set_state(AppState::CatchingUp).await;
 
+        // Tell the overlay we're no longer synced so it sheds flood traffic
+        // during catchup (parity: LedgerManager enters LM_CATCHING_UP_STATE).
+        if let Some(flag) = self.overlay_synced.lock().unwrap().as_ref() {
+            flag.store(false, Ordering::Relaxed);
+        }
+
         // Start timing from the moment we enter CatchingUp state, matching
         // stellar-core's LM_CATCHING_UP_STATE → LM_SYNCED_STATE window.
         let catchup_timer = std::time::Instant::now();
@@ -2333,6 +2339,10 @@ impl App {
                     self.herder.bootstrap(result.ledger_seq);
                     // Re-arm overlay tracking after catchup recovery.
                     if let Some(flag) = self.overlay_tracking.lock().unwrap().as_ref() {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    // Re-arm overlay synced — node is back in sync after catchup.
+                    if let Some(flag) = self.overlay_synced.lock().unwrap().as_ref() {
                         flag.store(true, Ordering::Relaxed);
                     }
                     self.herder.purge_slots_below(result.ledger_seq as u64);

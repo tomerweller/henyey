@@ -506,6 +506,12 @@ pub struct App {
     /// Populated by `start_overlay()`; `None` until the overlay starts.
     overlay_tracking: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
 
+    /// Shared handle to the overlay's synced flag. Mirrors stellar-core's
+    /// `LedgerManager::isSynced()`. Set false during catchup / lost sync,
+    /// true when operational. Allows synchronous callbacks to flip without
+    /// async overlay access. Populated by `start_overlay()`.
+    overlay_synced: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+
     /// Pre-bound TCP listener for the overlay, injected by the simulation
     /// harness to use OS-assigned ephemeral ports.  Set once before
     /// `start_overlay()` and consumed (taken) during overlay startup.
@@ -1275,6 +1281,7 @@ impl App {
             ledger_manager,
             overlay: RwLock::new(None),
             overlay_tracking: std::sync::Mutex::new(None),
+            overlay_synced: std::sync::Mutex::new(None),
             pre_bound_listener: std::sync::Mutex::new(None),
             herder,
             shutdown_tx,

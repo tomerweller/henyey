@@ -686,6 +686,16 @@ impl OverlayManager {
 
         let msg_type = helpers::message_type_name(message);
 
+        // Parity: Peer.cpp:1164-1171 — drop flood messages when not synced.
+        // During catchup, tx are rejected by herder and flood-pull responses
+        // reference messages the node can't use. Early shedding avoids
+        // flood-gate, rate-limiter, clone, and channel work.
+        if !state.is_synced.load(Ordering::Relaxed) && helpers::is_flood_shed_on_unsync(message) {
+            state.metrics.flood_shed_unsynced.inc();
+            trace!("Dropping {} from {} (not synced)", msg_type, peer_id);
+            return Some(false);
+        }
+
         // OVERLAY_SPEC §9.4: PEERS message validation.
         match validate_incoming_peers(ctx.peer.direction(), *ctx.received_peers, message) {
             PeersValidation::NotPeers => {}

@@ -572,6 +572,9 @@ pub(super) struct SharedPeerState {
     /// Whether the node is tracking consensus (set by the herder/app layer).
     /// When false, the overlay may drop random peers to try new connections.
     pub(super) is_tracking: Arc<AtomicBool>,
+    /// Whether the node's ledger state is synced with consensus.
+    /// See `OverlayManager::is_synced` for details.
+    pub(super) is_synced: Arc<AtomicBool>,
     /// Tracks in-flight connections for dedup.
     pub(super) pending_connections: PendingConnections,
     /// Preferred peer set shared by all connection tasks and updated after DNS
@@ -833,6 +836,11 @@ pub struct OverlayManager {
     /// Whether the node is tracking consensus (set by the herder/app layer).
     /// When false, the overlay may drop random peers to try new connections.
     pub(super) is_tracking: Arc<AtomicBool>,
+    /// Whether the node's ledger state is synced with consensus (set by app layer).
+    /// Parity: mirrors stellar-core's `LedgerManager::isSynced()`. When false,
+    /// the peer loop drops `Transaction`, `FloodAdvert`, and `FloodDemand`
+    /// messages early to avoid wasted flood-gate / rate-limiter / channel work.
+    pub(super) is_synced: Arc<AtomicBool>,
     /// Connection factory used for transport establishment.
     pub(super) connection_factory: Arc<dyn ConnectionFactory>,
     /// Tracks in-flight connections for dedup.
@@ -965,6 +973,7 @@ impl OverlayManager {
             last_closed_ledger: Arc::new(AtomicU32::new(0)),
             scp_callback: None,
             is_tracking: Arc::new(AtomicBool::new(false)),
+            is_synced: Arc::new(AtomicBool::new(false)),
             connection_factory,
             pending_connections: PendingConnections::new(),
             preferred_peers,
@@ -1002,6 +1011,7 @@ impl OverlayManager {
             peer_event_tx: self.config.peer_event_tx.clone(),
             extra_subscribers: Arc::clone(&self.extra_subscribers),
             is_tracking: Arc::clone(&self.is_tracking),
+            is_synced: Arc::clone(&self.is_synced),
             pending_connections: self.pending_connections.clone(),
             preferred_peers: Arc::clone(&self.preferred_peers),
             preferred_peers_only: self.config.preferred_peers_only,
@@ -1563,6 +1573,31 @@ impl OverlayManager {
     /// through the overlay manager's async accessor.
     pub fn tracking_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.is_tracking)
+    }
+
+    /// Set the ledger-synced state.
+    ///
+    /// The app layer should call this whenever the node transitions between
+    /// synced (`AppState::Validating` / `Synced`) and unsynced
+    /// (`AppState::CatchingUp`) states. When unsynced, the peer loop drops
+    /// `Transaction`, `FloodAdvert`, and `FloodDemand` messages early.
+    /// Parity: mirrors stellar-core's `LedgerManager::isSynced()`.
+    pub fn set_synced(&self, synced: bool) {
+        self.is_synced.store(synced, Ordering::Relaxed);
+    }
+
+    /// Returns whether the node's ledger state is synced with consensus.
+    pub fn is_synced(&self) -> bool {
+        self.is_synced.load(Ordering::Relaxed)
+    }
+
+    /// Returns a shared handle to the synced flag.
+    ///
+    /// The app layer can clone this and update it directly from synchronous
+    /// callbacks (e.g., `SyncRecoveryCallback::on_lost_sync`) without going
+    /// through the overlay manager's async accessor.
+    pub fn synced_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.is_synced)
     }
 
     /// Clear per-ledger state for ledgers below the given sequence.
@@ -2388,6 +2423,7 @@ mod tests {
             peer_event_tx: None,
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
+            is_synced: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
             preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
                 preferred,
@@ -2913,6 +2949,7 @@ mod tests {
             peer_event_tx: None,
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
+            is_synced: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
             preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
                 Vec::new(),
@@ -3008,6 +3045,7 @@ mod tests {
             peer_event_tx: None,
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
+            is_synced: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
             preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
                 Vec::new(),
@@ -3710,6 +3748,7 @@ mod tests {
             peer_event_tx: None,
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
+            is_synced: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
             preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
                 Vec::new(),
@@ -3783,6 +3822,7 @@ mod tests {
             peer_event_tx: None,
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
+            is_synced: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
             preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(Vec::new(), keys))),
             preferred_peers_only: true, // STRICT MODE

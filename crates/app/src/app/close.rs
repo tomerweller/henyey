@@ -116,6 +116,10 @@ impl SyncRecoveryCallback for App {
         if let Some(flag) = self.overlay_tracking.lock().unwrap().as_ref() {
             flag.store(false, Ordering::Relaxed);
         }
+        // Tell the overlay we're no longer synced so it sheds flood traffic.
+        if let Some(flag) = self.overlay_synced.lock().unwrap().as_ref() {
+            flag.store(false, Ordering::Relaxed);
+        }
     }
 
     fn on_out_of_sync_recovery(&self) {

@@ -514,6 +514,10 @@ pub struct OverlayMetrics {
     pub scp_flood_unique_recv: Counter,
     /// SCP-only duplicate flood messages received (#2648 diagnostic).
     pub scp_flood_duplicate_recv: Counter,
+    /// Flood messages dropped because the node is not synced.
+    /// Parity: Peer.cpp:1164-1171 — counts individual messages (Transaction,
+    /// FloodAdvert, FloodDemand) shed before flood-gate accounting.
+    pub flood_shed_unsynced: Counter,
 
     // ===== Fetch Metrics =====
     /// Unique fetch bytes received.
@@ -602,6 +606,7 @@ impl OverlayMetrics {
             flood_duplicate_recv: self.flood_duplicate_recv.get(),
             scp_flood_unique_recv: self.scp_flood_unique_recv.get(),
             scp_flood_duplicate_recv: self.scp_flood_duplicate_recv.get(),
+            flood_shed_unsynced: self.flood_shed_unsynced.get(),
 
             // Fetch metrics
             fetch_unique_bytes_recv: self.fetch_unique_bytes_recv.get(),
@@ -665,6 +670,7 @@ impl OverlayMetrics {
             &self.flood_duplicate_recv,
             &self.scp_flood_unique_recv,
             &self.scp_flood_duplicate_recv,
+            &self.flood_shed_unsynced,
             &self.fetch_unique_bytes_recv,
             &self.fetch_duplicate_bytes_recv,
             &self.item_fetcher_next_peer,
@@ -739,6 +745,8 @@ pub struct OverlayMetricsSnapshot {
     pub flood_duplicate_recv: u64,
     pub scp_flood_unique_recv: u64,
     pub scp_flood_duplicate_recv: u64,
+    /// Flood messages shed because node was not synced.
+    pub flood_shed_unsynced: u64,
 
     // Fetch metrics
     pub fetch_unique_bytes_recv: u64,
@@ -1103,5 +1111,18 @@ mod tests {
         for kind in OverlayMessageKind::ALL {
             assert_eq!(metrics.send_by_type[kind as usize].get(), 0);
         }
+    }
+
+    #[test]
+    fn test_flood_shed_unsynced_counter_in_snapshot_and_reset() {
+        let metrics = OverlayMetrics::new();
+
+        metrics.flood_shed_unsynced.add(42);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flood_shed_unsynced, 42);
+
+        metrics.reset();
+        assert_eq!(metrics.flood_shed_unsynced.get(), 0);
     }
 }

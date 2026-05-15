@@ -2673,6 +2673,10 @@ impl App {
         if let Some(flag) = self.overlay_tracking.lock().unwrap().as_ref() {
             flag.store(true, Ordering::Relaxed);
         }
+        // Re-arm overlay synced — watcher has caught up.
+        if let Some(flag) = self.overlay_synced.lock().unwrap().as_ref() {
+            flag.store(true, Ordering::Relaxed);
+        }
 
         // Update bucket snapshots for the query server.
         self.update_bucket_snapshot();

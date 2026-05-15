@@ -1607,6 +1607,11 @@ impl App {
         self.set_phase_sub(super::phase::PHASE_13_11_SPAWN_CATCHUP_SET_STATE);
         self.set_state(AppState::CatchingUp).await;
         self.herder.set_state(henyey_herder::HerderState::Syncing);
+        // Tell the overlay we're no longer synced so it sheds flood traffic
+        // during catchup (parity: LedgerManager transitions to LM_CATCHING_UP_STATE).
+        if let Some(flag) = self.overlay_synced.lock().unwrap().as_ref() {
+            flag.store(false, Ordering::Relaxed);
+        }
 
         // A catchup is now in flight — the stuck signal is stale. Clear it
         // so /health reflects CatchingUp truthfully. If the catchup fails,

@@ -344,6 +344,22 @@ pub mod helpers {
         )
     }
 
+    /// Returns true for message types that should be dropped when the node is not synced.
+    ///
+    /// Parity: Peer.cpp:1164-1166 — `ignoreIfOutOfSync` covers TRANSACTION,
+    /// FLOOD_ADVERT, FLOOD_DEMAND. During catchup, transactions are rejected by
+    /// the herder anyway and flood-pull responses reference messages the node
+    /// can't use. Dropping early avoids flood-gate, rate-limiter, clone, and
+    /// channel work.
+    pub fn is_flood_shed_on_unsync(message: &StellarMessage) -> bool {
+        matches!(
+            message,
+            StellarMessage::Transaction(_)
+                | StellarMessage::FloodAdvert(_)
+                | StellarMessage::FloodDemand(_)
+        )
+    }
+
     /// Returns true if this is a handshake message (Hello or Auth).
     ///
     /// Handshake messages are handled specially during connection setup
@@ -734,6 +750,39 @@ mod tests {
         ));
         assert!(!helpers::is_flood_gate_tracked(
             &StellarMessage::FloodDemand(Default::default())
+        ));
+    }
+
+    /// Parity: Peer.cpp:1164-1166 — Transaction, FloodAdvert, FloodDemand are
+    /// shed when the node is not synced. All other message types pass through.
+    #[test]
+    fn test_is_flood_shed_on_unsync() {
+        // These three message types should be shed when not synced.
+        assert!(helpers::is_flood_shed_on_unsync(
+            &StellarMessage::Transaction(Default::default())
+        ));
+        assert!(helpers::is_flood_shed_on_unsync(
+            &StellarMessage::FloodAdvert(Default::default())
+        ));
+        assert!(helpers::is_flood_shed_on_unsync(
+            &StellarMessage::FloodDemand(Default::default())
+        ));
+
+        // All other message types should NOT be shed.
+        assert!(!helpers::is_flood_shed_on_unsync(&StellarMessage::Peers(
+            Default::default()
+        )));
+        assert!(!helpers::is_flood_shed_on_unsync(
+            &StellarMessage::ErrorMsg(Default::default())
+        ));
+        assert!(!helpers::is_flood_shed_on_unsync(
+            &StellarMessage::GetScpState(0)
+        ));
+        assert!(!helpers::is_flood_shed_on_unsync(
+            &StellarMessage::SendMore(Default::default())
+        ));
+        assert!(!helpers::is_flood_shed_on_unsync(
+            &StellarMessage::SendMoreExtended(Default::default())
         ));
     }
 }

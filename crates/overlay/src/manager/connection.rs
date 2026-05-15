@@ -2555,6 +2555,7 @@ mod tests {
                 peer_event_tx: None,
                 extra_subscribers: Arc::new(RwLock::new(Vec::new())),
                 is_tracking: Arc::new(AtomicBool::new(true)),
+                is_synced: Arc::new(AtomicBool::new(true)),
                 pending_connections: PendingConnections::new(),
                 preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
                     vec![],

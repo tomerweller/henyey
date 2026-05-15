@@ -235,6 +235,12 @@ impl App {
         // peer rotation only fires when !isSynced).
         if let Some(overlay) = self.overlay().await {
             overlay.set_tracking(true);
+            // Only mark synced if we have actual ledger state. No-state watchers
+            // (ledger_seq == 0) aren't synced yet — they reach synced after first
+            // successful catchup or watcher re-bootstrap.
+            if ledger_seq > 0 {
+                overlay.set_synced(true);
+            }
         }
 
         // Populate the initial bucket snapshot for the query server.
@@ -1455,6 +1461,7 @@ impl App {
         // Grab the tracking flag handle so synchronous callbacks can update it.
         if let Some(ref om) = *self.overlay.read().await {
             *self.overlay_tracking.lock().unwrap() = Some(om.tracking_flag());
+            *self.overlay_synced.lock().unwrap() = Some(om.synced_flag());
         }
         Ok(())
     }

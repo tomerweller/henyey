@@ -74,6 +74,10 @@ async fn test_tx_duplicate_not_dropped_after_broadcast() {
     let mut manager_a = OverlayManager::new(config_a, local_a).expect("manager a");
     let mut manager_b = OverlayManager::new(config_b, local_b).expect("manager b");
 
+    // Mark both managers as synced so Transaction messages are not shed.
+    manager_a.set_synced(true);
+    manager_b.set_synced(true);
+
     if !try_start(&mut manager_a).await {
         return;
     }

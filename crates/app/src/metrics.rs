@@ -632,6 +632,10 @@ metric_catalog! {
         OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL = "stellar_overlay_item_fetcher_next_peer_total"
             => "Total item fetcher next-peer selections";
 
+        // Issue #2725: Flood messages shed when node is not synced.
+        OVERLAY_FLOOD_SHED_UNSYNCED_TOTAL = "henyey_overlay_flood_shed_unsynced_total"
+            => "Total flood messages dropped because node is not synced";
+
         // Issue #2621 B1: Per-type outbound queue drops.
         OVERLAY_OUTBOUND_QUEUE_DROP_SCP_TOTAL = "stellar_overlay_outbound_queue_drop_scp_total"
             => "Outbound SCP messages dropped (queue trim)";
@@ -1036,6 +1040,7 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         OVERLAY_FETCH_DUPLICATE_RECV_TOTAL.absolute(ov.fetch_duplicate_recv);
         OVERLAY_FETCH_UNIQUE_RECV_TOTAL.absolute(ov.fetch_unique_recv);
         OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL.absolute(ov.item_fetcher_next_peer);
+        OVERLAY_FLOOD_SHED_UNSYNCED_TOTAL.absolute(ov.flood_shed_unsynced);
         OVERLAY_MEMORY_FLOOD_KNOWN.set(ov.flood_known_count as f64);
 
         // Stage F.3: per-message-type send counter (issue #2245).
