@@ -291,11 +291,15 @@ pub fn verify_reverse_walk(
     // Process from highest checkpoint to lowest (reverse order).
     checkpoint_groups.reverse();
 
-    // State threaded between checkpoints: the incoming hash link from the
-    // higher checkpoint. For the highest checkpoint, this comes from TrustSource.
-    let mut incoming_hash: Option<(u32, Hash256)> = match &config.trust_source {
+    // Cross-checkpoint link: hash of the last header in the next-higher group,
+    // used to verify continuity between adjacent checkpoint groups.
+    let mut cross_checkpoint_link: Option<(u32, Hash256)> = None;
+
+    // Trust anchor from SCP consensus — verified against the header at the
+    // specified seq, which may be in any group.
+    let mut pending_trust_anchor: Option<(u32, Hash256)> = match &config.trust_source {
         TrustSource::Scp { seq, hash } => Some((*seq, *hash)),
-        TrustSource::None => Option::None,
+        TrustSource::None => None,
     };
 
     let mut local_state_disagrees = false;
@@ -324,65 +328,64 @@ pub fn verify_reverse_walk(
             }
         }
 
-        // Verify last header in this checkpoint against the incoming hash link.
-        // For cross-checkpoint links (from outgoing of a higher checkpoint), the
-        // expected_seq always matches last.ledger_seq because our groups are
-        // partitions of a contiguous array. For the top-level trust anchor
-        // (TrustSource::Scp), expected_seq must match the last header in the
-        // highest group — if it doesn't, the trust anchor refers to a ledger
-        // outside our verification range, which is an error.
-        let mut trust_anchor_consumed = true;
-        if let Some((expected_seq, expected_hash)) = &incoming_hash {
+        // Verify cross-checkpoint link: the higher group's outgoing link
+        // must match this group's last header hash.
+        if let Some((expected_seq, expected_hash)) = &cross_checkpoint_link {
             let last = group.last().unwrap();
-            if last.ledger_seq == *expected_seq {
-                let last_hash = compute_header_hash(last)?;
-                if last_hash != *expected_hash {
-                    return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
-                        crate::error::VerifyHashKind::TopAnchor,
-                        Some(last.ledger_seq),
-                        *expected_hash,
-                        last_hash,
-                    )
-                    .into());
-                }
-            } else if last.ledger_seq < *expected_seq {
-                // Trust anchor points beyond our data — cannot verify.
+            debug_assert_eq!(
+                last.ledger_seq, *expected_seq,
+                "cross-checkpoint link seq mismatch — groups must be contiguous"
+            );
+            let last_hash = compute_header_hash(last)?;
+            if last_hash != *expected_hash {
+                return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
+                    crate::error::VerifyHashKind::TopAnchor,
+                    Some(last.ledger_seq),
+                    *expected_hash,
+                    last_hash,
+                )
+                .into());
+            }
+        }
+
+        // Verify trust anchor if it falls within this group.
+        if let Some((anchor_seq, anchor_hash)) = &pending_trust_anchor {
+            let last = group.last().unwrap();
+            let first = &group[0];
+            if *anchor_seq > last.ledger_seq {
+                // Trust anchor points beyond our highest group — error.
+                // (Only reachable on the first group iteration.)
                 return Err(HistoryError::InvalidSequence {
-                    expected: *expected_seq,
+                    expected: *anchor_seq,
                     got: last.ledger_seq,
                 });
-            } else if *expected_seq >= group[0].ledger_seq {
-                // Trust anchor is within this group's range — find and verify.
+            } else if *anchor_seq >= first.ledger_seq {
+                // Trust anchor is in this group — find and verify.
                 let target = group
                     .iter()
-                    .find(|h| h.ledger_seq == *expected_seq)
-                    .expect("seq in range but not found — groups are contiguous");
+                    .find(|h| h.ledger_seq == *anchor_seq)
+                    .expect("anchor seq in group range but not found");
                 let target_hash = compute_header_hash(target)?;
-                if target_hash != *expected_hash {
+                if target_hash != *anchor_hash {
                     return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
                         crate::error::VerifyHashKind::TopAnchor,
                         Some(target.ledger_seq),
-                        *expected_hash,
+                        *anchor_hash,
                         target_hash,
                     )
                     .into());
                 }
-            } else {
-                // Trust anchor seq is below this entire group — propagate to
-                // the next (lower) group by preserving incoming_hash.
-                trust_anchor_consumed = false;
+                pending_trust_anchor = None; // consumed
             }
+            // else: anchor is in a lower group, keep pending
         }
 
-        // Record outgoing link: (first_entry.seq - 1, first_entry.previous_ledger_hash).
-        // Only overwrite if we consumed the incoming trust anchor for this group.
-        if trust_anchor_consumed {
-            let first = &group[0];
-            incoming_hash = Some((
-                first.ledger_seq - 1,
-                Hash256::from(first.previous_ledger_hash.clone()),
-            ));
-        }
+        // Record outgoing link for the next (lower) group.
+        let first = &group[0];
+        cross_checkpoint_link = Some((
+            first.ledger_seq - 1,
+            Hash256::from(first.previous_ledger_hash.clone()),
+        ));
 
         // LCL+1 comparison (§9.3 step 2d): if the first header in this group
         // is at lcl_seq + 1, verify its previous_ledger_hash matches lcl_hash.
@@ -2149,6 +2152,51 @@ mod tests {
         assert!(
             matches!(err, HistoryError::VerificationHashMismatch(_)),
             "expected VerificationHashMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reverse_walk_cross_checkpoint_link_enforced_with_lower_trust_anchor() {
+        // Regression: even when trust anchor is in a lower group, cross-checkpoint
+        // linking between higher groups must still be verified.
+        //
+        // Strategy: build a valid chain 1-127, and a separate unlinked chain
+        // 128-191. The internal links within each segment are valid, but the
+        // cross-checkpoint link (hash of header 127 vs 128.previous_ledger_hash)
+        // will fail.
+        let lower = make_chain(1, 127, 25);
+        // Build upper chain starting at 128 with a different genesis seed
+        // so its first header's previous_ledger_hash won't match hash(127).
+        let mut upper = make_chain(128, 191, 25);
+        // Tamper: set first header's previous_ledger_hash to garbage so it
+        // doesn't match hash(lower[126]).
+        upper[0].previous_ledger_hash = stellar_xdr::curr::Hash([0xDD; 32]);
+
+        let mut headers: Vec<_> = lower.into_iter().chain(upper.into_iter()).collect();
+        // Re-compute internal chain for upper group: header 129's prev must
+        // match hash of (tampered) header 128, etc. Use make_chain's approach.
+        for i in 128..headers.len() {
+            let prev_hash = compute_header_hash(&headers[i - 1]).unwrap();
+            headers[i].previous_ledger_hash = stellar_xdr::curr::Hash(prev_hash.0);
+        }
+
+        let hash_at_50 = compute_header_hash(&headers[49]).unwrap();
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::Scp {
+                seq: 50,
+                hash: hash_at_50,
+            },
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        // Cross-checkpoint link: outgoing from group 128-191 is
+        // (127, headers[127].previous_ledger_hash) which is garbage [0xDD..],
+        // but hash(headers[126]) is the real hash of ledger 127.
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::VerificationHashMismatch(_)),
+            "expected cross-checkpoint hash mismatch, got: {err}"
         );
     }
 }
