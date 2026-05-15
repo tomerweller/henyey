@@ -1351,6 +1351,62 @@ impl App {
             return None;
         }
 
+        // #2713: Suppress hard reset when archive cannot provide a catchup
+        // target. ProbeAhead would fail with "not ahead of min_ledger" —
+        // repeating it stalls consensus ~5s per cycle with no benefit.
+        //
+        // Placement: after cooldown + at-tip defense, BEFORE livelock
+        // (suppressed resets must not arm the fatal timer), BEFORE step 1
+        // (which clears the flag we read).
+        //
+        // Fresh cache only: Stale means refresh in-flight (archive may have
+        // published). Cold means no data (must probe). Leave
+        // archive_confirmed_behind set so decision function stays in the
+        // archive_behind branch where cooldown → AttemptRecovery.
+        let archive_cannot_provide_target = self.archive_confirmed_behind.load(Ordering::SeqCst)
+            && matches!(
+                self.get_cached_archive_checkpoint_nonblocking(),
+                CacheResult::Fresh(v) if v <= current_ledger
+            );
+
+        if archive_cannot_provide_target {
+            // Record cooldown so decision function routes to AttemptRecovery.
+            self.last_hard_reset_offset
+                .store(now_offset.max(1), Ordering::Relaxed);
+            self.last_hard_reset_gap
+                .store(current_gap, Ordering::Relaxed);
+
+            crate::metrics::RECOVERY_STALLED_TICK_TOTAL
+                .increment("hard_reset_suppressed_archive_behind", 1);
+
+            if self
+                .recovery_throttles
+                .hard_reset_followon
+                .should_log(now_offset)
+            {
+                tracing::warn!(
+                    current_ledger,
+                    latest_externalized = latest_ext,
+                    gap = current_gap,
+                    ?reason,
+                    "Hard reset suppressed: archive confirmed behind with fresh \
+                     cache at/below current_ledger — cooldown armed, requesting \
+                     SCP state from peers (#2713)"
+                );
+            } else {
+                tracing::debug!(
+                    current_ledger,
+                    latest_externalized = latest_ext,
+                    gap = current_gap,
+                    ?reason,
+                    "Hard reset suppressed (#2713) (repeated)"
+                );
+            }
+
+            self.request_scp_state_and_record().await;
+            return None;
+        }
+
         // Circuit breaker: hard-reset livelock detection (#2389).
         // Check BEFORE clearing state so the fatal path does not leave
         // partially-reset state.
@@ -5533,6 +5589,255 @@ mod tests {
             app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
             1,
             "counter should increment when Behind (guard must not fire)"
+        );
+    }
+
+    // ================================================================
+    // Tests for #2713: archive-behind hard-reset suppression
+    // ================================================================
+
+    /// When archive_confirmed_behind=true AND fresh cache shows checkpoint
+    /// at/below current_ledger, the hard reset should be suppressed.
+    #[tokio::test]
+    async fn test_hard_reset_suppressed_fresh_cache_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // Set latest_externalized > current_ledger (node is behind).
+        app.herder
+            .scp_driver()
+            .record_externalized(5050, Default::default(), None);
+        app.herder.scp_driver().publish_externalized(5050);
+
+        // Arm archive_confirmed_behind and seed fresh cache at current_ledger.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        app.archive_checkpoint_cache.seed(current_ledger);
+
+        // Backdate start_instant so cooldown doesn't block entry.
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let counter_before = app.post_catchup_hard_reset_total.load(Ordering::Relaxed);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        // Guard should fire — returns None.
+        assert!(result.is_none(), "suppression guard should return None");
+
+        // Counter must NOT increment (guard fires before step 7).
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            counter_before,
+            "counter must not increment when suppression guard fires"
+        );
+
+        // archive_confirmed_behind must remain true (not cleared).
+        assert!(
+            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "archive_confirmed_behind must remain set after suppression"
+        );
+
+        // Cooldown must be armed (last_hard_reset_offset > 0).
+        assert!(
+            app.last_hard_reset_offset.load(Ordering::Relaxed) > 0,
+            "cooldown must be armed after suppression"
+        );
+
+        // Livelock timer must NOT be armed (guard is before livelock).
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            0,
+            "livelock timer must not be armed on suppression"
+        );
+    }
+
+    /// When archive_confirmed_behind=true but cache is Stale, the guard
+    /// must NOT fire — ProbeAhead should proceed to discover truth.
+    #[tokio::test]
+    async fn test_hard_reset_not_suppressed_stale_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        app.herder
+            .scp_driver()
+            .record_externalized(5050, Default::default(), None);
+        app.herder.scp_driver().publish_externalized(5050);
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        // seed_stale makes the cache return Stale, not Fresh.
+        app.archive_checkpoint_cache.seed_stale(current_ledger);
+
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        assert!(result.is_none()); // test app, spawn returns None anyway
+                                   // Key: counter DID increment (guard didn't fire, function proceeded).
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "counter should increment (stale cache — guard must not fire)"
+        );
+    }
+
+    /// When archive_confirmed_behind=true but cache is Cold, the guard
+    /// must NOT fire.
+    #[tokio::test]
+    async fn test_hard_reset_not_suppressed_cold_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        app.herder
+            .scp_driver()
+            .record_externalized(5050, Default::default(), None);
+        app.herder.scp_driver().publish_externalized(5050);
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        // Do NOT seed cache — leaves it Cold.
+
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        assert!(result.is_none());
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "counter should increment (cold cache — guard must not fire)"
+        );
+    }
+
+    /// When archive_confirmed_behind=true but fresh cache is AHEAD of
+    /// current_ledger, the guard must NOT fire (archive can provide target).
+    #[tokio::test]
+    async fn test_hard_reset_not_suppressed_fresh_cache_ahead() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        app.herder
+            .scp_driver()
+            .record_externalized(5050, Default::default(), None);
+        app.herder.scp_driver().publish_externalized(5050);
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        // Fresh cache AHEAD of current_ledger.
+        app.archive_checkpoint_cache.seed(current_ledger + 64);
+
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        assert!(result.is_none());
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "counter should increment (fresh ahead — guard must not fire)"
+        );
+    }
+
+    /// When archive_confirmed_behind=false (even with fresh cache behind),
+    /// the guard must NOT fire.
+    #[tokio::test]
+    async fn test_hard_reset_not_suppressed_flag_false() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        app.herder
+            .scp_driver()
+            .record_externalized(5050, Default::default(), None);
+        app.herder.scp_driver().publish_externalized(5050);
+
+        // Flag is false — even with fresh cache behind, guard must not fire.
+        app.archive_confirmed_behind.store(false, Ordering::SeqCst);
+        app.archive_checkpoint_cache.seed(current_ledger);
+
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        assert!(result.is_none());
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "counter should increment (flag false — guard must not fire)"
+        );
+    }
+
+    /// Verify that after suppression, decide_consensus_stuck_action routes
+    /// to AttemptRecovery when cooldown is active and archive is behind.
+    #[test]
+    fn test_suppressed_reset_routes_to_attempt_recovery() {
+        // After suppression: archive_behind=true, cooldown active,
+        // recovery_attempts exhausted, stuck long enough for HardReset.
+        let signals = StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS + 100,
+            recovery_attempts: MAX_POST_CATCHUP_RECOVERY_ATTEMPTS + 1,
+            hard_reset_cooldown_active: true,
+        };
+
+        let action = App::decide_consensus_stuck_action(signals);
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "with cooldown active + archive_behind, should fall back to AttemptRecovery"
         );
     }
 }

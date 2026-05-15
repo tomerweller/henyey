@@ -772,7 +772,8 @@ metric_catalog! {
         RECOVERY_STALLED_TICK_TOTAL = "henyey_recovery_stalled_tick_total"
             => "Recovery stalled ticks by reason",
             "reason", ["backoff_active", "forcing_catchup_not_behind", "forcing_catchup_behind",
-                       "at_tip_no_scp_hard_reset", "archive_behind_peer_ahead_hard_reset"];
+                       "at_tip_no_scp_hard_reset", "archive_behind_peer_ahead_hard_reset",
+                       "hard_reset_suppressed_archive_behind"];
     }
 
     histograms {
@@ -1647,6 +1648,7 @@ mod tests {
             "backoff_active",
             "forcing_catchup_not_behind",
             "forcing_catchup_behind",
+            "hard_reset_suppressed_archive_behind",
         ] {
             let label = format!(
                 "henyey_recovery_stalled_tick_total{{reason=\"{}\"}}",
