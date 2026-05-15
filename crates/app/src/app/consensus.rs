@@ -1199,13 +1199,14 @@ impl App {
     }
 
     /// Query the herder for desired SCP timeout durations and reconcile with
-    /// the TimerManager. Schedules timers when the herder wants one, cancels
-    /// when it doesn't. Called after every SCP state mutation.
+    /// the TimerManager. Ensures timers exist when the herder wants one (without
+    /// resetting already-armed deadlines), cancels when it doesn't.
+    /// Called after every SCP state mutation.
     pub(super) async fn reconcile_scp_timers(&self, slot: u64) {
         match self.herder.get_nomination_timeout(slot) {
             Some(dur) => {
                 self.timer_manager_handle
-                    .schedule_nomination_timeout(slot, dur)
+                    .ensure_nomination_timeout(slot, dur)
                     .await;
             }
             None => {
@@ -1217,7 +1218,7 @@ impl App {
         match self.herder.get_ballot_timeout(slot) {
             Some(dur) => {
                 self.timer_manager_handle
-                    .schedule_ballot_timeout(slot, dur)
+                    .ensure_ballot_timeout(slot, dur)
                     .await;
             }
             None => {

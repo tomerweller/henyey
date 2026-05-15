@@ -52,10 +52,14 @@ use henyey_scp::SlotIndex;
 /// Commands sent to the timer manager task.
 #[derive(Debug)]
 pub enum TimerCommand {
-    /// Schedule a nomination timeout for a slot.
+    /// Schedule a nomination timeout for a slot (overwrites existing timer).
     ScheduleNominationTimeout { slot: SlotIndex, duration: Duration },
-    /// Schedule a ballot timeout for a slot.
+    /// Schedule a ballot timeout for a slot (overwrites existing timer).
     ScheduleBallotTimeout { slot: SlotIndex, duration: Duration },
+    /// Ensure a nomination timeout exists for a slot (no-op if already armed).
+    EnsureNominationTimeout { slot: SlotIndex, duration: Duration },
+    /// Ensure a ballot timeout exists for a slot (no-op if already armed).
+    EnsureBallotTimeout { slot: SlotIndex, duration: Duration },
     /// Cancel all timers for a slot.
     CancelSlotTimers { slot: SlotIndex },
     /// Cancel the nomination timer for a slot (but keep ballot timer).
@@ -159,6 +163,30 @@ impl TimerManagerHandle {
     pub async fn cancel_all_timers(&self) {
         let _ = self.sender.send(TimerCommand::CancelAllTimers).await;
     }
+
+    /// Ensure a nomination timeout exists for a slot (no-op if already armed).
+    ///
+    /// Unlike `schedule_nomination_timeout`, this does not overwrite an existing
+    /// timer's deadline. Used by reconciliation to avoid resetting timers on
+    /// every SCP envelope receipt.
+    pub async fn ensure_nomination_timeout(&self, slot: SlotIndex, duration: Duration) {
+        let _ = self
+            .sender
+            .send(TimerCommand::EnsureNominationTimeout { slot, duration })
+            .await;
+    }
+
+    /// Ensure a ballot timeout exists for a slot (no-op if already armed).
+    ///
+    /// Unlike `schedule_ballot_timeout`, this does not overwrite an existing
+    /// timer's deadline. Used by reconciliation to avoid resetting timers on
+    /// every SCP envelope receipt.
+    pub async fn ensure_ballot_timeout(&self, slot: SlotIndex, duration: Duration) {
+        let _ = self
+            .sender
+            .send(TimerCommand::EnsureBallotTimeout { slot, duration })
+            .await;
+    }
 }
 
 /// Callback trait for timer expiration events.
@@ -237,6 +265,12 @@ impl<C: TimerCallback> TimerManager<C> {
                         Some(TimerCommand::ScheduleBallotTimeout { slot, duration }) => {
                             self.schedule_timer(slot, TimerType::Ballot, duration);
                         }
+                        Some(TimerCommand::EnsureNominationTimeout { slot, duration }) => {
+                            self.ensure_timer(slot, TimerType::Nomination, duration);
+                        }
+                        Some(TimerCommand::EnsureBallotTimeout { slot, duration }) => {
+                            self.ensure_timer(slot, TimerType::Ballot, duration);
+                        }
                         Some(TimerCommand::CancelSlotTimers { slot }) => {
                             self.cancel_slot_timers(slot);
                         }
@@ -270,7 +304,7 @@ impl<C: TimerCallback> TimerManager<C> {
         }
     }
 
-    /// Schedule a timer for a slot.
+    /// Schedule a timer for a slot (overwrites any existing timer).
     fn schedule_timer(&mut self, slot: SlotIndex, timer_type: TimerType, duration: Duration) {
         self.generation = self.generation.wrapping_add(1);
         let expires_at = Instant::now() + duration;
@@ -290,6 +324,17 @@ impl<C: TimerCallback> TimerManager<C> {
         );
 
         self.timers.insert((slot, timer_type), timer);
+    }
+
+    /// Schedule a timer only if one does not already exist for this (slot, type).
+    ///
+    /// Used by reconciliation to avoid resetting an already-armed timer's deadline
+    /// on every SCP envelope receipt.
+    fn ensure_timer(&mut self, slot: SlotIndex, timer_type: TimerType, duration: Duration) {
+        if self.timers.contains_key(&(slot, timer_type)) {
+            return;
+        }
+        self.schedule_timer(slot, timer_type, duration);
     }
 
     /// Cancel all timers for a slot.
@@ -404,6 +449,12 @@ impl<C: TimerCallback> TimerManagerWithStats<C> {
                         }
                         Some(TimerCommand::ScheduleBallotTimeout { slot, duration }) => {
                             self.inner.schedule_timer(slot, TimerType::Ballot, duration);
+                        }
+                        Some(TimerCommand::EnsureNominationTimeout { slot, duration }) => {
+                            self.inner.ensure_timer(slot, TimerType::Nomination, duration);
+                        }
+                        Some(TimerCommand::EnsureBallotTimeout { slot, duration }) => {
+                            self.inner.ensure_timer(slot, TimerType::Ballot, duration);
                         }
                         Some(TimerCommand::CancelSlotTimers { slot }) => {
                             self.inner.cancel_slot_timers(slot);
@@ -589,6 +640,59 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Now it should have fired
+        assert_eq!(callback.nomination_fired.load(Ordering::SeqCst), 42);
+
+        // Shutdown
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_timer_does_not_reset_deadline() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+
+        let manager_task = tokio::spawn(manager.run());
+
+        // Schedule a 50ms nomination timeout via ensure
+        handle
+            .ensure_nomination_timeout(42, Duration::from_millis(50))
+            .await;
+
+        // Wait 20ms, then call ensure again with a fresh 200ms duration.
+        // If ensure resets the deadline, the timer wouldn't fire for another 200ms.
+        // If ensure is correctly a no-op, the original 50ms deadline is preserved.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle
+            .ensure_nomination_timeout(42, Duration::from_millis(200))
+            .await;
+
+        // Wait another 40ms (total 60ms > original 50ms deadline)
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Timer should have fired at ~50ms despite the second ensure call
+        assert_eq!(callback.nomination_fired.load(Ordering::SeqCst), 42);
+
+        // Shutdown
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_schedules_when_no_timer_exists() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+
+        let manager_task = tokio::spawn(manager.run());
+
+        // ensure with no existing timer should schedule normally
+        handle
+            .ensure_nomination_timeout(42, Duration::from_millis(50))
+            .await;
+
+        // Wait for it to fire
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
         assert_eq!(callback.nomination_fired.load(Ordering::SeqCst), 42);
 
         // Shutdown
