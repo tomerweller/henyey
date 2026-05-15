@@ -325,6 +325,12 @@ pub fn verify_reverse_walk(
         }
 
         // Verify last header in this checkpoint against the incoming hash link.
+        // For cross-checkpoint links (from outgoing of a higher checkpoint), the
+        // expected_seq always matches last.ledger_seq because our groups are
+        // partitions of a contiguous array. For the top-level trust anchor
+        // (TrustSource::Scp), expected_seq must match the last header in the
+        // highest group — if it doesn't, the trust anchor refers to a ledger
+        // outside our verification range, which is an error.
         if let Some((expected_seq, expected_hash)) = &incoming_hash {
             let last = group.last().unwrap();
             if last.ledger_seq == *expected_seq {
@@ -335,6 +341,29 @@ pub fn verify_reverse_walk(
                         Some(last.ledger_seq),
                         *expected_hash,
                         last_hash,
+                    )
+                    .into());
+                }
+            } else if last.ledger_seq < *expected_seq {
+                // Trust anchor points beyond our data — cannot verify.
+                // This is only possible for the TrustSource anchor (highest
+                // group); cross-checkpoint outgoing links always match because
+                // groups are contiguous partitions.
+                return Err(HistoryError::InvalidSequence {
+                    expected: *expected_seq,
+                    got: last.ledger_seq,
+                });
+            }
+            // last.ledger_seq > expected_seq can happen for partial ranges
+            // where the trust anchor is within the group. Find and verify it.
+            else if let Some(target) = group.iter().find(|h| h.ledger_seq == *expected_seq) {
+                let target_hash = compute_header_hash(target)?;
+                if target_hash != *expected_hash {
+                    return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
+                        crate::error::VerifyHashKind::TopAnchor,
+                        Some(target.ledger_seq),
+                        *expected_hash,
+                        target_hash,
                     )
                     .into());
                 }
@@ -2007,5 +2036,71 @@ mod tests {
         };
         let result = verify_reverse_walk(&[], &config).unwrap();
         assert!(!result.fatal_failure);
+    }
+
+    #[test]
+    fn test_reverse_walk_trust_anchor_seq_beyond_range() {
+        // TrustSource::Scp points to seq 20, but headers only go up to seq 10.
+        // This should error because the trust anchor can't be verified.
+        let headers = make_chain(1, 10, 25);
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::Scp {
+                seq: 20,
+                hash: Hash256([0xAA; 32]),
+            },
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HistoryError::InvalidSequence {
+                    expected: 20,
+                    got: 10
+                }
+            ),
+            "expected InvalidSequence for seq mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reverse_walk_trust_anchor_seq_within_range() {
+        // TrustSource::Scp points to seq 5, but headers go up to seq 10.
+        // Should verify the header at seq 5 against the trust hash.
+        let headers = make_chain(1, 10, 25);
+        let hash_at_5 = compute_header_hash(&headers[4]).unwrap();
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::Scp {
+                seq: 5,
+                hash: hash_at_5,
+            },
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let result = verify_reverse_walk(&headers, &config).unwrap();
+        assert!(!result.fatal_failure);
+    }
+
+    #[test]
+    fn test_reverse_walk_trust_anchor_seq_within_range_wrong_hash() {
+        // TrustSource::Scp points to seq 5, but with wrong hash.
+        let headers = make_chain(1, 10, 25);
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::Scp {
+                seq: 5,
+                hash: Hash256([0xBB; 32]),
+            },
+            lcl: None,
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::VerificationHashMismatch(_)),
+            "expected VerificationHashMismatch, got: {err}"
+        );
     }
 }
