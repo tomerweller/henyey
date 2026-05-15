@@ -1025,6 +1025,13 @@ impl BucketLevel {
         // This replaces the old completed-cache-only check and adds in-flight dedup
         // (parity with stellar-core getMergeFuture/putMergeFuture).
         if let Some(merge_map) = ctx.merge_map {
+            // Dedup uses P24+ waiver (MergeKey ignores normalize_init). Verify callers
+            // only enter this path with Preserve (production) to catch test misuse early.
+            debug_assert!(
+                matches!(ctx.normalize_init, InitEntryPolicy::Preserve),
+                "in-flight dedup requires Preserve normalize_init (P24+ waiver)"
+            );
+
             let curr_hash = curr_for_merge.hash();
             let snap_hash = incoming.hash();
             let key = MergeKey::new(ctx.keep_dead_entries, curr_hash, snap_hash);
