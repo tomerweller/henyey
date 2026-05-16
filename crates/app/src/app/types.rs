@@ -199,6 +199,10 @@ pub struct SimulationDebugStats {
     /// Times a trigger-timer firing was dropped by the active-slot staleness
     /// guard in `handle_scp_timer_event`.
     pub consensus_trigger_timer_skipped_stale: u64,
+    /// Times `handle_scp_timer_event::TriggerNextLedger` re-armed the trigger
+    /// timer after `try_trigger_consensus` returned `ShouldRearm` (a gated
+    /// fire that would otherwise have permanently un-armed the trigger).
+    pub consensus_trigger_timer_rearm_after_gate: u64,
     // Archive checkpoint cache (issue #1784)
     pub archive_checkpoint_stale_returns: u64,
     pub archive_checkpoint_cold_returns: u64,
@@ -405,6 +409,9 @@ pub struct AppMetricsSnapshot {
     /// Times a trigger-timer firing was dropped by the active-slot staleness
     /// guard in `handle_scp_timer_event`.
     pub consensus_trigger_timer_skipped_stale: u64,
+    /// Times `handle_scp_timer_event::TriggerNextLedger` re-armed the trigger
+    /// timer after `try_trigger_consensus` returned `ShouldRearm` (issue #2702).
+    pub consensus_trigger_timer_rearm_after_gate: u64,
 }
 
 /// Metrics for the overlay fetch-response channel (issue #1741).

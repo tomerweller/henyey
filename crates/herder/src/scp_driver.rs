@@ -1042,7 +1042,7 @@ impl ScpDriver {
     /// `setupTriggerNextLedger` to anchor the next consensus trigger off the
     /// most recent slot's ballot start. Returns `None` for slots that have not
     /// entered the ballot protocol yet (cold start, catchup-only slots, or
-    /// slots already purged via `purge_slots_below` / `purge_all_slot_state`).
+    /// slots already purged via `purge_slots_below`).
     pub fn prepare_start(&self, slot: SlotIndex) -> Option<std::time::Instant> {
         self.slot_timing
             .read()

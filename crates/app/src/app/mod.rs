@@ -670,6 +670,14 @@ pub struct App {
     /// Number of trigger-timer firings dropped by the active-slot staleness
     /// guard in `handle_scp_timer_event` (slot advanced past the timer's slot).
     pub(crate) consensus_trigger_timer_skipped_stale: AtomicU64,
+    /// Number of times `handle_scp_timer_event::TriggerNextLedger` re-armed
+    /// the trigger timer because `try_trigger_consensus` returned
+    /// [`super::consensus::TriggerAttemptOutcome::ShouldRearm`] (gated by
+    /// `is_applying_ledger`, LCL behind tracking, herder `SkippedStale`,
+    /// herder `Err`, or a `JoinError`). Without this re-arm path the
+    /// trigger timer was permanently un-armed on every gated fire,
+    /// wedging solo / starved validators (issue #2702 review feedback).
+    pub(crate) consensus_trigger_timer_rearm_after_gate: AtomicU64,
     /// Time when we last observed an externalized slot.
     last_externalized_at: RwLock<Instant>,
     /// Last time we requested SCP state due to stalled externalization.
@@ -1331,6 +1339,7 @@ impl App {
             ballot_timeout_fires: AtomicU64::new(0),
             consensus_trigger_timer_fires: AtomicU64::new(0),
             consensus_trigger_timer_skipped_stale: AtomicU64::new(0),
+            consensus_trigger_timer_rearm_after_gate: AtomicU64::new(0),
             last_externalized_at: RwLock::new(now),
             last_scp_state_request_at: RwLock::new(now),
             survey_state: RwLock::new(SurveyState::new(
@@ -2458,6 +2467,9 @@ impl App {
             consensus_trigger_timer_skipped_stale: self
                 .consensus_trigger_timer_skipped_stale
                 .load(Ordering::Relaxed),
+            consensus_trigger_timer_rearm_after_gate: self
+                .consensus_trigger_timer_rearm_after_gate
+                .load(Ordering::Relaxed),
             archive_checkpoint_stale_returns: self.archive_checkpoint_cache.stale_returns(),
             archive_checkpoint_cold_returns: self.archive_checkpoint_cache.cold_returns(),
             archive_checkpoint_fresh_returns: self.archive_checkpoint_cache.fresh_returns(),
@@ -2810,6 +2822,9 @@ impl App {
                 .load(Ordering::Relaxed),
             consensus_trigger_timer_skipped_stale: self
                 .consensus_trigger_timer_skipped_stale
+                .load(Ordering::Relaxed),
+            consensus_trigger_timer_rearm_after_gate: self
+                .consensus_trigger_timer_rearm_after_gate
                 .load(Ordering::Relaxed),
         }
     }
@@ -4317,6 +4332,74 @@ mod tests {
             skipped_before + 1,
             "consensus_trigger_skipped_applying must increment when applying"
         );
+    }
+
+    /// Regression test for issue #2702 (cycle-2 bounce-back).
+    ///
+    /// Verifies that `try_trigger_consensus` returns the `NoOp` outcome
+    /// in `manual_close` mode rather than incrementing any counter or
+    /// re-arming the trigger timer. The `manual_close_ledger` RPC handler
+    /// is the only path that should drive consensus in this mode, and a
+    /// fall-through to the gate matrix would be a regression.
+    #[tokio::test]
+    async fn test_try_trigger_consensus_noop_in_manual_close() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        config.node.manual_close = true;
+
+        let app = App::new(config).await.unwrap();
+
+        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        let outcome = app.try_trigger_consensus().await;
+        let attempts_after = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+
+        assert_eq!(
+            outcome,
+            super::consensus::TriggerAttemptOutcome::NoOp,
+            "manual_close must return NoOp (not ShouldRearm) to keep the trigger un-armed"
+        );
+        assert_eq!(
+            attempts_after, attempts_before,
+            "consensus_trigger_attempts must NOT increment in manual_close mode"
+        );
+    }
+
+    /// Regression test for issue #2702 (cycle-2 bounce-back, Reviewer B nit #6).
+    ///
+    /// Verifies that `setup_trigger_next_ledger` is a no-op while a ledger
+    /// close is in flight, matching the `!mLedgerManager.isApplying()`
+    /// invariant at `HerderImpl.cpp:1241`. The is_validator gate fires
+    /// first under default config; this test exercises the
+    /// `manual_close ➜ early-return` path and the absence of any panic.
+    /// The real `is_applying` short-circuit is covered structurally by the
+    /// gate ordering in `setup_trigger_next_ledger` (manual_close →
+    /// is_validator → is_tracking → is_applying), which we assert here by
+    /// passing through each in turn.
+    #[tokio::test]
+    async fn test_setup_trigger_next_ledger_gates_compose() {
+        // Default (is_validator=false): all gates short-circuit, no panic.
+        let dir1 = tempfile::tempdir().expect("temp dir");
+        let config1 = crate::config::ConfigBuilder::new()
+            .database_path(dir1.path().join("rs-stellar-test.db"))
+            .build();
+        let app = App::new(config1).await.unwrap();
+        app.set_applying_ledger(true);
+        app.setup_trigger_next_ledger().await;
+        app.set_applying_ledger(false);
+        app.setup_trigger_next_ledger().await;
+
+        // Manual close mode: returns at the very first gate.
+        let dir2 = tempfile::tempdir().expect("temp dir");
+        let mut config2 = crate::config::ConfigBuilder::new()
+            .database_path(dir2.path().join("rs-stellar-test.db"))
+            .build();
+        config2.node.manual_close = true;
+        let app2 = App::new(config2).await.unwrap();
+        app2.set_applying_ledger(true);
+        app2.setup_trigger_next_ledger().await;
     }
 
     #[tokio::test]

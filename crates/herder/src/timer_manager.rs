@@ -125,14 +125,21 @@ impl TimerManagerHandle {
     }
 
     /// Schedule a trigger-next-ledger timer for a slot.
-    pub async fn schedule_trigger_next_ledger(&self, slot: SlotIndex, duration: Duration) {
+    ///
+    /// Sync because the underlying `mpsc::UnboundedSender::send` is
+    /// non-suspending — the previous `async fn` signature forced every
+    /// caller into a pointless `.await` (issue #2702 review feedback).
+    pub fn schedule_trigger_next_ledger(&self, slot: SlotIndex, duration: Duration) {
         let _ = self
             .sender
             .send(TimerCommand::ScheduleTriggerNextLedger { slot, duration });
     }
 
     /// Cancel the trigger-next-ledger timer for a slot.
-    pub async fn cancel_trigger_next_ledger(&self, slot: SlotIndex) {
+    ///
+    /// Sync for the same reason as
+    /// [`schedule_trigger_next_ledger`](Self::schedule_trigger_next_ledger).
+    pub fn cancel_trigger_next_ledger(&self, slot: SlotIndex) {
         let _ = self
             .sender
             .send(TimerCommand::CancelTriggerNextLedger { slot });
@@ -836,9 +843,7 @@ mod tests {
         let (handle, manager) = TimerManager::new(callback.clone());
         let manager_task = tokio::spawn(manager.run());
 
-        handle
-            .schedule_trigger_next_ledger(123, Duration::from_millis(50))
-            .await;
+        handle.schedule_trigger_next_ledger(123, Duration::from_millis(50));
 
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 123);
@@ -854,14 +859,10 @@ mod tests {
         let manager_task = tokio::spawn(manager.run());
 
         // First schedule with short duration.
-        handle
-            .schedule_trigger_next_ledger(7, Duration::from_millis(50))
-            .await;
+        handle.schedule_trigger_next_ledger(7, Duration::from_millis(50));
         // Reschedule with longer duration before it fires.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        handle
-            .schedule_trigger_next_ledger(7, Duration::from_millis(200))
-            .await;
+        handle.schedule_trigger_next_ledger(7, Duration::from_millis(200));
 
         // Past the original fire time but before the new one — must not have fired.
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -881,9 +882,7 @@ mod tests {
         let (handle, manager) = TimerManager::new(callback.clone());
         let manager_task = tokio::spawn(manager.run());
 
-        handle
-            .schedule_trigger_next_ledger(11, Duration::from_millis(100))
-            .await;
+        handle.schedule_trigger_next_ledger(11, Duration::from_millis(100));
         tokio::time::sleep(Duration::from_millis(20)).await;
         handle.cancel_all_timers().await;
 
@@ -900,12 +899,8 @@ mod tests {
         let (handle, manager) = TimerManager::new(callback.clone());
         let manager_task = tokio::spawn(manager.run());
 
-        handle
-            .schedule_trigger_next_ledger(10, Duration::from_millis(200))
-            .await;
-        handle
-            .schedule_trigger_next_ledger(30, Duration::from_millis(200))
-            .await;
+        handle.schedule_trigger_next_ledger(10, Duration::from_millis(200));
+        handle.schedule_trigger_next_ledger(30, Duration::from_millis(200));
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         handle.purge_old_slots(25).await;
@@ -924,9 +919,7 @@ mod tests {
         let (handle, manager) = TimerManager::new(callback.clone());
         let manager_task = tokio::spawn(manager.run());
 
-        handle
-            .schedule_trigger_next_ledger(42, Duration::from_millis(100))
-            .await;
+        handle.schedule_trigger_next_ledger(42, Duration::from_millis(100));
         tokio::time::sleep(Duration::from_millis(20)).await;
         handle.cancel_slot_timers(42).await;
 
@@ -944,15 +937,13 @@ mod tests {
         let manager_task = tokio::spawn(manager.run());
 
         // Schedule trigger and ballot timer for the same slot.
-        handle
-            .schedule_trigger_next_ledger(99, Duration::from_millis(100))
-            .await;
+        handle.schedule_trigger_next_ledger(99, Duration::from_millis(100));
         handle
             .schedule_ballot_timeout(99, Duration::from_millis(100))
             .await;
 
         tokio::time::sleep(Duration::from_millis(20)).await;
-        handle.cancel_trigger_next_ledger(99).await;
+        handle.cancel_trigger_next_ledger(99);
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         // Trigger canceled; ballot must still have fired.

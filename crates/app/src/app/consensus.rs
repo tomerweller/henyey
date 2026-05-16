@@ -10,6 +10,21 @@ use super::*;
 /// (parity with `HerderImpl::ctValidityOffset`).
 pub(super) const MAX_TIME_SLIP_SECONDS_FOR_TRIGGER: u64 = 60;
 
+/// Backoff used to re-arm the event-driven trigger timer when
+/// [`App::try_trigger_consensus`] fired but was gated out (e.g. by
+/// `is_applying_ledger`, or `current_ledger + 1 < tracking_slot`, or a
+/// stale/failed `trigger_next_ledger` call). Without this re-arm the
+/// trigger remained permanently un-armed until the next *successful*
+/// close — but for solo / starved validators that successful close was
+/// supposed to be driven by this very trigger, so the validator wedged
+/// (issue #2702 review feedback).
+///
+/// The constant is intentionally short relative to
+/// `expectedLedgerCloseDuration` (~5s) so the gate clears quickly without
+/// hammering, and long enough to keep the trigger out of a tight loop
+/// when the gate is sticky (e.g. an in-flight `close_ledger`).
+pub(super) const TRIGGER_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Why the node cannot apply the next buffered slot even though the herder
 /// has an EXTERNALIZE for every slot in `[current_ledger+1, latest_externalized]`.
 ///
@@ -188,6 +203,43 @@ pub(super) fn compute_trigger_offset_pre_ct(
     }
 }
 
+/// Outcome of a single [`App::try_trigger_consensus`] invocation, used by
+/// [`App::handle_scp_timer_event`] to decide whether to re-arm the trigger
+/// timer with a short backoff (issue #2702 review feedback — without this
+/// re-arm path the trigger timer was permanently un-armed any time it
+/// fired into a gated state, wedging solo validators).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TriggerAttemptOutcome {
+    /// Nomination was started for this slot, or nomination for this slot is
+    /// already in progress. The post-close path will re-arm the trigger
+    /// timer once this round closes — no immediate re-arm needed.
+    Triggered,
+    /// `try_trigger_consensus` returned without starting nomination
+    /// because a transient gate was active (`is_applying_ledger`, LCL
+    /// behind tracking, herder `SkippedStale`, herder `Err`, or
+    /// `JoinError` from the blocking nomination task). The trigger timer
+    /// must be re-armed with [`TRIGGER_RETRY_BACKOFF`] so the validator
+    /// self-heals once the gate clears.
+    ShouldRearm,
+    /// Terminal no-op (currently only `manual_close`). The trigger timer
+    /// is never armed in `manual_close` mode anyway (see
+    /// [`App::setup_trigger_next_ledger`]), so this variant exists only
+    /// for completeness of the gate matrix and explicitly does *not* trigger
+    /// a re-arm.
+    NoOp,
+}
+
+/// Pure decision: should [`App::handle_scp_timer_event`] re-arm the
+/// trigger timer after a `try_trigger_consensus` fire produced `outcome`?
+///
+/// Kept as a free function so the re-arm matrix can be unit-tested without
+/// spinning up a full [`App`] (mirrors the pattern used by
+/// [`compute_trigger_offset_pre_ct`] and [`ct_validity_offset_secs`]).
+#[inline]
+pub(super) fn should_rearm_after_trigger(outcome: TriggerAttemptOutcome) -> bool {
+    matches!(outcome, TriggerAttemptOutcome::ShouldRearm)
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger (validators only).
     ///
@@ -195,9 +247,9 @@ impl App {
     /// the node is tracking the network AND the ledger manager is synced
     /// (LCL == tracking slot). Without this, a node that is behind would
     /// propose stale transaction sets for slots it hasn't closed yet.
-    pub(super) async fn try_trigger_consensus(&self) {
+    pub(super) async fn try_trigger_consensus(&self) -> TriggerAttemptOutcome {
         if self.config.node.manual_close {
-            return;
+            return TriggerAttemptOutcome::NoOp;
         }
 
         let tracking_slot = self.herder.tracking_slot().get();
@@ -216,7 +268,7 @@ impl App {
                     tracking_slot,
                     "Skipping consensus trigger: not synced (LCL behind tracking slot)"
                 );
-                return;
+                return TriggerAttemptOutcome::ShouldRearm;
             }
 
             // Parity: HerderImpl.cpp:1440-1447 — if a ledger close is in
@@ -236,7 +288,7 @@ impl App {
                     tracking_slot,
                     "Skipping consensus trigger: ledger close in progress"
                 );
-                return;
+                return TriggerAttemptOutcome::ShouldRearm;
             }
 
             let next_slot = current_ledger + 1;
@@ -276,25 +328,43 @@ impl App {
                 Ok(Ok(henyey_herder::TriggerOutcome::Triggered)) => {
                     self.consensus_trigger_successes
                         .fetch_add(1, Ordering::Relaxed);
+                    TriggerAttemptOutcome::Triggered
                 }
                 Ok(Ok(henyey_herder::TriggerOutcome::SkippedStale)) => {
                     self.consensus_trigger_skipped_stale
                         .fetch_add(1, Ordering::Relaxed);
+                    // Slot advanced between gate check and herder call;
+                    // re-arm so the next slot gets a fresh trigger.
+                    TriggerAttemptOutcome::ShouldRearm
                 }
                 Ok(Ok(henyey_herder::TriggerOutcome::AlreadyNominating)) => {
                     // Idempotent re-trigger; not a new success, not an error.
+                    // Nomination is in progress for this slot — post-close
+                    // will arm the next round's trigger when it externalizes.
+                    TriggerAttemptOutcome::Triggered
                 }
                 Ok(Err(e)) => {
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
                     tracing::error!(error = %e, slot = next_slot, "Failed to trigger ledger");
+                    TriggerAttemptOutcome::ShouldRearm
                 }
                 Err(_join_error) => {
                     // Already logged by spawn_blocking_logged
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
+                    TriggerAttemptOutcome::ShouldRearm
                 }
             }
+        } else {
+            // `is_tracking()` was false. Could be a transient state during a
+            // catchup → tracking transition; re-arm so we retry once tracking
+            // returns. (`setup_trigger_next_ledger` also self-gates on
+            // `is_tracking`, so if tracking is still false at the next fire,
+            // the re-arm becomes a no-op — at which point only the next
+            // post-close path will re-arm. Acceptable: a node that is not
+            // tracking has no business nominating anyway.)
+            TriggerAttemptOutcome::ShouldRearm
         }
     }
 
@@ -350,6 +420,16 @@ impl App {
         if !self.herder.is_tracking() {
             return;
         }
+        // Parity: HerderImpl.cpp:1241 — `setupTriggerNextLedger` asserts
+        // `!mLedgerManager.isApplying()`. Match the invariant rather than
+        // arming a timer while a close is in flight (issue #2702 review
+        // feedback). A debug log surfaces the suppression; the next
+        // post-close path will arm the trigger once `set_applying_ledger`
+        // clears.
+        if self.is_applying_ledger() {
+            tracing::debug!("Skipping setup_trigger_next_ledger: ledger close in progress");
+            return;
+        }
 
         let current_ledger = self.current_ledger_seq() as u64;
         let last_index = current_ledger;
@@ -400,8 +480,7 @@ impl App {
         );
 
         self.timer_manager_handle
-            .schedule_trigger_next_ledger(next_slot, total_offset)
-            .await;
+            .schedule_trigger_next_ledger(next_slot, total_offset);
     }
 
     /// Perform out-of-sync recovery matching stellar-core's outOfSyncRecovery().
@@ -1443,14 +1522,52 @@ impl App {
                 // The trigger timer is armed for `current_ledger + 1` when
                 // setup_trigger_next_ledger runs; if LCL has advanced past
                 // the timer's slot, the firing is stale.
+                //
+                // Race window (issue #2702 review): between the timer-fire
+                // send on the bridge channel and this dispatch, `current_ledger`
+                // can advance via close_pipeline completion. The dispatched
+                // event is then dropped as stale here, and the
+                // post-close path in `lifecycle.rs` is responsible for
+                // arming the *next* slot's trigger timer.
                 if event.slot != nominate_slot {
                     self.consensus_trigger_timer_skipped_stale
                         .fetch_add(1, Ordering::Relaxed);
                     return;
                 }
+                // Catchup visibility (issue #2702 review): if tracking is
+                // ahead of `current_ledger + 1` we'll still fire but
+                // `try_trigger_consensus`'s LCL-behind-tracking gate
+                // short-circuits. Surface that to make catchup-during-trigger
+                // visible in traces (the gate itself only debug-logs from
+                // inside `try_trigger_consensus`).
+                if active_slot > nominate_slot {
+                    tracing::debug!(
+                        nominate_slot,
+                        active_slot,
+                        tracking_slot = self.herder.tracking_slot().get(),
+                        "Trigger timer fired during catchup (tracking_slot > current_ledger+1); \
+                         try_trigger_consensus will short-circuit and the timer will be re-armed."
+                    );
+                }
                 self.consensus_trigger_timer_fires
                     .fetch_add(1, Ordering::Relaxed);
-                self.try_trigger_consensus().await;
+                let outcome = self.try_trigger_consensus().await;
+                if should_rearm_after_trigger(outcome) {
+                    // Re-arm with a short backoff so a gated fire (e.g.
+                    // `is_applying_ledger`, `SkippedStale`, herder error)
+                    // doesn't permanently un-arm the trigger. Without this
+                    // re-arm path, solo / starved validators wedged the
+                    // first time `try_trigger_consensus` hit a transient
+                    // gate (issue #2702 review feedback). The retry slot
+                    // is recomputed from current LCL so that if LCL
+                    // advanced during the trigger attempt we arm on the
+                    // freshest `current_ledger + 1`.
+                    self.consensus_trigger_timer_rearm_after_gate
+                        .fetch_add(1, Ordering::Relaxed);
+                    let retry_slot = self.current_ledger_seq() as u64 + 1;
+                    self.timer_manager_handle
+                        .schedule_trigger_next_ledger(retry_slot, TRIGGER_RETRY_BACKOFF);
+                }
             }
         }
     }
@@ -2198,5 +2315,47 @@ mod tests {
         // Must not panic.
         let off = compute_trigger_offset_pre_ct(now, expected, None);
         assert_eq!(off, std::time::Duration::ZERO);
+    }
+
+    // ── should_rearm_after_trigger decision matrix (#2702 bounce-back) ───
+    //
+    // These tests pin the contract that `handle_scp_timer_event::TriggerNextLedger`
+    // relies on: every `TriggerAttemptOutcome` variant maps deterministically
+    // to a re-arm decision. Without the re-arm path the trigger timer was
+    // permanently un-armed on every gated fire (e.g. `is_applying_ledger`),
+    // wedging solo / starved validators. The matrix encoded here is the only
+    // unit-testable surface for that fix; the full integration test (cold-start
+    // arms timer, fires while applying, asserts a follow-up timer fires) needs
+    // a real `App` and is covered indirectly by the Quickstart `core,rpc,horizon`
+    // smoke test in CI.
+
+    use super::{should_rearm_after_trigger, TriggerAttemptOutcome};
+
+    #[test]
+    fn test_should_rearm_triggered_does_not_rearm() {
+        // `Triggered` means nomination started (or is already in progress);
+        // the post-close path will arm the *next* round's trigger when this
+        // round externalizes. Re-arming here would step on that and double-fire.
+        assert!(!should_rearm_after_trigger(
+            TriggerAttemptOutcome::Triggered
+        ));
+    }
+
+    #[test]
+    fn test_should_rearm_should_rearm_does_rearm() {
+        // Every gated/failed branch of `try_trigger_consensus` maps to
+        // `ShouldRearm` so the validator self-heals once the gate clears.
+        assert!(should_rearm_after_trigger(
+            TriggerAttemptOutcome::ShouldRearm
+        ));
+    }
+
+    #[test]
+    fn test_should_rearm_noop_does_not_rearm() {
+        // `NoOp` is currently only returned by the `manual_close` gate. The
+        // trigger timer is never armed in `manual_close` mode in the first
+        // place (see `setup_trigger_next_ledger`), so this variant exists
+        // purely for matrix completeness and explicitly must not re-arm.
+        assert!(!should_rearm_after_trigger(TriggerAttemptOutcome::NoOp));
     }
 }

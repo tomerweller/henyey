@@ -229,15 +229,15 @@ impl App {
         self.herder.bootstrap(ledger_seq);
         tracing::info!(ledger_seq, "Herder bootstrapped");
 
-        // Cold-start trigger arm (issue #2702): once the herder is tracking and
-        // synced from bootstrap, arm a single trigger timer so the very first
-        // round is event-driven rather than waiting on the 1s polling tick.
-        // `setup_trigger_next_ledger` self-gates on `manual_close`,
-        // `is_validator`, and `is_tracking`; this call is safe even when one
-        // of those is false (it becomes a no-op).
-        if self.is_validator && self.herder.is_tracking() {
-            self.setup_trigger_next_ledger().await;
-        }
+        // Cold-start trigger arm (issue #2702): once the herder is bootstrapped,
+        // arm a single trigger timer so the very first round is event-driven
+        // rather than waiting on a polling tick.
+        //
+        // `setup_trigger_next_ledger` self-gates on `manual_close`, `is_validator`,
+        // and `is_tracking`, so an unconditional call is safe — it becomes a
+        // no-op when any of those is false. No call-site guard needed
+        // (issue #2702 review feedback: having both invites them to diverge).
+        self.setup_trigger_next_ledger().await;
 
         // Wire overlay tracking state to herder. The herder is now syncing,
         // so the overlay's maybe_drop_random_peer() should know the node is
@@ -547,7 +547,10 @@ impl App {
                         // path in steady state, not the primary scheduler.
                         if self.is_validator {
                             self.set_phase_sub(super::phase::PHASE_6_10_TRY_TRIGGER_CONSENSUS);
-                            self.try_trigger_consensus().await;
+                            // Return value ignored: post-close path always
+                            // arms the next round's trigger via the
+                            // `setup_trigger_next_ledger` call below.
+                            let _ = self.try_trigger_consensus().await;
                             self.setup_trigger_next_ledger().await;
                         }
 
