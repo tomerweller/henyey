@@ -375,7 +375,7 @@ pub struct BucketLevelVersionInfo {
 
 /// First protocol version where bucket shadows were removed.
 /// Matches stellar-core's `LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED`.
-const FIRST_PROTOCOL_SHADOWS_REMOVED: u32 = 12;
+pub(crate) const FIRST_PROTOCOL_SHADOWS_REMOVED: u32 = 12;
 
 /// Validate bucket list structure and version monotonicity.
 ///
@@ -887,6 +887,102 @@ impl HASBucketLevel {
             curr,
             snap,
             next: HASBucketNext::default(),
+        }
+    }
+}
+
+impl HistoryArchiveState {
+    /// Clear `next` fields that the on-disk HAS format cannot represent.
+    ///
+    /// Mirrors stellar-core's `HistoryArchiveState::prepareForPublish`
+    /// (`stellar-core/src/history/HistoryArchive.cpp:466-507`), restricted to
+    /// the shadows-removed branch (`buckets[i - 1].snap.version >=
+    /// LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED`). On those levels a pending
+    /// merge cannot be persisted, because the consumer rebuilds the merge
+    /// deterministically from `snap` + `curr` at restart (see
+    /// `BucketListBase::restartMerges` and henyey's `restart_merges_from_has`).
+    ///
+    /// # Architectural placement vs. stellar-core
+    ///
+    /// Stellar-core clears lazily inside `ResolveSnapshotWork::doWork`
+    /// (`stellar-core/src/historywork/ResolveSnapshotWork.cpp:30`), invoked
+    /// only on the publish path; in-memory `HistoryArchiveState` instances are
+    /// free to carry pending futures. Henyey clears eagerly here because
+    /// `build_history_archive_state` is the single emission entry point —
+    /// every caller reaching for a HAS at publication time goes through it.
+    /// The observable on-disk contents are identical; the placement just
+    /// matches henyey's narrower API surface. Any future code that constructs
+    /// a HAS for emission outside `build_history_archive_state` must call
+    /// this method (or equivalent) before serialization.
+    ///
+    /// # Skipped branch
+    ///
+    /// Stellar-core's second branch in `prepareForPublish` (the
+    /// `next.hasHashes() && !next.isLive()` → `makeLive` path,
+    /// `HistoryArchive.cpp:490-506`) reconstitutes pending merges loaded from
+    /// an older-protocol persisted HAS that came back in over the wire with
+    /// `state == 2` (inputs). Henyey's `build_history_archive_state` consumes
+    /// live in-memory `BucketLevel` state, never a deserialized HAS
+    /// round-trip, so that data shape cannot arise here and the branch is
+    /// intentionally omitted.
+    ///
+    /// # Arguments
+    ///
+    /// * `live_snap_versions` — protocol version of `snap` at each live level,
+    ///   in level order, length must equal `current_buckets.len()`. Empty or
+    ///   pre-metaentry buckets contribute `0`.
+    /// * `hot_snap_versions` — same shape for `hot_archive_buckets`. Must be
+    ///   `Some` iff `hot_archive_buckets` is `Some`, and same length.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Mirrors stellar-core's `releaseAssert(buckets[0].next.isClear())` at
+    /// `HistoryArchive.cpp:475`: level 0 never has a `next`, on either the
+    /// live or the hot-archive list.
+    pub(crate) fn clear_unrepresentable_futures(
+        &mut self,
+        live_snap_versions: &[u32],
+        hot_snap_versions: Option<&[u32]>,
+    ) {
+        Self::clear_levels(&mut self.current_buckets, live_snap_versions);
+
+        match (self.hot_archive_buckets.as_mut(), hot_snap_versions) {
+            (Some(hot), Some(versions)) => {
+                Self::clear_levels(hot, versions);
+            }
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                debug_assert!(
+                    false,
+                    "hot_archive_buckets / hot_snap_versions presence mismatch",
+                );
+            }
+        }
+    }
+
+    fn clear_levels(levels: &mut [HASBucketLevel], snap_versions: &[u32]) {
+        debug_assert_eq!(
+            levels.len(),
+            snap_versions.len(),
+            "snap_versions length must match bucket levels",
+        );
+        if levels.is_empty() {
+            return;
+        }
+        debug_assert!(
+            levels[0].next.is_clear(),
+            "level 0 must never carry a pending merge (parity with stellar-core HistoryArchive.cpp:475)",
+        );
+        // Predicate matches the validator's indexing
+        // (`prev_snap_version = levels[j - 1].snap_version`,
+        // archive_state.rs:449) and stellar-core's
+        // `buckets[i - 1].snap` reference at
+        // `stellar-core/src/history/HistoryArchive.cpp:483-489`.
+        for i in 1..levels.len() {
+            let prev_snap_version = snap_versions[i - 1];
+            if prev_snap_version >= FIRST_PROTOCOL_SHADOWS_REMOVED && !levels[i].next.is_clear() {
+                levels[i].next = HASBucketNext::default();
+            }
         }
     }
 }
