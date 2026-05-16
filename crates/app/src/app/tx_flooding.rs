@@ -1730,7 +1730,11 @@ mod tests {
     // ── handle_flood_demand regression tests ─────────────────────────────
 
     /// Helper: create a test App with overlay started, no port binding, no seed peers.
-    async fn create_test_app_with_overlay() -> (crate::app::App, tempfile::TempDir) {
+    ///
+    /// Returns `(TempDir, App)`; the `TempDir` guard is first so the `App`
+    /// (which holds open database handles into the directory) is dropped
+    /// before the directory it backs is removed.
+    async fn create_test_app_with_overlay() -> (tempfile::TempDir, crate::app::App) {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut config = crate::config::ConfigBuilder::new()
             .database_path(dir.path().join("test.db"))
@@ -1739,7 +1743,7 @@ mod tests {
         config.is_compat_config = true;
         let app = crate::app::App::new(config).await.unwrap();
         app.start_overlay().await.unwrap();
-        (app, dir)
+        (dir, app)
     }
 
     /// Regression test for commit 2b8d4801: handle_flood_demand must only send
@@ -1747,7 +1751,7 @@ mod tests {
     /// banned/unknown hashes, and must continue processing past misses.
     #[tokio::test]
     async fn test_handle_flood_demand_mixed_hashes() {
-        let (app, _dir) = create_test_app_with_overlay().await;
+        let (_dir, app) = create_test_app_with_overlay().await;
         let overlay = app.overlay().await.unwrap();
 
         // Inject a test peer with plenty of channel capacity.
@@ -1835,7 +1839,7 @@ mod tests {
     /// outbound channel is full (backpressure via try_send).
     #[tokio::test]
     async fn test_handle_flood_demand_channel_full_stops() {
-        let (app, _dir) = create_test_app_with_overlay().await;
+        let (_dir, app) = create_test_app_with_overlay().await;
         let overlay = app.overlay().await.unwrap();
 
         // Inject a peer with capacity for only 1 message.
@@ -1985,7 +1989,7 @@ mod tests {
             TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
         };
 
-        let (app, _dir) = create_test_app_with_overlay().await;
+        let (_dir, app) = create_test_app_with_overlay().await;
         let overlay = app.overlay().await.unwrap();
 
         // Inject a test peer.

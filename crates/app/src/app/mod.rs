@@ -11032,7 +11032,11 @@ mod tests {
 
     /// Helper: create an App with overlay started for scheduler tests that
     /// need to capture outbound messages via inject_test_peer.
-    async fn survey_test_app_with_overlay() -> (Arc<App>, tempfile::TempDir) {
+    ///
+    /// Returns `(TempDir, App)`; the `TempDir` guard is first so the `App`
+    /// (which holds open database handles into the directory) is dropped
+    /// before the directory it backs is removed.
+    async fn survey_test_app_with_overlay() -> (tempfile::TempDir, Arc<App>) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::config::ConfigBuilder::new()
             .database_path(dir.path().join("survey-test.db"))
@@ -11041,7 +11045,7 @@ mod tests {
         config.is_compat_config = true;
         let app = Arc::new(App::new(config).await.unwrap());
         app.start_overlay().await.unwrap();
-        (app, dir)
+        (dir, app)
     }
 
     /// Regression test for commit 2cbb6bb: each scheduler phase must read
@@ -11054,7 +11058,7 @@ mod tests {
     /// message carries N+2.
     #[tokio::test]
     async fn test_advance_survey_scheduler_ledger_restamping_across_phases() {
-        let (app, _dir) = survey_test_app_with_overlay().await;
+        let (_dir, app) = survey_test_app_with_overlay().await;
         let overlay = app.overlay().await.unwrap();
         let now = app.clock.now();
 
@@ -11297,7 +11301,7 @@ mod tests {
     /// must carry ledger_num = 15.
     #[tokio::test]
     async fn test_top_off_survey_requests_fresh_ledger_after_secret_resolution() {
-        let (app, _dir) = survey_test_app_with_overlay().await;
+        let (_dir, app) = survey_test_app_with_overlay().await;
         let overlay = app.overlay().await.unwrap();
 
         let peer_id = PeerId::from_bytes([7u8; 32]);
@@ -11417,7 +11421,7 @@ mod tests {
     /// message must carry 20 and the stop message must carry 25.
     #[tokio::test]
     async fn test_start_stop_survey_collecting_fresh_ledger() {
-        let (app, _dir) = survey_test_app_with_overlay().await;
+        let (_dir, app) = survey_test_app_with_overlay().await;
         let overlay = app.overlay().await.unwrap();
 
         let peer_id = PeerId::from_bytes([9u8; 32]);

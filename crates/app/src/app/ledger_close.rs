@@ -3097,7 +3097,11 @@ mod restore_result_tests {
     }
 
     /// Helper: create a minimal App for load_last_known_ledger tests.
-    async fn test_app() -> (Arc<App>, tempfile::TempDir) {
+    ///
+    /// Returns `(TempDir, App)`; the `TempDir` guard is first so the `App`
+    /// (which holds open database and bucket file handles into the directory)
+    /// is dropped before the directory it backs is removed.
+    async fn test_app() -> (tempfile::TempDir, Arc<App>) {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("test.db");
         let bucket_dir = dir.path().join("buckets");
@@ -3109,12 +3113,12 @@ mod restore_result_tests {
         let app = App::new(config).await.unwrap();
         let app = Arc::new(app);
         app.set_self_arc().await;
-        (app, dir)
+        (dir, app)
     }
 
     #[tokio::test]
     async fn test_no_lcl_returns_no_state() {
-        let (app, _dir) = test_app().await;
+        let (_dir, app) = test_app().await;
         // Fresh DB has no LCL — should return NoState.
         let result = app.load_last_known_ledger().await.unwrap();
         assert_eq!(result, RestoreResult::NoState);
@@ -3122,7 +3126,7 @@ mod restore_result_tests {
 
     #[tokio::test]
     async fn test_lcl_zero_returns_err() {
-        let (app, _dir) = test_app().await;
+        let (_dir, app) = test_app().await;
         // Set LCL to 0 (anomalous — genesis is seq 1).
         app.db_blocking("test-set-lcl", |db| {
             db.with_connection(|conn| {
@@ -3144,7 +3148,7 @@ mod restore_result_tests {
 
     #[tokio::test]
     async fn test_lcl_exists_but_no_has_returns_err() {
-        let (app, _dir) = test_app().await;
+        let (_dir, app) = test_app().await;
         // Set LCL but no HAS — inconsistent state.
         app.db_blocking("test-set-lcl", |db| {
             db.with_connection(|conn| {
@@ -3166,7 +3170,7 @@ mod restore_result_tests {
 
     #[tokio::test]
     async fn test_lcl_has_mismatch_returns_err() {
-        let (app, _dir) = test_app().await;
+        let (_dir, app) = test_app().await;
         // Set LCL=100 but HAS says current_ledger=50.
         app.db_blocking("test-set-lcl-has", |db| {
             db.with_connection(|conn| {
@@ -3190,7 +3194,7 @@ mod restore_result_tests {
 
     #[tokio::test]
     async fn test_malformed_has_json_returns_err() {
-        let (app, _dir) = test_app().await;
+        let (_dir, app) = test_app().await;
         app.db_blocking("test-set-lcl-has", |db| {
             db.with_connection(|conn| {
                 use henyey_db::queries::StateQueries;
@@ -3211,10 +3215,14 @@ mod restore_result_tests {
     }
 
     /// Helper: create a test App with custom validator/archive settings.
+    ///
+    /// Returns `(TempDir, App)`; the `TempDir` guard is first so the `App`
+    /// (which holds open database and bucket file handles into the directory)
+    /// is dropped before the directory it backs is removed.
     async fn test_app_with_publish_config(
         is_validator: bool,
         writable_archive: bool,
-    ) -> (Arc<App>, tempfile::TempDir) {
+    ) -> (tempfile::TempDir, Arc<App>) {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("test.db");
         let bucket_dir = dir.path().join("buckets");
@@ -3243,7 +3251,7 @@ mod restore_result_tests {
         let app = App::new(config).await.unwrap();
         let app = Arc::new(app);
         app.set_self_arc().await;
-        (app, dir)
+        (dir, app)
     }
 
     /// Regression test for #1989: startup drain clears stale publish queue
@@ -3251,7 +3259,7 @@ mod restore_result_tests {
     #[tokio::test]
     async fn test_startup_drain_clears_queue_when_not_validator() {
         // Non-validator with writable archives — can_publish should be false.
-        let (app, _dir) = test_app_with_publish_config(false, true).await;
+        let (_dir, app) = test_app_with_publish_config(false, true).await;
 
         // Seed DB with LCL and stale publish queue entries.
         app.db_blocking("seed-db", |db| {
@@ -3299,7 +3307,7 @@ mod restore_result_tests {
     #[tokio::test]
     async fn test_startup_drain_clears_queue_when_no_writable_archives() {
         // Validator with NO writable archives — can_publish should be false.
-        let (app, _dir) = test_app_with_publish_config(true, false).await;
+        let (_dir, app) = test_app_with_publish_config(true, false).await;
 
         // Seed DB with stale entries.
         app.db_blocking("seed-db", |db| {
@@ -3330,7 +3338,7 @@ mod restore_result_tests {
     #[tokio::test]
     async fn test_startup_preserves_queue_when_can_publish() {
         // Validator with writable archives — can_publish should be true.
-        let (app, _dir) = test_app_with_publish_config(true, true).await;
+        let (_dir, app) = test_app_with_publish_config(true, true).await;
 
         // Seed DB with entries that should be preserved.
         app.db_blocking("seed-db", |db| {
@@ -3365,7 +3373,7 @@ mod restore_result_tests {
     /// references but the actual bucket files were cleaned up.
     #[tokio::test]
     async fn test_missing_buckets_returns_no_state_and_clears_db() {
-        let (app, _dir) = test_app().await;
+        let (_dir, app) = test_app().await;
 
         // Build a HAS with one non-zero bucket hash (curr of level 0).
         let fake_hash = "a".repeat(64);
@@ -3476,7 +3484,11 @@ mod fatal_shutdown_tests {
     use std::sync::atomic::Ordering;
 
     /// Helper: create a minimal App for fatal-shutdown tests.
-    async fn test_app() -> (Arc<App>, tempfile::TempDir) {
+    ///
+    /// Returns `(TempDir, App)`; the `TempDir` guard is first so the `App`
+    /// (which holds open database and bucket file handles into the directory)
+    /// is dropped before the directory it backs is removed.
+    async fn test_app() -> (tempfile::TempDir, Arc<App>) {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("test.db");
         let bucket_dir = dir.path().join("buckets");
@@ -3488,7 +3500,7 @@ mod fatal_shutdown_tests {
         let app = App::new(config).await.unwrap();
         let app = Arc::new(app);
         app.set_self_arc().await;
-        (app, dir)
+        (dir, app)
     }
 
     /// Once `fatal_state_failure` is set, `try_start_ledger_close` must
@@ -3496,7 +3508,7 @@ mod fatal_shutdown_tests {
     /// the node has detected an unrecoverable state failure.
     #[tokio::test]
     async fn test_try_start_ledger_close_blocked_after_fatal() {
-        let (app, _dir) = test_app().await;
+        let (_dir, app) = test_app().await;
 
         // Pre-set the fatal flag to simulate a prior fatal failure.
         app.fatal_state_failure.store(true, Ordering::SeqCst);
@@ -3518,7 +3530,11 @@ mod refresh_stale_buffer_tests {
     use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
 
     /// Helper: create a minimal App for testing.
-    async fn test_app() -> (Arc<App>, tempfile::TempDir) {
+    ///
+    /// Returns `(TempDir, App)`; the `TempDir` guard is first so the `App`
+    /// (which holds open database and bucket file handles into the directory)
+    /// is dropped before the directory it backs is removed.
+    async fn test_app() -> (tempfile::TempDir, Arc<App>) {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("test.db");
         let bucket_dir = dir.path().join("buckets");
@@ -3530,7 +3546,7 @@ mod refresh_stale_buffer_tests {
         let app = App::new(config).await.unwrap();
         let app = Arc::new(app);
         app.set_self_arc().await;
-        (app, dir)
+        (dir, app)
     }
 
     /// When syncing_ledgers has an entry with tx_set=None but the herder's
@@ -3538,7 +3554,7 @@ mod refresh_stale_buffer_tests {
     /// refresh the entry and proceed with the close.
     #[tokio::test]
     async fn test_refresh_stale_syncing_ledgers_entry() {
-        let (app, _dir) = test_app().await;
+        let (_dir, app) = test_app().await;
 
         // The fresh app has current_ledger = 0, so next_seq = 1.
         let next_seq: u32 = 1;
@@ -3604,7 +3620,7 @@ mod refresh_stale_buffer_tests {
     /// buffered, the refresh must be rejected (no-op).
     #[tokio::test]
     async fn test_refresh_rejected_on_hash_mismatch() {
-        let (app, _dir) = test_app().await;
+        let (_dir, app) = test_app().await;
 
         let next_seq: u32 = 1;
         let slot: u64 = next_seq as u64;
