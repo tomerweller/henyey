@@ -736,10 +736,14 @@ impl HistoryArchiveManager {
         let temp_file = tempfile::NamedTempFile::new()?;
         std::fs::write(temp_file.path(), &json)?;
 
-        // Upload to the §4.3 pseudo-checkpoint path first (matches
-        // stellar-core's source order in
-        // PutHistoryArchiveStateWork::spawnPublishWork; functionally the
-        // two writes are independent).
+        // Upload to the §4.3 pseudo-checkpoint path first, then to the
+        // well-known root HAS path. The two writes are independent and the
+        // final archive state is identical regardless of order. Stellar-core
+        // schedules these as two separate `WorkSequence`s in
+        // `PutHistoryArchiveStateWork::spawnPublishWork`
+        // (PutHistoryArchiveStateWork.cpp:69), which the scheduler may run
+        // concurrently — so ordering here is not a parity-observable
+        // property.
         remote
             .put_file_with_mkdir(temp_file.path(), paths::pseudo_checkpoint_has_path())
             .await?;
