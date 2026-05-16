@@ -57,3 +57,8 @@ henyey-crypto.workspace = true
 henyey-ledger = { workspace = true, features = ["test-utils"] }
 henyey-scp = { workspace = true, features = ["test-helpers"] }
 sha2.workspace = true
+# `raw-api` exposes `DashMap::determine_map`, used by the
+# `test_request_at_cap_still_increments_existing` regression test to make the
+# shard collision between `first_hash` and `new_hash` deterministic across all
+# runners regardless of `num_cpus()`. Purely additive feature.
+dashmap = { workspace = true, features = ["raw-api"] }

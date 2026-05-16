@@ -998,8 +998,62 @@ mod tests {
             "existing entry should increment even at cap"
         );
 
+        // REGRESSION GUARD for PR #2747 / issues #2744, #2750.
+        //
+        // The pre-fix code held a `dashmap::mapref::one::Ref` into `pending`
+        // across the call to `tracker.request(new_hash, ...)`. `request()`
+        // takes a write lock on the destination shard via `pending.entry(...)`.
+        // When `new_hash` and `first_hash` land on the same DashMap shard,
+        // the still-live read guard from `pending.get(&first_hash)` causes
+        // `parking_lot`'s shard `RwLock::write()` call to deadlock the same
+        // thread.
+        //
+        // DashMap's shard count is `4 * num_cpus().next_power_of_two()`, so
+        // whether two arbitrary hashes share a shard depends on the runner.
+        // To make this regression test fail _deterministically_ on every
+        // runner if the snapshot pattern above is ever reverted, we pick
+        // `new_hash` to be provably on the same shard as `first_hash` using
+        // `DashMap::determine_map` (gated behind dashmap's `raw-api`
+        // dev-feature in `crates/herder/Cargo.toml`).
+        //
+        // Inlining `tracker.pending.get(&first_hash).unwrap().request_count`
+        // into the `assert_eq!` above (or re-binding it to a `let entry =
+        // tracker.pending.get(...)` that outlives the next `tracker.request`
+        // call) resurrects the deadlock.
+        let target_shard = tracker.pending.determine_map(&first_hash);
+        let new_hash = {
+            let mut found = None;
+            for i in 0u32..1_000_000 {
+                let mut bytes = [0xFFu8; 32];
+                bytes[0..4].copy_from_slice(&i.to_le_bytes());
+                let candidate = Hash256::from_bytes(bytes);
+                if candidate == first_hash {
+                    continue;
+                }
+                if tracker.pending.contains_key(&candidate) {
+                    continue;
+                }
+                if tracker.pending.determine_map(&candidate) == target_shard {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            found.expect(
+                "must find a hash on the same DashMap shard as first_hash within 1M tries; \
+                 shard count is 4 * num_cpus().next_power_of_two() so this should converge in O(shards)",
+            )
+        };
+        // Load-bearing invariant: if this ever fires, the regression guard
+        // below has lost its teeth and the test silently stops catching the
+        // bug it was written for.
+        assert_eq!(
+            tracker.pending.determine_map(&first_hash),
+            tracker.pending.determine_map(&new_hash),
+            "test invariant: first_hash and new_hash must collide on a DashMap shard \
+             so a Ref-held-across-request() regression deadlocks deterministically"
+        );
+
         // A brand new hash should be rejected.
-        let new_hash = Hash256::from_bytes([0xFF; 32]);
         assert!(!tracker.request(new_hash, 100));
         assert!(
             tracker.pending.get(&new_hash).is_none(),
