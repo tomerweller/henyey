@@ -817,15 +817,23 @@ mod tests {
     //     `apply_data[0]` for the case-4 (Apply) check.
     // ---------------------------------------------------------------
 
-    fn make_test_catchup_manager() -> CatchupManager {
+    /// Returns the manager together with the `TempDir` guard backing its
+    /// `BucketManager`. The caller must keep the `TempDir` alive for the
+    /// duration of the test so the bucket directory is deleted on drop
+    /// rather than leaked under the system temp location.
+    fn make_test_catchup_manager() -> (CatchupManager, tempfile::TempDir) {
         use henyey_bucket::BucketManager;
         use henyey_db::Database;
 
         let db = Database::open_in_memory().expect("in-memory db");
         let tmp_dir = tempfile::tempdir().expect("temp dir");
-        let bucket_manager = BucketManager::new(tmp_dir.keep()).expect("bucket manager");
+        let bucket_manager =
+            BucketManager::new(tmp_dir.path().to_path_buf()).expect("bucket manager");
         let archive = crate::HistoryArchive::new("https://example.com").expect("archive");
-        CatchupManager::new(vec![archive], bucket_manager, db)
+        (
+            CatchupManager::new(vec![archive], bucket_manager, db),
+            tmp_dir,
+        )
     }
 
     /// Build a `LedgerData` for ledger `seq` whose
@@ -854,7 +862,7 @@ mod tests {
     fn test_verify_knit_to_lcl_happy_path_mixed() {
         // LCL = 100, lcl_hash = H100, previous_ledger_hash = H99.
         let lcl = make_test_lcl(100, h(0x10), h(0x09));
-        let manager = make_test_catchup_manager();
+        let (manager, _tmp_dir) = make_test_catchup_manager();
 
         // Three knit entries spanning cases 1/2/3 — each must classify
         // as Skip inside the loop, exercising 3 iterations of the body.
@@ -888,7 +896,7 @@ mod tests {
     fn test_verify_knit_to_lcl_tampered_knit_entry_returns_fatal() {
         // LCL = 100, lcl_hash = H100, previous_ledger_hash = H99.
         let lcl = make_test_lcl(100, h(0x10), h(0x09));
-        let manager = make_test_catchup_manager();
+        let (manager, _tmp_dir) = make_test_catchup_manager();
         // apply_data is irrelevant — the loop must error out before
         // we reach the `.first()` branch.
         let apply_data = vec![make_apply_ledger_data(101, h(0x10))];
@@ -930,7 +938,7 @@ mod tests {
     #[test]
     fn test_verify_knit_to_lcl_empty_apply_data_noop() {
         let lcl = make_test_lcl(100, h(0x10), h(0x09));
-        let manager = make_test_catchup_manager();
+        let (manager, _tmp_dir) = make_test_catchup_manager();
 
         // No knit entries, no apply data: pure no-op, must Ok.
         manager
