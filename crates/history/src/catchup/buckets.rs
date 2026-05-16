@@ -1,8 +1,12 @@
 //! Bucket application logic for catchup: restoring bucket lists from HAS.
 
+use crate::archive_state::{
+    validate_bucket_list_structure, BucketLevelVersionInfo, HASBucketLevel,
+};
 use crate::{archive_state::HistoryArchiveState, HistoryError, Result};
 use henyey_bucket::{
-    canonical_bucket_filename, Bucket, BucketList, HotArchiveBucketList, PendingMergeState,
+    canonical_bucket_filename, Bucket, BucketLevel, BucketList, HotArchiveBucketLevel,
+    HotArchiveBucketList, PendingMergeState,
 };
 use henyey_common::fs_utils::atomic_write_bytes;
 use henyey_common::Hash256;
@@ -51,6 +55,96 @@ pub(super) fn verified_hot_archive_bucket_loader(
     bucket_manager: std::sync::Arc<henyey_bucket::BucketManager>,
 ) -> impl FnMut(&Hash256) -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
     move |hash: &Hash256| bucket_manager.load_hot_archive_bucket_for_merge(hash)
+}
+
+/// Build per-level version info for a restored live `BucketList`, suitable
+/// for passing to [`validate_bucket_list_structure`].
+///
+/// The `levels` and `has_levels` slices are zipped — any length mismatch is
+/// surfaced by the validator's own size check, not by an indexing panic, so
+/// passing mismatched lengths still yields the validator's structured error.
+///
+/// Each bucket's protocol version is taken from the cached
+/// `Bucket::protocol_version()` (O(1) after load); empty / metaentry-less
+/// buckets map to version 0, matching stellar-core's
+/// `bucket->isEmpty() ? 0 : bucket->getBucketVersion()` branch.
+pub(super) fn build_live_level_version_infos(
+    levels: &[BucketLevel],
+    has_levels: &[HASBucketLevel],
+) -> Result<Vec<BucketLevelVersionInfo>> {
+    let mut out = Vec::with_capacity(levels.len().max(has_levels.len()));
+    for (level, has_level) in levels.iter().zip(has_levels.iter()) {
+        let curr_version = level
+            .curr
+            .protocol_version()
+            .map_err(|e| {
+                HistoryError::CatchupFailed(format!(
+                    "failed to read curr bucket protocol version: {}",
+                    e
+                ))
+            })?
+            .unwrap_or(0);
+        let snap_version = level
+            .snap
+            .protocol_version()
+            .map_err(|e| {
+                HistoryError::CatchupFailed(format!(
+                    "failed to read snap bucket protocol version: {}",
+                    e
+                ))
+            })?
+            .unwrap_or(0);
+        out.push(BucketLevelVersionInfo {
+            snap_version,
+            curr_version,
+            next: has_level.next.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Build per-level version info for a restored hot-archive bucket list,
+/// suitable for passing to [`validate_bucket_list_structure`].
+///
+/// Same contract as [`build_live_level_version_infos`] but for hot-archive
+/// levels — `HotArchiveBucket::get_protocol_version()` returns `Ok(0)` for
+/// empty buckets directly, so no `unwrap_or(0)` is needed.
+pub(super) fn build_hot_archive_level_version_infos(
+    levels: &[HotArchiveBucketLevel],
+    has_levels: &[HASBucketLevel],
+) -> Result<Vec<BucketLevelVersionInfo>> {
+    let mut out = Vec::with_capacity(levels.len().max(has_levels.len()));
+    for (level, has_level) in levels.iter().zip(has_levels.iter()) {
+        let curr_version = level.curr().get_protocol_version().map_err(|e| {
+            HistoryError::CatchupFailed(format!(
+                "failed to read hot-archive curr bucket protocol version: {}",
+                e
+            ))
+        })?;
+        let snap_version = level.snap_bucket().get_protocol_version().map_err(|e| {
+            HistoryError::CatchupFailed(format!(
+                "failed to read hot-archive snap bucket protocol version: {}",
+                e
+            ))
+        })?;
+        out.push(BucketLevelVersionInfo {
+            snap_version,
+            curr_version,
+            next: has_level.next.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Translate a `validate_bucket_list_structure` error into the catchup error
+/// class so the catchup orchestrator's existing handling kicks in unchanged.
+fn map_validation_error(scope: &str, e: HistoryError) -> HistoryError {
+    match e {
+        HistoryError::VerificationFailed(msg) => {
+            HistoryError::CatchupFailed(format!("invalid {} bucket list structure: {}", scope, msg))
+        }
+        other => other,
+    }
 }
 
 impl CatchupManager {
@@ -348,6 +442,19 @@ impl CatchupManager {
                 })?;
         bucket_list.set_bucket_dir(bucket_dir.to_path_buf());
 
+        // Validate live bucket-list structure post-restore.
+        //
+        // This mirrors stellar-core's `containsValidBuckets` invocation in
+        // `CatchupWork.cpp:217` between `DownloadBucketsWork` and
+        // `ApplyBucketsWork`. Henyey runs the check inside `apply_buckets`
+        // (the structurally analogous post-restore point), still before any
+        // DB mutation so the observable effect is identical: a malformed HAS
+        // aborts catchup with the same error class.
+        let live_infos =
+            build_live_level_version_infos(bucket_list.levels(), &has.current_buckets)?;
+        validate_bucket_list_structure(&live_infos, BucketList::NUM_LEVELS)
+            .map_err(|e| map_validation_error("live", e))?;
+
         // Log the restored bucket list hash
         info!("Live bucket list restored hash: {}", bucket_list.hash());
         info!(
@@ -555,6 +662,15 @@ impl CatchupManager {
                 );
             }
 
+            // Validate hot-archive bucket-list structure post-restore.
+            // Mirrors stellar-core's second `validateBucketListHelper` call
+            // inside `containsValidBuckets` for the hot-archive list.
+            let hot_has_levels = has.hot_archive_levels();
+            let hot_infos =
+                build_hot_archive_level_version_infos(hot_bucket_list.levels(), hot_has_levels)?;
+            validate_bucket_list_structure(&hot_infos, HotArchiveBucketList::NUM_LEVELS)
+                .map_err(|e| map_validation_error("hot archive", e))?;
+
             hot_bucket_list
         } else {
             HotArchiveBucketList::new()
@@ -575,6 +691,34 @@ impl CatchupManager {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::archive_state::HASBucketNext;
+    use henyey_bucket::{BucketEntry, HOT_ARCHIVE_BUCKET_LIST_LEVELS};
+    use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt};
+
+    fn meta_entry(version: u32) -> BucketEntry {
+        BucketEntry::Metaentry(BucketMetadata {
+            ledger_version: version,
+            ext: BucketMetadataExt::V0,
+        })
+    }
+
+    fn bucket_with_version(version: u32) -> Bucket {
+        Bucket::from_entries(vec![meta_entry(version)]).expect("metaentry-only bucket valid")
+    }
+
+    fn empty_has_level() -> HASBucketLevel {
+        HASBucketLevel {
+            curr: Hash256::ZERO.to_hex(),
+            snap: Hash256::ZERO.to_hex(),
+            next: HASBucketNext::default(),
+        }
+    }
+
+    fn cleared_levels(n: usize) -> Vec<HASBucketLevel> {
+        (0..n).map(|_| empty_has_level()).collect()
+    }
+
     /// Stage E: pin the metric literals emitted from this module so a typo
     /// can't silently detach this crate from the central catalog.
     #[test]
@@ -618,6 +762,156 @@ mod tests {
                 search_from = idx + metric.len();
             }
             assert!(found_any, "metric {metric} not found in catchup/buckets.rs",);
+        }
+    }
+
+    #[test]
+    fn test_build_level_version_infos_pairs_buckets_and_has_levels() {
+        let mut bucket_list = BucketList::new();
+        // Level 0: curr=v24, snap=empty(0); higher levels: empty.
+        let level0 = bucket_list.level_mut(0).unwrap();
+        level0.set_curr(bucket_with_version(24));
+        // snap stays empty.
+
+        let mut has_levels = cleared_levels(BucketList::NUM_LEVELS);
+        // Default `next` (state=CLEAR) is fine for level 0.
+        has_levels[0].next = HASBucketNext::default();
+
+        let infos = build_live_level_version_infos(bucket_list.levels(), &has_levels).unwrap();
+        assert_eq!(infos.len(), BucketList::NUM_LEVELS);
+        assert_eq!(infos[0].curr_version, 24);
+        assert_eq!(infos[0].snap_version, 0);
+        for level_info in infos.iter().skip(1) {
+            assert_eq!(level_info.curr_version, 0);
+            assert_eq!(level_info.snap_version, 0);
+        }
+    }
+
+    #[test]
+    fn test_build_live_then_validator_accepts_well_formed_list() {
+        // All-empty bucket list: every level has version 0; the validator
+        // skips the next-field check via `non_empty_seen=false` until j==0,
+        // where the only check is `next.is_clear()` — satisfied by the
+        // default `HASBucketNext`.
+        let bucket_list = BucketList::new();
+        let has_levels = cleared_levels(BucketList::NUM_LEVELS);
+        let infos = build_live_level_version_infos(bucket_list.levels(), &has_levels).unwrap();
+        validate_bucket_list_structure(&infos, BucketList::NUM_LEVELS)
+            .expect("well-formed (all-empty) list must validate");
+    }
+
+    #[test]
+    fn test_build_live_then_validator_rejects_non_monotonic_versions() {
+        // Walking from deepest to level 0, snap then curr must be
+        // non-decreasing. Put the LOWER version at a deeper level than
+        // a HIGHER version → triggers the monotonicity error.
+        //
+        // Place v24 at the deepest curr and v20 at the next-deeper snap. Use
+        // version 24 at the prev-snap (level deep-1 snap) so the validator's
+        // `prev_snap_version >= FIRST_PROTOCOL_SHADOWS_REMOVED` branch
+        // accepts the cleared `next` field; the failure must come from the
+        // version monotonicity check, not the next-field check.
+        let mut bucket_list = BucketList::new();
+        let deep = BucketList::NUM_LEVELS - 1;
+        bucket_list
+            .level_mut(deep)
+            .unwrap()
+            .set_curr(bucket_with_version(24));
+        bucket_list
+            .level_mut(deep - 1)
+            .unwrap()
+            .set_snap(bucket_with_version(20));
+
+        let has_levels = cleared_levels(BucketList::NUM_LEVELS);
+        let infos = build_live_level_version_infos(bucket_list.levels(), &has_levels).unwrap();
+        let err = validate_bucket_list_structure(&infos, BucketList::NUM_LEVELS)
+            .expect_err("non-monotonic versions must be rejected");
+        match err {
+            HistoryError::VerificationFailed(msg) => {
+                assert!(
+                    msg.contains("incompatible bucket versions"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("expected VerificationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_live_then_validator_rejects_level0_next_not_clear() {
+        // All-empty list (so prev-level next-field checks are skipped via
+        // `non_empty_seen=false`) but with a non-clear `next` at level 0 →
+        // the level-0 next-clear check fires unconditionally.
+        let bucket_list = BucketList::new();
+        let mut has_levels = cleared_levels(BucketList::NUM_LEVELS);
+        has_levels[0].next = HASBucketNext {
+            state: 1, // FB_HASH_OUTPUT
+            output: Some(Hash256::ZERO.to_hex()),
+            ..HASBucketNext::default()
+        };
+
+        let infos = build_live_level_version_infos(bucket_list.levels(), &has_levels).unwrap();
+        let err = validate_bucket_list_structure(&infos, BucketList::NUM_LEVELS)
+            .expect_err("non-clear next at level 0 must be rejected");
+        match err {
+            HistoryError::VerificationFailed(msg) => {
+                assert!(
+                    msg.contains("next must be clear at level 0"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("expected VerificationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_hot_archive_then_validator_rejects_level0_next_not_clear() {
+        // All-empty hot archive list — level 0 next-clear check fires
+        // unconditionally regardless of versions (matches validator semantics).
+        let hot_list = HotArchiveBucketList::new();
+
+        let mut has_levels = cleared_levels(HOT_ARCHIVE_BUCKET_LIST_LEVELS);
+        has_levels[0].next = HASBucketNext {
+            state: 1,
+            output: Some(Hash256::ZERO.to_hex()),
+            ..HASBucketNext::default()
+        };
+
+        let infos = build_hot_archive_level_version_infos(hot_list.levels(), &has_levels).unwrap();
+        // Sanity: helper produced one info per level, all version 0.
+        assert_eq!(infos.len(), HotArchiveBucketList::NUM_LEVELS);
+        assert!(infos
+            .iter()
+            .all(|i| i.curr_version == 0 && i.snap_version == 0));
+
+        let err = validate_bucket_list_structure(&infos, HotArchiveBucketList::NUM_LEVELS)
+            .expect_err("non-clear next at level 0 must be rejected for hot archive");
+        match err {
+            HistoryError::VerificationFailed(msg) => {
+                assert!(
+                    msg.contains("next must be clear at level 0"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("expected VerificationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_validation_error_translates_to_catchup_failed() {
+        let v = HistoryError::VerificationFailed("boom".to_string());
+        match map_validation_error("live", v) {
+            HistoryError::CatchupFailed(msg) => {
+                assert!(msg.contains("invalid live bucket list structure"));
+                assert!(msg.contains("boom"));
+            }
+            other => panic!("expected CatchupFailed, got {other:?}"),
+        }
+        // Non-VerificationFailed errors pass through unchanged.
+        let other = HistoryError::CatchupFailed("untouched".to_string());
+        match map_validation_error("hot archive", other) {
+            HistoryError::CatchupFailed(msg) => assert_eq!(msg, "untouched"),
+            other => panic!("unexpected error variant: {other:?}"),
         }
     }
 }

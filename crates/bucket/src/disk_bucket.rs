@@ -40,7 +40,9 @@ use std::sync::{Arc, OnceLock};
 use memmap2::Mmap;
 
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{LedgerEntryType, LedgerKey, Limits, ReadXdr};
+use stellar_xdr::curr::{
+    BucketEntry as XdrBucketEntry, LedgerEntryType, LedgerKey, Limits, ReadXdr,
+};
 
 use henyey_common::{BucketListDbConfig, Hash256};
 
@@ -107,6 +109,16 @@ pub struct DiskBucket {
     /// Initialized lazily via `maybe_initialize_cache()`.
     /// Only caches ACCOUNT entries (matching stellar-core).
     cache: OnceLock<Arc<RandomEvictionCache>>,
+    /// Cached protocol version read from the leading metaentry.
+    ///
+    /// `Some(Some(v))` — bucket has a metaentry with `ledger_version = v`.
+    /// `Some(None)`     — bucket has no metaentry (legacy / empty bucket).
+    /// Not yet set      — cache has not been populated (no constructor exposes
+    ///                     this state in normal use; see `protocol_version()`).
+    ///
+    /// Populated cheaply at construction by every public constructor so calls
+    /// to `protocol_version()` are O(1) with no fallback file read.
+    protocol_version: OnceLock<Option<u32>>,
 }
 
 impl Clone for DiskBucket {
@@ -119,6 +131,7 @@ impl Clone for DiskBucket {
             index: self.index.clone(),
             mmap: self.mmap.clone(),
             cache: self.cache.clone(),
+            protocol_version: self.protocol_version.clone(),
         }
     }
 }
@@ -138,6 +151,14 @@ struct StreamingXdrEntryIterator {
     validator: crate::entry::StreamingSortedValidator,
     /// Number of records read (including those that failed to parse).
     record_count: usize,
+    /// Captured `ledger_version` from the bucket's leading metaentry, if any.
+    ///
+    /// We capture this here because `key().is_some()` filters metaentries out
+    /// of the yielded records below — but we need the value for the
+    /// disk-bucket-level `protocol_version` cache. Set on the *first*
+    /// metaentry encountered (matching stellar-core's `getBucketVersion`,
+    /// which reads the leading metaentry).
+    protocol_version: Option<u32>,
     failed: bool,
 }
 
@@ -153,6 +174,7 @@ impl StreamingXdrEntryIterator {
             },
             validator: crate::entry::StreamingSortedValidator::new(),
             record_count: 0,
+            protocol_version: None,
             failed: false,
         })
     }
@@ -161,14 +183,22 @@ impl StreamingXdrEntryIterator {
         self.records.position()
     }
 
-    /// Finalize the iterator, returning (record_count, hash).
-    /// Hash is only available if the iterator was created with `compute_hash=true`.
-    fn finalize(self) -> (usize, Option<Hash256>) {
+    /// Finalize the iterator, returning `(record_count, hash, protocol_version)`.
+    ///
+    /// - `hash` is only available if the iterator was created with `compute_hash=true`.
+    /// - `protocol_version` is `Some(v)` if a metaentry was observed during the
+    ///   stream (carrying `ledger_version = v`), otherwise `None`.
+    ///
+    /// **Note:** the return type was extended from
+    /// `(usize, Option<Hash256>)` to `(usize, Option<Hash256>, Option<u32>)`
+    /// when `protocol_version` capture was added — update any external
+    /// destructuring sites accordingly.
+    fn finalize(self) -> (usize, Option<Hash256>, Option<u32>) {
         let hash = self.hasher.map(|h| {
             let hash_bytes: [u8; 32] = h.finalize().into();
             Hash256::from_bytes(hash_bytes)
         });
-        (self.record_count, hash)
+        (self.record_count, hash, self.protocol_version)
     }
 }
 
@@ -213,6 +243,17 @@ impl Iterator for StreamingXdrEntryIterator {
             if let Err(e) = self.validator.validate(&xdr_entry) {
                 self.failed = true;
                 return Some(Err(e));
+            }
+
+            // Capture the leading metaentry's ledger_version for the disk bucket
+            // protocol-version cache. The metaentry is filtered out below
+            // (it has no key), but its `ledger_version` is what stellar-core's
+            // `getBucketVersion` returns. We only record the *first* metaentry
+            // because real bucket files have at most one metaentry at the head.
+            if let XdrBucketEntry::Metaentry(ref meta) = xdr_entry {
+                if self.protocol_version.is_none() {
+                    self.protocol_version = Some(meta.ledger_version);
+                }
             }
 
             if xdr_entry.key().is_some() {
@@ -312,7 +353,7 @@ impl DiskBucket {
                 ),
             )));
         }
-        let (entry_count, hash) = iter.finalize();
+        let (entry_count, hash, protocol_version) = iter.finalize();
         let hash = hash.expect("hasher was enabled");
 
         tracing::debug!(
@@ -330,6 +371,11 @@ impl DiskBucket {
         mmap.set(Self::create_mmap(path)?)
             .expect("just initialized");
 
+        let protocol_version_cache = OnceLock::new();
+        protocol_version_cache
+            .set(protocol_version)
+            .expect("just initialized");
+
         Ok(Self {
             hash,
             file_path: path.to_path_buf(),
@@ -338,6 +384,7 @@ impl DiskBucket {
             index: Box::new(live_index),
             mmap,
             cache: OnceLock::new(),
+            protocol_version: protocol_version_cache,
         })
     }
 
@@ -383,8 +430,19 @@ impl DiskBucket {
             });
         }
 
+        // Eagerly populate the protocol_version cache by reading the file's
+        // leading XDR record (one disk seek per bucket on startup). This keeps
+        // the post-construction contract uniform with `from_file_streaming_*`:
+        // `protocol_version()` is always O(1) with no fallback file read.
+        let protocol_version = Self::read_leading_protocol_version(path)?;
+
         let mmap = OnceLock::new();
         mmap.set(Self::create_mmap(path)?)
+            .expect("just initialized");
+
+        let protocol_version_cache = OnceLock::new();
+        protocol_version_cache
+            .set(protocol_version)
             .expect("just initialized");
 
         Ok(Self {
@@ -395,6 +453,36 @@ impl DiskBucket {
             index: Box::new(prebuilt_index),
             mmap,
             cache: OnceLock::new(),
+            protocol_version: protocol_version_cache,
+        })
+    }
+
+    /// Read just the leading XDR record of a bucket file and return the
+    /// metaentry's `ledger_version` if the leading record is a `Metaentry`.
+    /// Returns `Ok(None)` if the file is empty or the leading record is not a
+    /// metaentry (the latter matches stellar-core's `getBucketVersion` which
+    /// returns 0 for buckets without a leading metaentry — protocol 24+
+    /// always emits one for non-empty merges, so this is the legacy/empty
+    /// path).
+    fn read_leading_protocol_version(path: &Path) -> Result<Option<u32>> {
+        let file_len = std::fs::metadata(path)?.len();
+        if file_len == 0 {
+            return Ok(None);
+        }
+        let file = File::open(path)?;
+        let mut records = crate::record::RecordMarkedReader::new(BufReader::new(file), file_len);
+        let Some(record) = records.next_record()? else {
+            return Ok(None);
+        };
+        let xdr_entry = XdrBucketEntry::from_xdr(record.body, Limits::none()).map_err(|e| {
+            BucketError::Serialization(format!(
+                "Failed to parse leading bucket entry at offset {}: {}",
+                record.offset, e
+            ))
+        })?;
+        Ok(match xdr_entry {
+            XdrBucketEntry::Metaentry(m) => Some(m.ledger_version),
+            _ => None,
         })
     }
 
@@ -446,6 +534,25 @@ impl DiskBucket {
     /// Get the path to the bucket file.
     pub fn file_path(&self) -> &Path {
         &self.file_path
+    }
+
+    /// Get the protocol version recorded in this bucket's leading metaentry.
+    ///
+    /// Returns `Ok(Some(v))` if the bucket has a metaentry with
+    /// `ledger_version = v`, or `Ok(None)` if the bucket has no leading
+    /// metaentry (matches stellar-core's `getBucketVersion` returning 0 for
+    /// metaentry-less buckets — callers typically map `None` to 0).
+    ///
+    /// This is O(1) and never reads from disk: the value is captured at
+    /// construction time by every public constructor (`from_file_streaming*`
+    /// captures it during the streaming load; `from_prebuilt` reads just the
+    /// leading record once).
+    pub fn protocol_version(&self) -> Option<u32> {
+        // Every public constructor sets this OnceLock before returning, so the
+        // unwrap below cannot fail in normal use. Use `*get_or_init(... None)`
+        // as a defensive default rather than panicking, in case a future
+        // internal constructor forgets to populate it.
+        *self.protocol_version.get_or_init(|| None)
     }
 
     /// Returns a reference to the live bucket index.
@@ -1049,6 +1156,7 @@ mod tests {
             )),
             mmap: OnceLock::new(),
             cache: OnceLock::new(),
+            protocol_version: OnceLock::new(),
         };
         let key = LedgerKey::Account(LedgerKeyAccount {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32]))),
@@ -1337,5 +1445,78 @@ mod tests {
             "streaming loader should accept sorted entries"
         );
         assert_eq!(result.unwrap().len(), 2);
+    }
+
+    fn make_metaentry_bytes(ledger_version: u32) -> Vec<u8> {
+        use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, WriteXdr};
+
+        let entry = stellar_xdr::curr::BucketEntry::Metaentry(BucketMetadata {
+            ledger_version,
+            ext: BucketMetadataExt::V0,
+        });
+        let entry_bytes = entry.to_xdr(Limits::none()).unwrap();
+        let record_mark = (entry_bytes.len() as u32) | crate::XDR_RECORD_MARK;
+        let mut out = Vec::new();
+        out.extend_from_slice(&record_mark.to_be_bytes());
+        out.extend_from_slice(&entry_bytes);
+        out
+    }
+
+    fn make_bucket_bytes_with_metadata(ledger_version: u32) -> Vec<u8> {
+        let mut bytes = make_metaentry_bytes(ledger_version);
+        bytes.extend(make_test_bucket_bytes());
+        bytes
+    }
+
+    #[test]
+    fn test_disk_bucket_caches_protocol_version_on_streaming_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("with_meta.bucket");
+
+        let bytes = make_bucket_bytes_with_metadata(24);
+        let bucket = DiskBucket::from_xdr_bytes(&bytes, &path).unwrap();
+
+        // Cached value matches metaentry's ledger_version.
+        assert_eq!(bucket.protocol_version(), Some(24));
+
+        // Delete the underlying file — protocol_version() must still return
+        // the cached value (proves no fallback file read).
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(bucket.protocol_version(), Some(24));
+    }
+
+    #[test]
+    fn test_disk_bucket_caches_protocol_version_on_prebuilt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("prebuilt.bucket");
+
+        let bytes = make_bucket_bytes_with_metadata(25);
+        let original = DiskBucket::from_xdr_bytes(&bytes, &path).unwrap();
+
+        // Reconstruct via from_prebuilt using the original's index and metadata.
+        let prebuilt_index = (*original.index).clone();
+        let entry_count = original.entry_count;
+        let hash = original.hash();
+        // Drop the original bucket so the prebuilt path opens the file fresh.
+        drop(original);
+
+        let prebuilt = DiskBucket::from_prebuilt(&path, hash, entry_count, prebuilt_index).unwrap();
+        assert_eq!(
+            prebuilt.protocol_version(),
+            Some(25),
+            "from_prebuilt should eagerly populate the cache via a leading-record read"
+        );
+    }
+
+    #[test]
+    fn test_disk_bucket_protocol_version_no_metaentry_returns_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("no_meta.bucket");
+
+        // make_test_bucket_bytes produces a single liveentry with no metaentry.
+        let bytes = make_test_bucket_bytes();
+        let bucket = DiskBucket::from_xdr_bytes(&bytes, &path).unwrap();
+
+        assert_eq!(bucket.protocol_version(), None);
     }
 }
