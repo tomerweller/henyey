@@ -70,6 +70,15 @@ impl TxSetTracker {
     /// Register a pending tx-set request. Returns true if new.
     /// Returns false if already pending, already cached, or the pending map
     /// has reached its best-effort capacity cap (`MAX_PENDING_TXSET_REQUESTS`).
+    ///
+    /// # Reentrancy
+    ///
+    /// Callers (including tests) MUST NOT hold any guard into `self.pending`
+    /// (e.g. a `dashmap::mapref::one::Ref`/`RefMut` from `pending.get` or
+    /// `pending.get_mut`) when calling this. `request` acquires a write lock
+    /// on the destination shard via `pending.entry(...)` and read locks on
+    /// every shard via `pending.len()`; same-thread reentry will deadlock
+    /// whenever the held guard's shard collides with one of those.
     pub fn request(&self, hash: Hash256, slot: u64) -> bool {
         if self.cache.contains_key(&hash) {
             return false;
@@ -978,9 +987,14 @@ mod tests {
         // The first hash we inserted should still be incrementable.
         let first_hash = Hash256::from_bytes([0u8; 32]);
         assert!(!tracker.request(first_hash, 100));
-        let entry = tracker.pending.get(&first_hash).unwrap();
+        // Snapshot the field by value and let the `Ref` drop at the end of
+        // this statement BEFORE re-entering `tracker.request(...)` below.
+        // Holding the shard read-guard across `request()` would deadlock
+        // whenever `new_hash` collides with `first_hash` on a DashMap shard,
+        // because `request()` needs a write lock on the destination shard.
+        let request_count = tracker.pending.get(&first_hash).unwrap().request_count;
         assert_eq!(
-            entry.request_count, 2,
+            request_count, 2,
             "existing entry should increment even at cap"
         );
 
