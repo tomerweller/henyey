@@ -805,6 +805,150 @@ mod tests {
         ));
     }
 
+    // ---------------------------------------------------------------
+    // Direct tests for the `verify_knit_to_lcl` wrapper (#2737).
+    //
+    // The 11 `knit_to_lcl_decision` tests above exhaustively cover the
+    // §11.2 five-case decision matrix. The tests below target the
+    // wrapper's own glue that is *not* covered by those tests:
+    //   - the loop over `knit_entries` (multi-iteration, mid-loop `?`),
+    //   - the `apply_data.first()` short-circuit on empty input,
+    //   - the synthesis of the virtual `LedgerHeaderHistoryEntry` from
+    //     `apply_data[0]` for the case-4 (Apply) check.
+    // ---------------------------------------------------------------
+
+    fn make_test_catchup_manager() -> CatchupManager {
+        use henyey_bucket::BucketManager;
+        use henyey_db::Database;
+
+        let db = Database::open_in_memory().expect("in-memory db");
+        let tmp_dir = tempfile::tempdir().expect("temp dir");
+        let bucket_manager = BucketManager::new(tmp_dir.keep()).expect("bucket manager");
+        let archive = crate::HistoryArchive::new("https://example.com").expect("archive");
+        CatchupManager::new(vec![archive], bucket_manager, db)
+    }
+
+    /// Build a `LedgerData` for ledger `seq` whose
+    /// `header.previous_ledger_hash` is `prev_hash`. The accompanying
+    /// `LclContext` carries the same hash as its `lcl_hash`, so the
+    /// `(None, None)` arm of `LedgerData::new` (which validates
+    /// `header.previous_ledger_hash == lcl.lcl_hash()`) succeeds.
+    ///
+    /// `.expect("valid LedgerData")` is intentional: a misconstructed
+    /// helper surfaces as a clear panic at construction time rather
+    /// than as a confusing `HistoryError::VerificationFailed` bubbling
+    /// out of `verify_knit_to_lcl` later.
+    fn make_apply_ledger_data(seq: u32, prev_hash: Hash256) -> LedgerData {
+        use henyey_common::protocol::LclContext;
+        use stellar_xdr::curr::LedgerHeader;
+
+        let mut header = LedgerHeader::default();
+        header.ledger_seq = seq;
+        header.previous_ledger_hash = stellar_xdr::curr::Hash(prev_hash.0);
+
+        let lcl = LclContext::new(0, prev_hash);
+        LedgerData::new(header, None, None, &lcl).expect("valid LedgerData")
+    }
+
+    #[test]
+    fn test_verify_knit_to_lcl_happy_path_mixed() {
+        // LCL = 100, lcl_hash = H100, previous_ledger_hash = H99.
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        let manager = make_test_catchup_manager();
+
+        // Three knit entries spanning cases 1/2/3 — each must classify
+        // as Skip inside the loop, exercising 3 iterations of the body.
+        let knit_entries = vec![
+            make_test_entry(98, h(0x99), h(0x88)), // case 1 (skip-old): hashes irrelevant
+            make_test_entry(99, h(0x09), h(0x08)), // case 2: entry.hash == lcl.previous_ledger_hash
+            make_test_entry(100, h(0x10), h(0x09)), // case 3: entry.hash == lcl.hash
+        ];
+
+        // apply_data[0] is the one that exercises the wrapper's
+        // virtual-entry synthesis (case 4): its `previous_ledger_hash`
+        // must equal `lcl.hash`. apply_data[1] is included to confirm
+        // the wrapper only consults `.first()`; its own previous-hash
+        // chains off `compute_header_hash(apply_data[0].header)`.
+        //
+        // Note: the synthesized virtual entry's *own* `hash` field is
+        // irrelevant on the case-4 branch — `knit_to_lcl_decision`
+        // only reads `header.previous_ledger_hash` for Apply.
+        let ledger_101 = make_apply_ledger_data(101, h(0x10));
+        let hash_101 = henyey_ledger::compute_header_hash(ledger_101.header())
+            .expect("compute hash for ledger 101");
+        let ledger_102 = make_apply_ledger_data(102, hash_101);
+        let apply_data = vec![ledger_101, ledger_102];
+
+        manager
+            .verify_knit_to_lcl(&knit_entries, &apply_data, &lcl)
+            .expect("happy path must succeed");
+    }
+
+    #[test]
+    fn test_verify_knit_to_lcl_tampered_knit_entry_returns_fatal() {
+        // LCL = 100, lcl_hash = H100, previous_ledger_hash = H99.
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        let manager = make_test_catchup_manager();
+        // apply_data is irrelevant — the loop must error out before
+        // we reach the `.first()` branch.
+        let apply_data = vec![make_apply_ledger_data(101, h(0x10))];
+
+        // (a) Mid-loop failure on the *second* iteration: case 2 passes,
+        // case 3 hash is tampered. This proves `?` propagates from
+        // inside the loop, not just from the first iteration.
+        {
+            let knit_entries = vec![
+                make_test_entry(99, h(0x09), h(0x08)),  // case 2 ok
+                make_test_entry(100, h(0xBB), h(0x09)), // case 3 mismatch (entry.hash != lcl.hash)
+            ];
+            let err = manager
+                .verify_knit_to_lcl(&knit_entries, &apply_data, &lcl)
+                .expect_err("tampered case-3 entry must produce fatal");
+            assert!(
+                matches!(err, HistoryError::KnitLclHashMismatch { .. }),
+                "expected KnitLclHashMismatch, got {err:?}",
+            );
+        }
+
+        // (b) First-iteration failure with a *different* variant —
+        // confirms the loop does not remap or swallow distinct error
+        // variants from `knit_to_lcl_decision`.
+        {
+            let knit_entries = vec![
+                make_test_entry(99, h(0xAA), h(0x08)), // case 2 mismatch (entry.hash != lcl.previous_ledger_hash)
+            ];
+            let err = manager
+                .verify_knit_to_lcl(&knit_entries, &apply_data, &lcl)
+                .expect_err("tampered case-2 entry must produce fatal");
+            assert!(
+                matches!(err, HistoryError::KnitLclPredecessorHashMismatch { .. }),
+                "expected KnitLclPredecessorHashMismatch, got {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_knit_to_lcl_empty_apply_data_noop() {
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        let manager = make_test_catchup_manager();
+
+        // No knit entries, no apply data: pure no-op, must Ok.
+        manager
+            .verify_knit_to_lcl(&[], &[], &lcl)
+            .expect("empty inputs must be a no-op");
+
+        // Skip-only knit entries with empty apply data: the loop runs
+        // but the `apply_data.first()` branch is skipped — no panic,
+        // no error.
+        let knit_entries = vec![
+            make_test_entry(99, h(0x09), h(0x08)),  // case 2
+            make_test_entry(100, h(0x10), h(0x09)), // case 3
+        ];
+        manager
+            .verify_knit_to_lcl(&knit_entries, &[], &lcl)
+            .expect("skip-only entries with empty apply_data must succeed");
+    }
+
     /// Verify REPLAY_RETRY_COUNT matches stellar-core's RETRY_A_FEW = 5.
     #[test]
     fn test_replay_retry_count_matches_stellar_core() {
