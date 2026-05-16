@@ -93,7 +93,7 @@ metric_sum = [
 extraction = "form3"
 labels = []
 op = ">="
-threshold = 50
+threshold = 100
 severity = "WARN"
 gates = ["warmup-2-ticks"]
 cooldown_key = "overlay_error_total"
