@@ -47,6 +47,26 @@ Check each of:
    ```
    If a clear duplicate exists, route to `blocked` with a comment pointing at the duplicate.
 
+### Step 3.5 — Classify the kind of change + capture test seed
+
+Every accepted issue gets one of these `kind:` values in the triage report. Downstream skills key off this:
+
+| `kind:` | Meaning | Test obligation |
+|---|---|---|
+| `bug-fix` | Repairs broken behavior. The issue body describes what's wrong | Must include a **regression test** that fails on current `main` and passes on the fix |
+| `feature` | Adds new functionality, new public API, or new behavior | Must include **new tests** exercising every new public function and the new behavior |
+| `refactor` | Restructures code without changing behavior | Existing tests must keep passing; net behavioral diff = 0; usually no new tests required |
+| `docs` | Documentation, comments, READMEs only | No test obligation (but doc-tests must still pass if present) |
+| `test-only` | Test infrastructure / hygiene change (e.g. TempDir leak fix) | The test change IS the deliverable |
+
+**For `bug-fix` kind specifically**, capture a **failing-mode seed** in the triage report — the observable behavior of the bug that the regression test should reproduce. Examples:
+
+- "`assert_eq!` on line 42 of `scp.rs` fires with `expected: 7, got: 9` when fed a 3-validator quorum"
+- "`upload_history` panics with `unwrap` on `None` when `mkdir_cmd` is empty"
+- "Test `test_xyz` hangs >60s; the bug is a deadlock in `tx_set_tracker`"
+
+This seed is what `/plan` and `/do` will use to write the failing test. Without it, the bug-fix can't be TDD'd.
+
 ### Step 4 — Estimate size
 
 Set the `Size` project field to one of `XS`, `S`, `M`, `L`, `XL` based on your reading:
@@ -108,11 +128,21 @@ If well-formed, actionable, and not trivial:
 **Verdict:** ACCEPT
 
 **Type:** <bug|enhancement|documentation>
+**Kind:** <bug-fix|feature|refactor|docs|test-only>
 **Severity:** <critical|high|medium|low|n/a>
 **Crate:** <crate:scp | crate:herder | … | none>
 **Size:** <XS|S|M|L>
 
 **Summary:** <one or two sentences explaining what needs to happen and why>
+
+**Test obligation:** <derived from Kind — see Step 3.5 table>
+
+<For Kind=bug-fix, add this block:>
+
+**Failing-mode seed (for the regression test):**
+- Observable: <what the bug looks like: panic, wrong return, hang, etc.>
+- Reproducer: <minimal scenario that triggers it — fixture, input, config>
+- Where: <crate / file / function the bug lives in>
 
 **Label adjustments:** <list any labels added/removed>
 ```

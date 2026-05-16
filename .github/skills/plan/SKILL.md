@@ -68,10 +68,11 @@ Then post the draft:
 <2–4 paragraphs explaining the design. Include the key data structures or
 control flow changes. Reference specific functions by name where appropriate.>
 
-**Test plan:**
-- <Existing test that must still pass>
-- <New test that captures the fix / new behavior>
-- <Any integration test or fixture update>
+**Test plan** — three explicit lists (omit a list if empty):
+
+- **Regression tests** (required for `kind: bug-fix`): each test must (a) name the file path + test function it will live in, (b) describe what it asserts, (c) state explicitly why it would FAIL on `origin/main` today and PASS after this plan lands. If the kind is `bug-fix` and this list is empty, the plan is incomplete.
+- **New coverage** (required for `kind: feature`): every new public function or new behavioral branch the plan introduces gets at least one test. Name the file path + test function + what it asserts.
+- **Existing tests preserved**: explicit list of relevant existing tests that must keep passing (especially when refactoring touches shared code). These should be in `cargo test -p henyey-<crate>` and verified pre-/post- by `/do`.
 
 **Parity considerations:**
 <If parity-critical: which stellar-core function/file matches, what semantics
@@ -89,10 +90,24 @@ Launch three `general-purpose` agents in parallel — do not wait between them. 
 
 > Read the plan draft on issue #$ISSUE. Independently evaluate: does this plan
 > correctly solve the stated problem? Are there logical errors in the approach?
-> Are there missing edge cases the plan does not address? Are the proposed test
-> cases sufficient to catch regressions? You may read the issue body, the plan,
-> and any source files the plan references. Post your verdict as a PR-style
-> comment with this exact structure:
+> Are there missing edge cases the plan does not address?
+>
+> **Test-plan verification (REVISE-MAJOR if any of the following fails):**
+>
+> - If triage classified `kind: bug-fix`, the Test plan MUST list a regression
+>   test with (a) file path, (b) what it asserts, (c) an explicit claim that
+>   it fails on `origin/main` today. Verify the claim by reading the named
+>   test file's vicinity — if the test would actually pass on main (e.g. the
+>   bug isn't reachable from that test), call it out.
+> - If triage classified `kind: feature`, every new public function the plan
+>   introduces must have at least one test covering its public contract.
+>   Cross-check the file-list against the test-list.
+> - If a refactor is touching parity-critical code, the "Existing tests
+>   preserved" list must name the integration tests in that crate that exercise
+>   the touched behavior.
+>
+> You may read the issue body, the plan, and any source files the plan references.
+> Post your verdict as a PR-style comment with this exact structure:
 >
 > ```markdown
 > ## 🔍 Critic A (correctness) — Round 1
@@ -208,8 +223,12 @@ Post the final plan as a clean, scannable comment. This is the single document `
 **Approach:**
 <final, agreed-upon approach. 2–4 paragraphs. This is what /do reads.>
 
+**Kind:** <bug-fix|feature|refactor|docs|test-only>  *(from triage)*
+
 **Test plan:**
-- <each test>
+- **Regression tests:** <list each; for bug-fix, this section is non-empty>
+- **New coverage:** <list each>
+- **Existing tests preserved:** <list each>
 
 **Parity considerations:**
 <final form, after critic feedback>

@@ -152,11 +152,43 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 ### Reviewer A — Correctness (always)
 
 > Invoke /review on PR #$PR_NUM in stellar-experimental/henyey. Focus on:
-> correctness of the diff, test coverage, readability, error handling. Post
-> your verdict as a single PR-level comment using `gh pr comment`, headed
-> `## 🔍 Reviewer: Correctness`, with `**Verdict:** APPROVE` or
-> `**Verdict:** CHANGES_REQUESTED` on its own line. Inline line comments
-> via `gh api` are welcome for specific concerns.
+> correctness of the diff, test coverage, readability, error handling.
+>
+> **Test verification (REQUEST_CHANGES if any of these fails):**
+>
+> 1. Find the linked issue's `kind:` from its `## Triage Report` comment.
+> 2. For `kind: bug-fix`:
+>    - The PR must include a regression test. Find it by reading the PR body's
+>      `## Regression test` section (which /do should have populated).
+>    - **Verify the regression test would have caught the bug.** Walk the PR
+>      commit list (\`gh pr view $PR_NUM --json commits\`). The test should
+>      have been committed BEFORE the fix. Check out the parent of the fix
+>      commit and run the test:
+>      \`\`\`bash
+>      git fetch origin pull/$PR_NUM/head:pr-$PR_NUM
+>      git checkout <test-commit-sha>
+>      cargo test -p henyey-<crate> <test_fn> 2>&1 | tail -10
+>      \`\`\`
+>      Confirm the test FAILS at that point. If the test passes at the test-
+>      commit, the regression test doesn't actually capture the bug → bounce.
+>    - If the PR body has no \`## Regression test\` section, or the section's
+>      claims don't match what's in the diff, → bounce.
+> 3. For `kind: feature`:
+>    - Every new public function in the diff (search for new \`pub fn\`,
+>      \`pub struct\`, etc. lines) must have at least one test exercising it.
+>      Use \`gh pr diff $PR_NUM\` and grep for new public surface. Cross-check
+>      against the test files in the diff. Untested new public surface →
+>      bounce.
+> 4. For `kind: refactor` / `docs` / `test-only`: existing tests must still
+>    pass (CI will catch this) and the plan's "Existing tests preserved" list
+>    must all be green in CI.
+>
+> Then evaluate logic, error handling, readability per usual.
+>
+> Post your verdict as a single PR-level comment using \`gh pr comment\`,
+> headed \`## 🔍 Reviewer: Correctness\`, with \`**Verdict:** APPROVE\` or
+> \`**Verdict:** CHANGES_REQUESTED\` on its own line. Inline line comments
+> via \`gh api\` are welcome for specific concerns.
 
 ### Reviewer B — Parity OR Risk (auto-detected)
 

@@ -76,12 +76,48 @@ cd "$WORKTREE"
 
 `/data/` is gitignored in the repo. `~/data/` is the shared volume per CLAUDE.md.
 
+### A.2.5 Write the failing test FIRST (TDD)
+
+**This step is mandatory for `kind: bug-fix` and required for `kind: feature`. Skip only for `docs`, `test-only`, or pure `refactor` where the plan explicitly says no new tests.**
+
+For **bug-fix**:
+
+1. From the converged plan's "Regression tests" list, write each named regression test in the named file path. Use the failing-mode seed from triage to guide the assertion.
+2. Run the test against the unmodified code:
+   ```bash
+   cargo test -p henyey-<crate> <test_name> --no-fail-fast 2>&1 | tail -30
+   ```
+3. **Verify it FAILS with the expected error mode.** Capture the failure output (test name + assertion / panic / hang message). If it passes, the test doesn't capture the bug — go back and fix the test before writing the fix.
+4. Commit JUST the failing test:
+   ```bash
+   git add <test files only>
+   git commit -m "$(cat <<'EOF'
+   Regression test for #$ISSUE — fails on current main
+
+   <one-line description of what the test asserts and how it fails>
+
+   Refs #$ISSUE
+
+   Co-authored-by: Claude Code <claude-code@anthropic.com>
+   EOF
+   )"
+   ```
+   This is commit 1 of (at least) 2 — the failing test is its own committed artifact so reviewers can verify it captures the bug.
+
+For **feature**:
+
+1. From the plan's "New coverage" list, write each new test exercising the new public surface (the test will fail because the new public function doesn't exist yet — that's the point).
+2. Run the tests, verify they fail with `unresolved function` / `cannot find` / similar (not yet implemented).
+3. Commit just the failing tests as commit 1.
+
 ### A.3 Implement
 
 Make the changes the plan describes. Stay inside the plan's stated scope — if you discover the plan is wrong or incomplete:
 
 - **Minor:** note it in the PR body's `## Deviations from plan` section and proceed.
 - **Major:** stop, post `## Do: Plan Wrong` on the issue with detail, move issue back to `ready-for-planning`, unassign, exit. Don't silently expand scope.
+
+After implementing, **re-run the regression/new-coverage tests and verify they now PASS**. Capture the passing output. The transition from "fails on commit 1, passes on commit 2" is what makes the test a real regression test (not just any test you happen to add alongside).
 
 ### A.4 Local verification
 
@@ -140,6 +176,14 @@ Closes #$ISSUE
 - [x] cargo fmt --check
 - [x] cargo clippy --all -- -D warnings
 - [x] <test target run> passes
+
+## Regression test (kind: bug-fix only)
+
+- **Test:** \`<file>::\`<test_fn>\`
+- **Pre-fix:** committed as \`<sha-of-test-commit>\` — verified FAILED with: \`<one-line failure mode>\`
+- **Post-fix:** verified PASSES after \`<sha-of-fix-commit>\`
+
+<omit this section for non-bug-fix PRs>
 
 ## Deviations from plan
 
