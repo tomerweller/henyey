@@ -1,15 +1,17 @@
 ---
 name: review-pr
 description: |
-  Run two parallel adversarial PR reviewers and combine their verdicts with CI
-  state into a merge decision. Reviewers post structured comment verdicts (since
-  the agent is the PR author and cannot self-approve via GH native review).
-  Operates on issues in `in-review`. Auto-merges with --admin on triple-green
-  (after filing follow-up issues for any unaddressed inline review comments,
-  so non-critical feedback is preserved as backlog instead of dropped); bounces
-  to `ready-for-doing` on any request-changes or CI red; blocks after 3
-  bounce-back cycles. Use when invoked by /project-tick with an issue in
-  in-review, or manually as /review-pr <issue>.
+  Run two parallel adversarial PR reviewers and combine their verdicts with
+  external PR reviews (GH Copilot bot, humans, other bots) and CI state into a
+  merge decision. Agent reviewers post structured comment verdicts (since the
+  agent is the PR author and cannot self-approve via GH native review).
+  External CHANGES_REQUESTED reviews block merge identically to agent
+  CHANGES_REQUESTED. Operates on issues in `in-review`. Auto-merges with
+  --admin on all-green (after filing follow-up issues for unaddressed inline
+  review comments, so non-critical feedback is preserved as backlog instead of
+  dropped); bounces to `ready-for-doing` on any request-changes or CI red;
+  blocks after 3 bounce-back cycles. Use when invoked by /project-tick with an
+  issue in in-review, or manually as /review-pr <issue>.
 ---
 
 # /review-pr <issue> — adversarial PR review
@@ -168,13 +170,42 @@ For each comment, extract the reviewer name from the first line (`## 🔍 Review
 
 If only one verdict is found, treat the missing one as **pending** (Wait). If both are present, use them. If a reviewer posted twice (e.g. revised verdict), the latest comment wins.
 
-### 6.2 Combine with CI
+### 6.1b Parse external reviewer verdicts (GH Copilot bot, humans, other bots)
 
-Three signals — Reviewer A verdict, Reviewer B verdict, CI state.
+The agent reviewers post structured PR comments (Step 4); but GitHub also tracks native PR reviews from anyone else — GH's Copilot auto-reviewer, human reviewers, third-party bots. Fetch them too and include in the matrix:
 
-- **Reviewer A verdict:** APPROVE / CHANGES_REQUESTED / pending.
-- **Reviewer B verdict:** APPROVE / CHANGES_REQUESTED / pending.
-- **CI state:** green / red / running.
+```bash
+ME=$(gh api user --jq .login)
+
+# Get each distinct external reviewer's LATEST review state. Exclude the
+# agent's own user since gh would have downgraded any --approve to
+# COMMENTED (and the agent uses structured comments for its real verdicts).
+gh api repos/stellar-experimental/henyey/pulls/$PR_NUM/reviews \
+  --paginate --jq --arg me "$ME" '
+    [.[] | select(.user.login != $me)] |
+    group_by(.user.login) |
+    map(max_by(.submitted_at) | {user: .user.login, state, body_head: ((.body // "") | split("\n")[0])})
+  '
+```
+
+Each external reviewer's verdict is the `state` of their latest review:
+
+- `APPROVED` → external approve (nice-to-have, doesn't gate by itself)
+- `CHANGES_REQUESTED` → blocker, treated identically to an agent reviewer's CHANGES_REQUESTED
+- `COMMENTED` → neutral (notes; doesn't gate). The body still gets captured at merge time via the inline-comment follow-up logic in Step 7.
+
+### 6.2 Combine all signals
+
+Required signals — both must be APPROVE or the matrix bounces / waits:
+
+- **Reviewer A verdict** (agent, Correctness): APPROVE / CHANGES_REQUESTED / pending.
+- **Reviewer B verdict** (agent, Parity-or-Risk): APPROVE / CHANGES_REQUESTED / pending.
+
+Additional gate — any external CHANGES_REQUESTED is a blocker:
+
+- **External reviewer states**: union over all non-agent reviewers' latest states. If ANY is `CHANGES_REQUESTED` → bounce as if an agent had CHANGES_REQUESTED. External `APPROVED` and `COMMENTED` are non-blocking.
+
+CI state — same as before: green / red / running.
 
 Apply the outcome matrix:
 
@@ -193,11 +224,12 @@ Apply the outcome matrix:
 
 ### Bounce (PR has issues to address)
 
-| A | B | CI | Action |
-|---|---|---|---|
-| CHANGES_REQUESTED | (any) | (any) | Bounce — A has concerns. |
-| (any) | CHANGES_REQUESTED | (any) | Bounce — B has concerns. |
-| APPROVE | APPROVE | red (diff-attributable) | Bounce — CI is the third reviewer. |
+| A | B | External | CI | Action |
+|---|---|---|---|---|
+| CHANGES_REQUESTED | (any) | (any) | (any) | Bounce — A has concerns. |
+| (any) | CHANGES_REQUESTED | (any) | (any) | Bounce — B has concerns. |
+| (any) | (any) | any CHANGES_REQUESTED | (any) | Bounce — external reviewer (bot or human) has concerns. |
+| APPROVE | APPROVE | none CHANGES_REQUESTED | red (diff-attributable) | Bounce — CI is a reviewer too. |
 
 For diff-attributable vs. unrelated CI red, inspect the failing check's logs:
 
@@ -379,11 +411,14 @@ Post:
 ```markdown
 ## Review: Bounce-Back Cycle <N+1>
 
-**Reason:** <"Reviewer A requested changes" | "Reviewer B requested changes" | "CI failed (diff-attributable)" | "CI failed (unrelated, will rebase)">
+**Reason:** <"Reviewer A requested changes" | "Reviewer B requested changes" | "<external-user> requested changes" | "CI failed (diff-attributable)" | "CI failed (unrelated, will rebase)">
 
 **Reviewer A:** APPROVE | CHANGES_REQUESTED — <one-line summary>
 **Reviewer B:** APPROVE | CHANGES_REQUESTED — <one-line summary>
+**External reviewers:** <list "user: STATE" for each non-agent reviewer with a recent review; omit the section if none>
 **CI:** green | red | running
+
+<If an external reviewer's CHANGES_REQUESTED triggered the bounce, paste the relevant body excerpt and a link to the review so /do Mode B can address it the same way it addresses agent feedback.>
 
 <If CI red, paste the relevant failed-check excerpt via gh run view --log-failed>
 
