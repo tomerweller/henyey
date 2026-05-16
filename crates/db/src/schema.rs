@@ -204,10 +204,10 @@ pub mod state_keys {
     /// for `skipFirstCheckpointSinceItIsIncomplete`).
     ///
     /// Stored as the decimal checkpoint ledger seq. Set transactionally
-    /// by [`CatchupPersistData::write_to_db`] when LCL > genesis and LCL
-    /// is not a checkpoint boundary; consumed and cleared atomically by
-    /// the ledger-close persist transaction when the marked checkpoint
-    /// closes. Always set-or-deleted by the catchup persist path so a
-    /// prior-run marker can never leak into a new catchup terminus.
+    /// by `CatchupPersistData::write_to_db` (in `henyey-app`) when LCL >
+    /// genesis and LCL is not a checkpoint boundary; consumed and cleared
+    /// atomically by the ledger-close persist transaction when the marked
+    /// checkpoint closes. Always set-or-deleted by the catchup persist path
+    /// so a prior-run marker can never leak into a new catchup terminus.
     pub const PUBLISH_SKIP_FIRST_CHECKPOINT: &str = "publishskipfirstcheckpoint";
 }

@@ -35,19 +35,33 @@ fn consume_skip_marker_if_matches(
     checkpoint_seq: u32,
 ) -> Result<bool, henyey_db::DbError> {
     use henyey_db::queries::StateQueries;
-    let skip_target: Option<u32> = conn
-        .get_state(henyey_db::schema::state_keys::PUBLISH_SKIP_FIRST_CHECKPOINT)?
-        .and_then(|s| s.parse::<u32>().ok());
+    let raw = conn.get_state(henyey_db::schema::state_keys::PUBLISH_SKIP_FIRST_CHECKPOINT)?;
+    let skip_target: Option<u32> = match raw.as_deref() {
+        None => None,
+        Some(s) => Some(s.parse::<u32>().map_err(|e| {
+            henyey_db::DbError::Integrity(format!(
+                "PUBLISH_SKIP_FIRST_CHECKPOINT marker value {:?} is not a valid u32: {}",
+                s, e
+            ))
+        })?),
+    };
 
-    // If a marker survives past its target checkpoint, a prior close
-    // failed to clear it — surface that loudly in debug builds.
-    debug_assert!(
-        skip_target.map_or(true, |t| t >= checkpoint_seq),
-        "PUBLISH_SKIP_FIRST_CHECKPOINT marker ({:?}) is older than the current \
-         checkpoint ledger ({}); a prior close should have cleared it",
-        skip_target,
-        checkpoint_seq
-    );
+    // If a marker survives past its target checkpoint, a prior close failed
+    // to clear it. Warn and actively delete so the orphan can't sit in the
+    // `state` table forever (the seq monotone means it would otherwise
+    // never match again).
+    if let Some(t) = skip_target {
+        if t < checkpoint_seq {
+            tracing::warn!(
+                marker = t,
+                ledger_seq = checkpoint_seq,
+                "PUBLISH_SKIP_FIRST_CHECKPOINT marker is older than the closing \
+                 checkpoint; clearing orphaned marker"
+            );
+            conn.delete_state(henyey_db::schema::state_keys::PUBLISH_SKIP_FIRST_CHECKPOINT)?;
+            return Ok(false);
+        }
+    }
 
     if skip_target == Some(checkpoint_seq) {
         tracing::info!(
@@ -3676,6 +3690,39 @@ mod publish_skip_marker_tests {
             .unwrap()
     }
 
+    /// Orphan marker (older than the closing checkpoint) must be actively
+    /// cleared so it cannot sit in the `state` table forever — checkpoint
+    /// seqs only grow past it. The consumer also reports no skip.
+    #[test]
+    fn clears_orphan_marker_older_than_closing_checkpoint() {
+        let db = Database::open_in_memory().unwrap();
+        set_marker(&db, 63);
+        assert!(!run_consumer(&db, 127));
+        assert!(get_marker(&db).is_none());
+    }
+
+    /// Corrupt (non-numeric) marker must surface as an `Integrity` error
+    /// rather than be silently treated as "no marker", per the
+    /// "never fail silently" project rule.
+    #[test]
+    fn errors_on_corrupt_marker_value() {
+        let db = Database::open_in_memory().unwrap();
+        db.with_connection(|c| {
+            c.set_state(state_keys::PUBLISH_SKIP_FIRST_CHECKPOINT, "not-a-number")
+        })
+        .unwrap();
+        let res = db.transaction(|conn| Ok(consume_skip_marker_if_matches(conn, 127)?));
+        match res {
+            Err(henyey_db::DbError::Integrity(msg)) => {
+                assert!(
+                    msg.contains("PUBLISH_SKIP_FIRST_CHECKPOINT"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected DbError::Integrity, got {other:?}"),
+        }
+    }
+
     /// Marker=127, closing seq=127 → consumer reports skip and clears the
     /// marker in the same transaction.
     #[test]
@@ -3741,13 +3788,12 @@ mod publish_skip_marker_tests {
     }
 
     /// After a catchup ending at LCL=80, a marker is set for ckpt=127.
-    /// A close at an earlier checkpoint (63 — impossible in practice but
-    /// the consumer must not consume the marker) preserves the marker; a
-    /// close at exactly 127 consumes it; a close at the next checkpoint
-    /// (191) finds no marker and reports no skip.
+    /// A close at exactly 127 consumes the marker; a close at the next
+    /// checkpoint (191) finds no marker and reports no skip.
     ///
     /// Guards against the marker accidentally outliving its single
-    /// intended skip.
+    /// intended skip. The "earlier-checkpoint-than-marker" direction is
+    /// covered by `preserves_marker_for_future_checkpoint`.
     #[test]
     fn marker_targets_only_the_first_checkpoint_after_catchup() {
         let db = Database::open_in_memory().unwrap();
@@ -3760,11 +3806,6 @@ mod publish_skip_marker_tests {
             publish_enabled: true,
         };
         data.write_to_db(&db).unwrap();
-
-        // Close at an earlier checkpoint must not consume the marker.
-        // (Use a fresh DB shape for this branch — debug_assert fires if
-        // the marker is older than the closing seq, so we test the
-        // future-marker direction here instead.)
 
         // Close at the marked checkpoint consumes it.
         assert!(run_consumer(&db, 127));
