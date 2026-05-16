@@ -197,4 +197,17 @@ pub mod state_keys {
     /// Presence at startup indicates the previous catchup completed
     /// in-memory but crashed before the deferred persist ran (AUDIT-226).
     pub const CATCHUP_PERSIST_PENDING: &str = "catchuppersistpending";
+
+    /// Target checkpoint sequence whose publish-queue enqueue must be
+    /// skipped because the node finished catchup mid-checkpoint, so the
+    /// first checkpoint after catchup is incomplete (stellar-core parity
+    /// for `skipFirstCheckpointSinceItIsIncomplete`).
+    ///
+    /// Stored as the decimal checkpoint ledger seq. Set transactionally
+    /// by `CatchupPersistData::write_to_db` (in `henyey-app`) when LCL >
+    /// genesis and LCL is not a checkpoint boundary; consumed and cleared
+    /// atomically by the ledger-close persist transaction when the marked
+    /// checkpoint closes. Always set-or-deleted by the catchup persist path
+    /// so a prior-run marker can never leak into a new catchup terminus.
+    pub const PUBLISH_SKIP_FIRST_CHECKPOINT: &str = "publishskipfirstcheckpoint";
 }

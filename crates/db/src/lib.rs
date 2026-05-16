@@ -70,6 +70,9 @@ pub use error::DbError;
 
 pub use pool::Database;
 pub use queries::*;
+/// Re-export of `rusqlite` so downstream crates can name `rusqlite::Connection`
+/// without taking a direct dependency on the crate.
+pub use rusqlite;
 pub use scp_persistence::SqliteScpPersistence;
 
 /// Result type for database operations.

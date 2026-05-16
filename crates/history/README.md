@@ -149,7 +149,7 @@ println!("ledger {} closed at {}", header.ledger_seq, header.scp_value.close_tim
 - Ledger-header history entries are verified by recomputing `SHA256(XDR(header))` before their advertised hashes are trusted, matching stellar-core's catchup chain verification.
 - Protocol 23+ replay maintains both the live bucket list and the hot-archive bucket list, and verification uses `SHA256(live_hash || hot_archive_hash)`.
 - `HistoryArchiveState::differing_bucket_hashes()` mirrors stellar-core's inhibited bottom-up bucket diff algorithm so catchup can avoid re-downloading buckets already implied by local state.
-- `CheckpointBuilder` uses `.dirty` files plus durable rename so partially written checkpoints never become visible as final archive outputs.
+- `CheckpointBuilder` uses `.dirty` files plus durable rename so partially written checkpoints never become visible as final archive outputs. Unlike stellar-core, henyey's `CheckpointBuilder` only handles startup crash-recovery cleanup — there is no per-ledger append path (checkpoint files are reconstructed from SQLite at publish time). The parity equivalent of stellar-core's `skipFirstCheckpointSinceItIsIncomplete` is therefore enforced one level up, at the publish-queue enqueue site in `henyey-app`'s `LedgerPersistInputs::serialize_and_write_to_db` (see `PARITY_STATUS.md`).
 - Publish-queue backpressure mirrors stellar-core's hysteresis thresholds with `PUBLISH_QUEUE_MAX_SIZE` and `PUBLISH_QUEUE_UNBLOCK_APPLICATION`.
 
 ## stellar-core Mapping

@@ -310,6 +310,7 @@ impl App {
                 header: final_header.clone(),
                 header_xdr,
                 has_json,
+                publish_enabled: self.is_validator && self.config.history.publish_enabled(),
             });
 
             tracing::info!(
