@@ -180,7 +180,7 @@ notes = ""
 
 [[alarm]]
 name = "quorum-fail-at-low"
-baseline_version = 1  # introduced in #2711: threshold tightened from <=1 to <=0 to eliminate mainnet steady-state floor false-positive
+baseline_version = 2  # bumped in #2711: threshold tightened from <=1 to <=0 to eliminate mainnet steady-state floor false-positive (invalidates prior acks)
 semantic_change_date = "2026-05-16T00:00:00Z"  # tightened threshold per #2711 (was <=1, structurally fired at healthy mainnet floor)
 metric = "stellar_quorum_fail_at"
 kind = "gauge"
