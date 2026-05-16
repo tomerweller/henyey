@@ -123,9 +123,8 @@ const PENDING_TX_SET_MAX_AGE_SECS: u64 = 120;
 /// Interval for garbage-collecting unreferenced persisted transaction sets.
 ///
 /// Parity: stellar-core `Herder.cpp:22` — `TX_SET_GC_DELAY = 1 minute`.
-/// Not yet used by a runtime timer (persistence manager is not wired into
-/// the production lifecycle loop). Defined here for parity documentation.
-#[allow(dead_code)]
+/// Driven by the app event loop, which calls
+/// [`Herder::purge_persisted_tx_sets`] on a tokio interval.
 pub const TX_SET_GC_DELAY_SECS: u64 = 60;
 
 /// Result of receiving an SCP envelope.
@@ -497,6 +496,14 @@ pub struct Herder {
     >,
     /// Shared SCP metrics counters.
     scp_metrics: Arc<crate::metrics::ScpMetrics>,
+    /// SCP state persistence manager, installed after construction via
+    /// [`Self::set_scp_persistence`]. Used by [`Self::purge_persisted_tx_sets`]
+    /// to GC unreferenced tx sets on the app event loop's 60s timer.
+    ///
+    /// `OnceLock` enforces single-installer at the type level: tests that
+    /// don't install a manager simply leave it empty (purge becomes a no-op),
+    /// while production install exactly once in `init_herder`.
+    scp_persistence: std::sync::OnceLock<Arc<crate::persistence::ScpPersistenceManager>>,
 }
 
 impl Herder {
@@ -699,6 +706,7 @@ impl Herder {
             scp_verifier_handle,
             verified_rx: std::sync::Mutex::new(verified_rx),
             scp_metrics,
+            scp_persistence: std::sync::OnceLock::new(),
         }
     }
 
@@ -716,6 +724,42 @@ impl Herder {
         &self,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<crate::scp_verify::VerifiedEnvelope>> {
         self.verified_rx.lock().ok()?.take()
+    }
+
+    /// Install the SCP state persistence manager.
+    ///
+    /// Called once from `init_herder` after the `Arc<Herder>` is constructed.
+    /// `OnceLock` enforces single-installer at the type-system level: a second
+    /// call returns `Err` with the supplied manager so the caller can fail loud.
+    pub fn set_scp_persistence(
+        &self,
+        manager: Arc<crate::persistence::ScpPersistenceManager>,
+    ) -> std::result::Result<(), Arc<crate::persistence::ScpPersistenceManager>> {
+        self.scp_persistence.set(manager)
+    }
+
+    /// Purge persisted tx sets that are no longer referenced by any persisted
+    /// SCP state. No-op if no persistence manager has been installed.
+    ///
+    /// Called inline from the app event loop's `tx_set_gc_interval` branch
+    /// (every [`TX_SET_GC_DELAY_SECS`] seconds), matching stellar-core's
+    /// `HerderImpl::startTxSetGCTimer()` (`HerderImpl.cpp:2440-2444`) /
+    /// `purgeOldPersistedTxSets()` (`HerderImpl.cpp:2448-2487`) cadence.
+    ///
+    /// TODO(#2770): the underlying `purge_unreferenced_tx_sets()` performs
+    /// three serial connection checkouts — `get_all_tx_set_hashes`,
+    /// `load_all_scp_states`, `delete_tx_sets_by_hashes` — without a single
+    /// SQLite transaction. Today this is harmless because `persist_scp_state`
+    /// (#2768) is unwired; once it is wired, a concurrent persist between
+    /// steps 2 and 3 could mark a fresh tx-set as orphan. Make transactional
+    /// when persist is wired.
+    pub fn purge_persisted_tx_sets(&self) {
+        let Some(manager) = self.scp_persistence.get() else {
+            return;
+        };
+        if let Err(e) = manager.purge_unreferenced_tx_sets() {
+            error!(error = %e, "Failed to purge unreferenced persisted tx sets");
+        }
     }
 
     /// Set runtime upgrade parameters (called from HTTP `/upgrades?mode=set`).
@@ -7413,6 +7457,107 @@ mod tests {
              is_current_ledger path returns FullyValidated which does not \
              clear the slot's fully_validated flag"
         );
+    }
+
+    // -------- Tests for SCP persistence wiring (#2698) --------
+
+    fn make_persist_envelope_with_tx_set_hash(
+        slot: u64,
+        tx_set_hash: stellar_xdr::curr::Hash,
+    ) -> stellar_xdr::curr::ScpEnvelope {
+        let stellar_value = StellarValue {
+            tx_set_hash,
+            close_time: TimePoint(0),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let value = stellar_value.to_xdr(Limits::none()).unwrap();
+        stellar_xdr::curr::ScpEnvelope {
+            statement: ScpStatement {
+                node_id: XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::curr::Uint256([0u8; 32]),
+                )),
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    votes: vec![Value(value.try_into().unwrap())].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: XdrSignature::default(),
+        }
+    }
+
+    #[test]
+    fn test_purge_persisted_tx_sets_no_manager() {
+        let herder = make_test_herder();
+        // No persistence manager installed — must be a guarded no-op.
+        herder.purge_persisted_tx_sets();
+    }
+
+    #[test]
+    fn test_purge_persisted_tx_sets_with_manager_removes_orphans() {
+        let herder = make_test_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(
+            herder.set_scp_persistence(Arc::clone(&manager)).is_ok(),
+            "first install should succeed"
+        );
+
+        let referenced_hash = stellar_xdr::curr::Hash([1u8; 32]);
+        let orphan_hash = stellar_xdr::curr::Hash([2u8; 32]);
+
+        // Drive setup through the public manager API: persist an envelope
+        // referencing `referenced_hash`, but pass BOTH tx sets through so the
+        // backend stores both (only `referenced_hash` is reachable from the
+        // envelope).
+        let env = make_persist_envelope_with_tx_set_hash(100, referenced_hash.clone());
+        manager
+            .persist_scp_state(
+                100,
+                &[env],
+                &[
+                    (referenced_hash.clone(), vec![10]),
+                    (orphan_hash.clone(), vec![20]),
+                ],
+                &[],
+            )
+            .expect("persist_scp_state");
+
+        // Sanity check: both tx sets should currently be present.
+        assert!(manager.has_tx_set(&referenced_hash).unwrap());
+        assert!(manager.has_tx_set(&orphan_hash).unwrap());
+
+        // Run the production GC entry point.
+        herder.purge_persisted_tx_sets();
+
+        assert!(
+            manager.has_tx_set(&referenced_hash).unwrap(),
+            "referenced tx set must be retained"
+        );
+        assert!(
+            !manager.has_tx_set(&orphan_hash).unwrap(),
+            "orphan tx set must be purged"
+        );
+    }
+
+    #[test]
+    fn test_set_scp_persistence_rejects_double_install() {
+        let herder = make_test_herder();
+        let manager1 = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        let manager2 = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+
+        assert!(
+            herder.set_scp_persistence(manager1).is_ok(),
+            "first install must succeed"
+        );
+        let returned = herder
+            .set_scp_persistence(manager2)
+            .err()
+            .expect("second install must fail");
+        // OnceLock::set returns the supplied value back on Err; verify we
+        // got the same Arc back uniquely.
+        assert_eq!(Arc::strong_count(&returned), 1);
     }
 }
 

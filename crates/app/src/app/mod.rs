@@ -902,7 +902,8 @@ pub struct App {
     ///        12=try_apply_buffered, 13=maybe_buffered_catchup,
     ///        14=catchup_running, 15=heartbeat,
     ///        31=scp_verifier (pump_scp_intake: pre-filter + verifier enqueue),
-    ///        32=scp_verified (draining verified envelopes)
+    ///        32=scp_verified (draining verified envelopes),
+    ///        33=tx_set_gc (purge unreferenced persisted tx sets)
     event_loop_phase: Arc<AtomicU64>,
 
     /// Fine-grained sub-phase code for pinpointing a stall inside a
@@ -1618,6 +1619,17 @@ impl App {
             .set_account_provider(Arc::new(types::LedgerAccountProvider {
                 ledger_manager: ledger_manager.clone(),
             }));
+
+        // Wire SCP state persistence so the app event loop's tx_set_gc timer
+        // (lifecycle.rs, phase 33) has something to purge. Parity:
+        // stellar-core `HerderImpl::startTxSetGCTimer()` (HerderImpl.cpp:2440).
+        let scp_persistence = henyey_herder::SqliteScpPersistence::new(db.clone());
+        let scp_persistence_manager = Arc::new(henyey_herder::ScpPersistenceManager::new(
+            Box::new(scp_persistence),
+        ));
+        if herder.set_scp_persistence(scp_persistence_manager).is_err() {
+            panic!("set_scp_persistence called more than once");
+        }
 
         if let Some(qs) = herder.local_quorum_set() {
             let hash = hash_quorum_set(&qs);
@@ -3399,7 +3411,8 @@ pub(crate) const WATCHDOG_PHASE_LEGEND: &str = "\
     20=stats, 21=tx_advert, 22=tx_demand, 23=survey, \
     24=survey_req, 25=survey_phase, 26=scp_timeout, \
     27=ping, 28=peer_maint, 29=peer_refresh, \
-    30=herder_cleanup, 31=scp_verifier, 32=scp_verified.";
+    30=herder_cleanup, 31=scp_verifier, 32=scp_verified, \
+    33=tx_set_gc.";
 
 /// Name of the structured tracing field emitted by
 /// [`WatchdogSnapshot::emit_error()`].
@@ -6841,6 +6854,7 @@ mod tests {
             "30=herder_cleanup",
             "31=scp_verifier",
             "32=scp_verified",
+            "33=tx_set_gc",
         ];
         for entry in &expected {
             assert!(

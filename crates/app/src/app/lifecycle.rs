@@ -353,6 +353,18 @@ impl App {
         peer_refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut herder_cleanup_interval = tokio::time::interval(Duration::from_secs(30));
         herder_cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Arm the first tick at +TX_SET_GC_DELAY_SECS rather than firing
+        // immediately on entry, to mirror stellar-core's
+        // VirtualTimer::expires_from_now(TX_SET_GC_DELAY) shape
+        // (HerderImpl.cpp:2442). Functionally harmless either way (the purge
+        // is idempotent and a no-op on an empty DB), but matches upstream
+        // cadence exactly.
+        let tx_set_gc_period = Duration::from_secs(henyey_herder::TX_SET_GC_DELAY_SECS);
+        let mut tx_set_gc_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + tx_set_gc_period,
+            tx_set_gc_period,
+        );
+        tx_set_gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Get mutable access to SCP envelope receiver
         let mut scp_rx = self.scp_envelope_rx.lock().await;
@@ -1102,6 +1114,17 @@ impl App {
                 _ = herder_cleanup_interval.tick() => {
                     self.set_phase(30); // 30 = herder_cleanup
                     self.herder.cleanup();
+                }
+
+                // Periodic GC of unreferenced persisted SCP tx sets.
+                // Parity: stellar-core HerderImpl::startTxSetGCTimer() at
+                // HerderImpl.cpp:2440-2444. Called inline (no spawn_blocking)
+                // to match stellar-core's strictly serial reschedule cadence
+                // and to avoid a fire-and-forget task surviving select! exit
+                // on shutdown.
+                _ = tx_set_gc_interval.tick() => {
+                    self.set_phase(33); // 33 = tx_set_gc
+                    self.herder.purge_persisted_tx_sets();
                 }
 
                 // Shutdown signal (lowest priority)
