@@ -180,24 +180,27 @@ notes = ""
 
 [[alarm]]
 name = "quorum-fail-at-low"
+baseline_version = 2  # bumped in #2711: threshold tightened from <=1 to <=0 to eliminate mainnet steady-state floor false-positive (invalidates prior acks)
+semantic_change_date = "2026-05-16T00:00:00Z"  # tightened threshold per #2711 (was <=1, structurally fired at healthy mainnet floor)
 metric = "stellar_quorum_fail_at"
 kind = "gauge"
 extraction = "form1"
 labels = []
 op = "<="
-threshold = 1
+threshold = 0
 for_ticks = 3
 severity = "WARN"
 gates = ["synced-only", "validator-only", "warmup-2-ticks"]
 cooldown_key = "stellar_quorum_fail_at_low"
 cooldown_seconds = 1800
-filing_title = "metrics: stellar_quorum_fail_at — value={value} (quorum degraded)"
+filing_title = "metrics: stellar_quorum_fail_at — value={value} (quorum critical)"
 filing_search = "metrics: stellar_quorum_fail_at"
-summary = "Quorum fail-at low (degraded quorum health)"
+summary = "Quorum fail-at critical (one drop wedges or already v-blocked)"
 details = "value={value} threshold={threshold}"
-notes = "Covers fail_at==1 (one failure causes v-blocking) and fail_at==0 (already v-blocked). Monitor-tick files issues; Grafana rules 3a/3b handle tiered paging. Short cooldown (30min) ensures fail_at=0 is not suppressed by prior fail_at=1 filing. warmup-2-ticks gate suppresses post-restart false positives while quorum health rebuilds (5 monitor ticks total before firing: 2 warmup + 3 for_ticks)."
+notes = "Fires only when fail_at <= 0 (metric form excludes self; 0 means one more peer failure v-blocks consensus, or we are already v-blocked). On mainnet's standard topology (4 orgs × inner-3/outer-6 validators) the closest v-blocking set is 2 nodes, so the exclude-self metric floor is 1 even at full health (agree=21, missing=0); the previous <=1 threshold fired structurally on this steady state — see #2711. Related: #2614 (post-restart transient, handled by warmup-2-ticks gate), #2624 (real degradation with missing=1, still caught when fail_at reaches 0). Monitor-tick now collapses onto Grafana's critical tier (< 1); Grafana's separate == 1 warn tier remains for fleet-wide visibility (severity remains WARN per monitor-tick paging policy — the \"critical tier\" wording refers to Grafana's tier label, not paging severity). Short cooldown (30min) ensures repeated fail_at=0 events are not suppressed."
 # NOTE: surface mirror, NOT threshold-identical. Monitor-tick uses per-tick
-# gauge <= 1 with 3-tick persistence; Grafana uses == 1 / < 1 with 5m for-duration.
+# gauge <= 0 with 3-tick persistence (critical-tier semantics); Grafana uses
+# == 1 warn / < 1 critical with 5m for-duration.
 
 [[alarm]]
 name = "peer-count-low"

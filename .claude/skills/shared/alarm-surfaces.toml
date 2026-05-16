@@ -38,9 +38,9 @@ notes = "Different detection semantics (any vs rate)"
 alarm = "Quorum fail-at"
 toml_name = "quorum-fail-at-low"
 grafana_uid = ["henyey-quorum-failat-warn", "henyey-quorum-failat-crit"]
-monitor_tick = "gauge ≤ 1, WARN, 3 ticks"
+monitor_tick = "gauge ≤ 0, WARN, 3 ticks"
 grafana = "== 1 warn / < 1 critical, 5m"
-notes = "Monitor-tick collapses tiers; Grafana escalates"
+notes = "Monitor-tick collapses tiers onto Grafana's critical (< 1); Grafana's == 1 warn tier remains fleet-wide visibility only"
 
 [[mirrored]]
 alarm = "Post-catchup reset"
