@@ -6,6 +6,7 @@ description: |
   for its current state. Safe to run in parallel — concurrency via GitHub assignee
   race. Use proactively when the user asks to "run a tick", "pick up an issue",
   "process the board", or via the loop driver at scripts/project-tick-loop.sh.
+model: claude-haiku-4.5
 ---
 
 # /project-tick — pipeline dispatcher
@@ -196,14 +197,18 @@ If we lose the race, exit cleanly — the next `/project-tick` will pick a diffe
 
 ### Step 5 — Dispatch
 
-Based on the issue's status, invoke the specialist skill **as a foreground sub-agent** so its work stays in its own context window AND the parent waits for it. Use the `general-purpose` agent type with explicit instructions to run the slash command.
+Based on the issue's status, invoke the specialist skill **as a foreground sub-agent** so its work stays in its own context window AND the parent waits for it. Use the `general-purpose` agent type with explicit instructions to run the slash command, and **specify the model explicitly for the stage** (cost/capability balance):
 
-| Status | Sub-agent invocation |
-|---|---|
-| `backlog` | `Run /triage $ISSUE. Report the final state transition.` |
-| `ready-for-planning` | `Run /plan $ISSUE. Report the final state transition.` |
-| `ready-for-doing` | `Run /do $ISSUE. Report the final state transition.` |
-| `in-review` | `Run /review-pr $ISSUE. Report the final state transition.` |
+| Status | Model | Sub-agent invocation |
+|---|---|---|
+| `backlog` | `claude-haiku-4.5` | `Run /triage $ISSUE. Report the final state transition.` |
+| `ready-for-planning` | `gpt-5.4` | `Run /plan $ISSUE. Report the final state transition.` |
+| `ready-for-doing` | `claude-opus-4.6` | `Run /do $ISSUE. Report the final state transition.` |
+| `in-review` | `gpt-5.4` | `Run /review-pr $ISSUE. Report the final state transition.` |
+
+Pass the model explicitly when invoking the sub-agent (e.g. via `--model <model>` on copilot agent dispatch, or the `model:` parameter on the Agent tool call). Don't let it inherit from the orchestrator's model.
+
+**Rationale:** triage and orchestration are simple decision tasks (haiku is plenty). Implementation needs strong code-writing (opus). Plan-critics and PR-reviewers benefit from cross-model diversity (gpt-5.4 catches what an all-claude pipeline might miss).
 
 **Critical: the sub-agent MUST run in the foreground.** Do not set `run_in_background: true` on the Agent tool call. The dispatcher's job is to block until the specialist either completes the full state transition OR posts a failure marker (`## Blocked`, `## Plan: ...`, etc.) — anything less leaves work orphaned mid-flight (commit pushed but no PR open, etc.).
 

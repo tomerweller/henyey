@@ -8,6 +8,7 @@ description: |
   or re-review request (Mode B). `blocked` on unrecoverable failure. Use when
   invoked by /project-tick with an issue in ready-for-doing, or manually as
   /do <issue>.
+model: claude-opus-4.6
 ---
 
 # /do <issue> — implementation

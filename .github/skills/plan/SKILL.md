@@ -7,6 +7,7 @@ description: |
   `ready-for-doing` on convergence (or `blocked` if critics still disagree
   after two rounds). Use when invoked by /project-tick with an issue in
   ready-for-planning, or manually as /plan <issue>.
+model: gpt-5.4
 ---
 
 # /plan <issue> — adversarial plan drafting
@@ -82,7 +83,7 @@ must be preserved. If not parity-critical: write "n/a — non-parity path".>
 
 ## Step 3 — Round 1: Spawn 3 critics in parallel
 
-Launch three `general-purpose` agents in parallel — do not wait between them. Each gets the issue number, the plan-draft comment ID, and a focused brief:
+Launch three `general-purpose` agents in parallel — do not wait between them. **Each critic must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity is the whole point of the critic step. Each gets the issue number, the plan-draft comment ID, and a focused brief:
 
 ### Critic A — Correctness
 

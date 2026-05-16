@@ -12,6 +12,7 @@ description: |
   dropped); bounces to `ready-for-doing` on any request-changes or CI red;
   blocks after 3 bounce-back cycles. Use when invoked by /project-tick with an
   issue in in-review, or manually as /review-pr <issue>.
+model: gpt-5.4
 ---
 
 # /review-pr <issue> — adversarial PR review
@@ -122,7 +123,7 @@ Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
 ## Step 4 — Spawn 2 reviewers in parallel
 
-Launch both as `general-purpose` foreground sub-agents. Do not wait between them.
+Launch both as `general-purpose` foreground sub-agents. Do not wait between them. **Each reviewer must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity catches issues a same-model pipeline would miss.
 
 **Why structured comments, not `gh pr review --approve`:** the authenticated GH user is the PR author (the same user opened the PR via `/do` and now reviews it). GitHub disallows author self-approval, so `gh pr review --approve` is silently downgraded to a comment by `gh`. Instead, each reviewer posts a structured comment with a verdict marker that `/review-pr` parses in Step 6.
 
