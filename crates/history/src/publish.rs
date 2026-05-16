@@ -296,7 +296,9 @@ pub fn build_history_archive_state(
 
     let mut has = HistoryArchiveState {
         version,
-        server: Some("rs-stellar-core".to_string()),
+        server: Some(henyey_common::version::build_version_string(env!(
+            "CARGO_PKG_VERSION"
+        ))),
         current_ledger: ledger_seq,
         network_passphrase,
         current_buckets,
@@ -2167,5 +2169,23 @@ mod tests {
 
         let infos = build_live_level_version_infos(bl.levels(), &has.current_buckets).unwrap();
         validate_bucket_list_structure(&infos, BUCKET_LIST_LEVELS).unwrap();
+    }
+
+    /// HAS `server` field must self-identify as henyey, matching stellar-core's
+    /// `HistoryArchiveState() : server(STELLAR_CORE_VERSION)` convention
+    /// (HistoryArchive.cpp:533). Issue #2755.
+    #[test]
+    fn test_build_history_archive_state_server_field() {
+        let bl = BucketList::new();
+        let has = build_history_archive_state(0, &bl, None, None).unwrap();
+        let server = has.server.as_deref().expect("server must be set");
+        assert!(
+            server.starts_with("henyey-v"),
+            "server must start with henyey-v, got: {server:?}"
+        );
+        assert_eq!(
+            server,
+            henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION"))
+        );
     }
 }

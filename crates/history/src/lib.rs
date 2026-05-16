@@ -720,7 +720,9 @@ impl HistoryArchiveManager {
 
         let has = HistoryArchiveState {
             version: 1,
-            server: Some("rs-stellar-core".to_string()),
+            server: Some(henyey_common::version::build_version_string(env!(
+                "CARGO_PKG_VERSION"
+            ))),
             current_ledger: 0,
             network_passphrase: Some(self.network_passphrase.clone()),
             current_buckets: vec![empty_level; henyey_bucket::BUCKET_LIST_LEVELS],
@@ -1001,7 +1003,14 @@ mod archive_manager_tests {
 
         assert_eq!(has.version, 1, "empty HAS must use version 1");
         assert_eq!(has.current_ledger, 0);
-        assert_eq!(has.server.as_deref(), Some("rs-stellar-core"));
+        let expected_server =
+            henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION"));
+        assert!(
+            has.server.as_deref().unwrap().starts_with("henyey-v"),
+            "server must start with henyey-v, got: {:?}",
+            has.server
+        );
+        assert_eq!(has.server.as_deref(), Some(expected_server.as_str()));
         assert_eq!(has.network_passphrase.as_deref(), Some(passphrase));
         assert!(
             has.hot_archive_buckets.is_none(),
@@ -1145,11 +1154,18 @@ mod archive_manager_tests {
         );
 
         // The pre-existing stale bytes must have been overwritten with the
-        // canonical empty HAS (version=1, server=rs-stellar-core, ...).
+        // canonical empty HAS (version=1, server=henyey-v<version>, ...).
         let has: HistoryArchiveState = serde_json::from_slice(&pseudo_bytes).unwrap();
         assert_eq!(has.version, 1);
         assert_eq!(has.current_ledger, 0);
-        assert_eq!(has.server.as_deref(), Some("rs-stellar-core"));
+        let expected_server =
+            henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION"));
+        assert!(
+            has.server.as_deref().unwrap().starts_with("henyey-v"),
+            "server must start with henyey-v, got: {:?}",
+            has.server
+        );
+        assert_eq!(has.server.as_deref(), Some(expected_server.as_str()));
         assert_eq!(has.network_passphrase.as_deref(), Some(passphrase));
         assert!(has.hot_archive_buckets.is_none());
         assert_eq!(
