@@ -390,6 +390,17 @@ const FIRST_PROTOCOL_SHADOWS_REMOVED: u32 = 12;
 /// Empty buckets have version 0 and are skipped until the first non-empty bucket
 /// is seen (bottom-up). After a non-empty bucket, all higher-level buckets
 /// must satisfy the version constraint.
+///
+/// # Equivalence note
+///
+/// Stellar-core's `validateBucketListHelper` flips its `nonEmptySeen` flag from
+/// `!bucket->isEmpty()`, while this implementation flips it from `version > 0`.
+/// For protocol 24+ (the only protocol range henyey supports — see
+/// `crates/henyey/Cargo.toml` and the project README) every non-empty bucket
+/// carries a leading metaentry with `ledger_version >= 11`, so the two
+/// formulations are equivalent. Older protocols (pre-11) could in principle
+/// produce a non-empty bucket without a metaentry (`version == 0`), but those
+/// are out of scope for this codebase.
 pub fn validate_bucket_list_structure(
     levels: &[BucketLevelVersionInfo],
     expected_level_count: usize,

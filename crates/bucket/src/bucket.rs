@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
@@ -58,6 +58,14 @@ enum BucketStorage {
         entries: Arc<Vec<BucketEntry>>,
         /// Map from ledger key to entry index for O(1) lookups.
         key_index: Arc<HashMap<LedgerKey, usize>>,
+        /// Cached protocol version computed once from the leading metaentry.
+        ///
+        /// Mirrors the cache on `DiskBucket` for the disk-backed variant so
+        /// `Bucket::protocol_version()` is O(1) after first access regardless
+        /// of storage mode. `Some(Some(v))` = metaentry with `ledger_version=v`,
+        /// `Some(None)` = no metaentry / empty bucket. The `Arc` lets clones
+        /// share a single computation.
+        protocol_version: Arc<OnceLock<Option<u32>>>,
     },
     /// Entries stored on disk with a compact index for on-demand loading.
     DiskBacked {
@@ -153,6 +161,7 @@ impl Bucket {
             storage: BucketStorage::InMemory {
                 entries: Arc::new(Vec::new()),
                 key_index: Arc::new(HashMap::new()),
+                protocol_version: Arc::new(OnceLock::new()),
             },
             // Empty bucket with shared state at offset 0 - matches stellar-core where mEntries is empty vector
             level_zero_state: LevelZeroState::SharedWithStorage { metadata_count: 0 },
@@ -262,6 +271,7 @@ impl Bucket {
             storage: BucketStorage::InMemory {
                 entries: Arc::new(entries),
                 key_index: Arc::new(key_index),
+                protocol_version: Arc::new(OnceLock::new()),
             },
             level_zero_state: LevelZeroState::None,
         })
@@ -296,7 +306,11 @@ impl Bucket {
         }
         Ok(Self {
             hash,
-            storage: BucketStorage::InMemory { entries, key_index },
+            storage: BucketStorage::InMemory {
+                entries,
+                key_index,
+                protocol_version: Arc::new(OnceLock::new()),
+            },
             level_zero_state: LevelZeroState::SharedWithStorage { metadata_count },
         })
     }
@@ -333,6 +347,7 @@ impl Bucket {
             storage: BucketStorage::InMemory {
                 entries: Arc::new(entries),
                 key_index: Arc::new(HashMap::new()), // No index needed for merge input
+                protocol_version: Arc::new(OnceLock::new()),
             },
             // Use shared state - no cloning needed
             level_zero_state: LevelZeroState::SharedWithStorage { metadata_count },
@@ -490,6 +505,7 @@ impl Bucket {
             storage: BucketStorage::InMemory {
                 entries: Arc::new(entries),
                 key_index: Arc::new(key_index),
+                protocol_version: Arc::new(OnceLock::new()),
             },
             level_zero_state: LevelZeroState::None,
         })
@@ -729,7 +745,9 @@ impl Bucket {
     /// Estimate heap bytes used by this bucket (index + cache, excluding mmap).
     pub fn estimate_heap_bytes(&self) -> usize {
         match &self.storage {
-            BucketStorage::InMemory { entries, key_index } => {
+            BucketStorage::InMemory {
+                entries, key_index, ..
+            } => {
                 // entries Vec: BucketEntry structs on heap
                 let entries_cap = entries.capacity() * std::mem::size_of::<BucketEntry>();
                 // key_index: HashMap<LedgerKey, usize>
@@ -827,7 +845,9 @@ impl Bucket {
     /// loads the entry from disk.
     pub fn get(&self, key: &LedgerKey) -> Result<Option<BucketEntry>> {
         match &self.storage {
-            BucketStorage::InMemory { entries, key_index } => {
+            BucketStorage::InMemory {
+                entries, key_index, ..
+            } => {
                 if let Some(&idx) = key_index.get(key) {
                     Ok(entries.get(idx).cloned())
                 } else {
@@ -848,7 +868,9 @@ impl Bucket {
         key_bytes: &[u8],
     ) -> Result<Option<BucketEntry>> {
         match &self.storage {
-            BucketStorage::InMemory { entries, key_index } => {
+            BucketStorage::InMemory {
+                entries, key_index, ..
+            } => {
                 if let Some(&idx) = key_index.get(key) {
                     Ok(entries.get(idx).cloned())
                 } else {
@@ -875,18 +897,45 @@ impl Bucket {
 
     /// Get the protocol version from bucket metadata, if present.
     ///
-    /// Returns `Ok(None)` for empty buckets (no entries, no metadata).
+    /// Returns `Ok(None)` for empty buckets (no entries, no metadata) and for
+    /// buckets that have entries but no leading metaentry (legacy data — real
+    /// protocol 24+ buckets always carry one).
     /// Returns `Err` on I/O or deserialization errors from disk-backed buckets.
+    ///
+    /// **Performance:** O(1) after first call. The disk-backed variant reads
+    /// from a cache populated at load time (no file I/O); the in-memory
+    /// variant computes the value once from the leading entry and memoizes
+    /// it on a per-bucket `OnceLock`.
     pub fn protocol_version(&self) -> Result<Option<u32>> {
-        let iter = self.iter()?;
-        for entry_result in iter {
-            match entry_result {
-                Ok(BucketEntry::Metaentry(meta)) => return Ok(Some(meta.ledger_version)),
-                Ok(_) => {}
-                Err(e) => return Err(e),
+        // Empty/sentinel buckets carry no metaentry — short-circuit.
+        if self.is_empty() {
+            return Ok(None);
+        }
+        match &self.storage {
+            BucketStorage::DiskBacked { disk_bucket } => Ok(disk_bucket.protocol_version()),
+            BucketStorage::InMemory {
+                entries,
+                protocol_version,
+                ..
+            } => {
+                // Fast path: cached.
+                if let Some(v) = protocol_version.get() {
+                    return Ok(*v);
+                }
+                // Slow path (first call): scan for the leading metaentry.
+                // Stop at the first non-metaentry — by construction the
+                // metaentry is at the head of the entry list.
+                let computed = entries.iter().find_map(|e| match e {
+                    BucketEntry::Metaentry(m) => Some(Some(m.ledger_version)),
+                    _ => None,
+                });
+                let value = computed.unwrap_or(None);
+                // Best-effort populate; if a concurrent caller already set it,
+                // the value is identical (deterministic from `entries`).
+                let _ = protocol_version.set(value);
+                Ok(value)
             }
         }
-        Ok(None)
     }
 
     /// Convert bucket contents to uncompressed XDR bytes.
@@ -1021,6 +1070,7 @@ impl Bucket {
             storage: BucketStorage::InMemory {
                 entries: Arc::new(entries),
                 key_index: Arc::new(key_index),
+                protocol_version: Arc::new(OnceLock::new()),
             },
             // Use shared state - no cloning needed!
             level_zero_state: LevelZeroState::SharedWithStorage { metadata_count },
@@ -1918,5 +1968,44 @@ mod tests {
 
         let result = Bucket::from_parts(Hash256::ZERO, entries, key_index, 0);
         assert!(result.is_ok(), "from_parts should accept sorted entries");
+    }
+
+    #[test]
+    fn test_bucket_protocol_version_empty_bucket_returns_none() {
+        // Bucket::empty() — zero hash, no entries.
+        let empty = Bucket::empty();
+        assert_eq!(empty.protocol_version().unwrap(), None);
+
+        // Sentinel empty_hash bucket — non-zero hash, empty entries.
+        let sentinel = Bucket::for_sentinel_hash(Hash256::empty_hash()).unwrap();
+        assert_eq!(sentinel.protocol_version().unwrap(), None);
+    }
+
+    #[test]
+    fn test_bucket_protocol_version_in_memory_path() {
+        use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt};
+
+        let entries = vec![
+            BucketEntry::Metaentry(BucketMetadata {
+                ledger_version: 24,
+                ext: BucketMetadataExt::V0,
+            }),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+        ];
+        let bucket = Bucket::from_entries(entries).unwrap();
+
+        // First call computes; second call hits the cached OnceLock.
+        assert_eq!(bucket.protocol_version().unwrap(), Some(24));
+        assert_eq!(bucket.protocol_version().unwrap(), Some(24));
+    }
+
+    #[test]
+    fn test_bucket_protocol_version_in_memory_no_metaentry_returns_none() {
+        let entries = vec![
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
+        ];
+        let bucket = Bucket::from_entries(entries).unwrap();
+        assert_eq!(bucket.protocol_version().unwrap(), None);
     }
 }
