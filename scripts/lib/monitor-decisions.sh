@@ -34,7 +34,7 @@ _enumerate_henyey_processes() {
     exe=$(readlink "$p/exe" 2>/dev/null || true)
     [[ -z "$exe" ]] && continue
     # Strip " (deleted)" suffix
-    local clean_exe="${exe% (deleted)}"
+    local clean_exe="${exe%' (deleted)'}"
     # Prefix check: must be under data_root
     [[ "$clean_exe" == "$data_root"/* ]] || continue
     local after_root="${clean_exe#"$data_root"/}"
