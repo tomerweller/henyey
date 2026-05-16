@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use henyey_bucket::HotArchiveBucket;
 use henyey_db::Database;
+use henyey_history::{checkpoint_ledger, is_checkpoint_ledger, GENESIS_LEDGER_SEQ};
 use henyey_ledger::LedgerManager;
 
 use super::types::PendingPersist;
@@ -35,6 +36,14 @@ pub(super) struct CatchupPersistData {
     pub header: stellar_xdr::curr::LedgerHeader,
     pub header_xdr: Vec<u8>,
     pub has_json: String,
+    /// Whether checkpoint publishing is enabled for this run. Drives the
+    /// `skipFirstCheckpointSinceItIsIncomplete` parity logic: when true
+    /// and the catchup terminus is mid-checkpoint, a marker is persisted
+    /// so the first post-catchup checkpoint close skips its
+    /// `enqueue_publish` (it would otherwise publish an incomplete
+    /// checkpoint, since ledgers prior to the catchup LCL are absent
+    /// from the local DB).
+    pub publish_enabled: bool,
 }
 
 impl CatchupPersistData {
@@ -52,6 +61,23 @@ impl CatchupPersistData {
             // atomically with the state update so a crash before this
             // transaction leaves the sentinel set for startup detection.
             conn.delete_state(henyey_db::schema::state_keys::CATCHUP_PERSIST_PENDING)?;
+
+            // stellar-core parity: `skipFirstCheckpointSinceItIsIncomplete`.
+            // If publish is enabled and the catchup terminus is mid-checkpoint,
+            // record the target checkpoint seq so the next ledger close at
+            // that checkpoint suppresses its publish-queue enqueue. The
+            // set-or-delete pattern guarantees we never leak a stale marker
+            // from a prior run: every code path through `write_to_db` either
+            // sets the key to a fresh value or deletes it outright.
+            let lcl = self.header.ledger_seq;
+            if self.publish_enabled && lcl > GENESIS_LEDGER_SEQ && !is_checkpoint_ledger(lcl) {
+                conn.set_state(
+                    henyey_db::schema::state_keys::PUBLISH_SKIP_FIRST_CHECKPOINT,
+                    &checkpoint_ledger(lcl).to_string(),
+                )?;
+            } else {
+                conn.delete_state(henyey_db::schema::state_keys::PUBLISH_SKIP_FIRST_CHECKPOINT)?;
+            }
             Ok(())
         })
     }
@@ -451,6 +477,7 @@ mod tests {
             header,
             header_xdr,
             has_json: "{\"version\":1}".to_string(),
+            publish_enabled: false,
         };
 
         persist.write_to_db(&db).unwrap();
@@ -523,6 +550,7 @@ mod tests {
             header,
             header_xdr,
             has_json: "{}".to_string(),
+            publish_enabled: false,
         };
         let ready = CatchupPersistReady::new(data, db, lm);
         assert_eq!(ready.ledger_seq(), 99);
@@ -566,6 +594,7 @@ mod tests {
             header,
             header_xdr,
             has_json: "{}".to_string(),
+            publish_enabled: false,
         };
         let ready = CatchupPersistReady::new(data, db, lm);
         let result_ok = Ok(crate::app::types::CatchupResult {
@@ -893,6 +922,7 @@ mod tests {
             header,
             header_xdr,
             has_json: "{\"version\":1}".to_string(),
+            publish_enabled: false,
         };
         data.write_to_db(&db).unwrap();
 
@@ -925,5 +955,137 @@ mod tests {
             val.is_some(),
             "sentinel must persist when write_to_db is never called"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #2681: skipFirstCheckpointSinceItIsIncomplete parity tests
+    //
+    // The marker key (`PUBLISH_SKIP_FIRST_CHECKPOINT`) records the target
+    // checkpoint seq whose enqueue must be suppressed because the catchup
+    // terminus is mid-checkpoint. These tests pin down the set-or-delete
+    // contract in `CatchupPersistData::write_to_db` for the full grid of
+    // (publish_enabled, LCL-position) inputs, including stale-marker
+    // cleanup. The companion enqueue-time skip tests live in
+    // `app::ledger_close::tests`.
+    // ---------------------------------------------------------------------
+
+    fn skip_marker(db: &Database) -> Option<String> {
+        db.with_connection(|c| {
+            c.get_state(henyey_db::schema::state_keys::PUBLISH_SKIP_FIRST_CHECKPOINT)
+        })
+        .unwrap()
+    }
+
+    fn set_skip_marker(db: &Database, value: &str) {
+        db.with_connection(|c| {
+            c.set_state(
+                henyey_db::schema::state_keys::PUBLISH_SKIP_FIRST_CHECKPOINT,
+                value,
+            )
+        })
+        .unwrap();
+    }
+
+    /// LCL=80 is mid-checkpoint (the checkpoint covers 64..=127), and
+    /// publish is enabled → marker must point at 127.
+    #[test]
+    fn catchup_persist_mid_checkpoint_sets_skip_marker() {
+        let db = Database::open_in_memory().unwrap();
+        let (header, header_xdr) = make_header(80);
+        let data = CatchupPersistData {
+            header,
+            header_xdr,
+            has_json: "{}".to_string(),
+            publish_enabled: true,
+        };
+        data.write_to_db(&db).unwrap();
+        assert_eq!(skip_marker(&db).as_deref(), Some("127"));
+    }
+
+    /// LCL=127 is a checkpoint boundary (the checkpoint just completed
+    /// at this LCL) → no skip is required and any stale marker must be
+    /// cleared.
+    #[test]
+    fn catchup_persist_at_checkpoint_boundary_does_not_set_skip_marker() {
+        let db = Database::open_in_memory().unwrap();
+        let (header, header_xdr) = make_header(127);
+        let data = CatchupPersistData {
+            header,
+            header_xdr,
+            has_json: "{}".to_string(),
+            publish_enabled: true,
+        };
+        data.write_to_db(&db).unwrap();
+        assert!(skip_marker(&db).is_none());
+    }
+
+    /// Publish disabled → marker must never be set, regardless of LCL.
+    #[test]
+    fn catchup_persist_with_publish_disabled_does_not_set_skip_marker() {
+        let db = Database::open_in_memory().unwrap();
+        let (header, header_xdr) = make_header(80);
+        let data = CatchupPersistData {
+            header,
+            header_xdr,
+            has_json: "{}".to_string(),
+            publish_enabled: false,
+        };
+        data.write_to_db(&db).unwrap();
+        assert!(skip_marker(&db).is_none());
+    }
+
+    /// A marker left over from a previous catchup must be cleared when a
+    /// new catchup ends at a checkpoint boundary — the set-or-delete
+    /// pattern guarantees this.
+    #[test]
+    fn catchup_persist_clears_stale_skip_marker_when_lcl_complete() {
+        let db = Database::open_in_memory().unwrap();
+        set_skip_marker(&db, "127");
+
+        let (header, header_xdr) = make_header(127);
+        let data = CatchupPersistData {
+            header,
+            header_xdr,
+            has_json: "{}".to_string(),
+            publish_enabled: true,
+        };
+        data.write_to_db(&db).unwrap();
+        assert!(skip_marker(&db).is_none());
+    }
+
+    /// A stale marker must also be cleared when publish is disabled,
+    /// even if the LCL is mid-checkpoint (the "publish was on then went
+    /// off across runs" path).
+    #[test]
+    fn catchup_persist_clears_stale_skip_marker_when_publish_disabled() {
+        let db = Database::open_in_memory().unwrap();
+        set_skip_marker(&db, "127");
+
+        let (header, header_xdr) = make_header(80);
+        let data = CatchupPersistData {
+            header,
+            header_xdr,
+            has_json: "{}".to_string(),
+            publish_enabled: false,
+        };
+        data.write_to_db(&db).unwrap();
+        assert!(skip_marker(&db).is_none());
+    }
+
+    /// LCL=GENESIS_LEDGER_SEQ (1) → marker must not be set. Mirrors
+    /// stellar-core's flag init (false) and ensures we never skip
+    /// publishing checkpoint 63 on a fresh node.
+    #[test]
+    fn catchup_persist_at_genesis_does_not_set_marker() {
+        let db = Database::open_in_memory().unwrap();
+        let (header, header_xdr) = make_header(GENESIS_LEDGER_SEQ);
+        let data = CatchupPersistData {
+            header,
+            header_xdr,
+            has_json: "{}".to_string(),
+            publish_enabled: true,
+        };
+        data.write_to_db(&db).unwrap();
+        assert!(skip_marker(&db).is_none());
     }
 }

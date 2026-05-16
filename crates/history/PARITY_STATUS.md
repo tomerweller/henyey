@@ -128,7 +128,30 @@ Corresponds to: `CheckpointBuilder.h`
 | `cleanup(lcl)` | `cleanup()` | Full |
 | `checkpointComplete(checkpoint)` | `checkpoint_complete()` | Full |
 | `ensureOpen(ledgerSeq)` | `ensure_open()` | Full |
-| `skipIncompleteFirstCheckpointSinceRestart()` | -- | None |
+| `skipIncompleteFirstCheckpointSinceRestart()` | publish-queue enqueue guard in `LedgerPersistInputs::serialize_and_write_to_db` (post-catchup branch only) | Partial |
+
+> **Architectural note (#2681).** stellar-core hosts the
+> `skipFirstCheckpointSinceItIsIncomplete` flag inside `CheckpointBuilder`
+> because it writes `.dirty` per-ledger files and re-derives the flag at
+> startup from "no dirty files on disk". Henyey doesn't have a per-ledger
+> append path — checkpoint files are reconstructed from SQLite at publish
+> time — so the parity equivalent is implemented one level up, at the
+> publish-queue enqueue site. `CatchupPersistData::write_to_db` records
+> the target checkpoint sequence in the `publishskipfirstcheckpoint`
+> state key when catchup ends mid-checkpoint with publish enabled, and
+> the next `LedgerPersistInputs::serialize_and_write_to_db` for that
+> checkpoint suppresses its `enqueue_publish` and clears the marker — all
+> inside one DB transaction.
+>
+> stellar-core's trigger is "no dirty files at startup", which covers two
+> paths: (a) post-catchup, and (b) publish-disabled-then-re-enabled. Henyey
+> currently implements only (a). Path (b) is not a supported henyey
+> production configuration today (publish-disable on a validator has no
+> precedent and no observable archive divergence as long as it stays
+> disabled), so the gap is intentional. If/when path (b) becomes a
+> supported configuration, the follow-up should derive the marker at
+> startup from on-disk state (e.g., checkpoint files present but no
+> queued publish for the corresponding ledger).
 
 ### publish_queue.rs / publish.rs (`publish_queue.rs`, `publish.rs`)
 
