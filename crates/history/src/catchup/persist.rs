@@ -222,12 +222,25 @@ mod tests {
         NetworkId::from_passphrase("Test SDF Network ; September 2015")
     }
 
-    fn make_test_catchup_manager() -> CatchupManager {
+    /// Returns the `TempDir` guard backing the `BucketManager` together
+    /// with the manager. The `TempDir` is returned **first** so callers
+    /// destructure as `let (_tmp_dir, manager) = ...`: Rust drops local
+    /// bindings in reverse declaration order, so binding `manager`
+    /// second guarantees it (and any file handles its `BucketManager`
+    /// holds) is dropped before the `TempDir` removes the directory.
+    /// The caller must keep `_tmp_dir` alive for the duration of the
+    /// test so the bucket directory is deleted on drop rather than
+    /// leaked under the system temp location.
+    fn make_test_catchup_manager() -> (tempfile::TempDir, CatchupManager) {
         let db = Database::open_in_memory().expect("in-memory db");
         let tmp_dir = tempfile::tempdir().expect("temp dir");
-        let bucket_manager = BucketManager::new(tmp_dir.keep()).expect("bucket manager");
+        let bucket_manager =
+            BucketManager::new(tmp_dir.path().to_path_buf()).expect("bucket manager");
         let archive = crate::HistoryArchive::new("https://example.com").expect("archive");
-        CatchupManager::new(vec![archive], bucket_manager, db)
+        (
+            tmp_dir,
+            CatchupManager::new(vec![archive], bucket_manager, db),
+        )
     }
 
     fn make_test_envelope() -> TransactionEnvelope {
@@ -511,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_persist_ledger_history_happy_path() {
-        let manager = make_test_catchup_manager();
+        let (_tmp_dir, manager) = make_test_catchup_manager();
         let network_id = test_network_id();
 
         let envelope = make_test_envelope();
@@ -554,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_persist_ledger_history_empty_ledger() {
-        let manager = make_test_catchup_manager();
+        let (_tmp_dir, manager) = make_test_catchup_manager();
         let network_id = test_network_id();
 
         let data = LedgerData::new(
@@ -575,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_persist_ledger_history_with_absent_entries() {
-        let manager = make_test_catchup_manager();
+        let (_tmp_dir, manager) = make_test_catchup_manager();
         let network_id = test_network_id();
 
         let header = make_header(300);
@@ -612,7 +625,7 @@ mod tests {
 
     #[test]
     fn test_persist_ledger_history_batch_rollback() {
-        let manager = make_test_catchup_manager();
+        let (_tmp_dir, manager) = make_test_catchup_manager();
         let network_id = test_network_id();
 
         let envelope = make_test_envelope();
@@ -656,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_persist_and_load_ledger_header_round_trip() {
-        let manager = make_test_catchup_manager();
+        let (_tmp_dir, manager) = make_test_catchup_manager();
         let network_id = test_network_id();
 
         let header = make_header(600);
