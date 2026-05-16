@@ -369,6 +369,12 @@ impl ScpPersistenceManager {
         *self.last_slot_saved.read()
     }
 
+    /// Check whether a tx set with the given hash is present in the backing
+    /// store. Primarily used by tests to assert post-purge state.
+    pub fn has_tx_set(&self, hash: &Hash) -> Result<bool> {
+        self.storage.has_tx_set(hash)
+    }
+
     /// Persist SCP state for a slot.
     ///
     /// This saves the given envelopes, their referenced transaction sets, and

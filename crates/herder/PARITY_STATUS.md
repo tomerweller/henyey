@@ -126,8 +126,13 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `verifyEnvelope()` | `scp_driver.verify_envelope()` | Full |
 | `signEnvelope()` | `scp_driver.sign_envelope()` | Full |
 | `verifyStellarValueSignature()` | `scp_driver.verify_stellar_value_signature()` | Full |
-| `startTxSetGCTimer()` | `ScpPersistenceManager::purge_unreferenced_tx_sets()` | Partial |
+| `startTxSetGCTimer()` | `ScpPersistenceManager::purge_unreferenced_tx_sets()` | Full[^txset-gc] |
 | `recomputeKeysToFilter()` | _(not implemented)_ | None |
+
+[^txset-gc]: GC timer + purge wired in #2698 (driven by app event-loop phase
+33 every `TX_SET_GC_DELAY_SECS` = 60s). The broader SCP persist/restore story
+is still incomplete: `persist_scp_state` wiring is tracked in #2768 and
+`restore_scp_state` wiring in #2769.
 
 ### SCP Driver (`scp_driver.rs`)
 
@@ -515,7 +520,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `maxScaledLedgerResources()` | Low | Removed during simplification; re-add if needed |
 | `getTotalResourcesToFlood()` | Low | Flood resource tracking |
 | `stateChanged()` | Low | SCP state change callback |
-| `startTxSetGCTimer()` | Medium | GC logic implemented; periodic timer not yet wired |
 
 ## Architectural Differences
 

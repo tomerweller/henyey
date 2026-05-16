@@ -149,7 +149,7 @@ pub use fetching_envelopes::{
 };
 pub use herder::{
     EnvelopeState, Herder, HerderConfig, HerderStats, LastExternalizedLedger, LedgerCloseInfo,
-    NextConsensusSlot, TimeoutOutcome, TriggerOutcome,
+    NextConsensusSlot, TimeoutOutcome, TriggerOutcome, TX_SET_GC_DELAY_SECS,
 };
 pub use metrics::{ScpMetrics, ScpMetricsSnapshot};
 pub use pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
