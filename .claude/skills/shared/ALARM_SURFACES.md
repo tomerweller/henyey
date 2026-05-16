@@ -60,7 +60,7 @@ When an alarm legitimately belongs in both surfaces:
 |---|---|---|---|---|---|
 | Invariant failure | `ledger-invariant-failure` | `henyey-invariant-failure` | counter ≥ 1, ACTION | increase > 0 over 10m, critical | Monitor-tick best-effort for strict (panic before scrape) |
 | TX internal error | `tx-internal-error` | `henyey-tx-internal-error` | counter ≥ 1, ACTION | rate > 0.01 over 5m, critical | Different detection semantics (any vs rate) |
-| Quorum fail-at | `quorum-fail-at-low` | `henyey-quorum-failat-warn`, `henyey-quorum-failat-crit` | gauge ≤ 1, WARN, 3 ticks | == 1 warn / < 1 critical, 5m | Monitor-tick collapses tiers; Grafana escalates |
+| Quorum fail-at | `quorum-fail-at-low` | `henyey-quorum-failat-warn`, `henyey-quorum-failat-crit` | gauge ≤ 0, WARN, 3 ticks | == 1 warn / < 1 critical, 5m | Monitor-tick collapses tiers onto Grafana's critical (< 1); Grafana's == 1 warn tier remains fleet-wide visibility only |
 | Post-catchup reset | `post-catchup-hard-reset` | `henyey-post-catchup-hard-reset` | counter ≥ 1, ACTION | increase > 0 over 10m, critical |  |
 | Recovery stalled | `recovery-stalled` | `henyey-recovery-stalled` | counter-streak ≥ 3, WARN | increase >= 3 over 10m, warning |  |
 | Fetch channel depth | `fetch-channel-deep` | `henyey-overlay-fetch-depth` | gauge > 500, WARN, 2 ticks | > 128, warning, 5m | Different thresholds |
