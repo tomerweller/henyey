@@ -76,21 +76,33 @@ pub use scp_persistence::SqliteScpPersistence;
 /// (e.g. [`Database::with_connection`]).
 ///
 /// This is a narrow alias for [`rusqlite::Connection`] rather than a broad
-/// `pub use rusqlite;` re-export: only the two types that appear in
-/// `henyey-db`'s public signatures (`Connection` and [`Transaction`]) are
-/// re-exposed, so callers in higher-level crates can name them without taking
-/// a direct `rusqlite` dependency. Every other `rusqlite` item (the `params!`
-/// macro, `rusqlite::Error` variants, `OptionalExtension`, etc.) is an
-/// implementation detail of `henyey-db` and is not reachable through it.
+/// `pub use rusqlite;` re-export: the only `rusqlite` items intentionally
+/// named in `henyey-db`'s public signatures are `Connection`, [`Transaction`],
+/// and [`DbError::Sqlite`] (which wraps a [`rusqlite::Error`]). Other
+/// top-level `rusqlite` items (the `params!` macro, `OptionalExtension`,
+/// etc.) are *not* re-exported by name and callers cannot reach them through
+/// `henyey-db` without adding a direct `rusqlite` dependency.
 ///
-/// This keeps the named SemVer surface of `henyey-db` scoped to these two
-/// types — a `rusqlite` major-version bump that touches any other item is no
-/// longer automatically a breaking change to `henyey-db`'s API contract.
+/// **Caveat — transparent aliases leak rusqlite types.** Because `Connection`
+/// and `Transaction` are `pub type` aliases (not opaque newtype wrappers),
+/// methods called on them still return raw `rusqlite` types — e.g.
+/// `Connection::prepare` returns [`rusqlite::Statement`], `Statement::query`
+/// returns [`rusqlite::Rows`], iteration yields [`rusqlite::Row`]. Callers
+/// can name those types via type inference (`let stmt = conn.prepare(..)?;`)
+/// without `use rusqlite::...`, so the alias is a *naming* boundary, not a
+/// full encapsulation boundary.
 ///
-/// This is a deliberate two-step migration: the alias still resolves
-/// structurally to `rusqlite::Connection` (so its method signatures still
-/// propagate). A future follow-up to issue #2748 may promote this into a
-/// fully opaque newtype wrapper once the cost of migrating the internal
+/// What the narrowing actually buys: the named SemVer surface of `henyey-db`
+/// is scoped to `Connection`, `Transaction`, and `DbError::Sqlite`. A
+/// `rusqlite` major-version bump is a breaking change to `henyey-db` only if
+/// it touches the method signatures reachable through those two aliases or
+/// the [`rusqlite::Error`] type — bumps that only touch other top-level items
+/// are not breaking changes to `henyey-db`'s API contract.
+///
+/// This is a deliberate two-step migration. A future follow-up to issue
+/// #2748 may promote `Connection` / `Transaction` into fully opaque newtype
+/// wrappers (and replace `DbError::Sqlite`'s public `rusqlite::Error` payload
+/// with a crate-local error type) once the cost of migrating the internal
 /// `impl XQueries for rusqlite::Connection` blocks is justified.
 pub type Connection = rusqlite::Connection;
 
