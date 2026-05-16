@@ -153,7 +153,7 @@ impl std::fmt::Display for CatchupMode {
 ///   Case 4b checkpoint (LCL == genesis, target is a checkpoint inside the
 ///   first checkpoint period).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatchupRange {
+pub(crate) enum CatchupRange {
     /// Replay ledgers without applying buckets.
     ReplayOnly {
         /// Range of ledgers to replay (must be non-empty).
@@ -177,13 +177,13 @@ pub enum CatchupRange {
 
 impl CatchupRange {
     /// Create a range that only applies buckets (no replay).
-    pub fn buckets_only(checkpoint: u32) -> Self {
+    pub(crate) fn buckets_only(checkpoint: u32) -> Self {
         assert!(checkpoint > 0, "buckets_only checkpoint must be > 0");
         Self::BucketsOnly { checkpoint }
     }
 
     /// Create a range that only replays ledgers (no bucket application).
-    pub fn replay_only(replay: LedgerRange) -> Self {
+    pub(crate) fn replay_only(replay: LedgerRange) -> Self {
         assert!(
             replay.count > 0,
             "replay_only requires a non-empty replay range"
@@ -193,7 +193,7 @@ impl CatchupRange {
     }
 
     /// Create a range that applies buckets then replays ledgers.
-    pub fn buckets_and_replay(checkpoint: u32, replay: LedgerRange) -> Self {
+    pub(crate) fn buckets_and_replay(checkpoint: u32, replay: LedgerRange) -> Self {
         assert!(checkpoint > 0, "buckets_and_replay checkpoint must be > 0");
         assert!(
             replay.count > 0,
@@ -218,7 +218,7 @@ impl CatchupRange {
     /// # Panics
     ///
     /// Panics if preconditions are not met.
-    pub fn calculate(lcl: u32, target: u32, mode: CatchupMode) -> Self {
+    pub(crate) fn calculate(lcl: u32, target: u32, mode: CatchupMode) -> Self {
         // Validate preconditions
         assert!(
             lcl >= GENESIS_LEDGER_SEQ,
@@ -319,6 +319,7 @@ impl CatchupRange {
     }
 
     /// Get the replay range, if this variant performs replay.
+    #[cfg(test)]
     pub fn replay_range(&self) -> Option<LedgerRange> {
         match self {
             Self::ReplayOnly { replay } | Self::BucketApplyAndReplay { replay, .. } => {
@@ -329,6 +330,7 @@ impl CatchupRange {
     }
 
     /// Get the first ledger in the full range (bucket apply or replay start).
+    #[cfg(test)]
     pub fn first(&self) -> u32 {
         match self {
             Self::ReplayOnly { replay } => replay.first,
@@ -339,6 +341,7 @@ impl CatchupRange {
     }
 
     /// Get the last ledger in the full range.
+    #[cfg(test)]
     pub fn last(&self) -> u32 {
         match self {
             Self::ReplayOnly { replay } | Self::BucketApplyAndReplay { replay, .. } => {
@@ -349,6 +352,7 @@ impl CatchupRange {
     }
 
     /// Get the total count of ledgers (bucket apply counts as 1).
+    #[cfg(test)]
     pub fn count(&self) -> u32 {
         match self {
             Self::ReplayOnly { replay } => replay.count,
