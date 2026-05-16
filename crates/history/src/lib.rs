@@ -644,6 +644,39 @@ impl HistoryArchiveManager {
     /// - The archive is not writable (no put command)
     /// - The upload fails
     ///
+    /// # Partial failures and idempotency
+    ///
+    /// Initialization writes two files in sequence: the §4.3 pseudo-checkpoint
+    /// first, then the well-known root HAS. If the first upload succeeds but
+    /// the second fails (e.g. transient network error), the archive is left
+    /// **half-initialized**: the pseudo-checkpoint exists, but the root HAS
+    /// does not.
+    ///
+    /// The already-initialized probe at the top of this function checks only
+    /// the well-known root HAS via `fetch_root_has`. On a half-initialized
+    /// archive that probe returns `Err`, so a retry will **not** see
+    /// `ArchiveAlreadyInitialized` — instead it will re-upload the
+    /// pseudo-checkpoint (a byte-identical overwrite of the empty HAS) and
+    /// then upload the root HAS, completing initialization. This behavior is
+    /// **self-healing**: both writes are idempotent, and a retry recovers the
+    /// archive without operator intervention.
+    ///
+    /// Probing only the root HAS matches stellar-core's
+    /// `HistoryArchiveManager::initializeHistoryArchive`
+    /// (`HistoryArchiveManager.cpp:213–220`), which calls
+    /// `GetHistoryArchiveStateWork(seq=0, ...)` — `isWellKnown(0)`
+    /// (`GetHistoryArchiveStateWork.cpp:33`) routes seq=0 to the well-known
+    /// root HAS only, not the §4.3 pseudo-checkpoint. We deliberately do not
+    /// add a second probe for the pseudo-checkpoint: that would diverge from
+    /// upstream operator-facing behavior and offer no benefit, since the
+    /// retry path already recovers safely.
+    ///
+    /// **Operator note:** self-healing is a safety net, not a license to
+    /// ignore failures. The transient error that caused the half-init (e.g.
+    /// a `cp`/`s3 put` failure on the second upload) should still be
+    /// investigated — it may indicate an underlying problem with the remote
+    /// (auth, quota, network) that will recur during normal publish.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -1036,6 +1069,89 @@ mod archive_manager_tests {
         assert!(
             !pseudo.exists(),
             "init must not write pseudo-checkpoint when archive is already initialized"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_history_archive_recovers_from_half_initialized() {
+        // Simulates a half-initialized archive: the §4.3 pseudo-checkpoint
+        // exists (left over from a previous attempt that crashed between
+        // the two uploads), but the well-known root HAS does not. A retry
+        // must self-heal: it overwrites the pseudo-checkpoint with
+        // byte-identical content and then writes the root HAS.
+        let tmp = tempfile::tempdir().unwrap();
+        let passphrase = "test passphrase";
+
+        // Pre-create only the pseudo-checkpoint with arbitrary bytes — the
+        // retry must overwrite this with the canonical empty HAS.
+        let pseudo_dir = tmp.path().join("history/00/00/00");
+        std::fs::create_dir_all(&pseudo_dir).unwrap();
+        let pseudo_path = pseudo_dir.join("history-00000000.json");
+        std::fs::write(&pseudo_path, b"{\"stale\":\"half-init leftover\"}").unwrap();
+
+        // Manager with both read (file://) and write (cp) configured — required
+        // so the `fetch_root_has` probe at the top of initialize_history_archive
+        // actually runs. Without a read side, the probe is skipped entirely
+        // and the retry path is not exercised.
+        let root = tmp.path().to_string_lossy().into_owned();
+        let put_cmd = format!("cp {{0}} {root}/{{1}}");
+        let mkdir_cmd = format!("mkdir -p {root}/{{0}}");
+        let get_cmd = format!("cp {root}/{{0}} {{1}}");
+
+        let archive = HistoryArchive::new(&format!("file://{root}")).unwrap();
+        let remote_config = RemoteArchiveConfig {
+            name: "test-fs".to_string(),
+            put_cmd: Some(put_cmd),
+            mkdir_cmd: Some(mkdir_cmd),
+            get_cmd: Some(get_cmd),
+        };
+        let remote = RemoteArchive::new(remote_config);
+
+        let mut manager = HistoryArchiveManager::new(passphrase.to_string());
+        manager.add_archive(ArchiveEntry::new(
+            "test-fs".to_string(),
+            Some(archive),
+            Some(remote),
+        ));
+
+        // Sanity: the root HAS is missing, so fetch_root_has must fail and
+        // the function must not short-circuit with ArchiveAlreadyInitialized.
+        manager
+            .initialize_history_archive("test-fs")
+            .await
+            .expect("retry must recover from a half-initialized archive");
+
+        // Both files must now exist.
+        let root_path = tmp.path().join(".well-known/stellar-history.json");
+        assert!(
+            pseudo_path.exists(),
+            "pseudo-checkpoint must still exist after recovery"
+        );
+        assert!(
+            root_path.exists(),
+            "root HAS must be written by the recovery retry"
+        );
+
+        // Both files must be byte-identical (idempotent overwrite).
+        let pseudo_bytes = std::fs::read(&pseudo_path).unwrap();
+        let root_bytes = std::fs::read(&root_path).unwrap();
+        assert_eq!(
+            pseudo_bytes, root_bytes,
+            "after recovery, pseudo-checkpoint and root HAS must contain identical bytes"
+        );
+
+        // The pre-existing stale bytes must have been overwritten with the
+        // canonical empty HAS (version=1, server=rs-stellar-core, ...).
+        let has: HistoryArchiveState = serde_json::from_slice(&pseudo_bytes).unwrap();
+        assert_eq!(has.version, 1);
+        assert_eq!(has.current_ledger, 0);
+        assert_eq!(has.server.as_deref(), Some("rs-stellar-core"));
+        assert_eq!(has.network_passphrase.as_deref(), Some(passphrase));
+        assert!(has.hot_archive_buckets.is_none());
+        assert_eq!(
+            has.current_buckets.len(),
+            henyey_bucket::BUCKET_LIST_LEVELS,
+            "recovered HAS must have one entry per live bucket level"
         );
     }
 }
