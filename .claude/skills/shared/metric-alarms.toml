@@ -85,6 +85,8 @@ notes = ""
 
 [[alarm]]
 name = "overlay-errors-high"
+baseline_version = 2  # bumped in #2779: raise threshold 50→100 to absorb steady-state overlay churn
+semantic_change_date = "2026-05-16T00:00:00Z"
 kind = "counter"
 metric_sum = [
     "stellar_overlay_error_read_total",
@@ -93,7 +95,7 @@ metric_sum = [
 extraction = "form3"
 labels = []
 op = ">="
-threshold = 50
+threshold = 100
 severity = "WARN"
 gates = ["warmup-2-ticks"]
 cooldown_key = "overlay_error_total"

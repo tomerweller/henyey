@@ -232,7 +232,7 @@ table is the human reference.
 | `stellar_herder_lost_sync_total` | ≥ 1 | SYNC | Node fell out of Tracking — always a bug on a steady-state node |
 | `henyey_post_catchup_hard_reset_total` | ≥ 1 | ACTION | Recovery fired |
 | `stellar_overlay_timeout_idle_total` + `_straggler_total` (sum) | 5× prior-tick sum | WARN | Overlay churn burst |
-| `stellar_overlay_error_read_total` + `_write_total` (sum) | ≥ 50 | WARN | Overlay I/O errors |
+| `stellar_overlay_error_read_total` + `_write_total` (sum) | ≥ 100 | WARN | Overlay I/O errors |
 | `henyey_archive_cache_refresh_error_total` | ≥ 1 | NONC | Archive fetch failing |
 | `henyey_archive_cache_refresh_timeout_total` | ≥ 3 | NONC | Archive fetch slow |
 
