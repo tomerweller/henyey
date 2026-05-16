@@ -54,9 +54,53 @@ Capture:
 - **Current CI status:** `green` | `failing` | `running` | `not_started`.
 - **Existing reviews:** for bounce-back counting.
 
-## Step 2 — Count prior bounce-backs
+## Step 2 — Count prior bounce-backs (head-scoped + Reset escape hatch)
 
-Look for any issue comment matching `## Review: Bounce-Back Cycle ` in the issue's comment history. Count them. If the count is **≥ 3**, this is the 4th cycle — the PR has cycled too many times. Post `## Review: Cycle Cap Reached` summarizing the disagreement pattern, move the issue to `blocked`, unassign, and exit. Do not run another review.
+The bounce-back cap is **scoped to the current code**, not the issue's lifetime. Old bounces against earlier commits don't carry forward forever — they represent failed merge attempts on code that has since been rebased or replaced.
+
+Compute the **baseline timestamp** for counting:
+
+```bash
+# When was the current PR head commit pushed/committed? Fresh push = new baseline.
+HEAD_PUSHED=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
+  --json commits --jq '.commits | sort_by(.committedDate) | last | .committedDate')
+
+# Has the operator (or recovery script) posted a Reset marker?
+# This is the escape hatch for cases where the head didn't change but the
+# external cause did — e.g., main was broken, now it's green; same code,
+# fresh chance.
+RESET_AT=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
+  --jq '[.[] | select(.body | startswith("## Review: Reset"))] | sort_by(.created_at) | last.created_at // ""')
+
+# Baseline = max(HEAD_PUSHED, RESET_AT). Use the later of the two.
+BASELINE=$HEAD_PUSHED
+if [ -n "$RESET_AT" ] && [[ "$RESET_AT" > "$BASELINE" ]]; then
+  BASELINE=$RESET_AT
+fi
+```
+
+Then count bounce comments STRICTLY AFTER the baseline:
+
+```bash
+COUNT=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
+  --jq "[.[] | select(.body | startswith(\"## Review: Bounce-Back Cycle\")) |
+        select(.created_at > \"$BASELINE\")] | length")
+```
+
+If `COUNT >= 3`, this is the 4th cycle on the current code — the PR has genuinely cycled too many times against this exact state. Post `## Review: Cycle Cap Reached` summarizing the disagreement pattern, move the issue to `blocked`, unassign, and exit.
+
+Otherwise (COUNT < 3) → proceed with the review.
+
+**Recovery semantics:**
+
+- **Fresh `/do` Mode B push** → new commit `committedDate` advances the baseline → counter naturally resets to 0. Most recoveries (rebase after CI red, address review feedback) hit this path automatically.
+- **`## Review: Reset` comment** → manual escape hatch. Operator (or recovery script) posts this when the head hasn't changed but the external cause has (e.g., a broken-main outage that has since cleared). Everything before the Reset comment is excluded from the count. Post format:
+  ```markdown
+  ## Review: Reset
+
+  <one-line reason — e.g. "Quickstart on main was broken; now green. Resetting bounce counter so this PR can re-attempt.">
+  ```
+- **Old bounce comments aren't deleted** — they remain in the audit trail. They just don't count against the current attempt.
 
 ## Step 3 — Auto-detect the second reviewer's lens
 
