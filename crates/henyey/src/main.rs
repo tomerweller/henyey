@@ -2145,9 +2145,12 @@ fn cmd_force_scp(config: &AppConfig) -> anyhow::Result<()> {
 
 /// Initialize a named history archive.
 ///
-/// Creates the `.well-known/stellar-history.json` file in the archive using
-/// the archive's configured put/mkdir commands. This matches stellar-core's
-/// `new-hist` command for local filesystem archives.
+/// Creates two files in the archive — the §4.3 ledger-zero pseudo-checkpoint
+/// at `history/00/00/00/history-00000000.json` and the well-known root HAS at
+/// `.well-known/stellar-history.json` — using the archive's configured
+/// put/mkdir commands. This matches stellar-core's `new-hist` command for
+/// local filesystem archives (`HistoryArchiveManager::initializeHistoryArchive`
+/// + `PutHistoryArchiveStateWork::spawnPublishWork`).
 async fn cmd_new_hist(config: &AppConfig, name: &str) -> anyhow::Result<()> {
     use henyey_history::{
         remote_archive::RemoteArchiveConfig, ArchiveEntry, HistoryArchiveManager, RemoteArchive,
