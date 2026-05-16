@@ -223,39 +223,95 @@ pub fn build_history_archive_state(
         })
         .collect();
 
-    let hot_archive_buckets = hot_archive_bucket_list.map(|habl| {
-        habl.levels()
-            .iter()
-            .map(|level| {
-                let next = match level.pending_merge_output_hash() {
-                    Some(hash) => HASBucketNext {
-                        state: HAS_NEXT_STATE_OUTPUT,
-                        output: Some(hash.to_hex()),
-                        curr: None,
-                        snap: None,
-                        shadow: None,
-                    },
-                    None => HASBucketNext::default(),
-                };
-                HASBucketLevel {
-                    curr: level.curr().hash().to_hex(),
-                    snap: level.snap_bucket().hash().to_hex(),
-                    next,
-                }
-            })
-            .collect()
-    });
+    // Per-level snap protocol versions for the shadows-removed
+    // `next`-clearing pass below. `Bucket::protocol_version` returns
+    // `Ok(None)` for empty buckets / buckets without a leading metaentry;
+    // map those to 0 so the validator-equivalent predicate
+    // `prev_snap_version >= FIRST_PROTOCOL_SHADOWS_REMOVED` treats them as
+    // "no constraint" (matching `validate_bucket_list_structure` semantics).
+    let live_snap_versions: Vec<u32> = bucket_list
+        .levels()
+        .iter()
+        .enumerate()
+        .map(|(idx, level)| {
+            level
+                .snap
+                .protocol_version()
+                .map(|v| v.unwrap_or(0))
+                .map_err(|e| {
+                    HistoryError::VerificationFailed(format!(
+                        "failed to read snap protocol version at live level {}: {}",
+                        idx, e
+                    ))
+                })
+        })
+        .collect::<Result<_>>()?;
+
+    let hot_archive_buckets = hot_archive_bucket_list
+        .map(|habl| -> Result<Vec<HASBucketLevel>> {
+            habl.levels()
+                .iter()
+                .map(|level| {
+                    let next = match level.pending_merge_output_hash() {
+                        Some(hash) => HASBucketNext {
+                            state: HAS_NEXT_STATE_OUTPUT,
+                            output: Some(hash.to_hex()),
+                            curr: None,
+                            snap: None,
+                            shadow: None,
+                        },
+                        None => HASBucketNext::default(),
+                    };
+                    Ok(HASBucketLevel {
+                        curr: level.curr().hash().to_hex(),
+                        snap: level.snap_bucket().hash().to_hex(),
+                        next,
+                    })
+                })
+                .collect()
+        })
+        .transpose()?;
+
+    // Hot-archive snap protocol versions. Note the API shape mismatch with
+    // the live path: `HotArchiveBucket::get_protocol_version` returns
+    // `Result<u32>` (no `Option`); empty hot-archive buckets already report 0.
+    let hot_snap_versions: Option<Vec<u32>> = hot_archive_bucket_list
+        .map(|habl| -> Result<Vec<u32>> {
+            habl.levels()
+                .iter()
+                .enumerate()
+                .map(|(idx, level)| {
+                    level.snap_bucket().get_protocol_version().map_err(|e| {
+                        HistoryError::VerificationFailed(format!(
+                            "failed to read snap protocol version at hot-archive level {}: {}",
+                            idx, e
+                        ))
+                    })
+                })
+                .collect()
+        })
+        .transpose()?;
 
     let version = if hot_archive_buckets.is_some() { 2 } else { 1 };
 
-    Ok(HistoryArchiveState {
+    let mut has = HistoryArchiveState {
         version,
         server: Some("rs-stellar-core".to_string()),
         current_ledger: ledger_seq,
         network_passphrase,
         current_buckets,
         hot_archive_buckets,
-    })
+    };
+
+    // Mirror stellar-core's `HistoryArchiveState::prepareForPublish`
+    // shadows-removed branch (HistoryArchive.cpp:483-489). Henyey eager-clears
+    // here rather than lazily in a publish work step so every HAS emission
+    // path runs through this single helper. See
+    // `HistoryArchiveState::clear_unrepresentable_futures` for the full
+    // rationale and the documented skip of stellar-core's `makeLive` branch.
+    has.clear_unrepresentable_futures(&live_snap_versions, hot_snap_versions.as_deref());
+
+    Ok(has)
 }
 
 impl PublishManager {
@@ -1931,5 +1987,185 @@ mod tests {
         let cleaned = delete_published_files(64, publish_dir);
         assert_eq!(cleaned, 1);
         assert!(!dirty_path.exists());
+    }
+
+    // --- Regression tests for #2766 (prepareForPublish port) ---
+
+    use crate::archive_state::{validate_bucket_list_structure, BucketLevelVersionInfo};
+
+    /// Build a fully-populated `current_buckets` vector for a HAS:
+    /// every level gets dummy hex hashes and a clear `next`, then the
+    /// caller injects whatever per-level overrides the test needs.
+    fn make_skeleton_levels() -> Vec<HASBucketLevel> {
+        let zero = "0".repeat(64);
+        let one = "1".repeat(64);
+        (0..BUCKET_LIST_LEVELS)
+            .map(|_| HASBucketLevel {
+                curr: one.clone(),
+                snap: zero.clone(),
+                next: HASBucketNext::default(),
+            })
+            .collect()
+    }
+
+    /// Build matching `BucketLevelVersionInfo`s for the validator from a
+    /// per-level snap-version vector and the HAS levels (curr_version
+    /// is set equal to snap_version because the validator only requires
+    /// monotonicity, not exact values, for this test's purposes).
+    fn version_infos_from(
+        snap_versions: &[u32],
+        has_levels: &[HASBucketLevel],
+    ) -> Vec<BucketLevelVersionInfo> {
+        snap_versions
+            .iter()
+            .zip(has_levels.iter())
+            .map(|(&snap_version, has_level)| BucketLevelVersionInfo {
+                snap_version,
+                curr_version: snap_version,
+                next: has_level.next.clone(),
+            })
+            .collect()
+    }
+
+    fn make_has_with_levels(
+        current_buckets: Vec<HASBucketLevel>,
+        hot_archive_buckets: Option<Vec<HASBucketLevel>>,
+    ) -> HistoryArchiveState {
+        let version = if hot_archive_buckets.is_some() { 2 } else { 1 };
+        HistoryArchiveState {
+            version,
+            server: Some("rs-stellar-core".to_string()),
+            current_ledger: 64,
+            network_passphrase: None,
+            current_buckets,
+            hot_archive_buckets,
+        }
+    }
+
+    /// Regression for #2766: a level whose `prev_snap` is protocol 25 and
+    /// whose own `next` carries state=2 (Inputs) cannot be persisted —
+    /// `validate_bucket_list_structure` rejects it. The clearing pass must
+    /// erase the `next` field, after which the validator passes.
+    #[test]
+    fn test_clear_unrepresentable_futures_clears_inputs_at_shadowless_level() {
+        let mut levels = make_skeleton_levels();
+        // Level 2 is the prev_snap for level 3. Mark level 2's snap as
+        // protocol 25 (>= FIRST_PROTOCOL_SHADOWS_REMOVED = 12).
+        // Inject state=2 (Inputs) on level 3.
+        levels[3].next = HASBucketNext {
+            state: HAS_NEXT_STATE_INPUTS,
+            output: None,
+            curr: Some("a".repeat(64)),
+            snap: Some("b".repeat(64)),
+            shadow: None,
+        };
+        let snap_versions: Vec<u32> = (0..BUCKET_LIST_LEVELS).map(|_| 25u32).collect();
+
+        // Before clearing: validator rejects (this is exactly the symptom
+        // observed at ledger 90 in the bug report).
+        let pre_infos = version_infos_from(&snap_versions, &levels);
+        let pre = validate_bucket_list_structure(&pre_infos, BUCKET_LIST_LEVELS);
+        assert!(
+            pre.is_err(),
+            "validator should reject unrepresentable Inputs future at level 3 before clearing"
+        );
+
+        let mut has = make_has_with_levels(levels, None);
+        has.clear_unrepresentable_futures(&snap_versions, None);
+
+        assert!(
+            has.current_buckets[3].next.is_clear(),
+            "level 3 next must be cleared after prepareForPublish pass"
+        );
+        // After clearing: full round-trip through the real validator must
+        // pass.
+        let post_infos = version_infos_from(&snap_versions, &has.current_buckets);
+        validate_bucket_list_structure(&post_infos, BUCKET_LIST_LEVELS).unwrap();
+    }
+
+    /// Same as above but with state=1 (Output) on the target level.
+    /// Critics A and B both flagged that the clearing rule must apply
+    /// regardless of Inputs vs. Output for prev_snap >= 12.
+    #[test]
+    fn test_clear_unrepresentable_futures_clears_output_at_shadowless_level() {
+        let mut levels = make_skeleton_levels();
+        levels[5].next = HASBucketNext {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some("c".repeat(64)),
+            curr: None,
+            snap: None,
+            shadow: None,
+        };
+        let snap_versions: Vec<u32> = (0..BUCKET_LIST_LEVELS).map(|_| 24u32).collect();
+
+        let pre_infos = version_infos_from(&snap_versions, &levels);
+        assert!(
+            validate_bucket_list_structure(&pre_infos, BUCKET_LIST_LEVELS).is_err(),
+            "validator should reject unrepresentable Output future at level 5 before clearing"
+        );
+
+        let mut has = make_has_with_levels(levels, None);
+        has.clear_unrepresentable_futures(&snap_versions, None);
+
+        assert!(has.current_buckets[5].next.is_clear());
+        let post_infos = version_infos_from(&snap_versions, &has.current_buckets);
+        validate_bucket_list_structure(&post_infos, BUCKET_LIST_LEVELS).unwrap();
+    }
+
+    /// Hot-archive coverage: the same clearing must apply to the
+    /// `hot_archive_buckets` vector when present. Exercises the second
+    /// argument of `clear_unrepresentable_futures` and the
+    /// `HotArchiveBucket::get_protocol_version` API shape (Result<u32>,
+    /// no Option).
+    #[test]
+    fn test_clear_unrepresentable_futures_clears_hot_archive_future() {
+        let live_levels = make_skeleton_levels();
+        let mut hot_levels = make_skeleton_levels();
+        hot_levels[4].next = HASBucketNext {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some("d".repeat(64)),
+            curr: None,
+            snap: None,
+            shadow: None,
+        };
+        let live_snap_versions: Vec<u32> = (0..BUCKET_LIST_LEVELS).map(|_| 25u32).collect();
+        let hot_snap_versions: Vec<u32> = (0..BUCKET_LIST_LEVELS).map(|_| 25u32).collect();
+
+        let mut has = make_has_with_levels(live_levels, Some(hot_levels));
+        has.clear_unrepresentable_futures(&live_snap_versions, Some(&hot_snap_versions));
+
+        let hot = has.hot_archive_buckets.as_ref().unwrap();
+        assert!(
+            hot[4].next.is_clear(),
+            "hot-archive level 4 next must be cleared after prepareForPublish pass"
+        );
+        let post_infos = version_infos_from(&hot_snap_versions, hot);
+        validate_bucket_list_structure(&post_infos, BUCKET_LIST_LEVELS).unwrap();
+    }
+
+    /// End-to-end sanity: fresh-genesis `BucketList::new()` produces an
+    /// all-empty HAS, the per-level `protocol_version()` calls return
+    /// `Ok(None)` (mapped to 0), the clearing pass is a no-op, and the
+    /// resulting HAS satisfies the structural validator. Guards against
+    /// the cache-population edge case noted as a risk in the plan and
+    /// confirms `build_history_archive_state` end-to-end on the empty path.
+    #[test]
+    fn test_build_has_handles_all_empty_bucket_list() {
+        use crate::catchup::buckets::build_live_level_version_infos;
+
+        let bl = BucketList::new();
+        let has = build_history_archive_state(1, &bl, None, None).unwrap();
+
+        assert_eq!(has.current_buckets.len(), BUCKET_LIST_LEVELS);
+        for (i, level) in has.current_buckets.iter().enumerate() {
+            assert!(
+                level.next.is_clear(),
+                "fresh-genesis HAS level {} must have clear next",
+                i
+            );
+        }
+
+        let infos = build_live_level_version_infos(bl.levels(), &has.current_buckets).unwrap();
+        validate_bucket_list_structure(&infos, BUCKET_LIST_LEVELS).unwrap();
     }
 }

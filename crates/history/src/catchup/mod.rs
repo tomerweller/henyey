@@ -46,7 +46,7 @@
 //! - Incremental eviction scan must run each ledger for correct hashes
 //! - Bucket list hash = SHA256(live_hash || hot_archive_hash)
 
-mod buckets;
+pub(crate) mod buckets;
 mod download;
 mod persist;
 mod replay;

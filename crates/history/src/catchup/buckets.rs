@@ -68,7 +68,7 @@ pub(super) fn verified_hot_archive_bucket_loader(
 /// `Bucket::protocol_version()` (O(1) after load); empty / metaentry-less
 /// buckets map to version 0, matching stellar-core's
 /// `bucket->isEmpty() ? 0 : bucket->getBucketVersion()` branch.
-pub(super) fn build_live_level_version_infos(
+pub(crate) fn build_live_level_version_infos(
     levels: &[BucketLevel],
     has_levels: &[HASBucketLevel],
 ) -> Result<Vec<BucketLevelVersionInfo>> {
