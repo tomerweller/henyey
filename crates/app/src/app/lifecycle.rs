@@ -353,8 +353,17 @@ impl App {
         peer_refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut herder_cleanup_interval = tokio::time::interval(Duration::from_secs(30));
         herder_cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut tx_set_gc_interval =
-            tokio::time::interval(Duration::from_secs(henyey_herder::TX_SET_GC_DELAY_SECS));
+        // Arm the first tick at +TX_SET_GC_DELAY_SECS rather than firing
+        // immediately on entry, to mirror stellar-core's
+        // VirtualTimer::expires_from_now(TX_SET_GC_DELAY) shape
+        // (HerderImpl.cpp:2442). Functionally harmless either way (the purge
+        // is idempotent and a no-op on an empty DB), but matches upstream
+        // cadence exactly.
+        let tx_set_gc_period = Duration::from_secs(henyey_herder::TX_SET_GC_DELAY_SECS);
+        let mut tx_set_gc_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + tx_set_gc_period,
+            tx_set_gc_period,
+        );
         tx_set_gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Get mutable access to SCP envelope receiver
