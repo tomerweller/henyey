@@ -1176,8 +1176,16 @@ impl Herder {
                 .write()
                 .clear_slots_below(purge_slot);
 
-            // Purge SCP state
-            self.scp.purge_slots(purge_slot.saturating_sub(1), None);
+            // Purge SCP state, preserving the most-recent-checkpoint slot.
+            // Parity: stellar-core outOfSyncRecovery routes through
+            // HerderImpl::eraseOutsideRange (HerderImpl.cpp:1328-1335), which
+            // threads getMostRecentCheckpointSeq() into
+            // HerderSCPDriver::purgeSlotsOutsideRange(_, _, slotToKeep)
+            // (HerderSCPDriver.cpp:1300-1337). Without this, the checkpoint
+            // slot's SCP state can be evicted and the delayed
+            // send_scp_state callback (#2670) silently sends nothing (#2706).
+            self.scp
+                .purge_slots(purge_slot.saturating_sub(1), Some(last_checkpoint));
 
             // Purge externalized values and pending tx set requests
             self.scp_driver.purge_slots_below(purge_slot);
@@ -2481,8 +2489,21 @@ impl Herder {
         self.drain_and_process_pending(next_index);
         self.process_ready_fetching_envelopes();
 
-        // Clean up old SCP state
-        self.scp.purge_slots(slot.saturating_sub(10), None);
+        // Most-recent-checkpoint slot to preserve across all the cleanups
+        // below. Parity: stellar-core HerderImpl::eraseOutsideRange
+        // (HerderImpl.cpp:1328-1335) computes lastCheckpointSeq once and
+        // threads it into both HerderSCPDriver::purgeSlotsOutsideRange and
+        // PendingEnvelopes::eraseOutsideRange so the checkpoint slot's
+        // envelopes survive the retention window.
+        let keep_slot = self.get_most_recent_checkpoint_seq();
+
+        // Clean up old SCP state, preserving the most-recent-checkpoint
+        // slot so the delayed send_scp_state callback (#2670) can still
+        // find it after a long apply or upon validator startup (#2706).
+        // Parity: HerderSCPDriver::purgeSlotsOutsideRange
+        // (HerderSCPDriver.cpp:1300-1337).
+        self.scp
+            .purge_slots(slot.saturating_sub(10), Some(keep_slot));
         // Purge deferred slot tracking alongside SCP slot cleanup
         self.scp_driver
             .purge_deferred_slots(slot.saturating_sub(10));
@@ -2502,7 +2523,6 @@ impl Herder {
         } else {
             None
         };
-        let keep_slot = self.get_most_recent_checkpoint_seq();
         self.fetching_envelopes
             .erase_outside_range(min_slot, max_slot, keep_slot);
 
@@ -12482,6 +12502,111 @@ mod fetching_envelopes_routing_tests {
         assert!(
             !herder.fetching_envelopes.slots.read().contains_key(&50),
             "slot 50 should be erased"
+        );
+    }
+
+    /// Regression test for #2706: `ledger_closed` must preserve the most
+    /// recent checkpoint slot when purging old SCP state. The previous code
+    /// passed `None` for `slot_to_keep`, so a checkpoint slot below
+    /// `slot - 10` would be dropped — silently breaking the delayed
+    /// `send_scp_state` callback (#2670).
+    ///
+    /// Parity: stellar-core `HerderImpl::eraseOutsideRange`
+    /// (HerderImpl.cpp:1328-1335) → `HerderSCPDriver::purgeSlotsOutsideRange`
+    /// (HerderSCPDriver.cpp:1300-1337) always threads
+    /// `getMostRecentCheckpointSeq()` as `slotToKeep`.
+    #[test]
+    fn test_issue_2706_ledger_closed_preserves_checkpoint_slot_in_scp() {
+        let herder = make_test_herder();
+
+        // Bootstrap so tracking_consensus_index = 300. With
+        // checkpoint_frequency = 64 (default), the most-recent-checkpoint
+        // slot is 256. We will close slot 300, whose retention threshold is
+        // slot - 10 = 290, so checkpoint 256 sits well below the window.
+        herder.bootstrap(299);
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = 300;
+        }
+        assert_eq!(herder.get_most_recent_checkpoint_seq(), 256);
+
+        // Materialize SCP state for the checkpoint slot (must survive) and a
+        // control slot below the retention window (must be purged).
+        herder.scp.test_set_slot_v_blocking(256);
+        herder.scp.test_set_slot_v_blocking(250);
+        // And a slot inside the retention window — should also survive.
+        herder.scp.test_set_slot_v_blocking(295);
+        assert!(herder.scp.has_slot(256));
+        assert!(herder.scp.has_slot(250));
+        assert!(herder.scp.has_slot(295));
+
+        // Act
+        herder.ledger_closed(300, &[], &[], 0);
+
+        // Checkpoint slot 256 is preserved despite 256 < 290 (the
+        // slot - 10 retention threshold) thanks to slot_to_keep.
+        assert!(
+            herder.scp.has_slot(256),
+            "checkpoint slot 256 must be preserved as slot_to_keep (#2706)"
+        );
+        // Control slot 250 is below the window and not the checkpoint —
+        // it must be purged, confirming purge_slots actually ran.
+        assert!(
+            !herder.scp.has_slot(250),
+            "slot 250 should be purged (below retention window, not checkpoint)"
+        );
+        // Slot inside the retention window survives normally.
+        assert!(
+            herder.scp.has_slot(295),
+            "slot 295 should be preserved (within retention window)"
+        );
+    }
+
+    /// Regression test for #2706: `out_of_sync_recovery` must also preserve
+    /// the most-recent-checkpoint slot when purging old SCP state. Before
+    /// the fix, the SCP purge in `out_of_sync_recovery` passed `None` for
+    /// `slot_to_keep`, dropping the checkpoint slot's SCP state and
+    /// breaking the delayed `send_scp_state` callback (#2670) on the
+    /// recovery path.
+    #[test]
+    fn test_issue_2706_out_of_sync_recovery_preserves_checkpoint_in_scp() {
+        let herder = make_test_herder();
+
+        // Bootstrap to ledger 65 so checkpoint = 64.
+        herder.bootstrap(65);
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = false;
+        }
+        *herder.state.write() = HerderState::Syncing;
+        assert_eq!(herder.get_most_recent_checkpoint_seq(), 64);
+
+        // Materialize SCP state at the checkpoint (must survive) and one
+        // non-checkpoint slot below the purge boundary (must be purged).
+        herder.scp.test_set_slot_v_blocking(64);
+        herder.scp.test_set_slot_v_blocking(100);
+        assert!(herder.scp.has_slot(64));
+        assert!(herder.scp.has_slot(100));
+
+        // Set up >100 v-blocking SCP slots to trigger the recovery purge.
+        for slot in 300..=401 {
+            herder.scp.test_set_slot_v_blocking(slot);
+        }
+
+        let result = herder.out_of_sync_recovery();
+        assert_eq!(result, Some(302));
+
+        // Checkpoint slot survives despite being below the recovery purge
+        // boundary (purge_slot - 1 = 301).
+        assert!(
+            herder.scp.has_slot(64),
+            "checkpoint slot 64 must be preserved in SCP as slot_to_keep (#2706)"
+        );
+        // Non-checkpoint slot below the boundary is purged.
+        assert!(
+            !herder.scp.has_slot(100),
+            "slot 100 should be purged from SCP (below purge boundary, not checkpoint)"
         );
     }
 }
