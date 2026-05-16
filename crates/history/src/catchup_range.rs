@@ -138,49 +138,73 @@ impl std::fmt::Display for CatchupMode {
 
 /// Range required to perform a catchup operation.
 ///
-/// Contains information about whether to apply buckets and which ledgers to replay.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CatchupRange {
-    /// Whether to apply buckets from a checkpoint.
-    apply_buckets: bool,
-    /// Which ledger to apply buckets at (0 if !apply_buckets).
-    apply_buckets_at_ledger: u32,
-    /// Range of ledgers to replay after bucket application.
-    replay_range: LedgerRange,
+/// Three variants encode the post-#2677 invariant "bucket-apply only when
+/// LCL == genesis" at the type level:
+///
+/// - [`CatchupRange::ReplayOnly`]: pure replay of `replay.first ..=
+///   replay.last()`. Used for Case 0 (Complete from genesis), Case 1 (LCL >
+///   genesis), Case 4 fallback, and the Case 4b fallback when target is
+///   before the first checkpoint.
+/// - [`CatchupRange::BucketApplyAndReplay`]: apply buckets at `checkpoint`,
+///   then replay `replay` (which always starts at `checkpoint + 1`). Used
+///   for Case 5 (LCL == genesis, target past the first checkpoint).
+/// - [`CatchupRange::BucketsOnly`]: apply buckets at `checkpoint` and stop
+///   (no replay). Used for Case 3 (count=0 and target is a checkpoint) and
+///   Case 4b checkpoint (LCL == genesis, target is a checkpoint inside the
+///   first checkpoint period).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatchupRange {
+    /// Replay ledgers without applying buckets.
+    ReplayOnly {
+        /// Range of ledgers to replay (must be non-empty).
+        replay: LedgerRange,
+    },
+    /// Apply buckets at `checkpoint`, then replay ledgers starting at
+    /// `checkpoint + 1`. Invariants: `replay.first == checkpoint + 1` and
+    /// `replay.count > 0`. Enforced by [`CatchupRange::buckets_and_replay`].
+    BucketApplyAndReplay {
+        /// Checkpoint ledger at which to apply buckets.
+        checkpoint: u32,
+        /// Range of ledgers to replay after bucket application.
+        replay: LedgerRange,
+    },
+    /// Apply buckets at `checkpoint` and stop (no replay).
+    BucketsOnly {
+        /// Checkpoint ledger at which to apply buckets.
+        checkpoint: u32,
+    },
 }
 
 impl CatchupRange {
     /// Create a range that only applies buckets (no replay).
-    pub fn buckets_only(apply_at: u32) -> Self {
-        let range = Self {
-            apply_buckets: true,
-            apply_buckets_at_ledger: apply_at,
-            replay_range: LedgerRange::empty(),
-        };
-        range.check_invariants();
-        range
+    pub(crate) fn buckets_only(checkpoint: u32) -> Self {
+        assert!(checkpoint > 0, "buckets_only checkpoint must be > 0");
+        Self::BucketsOnly { checkpoint }
     }
 
     /// Create a range that only replays ledgers (no bucket application).
-    pub fn replay_only(replay_range: LedgerRange) -> Self {
-        let range = Self {
-            apply_buckets: false,
-            apply_buckets_at_ledger: 0,
-            replay_range,
-        };
-        range.check_invariants();
-        range
+    pub(crate) fn replay_only(replay: LedgerRange) -> Self {
+        assert!(
+            replay.count > 0,
+            "replay_only requires a non-empty replay range"
+        );
+        assert!(replay.first > 0, "replay_only replay.first must be > 0");
+        Self::ReplayOnly { replay }
     }
 
     /// Create a range that applies buckets then replays ledgers.
-    pub fn buckets_and_replay(apply_at: u32, replay_range: LedgerRange) -> Self {
-        let range = Self {
-            apply_buckets: true,
-            apply_buckets_at_ledger: apply_at,
-            replay_range,
-        };
-        range.check_invariants();
-        range
+    pub(crate) fn buckets_and_replay(checkpoint: u32, replay: LedgerRange) -> Self {
+        assert!(checkpoint > 0, "buckets_and_replay checkpoint must be > 0");
+        assert!(
+            replay.count > 0,
+            "buckets_and_replay requires a non-empty replay range"
+        );
+        assert_eq!(
+            checkpoint + 1,
+            replay.first,
+            "replay must start immediately after bucket apply"
+        );
+        Self::BucketApplyAndReplay { checkpoint, replay }
     }
 
     /// Calculate the catchup range based on LCL, target, and mode.
@@ -194,7 +218,7 @@ impl CatchupRange {
     /// # Panics
     ///
     /// Panics if preconditions are not met.
-    pub fn calculate(lcl: u32, target: u32, mode: CatchupMode) -> Self {
+    pub(crate) fn calculate(lcl: u32, target: u32, mode: CatchupMode) -> Self {
         // Validate preconditions
         assert!(
             lcl >= GENESIS_LEDGER_SEQ,
@@ -294,101 +318,46 @@ impl CatchupRange {
         Self::buckets_and_replay(apply_buckets_at, replay)
     }
 
-    fn check_invariants(&self) {
-        // Must be applying buckets and/or replaying
-        assert!(
-            self.apply_buckets || self.replay_ledgers(),
-            "must apply buckets or replay ledgers"
-        );
-
-        if !self.apply_buckets && self.replay_ledgers() {
-            // Cases 1, 2, 4: no buckets, only replay
-            assert_eq!(self.apply_buckets_at_ledger, 0);
-            assert_ne!(self.replay_range.first, 0);
-        } else if self.apply_buckets && self.replay_ledgers() {
-            // Case 5: buckets and replay
-            assert_ne!(self.apply_buckets_at_ledger, 0);
-            assert_ne!(self.replay_range.first, 0);
-            assert_eq!(
-                self.apply_buckets_at_ledger + 1,
-                self.replay_range.first,
-                "replay must start immediately after bucket apply"
-            );
-        } else {
-            // Case 3: buckets only, no replay
-            assert!(self.apply_buckets && !self.replay_ledgers());
-            assert_eq!(self.replay_range.first, 0);
+    /// Get the replay range, if this variant performs replay.
+    #[cfg(test)]
+    pub fn replay_range(&self) -> Option<LedgerRange> {
+        match self {
+            Self::ReplayOnly { replay } | Self::BucketApplyAndReplay { replay, .. } => {
+                Some(*replay)
+            }
+            Self::BucketsOnly { .. } => None,
         }
     }
 
-    /// Whether buckets should be applied.
-    pub fn apply_buckets(&self) -> bool {
-        self.apply_buckets
-    }
-
-    /// Get the ledger at which to apply buckets.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `apply_buckets()` is false.
-    pub fn bucket_apply_ledger(&self) -> u32 {
-        assert!(
-            self.apply_buckets,
-            "bucket_apply_ledger called when apply_buckets is false"
-        );
-        self.apply_buckets_at_ledger
-    }
-
-    /// Whether ledgers should be replayed.
-    pub fn replay_ledgers(&self) -> bool {
-        self.replay_range.count > 0
-    }
-
-    /// Get the replay range.
-    pub fn replay_range(&self) -> LedgerRange {
-        self.replay_range
-    }
-
-    /// Get the first ledger to replay.
-    pub fn replay_first(&self) -> u32 {
-        self.replay_range.first
-    }
-
-    /// Get the number of ledgers to replay.
-    pub fn replay_count(&self) -> u32 {
-        self.replay_range.count
-    }
-
-    /// Get one past the last ledger to replay.
-    pub fn replay_limit(&self) -> u32 {
-        self.replay_range.limit()
-    }
-
     /// Get the first ledger in the full range (bucket apply or replay start).
+    #[cfg(test)]
     pub fn first(&self) -> u32 {
-        if self.apply_buckets {
-            self.apply_buckets_at_ledger
-        } else {
-            self.replay_range.first
+        match self {
+            Self::ReplayOnly { replay } => replay.first,
+            Self::BucketApplyAndReplay { checkpoint, .. } | Self::BucketsOnly { checkpoint } => {
+                *checkpoint
+            }
         }
     }
 
     /// Get the last ledger in the full range.
+    #[cfg(test)]
     pub fn last(&self) -> u32 {
-        if self.replay_range.count > 0 {
-            self.replay_range.last()
-        } else {
-            assert!(self.apply_buckets);
-            self.apply_buckets_at_ledger
+        match self {
+            Self::ReplayOnly { replay } | Self::BucketApplyAndReplay { replay, .. } => {
+                replay.last()
+            }
+            Self::BucketsOnly { checkpoint } => *checkpoint,
         }
     }
 
     /// Get the total count of ledgers (bucket apply counts as 1).
+    #[cfg(test)]
     pub fn count(&self) -> u32 {
-        if self.apply_buckets {
-            self.replay_range.count + 1
-        } else {
-            self.replay_range.count
+        match self {
+            Self::ReplayOnly { replay } => replay.count,
+            Self::BucketApplyAndReplay { replay, .. } => replay.count + 1,
+            Self::BucketsOnly { .. } => 1,
         }
     }
 }
@@ -421,10 +390,12 @@ mod tests {
     fn test_case1_lcl_past_genesis_non_minimal() {
         // LCL is past genesis with non-Minimal mode — replay from LCL+1
         let range = CatchupRange::calculate(100, 200, CatchupMode::Complete);
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 101);
-        assert_eq!(range.replay_count(), 100);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(101, 100)
+            }
+        );
     }
 
     #[test]
@@ -434,10 +405,12 @@ mod tests {
         // block the event loop and cause an infinite catchup loop.
         // target=127 is a checkpoint ledger, but gap=27 < threshold → replay_only.
         let range = CatchupRange::calculate(100, 127, CatchupMode::Minimal);
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 101);
-        assert_eq!(range.replay_count(), 27);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(101, 27)
+            }
+        );
     }
 
     #[test]
@@ -445,10 +418,12 @@ mod tests {
         // Simulate the buffered-catchup scenario: LCL=61551871, gap=93.
         // Must use replay_only, not bucket download.
         let range = CatchupRange::calculate(61551871, 61551964, CatchupMode::Minimal);
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 61551872);
-        assert_eq!(range.replay_count(), 93);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(61551872, 93)
+            }
+        );
     }
 
     #[test]
@@ -458,42 +433,45 @@ mod tests {
         // Previously this used bucket-download optimization; now it replays
         // the full gap to maintain INV-C15.
         let range = CatchupRange::calculate(61529351, 61551615, CatchupMode::Minimal);
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 61529352);
-        assert_eq!(range.replay_count(), 22264); // 61551615 - 61529351
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(61529352, 22264) // 61551615 - 61529351
+            }
+        );
     }
 
     #[test]
     fn test_case2_full_replay() {
         // count >= full replay count, do full replay
         let range = CatchupRange::calculate(1, 100, CatchupMode::Complete);
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 2);
-        assert_eq!(range.replay_count(), 99);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 99)
+            }
+        );
     }
 
     #[test]
     fn test_case3_buckets_only() {
         // count=0 and target is checkpoint, buckets only
         let range = CatchupRange::calculate(1, 127, CatchupMode::Minimal);
-        assert!(range.apply_buckets());
-        assert!(!range.replay_ledgers());
-        assert_eq!(range.bucket_apply_ledger(), 127);
+        assert_eq!(range, CatchupRange::BucketsOnly { checkpoint: 127 });
     }
 
     #[test]
     fn test_case3_minimal_non_checkpoint() {
         // count=0 but target is NOT a checkpoint
-        // This falls through to case 5
+        // This falls through to case 5: apply buckets at 63, replay 64..=100.
         let range = CatchupRange::calculate(1, 100, CatchupMode::Minimal);
-        assert!(range.apply_buckets());
-        assert!(range.replay_ledgers());
-        // Should apply buckets at checkpoint 63, replay from 64 to 100
-        assert_eq!(range.bucket_apply_ledger(), 63);
-        assert_eq!(range.replay_first(), 64);
-        assert_eq!(range.replay_count(), 37); // 100 - 63 = 37
+        assert_eq!(
+            range,
+            CatchupRange::BucketApplyAndReplay {
+                checkpoint: 63,
+                replay: LedgerRange::new(64, 37) // 100 - 63 = 37
+            }
+        );
     }
 
     #[test]
@@ -501,10 +479,12 @@ mod tests {
         // target start is in first checkpoint, full replay
         let range = CatchupRange::calculate(1, 50, CatchupMode::Recent(10));
         // target_start = 50 - 10 + 1 = 41, which is in first checkpoint (0-63)
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 2);
-        assert_eq!(range.replay_count(), 49);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 49)
+            }
+        );
     }
 
     #[test]
@@ -514,11 +494,13 @@ mod tests {
         // target_start = 200 - 50 + 1 = 151
         // first_in_checkpoint(151) = 128
         // last_before_checkpoint(151) = 127
-        assert!(range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.bucket_apply_ledger(), 127);
-        assert_eq!(range.replay_first(), 128);
-        assert_eq!(range.replay_count(), 73); // 200 - 127 = 73
+        assert_eq!(
+            range,
+            CatchupRange::BucketApplyAndReplay {
+                checkpoint: 127,
+                replay: LedgerRange::new(128, 73) // 200 - 127 = 73
+            }
+        );
     }
 
     #[test]
@@ -528,13 +510,13 @@ mod tests {
         // genesis. stellar-core handles this identically (CatchupRange.cpp
         // Case 2: count=UINT32_MAX >= full_replay_count → replay_only).
         let range = CatchupRange::calculate(1, 63, CatchupMode::Complete);
-        assert!(
-            !range.apply_buckets(),
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 62)
+            },
             "Complete mode from genesis must replay, not bucket-apply"
         );
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 2);
-        assert_eq!(range.replay_count(), 62);
     }
 
     #[test]
@@ -543,12 +525,11 @@ mod tests {
         // (no replay). Replaying through protocol upgrades from genesis
         // produces different state hashes than the live network.
         let range = CatchupRange::calculate(1, 63, CatchupMode::Minimal);
-        assert!(
-            range.apply_buckets(),
+        assert_eq!(
+            range,
+            CatchupRange::BucketsOnly { checkpoint: 63 },
             "Minimal mode from genesis should use bucket-apply"
         );
-        assert!(!range.replay_ledgers());
-        assert_eq!(range.bucket_apply_ledger(), 63);
     }
 
     #[test]
@@ -556,20 +537,24 @@ mod tests {
         // Complete mode from genesis to a non-checkpoint target. No HAS is
         // available, so we must replay from genesis (fallback).
         let range = CatchupRange::calculate(1, 100, CatchupMode::Complete);
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 2);
-        assert_eq!(range.replay_count(), 99);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 99)
+            }
+        );
     }
 
     #[test]
     fn test_complete_from_non_genesis() {
         // Complete mode from a non-genesis LCL should still replay.
         let range = CatchupRange::calculate(50, 100, CatchupMode::Complete);
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 51);
-        assert_eq!(range.replay_count(), 50);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(51, 50)
+            }
+        );
     }
 
     #[test]
@@ -578,12 +563,11 @@ mod tests {
         // The lcl > GENESIS guard on Case 2 prevents a full replay from
         // genesis; should fall through to bucket-apply.
         let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100));
-        assert!(
-            range.apply_buckets(),
+        assert_eq!(
+            range,
+            CatchupRange::BucketsOnly { checkpoint: 63 },
             "Recent with large count from genesis should bucket-apply, not replay"
         );
-        assert!(!range.replay_ledgers());
-        assert_eq!(range.bucket_apply_ledger(), 63);
     }
 
     #[test]
@@ -594,9 +578,12 @@ mod tests {
         let range = CatchupRange::calculate(1, 50, CatchupMode::Recent(40));
         // target_start = 50 - 40 + 1 = 11, first_in_checkpoint(11) = 1 <= GENESIS
         // lcl == GENESIS, target is not a checkpoint -> fallback replay
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 2);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 49)
+            }
+        );
     }
 
     #[test]
@@ -604,10 +591,12 @@ mod tests {
         // LCL > genesis, target in first checkpoint.
         // Case 1 now unconditionally replays from LCL+1 (stellar-core parity).
         let range = CatchupRange::calculate(2, 50, CatchupMode::Recent(10));
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 3);
-        assert_eq!(range.replay_count(), 48); // 50 - 2 = 48
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(3, 48) // 50 - 2 = 48
+            }
+        );
     }
 
     #[test]
@@ -619,12 +608,13 @@ mod tests {
         // target_start = 843007 - 128 + 1 = 842880
         // first_in_checkpoint(842880) = 842880 (it's at checkpoint start)
         // last_before_checkpoint(842880) = 842879
-        assert!(range.apply_buckets());
-        assert!(range.replay_ledgers());
-        // Should apply buckets at 842879, replay 128 ledgers
-        assert_eq!(range.bucket_apply_ledger(), 842879);
-        assert_eq!(range.replay_first(), 842880);
-        assert_eq!(range.replay_count(), 128); // 843007 - 842879 = 128
+        assert_eq!(
+            range,
+            CatchupRange::BucketApplyAndReplay {
+                checkpoint: 842879,
+                replay: LedgerRange::new(842880, 128) // 843007 - 842879 = 128
+            }
+        );
     }
 
     #[test]
@@ -632,13 +622,15 @@ mod tests {
         // Minimal mode from genesis to a large non-checkpoint target.
         // count=0 → target_start = 10001 (past first checkpoint).
         // Falls through to Case 5: bucket-apply at prior checkpoint, then replay.
-        let range = CatchupRange::calculate(1, 10000, CatchupMode::Minimal);
-        assert!(range.apply_buckets());
-        assert!(range.replay_ledgers());
         // checkpoint_start(10001) = 9984, apply_buckets_at = 9983
-        assert_eq!(range.bucket_apply_ledger(), 9983);
-        assert_eq!(range.replay_first(), 9984);
-        assert_eq!(range.replay_count(), 17); // 10000 - 9983 = 17
+        let range = CatchupRange::calculate(1, 10000, CatchupMode::Minimal);
+        assert_eq!(
+            range,
+            CatchupRange::BucketApplyAndReplay {
+                checkpoint: 9983,
+                replay: LedgerRange::new(9984, 17) // 10000 - 9983 = 17
+            }
+        );
     }
 
     #[test]
@@ -647,10 +639,12 @@ mod tests {
         // stellar-core parity (Case 1), LCL > genesis always replays —
         // bucket-apply optimization was removed to enforce INV-C15.
         let range = CatchupRange::calculate(50000, 70000, CatchupMode::Minimal);
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 50001);
-        assert_eq!(range.replay_count(), 20000); // 70000 - 50000
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(50001, 20000) // 70000 - 50000
+            }
+        );
     }
 
     // ── Recent(N) Case 1 regression tests ──────────────────────────────
@@ -662,10 +656,12 @@ mod tests {
         // Recent(500), lcl=100, target=10_000 → gap=9900.
         // With stellar-core parity, LCL > genesis always replays from LCL+1.
         let range = CatchupRange::calculate(100, 10_000, CatchupMode::Recent(500));
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 101);
-        assert_eq!(range.replay_count(), 9900);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(101, 9900)
+            }
+        );
     }
 
     #[test]
@@ -673,10 +669,12 @@ mod tests {
         // Recent(10_000), lcl=100, target=5000 → gap=4900.
         // LCL > genesis → replay from lcl+1.
         let range = CatchupRange::calculate(100, 5000, CatchupMode::Recent(10_000));
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 101);
-        assert_eq!(range.replay_count(), 4900);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(101, 4900)
+            }
+        );
     }
 
     #[test]
@@ -684,10 +682,12 @@ mod tests {
         // Recent(500), lcl=61_551_871, target=61_551_964 → gap=93.
         // LCL > genesis → replay from lcl+1.
         let range = CatchupRange::calculate(61_551_871, 61_551_964, CatchupMode::Recent(500));
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 61_551_872);
-        assert_eq!(range.replay_count(), 93);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(61_551_872, 93)
+            }
+        );
     }
 
     #[test]
@@ -695,10 +695,12 @@ mod tests {
         // Recent(100), lcl=100, target=200 → gap=100 = N.
         // LCL > genesis → replay from lcl+1 regardless of count.
         let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(100));
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 101);
-        assert_eq!(range.replay_count(), 100);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(101, 100)
+            }
+        );
     }
 
     #[test]
@@ -707,10 +709,12 @@ mod tests {
         // With stellar-core parity, LCL > genesis always replays from LCL+1.
         // (Previously this fell through to checkpoint download — INV-C15 violation.)
         let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(99));
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 101);
-        assert_eq!(range.replay_count(), 100);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(101, 100)
+            }
+        );
     }
 
     #[test]
@@ -718,10 +722,12 @@ mod tests {
         // Recent(500), lcl=100, target=10_047 (non-checkpoint) → gap > 500.
         // With stellar-core parity, LCL > genesis always replays from LCL+1.
         let range = CatchupRange::calculate(100, 10_047, CatchupMode::Recent(500));
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 101);
-        assert_eq!(range.replay_count(), 9947); // 10047 - 100
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(101, 9947) // 10047 - 100
+            }
+        );
     }
 
     #[test]
@@ -729,10 +735,12 @@ mod tests {
         // Recent(150), lcl=2, target=200 → gap=198.
         // LCL > genesis → Case 1 returns replay_only.
         let range = CatchupRange::calculate(2, 200, CatchupMode::Recent(150));
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 3);
-        assert_eq!(range.replay_count(), 198);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(3, 198)
+            }
+        );
     }
 
     #[test]
@@ -741,9 +749,64 @@ mod tests {
         // With stellar-core parity, LCL > genesis always replays from LCL+1.
         // (Previously this fell through to checkpoint download.)
         let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(0));
-        assert!(!range.apply_buckets());
-        assert!(range.replay_ledgers());
-        assert_eq!(range.replay_first(), 101);
-        assert_eq!(range.replay_count(), 100);
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(101, 100)
+            }
+        );
+    }
+
+    // ── Accessor / constructor invariant tests ─────────────────────────
+
+    #[test]
+    fn test_accessors_replay_only() {
+        let range = CatchupRange::ReplayOnly {
+            replay: LedgerRange::new(10, 5),
+        };
+        assert_eq!(range.first(), 10);
+        assert_eq!(range.last(), 14);
+        assert_eq!(range.count(), 5);
+        assert_eq!(range.replay_range(), Some(LedgerRange::new(10, 5)));
+    }
+
+    #[test]
+    fn test_accessors_bucket_apply_and_replay() {
+        let range = CatchupRange::BucketApplyAndReplay {
+            checkpoint: 127,
+            replay: LedgerRange::new(128, 73),
+        };
+        assert_eq!(range.first(), 127);
+        assert_eq!(range.last(), 200);
+        assert_eq!(range.count(), 74); // 73 replayed + 1 bucket apply
+        assert_eq!(range.replay_range(), Some(LedgerRange::new(128, 73)));
+    }
+
+    #[test]
+    fn test_accessors_buckets_only() {
+        let range = CatchupRange::BucketsOnly { checkpoint: 127 };
+        assert_eq!(range.first(), 127);
+        assert_eq!(range.last(), 127);
+        assert_eq!(range.count(), 1);
+        assert_eq!(range.replay_range(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "replay must start immediately after bucket apply")]
+    fn test_buckets_and_replay_rejects_gap() {
+        // replay.first must equal checkpoint + 1.
+        let _ = CatchupRange::buckets_and_replay(127, LedgerRange::new(130, 10));
+    }
+
+    #[test]
+    #[should_panic(expected = "buckets_and_replay requires a non-empty replay range")]
+    fn test_buckets_and_replay_rejects_empty_replay() {
+        let _ = CatchupRange::buckets_and_replay(127, LedgerRange::new(128, 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "replay_only requires a non-empty replay range")]
+    fn test_replay_only_rejects_empty_replay() {
+        let _ = CatchupRange::replay_only(LedgerRange::empty());
     }
 }

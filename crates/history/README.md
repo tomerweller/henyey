@@ -48,7 +48,6 @@ flowchart LR
 | `HistoryArchiveState` | Parsed HAS document with bucket hash helpers and FutureBucket state. |
 | `CatchupManager` | End-to-end catchup orchestrator: download, verify, apply buckets, replay. |
 | `CatchupManagerBuilder` | Convenience builder for wiring archives, DB, bucket manager, and validation options. |
-| `CatchupRange` | stellar-core-compatible decision about buckets-only vs replay-only vs mixed catchup. |
 | `CatchupMode` | User-facing catchup policy: `Minimal`, `Complete`, or `Recent(n)`. |
 | `ReplayConfig` | Controls replay verification, eviction behavior, event emission, and publish backpressure. |
 | `ReplayedLedgerState` | Final replay summary derived from a ledger header and hash. |
@@ -76,25 +75,6 @@ println!("archive at ledger {}", has.current_ledger());
 println!("downloaded {} headers", headers.len());
 # Ok(())
 # }
-```
-
-```rust
-use henyey_history::{CatchupMode, CatchupRange, GENESIS_LEDGER_SEQ};
-
-let range = CatchupRange::calculate(
-    GENESIS_LEDGER_SEQ,
-    843_007,
-    CatchupMode::Recent(128),
-);
-
-assert!(range.apply_buckets());
-assert!(range.replay_ledgers());
-println!(
-    "apply at {}, replay {} ledgers from {}",
-    range.bucket_apply_ledger(),
-    range.replay_count(),
-    range.replay_first(),
-);
 ```
 
 ```rust

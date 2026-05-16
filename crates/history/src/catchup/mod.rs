@@ -744,92 +744,94 @@ impl CatchupManager {
 
         // Calculate the catchup range based on mode
         let range = CatchupRange::calculate(lcl, target, mode);
-        info!(
-            "Catchup range: apply_buckets={}, bucket_apply_ledger={}, replay_first={}, replay_count={}",
-            range.apply_buckets(),
-            if range.apply_buckets() { range.bucket_apply_ledger() } else { 0 },
-            range.replay_first(),
-            range.replay_count()
-        );
+        info!("Catchup range: {:?}", range);
 
-        let checkpoint_seq = if range.apply_buckets() {
-            // Apply buckets at the calculated checkpoint
-            let bucket_apply_at = range.bucket_apply_ledger();
-            info!("Applying buckets at checkpoint {}", bucket_apply_at);
+        let checkpoint_seq = match &range {
+            CatchupRange::BucketApplyAndReplay {
+                checkpoint: bucket_apply_at,
+                ..
+            }
+            | CatchupRange::BucketsOnly {
+                checkpoint: bucket_apply_at,
+            } => {
+                let bucket_apply_at = *bucket_apply_at;
+                info!("Applying buckets at checkpoint {}", bucket_apply_at);
 
-            // Download HAS
-            self.update_progress(
-                CatchupStatus::DownloadingHAS,
-                1,
-                "Downloading History Archive State",
-            );
-            let (has, has_archive_name) = self.download_and_verify_has(bucket_apply_at).await?;
+                // Download HAS
+                self.update_progress(
+                    CatchupStatus::DownloadingHAS,
+                    1,
+                    "Downloading History Archive State",
+                );
+                let (has, has_archive_name) = self.download_and_verify_has(bucket_apply_at).await?;
 
-            let scp_history = self.download_scp_history(bucket_apply_at).await?;
-            self.verify_and_persist_scp_history(&scp_history)?;
+                let scp_history = self.download_scp_history(bucket_apply_at).await?;
+                self.verify_and_persist_scp_history(&scp_history)?;
 
-            // Download buckets
-            self.update_progress(
-                CatchupStatus::DownloadingBuckets,
-                2,
-                "Downloading bucket files",
-            );
-            let bucket_hashes = self.compute_bucket_download_set(&has)?;
-            self.progress.buckets_total = bucket_hashes.len() as u32;
-            let buckets = self.download_buckets(&bucket_hashes).await?;
+                // Download buckets
+                self.update_progress(
+                    CatchupStatus::DownloadingBuckets,
+                    2,
+                    "Downloading bucket files",
+                );
+                let bucket_hashes = self.compute_bucket_download_set(&has)?;
+                self.progress.buckets_total = bucket_hashes.len() as u32;
+                let buckets = self.download_buckets(&bucket_hashes).await?;
 
-            // Apply buckets and initialize LedgerManager
-            let (checkpoint_header, checkpoint_hash) =
-                self.download_checkpoint_header(bucket_apply_at).await?;
+                // Apply buckets and initialize LedgerManager
+                let (checkpoint_header, checkpoint_hash) =
+                    self.download_checkpoint_header(bucket_apply_at).await?;
 
-            self.apply_buckets_and_init_ledger_manager(
-                &has,
-                &buckets,
-                bucket_apply_at,
-                checkpoint_header,
-                checkpoint_hash,
-                ledger_manager,
-                &has_archive_name,
-            )
-            .await?;
+                self.apply_buckets_and_init_ledger_manager(
+                    &has,
+                    &buckets,
+                    bucket_apply_at,
+                    checkpoint_header,
+                    checkpoint_hash,
+                    ledger_manager,
+                    &has_archive_name,
+                )
+                .await?;
 
-            bucket_apply_at
-        } else {
-            // No bucket application - Case 1: replay from current state.
-            // The LedgerManager is already initialized at the current LCL.
-            if !ledger_manager.is_initialized() {
-                // If we have existing state but ledger manager is not initialized,
-                // initialize it with the existing bucket state.
-                match existing_state {
-                    Some(state) => {
-                        info!(
-                            "Case 1 replay: initializing ledger manager from existing state at LCL {}",
-                            lcl
-                        );
-                        let (header, hash) = self.download_checkpoint_header(lcl).await?;
-                        ledger_manager
-                            .initialize(
-                                state.bucket_list,
-                                state.hot_archive_bucket_list,
-                                header,
-                                hash,
-                            )
-                            .map_err(|e| map_initialize_error(e, " from existing state"))?;
-                    }
-                    None => {
-                        return Err(HistoryError::CatchupFailed(
-                            "Catchup from LCL > genesis requires existing bucket lists or an initialized ledger manager"
-                                .to_string(),
-                        ));
+                bucket_apply_at
+            }
+            CatchupRange::ReplayOnly { .. } => {
+                // No bucket application - Case 1: replay from current state.
+                // The LedgerManager is already initialized at the current LCL.
+                if !ledger_manager.is_initialized() {
+                    // If we have existing state but ledger manager is not initialized,
+                    // initialize it with the existing bucket state.
+                    match existing_state {
+                        Some(state) => {
+                            info!(
+                                "Case 1 replay: initializing ledger manager from existing state at LCL {}",
+                                lcl
+                            );
+                            let (header, hash) = self.download_checkpoint_header(lcl).await?;
+                            ledger_manager
+                                .initialize(
+                                    state.bucket_list,
+                                    state.hot_archive_bucket_list,
+                                    header,
+                                    hash,
+                                )
+                                .map_err(|e| map_initialize_error(e, " from existing state"))?;
+                        }
+                        None => {
+                            return Err(HistoryError::CatchupFailed(
+                                "Catchup from LCL > genesis requires existing bucket lists or an initialized ledger manager"
+                                    .to_string(),
+                            ));
+                        }
                     }
                 }
+                lcl
             }
-            lcl
         };
 
         // Download, verify, and replay ledgers with retry.
         // Matches stellar-core's DownloadApplyTxsWork(RETRY_A_FEW).
-        if range.replay_count() == 0 {
+        if matches!(range, CatchupRange::BucketsOnly { .. }) {
             info!(
                 "Catching up to checkpoint {} (no ledgers to replay)",
                 checkpoint_seq
