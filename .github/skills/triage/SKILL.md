@@ -30,9 +30,23 @@ gh issue view $ISSUE --repo stellar-experimental/henyey --json title,body,labels
 
 Skim the body and the last few comments. Note the existing labels. If the issue was filed by `/monitor-loop`, the body should already be structured (problem statement, evidence, suggested labels). If filed by a human, structure may be looser.
 
-### Step 2 — Verify the handoff (no-op if `backlog`)
+### Step 2 — Verify the handoff (no-op if not `backlog`)
 
-Confirm the issue's current Status is `backlog`. If it's already past backlog (someone moved it manually) and there's no triage report comment, post a brief note and proceed. If a `## Triage Report` comment already exists, this is a re-triage — re-run only if the operator explicitly requested it via the `--force` flag; otherwise exit 0.
+Confirm the issue's current Status is `backlog`:
+
+```bash
+STATUS=$(gh api graphql -f query='{organization(login:"stellar-experimental"){projectV2(number:2){items(first:100){nodes{content{...on Issue{number}} fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name}}}}}}}' \
+  --jq ".data.organization.projectV2.items.nodes[] | select(.content.number == $ISSUE) | .fieldValueByName.name")
+```
+
+Branching:
+
+- **Status is `backlog`** (the expected case): proceed to Step 3.
+- **Status is anything else AND `--force` was NOT passed**: exit 0 silently. Triage should not demote an issue that an operator or another agent has already moved forward. Post nothing, change nothing.
+- **Status is anything else AND `--force` was passed**: re-triage as if `backlog` — the operator explicitly asked for a re-evaluation. Note in the resulting Triage Report which prior state we ran from (for audit trail).
+- **A `## Triage Report` comment already exists** AND `--force` was NOT passed: exit 0 silently (also handles "monitor-loop refiled an issue we already triaged" cases).
+
+This early-exit protects against the bug where /triage runs on an `in-review` issue and accidentally routes it to `blocked` (`needs-human-decision` etc.).
 
 ### Step 3 — Validate well-formed-ness
 

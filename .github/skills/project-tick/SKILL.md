@@ -103,29 +103,48 @@ for ISSUE in <in-review candidates>; do
   # No PR linked = broken state; let /review-pr handle the recovery.
   [ -z "$PR_NUM" ] && continue
 
-  # Count CI checks not yet completed (status != "completed").
-  CI_PENDING=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
-    --json statusCheckRollup \
-    --jq '[.statusCheckRollup[] | select(.status != "COMPLETED" and .status != "completed")] | length')
+  # Fetch the rollup once.
+  ROLLUP=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
+    --json statusCheckRollup --jq '.statusCheckRollup')
 
-  # Also count failed; if any failed, CI is RED (not pending) — keep actionable so /review-pr can bounce.
-  CI_FAILED=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
-    --json statusCheckRollup \
-    --jq '[.statusCheckRollup[] | select(.conclusion == "FAILURE" or .conclusion == "CANCELLED")] | length')
+  # Count rollup entries (must be > 0 — empty rollup is suspicious, not "green").
+  CI_TOTAL=$(echo "$ROLLUP" | jq 'length')
 
-  if [ "$CI_PENDING" -gt 0 ] && [ "$CI_FAILED" -eq 0 ]; then
-    # CI still running with no failures yet → skip this tick.
+  # Pending: anything not yet completed. Handle BOTH casings AND StatusContext.
+  # GH Actions CheckRun: .status in [QUEUED, IN_PROGRESS, COMPLETED] (uppercase)
+  # StatusContext (legacy commit status): .status is null; .state in [PENDING, SUCCESS, FAILURE, ERROR]
+  CI_PENDING=$(echo "$ROLLUP" | jq '[.[] |
+    select(
+      (.status != null and (.status | ascii_upcase) != "COMPLETED")
+      or
+      (.status == null and (.state | ascii_upcase) == "PENDING")
+    )] | length')
+
+  # Failed: any failure / cancellation / error / timed out.
+  CI_FAILED=$(echo "$ROLLUP" | jq '[.[] |
+    select(
+      ((.conclusion // "") | ascii_upcase) as $c |
+      $c == "FAILURE" or $c == "CANCELLED" or $c == "TIMED_OUT"
+      or ((.state // "") | ascii_upcase) as $s | $s == "FAILURE" or $s == "ERROR"
+    )] | length')
+
+  # Skip this tick if CI is genuinely in-progress (entries exist AND some are pending AND none failed).
+  if [ "$CI_TOTAL" -gt 0 ] && [ "$CI_PENDING" -gt 0 ] && [ "$CI_FAILED" -eq 0 ]; then
     SKIP_THIS_ISSUE=true
   fi
+
+  # NOTE: empty rollup (CI_TOTAL == 0) → keep actionable; /review-pr Step 5 will refuse to classify
+  # it as green (see "Empty rollup is NOT green" rule there) and bounce/block as appropriate.
 done
 ```
 
 Rule summary:
 
-- CI green → actionable (`/review-pr` will merge).
-- CI red (any failure or cancellation) → actionable (`/review-pr` will bounce).
-- CI still running with no failures yet → **NOT actionable this tick**. The next tick re-evaluates.
-- No PR linked → actionable anyway (`/review-pr`'s no-PR recovery path runs).
+- CI green (entries exist, none pending, none failed) → actionable (`/review-pr` will merge).
+- CI red (any failure / cancellation / error) → actionable (`/review-pr` will bounce).
+- CI still running (entries exist, some pending, none failed) → **NOT actionable this tick**. Next tick re-evaluates.
+- Empty rollup (zero entries — workflow never started, broken config, fork PR gated) → actionable so `/review-pr` can detect and either block or bounce. **Never treat empty rollup as "green".**
+- No PR linked → actionable (`/review-pr`'s no-PR recovery path).
 
 This single change eliminates the wasted reviewer-spawn-during-CI-wait pattern. Wall-clock latency for the first review is unchanged in expectation because CI (10–30 min) dominates reviewer-agent time (2–3 min) — reviewers running in parallel with CI was an optimization the cost didn't justify.
 
@@ -182,9 +201,11 @@ WINNER_TICK=$(gh api "repos/stellar-experimental/henyey/issues/$ISSUE/comments" 
 
 if [ "$WINNER_TICK" != "$TICK_ID" ]; then
   echo "race lost on #$ISSUE (winner: $WINNER_TICK, us: $TICK_ID) — exiting"
-  # Clean up our sentinel and unassign.
+  # Clean up our sentinel only. DO NOT unassign — multiple ticks running as the
+  # same GitHub user share one assignment record, so removing it would yank
+  # the winner's assignment out from under it (see #2787 / audit M1). The
+  # winner retains the assignment and proceeds; we just step back.
   gh api "repos/stellar-experimental/henyey/issues/comments/$SENTINEL_ID" --method DELETE 2>/dev/null || true
-  gh issue edit "$ISSUE" --repo stellar-experimental/henyey --remove-assignee @me 2>/dev/null || true
   exit 0
 fi
 
@@ -210,7 +231,7 @@ Pass the model explicitly when invoking the sub-agent (e.g. via `--model <model>
 
 **Rationale:** triage and orchestration are simple decision tasks (haiku is plenty). Implementation needs strong code-writing (opus). Plan-critics and PR-reviewers benefit from cross-model diversity (gpt-5.4 catches what an all-claude pipeline might miss).
 
-**Critical: the sub-agent MUST run in the foreground.** Do not set `run_in_background: true` on the Agent tool call. The dispatcher's job is to block until the specialist either completes the full state transition OR posts a failure marker (`## Blocked`, `## Plan: ...`, etc.) — anything less leaves work orphaned mid-flight (commit pushed but no PR open, etc.).
+**Critical: the sub-agent MUST run in the foreground.** Do not set `run_in_background: true` on the Agent tool call. The dispatcher's job is to block until the specialist either completes the full state transition OR posts a recognized failure marker (e.g. `## Plan: Did Not Converge`, `## Plan: Triage Disagreement`, `## Do: Plan Wrong`, `## Do: Local Verification Failed`, `## Review: Cycle Cap Reached`, `## Review: No PR Linked`) — anything less leaves work orphaned mid-flight (commit pushed but no PR open, etc.).
 
 Wait for the sub-agent to complete. Do not try to summarize or second-guess its work — the specialist's commit history, issue comments, and PR reviews are the audit trail. After the sub-agent returns, report a one-line summary of the state transition it accomplished and exit.
 

@@ -63,29 +63,39 @@ Compute the **baseline timestamp** for counting:
 
 ```bash
 # When was the current PR head commit pushed/committed? Fresh push = new baseline.
-HEAD_PUSHED=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
+HEAD_PUSHED_ISO=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
   --json commits --jq '.commits | sort_by(.committedDate) | last | .committedDate')
 
 # Has the operator (or recovery script) posted a Reset marker?
 # This is the escape hatch for cases where the head didn't change but the
 # external cause did — e.g., main was broken, now it's green; same code,
 # fresh chance.
-RESET_AT=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
+RESET_AT_ISO=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
   --jq '[.[] | select(.body | startswith("## Review: Reset"))] | sort_by(.created_at) | last.created_at // ""')
 
-# Baseline = max(HEAD_PUSHED, RESET_AT). Use the later of the two.
-BASELINE=$HEAD_PUSHED
-if [ -n "$RESET_AT" ] && [[ "$RESET_AT" > "$BASELINE" ]]; then
-  BASELINE=$RESET_AT
+# Convert both to epoch seconds for unambiguous numeric comparison
+# (ISO strings can drift in format — fractional seconds, +00:00 vs Z, etc.).
+HEAD_PUSHED_EPOCH=$(date -u -d "$HEAD_PUSHED_ISO" +%s)
+if [ -n "$RESET_AT_ISO" ]; then
+  RESET_AT_EPOCH=$(date -u -d "$RESET_AT_ISO" +%s)
+else
+  RESET_AT_EPOCH=0
+fi
+
+# Baseline = max(HEAD_PUSHED, RESET_AT) as epoch seconds.
+if [ "$RESET_AT_EPOCH" -gt "$HEAD_PUSHED_EPOCH" ]; then
+  BASELINE_EPOCH=$RESET_AT_EPOCH
+else
+  BASELINE_EPOCH=$HEAD_PUSHED_EPOCH
 fi
 ```
 
-Then count bounce comments STRICTLY AFTER the baseline:
+Then count bounce comments STRICTLY AFTER the baseline (jq's `fromdate` parses ISO-8601 into epoch seconds, so the comparison is numeric, not lexical):
 
 ```bash
 COUNT=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
   --jq "[.[] | select(.body | startswith(\"## Review: Bounce-Back Cycle\")) |
-        select(.created_at > \"$BASELINE\")] | length")
+        select((.created_at | fromdate) > $BASELINE_EPOCH)] | length")
 ```
 
 If `COUNT >= 3`, this is the 4th cycle on the current code — the PR has genuinely cycled too many times against this exact state. Post `## Review: Cycle Cap Reached` summarizing the disagreement pattern, move the issue to `blocked`, unassign, and exit.
@@ -218,15 +228,37 @@ Wait for both reviewers to post.
 Reviewers run in parallel with CI. By the time both have posted their reviews, CI may have finished. Re-query:
 
 ```bash
-gh pr view $PR_NUM --repo stellar-experimental/henyey \
-  --json statusCheckRollup --jq '.statusCheckRollup | map(.conclusion) | unique'
+ROLLUP=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
+  --json statusCheckRollup --jq '.statusCheckRollup')
+CI_TOTAL=$(echo "$ROLLUP" | jq 'length')
 ```
 
-CI state buckets:
+CI state buckets — apply in this order:
 
-- **Green** — all required checks have `conclusion: SUCCESS` (or `SKIPPED`/`NEUTRAL` for non-required).
-- **Red** — at least one required check is `FAILURE` or `CANCELLED`.
-- **Running** — at least one required check is still `IN_PROGRESS`/`QUEUED`/`PENDING`, no failures yet.
+- **Empty rollup** (`CI_TOTAL == 0`): the PR has NO CI runs at all. Could be a misconfigured workflow file, a fork PR with workflows gated, or a workflow_dispatch-only repo. **NEVER classify this as green.** Block with `## Review: No CI Detected` and a note that the operator needs to investigate why CI didn't trigger.
+- **Red** — at least one entry has `conclusion: FAILURE | CANCELLED | TIMED_OUT` (or `state: FAILURE | ERROR` for StatusContext).
+- **Running** — entries exist, none failed, but at least one is `status != COMPLETED` (or for StatusContext: `state == PENDING`).
+- **Green** — `CI_TOTAL > 0` AND every entry has `conclusion: SUCCESS | SKIPPED | NEUTRAL` (or `state: SUCCESS` for StatusContext). Requires positive evidence of completion, never vacuous.
+
+```bash
+# Classification (apply top-down):
+if [ "$CI_TOTAL" -eq 0 ]; then
+  CI_STATE="empty"
+elif [ "$(echo "$ROLLUP" | jq '[.[] | select(
+       ((.conclusion // "") | ascii_upcase) as $c |
+       $c == "FAILURE" or $c == "CANCELLED" or $c == "TIMED_OUT"
+       or ((.state // "") | ascii_upcase) as $s | $s == "FAILURE" or $s == "ERROR"
+     )] | length')" -gt 0 ]; then
+  CI_STATE="red"
+elif [ "$(echo "$ROLLUP" | jq '[.[] | select(
+       (.status != null and (.status | ascii_upcase) != "COMPLETED")
+       or (.status == null and (.state | ascii_upcase) == "PENDING")
+     )] | length')" -gt 0 ]; then
+  CI_STATE="running"
+else
+  CI_STATE="green"
+fi
+```
 
 ## Step 6 — Decide
 
@@ -245,7 +277,7 @@ For each comment, extract the reviewer name from the first line (`## 🔍 Review
 - `Correctness` (always)
 - `Parity` or `Risk` (depending on parity-critical detection from Step 3)
 
-If only one verdict is found, treat the missing one as **pending** (Wait). If both are present, use them. If a reviewer posted twice (e.g. revised verdict), the latest comment wins.
+If only one verdict is found, **treat the missing one as `CHANGES_REQUESTED` and bounce.** A missing verdict means a reviewer sub-agent failed to post — that's the same failure mode as the "Reviewer sub-agent fails to post" entry in the failure-handling table below. Do NOT wait indefinitely on a missing verdict; bounce so `/do` Mode B can retry, and the next `/review-pr` cycle will spawn fresh reviewers. If both are present, use them. If a reviewer posted twice (e.g. revised verdict), the latest comment wins.
 
 ### 6.1b Parse external reviewer verdicts (GH Copilot bot, humans, other bots)
 
@@ -282,15 +314,21 @@ Additional gate — any external CHANGES_REQUESTED is a blocker:
 
 - **External reviewer states**: union over all non-agent reviewers' latest states. If ANY is `CHANGES_REQUESTED` → bounce as if an agent had CHANGES_REQUESTED. External `APPROVED` and `COMMENTED` are non-blocking.
 
-CI state — same as before: green / red / running.
+CI state — `empty` / `green` / `red` / `running` (per the bucket rules in Step 5).
 
-Apply the outcome matrix:
+Apply the outcome matrix (top-to-bottom, first match wins):
+
+### Block immediately on suspicious CI state
+
+| CI state | Action |
+|---|---|
+| `empty` (zero rollup entries — no CI ever started) | **Block.** Post `## Review: No CI Detected` explaining the situation; move to `blocked`. Operator investigates whether the workflow file is broken or whether this is a fork-PR / dispatch-only scenario. Never auto-merge without positive CI evidence. |
 
 ### Auto-merge (triple-green)
 
 | A | B | CI | Action |
 |---|---|---|---|
-| APPROVE | APPROVE | green | Auto-merge (see Step 7) |
+| APPROVE | APPROVE | `green` | Auto-merge (see Step 7) |
 
 ### Wait (re-pick next tick)
 
@@ -446,11 +484,21 @@ The `--admin` flag means the agent must be authenticated as a repo admin. If you
 bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE done
 gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 
-# Worktree + build cache cleanup
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Recover session ID from the sidecar /do persisted (see do/SKILL.md A.2).
+# Build cache lives at $HOME/data/<session-id>/do-$ISSUE/cargo-target/ — can be
+# 25-50 GB per issue. Clean it up here; otherwise nothing else will.
+if [ -f "$REPO_ROOT/data/do-$ISSUE/.session-id" ]; then
+  SESSION_ID=$(cat "$REPO_ROOT/data/do-$ISSUE/.session-id")
+  if [ -n "$SESSION_ID" ] && [ -d "$HOME/data/$SESSION_ID/do-$ISSUE" ]; then
+    rm -rf "$HOME/data/$SESSION_ID/do-$ISSUE"
+  fi
+fi
+
+# Worktree dir cleanup.
 rm -rf "$REPO_ROOT/data/do-$ISSUE"
 git worktree prune
-# If session id is recoverable from a sidecar file, also rm -rf ~/data/<sid>/do-$ISSUE
 ```
 
 Post a `## ✅ Merged` comment with the merge commit SHA AND the list of follow-up issues filed:

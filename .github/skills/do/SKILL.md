@@ -68,6 +68,10 @@ export CARGO_TARGET_DIR="$HOME/data/$SESSION_ID/do-$ISSUE/cargo-target"
 
 mkdir -p "$REPO_ROOT/data" "$HOME/data/$SESSION_ID/do-$ISSUE"
 
+# Persist the session ID alongside the worktree so /review-pr can clean up
+# the cargo target dir on merge (avoids accumulating multi-GB stale caches).
+echo "$SESSION_ID" > "$REPO_ROOT/data/do-$ISSUE/.session-id"
+
 # Fresh worktree off origin/main.
 git fetch origin main
 git -C "$REPO_ROOT" worktree add -B "$BRANCH" "$WORKTREE" origin/main
@@ -212,16 +216,33 @@ Exit.
 
 ### B.1 Fetch review comments
 
-```bash
-# General review-level comments
-gh pr view $PR_NUM --repo stellar-experimental/henyey --comments \
-  --json reviews,comments
+Capture the head-commit timestamp first, so you only consider comments newer than your last push:
 
-# Inline review threads (per-line comments)
-gh api repos/stellar-experimental/henyey/pulls/$PR_NUM/comments
+```bash
+LAST_PUSH=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
+  --json commits --jq '.commits | sort_by(.committedDate) | last | .committedDate')
 ```
 
-Pull all comments newer than your last push. Earlier comments you've already addressed are out of scope (unless explicitly re-raised).
+Fetch inline review-comments WITH IDs (you'll need these to reply):
+
+```bash
+gh api "repos/stellar-experimental/henyey/pulls/$PR_NUM/comments" --paginate \
+  --jq --arg cutoff "$LAST_PUSH" '
+    [.[] | select(.created_at > $cutoff) |
+     {id, path, line, body, in_reply_to: .in_reply_to_id, url: .html_url}]' \
+  > /tmp/review-comments-$PR_NUM.json
+```
+
+Also fetch PR-level reviews (the structured `## 🔍 Reviewer:` comments from /review-pr are issue-level, NOT review-comments):
+
+```bash
+gh api "repos/stellar-experimental/henyey/issues/$PR_NUM/comments" --paginate \
+  --jq --arg cutoff "$LAST_PUSH" '
+    [.[] | select(.created_at > $cutoff) |
+     {id, body, url: .html_url}]'
+```
+
+Items in `/tmp/review-comments-$PR_NUM.json` are the inline ones with `.id` you'll iterate over in B.6 to post replies. Items not in `in_reply_to` chains (i.e. `in_reply_to: null`) are top-level thread comments; replying to those creates a follow-up in the same thread.
 
 ### B.2 Group the feedback
 
@@ -236,6 +257,18 @@ For each comment, classify:
 ```bash
 WORKTREE="$REPO_ROOT/data/do-$ISSUE/worktree"
 export CARGO_TARGET_DIR="$HOME/data/$SESSION_ID/do-$ISSUE/cargo-target"
+BRANCH="do/issue-$ISSUE"
+
+# Re-enter or re-create the worktree. The worktree may have been cleaned up
+# by /review-pr after a previous merge attempt, or never existed if this is
+# the first Mode B run on a re-bounced issue.
+if [ ! -d "$WORKTREE/.git" ] && [ ! -f "$WORKTREE/.git" ]; then
+  # No worktree — recreate from origin/$BRANCH (PR head).
+  git -C "$REPO_ROOT" fetch origin "$BRANCH"
+  mkdir -p "$(dirname "$WORKTREE")"
+  git -C "$REPO_ROOT" worktree add -B "$BRANCH" "$WORKTREE" "origin/$BRANCH"
+fi
+
 cd "$WORKTREE"
 git fetch origin
 git rebase origin/main  # In case main moved during review.
@@ -253,19 +286,29 @@ Same as Mode A.5.
 
 ### B.6 Reply inline and push
 
-For each addressable comment, reply inline with what you changed:
+Iterate over every inline comment in `/tmp/review-comments-$PR_NUM.json` and reply within the same thread. The endpoint `POST /repos/.../pulls/{pr}/comments/{comment_id}/replies` creates a reply IN the thread containing `{comment_id}`, which is what `/review-pr`'s "addressed" heuristic looks for (it scans `reviewThreads { comments }` for `Addressed in` / `Fixed in` / `Done in`).
 
 ```bash
-gh api repos/stellar-experimental/henyey/pulls/$PR_NUM/comments/$COMMENT_ID/replies \
-  -f body="Addressed in <commit-sha>: <one line>."
+FIX_SHA=$(git rev-parse HEAD)   # captured AFTER the fix commit in B.5/B.7
+
+jq -r '.[] | .id' /tmp/review-comments-$PR_NUM.json | while read CID; do
+  # classify: actionable / question / disagree (per B.2)
+  # then reply with the appropriate template:
+  gh api -X POST \
+    "repos/stellar-experimental/henyey/pulls/$PR_NUM/comments/$CID/replies" \
+    -f body="Addressed in $FIX_SHA: <one-line description>."
+done
 ```
 
-For each disagreement comment, reply inline with your case:
+For disagreement comments, swap the body for:
 
 ```bash
-gh api repos/stellar-experimental/henyey/pulls/$PR_NUM/comments/$COMMENT_ID/replies \
+gh api -X POST \
+  "repos/stellar-experimental/henyey/pulls/$PR_NUM/comments/$CID/replies" \
   -f body="Disagree because <reason>. Current code is correct because <reason>."
 ```
+
+Verify each reply landed in the correct thread by reading the response — if any reply 404s or 422s, log it; the merge-time auto-followup logic in `/review-pr` will catch unaddressed threads.
 
 Commit:
 
@@ -282,7 +325,11 @@ Co-authored-by: Claude Code <claude-code@anthropic.com>
 EOF
 )"
 
-git push
+# B.3 includes a `git rebase origin/main`, which rewrites the branch's commit
+# history. After a rebase, a plain `git push` fails non-fast-forward; we have
+# to force-push. Use --force-with-lease so we refuse to clobber if someone
+# else pushed to the PR's branch in the meantime.
+git push --force-with-lease
 ```
 
 ### B.7 Request re-review and advance
