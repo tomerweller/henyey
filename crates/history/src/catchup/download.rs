@@ -604,17 +604,30 @@ mod tests {
     use henyey_bucket::BucketManager;
     use henyey_db::{queries::StateQueries, Database};
 
-    fn make_test_catchup_manager() -> CatchupManager {
+    /// Returns the `TempDir` guard backing the `BucketManager` together
+    /// with the manager. The `TempDir` is returned **first** so callers
+    /// destructure as `let (_tmp_dir, manager) = ...`: Rust drops local
+    /// bindings in reverse declaration order, so binding `manager`
+    /// second guarantees it (and any file handles its `BucketManager`
+    /// holds) is dropped before the `TempDir` removes the directory.
+    /// The caller must keep `_tmp_dir` alive for the duration of the
+    /// test so the bucket directory is deleted on drop rather than
+    /// leaked under the system temp location.
+    fn make_test_catchup_manager() -> (tempfile::TempDir, CatchupManager) {
         let db = Database::open_in_memory().expect("in-memory db");
         let tmp_dir = tempfile::tempdir().expect("temp dir");
-        let bucket_manager = BucketManager::new(tmp_dir.keep()).expect("bucket manager");
+        let bucket_manager =
+            BucketManager::new(tmp_dir.path().to_path_buf()).expect("bucket manager");
         let archive = crate::HistoryArchive::new("https://example.com").expect("archive");
-        super::super::CatchupManager::new(vec![archive], bucket_manager, db)
+        (
+            tmp_dir,
+            super::super::CatchupManager::new(vec![archive], bucket_manager, db),
+        )
     }
 
     #[test]
     fn test_load_local_has_absent() {
-        let mgr = make_test_catchup_manager();
+        let (_tmp_dir, mgr) = make_test_catchup_manager();
         let result = mgr.load_local_has();
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
         assert!(result.unwrap().is_none(), "expected None for fresh DB");
@@ -622,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_load_local_has_valid() {
-        let mgr = make_test_catchup_manager();
+        let (_tmp_dir, mgr) = make_test_catchup_manager();
         // Structurally valid v1 HAS with BUCKET_LIST_LEVELS zero-hash levels.
         let zero = "0".repeat(64);
         let zero_level = format!(
@@ -652,7 +665,7 @@ mod tests {
 
     #[test]
     fn test_load_local_has_corrupt_json() {
-        let mgr = make_test_catchup_manager();
+        let (_tmp_dir, mgr) = make_test_catchup_manager();
         mgr.db
             .with_connection(|conn| {
                 conn.set_state(
