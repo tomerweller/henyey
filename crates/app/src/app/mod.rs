@@ -2879,7 +2879,25 @@ impl App {
     /// This spawns a background task that monitors for consensus stuck conditions
     /// and triggers recovery actions when needed. The task is supervised: if it
     /// panics, shutdown is triggered immediately.
+    ///
+    /// In standalone mode (`manual_close && run_standalone`) the manager is not
+    /// started — there is no peer to fall behind, so the consensus-stuck and
+    /// out-of-sync recovery timers would only generate noise. This mirrors the
+    /// stellar-core gates in `HerderImpl::triggerNextLedger` (HerderImpl.cpp:582-588,
+    /// `startOutOfSyncTimer`) and `HerderImpl::trackingHeartBeat`
+    /// (HerderImpl.cpp:2502-2510). The henyey gate intentionally widens the
+    /// `trackingHeartBeat` predicate from `MANUAL_CLOSE` to
+    /// `MANUAL_CLOSE && RUN_STANDALONE` so that simulation tests
+    /// (`manual_close=true, run_standalone=false`) still get sync-recovery —
+    /// see `HerderConfig::suppress_scp` for the same convention.
     pub fn start_sync_recovery(self: &Arc<Self>) {
+        if self.config.node.manual_close && self.config.testing.run_standalone {
+            tracing::info!(
+                "Sync recovery suppressed (standalone mode: MANUAL_CLOSE && RUN_STANDALONE) \
+                 — parity: HerderImpl.cpp:582-588 / 2502-2510"
+            );
+            return;
+        }
         let (handle, manager) = SyncRecoveryManager::new(Arc::clone(self));
         *self.sync_recovery_handle.write() = Some(handle);
         let shutdown_tx = self.shutdown_tx.clone();
@@ -4065,6 +4083,137 @@ mod tests {
 
         // Should not panic when handle is None
         app.sync_recovery_heartbeat();
+    }
+
+    /// Regression test for #2688 — in standalone mode
+    /// (`manual_close && run_standalone`) `start_sync_recovery()` must skip
+    /// spawning the `SyncRecoveryManager`, mirroring stellar-core's
+    /// `HerderImpl.cpp:582-588` (`startOutOfSyncTimer`) and
+    /// `HerderImpl.cpp:2502-2510` (`trackingHeartBeat`) gates.
+    #[tokio::test]
+    async fn test_start_sync_recovery_suppressed_in_standalone_mode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        config.node.manual_close = true;
+        config.testing.run_standalone = true;
+
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        app.start_sync_recovery();
+
+        assert!(
+            app.sync_recovery_handle.read().is_none(),
+            "standalone mode must not create a sync_recovery_handle"
+        );
+        assert!(
+            app.sync_recovery_task.read().is_none(),
+            "standalone mode must not spawn a sync_recovery_task"
+        );
+    }
+
+    /// Regression test for #2688 — henyey intentionally widens stellar-core's
+    /// `trackingHeartBeat` predicate from `MANUAL_CLOSE` to
+    /// `MANUAL_CLOSE && RUN_STANDALONE`, matching the convention used by
+    /// `HerderConfig::suppress_scp`. Simulation tests run with
+    /// `manual_close=true, run_standalone=false` and must keep sync-recovery.
+    #[tokio::test]
+    async fn test_start_sync_recovery_active_when_only_manual_close() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        config.node.manual_close = true;
+        config.testing.run_standalone = false;
+
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        app.start_sync_recovery();
+
+        assert!(
+            app.sync_recovery_handle.read().is_some(),
+            "manual_close alone must not suppress sync recovery"
+        );
+        assert!(app.sync_recovery_task.read().is_some());
+
+        // Cleanup: shut down the manager so the spawned task drains.
+        let handle = app.sync_recovery_handle.read().clone();
+        if let Some(handle) = handle {
+            handle.shutdown().await;
+        }
+        let task = app.sync_recovery_task.write().take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    /// Regression test for #2688 — normal (non-standalone, non-manual-close)
+    /// mode must start the sync recovery manager.
+    #[tokio::test]
+    async fn test_start_sync_recovery_active_in_normal_mode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        // Defaults: manual_close=false, run_standalone=false.
+
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        app.start_sync_recovery();
+
+        assert!(app.sync_recovery_handle.read().is_some());
+        assert!(app.sync_recovery_task.read().is_some());
+
+        let handle = app.sync_recovery_handle.read().clone();
+        if let Some(handle) = handle {
+            handle.shutdown().await;
+        }
+        let task = app.sync_recovery_task.write().take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    /// Regression test for #2688 — when the sync recovery manager is suppressed,
+    /// the public callbacks (`sync_recovery_heartbeat`, `start_sync_recovery_tracking`,
+    /// `set_applying_ledger`) must remain safe no-ops on the channel side. Note:
+    /// `set_applying_ledger` still flips the `is_applying_ledger` AtomicBool,
+    /// which is independent of recovery scheduling and is read by code paths in
+    /// `consensus.rs` and `ledger_close.rs`.
+    #[tokio::test]
+    async fn test_sync_recovery_heartbeat_noop_when_suppressed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        config.node.manual_close = true;
+        config.testing.run_standalone = true;
+
+        let app = Arc::new(App::new(config).await.unwrap());
+        app.start_sync_recovery();
+        assert!(app.sync_recovery_handle.read().is_none());
+
+        // Heartbeat / start-tracking are pure no-ops: no panic, handle stays None.
+        app.sync_recovery_heartbeat();
+        app.start_sync_recovery_tracking();
+        assert!(app.sync_recovery_handle.read().is_none());
+        assert!(app.sync_recovery_task.read().is_none());
+
+        // set_applying_ledger flips the AtomicBool unconditionally (independent
+        // of recovery scheduling) but the channel-send half is a no-op because
+        // the handle is None.
+        assert!(!app.is_applying_ledger.load(Ordering::Relaxed));
+        app.set_applying_ledger(true);
+        assert!(app.is_applying_ledger.load(Ordering::Relaxed));
+        assert!(app.sync_recovery_handle.read().is_none());
+        assert!(app.sync_recovery_task.read().is_none());
+        app.set_applying_ledger(false);
+        assert!(!app.is_applying_ledger.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
