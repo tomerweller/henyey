@@ -922,14 +922,13 @@ impl Bucket {
                 if let Some(v) = protocol_version.get() {
                     return Ok(*v);
                 }
-                // Slow path (first call): scan for the leading metaentry.
-                // Stop at the first non-metaentry — by construction the
-                // metaentry is at the head of the entry list.
-                let computed = entries.iter().find_map(|e| match e {
-                    BucketEntry::Metaentry(m) => Some(Some(m.ledger_version)),
+                // Slow path (first call): inspect only the leading entry —
+                // by construction the metaentry is at index 0 if present, so
+                // we never need to scan past the head.
+                let value = match entries.first() {
+                    Some(BucketEntry::Metaentry(m)) => Some(m.ledger_version),
                     _ => None,
-                });
-                let value = computed.unwrap_or(None);
+                };
                 // Best-effort populate; if a concurrent caller already set it,
                 // the value is identical (deterministic from `entries`).
                 let _ = protocol_version.set(value);

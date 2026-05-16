@@ -60,9 +60,14 @@ pub(super) fn verified_hot_archive_bucket_loader(
 /// Build per-level version info for a restored live `BucketList`, suitable
 /// for passing to [`validate_bucket_list_structure`].
 ///
-/// The `levels` and `has_levels` slices are zipped — any length mismatch is
-/// surfaced by the validator's own size check, not by an indexing panic, so
-/// passing mismatched lengths still yields the validator's structured error.
+/// The `levels` and `has_levels` slices are zipped: any length mismatch is
+/// surfaced by the validator's own size check rather than by an indexing
+/// panic, so passing mismatched lengths still yields the validator's
+/// structured error — **provided** callers pass the *expected*
+/// `BucketList::NUM_LEVELS` (not `infos.len()`) to
+/// `validate_bucket_list_structure`. Passing `infos.len()` would silently
+/// short-circuit the size check; the call sites in this module pass the
+/// constant directly to make that intent explicit.
 ///
 /// Each bucket's protocol version is taken from the cached
 /// `Bucket::protocol_version()` (O(1) after load); empty / metaentry-less
@@ -106,9 +111,10 @@ pub(super) fn build_live_level_version_infos(
 /// Build per-level version info for a restored hot-archive bucket list,
 /// suitable for passing to [`validate_bucket_list_structure`].
 ///
-/// Same contract as [`build_live_level_version_infos`] but for hot-archive
-/// levels — `HotArchiveBucket::get_protocol_version()` returns `Ok(0)` for
-/// empty buckets directly, so no `unwrap_or(0)` is needed.
+/// Same contract as [`build_live_level_version_infos`] (including the
+/// caller-must-pass-`NUM_LEVELS` requirement for the validator's size check)
+/// but for hot-archive levels — `HotArchiveBucket::get_protocol_version()`
+/// returns `Ok(0)` for empty buckets directly, so no `unwrap_or(0)` is needed.
 pub(super) fn build_hot_archive_level_version_infos(
     levels: &[HotArchiveBucketLevel],
     has_levels: &[HASBucketLevel],
