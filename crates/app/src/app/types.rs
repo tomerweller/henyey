@@ -192,6 +192,13 @@ pub struct SimulationDebugStats {
     /// Times `handle_nomination_timeout` returned
     /// `TimeoutOutcome::SkippedStale` because LCL advanced during build/drain.
     pub nomination_timeout_skipped_stale: u64,
+    /// Times the event-driven consensus trigger timer fired and was
+    /// dispatched to `try_trigger_consensus` (parity counterpart for
+    /// stellar-core's `mTriggerTimer` firings in `setupTriggerNextLedger`).
+    pub consensus_trigger_timer_fires: u64,
+    /// Times a trigger-timer firing was dropped by the active-slot staleness
+    /// guard in `handle_scp_timer_event`.
+    pub consensus_trigger_timer_skipped_stale: u64,
     // Archive checkpoint cache (issue #1784)
     pub archive_checkpoint_stale_returns: u64,
     pub archive_checkpoint_cold_returns: u64,
@@ -392,6 +399,12 @@ pub struct AppMetricsSnapshot {
     /// Times `handle_nomination_timeout` returned
     /// `TimeoutOutcome::SkippedStale` because LCL advanced during build/drain.
     pub nomination_timeout_skipped_stale: u64,
+    /// Times the event-driven consensus trigger timer fired and was
+    /// dispatched to `try_trigger_consensus`.
+    pub consensus_trigger_timer_fires: u64,
+    /// Times a trigger-timer firing was dropped by the active-slot staleness
+    /// guard in `handle_scp_timer_event`.
+    pub consensus_trigger_timer_skipped_stale: u64,
 }
 
 /// Metrics for the overlay fetch-response channel (issue #1741).

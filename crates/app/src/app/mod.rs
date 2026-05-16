@@ -663,6 +663,13 @@ pub struct App {
     pub(crate) nomination_timeout_skipped_stale: AtomicU64,
     /// Number of ballot timeout firings.
     ballot_timeout_fires: AtomicU64,
+    /// Number of times the event-driven trigger timer fired and was
+    /// dispatched to `try_trigger_consensus`. Parity counterpart for
+    /// stellar-core's `mTriggerTimer` firings inside `setupTriggerNextLedger`.
+    pub(crate) consensus_trigger_timer_fires: AtomicU64,
+    /// Number of trigger-timer firings dropped by the active-slot staleness
+    /// guard in `handle_scp_timer_event` (slot advanced past the timer's slot).
+    pub(crate) consensus_trigger_timer_skipped_stale: AtomicU64,
     /// Time when we last observed an externalized slot.
     last_externalized_at: RwLock<Instant>,
     /// Last time we requested SCP state due to stalled externalization.
@@ -1322,6 +1329,8 @@ impl App {
             nomination_timeout_fires: AtomicU64::new(0),
             nomination_timeout_skipped_stale: AtomicU64::new(0),
             ballot_timeout_fires: AtomicU64::new(0),
+            consensus_trigger_timer_fires: AtomicU64::new(0),
+            consensus_trigger_timer_skipped_stale: AtomicU64::new(0),
             last_externalized_at: RwLock::new(now),
             last_scp_state_request_at: RwLock::new(now),
             survey_state: RwLock::new(SurveyState::new(
@@ -2443,6 +2452,12 @@ impl App {
             nomination_timeout_skipped_stale: self
                 .nomination_timeout_skipped_stale
                 .load(Ordering::Relaxed),
+            consensus_trigger_timer_fires: self
+                .consensus_trigger_timer_fires
+                .load(Ordering::Relaxed),
+            consensus_trigger_timer_skipped_stale: self
+                .consensus_trigger_timer_skipped_stale
+                .load(Ordering::Relaxed),
             archive_checkpoint_stale_returns: self.archive_checkpoint_cache.stale_returns(),
             archive_checkpoint_cold_returns: self.archive_checkpoint_cache.cold_returns(),
             archive_checkpoint_fresh_returns: self.archive_checkpoint_cache.fresh_returns(),
@@ -2789,6 +2804,12 @@ impl App {
                 .load(Ordering::Relaxed),
             nomination_timeout_skipped_stale: self
                 .nomination_timeout_skipped_stale
+                .load(Ordering::Relaxed),
+            consensus_trigger_timer_fires: self
+                .consensus_trigger_timer_fires
+                .load(Ordering::Relaxed),
+            consensus_trigger_timer_skipped_stale: self
+                .consensus_trigger_timer_skipped_stale
                 .load(Ordering::Relaxed),
         }
     }

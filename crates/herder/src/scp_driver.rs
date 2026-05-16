@@ -1036,6 +1036,20 @@ impl ScpDriver {
             .get_or_insert_with(std::time::Instant::now);
     }
 
+    /// Return the recorded ballot-protocol start instant for `slot`, if any.
+    ///
+    /// Mirrors stellar-core's `HerderSCPDriver::getPrepareStart` — used by
+    /// `setupTriggerNextLedger` to anchor the next consensus trigger off the
+    /// most recent slot's ballot start. Returns `None` for slots that have not
+    /// entered the ballot protocol yet (cold start, catchup-only slots, or
+    /// slots already purged via `purge_slots_below` / `purge_all_slot_state`).
+    pub fn prepare_start(&self, slot: SlotIndex) -> Option<std::time::Instant> {
+        self.slot_timing
+            .read()
+            .get(&slot)
+            .and_then(|s| s.ballot_start)
+    }
+
     /// Duration of the highest externalized slot (first-seen → externalized).
     pub fn last_externalize_duration(&self) -> Option<std::time::Duration> {
         self.last_externalize_timing
@@ -7199,6 +7213,55 @@ mod tests {
 
         // This should panic on the malformed upgrade
         let _ = driver.combine_candidates_impl(1, &[v]);
+    }
+
+    // ── prepare_start (issue #2702) ───────────────────────────────────────
+
+    #[test]
+    fn test_prepare_start_returns_none_before_ballot() {
+        let driver = make_test_driver();
+        // No record_ballot_start call has happened for slot 50.
+        assert!(driver.prepare_start(50).is_none());
+
+        // Nomination-only activity also does not record ballot_start.
+        driver.record_slot_activity(51);
+        driver.record_nomination_start(51);
+        assert!(driver.prepare_start(51).is_none());
+    }
+
+    #[test]
+    fn test_prepare_start_returns_recorded_instant() {
+        let driver = make_test_driver();
+        let before = std::time::Instant::now();
+        driver.record_ballot_start(123);
+        let after = std::time::Instant::now();
+
+        let got = driver.prepare_start(123).expect("should be recorded");
+        assert!(got >= before && got <= after);
+
+        // Subsequent calls to record_ballot_start are no-ops; the returned
+        // instant stays pinned to the first recording.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        driver.record_ballot_start(123);
+        assert_eq!(driver.prepare_start(123).unwrap(), got);
+    }
+
+    #[test]
+    fn test_prepare_start_purged_with_slot_trim() {
+        let driver = make_test_driver();
+        driver.record_ballot_start(10);
+        driver.record_ballot_start(20);
+        driver.record_ballot_start(30);
+
+        assert!(driver.prepare_start(10).is_some());
+        assert!(driver.prepare_start(20).is_some());
+        assert!(driver.prepare_start(30).is_some());
+
+        driver.purge_slots_below(25);
+
+        assert!(driver.prepare_start(10).is_none());
+        assert!(driver.prepare_start(20).is_none());
+        assert!(driver.prepare_start(30).is_some());
     }
 }
 

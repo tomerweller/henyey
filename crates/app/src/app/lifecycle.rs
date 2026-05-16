@@ -229,6 +229,16 @@ impl App {
         self.herder.bootstrap(ledger_seq);
         tracing::info!(ledger_seq, "Herder bootstrapped");
 
+        // Cold-start trigger arm (issue #2702): once the herder is tracking and
+        // synced from bootstrap, arm a single trigger timer so the very first
+        // round is event-driven rather than waiting on the 1s polling tick.
+        // `setup_trigger_next_ledger` self-gates on `manual_close`,
+        // `is_validator`, and `is_tracking`; this call is safe even when one
+        // of those is false (it becomes a no-op).
+        if self.is_validator && self.herder.is_tracking() {
+            self.setup_trigger_next_ledger().await;
+        }
+
         // Wire overlay tracking state to herder. The herder is now syncing,
         // so the overlay's maybe_drop_random_peer() should know the node is
         // tracking (parity: stellar-core Config::REALLY_DEAD_NUM_FAILURES_CUTOFF
@@ -520,10 +530,14 @@ impl App {
                         self.set_phase_sub(super::phase::PHASE_6_9_MAYBE_PUBLISH_HISTORY);
                         self.maybe_publish_history().await;
 
-                        // Trigger consensus immediately after a successful close.
+                        // Trigger consensus immediately after a successful close
+                        // and arm the event-driven trigger timer for the next
+                        // ledger (parity with stellar-core's
+                        // `lastClosedLedgerIncreased` → `setupTriggerNextLedger`).
                         if self.is_validator {
                             self.set_phase_sub(super::phase::PHASE_6_10_TRY_TRIGGER_CONSENSUS);
                             self.try_trigger_consensus().await;
+                            self.setup_trigger_next_ledger().await;
                         }
 
                         // Drain SCP + fetch response channels.
@@ -1036,10 +1050,13 @@ impl App {
                         self.maybe_publish_history().await;
                     }
 
-                    // For validators, try to trigger next round
-                    if self.is_validator {
-                        self.try_trigger_consensus().await;
-                    }
+                    // NOTE (issue #2702): consensus is no longer triggered from
+                    // this 1s tick. The trigger fires from the event-driven
+                    // trigger timer armed by `setup_trigger_next_ledger()`
+                    // post-close (parity with stellar-core's `mTriggerTimer` +
+                    // `setupTriggerNextLedger`). The 1s tick is preserved for
+                    // the maintenance work above (drains,
+                    // `request_pending_tx_sets`, `maybe_publish_history`).
                 }
 
                 // Stats logging
