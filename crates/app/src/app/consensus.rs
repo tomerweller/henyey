@@ -130,18 +130,28 @@ pub(super) fn should_delay_checkpoint(checkpoint: u64, first_sequential_ledger: 
 /// Mirrors stellar-core's `+ std::chrono::milliseconds(1)` epsilon so the
 /// computed trigger instant is strictly *after* the validity threshold rather
 /// than landing exactly on it.
+///
+/// All arithmetic is performed in milliseconds to mirror stellar-core's
+/// `std::chrono::milliseconds` `time_point` math in `HerderImpl.cpp:1158-1172`.
+/// `now_secs` and `ct` carry only whole-second precision (Unix close-time),
+/// but `max_ct_offset` is genuinely sub-second valued in protocol v23+
+/// (`SorobanNetworkConfig::ledgerTargetCloseTimeMilliseconds()`), so doing
+/// the arithmetic in seconds would truncate up to ~1ms per operand.
 pub(super) fn ct_validity_offset_secs(
     now_secs: u64,
     ct: u64,
     max_ct_offset: std::time::Duration,
 ) -> std::time::Duration {
-    let max_candidate_ct_secs = now_secs
-        .saturating_add(max_ct_offset.as_secs())
-        .saturating_add(MAX_TIME_SLIP_SECONDS_FOR_TRIGGER);
+    let max_ct_offset_ms = u64::try_from(max_ct_offset.as_millis()).unwrap_or(u64::MAX);
+    let max_candidate_ct_ms = now_secs
+        .saturating_mul(1000)
+        .saturating_add(max_ct_offset_ms)
+        .saturating_add(MAX_TIME_SLIP_SECONDS_FOR_TRIGGER.saturating_mul(1000));
+    let ct_ms = ct.saturating_mul(1000);
 
-    if ct > max_candidate_ct_secs {
-        let diff_secs = ct - max_candidate_ct_secs;
-        std::time::Duration::from_secs(diff_secs) + std::time::Duration::from_millis(1)
+    if ct_ms > max_candidate_ct_ms {
+        let diff_ms = ct_ms - max_candidate_ct_ms;
+        std::time::Duration::from_millis(diff_ms) + std::time::Duration::from_millis(1)
     } else {
         std::time::Duration::ZERO
     }
@@ -154,14 +164,22 @@ pub(super) fn ct_validity_offset_secs(
 /// the `triggerTime < now` clamp.
 ///
 /// When `last_ballot_start` is `None` (cold start / catchup), the function
-/// substitutes `now - expected` (stellar-core's "pessimistic estimate")
-/// which collapses to an immediate trigger via the subsequent clamp.
+/// returns [`Duration::ZERO`] directly — semantically equivalent to
+/// stellar-core's "pessimistic estimate" (`now - expected`) which would
+/// collapse to `(now - expected) + expected = now` and clamp to zero. We
+/// short-circuit here because computing `now - expected` on
+/// [`tokio::time::Instant`] (a monotonic clock) panics on underflow when
+/// `expected` exceeds the time elapsed since the monotonic origin — reachable
+/// on fresh CI VMs where system uptime is small (issue #2702 bounce-back
+/// inline review).
 pub(super) fn compute_trigger_offset_pre_ct(
     now: tokio::time::Instant,
     expected: std::time::Duration,
     last_ballot_start: Option<tokio::time::Instant>,
 ) -> std::time::Duration {
-    let last_ballot_start = last_ballot_start.unwrap_or_else(|| now - expected);
+    let Some(last_ballot_start) = last_ballot_start else {
+        return std::time::Duration::ZERO;
+    };
     let trigger_time = last_ballot_start + expected;
     if trigger_time < now {
         std::time::Duration::ZERO
@@ -337,11 +355,16 @@ impl App {
         let last_index = current_ledger;
         let next_slot = current_ledger + 1;
 
-        // Always cancel any previously-armed trigger timer first (parity:
-        // `mTriggerTimer.cancel()`).
-        self.timer_manager_handle
-            .cancel_trigger_next_ledger(next_slot)
-            .await;
+        // Note: we intentionally do NOT pre-cancel the existing
+        // `(next_slot, TriggerNextLedger)` entry here. `schedule_timer` in the
+        // `TimerManager` already overwrites the entry atomically inside the
+        // manager task (timer_manager.rs `self.timers.insert(...)`), so an
+        // explicit cancel would just be a second channel send and open a
+        // (harmless but real) interleaving window where the manager processes
+        // the cancel, recomputes `next_timeout`, then processes the schedule.
+        // Stellar-core's `mTriggerTimer.cancel()` exists because its
+        // `mTriggerTimer` is a single in-flight timer object that needs
+        // explicit cancellation before re-arming; our keyed-map model doesn't.
 
         let expected = self.herder.ledger_close_duration();
         let now = tokio::time::Instant::now();
@@ -2142,16 +2165,37 @@ mod tests {
         assert_eq!(off, std::time::Duration::ZERO);
     }
 
-    /// Cold start: no `prepare_start` recorded. The helper substitutes
-    /// `now - expected` for `lastBallotStart`, which collapses to
-    /// `(now - expected) + expected = now`, then the clamp keeps it at zero
-    /// — i.e. fire immediately. This matches stellar-core's
-    /// "bootstrap with a pessimistic estimate" comment.
+    /// Cold start: no `prepare_start` recorded. The helper short-circuits to
+    /// zero immediately (no monotonic-clock subtraction), so the timer fires
+    /// right away. This matches stellar-core's "bootstrap with a pessimistic
+    /// estimate" semantics and avoids the `now - expected` underflow panic
+    /// that bit fresh CI VMs.
     #[test]
     fn test_setup_trigger_cold_start_no_prepare_start() {
         let now = tokio::time::Instant::now();
         let expected = std::time::Duration::from_secs(5);
 
+        let off = compute_trigger_offset_pre_ct(now, expected, None);
+        assert_eq!(off, std::time::Duration::ZERO);
+    }
+
+    /// Regression: `compute_trigger_offset_pre_ct` must not panic when
+    /// `last_ballot_start` is `None` and `expected` exceeds the time elapsed
+    /// since the monotonic clock origin. Reachable on fresh CI VMs where
+    /// `tokio::time::Instant::now()` early in process life can be smaller
+    /// than `expected` (5s in pre-v23, configurable from Soroban network
+    /// info). The pre-fix `unwrap_or_else(|| now - expected)` would panic
+    /// here with `overflow when subtracting duration from instant`.
+    #[tokio::test(start_paused = true)]
+    async fn test_setup_trigger_cold_start_does_not_underflow_monotonic_clock() {
+        // With `start_paused`, `tokio::time::Instant::now()` is anchored to
+        // the runtime's clock origin. Advance by 100ms — much less than
+        // `expected` — so subtracting 5s would underflow.
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        let now = tokio::time::Instant::now();
+        let expected = std::time::Duration::from_secs(5);
+
+        // Must not panic.
         let off = compute_trigger_offset_pre_ct(now, expected, None);
         assert_eq!(off, std::time::Duration::ZERO);
     }

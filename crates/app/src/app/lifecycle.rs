@@ -534,6 +534,17 @@ impl App {
                         // and arm the event-driven trigger timer for the next
                         // ledger (parity with stellar-core's
                         // `lastClosedLedgerIncreased` → `setupTriggerNextLedger`).
+                        //
+                        // Phase 2 behavior (issue #2702): the immediate
+                        // `try_trigger_consensus` here paces consensus on the
+                        // happy path; the just-armed timer fires later and
+                        // hits the `AlreadyNominating` idempotent path. The
+                        // timer's `lastBallotStart + expectedLedgerCloseDuration`
+                        // cadence math therefore only takes effect when the
+                        // immediate trigger is gated out (e.g. `is_applying_ledger`
+                        // is still true, or `is_tracking` is briefly false at
+                        // this exact point) — i.e. the timer is a recovery
+                        // path in steady state, not the primary scheduler.
                         if self.is_validator {
                             self.set_phase_sub(super::phase::PHASE_6_10_TRY_TRIGGER_CONSENSUS);
                             self.try_trigger_consensus().await;

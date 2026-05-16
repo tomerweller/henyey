@@ -245,10 +245,12 @@ pub trait TimerCallback: Send + Sync + 'static {
 
     /// Called when a trigger-next-ledger timer expires.
     ///
-    /// Default implementation is a no-op so existing test callbacks compile
-    /// without modification. Production callbacks must override this to
-    /// dispatch the trigger event into the main event loop.
-    fn on_trigger_next_ledger(&self, _slot: SlotIndex) {}
+    /// Production callbacks must dispatch this into the main event loop. A
+    /// missed override would silently swallow consensus trigger firings —
+    /// unlike a missed nomination/ballot, a swallowed trigger causes the
+    /// validator to stop making progress with no compile-time signal, so
+    /// this method is intentionally required (no default impl).
+    fn on_trigger_next_ledger(&self, slot: SlotIndex);
 }
 
 /// Timer type for a slot.
