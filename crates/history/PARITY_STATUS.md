@@ -111,7 +111,7 @@ Corresponds to: `HistoryArchiveManager.h`
 | `selectRandomReadableHistoryArchive()` | `get_readable_archives()` | Partial |
 | `getHistoryArchiveReportWork()` | -- | None |
 | `getCheckLedgerHeaderWork()` | -- | None |
-| `initializeHistoryArchive()` | `initialize_history_archive()` | Full |
+| `initializeHistoryArchive()` | `initialize_history_archive()` | Full — writes both the §4.3 ledger-zero pseudo-checkpoint (`history/00/00/00/history-00000000.json`) and the well-known root HAS, matching `PutHistoryArchiveStateWork::spawnPublishWork`. |
 | `publishEnabled()` | `publish_enabled()` | Full |
 | `getHistoryArchive()` | `get_archive()` | Full |
 | `getWritableHistoryArchives()` | `get_writable_archives()` | Full |

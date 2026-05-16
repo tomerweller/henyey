@@ -133,6 +133,23 @@ pub fn has_path(ledger: u32) -> String {
     checkpoint_path("history", ledger, "json")
 }
 
+/// Generate the path for the §4.3 ledger-zero pseudo-checkpoint HAS file.
+///
+/// Returns the literal `"history/00/00/00/history-00000000.json"`.
+///
+/// This intentionally does NOT route through [`has_path`]/[`checkpoint_path`]
+/// because [`crate::checkpoint::checkpoint_ledger`] rounds `0` up to the first
+/// real checkpoint (`63 == 0x3f`), which would yield
+/// `history-0000003f.json` — the wrong file.
+///
+/// The pseudo-checkpoint is written by `initialize_history_archive` alongside
+/// the well-known root HAS to mark an archive as initialized. See
+/// stellar-core's `PutHistoryArchiveStateWork::spawnPublishWork` and
+/// `HistoryManager.h` §4.3.
+pub fn pseudo_checkpoint_has_path() -> &'static str {
+    "history/00/00/00/history-00000000.json"
+}
+
 // ============================================================================
 // Dirty file helpers for crash-safe checkpoint building
 // ============================================================================
@@ -271,6 +288,18 @@ mod tests {
         let path = has_path(0xaabbcc00 + 63);
         assert!(path.starts_with("history/"));
         assert!(path.ends_with(".json"));
+    }
+
+    #[test]
+    fn test_pseudo_checkpoint_has_path_literal() {
+        // Regression guard: this path MUST be the literal ledger-0 file, not
+        // the rounded-up `history-0000003f.json` that `has_path(0)` would
+        // produce via `checkpoint_ledger(0) == 63`.
+        assert_eq!(
+            pseudo_checkpoint_has_path(),
+            "history/00/00/00/history-00000000.json"
+        );
+        assert_ne!(pseudo_checkpoint_has_path(), has_path(0));
     }
 
     #[test]

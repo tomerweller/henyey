@@ -620,8 +620,21 @@ impl HistoryArchiveManager {
 
     /// Initialize a new history archive with an empty HAS.
     ///
-    /// This creates a new archive by writing an empty `HistoryArchiveState`
-    /// to `.well-known/stellar-history.json`.
+    /// Mirrors stellar-core's `HistoryArchiveManager::initializeHistoryArchive`
+    /// (and its `PutHistoryArchiveStateWork::spawnPublishWork` upload step):
+    /// writes the same empty `HistoryArchiveState` JSON to **two** files in
+    /// the archive:
+    ///
+    /// 1. The §4.3 ledger-zero pseudo-checkpoint at
+    ///    `history/00/00/00/history-00000000.json` — the marker that signals
+    ///    the archive has been initialized (see `HistoryManager.h` §4.3).
+    /// 2. The well-known root HAS at `.well-known/stellar-history.json` —
+    ///    the file `GetHistoryArchiveStateWork(seq=0)` discovers via
+    ///    `isWellKnown(0)`.
+    ///
+    /// The empty HAS uses `version = 1` with `hot_archive_buckets = None`,
+    /// matching stellar-core's default `HistoryArchiveState` constructor in
+    /// `HistoryArchive.cpp`.
     ///
     /// # Errors
     ///
@@ -662,8 +675,9 @@ impl HistoryArchiveManager {
             return Err(HistoryError::ArchiveNotWritable(name.to_string()));
         }
 
-        // Create an empty HAS with resolved (cleared) futures
-        // All bucket levels have empty curr/snap and cleared next state
+        // Create an empty HAS matching stellar-core's default ctor
+        // (HistoryArchive.cpp): version = 1, no hot-archive buckets,
+        // all-zero curr/snap on every live-bucket level.
         let zero_hash = henyey_common::Hash256::from_bytes([0u8; 32]);
         let empty_level = HASBucketLevel {
             curr: zero_hash.to_hex(),
@@ -672,27 +686,34 @@ impl HistoryArchiveManager {
         };
 
         let has = HistoryArchiveState {
-            version: 2,
+            version: 1,
             server: Some("rs-stellar-core".to_string()),
             current_ledger: 0,
             network_passphrase: Some(self.network_passphrase.clone()),
-            current_buckets: vec![empty_level.clone(); henyey_bucket::BUCKET_LIST_LEVELS],
-            hot_archive_buckets: Some(vec![
-                empty_level;
-                henyey_bucket::HOT_ARCHIVE_BUCKET_LIST_LEVELS
-            ]),
+            current_buckets: vec![empty_level; henyey_bucket::BUCKET_LIST_LEVELS],
+            hot_archive_buckets: None,
         };
 
         // Serialize to JSON
         let json = serde_json::to_string_pretty(&has)?;
 
-        // Write to a temp file
+        // Write to a temp file once; `put_file_with_mkdir` only reads the
+        // local path (it shells out via `execute_command`) and does not
+        // consume the file, so we can upload the same tempfile twice.
         let temp_file = tempfile::NamedTempFile::new()?;
         std::fs::write(temp_file.path(), &json)?;
 
-        // Upload to .well-known/stellar-history.json
+        // Upload to the §4.3 pseudo-checkpoint path first (matches
+        // stellar-core's source order in
+        // PutHistoryArchiveStateWork::spawnPublishWork; functionally the
+        // two writes are independent).
         remote
-            .put_file_with_mkdir(temp_file.path(), ".well-known/stellar-history.json")
+            .put_file_with_mkdir(temp_file.path(), paths::pseudo_checkpoint_has_path())
+            .await?;
+
+        // Upload to the well-known root HAS path.
+        remote
+            .put_file_with_mkdir(temp_file.path(), paths::root_has_path())
             .await?;
 
         tracing::info!(
@@ -860,5 +881,161 @@ mod archive_manager_tests {
 
         // Inert archive is not sensible
         assert!(!manager.check_sensible_config());
+    }
+
+    /// Build a write-only `HistoryArchiveManager` whose put/mkdir commands
+    /// target a local filesystem tempdir. Returns the manager, the tempdir
+    /// (kept alive by the caller), and the archive name.
+    fn make_filesystem_manager(
+        tmp: &tempfile::TempDir,
+        passphrase: &str,
+    ) -> (HistoryArchiveManager, &'static str) {
+        let root = tmp.path().to_string_lossy().into_owned();
+        let put_cmd = format!("cp {{0}} {root}/{{1}}");
+        let mkdir_cmd = format!("mkdir -p {root}/{{0}}");
+
+        let config = RemoteArchiveConfig {
+            name: "test-fs".to_string(),
+            put_cmd: Some(put_cmd),
+            mkdir_cmd: Some(mkdir_cmd),
+            get_cmd: None,
+        };
+        let remote = RemoteArchive::new(config);
+        let mut manager = HistoryArchiveManager::new(passphrase.to_string());
+        manager.add_archive(ArchiveEntry::write_only("test-fs".to_string(), remote));
+        (manager, "test-fs")
+    }
+
+    #[tokio::test]
+    async fn test_initialize_history_archive_writes_pseudo_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manager, name) = make_filesystem_manager(&tmp, "test passphrase");
+
+        manager.initialize_history_archive(name).await.unwrap();
+
+        let pseudo = tmp.path().join("history/00/00/00/history-00000000.json");
+        assert!(
+            pseudo.exists(),
+            "expected pseudo-checkpoint at {}",
+            pseudo.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_history_archive_writes_root_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manager, name) = make_filesystem_manager(&tmp, "test passphrase");
+
+        manager.initialize_history_archive(name).await.unwrap();
+
+        let root = tmp.path().join(".well-known/stellar-history.json");
+        assert!(root.exists(), "expected root HAS at {}", root.display());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_history_archive_files_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manager, name) = make_filesystem_manager(&tmp, "test passphrase");
+
+        manager.initialize_history_archive(name).await.unwrap();
+
+        let pseudo_bytes =
+            std::fs::read(tmp.path().join("history/00/00/00/history-00000000.json")).unwrap();
+        let root_bytes =
+            std::fs::read(tmp.path().join(".well-known/stellar-history.json")).unwrap();
+
+        assert_eq!(
+            pseudo_bytes, root_bytes,
+            "pseudo-checkpoint and root HAS must contain identical bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_history_archive_pseudo_checkpoint_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passphrase = "test passphrase";
+        let (manager, name) = make_filesystem_manager(&tmp, passphrase);
+
+        manager.initialize_history_archive(name).await.unwrap();
+
+        let pseudo_path = tmp.path().join("history/00/00/00/history-00000000.json");
+        let json = std::fs::read_to_string(&pseudo_path).unwrap();
+        let has: HistoryArchiveState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(has.version, 1, "empty HAS must use version 1");
+        assert_eq!(has.current_ledger, 0);
+        assert_eq!(has.server.as_deref(), Some("rs-stellar-core"));
+        assert_eq!(has.network_passphrase.as_deref(), Some(passphrase));
+        assert!(
+            has.hot_archive_buckets.is_none(),
+            "version-1 HAS must omit hot_archive_buckets"
+        );
+
+        // Confirm the field is omitted from the JSON entirely (not just null).
+        assert!(
+            !json.contains("hotArchiveBuckets"),
+            "JSON must omit hotArchiveBuckets field, got: {json}"
+        );
+
+        assert_eq!(
+            has.current_buckets.len(),
+            henyey_bucket::BUCKET_LIST_LEVELS,
+            "current_buckets must have one entry per live bucket level"
+        );
+        let zero_hex = henyey_common::Hash256::from_bytes([0u8; 32]).to_hex();
+        for (i, level) in has.current_buckets.iter().enumerate() {
+            assert_eq!(level.curr, zero_hex, "level {i} curr must be all-zero");
+            assert_eq!(level.snap, zero_hex, "level {i} snap must be all-zero");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_initialize_history_archive_already_initialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passphrase = "test passphrase";
+
+        // Pre-create the well-known root HAS so the fetch_root_has probe succeeds.
+        let well_known_dir = tmp.path().join(".well-known");
+        std::fs::create_dir_all(&well_known_dir).unwrap();
+        let existing = b"{\"version\":1,\"server\":\"preexisting\",\"currentLedger\":0,\"networkPassphrase\":\"x\",\"currentBuckets\":[]}";
+        std::fs::write(well_known_dir.join("stellar-history.json"), existing).unwrap();
+
+        // Manager with both read (file://) and write (cp) configured.
+        let root = tmp.path().to_string_lossy().into_owned();
+        let put_cmd = format!("cp {{0}} {root}/{{1}}");
+        let mkdir_cmd = format!("mkdir -p {root}/{{0}}");
+        let get_cmd = format!("cp {root}/{{0}} {{1}}");
+
+        let archive = HistoryArchive::new(&format!("file://{root}")).unwrap();
+        let remote_config = RemoteArchiveConfig {
+            name: "test-fs".to_string(),
+            put_cmd: Some(put_cmd),
+            mkdir_cmd: Some(mkdir_cmd),
+            get_cmd: Some(get_cmd),
+        };
+        let remote = RemoteArchive::new(remote_config);
+
+        let mut manager = HistoryArchiveManager::new(passphrase.to_string());
+        manager.add_archive(ArchiveEntry::new(
+            "test-fs".to_string(),
+            Some(archive),
+            Some(remote),
+        ));
+
+        let err = manager
+            .initialize_history_archive("test-fs")
+            .await
+            .expect_err("should refuse to overwrite an initialized archive");
+        assert!(
+            matches!(err, HistoryError::ArchiveAlreadyInitialized(_)),
+            "expected ArchiveAlreadyInitialized, got {err:?}"
+        );
+
+        // The pseudo-checkpoint must NOT have been created.
+        let pseudo = tmp.path().join("history/00/00/00/history-00000000.json");
+        assert!(
+            !pseudo.exists(),
+            "init must not write pseudo-checkpoint when archive is already initialized"
+        );
     }
 }
