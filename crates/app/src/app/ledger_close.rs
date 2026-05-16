@@ -31,7 +31,7 @@ fn record_phase_histogram(
 /// whether to enqueue the checkpoint for publishing, so the read, the
 /// enqueue suppression, and the marker clear are all atomic.
 fn consume_skip_marker_if_matches(
-    conn: &henyey_db::rusqlite::Connection,
+    conn: &henyey_db::Connection,
     checkpoint_seq: u32,
 ) -> Result<bool, henyey_db::DbError> {
     use henyey_db::queries::StateQueries;
