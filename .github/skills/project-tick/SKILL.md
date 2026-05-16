@@ -87,6 +87,47 @@ An item is **actionable** if all of:
 
 Skip items where any check fails. Skip items whose status is `planning` (always assigned), `doing` (always assigned), `done`, or `blocked`.
 
+#### Step 2b — Skip in-review items whose CI is still pending
+
+`/review-pr`'s only useful work when CI is pending is to post "Waiting on CI" and unassign. Picking such items burns 2 reviewer-agent spawns per tick (~2M tokens) just to find CI hasn't finished — wasteful and amplifies on multi-loop deployments. Filter them at the orchestrator:
+
+For each in-review candidate after the actionability filter above, look up the linked PR's CI summary and skip the item if CI is still running:
+
+```bash
+for ISSUE in <in-review candidates>; do
+  PR_NUM=$(gh issue view "$ISSUE" --repo stellar-experimental/henyey \
+    --json closedByPullRequestsReferences \
+    --jq '.closedByPullRequestsReferences | map(select(.state == "OPEN")) | .[0].number // empty')
+
+  # No PR linked = broken state; let /review-pr handle the recovery.
+  [ -z "$PR_NUM" ] && continue
+
+  # Count CI checks not yet completed (status != "completed").
+  CI_PENDING=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
+    --json statusCheckRollup \
+    --jq '[.statusCheckRollup[] | select(.status != "COMPLETED" and .status != "completed")] | length')
+
+  # Also count failed; if any failed, CI is RED (not pending) — keep actionable so /review-pr can bounce.
+  CI_FAILED=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
+    --json statusCheckRollup \
+    --jq '[.statusCheckRollup[] | select(.conclusion == "FAILURE" or .conclusion == "CANCELLED")] | length')
+
+  if [ "$CI_PENDING" -gt 0 ] && [ "$CI_FAILED" -eq 0 ]; then
+    # CI still running with no failures yet → skip this tick.
+    SKIP_THIS_ISSUE=true
+  fi
+done
+```
+
+Rule summary:
+
+- CI green → actionable (`/review-pr` will merge).
+- CI red (any failure or cancellation) → actionable (`/review-pr` will bounce).
+- CI still running with no failures yet → **NOT actionable this tick**. The next tick re-evaluates.
+- No PR linked → actionable anyway (`/review-pr`'s no-PR recovery path runs).
+
+This single change eliminates the wasted reviewer-spawn-during-CI-wait pattern. Wall-clock latency for the first review is unchanged in expectation because CI (10–30 min) dominates reviewer-agent time (2–3 min) — reviewers running in parallel with CI was an optimization the cost didn't justify.
+
 ### Step 3 — Pick one issue
 
 Order actionable items by:
