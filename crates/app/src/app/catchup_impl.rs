@@ -5905,4 +5905,123 @@ mod tests {
             "with cooldown active + archive_behind, should fall back to AttemptRecovery"
         );
     }
+
+    // ================================================================
+    // Tests for #2789: at-tip suppression must not block recovery when
+    // peers are clearly ahead. The #2713 suppression is correct only when
+    // the validator is at-or-near the network tip; with peer_gap >= 12 the
+    // node must attempt catchup, not sit on a suppressed hard reset.
+    // ================================================================
+
+    /// When archive is ConfirmedBehind with fresh-cache-behind AND peers are
+    /// verified far ahead (peer_gap >= HARD_RESET_GAP_ESCALATION), the
+    /// suppression must NOT fire — the node has clear peer evidence that
+    /// the network is past us and must escalate. This is the #2789 wedge.
+    #[tokio::test]
+    async fn test_hard_reset_not_suppressed_when_peers_ahead() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // latest_externalized far ahead (network advanced 50 ledgers).
+        app.herder
+            .scp_driver()
+            .record_externalized(5050, Default::default(), None);
+        app.herder.scp_driver().publish_externalized(5050);
+
+        // Verified peer evidence: max_verified_scp_slot = 5050 → peer_gap = 50.
+        app.max_verified_scp_slot.store(5050, Ordering::Relaxed);
+
+        // Archive is ConfirmedBehind, cache fresh at/below current_ledger
+        // (#2713 suppression condition).
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
+        app.archive_checkpoint_cache.seed(current_ledger);
+
+        // Backdate so cooldown doesn't gate entry.
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let counter_before = app.post_catchup_hard_reset_total.load(Ordering::Relaxed);
+
+        let _ = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        // Hard-reset counter MUST advance — suppression must not fire when
+        // peer_gap >= HARD_RESET_GAP_ESCALATION. On origin/main today this
+        // FAILS because the suppression at the start of
+        // force_post_catchup_hard_reset fires regardless of peer_gap.
+        assert!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed) > counter_before,
+            "hard reset must proceed when peer_gap >= {} \
+             (peer_gap=50, expected counter > {}, got {}). #2789 wedge: \
+             suppression blocks the only state-changing recovery path.",
+            HARD_RESET_GAP_ESCALATION,
+            counter_before,
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+        );
+    }
+
+    /// Drive the recovery loop three times with the #2789 fixture (peer_gap
+    /// large, archive fresh-but-behind). The first call must break the
+    /// suppression and proceed to the hard reset; subsequent calls hit the
+    /// legitimate hard-reset cooldown (which is correct). The wedge is
+    /// broken, not perpetuated by repeated suppression.
+    #[tokio::test]
+    async fn test_recovery_loop_unwedges_when_peers_ahead() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        app.herder
+            .scp_driver()
+            .record_externalized(5050, Default::default(), None);
+        app.herder.scp_driver().publish_externalized(5050);
+        app.max_verified_scp_slot.store(5050, Ordering::Relaxed);
+
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
+        app.archive_checkpoint_cache.seed(current_ledger);
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        for _ in 0..3 {
+            let _ = app
+                .force_post_catchup_hard_reset(
+                    current_ledger,
+                    HardResetReason::ArchiveBehindStallWallClock,
+                )
+                .await;
+        }
+
+        // After three rapid calls: counter has advanced at least once
+        // (suppression broken). On origin/main, counter stays at 0 across
+        // all three calls because suppression fires every time.
+        assert!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed) >= 1,
+            "loop must unwedge after first call: counter expected >= 1, got {}. \
+             #2789: suppression on every tick prevents any state-changing recovery.",
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+        );
+    }
 }
