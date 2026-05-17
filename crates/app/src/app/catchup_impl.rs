@@ -1366,14 +1366,29 @@ impl App {
         // published). Cold means no data (must probe). Leave
         // archive_recovery_status as ConfirmedBehind so decision function stays
         // in the archive_behind branch where cooldown → AttemptRecovery.
-        let archive_cannot_provide_target =
+        //
+        // #2789 (narrowing): only suppress when the validator is at-or-near
+        // the network tip. Peer-gap is read from verified SCP evidence
+        // (max_verified_scp_slot, via effective_peer_gap) rather than from
+        // the herder's latest_externalized — when the node is stuck waiting
+        // for tx_sets, latest_externalized stays at LCL while
+        // max_verified_scp_slot reflects the network tip. When peers are
+        // clearly ahead (peer_gap >= HARD_RESET_GAP_ESCALATION = 12), the
+        // suppression blocks the only state-changing recovery path and
+        // leaves the validator wedged for ~90s. Falling through to the
+        // hard-reset+ProbeAhead path is bounded by the 60s cooldown and the
+        // livelock circuit-breaker, and the spawn_catchup state transition
+        // to CatchingUp itself breaks the wedge.
+        let peer_gap = self.effective_peer_gap(current_ledger);
+        let suppress_archive_behind_at_tip =
             self.archive_recovery_snapshot().await.is_confirmed_behind()
+                && peer_gap < HARD_RESET_GAP_ESCALATION
                 && matches!(
                     self.get_cached_archive_checkpoint_nonblocking(),
                     CacheResult::Fresh(v) if v <= current_ledger
                 );
 
-        if archive_cannot_provide_target {
+        if suppress_archive_behind_at_tip {
             // Record cooldown so decision function routes to AttemptRecovery.
             self.last_hard_reset_offset
                 .store(now_offset.max(1), Ordering::Relaxed);
@@ -1392,16 +1407,19 @@ impl App {
                     current_ledger,
                     latest_externalized = latest_ext,
                     gap = current_gap,
+                    peer_gap,
                     ?reason,
                     "Hard reset suppressed: archive confirmed behind with fresh \
-                     cache at/below current_ledger — cooldown armed, requesting \
-                     SCP state from peers (#2713)"
+                     cache at/below current_ledger AND peers within \
+                     HARD_RESET_GAP_ESCALATION — cooldown armed, requesting \
+                     SCP state from peers (#2713, narrowed by #2789)"
                 );
             } else {
                 tracing::debug!(
                     current_ledger,
                     latest_externalized = latest_ext,
                     gap = current_gap,
+                    peer_gap,
                     ?reason,
                     "Hard reset suppressed (#2713) (repeated)"
                 );
@@ -5642,7 +5660,9 @@ mod tests {
     // ================================================================
 
     /// When archive is ConfirmedBehind AND fresh cache shows checkpoint
-    /// at/below current_ledger, the hard reset should be suppressed.
+    /// at/below current_ledger AND peers are at-or-near tip (peer_gap <
+    /// HARD_RESET_GAP_ESCALATION), the hard reset should be suppressed.
+    /// This is the original #2713 at-tip case.
     #[tokio::test]
     async fn test_hard_reset_suppressed_fresh_cache_behind() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5659,6 +5679,13 @@ mod tests {
             .scp_driver()
             .record_externalized(5050, Default::default(), None);
         app.herder.scp_driver().publish_externalized(5050);
+
+        // peer_gap=5 (above PEER_AHEAD_ESCALATION_THRESHOLD=3, below
+        // HARD_RESET_GAP_ESCALATION=12) — the at-tip suppression window
+        // from #2789. Without this, peer_gap defaults to 0 and the test
+        // does not exercise the meaningful at-tip path.
+        app.max_verified_scp_slot
+            .store(u64::from(current_ledger) + 5, Ordering::Relaxed);
 
         // Arm archive recovery status and seed fresh cache at current_ledger.
         {
