@@ -423,6 +423,22 @@ pub struct ScpDriverCacheSizes {
 /// Callback type for broadcasting SCP envelopes to peers.
 type EnvelopeSender = Box<dyn Fn(ScpEnvelope) + Send + Sync>;
 
+/// Callback type for persisting SCP state after an envelope emission.
+///
+/// Receives the slot index whose envelopes were just emitted. The closure
+/// is responsible for gathering the slot's `getLatestMessagesSend` envelopes
+/// plus their referenced tx-sets and quorum-sets, and handing them to
+/// `ScpPersistenceManager::persist_scp_state()`. See
+/// [`crate::herder::Herder::set_scp_persistence`] for the installation
+/// site and the captured Arcs.
+///
+/// Parity: stellar-core fires `HerderImpl::persistSCPState(slotIndex)`
+/// from `HerderImpl::emitEnvelope()` (HerderImpl.cpp:599-612) BEFORE
+/// broadcasting. henyey fires it AFTER broadcasting (inside
+/// [`ScpDriver::emit`]). The ordering difference has no crash-safety
+/// implication — both can be interrupted between persist and broadcast.
+type PersistCallback = Box<dyn Fn(u64) + Send + Sync>;
+
 /// Per-slot SCP timing timestamps (first-seen, nomination start, ballot start).
 /// Consolidates what were previously three parallel `HashMap<SlotIndex, Instant>` fields
 /// so cleanup paths cannot drift.
@@ -460,6 +476,17 @@ pub struct ScpDriver {
     latest_externalized: RwLock<Option<SlotIndex>>,
     /// Envelope broadcast callback.
     envelope_sender: OnceLock<EnvelopeSender>,
+    /// SCP-state persist callback. Installed by
+    /// [`crate::herder::Herder::set_scp_persistence`] when a persistence
+    /// manager is configured. Captures `Arc<SCP>`, `Arc<ScpDriver>`,
+    /// `Arc<ScpPersistenceManager>` (intentional Arc cycle mirroring
+    /// `envelope_sender`, benign because both are dropped together with
+    /// the owning `Herder`).
+    ///
+    /// Fires from [`Self::emit`] after the broadcast. No-op when the
+    /// `OnceLock` is empty (tests / standalone) or when `suppress_scp`
+    /// short-circuited `emit`.
+    persist_callback: OnceLock<PersistCallback>,
     /// Network ID for signing.
     network_id: Hash256,
     /// Ledger manager for network configuration lookups.
@@ -582,6 +609,7 @@ impl ScpDriver {
             externalized: RwLock::new(HashMap::new()),
             latest_externalized: RwLock::new(None),
             envelope_sender: OnceLock::new(),
+            persist_callback: OnceLock::new(),
             network_id,
             ledger_manager,
             upgrades,
@@ -665,6 +693,21 @@ impl ScpDriver {
         F: Fn(ScpEnvelope) + Send + Sync + 'static,
     {
         let _ = self.envelope_sender.set(Box::new(sender));
+    }
+
+    /// Set the SCP-state persist callback. Fires from [`Self::emit`] after
+    /// the broadcast, mirroring stellar-core's `HerderImpl::persistSCPState`
+    /// call from `HerderImpl::emitEnvelope` (HerderImpl.cpp:599-612).
+    ///
+    /// Single-install via `OnceLock`: a second `set_persist_callback` call
+    /// is silently ignored (returns the supplied closure on `Err`, which
+    /// we drop). Installed at most once per [`ScpDriver`] from
+    /// [`crate::herder::Herder::set_scp_persistence`].
+    pub fn set_persist_callback<F>(&self, cb: F)
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        let _ = self.persist_callback.set(Box::new(cb));
     }
 
     /// Clear the tx set validity cache (call on ledger close).
@@ -2463,8 +2506,19 @@ impl ScpDriver {
         if self.config.suppress_scp {
             return;
         }
+        let slot = envelope.statement.slot_index;
         if let Some(sender) = self.envelope_sender.get() {
             sender(envelope);
+        }
+        // Parity: stellar-core HerderImpl::emitEnvelope (HerderImpl.cpp:599-612)
+        // calls persistSCPState(slotIndex) BEFORE broadcast(); we fire it
+        // after the broadcast for simpler ownership (the persist closure
+        // captures Arc<SCP>, which is set up post-construction). Either
+        // ordering can be interrupted between persist and broadcast, so
+        // crash-safety is unchanged. No-op when the OnceLock is empty
+        // (tests, observer mode without a persistence manager).
+        if let Some(cb) = self.persist_callback.get() {
+            cb(slot);
         }
     }
 

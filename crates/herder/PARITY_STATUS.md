@@ -114,7 +114,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `maybeSetupSorobanQueue()` | Integrated via lane-based `TransactionQueue` | Full |
 | `herderOutOfSync()` | `SyncRecoveryManager` | Full |
 | `getMoreSCPState()` | _(not implemented)_ | None |
-| `persistSCPState()` | `ScpPersistenceManager.persist()` | Full |
+| `persistSCPState()` | `ScpPersistenceManager.persist_scp_state()` wired via `ScpDriver::emit` persist callback | Full[^persist-scp] |
 | `restoreSCPState()` | `ScpPersistenceManager.restore()` | Full |
 | `persistUpgrades()` | `UpgradeParameters` with Serde persistence | Full |
 | `restoreUpgrades()` | `UpgradeParameters` with Serde persistence | Full |
@@ -130,9 +130,22 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `recomputeKeysToFilter()` | _(not implemented)_ | None |
 
 [^txset-gc]: GC timer + purge wired in #2698 (driven by app event-loop phase
-33 every `TX_SET_GC_DELAY_SECS` = 60s). The broader SCP persist/restore story
-is still incomplete: `persist_scp_state` wiring is tracked in #2768 and
-`restore_scp_state` wiring in #2769.
+33 every `TX_SET_GC_DELAY_SECS` = 60s). The `persist_scp_state` wiring was
+completed in #2768 (`ScpDriver::emit` invokes the persist callback installed
+by `Herder::set_scp_persistence`). The `restore_scp_state` wiring remains
+tracked in #2769.
+
+[^persist-scp]: Wired in #2768 via a deferred persist callback on `ScpDriver`.
+Each call to `ScpDriver::emit` (which mirrors stellar-core's
+`HerderImpl::emitEnvelope`) fires the callback installed by
+`Herder::set_scp_persistence`; the callback spawns a worker thread that
+gathers `get_latest_messages_send(slot)` envelopes plus referenced tx-sets
+and quorum-sets and invokes `ScpPersistenceManager::persist_scp_state`. The
+work is deferred to a worker thread (not synchronous as in stellar-core)
+because henyey's `SCP` holds a `parking_lot::RwLock` write guard on its
+slots map while `emit` runs, and a synchronous `get_latest_messages_send`
+would deadlock against the same lock. Persistence remains best-effort:
+errors are logged but not propagated.
 
 ### SCP Driver (`scp_driver.rs`)
 

@@ -348,6 +348,16 @@ pub struct ScpPersistenceManager {
     storage: Box<dyn ScpStatePersistence>,
     /// Last slot that was persisted.
     last_slot_saved: parking_lot::RwLock<u64>,
+    /// Number of persist worker threads spawned by [`crate::herder::Herder`]'s
+    /// SCP-emit callback that have not yet returned. The callback defers the
+    /// gather + persist work onto a dedicated thread to avoid deadlocking on
+    /// SCP's internal slots lock (which is write-held while `emit` fires).
+    ///
+    /// Tests use [`Self::wait_for_pending_persists`] to synchronize on the
+    /// background work completing before asserting `last_slot_saved`.
+    pending_persists: std::sync::Mutex<usize>,
+    /// Condvar signaled when `pending_persists` reaches zero.
+    pending_persists_cv: std::sync::Condvar,
 }
 
 impl ScpPersistenceManager {
@@ -356,6 +366,8 @@ impl ScpPersistenceManager {
         Self {
             storage,
             last_slot_saved: parking_lot::RwLock::new(0),
+            pending_persists: std::sync::Mutex::new(0),
+            pending_persists_cv: std::sync::Condvar::new(),
         }
     }
 
@@ -373,6 +385,58 @@ impl ScpPersistenceManager {
     /// store. Primarily used by tests to assert post-purge state.
     pub fn has_tx_set(&self, hash: &Hash) -> Result<bool> {
         self.storage.has_tx_set(hash)
+    }
+
+    /// Increment the pending-persist counter. Called by the emit callback's
+    /// worker thread spawner BEFORE the thread is detached.
+    pub(crate) fn pending_persist_begin(&self) {
+        let mut pending = self
+            .pending_persists
+            .lock()
+            .expect("pending mutex poisoned");
+        *pending += 1;
+    }
+
+    /// Decrement the pending-persist counter and notify waiters. Called by
+    /// the worker thread on completion (success or error).
+    pub(crate) fn pending_persist_end(&self) {
+        let mut pending = self
+            .pending_persists
+            .lock()
+            .expect("pending mutex poisoned");
+        *pending = pending.saturating_sub(1);
+        if *pending == 0 {
+            self.pending_persists_cv.notify_all();
+        }
+    }
+
+    /// Wait for all in-flight persist worker threads to finish, up to
+    /// `timeout`. Returns `true` if the queue drained, `false` on timeout.
+    ///
+    /// Tests use this after `trigger_next_ledger` to ensure persist threads
+    /// spawned by the emit hot path have completed before asserting state.
+    pub fn wait_for_pending_persists(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut pending = self
+            .pending_persists
+            .lock()
+            .expect("pending mutex poisoned");
+        while *pending > 0 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining = deadline - now;
+            let (next, wait_result) = self
+                .pending_persists_cv
+                .wait_timeout(pending, remaining)
+                .expect("pending cv poisoned");
+            pending = next;
+            if wait_result.timed_out() && *pending > 0 {
+                return false;
+            }
+        }
+        true
     }
 
     /// Persist SCP state for a slot.

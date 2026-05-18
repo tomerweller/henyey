@@ -456,7 +456,12 @@ pub struct Herder {
     /// SCP consensus protocol instance.
     /// Always created — observers run SCP with `is_validator: false` (same as stellar-core),
     /// which means `fully_validated` is false on slots and `send_latest_envelope` won't emit.
-    scp: SCP<HerderScpCallback>,
+    ///
+    /// Wrapped in `Arc` so [`Self::set_scp_persistence`] can clone a handle
+    /// into the persist callback installed on [`Self::scp_driver`]. The
+    /// callback fires from [`crate::scp_driver::ScpDriver::emit`] after
+    /// each envelope broadcast and needs read-access to `get_latest_messages_send`.
+    scp: Arc<SCP<HerderScpCallback>>,
     /// Shared tracking consensus state (also read by ScpDriver for value validation).
     tracking_state: Arc<RwLock<SharedTrackingState>>,
     /// When we started tracking.
@@ -640,12 +645,12 @@ impl Herder {
             warn!("Validator mode requested but no quorum set configured");
         }
         let callback = HerderScpCallback::new(Arc::clone(&scp_driver));
-        let scp = SCP::new(
+        let scp = Arc::new(SCP::new(
             node_id.clone(),
             is_validator,
             quorum_set,
             Arc::new(callback),
-        );
+        ));
 
         let slot_quorum_tracker =
             SlotQuorumTracker::new(config.local_quorum_set.clone(), max_slots);
@@ -738,11 +743,123 @@ impl Herder {
     /// Called once from `init_herder` after the `Arc<Herder>` is constructed.
     /// `OnceLock` enforces single-installer at the type-system level: a second
     /// call returns `Err` with the supplied manager so the caller can fail loud.
+    ///
+    /// On first install, also wires the persist callback into
+    /// [`crate::scp_driver::ScpDriver::set_persist_callback`] so each emitted
+    /// envelope triggers a `persist_scp_state` call on the manager. The
+    /// callback captures `Arc<SCP>`, `Arc<ScpDriver>`, and
+    /// `Arc<ScpPersistenceManager>` (an intentional Arc cycle mirroring
+    /// the existing `envelope_sender` cycle — benign because all three
+    /// are dropped together with the owning `Herder`).
     pub fn set_scp_persistence(
         &self,
         manager: Arc<crate::persistence::ScpPersistenceManager>,
     ) -> std::result::Result<(), Arc<crate::persistence::ScpPersistenceManager>> {
-        self.scp_persistence.set(manager)
+        // Set first; if this fails, do NOT install the callback (we're a
+        // double-install and the existing manager is already wired).
+        self.scp_persistence.set(Arc::clone(&manager))?;
+
+        // Capture handles for the persist closure. Each call to the closure
+        // re-clones these Arcs onto a worker thread; the thread does the
+        // gather + persist work AFTER returning from `emit()` so SCP's
+        // internal slots write-lock has been released (otherwise the
+        // closure's `scp.get_latest_messages_send` would deadlock against
+        // the writer chain that invoked `emit`).
+        let scp = Arc::clone(&self.scp);
+        let driver = Arc::clone(&self.scp_driver);
+        let manager_for_cb = Arc::clone(&manager);
+
+        // Parity: stellar-core HerderImpl::persistSCPState (HerderImpl.cpp:2152-2186):
+        //   1. getSCP().getLatestMessagesSend(slotIndex) → envelopes
+        //   2. for each envelope: mPendingEnvelopes.getTxSet(h) → encode StoredTransactionSet
+        //   3. mPendingEnvelopes.getQSet(qsHash) → ScpQuorumSet
+        //   4. persistentState.setSCPstate(slot, ..., txSets, ...)
+        //
+        // Deviation: stellar-core runs this synchronously inside `emitEnvelope`.
+        // henyey's `SCP::nominate`/`process_envelope`/etc hold a
+        // `parking_lot::RwLock` write guard on `slots` while the driver
+        // emits, so a synchronous `get_latest_messages_send` (which takes
+        // the same RwLock for reading) would deadlock. We spawn a worker
+        // thread instead; the thread acquires the read lock after the
+        // writer chain unwinds. `pending_persist_begin`/`_end` provide
+        // synchronization for tests (`wait_for_pending_persists`).
+        self.scp_driver.set_persist_callback(move |slot| {
+            let scp = Arc::clone(&scp);
+            let driver = Arc::clone(&driver);
+            let manager_for_thread = Arc::clone(&manager_for_cb);
+
+            // Increment BEFORE spawn so a tightly-following
+            // `wait_for_pending_persists` cannot race past us.
+            manager_for_thread.pending_persist_begin();
+
+            // Worker thread: gather state + persist outside the SCP slot
+            // write-lock. Errors are best-effort logged.
+            std::thread::Builder::new()
+                .name(format!("scp-persist-{}", slot))
+                .spawn(move || {
+                    // Decrement on any exit path.
+                    struct Guard<'a>(&'a crate::persistence::ScpPersistenceManager);
+                    impl<'a> Drop for Guard<'a> {
+                        fn drop(&mut self) {
+                            self.0.pending_persist_end();
+                        }
+                    }
+                    let _guard = Guard(&manager_for_thread);
+
+                    use stellar_xdr::curr::{Limits, WriteXdr};
+
+                    let envelopes = scp.get_latest_messages_send(slot);
+
+                    let mut tx_sets: Vec<(stellar_xdr::curr::Hash, Vec<u8>)> = Vec::new();
+                    let mut quorum_sets: Vec<(
+                        stellar_xdr::curr::Hash,
+                        stellar_xdr::curr::ScpQuorumSet,
+                    )> = Vec::new();
+
+                    for envelope in &envelopes {
+                        for hash in crate::persistence::get_tx_set_hashes(envelope) {
+                            let hash256 = henyey_common::Hash256(hash.0);
+                            if let Some(tx_set) = driver.get_tx_set(&hash256) {
+                                let stored = tx_set.to_xdr_stored_set();
+                                match stored.to_xdr(Limits::none()) {
+                                    Ok(bytes) => tx_sets.push((hash, bytes)),
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            slot,
+                                            "persist_scp_state: failed to encode \
+                                             StoredTransactionSet"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(qhash) = crate::persistence::get_quorum_set_hash(envelope) {
+                            let qhash256 = henyey_common::Hash256(qhash.0);
+                            if let Some(qs) = driver.get_quorum_set_by_hash(&qhash256) {
+                                quorum_sets.push((qhash, qs));
+                            }
+                        }
+                    }
+
+                    if let Err(e) = manager_for_thread.persist_scp_state(
+                        slot,
+                        &envelopes,
+                        &tx_sets,
+                        &quorum_sets,
+                    ) {
+                        warn!(error = %e, slot, "persist_scp_state failed");
+                    }
+                })
+                .map_err(|e| {
+                    // If spawn fails we still need to drop the pending count.
+                    manager_for_cb.pending_persist_end();
+                    warn!(error = %e, slot, "failed to spawn scp-persist worker");
+                })
+                .ok();
+        });
+
+        Ok(())
     }
 
     /// Purge persisted tx sets that are no longer referenced by any persisted
@@ -756,10 +873,9 @@ impl Herder {
     /// TODO(#2770): the underlying `purge_unreferenced_tx_sets()` performs
     /// three serial connection checkouts — `get_all_tx_set_hashes`,
     /// `load_all_scp_states`, `delete_tx_sets_by_hashes` — without a single
-    /// SQLite transaction. Today this is harmless because `persist_scp_state`
-    /// (#2768) is unwired; once it is wired, a concurrent persist between
-    /// steps 2 and 3 could mark a fresh tx-set as orphan. Make transactional
-    /// when persist is wired.
+    /// SQLite transaction. With `persist_scp_state` now wired (#2768), a
+    /// concurrent persist between steps 2 and 3 could mark a fresh tx-set
+    /// as orphan. Tracked in #2770; make transactional there.
     pub fn purge_persisted_tx_sets(&self) {
         let Some(manager) = self.scp_persistence.get() else {
             return;
@@ -7600,6 +7716,143 @@ mod tests {
         // OnceLock::set returns the supplied value back on Err; verify we
         // got the same Arc back uniquely.
         assert_eq!(Arc::strong_count(&returned), 1);
+    }
+
+    // -------- Regression tests for SCP persist wiring (#2768) --------
+
+    /// Drives a full solo-validator nomination → externalize round through
+    /// the herder and asserts that the persistence manager observed the
+    /// slot via `persist_scp_state()` (i.e. `last_slot_saved > 0`).
+    ///
+    /// Fails on `origin/main` because `persist_scp_state` is never called
+    /// from the emit hot path. Passes once #2768 wires the persist
+    /// callback into `ScpDriver::emit()`.
+    #[tokio::test]
+    async fn test_persist_scp_state_called_on_emit() {
+        let (herder, _secret) = make_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(
+            herder.set_scp_persistence(Arc::clone(&manager)).is_ok(),
+            "install scp persistence"
+        );
+
+        herder.bootstrap(0);
+        assert_eq!(herder.state(), HerderState::Tracking);
+
+        // Solo validator (1-of-1 quorum) — nomination → ballot → externalize
+        // happens synchronously inside `trigger_next_ledger`, emitting at
+        // least one envelope. Each emit must call into the persist callback.
+        let outcome = herder
+            .trigger_next_ledger(1)
+            .expect("trigger_next_ledger should succeed");
+        let _ = outcome;
+
+        // Sanity: slot 1 actually externalized.
+        assert!(
+            herder.scp_driver.get_externalized(1).is_some(),
+            "solo validator must externalize slot 1"
+        );
+
+        // The persist callback dispatches work to a background thread (to
+        // avoid deadlocking on SCP's slot RwLock); wait for it to settle.
+        assert!(
+            manager.wait_for_pending_persists(std::time::Duration::from_secs(5)),
+            "persist worker threads must drain within 5s"
+        );
+
+        // KEY ASSERTION: the persist callback fired, so `last_slot_saved`
+        // is now >0. On unmodified main this is 0 because nothing ever
+        // calls `persist_scp_state()`.
+        assert!(
+            manager.last_slot_saved() > 0,
+            "persist_scp_state must be invoked from the emit hot path; \
+             last_slot_saved = {}",
+            manager.last_slot_saved()
+        );
+    }
+
+    /// When no persistence manager is installed, `ScpDriver::emit()` must
+    /// still be a no-op for persistence (the OnceLock guard). Drives a
+    /// full nomination round and asserts no panic and no externalize loss.
+    #[tokio::test]
+    async fn test_persist_scp_state_no_manager_no_panic() {
+        let (herder, _secret) = make_validator_herder();
+        // Intentionally DO NOT install a persistence manager.
+
+        herder.bootstrap(0);
+        herder
+            .trigger_next_ledger(1)
+            .expect("trigger_next_ledger should succeed without persistence");
+
+        assert!(
+            herder.scp_driver.get_externalized(1).is_some(),
+            "solo validator must externalize even without persistence"
+        );
+    }
+
+    /// End-to-end check: after a real emit triggers a real persist, the
+    /// GC purge must keep referenced tx sets and remove orphans. Validates
+    /// the full #2698 + #2768 persistence loop.
+    #[tokio::test]
+    async fn test_persist_scp_state_gc_sees_persisted_rows() {
+        let (herder, _secret) = make_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(
+            herder.set_scp_persistence(Arc::clone(&manager)).is_ok(),
+            "install scp persistence"
+        );
+
+        herder.bootstrap(0);
+        herder
+            .trigger_next_ledger(1)
+            .expect("trigger_next_ledger should succeed");
+
+        // Wait for the deferred persist workers spawned by the emit
+        // callback to finish before observing manager state.
+        assert!(
+            manager.wait_for_pending_persists(std::time::Duration::from_secs(5)),
+            "persist worker threads must drain within 5s"
+        );
+
+        // KEY ASSERTION: the real emit triggered a real persist; capture
+        // last_slot_saved BEFORE injecting any orphan slot so we don't
+        // measure the orphan injection itself.
+        let last_after_real_emit = manager.last_slot_saved();
+        assert!(
+            last_after_real_emit >= 1,
+            "real emit must have persisted; last_slot_saved = {}",
+            last_after_real_emit
+        );
+
+        // Inject an orphan tx set directly via the manager (not referenced
+        // by any persisted envelope).
+        let orphan_hash = stellar_xdr::curr::Hash([0xAAu8; 32]);
+        let orphan_env = make_persist_envelope_with_tx_set_hash(
+            999_999,
+            stellar_xdr::curr::Hash([0xBBu8; 32]), // some unrelated hash
+        );
+        manager
+            .persist_scp_state(
+                999_999,
+                &[orphan_env],
+                &[(orphan_hash.clone(), vec![42])],
+                &[],
+            )
+            .expect("persist orphan");
+        // Sanity: orphan is present pre-purge.
+        assert!(
+            manager.has_tx_set(&orphan_hash).unwrap(),
+            "orphan tx set must be stored before purge"
+        );
+
+        // Run the production GC entry point.
+        herder.purge_persisted_tx_sets();
+
+        // Orphan must be gone.
+        assert!(
+            !manager.has_tx_set(&orphan_hash).unwrap(),
+            "orphan tx set must be purged by GC"
+        );
     }
 }
 
