@@ -229,16 +229,6 @@ impl App {
         self.herder.bootstrap(ledger_seq);
         tracing::info!(ledger_seq, "Herder bootstrapped");
 
-        // Cold-start trigger arm (issue #2702): once the herder is bootstrapped,
-        // arm a single trigger timer so the very first round is event-driven
-        // rather than waiting on a polling tick.
-        //
-        // `setup_trigger_next_ledger` self-gates on `manual_close`, `is_validator`,
-        // and `is_tracking`, so an unconditional call is safe — it becomes a
-        // no-op when any of those is false. No call-site guard needed
-        // (issue #2702 review feedback: having both invites them to diverge).
-        self.setup_trigger_next_ledger().await;
-
         // Wire overlay tracking state to herder. The herder is now syncing,
         // so the overlay's maybe_drop_random_peer() should know the node is
         // tracking (parity: stellar-core Config::REALLY_DEAD_NUM_FAILURES_CUTOFF
@@ -272,6 +262,29 @@ impl App {
 
         // Set state based on validator mode
         self.restore_operational_state().await;
+
+        // Cold-start trigger arm (issue #2702): once the node is fully
+        // operational (state set to Validating/Synced and overlay flood
+        // accept re-armed), arm a single trigger timer so the very first
+        // round is event-driven rather than waiting on a polling tick.
+        //
+        // This MUST run AFTER `restore_operational_state()` so we mirror
+        // stellar-core's sequencing: `setupTriggerNextLedger()` in
+        // `HerderImpl` is only called from `lastClosedLedgerIncreased(
+        // latest=true)`, which itself only fires when the herder is fully
+        // in-sync (`isTracking() && isSynced()`). Calling earlier — e.g.
+        // immediately after `herder.bootstrap()` — risks the 0ms timer
+        // firing while the node is still transitioning into operational
+        // state, where `is_tracking()` can momentarily flap and the
+        // trigger ends up un-armed with no recovery path (issue #2702
+        // bounce-back cycle 1: solo-validator stall in `core,rpc,horizon`
+        // Quickstart CI).
+        //
+        // `setup_trigger_next_ledger` self-gates on `manual_close`,
+        // `is_validator`, `is_tracking`, and `is_applying_ledger`, so an
+        // unconditional call is safe — it becomes a no-op when any of
+        // those is false.
+        self.setup_trigger_next_ledger().await;
 
         // Start sync recovery tracking to enable the consensus stuck timer
         self.start_sync_recovery_tracking();

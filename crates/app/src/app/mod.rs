@@ -678,6 +678,14 @@ pub struct App {
     /// trigger timer was permanently un-armed on every gated fire,
     /// wedging solo / starved validators (issue #2702 review feedback).
     pub(crate) consensus_trigger_timer_rearm_after_gate: AtomicU64,
+    /// Number of times [`App::setup_trigger_next_ledger`] reached the
+    /// `timer_manager_handle.schedule_trigger_next_ledger(...)` call, i.e.
+    /// all gates (`manual_close`, `is_validator`, `is_tracking`,
+    /// `is_applying_ledger`) passed and a trigger timer was armed. Used by
+    /// regression tests to assert the cold-start arm reaches the schedule
+    /// site when called after `restore_operational_state()` (issue #2702
+    /// bounce-back cycle 1 — solo-validator stall).
+    pub(crate) consensus_trigger_setup_armed: AtomicU64,
     /// Time when we last observed an externalized slot.
     last_externalized_at: RwLock<Instant>,
     /// Last time we requested SCP state due to stalled externalization.
@@ -1340,6 +1348,7 @@ impl App {
             consensus_trigger_timer_fires: AtomicU64::new(0),
             consensus_trigger_timer_skipped_stale: AtomicU64::new(0),
             consensus_trigger_timer_rearm_after_gate: AtomicU64::new(0),
+            consensus_trigger_setup_armed: AtomicU64::new(0),
             last_externalized_at: RwLock::new(now),
             last_scp_state_request_at: RwLock::new(now),
             survey_state: RwLock::new(SurveyState::new(
@@ -4390,6 +4399,13 @@ mod tests {
         app.setup_trigger_next_ledger().await;
         app.set_applying_ledger(false);
         app.setup_trigger_next_ledger().await;
+        // No gate passed → the schedule-call counter stays at zero.
+        assert_eq!(
+            app.consensus_trigger_setup_armed.load(Ordering::Relaxed),
+            0,
+            "consensus_trigger_setup_armed must NOT increment when any gate \
+             rejects the call (is_validator=false here)"
+        );
 
         // Manual close mode: returns at the very first gate.
         let dir2 = tempfile::tempdir().expect("temp dir");
@@ -4400,6 +4416,108 @@ mod tests {
         let app2 = App::new(config2).await.unwrap();
         app2.set_applying_ledger(true);
         app2.setup_trigger_next_ledger().await;
+        assert_eq!(
+            app2.consensus_trigger_setup_armed.load(Ordering::Relaxed),
+            0,
+            "consensus_trigger_setup_armed must NOT increment when \
+             manual_close gates the call"
+        );
+    }
+
+    /// Regression test for issue #2702 bounce-back cycle 1.
+    ///
+    /// Pins the contract Reviewer A specifically requested: when
+    /// `setup_trigger_next_ledger` is called with `is_validator=true,
+    /// is_tracking=true, is_applying=false, manual_close=false`, it MUST
+    /// reach `timer_manager_handle.schedule_trigger_next_ledger(...)` (i.e.
+    /// the trigger timer is armed, not silently swallowed by a gate).
+    ///
+    /// Without this contract, the cold-start lifecycle is wedged: if any
+    /// gate gets reordered or a new one is added without explicit thought,
+    /// the timer can be silently un-armed and the validator never produces
+    /// the first ledger (manifests as `test_horizon_ingesting` timeout).
+    ///
+    /// Also covers the `is_tracking()` false → true transition: a call made
+    /// before `herder.bootstrap()` (when `is_tracking()` is false) must
+    /// NOT arm the timer, but a call made after bootstrap (tracking=true)
+    /// MUST arm it. This is the structural reason the cold-start
+    /// `setup_trigger_next_ledger()` call in `lifecycle.rs` must run AFTER
+    /// the herder is in a fully-operational state — placing it before
+    /// `restore_operational_state()` (the bug we just fixed) created a
+    /// window where the gates could reject the call and leave the
+    /// validator un-armed.
+    #[tokio::test]
+    async fn test_setup_trigger_next_ledger_arms_timer_on_cold_start_when_tracking() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .validator(true)
+            .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
+            .build();
+        // Defensive: ensure manual_close stays false in case defaults shift.
+        config.node.manual_close = false;
+
+        let app = App::new(config).await.unwrap();
+
+        // Pre-bootstrap: HerderState is Booting → `is_tracking()` is false.
+        // Calling `setup_trigger_next_ledger()` here MUST NOT arm a timer.
+        // This is the "called too early" failure mode that the lifecycle
+        // reordering guards against.
+        assert!(
+            !app.herder.is_tracking(),
+            "herder must be in Booting state before bootstrap"
+        );
+        app.setup_trigger_next_ledger().await;
+        assert_eq!(
+            app.consensus_trigger_setup_armed.load(Ordering::Relaxed),
+            0,
+            "setup_trigger_next_ledger MUST NOT arm a timer when \
+             is_tracking() is false (cold-start gap that wedged solo \
+             validators when called before restore_operational_state)"
+        );
+
+        // Post-bootstrap: HerderState transitions to Tracking via
+        // `bootstrap()` → `advance_tracking_to()` → `ensure_tracking_state()`.
+        // `is_tracking()` returns true and the schedule-call MUST execute.
+        let ledger_seq = app.current_ledger_seq();
+        app.herder.start_syncing();
+        app.herder.bootstrap(ledger_seq);
+        assert!(
+            app.herder.is_tracking(),
+            "herder must be tracking after bootstrap"
+        );
+
+        app.setup_trigger_next_ledger().await;
+        assert_eq!(
+            app.consensus_trigger_setup_armed.load(Ordering::Relaxed),
+            1,
+            "setup_trigger_next_ledger MUST arm exactly one timer when all \
+             gates pass (is_validator=true, is_tracking=true, \
+             is_applying=false, manual_close=false)"
+        );
+
+        // Sanity check: calling again is also idempotent — the timer_manager
+        // overwrites the entry atomically (see comment in
+        // setup_trigger_next_ledger), so a second call still increments the
+        // counter (one more schedule send).
+        app.setup_trigger_next_ledger().await;
+        assert_eq!(
+            app.consensus_trigger_setup_armed.load(Ordering::Relaxed),
+            2,
+            "consecutive setup_trigger_next_ledger calls must each reach \
+             schedule_trigger_next_ledger (timer_manager handles the \
+             keyed-map overwrite)"
+        );
+
+        // is_applying_ledger = true short-circuits even after bootstrap.
+        app.set_applying_ledger(true);
+        app.setup_trigger_next_ledger().await;
+        assert_eq!(
+            app.consensus_trigger_setup_armed.load(Ordering::Relaxed),
+            2,
+            "is_applying_ledger gate must block the schedule call"
+        );
     }
 
     #[tokio::test]

@@ -138,7 +138,8 @@ pub(super) fn should_delay_checkpoint(checkpoint: u64, first_sequential_ledger: 
 /// so the math can be unit-tested without spinning up an [`App`].
 ///
 /// Returns the extra delay required so that a value nominated `max_ct_offset`
-/// from `now_secs` with close-time `ct` is guaranteed to pass
+/// from `now_ms` (wall-clock milliseconds since Unix epoch) with close-time
+/// `ct` (Unix seconds, matching the SCP value field) is guaranteed to pass
 /// `Herder::validateValue`'s "not too far in the future" check
 /// (i.e. `ct <= now + max_ct_offset + MAX_TIME_SLIP_SECONDS`).
 ///
@@ -148,18 +149,21 @@ pub(super) fn should_delay_checkpoint(checkpoint: u64, first_sequential_ledger: 
 ///
 /// All arithmetic is performed in milliseconds to mirror stellar-core's
 /// `std::chrono::milliseconds` `time_point` math in `HerderImpl.cpp:1158-1172`.
-/// `now_secs` and `ct` carry only whole-second precision (Unix close-time),
-/// but `max_ct_offset` is genuinely sub-second valued in protocol v23+
-/// (`SorobanNetworkConfig::ledgerTargetCloseTimeMilliseconds()`), so doing
-/// the arithmetic in seconds would truncate up to ~1ms per operand.
+/// `ct` carries only whole-second precision (Unix close-time field in the
+/// SCP value), but `now_ms` and `max_ct_offset` are genuinely sub-second
+/// valued — `max_ct_offset` in protocol v23+ comes from
+/// `SorobanNetworkConfig::ledgerTargetCloseTimeMilliseconds()`, and `now`
+/// is the system clock at ms precision. Truncating `now` to whole seconds
+/// (issue #2702 bounce-back cycle 1, Reviewer B P2) silently lost up to
+/// ~999ms of precision and contradicted the parity-with-stellar-core
+/// claim in this doc comment.
 pub(super) fn ct_validity_offset_secs(
-    now_secs: u64,
+    now_ms: u64,
     ct: u64,
     max_ct_offset: std::time::Duration,
 ) -> std::time::Duration {
     let max_ct_offset_ms = u64::try_from(max_ct_offset.as_millis()).unwrap_or(u64::MAX);
-    let max_candidate_ct_ms = now_secs
-        .saturating_mul(1000)
+    let max_candidate_ct_ms = now_ms
         .saturating_add(max_ct_offset_ms)
         .saturating_add(MAX_TIME_SLIP_SECONDS_FOR_TRIGGER.saturating_mul(1000));
     let ct_ms = ct.saturating_mul(1000);
@@ -384,13 +388,15 @@ impl App {
         ct: u64,
         max_ct_offset: std::time::Duration,
     ) -> std::time::Duration {
-        let now_secs = self
-            .clock
-            .system_now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
-        ct_validity_offset_secs(now_secs, ct, max_ct_offset)
+        let now_ms = u64::try_from(
+            self.clock
+                .system_now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX epoch")
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        ct_validity_offset_secs(now_ms, ct, max_ct_offset)
     }
 
     /// Port of stellar-core's `HerderImpl::setupTriggerNextLedger`
@@ -481,6 +487,8 @@ impl App {
 
         self.timer_manager_handle
             .schedule_trigger_next_ledger(next_slot, total_offset);
+        self.consensus_trigger_setup_armed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Perform out-of-sync recovery matching stellar-core's outOfSyncRecovery().
@@ -2220,19 +2228,20 @@ mod tests {
     /// `now + max_ct_offset + MAX_TIME_SLIP_SECONDS`, no extra wait is needed.
     #[test]
     fn test_ct_validity_offset_zero_when_ct_in_past() {
-        let now_secs = 1_000_000;
+        let now_secs: u64 = 1_000_000;
+        let now_ms = now_secs * 1000;
         let max_offset = std::time::Duration::from_secs(2);
         // ct sits well below the validity threshold (now + 2 + 60 = 1_000_062).
         let ct = now_secs - 100;
         assert_eq!(
-            ct_validity_offset_secs(now_secs, ct, max_offset),
+            ct_validity_offset_secs(now_ms, ct, max_offset),
             std::time::Duration::ZERO
         );
 
         // ct exactly at threshold also returns zero (strict `>` check).
         let ct = now_secs + max_offset.as_secs() + MAX_TIME_SLIP_SECONDS_FOR_TRIGGER;
         assert_eq!(
-            ct_validity_offset_secs(now_secs, ct, max_offset),
+            ct_validity_offset_secs(now_ms, ct, max_offset),
             std::time::Duration::ZERO
         );
     }
@@ -2242,17 +2251,51 @@ mod tests {
     /// stellar-core 1ms safety epsilon.
     #[test]
     fn test_ct_validity_offset_nonzero_when_ct_in_future() {
-        let now_secs = 1_000_000;
+        let now_secs: u64 = 1_000_000;
+        let now_ms = now_secs * 1000;
         let max_offset = std::time::Duration::from_secs(2);
         let threshold = now_secs + max_offset.as_secs() + MAX_TIME_SLIP_SECONDS_FOR_TRIGGER;
         // Push ct 5 seconds beyond threshold.
         let ct = threshold + 5;
 
-        let got = ct_validity_offset_secs(now_secs, ct, max_offset);
+        let got = ct_validity_offset_secs(now_ms, ct, max_offset);
         assert_eq!(
             got,
             std::time::Duration::from_secs(5) + std::time::Duration::from_millis(1)
         );
+    }
+
+    /// Regression for issue #2702 bounce-back cycle 1 (Reviewer B P2): the
+    /// `now` argument must be milliseconds, not whole seconds. Previously
+    /// the caller passed `.as_secs()`, silently truncating sub-second
+    /// precision. This test pins the ms-precision contract by passing a
+    /// sub-second `now_ms` value and checking the threshold math reflects
+    /// it.
+    #[test]
+    fn test_ct_validity_offset_respects_sub_second_now_ms() {
+        // now = 1_000_000.500s == 1_000_000_500 ms (500ms past a whole second).
+        let now_ms: u64 = 1_000_000_500;
+        // max_ct_offset of 600ms — sub-second, mirrors v23+ Soroban target
+        // close-time fractions.
+        let max_offset = std::time::Duration::from_millis(600);
+        // ct in seconds. Threshold = 1_000_000.500 + 0.600 + 60 = 1_000_061.100 s.
+        // Pick ct = 1_000_062 (Unix sec) → ct_ms = 1_000_062_000.
+        // diff = 1_000_062_000 - 1_000_061_100 = 900 ms, plus 1ms epsilon.
+        let ct: u64 = 1_000_062;
+        let got = ct_validity_offset_secs(now_ms, ct, max_offset);
+        assert_eq!(got, std::time::Duration::from_millis(900 + 1));
+
+        // Compare: had we truncated now to whole seconds (1_000_000 s →
+        // 1_000_000_000 ms), threshold would shift down by 500 ms to
+        // 1_000_060_600, giving 1_400 ms + 1ms — different result, proving
+        // the truncation was load-bearing.
+        let truncated_now_ms = 1_000_000_000;
+        let got_truncated = ct_validity_offset_secs(truncated_now_ms, ct, max_offset);
+        assert_ne!(
+            got, got_truncated,
+            "ms-precision must NOT collapse onto sec-precision math"
+        );
+        assert_eq!(got_truncated, std::time::Duration::from_millis(1_400 + 1));
     }
 
     /// When `prepare_start` is available, the trigger offset equals
