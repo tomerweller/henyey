@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=315
+TAP_PLAN=316
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -63,8 +63,15 @@ tap_not_ok() {
   TAP_FAILURES=$((TAP_FAILURES + 1))
   echo "not ok $TAP_CURRENT - $1"
   if [[ -n "${2:-}" ]]; then
-    echo "  # $2" 
+    echo "  # $2"
   fi
+}
+
+tap_skip() {
+  # Emit a passing TAP line with a SKIP directive so the count stays
+  # consistent regardless of whether the optional dependency is installed.
+  TAP_CURRENT=$((TAP_CURRENT + 1))
+  echo "ok $TAP_CURRENT - $1 # SKIP ${2:-unavailable}"
 }
 
 # ── Section extraction helper ─────────────────────────────────────────────────
@@ -892,6 +899,28 @@ run_tests() {
     tap_ok "_enumerate_henyey_processes: (deleted) exe matched"
   else
     tap_not_ok "_enumerate_henyey_processes: (deleted) exe matched" "got: '$enum_out'"
+  fi
+
+  # ── Test 20c3-zsh: (deleted) exe matched — zsh recheck ──────────────────
+  # Regression guard for the zsh parameter-expansion bug fixed in PR #2780:
+  # under zsh, the unquoted form `${exe% (deleted)}` parses ` ` as a glob and
+  # silently fails to strip the suffix. This re-runs the T20c3 scenario inside
+  # a `zsh -c` subprocess so the suffix-strip in monitor-decisions.sh line 37
+  # is exercised under zsh semantics. Gated on zsh availability.
+  if command -v zsh >/dev/null 2>&1; then
+    data="$TEST_ROOT/t20c3z/data"
+    proc="$TEST_ROOT/t20c3z/proc"
+    mkdir -p "$data" "$proc"
+    mock_proc_entry "$proc" "8010" "$data/sessc3z/cargo-target/release/henyey (deleted)" "henyey --mainnet run"
+    # Pass all paths as positional args to avoid inline-quoting hazards.
+    enum_out=$(zsh -c 'source "$1/scripts/lib/monitor-decisions.sh"; _enumerate_henyey_processes "$2" "$3"' -- "$REPO_ROOT" "$data" "$proc")
+    if [[ "$enum_out" == "8010 sessc3z" ]]; then
+      tap_ok "_enumerate_henyey_processes: (deleted) exe matched — zsh recheck"
+    else
+      tap_not_ok "_enumerate_henyey_processes: (deleted) exe matched — zsh recheck" "got: '$enum_out'"
+    fi
+  else
+    tap_skip "_enumerate_henyey_processes: (deleted) exe matched — zsh recheck" "zsh not found"
   fi
 
   # ── Test 20c4: empty proc root ─────────────────────────────────────────
