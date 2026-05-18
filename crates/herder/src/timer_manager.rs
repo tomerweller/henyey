@@ -56,12 +56,17 @@ pub enum TimerCommand {
     ScheduleNominationTimeout { slot: SlotIndex, duration: Duration },
     /// Schedule a ballot timeout for a slot (overwrites existing timer).
     ScheduleBallotTimeout { slot: SlotIndex, duration: Duration },
+    /// Schedule a trigger-next-ledger timer for a slot (overwrites existing timer).
+    /// Mirrors stellar-core's `mTriggerTimer` armed from `setupTriggerNextLedger`.
+    ScheduleTriggerNextLedger { slot: SlotIndex, duration: Duration },
     /// Cancel all timers for a slot.
     CancelSlotTimers { slot: SlotIndex },
     /// Cancel the nomination timer for a slot (but keep ballot timer).
     CancelNominationTimer { slot: SlotIndex },
     /// Cancel the ballot timer for a slot (but keep nomination timer).
     CancelBallotTimer { slot: SlotIndex },
+    /// Cancel the trigger-next-ledger timer for a slot.
+    CancelTriggerNextLedger { slot: SlotIndex },
     /// Purge timers for slots older than the given slot.
     PurgeOldSlots { min_slot: SlotIndex },
     /// Cancel all active timers regardless of slot.
@@ -117,6 +122,27 @@ impl TimerManagerHandle {
     /// Cancel only the ballot timer for a slot.
     pub async fn cancel_ballot_timer(&self, slot: SlotIndex) {
         let _ = self.sender.send(TimerCommand::CancelBallotTimer { slot });
+    }
+
+    /// Schedule a trigger-next-ledger timer for a slot.
+    ///
+    /// Sync because the underlying `mpsc::UnboundedSender::send` is
+    /// non-suspending — the previous `async fn` signature forced every
+    /// caller into a pointless `.await` (issue #2702 review feedback).
+    pub fn schedule_trigger_next_ledger(&self, slot: SlotIndex, duration: Duration) {
+        let _ = self
+            .sender
+            .send(TimerCommand::ScheduleTriggerNextLedger { slot, duration });
+    }
+
+    /// Cancel the trigger-next-ledger timer for a slot.
+    ///
+    /// Sync for the same reason as
+    /// [`schedule_trigger_next_ledger`](Self::schedule_trigger_next_ledger).
+    pub fn cancel_trigger_next_ledger(&self, slot: SlotIndex) {
+        let _ = self
+            .sender
+            .send(TimerCommand::CancelTriggerNextLedger { slot });
     }
 
     /// Purge timers for slots older than the given slot.
@@ -190,6 +216,28 @@ impl TimerManagerHandle {
             tracing::warn!(slot, "timer channel closed: cancel ballot dropped");
         }
     }
+
+    /// Schedule a trigger-next-ledger timer (non-blocking, infallible while channel open).
+    pub fn schedule_trigger_next_ledger_nonblocking(&self, slot: SlotIndex, duration: Duration) {
+        if self
+            .sender
+            .send(TimerCommand::ScheduleTriggerNextLedger { slot, duration })
+            .is_err()
+        {
+            tracing::warn!(slot, "timer channel closed: schedule trigger dropped");
+        }
+    }
+
+    /// Cancel the trigger-next-ledger timer for a slot (non-blocking).
+    pub fn cancel_trigger_next_ledger_nonblocking(&self, slot: SlotIndex) {
+        if self
+            .sender
+            .send(TimerCommand::CancelTriggerNextLedger { slot })
+            .is_err()
+        {
+            tracing::warn!(slot, "timer channel closed: cancel trigger dropped");
+        }
+    }
 }
 
 /// Callback trait for timer expiration events.
@@ -201,6 +249,15 @@ pub trait TimerCallback: Send + Sync + 'static {
 
     /// Called when a ballot timeout expires.
     fn on_ballot_timeout(&self, slot: SlotIndex);
+
+    /// Called when a trigger-next-ledger timer expires.
+    ///
+    /// Production callbacks must dispatch this into the main event loop. A
+    /// missed override would silently swallow consensus trigger firings —
+    /// unlike a missed nomination/ballot, a swallowed trigger causes the
+    /// validator to stop making progress with no compile-time signal, so
+    /// this method is intentionally required (no default impl).
+    fn on_trigger_next_ledger(&self, slot: SlotIndex);
 }
 
 /// Timer type for a slot.
@@ -208,6 +265,9 @@ pub trait TimerCallback: Send + Sync + 'static {
 pub enum TimerType {
     Nomination,
     Ballot,
+    /// Event-driven consensus trigger (mirrors stellar-core's `mTriggerTimer`
+    /// armed by `setupTriggerNextLedger`).
+    TriggerNextLedger,
 }
 
 /// Active timer state.
@@ -288,6 +348,9 @@ impl<C: TimerCallback> TimerManager<C> {
             TimerCommand::ScheduleBallotTimeout { slot, duration } => {
                 self.schedule_timer(slot, TimerType::Ballot, duration);
             }
+            TimerCommand::ScheduleTriggerNextLedger { slot, duration } => {
+                self.schedule_timer(slot, TimerType::TriggerNextLedger, duration);
+            }
             TimerCommand::CancelSlotTimers { slot } => {
                 self.cancel_slot_timers(slot);
             }
@@ -296,6 +359,9 @@ impl<C: TimerCallback> TimerManager<C> {
             }
             TimerCommand::CancelBallotTimer { slot } => {
                 self.cancel_timer(slot, TimerType::Ballot);
+            }
+            TimerCommand::CancelTriggerNextLedger { slot } => {
+                self.cancel_timer(slot, TimerType::TriggerNextLedger);
             }
             TimerCommand::PurgeOldSlots { min_slot } => {
                 self.purge_old_slots(min_slot);
@@ -340,8 +406,12 @@ impl<C: TimerCallback> TimerManager<C> {
     fn cancel_slot_timers(&mut self, slot: SlotIndex) {
         let removed_nom = self.timers.remove(&(slot, TimerType::Nomination)).is_some();
         let removed_bal = self.timers.remove(&(slot, TimerType::Ballot)).is_some();
+        let removed_trig = self
+            .timers
+            .remove(&(slot, TimerType::TriggerNextLedger))
+            .is_some();
 
-        if removed_nom || removed_bal {
+        if removed_nom || removed_bal || removed_trig {
             debug!(slot, "Cancelled slot timers");
         }
     }
@@ -394,6 +464,9 @@ impl<C: TimerCallback> TimerManager<C> {
                 TimerType::Ballot => {
                     self.callback.on_ballot_timeout(slot);
                 }
+                TimerType::TriggerNextLedger => {
+                    self.callback.on_trigger_next_ledger(slot);
+                }
             }
         }
     }
@@ -406,6 +479,8 @@ pub struct TimerStats {
     pub nomination_timers: usize,
     /// Number of active ballot timers.
     pub ballot_timers: usize,
+    /// Number of active trigger-next-ledger timers.
+    pub trigger_next_ledger_timers: usize,
     /// Total active timers.
     pub total_timers: usize,
 }
@@ -474,10 +549,17 @@ impl<C: TimerCallback> TimerManagerWithStats<C> {
             .values()
             .filter(|t| t.timer_type == TimerType::Ballot)
             .count();
+        let trigger_count = self
+            .inner
+            .timers
+            .values()
+            .filter(|t| t.timer_type == TimerType::TriggerNextLedger)
+            .count();
 
         let mut stats = self.stats.write();
         stats.nomination_timers = nomination_count;
         stats.ballot_timers = ballot_count;
+        stats.trigger_next_ledger_timers = trigger_count;
         stats.total_timers = self.inner.timers.len();
     }
 }
@@ -491,6 +573,7 @@ mod tests {
     struct TestCallback {
         nomination_fired: AtomicU64,
         ballot_fired: AtomicU64,
+        trigger_fired: AtomicU64,
     }
 
     impl TestCallback {
@@ -498,6 +581,7 @@ mod tests {
             Self {
                 nomination_fired: AtomicU64::new(0),
                 ballot_fired: AtomicU64::new(0),
+                trigger_fired: AtomicU64::new(0),
             }
         }
     }
@@ -509,6 +593,10 @@ mod tests {
 
         fn on_ballot_timeout(&self, slot: SlotIndex) {
             self.ballot_fired.store(slot, Ordering::SeqCst);
+        }
+
+        fn on_trigger_next_ledger(&self, slot: SlotIndex) {
+            self.trigger_fired.store(slot, Ordering::SeqCst);
         }
     }
 
@@ -742,8 +830,127 @@ mod tests {
         // These should not panic — the channel is open (receiver leaked)
         handle.schedule_nomination_timeout_nonblocking(1, Duration::from_secs(1));
         handle.schedule_ballot_timeout_nonblocking(1, Duration::from_secs(1));
+        handle.schedule_trigger_next_ledger_nonblocking(1, Duration::from_secs(1));
         handle.cancel_slot_timers_nonblocking(1);
         handle.cancel_nomination_timer_nonblocking(1);
         handle.cancel_ballot_timer_nonblocking(1);
+        handle.cancel_trigger_next_ledger_nonblocking(1);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_next_ledger_fires_after_duration() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        handle.schedule_trigger_next_ledger(123, Duration::from_millis(50));
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 123);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_trigger_next_ledger_reschedule_cancels_prior() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        // First schedule with short duration.
+        handle.schedule_trigger_next_ledger(7, Duration::from_millis(50));
+        // Reschedule with longer duration before it fires.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.schedule_trigger_next_ledger(7, Duration::from_millis(200));
+
+        // Past the original fire time but before the new one — must not have fired.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 0);
+
+        // Past the new fire time — must have fired exactly once with slot 7.
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 7);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_trigger_next_ledger_cancel_via_cancel_all_timers() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        handle.schedule_trigger_next_ledger(11, Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.cancel_all_timers().await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 0);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_trigger_next_ledger_purged_by_purge_old_slots() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        handle.schedule_trigger_next_ledger(10, Duration::from_millis(200));
+        handle.schedule_trigger_next_ledger(30, Duration::from_millis(200));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.purge_old_slots(25).await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Only slot 30 should have fired; slot 10 was purged.
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 30);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_trigger_next_ledger_canceled_by_cancel_slot_timers() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        handle.schedule_trigger_next_ledger(42, Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.cancel_slot_timers(42).await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 0);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_trigger_next_ledger_canceled_via_cancel_trigger() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone());
+        let manager_task = tokio::spawn(manager.run());
+
+        // Schedule trigger and ballot timer for the same slot.
+        handle.schedule_trigger_next_ledger(99, Duration::from_millis(100));
+        handle
+            .schedule_ballot_timeout(99, Duration::from_millis(100))
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.cancel_trigger_next_ledger(99);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Trigger canceled; ballot must still have fired.
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 0);
+        assert_eq!(callback.ballot_fired.load(Ordering::SeqCst), 99);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
     }
 }

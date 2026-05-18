@@ -3,6 +3,28 @@
 use super::archive_cache::CacheResult;
 use super::*;
 
+/// Maximum allowed clock skew (seconds) used by stellar-core's `validateValue`
+/// for accepting nominated close-times. Mirrors `Herder::MAX_TIME_SLIP_SECONDS = 60`
+/// (`stellar-core/src/herder/Herder.h`). Used by [`App::ct_validity_offset`] to
+/// keep the locally-armed trigger time consistent with what peers will accept
+/// (parity with `HerderImpl::ctValidityOffset`).
+pub(super) const MAX_TIME_SLIP_SECONDS_FOR_TRIGGER: u64 = 60;
+
+/// Backoff used to re-arm the event-driven trigger timer when
+/// [`App::try_trigger_consensus`] fired but was gated out (e.g. by
+/// `is_applying_ledger`, or `current_ledger + 1 < tracking_slot`, or a
+/// stale/failed `trigger_next_ledger` call). Without this re-arm the
+/// trigger remained permanently un-armed until the next *successful*
+/// close — but for solo / starved validators that successful close was
+/// supposed to be driven by this very trigger, so the validator wedged
+/// (issue #2702 review feedback).
+///
+/// The constant is intentionally short relative to
+/// `expectedLedgerCloseDuration` (~5s) so the gate clears quickly without
+/// hammering, and long enough to keep the trigger out of a tight loop
+/// when the gate is sticky (e.g. an in-flight `close_ledger`).
+pub(super) const TRIGGER_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Why the node cannot apply the next buffered slot even though the herder
 /// has an EXTERNALIZE for every slot in `[current_ledger+1, latest_externalized]`.
 ///
@@ -111,6 +133,117 @@ pub(super) fn should_delay_checkpoint(checkpoint: u64, first_sequential_ledger: 
     checkpoint < first_sequential_ledger
 }
 
+/// Pure form of stellar-core's `ctValidityOffset`
+/// (`HerderImpl.cpp:1158-1175`). Separated from [`App::ct_validity_offset`]
+/// so the math can be unit-tested without spinning up an [`App`].
+///
+/// Returns the extra delay required so that a value nominated `max_ct_offset`
+/// from `now_ms` (wall-clock milliseconds since Unix epoch) with close-time
+/// `ct` (Unix seconds, matching the SCP value field) is guaranteed to pass
+/// `Herder::validateValue`'s "not too far in the future" check
+/// (i.e. `ct <= now + max_ct_offset + MAX_TIME_SLIP_SECONDS`).
+///
+/// Mirrors stellar-core's `+ std::chrono::milliseconds(1)` epsilon so the
+/// computed trigger instant is strictly *after* the validity threshold rather
+/// than landing exactly on it.
+///
+/// All arithmetic is performed in milliseconds to mirror stellar-core's
+/// `std::chrono::milliseconds` `time_point` math in `HerderImpl.cpp:1158-1172`.
+/// `ct` carries only whole-second precision (Unix close-time field in the
+/// SCP value), but `now_ms` and `max_ct_offset` are genuinely sub-second
+/// valued — `max_ct_offset` in protocol v23+ comes from
+/// `SorobanNetworkConfig::ledgerTargetCloseTimeMilliseconds()`, and `now`
+/// is the system clock at ms precision. Truncating `now` to whole seconds
+/// (issue #2702 bounce-back cycle 1, Reviewer B P2) silently lost up to
+/// ~999ms of precision and contradicted the parity-with-stellar-core
+/// claim in this doc comment.
+pub(super) fn ct_validity_offset_secs(
+    now_ms: u64,
+    ct: u64,
+    max_ct_offset: std::time::Duration,
+) -> std::time::Duration {
+    let max_ct_offset_ms = u64::try_from(max_ct_offset.as_millis()).unwrap_or(u64::MAX);
+    let max_candidate_ct_ms = now_ms
+        .saturating_add(max_ct_offset_ms)
+        .saturating_add(MAX_TIME_SLIP_SECONDS_FOR_TRIGGER.saturating_mul(1000));
+    let ct_ms = ct.saturating_mul(1000);
+
+    if ct_ms > max_candidate_ct_ms {
+        let diff_ms = ct_ms - max_candidate_ct_ms;
+        std::time::Duration::from_millis(diff_ms) + std::time::Duration::from_millis(1)
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+/// Pure form of the trigger-instant computation from
+/// `HerderImpl::setupTriggerNextLedger` (`HerderImpl.cpp:1252-1278`), up to
+/// but not including the `ctValidityOffset` adjustment. Returns the trigger
+/// offset relative to `now` after the `lastBallotStart + expected` math and
+/// the `triggerTime < now` clamp.
+///
+/// When `last_ballot_start` is `None` (cold start / catchup), the function
+/// returns [`Duration::ZERO`] directly — semantically equivalent to
+/// stellar-core's "pessimistic estimate" (`now - expected`) which would
+/// collapse to `(now - expected) + expected = now` and clamp to zero. We
+/// short-circuit here because computing `now - expected` on
+/// [`tokio::time::Instant`] (a monotonic clock) panics on underflow when
+/// `expected` exceeds the time elapsed since the monotonic origin — reachable
+/// on fresh CI VMs where system uptime is small (issue #2702 bounce-back
+/// inline review).
+pub(super) fn compute_trigger_offset_pre_ct(
+    now: tokio::time::Instant,
+    expected: std::time::Duration,
+    last_ballot_start: Option<tokio::time::Instant>,
+) -> std::time::Duration {
+    let Some(last_ballot_start) = last_ballot_start else {
+        return std::time::Duration::ZERO;
+    };
+    let trigger_time = last_ballot_start + expected;
+    if trigger_time < now {
+        std::time::Duration::ZERO
+    } else {
+        trigger_time.saturating_duration_since(now)
+    }
+}
+
+/// Outcome of a single [`App::try_trigger_consensus`] invocation, used by
+/// [`App::handle_scp_timer_event`] to decide whether to re-arm the trigger
+/// timer with a short backoff (issue #2702 review feedback — without this
+/// re-arm path the trigger timer was permanently un-armed any time it
+/// fired into a gated state, wedging solo validators).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TriggerAttemptOutcome {
+    /// Nomination was started for this slot, or nomination for this slot is
+    /// already in progress. The post-close path will re-arm the trigger
+    /// timer once this round closes — no immediate re-arm needed.
+    Triggered,
+    /// `try_trigger_consensus` returned without starting nomination
+    /// because a transient gate was active (`is_applying_ledger`, LCL
+    /// behind tracking, herder `SkippedStale`, herder `Err`, or
+    /// `JoinError` from the blocking nomination task). The trigger timer
+    /// must be re-armed with [`TRIGGER_RETRY_BACKOFF`] so the validator
+    /// self-heals once the gate clears.
+    ShouldRearm,
+    /// Terminal no-op (currently only `manual_close`). The trigger timer
+    /// is never armed in `manual_close` mode anyway (see
+    /// [`App::setup_trigger_next_ledger`]), so this variant exists only
+    /// for completeness of the gate matrix and explicitly does *not* trigger
+    /// a re-arm.
+    NoOp,
+}
+
+/// Pure decision: should [`App::handle_scp_timer_event`] re-arm the
+/// trigger timer after a `try_trigger_consensus` fire produced `outcome`?
+///
+/// Kept as a free function so the re-arm matrix can be unit-tested without
+/// spinning up a full [`App`] (mirrors the pattern used by
+/// [`compute_trigger_offset_pre_ct`] and [`ct_validity_offset_secs`]).
+#[inline]
+pub(super) fn should_rearm_after_trigger(outcome: TriggerAttemptOutcome) -> bool {
+    matches!(outcome, TriggerAttemptOutcome::ShouldRearm)
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger (validators only).
     ///
@@ -118,9 +251,9 @@ impl App {
     /// the node is tracking the network AND the ledger manager is synced
     /// (LCL == tracking slot). Without this, a node that is behind would
     /// propose stale transaction sets for slots it hasn't closed yet.
-    pub(super) async fn try_trigger_consensus(&self) {
+    pub(super) async fn try_trigger_consensus(&self) -> TriggerAttemptOutcome {
         if self.config.node.manual_close {
-            return;
+            return TriggerAttemptOutcome::NoOp;
         }
 
         let tracking_slot = self.herder.tracking_slot().get();
@@ -139,7 +272,7 @@ impl App {
                     tracking_slot,
                     "Skipping consensus trigger: not synced (LCL behind tracking slot)"
                 );
-                return;
+                return TriggerAttemptOutcome::ShouldRearm;
             }
 
             // Parity: HerderImpl.cpp:1440-1447 — if a ledger close is in
@@ -159,7 +292,7 @@ impl App {
                     tracking_slot,
                     "Skipping consensus trigger: ledger close in progress"
                 );
-                return;
+                return TriggerAttemptOutcome::ShouldRearm;
             }
 
             let next_slot = current_ledger + 1;
@@ -199,26 +332,163 @@ impl App {
                 Ok(Ok(henyey_herder::TriggerOutcome::Triggered)) => {
                     self.consensus_trigger_successes
                         .fetch_add(1, Ordering::Relaxed);
+                    TriggerAttemptOutcome::Triggered
                 }
                 Ok(Ok(henyey_herder::TriggerOutcome::SkippedStale)) => {
                     self.consensus_trigger_skipped_stale
                         .fetch_add(1, Ordering::Relaxed);
+                    // Slot advanced between gate check and herder call;
+                    // re-arm so the next slot gets a fresh trigger.
+                    TriggerAttemptOutcome::ShouldRearm
                 }
                 Ok(Ok(henyey_herder::TriggerOutcome::AlreadyNominating)) => {
                     // Idempotent re-trigger; not a new success, not an error.
+                    // Nomination is in progress for this slot — post-close
+                    // will arm the next round's trigger when it externalizes.
+                    TriggerAttemptOutcome::Triggered
                 }
                 Ok(Err(e)) => {
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
                     tracing::error!(error = %e, slot = next_slot, "Failed to trigger ledger");
+                    TriggerAttemptOutcome::ShouldRearm
                 }
                 Err(_join_error) => {
                     // Already logged by spawn_blocking_logged
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
+                    TriggerAttemptOutcome::ShouldRearm
                 }
             }
+        } else {
+            // `is_tracking()` was false. Could be a transient state during a
+            // catchup → tracking transition; re-arm so we retry once tracking
+            // returns. (`setup_trigger_next_ledger` also self-gates on
+            // `is_tracking`, so if tracking is still false at the next fire,
+            // the re-arm becomes a no-op — at which point only the next
+            // post-close path will re-arm. Acceptable: a node that is not
+            // tracking has no business nominating anyway.)
+            TriggerAttemptOutcome::ShouldRearm
         }
+    }
+
+    /// Port of stellar-core's `HerderImpl::ctValidityOffset` (`HerderImpl.cpp:1158-1175`).
+    ///
+    /// Given the minimum candidate close-time (`ct`, in Unix seconds) and the
+    /// already-computed `max_ct_offset` (the time the trigger timer will wait
+    /// before firing), returns the additional offset required so that the
+    /// nominated value's `closeTime` is guaranteed to pass `Herder::validateValue`
+    /// (which rejects values whose `closeTime > now + maxCtOffset +
+    /// MAX_TIME_SLIP_SECONDS`).
+    ///
+    /// Returns `Duration::ZERO` if no extra wait is needed. Uses `clock.system_now()`
+    /// for the wall-clock side, matching stellar-core's `mApp.getClock().system_now()`.
+    pub(super) fn ct_validity_offset(
+        &self,
+        ct: u64,
+        max_ct_offset: std::time::Duration,
+    ) -> std::time::Duration {
+        let now_ms = u64::try_from(
+            self.clock
+                .system_now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX epoch")
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        ct_validity_offset_secs(now_ms, ct, max_ct_offset)
+    }
+
+    /// Port of stellar-core's `HerderImpl::setupTriggerNextLedger`
+    /// (`HerderImpl.cpp:1236-1303`).
+    ///
+    /// Computes the next consensus trigger instant from
+    ///   `lastBallotStart + expectedLedgerCloseDuration + ctValidityOffset`
+    /// and arms a single-shot timer via the [`TimerManager`]. The timer fires
+    /// `try_trigger_consensus()` exactly once when due. Any previously-armed
+    /// trigger timer is cancelled first (matching stellar-core's
+    /// `mTriggerTimer.cancel()`), so re-entrant calls always supersede.
+    ///
+    /// Skips arming (but does not panic) when `manual_close` is set — manual
+    /// close mode drives `try_trigger_consensus` from the
+    /// `manual_close_ledger` RPC handler instead.
+    ///
+    /// All trigger-time math uses monotonic [`tokio::time::Instant`] (mirrors
+    /// stellar-core's `VirtualClock::now()`); the wall-clock check inside
+    /// `ct_validity_offset` is the only place that touches `system_now`.
+    pub(super) async fn setup_trigger_next_ledger(&self) {
+        if self.config.node.manual_close {
+            return;
+        }
+        if !self.is_validator {
+            return;
+        }
+        if !self.herder.is_tracking() {
+            return;
+        }
+        // Parity: HerderImpl.cpp:1241 — `setupTriggerNextLedger` asserts
+        // `!mLedgerManager.isApplying()`. Match the invariant rather than
+        // arming a timer while a close is in flight (issue #2702 review
+        // feedback). A debug log surfaces the suppression; the next
+        // post-close path will arm the trigger once `set_applying_ledger`
+        // clears.
+        if self.is_applying_ledger() {
+            tracing::debug!("Skipping setup_trigger_next_ledger: ledger close in progress");
+            return;
+        }
+
+        let current_ledger = self.current_ledger_seq() as u64;
+        let last_index = current_ledger;
+        let next_slot = current_ledger + 1;
+
+        // Note: we intentionally do NOT pre-cancel the existing
+        // `(next_slot, TriggerNextLedger)` entry here. `schedule_timer` in the
+        // `TimerManager` already overwrites the entry atomically inside the
+        // manager task (timer_manager.rs `self.timers.insert(...)`), so an
+        // explicit cancel would just be a second channel send and open a
+        // (harmless but real) interleaving window where the manager processes
+        // the cancel, recomputes `next_timeout`, then processes the schedule.
+        // Stellar-core's `mTriggerTimer.cancel()` exists because its
+        // `mTriggerTimer` is a single in-flight timer object that needs
+        // explicit cancellation before re-arming; our keyed-map model doesn't.
+
+        let expected = self.herder.ledger_close_duration();
+        let now = tokio::time::Instant::now();
+
+        let last_ballot_start = self
+            .herder
+            .prepare_start(last_index)
+            .map(tokio::time::Instant::from_std);
+
+        // Pure pre-ct trigger-offset math (clamps `triggerTime < now → now`).
+        let pre_ct_offset = compute_trigger_offset_pre_ct(now, expected, last_ballot_start);
+
+        // Compute close-time validity offset using LCL.scpValue.closeTime + 1.
+        let snap = self.ledger_manager.header_snapshot();
+        let lcl_close_time = ledger_close_time(&snap.header);
+        let min_candidate_ct = lcl_close_time.saturating_add(1);
+        let ct_offset = self.ct_validity_offset(min_candidate_ct, pre_ct_offset);
+
+        if ct_offset > std::time::Duration::ZERO {
+            tracing::info!(
+                slot = next_slot,
+                ct_offset_ms = ct_offset.as_millis() as u64,
+                "Adjust trigger time by ct_validity_offset"
+            );
+        }
+        let total_offset = pre_ct_offset + ct_offset;
+
+        tracing::debug!(
+            slot = next_slot,
+            last_index,
+            trigger_offset_ms = total_offset.as_millis() as u64,
+            "Arming event-driven consensus trigger timer"
+        );
+
+        self.timer_manager_handle
+            .schedule_trigger_next_ledger(next_slot, total_offset);
+        self.consensus_trigger_setup_armed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Perform out-of-sync recovery matching stellar-core's outOfSyncRecovery().
@@ -1223,18 +1493,21 @@ impl App {
         }
 
         // Staleness guard: compute the active slot exactly as the old
-        // check_scp_timeouts did (consensus.rs:1157-1158).
+        // check_scp_timeouts did (consensus.rs:1157-1158). For the trigger
+        // timer we compare against `current_ledger + 1` (the slot we'd
+        // nominate); for nomination/ballot we compare against the active
+        // SCP slot (tracking_slot or current_ledger+1, whichever is higher).
         let current_ledger = self.current_ledger_seq() as u64;
-        let active_slot = self.herder.tracking_slot().get().max(current_ledger + 1);
-        if event.slot != active_slot {
-            // Stale event — slot advanced past this timer
-            return;
-        }
+        let nominate_slot = current_ledger + 1;
+        let active_slot = self.herder.tracking_slot().get().max(nominate_slot);
 
         // Fire the timeout handler, preserving counters and spawn_blocking
         // for nomination (parity with the removed check_scp_timeouts).
         match event.timer_type {
             henyey_herder::TimerType::Nomination => {
+                if event.slot != active_slot {
+                    return;
+                }
                 self.nomination_timeout_fires
                     .fetch_add(1, Ordering::Relaxed);
                 let outcome = self
@@ -1247,8 +1520,62 @@ impl App {
                 }
             }
             henyey_herder::TimerType::Ballot => {
+                if event.slot != active_slot {
+                    return;
+                }
                 self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
                 self.herder.handle_ballot_timeout(event.slot);
+            }
+            henyey_herder::TimerType::TriggerNextLedger => {
+                // The trigger timer is armed for `current_ledger + 1` when
+                // setup_trigger_next_ledger runs; if LCL has advanced past
+                // the timer's slot, the firing is stale.
+                //
+                // Race window (issue #2702 review): between the timer-fire
+                // send on the bridge channel and this dispatch, `current_ledger`
+                // can advance via close_pipeline completion. The dispatched
+                // event is then dropped as stale here, and the
+                // post-close path in `lifecycle.rs` is responsible for
+                // arming the *next* slot's trigger timer.
+                if event.slot != nominate_slot {
+                    self.consensus_trigger_timer_skipped_stale
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                // Catchup visibility (issue #2702 review): if tracking is
+                // ahead of `current_ledger + 1` we'll still fire but
+                // `try_trigger_consensus`'s LCL-behind-tracking gate
+                // short-circuits. Surface that to make catchup-during-trigger
+                // visible in traces (the gate itself only debug-logs from
+                // inside `try_trigger_consensus`).
+                if active_slot > nominate_slot {
+                    tracing::debug!(
+                        nominate_slot,
+                        active_slot,
+                        tracking_slot = self.herder.tracking_slot().get(),
+                        "Trigger timer fired during catchup (tracking_slot > current_ledger+1); \
+                         try_trigger_consensus will short-circuit and the timer will be re-armed."
+                    );
+                }
+                self.consensus_trigger_timer_fires
+                    .fetch_add(1, Ordering::Relaxed);
+                let outcome = self.try_trigger_consensus().await;
+                if should_rearm_after_trigger(outcome) {
+                    // Re-arm with a short backoff so a gated fire (e.g.
+                    // `is_applying_ledger`, `SkippedStale`, herder error)
+                    // doesn't permanently un-arm the trigger. Without this
+                    // re-arm path, solo / starved validators wedged the
+                    // first time `try_trigger_consensus` hit a transient
+                    // gate (issue #2702 review feedback). The retry slot
+                    // is recomputed from current LCL so that if LCL
+                    // advanced during the trigger attempt we arm on the
+                    // freshest `current_ledger + 1`.
+                    self.consensus_trigger_timer_rearm_after_gate
+                        .fetch_add(1, Ordering::Relaxed);
+                    let retry_slot = self.current_ledger_seq() as u64 + 1;
+                    self.timer_manager_handle
+                        .schedule_trigger_next_ledger(retry_slot, TRIGGER_RETRY_BACKOFF);
+                }
             }
         }
     }
@@ -1889,5 +2216,189 @@ mod tests {
     #[test]
     fn test_should_delay_checkpoint_first_checkpoint_behind() {
         assert!(should_delay_checkpoint(1, 5));
+    }
+
+    // ── ct_validity_offset + setup_trigger_next_ledger tests (#2702) ─────
+
+    use super::{
+        compute_trigger_offset_pre_ct, ct_validity_offset_secs, MAX_TIME_SLIP_SECONDS_FOR_TRIGGER,
+    };
+
+    /// When the candidate close-time is in the past relative to
+    /// `now + max_ct_offset + MAX_TIME_SLIP_SECONDS`, no extra wait is needed.
+    #[test]
+    fn test_ct_validity_offset_zero_when_ct_in_past() {
+        let now_secs: u64 = 1_000_000;
+        let now_ms = now_secs * 1000;
+        let max_offset = std::time::Duration::from_secs(2);
+        // ct sits well below the validity threshold (now + 2 + 60 = 1_000_062).
+        let ct = now_secs - 100;
+        assert_eq!(
+            ct_validity_offset_secs(now_ms, ct, max_offset),
+            std::time::Duration::ZERO
+        );
+
+        // ct exactly at threshold also returns zero (strict `>` check).
+        let ct = now_secs + max_offset.as_secs() + MAX_TIME_SLIP_SECONDS_FOR_TRIGGER;
+        assert_eq!(
+            ct_validity_offset_secs(now_ms, ct, max_offset),
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// When the candidate close-time is in the future beyond the validity
+    /// threshold, the returned offset is `(ct - threshold)` seconds plus the
+    /// stellar-core 1ms safety epsilon.
+    #[test]
+    fn test_ct_validity_offset_nonzero_when_ct_in_future() {
+        let now_secs: u64 = 1_000_000;
+        let now_ms = now_secs * 1000;
+        let max_offset = std::time::Duration::from_secs(2);
+        let threshold = now_secs + max_offset.as_secs() + MAX_TIME_SLIP_SECONDS_FOR_TRIGGER;
+        // Push ct 5 seconds beyond threshold.
+        let ct = threshold + 5;
+
+        let got = ct_validity_offset_secs(now_ms, ct, max_offset);
+        assert_eq!(
+            got,
+            std::time::Duration::from_secs(5) + std::time::Duration::from_millis(1)
+        );
+    }
+
+    /// Regression for issue #2702 bounce-back cycle 1 (Reviewer B P2): the
+    /// `now` argument must be milliseconds, not whole seconds. Previously
+    /// the caller passed `.as_secs()`, silently truncating sub-second
+    /// precision. This test pins the ms-precision contract by passing a
+    /// sub-second `now_ms` value and checking the threshold math reflects
+    /// it.
+    #[test]
+    fn test_ct_validity_offset_respects_sub_second_now_ms() {
+        // now = 1_000_000.500s == 1_000_000_500 ms (500ms past a whole second).
+        let now_ms: u64 = 1_000_000_500;
+        // max_ct_offset of 600ms — sub-second, mirrors v23+ Soroban target
+        // close-time fractions.
+        let max_offset = std::time::Duration::from_millis(600);
+        // ct in seconds. Threshold = 1_000_000.500 + 0.600 + 60 = 1_000_061.100 s.
+        // Pick ct = 1_000_062 (Unix sec) → ct_ms = 1_000_062_000.
+        // diff = 1_000_062_000 - 1_000_061_100 = 900 ms, plus 1ms epsilon.
+        let ct: u64 = 1_000_062;
+        let got = ct_validity_offset_secs(now_ms, ct, max_offset);
+        assert_eq!(got, std::time::Duration::from_millis(900 + 1));
+
+        // Compare: had we truncated now to whole seconds (1_000_000 s →
+        // 1_000_000_000 ms), threshold would shift down by 500 ms to
+        // 1_000_060_600, giving 1_400 ms + 1ms — different result, proving
+        // the truncation was load-bearing.
+        let truncated_now_ms = 1_000_000_000;
+        let got_truncated = ct_validity_offset_secs(truncated_now_ms, ct, max_offset);
+        assert_ne!(
+            got, got_truncated,
+            "ms-precision must NOT collapse onto sec-precision math"
+        );
+        assert_eq!(got_truncated, std::time::Duration::from_millis(1_400 + 1));
+    }
+
+    /// When `prepare_start` is available, the trigger offset equals
+    /// `lastBallotStart + expected - now` (no clamp).
+    #[test]
+    fn test_setup_trigger_uses_prepare_start_when_available() {
+        // Anchor a synthetic monotonic clock via tokio::time::Instant.
+        let now = tokio::time::Instant::now();
+        let expected = std::time::Duration::from_secs(5);
+        // Ballot started 1s ago — next trigger should fire in expected - 1s = 4s.
+        let last = now - std::time::Duration::from_secs(1);
+
+        let off = compute_trigger_offset_pre_ct(now, expected, Some(last));
+        assert_eq!(off, std::time::Duration::from_secs(4));
+    }
+
+    /// When the computed trigger time is in the past (e.g. ballot started
+    /// long ago), the offset clamps to zero so the timer fires immediately.
+    #[test]
+    fn test_setup_trigger_uses_now_when_trigger_time_in_past() {
+        let now = tokio::time::Instant::now();
+        let expected = std::time::Duration::from_secs(5);
+        // Ballot started 10s ago — `last + expected = now - 5s < now` → clamp.
+        let last = now - std::time::Duration::from_secs(10);
+
+        let off = compute_trigger_offset_pre_ct(now, expected, Some(last));
+        assert_eq!(off, std::time::Duration::ZERO);
+    }
+
+    /// Cold start: no `prepare_start` recorded. The helper short-circuits to
+    /// zero immediately (no monotonic-clock subtraction), so the timer fires
+    /// right away. This matches stellar-core's "bootstrap with a pessimistic
+    /// estimate" semantics and avoids the `now - expected` underflow panic
+    /// that bit fresh CI VMs.
+    #[test]
+    fn test_setup_trigger_cold_start_no_prepare_start() {
+        let now = tokio::time::Instant::now();
+        let expected = std::time::Duration::from_secs(5);
+
+        let off = compute_trigger_offset_pre_ct(now, expected, None);
+        assert_eq!(off, std::time::Duration::ZERO);
+    }
+
+    /// Regression: `compute_trigger_offset_pre_ct` must not panic when
+    /// `last_ballot_start` is `None` and `expected` exceeds the time elapsed
+    /// since the monotonic clock origin. Reachable on fresh CI VMs where
+    /// `tokio::time::Instant::now()` early in process life can be smaller
+    /// than `expected` (5s in pre-v23, configurable from Soroban network
+    /// info). The pre-fix `unwrap_or_else(|| now - expected)` would panic
+    /// here with `overflow when subtracting duration from instant`.
+    #[tokio::test(start_paused = true)]
+    async fn test_setup_trigger_cold_start_does_not_underflow_monotonic_clock() {
+        // With `start_paused`, `tokio::time::Instant::now()` is anchored to
+        // the runtime's clock origin. Advance by 100ms — much less than
+        // `expected` — so subtracting 5s would underflow.
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        let now = tokio::time::Instant::now();
+        let expected = std::time::Duration::from_secs(5);
+
+        // Must not panic.
+        let off = compute_trigger_offset_pre_ct(now, expected, None);
+        assert_eq!(off, std::time::Duration::ZERO);
+    }
+
+    // ── should_rearm_after_trigger decision matrix (#2702 bounce-back) ───
+    //
+    // These tests pin the contract that `handle_scp_timer_event::TriggerNextLedger`
+    // relies on: every `TriggerAttemptOutcome` variant maps deterministically
+    // to a re-arm decision. Without the re-arm path the trigger timer was
+    // permanently un-armed on every gated fire (e.g. `is_applying_ledger`),
+    // wedging solo / starved validators. The matrix encoded here is the only
+    // unit-testable surface for that fix; the full integration test (cold-start
+    // arms timer, fires while applying, asserts a follow-up timer fires) needs
+    // a real `App` and is covered indirectly by the Quickstart `core,rpc,horizon`
+    // smoke test in CI.
+
+    use super::{should_rearm_after_trigger, TriggerAttemptOutcome};
+
+    #[test]
+    fn test_should_rearm_triggered_does_not_rearm() {
+        // `Triggered` means nomination started (or is already in progress);
+        // the post-close path will arm the *next* round's trigger when this
+        // round externalizes. Re-arming here would step on that and double-fire.
+        assert!(!should_rearm_after_trigger(
+            TriggerAttemptOutcome::Triggered
+        ));
+    }
+
+    #[test]
+    fn test_should_rearm_should_rearm_does_rearm() {
+        // Every gated/failed branch of `try_trigger_consensus` maps to
+        // `ShouldRearm` so the validator self-heals once the gate clears.
+        assert!(should_rearm_after_trigger(
+            TriggerAttemptOutcome::ShouldRearm
+        ));
+    }
+
+    #[test]
+    fn test_should_rearm_noop_does_not_rearm() {
+        // `NoOp` is currently only returned by the `manual_close` gate. The
+        // trigger timer is never armed in `manual_close` mode in the first
+        // place (see `setup_trigger_next_ledger`), so this variant exists
+        // purely for matrix completeness and explicitly must not re-arm.
+        assert!(!should_rearm_after_trigger(TriggerAttemptOutcome::NoOp));
     }
 }

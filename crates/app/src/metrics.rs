@@ -715,6 +715,21 @@ metric_catalog! {
             "henyey_nomination_timeout_skipped_stale_total"
             => "Total handle_nomination_timeout invocations that returned \
                 SkippedStale because LCL advanced during build/drain";
+        CONSENSUS_TRIGGER_TIMER_FIRES_TOTAL =
+            "henyey_consensus_trigger_timer_fires_total"
+            => "Total event-driven consensus trigger timer firings dispatched \
+                to try_trigger_consensus (parity with stellar-core mTriggerTimer)";
+        CONSENSUS_TRIGGER_TIMER_SKIPPED_STALE_TOTAL =
+            "henyey_consensus_trigger_timer_skipped_stale_total"
+            => "Total event-driven trigger timer firings dropped by the \
+                active-slot staleness guard in handle_scp_timer_event";
+        CONSENSUS_TRIGGER_TIMER_REARM_AFTER_GATE_TOTAL =
+            "henyey_consensus_trigger_timer_rearm_after_gate_total"
+            => "Total trigger-timer re-arms issued by handle_scp_timer_event \
+                after try_trigger_consensus returned ShouldRearm (gated by \
+                is_applying_ledger, LCL behind tracking, herder SkippedStale, \
+                herder Err, or JoinError) — required for self-healing of \
+                solo/starved validators (issue #2702)";
 
         // Stage E: History archive lifecycle counters (10334 dashboard).
         // All count terminal outcomes; retries within an operation are not counted.
@@ -1265,6 +1280,11 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     CONSENSUS_TRIGGER_SKIPPED_APPLYING_TOTAL.absolute(snap.consensus_trigger_skipped_applying);
     CONSENSUS_TRIGGER_SKIPPED_STALE_TOTAL.absolute(snap.consensus_trigger_skipped_stale);
     NOMINATION_TIMEOUT_SKIPPED_STALE_TOTAL.absolute(snap.nomination_timeout_skipped_stale);
+    CONSENSUS_TRIGGER_TIMER_FIRES_TOTAL.absolute(snap.consensus_trigger_timer_fires);
+    CONSENSUS_TRIGGER_TIMER_SKIPPED_STALE_TOTAL
+        .absolute(snap.consensus_trigger_timer_skipped_stale);
+    CONSENSUS_TRIGGER_TIMER_REARM_AFTER_GATE_TOTAL
+        .absolute(snap.consensus_trigger_timer_rearm_after_gate);
     SCP_ENVELOPE_VALIDSIG_TOTAL.absolute(snap.scp.envelope_validsig_total);
     SCP_ENVELOPE_INVALIDSIG_TOTAL.absolute(snap.scp.envelope_invalidsig_total);
     SCP_ENVELOPE_SIGN_TOTAL.absolute(snap.scp.envelope_sign_total);

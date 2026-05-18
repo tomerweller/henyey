@@ -1213,6 +1213,15 @@ impl Herder {
         self.ledger_manager.expected_ledger_close_duration()
     }
 
+    /// Recorded ballot-protocol start instant for `slot`, if any.
+    ///
+    /// Thin forward over [`ScpDriver::prepare_start`]. Used by
+    /// `setup_trigger_next_ledger` (parity with stellar-core's
+    /// `HerderSCPDriver::getPrepareStart`).
+    pub fn prepare_start(&self, slot: u64) -> Option<std::time::Instant> {
+        self.scp_driver.prepare_start(slot)
+    }
+
     /// Get the maximum size of a transaction set (ops).
     pub fn max_tx_set_size(&self) -> usize {
         self.config.max_tx_set_size

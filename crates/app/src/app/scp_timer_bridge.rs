@@ -40,4 +40,11 @@ impl TimerCallback for ScpTimerBridge {
             timer_type: TimerType::Ballot,
         });
     }
+
+    fn on_trigger_next_ledger(&self, slot: SlotIndex) {
+        let _ = self.sender.send(ScpTimerEvent {
+            slot,
+            timer_type: TimerType::TriggerNextLedger,
+        });
+    }
 }

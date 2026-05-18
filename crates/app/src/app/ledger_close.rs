@@ -1782,7 +1782,13 @@ impl App {
         if success {
             // Trigger consensus immediately after close, matching stellar-core.
             if self.is_validator {
-                self.try_trigger_consensus().await;
+                // Ignored: post-close path always arms the next round's
+                // trigger via `setup_trigger_next_ledger` below
+                // (issue #2702 review feedback — parity with stellar-core's
+                // `lastClosedLedgerIncreased(latest=true)` arming site at
+                // `HerderImpl.cpp:1232`).
+                let _ = self.try_trigger_consensus().await;
+                self.setup_trigger_next_ledger().await;
             }
 
             *self.last_externalized_at.write().await = self.clock.now();

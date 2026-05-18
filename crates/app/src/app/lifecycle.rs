@@ -263,6 +263,29 @@ impl App {
         // Set state based on validator mode
         self.restore_operational_state().await;
 
+        // Cold-start trigger arm (issue #2702): once the node is fully
+        // operational (state set to Validating/Synced and overlay flood
+        // accept re-armed), arm a single trigger timer so the very first
+        // round is event-driven rather than waiting on a polling tick.
+        //
+        // This MUST run AFTER `restore_operational_state()` so we mirror
+        // stellar-core's sequencing: `setupTriggerNextLedger()` in
+        // `HerderImpl` is only called from `lastClosedLedgerIncreased(
+        // latest=true)`, which itself only fires when the herder is fully
+        // in-sync (`isTracking() && isSynced()`). Calling earlier — e.g.
+        // immediately after `herder.bootstrap()` — risks the 0ms timer
+        // firing while the node is still transitioning into operational
+        // state, where `is_tracking()` can momentarily flap and the
+        // trigger ends up un-armed with no recovery path (issue #2702
+        // bounce-back cycle 1: solo-validator stall in `core,rpc,horizon`
+        // Quickstart CI).
+        //
+        // `setup_trigger_next_ledger` self-gates on `manual_close`,
+        // `is_validator`, `is_tracking`, and `is_applying_ledger`, so an
+        // unconditional call is safe — it becomes a no-op when any of
+        // those is false.
+        self.setup_trigger_next_ledger().await;
+
         // Start sync recovery tracking to enable the consensus stuck timer
         self.start_sync_recovery_tracking();
 
@@ -520,10 +543,28 @@ impl App {
                         self.set_phase_sub(super::phase::PHASE_6_9_MAYBE_PUBLISH_HISTORY);
                         self.maybe_publish_history().await;
 
-                        // Trigger consensus immediately after a successful close.
+                        // Trigger consensus immediately after a successful close
+                        // and arm the event-driven trigger timer for the next
+                        // ledger (parity with stellar-core's
+                        // `lastClosedLedgerIncreased` → `setupTriggerNextLedger`).
+                        //
+                        // Phase 2 behavior (issue #2702): the immediate
+                        // `try_trigger_consensus` here paces consensus on the
+                        // happy path; the just-armed timer fires later and
+                        // hits the `AlreadyNominating` idempotent path. The
+                        // timer's `lastBallotStart + expectedLedgerCloseDuration`
+                        // cadence math therefore only takes effect when the
+                        // immediate trigger is gated out (e.g. `is_applying_ledger`
+                        // is still true, or `is_tracking` is briefly false at
+                        // this exact point) — i.e. the timer is a recovery
+                        // path in steady state, not the primary scheduler.
                         if self.is_validator {
                             self.set_phase_sub(super::phase::PHASE_6_10_TRY_TRIGGER_CONSENSUS);
-                            self.try_trigger_consensus().await;
+                            // Return value ignored: post-close path always
+                            // arms the next round's trigger via the
+                            // `setup_trigger_next_ledger` call below.
+                            let _ = self.try_trigger_consensus().await;
+                            self.setup_trigger_next_ledger().await;
                         }
 
                         // Drain SCP + fetch response channels.
@@ -1036,10 +1077,13 @@ impl App {
                         self.maybe_publish_history().await;
                     }
 
-                    // For validators, try to trigger next round
-                    if self.is_validator {
-                        self.try_trigger_consensus().await;
-                    }
+                    // NOTE (issue #2702): consensus is no longer triggered from
+                    // this 1s tick. The trigger fires from the event-driven
+                    // trigger timer armed by `setup_trigger_next_ledger()`
+                    // post-close (parity with stellar-core's `mTriggerTimer` +
+                    // `setupTriggerNextLedger`). The 1s tick is preserved for
+                    // the maintenance work above (drains,
+                    // `request_pending_tx_sets`, `maybe_publish_history`).
                 }
 
                 // Stats logging
