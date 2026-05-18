@@ -800,7 +800,7 @@ mod tests {
     }
 
     /// Create an envelope whose NOMINATE ballot references a known tx set hash.
-    fn make_envelope_with_tx_set_hash(slot: u64, tx_set_hash: Hash) -> ScpEnvelope {
+    pub(super) fn make_envelope_with_tx_set_hash(slot: u64, tx_set_hash: Hash) -> ScpEnvelope {
         let stellar_value = StellarValue {
             tx_set_hash: tx_set_hash.clone(),
             close_time: TimePoint(0),
@@ -1166,5 +1166,39 @@ mod sqlite_tests {
         // Load all
         let all = persistence.load_all_tx_sets().unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    /// Exercise the atomic purge through `ScpPersistenceManager` backed by
+    /// `SqliteScpPersistence`. This is the path used in production once the
+    /// persist timer is wired (#2768).
+    #[test]
+    fn test_purge_atomic_via_manager_sqlite() {
+        use super::tests::make_envelope_with_tx_set_hash;
+
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let manager = ScpPersistenceManager::new(Box::new(SqliteScpPersistence::new(db)));
+
+        let referenced = Hash([0xAA; 32]);
+        let orphan = Hash([0xBB; 32]);
+
+        // Slot 100 references `referenced`; slot 50 references `orphan` then
+        // gets cleaned up so `orphan` becomes unreferenced.
+        let env_r = make_envelope_with_tx_set_hash(100, referenced.clone());
+        manager
+            .persist_scp_state(100, &[env_r], &[(referenced.clone(), vec![1])], &[])
+            .unwrap();
+        let env_o = make_envelope_with_tx_set_hash(50, orphan.clone());
+        manager
+            .persist_scp_state(50, &[env_o], &[(orphan.clone(), vec![2])], &[])
+            .unwrap();
+
+        // Drop slot 50's state -> orphan is now unreferenced.
+        // Cleanup itself calls purge — but we then call purge again to
+        // confirm the atomic path is idempotent.
+        manager.cleanup(100).unwrap();
+        manager.purge_unreferenced_tx_sets().unwrap();
+
+        assert!(manager.has_tx_set(&referenced).unwrap());
+        assert!(!manager.has_tx_set(&orphan).unwrap());
     }
 }

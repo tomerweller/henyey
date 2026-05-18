@@ -647,6 +647,117 @@ mod tests {
         assert!(conn.has_tx_set_data(&hash1).unwrap());
     }
 
+    /// Builds a JSON-encoded `PersistedSlotState` whose single envelope
+    /// references `tx_set_hash`. Mirrors the herder-side
+    /// `PersistedSlotState::to_json` output, so the on-disk encoding here
+    /// matches what `ScpPersistenceManager` would write at runtime.
+    fn persisted_state_json_referencing(tx_set_hash: &Hash) -> String {
+        // Construct a NOMINATE envelope referencing `tx_set_hash` via a
+        // StellarValue.
+        let stellar_value = stellar_xdr::curr::StellarValue {
+            tx_set_hash: tx_set_hash.clone(),
+            close_time: stellar_xdr::curr::TimePoint(0),
+            upgrades: vec![].try_into().unwrap(),
+            ext: stellar_xdr::curr::StellarValueExt::Basic,
+        };
+        let value_xdr = stellar_value.to_xdr(Limits::none()).unwrap();
+        let envelope = ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                slot_index: 100,
+                pledges: stellar_xdr::curr::ScpStatementPledges::Nominate(
+                    stellar_xdr::curr::ScpNomination {
+                        quorum_set_hash: Hash([0u8; 32]),
+                        votes: vec![stellar_xdr::curr::Value(value_xdr.try_into().unwrap())]
+                            .try_into()
+                            .unwrap(),
+                        accepted: vec![].try_into().unwrap(),
+                    },
+                ),
+            },
+            signature: stellar_xdr::curr::Signature::default(),
+        };
+        let env_xdr: Vec<u8> = envelope.to_xdr(Limits::none()).unwrap();
+        // Match the herder's PersistedSlotState JSON shape: serde_json renders
+        // `Vec<u8>` as a JSON array of numbers. Build that shape manually so
+        // we don't need a serde_json dev-dep on the db crate.
+        let env_array = env_xdr
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"version":1,"envelopes":[[{}]],"quorum_sets":[]}}"#,
+            env_array
+        )
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_atomic_basic() {
+        let conn = setup_db();
+
+        let referenced = Hash([0xAA; 32]);
+        let orphan = Hash([0xBB; 32]);
+
+        // Two tx sets persisted: one referenced, one orphan.
+        conn.save_tx_set_data(&referenced, &[1, 2, 3]).unwrap();
+        conn.save_tx_set_data(&orphan, &[4, 5, 6]).unwrap();
+
+        // One SCP state references `referenced`.
+        let state_json = persisted_state_json_referencing(&referenced);
+        conn.save_scp_slot_state(100, &state_json).unwrap();
+
+        // Atomic purge.
+        conn.purge_unreferenced_tx_sets_atomic().unwrap();
+
+        assert!(conn.has_tx_set_data(&referenced).unwrap());
+        assert!(!conn.has_tx_set_data(&orphan).unwrap());
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_atomic_empty_is_noop() {
+        let conn = setup_db();
+        // Empty DB — should be a no-op (and not error).
+        conn.purge_unreferenced_tx_sets_atomic().unwrap();
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_atomic_all_referenced() {
+        let conn = setup_db();
+
+        let hash = Hash([0xCC; 32]);
+        conn.save_tx_set_data(&hash, &[1]).unwrap();
+        let state_json = persisted_state_json_referencing(&hash);
+        conn.save_scp_slot_state(100, &state_json).unwrap();
+
+        conn.purge_unreferenced_tx_sets_atomic().unwrap();
+        assert!(conn.has_tx_set_data(&hash).unwrap());
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_atomic_skips_corrupt_state() {
+        let conn = setup_db();
+
+        let valid_hash = Hash([0xAA; 32]);
+        let orphan_from_corrupt = Hash([0xBB; 32]);
+        conn.save_tx_set_data(&valid_hash, &[1]).unwrap();
+        conn.save_tx_set_data(&orphan_from_corrupt, &[2]).unwrap();
+
+        // Valid state references valid_hash.
+        let valid_state = persisted_state_json_referencing(&valid_hash);
+        conn.save_scp_slot_state(100, &valid_state).unwrap();
+
+        // Corrupt JSON for slot 101 — invalid bytes that won't deserialize.
+        conn.save_scp_slot_state(101, "{not valid json").unwrap();
+
+        // Should NOT panic; corrupt state is logged + skipped. valid_hash
+        // survives; orphan_from_corrupt is deleted (can't prove it's
+        // referenced).
+        conn.purge_unreferenced_tx_sets_atomic().unwrap();
+        assert!(conn.has_tx_set_data(&valid_hash).unwrap());
+        assert!(!conn.has_tx_set_data(&orphan_from_corrupt).unwrap());
+    }
+
     #[test]
     fn test_copy_scp_history_to_stream_basic() {
         let conn = setup_db();
