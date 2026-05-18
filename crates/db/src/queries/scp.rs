@@ -347,6 +347,26 @@ pub trait ScpStatePersistenceQueries {
 
     /// Delete persisted transaction sets by their hashes.
     fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<(), DbError>;
+
+    /// Atomic purge of unreferenced persisted transaction sets.
+    ///
+    /// Reads all persisted tx-set hashes, all persisted SCP slot states,
+    /// computes the set of orphan hashes (those not referenced by any
+    /// stored envelope), and deletes the orphans — all on the same
+    /// connection. The caller is expected to wrap the call in a transaction
+    /// (e.g. via [`Database::transaction`]) so the read-then-delete sequence
+    /// is observed atomically with respect to concurrent writers.
+    ///
+    /// SCP envelopes are stored as JSON-encoded `PersistedSlotState`. The
+    /// JSON shape (`{"envelopes": [[byte, byte, ...], ...], ...}`) is
+    /// defined by the herder's `PersistedSlotState` Serde representation;
+    /// this method parses it without depending on the herder crate.
+    ///
+    /// Per-state error handling: if a stored SCP state fails to parse, the
+    /// state is logged and skipped (its tx-set references can't be proven,
+    /// so its tx-sets may be deleted as orphans). Matches stellar-core
+    /// `HerderImpl::purgeOldPersistedTxSets()` (HerderImpl.cpp:2456-2478).
+    fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), DbError>;
 }
 
 impl ScpStatePersistenceQueries for Connection {
@@ -496,6 +516,139 @@ impl ScpStatePersistenceQueries for Connection {
         self.execute(&sql, params.as_slice())?;
         Ok(())
     }
+
+    fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), DbError> {
+        // Step 1: read all stored tx-set hashes.
+        let all_hashes_vec = self.get_all_tx_set_hashes()?;
+        if all_hashes_vec.is_empty() {
+            // Nothing to do; avoid a needless write lock when caller wraps
+            // this in a transaction.
+            return Ok(());
+        }
+        let all_hashes: std::collections::HashSet<Hash> = all_hashes_vec.into_iter().collect();
+
+        // Step 2: read all stored SCP slot states and compute the set of
+        // referenced tx-set hashes. Per-state error handling matches
+        // stellar-core (HerderImpl.cpp:2456-2478) and the in-memory path
+        // (`ScpPersistenceManager::purge_unreferenced_tx_sets`).
+        let mut referenced: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        for (slot, state_json) in self.load_all_scp_slot_states()? {
+            match referenced_tx_set_hashes_from_state_json(&state_json) {
+                Ok(hashes) => referenced.extend(hashes),
+                Err(e) => tracing::warn!(
+                    slot,
+                    error = %e,
+                    "Error extracting tx set hashes from persisted state, skipping"
+                ),
+            }
+        }
+
+        // Step 3: delete orphans (stored but not referenced).
+        let unreferenced: Vec<Hash> = all_hashes.difference(&referenced).cloned().collect();
+        if !unreferenced.is_empty() {
+            tracing::debug!(
+                count = unreferenced.len(),
+                "Purging unreferenced persisted tx sets (atomic)"
+            );
+            self.delete_tx_sets_by_hashes(&unreferenced)?;
+        }
+        Ok(())
+    }
+}
+
+/// Parse a JSON-encoded `PersistedSlotState` and return all tx-set hashes
+/// referenced by its envelopes.
+///
+/// Mirrors the herder's `PersistedSlotState` Serde shape:
+/// `{ "version": u32, "envelopes": [[u8, ...], ...], "quorum_sets": [...] }`.
+/// Each envelope is the raw XDR bytes of an `ScpEnvelope`. We decode the
+/// XDR and extract the tx-set hash from the embedded `StellarValue` in
+/// the pledges. This duplicates `henyey_herder::persistence::get_tx_set_hashes`
+/// — kept in sync by the regression tests in this module.
+fn referenced_tx_set_hashes_from_state_json(state_json: &str) -> Result<Vec<Hash>, DbError> {
+    let value: serde_json::Value = serde_json::from_str(state_json)
+        .map_err(|e| DbError::Integrity(format!("invalid persisted state JSON: {}", e)))?;
+    let envelopes_json = value
+        .get("envelopes")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            DbError::Integrity("persisted state JSON missing 'envelopes' array".to_string())
+        })?;
+
+    let mut hashes = Vec::new();
+    for env_json in envelopes_json {
+        let bytes: Vec<u8> = env_json
+            .as_array()
+            .ok_or_else(|| {
+                DbError::Integrity("persisted envelope JSON is not a byte array".to_string())
+            })?
+            .iter()
+            .map(|n| {
+                n.as_u64()
+                    .and_then(|x| u8::try_from(x).ok())
+                    .ok_or_else(|| {
+                        DbError::Integrity("invalid byte in persisted envelope".to_string())
+                    })
+            })
+            .collect::<Result<Vec<u8>, _>>()?;
+        let envelope = ScpEnvelope::from_xdr(bytes.as_slice(), Limits::none())?;
+        for hash in extract_tx_set_hashes_from_envelope(&envelope) {
+            hashes.push(hash);
+        }
+    }
+    Ok(hashes)
+}
+
+/// Extract the tx-set hashes referenced by an SCP envelope.
+///
+/// Mirrors `henyey_herder::persistence::get_tx_set_hashes`. The envelope's
+/// pledges carry an `ScpBallot` (in Prepare/Confirm/Externalize) or
+/// `Vec<Value>` (in Nominate); each `Value` decodes into a `StellarValue`
+/// whose `tx_set_hash` is the referenced hash.
+fn extract_tx_set_hashes_from_envelope(envelope: &ScpEnvelope) -> Vec<Hash> {
+    use stellar_xdr::curr::{ScpStatementPledges, StellarValue, Value as XdrValue};
+
+    fn from_value(value: &XdrValue) -> Option<Hash> {
+        let sv = StellarValue::from_xdr(value.as_slice(), Limits::none()).ok()?;
+        Some(sv.tx_set_hash)
+    }
+
+    let mut hashes = Vec::new();
+    match &envelope.statement.pledges {
+        ScpStatementPledges::Nominate(nom) => {
+            for value in nom.votes.iter().chain(nom.accepted.iter()) {
+                if let Some(h) = from_value(value) {
+                    hashes.push(h);
+                }
+            }
+        }
+        ScpStatementPledges::Prepare(prep) => {
+            if let Some(h) = from_value(&prep.ballot.value) {
+                hashes.push(h);
+            }
+            if let Some(p) = &prep.prepared {
+                if let Some(h) = from_value(&p.value) {
+                    hashes.push(h);
+                }
+            }
+            if let Some(pp) = &prep.prepared_prime {
+                if let Some(h) = from_value(&pp.value) {
+                    hashes.push(h);
+                }
+            }
+        }
+        ScpStatementPledges::Confirm(conf) => {
+            if let Some(h) = from_value(&conf.ballot.value) {
+                hashes.push(h);
+            }
+        }
+        ScpStatementPledges::Externalize(ext) => {
+            if let Some(h) = from_value(&ext.commit.value) {
+                hashes.push(h);
+            }
+        }
+    }
+    hashes
 }
 
 #[cfg(test)]
@@ -645,6 +798,117 @@ mod tests {
         // Delete with empty list should be a no-op
         conn.delete_tx_sets_by_hashes(&[]).unwrap();
         assert!(conn.has_tx_set_data(&hash1).unwrap());
+    }
+
+    /// Builds a JSON-encoded `PersistedSlotState` whose single envelope
+    /// references `tx_set_hash`. Mirrors the herder-side
+    /// `PersistedSlotState::to_json` output, so the on-disk encoding here
+    /// matches what `ScpPersistenceManager` would write at runtime.
+    fn persisted_state_json_referencing(tx_set_hash: &Hash) -> String {
+        // Construct a NOMINATE envelope referencing `tx_set_hash` via a
+        // StellarValue.
+        let stellar_value = stellar_xdr::curr::StellarValue {
+            tx_set_hash: tx_set_hash.clone(),
+            close_time: stellar_xdr::curr::TimePoint(0),
+            upgrades: vec![].try_into().unwrap(),
+            ext: stellar_xdr::curr::StellarValueExt::Basic,
+        };
+        let value_xdr = stellar_value.to_xdr(Limits::none()).unwrap();
+        let envelope = ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                slot_index: 100,
+                pledges: stellar_xdr::curr::ScpStatementPledges::Nominate(
+                    stellar_xdr::curr::ScpNomination {
+                        quorum_set_hash: Hash([0u8; 32]),
+                        votes: vec![stellar_xdr::curr::Value(value_xdr.try_into().unwrap())]
+                            .try_into()
+                            .unwrap(),
+                        accepted: vec![].try_into().unwrap(),
+                    },
+                ),
+            },
+            signature: stellar_xdr::curr::Signature::default(),
+        };
+        let env_xdr: Vec<u8> = envelope.to_xdr(Limits::none()).unwrap();
+        // Match the herder's PersistedSlotState JSON shape: serde_json renders
+        // `Vec<u8>` as a JSON array of numbers. Build that shape manually so
+        // we don't need a serde_json dev-dep on the db crate.
+        let env_array = env_xdr
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"version":1,"envelopes":[[{}]],"quorum_sets":[]}}"#,
+            env_array
+        )
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_atomic_basic() {
+        let conn = setup_db();
+
+        let referenced = Hash([0xAA; 32]);
+        let orphan = Hash([0xBB; 32]);
+
+        // Two tx sets persisted: one referenced, one orphan.
+        conn.save_tx_set_data(&referenced, &[1, 2, 3]).unwrap();
+        conn.save_tx_set_data(&orphan, &[4, 5, 6]).unwrap();
+
+        // One SCP state references `referenced`.
+        let state_json = persisted_state_json_referencing(&referenced);
+        conn.save_scp_slot_state(100, &state_json).unwrap();
+
+        // Atomic purge.
+        conn.purge_unreferenced_tx_sets_atomic().unwrap();
+
+        assert!(conn.has_tx_set_data(&referenced).unwrap());
+        assert!(!conn.has_tx_set_data(&orphan).unwrap());
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_atomic_empty_is_noop() {
+        let conn = setup_db();
+        // Empty DB — should be a no-op (and not error).
+        conn.purge_unreferenced_tx_sets_atomic().unwrap();
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_atomic_all_referenced() {
+        let conn = setup_db();
+
+        let hash = Hash([0xCC; 32]);
+        conn.save_tx_set_data(&hash, &[1]).unwrap();
+        let state_json = persisted_state_json_referencing(&hash);
+        conn.save_scp_slot_state(100, &state_json).unwrap();
+
+        conn.purge_unreferenced_tx_sets_atomic().unwrap();
+        assert!(conn.has_tx_set_data(&hash).unwrap());
+    }
+
+    #[test]
+    fn test_purge_unreferenced_tx_sets_atomic_skips_corrupt_state() {
+        let conn = setup_db();
+
+        let valid_hash = Hash([0xAA; 32]);
+        let orphan_from_corrupt = Hash([0xBB; 32]);
+        conn.save_tx_set_data(&valid_hash, &[1]).unwrap();
+        conn.save_tx_set_data(&orphan_from_corrupt, &[2]).unwrap();
+
+        // Valid state references valid_hash.
+        let valid_state = persisted_state_json_referencing(&valid_hash);
+        conn.save_scp_slot_state(100, &valid_state).unwrap();
+
+        // Corrupt JSON for slot 101 — invalid bytes that won't deserialize.
+        conn.save_scp_slot_state(101, "{not valid json").unwrap();
+
+        // Should NOT panic; corrupt state is logged + skipped. valid_hash
+        // survives; orphan_from_corrupt is deleted (can't prove it's
+        // referenced).
+        conn.purge_unreferenced_tx_sets_atomic().unwrap();
+        assert!(conn.has_tx_set_data(&valid_hash).unwrap());
+        assert!(!conn.has_tx_set_data(&orphan_from_corrupt).unwrap());
     }
 
     #[test]
