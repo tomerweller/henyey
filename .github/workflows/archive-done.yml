@@ -34,6 +34,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Diagnostic: surface secret state before the script runs. This is
+      # purely informational; the script's pre-flight probe is what actually
+      # fails fast with an actionable error when the token is unscoped.
+      #
+      # Note: the `repository-projects: write` permission above grants
+      # repo-level classic Projects access only; it does NOT grant the
+      # org-level ProjectV2 scope required by archive-stale-done.sh. That
+      # requires a fine-grained PAT with Projects:Read+Write on
+      # stellar-experimental, set as the PROJECT_BOARD_TOKEN secret.
+      - name: Check PROJECT_BOARD_TOKEN secret
+        env:
+          HAS_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "::warning::PROJECT_BOARD_TOKEN secret is not configured; falling back to GITHUB_TOKEN, which lacks org-level ProjectV2 scope. The next step will fail with a diagnostic message. See issue #2777."
+          else
+            echo "PROJECT_BOARD_TOKEN is configured."
+          fi
+
       - name: Run archive-stale-done.sh
         env:
           GH_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN || secrets.GITHUB_TOKEN }}
