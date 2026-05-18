@@ -314,9 +314,10 @@ mod tests {
     use crate::http::{build_router, ServerState};
 
     /// Build a `ServerState` backed by a real (minimal) `App` with the given
-    /// `commit_hash`. Returns the state and the `TempDir` whose lifetime keeps
-    /// the on-disk database valid.
-    async fn test_server_state(commit_hash: &str) -> (Arc<ServerState>, tempfile::TempDir) {
+    /// `commit_hash`. Returns `(TempDir, ServerState)`; the `TempDir` guard is
+    /// first so the `ServerState` (which holds open database handles) is
+    /// dropped before the directory it backs is removed.
+    async fn test_server_state(commit_hash: &str) -> (tempfile::TempDir, Arc<ServerState>) {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("test.db");
         let mut config = ConfigBuilder::new().database_path(db_path).build();
@@ -337,7 +338,7 @@ mod tests {
             #[cfg(feature = "loadgen")]
             loadgen_state: None,
         });
-        (state, dir)
+        (dir, state)
     }
 
     /// Collect an axum response body and parse it as JSON.
@@ -349,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn test_info_handler_commit_hash_present() {
         let commit = "abc123def456";
-        let (state, _dir) = test_server_state(commit).await;
+        let (_dir, state) = test_server_state(commit).await;
         let app = build_router(state);
 
         let response = app
@@ -370,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_info_handler_commit_hash_absent() {
-        let (state, _dir) = test_server_state("").await;
+        let (_dir, state) = test_server_state("").await;
         let app = build_router(state);
 
         let response = app

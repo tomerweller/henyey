@@ -4333,7 +4333,11 @@ mod tests {
     /// - schedule_due=true (last_recovery_attempt 15s ago)
     ///
     /// Caller sets `last_hard_reset_offset` to control cooldown state.
-    async fn mk_app_for_cooldown_livelock_scenario() -> (App, tempfile::TempDir) {
+    ///
+    /// Returns `(TempDir, App)`; the `TempDir` guard is first so the `App`
+    /// (which holds open database handles into the directory) is dropped
+    /// before the directory it backs is removed.
+    async fn mk_app_for_cooldown_livelock_scenario() -> (tempfile::TempDir, App) {
         use std::time::Duration;
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4402,7 +4406,7 @@ mod tests {
         // recovery_attempts_without_progress stays at 0 (default),
         // below RECOVERY_ESCALATION_CATCHUP=6.
 
-        (app, dir)
+        (dir, app)
     }
 
     /// #1844 regression: when HardReset cooldown is active, the livelock
@@ -4413,7 +4417,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
-        let (app, _dir) = mk_app_for_cooldown_livelock_scenario().await;
+        let (_dir, app) = mk_app_for_cooldown_livelock_scenario().await;
 
         // Activate cooldown: store a recent hard-reset offset.
         // max(1) because 0 is the sentinel for "no previous reset".
@@ -4494,7 +4498,7 @@ mod tests {
     async fn test_no_previous_reset_routes_to_hard_reset() {
         use std::sync::atomic::Ordering;
 
-        let (app, _dir) = mk_app_for_cooldown_livelock_scenario().await;
+        let (_dir, app) = mk_app_for_cooldown_livelock_scenario().await;
 
         // last_hard_reset_offset stays at 0 (default) → "no previous reset"
         // → cooldown is inactive → HardReset fires.
@@ -4706,7 +4710,11 @@ mod tests {
     /// target=88, checkpoint_containing(88)=128 > 100 → enters cache check.
     /// No cooldown stamp → cooldown skipped. No cached externalized for
     /// slot 1 → `should_skip_externalized_catchup_cooldown` returns false.
-    async fn mk_app_for_externalized_catchup_cache_test() -> (App, u64, tempfile::TempDir) {
+    ///
+    /// Returns `(TempDir, App, latest_externalized)`; the `TempDir` guard is
+    /// first so the `App` (which holds open database handles into the
+    /// directory) is dropped before the directory it backs is removed.
+    async fn mk_app_for_externalized_catchup_cache_test() -> (tempfile::TempDir, App, u64) {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("ext-catchup-cache-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -4724,7 +4732,7 @@ mod tests {
         // No last_catchup_completed_at → cooldown check passes.
         // No cached externalized for slot 1 → skip cooldown returns false.
 
-        (app, latest_externalized, dir)
+        (dir, app, latest_externalized)
     }
 
     #[tokio::test]
@@ -4732,7 +4740,7 @@ mod tests {
         // Regression test for #1863: when the archive cache is cold (None),
         // externalized catchup should spawn a ProbeAhead escalation and set
         // urgent mode, NOT stamp last_catchup_completed_at.
-        let (app, latest_externalized, _dir) = mk_app_for_externalized_catchup_cache_test().await;
+        let (_dir, app, latest_externalized) = mk_app_for_externalized_catchup_cache_test().await;
 
         // Precondition: cache is cold.
         assert_eq!(
@@ -4780,7 +4788,7 @@ mod tests {
     async fn test_externalized_catchup_archive_behind_does_not_stamp_completion() {
         // Regression test for #1863: when archive_latest <= current_ledger,
         // externalized catchup should NOT stamp last_catchup_completed_at.
-        let (app, latest_externalized, _dir) = mk_app_for_externalized_catchup_cache_test().await;
+        let (_dir, app, latest_externalized) = mk_app_for_externalized_catchup_cache_test().await;
 
         // Seed archive cache at 0 (at current_ledger, which is 0 for
         // uninitialized ledger_manager).
@@ -4825,7 +4833,7 @@ mod tests {
         // should also NOT stamp last_catchup_completed_at. This is the same
         // behavior as the fresh-cache-behind case — stale values that show
         // "behind" are handled identically.
-        let (app, latest_externalized, _dir) = mk_app_for_externalized_catchup_cache_test().await;
+        let (_dir, app, latest_externalized) = mk_app_for_externalized_catchup_cache_test().await;
 
         // Use seed_stale so the cache actually returns Stale(0), exercising
         // the CacheResult::Stale arm in maybe_start_externalized_catchup.
@@ -4870,7 +4878,7 @@ mod tests {
         use std::time::Duration;
         use tokio::sync::Notify;
 
-        let (app, _dir) = mk_app_for_cooldown_livelock_scenario().await;
+        let (_dir, app) = mk_app_for_cooldown_livelock_scenario().await;
         let app = Arc::new(app);
 
         // Shared signal: the spawned task holds `archive_recovery_status.write()`
