@@ -870,12 +870,12 @@ impl Herder {
     /// `HerderImpl::startTxSetGCTimer()` (`HerderImpl.cpp:2440-2444`) /
     /// `purgeOldPersistedTxSets()` (`HerderImpl.cpp:2448-2487`) cadence.
     ///
-    /// TODO(#2770): the underlying `purge_unreferenced_tx_sets()` performs
-    /// three serial connection checkouts — `get_all_tx_set_hashes`,
-    /// `load_all_scp_states`, `delete_tx_sets_by_hashes` — without a single
-    /// SQLite transaction. With `persist_scp_state` now wired (#2768), a
-    /// concurrent persist between steps 2 and 3 could mark a fresh tx-set
-    /// as orphan. Tracked in #2770; make transactional there.
+    /// The underlying `purge_unreferenced_tx_sets()` routes through the
+    /// `ScpStatePersistence::purge_unreferenced_tx_sets_atomic` trait
+    /// method, which the SQLite backend overrides to run the three-step
+    /// purge inside a single transaction so a concurrent `persist_scp_state`
+    /// cannot have its tx-set deleted as an orphan between the read and the
+    /// delete (#2770).
     pub fn purge_persisted_tx_sets(&self) {
         let Some(manager) = self.scp_persistence.get() else {
             return;

@@ -347,6 +347,26 @@ pub trait ScpStatePersistenceQueries {
 
     /// Delete persisted transaction sets by their hashes.
     fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<(), DbError>;
+
+    /// Atomic purge of unreferenced persisted transaction sets.
+    ///
+    /// Reads all persisted tx-set hashes, all persisted SCP slot states,
+    /// computes the set of orphan hashes (those not referenced by any
+    /// stored envelope), and deletes the orphans — all on the same
+    /// connection. The caller is expected to wrap the call in a transaction
+    /// (e.g. via [`Database::transaction`]) so the read-then-delete sequence
+    /// is observed atomically with respect to concurrent writers.
+    ///
+    /// SCP envelopes are stored as JSON-encoded `PersistedSlotState`. The
+    /// JSON shape (`{"envelopes": [[byte, byte, ...], ...], ...}`) is
+    /// defined by the herder's `PersistedSlotState` Serde representation;
+    /// this method parses it without depending on the herder crate.
+    ///
+    /// Per-state error handling: if a stored SCP state fails to parse, the
+    /// state is logged and skipped (its tx-set references can't be proven,
+    /// so its tx-sets may be deleted as orphans). Matches stellar-core
+    /// `HerderImpl::purgeOldPersistedTxSets()` (HerderImpl.cpp:2456-2478).
+    fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), DbError>;
 }
 
 impl ScpStatePersistenceQueries for Connection {
@@ -496,6 +516,139 @@ impl ScpStatePersistenceQueries for Connection {
         self.execute(&sql, params.as_slice())?;
         Ok(())
     }
+
+    fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), DbError> {
+        // Step 1: read all stored tx-set hashes.
+        let all_hashes_vec = self.get_all_tx_set_hashes()?;
+        if all_hashes_vec.is_empty() {
+            // Nothing to do; avoid a needless write lock when caller wraps
+            // this in a transaction.
+            return Ok(());
+        }
+        let all_hashes: std::collections::HashSet<Hash> = all_hashes_vec.into_iter().collect();
+
+        // Step 2: read all stored SCP slot states and compute the set of
+        // referenced tx-set hashes. Per-state error handling matches
+        // stellar-core (HerderImpl.cpp:2456-2478) and the in-memory path
+        // (`ScpPersistenceManager::purge_unreferenced_tx_sets`).
+        let mut referenced: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        for (slot, state_json) in self.load_all_scp_slot_states()? {
+            match referenced_tx_set_hashes_from_state_json(&state_json) {
+                Ok(hashes) => referenced.extend(hashes),
+                Err(e) => tracing::warn!(
+                    slot,
+                    error = %e,
+                    "Error extracting tx set hashes from persisted state, skipping"
+                ),
+            }
+        }
+
+        // Step 3: delete orphans (stored but not referenced).
+        let unreferenced: Vec<Hash> = all_hashes.difference(&referenced).cloned().collect();
+        if !unreferenced.is_empty() {
+            tracing::debug!(
+                count = unreferenced.len(),
+                "Purging unreferenced persisted tx sets (atomic)"
+            );
+            self.delete_tx_sets_by_hashes(&unreferenced)?;
+        }
+        Ok(())
+    }
+}
+
+/// Parse a JSON-encoded `PersistedSlotState` and return all tx-set hashes
+/// referenced by its envelopes.
+///
+/// Mirrors the herder's `PersistedSlotState` Serde shape:
+/// `{ "version": u32, "envelopes": [[u8, ...], ...], "quorum_sets": [...] }`.
+/// Each envelope is the raw XDR bytes of an `ScpEnvelope`. We decode the
+/// XDR and extract the tx-set hash from the embedded `StellarValue` in
+/// the pledges. This duplicates `henyey_herder::persistence::get_tx_set_hashes`
+/// — kept in sync by the regression tests in this module.
+fn referenced_tx_set_hashes_from_state_json(state_json: &str) -> Result<Vec<Hash>, DbError> {
+    let value: serde_json::Value = serde_json::from_str(state_json)
+        .map_err(|e| DbError::Integrity(format!("invalid persisted state JSON: {}", e)))?;
+    let envelopes_json = value
+        .get("envelopes")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            DbError::Integrity("persisted state JSON missing 'envelopes' array".to_string())
+        })?;
+
+    let mut hashes = Vec::new();
+    for env_json in envelopes_json {
+        let bytes: Vec<u8> = env_json
+            .as_array()
+            .ok_or_else(|| {
+                DbError::Integrity("persisted envelope JSON is not a byte array".to_string())
+            })?
+            .iter()
+            .map(|n| {
+                n.as_u64()
+                    .and_then(|x| u8::try_from(x).ok())
+                    .ok_or_else(|| {
+                        DbError::Integrity("invalid byte in persisted envelope".to_string())
+                    })
+            })
+            .collect::<Result<Vec<u8>, _>>()?;
+        let envelope = ScpEnvelope::from_xdr(bytes.as_slice(), Limits::none())?;
+        for hash in extract_tx_set_hashes_from_envelope(&envelope) {
+            hashes.push(hash);
+        }
+    }
+    Ok(hashes)
+}
+
+/// Extract the tx-set hashes referenced by an SCP envelope.
+///
+/// Mirrors `henyey_herder::persistence::get_tx_set_hashes`. The envelope's
+/// pledges carry an `ScpBallot` (in Prepare/Confirm/Externalize) or
+/// `Vec<Value>` (in Nominate); each `Value` decodes into a `StellarValue`
+/// whose `tx_set_hash` is the referenced hash.
+fn extract_tx_set_hashes_from_envelope(envelope: &ScpEnvelope) -> Vec<Hash> {
+    use stellar_xdr::curr::{ScpStatementPledges, StellarValue, Value as XdrValue};
+
+    fn from_value(value: &XdrValue) -> Option<Hash> {
+        let sv = StellarValue::from_xdr(value.as_slice(), Limits::none()).ok()?;
+        Some(sv.tx_set_hash)
+    }
+
+    let mut hashes = Vec::new();
+    match &envelope.statement.pledges {
+        ScpStatementPledges::Nominate(nom) => {
+            for value in nom.votes.iter().chain(nom.accepted.iter()) {
+                if let Some(h) = from_value(value) {
+                    hashes.push(h);
+                }
+            }
+        }
+        ScpStatementPledges::Prepare(prep) => {
+            if let Some(h) = from_value(&prep.ballot.value) {
+                hashes.push(h);
+            }
+            if let Some(p) = &prep.prepared {
+                if let Some(h) = from_value(&p.value) {
+                    hashes.push(h);
+                }
+            }
+            if let Some(pp) = &prep.prepared_prime {
+                if let Some(h) = from_value(&pp.value) {
+                    hashes.push(h);
+                }
+            }
+        }
+        ScpStatementPledges::Confirm(conf) => {
+            if let Some(h) = from_value(&conf.ballot.value) {
+                hashes.push(h);
+            }
+        }
+        ScpStatementPledges::Externalize(ext) => {
+            if let Some(h) = from_value(&ext.commit.value) {
+                hashes.push(h);
+            }
+        }
+    }
+    hashes
 }
 
 #[cfg(test)]

@@ -23,5 +23,12 @@ tracing.workspace = true
 hex.workspace = true
 base64.workspace = true
 
+# JSON decoding of persisted SCP slot states for atomic purge
+# (PersistedSlotState is JSON-encoded by the herder; the atomic purge
+# parses it on the same connection inside a transaction). Only `Value`
+# is used so the herder's `PersistedSlotState` shape doesn't have to be
+# duplicated here.
+serde_json.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

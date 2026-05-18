@@ -187,6 +187,63 @@ pub trait ScpStatePersistence: Send + Sync {
 
     /// Delete persisted transaction sets by their hashes.
     fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<()>;
+
+    /// Atomic purge of unreferenced persisted transaction sets.
+    ///
+    /// Implementations that have transactional storage (e.g. SQLite) should
+    /// override this to wrap the read-then-delete sequence in a single
+    /// transaction, so a concurrent `save_tx_set` cannot have its tx-set
+    /// deleted as an orphan between the read and the delete.
+    ///
+    /// The default implementation is the historical three-call sequence
+    /// (read hashes, read SCP states, delete orphans). It is safe for
+    /// in-process backends whose individual calls already serialize on a
+    /// single lock (e.g. `InMemoryScpPersistence`); it is **not** safe for
+    /// backends that check out a fresh connection per call.
+    ///
+    /// Mirrors stellar-core `HerderImpl::purgeOldPersistedTxSets()`
+    /// (HerderImpl.cpp:2448-2487).
+    fn purge_unreferenced_tx_sets_atomic(&self) -> Result<()> {
+        let all_hashes: std::collections::HashSet<Hash> =
+            self.get_all_tx_set_hashes()?.into_iter().collect();
+        if all_hashes.is_empty() {
+            return Ok(());
+        }
+
+        let mut referenced = std::collections::HashSet::new();
+        for (slot, state) in self.load_all_scp_states()? {
+            match extract_tx_set_hashes_from_state(&state) {
+                Ok(hashes) => referenced.extend(hashes),
+                Err(e) => warn!(
+                    slot,
+                    "Error extracting tx set hashes from persisted state, skipping: {}", e
+                ),
+            }
+        }
+
+        let unreferenced: Vec<Hash> = all_hashes.difference(&referenced).cloned().collect();
+        if !unreferenced.is_empty() {
+            debug!(
+                count = unreferenced.len(),
+                "Purging unreferenced persisted tx sets"
+            );
+            self.delete_tx_sets_by_hashes(&unreferenced)?;
+        }
+        Ok(())
+    }
+}
+
+/// Extract all tx set hashes from a persisted slot state.
+///
+/// Returns an error if any envelope in the state cannot be decoded,
+/// allowing the caller to skip the entire state (per-state error granularity).
+fn extract_tx_set_hashes_from_state(state: &PersistedSlotState) -> Result<Vec<Hash>> {
+    let mut hashes = Vec::new();
+    for env_result in state.get_envelopes() {
+        let envelope = env_result?;
+        hashes.extend(get_tx_set_hashes(&envelope));
+    }
+    Ok(hashes)
 }
 
 /// In-memory implementation of SCP state persistence for testing.
@@ -559,57 +616,31 @@ impl ScpPersistenceManager {
 
     /// Purge persisted tx sets not referenced by any persisted SCP state.
     ///
-    /// Mirrors stellar-core's `purgeOldPersistedTxSets()` (`HerderImpl.cpp:2448-2487`).
-    /// Error handling is per-state: if a state fails to decode, we skip it
-    /// (preserving its tx set hashes as potentially referenced) and continue.
-    pub fn purge_unreferenced_tx_sets(&self) -> Result<()> {
-        let all_hashes: std::collections::HashSet<Hash> =
-            self.storage.get_all_tx_set_hashes()?.into_iter().collect();
-        if all_hashes.is_empty() {
-            return Ok(());
-        }
-
-        let mut referenced = std::collections::HashSet::new();
-
-        // Per-state error handling: skip entire state on error.
-        // Matches stellar-core HerderImpl.cpp:2456-2478 per-state try/catch.
-        for (slot, state) in self.storage.load_all_scp_states()? {
-            match Self::extract_tx_set_hashes_from_state(&state) {
-                Ok(hashes) => {
-                    referenced.extend(hashes);
-                }
-                Err(e) => {
-                    warn!(
-                        slot,
-                        "Error extracting tx set hashes from persisted state, skipping: {}", e
-                    );
-                }
-            }
-        }
-
-        let unreferenced: Vec<Hash> = all_hashes.difference(&referenced).cloned().collect();
-        if !unreferenced.is_empty() {
-            debug!(
-                count = unreferenced.len(),
-                "Purging unreferenced persisted tx sets"
-            );
-            self.storage.delete_tx_sets_by_hashes(&unreferenced)?;
-        }
-
-        Ok(())
-    }
-
-    /// Extract all tx set hashes from a persisted slot state.
+    /// Delegates to `ScpStatePersistence::purge_unreferenced_tx_sets_atomic`,
+    /// which the SQLite backend overrides to wrap the read-then-delete
+    /// sequence in a single transaction (preventing a concurrent
+    /// `persist_scp_state` from having its freshly-inserted tx-set deleted
+    /// as an orphan between the read and the delete). See #2770.
     ///
-    /// Returns an error if any envelope in the state cannot be decoded,
-    /// allowing the caller to skip the entire state (per-state error granularity).
-    fn extract_tx_set_hashes_from_state(state: &PersistedSlotState) -> Result<Vec<Hash>> {
-        let mut hashes = Vec::new();
-        for env_result in state.get_envelopes() {
-            let envelope = env_result?;
-            hashes.extend(get_tx_set_hashes(&envelope));
-        }
-        Ok(hashes)
+    /// Acquires the same in-process `last_slot_saved` lock that
+    /// `persist_scp_state` holds, serializing purge w.r.t. all persists at
+    /// the manager level. This is needed because `persist_scp_state` itself
+    /// performs two separate storage calls (`save_tx_set` then
+    /// `save_scp_state`), so a purge that interleaved between them would
+    /// still observe a tx-set without its referencing state. Matches
+    /// stellar-core (`HerderImpl.cpp`), which serializes persist and purge
+    /// on the main thread.
+    ///
+    /// Mirrors stellar-core's `purgeOldPersistedTxSets()` (`HerderImpl.cpp:2448-2487`).
+    /// Error handling is per-state: if a state fails to decode, the state is
+    /// skipped (its tx-set references can't be proven, so its tx-sets may be
+    /// deleted as orphans).
+    pub fn purge_unreferenced_tx_sets(&self) -> Result<()> {
+        // Hold the same lock `persist_scp_state` takes so the two operations
+        // serialize at the manager level (in addition to the SQLite-level
+        // BEGIN IMMEDIATE inside the SQLite backend's atomic implementation).
+        let _guard = self.last_slot_saved.write();
+        self.storage.purge_unreferenced_tx_sets_atomic()
     }
 }
 
@@ -1103,6 +1134,16 @@ impl ScpStatePersistence for SqliteScpPersistence {
     fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<()> {
         self.inner
             .delete_tx_sets_by_hashes(hashes)
+            .map_err(HerderError::Internal)
+    }
+
+    /// Override the trait default with a SQLite-transactional implementation
+    /// so the read-then-delete sequence is atomic w.r.t. concurrent writers.
+    /// See `henyey_db::SqliteScpPersistence::purge_unreferenced_tx_sets_atomic`
+    /// (#2770).
+    fn purge_unreferenced_tx_sets_atomic(&self) -> Result<()> {
+        self.inner
+            .purge_unreferenced_tx_sets_atomic()
             .map_err(HerderError::Internal)
     }
 }

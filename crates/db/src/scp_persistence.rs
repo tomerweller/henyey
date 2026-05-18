@@ -106,6 +106,22 @@ impl SqliteScpPersistence {
     pub fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<(), String> {
         self.with_connection(|conn| conn.delete_tx_sets_by_hashes(hashes))
     }
+
+    /// Atomic purge of unreferenced persisted transaction sets.
+    ///
+    /// Wraps the three-step purge (read hashes, read SCP states, delete
+    /// orphans) in a single SQLite transaction so a concurrent writer
+    /// (e.g. `persist_scp_state`) cannot have its freshly-inserted tx-set
+    /// deleted as an orphan between steps. See `#2770` for context.
+    pub fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), String> {
+        // BEGIN IMMEDIATE so the purge holds a RESERVED write lock for the
+        // entire read-then-delete sequence — blocks concurrent `save_tx_set`
+        // / `save_scp_state` on other pool connections so we cannot delete a
+        // tx-set that a writer is in the middle of registering. See #2770.
+        self.db
+            .transaction_immediate(|tx| tx.purge_unreferenced_tx_sets_atomic())
+            .map_err(Self::map_error)
+    }
 }
 
 #[cfg(test)]

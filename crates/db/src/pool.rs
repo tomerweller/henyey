@@ -100,6 +100,30 @@ impl Database {
         Ok(result)
     }
 
+    /// Executes a closure within a `BEGIN IMMEDIATE` SQLite transaction.
+    ///
+    /// Unlike [`transaction`](Self::transaction) which uses `BEGIN DEFERRED`
+    /// (acquiring a write lock lazily on first write), this method acquires
+    /// the RESERVED write lock up-front. This means concurrent writers on
+    /// other pool connections are blocked for the entire duration of the
+    /// closure — useful when read-then-write sequences must be serialized
+    /// w.r.t. all other writers.
+    ///
+    /// Used by the atomic SCP-tx-set purge (#2770): without an immediate
+    /// lock, a concurrent `save_tx_set` on another connection can interleave
+    /// between the purge's reads and lead to the freshly-inserted tx-set
+    /// being deleted as an orphan.
+    pub fn transaction_immediate<T, F>(&self, f: F) -> Result<T, DbError>
+    where
+        F: FnOnce(&rusqlite::Transaction) -> Result<T, DbError>,
+    {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let result = f(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Executes a closure with a database connection.
     ///
     /// This is useful for read operations or simple writes that don't
