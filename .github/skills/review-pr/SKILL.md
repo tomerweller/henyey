@@ -30,9 +30,22 @@ You do **not** review the code yourself — you orchestrate two independent revi
 ## Step 0 — Find the PR
 
 ```bash
-PR_NUM=$(gh issue view $ISSUE --repo stellar-experimental/henyey \
-  --json closedByPullRequestsReferences \
-  --jq '.closedByPullRequestsReferences | map(select(.state == "OPEN")) | .[0].number // empty')
+# NOTE: `gh issue view --json closedByPullRequestsReferences` does NOT expose
+# a nested `.state` subfield (only id/number/repository/url), so filtering by
+# `.state == "OPEN"` always yields empty. Use the GraphQL endpoint, which
+# does expose `state`, to identify the linked open PR. See #2793.
+PR_NUM=$(gh api graphql -F num=$ISSUE -f query='
+  query($num: Int!) {
+    repository(owner: "stellar-experimental", name: "henyey") {
+      issue(number: $num) {
+        closedByPullRequestsReferences(first: 5) {
+          nodes { number state }
+        }
+      }
+    }
+  }
+' --jq '.data.repository.issue.closedByPullRequestsReferences.nodes
+        | map(select(.state == "OPEN")) | .[0].number // empty')
 ```
 
 If `PR_NUM` is empty, the issue is in `in-review` but has no open PR — that's a bug in `/do`. Post `## Review: No PR Linked` and move the issue back to `ready-for-doing`. Unassign. Exit.

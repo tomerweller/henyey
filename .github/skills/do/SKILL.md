@@ -26,9 +26,22 @@ You execute one plan. The plan was already vetted in `/plan` — your job is to 
 Check whether a PR is linked to the issue:
 
 ```bash
-PR_NUM=$(gh issue view $ISSUE --repo stellar-experimental/henyey \
-  --json closedByPullRequestsReferences \
-  --jq '.closedByPullRequestsReferences | map(select(.state == "OPEN")) | .[0].number // empty')
+# NOTE: `gh issue view --json closedByPullRequestsReferences` does NOT expose
+# a nested `.state` subfield (only id/number/repository/url), so filtering by
+# `.state == "OPEN"` always yields empty. Use the GraphQL endpoint, which
+# does expose `state`, to identify the linked open PR. See #2793.
+PR_NUM=$(gh api graphql -F num=$ISSUE -f query='
+  query($num: Int!) {
+    repository(owner: "stellar-experimental", name: "henyey") {
+      issue(number: $num) {
+        closedByPullRequestsReferences(first: 5) {
+          nodes { number state }
+        }
+      }
+    }
+  }
+' --jq '.data.repository.issue.closedByPullRequestsReferences.nodes
+        | map(select(.state == "OPEN")) | .[0].number // empty')
 ```
 
 - **Mode A (fresh implementation):** `PR_NUM` is empty.
