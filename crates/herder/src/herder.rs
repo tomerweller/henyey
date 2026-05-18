@@ -496,6 +496,12 @@ pub struct Herder {
     >,
     /// Shared SCP metrics counters.
     scp_metrics: Arc<crate::metrics::ScpMetrics>,
+    /// Number of times `assert_lcl_consistency` took the corrective branch
+    /// because LCL had legitimately advanced ahead of tracking (e.g. during
+    /// catchup-replay burst close). Each fire restores the invariant via an
+    /// idempotent `advance_tracking_to(lcl_seq, ...)` call rather than
+    /// crashing the process. See [`Self::assert_lcl_consistency`] and #2791.
+    lcl_ahead_of_tracking_corrective_total: AtomicU64,
     /// SCP state persistence manager, installed after construction via
     /// [`Self::set_scp_persistence`]. Used by [`Self::purge_persisted_tx_sets`]
     /// to GC unreferenced tx sets on the app event loop's 60s timer.
@@ -706,6 +712,7 @@ impl Herder {
             scp_verifier_handle,
             verified_rx: std::sync::Mutex::new(verified_rx),
             scp_metrics,
+            lcl_ahead_of_tracking_corrective_total: AtomicU64::new(0),
             scp_persistence: std::sync::OnceLock::new(),
         }
     }
@@ -908,14 +915,38 @@ impl Herder {
         LastExternalizedLedger::new(self.tracking_slot().get().saturating_sub(1))
     }
 
-    /// INV-H2: Assert that the ledger manager's LCL is not ahead of consensus tracking.
+    /// INV-H2: Verify that the ledger manager's LCL is not ahead of consensus tracking;
+    /// self-correct if it is.
     ///
-    /// Panics (process-fatal in release via `panic = "abort"`) if violated.
-    /// Mirrors stellar-core's `trackingConsensusLedgerIndex()` (HerderImpl.cpp:170-178)
-    /// which throws on `lcl > mTrackingSCP.mConsensusIndex`.
+    /// Parity: mirrors stellar-core's `trackingConsensusLedgerIndex()`
+    /// (HerderImpl.cpp:170-178) which **throws** (not aborts) on
+    /// `lcl > mTrackingSCP.mConsensusIndex`. The throw propagates and can be
+    /// caught by the catchup state machine. The henyey port had ported this
+    /// as `panic = "abort"` which is strictly more fatal than upstream — any
+    /// race window that briefly leaves LCL ahead of tracking would kill the
+    /// validator (#2720, #2791). The corrective branch restores the invariant
+    /// inline, which is the closest semantic match to upstream's recoverable
+    /// throw available in a Rust caller that doesn't unwind.
     ///
-    /// No-op when not in Tracking state or at genesis (tracking_slot == 0), since
-    /// during Booting/Syncing/catchup the LM legitimately advances before tracking.
+    /// No-op when not in Tracking state or at genesis (tracking_slot == 0),
+    /// since during Booting/Syncing the LM legitimately advances before
+    /// tracking (handled by the early-return on `!is_tracking`).
+    ///
+    /// When LCL >= tracking (invariant violation):
+    /// 1. Log a WARN with `lcl_seq` / `tracking` / `gap` for operator visibility.
+    /// 2. Increment `lcl_ahead_of_tracking_corrective_total` so the rate of
+    ///    corrective fires can be monitored (alerts can be added later).
+    /// 3. Call `advance_tracking_to(lcl_seq, close_time)` to bring tracking
+    ///    to `lcl_seq + 1`. Monotone-idempotent — safe even if a parallel
+    ///    path has already advanced tracking.
+    /// 4. Return normally.
+    ///
+    /// The `close_time` for the corrective call is read from the LedgerManager's
+    /// current header, the same way `bootstrap` reads it (h:1341). A concurrent
+    /// close landing between the lcl_seq read and the close_time read may
+    /// supply a close_time for `lcl_seq + 1` — still a valid tracking-close-time
+    /// (tracking would then point one slot past the LCL the corrective branch
+    /// observed, which is still consistent with the invariant).
     fn assert_lcl_consistency(&self) {
         if !self.is_tracking() {
             return;
@@ -925,24 +956,35 @@ impl Herder {
             return;
         }
         let lcl_seq = self.ledger_manager.current_ledger_seq() as u64;
-        // Strict bound: lcl_seq < tracking_slot must hold on all paths.
-        //
-        // In the normal SCP-driven path, complete_externalization advances
-        // tracking_slot to N+1 before LCL can reach N. On the non-SCP
-        // (catchup rapid-close) path, advance_tracking_to is called in
-        // handle_close_complete_inner immediately after the close task joins
-        // (before any .await), ensuring tracking is visible before any
-        // concurrent task can observe the new LCL. See #2720.
-        //
-        // Parity: stellar-core HerderImpl.cpp:1227-1248 asserts
-        // mTrackingSCP->mConsensusIndex > lcl in lastClosedLedgerIncreased.
-        // This is equivalent to lcl < tracking in henyey's representation.
-        assert!(
-            lcl_seq < tracking,
-            "INV-H2 FATAL: LCL ({lcl_seq}) is at or ahead of tracking consensus slot \
-             ({tracking}). Unrecoverable state divergence between consensus \
-             and ledger-manager."
+        if lcl_seq < tracking {
+            return;
+        }
+
+        // Invariant violated: LCL has legitimately advanced ahead of tracking
+        // (e.g. burst close from buffered EXTERNALIZE messages during catchup
+        // replay — see #2791 timeline). Restore the invariant inline.
+        let gap = lcl_seq.saturating_sub(tracking).saturating_add(1);
+        let close_time = self.ledger_manager.current_header().scp_value.close_time.0;
+        self.lcl_ahead_of_tracking_corrective_total
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            lcl_seq,
+            tracking,
+            gap,
+            close_time,
+            herder_state = %self.state(),
+            "INV-H2: LCL at or ahead of tracking — advancing tracking to lcl + 1 \
+             (corrective; was process-fatal pre-#2791)"
         );
+        self.advance_tracking_to(lcl_seq, close_time);
+    }
+
+    /// Cumulative count of times the `assert_lcl_consistency` corrective
+    /// branch fired (LCL >= tracking → advance tracking to lcl + 1). Used
+    /// by the metrics scrape path and by regression tests. See #2791.
+    pub fn lcl_ahead_of_tracking_corrective_total(&self) -> u64 {
+        self.lcl_ahead_of_tracking_corrective_total
+            .load(Ordering::Relaxed)
     }
 
     /// Get the tracking consensus close time.
@@ -7646,29 +7688,83 @@ mod inv_h2_lcl_guard_tests {
     }
 
     #[test]
-    #[should_panic(expected = "INV-H2 FATAL")]
-    fn test_assert_lcl_consistency_panics_when_lcl_equals_tracking_slot() {
-        // LCL=6, tracking_slot=6 → LCL == tracking → PANIC
-        // After the fix for #2712, equality is no longer valid: advance_tracking_to
-        // must be called before ledger_closed to ensure tracking > LCL.
+    fn test_assert_lcl_consistency_recovers_when_lcl_equals_tracking_slot() {
+        // LCL=6, tracking_slot=6 → LCL == tracking → corrective branch fires.
+        // After #2791 this no longer panics: the corrective branch advances
+        // tracking to lcl+1 and returns normally.
         let herder = make_tracking_herder_at(6, 6);
         herder.assert_lcl_consistency();
+        assert_eq!(
+            herder.tracking_slot().get(),
+            7,
+            "corrective branch must advance tracking to lcl + 1"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "INV-H2 FATAL")]
-    fn test_assert_lcl_consistency_fires_when_lcl_ahead_of_tracking() {
-        // LCL=7, tracking_slot=6 → LCL > tracking → PANIC (genuine divergence)
+    fn test_assert_lcl_consistency_recovers_when_lcl_ahead_of_tracking() {
+        // LCL=7, tracking_slot=6 → LCL > tracking by 1 → corrective branch fires.
         let herder = make_tracking_herder_at(7, 6);
         herder.assert_lcl_consistency();
+        assert_eq!(
+            herder.tracking_slot().get(),
+            8,
+            "corrective branch must advance tracking to lcl + 1"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "INV-H2 FATAL")]
-    fn test_assert_lcl_consistency_fires_when_lcl_exceeds_tracking() {
-        // LCL=8, tracking_slot=6 → LCL > tracking by 2 → PANIC (multi-slot divergence)
+    fn test_assert_lcl_consistency_recovers_when_lcl_exceeds_tracking() {
+        // LCL=8, tracking_slot=6 → LCL > tracking by 2 → corrective branch fires.
         let herder = make_tracking_herder_at(8, 6);
         herder.assert_lcl_consistency();
+        assert_eq!(
+            herder.tracking_slot().get(),
+            9,
+            "corrective branch must advance tracking to lcl + 1"
+        );
+    }
+
+    #[test]
+    fn test_assert_lcl_consistency_recovers_when_lcl_ahead_by_5() {
+        // #2791 production fixture: LCL=5005, tracking_slot=5000 (gap=5).
+        // Replays the catchup-replay burst-close scenario that brought the
+        // mainnet validator down on 0df88603 (and 52ac1665 before it).
+        let herder = make_tracking_herder_at(5005, 5000);
+        herder.assert_lcl_consistency();
+        assert_eq!(
+            herder.tracking_slot().get(),
+            5006,
+            "corrective branch must advance tracking to lcl + 1 even with gap=5"
+        );
+    }
+
+    #[test]
+    fn test_assert_lcl_consistency_increments_metric_on_corrective_fire() {
+        // Verify the corrective-fire counter increments by exactly 1 per
+        // corrective branch entry.
+        let herder = make_tracking_herder_at(7, 6);
+        let before = herder.lcl_ahead_of_tracking_corrective_total();
+        herder.assert_lcl_consistency();
+        let after = herder.lcl_ahead_of_tracking_corrective_total();
+        assert_eq!(
+            after,
+            before + 1,
+            "corrective-fire counter must increment by 1 (before={before}, after={after})"
+        );
+    }
+
+    #[test]
+    fn test_assert_lcl_consistency_no_metric_increment_on_passing_case() {
+        // Counter must NOT increment when the invariant holds (LCL < tracking).
+        let herder = make_tracking_herder_at(5, 6); // LCL=5, consensus_idx=6 → LCL<tracking
+        let before = herder.lcl_ahead_of_tracking_corrective_total();
+        herder.assert_lcl_consistency();
+        let after = herder.lcl_ahead_of_tracking_corrective_total();
+        assert_eq!(
+            after, before,
+            "counter must not increment when invariant holds"
+        );
     }
 
     #[test]
@@ -7763,22 +7859,24 @@ mod inv_h2_lcl_guard_tests {
     }
 
     #[test]
-    #[should_panic(expected = "INV-H2 FATAL")]
-    fn test_assert_lcl_consistency_panics_lcl_ahead_by_one_2720() {
-        // Regression test for #2720: fast-tracking catchup burst-close race.
+    fn test_assert_lcl_consistency_recovers_when_lcl_ahead_by_one_2720() {
+        // Regression test for #2720 + #2791: fast-tracking catchup burst-close race.
         //
         // Scenario: Close of ledger N-1 advanced tracking to N. Then close of
         // ledger N completes (LCL=N), but advance_tracking_to(N) hasn't fired
         // yet. A concurrent task calls assert_lcl_consistency and observes
-        // LCL=N, tracking=N → panic (N < N is false).
+        // LCL=N, tracking=N.
         //
-        // This is the exact state observed in production: LCL=62579903,
-        // tracking=62579903 (consensus_index=62579903, tracking_slot()=62579903).
-        // The previous close set tracking to N, then the current close advanced
-        // LCL to N without first calling advance_tracking_to(N) to push
-        // tracking to N+1.
+        // Before #2791 this panicked. After #2791 the corrective branch fires:
+        // advance_tracking_to(N) runs, tracking advances to N+1, the function
+        // returns normally.
         let herder = make_tracking_herder_at(10, 10); // LCL=10, tracking=10
-        herder.assert_lcl_consistency(); // should panic: 10 < 10 is false
+        herder.assert_lcl_consistency();
+        assert_eq!(
+            herder.tracking_slot().get(),
+            11,
+            "corrective branch must advance tracking to lcl + 1"
+        );
     }
 
     #[test]
@@ -7924,10 +8022,12 @@ mod inv_h2_lcl_guard_tests {
     }
 
     #[test]
-    #[should_panic(expected = "INV-H2 FATAL")]
-    fn test_ledger_closed_panics_without_advance_tracking_to() {
-        // Proves the original bug: without advance_tracking_to, ledger_closed
-        // panics when LCL == tracking_slot (the catchup rapid-close scenario).
+    fn test_ledger_closed_recovers_without_advance_tracking_to() {
+        // Regression for #2791 (sibling of #2720): without advance_tracking_to,
+        // ledger_closed previously panicked when LCL == tracking_slot (catchup
+        // rapid-close scenario). After #2791 the corrective branch fires
+        // inside assert_lcl_consistency, advances tracking to lcl+1, and
+        // ledger_closed completes without panicking.
         let lm = make_lm_at_seq(6); // LCL = 6
         let config = HerderConfig::default();
         let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
@@ -7940,8 +8040,12 @@ mod inv_h2_lcl_guard_tests {
             ts.is_tracking = true;
             ts.consensus_index = 6; // tracking_slot = 6 (stale)
         }
-        // Without advance_tracking_to: LCL=6 == tracking=6 → PANIC
         herder.ledger_closed(6, &[], &[], 1000);
+        assert_eq!(
+            herder.tracking_slot().get(),
+            7,
+            "corrective branch must advance tracking to lcl + 1 during ledger_closed"
+        );
     }
 }
 
