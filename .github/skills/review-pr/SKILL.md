@@ -72,50 +72,48 @@ Capture:
 
 The bounce-back cap is **scoped to the current code**, not the issue's lifetime. Old bounces against earlier commits don't carry forward forever — they represent failed merge attempts on code that has since been rebased or replaced.
 
-Compute the **baseline timestamp** for counting:
+**The script computes this. Do not re-implement or override.** Invoke `bounce-cap-check.sh` — its exit code IS the verdict:
 
 ```bash
-# When was the current PR head commit pushed/committed? Fresh push = new baseline.
-HEAD_PUSHED_ISO=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
-  --json commits --jq '.commits | sort_by(.committedDate) | last | .committedDate')
+# Exit 0 = under cap, proceed. Exit 1 = at/over cap (≥3), block.
+# Stdout: single human-readable line with the count and baseline source
+# (e.g. "COUNT=2/3 BASELINE=HEAD_PUSHED@2026-05-17T12:34:56Z (no Reset marker)").
+# Capture into BOUNCE_CAP_OUTPUT for embedding in the bounce/block comment.
+#
+# Use the `cmd || { ... }` pattern (NOT a separate `$?` capture) so `set -e`
+# in the parent shell doesn't trip on the non-zero exit before we can react.
+BOUNCE_CAP_OUTPUT=""
+BOUNCE_CAP_EXIT=0
+BOUNCE_CAP_OUTPUT=$(bash .github/skills/shared/scripts/bounce-cap-check.sh "$ISSUE" "$PR_NUM") \
+  || BOUNCE_CAP_EXIT=$?
 
-# Has the operator (or recovery script) posted a Reset marker?
-# This is the escape hatch for cases where the head didn't change but the
-# external cause did — e.g., main was broken, now it's green; same code,
-# fresh chance.
-RESET_AT_ISO=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
-  --jq '[.[] | select(.body | startswith("## Review: Reset"))] | sort_by(.created_at) | last.created_at // ""')
+if [ "$BOUNCE_CAP_EXIT" -ne 0 ]; then
+  # Cap reached — post block comment, move to `blocked`, exit.
+  # The script's stdout is the audit summary; include it verbatim.
+  gh issue comment "$ISSUE" --repo stellar-experimental/henyey --body "$(cat <<EOF
+## Review: Cycle Cap Reached
 
-# Convert both to epoch seconds for unambiguous numeric comparison
-# (ISO strings can drift in format — fractional seconds, +00:00 vs Z, etc.).
-HEAD_PUSHED_EPOCH=$(date -u -d "$HEAD_PUSHED_ISO" +%s)
-if [ -n "$RESET_AT_ISO" ]; then
-  RESET_AT_EPOCH=$(date -u -d "$RESET_AT_ISO" +%s)
-else
-  RESET_AT_EPOCH=0
+**Status:** blocked
+**Audit:** \`$BOUNCE_CAP_OUTPUT\`
+
+This PR has cycled too many times against the current code (head-scoped
+count, Reset markers honored). Human review required to break the tie.
+EOF
+)"
+  bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" blocked
+  gh issue edit "$ISSUE" --repo stellar-experimental/henyey --remove-assignee @me
+  exit 0
 fi
 
-# Baseline = max(HEAD_PUSHED, RESET_AT) as epoch seconds.
-if [ "$RESET_AT_EPOCH" -gt "$HEAD_PUSHED_EPOCH" ]; then
-  BASELINE_EPOCH=$RESET_AT_EPOCH
-else
-  BASELINE_EPOCH=$HEAD_PUSHED_EPOCH
-fi
+# Under cap — proceed. $BOUNCE_CAP_OUTPUT is available for the eventual
+# bounce comment (Step 7) to report the current count.
 ```
 
-Then count bounce comments STRICTLY AFTER the baseline (jq's `fromdate` parses ISO-8601 into epoch seconds, so the comparison is numeric, not lexical):
+The script encodes the head-scoped + Reset-marker algorithm (see issue #2787 for why it lives in a script, not prose). The rest of this section documents **how operators use** the Reset escape hatch — it is reference material for humans, NOT an algorithm spec; the algorithm lives exclusively in `bounce-cap-check.sh`.
 
-```bash
-COUNT=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
-  --jq "[.[] | select(.body | startswith(\"## Review: Bounce-Back Cycle\")) |
-        select((.created_at | fromdate) > $BASELINE_EPOCH)] | length")
-```
+---
 
-If `COUNT >= 3`, this is the 4th cycle on the current code — the PR has genuinely cycled too many times against this exact state. Post `## Review: Cycle Cap Reached` summarizing the disagreement pattern, move the issue to `blocked`, unassign, and exit.
-
-Otherwise (COUNT < 3) → proceed with the review.
-
-**Recovery semantics:**
+**Recovery semantics (operator reference, not algorithm spec):**
 
 - **Fresh `/do` Mode B push** → new commit `committedDate` advances the baseline → counter naturally resets to 0. Most recoveries (rebase after CI red, address review feedback) hit this path automatically.
 - **`## Review: Reset` comment** → manual escape hatch. Operator (or recovery script) posts this when the head hasn't changed but the external cause has (e.g., a broken-main outage that has since cleared). Everything before the Reset comment is excluded from the count. Post format:
