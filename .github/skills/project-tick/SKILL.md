@@ -47,11 +47,15 @@ Multiple `/project-tick` invocations run in parallel safely. The GitHub assignee
 Single GraphQL call to fetch every open issue on the project with: assignees, status, labels, createdAt, linked PRs.
 
 ```bash
-gh api graphql -f query='
-  query {
+# Paginate — the project has >100 items once `done`/`blocked` accumulates,
+# and without `--paginate` the picker silently goes blind to anything past
+# the first page. See #2793-followup.
+gh api graphql --paginate -f query='
+  query($endCursor: String) {
     organization(login: "stellar-experimental") {
       projectV2(number: 2) {
-        items(first: 100) {
+        items(first: 100, after: $endCursor) {
+          pageInfo { hasNextPage endCursor }
           nodes {
             id
             content {
