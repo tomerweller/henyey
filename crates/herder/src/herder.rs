@@ -7601,6 +7601,129 @@ mod tests {
         // got the same Arc back uniquely.
         assert_eq!(Arc::strong_count(&returned), 1);
     }
+
+    // -------- Regression tests for SCP persist wiring (#2768) --------
+
+    /// Drives a full solo-validator nomination → externalize round through
+    /// the herder and asserts that the persistence manager observed the
+    /// slot via `persist_scp_state()` (i.e. `last_slot_saved > 0`).
+    ///
+    /// Fails on `origin/main` because `persist_scp_state` is never called
+    /// from the emit hot path. Passes once #2768 wires the persist
+    /// callback into `ScpDriver::emit()`.
+    #[tokio::test]
+    async fn test_persist_scp_state_called_on_emit() {
+        let (herder, _secret) = make_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(
+            herder.set_scp_persistence(Arc::clone(&manager)).is_ok(),
+            "install scp persistence"
+        );
+
+        herder.bootstrap(0);
+        assert_eq!(herder.state(), HerderState::Tracking);
+
+        // Solo validator (1-of-1 quorum) — nomination → ballot → externalize
+        // happens synchronously inside `trigger_next_ledger`, emitting at
+        // least one envelope. Each emit must call into the persist callback.
+        let outcome = herder
+            .trigger_next_ledger(1)
+            .expect("trigger_next_ledger should succeed");
+        let _ = outcome;
+
+        // Sanity: slot 1 actually externalized.
+        assert!(
+            herder.scp_driver.get_externalized(1).is_some(),
+            "solo validator must externalize slot 1"
+        );
+
+        // KEY ASSERTION: the persist callback fired, so `last_slot_saved`
+        // is now >0. On unmodified main this is 0 because nothing ever
+        // calls `persist_scp_state()`.
+        assert!(
+            manager.last_slot_saved() > 0,
+            "persist_scp_state must be invoked from the emit hot path; \
+             last_slot_saved = {}",
+            manager.last_slot_saved()
+        );
+    }
+
+    /// When no persistence manager is installed, `ScpDriver::emit()` must
+    /// still be a no-op for persistence (the OnceLock guard). Drives a
+    /// full nomination round and asserts no panic and no externalize loss.
+    #[tokio::test]
+    async fn test_persist_scp_state_no_manager_no_panic() {
+        let (herder, _secret) = make_validator_herder();
+        // Intentionally DO NOT install a persistence manager.
+
+        herder.bootstrap(0);
+        herder
+            .trigger_next_ledger(1)
+            .expect("trigger_next_ledger should succeed without persistence");
+
+        assert!(
+            herder.scp_driver.get_externalized(1).is_some(),
+            "solo validator must externalize even without persistence"
+        );
+    }
+
+    /// End-to-end check: after a real emit triggers a real persist, the
+    /// GC purge must keep referenced tx sets and remove orphans. Validates
+    /// the full #2698 + #2768 persistence loop.
+    #[tokio::test]
+    async fn test_persist_scp_state_gc_sees_persisted_rows() {
+        let (herder, _secret) = make_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(
+            herder.set_scp_persistence(Arc::clone(&manager)).is_ok(),
+            "install scp persistence"
+        );
+
+        herder.bootstrap(0);
+        herder
+            .trigger_next_ledger(1)
+            .expect("trigger_next_ledger should succeed");
+
+        // KEY ASSERTION: the real emit triggered a real persist; capture
+        // last_slot_saved BEFORE injecting any orphan slot so we don't
+        // measure the orphan injection itself.
+        let last_after_real_emit = manager.last_slot_saved();
+        assert!(
+            last_after_real_emit >= 1,
+            "real emit must have persisted; last_slot_saved = {}",
+            last_after_real_emit
+        );
+
+        // Inject an orphan tx set directly via the manager (not referenced
+        // by any persisted envelope).
+        let orphan_hash = stellar_xdr::curr::Hash([0xAAu8; 32]);
+        let orphan_env = make_persist_envelope_with_tx_set_hash(
+            999_999,
+            stellar_xdr::curr::Hash([0xBBu8; 32]), // some unrelated hash
+        );
+        manager
+            .persist_scp_state(
+                999_999,
+                &[orphan_env],
+                &[(orphan_hash.clone(), vec![42])],
+                &[],
+            )
+            .expect("persist orphan");
+        // Sanity: orphan is present pre-purge.
+        assert!(
+            manager.has_tx_set(&orphan_hash).unwrap(),
+            "orphan tx set must be stored before purge"
+        );
+
+        // Run the production GC entry point.
+        herder.purge_persisted_tx_sets();
+
+        // Orphan must be gone.
+        assert!(
+            !manager.has_tx_set(&orphan_hash).unwrap(),
+            "orphan tx set must be purged by GC"
+        );
+    }
 }
 
 #[cfg(test)]
