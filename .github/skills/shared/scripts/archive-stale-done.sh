@@ -29,6 +29,36 @@ OWNER="stellar-experimental"
 PROJECT_NUM=2
 PROJECT_ID="PVT_kwDOD-vqsM4BWQnL"
 
+# Pre-flight: probe whether GH_TOKEN has org-level project scope. The default
+# GITHUB_TOKEN granted to GitHub Actions runs lacks the org-level read:project
+# scope required for `organization(login:...).projectV2(...)` GraphQL queries —
+# the `repository-projects: write` workflow permission only grants repo-level
+# classic Projects access and does not help here. When the token is
+# underprivileged, the GraphQL call below would fail with the opaque
+# "Could not resolve to a ProjectV2 with the number 2." error, which doesn't
+# tell the operator what to fix. This probe catches that case and emits a
+# structured, actionable error message instead.
+#
+# SKIP_PREFLIGHT=1 is for test harnesses only; do not document or rely on it
+# in production paths.
+if [ "${SKIP_PREFLIGHT:-0}" != "1" ]; then
+  probe_exit=0
+  probe_output=$(gh api graphql -f query='
+    query($org: String!, $proj: Int!) {
+      organization(login: $org) { projectV2(number: $proj) { id } }
+    }' -f org="$OWNER" -F proj="$PROJECT_NUM" 2>&1) || probe_exit=$?
+  if [ "$probe_exit" -ne 0 ]; then
+    if grep -q "Could not resolve to a ProjectV2" <<<"$probe_output"; then
+      echo "ERROR: GH_TOKEN lacks org project scope — set PROJECT_BOARD_TOKEN secret with Projects:Read+Write on stellar-experimental" >&2
+      exit 1
+    fi
+    # Different failure (network, 401, etc.) — surface it and exit so the
+    # main fetch doesn't paper over a real error.
+    echo "ERROR: pre-flight probe failed: $probe_output" >&2
+    exit 1
+  fi
+fi
+
 # Fetch all project items + their issue/PR state and closedAt.
 # `--paginate` requires the cursor variable to be named $endCursor; jq -s
 # is required because gh emits one JSON object per page.
