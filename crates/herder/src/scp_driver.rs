@@ -1851,10 +1851,7 @@ impl ScpDriver {
             return Value::default();
         }
 
-        // Phase 1: Decode and resolve all candidates.
-        // Parity: stellar-core's ValueWrapperPtrSet iterates by raw Value byte
-        // order (WrappedValuePtrComparator, SCPDriver.cpp:36-41). We sort by the
-        // same key to ensure identical tie-breaking.
+        // Phase 1: Decode all candidates.
         // Parity: stellar-core throws on decode failure in combineCandidates
         // (HerderSCPDriver.cpp:682-688). We panic to match fail-loud behavior.
         let decoded: Vec<(Value, StellarValue)> = values
@@ -1866,49 +1863,14 @@ impl ScpDriver {
             })
             .collect();
 
-        // Resolve tx sets upfront in a single atomic lookup per candidate.
-        // Parity deviation: stellar-core releaseAssert(cTxSet) on missing tx sets
-        // (HerderSCPDriver.cpp:780) — we filter instead to be defensive.
-        // This also eliminates the TOCTOU race that existed when is_cached() and
-        // get() were separate calls (AUDIT-220 / issue #2157).
-        struct ResolvedCandidate {
-            raw: Value,
-            sv: StellarValue,
-            tx_set: TransactionSet,
-            tx_set_hash: Hash256,
-        }
-        let all_candidates: Vec<ResolvedCandidate> = decoded
-            .into_iter()
-            .filter_map(|(raw, sv)| {
-                let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                match self.tx_tracker.get(&tx_set_hash) {
-                    Some(tx_set) => Some(ResolvedCandidate {
-                        raw,
-                        sv,
-                        tx_set,
-                        tx_set_hash,
-                    }),
-                    None => {
-                        warn!(
-                            "combine_candidates: tx set {} missing from cache, filtering out",
-                            tx_set_hash
-                        );
-                        None
-                    }
-                }
-            })
-            .collect();
-        if all_candidates.is_empty() {
-            return values[0].clone();
-        }
-
         // Phase 2: Compute candidates_hash (XOR) and merge upgrades over ALL
-        // resolved candidates — before any previousLedgerHash filter.
+        // decoded candidates — before any tx-set lookup.
         // Parity: stellar-core computes candidatesHash (line 690) and merges
-        // upgrades (lines 692-766) over the full candidate set unconditionally.
+        // upgrades (lines 692-766) over the full candidate set unconditionally,
+        // before resolving tx sets.
         let mut candidates_hash = [0u8; 32];
-        for c in &all_candidates {
-            let val_bytes = henyey_common::xdr_stream::xdr_to_bytes(&c.sv);
+        for (_, sv) in &decoded {
+            let val_bytes = henyey_common::xdr_stream::xdr_to_bytes(sv);
             let hash = Hash256::hash(&val_bytes);
             for (i, byte) in candidates_hash.iter_mut().enumerate() {
                 *byte ^= hash.as_bytes()[i];
@@ -1917,8 +1879,8 @@ impl ScpDriver {
 
         let mut merged_upgrades: std::collections::BTreeMap<u32, LedgerUpgrade> =
             std::collections::BTreeMap::new();
-        for c in &all_candidates {
-            for upgrade_bytes in c.sv.upgrades.iter() {
+        for (_, sv) in &decoded {
+            for upgrade_bytes in sv.upgrades.iter() {
                 // Parity: stellar-core throws on upgrade parse failure in
                 // combineCandidates (HerderSCPDriver.cpp:694-704).
                 let upgrade = LedgerUpgrade::from_xdr(
@@ -1938,7 +1900,42 @@ impl ScpDriver {
             }
         }
 
-        // Phase 3: Filter to selectable candidates (previousLedgerHash matches LCL).
+        // Phase 3: Resolve tx sets and enforce prepare_for_apply on ALL candidates.
+        // Parity: stellar-core releaseAssert(cTxSet) on missing tx sets
+        // (HerderSCPDriver.cpp:780) and releaseAssert(cApplicableTxSet) at line 781.
+        struct ResolvedCandidate {
+            raw: Value,
+            sv: StellarValue,
+            tx_set: TransactionSet,
+            tx_set_hash: Hash256,
+        }
+        let network_id = NetworkId(self.network_id);
+        let all_candidates: Vec<ResolvedCandidate> = decoded
+            .into_iter()
+            .map(|(raw, sv)| {
+                let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+                let tx_set = self.tx_tracker.get(&tx_set_hash).unwrap_or_else(|| {
+                    panic!(
+                        "BUG: tx set {} missing from cache in combineCandidates",
+                        tx_set_hash
+                    )
+                });
+                tx_set.prepare_for_apply(network_id).unwrap_or_else(|e| {
+                    panic!(
+                        "BUG: prepare_for_apply failed in combineCandidates for tx set {}: {}",
+                        tx_set_hash, e
+                    )
+                });
+                ResolvedCandidate {
+                    raw,
+                    sv,
+                    tx_set,
+                    tx_set_hash,
+                }
+            })
+            .collect();
+
+        // Phase 4: Filter to selectable candidates (previousLedgerHash matches LCL).
         // Parity: stellar-core applies this filter only during tx set selection
         // (HerderSCPDriver.cpp:784), not during hash/upgrade computation.
         let lcl_hash = self.ledger_manager.current_header_hash();
@@ -1948,18 +1945,12 @@ impl ScpDriver {
             .collect();
 
         if selectable_candidates.is_empty() {
-            // Intentional divergence: stellar-core throws at line 800-804
-            // ("No highest candidate transaction set found"). We return a
-            // defensive fallback instead of panicking. This can happen if the
-            // LCL advances between validate and combine under network latency.
-            error!(
-                "combine_candidates: all candidates filtered by previousLedgerHash \
-                 — no selectable tx set (defensive fallback to first value)"
+            panic!(
+                "BUG: no selectable candidate in combineCandidates after previousLedgerHash filter"
             );
-            return values[0].clone();
         }
 
-        // Phase 4: Sort and select best candidate.
+        // Phase 5: Sort and select best candidate.
         // Parity: stellar-core iterates a ValueWrapperPtrSet (std::set ordered
         // by raw Value bytes via WrappedValuePtrComparator, SCPDriver.cpp:36-41).
         selectable_candidates.sort_by(|a, b| a.raw.cmp(&b.raw));
@@ -1983,7 +1974,7 @@ impl ScpDriver {
             }
         }
 
-        // Phase 5: Compose result from selected candidate + merged upgrades.
+        // Phase 6: Compose result from selected candidate + merged upgrades.
         let mut result = selectable_candidates[best_idx].sv.clone();
 
         // Parity: stellar-core uses xdr_to_opaque (throws on failure) at
@@ -6143,7 +6134,7 @@ mod tests {
     /// Issue #2817: combine_candidates_impl must panic when a tx set is missing
     /// from cache, mirroring stellar-core's releaseAssert(cTxSet).
     #[test]
-    #[should_panic(expected = "BUG: tx set missing from cache in combineCandidates")]
+    #[should_panic(expected = "missing from cache in combineCandidates")]
     fn test_combine_candidates_panics_on_missing_tx_set() {
         let driver = make_test_driver();
         let lcl_hash = driver.ledger_manager.current_header_hash();
@@ -7830,7 +7821,7 @@ mod compare_tx_sets_tests {
     /// candidate's tx set is missing from cache, instead of silently filtering
     /// and letting the lower-priority cached candidate win.
     #[test]
-    #[should_panic(expected = "BUG: tx set missing from cache in combineCandidates")]
+    #[should_panic(expected = "missing from cache in combineCandidates")]
     fn test_combine_candidates_panics_instead_of_filtering_missing_high_priority_candidate() {
         use stellar_xdr::curr::{StellarValue, StellarValueExt, TimePoint};
 
