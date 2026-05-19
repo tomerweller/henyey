@@ -132,8 +132,9 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 [^txset-gc]: GC timer + purge wired in #2698 (driven by app event-loop phase
 33 every `TX_SET_GC_DELAY_SECS` = 60s). The `persist_scp_state` wiring was
 completed in #2768 (`ScpDriver::emit` invokes the persist callback installed
-by `Herder::set_scp_persistence`). The `restore_scp_state` wiring remains
-tracked in #2769.
+by `Herder::set_scp_persistence`). The `restore_scp_state` wiring was
+completed in #2769 (`init_herder` calls `restore_scp_state()` +
+`apply_restored_scp_state()` after installing the persistence manager).
 
 [^persist-scp]: Wired in #2768 via a deferred persist callback on `ScpDriver`.
 Each call to `ScpDriver::emit` (which mirrors stellar-core's

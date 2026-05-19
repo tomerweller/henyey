@@ -223,6 +223,18 @@ impl QuorumSetTracker {
         inner.associate_known_qset(key, hash, quorum_set);
     }
 
+    /// Store a validated qset by hash only (no NodeId association).
+    ///
+    /// Used during SCP state restore where we know the quorum set and its hash
+    /// but don't have the originating NodeId. Inserts into `by_hash` only and
+    /// clears any pending entry, matching stellar-core's
+    /// `PendingEnvelopes::addSCPQuorumSet` which stores by hash only.
+    pub fn store_by_hash(&self, hash: Hash256, quorum_set: ScpQuorumSet) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.by_hash.put(hash, quorum_set);
+        inner.pending.remove(&hash);
+    }
+
     /// Look up by node ID.
     ///
     /// Checks the pinned local qset first, then the bounded caches.

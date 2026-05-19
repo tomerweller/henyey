@@ -59,7 +59,8 @@ use henyey_scp::{SlotIndex, SCP};
 use stellar_xdr::curr::{
     EnvelopeType, LedgerCloseValueSignature, LedgerHeader, LedgerUpgrade, Limits, NodeId, ReadXdr,
     ScpEnvelope, ScpQuorumSet, ScpStatementPledges, Signature as XdrSignature, StellarValue,
-    StellarValueExt, TimePoint, TransactionEnvelope, Uint256, UpgradeType, Value, WriteXdr,
+    StellarValueExt, StoredTransactionSet, TimePoint, TransactionEnvelope, Uint256, UpgradeType,
+    Value, WriteXdr,
 };
 
 use crate::error::HerderError;
@@ -883,6 +884,80 @@ impl Herder {
         if let Err(e) = manager.purge_unreferenced_tx_sets() {
             error!(error = %e, "Failed to purge unreferenced persisted tx sets");
         }
+    }
+
+    /// Apply restored SCP state from persistence on startup.
+    ///
+    /// Processes the `RestoredScpState` in the order matching stellar-core's
+    /// `HerderImpl::restoreSCPState()` (HerderImpl.cpp:2189-2261):
+    ///
+    /// 1. Tx sets — decode and cache each one
+    /// 2. Quorum sets — store by hash and notify fetching pipeline
+    /// 3. SCP envelopes — restore SCP slot state
+    /// 4. Rebuild quorum tracker (called once at end; idempotent)
+    pub fn apply_restored_scp_state(&self, state: crate::persistence::RestoredScpState) {
+        // Step 1: Tx sets — decode from XDR bytes and cache.
+        let mut tx_sets_loaded = 0u32;
+        for (hash, bytes) in &state.tx_sets {
+            match StoredTransactionSet::from_xdr(bytes, Limits::none()) {
+                Ok(stored) => match TransactionSet::from_xdr_stored_set(&stored) {
+                    Ok(tx_set) => {
+                        self.scp_driver.cache_tx_set(tx_set);
+                        tx_sets_loaded += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            hash = %hex::encode(hash.0),
+                            error = %e,
+                            "Failed to build TransactionSet from restored StoredTransactionSet"
+                        );
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        hash = %hex::encode(hash.0),
+                        error = %e,
+                        "Failed to decode restored StoredTransactionSet XDR"
+                    );
+                }
+            }
+        }
+
+        // Step 2: Quorum sets — store by hash and notify fetching pipeline.
+        let mut qsets_loaded = 0u32;
+        for (hash, qs) in &state.quorum_sets {
+            let h256 = Hash256::from(hash.clone());
+            self.scp_driver.store_quorum_set_by_hash(h256, qs.clone());
+            self.fetching_envelopes.recv_quorum_set(h256, qs.clone());
+            qsets_loaded += 1;
+        }
+
+        // Step 3: SCP envelopes — restore slot state.
+        let mut envelopes_loaded = 0u32;
+        for (slot, env) in &state.envelopes {
+            if self.scp.set_state_from_envelope(env) {
+                envelopes_loaded += 1;
+            } else {
+                warn!(slot, "Failed to restore SCP state from envelope");
+            }
+        }
+
+        // Step 4: Rebuild quorum tracker once after all envelopes are loaded.
+        // This is semantically equivalent to stellar-core's per-slot
+        // `rebuildQuorumTrackerState()` because rebuild is idempotent.
+        {
+            let mut tracker = self.quorum_tracker.write();
+            if let Err(err) = tracker.rebuild(|id| self.scp_driver.get_quorum_set(id)) {
+                warn!(error = %err, "Failed to rebuild quorum tracker after SCP state restore");
+            }
+        }
+
+        info!(
+            tx_sets = tx_sets_loaded,
+            quorum_sets = qsets_loaded,
+            envelopes = envelopes_loaded,
+            "Applied restored SCP state"
+        );
     }
 
     /// Set runtime upgrade parameters (called from HTTP `/upgrades?mode=set`).
@@ -13109,6 +13184,194 @@ mod fetching_envelopes_routing_tests {
         assert!(
             !herder.scp.has_slot(100),
             "slot 100 should be purged from SCP (below purge boundary, not checkpoint)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod restore_scp_state_tests {
+    use super::*;
+    use crate::persistence::RestoredScpState;
+    use crate::tx_queue::TransactionSet;
+    use henyey_scp::hash_quorum_set;
+    use stellar_xdr::curr::{
+        Limits, NodeId as XdrNodeId, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement,
+        ScpStatementPledges, Signature as XdrSignature, Uint256, Value, WriteXdr,
+    };
+
+    fn make_test_herder() -> Herder {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash as XdrHash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt,
+            TimePoint, VecM,
+        };
+        let lm_config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), lm_config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: XdrHash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: XdrHash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: XdrHash([0u8; 32]),
+            bucket_list_hash: XdrHash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                XdrHash([0u8; 32]),
+                XdrHash([0u8; 32]),
+                XdrHash([0u8; 32]),
+                XdrHash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        let _ = lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        );
+        let config = HerderConfig::default();
+        Herder::new(config, Arc::new(lm), TimerManagerHandle::no_op())
+    }
+
+    #[test]
+    fn test_apply_restored_scp_state_loads_envelopes_into_scp() {
+        let herder = make_test_herder();
+        let slot = 5u64;
+
+        // Use the herder's local node_id so set_state_from_envelope accepts it.
+        let local_node_id = herder.scp.local_node_id().clone();
+
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: local_node_id,
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    votes: vec![Value(vec![1, 2, 3].try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        let restored = RestoredScpState {
+            envelopes: vec![(slot, envelope.clone())],
+            tx_sets: vec![],
+            quorum_sets: vec![],
+        };
+
+        herder.apply_restored_scp_state(restored);
+
+        // Use get_entire_current_state which includes self even when not fully_validated.
+        let envelopes = herder.scp.get_entire_current_state(slot);
+        assert_eq!(envelopes.len(), 1, "Expected 1 envelope for slot 5");
+        assert_eq!(envelopes[0].statement.slot_index, slot);
+    }
+
+    #[test]
+    fn test_apply_restored_scp_state_loads_quorum_sets() {
+        let herder = make_test_herder();
+
+        let qs = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![
+                XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [10u8; 32],
+                ))),
+                XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [11u8; 32],
+                ))),
+            ]
+            .try_into()
+            .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let hash = hash_quorum_set(&qs);
+        let xdr_hash = stellar_xdr::curr::Hash(hash.0);
+
+        let restored = RestoredScpState {
+            envelopes: vec![],
+            tx_sets: vec![],
+            quorum_sets: vec![(xdr_hash, qs.clone())],
+        };
+
+        herder.apply_restored_scp_state(restored);
+
+        let found = herder.scp_driver.get_quorum_set_by_hash(&hash);
+        assert!(found.is_some(), "Quorum set should be cached after restore");
+        assert_eq!(found.unwrap().threshold, 2);
+    }
+
+    #[test]
+    fn test_apply_restored_scp_state_loads_tx_sets() {
+        let herder = make_test_herder();
+
+        let lcl_hash = herder.scp_driver.current_header_hash();
+        let tx_set = TransactionSet::new(lcl_hash, Vec::new());
+        let tx_set_hash = *tx_set.hash();
+        let stored = tx_set.to_xdr_stored_set();
+        let bytes = stored.to_xdr(Limits::none()).unwrap();
+        let xdr_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
+
+        let restored = RestoredScpState {
+            envelopes: vec![],
+            tx_sets: vec![(xdr_hash, bytes)],
+            quorum_sets: vec![],
+        };
+
+        herder.apply_restored_scp_state(restored);
+
+        assert!(
+            herder.scp_driver.has_tx_set_and_touch(&tx_set_hash),
+            "Tx set should be cached after restore"
+        );
+    }
+
+    #[test]
+    fn test_apply_restored_scp_state_skips_corrupt_tx_set() {
+        let herder = make_test_herder();
+
+        // Create one valid tx set.
+        let lcl_hash = herder.scp_driver.current_header_hash();
+        let tx_set = TransactionSet::new(lcl_hash, Vec::new());
+        let tx_set_hash = *tx_set.hash();
+        let stored = tx_set.to_xdr_stored_set();
+        let valid_bytes = stored.to_xdr(Limits::none()).unwrap();
+        let valid_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
+
+        // Create corrupt bytes.
+        let corrupt_hash = stellar_xdr::curr::Hash([0xFFu8; 32]);
+        let corrupt_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        let restored = RestoredScpState {
+            envelopes: vec![],
+            tx_sets: vec![(corrupt_hash, corrupt_bytes), (valid_hash, valid_bytes)],
+            quorum_sets: vec![],
+        };
+
+        // Should not panic — corrupt entry is skipped.
+        herder.apply_restored_scp_state(restored);
+
+        assert!(
+            herder.scp_driver.has_tx_set_and_touch(&tx_set_hash),
+            "Valid tx set should be cached despite corrupt sibling"
         );
     }
 }

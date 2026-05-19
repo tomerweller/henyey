@@ -2725,6 +2725,14 @@ impl ScpDriver {
         self.qset_tracker.get_by_node(node_id)
     }
 
+    /// Store a quorum set by hash only (no NodeId association).
+    ///
+    /// Used during SCP state restore where we have the hash and quorum set
+    /// but not the originating node. Inserts into `by_hash` cache only.
+    pub fn store_quorum_set_by_hash(&self, hash: Hash256, qs: ScpQuorumSet) {
+        self.qset_tracker.store_by_hash(hash, qs);
+    }
+
     /// Get a quorum set by its hash.
     pub fn get_quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
         self.qset_tracker.get_by_hash(hash)
