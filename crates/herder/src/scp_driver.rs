@@ -6140,50 +6140,38 @@ mod tests {
         );
     }
 
-    /// Regression test for AUDIT-220 / issue #2157: combine_candidates_impl must
-    /// not panic when tx sets are evicted between is_cached() and get().
-    /// After the fix, resolution and filtering happen in a single pass.
+    /// Issue #2817: combine_candidates_impl must panic when a tx set is missing
+    /// from cache, mirroring stellar-core's releaseAssert(cTxSet).
     #[test]
-    fn test_audit_220_combine_candidates_no_panic_on_missing() {
-        use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
-
+    #[should_panic(expected = "BUG: tx set missing from cache in combineCandidates")]
+    fn test_combine_candidates_panics_on_missing_tx_set() {
         let driver = make_test_driver();
         let lcl_hash = driver.ledger_manager.current_header_hash();
 
         // Create two tx sets but only cache one.
-        // tx_set_a uses a non-LCL hash, tx_set_b uses the LCL hash.
         let tx_set_a = TransactionSet::new(Hash256::from_bytes([1u8; 32]), vec![]);
         let tx_set_b = TransactionSet::new(lcl_hash, vec![]);
 
         let sv_a = StellarValue {
             tx_set_hash: stellar_xdr::curr::Hash(tx_set_a.hash().0),
             close_time: TimePoint(1_700_000_000),
-            upgrades: Default::default(),
+            upgrades: VecM::default(),
             ext: StellarValueExt::Basic,
         };
         let sv_b = StellarValue {
             tx_set_hash: stellar_xdr::curr::Hash(tx_set_b.hash().0),
             close_time: TimePoint(1_700_000_000),
-            upgrades: Default::default(),
+            upgrades: VecM::default(),
             ext: StellarValueExt::Basic,
         };
 
-        let val_a = Value(sv_a.to_xdr(Limits::none()).unwrap().try_into().unwrap());
-        let val_b = Value(sv_b.to_xdr(Limits::none()).unwrap().try_into().unwrap());
-        let values = vec![val_a, val_b];
+        let val_a = encode_sv(&sv_a);
+        let val_b = encode_sv(&sv_b);
 
-        // Only cache B, not A — this simulates the TOCTOU scenario where A
-        // was present when is_cached() was called but evicted before get().
-        driver.cache_tx_set(tx_set_b.clone());
+        // Only cache B, not A — A being missing must trigger panic.
+        driver.cache_tx_set(tx_set_b);
 
-        // Must not panic — should gracefully filter out the missing set
-        let result = driver.combine_candidates_impl(1, &values);
-        let result_sv = StellarValue::from_xdr(&result.0, Limits::none()).unwrap();
-        assert_eq!(
-            result_sv.tx_set_hash.0,
-            tx_set_b.hash().0,
-            "AUDIT-220: missing tx set A should be filtered out, B should win"
-        );
+        let _ = driver.combine_candidates_impl(1, &[val_a, val_b]);
     }
 
     // ========== AUDIT-260 regression tests (issue #2333) ==========
@@ -6449,10 +6437,13 @@ mod tests {
         );
     }
 
-    /// Regression test for AUDIT-260: single stale candidate should trigger
-    /// defensive fallback (not panic).
+    /// Issue #2817: single stale candidate must panic (fail-loud), not return
+    /// values[0] as defensive fallback.
     #[test]
-    fn test_audit_260_single_stale_candidate() {
+    #[should_panic(
+        expected = "BUG: no selectable candidate in combineCandidates after previousLedgerHash filter"
+    )]
+    fn test_combine_candidates_panics_when_single_candidate_is_stale() {
         use henyey_bucket::{BucketList, HotArchiveBucketList};
         use henyey_ledger::{compute_header_hash, LedgerManagerConfig};
         use stellar_xdr::curr::{
@@ -6516,18 +6507,17 @@ mod tests {
         };
         let v_stale = encode_sv(&sv_stale);
 
-        // Must not panic — returns defensive fallback
-        let result = driver.combine_candidates_impl(1, &[v_stale.clone()]);
-        assert_eq!(
-            result, v_stale,
-            "AUDIT-260: single stale candidate should return values[0] as fallback"
-        );
+        // Must panic — no longer returns defensive fallback
+        let _ = driver.combine_candidates_impl(1, &[v_stale]);
     }
 
-    /// Regression test for AUDIT-260: all candidates stale should trigger
-    /// defensive fallback.
+    /// Issue #2817: all candidates stale must panic (fail-loud), not return
+    /// values[0] as defensive fallback.
     #[test]
-    fn test_audit_260_all_candidates_stale() {
+    #[should_panic(
+        expected = "BUG: no selectable candidate in combineCandidates after previousLedgerHash filter"
+    )]
+    fn test_combine_candidates_panics_when_all_candidates_are_stale() {
         use henyey_bucket::{BucketList, HotArchiveBucketList};
         use henyey_ledger::{compute_header_hash, LedgerManagerConfig};
         use stellar_xdr::curr::{
@@ -6605,12 +6595,8 @@ mod tests {
         let v1 = encode_sv(&sv_1);
         let v2 = encode_sv(&sv_2);
 
-        // Must not panic — returns defensive fallback (first value)
-        let result = driver.combine_candidates_impl(1, &[v1.clone(), v2]);
-        assert_eq!(
-            result, v1,
-            "AUDIT-260: all-stale candidates should return values[0] as fallback"
-        );
+        // Must panic — no longer returns defensive fallback
+        let _ = driver.combine_candidates_impl(1, &[v1, v2]);
     }
 
     // ========== Deferred-causes regression tests (issue #2096 / H-014) =========
@@ -7254,6 +7240,174 @@ mod tests {
         // This should panic on the malformed upgrade
         let _ = driver.combine_candidates_impl(1, &[v]);
     }
+
+    /// Issue #2817: prepare_for_apply failure must panic before the LCL filter
+    /// can select a valid candidate. This proves the invariant enforcement is
+    /// ordered correctly (prepare_for_apply runs on ALL candidates before selection).
+    #[test]
+    #[should_panic(expected = "BUG: prepare_for_apply failed in combineCandidates")]
+    fn test_combine_candidates_panics_on_prepare_for_apply_failure_before_lcl_filter() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+        use henyey_ledger::{compute_header_hash, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, Hash, LedgerHeader, LedgerHeaderExt, StellarValue,
+            StellarValueExt, TimePoint, TransactionPhase, TransactionSetV1, TxSetComponent,
+            TxSetComponentTxsMaybeDiscountedFee, VecM,
+        };
+
+        let lm_config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), lm_config);
+        let lcl_header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 1,
+            total_coins: 1_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 100,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let lcl_hash = compute_header_hash(&lcl_header).expect("hash");
+        let lcl_hash256 = Hash256::from_bytes(lcl_hash.0);
+        lm.initialize(
+            BucketList::new(),
+            HotArchiveBucketList::new(),
+            lcl_header,
+            lcl_hash,
+        )
+        .expect("init");
+
+        let driver = make_test_driver_with_lm(Arc::new(lm));
+
+        // Candidate 1: stale LCL, with an unpreparable generalized tx set
+        // (3-phase generalized tx set is structurally invalid → prepare_for_apply fails)
+        let stale_lcl = Hash256::from_bytes([0xBB; 32]);
+        let invalid_gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash(stale_lcl.0),
+            phases: vec![
+                TransactionPhase::V0(
+                    vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                        TxSetComponentTxsMaybeDiscountedFee {
+                            base_fee: None,
+                            txs: vec![].try_into().unwrap(),
+                        },
+                    )]
+                    .try_into()
+                    .unwrap(),
+                ),
+                TransactionPhase::V0(
+                    vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                        TxSetComponentTxsMaybeDiscountedFee {
+                            base_fee: None,
+                            txs: vec![].try_into().unwrap(),
+                        },
+                    )]
+                    .try_into()
+                    .unwrap(),
+                ),
+                TransactionPhase::V0(
+                    vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                        TxSetComponentTxsMaybeDiscountedFee {
+                            base_fee: None,
+                            txs: vec![].try_into().unwrap(),
+                        },
+                    )]
+                    .try_into()
+                    .unwrap(),
+                ),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let bad_tx_set = TransactionSet::new_generalized(invalid_gen);
+        let bad_hash = *bad_tx_set.hash();
+        driver.cache_tx_set(bad_tx_set);
+
+        // Candidate 2: valid LCL-rooted candidate (would win if bad candidate were filtered)
+        let valid_tx_set = TransactionSet::new(lcl_hash256, vec![]);
+        let valid_hash = *valid_tx_set.hash();
+        driver.cache_tx_set(valid_tx_set);
+
+        let sv_bad = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(bad_hash.0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let sv_valid = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(valid_hash.0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let v_bad = encode_sv(&sv_bad);
+        let v_valid = encode_sv(&sv_valid);
+
+        // Must panic on prepare_for_apply before the LCL filter can select v_valid
+        let _ = driver.combine_candidates_impl(1, &[v_bad, v_valid]);
+    }
+
+    /// Issue #2817: malformed upgrade parsing must panic before tx-set lookup,
+    /// preserving stellar-core's failure precedence where upgrade parse failures
+    /// fire before missing-tx-set assertions.
+    #[test]
+    #[should_panic(expected = "BUG: cannot parse upgrade in validated candidate")]
+    fn test_combine_candidates_panics_on_malformed_upgrade_before_missing_tx_set() {
+        let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
+
+        // Candidate 1: has a malformed upgrade AND its tx set is uncached.
+        // The malformed upgrade panic must fire before any missing-tx-set check.
+        let uncached_hash = Hash256::from_bytes([0xAA; 32]);
+        let malformed_bytes: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
+        let sv_bad = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(uncached_hash.0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: vec![UpgradeType(malformed_bytes.try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        // Candidate 2: valid, cached, LCL-rooted
+        let valid_tx_set = TransactionSet::new(lcl_hash, vec![]);
+        let valid_hash = *valid_tx_set.hash();
+        driver.cache_tx_set(valid_tx_set);
+
+        let sv_valid = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(valid_hash.0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let v_bad = encode_sv(&sv_bad);
+        let v_valid = encode_sv(&sv_valid);
+
+        // Must panic on malformed upgrade, not on missing tx set
+        let _ = driver.combine_candidates_impl(1, &[v_bad, v_valid]);
+    }
 }
 
 #[cfg(test)]
@@ -7261,8 +7415,8 @@ mod compare_tx_sets_tests {
     use super::*;
     use crate::tx_queue::TransactionSet;
     use stellar_xdr::curr::{
-        GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase, TransactionSetV1,
-        TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+        GeneralizedTransactionSet, Hash, Limits, ParallelTxsComponent, TransactionPhase,
+        TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
     };
 
     fn make_config() -> ScpDriverConfig {
@@ -7672,12 +7826,13 @@ mod compare_tx_sets_tests {
         assert_eq!(result, std::cmp::Ordering::Equal);
     }
 
-    /// Regression test for AUDIT-014: combine_candidates_impl must not silently
-    /// degrade to XOR-only tiebreak when a tx set is missing from cache.
-    /// Missing tx sets should be filtered out before comparison.
+    /// Issue #2817: combine_candidates_impl must panic when the higher-priority
+    /// candidate's tx set is missing from cache, instead of silently filtering
+    /// and letting the lower-priority cached candidate win.
     #[test]
-    fn test_audit_014_combine_candidates_filters_missing_tx_sets() {
-        use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
+    #[should_panic(expected = "BUG: tx set missing from cache in combineCandidates")]
+    fn test_combine_candidates_panics_instead_of_filtering_missing_high_priority_candidate() {
+        use stellar_xdr::curr::{StellarValue, StellarValueExt, TimePoint};
 
         let driver = make_driver();
         let lcl_hash = driver.ledger_manager.current_header_hash();
@@ -7702,31 +7857,10 @@ mod compare_tx_sets_tests {
 
         let val_a = Value(sv_a.to_xdr(Limits::none()).unwrap().try_into().unwrap());
         let val_b = Value(sv_b.to_xdr(Limits::none()).unwrap().try_into().unwrap());
-        let values = vec![val_a.clone(), val_b.clone()];
 
-        // Both cached: A wins (5 ops > 1 op)
-        cache_tx_set(&driver, tx_set_a.clone());
-        cache_tx_set(&driver, tx_set_b.clone());
-        let full_result = driver.combine_candidates_impl(1, &values);
-        let full_sv = StellarValue::from_xdr(&full_result.0, Limits::none()).unwrap();
-        assert_eq!(
-            full_sv.tx_set_hash.0,
-            tx_set_a.hash().0,
-            "A should win with both cached"
-        );
-
-        // Only B cached, A missing: A should be filtered out, B wins by default
-        driver.tx_tracker.clear_cache();
-        cache_tx_set(&driver, tx_set_b.clone());
-        let partial_result = driver.combine_candidates_impl(1, &values);
-        let partial_sv = StellarValue::from_xdr(&partial_result.0, Limits::none()).unwrap();
-        // The key assertion: with A missing from cache, the result should be B
-        // (not a silently degraded XOR tiebreak that might pick A)
-        assert_eq!(
-            partial_sv.tx_set_hash.0,
-            tx_set_b.hash().0,
-            "AUDIT-014: Missing tx set A should be filtered out, B should win"
-        );
+        // Only B cached, A missing: must panic (not silently filter A)
+        cache_tx_set(&driver, tx_set_b);
+        let _ = driver.combine_candidates_impl(1, &[val_a, val_b]);
     }
 
     #[test]
