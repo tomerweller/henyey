@@ -146,6 +146,12 @@ Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
 Launch both as `general-purpose` foreground sub-agents. Do not wait between them. **Each reviewer must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity catches issues a same-model pipeline would miss.
 
+**Record the review start time** before dispatching reviewers — this is the freshness cutoff for verdict verification:
+
+```bash
+REVIEW_START_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+```
+
 **Why structured comments, not `gh pr review --approve`:** the authenticated GH user is the PR author (the same user opened the PR via `/do` and now reviews it). GitHub disallows author self-approval, so `gh pr review --approve` is silently downgraded to a comment by `gh`. Instead, each reviewer posts a structured comment with a verdict marker that `/review-pr` parses in Step 6.
 
 **Verdict comment format** — each reviewer MUST post exactly one comment with this exact shape:
@@ -234,6 +240,79 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 
 Wait for both reviewers to post.
 
+### Step 4b — Verify reviewer verdicts were posted
+
+After both reviewer sub-agents return, verify that fresh structured verdict comments actually landed on the PR. Sub-agents may complete their analysis without posting the required `gh pr comment` (see #2813). Use the shared verdict-validation library:
+
+```bash
+source scripts/lib/review-pr-verdicts.sh
+
+VERDICTS=$(fetch_reviewer_verdict_comments "$PR_NUM" "$REVIEW_START_ISO")
+
+# Determine expected reviewer B name from Step 3
+REVIEWER_B_NAME="Risk"  # or "Parity" if parity-critical
+
+CLASS_A=$(classify_reviewer "Correctness" "$VERDICTS")
+CLASS_B=$(classify_reviewer "$REVIEWER_B_NAME" "$VERDICTS")
+```
+
+For each reviewer classified as `missing` or `malformed:*`:
+
+1. **Retry once** — re-dispatch ONLY the failing reviewer with a narrow prompt:
+   > Your previous run completed without posting the required structured verdict
+   > comment. Post it NOW using `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <tmpfile>`.
+   > The comment MUST start with `## 🔍 Reviewer: <name>` and contain `**Verdict:** APPROVE | CHANGES_REQUESTED`
+   > and `**Summary:**` lines. Do NOT re-analyze the PR — just post your verdict from your prior analysis.
+
+2. **Re-verify** after the retry:
+   ```bash
+   VERDICTS=$(fetch_reviewer_verdict_comments "$PR_NUM" "$REVIEW_START_ISO")
+   CLASS_A=$(classify_reviewer "Correctness" "$VERDICTS")
+   CLASS_B=$(classify_reviewer "$REVIEWER_B_NAME" "$VERDICTS")
+   ```
+
+3. **If still missing or malformed after retry**, emit an explicit audit artifact and bounce:
+
+   For `malformed`:
+   ```bash
+   gh issue comment "$ISSUE" --repo stellar-experimental/henyey --body "$(cat <<EOF
+   ## Review: Malformed Verdict
+
+   **Reviewer:** <name>
+   **Classification:** $CLASS_X
+   **Action:** Treating as CHANGES_REQUESTED and bouncing to ready-for-doing.
+
+   The reviewer sub-agent posted a comment that does not match the required
+   structured verdict format. /do Mode B should re-trigger /review-pr which
+   will spawn fresh reviewers.
+   EOF
+   )"
+   ```
+
+   For `missing`:
+   ```bash
+   gh issue comment "$ISSUE" --repo stellar-experimental/henyey --body "$(cat <<EOF
+   ## Review: Bounce-Back Cycle <N+1>
+
+   **Reason:** reviewer sub-agent skipped verdict post (<name>)
+
+   **Reviewer A:** ${CLASS_A}
+   **Reviewer B:** ${CLASS_B}
+   **CI:** (not yet checked — bouncing due to missing verdict)
+
+   Reviewer sub-agent completed but did not post the required structured
+   verdict comment after one retry. Routing to ready-for-doing so the next
+   /review-pr cycle spawns fresh reviewers.
+   EOF
+   )"
+
+   bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" ready-for-doing
+   gh issue edit "$ISSUE" --repo stellar-experimental/henyey --remove-assignee @me
+   exit 0
+   ```
+
+Only proceed to Step 5 if both `CLASS_A` and `CLASS_B` start with `ok:`.
+
 ## Step 5 — Recheck CI
 
 Reviewers run in parallel with CI. By the time both have posted their reviews, CI may have finished. Re-query:
@@ -275,15 +354,22 @@ fi
 
 ### 6.1 Parse the reviewer verdicts from PR comments
 
-Fetch all PR-level comments and find the latest one matching each reviewer header. Use the most recent comment per reviewer (in case a reviewer posted, then re-posted):
+Use the shared verdict-validation library with the `REVIEW_START_ISO` cutoff recorded in Step 4. This ensures only fresh verdicts from the current review cycle are considered (stale verdicts from prior cycles are excluded):
 
 ```bash
-gh api repos/stellar-experimental/henyey/issues/$PR_NUM/comments \
-  --paginate --jq '.[] | select(.body | startswith("## 🔍 Reviewer:")) |
-                   {created_at, body}' | jq -s 'sort_by(.created_at)'
+source scripts/lib/review-pr-verdicts.sh
+
+VERDICTS=$(fetch_reviewer_verdict_comments "$PR_NUM" "$REVIEW_START_ISO")
 ```
 
-For each comment, extract the reviewer name from the first line (`## 🔍 Reviewer: Correctness` etc.) and the verdict from the `**Verdict:**` line. Keep only the LATEST comment per reviewer name. The two reviewers we expect:
+For each reviewer, extract the verdict state (already validated in Step 4b — but re-read here in case Step 4b's retry produced new comments):
+
+```bash
+VERDICT_A=$(latest_reviewer_verdict_state "Correctness" "$VERDICTS")
+VERDICT_B=$(latest_reviewer_verdict_state "$REVIEWER_B_NAME" "$VERDICTS")
+```
+
+The two reviewers we expect:
 
 - `Correctness` (always)
 - `Parity` or `Risk` (depending on parity-critical detection from Step 3)
@@ -610,8 +696,8 @@ Exit.
 
 | Failure | Action |
 |---|---|
-| Reviewer sub-agent fails to post | Retry once. If still failing, treat as `CHANGES_REQUESTED` and bounce. |
-| Reviewer's comment doesn't match the expected header/verdict shape | Treat as `pending`; if it stays malformed after Step 4 completes, bounce with a `## Review: Malformed Verdict` note. |
+| Reviewer sub-agent fails to post | Detected in Step 4b via `classify_reviewer` returning `missing`. Retry once with narrow "post now" prompt. If still missing after retry, emit `## Review: Bounce-Back Cycle <N+1>` with reason "reviewer sub-agent skipped verdict post" and bounce to `ready-for-doing`. |
+| Reviewer's comment doesn't match the expected header/verdict shape | Detected in Step 4b via `classify_reviewer` returning `malformed:<reason>`. Retry once. If still malformed after retry, emit `## Review: Malformed Verdict` then bounce to `ready-for-doing`. |
 | No PR linked | Bounce to `ready-for-doing` with `## Review: No PR Linked`. |
 | `gh pr merge --admin` fails (token lacks admin) | Leave the issue in `in-review`; file a follow-up issue documenting the gap; do NOT degrade to a non-admin merge that might bypass CI gates. |
 | GH API failure | Retry once after 5s; if still failing, leave assigned and exit non-zero. |
