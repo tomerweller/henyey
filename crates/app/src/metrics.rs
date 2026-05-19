@@ -802,6 +802,10 @@ metric_catalog! {
             => "Ledger close eviction phase (seconds)";
         CLOSE_SOROBAN_STATE_SECONDS = "henyey_ledger_close_soroban_state_seconds"
             => "Ledger close soroban_state phase (seconds)";
+        CLOSE_SOROBAN_STATE_DATA_ARC_COUNT = "henyey_ledger_close_soroban_state_data_arc_refs"
+            => "Arc strong_count for contract_data_entries at start of soroban_state phase";
+        CLOSE_SOROBAN_STATE_CODE_ARC_COUNT = "henyey_ledger_close_soroban_state_code_arc_refs"
+            => "Arc strong_count for contract_code_entries at start of soroban_state phase";
         CLOSE_BUCKET_ADD_SECONDS = "henyey_ledger_close_bucket_add_seconds"
             => "Ledger close bucket_add phase (seconds)";
         CLOSE_HOT_ARCHIVE_SECONDS = "henyey_ledger_close_hot_archive_seconds"
@@ -1339,6 +1343,9 @@ const SCP_RELAY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0,
 ];
 
+/// Arc strong_count bucket boundaries for soroban_state diagnostics.
+const SOROBAN_ARC_COUNT_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0];
+
 /// Configure all histogram bucket overrides on a `PrometheusBuilder`.
 ///
 /// Shared between `install_recorder()` and `ensure_test_recorder()` so that
@@ -1427,6 +1434,17 @@ fn configure_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
             SCP_RELAY_BUCKETS,
         )
         .expect("valid scp relay histogram buckets")
+        // Soroban state Arc strong_count histograms (issue #2810).
+        .set_buckets_for_metric(
+            Matcher::Full(CLOSE_SOROBAN_STATE_DATA_ARC_COUNT.to_string()),
+            SOROBAN_ARC_COUNT_BUCKETS,
+        )
+        .expect("valid soroban state data arc count histogram buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(CLOSE_SOROBAN_STATE_CODE_ARC_COUNT.to_string()),
+            SOROBAN_ARC_COUNT_BUCKETS,
+        )
+        .expect("valid soroban state code arc count histogram buckets")
 }
 
 // ── Test helper ────────────────────────────────────────────────────────
@@ -2579,6 +2597,47 @@ mod tests {
                 "dashboard JSON files reference unknown metrics:\n  {}",
                 unknown.join("\n  ")
             );
+        }
+    }
+
+    /// Verify soroban state Arc-count histograms render with custom [1, 2, 3, 5, 10] buckets.
+    #[test]
+    fn test_soroban_state_arc_count_histograms_custom_buckets_rendered() {
+        let recorder = configure_histogram_buckets(PrometheusBuilder::new()).build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            CLOSE_SOROBAN_STATE_DATA_ARC_COUNT.record(2.0);
+            CLOSE_SOROBAN_STATE_CODE_ARC_COUNT.record(1.0);
+        });
+
+        let output = handle.render();
+
+        for metric in &[
+            CLOSE_SOROBAN_STATE_DATA_ARC_COUNT,
+            CLOSE_SOROBAN_STATE_CODE_ARC_COUNT,
+        ] {
+            let name = metric.name();
+            for boundary in &["1", "2", "3", "5", "10"] {
+                let needle = format!("{}_bucket{{le=\"{}\"}}", name, boundary);
+                assert!(
+                    output.contains(&needle),
+                    "missing custom bucket boundary `{}` for metric `{}`.\nOutput:\n{}",
+                    needle,
+                    name,
+                    output,
+                );
+            }
+            // Default-only boundaries must be absent.
+            for absent in &["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "30"] {
+                let absent_needle = format!("{}_bucket{{le=\"{}\"}}", name, absent);
+                assert!(
+                    !output.contains(&absent_needle),
+                    "default-only boundary `{}` should NOT appear for metric `{}`",
+                    absent_needle,
+                    name,
+                );
+            }
         }
     }
 }

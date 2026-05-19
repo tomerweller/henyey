@@ -2188,6 +2188,10 @@ impl App {
                 .record(us_to_secs(perf.bucket_lock_wait_us));
             crate::metrics::CLOSE_EVICTION_SECONDS.record(us_to_secs(perf.eviction_us));
             crate::metrics::CLOSE_SOROBAN_STATE_SECONDS.record(us_to_secs(perf.soroban_state_us));
+            crate::metrics::CLOSE_SOROBAN_STATE_DATA_ARC_COUNT
+                .record(perf.soroban_state_data_arc_count as f64);
+            crate::metrics::CLOSE_SOROBAN_STATE_CODE_ARC_COUNT
+                .record(perf.soroban_state_code_arc_count as f64);
             crate::metrics::CLOSE_BUCKET_ADD_SECONDS.record(us_to_secs(perf.add_batch_us));
             crate::metrics::CLOSE_HOT_ARCHIVE_SECONDS.record(us_to_secs(perf.hot_archive_us));
             crate::metrics::CLOSE_HEADER_SECONDS.record(us_to_secs(perf.header_us));

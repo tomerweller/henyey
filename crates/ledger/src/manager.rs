@@ -4917,6 +4917,8 @@ impl LedgerCloseContext<'_> {
             hot_archive_us,
             bg_eviction_data,
             evicted_meta_keys,
+            soroban_state_data_arc_count,
+            soroban_state_code_arc_count,
         ) = {
             let lock_wait_start = std::time::Instant::now();
             let mut bucket_list = self.manager.bucket_list.write();
@@ -5216,6 +5218,24 @@ impl LedgerCloseContext<'_> {
             // Update in-memory Soroban state with changes from this ledger.
             // This happens AFTER computing state size window (see comment above).
             let soroban_state_start = std::time::Instant::now();
+
+            // Diagnostic: sample Arc strong_count BEFORE any make_mut call.
+            // A count >1 means make_mut will deep-clone the map.
+            let (soroban_state_data_arc_count, soroban_state_code_arc_count) = {
+                let soroban_state_read = self.manager.soroban_state.read();
+                soroban_state_read.arc_strong_counts()
+            };
+            let dirty_entry_count = init_entries.len() + live_entries.len() + dead_entries.len();
+            tracing::debug!(
+                ledger_seq = self.close_data.ledger_seq,
+                data_arc_count = soroban_state_data_arc_count,
+                code_arc_count = soroban_state_code_arc_count,
+                data_count = self.manager.soroban_state.read().contract_data_count(),
+                code_count = self.manager.soroban_state.read().contract_code_count(),
+                dirty_entry_count,
+                "soroban_state phase: pre-mutation Arc diagnostics"
+            );
+
             // Gate on prev_version (initialLedgerVers): on the upgrade ledger, the
             // in-memory Soroban state update via this path does NOT run.
             if prev_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
@@ -5502,6 +5522,8 @@ impl LedgerCloseContext<'_> {
                 hot_archive_us,
                 bg_eviction_data,
                 evicted_meta_keys,
+                soroban_state_data_arc_count,
+                soroban_state_code_arc_count,
             )
         };
 
@@ -5905,6 +5927,8 @@ impl LedgerCloseContext<'_> {
             rss_after_bytes: rss_after,
             soroban_stage_count: self.soroban_stage_count,
             soroban_max_cluster_count: self.soroban_max_cluster_count,
+            soroban_state_data_arc_count,
+            soroban_state_code_arc_count,
         };
 
         Ok(LedgerCloseResult::new(new_header, header_hash)
