@@ -897,7 +897,7 @@ impl SearchableBucketListSnapshot {
 
                                 // Only count accounts with an inflation destination
                                 // and balance >= 100 XLM (1,000,000,000 stroops).
-                                // Spec: BUCKETLISTDB_SPEC §10.6 — minimum balance for
+                                // Spec: BUCKETLISTDB_SPEC §10.5 — minimum balance for
                                 // vote counting is hardcoded at 100 XLM, independent of
                                 // the minBalance parameter.
                                 if let Some(dest) = &account.inflation_dest {
@@ -1715,7 +1715,7 @@ mod tests {
         let dest2 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xBB; 32])));
 
         // Account 1 votes for dest1 with balance below 100 XLM threshold (500M stroops).
-        // Per BUCKETLISTDB_SPEC §10.6, accounts with balance < 1B stroops (100 XLM)
+        // Per BUCKETLISTDB_SPEC §10.5, accounts with balance < 1B stroops (100 XLM)
         // are excluded from vote counting entirely.
         let entry1 = LedgerEntry {
             last_modified_ledger_seq: 1,
