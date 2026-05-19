@@ -126,3 +126,12 @@ jobs:
         run: git submodule update --init stellar-core
       - name: Check spec-eval freshness
         run: bash scripts/check-spec-eval-freshness.sh
+
+  agent-worktree-contract:
+    name: Agent Worktree Contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify agent workspace contract
+        run: bash scripts/test-agent-worktree-contract.sh

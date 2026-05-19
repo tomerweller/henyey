@@ -144,6 +144,22 @@ Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
 ## Step 4 — Spawn 2 reviewers in parallel
 
+### Reviewer workspace contract
+
+**All reviewer scratch work must live only under `$HOME/data`.** Reviewers must never create worktrees, checkouts, or build artifacts in the repo root, the repo parent, or anywhere outside `$HOME/data`. Each reviewer derives its workspace as follows:
+
+```bash
+SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
+WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/review-pr-$PR_NUM}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORKTREE_BASE/cargo-target}"
+
+# Reviewer-specific worktree (e.g. for regression-test verification):
+REVIEWER_WORKTREE="$WORKTREE_BASE/reviewer-a"
+mkdir -p "$REVIEWER_WORKTREE"
+```
+
+Include this bootstrap verbatim in each reviewer's prompt so the sub-agent knows where to place any checkout or build output. The bootstrap is self-seeding: if the parent runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, the reviewer respects those; otherwise it falls back to `$HOME/data/$SESSION_ID/review-pr-$PR_NUM/...`.
+
 Launch both as `general-purpose` foreground sub-agents. Do not wait between them. **Each reviewer must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity catches issues a same-model pipeline would miss.
 
 **Why structured comments, not `gh pr review --approve`:** the authenticated GH user is the PR author (the same user opened the PR via `/do` and now reviews it). GitHub disallows author self-approval, so `gh pr review --approve` is silently downgraded to a comment by `gh`. Instead, each reviewer posts a structured comment with a verdict marker that `/review-pr` parses in Step 6.
@@ -184,11 +200,14 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 >    - **Verify the regression test would have caught the bug.** Walk the PR
 >      commit list (\`gh pr view $PR_NUM --json commits\`). The test should
 >      have been committed BEFORE the fix. Check out the parent of the fix
->      commit and run the test:
+>      commit IN YOUR REVIEWER WORKSPACE and run the test:
 >      \`\`\`bash
+>      # Use the reviewer workspace — never checkout in the repo root
+>      cd "$REVIEWER_WORKTREE"
+>      git clone --shared "$REPO_ROOT" . 2>/dev/null || true
 >      git fetch origin pull/$PR_NUM/head:pr-$PR_NUM
 >      git checkout <test-commit-sha>
->      cargo test -p henyey-<crate> <test_fn> 2>&1 | tail -10
+>      CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test -p henyey-<crate> <test_fn> 2>&1 | tail -10
 >      \`\`\`
 >      Confirm the test FAILS at that point. If the test passes at the test-
 >      commit, the regression test doesn't actually capture the bug → bounce.
