@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-scp`
 **Upstream**: `stellar-core/src/scp/`
-**Overall Parity**: 95%
-**Last Updated**: 2026-04-26
+**Overall Parity**: 96%
+**Last Updated**: 2026-05-19
 
 ## Summary
 
@@ -216,7 +216,7 @@ Corresponds to: `NominationProtocol.h`
 | `emitNomination()` | `emit_nomination()` | Full |
 | `acceptPredicate()` | Inline in `should_accept_value()` | Full |
 | `applyAll()` | Inline iteration | Full |
-| `updateRoundLeaders()` | `update_round_leaders()` | Full |
+| `updateRoundLeaders()` | `update_round_leaders()` | Full | Zero-weight exclusion + 1000-iteration cap |
 | `hashNode()` | `compute_hash_node()` via driver | Full |
 | `hashValue()` | `hash_value()` via driver | Full |
 | `getNodePriority()` | `get_node_priority()` | Full |

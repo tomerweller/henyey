@@ -498,7 +498,7 @@ henyey/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-scp`](crates/scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [95%](crates/scp/PARITY_STATUS.md) |
+| [`henyey-scp`](crates/scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [96%](crates/scp/PARITY_STATUS.md) |
 | [`henyey-herder`](crates/herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [79%](crates/herder/PARITY_STATUS.md) |
 | [`henyey-overlay`](crates/overlay/README.md) | P2P overlay network, peer management, message flooding | [92%](crates/overlay/PARITY_STATUS.md) |
 

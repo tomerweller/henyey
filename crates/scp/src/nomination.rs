@@ -206,6 +206,28 @@ impl NominationProtocol {
         self.latest_composite = value;
     }
 
+    /// Test helper: directly call update_round_leaders.
+    #[cfg(test)]
+    pub(crate) fn update_round_leaders_for_test<D: SCPDriver>(
+        &mut self,
+        ctx: &SlotContext<'_, D>,
+        prev_value: &Value,
+    ) {
+        self.update_round_leaders(ctx, prev_value);
+    }
+
+    /// Test helper: pre-seed round_leaders to test no-progress scenarios.
+    #[cfg(test)]
+    pub(crate) fn set_round_leaders_for_test(&mut self, leaders: BTreeSet<NodeId>) {
+        self.round_leaders = leaders;
+    }
+
+    /// Test helper: set the previous_value (required for hash computations).
+    #[cfg(test)]
+    pub(crate) fn set_previous_value_for_test(&mut self, value: Option<Value>) {
+        self.previous_value = value;
+    }
+
     /// Get the last envelope constructed by this node.
     pub fn get_last_envelope(&self) -> Option<&ScpEnvelope> {
         self.last_envelope.as_ref()
@@ -357,6 +379,8 @@ impl NominationProtocol {
     ///
     /// # Returns
     /// True if nomination was updated.
+    // Spec: SCP_SPEC §8 — nomination protocol entry point: propose values,
+    // update round leaders, and emit nomination envelope.
     pub(crate) fn nominate<D: SCPDriver>(
         &mut self,
         ctx: &SlotContext<'_, D>,
@@ -944,6 +968,8 @@ impl NominationProtocol {
             .compute_value_hash(ctx.slot_index, prev, self.round, value)
     }
 
+    // Spec: SCP_SPEC §8.2 — round-leader election: compute leaders per round,
+    // only counting nodes with non-zero weight, with a 1000-iteration defensive cap.
     fn update_round_leaders<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>, prev_value: &Value) {
         // stellar-core normalizes the quorum set, removing self and adjusting thresholds.
         // This ensures weight calculations and leader selection match stellar-core.
@@ -953,8 +979,26 @@ impl NominationProtocol {
             Some(ctx.local_node_id),
         );
 
-        // maxLeaderCount = 1 (self) + all nodes in the normalized set
-        let max_leader_count = 1 + Self::count_all_nodes(&normalized_qs);
+        // Count potential leaders: only include nodes with non-zero weight,
+        // as nodes with weight 0 can never be elected as round leaders.
+        // stellar-core: counts local + forAllNodes with getNodeWeight > 0
+        let mut max_leader_count: usize = 0;
+        if ctx
+            .driver
+            .get_node_weight(ctx.local_node_id, &normalized_qs, true)
+            > 0
+        {
+            max_leader_count += 1;
+        }
+        Self::for_all_nodes(&normalized_qs, &mut |node| {
+            if ctx.driver.get_node_weight(node, &normalized_qs, false) > 0 {
+                max_leader_count += 1;
+            }
+        });
+
+        // Cap the number of iterations to prevent infinite loops if something has
+        // gone wrong (stellar-core: iterationsRemaining = 1000)
+        let mut iterations_remaining: u32 = 1000;
 
         while self.round_leaders.len() < max_leader_count {
             let mut new_leaders = HashSet::new();
@@ -984,6 +1028,11 @@ impl NominationProtocol {
             }
 
             self.round = self.round.saturating_add(1);
+
+            iterations_remaining -= 1;
+            if iterations_remaining == 0 {
+                panic!("updateRoundLeaders appears to be stuck in an infinite loop");
+            }
         }
     }
 
@@ -1025,18 +1074,6 @@ impl NominationProtocol {
         for inner in quorum_set.inner_sets.iter() {
             Self::for_all_nodes(inner, f);
         }
-    }
-
-    /// Count all nodes in a quorum set (stellar-core `forAllNodes` with counter).
-    ///
-    /// Since the quorum set is already normalized with self removed,
-    /// this counts all validators without exclusions.
-    fn count_all_nodes(quorum_set: &ScpQuorumSet) -> usize {
-        let mut count = quorum_set.validators.len();
-        for inner in quorum_set.inner_sets.iter() {
-            count += Self::count_all_nodes(inner);
-        }
-        count
     }
 
     /// Restore state from a saved envelope (for crash recovery).
@@ -2782,5 +2819,265 @@ mod tests {
             priority_zero, priority_max,
             "different custom weights must produce different priorities"
         );
+    }
+
+    /// A driver that gives zero weight to specific nodes, to test zero-weight exclusion.
+    struct ZeroWeightDriver {
+        quorum_set: ScpQuorumSet,
+        zero_weight_nodes: HashSet<NodeId>,
+    }
+
+    impl SCPDriver for ZeroWeightDriver {
+        fn validate_value(
+            &self,
+            _slot_index: u64,
+            _value: &Value,
+            _nomination: bool,
+        ) -> ValidationLevel {
+            ValidationLevel::FullyValidated
+        }
+
+        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
+            candidates.first().cloned()
+        }
+
+        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
+            Some(value.clone())
+        }
+
+        fn emit_envelope(&self, _envelope: &ScpEnvelope) {}
+
+        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
+            Some(self.quorum_set.clone())
+        }
+
+        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
+        fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
+        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+        fn get_node_weight(
+            &self,
+            node_id: &NodeId,
+            quorum_set: &ScpQuorumSet,
+            is_local: bool,
+        ) -> u64 {
+            if self.zero_weight_nodes.contains(node_id) {
+                return 0;
+            }
+            crate::driver::base_get_node_weight(node_id, quorum_set, is_local)
+        }
+
+        fn compute_hash_node(
+            &self,
+            _slot_index: u64,
+            _prev_value: &Value,
+            is_priority: bool,
+            round: u32,
+            node_id: &NodeId,
+        ) -> u64 {
+            let seed = match &node_id.0 {
+                PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) => bytes[0] as u64,
+            };
+            if is_priority {
+                let h = (seed
+                    .wrapping_mul(7919)
+                    .wrapping_add((round as u64).wrapping_mul(104729)))
+                    % 100_000;
+                h + 1
+            } else {
+                1
+            }
+        }
+
+        fn compute_value_hash(
+            &self,
+            _slot_index: u64,
+            _prev_value: &Value,
+            _round: u32,
+            value: &Value,
+        ) -> u64 {
+            value.iter().map(|b| *b as u64).sum()
+        }
+
+        fn compute_timeout(&self, _round: u32, _is_nomination: bool) -> Duration {
+            Duration::from_millis(1)
+        }
+
+        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
+        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
+            true
+        }
+        fn stop_timer(&self, _slot_index: u64, _timer_type: crate::driver::SCPTimerType) {}
+        fn has_upgrades(&self, _value: &Value) -> bool {
+            false
+        }
+        fn strip_all_upgrades(&self, _value: &Value) -> Option<Value> {
+            None
+        }
+        fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
+            u32::MAX
+        }
+    }
+
+    #[test]
+    fn test_round_leaders_exclude_zero_weight_validators() {
+        // Create a quorum set with 4 nodes: node0 (local), node1, node2, node3
+        // node2 and node3 have zero weight — they should never become leaders.
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        let quorum_set = make_quorum_set(
+            vec![node0.clone(), node1.clone(), node2.clone(), node3.clone()],
+            2,
+        );
+
+        let mut zero_weight_nodes = HashSet::new();
+        zero_weight_nodes.insert(node2.clone());
+        zero_weight_nodes.insert(node3.clone());
+
+        let driver = Arc::new(ZeroWeightDriver {
+            quorum_set: quorum_set.clone(),
+            zero_weight_nodes,
+        });
+
+        let mut nom = NominationProtocol::new();
+        nom.set_previous_value_for_test(Some(make_value(&[0])));
+
+        let prev = make_value(&[0]);
+        let ctx = ctx!(&node0, &quorum_set, &driver, 1);
+
+        nom.update_round_leaders_for_test(&ctx, &prev);
+
+        let leaders = nom.get_round_leaders();
+        // Zero-weight nodes must not appear as leaders
+        assert!(
+            !leaders.contains(&node2),
+            "zero-weight node2 must not be a leader"
+        );
+        assert!(
+            !leaders.contains(&node3),
+            "zero-weight node3 must not be a leader"
+        );
+        // At least one non-zero-weight node should be a leader
+        assert!(
+            leaders.contains(&node0) || leaders.contains(&node1),
+            "at least one non-zero-weight node should be a leader"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "updateRoundLeaders appears to be stuck in an infinite loop")]
+    fn test_round_leaders_abort_after_1000_no_progress_iterations() {
+        // Setup: a driver that always returns the same leader (node1) regardless of round.
+        // Pre-seed round_leaders with node1 so no progress is ever made.
+        // max_leader_count > 1, so the loop tries to find more leaders but can't.
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        let quorum_set = make_quorum_set(vec![node0.clone(), node1.clone(), node2.clone()], 2);
+
+        // Give node2 zero weight so max_leader_count = 2 (node0 + node1).
+        // Pre-seed leaders with both, except we need to make the loop think there's
+        // one more to find. Actually let's give all nodes non-zero weight (max=3)
+        // but make the priority function always return the same winner.
+        // We'll use a driver where compute_hash_node always returns the same value
+        // for all nodes so they always tie, but then use a special driver that
+        // makes only node1 ever win by always inserting only node1.
+        //
+        // Simpler approach: give all 3 nodes non-zero weight (max_leader_count=3),
+        // pre-seed round_leaders with {node1} (size=1 < 3), and use a driver
+        // where only node1 ever gets priority. This ensures the loop never
+        // adds new leaders.
+
+        // A driver where only node1 gets non-zero priority
+        struct StuckDriver {
+            quorum_set: ScpQuorumSet,
+            stuck_leader: NodeId,
+        }
+
+        impl SCPDriver for StuckDriver {
+            fn validate_value(&self, _: u64, _: &Value, _: bool) -> ValidationLevel {
+                ValidationLevel::FullyValidated
+            }
+            fn combine_candidates(&self, _: u64, c: &[Value]) -> Option<Value> {
+                c.first().cloned()
+            }
+            fn extract_valid_value(&self, _: u64, v: &Value) -> Option<Value> {
+                Some(v.clone())
+            }
+            fn emit_envelope(&self, _: &ScpEnvelope) {}
+            fn get_quorum_set(&self, _: &NodeId) -> Option<ScpQuorumSet> {
+                Some(self.quorum_set.clone())
+            }
+            fn nominating_value(&self, _: u64, _: &Value) {}
+            fn value_externalized(&self, _: u64, _: &Value) {}
+            fn ballot_did_prepare(&self, _: u64, _: &ScpBallot) {}
+            fn ballot_did_confirm(&self, _: u64, _: &ScpBallot) {}
+            fn get_node_weight(&self, _: &NodeId, _: &ScpQuorumSet, _: bool) -> u64 {
+                // All nodes have non-zero weight (so max_leader_count = all nodes)
+                u64::MAX / 2
+            }
+            fn compute_hash_node(
+                &self,
+                _: u64,
+                _: &Value,
+                is_priority: bool,
+                _round: u32,
+                node_id: &NodeId,
+            ) -> u64 {
+                if !is_priority {
+                    // Weight check: return 1, always <= u64::MAX/2
+                    return 1;
+                }
+                // Only the stuck_leader gets high priority
+                if node_id == &self.stuck_leader {
+                    1000
+                } else {
+                    500
+                }
+            }
+            fn compute_value_hash(&self, _: u64, _: &Value, _: u32, v: &Value) -> u64 {
+                v.iter().map(|b| *b as u64).sum()
+            }
+            fn compute_timeout(&self, _: u32, _: bool) -> Duration {
+                Duration::from_millis(1)
+            }
+            fn sign_envelope(&self, _: &mut ScpEnvelope) {}
+            fn verify_envelope(&self, _: &ScpEnvelope) -> bool {
+                true
+            }
+            fn stop_timer(&self, _: u64, _: crate::driver::SCPTimerType) {}
+            fn has_upgrades(&self, _: &Value) -> bool {
+                false
+            }
+            fn strip_all_upgrades(&self, _: &Value) -> Option<Value> {
+                None
+            }
+            fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
+                u32::MAX
+            }
+        }
+
+        let driver = Arc::new(StuckDriver {
+            quorum_set: quorum_set.clone(),
+            stuck_leader: node1.clone(),
+        });
+
+        let mut nom = NominationProtocol::new();
+        nom.set_previous_value_for_test(Some(make_value(&[0])));
+        // Pre-seed with node1 so the loop makes no progress (node1 always wins again)
+        let mut initial_leaders = BTreeSet::new();
+        initial_leaders.insert(node1.clone());
+        nom.set_round_leaders_for_test(initial_leaders);
+
+        let prev = make_value(&[0]);
+        let ctx = ctx!(&node0, &quorum_set, &driver, 1);
+
+        // This should panic after 1000 iterations
+        nom.update_round_leaders_for_test(&ctx, &prev);
     }
 }

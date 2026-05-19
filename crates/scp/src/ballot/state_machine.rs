@@ -7,6 +7,9 @@ use super::*;
 
 impl BallotProtocol {
     /// Try to advance the slot state based on received messages.
+    ///
+    // Spec: SCP_SPEC §10 — ballot protocol progression: attempt accept-prepared,
+    // confirm-prepared, accept-commit, confirm-commit in order, then bump.
     pub(super) fn advance_slot<D: SCPDriver>(
         &mut self,
         hint: &ScpStatement,
@@ -96,13 +99,16 @@ impl BallotProtocol {
         false
     }
 
-    fn set_accept_prepared<D: SCPDriver>(
+    pub(super) fn set_accept_prepared<D: SCPDriver>(
         &mut self,
         ballot: ScpBallot,
         ctx: &SlotContext<'_, D>,
     ) -> bool {
         let mut did_work = self.set_prepared(ballot.clone(), ctx.driver, ctx.slot_index);
 
+        // Spec: SCP_SPEC §10.4 — clear commit when high_ballot is incompatible
+        // with newly accepted prepared ballot. This can only happen in PREPARE phase;
+        // in CONFIRM phase, attempt_accept_prepared filters out incompatible candidates.
         if self.commit.is_some() {
             let Some(high) = self.high_ballot.as_ref() else {
                 return did_work;
@@ -118,6 +124,12 @@ impl BallotProtocol {
                     .map(|p| are_ballots_less_and_incompatible(high, p))
                     .unwrap_or(false);
             if incompatible {
+                // stellar-core: dbgAssert(mPhase == SCP_PHASE_PREPARE)
+                assert_eq!(
+                    self.phase,
+                    BallotPhase::Prepare,
+                    "commit voiding can only occur in PREPARE phase"
+                );
                 self.commit = None;
                 did_work = true;
             }

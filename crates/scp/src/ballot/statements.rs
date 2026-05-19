@@ -301,6 +301,8 @@ impl BallotProtocol {
         map
     }
 
+    // Spec: SCP_SPEC §5.3 — federated accept: a statement is accepted if
+    // either a v-blocking set accepts it, or a quorum votes-or-accepts it.
     pub(super) fn federated_accept<D: SCPDriver, V, A>(
         &self,
         voted: V,
@@ -332,6 +334,8 @@ impl BallotProtocol {
         is_quorum(ctx.local_quorum_set, &supporters, get_qs)
     }
 
+    // Spec: SCP_SPEC §5.4 — federated ratify (confirm): a statement is ratified
+    // when a quorum of nodes accept it.
     pub(super) fn federated_ratify<D: SCPDriver, V>(
         &self,
         voted: V,
