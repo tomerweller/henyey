@@ -81,7 +81,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `getMinLedgerSeqToRemember()` | `get_min_ledger_seq_to_remember()` | Full |
 | `isNewerNominationOrBallotSt()` | _(not implemented)_ | None |
 | `getMostRecentCheckpointSeq()` | `get_most_recent_checkpoint_seq()` | Full |
-| `triggerNextLedger()` | `trigger_next_ledger()` | Full | Henyey adds an `is_nominating` idempotency guard that skips duplicate triggers while nomination is active. stellar-core logs and continues on duplicate calls but never invokes them in a retry loop. Observable SCP behavior is unchanged. |
+| `triggerNextLedger()` | `trigger_next_ledger()` | Full | Henyey adds an `is_nominating` idempotency guard and a far-ahead close-time abort (#2816) that skips nomination when the proposed close time exceeds `now + MAX_TIME_SLIP_SECONDS`. stellar-core's equivalent abort lives in the same function. Observable SCP behavior is unchanged. |
 | Nomination value caching (timer lambda capture) | `cached_nomination_value` field + `handle_nomination_timeout()` | Full |
 | `setInSyncAndTriggerNextLedger()` | `trigger_next_ledger()` | Full |
 | `resolveNodeID()` | _(not implemented)_ | None |
@@ -104,8 +104,8 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `emitEnvelope()` | handled by `ScpDriver` | Full |
 | `lostSync()` | `SyncRecoveryManager::record_lost_sync()` | Full |
 | `checkCloseTime()` | `check_envelope_close_time()` | Full |
-| `ctValidityOffset()` | _(not implemented)_ | None |
-| `setupTriggerNextLedger()` | _(not implemented)_ | None |
+| `ctValidityOffset()` | `ct_validity_offset()` | Partial | Close-time validity offset computed and used by app-side trigger delay and herder-side far-ahead abort; exact event-driven timer scheduling remains in #2702. |
+| `setupTriggerNextLedger()` | `try_trigger_consensus()` | Partial | App-side polling loop now enforces `prepareStart + expectedClose` delay and ctValidityOffset before calling `trigger_next_ledger()`; exact timer-based scheduling (#2702) not yet ported. |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
 | `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, arb flood damping, and ban-on-damping; broadcast period uses `flood_tx_period_ms` (200 ms) matching stellar-core `FLOOD_TX_PERIOD_MS`; missing dedicated flood queue, mark-on-attempt, separate advert flush timer |
@@ -520,7 +520,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `checkAndMaybeReanalyzeQuorumMap()` | Low | Background quorum analysis |
 | `getMoreSCPState()` | Low | Peer SCP state request |
 | `recomputeKeysToFilter()` | Low | Soroban footprint filtering |
-| `ctValidityOffset()` | Low | Close time offset computation |
+| ~~`ctValidityOffset()`~~ | ~~Low~~ | ~~Close time offset computation~~ — **Implemented in #2816** |
 | PendingEnvelopes cost tracking (4 methods) | Low | Per-validator cost analysis |
 | `HerderPersistence::getNodeQuorumSet()` | Low | Node-level quorum set lookup |
 | `HerderPersistence::getQuorumSet()` | Low | Hash-based quorum set lookup |
@@ -576,7 +576,13 @@ Features not yet implemented. These ARE counted against parity %.
      (`HerderImpl.cpp:1194`), giving ledger apply a chance to complete
      before peer envelopes for the next tracking slot are processed.
      `setupTriggerNextLedger` (`HerderImpl.cpp:1237-1254`) asserts that
-     apply is not in flight and tracking equals the LCL.
+     apply is not in flight and tracking equals the LCL. As of #2816,
+     henyey's `try_trigger_consensus()` enforces the `prepareStart +
+     expectedClose` delay and `ctValidityOffset` check before calling
+     `trigger_next_ledger()`, and the herder-side far-ahead abort in
+     `trigger_next_ledger()` refuses to build/nominate when the proposed
+     close time exceeds `now + MAX_TIME_SLIP_SECONDS`. Full event-driven
+     timer scheduling (#2702) is not yet ported.
    - **Rust**: `process_scp_envelope` forwards peer EXTERNALIZE to SCP
      before the tx_set is fetched, so tracking advance can proceed
      during catchup (#1795). Pending envelope drain now runs post-apply

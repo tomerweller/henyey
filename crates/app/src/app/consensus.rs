@@ -165,6 +165,43 @@ impl App {
             let next_slot = current_ledger + 1;
             tracing::debug!(next_slot, "Checking if we should trigger consensus");
 
+            // Parity: HerderImpl::setupTriggerNextLedger — delay nomination until
+            // prepareStart + expectedClose + ctValidityOffset says the proposed
+            // close time is valid. This preserves the poller architecture while
+            // preventing earlier triggers than stellar-core would allow.
+            let expected_close = self.herder.ledger_close_duration();
+            let last_slot = current_ledger as u64;
+            let last_ballot_start = self.herder.prepare_start(last_slot);
+            let now_instant = std::time::Instant::now();
+            let trigger_time = match last_ballot_start {
+                Some(ballot_start) => ballot_start + expected_close,
+                None => now_instant,
+            };
+            if trigger_time > now_instant {
+                tracing::debug!(
+                    next_slot,
+                    "Skipping consensus trigger: trigger_time not yet reached (setupTriggerNextLedger parity)"
+                );
+                return;
+            }
+
+            let trigger_offset_secs = now_instant
+                .saturating_duration_since(last_ballot_start.unwrap_or(now_instant))
+                .as_secs()
+                .min(expected_close.as_secs());
+            let ct_offset = self.herder.ct_validity_offset(
+                self.herder.lcl_close_time().saturating_add(1),
+                trigger_offset_secs,
+            );
+            if ct_offset > 0 {
+                tracing::debug!(
+                    next_slot,
+                    ct_offset,
+                    "Skipping consensus trigger: ctValidityOffset requires additional delay"
+                );
+                return;
+            }
+
             // Record local close time for drift tracking before triggering consensus.
             // This captures when we started the consensus round.
             let local_time = self
@@ -206,6 +243,12 @@ impl App {
                 }
                 Ok(Ok(henyey_herder::TriggerOutcome::AlreadyNominating)) => {
                     // Idempotent re-trigger; not a new success, not an error.
+                }
+                Ok(Ok(henyey_herder::TriggerOutcome::SkippedInvalidCloseTime)) => {
+                    tracing::debug!(
+                        slot = next_slot,
+                        "Consensus trigger: close time invalid, will retry"
+                    );
                 }
                 Ok(Err(e)) => {
                     self.consensus_trigger_failures
