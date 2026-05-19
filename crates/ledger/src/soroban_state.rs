@@ -420,6 +420,17 @@ impl InMemorySorobanState {
         self.contract_code_entries.len()
     }
 
+    /// Get the `Arc::strong_count` for the data and code maps.
+    ///
+    /// Returns `(data_arc_count, code_arc_count)`. A count of 1 means
+    /// `Arc::make_mut` can mutate in-place; >1 means a deep clone will occur.
+    pub fn arc_strong_counts(&self) -> (usize, usize) {
+        (
+            Arc::strong_count(&self.contract_data_entries),
+            Arc::strong_count(&self.contract_code_entries),
+        )
+    }
+
     /// Get the total contract data state size in bytes.
     pub fn contract_data_state_size(&self) -> i64 {
         self.contract_data_state_size
@@ -1960,5 +1971,51 @@ mod tests {
 
         // Snapshot still unchanged
         assert_eq!(snap.contract_data_state_size(), snap_data_size);
+    }
+
+    #[test]
+    fn test_arc_strong_counts_tracks_snapshot_sharing() {
+        let mut state = InMemorySorobanState::new();
+        state.set_last_closed_ledger_seq(100);
+
+        // Fresh state: sole owner of both Arcs.
+        let (data_count, code_count) = state.arc_strong_counts();
+        assert_eq!(data_count, 1, "fresh state data arc should have count 1");
+        assert_eq!(code_count, 1, "fresh state code arc should have count 1");
+
+        // Insert some data so the maps are non-trivial.
+        let data1 = make_contract_data_entry([10u8; 32]);
+        let code1 = make_contract_code_entry([20u8; 32]);
+        state.process_entry_create(&data1, 25, None).unwrap();
+        state.process_entry_create(&code1, 25, None).unwrap();
+
+        // Still sole owner.
+        let (data_count, code_count) = state.arc_strong_counts();
+        assert_eq!(data_count, 1);
+        assert_eq!(code_count, 1);
+
+        // Take a snapshot — now both Arcs are shared.
+        let _snap = state.snapshot();
+        let (data_count, code_count) = state.arc_strong_counts();
+        assert_eq!(data_count, 2, "snapshot should increment data arc count");
+        assert_eq!(code_count, 2, "snapshot should increment code arc count");
+
+        // Take another snapshot — triple sharing.
+        let _snap2 = state.snapshot();
+        let (data_count, code_count) = state.arc_strong_counts();
+        assert_eq!(data_count, 3);
+        assert_eq!(code_count, 3);
+
+        // Drop one snapshot — back to double.
+        drop(_snap);
+        let (data_count, code_count) = state.arc_strong_counts();
+        assert_eq!(data_count, 2);
+        assert_eq!(code_count, 2);
+
+        // Drop the last snapshot — sole owner again.
+        drop(_snap2);
+        let (data_count, code_count) = state.arc_strong_counts();
+        assert_eq!(data_count, 1);
+        assert_eq!(code_count, 1);
     }
 }
