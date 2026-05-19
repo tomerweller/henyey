@@ -4,7 +4,8 @@
 # Verifies that /review-pr and /plan skill files enforce the ~/data workspace
 # contract: all worktrees, cargo targets, and scratch dirs resolve under
 # $HOME/data/$SESSION_ID/..., and both skills explicitly forbid repo-root or
-# repo-parent worktree creation.
+# repo-parent worktree creation. Also verifies that .claude/skills/ copies
+# remain synchronized with their .github/skills/ counterparts.
 #
 # Usage: bash scripts/test-agent-worktree-contract.sh
 # Exit: 0 if all tests pass, 1 otherwise.
@@ -154,6 +155,90 @@ test_plan_cargo_target_under_data() {
 }
 
 # --------------------------------------------------------------------------
+# Test: .claude/skills/review-pr is synchronized with .github/skills/review-pr
+# --------------------------------------------------------------------------
+test_claude_review_pr_synced() {
+  local desc=".claude/skills/review-pr is synchronized with .github/skills/review-pr"
+  local claude_path="$REPO_ROOT/.claude/skills/review-pr"
+  local github_path="$REPO_ROOT/.github/skills/review-pr"
+
+  if [ ! -e "$claude_path" ] && [ ! -L "$claude_path" ]; then
+    tap_not_ok "$desc" ".claude/skills/review-pr does not exist"
+    return
+  fi
+
+  if [ -L "$claude_path" ]; then
+    # It's a symlink — verify it resolves to the .github copy
+    local target resolved expected
+    target="$(readlink "$claude_path")"
+    if ! resolved="$(cd "$(dirname "$claude_path")" && cd "$target" 2>/dev/null && pwd)"; then
+      tap_not_ok "$desc" "Symlink target '$target' does not resolve"
+      return
+    fi
+    if ! expected="$(cd "$github_path" 2>/dev/null && pwd)"; then
+      tap_not_ok "$desc" "Expected path '$github_path' does not exist"
+      return
+    fi
+    if [ "$resolved" = "$expected" ]; then
+      tap_ok "$desc (symlink)"
+    else
+      tap_not_ok "$desc" "Symlink points to $resolved, expected $expected"
+    fi
+  elif [ -d "$claude_path" ]; then
+    # Not a symlink — verify content is identical
+    if diff -r "$claude_path" "$github_path" > /dev/null 2>&1; then
+      tap_ok "$desc (identical copy)"
+    else
+      tap_not_ok "$desc" ".claude/skills/review-pr differs from .github/skills/review-pr"
+    fi
+  else
+    tap_not_ok "$desc" ".claude/skills/review-pr is not a directory or symlink"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: .claude/skills/plan is synchronized with .github/skills/plan
+# --------------------------------------------------------------------------
+test_claude_plan_synced() {
+  local desc=".claude/skills/plan is synchronized with .github/skills/plan"
+  local claude_path="$REPO_ROOT/.claude/skills/plan"
+  local github_path="$REPO_ROOT/.github/skills/plan"
+
+  if [ ! -e "$claude_path" ] && [ ! -L "$claude_path" ]; then
+    tap_not_ok "$desc" ".claude/skills/plan does not exist"
+    return
+  fi
+
+  if [ -L "$claude_path" ]; then
+    # It's a symlink — verify it resolves to the .github copy
+    local target resolved expected
+    target="$(readlink "$claude_path")"
+    if ! resolved="$(cd "$(dirname "$claude_path")" && cd "$target" 2>/dev/null && pwd)"; then
+      tap_not_ok "$desc" "Symlink target '$target' does not resolve"
+      return
+    fi
+    if ! expected="$(cd "$github_path" 2>/dev/null && pwd)"; then
+      tap_not_ok "$desc" "Expected path '$github_path' does not exist"
+      return
+    fi
+    if [ "$resolved" = "$expected" ]; then
+      tap_ok "$desc (symlink)"
+    else
+      tap_not_ok "$desc" "Symlink points to $resolved, expected $expected"
+    fi
+  elif [ -d "$claude_path" ]; then
+    # Not a symlink — verify content is identical
+    if diff -r "$claude_path" "$github_path" > /dev/null 2>&1; then
+      tap_ok "$desc (identical copy)"
+    else
+      tap_not_ok "$desc" ".claude/skills/plan differs from .github/skills/plan"
+    fi
+  else
+    tap_not_ok "$desc" ".claude/skills/plan is not a directory or symlink"
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -165,6 +250,8 @@ test_review_pr_self_seeding
 test_plan_self_seeding
 test_review_pr_cargo_target_under_data
 test_plan_cargo_target_under_data
+test_claude_review_pr_synced
+test_claude_plan_synced
 
 echo "1..$TEST_NUM"
 echo "# pass: $PASS"
