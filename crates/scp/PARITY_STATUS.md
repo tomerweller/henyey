@@ -419,9 +419,9 @@ Features excluded by design. These are NOT counted against parity %.
    - **Rationale**: Type-safe serialization is simpler to maintain, but the surface is not yet API-compatible with upstream diagnostics.
 
 5. **Error handling**
-   - **stellar-core**: Uses `releaseAssert()` for invariant violations and return values for flow control.
-   - **Rust**: Uses `Result` types, `Option`, and `tracing` for error reporting. Invariant violations are logged rather than panicking.
-   - **Rationale**: Graceful degradation instead of process abort. Allows the node to continue operating even if a single slot encounters an anomaly.
+   - **stellar-core**: Uses `releaseAssert()` for invariant violations and return values for flow control. Uses `dbgAssert()` for debug-only checks compiled out in release.
+   - **Rust**: Uses `Result` types, `Option`, and `tracing` for error reporting. Invariant violations are logged rather than panicking. Debug-only invariants use `debug_assert!` / `debug_assert_eq!` to match stellar-core's `dbgAssert` semantics.
+   - **Rationale**: Graceful degradation instead of process abort. Allows the node to continue operating even if a single slot encounters an anomaly. Debug-only asserts preserve development-time checking without affecting release performance or behavior.
 
 6. **Historical slot reporting**
    - **stellar-core**: Tracks `HistoricalStatement` records with timestamps and validation markers for debug output.

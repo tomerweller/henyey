@@ -5093,4 +5093,70 @@ mod tests {
         // Phase should still be CONFIRM
         assert_eq!(bp.phase(), BallotPhase::Confirm);
     }
+
+    /// INV-S9 parity regression: The phase guard in `set_accept_prepared` must use
+    /// `debug_assert_eq!` (matching stellar-core's `dbgAssert`) so release builds
+    /// do not abort on the structurally impossible CONFIRM-phase state. Debug builds
+    /// should still panic to catch invariant violations during development.
+    #[test]
+    fn test_set_accept_prepared_phase_guard_matches_debug_assert_semantics() {
+        let node_self = make_node_id(0);
+        let node_b = make_node_id(1);
+        let node_c = make_node_id(2);
+        let value_a: Value = vec![1u8, 0].try_into().unwrap();
+        let value_b: Value = vec![2u8, 0].try_into().unwrap();
+        let quorum_set =
+            make_quorum_set(vec![node_self.clone(), node_b.clone(), node_c.clone()], 3);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .build(),
+        );
+        let ctx = ctx!(&node_self, &quorum_set, &driver, 1);
+
+        let mut bp = BallotProtocol::new();
+        // Construct the structurally impossible CONFIRM-phase state where
+        // high_ballot is incompatible with the prepared ballot we're about to accept.
+        bp.set_phase_for_test(BallotPhase::Confirm);
+        bp.set_current_ballot_for_test(Some(ScpBallot {
+            counter: 2,
+            value: value_a.clone(),
+        }));
+        bp.set_commit_for_test(Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        }));
+        bp.set_high_ballot_for_test(Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        }));
+
+        let incompatible_prepared = ScpBallot {
+            counter: 2,
+            value: value_b.clone(),
+        };
+
+        // In debug builds, the debug_assert_eq! should fire (panic).
+        // In release builds, the guard compiles out and commit is cleared.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bp.set_accept_prepared_for_test(incompatible_prepared, &ctx)
+        }));
+
+        if cfg!(debug_assertions) {
+            assert!(
+                result.is_err(),
+                "debug builds must panic on CONFIRM-phase commit voiding (invariant violation)"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "release builds must NOT panic — matches stellar-core dbgAssert semantics"
+            );
+            assert!(result.unwrap(), "set_accept_prepared should have done work");
+            assert!(
+                bp.commit().is_none(),
+                "commit must be cleared in release builds even if phase is CONFIRM"
+            );
+        }
+    }
 }

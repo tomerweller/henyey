@@ -125,7 +125,7 @@ impl BallotProtocol {
                     .unwrap_or(false);
             if incompatible {
                 // stellar-core: dbgAssert(mPhase == SCP_PHASE_PREPARE)
-                assert_eq!(
+                debug_assert_eq!(
                     self.phase,
                     BallotPhase::Prepare,
                     "commit voiding can only occur in PREPARE phase"
