@@ -911,7 +911,7 @@ impl BallotProtocol {
         self.latest_envelopes
             .insert(envelope.statement.node_id.clone(), envelope.clone());
         self.last_envelope = Some(envelope.clone());
-        // Spec: SCP_SPEC §9.13 — set last_envelope_emit to prevent re-emission
+        // Spec: SCP_SPEC §10.4 — set last_envelope_emit to prevent re-emission
         // after crash recovery.
         self.last_envelope_emit = Some(envelope.clone());
 
@@ -997,6 +997,40 @@ impl BallotProtocol {
         ctx: &SlotContext<'_, D>,
     ) -> bool {
         self.attempt_confirm_commit(hint, ctx)
+    }
+
+    /// Test helper: set the ballot phase.
+    pub(crate) fn set_phase_for_test(&mut self, phase: BallotPhase) {
+        self.phase = phase;
+    }
+
+    /// Test helper: set commit ballot.
+    pub(crate) fn set_commit_for_test(&mut self, commit: Option<ScpBallot>) {
+        self.commit = commit;
+    }
+
+    /// Test helper: set high_ballot.
+    pub(crate) fn set_high_ballot_for_test(&mut self, high: Option<ScpBallot>) {
+        self.high_ballot = high;
+    }
+
+    /// Test helper: set prepared ballot.
+    pub(crate) fn set_prepared_ballot_for_test(&mut self, prepared: Option<ScpBallot>) {
+        self.prepared = prepared;
+    }
+
+    /// Test helper: set current_ballot.
+    pub(crate) fn set_current_ballot_for_test(&mut self, ballot: Option<ScpBallot>) {
+        self.current_ballot = ballot;
+    }
+
+    /// Test helper: expose set_accept_prepared for direct testing.
+    pub(crate) fn set_accept_prepared_for_test<D: SCPDriver>(
+        &mut self,
+        ballot: ScpBallot,
+        ctx: &SlotContext<'_, D>,
+    ) -> bool {
+        self.set_accept_prepared(ballot, ctx)
     }
 }
 
@@ -4936,5 +4970,127 @@ mod tests {
             !driver.get_externalized_values().is_empty(),
             "externalization should occur with CONFIRM hint"
         );
+    }
+
+    /// INV-S9: In PREPARE phase, accepting a prepared ballot that is incompatible
+    /// with high_ballot should clear commit. This tests the positive case.
+    #[test]
+    fn test_advance_slot_clears_commit_when_prepare_accepts_incompatible_prepared() {
+        let node_self = make_node_id(0);
+        let node_b = make_node_id(1);
+        let node_c = make_node_id(2);
+        let value_a: Value = vec![1u8, 0].try_into().unwrap();
+        let value_b: Value = vec![2u8, 0].try_into().unwrap();
+        // Use a 3-of-3 quorum so the self-envelope alone can't form a quorum
+        // in the recursive advance_slot call.
+        let quorum_set =
+            make_quorum_set(vec![node_self.clone(), node_b.clone(), node_c.clone()], 3);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .build(),
+        );
+        let ctx = ctx!(&node_self, &quorum_set, &driver, 1);
+
+        let mut bp = BallotProtocol::new();
+        // Set up PREPARE phase with commit and high_ballot
+        bp.set_phase_for_test(BallotPhase::Prepare);
+        bp.set_current_ballot_for_test(Some(ScpBallot {
+            counter: 2,
+            value: value_a.clone(),
+        }));
+        bp.set_commit_for_test(Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        }));
+        bp.set_high_ballot_for_test(Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        }));
+
+        // Accept a prepared ballot with an incompatible value that is > high_ballot
+        // This should trigger the commit-voiding path
+        let incompatible_prepared = ScpBallot {
+            counter: 2,
+            value: value_b.clone(),
+        };
+
+        let did_work = bp.set_accept_prepared_for_test(incompatible_prepared, &ctx);
+        assert!(did_work, "set_accept_prepared should have done work");
+        // commit should be cleared because prepared (value_b counter=2) is
+        // incompatible with high_ballot (value_a counter=1) and high < prepared
+        assert!(
+            bp.commit().is_none(),
+            "commit must be cleared when incompatible prepared is accepted in PREPARE phase"
+        );
+    }
+
+    /// INV-S9 complementary: In CONFIRM phase, attempt_accept_prepared filters out
+    /// incompatible candidates so the commit-voiding assertion is never reached.
+    #[test]
+    fn test_attempt_accept_prepared_confirm_phase_rejects_incompatible_candidate() {
+        let node_self = make_node_id(0);
+        let node_b = make_node_id(1);
+        let value_a: Value = vec![1u8, 0].try_into().unwrap();
+        let value_b: Value = vec![2u8, 0].try_into().unwrap();
+        let quorum_set = make_quorum_set(vec![node_self.clone(), node_b.clone()], 1);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .build(),
+        );
+        let ctx = ctx!(&node_self, &quorum_set, &driver, 1);
+
+        let mut bp = BallotProtocol::new();
+        // Set up CONFIRM phase with commit and high_ballot on value_a
+        bp.set_phase_for_test(BallotPhase::Confirm);
+        bp.set_current_ballot_for_test(Some(ScpBallot {
+            counter: 2,
+            value: value_a.clone(),
+        }));
+        bp.set_commit_for_test(Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        }));
+        bp.set_high_ballot_for_test(Some(ScpBallot {
+            counter: 2,
+            value: value_a.clone(),
+        }));
+        bp.set_prepared_ballot_for_test(Some(ScpBallot {
+            counter: 2,
+            value: value_a.clone(),
+        }));
+
+        // Create a hint that would suggest accepting prepared for value_b (incompatible)
+        let qs_hash = crate::quorum::hash_quorum_set(&quorum_set);
+        let hint = ScpStatement {
+            node_id: node_b.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                ballot: ScpBallot {
+                    counter: 3,
+                    value: value_b.clone(),
+                },
+                prepared: Some(ScpBallot {
+                    counter: 3,
+                    value: value_b.clone(),
+                }),
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+                quorum_set_hash: qs_hash.into(),
+            }),
+        };
+
+        // In CONFIRM phase, attempt_accept_prepared should filter out the
+        // incompatible candidate because it's not compatible with commit
+        let _result = bp.advance_slot_for_test(&hint, &ctx);
+        // The incompatible ballot should have been filtered — commit stays intact
+        assert!(
+            bp.commit().is_some(),
+            "commit must remain unchanged in CONFIRM phase — incompatible candidates are filtered"
+        );
+        // Phase should still be CONFIRM
+        assert_eq!(bp.phase(), BallotPhase::Confirm);
     }
 }

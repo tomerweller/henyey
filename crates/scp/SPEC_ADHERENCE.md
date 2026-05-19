@@ -3,17 +3,17 @@
 **Spec version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Spec path:** `stellar-specs/SCP_SPEC.md` (1689 lines)
 **Crate:** `crates/scp`
-**Last updated:** 2026-05-13
-**Overall adherence:** 96%
+**Last updated:** 2026-05-19
+**Overall adherence:** 100%
 
 Counts (production code only, tests excluded):
-- Full: 47
-- Partial: 2
+- Full: 49
+- Partial: 0
 - Absent: 0
 - Drift: 0
 - N/A: 3
 
-`adherence_pct = 47 / (47 + 2 + 0) = 95.9%`
+`adherence_pct = 49 / (49 + 0 + 0) = 100%`
 
 ## Summary
 
@@ -73,7 +73,7 @@ Counts (production code only, tests excluded):
 | INV-S6 `c ≲ h ≲ b` chain | Full | `check_invariants` verifies both edges (ballot/mod.rs:443-458). |
 | INV-S7 Commit-only-with-high | Full | `check_invariants` enforces (`commit.is_some()` requires `high_ballot.is_some()`, ballot/mod.rs:443-451); `bump_to_ballot` clears commit when it clears high (state_machine.rs:559-566). |
 | INV-S8 CONFIRM/EXTERNALIZE require complete state | Full | `check_invariants` rejects missing core fields in Confirm/Externalize (ballot/mod.rs:395-411). |
-| INV-S9 Commit voiding correctness | Partial | Voiding happens correctly in `set_accept_prepared` when `mHighBallot ≨ mPrepared / mPreparedPrime` (state_machine.rs:106-124). **However**, the spec's "MUST happen only in `SCP_PHASE_PREPARE`; voiding in CONFIRM or EXTERNALIZE is forbidden" assertion is **not** explicitly enforced. The implementation relies on the upstream conditions (commit + new accept-prepared) being structurally impossible outside PREPARE rather than an explicit phase check. Stellar-core enforces this with a `releaseAssert(mPhase == SCP_PHASE_PREPARE)` at the same site. |
+| INV-S9 Commit voiding correctness | Full | Voiding happens in `set_accept_prepared` when `mHighBallot ≨ mPrepared / mPreparedPrime` (state_machine.rs:120-135). Explicit `assert_eq!(self.phase, BallotPhase::Prepare)` matches stellar-core's `dbgAssert(mPhase == SCP_PHASE_PREPARE)`. |
 | INV-S10 `mValueOverride` locking | Full | `bump_state` uses `value_override` when set (ballot/mod.rs:946-952); `set_confirm_prepared` and `set_accept_commit` set it (state_machine.rs:234, 328). |
 | INV-S11 Singleton qset for EXTERNALIZE | Full | `statement_quorum_set` returns `simple_quorum_set(1, vec![nodeid])` for Externalize statements (ballot/statements.rs:122-124). `commitQuorumSetHash` is not consulted for quorum/v-blocking gating. |
 | INV-S12 Nomination set monotonicity | Full | `is_newer_nomination` checks `old_votes ⊆ new_votes` AND `old_accepted ⊆ new_accepted` AND at least one strictly grew (nomination.rs:777-789); same logic in `compare.rs:97-108`. |
@@ -126,9 +126,9 @@ Counts (production code only, tests excluded):
 - **Status**: Full.
 
 ### §8.2 — Round-leader election
-- **Spec**: Normalize qset with `idToRemove = localNodeID`; iterate priority computation; if `topPriority == 0` for all candidates, increment `mRoundNumber` and retry; cap at 1000 iterations.
-- **Rust**: `nomination.rs::update_round_leaders` (lines 947-988). The 1000-iteration cap from the spec is **not present** — the loop is bounded only by `round_leaders.len() < max_leader_count` plus the `top_priority == 0` reset. In practice, the absence of the cap is benign on sane qsets (which the spec elsewhere requires); on a degenerate qset the loop could in principle spin longer than upstream. Treat as **Partial** for completeness.
-- **Status**: Partial (missing the defensive 1000-iteration ceiling).
+- **Spec**: Normalize qset with `idToRemove = localNodeID`; iterate priority computation; if `topPriority == 0` for all candidates, increment `mRoundNumber` and retry; cap at 1000 iterations. Only count nodes with non-zero weight toward `maxLeaderCount`.
+- **Rust**: `nomination.rs::update_round_leaders`. Computes `max_leader_count` by counting only nodes with non-zero weight (matching stellar-core's approach). Includes the 1000-iteration defensive cap that panics on exhaustion, matching stellar-core's `throw std::runtime_error`.
+- **Status**: Full.
 
 ### §9.5.1 — attemptAcceptPrepared step ordering
 - **Spec**: For each candidate (highest→lowest), apply 5 filters in order: CONFIRM-phase prepared-extension, CONFIRM-phase commit compatibility, ≤ p' skip, ≲ p skip, `federatedAccept`.
@@ -155,9 +155,9 @@ None identified. The two Partial items above are completeness gaps (missing defe
 
 ## Recommendations
 
-1. **Add the missing phase assertion for INV-S9 commit voiding.** In `ballot/state_machine.rs::set_accept_prepared` around line 121 (where `self.commit = None`), add a debug-assert that `self.phase == BallotPhase::Prepare`. Stellar-core has this assert; it's defense-in-depth against future refactors.
-2. **Cap the round-leader election loop at 1000 iterations (§8.2 step 4).** In `nomination.rs::update_round_leaders` (around line 959), add a counter and panic at 1000 to match the spec's defensive cap.
-3. **Fix the dangling spec anchor** in `crates/scp/src/ballot/mod.rs:914` (currently cites `§9.13`, should be `§10.4`).
+1. ~~**Add the missing phase assertion for INV-S9 commit voiding.**~~ ✅ Done (2026-05-19).
+2. ~~**Cap the round-leader election loop at 1000 iterations (§8.2 step 4).**~~ ✅ Done (2026-05-19).
+3. ~~**Fix the dangling spec anchor** in `crates/scp/src/ballot/mod.rs:914` (§9.13 → §10.4).~~ ✅ Done (2026-05-19).
 4. **Optional: rename `MAX_PROTOCOL_TRANSITIONS` → `MAX_ADVANCE_SLOT_RECURSION`** (ballot/mod.rs:48) to match the spec name verbatim; the semantics are identical.
 5. **Optional: add an explicit re-exported constant** `pub const MAX_ADVANCE_SLOT_RECURSION: u32 = 50;` at crate level so external integrators (or tests in adjacent crates) can reference it without hardcoding `50`.
-6. **Consider adding `// Spec: SCP_SPEC §N.M` anchors** at the major entry points (e.g., `nominate`, `process_envelope` paths, `attempt_*` functions, `set_state_from_envelope`). The crate currently has only 1 anchor; richer anchoring would let future `/spec-adhere` audits operate by anchor-first lookup and would help reviewers cross-reference against the regenerated spec.
+6. ~~**Consider adding `// Spec: SCP_SPEC §N.M` anchors** at the major entry points.~~ ✅ Done (2026-05-19): anchors added at `advance_slot`, `nominate`, `federated_accept`, `federated_ratify`, `set_accept_prepared`, and `update_round_leaders`.
