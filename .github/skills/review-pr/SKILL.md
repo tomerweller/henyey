@@ -30,22 +30,16 @@ You do **not** review the code yourself — you orchestrate two independent revi
 ## Step 0 — Find the PR
 
 ```bash
-# NOTE: `gh issue view --json closedByPullRequestsReferences` does NOT expose
-# a nested `.state` subfield (only id/number/repository/url), so filtering by
-# `.state == "OPEN"` always yields empty. Use the GraphQL endpoint, which
-# does expose `state`, to identify the linked open PR. See #2793.
-PR_NUM=$(gh api graphql -F num=$ISSUE -f query='
-  query($num: Int!) {
-    repository(owner: "stellar-experimental", name: "henyey") {
-      issue(number: $num) {
-        closedByPullRequestsReferences(first: 5) {
-          nodes { number state }
-        }
-      }
+# Use raw GraphQL — `gh issue view --json closedByPullRequestsReferences` silently
+# omits the `state` subfield, so `select(.state == "OPEN")` would never match and
+# PR_NUM would always be empty even when an OPEN PR exists.
+PR_NUM=$(gh api graphql -f query='{
+  repository(owner: "stellar-experimental", name: "henyey") {
+    issue(number: '"$ISSUE"') {
+      closedByPullRequestsReferences(first: 5) { nodes { number state } }
     }
   }
-' --jq '.data.repository.issue.closedByPullRequestsReferences.nodes
-        | map(select(.state == "OPEN")) | .[0].number // empty')
+}' --jq '.data.repository.issue.closedByPullRequestsReferences.nodes | map(select(.state == "OPEN")) | .[0].number // empty')
 ```
 
 If `PR_NUM` is empty, the issue is in `in-review` but has no open PR — that's a bug in `/do`. Post `## Review: No PR Linked` and move the issue back to `ready-for-doing`. Unassign. Exit.
@@ -72,48 +66,50 @@ Capture:
 
 The bounce-back cap is **scoped to the current code**, not the issue's lifetime. Old bounces against earlier commits don't carry forward forever — they represent failed merge attempts on code that has since been rebased or replaced.
 
-**The script computes this. Do not re-implement or override.** Invoke `bounce-cap-check.sh` — its exit code IS the verdict:
+Compute the **baseline timestamp** for counting:
 
 ```bash
-# Exit 0 = under cap, proceed. Exit 1 = at/over cap (≥3), block.
-# Stdout: single human-readable line with the count and baseline source
-# (e.g. "COUNT=2/3 BASELINE=HEAD_PUSHED@2026-05-17T12:34:56Z (no Reset marker)").
-# Capture into BOUNCE_CAP_OUTPUT for embedding in the bounce/block comment.
-#
-# Use the `cmd || { ... }` pattern (NOT a separate `$?` capture) so `set -e`
-# in the parent shell doesn't trip on the non-zero exit before we can react.
-BOUNCE_CAP_OUTPUT=""
-BOUNCE_CAP_EXIT=0
-BOUNCE_CAP_OUTPUT=$(bash .github/skills/shared/scripts/bounce-cap-check.sh "$ISSUE" "$PR_NUM") \
-  || BOUNCE_CAP_EXIT=$?
+# When was the current PR head commit pushed/committed? Fresh push = new baseline.
+HEAD_PUSHED_ISO=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
+  --json commits --jq '.commits | sort_by(.committedDate) | last | .committedDate')
 
-if [ "$BOUNCE_CAP_EXIT" -ne 0 ]; then
-  # Cap reached — post block comment, move to `blocked`, exit.
-  # The script's stdout is the audit summary; include it verbatim.
-  gh issue comment "$ISSUE" --repo stellar-experimental/henyey --body "$(cat <<EOF
-## Review: Cycle Cap Reached
+# Has the operator (or recovery script) posted a Reset marker?
+# This is the escape hatch for cases where the head didn't change but the
+# external cause did — e.g., main was broken, now it's green; same code,
+# fresh chance.
+RESET_AT_ISO=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
+  --jq '[.[] | select(.body | startswith("## Review: Reset"))] | sort_by(.created_at) | last.created_at // ""')
 
-**Status:** blocked
-**Audit:** \`$BOUNCE_CAP_OUTPUT\`
-
-This PR has cycled too many times against the current code (head-scoped
-count, Reset markers honored). Human review required to break the tie.
-EOF
-)"
-  bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" blocked
-  gh issue edit "$ISSUE" --repo stellar-experimental/henyey --remove-assignee @me
-  exit 0
+# Convert both to epoch seconds for unambiguous numeric comparison
+# (ISO strings can drift in format — fractional seconds, +00:00 vs Z, etc.).
+HEAD_PUSHED_EPOCH=$(date -u -d "$HEAD_PUSHED_ISO" +%s)
+if [ -n "$RESET_AT_ISO" ]; then
+  RESET_AT_EPOCH=$(date -u -d "$RESET_AT_ISO" +%s)
+else
+  RESET_AT_EPOCH=0
 fi
 
-# Under cap — proceed. $BOUNCE_CAP_OUTPUT is available for the eventual
-# bounce comment (Step 7) to report the current count.
+# Baseline = max(HEAD_PUSHED, RESET_AT) as epoch seconds.
+if [ "$RESET_AT_EPOCH" -gt "$HEAD_PUSHED_EPOCH" ]; then
+  BASELINE_EPOCH=$RESET_AT_EPOCH
+else
+  BASELINE_EPOCH=$HEAD_PUSHED_EPOCH
+fi
 ```
 
-The script encodes the head-scoped + Reset-marker algorithm (see issue #2787 for why it lives in a script, not prose). The rest of this section documents **how operators use** the Reset escape hatch — it is reference material for humans, NOT an algorithm spec; the algorithm lives exclusively in `bounce-cap-check.sh`.
+Then count bounce comments STRICTLY AFTER the baseline (jq's `fromdate` parses ISO-8601 into epoch seconds, so the comparison is numeric, not lexical):
 
----
+```bash
+COUNT=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
+  --jq "[.[] | select(.body | startswith(\"## Review: Bounce-Back Cycle\")) |
+        select((.created_at | fromdate) > $BASELINE_EPOCH)] | length")
+```
 
-**Recovery semantics (operator reference, not algorithm spec):**
+If `COUNT >= 3`, this is the 4th cycle on the current code — the PR has genuinely cycled too many times against this exact state. Post `## Review: Cycle Cap Reached` summarizing the disagreement pattern, move the issue to `blocked`, unassign, and exit.
+
+Otherwise (COUNT < 3) → proceed with the review.
+
+**Recovery semantics:**
 
 - **Fresh `/do` Mode B push** → new commit `committedDate` advances the baseline → counter naturally resets to 0. Most recoveries (rebase after CI red, address review feedback) hit this path automatically.
 - **`## Review: Reset` comment** → manual escape hatch. Operator (or recovery script) posts this when the head hasn't changed but the external cause has (e.g., a broken-main outage that has since cleared). Everything before the Reset comment is excluded from the count. Post format:
@@ -144,29 +140,7 @@ Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
 ## Step 4 — Spawn 2 reviewers in parallel
 
-### Reviewer workspace contract
-
-**All reviewer scratch work must live only under `$HOME/data`.** Reviewers must never create worktrees, checkouts, or build artifacts in the repo root, the repo parent, or anywhere outside `$HOME/data`. Each reviewer derives its workspace as follows:
-
-```bash
-SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
-WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/review-pr-$PR_NUM}"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORKTREE_BASE/cargo-target}"
-
-# Reviewer-specific worktree (e.g. for regression-test verification):
-REVIEWER_WORKTREE="$WORKTREE_BASE/reviewer-a"
-mkdir -p "$REVIEWER_WORKTREE"
-```
-
-Include this bootstrap verbatim in each reviewer's prompt so the sub-agent knows where to place any checkout or build output. The bootstrap is self-seeding: if the parent runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, the reviewer respects those; otherwise it falls back to `$HOME/data/$SESSION_ID/review-pr-$PR_NUM/...`.
-
 Launch both as `general-purpose` foreground sub-agents. Do not wait between them. **Each reviewer must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity catches issues a same-model pipeline would miss.
-
-**Record the review start time** before dispatching reviewers — this is the freshness cutoff for verdict verification:
-
-```bash
-REVIEW_START_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-```
 
 **Why structured comments, not `gh pr review --approve`:** the authenticated GH user is the PR author (the same user opened the PR via `/do` and now reviews it). GitHub disallows author self-approval, so `gh pr review --approve` is silently downgraded to a comment by `gh`. Instead, each reviewer posts a structured comment with a verdict marker that `/review-pr` parses in Step 6.
 
@@ -206,14 +180,11 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 >    - **Verify the regression test would have caught the bug.** Walk the PR
 >      commit list (\`gh pr view $PR_NUM --json commits\`). The test should
 >      have been committed BEFORE the fix. Check out the parent of the fix
->      commit IN YOUR REVIEWER WORKSPACE and run the test:
+>      commit and run the test:
 >      \`\`\`bash
->      # Use the reviewer workspace — never checkout in the repo root
->      cd "$REVIEWER_WORKTREE"
->      git clone --shared "$REPO_ROOT" . 2>/dev/null || true
 >      git fetch origin pull/$PR_NUM/head:pr-$PR_NUM
 >      git checkout <test-commit-sha>
->      CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test -p henyey-<crate> <test_fn> 2>&1 | tail -10
+>      cargo test -p henyey-<crate> <test_fn> 2>&1 | tail -10
 >      \`\`\`
 >      Confirm the test FAILS at that point. If the test passes at the test-
 >      commit, the regression test doesn't actually capture the bug → bounce.
@@ -259,79 +230,6 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 
 Wait for both reviewers to post.
 
-### Step 4b — Verify reviewer verdicts were posted
-
-After both reviewer sub-agents return, verify that fresh structured verdict comments actually landed on the PR. Sub-agents may complete their analysis without posting the required `gh pr comment` (see #2813). Use the shared verdict-validation library:
-
-```bash
-source scripts/lib/review-pr-verdicts.sh
-
-VERDICTS=$(fetch_reviewer_verdict_comments "$PR_NUM" "$REVIEW_START_ISO")
-
-# Determine expected reviewer B name from Step 3
-REVIEWER_B_NAME="Risk"  # or "Parity" if parity-critical
-
-CLASS_A=$(classify_reviewer "Correctness" "$VERDICTS")
-CLASS_B=$(classify_reviewer "$REVIEWER_B_NAME" "$VERDICTS")
-```
-
-For each reviewer classified as `missing` or `malformed:*`:
-
-1. **Retry once** — re-dispatch ONLY the failing reviewer with a narrow prompt:
-   > Your previous run completed without posting the required structured verdict
-   > comment. Post it NOW using `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <tmpfile>`.
-   > The comment MUST start with `## 🔍 Reviewer: <name>` and contain `**Verdict:** APPROVE | CHANGES_REQUESTED`
-   > and `**Summary:**` lines. Do NOT re-analyze the PR — just post your verdict from your prior analysis.
-
-2. **Re-verify** after the retry:
-   ```bash
-   VERDICTS=$(fetch_reviewer_verdict_comments "$PR_NUM" "$REVIEW_START_ISO")
-   CLASS_A=$(classify_reviewer "Correctness" "$VERDICTS")
-   CLASS_B=$(classify_reviewer "$REVIEWER_B_NAME" "$VERDICTS")
-   ```
-
-3. **If still missing or malformed after retry**, emit an explicit audit artifact and bounce:
-
-   For `malformed`:
-   ```bash
-   gh issue comment "$ISSUE" --repo stellar-experimental/henyey --body "$(cat <<EOF
-   ## Review: Malformed Verdict
-
-   **Reviewer:** <name>
-   **Classification:** $CLASS_X
-   **Action:** Treating as CHANGES_REQUESTED and bouncing to ready-for-doing.
-
-   The reviewer sub-agent posted a comment that does not match the required
-   structured verdict format. /do Mode B should re-trigger /review-pr which
-   will spawn fresh reviewers.
-   EOF
-   )"
-   ```
-
-   For `missing`:
-   ```bash
-   gh issue comment "$ISSUE" --repo stellar-experimental/henyey --body "$(cat <<EOF
-   ## Review: Bounce-Back Cycle <N+1>
-
-   **Reason:** reviewer sub-agent skipped verdict post (<name>)
-
-   **Reviewer A:** ${CLASS_A}
-   **Reviewer B:** ${CLASS_B}
-   **CI:** (not yet checked — bouncing due to missing verdict)
-
-   Reviewer sub-agent completed but did not post the required structured
-   verdict comment after one retry. Routing to ready-for-doing so the next
-   /review-pr cycle spawns fresh reviewers.
-   EOF
-   )"
-
-   bash .github/skills/shared/scripts/move-issue-status.sh "$ISSUE" ready-for-doing
-   gh issue edit "$ISSUE" --repo stellar-experimental/henyey --remove-assignee @me
-   exit 0
-   ```
-
-Only proceed to Step 5 if both `CLASS_A` and `CLASS_B` start with `ok:`.
-
 ## Step 5 — Recheck CI
 
 Reviewers run in parallel with CI. By the time both have posted their reviews, CI may have finished. Re-query:
@@ -373,22 +271,15 @@ fi
 
 ### 6.1 Parse the reviewer verdicts from PR comments
 
-Use the shared verdict-validation library with the `REVIEW_START_ISO` cutoff recorded in Step 4. This ensures only fresh verdicts from the current review cycle are considered (stale verdicts from prior cycles are excluded):
+Fetch all PR-level comments and find the latest one matching each reviewer header. Use the most recent comment per reviewer (in case a reviewer posted, then re-posted):
 
 ```bash
-source scripts/lib/review-pr-verdicts.sh
-
-VERDICTS=$(fetch_reviewer_verdict_comments "$PR_NUM" "$REVIEW_START_ISO")
+gh api repos/stellar-experimental/henyey/issues/$PR_NUM/comments \
+  --paginate --jq '.[] | select(.body | startswith("## 🔍 Reviewer:")) |
+                   {created_at, body}' | jq -s 'sort_by(.created_at)'
 ```
 
-For each reviewer, extract the verdict state (already validated in Step 4b — but re-read here in case Step 4b's retry produced new comments):
-
-```bash
-VERDICT_A=$(latest_reviewer_verdict_state "Correctness" "$VERDICTS")
-VERDICT_B=$(latest_reviewer_verdict_state "$REVIEWER_B_NAME" "$VERDICTS")
-```
-
-The two reviewers we expect:
+For each comment, extract the reviewer name from the first line (`## 🔍 Reviewer: Correctness` etc.) and the verdict from the `**Verdict:**` line. Keep only the LATEST comment per reviewer name. The two reviewers we expect:
 
 - `Correctness` (always)
 - `Parity` or `Risk` (depending on parity-critical detection from Step 3)
@@ -715,8 +606,8 @@ Exit.
 
 | Failure | Action |
 |---|---|
-| Reviewer sub-agent fails to post | Detected in Step 4b via `classify_reviewer` returning `missing`. Retry once with narrow "post now" prompt. If still missing after retry, emit `## Review: Bounce-Back Cycle <N+1>` with reason "reviewer sub-agent skipped verdict post" and bounce to `ready-for-doing`. |
-| Reviewer's comment doesn't match the expected header/verdict shape | Detected in Step 4b via `classify_reviewer` returning `malformed:<reason>`. Retry once. If still malformed after retry, emit `## Review: Malformed Verdict` then bounce to `ready-for-doing`. |
+| Reviewer sub-agent fails to post | Retry once. If still failing, treat as `CHANGES_REQUESTED` and bounce. |
+| Reviewer's comment doesn't match the expected header/verdict shape | Treat as `pending`; if it stays malformed after Step 4 completes, bounce with a `## Review: Malformed Verdict` note. |
 | No PR linked | Bounce to `ready-for-doing` with `## Review: No PR Linked`. |
 | `gh pr merge --admin` fails (token lacks admin) | Leave the issue in `in-review`; file a follow-up issue documenting the gap; do NOT degrade to a non-admin merge that might bypass CI gates. |
 | GH API failure | Retry once after 5s; if still failing, leave assigned and exit non-zero. |

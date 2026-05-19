@@ -162,27 +162,24 @@ test_claude_review_pr_synced() {
   local claude_path="$REPO_ROOT/.claude/skills/review-pr"
   local github_path="$REPO_ROOT/.github/skills/review-pr"
 
-  if [ ! -e "$claude_path" ] && [ ! -L "$claude_path" ]; then
-    tap_not_ok "$desc" ".claude/skills/review-pr does not exist"
-    return
-  fi
-
   if [ -L "$claude_path" ]; then
     # It's a symlink — verify it resolves to the .github copy
     local target resolved expected
     target="$(readlink "$claude_path")"
-    if ! resolved="$(cd "$(dirname "$claude_path")" && cd "$target" 2>/dev/null && pwd)"; then
-      tap_not_ok "$desc" "Symlink target '$target' does not resolve"
-      return
-    fi
-    if ! expected="$(cd "$github_path" 2>/dev/null && pwd)"; then
-      tap_not_ok "$desc" "Expected path '$github_path' does not exist"
-      return
-    fi
-    if [ "$resolved" = "$expected" ]; then
-      tap_ok "$desc (symlink)"
+    # Guard: resolve the symlink target safely; broken/misdirected symlinks
+    # must emit tap_not_ok rather than aborting the script under set -e.
+    if resolved="$(cd "$(dirname "$claude_path")" && cd "$target" 2>/dev/null && pwd)"; then
+      if expected="$(cd "$github_path" 2>/dev/null && pwd)"; then
+        if [ "$resolved" = "$expected" ]; then
+          tap_ok "$desc (symlink)"
+        else
+          tap_not_ok "$desc" "Symlink points to $resolved, expected $expected"
+        fi
+      else
+        tap_not_ok "$desc" "Expected path '$github_path' does not exist"
+      fi
     else
-      tap_not_ok "$desc" "Symlink points to $resolved, expected $expected"
+      tap_not_ok "$desc" "Symlink target '$target' does not resolve"
     fi
   elif [ -d "$claude_path" ]; then
     # Not a symlink — verify content is identical
@@ -192,7 +189,7 @@ test_claude_review_pr_synced() {
       tap_not_ok "$desc" ".claude/skills/review-pr differs from .github/skills/review-pr"
     fi
   else
-    tap_not_ok "$desc" ".claude/skills/review-pr is not a directory or symlink"
+    tap_not_ok "$desc" ".claude/skills/review-pr does not exist"
   fi
 }
 
@@ -204,27 +201,24 @@ test_claude_plan_synced() {
   local claude_path="$REPO_ROOT/.claude/skills/plan"
   local github_path="$REPO_ROOT/.github/skills/plan"
 
-  if [ ! -e "$claude_path" ] && [ ! -L "$claude_path" ]; then
-    tap_not_ok "$desc" ".claude/skills/plan does not exist"
-    return
-  fi
-
   if [ -L "$claude_path" ]; then
     # It's a symlink — verify it resolves to the .github copy
     local target resolved expected
     target="$(readlink "$claude_path")"
-    if ! resolved="$(cd "$(dirname "$claude_path")" && cd "$target" 2>/dev/null && pwd)"; then
-      tap_not_ok "$desc" "Symlink target '$target' does not resolve"
-      return
-    fi
-    if ! expected="$(cd "$github_path" 2>/dev/null && pwd)"; then
-      tap_not_ok "$desc" "Expected path '$github_path' does not exist"
-      return
-    fi
-    if [ "$resolved" = "$expected" ]; then
-      tap_ok "$desc (symlink)"
+    # Guard: resolve the symlink target safely; broken/misdirected symlinks
+    # must emit tap_not_ok rather than aborting the script under set -e.
+    if resolved="$(cd "$(dirname "$claude_path")" && cd "$target" 2>/dev/null && pwd)"; then
+      if expected="$(cd "$github_path" 2>/dev/null && pwd)"; then
+        if [ "$resolved" = "$expected" ]; then
+          tap_ok "$desc (symlink)"
+        else
+          tap_not_ok "$desc" "Symlink points to $resolved, expected $expected"
+        fi
+      else
+        tap_not_ok "$desc" "Expected path '$github_path' does not exist"
+      fi
     else
-      tap_not_ok "$desc" "Symlink points to $resolved, expected $expected"
+      tap_not_ok "$desc" "Symlink target '$target' does not resolve"
     fi
   elif [ -d "$claude_path" ]; then
     # Not a symlink — verify content is identical
@@ -234,7 +228,7 @@ test_claude_plan_synced() {
       tap_not_ok "$desc" ".claude/skills/plan differs from .github/skills/plan"
     fi
   else
-    tap_not_ok "$desc" ".claude/skills/plan is not a directory or symlink"
+    tap_not_ok "$desc" ".claude/skills/plan does not exist"
   fi
 }
 
