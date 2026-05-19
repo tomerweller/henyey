@@ -2644,3 +2644,92 @@ fn test_audit_238_fee_bump_outer_auth_same_source() {
     );
     assert_eq!(result.fee_charged, 0, "No fee charged on pre-seq failure");
 }
+
+// ============================================================================
+// #2805 — XDR depth limit check at executor level
+// Mirrors: stellar-core TransactionFrame.cpp:1973 — over-depth envelope → txMALFORMED
+// ============================================================================
+
+#[test]
+fn test_execute_transaction_rejects_over_depth_envelope() {
+    // Build a deeply nested ScVal to exceed XDR depth limit of 500
+    let mut val = ScVal::U32(42);
+    for _ in 0..501 {
+        val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+            vec![val].try_into().unwrap(),
+        )));
+    }
+
+    let secret = SecretKey::from_seed(&[7u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+    let source = MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes()));
+
+    let (key, entry) = create_account_entry(account_id.clone(), 0, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+                function_name: ScSymbol(StringM::<32>::try_from("deep".to_string()).unwrap()),
+                args: vec![val].try_into().unwrap(),
+            }),
+            auth: VecM::default(),
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: source,
+        fee: 10_000,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V1(SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::default(),
+                    read_write: VecM::default(),
+                },
+                instructions: 100,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 5000,
+        }),
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    // Sign the envelope
+    let sig = sign_envelope(&envelope, &secret, &NetworkId::testnet());
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(1, 1000, 100, 5_000_000, 25, NetworkId::testnet());
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+    assert!(!result.success);
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxMalformed),
+        "over-depth envelope must be rejected as TxMalformed"
+    );
+}
