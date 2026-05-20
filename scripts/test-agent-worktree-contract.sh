@@ -46,10 +46,12 @@ test_review_pr_workspace_contract_resolves_under_home_data() {
   if grep -q 'HOME/data/\$SESSION_ID/review-pr' "$REVIEW_PR_SKILL" ||
      grep -q 'HOME/data/\${SESSION_ID}/review-pr' "$REVIEW_PR_SKILL" ||
      grep -q '\~/data/\$SESSION_ID/review-pr' "$REVIEW_PR_SKILL" ||
-     grep -q '\$HOME/data/.*review-pr' "$REVIEW_PR_SKILL"; then
+     grep -q '\$HOME/data/.*review-pr' "$REVIEW_PR_SKILL" ||
+     grep -q 'HOME/data/\$SESSION_ID/pr-.*-review' "$REVIEW_PR_SKILL" ||
+     grep -q '\$HOME/data/.*pr-.*-review' "$REVIEW_PR_SKILL"; then
     tap_ok "$desc"
   else
-    tap_not_ok "$desc" "SKILL.md does not contain a ~/data/\$SESSION_ID/review-pr workspace derivation"
+    tap_not_ok "$desc" "SKILL.md does not contain a ~/data/\$SESSION_ID/pr-\$PR_NUM-review (or legacy review-pr) workspace derivation"
   fi
 }
 
@@ -233,6 +235,296 @@ test_claude_plan_synced() {
 }
 
 # --------------------------------------------------------------------------
+# Test: review-pr exit paths cleanup reviewer workspace base
+# --------------------------------------------------------------------------
+test_review_pr_exit_paths_cleanup_workspace_base() {
+  local desc="review-pr exit paths cleanup reviewer workspace base"
+
+  # Every terminal Step 7 path (merge, wait, bounce, block) must clean up the
+  # reviewer workspace base (WORKTREE_BASE or equivalent). We scope the search
+  # to the Step 7 section (starts at "## Step 7") to avoid false positives from
+  # the workspace-contract prose earlier in the file.
+  local step7_content
+  step7_content=$(sed -n '/^## Step 7/,$p' "$REVIEW_PR_SKILL")
+
+  local cleanup_pattern='rm -rf.*WORKTREE_BASE\|rm -rf.*review-pr-\$ISSUE\|cleanup_review_workspace\|rm -rf.*pr-\$PR_NUM-review\|rm -rf.*\$REVIEW_WORKSPACE'
+
+  if echo "$step7_content" | grep -q "$cleanup_pattern"; then
+    # Count cleanup references within Step 7 only. We need at least 4
+    # (one per terminal path: merge, wait, bounce, block).
+    local cleanup_count
+    cleanup_count=$(echo "$step7_content" | grep -c "$cleanup_pattern" || true)
+    if [ "$cleanup_count" -ge 4 ]; then
+      tap_ok "$desc"
+    else
+      tap_not_ok "$desc" "Cleanup found $cleanup_count times in Step 7; need at least 4 (merge + wait + bounce + block)"
+    fi
+  else
+    tap_not_ok "$desc" "No review workspace cleanup (rm -rf \$WORKTREE_BASE or equivalent) found in Step 7 exit paths"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: review-pr explicitly forbids /tmp/pr* and .pr-* worktree patterns
+# --------------------------------------------------------------------------
+test_review_pr_forbids_tmp_and_repo_root_patterns() {
+  local desc="review-pr forbids /tmp/pr* and .pr-* worktree patterns"
+
+  local has_tmp_ban=false
+  local has_dotpr_ban=false
+
+  # Check for explicit prohibition of /tmp/pr patterns
+  if grep -qi '/tmp/pr\|/tmp.*prohibited\|never.*\/tmp\|must not.*\/tmp\|do not.*\/tmp' "$REVIEW_PR_SKILL"; then
+    has_tmp_ban=true
+  fi
+
+  # Check for explicit prohibition of .pr-* patterns at repo root
+  if grep -qi '\.pr-\|repo.*root.*\.pr\|never.*\.pr-\|must not.*\.pr-\|do not.*\.pr-' "$REVIEW_PR_SKILL"; then
+    has_dotpr_ban=true
+  fi
+
+  if $has_tmp_ban && $has_dotpr_ban; then
+    tap_ok "$desc"
+  else
+    local missing=""
+    $has_tmp_ban || missing="/tmp/pr* ban"
+    $has_dotpr_ban || missing="${missing:+$missing, }.pr-* ban"
+    tap_not_ok "$desc" "Missing explicit prohibition of: $missing"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: review-pr defines reviewer-specific scratch dirs under workspace base
+# --------------------------------------------------------------------------
+test_review_pr_reviewer_scratch_dirs() {
+  local desc="review-pr defines reviewer-specific scratch dirs under workspace base"
+
+  # The skill must define per-reviewer scratch directories (reviewer-a, reviewer-b)
+  # under the workspace base for isolation between parallel reviewers.
+  if grep -q 'reviewer-a\|reviewer_a\|REVIEWER_A' "$REVIEW_PR_SKILL" &&
+     grep -q 'reviewer-b\|reviewer_b\|REVIEWER_B' "$REVIEW_PR_SKILL"; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Missing reviewer-a / reviewer-b scratch dir definitions in review-pr SKILL.md"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: review-pr validates WORKTREE_BASE before rm -rf (safety check)
+# --------------------------------------------------------------------------
+test_review_pr_validate_worktree_base_safety() {
+  local desc="review-pr validates WORKTREE_BASE before rm -rf (safety check)"
+
+  # The skill must define a validate_worktree_base helper that rejects broad
+  # paths (/, $HOME, $HOME/data) and only accepts the expected pr-*-review pattern.
+  # Every rm -rf of WORKTREE_BASE must be guarded by this validation.
+  local has_validator=false
+  local all_guarded=true
+
+  if grep -q 'validate_worktree_base' "$REVIEW_PR_SKILL"; then
+    has_validator=true
+  fi
+
+  # Check that every rm -rf $WORKTREE_BASE in Step 7 is within a block guarded
+  # by validate_worktree_base (the validation is on the if-line, not the rm line).
+  # We check that there are no rm -rf $WORKTREE_BASE lines that aren't preceded
+  # (within 2 lines above) by validate_worktree_base.
+  local step7_content
+  step7_content=$(sed -n '/^## Step 7/,$p' "$REVIEW_PR_SKILL")
+  local unguarded_count=0
+  local line_num=0
+  local prev1="" prev2=""
+  while IFS= read -r line; do
+    line_num=$((line_num + 1))
+    if echo "$line" | grep -q 'rm -rf.*WORKTREE_BASE'; then
+      # Skip prose mentions (lines containing backticks around the command)
+      if echo "$line" | grep -q '`rm -rf'; then
+        prev2="$prev1"; prev1="$line"
+        continue
+      fi
+      # Check if validate_worktree_base appears in previous 2 lines
+      if ! echo "$prev1$prev2" | grep -q 'validate_worktree_base'; then
+        unguarded_count=$((unguarded_count + 1))
+      fi
+    fi
+    prev2="$prev1"
+    prev1="$line"
+  done <<< "$step7_content"
+
+  if [ "$unguarded_count" -gt 0 ]; then
+    all_guarded=false
+  fi
+
+  if $has_validator && $all_guarded; then
+    tap_ok "$desc"
+  else
+    local reason=""
+    $has_validator || reason="no validate_worktree_base helper defined"
+    $all_guarded || reason="${reason:+$reason; }some rm -rf \$WORKTREE_BASE calls not guarded by validate_worktree_base"
+    tap_not_ok "$desc" "$reason"
+  fi
+}
+
+test_review_pr_validate_worktree_base_rejects_traversal() {
+  local desc="review-pr validate_worktree_base rejects '..' path traversal"
+
+  # The validator must reject paths containing '..' components even when the
+  # directory does not exist yet (cannot rely on cd-based canonicalization).
+  # Check that the function body explicitly rejects '..' before resolution.
+  local func_body
+  func_body=$(sed -n '/^validate_worktree_base()/,/^}/p' "$REVIEW_PR_SKILL")
+
+  if echo "$func_body" | grep -qE '\.\.' ; then
+    # Verify the rejection is an actual guard (contains return 1 or exit)
+    if echo "$func_body" | grep -B2 -A2 '\.\.' | grep -qE 'return 1|exit 1'; then
+      tap_ok "$desc"
+    else
+      tap_not_ok "$desc" "'..' mentioned but no rejection (return 1/exit) found near it"
+    fi
+  else
+    tap_not_ok "$desc" "validate_worktree_base does not check for '..' traversal"
+  fi
+}
+
+test_review_pr_validate_worktree_base_at_bootstrap() {
+  local desc="review-pr validates WORKTREE_BASE at bootstrap before mkdir/export"
+
+  # The skill must call validate_worktree_base BEFORE exporting CARGO_TARGET_DIR
+  # and BEFORE creating reviewer directories. This prevents an overridden
+  # WORKTREE_BASE from placing artifacts outside ~/data.
+  # We check that in the Step 3.5 bootstrap block, validate_worktree_base appears
+  # AFTER WORKTREE_BASE assignment but BEFORE CARGO_TARGET_DIR and mkdir.
+  local bootstrap_content
+  bootstrap_content=$(sed -n '/^## Step 3\.5/,/^## Step [4-9]/p' "$REVIEW_PR_SKILL")
+
+  local worktree_line=0
+  local validate_line=0
+  local cargo_line=0
+  local mkdir_line=0
+  local line_num=0
+
+  while IFS= read -r line; do
+    line_num=$((line_num + 1))
+    if echo "$line" | grep -q 'WORKTREE_BASE=.*\$HOME/data'; then
+      [ "$worktree_line" -eq 0 ] && worktree_line=$line_num
+    fi
+    if echo "$line" | grep -q 'validate_worktree_base.*WORKTREE_BASE\|validate_worktree_base "\$WORKTREE_BASE"'; then
+      [ "$validate_line" -eq 0 ] && validate_line=$line_num
+    fi
+    if echo "$line" | grep -q 'CARGO_TARGET_DIR=.*WORKTREE_BASE'; then
+      [ "$cargo_line" -eq 0 ] && cargo_line=$line_num
+    fi
+    if echo "$line" | grep -q 'mkdir.*WORKTREE_BASE'; then
+      [ "$mkdir_line" -eq 0 ] && mkdir_line=$line_num
+    fi
+  done <<< "$bootstrap_content"
+
+  if [ "$validate_line" -gt 0 ] &&
+     [ "$worktree_line" -gt 0 ] &&
+     [ "$validate_line" -gt "$worktree_line" ] &&
+     { [ "$cargo_line" -eq 0 ] || [ "$validate_line" -lt "$cargo_line" ]; } &&
+     { [ "$mkdir_line" -eq 0 ] || [ "$validate_line" -lt "$mkdir_line" ]; }; then
+    tap_ok "$desc"
+  else
+    local reason="validate_worktree_base not called at bootstrap before CARGO_TARGET_DIR/mkdir"
+    [ "$validate_line" -eq 0 ] && reason="validate_worktree_base not called in Step 3.5 bootstrap"
+    tap_not_ok "$desc" "$reason"
+  fi
+}
+
+test_review_pr_session_id_fallback_collision_resistant() {
+  local desc="review-pr SESSION_ID fallback is collision-resistant (includes PID + random)"
+
+  # The fallback SESSION_ID (when CLAUDE_SESSION_ID is unset) must include
+  # per-invocation entropy beyond second-granularity timestamps, so two
+  # concurrent /review-pr runs for the same PR cannot derive the same path.
+  # We check for PID ($$) AND a randomness source (urandom/RANDOM/uuidgen).
+  local bootstrap_line
+  bootstrap_line=$(grep 'CLAUDE_SESSION_ID:-' "$REVIEW_PR_SKILL" | head -1)
+
+  local has_pid=false
+  if echo "$bootstrap_line" | grep -qE '\$\$|\\$\\$'; then
+    has_pid=true
+  fi
+
+  local has_random=false
+  if echo "$bootstrap_line" | grep -qE 'urandom|RANDOM|uuidgen|uuid'; then
+    has_random=true
+  fi
+
+  if $has_pid && $has_random; then
+    tap_ok "$desc"
+  else
+    local reason=""
+    $has_pid || reason="SESSION_ID fallback does not include PID ($$)"
+    $has_random || reason="${reason:+$reason; }SESSION_ID fallback does not include randomness source"
+    tap_not_ok "$desc" "$reason"
+  fi
+}
+
+test_review_pr_validate_worktree_base_rejects_wrong_pr() {
+  local desc="review-pr validate_worktree_base rejects wrong PR number"
+
+  # The validator must accept a second argument (PR number) and, when provided,
+  # reject paths that belong to a different PR. This prevents concurrent reviews
+  # from accidentally sharing or deleting another PR's workspace.
+  local func_body
+  func_body=$(sed -n '/^validate_worktree_base()/,/^}/p' "$REVIEW_PR_SKILL")
+
+  # Check that the function accepts a second parameter for PR number
+  local has_pr_param=false
+  if echo "$func_body" | grep -qE 'expected_pr|pr_num|PR_NUM|\$2|\{2'; then
+    has_pr_param=true
+  fi
+
+  # Check that when PR number is provided, validation is PR-specific
+  # (rejects pr-*-review generically and requires the exact PR number)
+  local has_pr_specific_check=false
+  if echo "$func_body" | grep -qE 'pr-.*expected_pr.*-review|pr-"\$expected_pr"-review|pr-\$\{?expected_pr'; then
+    has_pr_specific_check=true
+  fi
+
+  # The bootstrap call must pass $PR_NUM to validate_worktree_base
+  local bootstrap_passes_pr=false
+  if grep -q 'validate_worktree_base "\$WORKTREE_BASE" "\$PR_NUM"' "$REVIEW_PR_SKILL"; then
+    bootstrap_passes_pr=true
+  fi
+
+  if $has_pr_param && $has_pr_specific_check && $bootstrap_passes_pr; then
+    tap_ok "$desc"
+  else
+    local reason=""
+    $has_pr_param || reason="validate_worktree_base does not accept a PR number parameter"
+    $has_pr_specific_check || reason="${reason:+$reason; }no PR-specific path check found"
+    $bootstrap_passes_pr || reason="${reason:+$reason; }bootstrap call does not pass \$PR_NUM to validator"
+    tap_not_ok "$desc" "$reason"
+  fi
+}
+
+test_review_pr_validate_worktree_base_accepts_legacy_issue_override() {
+  local desc="review-pr validate_worktree_base accepts legacy review-pr-\$ISSUE when ISSUE != PR_NUM"
+
+  # When a PR closes a different-numbered issue (e.g. PR #2846 closes #2843),
+  # legacy wrappers may set WORKTREE_BASE=$HOME/data/$SESSION_ID/review-pr-2843.
+  # The validator must accept this even when called with PR_NUM=2846.
+  local func_body
+  func_body=$(sed -n '/^validate_worktree_base()/,/^}/p' "$REVIEW_PR_SKILL")
+
+  # Check that the function has a pattern accepting review-pr-<any-number> or
+  # review-pr-[0-9]* in the expected_pr branch (not just review-pr-$expected_pr).
+  local has_legacy_accept=false
+  if echo "$func_body" | grep -qE 'review-pr-\[0-9\]\*|review-pr-\*|review-pr-[^"$]*legacy'; then
+    has_legacy_accept=true
+  fi
+
+  if $has_legacy_accept; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "validate_worktree_base does not accept legacy review-pr-\$ISSUE overrides when ISSUE != PR_NUM"
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -244,6 +536,15 @@ test_review_pr_self_seeding
 test_plan_self_seeding
 test_review_pr_cargo_target_under_data
 test_plan_cargo_target_under_data
+test_review_pr_exit_paths_cleanup_workspace_base
+test_review_pr_forbids_tmp_and_repo_root_patterns
+test_review_pr_reviewer_scratch_dirs
+test_review_pr_validate_worktree_base_safety
+test_review_pr_validate_worktree_base_rejects_traversal
+test_review_pr_validate_worktree_base_at_bootstrap
+test_review_pr_validate_worktree_base_rejects_wrong_pr
+test_review_pr_validate_worktree_base_accepts_legacy_issue_override
+test_review_pr_session_id_fallback_collision_resistant
 test_claude_review_pr_synced
 test_claude_plan_synced
 

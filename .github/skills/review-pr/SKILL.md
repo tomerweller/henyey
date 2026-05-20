@@ -148,6 +148,90 @@ If any path matches one of these prefixes, the PR is **parity-critical** — Rev
 
 Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
+## Step 3.5 — Bootstrap reviewer workspace
+
+Before spawning reviewers, set up a shared workspace rooted under `~/data` so all reviewer scratch state stays off root FS:
+
+```bash
+SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)-$$-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/pr-$PR_NUM-review}"
+
+# Safety: validate WORKTREE_BASE is under $HOME/data/ and matches expected layout.
+# Reject overly broad paths that could cause catastrophic deletion on cleanup.
+# Called at bootstrap (before mkdir/export) AND before every rm -rf on exit paths.
+# Usage: validate_worktree_base <path> [<pr_number>]
+# When <pr_number> is supplied, the path must match that specific PR (not any PR).
+validate_worktree_base() {
+  local base="$1"
+  local expected_pr="${2:-}"
+
+  # Reject path traversal components before any resolution — prevents escaping
+  # ~/data/ even when the target directory does not yet exist.
+  case "$base" in
+    */..*|*/../*|../*|..) echo "FATAL: WORKTREE_BASE='$base' contains '..' traversal; refusing" >&2; return 1 ;;
+  esac
+
+  # Canonicalize: use realpath --canonicalize-missing if available (resolves
+  # symlinks/.. without requiring the path to exist), otherwise fall back to
+  # cd-based resolution for existing paths or the already-sanitized raw string.
+  local resolved
+  if command -v realpath >/dev/null 2>&1; then
+    resolved="$(realpath --canonicalize-missing "$base")"
+  else
+    resolved="$(cd "$base" 2>/dev/null && pwd || echo "$base")"
+  fi
+
+  if [ -z "$resolved" ] ||
+     [ "$resolved" = "/" ] ||
+     [ "$resolved" = "$HOME" ] ||
+     [ "$resolved" = "$HOME/data" ] ||
+     [ "$resolved" = "$HOME/data/" ]; then
+    echo "FATAL: WORKTREE_BASE='$resolved' is too broad; refusing rm -rf" >&2
+    return 1
+  fi
+
+  # When a specific PR number is provided, only accept paths for that PR.
+  # This prevents a stale/leaked WORKTREE_BASE from one PR accidentally
+  # targeting another PR's workspace during concurrent reviews.
+  # Legacy exception: review-pr-$ISSUE overrides (where ISSUE != PR_NUM) are
+  # accepted because linked-issue PRs commonly have different numbers.
+  if [ -n "$expected_pr" ]; then
+    case "$resolved" in
+      "$HOME/data/"*/pr-"$expected_pr"-review) return 0 ;;
+      "$HOME/data/"*/review-pr-"$expected_pr") return 0 ;;
+      "$HOME/data/"*/review-pr-[0-9]*) return 0 ;;  # legacy issue-based override
+      *) echo "FATAL: WORKTREE_BASE='$resolved' does not match current PR $expected_pr; expected \$HOME/data/<session>/pr-${expected_pr}-review or \$HOME/data/<session>/review-pr-<issue>" >&2; return 1 ;;
+    esac
+  fi
+
+  case "$resolved" in
+    "$HOME/data/"*/pr-*-review) return 0 ;;
+    "$HOME/data/"*/review-pr-*) return 0 ;;
+    *) echo "FATAL: WORKTREE_BASE='$resolved' does not match expected pattern \$HOME/data/<session>/pr-<N>-review" >&2; return 1 ;;
+  esac
+}
+
+# Validate WORKTREE_BASE immediately — fail early if an override points outside ~/data.
+# Pass $PR_NUM so the validator rejects paths belonging to a different PR.
+validate_worktree_base "$WORKTREE_BASE" "$PR_NUM" || exit 1
+
+export CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"
+mkdir -p "$WORKTREE_BASE/reviewer-a" "$WORKTREE_BASE/reviewer-b"
+```
+
+Each reviewer gets its own scratch directory:
+
+- **Reviewer A** scratch: `$WORKTREE_BASE/reviewer-a/`
+- **Reviewer B** scratch: `$WORKTREE_BASE/reviewer-b/`
+
+**Prohibited patterns — reviewers must NEVER use:**
+
+- `/tmp/pr*` — lands on root FS, causes near-OOM on small root partitions.
+- `$REPO_ROOT/.pr-*` — pollutes the shared checkout and is not cleaned up.
+- Any path outside `$HOME/data/` for worktrees or build artifacts.
+
+Pass `WORKTREE_BASE`, `CARGO_TARGET_DIR`, and the reviewer-specific scratch dir to each reviewer sub-agent prompt so they know exactly where to place any checkout or build output.
+
 ## Step 4 — Spawn 2 reviewers in parallel
 
 Launch both as `general-purpose` foreground sub-agents. Do not wait between them. **Each reviewer must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity catches issues a same-model pipeline would miss.
@@ -180,6 +264,12 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 
 > Invoke /review on PR #$PR_NUM in stellar-experimental/henyey. Focus on:
 > correctness of the diff, test coverage, readability, error handling.
+>
+> **Workspace:** Your scratch directory is `$WORKTREE_BASE/reviewer-a/`. If you
+> need to check out code or build, use ONLY that directory. Set
+> `CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"`. **Never** create worktrees
+> under `/tmp/pr*`, `$REPO_ROOT/.pr-*`, or anywhere outside `$HOME/data/`.
+> Clean up any scratch worktrees you create before exiting.
 >
 > **Test verification (REQUEST_CHANGES if any of these fails):**
 >
@@ -221,6 +311,12 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 
 **If parity-critical:**
 
+> **Workspace:** Your scratch directory is `$WORKTREE_BASE/reviewer-b/`. If you
+> need to check out code or build, use ONLY that directory. Set
+> `CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"`. **Never** create worktrees
+> under `/tmp/pr*`, `$REPO_ROOT/.pr-*`, or anywhere outside `$HOME/data/`.
+> Clean up any scratch worktrees you create before exiting.
+>
 > Invoke /spec-adhere style audit on PR #$PR_NUM in stellar-experimental/henyey.
 > Focus on: does the change match stellar-core's behavior on this path?
 > Consult the `stellar-core/` submodule for the matching C++ implementation.
@@ -231,6 +327,12 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 
 **If non-parity (risk lens):**
 
+> **Workspace:** Your scratch directory is `$WORKTREE_BASE/reviewer-b/`. If you
+> need to check out code or build, use ONLY that directory. Set
+> `CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"`. **Never** create worktrees
+> under `/tmp/pr*`, `$REPO_ROOT/.pr-*`, or anywhere outside `$HOME/data/`.
+> Clean up any scratch worktrees you create before exiting.
+>
 > Review PR #$PR_NUM in stellar-experimental/henyey for risk: regressions in
 > existing behavior, performance impact, breaking changes to APIs or data
 > formats, security implications, operational concerns (config, migrations).
@@ -503,6 +605,13 @@ gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
+# Clean up the reviewer workspace (Step 3.5 artifacts).
+# This is the primary fix for #2843 — ensures reviewer scratch state never
+# lingers on disk after /review-pr completes.
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE" "$PR_NUM"; then
+  rm -rf "$WORKTREE_BASE"
+fi
+
 # Recover session ID from the sidecar /do persisted (see do/SKILL.md A.2).
 # Build cache lives at $HOME/data/<session-id>/do-$ISSUE/cargo-target/ — can be
 # 25-50 GB per issue. Clean it up here; otherwise nothing else will.
@@ -544,7 +653,16 @@ CI age: <CI_AGE_MIN> min / budget <CI_STUCK_AFTER_MINUTES> min.
 Bounce-back count: <N>/3.
 ```
 
-Unassign yourself so the next tick re-picks this issue. Exit.
+Unassign yourself so the next tick re-picks this issue.
+
+```bash
+# Clean up reviewer workspace before exiting (prevents stale artifacts on disk).
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE" "$PR_NUM"; then
+  rm -rf "$WORKTREE_BASE"
+fi
+```
+
+Exit.
 
 ### Bounce path
 
@@ -570,6 +688,11 @@ Routing back to `ready-for-doing` for `/do` Mode B.
 Move state and unassign:
 
 ```bash
+# Clean up reviewer workspace before exiting (prevents stale artifacts on disk).
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE" "$PR_NUM"; then
+  rm -rf "$WORKTREE_BASE"
+fi
+
 bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE ready-for-doing
 gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 ```
@@ -615,6 +738,11 @@ To retry after addressing root cause, post `## Review: Reset` with a one-line re
 Move state:
 
 ```bash
+# Clean up reviewer workspace before exiting (prevents stale artifacts on disk).
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE" "$PR_NUM"; then
+  rm -rf "$WORKTREE_BASE"
+fi
+
 bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE blocked
 gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 ```
@@ -644,20 +772,40 @@ Exit.
 ## Workspace contract
 
 The `/review-pr` skill must never create worktrees outside `$HOME/data`. All scratch
-state lives under `$HOME/data/$SESSION_ID/review-pr-$ISSUE/`:
+state lives under `$HOME/data/$SESSION_ID/pr-$PR_NUM-review/` (set via `WORKTREE_BASE`
+in Step 3.5):
 
 ```bash
-SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
-export CARGO_TARGET_DIR="$HOME/data/$SESSION_ID/review-pr-$ISSUE/cargo-target"
+SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)-$$-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/pr-$PR_NUM-review}"
+validate_worktree_base "$WORKTREE_BASE" "$PR_NUM" || exit 1   # fail early on bad override
+export CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"
 ```
+
+The `validate_worktree_base` call at bootstrap ensures that any environment override
+of `WORKTREE_BASE` is rejected before `CARGO_TARGET_DIR` is exported or directories
+are created — preventing artifacts from spilling outside `~/data`.
+
+Per-reviewer scratch directories:
+- `$WORKTREE_BASE/reviewer-a/` — Reviewer A's exclusive scratch space
+- `$WORKTREE_BASE/reviewer-b/` — Reviewer B's exclusive scratch space
 
 This ensures build artifacts are isolated per-session and automatically discoverable
 for cleanup. The skill itself is read-only (no code changes), so it rarely needs a
 build cache — but if a reviewer sub-agent builds to verify, the target dir must
 resolve under `$HOME/data`.
 
+**Prohibited patterns — never use these:**
+- `/tmp/pr*` — lands on root FS, causes near-OOM on small root partitions.
+- `$REPO_ROOT/.pr-*` — pollutes the shared checkout and is not cleaned up.
+- Any path outside `$HOME/data/` for worktrees or build artifacts.
+
 **Never create worktrees at the repo root or outside `$HOME/data`.** All worktrees
 must be under `$HOME/data/$SESSION_ID/` to avoid polluting the shared checkout.
+
+**Exit-path cleanup:** Every terminal path in Step 7 (merge, wait, bounce, block)
+must run `rm -rf "$WORKTREE_BASE"` before exiting to prevent stale reviewer
+artifacts from accumulating on disk.
 
 ## Branch protection
 
