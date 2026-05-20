@@ -153,7 +153,7 @@ Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 Before spawning reviewers, set up a shared workspace rooted under `~/data` so all reviewer scratch state stays off root FS:
 
 ```bash
-SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
+SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)-$$-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/pr-$PR_NUM-review}"
 
 # Safety: validate WORKTREE_BASE is under $HOME/data/ and matches expected layout.
@@ -773,7 +773,7 @@ state lives under `$HOME/data/$SESSION_ID/pr-$PR_NUM-review/` (set via `WORKTREE
 in Step 3.5):
 
 ```bash
-SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
+SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)-$$-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/pr-$PR_NUM-review}"
 validate_worktree_base "$WORKTREE_BASE" "$PR_NUM" || exit 1   # fail early on bad override
 export CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"

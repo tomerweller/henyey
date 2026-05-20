@@ -432,6 +432,36 @@ test_review_pr_validate_worktree_base_at_bootstrap() {
   fi
 }
 
+test_review_pr_session_id_fallback_collision_resistant() {
+  local desc="review-pr SESSION_ID fallback is collision-resistant (includes PID + random)"
+
+  # The fallback SESSION_ID (when CLAUDE_SESSION_ID is unset) must include
+  # per-invocation entropy beyond second-granularity timestamps, so two
+  # concurrent /review-pr runs for the same PR cannot derive the same path.
+  # We check for PID ($$) AND a randomness source (urandom/RANDOM/uuidgen).
+  local bootstrap_line
+  bootstrap_line=$(grep 'CLAUDE_SESSION_ID:-' "$REVIEW_PR_SKILL" | head -1)
+
+  local has_pid=false
+  if echo "$bootstrap_line" | grep -qE '\$\$|\\$\\$'; then
+    has_pid=true
+  fi
+
+  local has_random=false
+  if echo "$bootstrap_line" | grep -qE 'urandom|RANDOM|uuidgen|uuid'; then
+    has_random=true
+  fi
+
+  if $has_pid && $has_random; then
+    tap_ok "$desc"
+  else
+    local reason=""
+    $has_pid || reason="SESSION_ID fallback does not include PID ($$)"
+    $has_random || reason="${reason:+$reason; }SESSION_ID fallback does not include randomness source"
+    tap_not_ok "$desc" "$reason"
+  fi
+}
+
 test_review_pr_validate_worktree_base_rejects_wrong_pr() {
   local desc="review-pr validate_worktree_base rejects wrong PR number"
 
@@ -490,6 +520,7 @@ test_review_pr_validate_worktree_base_safety
 test_review_pr_validate_worktree_base_rejects_traversal
 test_review_pr_validate_worktree_base_at_bootstrap
 test_review_pr_validate_worktree_base_rejects_wrong_pr
+test_review_pr_session_id_fallback_collision_resistant
 test_claude_review_pr_synced
 test_claude_plan_synced
 
