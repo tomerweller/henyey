@@ -48,7 +48,13 @@ use stellar_xdr::curr::{
 use crate::fee_bump::{validate_fee_bump, FeeBumpError, FeeBumpFrame};
 use crate::frame::TransactionFrame;
 
-/// Maximum XDR recursion depth for envelope validation.
+/// Maximum XDR recursion depth (500 levels) for envelope validation.
+///
+/// stellar-core's `xdr::check_xdr_depth(envelope, 500)` rejects envelopes whose
+/// recursive XDR structure exceeds 500 nesting levels (returning `txMALFORMED`).
+/// This is a recursion-depth limit, not a byte-size limit — it prevents stack
+/// overflow from deeply nested XDR unions/sequences.
+///
 /// Parity: stellar-core TransactionFrame.cpp:1973 / FeeBumpTransactionFrame.cpp:278
 const XDR_DEPTH_LIMIT: u32 = 500;
 
