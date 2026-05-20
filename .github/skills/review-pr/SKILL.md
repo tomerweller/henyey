@@ -10,8 +10,9 @@ description: |
   --admin on all-green (after filing follow-up issues for unaddressed inline
   review comments, so non-critical feedback is preserved as backlog instead of
   dropped); bounces to `ready-for-doing` on any request-changes or CI red;
-  blocks after 3 bounce-back cycles. Use when invoked by /project-tick with an
-  issue in in-review, or manually as /review-pr <issue>.
+  blocks after 3 bounce-backs on the same code state OR 6 lifetime bounces
+  (since last `## Review: Reset`), whichever trips first. Use when invoked by
+  /project-tick with an issue in in-review, or manually as /review-pr <issue>.
 model: gpt-5.4
 ---
 
@@ -62,11 +63,14 @@ Capture:
 - **Current CI status:** `green` | `failing` | `running` | `not_started`.
 - **Existing reviews:** for bounce-back counting.
 
-## Step 2 — Count prior bounce-backs (head-scoped + Reset escape hatch)
+## Step 2 — Count prior bounce-backs (head-scoped + lifetime cap, both with Reset escape hatch)
 
-The bounce-back cap is **scoped to the current code**, not the issue's lifetime. Old bounces against earlier commits don't carry forward forever — they represent failed merge attempts on code that has since been rebased or replaced.
+Two caps run together:
 
-Compute the **baseline timestamp** for counting:
+1. **Head-scoped cap (3 bounces per code state):** old bounces against earlier commits don't carry forward — they represent failed merge attempts on code that has since been rebased or replaced. Fresh push naturally resets this counter.
+2. **Lifetime cap (6 bounces since last Reset):** catches the runaway pattern where `/do` keeps pushing fresh commits and the head-scoped counter resets every cycle, allowing indefinite churn. Only a `## Review: Reset` resets this counter.
+
+Compute the **head-scoped baseline timestamp**:
 
 ```bash
 # When was the current PR head commit pushed/committed? Fresh push = new baseline.
@@ -74,13 +78,11 @@ HEAD_PUSHED_ISO=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
   --json commits --jq '.commits | sort_by(.committedDate) | last | .committedDate')
 
 # Has the operator (or recovery script) posted a Reset marker?
-# This is the escape hatch for cases where the head didn't change but the
-# external cause did — e.g., main was broken, now it's green; same code,
-# fresh chance.
+# This is the escape hatch that resets BOTH caps when the cause has cleared.
 RESET_AT_ISO=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
   --jq '[.[] | select(.body | startswith("## Review: Reset"))] | sort_by(.created_at) | last.created_at // ""')
 
-# Convert both to epoch seconds for unambiguous numeric comparison
+# Convert to epoch seconds for unambiguous numeric comparison
 # (ISO strings can drift in format — fractional seconds, +00:00 vs Z, etc.).
 HEAD_PUSHED_EPOCH=$(date -u -d "$HEAD_PUSHED_ISO" +%s)
 if [ -n "$RESET_AT_ISO" ]; then
@@ -89,30 +91,38 @@ else
   RESET_AT_EPOCH=0
 fi
 
-# Baseline = max(HEAD_PUSHED, RESET_AT) as epoch seconds.
+# Head-scoped baseline = max(HEAD_PUSHED, RESET_AT). Lifetime baseline = RESET_AT only.
 if [ "$RESET_AT_EPOCH" -gt "$HEAD_PUSHED_EPOCH" ]; then
-  BASELINE_EPOCH=$RESET_AT_EPOCH
+  HEAD_BASELINE_EPOCH=$RESET_AT_EPOCH
 else
-  BASELINE_EPOCH=$HEAD_PUSHED_EPOCH
+  HEAD_BASELINE_EPOCH=$HEAD_PUSHED_EPOCH
 fi
+LIFETIME_BASELINE_EPOCH=$RESET_AT_EPOCH
 ```
 
-Then count bounce comments STRICTLY AFTER the baseline (jq's `fromdate` parses ISO-8601 into epoch seconds, so the comparison is numeric, not lexical):
+Then count bounce comments for each cap (jq's `fromdate` parses ISO-8601 into epoch seconds, so the comparison is numeric, not lexical):
 
 ```bash
-COUNT=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
-  --jq "[.[] | select(.body | startswith(\"## Review: Bounce-Back Cycle\")) |
-        select((.created_at | fromdate) > $BASELINE_EPOCH)] | length")
+ALL_BOUNCES_JSON=$(gh api repos/stellar-experimental/henyey/issues/$ISSUE/comments --paginate \
+  --jq "[.[] | select(.body | startswith(\"## Review: Bounce-Back Cycle\")) | .created_at]")
+
+HEAD_COUNT=$(echo "$ALL_BOUNCES_JSON" | jq --argjson base "$HEAD_BASELINE_EPOCH" \
+  '[.[] | select((. | fromdate) > $base)] | length')
+
+LIFETIME_COUNT=$(echo "$ALL_BOUNCES_JSON" | jq --argjson base "$LIFETIME_BASELINE_EPOCH" \
+  '[.[] | select((. | fromdate) > $base)] | length')
 ```
 
-If `COUNT >= 3`, this is the 4th cycle on the current code — the PR has genuinely cycled too many times against this exact state. Post `## Review: Cycle Cap Reached` summarizing the disagreement pattern, move the issue to `blocked`, unassign, and exit.
+**Cap checks (apply in order):**
 
-Otherwise (COUNT < 3) → proceed with the review.
+- If `LIFETIME_COUNT >= 6`, the PR has cycled too many times across multiple code states. Post `## Review: Lifetime Cycle Cap Reached` (see message template in the Block section below), move to `blocked`, unassign, and exit. This catches runaway loops where each fresh `/do` push resets the head-scoped counter but the underlying disagreement never converges.
+- Otherwise, if `HEAD_COUNT >= 3`, this is the 4th cycle on the current code. Post `## Review: Cycle Cap Reached`, move to `blocked`, unassign, and exit.
+- Otherwise (both under cap) → proceed with the review.
 
 **Recovery semantics:**
 
-- **Fresh `/do` Mode B push** → new commit `committedDate` advances the baseline → counter naturally resets to 0. Most recoveries (rebase after CI red, address review feedback) hit this path automatically.
-- **`## Review: Reset` comment** → manual escape hatch. Operator (or recovery script) posts this when the head hasn't changed but the external cause has (e.g., a broken-main outage that has since cleared). Everything before the Reset comment is excluded from the count. Post format:
+- **Fresh `/do` Mode B push** → new commit `committedDate` advances the head-scoped baseline → head counter resets to 0. Lifetime counter is **unaffected** — it keeps climbing across pushes until a Reset.
+- **`## Review: Reset` comment** → manual escape hatch that resets **both** counters. Operator (or recovery script) posts this when the underlying cause has cleared (broken main, flaky CI, reviewer disagreement resolved out-of-band). Everything before the Reset comment is excluded from both counts. Post format:
   ```markdown
   ## Review: Reset
 
@@ -568,19 +578,38 @@ Exit.
 
 ### Block path
 
-Post:
+Post one of these (whichever cap tripped):
 
 ```markdown
 ## Review: Cycle Cap Reached / CI Stuck
 
-**Bounce count:** 3
+**Bounce count (head-scoped):** 3
 **Status:** blocked
 
 **Pattern:** <summary of the disagreement: which reviewer kept failing, what
 they kept asking for, what /do kept doing. This is what humans need to break
 the tie.>
 
-This PR has cycled 3 times without converging. Human review required.
+This PR has cycled 3 times on the current code state without converging. Human review required.
+```
+
+```markdown
+## Review: Lifetime Cycle Cap Reached
+
+**Lifetime bounce count:** <LIFETIME_COUNT>
+**Status:** blocked
+
+**Pattern:** <summary across the lifetime of this PR: what concerns kept recurring
+across multiple /do pushes. This is the runaway-loop pattern — /do produces a
+fix, /review-pr finds different (or same) issues, /do tries again, indefinitely.
+This is what humans need to break the underlying disagreement.>
+
+This PR has cycled 6+ times across multiple code states without converging. The head-scoped cap kept resetting on each fresh push but the underlying issue never resolved. Human review required to either:
+- Approve manually (if reviewer concerns are over-strict),
+- Reframe the issue / plan (if /do is missing context),
+- Or close the PR and re-plan.
+
+To retry after addressing root cause, post `## Review: Reset` with a one-line reason.
 ```
 
 Move state:
