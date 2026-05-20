@@ -465,7 +465,6 @@ pub(super) fn compute_soroban_state_size_window_entry(
     }))
 }
 
-// Spec: BUCKETLISTDB_SPEC INV-B15 — bucketListHash = SHA256(live || hot_archive)
 fn combined_bucket_list_hash(
     live_bucket_list: &henyey_bucket::BucketList,
     hot_archive_bucket_list: &henyey_bucket::HotArchiveBucketList,
@@ -473,6 +472,7 @@ fn combined_bucket_list_hash(
 ) -> Hash256 {
     let live_hash = live_bucket_list.hash();
     if hot_archive_supported(protocol_version) {
+        // Spec: BUCKETLISTDB_SPEC INV-B15 — bucketListHash = SHA256(live || hot_archive)
         let hot_hash = hot_archive_bucket_list.hash();
         tracing::info!(
             live_hash = %live_hash,
