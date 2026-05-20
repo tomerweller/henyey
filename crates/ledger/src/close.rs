@@ -1093,10 +1093,11 @@ impl std::ops::AddAssign<&LedgerClosePerf> for LedgerClosePerf {
         self.fee_pre_deduct_us += rhs.fee_pre_deduct_us;
         self.post_exec_us += rhs.post_exec_us;
         self.tx_count += rhs.tx_count;
-        self.soroban_state_data_arc_count += rhs.soroban_state_data_arc_count;
-        self.soroban_state_code_arc_count += rhs.soroban_state_code_arc_count;
-        // soroban_stage_count and soroban_max_cluster_count are per-close
+        // soroban_state_*_arc_count, soroban_stage_count, and
+        // soroban_max_cluster_count are per-close instantaneous observations
         // (not cumulative), so take the latest rather than summing.
+        self.soroban_state_data_arc_count = rhs.soroban_state_data_arc_count;
+        self.soroban_state_code_arc_count = rhs.soroban_state_code_arc_count;
     }
 }
 
