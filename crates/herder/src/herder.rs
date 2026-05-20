@@ -2491,6 +2491,21 @@ impl Herder {
             let build_result = self.build_and_cache_nomination_tx_set();
             let build_value_ms = t0.elapsed().as_millis();
 
+            // Parity: stellar-core bans transactions trimmed during
+            // nomination-set construction immediately after build, before the
+            // stale recheck (HerderImpl.cpp:1543-1564). This ensures
+            // trimmed-invalid transactions are banned even when the trigger
+            // returns SkippedStale due to a concurrent LCL advance.
+            if let Some((_, ref trimmed_hashes)) = build_result {
+                if !trimmed_hashes.is_empty() {
+                    tracing::debug!(
+                        count = trimmed_hashes.len(),
+                        "Observer trigger: banning trimmed-invalid transactions"
+                    );
+                    self.tx_queue.ban(trimmed_hashes);
+                }
+            }
+
             self.process_ready_fetching_envelopes();
 
             // Parity: stellar-core re-reads LCL after build and returns when
@@ -2507,21 +2522,7 @@ impl Herder {
             }
 
             match build_result {
-                Some((hash, trimmed_hashes)) => {
-                    // Parity: stellar-core bans transactions trimmed during
-                    // nomination-set construction before the non-validator early
-                    // return (HerderImpl.cpp:1543-1564). Without this, an
-                    // observer keeps locally-invalid transactions queued, causing
-                    // them to block same-account/cross-type admission and get
-                    // reconsidered on later slots.
-                    if !trimmed_hashes.is_empty() {
-                        tracing::debug!(
-                            count = trimmed_hashes.len(),
-                            "Observer trigger: banning trimmed-invalid transactions"
-                        );
-                        self.tx_queue.ban(&trimmed_hashes);
-                    }
-
+                Some((hash, _trimmed_hashes)) => {
                     tracing::debug!(
                         slot,
                         build_value_ms,
@@ -14083,6 +14084,140 @@ mod issue_2819_spec_adherence_tests {
         );
 
         // The tx should have been removed from the queue by the ban.
+        assert_eq!(
+            herder.tx_queue().len(),
+            0,
+            "banned tx should be removed from queue"
+        );
+    }
+
+    /// Regression test for observer stale-race path: trimmed-invalid
+    /// transactions must be banned even when the trigger returns
+    /// `SkippedStale` due to LCL advancing during build.
+    ///
+    /// stellar-core bans trimmed txs immediately after `cacheValidTxSet`
+    /// (HerderImpl.cpp:1543-1564), before the stale recheck
+    /// (HerderImpl.cpp:1574-1585). This test verifies henyey mirrors that
+    /// ordering — a concurrent LCL advance that causes `SkippedStale` must
+    /// NOT skip the ban step.
+    #[test]
+    fn test_observer_trigger_bans_trimmed_even_on_stale_race() {
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+
+        let lm_config = henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), lm_config);
+        let header = LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(500),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header.clone(),
+            header_hash,
+        )
+        .expect("init");
+        lm.set_soroban_network_info_for_test(henyey_ledger::SorobanNetworkInfo::default());
+        let lm = Arc::new(lm);
+
+        let herder = Arc::new(Herder::new(config, lm.clone(), TimerManagerHandle::no_op()));
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        // Add a classic tx that will be trimmed during build (source account
+        // doesn't exist in the ledger).
+        let tx = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([42u8; 32])),
+                fee: 1000,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+                        destination: MuxedAccount::Ed25519(Uint256([99u8; 32])),
+                        asset: stellar_xdr::curr::Asset::Native,
+                        amount: 1000,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: stellar_xdr::curr::TransactionExt::V0,
+            },
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+        let tx_hash = Hash256::hash_xdr(&tx);
+        let add_result = herder.receive_transaction(tx);
+        assert_eq!(add_result, TxQueueResult::Added);
+        assert!(!herder.tx_queue().is_banned(&tx_hash));
+
+        // Spawn a thread that advances LCL after a brief delay, simulating a
+        // concurrent close_ledger that races with the observer build. If the
+        // thread wins the race, `lcl_matches_slot(1)` flips to false after
+        // build completes, causing the trigger to return SkippedStale.
+        let lm_clone = lm.clone();
+        let header_clone = header.clone();
+        let advancer = std::thread::spawn(move || {
+            // Small sleep to let build_and_cache_nomination_tx_set start.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let mut advanced_header = header_clone;
+            advanced_header.ledger_seq = 1;
+            let hash = henyey_ledger::compute_header_hash(&advanced_header).expect("hash");
+            lm_clone.set_header_for_test(advanced_header, hash);
+        });
+
+        let result = herder.trigger_next_ledger(1);
+        advancer.join().unwrap();
+
+        // Regardless of whether the race was hit (SkippedStale) or not
+        // (ObserverBuilt), the trimmed-invalid tx MUST be banned. Before
+        // this fix, a SkippedStale return would skip the ban.
+        match result {
+            Ok(TriggerOutcome::ObserverBuilt) | Ok(TriggerOutcome::SkippedStale) => {}
+            other => panic!("expected ObserverBuilt or SkippedStale, got {:?}", other),
+        }
+
+        assert!(
+            herder.tx_queue().is_banned(&tx_hash),
+            "trimmed tx must be banned even when trigger returns SkippedStale \
+             (parity: ban happens before stale recheck per HerderImpl.cpp:1543-1585)"
+        );
         assert_eq!(
             herder.tx_queue().len(),
             0,
