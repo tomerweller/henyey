@@ -1736,6 +1736,31 @@ impl TransactionQueue {
         Ok(())
     }
 
+    /// Check whether the given envelope's source account already has a pending
+    /// transaction of the opposite type (classic vs soroban).
+    ///
+    /// This is a thin top-level precheck for §12.2 ordering: a conflicting
+    /// cross-type tx should return `TryAgainLater` BEFORE any fee validation
+    /// can surface a different result. The authoritative cross-type rejection
+    /// remains inside `check_account_limit` as defense-in-depth.
+    ///
+    /// Parity: mirrors the narrow top-level gate in stellar-core
+    /// `HerderImpl::recvTransaction` (HerderImpl.cpp:627-642).
+    pub fn has_cross_type_conflict(&self, envelope: &TransactionEnvelope) -> bool {
+        let candidate_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(envelope);
+        let seq_source_key = account_key(envelope);
+
+        let account_states = self.account_states.read();
+        if let Some(state) = account_states.get(&seq_source_key) {
+            if let Some(ref current_tx) = state.transaction {
+                let current_is_soroban =
+                    henyey_tx::envelope_utils::is_soroban_envelope(&current_tx.envelope);
+                return current_is_soroban != candidate_is_soroban;
+            }
+        }
+        false
+    }
+
     /// Check per-account limit: one pending transaction per sequence-number source.
     ///
     /// Returns `Ok(None)` if no existing transaction, `Ok(Some(replaced))` if a

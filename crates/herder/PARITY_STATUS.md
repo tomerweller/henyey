@@ -66,7 +66,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `setTrackingSCPState()` | `advance_tracking_slot()` | Full |
 | `recvSCPQuorumSet()` | `store_quorum_set()` | Full |
 | `recvTxSet()` | `receive_tx_set()` | Full |
-| `recvTransaction()` | `receive_transaction()` | Full |
+| `recvTransaction()` | `receive_transaction()` | Full | Top-level cross-type source-account precheck added to mirror HerderImpl.cpp:627-642 ordering |
 | `peerDoesntHave()` | `fetching_envelopes.peer_doesnt_have()` | Full |
 | `getTxSet()` | `scp_driver.get_tx_set()` | Full |
 | `getQSet()` | `get_quorum_set_by_hash()` | Full |
@@ -105,7 +105,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `lostSync()` | `SyncRecoveryManager::record_lost_sync()` | Full |
 | `checkCloseTime()` | `check_envelope_close_time()` | Full |
 | `ctValidityOffset()` | _(not implemented)_ | None |
-| `setupTriggerNextLedger()` | _(not implemented)_ | None |
+| `setupTriggerNextLedger()` | _(split)_ | Partial | Timer arming + ctValidityOffset remain out of scope; preconditions (isApplying, isSynced) enforced in App::try_trigger_consensus; observer build/cache path implemented in trigger_next_ledger |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
 | `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, arb flood damping, and ban-on-damping; broadcast period uses `flood_tx_period_ms` (200 ms) matching stellar-core `FLOOD_TX_PERIOD_MS`; missing dedicated flood queue, mark-on-attempt, separate advert flush timer |

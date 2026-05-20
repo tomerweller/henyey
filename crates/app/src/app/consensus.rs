@@ -207,6 +207,10 @@ impl App {
                 Ok(Ok(henyey_herder::TriggerOutcome::AlreadyNominating)) => {
                     // Idempotent re-trigger; not a new success, not an error.
                 }
+                Ok(Ok(henyey_herder::TriggerOutcome::ObserverBuilt)) => {
+                    // Observer built/cached tx-set without nominating. Not a
+                    // failure — this is the expected path for non-validators.
+                }
                 Ok(Err(e)) => {
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);

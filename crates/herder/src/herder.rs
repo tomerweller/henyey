@@ -176,6 +176,10 @@ pub enum TriggerOutcome {
     /// LCL advanced during `build_nomination_value`; the value is for an
     /// already-closed slot and was not broadcast.
     SkippedStale,
+    /// Observer (non-validator) built and cached the tx-set without nominating.
+    /// Parity: stellar-core's `triggerNextLedger` builds/caches even for
+    /// non-validators before the `!getSCP().isValidator()` early-return.
+    ObserverBuilt,
 }
 
 /// Outcome of [`Herder::handle_nomination_timeout`].
@@ -1928,6 +1932,19 @@ impl Herder {
             .write()
             .record_envelope(slot, envelope.statement.node_id.clone());
 
+        // Parity: reject envelopes with non-SIGNED inner StellarValues before
+        // any prefetch or validated-fetch path. This mirrors the check in
+        // FetchingEnvelopes::recv_envelope for the non-prevalidated path and
+        // ensures the validated-fetch path (recv_envelope_validated) cannot
+        // bypass the same rule.
+        if !crate::herder_utils::check_all_values_signed(&envelope) {
+            debug!(
+                slot,
+                "Rejecting post-verified envelope with non-SIGNED StellarValue"
+            );
+            return (EnvelopeState::Invalid, PostVerifyReason::InvalidInnerValue);
+        }
+
         // Pre-fetch tx sets from EXTERNALIZE envelopes immediately so they're
         // available by the time SCP processes the envelope.
         let lcl = self.ledger_manager.current_ledger_seq() as u64;
@@ -2340,6 +2357,17 @@ impl Herder {
             return TxQueueResult::TryAgainLater;
         }
 
+        // Parity: §12.2 cross-type source-account precheck. If the account
+        // already has a pending tx of the opposite type (classic vs soroban),
+        // reject with TryAgainLater BEFORE queue-local fee validation can
+        // surface a different result (FeeTooLow). This restores the externally
+        // visible reception pipeline ordering from stellar-core's
+        // HerderImpl::recvTransaction (HerderImpl.cpp:627-642).
+        if self.tx_queue.has_cross_type_conflict(&tx) {
+            debug!("Transaction rejected: cross-type conflict with pending tx");
+            return TxQueueResult::TryAgainLater;
+        }
+
         // Add to transaction queue
         let result = self.tx_queue.try_add(tx);
 
@@ -2394,12 +2422,18 @@ impl Herder {
     /// This is called periodically by the consensus timer.
     /// Trigger SCP nomination for the next ledger.
     ///
+    /// For validators: builds the tx-set, caches it, and starts SCP nomination.
+    /// For observers: builds and caches the tx-set (for later fetch responses)
+    /// without entering SCP nomination.
+    ///
+    /// Parity: stellar-core's `triggerNextLedger` (HerderImpl.cpp:1424-1603)
+    /// builds/caches even for non-validators before the
+    /// `!getSCP().isValidator()` early-return.
+    ///
     /// This is entirely synchronous (parking_lot locks + CPU). It was
     /// previously declared `async` but had no `.await` points.
     pub fn trigger_next_ledger(&self, ledger_seq: u32) -> Result<TriggerOutcome> {
-        if !self.is_validator() {
-            return Err(HerderError::NotValidating);
-        }
+        let is_validator = self.is_validator();
 
         if !self.is_tracking() {
             return Err(HerderError::NotValidating);
@@ -2449,6 +2483,28 @@ impl Herder {
         self.scp_driver.record_slot_activity(slot);
 
         let t0 = std::time::Instant::now();
+
+        // Observer path: build/cache the tx-set without signing or nominating.
+        // Parity: stellar-core's triggerNextLedger builds+caches the tx-set and
+        // records the trigger event even for non-validators before the
+        // `!getSCP().isValidator()` early-return (HerderImpl.cpp:1493-1530).
+        if !is_validator {
+            // build_nomination_value will build+cache the tx-set (steps 1-3.5)
+            // then fail at make_stellar_value (no secret key). The tx-set cache
+            // is populated as a side-effect before the signing failure.
+            let _ = self.build_nomination_value();
+            let build_value_ms = t0.elapsed().as_millis();
+
+            self.process_ready_fetching_envelopes();
+
+            tracing::debug!(
+                slot,
+                build_value_ms,
+                "Observer trigger: built and cached tx-set without nominating"
+            );
+            return Ok(TriggerOutcome::ObserverBuilt);
+        }
+
         let value = self
             .build_nomination_value()
             .ok_or_else(|| HerderError::Internal("Failed to build nomination value".into()))?;
@@ -5069,7 +5125,12 @@ mod tests {
             tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
             close_time: TimePoint(close_time),
             upgrades: vec![].try_into().unwrap(),
-            ext: StellarValueExt::Basic,
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id: XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::curr::Uint256([0u8; 32]),
+                )),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }),
         };
         Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap())
     }
@@ -13110,5 +13171,315 @@ mod fetching_envelopes_routing_tests {
             !herder.scp.has_slot(100),
             "slot 100 should be purged from SCP (below purge boundary, not checkpoint)"
         );
+    }
+}
+
+// =============================================================================
+// Issue #2819 — HERDER spec adherence regression tests
+// =============================================================================
+
+#[cfg(test)]
+mod issue_2819_spec_adherence_tests {
+    use super::*;
+    use crate::scp_verify::PostVerifyReason;
+    use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+    use stellar_xdr::curr::Signature as XdrSignature;
+    use stellar_xdr::curr::{
+        DecoratedSignature, Hash, LedgerHeader, LedgerHeaderExt, Limits, Memo, MuxedAccount,
+        Operation, OperationBody, Preconditions, ScpBallot, ScpEnvelope, ScpStatement,
+        ScpStatementExternalize, ScpStatementPledges, SequenceNumber, SignatureHint, StellarValue,
+        StellarValueExt, TimePoint, Transaction, TransactionEnvelope, TransactionV1Envelope,
+        Uint256, Value, VecM, WriteXdr,
+    };
+
+    fn make_ledger_manager_at_seq(ledger_seq: u32) -> Arc<LedgerManager> {
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(500),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
+    fn make_observer_herder() -> Herder {
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+        Herder::new(
+            config,
+            make_ledger_manager_at_seq(0),
+            TimerManagerHandle::no_op(),
+        )
+    }
+
+    fn make_validator_herder_with_lm(ledger_seq: u32) -> (Herder, SecretKey) {
+        let seed = [7u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let node_id = node_id_from_public_key(&public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&seed),
+            make_ledger_manager_at_seq(ledger_seq),
+            TimerManagerHandle::no_op(),
+        );
+        (herder, SecretKey::from_seed(&seed))
+    }
+
+    fn make_classic_tx_envelope(source_seed: u8, fee: u32, seq: i64) -> TransactionEnvelope {
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([source_seed; 32])),
+                fee,
+                seq_num: SequenceNumber(seq),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Inflation,
+                }]
+                .try_into()
+                .unwrap(),
+                ext: stellar_xdr::curr::TransactionExt::V0,
+            },
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    fn make_soroban_tx_envelope(source_seed: u8, fee: u32, seq: i64) -> TransactionEnvelope {
+        use stellar_xdr::curr::{
+            HostFunction, InvokeContractArgs, InvokeHostFunctionOp, ScAddress, ScSymbol, ScVal,
+            StringM,
+        };
+        let function_name = ScSymbol(StringM::<32>::try_from("test".to_string()).expect("symbol"));
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: ScAddress::default(),
+            function_name,
+            args: VecM::<ScVal>::default(),
+        });
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([source_seed; 32])),
+                fee,
+                seq_num: SequenceNumber(seq),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                        host_function,
+                        auth: VecM::default(),
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: stellar_xdr::curr::TransactionExt::V0,
+            },
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    /// §5.1/§5.2: Observer (non-validator) trigger builds and caches the tx-set
+    /// without entering SCP nomination.
+    ///
+    /// Previously `trigger_next_ledger` returned `Err(HerderError::NotValidating)`
+    /// before any build/cache work for non-validators.
+    #[test]
+    fn test_trigger_next_ledger_observer_builds_and_caches_without_nominating() {
+        let herder = make_observer_herder();
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        // trigger_next_ledger should succeed with ObserverBuilt
+        let result = herder.trigger_next_ledger(1);
+        assert_eq!(
+            result.expect("observer trigger should not error"),
+            TriggerOutcome::ObserverBuilt,
+            "observer should get ObserverBuilt, not an error"
+        );
+
+        // Verify no SCP nomination state was created
+        let slot_state = herder.scp().get_slot_state(1);
+        assert!(
+            slot_state.map_or(true, |s| !s.is_nominating),
+            "observer must not enter SCP nomination"
+        );
+    }
+
+    /// §12.2: Cross-type source-account conflict preempts fee-gate at the
+    /// herder level.
+    ///
+    /// Seeds a pending soroban tx, then submits a classic tx for the same
+    /// source with a fee LOW ENOUGH to fail admission (below base_fee *
+    /// op_count). If the top-level cross-type precheck is absent, the fee
+    /// check would run first and return FeeTooLow instead of TryAgainLater.
+    #[test]
+    fn test_receive_transaction_cross_type_conflict_preempts_fee_gate() {
+        let (herder, _) = make_validator_herder_with_lm(0);
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        // Seed a soroban tx for source account [42; 32], seq 1, fee 200.
+        let soroban = make_soroban_tx_envelope(42, 200, 1);
+        let add_result = herder.receive_transaction(soroban);
+        assert_eq!(
+            add_result,
+            TxQueueResult::Added,
+            "soroban tx should be added to queue"
+        );
+
+        // Submit a classic tx for the SAME source account with fee=1 (below
+        // base_fee * 1 op = 100). Without the cross-type precheck, this would
+        // hit the fee gate first and return FeeTooLow.
+        let classic = make_classic_tx_envelope(42, 1, 2);
+        let result = herder.receive_transaction(classic);
+        assert_eq!(
+            result,
+            TxQueueResult::TryAgainLater,
+            "cross-type conflict must return TryAgainLater before fee check"
+        );
+    }
+
+    /// §15.1: `process_verified` rejects an otherwise-valid EXTERNALIZE whose
+    /// inner StellarValue uses `StellarValueExt::Basic` (unsigned) before any
+    /// tx-set request or validated-fetch side effect.
+    #[test]
+    fn test_process_verified_rejects_unsigned_externalize_before_prefetch() {
+        let seed = [7u8; 32];
+        let local_secret = SecretKey::from_seed(&seed);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_seed = [8u8; 32];
+        let other_secret = SecretKey::from_seed(&other_seed);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_ledger_manager_at_seq(0),
+            TimerManagerHandle::no_op(),
+        );
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        // Register the other node as in-quorum.
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set)
+            .unwrap();
+
+        // Build an EXTERNALIZE envelope with Basic (non-SIGNED) StellarValue.
+        let basic_value = StellarValue {
+            tx_set_hash: Hash([1u8; 32]),
+            close_time: TimePoint(600),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic, // <-- intentionally non-SIGNED
+        };
+        let value_bytes = basic_value.to_xdr(Limits::none()).unwrap();
+
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: other_node_id,
+                slot_index: 1,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot {
+                        counter: 1,
+                        value: Value(value_bytes.try_into().unwrap()),
+                    },
+                    n_h: 1,
+                    commit_quorum_set_hash: Hash([0u8; 32]),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        // Feed it through process_verified with a successful signature verdict.
+        let intake = crate::scp_verify::PipelinedIntake::from_local(envelope, 1, true);
+        let ve = crate::scp_verify::VerifiedEnvelope {
+            intake,
+            verdict: crate::scp_verify::Verdict::Ok,
+        };
+        let (state, reason) = herder.process_verified(ve);
+
+        assert_eq!(state, EnvelopeState::Invalid);
+        assert_eq!(reason, PostVerifyReason::InvalidInnerValue);
     }
 }
