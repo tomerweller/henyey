@@ -1859,38 +1859,31 @@ impl ScpDriver {
         let lcl_hash = lcl_snapshot.hash;
         let protocol_version = lcl_snapshot.header.ledger_version;
 
-        // Phase 1: Decode all candidates.
-        // Parity: stellar-core throws on decode failure in combineCandidates
-        // (HerderSCPDriver.cpp:682-688). We panic to match fail-loud behavior.
-        let decoded: Vec<(Value, StellarValue)> = values
-            .iter()
-            .map(|v| {
-                let sv = StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none())
-                    .expect("BUG: cannot parse candidate value in combineCandidates");
-                (v.clone(), sv)
-            })
-            .collect();
-
-        // Phase 2: Compute candidates_hash (XOR) and merge upgrades over ALL
-        // decoded candidates — before any tx-set lookup.
-        // Parity: stellar-core computes candidatesHash (line 690) and merges
-        // upgrades (lines 692-766) over the full candidate set unconditionally,
-        // before resolving tx sets.
+        // Phase 1: Per-candidate loop — decode, XOR hash, parse upgrades.
+        // Parity: stellar-core processes each candidate in a single ordered loop
+        // (HerderSCPDriver.cpp:675-766): parse candidate value → XOR hash →
+        // parse upgrades, then move to the next candidate. This ordering means
+        // that a malformed upgrade on candidate A fires before a malformed value
+        // on later candidate B. We replicate this exact per-candidate sequencing.
         let mut candidates_hash = [0u8; 32];
-        for (_, sv) in &decoded {
-            let val_bytes = henyey_common::xdr_stream::xdr_to_bytes(sv);
+        let mut merged_upgrades: std::collections::BTreeMap<u32, LedgerUpgrade> =
+            std::collections::BTreeMap::new();
+        let mut decoded: Vec<(Value, StellarValue)> = Vec::with_capacity(values.len());
+
+        for v in values {
+            // Step 1: Parse candidate value (stellar-core line 682-688).
+            let sv = StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none())
+                .expect("BUG: cannot parse candidate value in combineCandidates");
+
+            // Step 2: XOR hash (stellar-core line 690).
+            let val_bytes = henyey_common::xdr_stream::xdr_to_bytes(&sv);
             let hash = Hash256::hash(&val_bytes);
             for (i, byte) in candidates_hash.iter_mut().enumerate() {
                 *byte ^= hash.as_bytes()[i];
             }
-        }
 
-        let mut merged_upgrades: std::collections::BTreeMap<u32, LedgerUpgrade> =
-            std::collections::BTreeMap::new();
-        for (_, sv) in &decoded {
+            // Step 3: Parse and merge upgrades (stellar-core lines 692-766).
             for upgrade_bytes in sv.upgrades.iter() {
-                // Parity: stellar-core throws on upgrade parse failure in
-                // combineCandidates (HerderSCPDriver.cpp:694-704).
                 let upgrade = LedgerUpgrade::from_xdr(
                     upgrade_bytes.0.as_slice(),
                     stellar_xdr::curr::Limits::none(),
@@ -1906,9 +1899,11 @@ impl ScpDriver {
                     })
                     .or_insert(upgrade);
             }
+
+            decoded.push((v.clone(), sv));
         }
 
-        // Phase 3: Resolve tx sets and enforce prepare_for_apply on ALL candidates.
+        // Phase 2: Resolve tx sets and enforce prepare_for_apply on ALL candidates.
         // Parity: stellar-core releaseAssert(cTxSet) on missing tx sets
         // (HerderSCPDriver.cpp:780) and releaseAssert(cApplicableTxSet) at line 781.
         struct ResolvedCandidate {
@@ -1943,7 +1938,7 @@ impl ScpDriver {
             })
             .collect();
 
-        // Phase 4: Filter to selectable candidates (previousLedgerHash matches LCL).
+        // Phase 3: Filter to selectable candidates (previousLedgerHash matches LCL).
         // lcl_hash and protocol_version were captured at function entry to match
         // stellar-core's single-snapshot approach (HerderSCPDriver.cpp:669).
 
@@ -1958,7 +1953,7 @@ impl ScpDriver {
             );
         }
 
-        // Phase 5: Sort and select best candidate.
+        // Phase 4: Sort and select best candidate.
         // Parity: stellar-core iterates a ValueWrapperPtrSet (std::set ordered
         // by raw Value bytes via WrappedValuePtrComparator, SCPDriver.cpp:36-41).
         selectable_candidates.sort_by(|a, b| a.raw.cmp(&b.raw));
@@ -1981,7 +1976,7 @@ impl ScpDriver {
             }
         }
 
-        // Phase 6: Compose result from selected candidate + merged upgrades.
+        // Phase 5: Compose result from selected candidate + merged upgrades.
         let mut result = selectable_candidates[best_idx].sv.clone();
 
         // Parity: stellar-core uses xdr_to_opaque (throws on failure) at
@@ -7405,6 +7400,36 @@ mod tests {
 
         // Must panic on malformed upgrade, not on missing tx set
         let _ = driver.combine_candidates_impl(1, &[v_bad, v_valid]);
+    }
+
+    /// Regression test for #2817 review — mixed failure precedence.
+    /// Candidate A (earlier in iteration order) has valid StellarValue XDR but
+    /// a malformed upgrade payload. Candidate B (later) has malformed
+    /// StellarValue XDR entirely. stellar-core's per-candidate loop processes
+    /// A's upgrade parse before ever attempting to decode B, so A's upgrade
+    /// failure fires first. This test locks in that ordering.
+    #[test]
+    #[should_panic(expected = "cannot parse upgrade in validated candidate")]
+    fn test_combine_candidates_panics_malformed_upgrade_before_malformed_later_candidate() {
+        let driver = make_test_driver();
+
+        // Candidate A: valid StellarValue XDR with a malformed upgrade.
+        let sv_a = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([0x11; 32]),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: vec![UpgradeType(vec![0xFF, 0xFE, 0xFD].try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let v_a = encode_sv(&sv_a);
+
+        // Candidate B: completely invalid XDR (cannot parse as StellarValue).
+        let v_b = Value(vec![0x00, 0x01, 0x02, 0x03].try_into().unwrap());
+
+        // Per-candidate ordering: A is processed first (parse value OK → XOR
+        // hash → parse upgrade → PANIC). B's malformed value is never reached.
+        let _ = driver.combine_candidates_impl(1, &[v_a, v_b]);
     }
 }
 
