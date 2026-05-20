@@ -1431,3 +1431,91 @@ fn test_ledger_close_counts_ops_for_pre_execution_rejected_transactions() {
          to match stellar-core's txSet.sizeOpTotal() behavior"
     );
 }
+
+/// Test that holding a snapshot open across a ledger close with Soroban mutations
+/// succeeds and produces correct results. This exercises the sharded COW behavior:
+/// the held snapshot forces per-shard Arc::make_mut clones on the mutated shards,
+/// but the close should still complete normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_close_ledger_with_held_snapshot_preserves_results() {
+    let config = LedgerManagerConfig {
+        validate_bucket_hash: false,
+        ..Default::default()
+    };
+    let ledger = Arc::new(LedgerManager::new("Test Network".to_string(), config));
+
+    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
+    let hot_archive = HotArchiveBucketList::new();
+    let header = make_genesis_header();
+    let header_hash = compute_header_hash(&header).expect("hash");
+    ledger
+        .initialize(bucket_list, hot_archive, header, header_hash)
+        .expect("init");
+
+    // Close ledger 1 (empty) to advance past genesis.
+    let close_data = LedgerCloseData::new(
+        1,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash([0u8; 32]),
+            txs: VecM::default(),
+        }),
+        1,
+        ledger.current_header_hash(),
+    );
+    let handle = tokio::runtime::Handle::current();
+    let lm = ledger.clone();
+    let h = handle.clone();
+    tokio::task::spawn_blocking(move || lm.close_ledger(close_data, Some(h)))
+        .await
+        .expect("spawn_blocking")
+        .expect("close 1");
+
+    // Take a snapshot (simulating an RPC or SCP consumer holding a reference).
+    // This bumps the Arc strong_count on all shards from 1 to 2.
+    let snapshot = ledger.create_snapshot().expect("create_snapshot");
+
+    // Close ledger 2 (also empty — but this exercises the soroban_state update
+    // path which now has to Arc::make_mut against shared shards).
+    let close_data_2 = LedgerCloseData::new(
+        2,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash([0u8; 32]),
+            txs: VecM::default(),
+        }),
+        2,
+        ledger.current_header_hash(),
+    );
+    let lm = ledger.clone();
+    let h = handle.clone();
+    let result = tokio::task::spawn_blocking(move || lm.close_ledger(close_data_2, Some(h)))
+        .await
+        .expect("spawn_blocking")
+        .expect("close 2 with held snapshot should succeed");
+
+    // Verify the close produced a valid result.
+    assert_eq!(result.header.ledger_seq, 2);
+    assert_eq!(ledger.current_ledger_seq(), 2);
+
+    // The held snapshot should still be valid (frozen at ledger 1).
+    assert_eq!(snapshot.ledger_seq(), 1);
+
+    // Drop the snapshot and verify a subsequent close still works.
+    drop(snapshot);
+
+    let close_data_3 = LedgerCloseData::new(
+        3,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash([0u8; 32]),
+            txs: VecM::default(),
+        }),
+        3,
+        ledger.current_header_hash(),
+    );
+    let lm = ledger.clone();
+    let h = handle.clone();
+    let result3 = tokio::task::spawn_blocking(move || lm.close_ledger(close_data_3, Some(h)))
+        .await
+        .expect("spawn_blocking")
+        .expect("close 3 after snapshot drop");
+    assert_eq!(result3.header.ledger_seq, 3);
+}

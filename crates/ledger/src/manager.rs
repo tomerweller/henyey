@@ -5224,8 +5224,10 @@ impl LedgerCloseContext<'_> {
             // This happens AFTER computing state size window (see comment above).
             let soroban_state_start = std::time::Instant::now();
 
-            // Diagnostic: sample Arc strong_count BEFORE any make_mut call.
-            // A count >1 means make_mut will deep-clone the map.
+            // Diagnostic: sample max per-shard Arc strong_count BEFORE any mutation.
+            // A count >1 means at least one shard is shared with a snapshot and
+            // that shard's next mutation will trigger a per-shard clone (not the
+            // entire map — sharding bounds the COW blast radius).
             let (soroban_state_data_arc_count, soroban_state_code_arc_count) = {
                 let soroban_state_read = self.manager.soroban_state.read();
                 soroban_state_read.arc_strong_counts()

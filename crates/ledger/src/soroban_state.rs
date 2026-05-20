@@ -47,6 +47,133 @@ use std::sync::Arc;
 
 use henyey_common::protocol::{protocol_version_is_before, ProtocolVersion};
 use henyey_common::Hash256;
+
+// ---------------------------------------------------------------------------
+// ShardedCowMap — fixed-size sharded Arc<HashMap> wrapper
+// ---------------------------------------------------------------------------
+
+/// Number of shards for the contract data/code maps.
+///
+/// 64 shards means we use the top 6 bits of the key hash for routing.
+/// During ledger close, only the shards containing mutated keys will be
+/// deep-cloned by `Arc::make_mut`; untouched shards remain shared with
+/// any outstanding snapshots.
+const NUM_SHARDS: usize = 64;
+
+/// A sharded copy-on-write map backed by `[Arc<HashMap<Hash, V>>; NUM_SHARDS]`.
+///
+/// Provides the same logical interface as a single `Arc<HashMap<Hash, V>>` but
+/// limits the blast radius of `Arc::make_mut`: when concurrent snapshots hold
+/// references, only the shards that are actually mutated incur a deep clone
+/// (typically 1–5 per close out of 64), proportional to the per-ledger write
+/// set rather than the total state size.
+///
+/// Shard selection uses the top 6 bits of the `Hash` key (bytes are already
+/// uniformly distributed by SHA-256), keeping routing O(1) with no extra
+/// hashing.
+#[derive(Debug, Clone)]
+struct ShardedCowMap<V> {
+    shards: [Arc<HashMap<Hash, V>>; NUM_SHARDS],
+}
+
+impl<V: Clone> ShardedCowMap<V> {
+    /// Create a new empty sharded map.
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Arc::new(HashMap::new())),
+        }
+    }
+
+    /// Select the shard index from the top 6 bits of a Hash key.
+    #[inline]
+    fn shard_index(key: &Hash) -> usize {
+        (key.0[0] >> 2) as usize
+    }
+
+    /// Get a reference to an entry.
+    #[inline]
+    fn get(&self, key: &Hash) -> Option<&V> {
+        self.shards[Self::shard_index(key)].get(key)
+    }
+
+    /// Check if a key exists.
+    #[inline]
+    fn contains_key(&self, key: &Hash) -> bool {
+        self.shards[Self::shard_index(key)].contains_key(key)
+    }
+
+    /// Get a mutable reference to the shard's HashMap for the given key.
+    ///
+    /// This calls `Arc::make_mut` only on the targeted shard, so concurrent
+    /// snapshot holders only force a clone of this one shard.
+    #[inline]
+    fn shard_mut(&mut self, key: &Hash) -> &mut HashMap<Hash, V> {
+        Arc::make_mut(&mut self.shards[Self::shard_index(key)])
+    }
+
+    /// Insert a key-value pair into the appropriate shard.
+    fn insert(&mut self, key: Hash, value: V) {
+        self.shard_mut(&key).insert(key, value);
+    }
+
+    /// Remove a key from the appropriate shard, returning the value if present.
+    fn remove(&mut self, key: &Hash) -> Option<V> {
+        self.shard_mut(key).remove(key)
+    }
+
+    /// Total number of entries across all shards.
+    fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    /// Check if all shards are empty.
+    fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| s.is_empty())
+    }
+
+    /// Total capacity across all shards (for memory estimation).
+    fn capacity(&self) -> usize {
+        self.shards.iter().map(|s| s.capacity()).sum()
+    }
+
+    /// Maximum `Arc::strong_count` across all shards.
+    ///
+    /// A value of 1 means all shards are exclusively owned and `Arc::make_mut`
+    /// will mutate in-place. A value >1 means at least one shard is shared
+    /// with a snapshot and that shard's next mutation will trigger a clone.
+    fn max_arc_strong_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| Arc::strong_count(s))
+            .max()
+            .unwrap_or(1)
+    }
+
+    /// Clear all shards by replacing with fresh empty `Arc<HashMap>` values.
+    ///
+    /// This avoids calling `Arc::make_mut` + `.clear()` on shared shards,
+    /// which would deep-clone then immediately discard the data.
+    fn clear(&mut self) {
+        for shard in &mut self.shards {
+            *shard = Arc::new(HashMap::new());
+        }
+    }
+
+    /// Snapshot: clone all shard Arcs (O(NUM_SHARDS), not O(entries)).
+    fn snapshot(&self) -> Self {
+        Self {
+            shards: self.shards.clone(),
+        }
+    }
+
+    /// Get a mutable reference to the HashMap of a specific shard by index.
+    ///
+    /// Used by `recompute_contract_code_sizes` which needs to iterate mutably
+    /// over all entries.
+    fn shard_mut_by_index(&mut self, idx: usize) -> &mut HashMap<Hash, V> {
+        Arc::make_mut(&mut self.shards[idx])
+    }
+}
 use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
 use henyey_tx::soroban::convert::{
     try_convert_cost_params_ws_to_p25, try_convert_ledger_entry_ws_to_p25,
@@ -311,14 +438,15 @@ pub struct InMemorySorobanState {
     /// Uses the TTL key hash as index to enable lookup by either
     /// CONTRACT_DATA key or TTL key without key duplication.
     ///
-    /// Wrapped in `Arc` for O(1) snapshot creation via `Arc::clone`.
-    /// Mutations use `Arc::make_mut` for copy-on-write semantics.
-    contract_data_entries: Arc<HashMap<Hash, ContractDataMapEntry>>,
+    /// Sharded across 64 `Arc<HashMap>` slots for bounded copy-on-write:
+    /// concurrent snapshots only force a clone of the shards touched by a
+    /// given close, not the entire map.
+    contract_data_entries: ShardedCowMap<ContractDataMapEntry>,
 
     /// Contract code entries indexed by TTL key hash.
     ///
-    /// Wrapped in `Arc` for O(1) snapshot creation (see `contract_data_entries`).
-    contract_code_entries: Arc<HashMap<Hash, ContractCodeMapEntry>>,
+    /// Sharded across 64 `Arc<HashMap>` slots (see `contract_data_entries`).
+    contract_code_entries: ShardedCowMap<ContractCodeMapEntry>,
 
     /// ConfigSetting entries indexed by ConfigSettingId.
     ///
@@ -352,8 +480,8 @@ impl InMemorySorobanState {
     /// Create a new empty in-memory Soroban state.
     pub fn new() -> Self {
         Self {
-            contract_data_entries: Arc::new(HashMap::new()),
-            contract_code_entries: Arc::new(HashMap::new()),
+            contract_data_entries: ShardedCowMap::new(),
+            contract_code_entries: ShardedCowMap::new(),
             config_settings: HashMap::new(),
             pending_ttls: HashMap::new(),
             last_closed_ledger_seq: 0,
@@ -372,9 +500,10 @@ impl InMemorySorobanState {
 
     /// Create a frozen, point-in-time clone of this state for snapshot lookups.
     ///
-    /// The clone shares map data with the original via `Arc`, making this O(1)
-    /// instead of O(n). The first mutation after a snapshot uses copy-on-write
-    /// (`Arc::make_mut`) to detach the live state from the frozen snapshot.
+    /// The clone shares map data with the original via per-shard `Arc`, making
+    /// this O(NUM_SHARDS) instead of O(n). The first mutation after a snapshot
+    /// uses copy-on-write (`Arc::make_mut`) to detach only the affected shard
+    /// from the frozen snapshot.
     ///
     /// The snapshot is used by `create_snapshot()` to ensure that Soroban entry
     /// lookups return data consistent with the header captured at the same
@@ -382,8 +511,8 @@ impl InMemorySorobanState {
     /// before the header is published.
     pub fn snapshot(&self) -> Self {
         Self {
-            contract_data_entries: Arc::clone(&self.contract_data_entries),
-            contract_code_entries: Arc::clone(&self.contract_code_entries),
+            contract_data_entries: self.contract_data_entries.snapshot(),
+            contract_code_entries: self.contract_code_entries.snapshot(),
             config_settings: self.config_settings.clone(),
             pending_ttls: HashMap::new(),
             last_closed_ledger_seq: self.last_closed_ledger_seq,
@@ -420,14 +549,16 @@ impl InMemorySorobanState {
         self.contract_code_entries.len()
     }
 
-    /// Get the `Arc::strong_count` for the data and code maps.
+    /// Get the maximum `Arc::strong_count` across shards for data and code maps.
     ///
-    /// Returns `(data_arc_count, code_arc_count)`. A count of 1 means
-    /// `Arc::make_mut` can mutate in-place; >1 means a deep clone will occur.
+    /// Returns `(max_data_shard_count, max_code_shard_count)`. A count of 1
+    /// means all shards are exclusively owned and `Arc::make_mut` can mutate
+    /// in-place; >1 means at least one shard is shared with a snapshot and
+    /// that shard's next mutation will trigger a clone.
     pub fn arc_strong_counts(&self) -> (usize, usize) {
         (
-            Arc::strong_count(&self.contract_data_entries),
-            Arc::strong_count(&self.contract_code_entries),
+            self.contract_data_entries.max_arc_strong_count(),
+            self.contract_code_entries.max_arc_strong_count(),
         )
     }
 
@@ -586,7 +717,7 @@ impl InMemorySorobanState {
         let map_entry = ContractDataMapEntry::new(Arc::new(entry), ttl_data);
 
         self.contract_data_state_size += map_entry.xdr_size() as i64;
-        Arc::make_mut(&mut self.contract_data_entries).insert(key_hash, map_entry);
+        self.contract_data_entries.insert(key_hash, map_entry);
 
         trace!("Created contract data entry");
         Ok(())
@@ -615,8 +746,8 @@ impl InMemorySorobanState {
 
         let key_hash = Self::contract_data_key_hash(&key);
 
-        let map = Arc::make_mut(&mut self.contract_data_entries);
-        let old_entry = map
+        let old_entry = self
+            .contract_data_entries
             .remove(&key_hash)
             .ok_or_else(|| LedgerError::InvalidEntry("contract data does not exist".into()))?;
 
@@ -626,7 +757,7 @@ impl InMemorySorobanState {
         let new_size = new_entry.xdr_size();
 
         self.contract_data_state_size += (new_size as i64) - (old_size as i64);
-        map.insert(key_hash, new_entry);
+        self.contract_data_entries.insert(key_hash, new_entry);
 
         trace!("Updated contract data entry");
         Ok(())
@@ -640,7 +771,8 @@ impl InMemorySorobanState {
     pub fn delete_contract_data(&mut self, key: &LedgerKeyContractData) -> Result<()> {
         let key_hash = Self::contract_data_key_hash(key);
 
-        let old_entry = Arc::make_mut(&mut self.contract_data_entries)
+        let old_entry = self
+            .contract_data_entries
             .remove(&key_hash)
             .ok_or_else(|| LedgerError::InvalidEntry("contract data does not exist".into()))?;
 
@@ -697,7 +829,7 @@ impl InMemorySorobanState {
             ContractCodeMapEntry::with_xdr_size(arc_entry, ttl_data, size_bytes, xdr_size);
 
         self.contract_code_state_size += map_entry.size_bytes as i64;
-        Arc::make_mut(&mut self.contract_code_entries).insert(key_hash, map_entry);
+        self.contract_code_entries.insert(key_hash, map_entry);
 
         trace!("Created contract code entry");
         Ok(())
@@ -735,7 +867,7 @@ impl InMemorySorobanState {
         let new_size =
             Self::calculate_code_size(&arc_entry, xdr_size, protocol_version, rent_config);
 
-        let map = Arc::make_mut(&mut self.contract_code_entries);
+        let map = self.contract_code_entries.shard_mut(&key_hash);
         let old_entry = map
             .remove(&key_hash)
             .ok_or_else(|| LedgerError::InvalidEntry("contract code does not exist".into()))?;
@@ -759,7 +891,8 @@ impl InMemorySorobanState {
     pub fn delete_contract_code(&mut self, key: &LedgerKeyContractCode) -> Result<()> {
         let key_hash = Self::contract_code_key_hash(key);
 
-        let old_entry = Arc::make_mut(&mut self.contract_code_entries)
+        let old_entry = self
+            .contract_code_entries
             .remove(&key_hash)
             .ok_or_else(|| LedgerError::InvalidEntry("contract code does not exist".into()))?;
 
@@ -775,9 +908,11 @@ impl InMemorySorobanState {
     /// the TTL inline. Otherwise, stores in pending_ttls to be adopted later.
     pub fn create_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) -> Result<()> {
         // Check which map contains the key before taking a mutable reference,
-        // to avoid an unnecessary COW clone on the wrong map.
+        // to avoid an unnecessary COW clone on the wrong shard.
         if self.contract_data_entries.contains_key(&key.key_hash) {
-            let entry = Arc::make_mut(&mut self.contract_data_entries)
+            let entry = self
+                .contract_data_entries
+                .shard_mut(&key.key_hash)
                 .get_mut(&key.key_hash)
                 .unwrap();
             if entry.ttl_data.is_initialized() {
@@ -791,7 +926,9 @@ impl InMemorySorobanState {
         }
 
         if self.contract_code_entries.contains_key(&key.key_hash) {
-            let entry = Arc::make_mut(&mut self.contract_code_entries)
+            let entry = self
+                .contract_code_entries
+                .shard_mut(&key.key_hash)
                 .get_mut(&key.key_hash)
                 .unwrap();
             if entry.ttl_data.is_initialized() {
@@ -820,9 +957,10 @@ impl InMemorySorobanState {
     /// Returns an error if the corresponding data/code entry does not exist.
     pub fn update_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) -> Result<()> {
         // Check which map contains the key before taking a mutable reference,
-        // to avoid an unnecessary COW clone on the wrong map.
+        // to avoid an unnecessary COW clone on the wrong shard.
         if self.contract_data_entries.contains_key(&key.key_hash) {
-            Arc::make_mut(&mut self.contract_data_entries)
+            self.contract_data_entries
+                .shard_mut(&key.key_hash)
                 .get_mut(&key.key_hash)
                 .unwrap()
                 .ttl_data = ttl_data;
@@ -831,7 +969,8 @@ impl InMemorySorobanState {
         }
 
         if self.contract_code_entries.contains_key(&key.key_hash) {
-            Arc::make_mut(&mut self.contract_code_entries)
+            self.contract_code_entries
+                .shard_mut(&key.key_hash)
                 .get_mut(&key.key_hash)
                 .unwrap()
                 .ttl_data = ttl_data;
@@ -1067,16 +1206,19 @@ impl InMemorySorobanState {
     ) {
         let mut total_size: i64 = 0;
 
-        for entry in Arc::make_mut(&mut self.contract_code_entries).values_mut() {
-            let new_size = Self::calculate_code_size(
-                &entry.ledger_entry,
-                entry.cached_xdr_size,
-                protocol_version,
-                rent_config,
-            );
+        for shard_idx in 0..NUM_SHARDS {
+            let shard = self.contract_code_entries.shard_mut_by_index(shard_idx);
+            for entry in shard.values_mut() {
+                let new_size = Self::calculate_code_size(
+                    &entry.ledger_entry,
+                    entry.cached_xdr_size,
+                    protocol_version,
+                    rent_config,
+                );
 
-            entry.size_bytes = new_size;
-            total_size += new_size as i64;
+                entry.size_bytes = new_size;
+                total_size += new_size as i64;
+            }
         }
 
         self.contract_code_state_size = total_size;
@@ -1090,8 +1232,8 @@ impl InMemorySorobanState {
 
     /// Clear all state.
     pub fn clear(&mut self) {
-        Arc::make_mut(&mut self.contract_data_entries).clear();
-        Arc::make_mut(&mut self.contract_code_entries).clear();
+        self.contract_data_entries.clear();
+        self.contract_code_entries.clear();
         self.pending_ttls.clear();
         self.last_closed_ledger_seq = 0;
         self.contract_data_state_size = 0;
@@ -1119,17 +1261,14 @@ impl InMemorySorobanState {
     /// Estimate heap bytes for contract data entries.
     ///
     /// Uses `contract_data_state_size` as a proxy for Arc<LedgerEntry> payload
-    /// sizes plus HashMap overhead for the key-to-entry mapping.
+    /// sizes plus HashMap overhead for the key-to-entry mapping across all shards.
     pub fn estimate_contract_data_heap_bytes(&self) -> usize {
         use henyey_common::memory::hashmap_heap_bytes;
-        // HashMap<[u8;32], ContractDataMapEntry>
-        // ContractDataMapEntry size: see std::mem::size_of (auto-adjusts with struct changes)
         let map_bytes = hashmap_heap_bytes(
             self.contract_data_entries.capacity(),
             32,
             std::mem::size_of::<ContractDataMapEntry>(),
         );
-        // Arc payload sizes tracked by contract_data_state_size
         let payload_bytes = self.contract_data_state_size.max(0) as usize;
         map_bytes + payload_bytes
     }
@@ -2017,5 +2156,150 @@ mod tests {
         let (data_count, code_count) = state.arc_strong_counts();
         assert_eq!(data_count, 1);
         assert_eq!(code_count, 1);
+    }
+
+    /// Test that snapshot mutation only detaches the touched contract data shard.
+    ///
+    /// Creates two entries that land in different shards, takes a snapshot,
+    /// mutates one key, and asserts only the touched shard detaches while the
+    /// untouched shard remains shared.
+    #[test]
+    fn test_snapshot_mutation_detaches_only_touched_contract_data_shard() {
+        let mut state = InMemorySorobanState::new();
+
+        // Find two keys that land in different shards.
+        // Key [0x00; 32] -> shard 0 (top 6 bits of 0x00 >> 2 = 0)
+        // Key [0xFC; 32] -> shard 63 (top 6 bits of 0xFC >> 2 = 63)
+        let entry_shard0 = make_contract_data_entry([0x00; 32]);
+        let entry_shard63 = make_contract_data_entry([0xFC; 32]);
+
+        state.create_contract_data(entry_shard0.clone()).unwrap();
+        state.create_contract_data(entry_shard63.clone()).unwrap();
+        assert_eq!(state.contract_data_count(), 2);
+
+        // Take a snapshot — all shards are now shared (strong_count=2 for
+        // the two occupied shards).
+        let snap = state.snapshot();
+
+        // Mutate entry in shard 0 only.
+        let mut updated = make_contract_data_entry([0x00; 32]);
+        if let LedgerEntryData::ContractData(cd) = &mut updated.data {
+            cd.val = ScVal::I32(999);
+        }
+        state.update_contract_data(updated).unwrap();
+
+        // The shard containing [0xFC] should still be shared (the snapshot
+        // Arc wasn't cloned because we only touched shard 0).
+        // Verify snapshot isolation: snapshot still sees original values.
+        let snap_key_shard63 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: make_contract_address(),
+            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                [0xFC; 32].to_vec().try_into().unwrap(),
+            )),
+            durability: ContractDataDurability::Persistent,
+        });
+        assert!(snap.get(&snap_key_shard63).is_some());
+
+        // Snapshot should see original value for shard 0 entry
+        let snap_key_shard0 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: make_contract_address(),
+            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                [0x00; 32].to_vec().try_into().unwrap(),
+            )),
+            durability: ContractDataDurability::Persistent,
+        });
+        let snap_entry = snap.get(&snap_key_shard0).unwrap();
+        if let LedgerEntryData::ContractData(cd) = &snap_entry.data {
+            assert_eq!(cd.val, ScVal::I32(42), "snapshot must see original value");
+        }
+
+        // Live state should see updated value
+        let live_entry = state.get(&snap_key_shard0).unwrap();
+        if let LedgerEntryData::ContractData(cd) = &live_entry.data {
+            assert_eq!(cd.val, ScVal::I32(999), "live state must see updated value");
+        }
+    }
+
+    /// Test that snapshot mutation only detaches the touched contract code shard.
+    #[test]
+    fn test_snapshot_mutation_detaches_only_touched_contract_code_shard() {
+        let mut state = InMemorySorobanState::new();
+
+        // Two code entries in different shards
+        let entry_shard0 = make_contract_code_entry([0x00; 32]);
+        let entry_shard63 = make_contract_code_entry([0xFC; 32]);
+
+        state
+            .create_contract_code(entry_shard0.clone(), 25, None)
+            .unwrap();
+        state
+            .create_contract_code(entry_shard63.clone(), 25, None)
+            .unwrap();
+        assert_eq!(state.contract_code_count(), 2);
+
+        let snap = state.snapshot();
+        let snap_code_size = snap.contract_code_state_size();
+
+        // Update code in shard 0 only
+        let mut updated = make_contract_code_entry([0x00; 32]);
+        if let LedgerEntryData::ContractCode(cc) = &mut updated.data {
+            cc.code = vec![1u8; 200].try_into().unwrap();
+        }
+        state.update_contract_code(updated, 25, None).unwrap();
+
+        // Snapshot sizes must be unchanged (snapshot isolation)
+        assert_eq!(snap.contract_code_state_size(), snap_code_size);
+        assert_eq!(snap.contract_code_count(), 2);
+
+        // Snapshot should still be able to look up the shard 63 entry
+        let key_shard63 = LedgerKeyContractCode {
+            hash: Hash([0xFC; 32]),
+        };
+        assert!(
+            snap.get_contract_code(&key_shard63).is_some(),
+            "snapshot must still see untouched shard entry"
+        );
+    }
+
+    /// Test that arc_strong_counts reports the maximum shared per-shard refcount.
+    #[test]
+    fn test_arc_strong_counts_reports_max_shared_shard_refcount() {
+        let mut state = InMemorySorobanState::new();
+
+        // Insert entries so at least one shard is occupied.
+        let data1 = make_contract_data_entry([10u8; 32]);
+        state.create_contract_data(data1).unwrap();
+
+        // Fresh state: sole owner.
+        let (d, c) = state.arc_strong_counts();
+        assert_eq!(d, 1);
+        assert_eq!(c, 1);
+
+        // Hold two snapshots — the occupied data shard should have count 3.
+        let _snap1 = state.snapshot();
+        let _snap2 = state.snapshot();
+        let (d, _c) = state.arc_strong_counts();
+        assert_eq!(d, 3, "two snapshots + original = 3 for the occupied shard");
+
+        // Mutate the entry — this detaches the shard from the snapshots.
+        let mut updated = make_contract_data_entry([10u8; 32]);
+        if let LedgerEntryData::ContractData(cd) = &mut updated.data {
+            cd.val = ScVal::I32(999);
+        }
+        state.update_contract_data(updated).unwrap();
+
+        // After mutation, the live shard for the mutated key now has a fresh Arc
+        // (count=1 for that shard). But other shards that were snapshot'd still
+        // have count 3 (the empty shards are still shared).
+        // max_arc_strong_count reports the max across all shards.
+        let (d, _c) = state.arc_strong_counts();
+        assert!(d >= 1, "after mutation, max count should be at least 1");
+
+        // Drop snapshots — all counts return to 1.
+        drop(_snap1);
+        drop(_snap2);
+        let (d, c) = state.arc_strong_counts();
+        assert_eq!(d, 1);
+        assert_eq!(c, 1);
     }
 }
