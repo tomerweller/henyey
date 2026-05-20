@@ -155,10 +155,10 @@ Before spawning reviewers, set up a shared workspace rooted under `~/data` so al
 ```bash
 SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/pr-$PR_NUM-review}"
-export CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"
 
 # Safety: validate WORKTREE_BASE is under $HOME/data/ and matches expected layout.
 # Reject overly broad paths that could cause catastrophic deletion on cleanup.
+# Called at bootstrap (before mkdir/export) AND before every rm -rf on exit paths.
 validate_worktree_base() {
   local base="$1"
   local resolved
@@ -178,6 +178,10 @@ validate_worktree_base() {
   esac
 }
 
+# Validate WORKTREE_BASE immediately — fail early if an override points outside ~/data.
+validate_worktree_base "$WORKTREE_BASE" || exit 1
+
+export CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"
 mkdir -p "$WORKTREE_BASE/reviewer-a" "$WORKTREE_BASE/reviewer-b"
 ```
 
@@ -740,8 +744,13 @@ in Step 3.5):
 ```bash
 SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/pr-$PR_NUM-review}"
+validate_worktree_base "$WORKTREE_BASE" || exit 1   # fail early on bad override
 export CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"
 ```
+
+The `validate_worktree_base` call at bootstrap ensures that any environment override
+of `WORKTREE_BASE` is rejected before `CARGO_TARGET_DIR` is exported or directories
+are created — preventing artifacts from spilling outside `~/data`.
 
 Per-reviewer scratch directories:
 - `$WORKTREE_BASE/reviewer-a/` — Reviewer A's exclusive scratch space

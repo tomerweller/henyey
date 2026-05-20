@@ -365,6 +365,52 @@ test_review_pr_validate_worktree_base_safety() {
   fi
 }
 
+test_review_pr_validate_worktree_base_at_bootstrap() {
+  local desc="review-pr validates WORKTREE_BASE at bootstrap before mkdir/export"
+
+  # The skill must call validate_worktree_base BEFORE exporting CARGO_TARGET_DIR
+  # and BEFORE creating reviewer directories. This prevents an overridden
+  # WORKTREE_BASE from placing artifacts outside ~/data.
+  # We check that in the Step 3.5 bootstrap block, validate_worktree_base appears
+  # AFTER WORKTREE_BASE assignment but BEFORE CARGO_TARGET_DIR and mkdir.
+  local bootstrap_content
+  bootstrap_content=$(sed -n '/^## Step 3\.5/,/^## Step [4-9]/p' "$REVIEW_PR_SKILL")
+
+  local worktree_line=0
+  local validate_line=0
+  local cargo_line=0
+  local mkdir_line=0
+  local line_num=0
+
+  while IFS= read -r line; do
+    line_num=$((line_num + 1))
+    if echo "$line" | grep -q 'WORKTREE_BASE=.*\$HOME/data'; then
+      [ "$worktree_line" -eq 0 ] && worktree_line=$line_num
+    fi
+    if echo "$line" | grep -q 'validate_worktree_base.*WORKTREE_BASE\|validate_worktree_base "\$WORKTREE_BASE"'; then
+      [ "$validate_line" -eq 0 ] && validate_line=$line_num
+    fi
+    if echo "$line" | grep -q 'CARGO_TARGET_DIR=.*WORKTREE_BASE'; then
+      [ "$cargo_line" -eq 0 ] && cargo_line=$line_num
+    fi
+    if echo "$line" | grep -q 'mkdir.*WORKTREE_BASE'; then
+      [ "$mkdir_line" -eq 0 ] && mkdir_line=$line_num
+    fi
+  done <<< "$bootstrap_content"
+
+  if [ "$validate_line" -gt 0 ] &&
+     [ "$worktree_line" -gt 0 ] &&
+     [ "$validate_line" -gt "$worktree_line" ] &&
+     { [ "$cargo_line" -eq 0 ] || [ "$validate_line" -lt "$cargo_line" ]; } &&
+     { [ "$mkdir_line" -eq 0 ] || [ "$validate_line" -lt "$mkdir_line" ]; }; then
+    tap_ok "$desc"
+  else
+    local reason="validate_worktree_base not called at bootstrap before CARGO_TARGET_DIR/mkdir"
+    [ "$validate_line" -eq 0 ] && reason="validate_worktree_base not called in Step 3.5 bootstrap"
+    tap_not_ok "$desc" "$reason"
+  fi
+}
+
 # --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
@@ -381,6 +427,7 @@ test_review_pr_exit_paths_cleanup_workspace_base
 test_review_pr_forbids_tmp_and_repo_root_patterns
 test_review_pr_reviewer_scratch_dirs
 test_review_pr_validate_worktree_base_safety
+test_review_pr_validate_worktree_base_at_bootstrap
 test_claude_review_pr_synced
 test_claude_plan_synced
 
