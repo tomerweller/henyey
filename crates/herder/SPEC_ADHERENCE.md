@@ -59,7 +59,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §9.4 | Cluster footprint disjointness (TX_ORDERING_INVALID) | Full | tx_set_utils.rs |
 | §9.5 | Per-tx validation + accountFeeMap | Full | tx_set_utils.rs::get_invalid_tx_list_with_fee_map |
 | §9.6 | XDR structural decoding | Full | tx_queue/tx_set.rs:646-734 |
-| §9.7 | Validity cache + fatal on flip | Partial | tx_set_tracker.rs (cached, no flip-abort) |
+| §9.7 | Validity cache + fatal on flip | Partial | tx_set_tracker.rs (fatal panic on false→true flip, #2818); nomination-side write path not yet wired |
 | §10 | Apply ordering (sequential + parallel) | N/A | implemented in `crates/ledger/src/close.rs` (cross-crate by spec mapping) |
 | §11 | combineCandidates: tx-set selection + tiebreaks | Full | scp_driver.rs:1849-2017 + 2037-2105 |
 | §11 | combineCandidates: upgrade merge by type | Full | scp_driver.rs:1918-1939, 2021-2034 |
@@ -108,7 +108,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §17 | INV-H5 StellarValue close-time monotonicity | Full | scp_driver.rs:1198-1226 (check_close_time) |
 | §17 | INV-H6 Upgrade ordering | Full | scp_driver.rs:1563-1584 |
 | §17 | INV-H7 Tx set hash stability roundtrip | Full | herder.rs:3054 (validate_and_cache_built_tx_set) |
-| §17 | INV-H8 Validity cache consistency | Partial | tx_set_tracker.rs caches but does not abort on false→true flip |
+| §17 | INV-H8 Validity cache consistency | Partial | tx_set_tracker.rs panics on false→true flip (#2818); nomination-side write path pending |
 | §17 | INV-H9 Single nominate per slot | Full | herder.rs:2415 (early-return on is_nominating) |
 | §18 | Constants table | Full (most) | see Constants section below |
 
@@ -380,12 +380,14 @@ excluded. SHOULD claims and operational defaults excluded.
 - **§9.7 (MUST + SHOULD)** Validity cache + fatal on cached-false →
   observed-true.
   - **Rust:** `tx_set_tracker.rs:21 TXSET_VALID_CACHE_SIZE = 1000`. The
-    cache stores both true and false outcomes. **No** runtime
-    "false-then-true" abort assertion is found.
-    Search: `grep -rn "Inconsistent txSet validity\|cached.*false.*true" crates/herder/src/`
-    → nothing.
-  - **Status:** Partial (cache present; spec's MAY-grade abort omitted).
-    See INV-H8.
+    cache stores both true and false outcomes. `store_valid` panics on
+    false→true flip before overwriting, matching stellar-core's
+    `cacheValidTxSet` which throws `std::runtime_error`.
+    Search: `grep -rn "Inconsistent txSet validity" crates/herder/src/`
+    → `tx_set_tracker.rs` panic message.
+  - **Gap:** The nomination-side path (`HerderImpl::cacheValidTxSet` equivalent)
+    does not yet write `true` into the validity cache after self-validation.
+  - **Status:** Partial (#2818).
 
 ### §10 — Apply Ordering
 
@@ -679,7 +681,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | INV-H5 (StellarValue close-time monotonicity) | Full | `scp_driver.rs:1198-1226 check_close_time` |
 | INV-H6 (Upgrade ordering) | Full | `scp_driver.rs:1563-1584 check_upgrade_ordering` + `herder.rs:3142-3150` sort-on-build |
 | INV-H7 (Tx set hash stability roundtrip) | Full | `herder.rs:3054` `validate_and_cache_built_tx_set` + roundtrip in `self_validate_nomination_tx_set` |
-| INV-H8 (Validity cache consistency) | Partial | `tx_set_tracker.rs::valid_cache` stores results; no abort on false→true flip |
+| INV-H8 (Validity cache consistency) | Partial | `tx_set_tracker.rs::store_valid` panics on false→true flip (#2818); nomination-side write path pending |
 | INV-H9 (Single nominate per slot) | Full | `herder.rs:2415-2423` early-return on `is_nominating` |
 
 ### Drift notes
@@ -692,8 +694,10 @@ excluded. SHOULD claims and operational defaults excluded.
   invariant is restored, not violated; classify as drift if strict spec
   conformance is required.
 
-- **INV-H8 partial**: A SHOULD-grade defensive abort. Cache size matches
-  (`TXSET_VALID_CACHE_SIZE = 1000`).
+- **INV-H8**: Now Partial (#2818). `store_valid` panics on false→true flips
+  matching stellar-core's `cacheValidTxSet` fatal error. The nomination-side
+  write path (equivalent to upstream `HerderImpl::cacheValidTxSet` call) is
+  not yet wired to populate the validity cache after self-validation.
 
 ---
 
@@ -740,9 +744,10 @@ sections present in the current spec:
    callback may fire before tracking advances, producing spurious timer
    work. Low priority but spec-mandated.
 
-2. **Implement the runtime "validity cache false→true" abort** (§9.7 /
-   INV-H8). MAY-grade but useful for catching builder/validator
-   divergence in production.
+2. ~~**Implement the runtime "validity cache false→true" abort** (§9.7 /
+   INV-H8).~~ Fatal flip guard done in #2818. Remaining: wire the
+   nomination-side write path to populate the validity cache after
+   self-validation (equivalent to upstream `HerderImpl::cacheValidTxSet`).
 
 3. **Document the INV-H2 deviation** more visibly in `PARITY_STATUS.md`
    so reviewers understand the spec calls it fatal but henyey treats it

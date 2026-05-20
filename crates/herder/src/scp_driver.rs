@@ -7036,6 +7036,57 @@ mod tests {
         assert!(result, "Pre-v20 LedgerManager should be permissive");
     }
 
+    /// Regression test for #2818: check_and_cache_tx_set_valid must reuse a
+    /// pre-seeded cached `false` without revalidation. This locks down the
+    /// cached-invalid short-circuit path and proves it does not trigger the
+    /// fatal false→true panic in store_valid.
+    #[test]
+    fn test_check_and_cache_tx_set_valid_reuses_cached_false_without_revalidation() {
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase,
+            TransactionSetV1,
+        };
+
+        let driver = make_test_driver();
+        let lcl_hash = Hash256::ZERO;
+
+        // Build a minimal generalized TX set that would otherwise validate
+        // successfully (empty phases, valid structure, protocol < 20 is permissive).
+        let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash(lcl_hash.0),
+            phases: vec![
+                TransactionPhase::V0(vec![].try_into().unwrap()),
+                TransactionPhase::V1(ParallelTxsComponent {
+                    base_fee: Some(100),
+                    execution_stages: vec![].try_into().unwrap(),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let tx_set = TransactionSet::new_generalized(gen);
+
+        // Pre-seed the validity cache with `false` for this tx set's key.
+        let cache_key = (lcl_hash, *tx_set.hash(), 0u64);
+        driver.tx_tracker.store_valid(cache_key, false);
+
+        // Call check_and_cache_tx_set_valid — must return cached `false`
+        // without running validation (which would produce `true` and trigger
+        // the fatal false→true flip panic).
+        let result = driver.check_and_cache_tx_set_valid(&tx_set, lcl_hash, 0);
+        assert!(
+            !result,
+            "check_and_cache_tx_set_valid must return cached false without revalidation"
+        );
+
+        // Verify the cache entry remains `false` (not overwritten).
+        assert_eq!(
+            driver.tx_tracker.check_valid(&cache_key),
+            Some(false),
+            "cached false must not be overwritten"
+        );
+    }
+
     #[test]
     fn test_combine_candidates_merges_6_upgrade_types() {
         // Verify that 6 distinct upgrade types from multiple candidates merge correctly
