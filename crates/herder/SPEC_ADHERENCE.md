@@ -3,9 +3,9 @@
 **Spec version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Crate:** crates/herder
 **Last updated:** 2026-05-13
-**Overall adherence:** 83%
+**Overall adherence:** 86%
 
-**Tally:** Full 49 | Partial 9 | Absent 1 | Drift 2 | N/A 4
+**Tally:** Full 51 | Partial 7 | Absent 1 | Drift 2 | N/A 4
 
 Adherence percentage is computed as `Full / (Full + Partial + Absent) × 100` over
 normative-strong claims (MUST/SHALL/MUST NOT/SHALL NOT). Drift and N/A items
