@@ -550,9 +550,9 @@ fn test_reject_transaction_exceeding_xdr_depth_limit() {
     assert_eq!(
         result,
         Err(PreSeqNumError::Malformed(
-            "XDR depth limit exceeded".to_string()
+            "XDR depth limit exceeded (limit: 500)".to_string()
         )),
-        "check_valid_pre_seq_num should reject over-depth envelope as Malformed"
+        "check_valid_pre_seq_num should reject over-depth envelope as Malformed with limit"
     );
 }
 
@@ -576,10 +576,54 @@ fn test_validate_basic_rejects_transaction_exceeding_xdr_depth_limit() {
     let errors = result.expect_err("validate_basic should reject over-depth envelope");
     let has_depth_error = errors
         .iter()
-        .any(|e| matches!(e, ValidationError::InvalidStructure(msg) if msg.contains("depth")));
+        .any(|e| matches!(e, ValidationError::InvalidStructure(msg) if msg.contains("depth") && msg.contains("500")));
     assert!(
         has_depth_error,
-        "expected InvalidStructure error about XDR depth, got: {:?}",
+        "expected InvalidStructure error about XDR depth with limit 500, got: {:?}",
         errors
+    );
+}
+
+/// §5.1-1: Fee-bump envelopes must also be rejected when the outer envelope exceeds
+/// the XDR depth limit. Parity: stellar-core FeeBumpTransactionFrame.cpp:278.
+#[test]
+fn test_reject_fee_bump_transaction_exceeding_xdr_depth_limit() {
+    use stellar_xdr::curr::{
+        DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+        FeeBumpTransactionInnerTx, Int64, Signature, SignatureHint,
+    };
+
+    // Build an over-depth inner envelope and wrap it in a fee-bump.
+    let inner_envelope = make_over_depth_soroban_envelope();
+    let inner_tx_env = match inner_envelope {
+        TransactionEnvelope::Tx(env) => env,
+        _ => panic!("expected Tx variant"),
+    };
+
+    let fee_bump_tx = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+        fee: Int64(20_000),
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_tx_env),
+        ext: FeeBumpTransactionExt::V0,
+    };
+
+    let fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump_tx,
+        signatures: vec![DecoratedSignature {
+            hint: SignatureHint([0u8; 4]),
+            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+        }]
+        .try_into()
+        .unwrap(),
+    });
+
+    let frame = TransactionFrame::from_owned(fee_bump_envelope);
+    let result = check_valid_pre_seq_num(&frame, PROTOCOL_VERSION, 0);
+    assert_eq!(
+        result,
+        Err(PreSeqNumError::Malformed(
+            "XDR depth limit exceeded (limit: 500)".to_string()
+        )),
+        "check_valid_pre_seq_num should reject over-depth fee-bump envelope as Malformed"
     );
 }

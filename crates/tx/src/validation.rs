@@ -3815,4 +3815,49 @@ mod tests {
         // Account key = 1 classic disk read, ContractData = 0 (Soroban, in-memory)
         assert_eq!(count, 1);
     }
+
+    // ========================================================================
+    // #2845 — XDR depth guard error detail tests
+    // ========================================================================
+
+    #[test]
+    fn test_xdr_depth_error_message_includes_limit() {
+        let err = stellar_xdr::curr::Error::DepthLimitExceeded;
+        let result = format_xdr_depth_error(err);
+        assert_eq!(
+            result,
+            PreSeqNumError::Malformed(format!(
+                "XDR depth limit exceeded (limit: {})",
+                XDR_DEPTH_LIMIT
+            )),
+            "depth error message should include the configured limit"
+        );
+        let msg = match &result {
+            PreSeqNumError::Malformed(m) => m.clone(),
+            _ => panic!("expected Malformed"),
+        };
+        assert!(
+            msg.contains("500"),
+            "message should mention the limit value 500, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_xdr_depth_error_message_preserves_non_depth_xdr_error() {
+        let err = stellar_xdr::curr::Error::LengthLimitExceeded;
+        let expected_inner = format!("{err}");
+        let result = format_xdr_depth_error(err);
+        let msg = match &result {
+            PreSeqNumError::Malformed(m) => m.clone(),
+            _ => panic!("expected Malformed"),
+        };
+        assert!(
+            msg.contains(&expected_inner),
+            "message should contain the original XDR error text, got: {msg}"
+        );
+        assert!(
+            msg.contains("XDR depth check failed"),
+            "message should have 'XDR depth check failed' prefix, got: {msg}"
+        );
+    }
 }
