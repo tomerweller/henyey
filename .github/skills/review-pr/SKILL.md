@@ -641,6 +641,24 @@ Exit.
 | `gh pr merge --admin` fails (token lacks admin) | Leave the issue in `in-review`; file a follow-up issue documenting the gap; do NOT degrade to a non-admin merge that might bypass CI gates. |
 | GH API failure | Retry once after 5s; if still failing, leave assigned and exit non-zero. |
 
+## Workspace contract
+
+The `/review-pr` skill must never create worktrees outside `$HOME/data`. All scratch
+state lives under `$HOME/data/$SESSION_ID/review-pr-$ISSUE/`:
+
+```bash
+SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
+export CARGO_TARGET_DIR="$HOME/data/$SESSION_ID/review-pr-$ISSUE/cargo-target"
+```
+
+This ensures build artifacts are isolated per-session and automatically discoverable
+for cleanup. The skill itself is read-only (no code changes), so it rarely needs a
+build cache — but if a reviewer sub-agent builds to verify, the target dir must
+resolve under `$HOME/data`.
+
+**Never create worktrees at the repo root or outside `$HOME/data`.** All worktrees
+must be under `$HOME/data/$SESSION_ID/` to avoid polluting the shared checkout.
+
 ## Branch protection
 
 Because the pipeline gates merges on its own parsed verdicts (not GH-recognized approvals), `main` branch protection should NOT require pull-request approvals — that gate is impossible to satisfy when the agent is the PR author. Recommended branch protection:
