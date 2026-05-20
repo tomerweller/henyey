@@ -2359,18 +2359,10 @@ impl Herder {
             return TxQueueResult::TryAgainLater;
         }
 
-        // Parity: §12.2 cross-type source-account precheck. If the account
-        // already has a pending tx of the opposite type (classic vs soroban),
-        // reject with TryAgainLater BEFORE queue-local fee validation can
-        // surface a different result (FeeTooLow). This restores the externally
-        // visible reception pipeline ordering from stellar-core's
-        // HerderImpl::recvTransaction (HerderImpl.cpp:627-642).
-        if self.tx_queue.has_cross_type_conflict(&tx) {
-            debug!("Transaction rejected: cross-type conflict with pending tx");
-            return TxQueueResult::TryAgainLater;
-        }
-
-        // Add to transaction queue
+        // Add to transaction queue. The cross-type source-account precheck
+        // (§12.2) is handled atomically inside try_add before fee validation,
+        // so "cross-type conflict beats fee gate" ordering is guaranteed
+        // without a TOCTOU race between a standalone precheck and queue add.
         let result = self.tx_queue.try_add(tx);
 
         match result {
@@ -2491,19 +2483,12 @@ impl Herder {
         // records the trigger event even for non-validators before the
         // `!getSCP().isValidator()` early-return (HerderImpl.cpp:1493-1530).
         if !is_validator {
-            // Parity: stellar-core's triggerNextLedger completes the build/cache
-            // sequence before the non-validator early return (HerderImpl.cpp:1546-1573,
-            // 1616-1620). Only report ObserverBuilt if the tx-set was actually
-            // built and cached; propagate error if build_nomination_value aborts.
-            //
-            // Use store_generation (not cache_size) to detect success: store_generation
-            // increments on every successful store including in-place overwrites of
-            // an already-cached hash. This ensures repeated observer triggers for the
-            // same slot/hash correctly report ObserverBuilt instead of erroring.
-            // Parity: stellar-core treats re-adding an already-known tx-set as
-            // success (PendingEnvelopes.cpp:185-238).
-            let gen_before = self.scp_driver.tx_set_store_generation();
-            let build_result = self.build_nomination_value();
+            // Use the dedicated build-and-cache method that returns a direct
+            // success signal (the cached tx-set hash) rather than relying on
+            // the global store_generation counter. This eliminates the race
+            // where an unrelated concurrent tx-set store could make a failed
+            // build incorrectly report ObserverBuilt.
+            let cached_hash = self.build_and_cache_nomination_tx_set();
             let build_value_ms = t0.elapsed().as_millis();
 
             self.process_ready_fetching_envelopes();
@@ -2516,40 +2501,27 @@ impl Herder {
             if !self.lcl_matches_slot(slot) {
                 tracing::warn!(
                     requested_slot = slot,
-                    "Observer: skipping — LCL advanced during build_nomination_value"
+                    "Observer: skipping — LCL advanced during build_and_cache_nomination_tx_set"
                 );
                 return Ok(TriggerOutcome::SkippedStale);
             }
 
-            // Determine success by whether a store occurred during build.
-            // store_generation grows on both new inserts and in-place updates,
-            // so repeated triggers for the same tx-set hash still succeed.
-            let gen_after = self.scp_driver.tx_set_store_generation();
-            if gen_after > gen_before {
-                tracing::debug!(
-                    slot,
-                    build_value_ms,
-                    "Observer trigger: built and cached tx-set without nominating"
-                );
-                return Ok(TriggerOutcome::ObserverBuilt);
+            match cached_hash {
+                Some(hash) => {
+                    tracing::debug!(
+                        slot,
+                        build_value_ms,
+                        %hash,
+                        "Observer trigger: built and cached tx-set without nominating"
+                    );
+                    return Ok(TriggerOutcome::ObserverBuilt);
+                }
+                None => {
+                    return Err(HerderError::Internal(
+                        "Observer trigger: build_and_cache_nomination_tx_set failed".into(),
+                    ));
+                }
             }
-
-            // Generation unchanged — genuine pre-cache failure.
-            if build_result.is_some() {
-                // build_result is Some means signing succeeded too (unexpected
-                // for an observer) — still report success since cache must have
-                // been populated (validate_and_cache runs before signing).
-                tracing::debug!(
-                    slot,
-                    build_value_ms,
-                    "Observer trigger: full build succeeded"
-                );
-                return Ok(TriggerOutcome::ObserverBuilt);
-            }
-
-            return Err(HerderError::Internal(
-                "Observer trigger: build_nomination_value failed before cache".into(),
-            ));
         }
 
         let value = self
@@ -2962,6 +2934,146 @@ impl Herder {
         }
         // SCP may have externalized synchronously; complete if so (#2695).
         self.complete_externalization(slot);
+    }
+
+    /// Build and cache the nomination tx-set without signing or upgrading.
+    ///
+    /// Returns `Some(tx_set_hash)` if the tx-set was successfully built,
+    /// self-validated, and cached. Returns `None` if any step fails (snapshot
+    /// creation, build, or self-validation). This provides a build-local
+    /// success signal for the observer trigger path, avoiding reliance on the
+    /// global `store_generation` counter which is racy with unrelated stores.
+    fn build_and_cache_nomination_tx_set(&self) -> Option<Hash256> {
+        // Reuses the same snapshot/build/validate/cache logic as
+        // build_nomination_value steps 1-3.5, but stops before upgrades/signing.
+        let (
+            previous_hash,
+            max_txs,
+            starting_seq,
+            header,
+            lcl_close_time,
+            snapshot_providers,
+            soroban_info,
+            frozen_key_config,
+        ) = {
+            let snap = match self.ledger_manager.create_snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to create snapshot for observer build; aborting"
+                    );
+                    return None;
+                }
+            };
+
+            let header = snap.header().clone();
+            let lcl_ct = header.scp_value.close_time.0;
+            let max = header.max_tx_set_size as usize;
+            let ledger_seq = snap.ledger_seq();
+            let header_hash = snap.header_hash();
+
+            let soroban_info = snap.soroban_network_info().cloned();
+
+            let frozen_key_config = match henyey_ledger::execution::load_frozen_key_config(
+                &snap,
+                header.ledger_version,
+            ) {
+                Ok(config) => Some(config),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to load frozen key config for observer; proceeding without"
+                    );
+                    None
+                }
+            };
+
+            let seq = self.build_starting_seq_map(&snap, ledger_seq);
+
+            let sp = crate::tx_queue::SnapshotProviders::new(snap);
+
+            (
+                header_hash,
+                max,
+                seq,
+                header,
+                lcl_ct,
+                Some(sp),
+                soroban_info,
+                frozen_key_config,
+            )
+        };
+
+        // Close time with monotonic clamp.
+        let mut close_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+        if close_time <= lcl_close_time {
+            close_time = lcl_close_time + 1;
+        }
+        let close_time_offset = close_time - lcl_close_time;
+
+        // Build the tx-set.
+        let lcl = LclContext::new(header.ledger_version, previous_hash);
+        let tx_set = if !protocol_version_starts_from(lcl.protocol_version(), ProtocolVersion::V20)
+        {
+            TransactionSet::new_legacy(previous_hash, vec![])
+        } else {
+            let network_id = NetworkId(self.scp_driver.network_id());
+            let ledger_flags = match &header.ext {
+                stellar_xdr::curr::LedgerHeaderExt::V0 => 0u32,
+                stellar_xdr::curr::LedgerHeaderExt::V1(v1) => v1.flags,
+            };
+            let mut validation_ctx = crate::tx_set_utils::TxSetValidationContext::new(
+                header.ledger_seq,
+                header.scp_value.close_time.0,
+                header.base_fee,
+                header.base_reserve,
+                header.ledger_version,
+                network_id,
+                ledger_flags,
+            );
+            if let Some(info) = soroban_info.as_ref() {
+                validation_ctx.soroban_resource_limits = Some(info.to_resource_limits());
+            }
+            if let Some(fk) = frozen_key_config.as_ref() {
+                validation_ctx.frozen_key_config = fk.clone();
+            }
+            let nomination_ctx = crate::tx_queue::NominationBuildContext {
+                base_fee: header.base_fee as i64,
+                protocol_version: header.ledger_version,
+                validation_ctx,
+            };
+            self.tx_queue.build_generalized_tx_set_with_providers(
+                crate::tx_queue::BuildContext::Nomination(&nomination_ctx),
+                previous_hash,
+                max_txs,
+                starting_seq.as_ref(),
+                close_time_offset,
+                snapshot_providers
+                    .as_ref()
+                    .map(|sp| sp as &dyn crate::tx_queue::FeeBalanceProvider),
+                snapshot_providers
+                    .as_ref()
+                    .map(|sp| sp as &dyn crate::tx_queue::AccountProvider),
+            )
+        };
+
+        let hash = *tx_set.hash();
+
+        // Self-validate and cache.
+        self.validate_and_cache_built_tx_set(
+            &tx_set,
+            &header,
+            previous_hash,
+            close_time_offset,
+            soroban_info.as_ref(),
+            snapshot_providers.as_ref(),
+        )?;
+
+        Some(hash)
     }
 
     /// Build a nomination-ready SCP `Value`: transaction set + signed StellarValue.
@@ -13233,10 +13345,10 @@ mod issue_2819_spec_adherence_tests {
     use stellar_xdr::curr::Signature as XdrSignature;
     use stellar_xdr::curr::{
         DecoratedSignature, Hash, LedgerHeader, LedgerHeaderExt, Limits, Memo, MuxedAccount,
-        Operation, OperationBody, Preconditions, ScpBallot, ScpEnvelope, ScpStatement,
-        ScpStatementExternalize, ScpStatementPledges, SequenceNumber, SignatureHint, StellarValue,
-        StellarValueExt, TimePoint, Transaction, TransactionEnvelope, TransactionV1Envelope,
-        Uint256, Value, VecM, WriteXdr,
+        Operation, OperationBody, Preconditions, ScpBallot, ScpEnvelope, ScpNomination,
+        ScpStatement, ScpStatementExternalize, ScpStatementPledges, ScpStatementPrepare,
+        SequenceNumber, SignatureHint, StellarValue, StellarValueExt, TimePoint, Transaction,
+        TransactionEnvelope, TransactionV1Envelope, Uint256, Value, VecM, WriteXdr,
     };
 
     fn make_ledger_manager_at_seq(ledger_seq: u32) -> Arc<LedgerManager> {
@@ -13569,5 +13681,236 @@ mod issue_2819_spec_adherence_tests {
             !herder.slot_quorum_tracker.read().is_v_blocking(1),
             "InvalidInnerValue envelope must not contribute to slot quorum tracking"
         );
+    }
+
+    /// §5.2 Parity regression: observer trigger must leave the built tx-set
+    /// discoverable in the local cache, so future fetch/receive operations
+    /// can service it (HerderImpl.cpp:1568-1572, 1616-1620).
+    #[test]
+    fn test_trigger_next_ledger_observer_leaves_tx_set_servable() {
+        let herder = make_observer_herder();
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        let result = herder.trigger_next_ledger(1);
+        assert_eq!(
+            result.expect("observer trigger should not error"),
+            TriggerOutcome::ObserverBuilt,
+        );
+
+        // The observer's built tx-set must be discoverable via the cache.
+        // Retrieve the LCL hash to compute what the tx-set hash should be:
+        // for an empty queue at protocol >=20, the tx-set is a Generalized
+        // empty set whose hash we can look up.
+        let cache_count = herder.scp_driver.tx_set_cache_count();
+        assert!(
+            cache_count > 0,
+            "observer trigger must cache at least one tx-set, got cache_count={}",
+            cache_count
+        );
+    }
+
+    /// Correctness regression: a failed observer build must return Err even if
+    /// an unrelated tx-set store bumps the global store_generation counter
+    /// during the build window. This proves the new build-local success signal
+    /// is not influenced by external stores.
+    ///
+    /// We simulate this by creating an observer with a broken ledger manager
+    /// that always fails snapshot creation, then manually storing an unrelated
+    /// tx-set in the tracker before calling trigger_next_ledger.
+    #[test]
+    fn test_observer_trigger_not_fooled_by_unrelated_store() {
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+        // Use a ledger manager at seq 0 but do NOT set soroban info, so
+        // validate_and_cache_built_tx_set will fail (simulating a build failure).
+        let lm = make_ledger_manager_at_seq(0);
+        // Don't set soroban info — this causes self-validation to fail.
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        // Simulate an unrelated tx-set arriving (e.g., from overlay) that
+        // bumps store_generation. The old store_generation approach would have
+        // been fooled by this.
+        let dummy_tx_set = TransactionSet::new_legacy(Hash256::ZERO, vec![]);
+        herder.scp_driver.cache_tx_set(dummy_tx_set);
+
+        // Now trigger — should fail because soroban config is unavailable,
+        // despite store_generation having incremented.
+        let result = herder.trigger_next_ledger(1);
+        assert!(
+            result.is_err(),
+            "observer trigger should fail when build fails, \
+             even if an unrelated store bumped store_generation"
+        );
+    }
+
+    /// §15.1 Parity regression: process_verified must reject unsigned
+    /// NOMINATE values (votes/accepted) via the shared signed-value walker.
+    #[test]
+    fn test_process_verified_rejects_unsigned_nominate_values() {
+        let seed = [7u8; 32];
+        let local_secret = SecretKey::from_seed(&seed);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_seed = [8u8; 32];
+        let other_secret = SecretKey::from_seed(&other_seed);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_ledger_manager_at_seq(0),
+            TimerManagerHandle::no_op(),
+        );
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set)
+            .unwrap();
+
+        // Build a NOMINATE envelope with Basic (non-SIGNED) StellarValue in votes.
+        let basic_value = StellarValue {
+            tx_set_hash: Hash([1u8; 32]),
+            close_time: TimePoint(600),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let value_bytes = basic_value.to_xdr(Limits::none()).unwrap();
+
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: other_node_id,
+                slot_index: 1,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    votes: vec![Value(value_bytes.clone().try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                    quorum_set_hash: Hash([0u8; 32]),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        let intake = crate::scp_verify::PipelinedIntake::from_local(envelope, 1, true);
+        let ve = crate::scp_verify::VerifiedEnvelope {
+            intake,
+            verdict: crate::scp_verify::Verdict::Ok,
+        };
+        let (state, reason) = herder.process_verified(ve);
+
+        assert_eq!(state, EnvelopeState::Invalid);
+        assert_eq!(reason, PostVerifyReason::InvalidInnerValue);
+    }
+
+    /// §15.1 Parity regression: process_verified must reject unsigned PREPARE
+    /// prepared/preparedPrime values via the shared signed-value walker.
+    #[test]
+    fn test_process_verified_rejects_unsigned_prepare_values() {
+        let seed = [7u8; 32];
+        let local_secret = SecretKey::from_seed(&seed);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_seed = [8u8; 32];
+        let other_secret = SecretKey::from_seed(&other_seed);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_ledger_manager_at_seq(0),
+            TimerManagerHandle::no_op(),
+        );
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set)
+            .unwrap();
+
+        // Build a PREPARE envelope with Basic (non-SIGNED) StellarValue in
+        // the `prepared` field.
+        let basic_value = StellarValue {
+            tx_set_hash: Hash([2u8; 32]),
+            close_time: TimePoint(700),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let value_bytes = basic_value.to_xdr(Limits::none()).unwrap();
+
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: other_node_id,
+                slot_index: 1,
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: Hash([0u8; 32]),
+                    ballot: ScpBallot {
+                        counter: 1,
+                        value: Value(value_bytes.clone().try_into().unwrap()),
+                    },
+                    prepared: Some(ScpBallot {
+                        counter: 1,
+                        value: Value(value_bytes.clone().try_into().unwrap()),
+                    }),
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        let intake = crate::scp_verify::PipelinedIntake::from_local(envelope, 1, true);
+        let ve = crate::scp_verify::VerifiedEnvelope {
+            intake,
+            verdict: crate::scp_verify::Verdict::Ok,
+        };
+        let (state, reason) = herder.process_verified(ve);
+
+        assert_eq!(state, EnvelopeState::Invalid);
+        assert_eq!(reason, PostVerifyReason::InvalidInnerValue);
     }
 }

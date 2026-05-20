@@ -1746,7 +1746,7 @@ impl TransactionQueue {
     ///
     /// Parity: mirrors the narrow top-level gate in stellar-core
     /// `HerderImpl::recvTransaction` (HerderImpl.cpp:627-642).
-    pub fn has_cross_type_conflict(&self, envelope: &TransactionEnvelope) -> bool {
+    pub(crate) fn has_cross_type_conflict(&self, envelope: &TransactionEnvelope) -> bool {
         let candidate_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(envelope);
         let seq_source_key = account_key(envelope);
 
@@ -2088,6 +2088,21 @@ impl TransactionQueue {
 
     /// Try to add a transaction to the queue.
     pub fn try_add(&self, envelope: TransactionEnvelope) -> TxQueueResult {
+        // Parity: §12.2 cross-type source-account precheck. If the account
+        // already has a pending tx of the opposite type (classic vs soroban),
+        // reject with TryAgainLater BEFORE any validation or fee check can
+        // surface a different result (FeeTooLow, Invalid). This restores the
+        // externally visible reception pipeline ordering from stellar-core's
+        // HerderImpl::recvTransaction (HerderImpl.cpp:627-642).
+        //
+        // This check is inside try_add (not a standalone call from
+        // receive_transaction) so that no TOCTOU race can occur between
+        // the cross-type read and the authoritative queue-local check in
+        // check_account_limit. The queue-local check remains as defense-in-depth.
+        if self.has_cross_type_conflict(&envelope) {
+            return TxQueueResult::TryAgainLater;
+        }
+
         // Validate transaction before queueing
         if let Err(code) = self.validate_transaction(&envelope) {
             return TxQueueResult::Invalid(Some(code));
