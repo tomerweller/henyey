@@ -3,7 +3,7 @@
 **Crate**: `henyey-tx`
 **Upstream**: `stellar-core/src/transactions/` (v26.0.1)
 **Overall Parity**: 97%
-**Last Updated**: 2026-05-10
+**Last Updated**: 2026-05-19
 
 ## Summary
 
@@ -687,6 +687,8 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
 
 9. **Balance Refund Overflow (Fixed March 2026)**: Fee refund arithmetic could overflow on i64 boundaries. Fixed with saturating arithmetic.
 
+10. **XDR Depth Check (Fixed May 2026)**: Missing `check_xdr_depth(envelope, 500)` validation at the top of shared validation entry points (`check_valid_pre_seq_num_with_config`, `validate_basic`, `validate_full`). Over-depth envelopes could pass structural validation and leak as non-parity first failures. Fixed by adding depth-limited XDR write as the first check in all shared paths. Spec anchor references §4.2.3 and §4.2.6 corrected to §5.2 step 8 and §5.2 step 7 respectively.
+
 #### Remaining Work
 
 1. **Bucket list parity**: The primary blocker for higher match rates at high ledger numbers is bucket list state divergence, being addressed in `henyey-bucket`.
@@ -699,14 +701,14 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 201 |
+| Implemented (Full) | 202 |
 | Gaps (None + Partial) | 6 |
 | Intentional Omissions | 31 |
-| **Parity** | **201 / (201 + 6) = 97%** |
+| **Parity** | **202 / (202 + 6) = 97%** |
 
-Breakdown of the 201 implemented items:
+Breakdown of the 202 implemented items:
 - TransactionFrame accessors/methods: 29
-- Validation functions: 13
+- Validation functions: 14
 - SignatureChecker functions: 10
 - MutableTransactionResult functions: 16
 - FeeBumpTransactionFrame functions: 11

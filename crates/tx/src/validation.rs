@@ -41,14 +41,42 @@
 use henyey_common::{asset::is_asset_valid, Hash256, NetworkId};
 use henyey_crypto::{PublicKey, Signature};
 use stellar_xdr::curr::{
-    AccountEntry, DecoratedSignature, OperationBody, Preconditions, SignerKey, TransactionEnvelope,
+    AccountEntry, DecoratedSignature, Limits, OperationBody, Preconditions, SignerKey,
+    TransactionEnvelope, WriteXdr,
 };
 
 use crate::fee_bump::{validate_fee_bump, FeeBumpError, FeeBumpFrame};
 use crate::frame::TransactionFrame;
 
+/// Maximum XDR recursion depth for envelope validation.
+/// Parity: stellar-core TransactionFrame.cpp:1973 / FeeBumpTransactionFrame.cpp:278
+const XDR_DEPTH_LIMIT: u32 = 500;
+
 /// stellar-core: TransactionFrame.cpp:65 — MAX_RESOURCE_FEE = 2^50
 pub(crate) const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
+
+/// Check that the transaction envelope does not exceed the XDR recursion depth limit.
+///
+/// Parity: stellar-core `TransactionFrame::checkValid` (TransactionFrame.cpp:1973) and
+/// `FeeBumpTransactionFrame::checkValidImpl` (FeeBumpTransactionFrame.cpp:278):
+/// ```text
+/// if (!xdr::check_xdr_depth(mEnvelope, 500)) { return txMALFORMED; }
+/// ```
+///
+/// This validates the full outer envelope by attempting a depth-limited XDR write.
+/// If the envelope's recursive structure exceeds 500 levels, it is rejected as malformed.
+fn check_xdr_depth(frame: &TransactionFrame) -> std::result::Result<(), PreSeqNumError> {
+    if frame
+        .envelope()
+        .to_xdr(Limits::depth(XDR_DEPTH_LIMIT))
+        .is_err()
+    {
+        return Err(PreSeqNumError::Malformed(
+            "XDR depth limit exceeded".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Per-transaction Soroban resource limits from the network configuration.
 ///
@@ -550,7 +578,7 @@ pub fn is_too_late(
     }
 
     // Check ledger max bound
-    // Spec: TX_SPEC §4.2.3 — ledger sequence MUST be strictly less than maxLedger.
+    // Spec: TX_SPEC §5.2 step 8 — ledger sequence MUST be strictly less than maxLedger.
     let ledger_bounds = match frame.preconditions() {
         Preconditions::None | Preconditions::Time(_) => None,
         Preconditions::V2(cond) => cond.ledger_bounds,
@@ -584,7 +612,7 @@ fn validate_soroban_resources(
     context: &LedgerContext,
 ) -> std::result::Result<(), ValidationError> {
     if !frame.is_soroban() {
-        // Spec: TX_SPEC §4.2.6 — a non-Soroban transaction MUST NOT carry
+        // Spec: TX_SPEC §5.2 step 7 — a non-Soroban transaction MUST NOT carry
         // SorobanTransactionData. Result: txMALFORMED.
         if frame.soroban_data().is_some() {
             return Err(ValidationError::InvalidStructure(
@@ -728,6 +756,11 @@ pub fn validate_basic(
     frame: &TransactionFrame,
     context: &LedgerContext,
 ) -> std::result::Result<(), Vec<ValidationError>> {
+    // Spec: TX_SPEC §5.1-1 — XDR depth check (first, before any other validation).
+    if let Err(e) = check_xdr_depth(frame) {
+        return Err(vec![ValidationError::InvalidStructure(e.to_string())]);
+    }
+
     let mut errors = Vec::new();
 
     if let Err(e) = validate_structure(frame) {
@@ -772,6 +805,11 @@ pub fn validate_full(
     context: &LedgerContext,
     source_account: &AccountEntry,
 ) -> std::result::Result<(), Vec<ValidationError>> {
+    // Spec: TX_SPEC §5.1-1 — XDR depth check (first, before any other validation).
+    if let Err(e) = check_xdr_depth(frame) {
+        return Err(vec![ValidationError::InvalidStructure(e.to_string())]);
+    }
+
     let mut errors = Vec::new();
 
     if let Err(e) = validate_structure(frame) {
@@ -1010,6 +1048,12 @@ pub fn check_valid_pre_seq_num_with_config(
     _ledger_flags: u32,
     soroban_limits: Option<&SorobanResourceLimits>,
 ) -> std::result::Result<(), PreSeqNumError> {
+    // Spec: TX_SPEC §5.1-1 — XDR depth check on the full outer envelope.
+    // Parity: stellar-core TransactionFrame.cpp:1973
+    //   `if (!xdr::check_xdr_depth(mEnvelope, 500))`
+    // This MUST be first: over-depth envelopes must not leak as InvalidSignature/TooLate/etc.
+    check_xdr_depth(frame)?;
+
     // 1. Structure: op count, fee > 0, soroban single-op consistency
     if frame.operations().is_empty() {
         return Err(PreSeqNumError::MissingOperation);

@@ -481,3 +481,105 @@ fn test_validate_basic_rejects_resource_fee_overflow() {
         errors
     );
 }
+
+// ============================================================================
+// #2805 — XDR depth limit check (§5.1-1)
+// Mirrors: stellar-core TransactionFrame.cpp:1969-1976 — xdr::check_xdr_depth(mEnvelope, 500)
+// ============================================================================
+
+/// Build an otherwise-valid Soroban envelope whose XDR nesting depth exceeds 500.
+/// Uses recursive ScVal::Vec nesting to achieve the required depth.
+fn make_over_depth_soroban_envelope() -> TransactionEnvelope {
+    // Build a deeply nested ScVal: Vec([Vec([Vec([...])])])
+    // Each ScVal::Vec layer adds XDR depth. We need >500 layers.
+    let mut val = ScVal::U32(42);
+    for _ in 0..501 {
+        val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+            vec![val].try_into().unwrap(),
+        )));
+    }
+
+    let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(stellar_xdr::curr::InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+                function_name: stellar_xdr::curr::ScSymbol(
+                    stellar_xdr::curr::StringM::<32>::try_from("deep".to_string()).unwrap(),
+                ),
+                args: vec![val].try_into().unwrap(),
+            }),
+            auth: VecM::default(),
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: source,
+        fee: 10_000,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V1(SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: empty_footprint(),
+                instructions: 100,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 5000,
+        }),
+    };
+
+    TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: vec![].try_into().unwrap(),
+    })
+}
+
+/// §5.1-1: check_valid_pre_seq_num must reject envelopes exceeding XDR depth limit of 500.
+/// Parity: stellar-core TransactionFrame.cpp:1973 — `if (!xdr::check_xdr_depth(mEnvelope, 500))`
+#[test]
+fn test_reject_transaction_exceeding_xdr_depth_limit() {
+    let envelope = make_over_depth_soroban_envelope();
+    let frame = TransactionFrame::from_owned(envelope);
+
+    let result = check_valid_pre_seq_num(&frame, PROTOCOL_VERSION, 0);
+    assert_eq!(
+        result,
+        Err(PreSeqNumError::Malformed(
+            "XDR depth limit exceeded".to_string()
+        )),
+        "check_valid_pre_seq_num should reject over-depth envelope as Malformed"
+    );
+}
+
+/// §5.1-1: validate_basic must also reject envelopes exceeding XDR depth limit.
+#[test]
+fn test_validate_basic_rejects_transaction_exceeding_xdr_depth_limit() {
+    use henyey_tx::validation::{validate_basic, LedgerContext, ValidationError};
+
+    let envelope = make_over_depth_soroban_envelope();
+    let frame = TransactionFrame::from_owned(envelope);
+
+    let ctx = LedgerContext::new(
+        100,
+        1000,
+        100,
+        5_000_000,
+        PROTOCOL_VERSION,
+        NetworkId::testnet(),
+    );
+    let result = validate_basic(&frame, &ctx);
+    let errors = result.expect_err("validate_basic should reject over-depth envelope");
+    let has_depth_error = errors
+        .iter()
+        .any(|e| matches!(e, ValidationError::InvalidStructure(msg) if msg.contains("depth")));
+    assert!(
+        has_depth_error,
+        "expected InvalidStructure error about XDR depth, got: {:?}",
+        errors
+    );
+}
