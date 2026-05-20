@@ -3685,6 +3685,28 @@ impl Herder {
         self.scp_driver.get_local_quorum_set()
     }
 
+    /// Return the full currently-tracked quorum map as (node_id_strkey, qset_hash_hex) pairs.
+    ///
+    /// This mirrors stellar-core's `getCurrentlyTrackedQuorum()` which is passed
+    /// to `saveSCPHistory()` at ledger close. It includes ALL tracked nodes
+    /// (local + transitive quorum members) that have a known quorum set, not
+    /// just those present in the current slot's SCP envelopes. This ensures
+    /// remote validators' node→qset_hash associations survive restarts even
+    /// when they were silent in the closing ledger.
+    pub fn get_currently_tracked_quorum(&self) -> Vec<(String, String)> {
+        let tracker = self.quorum_tracker.read();
+        let mut entries = Vec::new();
+        for (node_id, info) in tracker.quorum_map() {
+            if let Some(ref qs) = info.quorum_set {
+                let hash = henyey_scp::hash_quorum_set(qs);
+                let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(node_key) = &node_id.0;
+                let node_strkey = stellar_strkey::ed25519::PublicKey(node_key.0).to_string();
+                entries.push((node_strkey, hex::encode(hash.0)));
+            }
+        }
+        entries
+    }
+
     /// Purge SCP state for slots below the given slot.
     ///
     /// This is used during out-of-sync recovery to free memory and allow

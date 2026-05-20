@@ -380,7 +380,10 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
         }
         tracing::info!("force-scp flag detected, bootstrapping from DB state");
         app.bootstrap_from_db().await?;
-        app.clear_force_scp().await;
+        // Set in-memory flag so the restore guard in lifecycle.rs allows
+        // restore at genesis. The persistent DB flag is cleared AFTER
+        // restore_scp_state() completes (in lifecycle.rs) to avoid a crash
+        // window where the flag is cleared but restore hasn't run yet.
         app.set_force_scp_bootstrapped();
     }
 

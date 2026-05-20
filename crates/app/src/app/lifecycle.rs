@@ -239,6 +239,14 @@ impl App {
             self.herder.restore_scp_state();
         }
 
+        // Clear the persistent FORCE_SCP flag only AFTER restore completes.
+        // This eliminates the crash window: if the process dies before this
+        // point, the next restart will re-detect FORCE_SCP and re-run the
+        // full bootstrap+restore sequence.
+        if self.was_force_scp_bootstrapped() {
+            self.clear_force_scp().await;
+        }
+
         // Wire overlay tracking state to herder. The herder is now syncing,
         // so the overlay's maybe_drop_random_peer() should know the node is
         // tracking (parity: stellar-core Config::REALLY_DEAD_NUM_FAILURES_CUTOFF
