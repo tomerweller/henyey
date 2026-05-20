@@ -558,38 +558,66 @@ impl ScpPersistenceManager {
             restored.tx_sets.push((hash, tx_set));
         }
 
-        // Load SCP states
+        // Load SCP states — all-or-nothing per slot.
+        // Parity: stellar-core wraps each persisted slot in one try block
+        // (HerderImpl.cpp:2227-2258); if any decode fails, the entire slot is
+        // skipped. We mirror that by collecting into temporary vecs and only
+        // appending to `restored` if the entire slot decoded successfully.
         let states = self.storage.load_all_scp_states()?;
 
         for (slot, state) in states {
-            // Process quorum sets
+            let mut slot_quorum_sets = Vec::new();
+            let mut slot_envelopes = Vec::new();
+            let mut slot_ok = true;
+
+            // Decode quorum sets for this slot.
             for qs_result in state.get_quorum_sets() {
                 match qs_result {
                     Ok(qs) => {
                         let hash = Hash(*henyey_common::Hash256::hash_xdr(&qs).as_bytes());
-                        restored.quorum_sets.push((hash, qs));
+                        slot_quorum_sets.push((hash, qs));
                     }
                     Err(e) => {
-                        warn!("Failed to restore quorum set for slot {}: {}", slot, e);
+                        warn!(
+                            slot,
+                            error = %e,
+                            "Failed to decode quorum set in persisted slot — skipping entire slot"
+                        );
+                        slot_ok = false;
+                        break;
                     }
                 }
             }
 
-            // Process envelopes
-            for env_result in state.get_envelopes() {
-                match env_result {
-                    Ok(env) => {
-                        let env_slot = env.statement.slot_index;
-                        restored.envelopes.push((env_slot, env));
-
-                        // Update last slot saved
-                        let mut last_saved = self.last_slot_saved.write();
-                        *last_saved = (*last_saved).max(env_slot);
-                    }
-                    Err(e) => {
-                        warn!("Failed to restore envelope for slot {}: {}", slot, e);
+            // Decode envelopes for this slot.
+            if slot_ok {
+                for env_result in state.get_envelopes() {
+                    match env_result {
+                        Ok(env) => {
+                            let env_slot = env.statement.slot_index;
+                            slot_envelopes.push((env_slot, env));
+                        }
+                        Err(e) => {
+                            warn!(
+                                slot,
+                                error = %e,
+                                "Failed to decode envelope in persisted slot — skipping entire slot"
+                            );
+                            slot_ok = false;
+                            break;
+                        }
                     }
                 }
+            }
+
+            // Only commit this slot's data if everything decoded successfully.
+            if slot_ok {
+                restored.quorum_sets.extend(slot_quorum_sets);
+                for &(env_slot, _) in &slot_envelopes {
+                    let mut last_saved = self.last_slot_saved.write();
+                    *last_saved = (*last_saved).max(env_slot);
+                }
+                restored.envelopes.extend(slot_envelopes);
             }
         }
 
