@@ -3,7 +3,7 @@
 **Crate**: `henyey-history`
 **Upstream**: `stellar-core/src/history/`
 **Overall Parity**: 79%
-**Last Updated**: 2026-04-26
+**Last Updated**: 2026-05-20
 
 ## Summary
 
@@ -265,7 +265,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 3. **Publish queue storage**
    - **stellar-core**: Uses a filesystem queue directory where each pending checkpoint is represented by `<seq>.checkpoint.dirty` (written by `writeCheckpointFile(..., false)` in `publishQueuePath()`) and finalized to `<seq>.checkpoint` by `maybeCheckpointComplete()`. On restart, `restoreCheckpoint()` iterates the queue directory and removes entries above LCL.
-   - **Rust**: Uses a SQLite `publishqueue` table (`ledgerseq → HAS JSON`). Rows are created atomically inside the ledger-close DB transaction (`conn.enqueue_publish(...)` in `crates/app/src/app/ledger_close.rs`). There is no pending/dirty row state — the entry either committed or it didn't. On restart, `restore_checkpoint()` calls `remove_above_lcl()` to clean stale rows, paralleling stellar-core's filesystem cleanup.
+   - **Rust**: Uses a SQLite `publishqueue` table (`ledgerseq → HAS JSON`). Rows are created atomically inside the ledger-close DB transaction (`conn.enqueue_publish(...)` in `crates/app/src/app/ledger_close.rs`). There is no pending/dirty row state — the entry either committed or it didn't. On restart, `restore_checkpoint()` calls `db.remove_publish_above_lcl(lcl)` to clean stale rows, paralleling stellar-core's filesystem cleanup.
    - **Rationale**: The queue is node-local and never externally observable. SQLite's ACID commit replaces the two-phase `.dirty` → rename pattern while providing equivalent durability and restart-safety guarantees. The Rust implementation skips migration baggage and keeps queue state crash-safe in one transactional store. Checkpoint XDR file staging (the part that *is* filesystem-based) remains in `CheckpointBuilder` with `.dirty` files and durable rename, identical in spirit to stellar-core.
 
 4. **FutureBucket handling**

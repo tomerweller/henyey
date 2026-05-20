@@ -17,15 +17,17 @@
 //!
 //! Henyey uses SQLite rows instead. This is an **intentional implementation
 //! choice** — the queue is node-local and never externally observable, so
-//! the storage shape has no consensus or interoperability implications. The
-//! semantic equivalence is:
+//! the storage shape has no consensus or interoperability implications.
+//! However, the on-disk representation differs from stellar-core's filesystem
+//! queue, which affects local operational tooling and manual inspection.
+//! The crash-recovery semantic equivalence is:
 //!
 //! | stellar-core filesystem | henyey SQLite |
 //! |-------------------------|---------------|
 //! | File absent → not queued | Row absent → not queued |
 //! | `.dirty` file exists → pending (partially written) | *No analogue* — rows appear only on commit (see below) |
 //! | `.checkpoint` file exists → ready to publish | Row exists with HAS JSON → ready to publish |
-//! | `restoreCheckpoint()` removes files > LCL | `remove_above_lcl()` removes rows > LCL |
+//! | `restoreCheckpoint()` removes files > LCL | `db.remove_publish_above_lcl(lcl)` removes rows > LCL |
 //!
 //! The key difference is that henyey has **no pending/dirty row state**.
 //! Queue entries are created atomically inside the ledger-close DB
@@ -33,7 +35,7 @@
 //! `crates/app/src/app/ledger_close.rs`). If the transaction rolls back,
 //! the row never existed. This replaces the two-phase `.dirty` → rename
 //! pattern with single-phase transactional commit — the database's ACID
-//! guarantees provide the durability that stellar-core achieves via
+//! guarantees provide equivalent crash-recovery semantics to stellar-core's
 //! `fsync` + durable rename.
 //!
 //! # Recovery path split
@@ -47,7 +49,8 @@
 //!
 //! - **Publish queue rows** (stale HAS snapshots above LCL): cleaned up by
 //!   `restore_checkpoint()` in `crates/app/src/app/ledger_close.rs` via
-//!   `crates/db/src/queries/publish_queue.rs::remove_above_lcl()`.
+//!   `db.remove_publish_above_lcl(lcl)` (which delegates to
+//!   `crates/db/src/queries/publish_queue.rs::remove_above_lcl()`).
 //!
 //! Together these two paths provide the same restart-safety guarantee as
 //! stellar-core's `restoreCheckpoint()`, which handles both filesystem
