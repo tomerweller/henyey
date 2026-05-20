@@ -3845,8 +3845,8 @@ mod tests {
             _ => panic!("expected Malformed"),
         };
         assert!(
-            msg.contains("500"),
-            "message should mention the limit value 500, got: {msg}"
+            msg.contains(&XDR_DEPTH_LIMIT.to_string()),
+            "message should mention the configured limit value, got: {msg}"
         );
     }
 
