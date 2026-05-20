@@ -1936,9 +1936,15 @@ impl ScpDriver {
             .collect();
 
         // Phase 4: Filter to selectable candidates (previousLedgerHash matches LCL).
-        // Parity: stellar-core applies this filter only during tx set selection
-        // (HerderSCPDriver.cpp:784), not during hash/upgrade computation.
-        let lcl_hash = self.ledger_manager.current_header_hash();
+        // Parity: stellar-core snapshots `lcl` once (HerderSCPDriver.cpp:669)
+        // and uses that snapshot for both previousLedgerHash filtering (:784)
+        // and compareTxSets protocol_version (:788-792). We use
+        // header_snapshot() to atomically capture both, avoiding a race with
+        // commit_close() between the reads.
+        let lcl_snapshot = self.ledger_manager.header_snapshot();
+        let lcl_hash = lcl_snapshot.hash;
+        let protocol_version = lcl_snapshot.header.ledger_version;
+
         let mut selectable_candidates: Vec<ResolvedCandidate> = all_candidates
             .into_iter()
             .filter(|c| c.tx_set.previous_ledger_hash() == lcl_hash)
@@ -1958,7 +1964,6 @@ impl ScpDriver {
         // Parity: HerderSCPDriver.cpp:775-797 — manual loop that keeps the
         // first winner on ties (stellar-core: `if (!highestTxSet || compareTxSets(...))`).
         // Uses owned tx_set references — no cache re-reads.
-        let protocol_version = self.ledger_manager.current_header().ledger_version;
         let mut best_idx = 0;
         for i in 1..selectable_candidates.len() {
             if Self::compare_tx_sets(
