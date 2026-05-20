@@ -10487,30 +10487,42 @@ mod tests {
         );
     }
 
-    /// §14.5 parity: end-to-end test that `App::new()` seeds
-    /// `catchup_needs_full_reset` from `CATCHUP_PERSIST_PENDING` on a
-    /// file-backed DB, AND does not consume/clear the sentinel (so
-    /// repeated restarts remain crash-idempotent).
-    #[test]
-    fn test_app_new_sets_full_reset_and_preserves_catchup_persist_sentinel() {
-        let db = henyey_db::Database::open_in_memory().unwrap();
+    /// §14.5 parity: end-to-end test that `App::new()` on a file-backed DB
+    /// seeds `catchup_needs_full_reset` from `CATCHUP_PERSIST_PENDING`, AND
+    /// does not consume/clear the sentinel (so repeated restarts remain
+    /// crash-idempotent).
+    #[tokio::test]
+    async fn test_app_new_sets_full_reset_and_preserves_catchup_persist_sentinel() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
 
-        // Seed the sentinel as if a prior catchup crashed mid-deferred-persist.
-        db.with_connection(|conn| {
-            use henyey_db::queries::StateQueries;
-            conn.set_state(state_keys::CATCHUP_PERSIST_PENDING, "1")
-        })
-        .unwrap();
+        // Pre-create the DB and seed the sentinel as if a prior catchup
+        // crashed mid-deferred-persist.
+        {
+            let db = henyey_db::Database::open(db_path.clone()).unwrap();
+            db.with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                conn.set_state(state_keys::CATCHUP_PERSIST_PENDING, "1")
+            })
+            .unwrap();
+        }
 
-        // Simulate the startup path: check_catchup_persist_pending → force_full_catchup.
-        let force_full_catchup = App::check_catchup_persist_pending(&db);
+        // Construct the App via the real startup path.
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path.clone())
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Assert that App::new() detected the sentinel and set the flag.
         assert!(
-            force_full_catchup,
-            "startup must detect CATCHUP_PERSIST_PENDING and return true"
+            app.catchup_needs_full_reset
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "App::new() must detect CATCHUP_PERSIST_PENDING and set catchup_needs_full_reset"
         );
 
-        // Verify the sentinel is still present after detection (crash-idempotent).
-        let sentinel_still_present = db
+        // Verify the sentinel is still present in the DB (crash-idempotent).
+        let sentinel_still_present = app
+            .database()
             .with_connection(|conn| {
                 use henyey_db::queries::StateQueries;
                 conn.get_state(state_keys::CATCHUP_PERSIST_PENDING)
@@ -10518,7 +10530,7 @@ mod tests {
             .unwrap();
         assert!(
             sentinel_still_present.is_some(),
-            "CATCHUP_PERSIST_PENDING must remain set after startup detection \
+            "CATCHUP_PERSIST_PENDING must remain set after App::new() detection \
              (crash-idempotent — cleared only by successful persist)"
         );
     }
