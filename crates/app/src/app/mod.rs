@@ -559,6 +559,10 @@ pub struct App {
     /// replay-only. This is triggered when a previous catchup fails with a
     /// hash mismatch (state divergence, e.g., protocol upgrade missed).
     catchup_needs_full_reset: AtomicBool,
+    /// Set when the node was bootstrapped via FORCE_SCP. Used by the startup
+    /// restore guard to allow `restore_scp_state()` at genesis when FORCE_SCP
+    /// was active, matching stellar-core's `HerderImpl::start()` logic.
+    force_scp_bootstrapped: AtomicBool,
     /// Prevent concurrent history publish operations.
     /// When set, a background task is publishing a checkpoint.
     publish_in_progress: AtomicBool,
@@ -1293,6 +1297,7 @@ impl App {
             catchup_in_progress: AtomicBool::new(false),
             deferred_catchup: tokio::sync::Mutex::new(None),
             fatal_state_failure: AtomicBool::new(false),
+            force_scp_bootstrapped: AtomicBool::new(false),
             catchup_needs_full_reset: AtomicBool::new(force_full_catchup),
             publish_in_progress: AtomicBool::new(false),
             #[cfg(test)]
@@ -1790,6 +1795,20 @@ impl App {
                 .map_err(Into::into)
             })
             .await;
+    }
+
+    /// Record that FORCE_SCP bootstrapping was performed. The startup restore
+    /// guard in `lifecycle.rs` uses this to allow `restore_scp_state()` at
+    /// genesis when FORCE_SCP was active, matching stellar-core.
+    pub(crate) fn set_force_scp_bootstrapped(&self) {
+        self.force_scp_bootstrapped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns true if the node was bootstrapped via FORCE_SCP this startup.
+    pub(crate) fn was_force_scp_bootstrapped(&self) -> bool {
+        self.force_scp_bootstrapped
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the database.
@@ -10417,6 +10436,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lcl, Some(1), "in-memory DB should have genesis LCL=1");
+    }
+
+    /// Parity: stellar-core skips `restoreSCPState()` at GENESIS_LEDGER_SEQ
+    /// unless FORCE_SCP is active. Verify the guard defaults correctly.
+    #[tokio::test]
+    async fn test_restore_scp_state_skipped_at_genesis_without_force_scp() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        // App starts at genesis (ledger_seq=1) which equals GENESIS_LEDGER_SEQ.
+        let ledger_seq = app.current_ledger_seq();
+        assert_eq!(ledger_seq, henyey_history::GENESIS_LEDGER_SEQ);
+
+        // Without FORCE_SCP, the guard should NOT restore.
+        assert!(!app.was_force_scp_bootstrapped());
+        let at_genesis = ledger_seq <= henyey_history::GENESIS_LEDGER_SEQ;
+        assert!(at_genesis, "should be at genesis");
+        // Guard: `!at_genesis || was_force_scp_bootstrapped()` → false
+        assert!(
+            !((!at_genesis) || app.was_force_scp_bootstrapped()),
+            "restore should be skipped at genesis without force_scp"
+        );
+    }
+
+    /// Parity: stellar-core DOES call `restoreSCPState()` at genesis when
+    /// FORCE_SCP is active. Verify the guard allows it.
+    #[tokio::test]
+    async fn test_restore_scp_state_allowed_at_genesis_with_force_scp() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        // Simulate FORCE_SCP bootstrap.
+        app.set_force_scp_bootstrapped();
+
+        let ledger_seq = app.current_ledger_seq();
+        assert_eq!(ledger_seq, henyey_history::GENESIS_LEDGER_SEQ);
+
+        // With FORCE_SCP, the guard SHOULD allow restore even at genesis.
+        let at_genesis = ledger_seq <= henyey_history::GENESIS_LEDGER_SEQ;
+        assert!(at_genesis);
+        // Guard: `!at_genesis || was_force_scp_bootstrapped()` → true
+        assert!(
+            (!at_genesis) || app.was_force_scp_bootstrapped(),
+            "restore should proceed at genesis with force_scp"
+        );
     }
 
     /// AUDIT-226: `check_catchup_persist_pending` returns true when the

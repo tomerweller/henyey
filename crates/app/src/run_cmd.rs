@@ -381,6 +381,7 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
         tracing::info!("force-scp flag detected, bootstrapping from DB state");
         app.bootstrap_from_db().await?;
         app.clear_force_scp().await;
+        app.set_force_scp_bootstrapped();
     }
 
     // Attempt to restore node state from persisted DB + on-disk bucket files.
