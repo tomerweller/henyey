@@ -1851,6 +1851,14 @@ impl ScpDriver {
             return Value::default();
         }
 
+        // Parity: stellar-core snapshots `lcl` once on entry
+        // (HerderSCPDriver.cpp:669) and uses that snapshot for both
+        // previousLedgerHash filtering and compareTxSets protocol_version.
+        // We capture it here before any candidate processing to match.
+        let lcl_snapshot = self.ledger_manager.header_snapshot();
+        let lcl_hash = lcl_snapshot.hash;
+        let protocol_version = lcl_snapshot.header.ledger_version;
+
         // Phase 1: Decode all candidates.
         // Parity: stellar-core throws on decode failure in combineCandidates
         // (HerderSCPDriver.cpp:682-688). We panic to match fail-loud behavior.
@@ -1936,14 +1944,8 @@ impl ScpDriver {
             .collect();
 
         // Phase 4: Filter to selectable candidates (previousLedgerHash matches LCL).
-        // Parity: stellar-core snapshots `lcl` once (HerderSCPDriver.cpp:669)
-        // and uses that snapshot for both previousLedgerHash filtering (:784)
-        // and compareTxSets protocol_version (:788-792). We use
-        // header_snapshot() to atomically capture both, avoiding a race with
-        // commit_close() between the reads.
-        let lcl_snapshot = self.ledger_manager.header_snapshot();
-        let lcl_hash = lcl_snapshot.hash;
-        let protocol_version = lcl_snapshot.header.ledger_version;
+        // lcl_hash and protocol_version were captured at function entry to match
+        // stellar-core's single-snapshot approach (HerderSCPDriver.cpp:669).
 
         let mut selectable_candidates: Vec<ResolvedCandidate> = all_candidates
             .into_iter()
