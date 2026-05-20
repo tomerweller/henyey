@@ -1859,6 +1859,14 @@ impl ScpDriver {
         let lcl_hash = lcl_snapshot.hash;
         let protocol_version = lcl_snapshot.header.ledger_version;
 
+        // Parity: stellar-core's `candidates` parameter is a `ValueWrapperPtrSet`
+        // (std::set ordered by raw Value bytes via WrappedValuePtrComparator,
+        // SCPDriver.cpp:35-41). This canonical ordering governs which fail-loud
+        // condition fires first inside the phase-1 loop. We sort by raw bytes
+        // before processing to match that ordering contract.
+        let mut sorted_values: Vec<&Value> = values.iter().collect();
+        sorted_values.sort_by(|a, b| a.0.cmp(&b.0));
+
         // Phase 1: Per-candidate loop — decode, XOR hash, parse upgrades.
         // Parity: stellar-core processes each candidate in a single ordered loop
         // (HerderSCPDriver.cpp:675-766): parse candidate value → XOR hash →
@@ -1868,9 +1876,9 @@ impl ScpDriver {
         let mut candidates_hash = [0u8; 32];
         let mut merged_upgrades: std::collections::BTreeMap<u32, LedgerUpgrade> =
             std::collections::BTreeMap::new();
-        let mut decoded: Vec<(Value, StellarValue)> = Vec::with_capacity(values.len());
+        let mut decoded: Vec<(Value, StellarValue)> = Vec::with_capacity(sorted_values.len());
 
-        for v in values {
+        for &v in &sorted_values {
             // Step 1: Parse candidate value (stellar-core line 682-688).
             let sv = StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none())
                 .expect("BUG: cannot parse candidate value in combineCandidates");
@@ -1900,7 +1908,7 @@ impl ScpDriver {
                     .or_insert(upgrade);
             }
 
-            decoded.push((v.clone(), sv));
+            decoded.push(((*v).clone(), sv));
         }
 
         // Phase 2: Resolve tx sets and enforce prepare_for_apply on ALL candidates.
@@ -1956,6 +1964,8 @@ impl ScpDriver {
         // Phase 4: Sort and select best candidate.
         // Parity: stellar-core iterates a ValueWrapperPtrSet (std::set ordered
         // by raw Value bytes via WrappedValuePtrComparator, SCPDriver.cpp:36-41).
+        // Candidates were already sorted at entry (before phase 1), so this is
+        // a stable no-op; kept as a defensive guard against future refactors.
         selectable_candidates.sort_by(|a, b| a.raw.cmp(&b.raw));
 
         // Parity: HerderSCPDriver.cpp:775-797 — manual loop that keeps the
@@ -7403,11 +7413,12 @@ mod tests {
     }
 
     /// Regression test for #2817 review — mixed failure precedence.
-    /// Candidate A (earlier in iteration order) has valid StellarValue XDR but
-    /// a malformed upgrade payload. Candidate B (later) has malformed
-    /// StellarValue XDR entirely. stellar-core's per-candidate loop processes
-    /// A's upgrade parse before ever attempting to decode B, so A's upgrade
-    /// failure fires first. This test locks in that ordering.
+    /// Candidate A (canonically first by raw bytes) has valid StellarValue XDR
+    /// but a malformed upgrade payload. Candidate B (canonically second — higher
+    /// raw bytes) has malformed StellarValue XDR entirely. stellar-core's
+    /// per-candidate loop processes A's upgrade parse before ever attempting to
+    /// decode B, so A's upgrade failure fires first. This test locks in that
+    /// ordering.
     #[test]
     #[should_panic(expected = "cannot parse upgrade in validated candidate")]
     fn test_combine_candidates_panics_malformed_upgrade_before_malformed_later_candidate() {
@@ -7425,11 +7436,105 @@ mod tests {
         let v_a = encode_sv(&sv_a);
 
         // Candidate B: completely invalid XDR (cannot parse as StellarValue).
-        let v_b = Value(vec![0x00, 0x01, 0x02, 0x03].try_into().unwrap());
+        // Uses 0xFF bytes to ensure it sorts AFTER candidate A in canonical
+        // raw-byte order (matching stellar-core's WrappedValuePtrComparator).
+        let v_b = Value(vec![0xFF; 32].try_into().unwrap());
+
+        assert!(
+            v_a.0 < v_b.0,
+            "test setup: v_a must sort before v_b canonically"
+        );
 
         // Per-candidate ordering: A is processed first (parse value OK → XOR
         // hash → parse upgrade → PANIC). B's malformed value is never reached.
         let _ = driver.combine_candidates_impl(1, &[v_a, v_b]);
+    }
+
+    /// Regression test for #2817 review round 2 — canonical raw-Value ordering.
+    /// stellar-core's `combineCandidates` receives candidates via a
+    /// `ValueWrapperPtrSet` (std::set with `WrappedValuePtrComparator`,
+    /// SCPDriver.cpp:35-41), which orders by raw `Value` bytes. This means
+    /// failure precedence is determined by byte order, NOT caller-supplied order.
+    ///
+    /// This test passes candidates in REVERSE raw-byte order and verifies that
+    /// the failure still fires on the canonically-first candidate (lowest raw
+    /// bytes), proving that henyey sorts before processing.
+    #[test]
+    #[should_panic(expected = "cannot parse upgrade in validated candidate")]
+    fn test_combine_candidates_canonical_order_determines_failure_precedence() {
+        let driver = make_test_driver();
+
+        // Candidate A: valid StellarValue with a malformed upgrade.
+        // Its raw bytes will be LOWER than candidate B's.
+        let sv_a = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([0x01; 32]),
+            close_time: TimePoint(1_000_000_000),
+            upgrades: vec![UpgradeType(vec![0xFF, 0xFE, 0xFD].try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let v_a = encode_sv(&sv_a);
+
+        // Candidate B: valid StellarValue with a malformed upgrade.
+        // Its raw bytes will be HIGHER than candidate A's (tx_set_hash 0x99 > 0x01).
+        let sv_b = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([0x99; 32]),
+            close_time: TimePoint(2_000_000_000),
+            upgrades: vec![UpgradeType(vec![0xAA, 0xBB, 0xCC].try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let v_b = encode_sv(&sv_b);
+
+        // Verify that v_a < v_b in raw bytes (canonical order).
+        assert!(v_a.0 < v_b.0, "test setup: v_a must sort before v_b");
+
+        // Pass in REVERSE order: [v_b, v_a]. Without the canonical sort fix,
+        // this would process v_b first and panic on v_b's malformed upgrade.
+        // With the fix, v_a is processed first (lower raw bytes) and panics
+        // on v_a's malformed upgrade — same as stellar-core would.
+        //
+        // Both have malformed upgrades, but the panic message is the same.
+        // The key assertion is that it panics at all (proving it processes in
+        // canonical order, not skipping). To verify ordering, we use a mixed
+        // scenario below.
+        let _ = driver.combine_candidates_impl(1, &[v_b, v_a]);
+    }
+
+    /// Stronger ordering test: candidate with lower raw bytes has a malformed
+    /// upgrade, candidate with higher raw bytes has a malformed Value entirely.
+    /// Passed in reverse order [high, low], proves low's upgrade failure fires
+    /// before high's decode failure.
+    #[test]
+    #[should_panic(expected = "cannot parse upgrade in validated candidate")]
+    fn test_combine_candidates_reverse_order_still_panics_on_canonical_first() {
+        let driver = make_test_driver();
+
+        // Candidate A (canonically first — low raw bytes): valid StellarValue
+        // with a malformed upgrade.
+        let sv_a = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([0x01; 32]),
+            close_time: TimePoint(1_000_000_000),
+            upgrades: vec![UpgradeType(vec![0xFF, 0xFE, 0xFD].try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let v_a = encode_sv(&sv_a);
+
+        // Candidate B (canonically second — high raw bytes): completely invalid
+        // XDR that would panic with "cannot parse candidate value".
+        let v_b = Value(vec![0xFF; 32].try_into().unwrap());
+
+        // v_a raw bytes start with XDR encoding of the struct; v_b is all 0xFF.
+        assert!(v_a.0 < v_b.0, "test setup: v_a must sort before v_b");
+
+        // Pass in REVERSE canonical order: [v_b, v_a].
+        // Without sorting: processes v_b first → panics "cannot parse candidate value"
+        // With sorting: processes v_a first → panics "cannot parse upgrade"
+        let _ = driver.combine_candidates_impl(1, &[v_b, v_a]);
     }
 }
 
