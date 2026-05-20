@@ -620,8 +620,8 @@ mod tests {
         // Overwrite true→false: previous is true
         assert_eq!(tracker.store_valid(key, false), Some(true));
 
-        // Overwrite false→true (INV-H8 flip): previous is false
-        assert_eq!(tracker.store_valid(key, true), Some(false));
+        // NOTE: false→true flip is now fatal (INV-H8, #2818) — tested
+        // separately in test_store_valid_false_to_true_flip_panics_before_overwrite.
     }
 
     /// Regression test for AUDIT-080: unsolicited tx sets must not be cached.
@@ -1107,6 +1107,69 @@ mod tests {
         assert!(
             tracker.cache_count() >= 1,
             "cache should not be empty after stores"
+        );
+    }
+
+    /// Regression test for #2818: A false→true validity-cache flip must panic
+    /// (fatal per HERDER_SPEC §9.7 / INV-H8) and must NOT overwrite the cached
+    /// `false` entry.
+    #[test]
+    fn test_store_valid_false_to_true_flip_panics_before_overwrite() {
+        let tracker = TxSetTracker::new(256);
+        let lcl = Hash256::from_bytes([0; 32]);
+        let key_hash = Hash256::from_bytes([1; 32]);
+        let key = (lcl, key_hash, 0u64);
+
+        // Seed the cache with false.
+        tracker.store_valid(key, false);
+        assert_eq!(tracker.check_valid(&key), Some(false));
+
+        // Attempt false→true: must panic.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracker.store_valid(key, true);
+        }));
+        assert!(result.is_err(), "false→true flip must panic (INV-H8)");
+
+        // The cached value must still be `false` — the panic fires BEFORE the
+        // overwrite so the invariant-violating `true` is never persisted.
+        assert_eq!(
+            tracker.check_valid(&key),
+            Some(false),
+            "cached value must remain false after panic"
+        );
+    }
+
+    /// Regression test for #2818: The panic message for a false→true flip must
+    /// contain the upstream-style prefix and the tx-set hash so operators can
+    /// correlate it with the offending tx set.
+    #[test]
+    fn test_store_valid_false_to_true_flip_panic_mentions_tx_set_hash() {
+        let tracker = TxSetTracker::new(256);
+        let lcl = Hash256::from_bytes([0; 32]);
+        let key_hash = Hash256::from_bytes([0xab; 32]);
+        let key = (lcl, key_hash, 0u64);
+
+        tracker.store_valid(key, false);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracker.store_valid(key, true);
+        }));
+        let err = result.expect_err("false→true flip must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+
+        assert!(
+            msg.contains("Inconsistent txSet validity for tx set"),
+            "panic message must contain upstream prefix, got: {msg}"
+        );
+        // The tx-set hash component of the key should appear in the message.
+        let hash_hex = key_hash.to_hex();
+        assert!(
+            msg.contains(&hash_hex),
+            "panic message must contain tx-set hash {hash_hex}, got: {msg}"
         );
     }
 }
