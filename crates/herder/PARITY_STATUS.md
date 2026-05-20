@@ -195,7 +195,7 @@ Corresponds to: `HerderSCPDriver.h`
 | `getMaybeDeadNodes()` | `DeadNodeTracker` | Full |
 | `startCheckForDeadNodesInterval()` | `DeadNodeTracker` | Full |
 | `getNodeWeight()` | _(not implemented)_ | None |
-| `cacheValidTxSet()` | `TxSetTracker::store_valid` | Full (fatal on false→true flip per INV-H8) |
+| `cacheValidTxSet()` | `TxSetTracker::store_valid` | Partial (fatal on false→true flip per INV-H8; nomination-side write path not yet wired) |
 | `checkAndCacheTxSetValid()` | `ScpDriver::check_and_cache_tx_set_valid` | Full |
 
 ### Persistence (`persistence.rs`)
@@ -507,7 +507,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `recordSCPEvent()` / `recordSCPExternalizeEvent()` | Low | SCP event tracking |
 | `getExternalizeLag()` / `getQsetLagInfo()` | Low | Externalize timing metrics |
 | `getNodeWeight()` | Medium | Application-specific leader election (P22+) |
-| ~~`cacheValidTxSet()` / `checkAndCacheTxSetValid()`~~ | ~~Low~~ | ~~TxSet validity caching~~ — **Implemented** (#2818) |
+| ~~`cacheValidTxSet()` / `checkAndCacheTxSetValid()`~~ | ~~Low~~ | ~~TxSet validity caching~~ — **Partially implemented** (#2818): fatal flip guard done, nomination-side write path pending |
 | `wrapEnvelope()` / `wrapStellarValue()` / `wrapValue()` | Low | Value wrapper pattern |
 | Ballot phase callbacks (7 methods) | Low | Logging/metrics callbacks |
 | `getPrepareStart()` / SCPTiming | Partial | `SlotTimingState::ballot_start` tracks prepare start; `nomination_duration` matches `mNominateToPrepare`. Missing: `mPrepareToExternalize` metric. |
