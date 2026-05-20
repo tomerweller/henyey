@@ -590,7 +590,7 @@ fn test_validate_basic_rejects_transaction_exceeding_xdr_depth_limit() {
 fn test_reject_fee_bump_transaction_exceeding_xdr_depth_limit() {
     use stellar_xdr::curr::{
         DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
-        FeeBumpTransactionInnerTx, Int64, Signature, SignatureHint,
+        FeeBumpTransactionInnerTx, Signature, SignatureHint,
     };
 
     // Build an over-depth inner envelope and wrap it in a fee-bump.
@@ -602,7 +602,7 @@ fn test_reject_fee_bump_transaction_exceeding_xdr_depth_limit() {
 
     let fee_bump_tx = FeeBumpTransaction {
         fee_source: MuxedAccount::Ed25519(Uint256([2u8; 32])),
-        fee: Int64(20_000),
+        fee: 20_000,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_tx_env),
         ext: FeeBumpTransactionExt::V0,
     };

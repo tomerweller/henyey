@@ -72,16 +72,24 @@ pub(crate) const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
 /// This validates the full outer envelope by attempting a depth-limited XDR write.
 /// If the envelope's recursive structure exceeds 500 levels, it is rejected as malformed.
 fn check_xdr_depth(frame: &TransactionFrame) -> std::result::Result<(), PreSeqNumError> {
-    if frame
-        .envelope()
-        .to_xdr(Limits::depth(XDR_DEPTH_LIMIT))
-        .is_err()
-    {
-        return Err(PreSeqNumError::Malformed(
-            "XDR depth limit exceeded".to_string(),
-        ));
+    if let Err(err) = frame.envelope().to_xdr(Limits::depth(XDR_DEPTH_LIMIT)) {
+        return Err(format_xdr_depth_error(err));
     }
     Ok(())
+}
+
+/// Convert a `stellar_xdr` error from a depth-limited XDR write into a
+/// [`PreSeqNumError::Malformed`] with an actionable message.
+///
+/// - `DepthLimitExceeded` → includes the configured limit value.
+/// - Any other XDR error → preserves the underlying error text.
+fn format_xdr_depth_error(err: stellar_xdr::curr::Error) -> PreSeqNumError {
+    match err {
+        stellar_xdr::curr::Error::DepthLimitExceeded => PreSeqNumError::Malformed(format!(
+            "XDR depth limit exceeded (limit: {XDR_DEPTH_LIMIT})"
+        )),
+        other => PreSeqNumError::Malformed(format!("XDR depth check failed: {other}")),
+    }
 }
 
 /// Per-transaction Soroban resource limits from the network configuration.
