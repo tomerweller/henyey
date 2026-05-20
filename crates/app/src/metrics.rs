@@ -803,9 +803,9 @@ metric_catalog! {
         CLOSE_SOROBAN_STATE_SECONDS = "henyey_ledger_close_soroban_state_seconds"
             => "Ledger close soroban_state phase (seconds)";
         CLOSE_SOROBAN_STATE_DATA_ARC_COUNT = "henyey_ledger_close_soroban_state_data_arc_refs"
-            => "Arc strong_count for contract_data_entries at start of soroban_state phase";
+            => "Max per-shard Arc strong_count for contract_data_entries at start of soroban_state phase";
         CLOSE_SOROBAN_STATE_CODE_ARC_COUNT = "henyey_ledger_close_soroban_state_code_arc_refs"
-            => "Arc strong_count for contract_code_entries at start of soroban_state phase";
+            => "Max per-shard Arc strong_count for contract_code_entries at start of soroban_state phase";
         CLOSE_BUCKET_ADD_SECONDS = "henyey_ledger_close_bucket_add_seconds"
             => "Ledger close bucket_add phase (seconds)";
         CLOSE_HOT_ARCHIVE_SECONDS = "henyey_ledger_close_hot_archive_seconds"
