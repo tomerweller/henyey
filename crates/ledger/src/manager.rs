@@ -4243,9 +4243,10 @@ impl LedgerCloseContext<'_> {
         // Update stats
         let tx_count = tx_set_result.results.len();
         let success_count = tx_set_result.results.iter().filter(|r| r.success).count();
-        // Count ops from envelope operation lists (not execution results), mirroring
-        // stellar-core's `txSet.sizeOpTotal()`. Pre-execution-rejected txs (TxBadSeq,
-        // TxBadAuth, etc.) have zero operation_results but still contribute ops.
+        // Count ops mirroring stellar-core's `txSet.sizeOpTotal()` which sums
+        // `getNumOperations()` per tx. For fee-bump txs this is `inner_ops + 1`;
+        // for regular txs it is `operations.len()`. Uses the envelope (not
+        // execution results) so pre-execution-rejected txs still contribute.
         let op_count: usize = prepared
             .all_txs
             .iter()
