@@ -132,8 +132,15 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 [^txset-gc]: GC timer + purge wired in #2698 (driven by app event-loop phase
 33 every `TX_SET_GC_DELAY_SECS` = 60s). The `persist_scp_state` wiring was
 completed in #2768 (`ScpDriver::emit` invokes the persist callback installed
-by `Herder::set_scp_persistence`). The `restore_scp_state` wiring remains
-tracked in #2769.
+by `Herder::set_scp_persistence`). The `restore_scp_state` wiring was
+completed in #2769: `lifecycle.rs` calls `restore_scp_state()` after
+`bootstrap(ledger_seq)` (not in `init_herder`) so finalized slot state is
+already seeded before replay. The `FORCE_SCP` DB flag is cleared only after
+restore completes to eliminate crash windows. `quoruminfo` persistence at
+ledger close uses the full `get_currently_tracked_quorum()` map (all tracked
+nodes with known qsets), mirroring stellar-core's `saveSCPHistory()` which
+writes `getCurrentlyTrackedQuorum()` — not just the closing ledger's envelope
+set.
 
 [^persist-scp]: Wired in #2768 via a deferred persist callback on `ScpDriver`.
 Each call to `ScpDriver::emit` (which mirrors stellar-core's

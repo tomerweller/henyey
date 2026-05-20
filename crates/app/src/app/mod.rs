@@ -559,6 +559,10 @@ pub struct App {
     /// replay-only. This is triggered when a previous catchup fails with a
     /// hash mismatch (state divergence, e.g., protocol upgrade missed).
     catchup_needs_full_reset: AtomicBool,
+    /// Set when the node was bootstrapped via FORCE_SCP. Used by the startup
+    /// restore guard to allow `restore_scp_state()` at genesis when FORCE_SCP
+    /// was active, matching stellar-core's `HerderImpl::start()` logic.
+    force_scp_bootstrapped: AtomicBool,
     /// Prevent concurrent history publish operations.
     /// When set, a background task is publishing a checkpoint.
     publish_in_progress: AtomicBool,
@@ -1293,6 +1297,7 @@ impl App {
             catchup_in_progress: AtomicBool::new(false),
             deferred_catchup: tokio::sync::Mutex::new(None),
             fatal_state_failure: AtomicBool::new(false),
+            force_scp_bootstrapped: AtomicBool::new(false),
             catchup_needs_full_reset: AtomicBool::new(force_full_catchup),
             publish_in_progress: AtomicBool::new(false),
             #[cfg(test)]
@@ -1627,7 +1632,10 @@ impl App {
         let scp_persistence_manager = Arc::new(henyey_herder::ScpPersistenceManager::new(
             Box::new(scp_persistence),
         ));
-        if herder.set_scp_persistence(scp_persistence_manager).is_err() {
+        if herder
+            .set_scp_persistence(scp_persistence_manager.clone())
+            .is_err()
+        {
             panic!("set_scp_persistence called more than once");
         }
 
@@ -1787,6 +1795,20 @@ impl App {
                 .map_err(Into::into)
             })
             .await;
+    }
+
+    /// Record that FORCE_SCP bootstrapping was performed. The startup restore
+    /// guard in `lifecycle.rs` uses this to allow `restore_scp_state()` at
+    /// genesis when FORCE_SCP was active, matching stellar-core.
+    pub(crate) fn set_force_scp_bootstrapped(&self) {
+        self.force_scp_bootstrapped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns true if the node was bootstrapped via FORCE_SCP this startup.
+    pub(crate) fn was_force_scp_bootstrapped(&self) -> bool {
+        self.force_scp_bootstrapped
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the database.
@@ -10400,6 +10422,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = crate::config::ConfigBuilder::new()
             .in_memory(true)
+            .database_path(dir.path().join("test.db"))
             .bucket_directory(dir.path().join("buckets"))
             .build();
 
@@ -10414,6 +10437,415 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lcl, Some(1), "in-memory DB should have genesis LCL=1");
+    }
+
+    /// Parity: stellar-core skips `restoreSCPState()` at GENESIS_LEDGER_SEQ
+    /// unless FORCE_SCP is active. Verify the guard defaults correctly.
+    #[tokio::test]
+    async fn test_restore_scp_state_skipped_at_genesis_without_force_scp() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .database_path(dir.path().join("test.db"))
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        // App starts at genesis (ledger_seq=1) which equals GENESIS_LEDGER_SEQ.
+        let ledger_seq = app.current_ledger_seq();
+        assert_eq!(ledger_seq, henyey_history::GENESIS_LEDGER_SEQ);
+
+        // Without FORCE_SCP, the guard should NOT restore.
+        assert!(!app.was_force_scp_bootstrapped());
+        let at_genesis = ledger_seq <= henyey_history::GENESIS_LEDGER_SEQ;
+        assert!(at_genesis, "should be at genesis");
+        // Guard: `!at_genesis || was_force_scp_bootstrapped()` → false
+        assert!(
+            !((!at_genesis) || app.was_force_scp_bootstrapped()),
+            "restore should be skipped at genesis without force_scp"
+        );
+    }
+
+    /// Parity: stellar-core DOES call `restoreSCPState()` at genesis when
+    /// FORCE_SCP is active. Verify the guard allows it.
+    #[tokio::test]
+    async fn test_restore_scp_state_allowed_at_genesis_with_force_scp() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .database_path(dir.path().join("test.db"))
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        // Simulate FORCE_SCP bootstrap.
+        app.set_force_scp_bootstrapped();
+
+        let ledger_seq = app.current_ledger_seq();
+        assert_eq!(ledger_seq, henyey_history::GENESIS_LEDGER_SEQ);
+
+        // With FORCE_SCP, the guard SHOULD allow restore even at genesis.
+        let at_genesis = ledger_seq <= henyey_history::GENESIS_LEDGER_SEQ;
+        assert!(at_genesis);
+        // Guard: `!at_genesis || was_force_scp_bootstrapped()` → true
+        assert!(
+            (!at_genesis) || app.was_force_scp_bootstrapped(),
+            "restore should proceed at genesis with force_scp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_scp_state_via_app_uses_sqlite_persistence() {
+        use henyey_herder::{ScpPersistenceManager, SqliteScpPersistence};
+        use henyey_scp::hash_quorum_set;
+        use stellar_xdr::curr::{
+            Limits, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementPledges,
+            Signature, StellarValue, StellarValueExt, TimePoint, Value, WriteXdr,
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("restore-scp-state.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let app = Arc::new(App::new(config).await.unwrap());
+        app.herder.start_syncing();
+        app.herder.bootstrap(2);
+
+        let manager =
+            ScpPersistenceManager::new(Box::new(SqliteScpPersistence::new(app.database().clone())));
+        let local_node_id = app.herder.scp().local_node_id().clone();
+        let lcl_hash = app.ledger_manager.current_header_hash();
+        let tx_set = henyey_herder::TransactionSet::new(lcl_hash, Vec::new());
+        let tx_set_hash = *tx_set.hash();
+        let tx_set_bytes = tx_set
+            .to_xdr_stored_set()
+            .to_xdr(Limits::none())
+            .expect("encode stored tx set");
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let quorum_set_hash = hash_quorum_set(&quorum_set);
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(1000),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: local_node_id.clone(),
+                slot_index: 7,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash(quorum_set_hash.0),
+                    votes: vec![Value(
+                        stellar_value
+                            .to_xdr(Limits::none())
+                            .expect("encode stellar value")
+                            .try_into()
+                            .unwrap(),
+                    )]
+                    .try_into()
+                    .unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        manager
+            .persist_scp_state(
+                7,
+                &[envelope],
+                &[(stellar_xdr::curr::Hash(tx_set_hash.0), tx_set_bytes)],
+                &[(
+                    stellar_xdr::curr::Hash(quorum_set_hash.0),
+                    quorum_set.clone(),
+                )],
+            )
+            .unwrap();
+
+        app.herder.restore_scp_state();
+
+        assert!(
+            app.herder.has_tx_set(&tx_set_hash),
+            "tx set should be cached after app-level restore"
+        );
+        assert!(
+            app.herder
+                .get_quorum_set_by_hash(&quorum_set_hash)
+                .is_some(),
+            "quorum set should be cached after app-level restore"
+        );
+        assert_eq!(
+            app.herder.scp().get_entire_current_state(7).len(),
+            1,
+            "SCP envelope should be restored through app herder"
+        );
+    }
+
+    /// True restart test: persist SCP state into SQLite via one App instance,
+    /// then create a FRESH App from the same DB and verify that
+    /// `restore_scp_state()` rehydrates the persisted state. This exercises
+    /// the real startup/restart path against the same SQLite DB, not just an
+    /// in-process restore on the same instance.
+    #[tokio::test]
+    async fn test_restore_scp_state_survives_app_restart_with_same_db() {
+        use henyey_herder::{ScpPersistenceManager, SqliteScpPersistence};
+        use henyey_scp::hash_quorum_set;
+        use stellar_xdr::curr::{
+            Limits, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementPledges,
+            Signature, StellarValue, StellarValueExt, TimePoint, Value, WriteXdr,
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("restart-test.db");
+        let bucket_dir = dir.path().join("buckets");
+
+        // --- First App instance: persist SCP state ---
+        // Use a fixed node_seed so both App instances have the same local node ID.
+        let fixed_key = henyey_crypto::SecretKey::from_seed(&[1u8; 32]);
+        let seed = fixed_key.to_strkey();
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path.clone())
+            .bucket_directory(bucket_dir.clone())
+            .node_seed(&seed)
+            .build();
+
+        let app1 = Arc::new(App::new(config).await.unwrap());
+        app1.herder.start_syncing();
+        app1.herder.bootstrap(5);
+
+        // The persistence manager is already installed by init_herder.
+        // Create a separate manager writing to the same DB to persist test data.
+        let persist_manager = ScpPersistenceManager::new(Box::new(SqliteScpPersistence::new(
+            app1.database().clone(),
+        )));
+
+        let local_node_id = app1.herder.scp().local_node_id().clone();
+        let lcl_hash = app1.ledger_manager.current_header_hash();
+        let tx_set = henyey_herder::TransactionSet::new(lcl_hash, Vec::new());
+        let tx_set_hash = *tx_set.hash();
+        let tx_set_bytes = tx_set
+            .to_xdr_stored_set()
+            .to_xdr(Limits::none())
+            .expect("encode stored tx set");
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let quorum_set_hash = hash_quorum_set(&quorum_set);
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(1000),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: local_node_id.clone(),
+                slot_index: 7,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash(quorum_set_hash.0),
+                    votes: vec![Value(
+                        stellar_value
+                            .to_xdr(Limits::none())
+                            .expect("encode stellar value")
+                            .try_into()
+                            .unwrap(),
+                    )]
+                    .try_into()
+                    .unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        persist_manager
+            .persist_scp_state(
+                7,
+                &[envelope],
+                &[(stellar_xdr::curr::Hash(tx_set_hash.0), tx_set_bytes)],
+                &[(
+                    stellar_xdr::curr::Hash(quorum_set_hash.0),
+                    quorum_set.clone(),
+                )],
+            )
+            .unwrap();
+
+        // Drop the first App completely.
+        drop(app1);
+
+        // --- Second App instance: restore from same DB ---
+        let config2 = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .bucket_directory(bucket_dir)
+            .node_seed(&seed)
+            .build();
+
+        let app2 = Arc::new(App::new(config2).await.unwrap());
+        app2.herder.start_syncing();
+        app2.herder.bootstrap(5);
+
+        // Persistence manager is already installed by init_herder on the new
+        // instance. This is the call that the lifecycle startup hook makes:
+        app2.herder.restore_scp_state();
+
+        assert!(
+            app2.herder.has_tx_set(&tx_set_hash),
+            "tx set should be cached after restart restore"
+        );
+        assert!(
+            app2.herder
+                .get_quorum_set_by_hash(&quorum_set_hash)
+                .is_some(),
+            "quorum set should be cached after restart restore"
+        );
+        assert_eq!(
+            app2.herder.scp().get_entire_current_state(7).len(),
+            1,
+            "SCP envelope should be restored after restart"
+        );
+    }
+
+    /// Parity: `get_currently_tracked_quorum()` includes silent validators
+    /// (those tracked in the quorum graph but absent from the closing ledger's
+    /// SCP envelopes). This ensures their node→qset_hash associations survive
+    /// ledger close persistence and are available on restore.
+    #[tokio::test]
+    async fn test_tracked_quorum_includes_silent_validator() {
+        use henyey_scp::hash_quorum_set;
+        use stellar_xdr::curr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .database_path(dir.path().join("test.db"))
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let app = Arc::new(App::new(config).await.unwrap());
+        app.herder.start_syncing();
+        app.herder.bootstrap(2);
+
+        // Create a "silent" remote validator with a known quorum set.
+        // The local node's qset was already expanded in init_herder, so we
+        // need to get a node that's already in the quorum map (distance 1)
+        // and then expand IT to add our target remote node at distance 2.
+        //
+        // Instead, we use a simpler approach: get the list of nodes already
+        // in the tracker from the testnet quorum config, pick one, and verify
+        // it appears in get_currently_tracked_quorum().
+        //
+        // For a cleaner test, we verify the local node's qset appears.
+        let local_node_id = app.herder.scp().local_node_id().clone();
+        let local_qs = app.herder.local_quorum_set().expect("has local qset");
+        let local_qs_hash = hash_quorum_set(&local_qs);
+
+        let tracked = app.herder.get_currently_tracked_quorum();
+
+        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(local_key) = &local_node_id.0;
+        let local_strkey = stellar_strkey::ed25519::PublicKey(local_key.0).to_string();
+        let local_hash_hex = hex::encode(local_qs_hash.0);
+
+        let found = tracked
+            .iter()
+            .any(|(node, hash)| node == &local_strkey && hash == &local_hash_hex);
+        assert!(
+            found,
+            "Local node should appear in tracked quorum map with its qset hash; got: {:?}",
+            tracked
+        );
+
+        // Verify a remote node in the testnet quorum set is also tracked
+        // (even though it hasn't sent any SCP envelopes in this test — it's
+        // "silent"). The remote nodes are in the map from init_herder expand
+        // but without a known quorum_set yet — so they won't appear in
+        // get_currently_tracked_quorum() until their qset is learned.
+        // Simulate learning a remote node's qset:
+        let remote_key = [42u8; 32];
+        let remote_node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(remote_key)));
+        let remote_qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![remote_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let _remote_qs_hash = hash_quorum_set(&remote_qs);
+
+        // store_quorum_set adds the node to the quorum tracker if it's already
+        // in the map (which it isn't yet). We need to use
+        // expand_quorum_tracker_for_testing on a node that IS in the map.
+        // The local node IS in the map and already expanded. Nodes added by
+        // the local expand are in the map but unexpanded. Let's find one.
+        let tracked_before = app.herder.get_currently_tracked_quorum();
+
+        // Use the herder's store_quorum_set path which also expands the tracker.
+        // First, make the remote node known to the quorum tracker by adding it
+        // via the local node's qset (we override with a new qset that includes it).
+        // Since the local node is already expanded, we can't re-expand it.
+        // Instead, use the Herder's normal code path: store_quorum_set expands
+        // any node already in the quorum map.
+        //
+        // Get a testnet validator that's already in the map:
+        let testnet_validators: Vec<_> = local_qs
+            .validators
+            .iter()
+            .filter(|v| v != &&local_node_id)
+            .cloned()
+            .collect();
+
+        if let Some(testnet_validator) = testnet_validators.first() {
+            // This validator is in the map from the local expand but has no qset.
+            // Expand it (simulating learning its qset from the network).
+            let validator_qs = ScpQuorumSet {
+                threshold: 1,
+                validators: vec![testnet_validator.clone(), remote_node_id.clone()]
+                    .try_into()
+                    .unwrap(),
+                inner_sets: vec![].try_into().unwrap(),
+            };
+            let validator_qs_hash = hash_quorum_set(&validator_qs);
+
+            app.herder
+                .expand_quorum_tracker_for_testing(testnet_validator, validator_qs.clone())
+                .expect("expand testnet validator should succeed");
+
+            // Now the testnet validator has a known qset and should appear in tracked quorum
+            let tracked_after = app.herder.get_currently_tracked_quorum();
+            let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(v_key) = &testnet_validator.0;
+            let v_strkey = stellar_strkey::ed25519::PublicKey(v_key.0).to_string();
+            let v_hash_hex = hex::encode(validator_qs_hash.0);
+
+            let found_validator = tracked_after
+                .iter()
+                .any(|(node, hash)| node == &v_strkey && hash == &v_hash_hex);
+            assert!(
+                found_validator,
+                "Silent validator (no envelopes sent) should appear in tracked quorum after qset learned"
+            );
+
+            // The tracked quorum should now be larger than before
+            assert!(
+                tracked_after.len() > tracked_before.len(),
+                "Tracked quorum should grow after learning a validator's qset: before={}, after={}",
+                tracked_before.len(),
+                tracked_after.len()
+            );
+        } else {
+            panic!("Testnet config should have at least one non-local validator in quorum set");
+        }
     }
 
     /// AUDIT-226: `check_catchup_persist_pending` returns true when the

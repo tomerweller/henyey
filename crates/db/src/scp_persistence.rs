@@ -107,6 +107,30 @@ impl SqliteScpPersistence {
         self.with_connection(|conn| conn.delete_tx_sets_by_hashes(hashes))
     }
 
+    /// Save quorum info (node → qset hash mapping).
+    pub fn save_quorum_info(&self, entries: &[(String, String)]) -> Result<(), String> {
+        self.with_connection(|conn| conn.save_quorum_info(entries))
+    }
+
+    /// Load all quorum info entries.
+    pub fn load_all_quorum_info(&self) -> Result<Vec<(String, String)>, String> {
+        self.with_connection(|conn| conn.load_all_quorum_info())
+    }
+
+    /// Load a quorum set from `scpquorums` by its hash.
+    ///
+    /// Used as a fallback during SCP state restore when a quorum set referenced
+    /// by `quoruminfo` is not present in the restored slot state.
+    pub fn load_scp_quorum_set(
+        &self,
+        hash: &henyey_common::Hash256,
+    ) -> Result<Option<stellar_xdr::curr::ScpQuorumSet>, String> {
+        self.with_connection(|conn| {
+            use crate::queries::ScpQueries;
+            conn.load_scp_quorum_set(hash)
+        })
+    }
+
     /// Atomic purge of unreferenced persisted transaction sets.
     ///
     /// Wraps the three-step purge (read hashes, read SCP states, delete
@@ -150,6 +174,22 @@ mod tests {
         let remaining = persistence.load_all_scp_states().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, 101);
+    }
+
+    #[test]
+    fn test_sqlite_quorum_info_persistence() {
+        let db = Database::open_in_memory().unwrap();
+        let persistence = SqliteScpPersistence::new(db);
+
+        persistence
+            .save_quorum_info(&[("GA123".to_string(), "aa".repeat(32))])
+            .unwrap();
+        persistence
+            .save_quorum_info(&[("GA123".to_string(), "bb".repeat(32))])
+            .unwrap();
+
+        let all = persistence.load_all_quorum_info().unwrap();
+        assert_eq!(all, vec![("GA123".to_string(), "bb".repeat(32))]);
     }
 
     #[test]

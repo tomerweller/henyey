@@ -92,6 +92,10 @@ struct LedgerPersistInputs {
     network_id: NetworkId,
     scp_envelopes: Vec<stellar_xdr::curr::ScpEnvelope>,
     scp_quorum_sets: Vec<(Hash256, stellar_xdr::curr::ScpQuorumSet)>,
+    /// Full currently-tracked quorum map (node_strkey, qset_hash_hex) for
+    /// `quoruminfo` persistence. Includes all tracked nodes, not just those
+    /// in the closing ledger's SCP envelopes.
+    tracked_quorum_info: Vec<(String, String)>,
     /// HAS struct built on the event loop under bucket-list read guards.
     /// JSON serialization happens later on the blocking thread.
     has: HistoryArchiveState,
@@ -215,6 +219,15 @@ impl LedgerPersistInputs {
             conn.store_scp_history(self.header.ledger_seq, &self.scp_envelopes)?;
             for (hash, qset) in &self.scp_quorum_sets {
                 conn.store_scp_quorum_set(hash, self.header.ledger_seq, qset)?;
+            }
+
+            // Persist node→qset_hash associations from the full currently-tracked
+            // quorum map. Mirrors stellar-core's `saveSCPHistory()` which writes
+            // the full `getCurrentlyTrackedQuorum()` (not just the closing
+            // ledger's envelope set). This ensures remote validators' associations
+            // survive restarts even when they were silent in the closing ledger.
+            if !self.tracked_quorum_info.is_empty() {
+                conn.save_quorum_info(&self.tracked_quorum_info)?;
             }
 
             conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
@@ -440,6 +453,12 @@ impl App {
             None
         };
 
+        // Gather the full currently-tracked quorum map for quoruminfo
+        // persistence. Mirrors stellar-core's `getCurrentlyTrackedQuorum()`
+        // passed to `saveSCPHistory()` — includes all tracked validators,
+        // not just those with envelopes in the closing ledger.
+        let tracked_quorum_info = self.herder.get_currently_tracked_quorum();
+
         Ok(LedgerPersistInputs {
             header: header.clone(),
             tx_history_entry,
@@ -451,6 +470,7 @@ impl App {
             network_id,
             scp_envelopes,
             scp_quorum_sets,
+            tracked_quorum_info,
             has,
             bucket_list_levels,
             publish_enabled: self.is_validator && self.config.history.publish_enabled(),

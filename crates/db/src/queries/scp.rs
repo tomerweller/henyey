@@ -348,6 +348,15 @@ pub trait ScpStatePersistenceQueries {
     /// Delete persisted transaction sets by their hashes.
     fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<(), DbError>;
 
+    /// Save quorum info (node → qset hash mapping).
+    ///
+    /// Uses `INSERT OR REPLACE` so persisted mappings accumulate across
+    /// saves, matching stellar-core's effective last-known fallback.
+    fn save_quorum_info(&self, entries: &[(String, String)]) -> Result<(), DbError>;
+
+    /// Load all quorum info entries.
+    fn load_all_quorum_info(&self) -> Result<Vec<(String, String)>, DbError>;
+
     /// Atomic purge of unreferenced persisted transaction sets.
     ///
     /// Reads all persisted tx-set hashes, all persisted SCP slot states,
@@ -517,6 +526,22 @@ impl ScpStatePersistenceQueries for Connection {
         Ok(())
     }
 
+    fn save_quorum_info(&self, entries: &[(String, String)]) -> Result<(), DbError> {
+        for (node_id, qset_hash) in entries {
+            self.execute(
+                "INSERT OR REPLACE INTO quoruminfo (nodeid, qsethash) VALUES (?1, ?2)",
+                params![node_id, qset_hash],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn load_all_quorum_info(&self) -> Result<Vec<(String, String)>, DbError> {
+        let mut stmt = self.prepare("SELECT nodeid, qsethash FROM quoruminfo ORDER BY nodeid")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), DbError> {
         // Step 1: read all stored tx-set hashes.
         let all_hashes_vec = self.get_all_tx_set_hashes()?;
@@ -662,6 +687,7 @@ mod tests {
             CREATE TABLE storestate (statename TEXT PRIMARY KEY, state TEXT NOT NULL);
             CREATE TABLE scphistory (nodeid TEXT, ledgerseq INTEGER, envelope BLOB);
             CREATE TABLE scpquorums (qsethash TEXT PRIMARY KEY, lastledgerseq INTEGER, qset BLOB);
+            CREATE TABLE quoruminfo (nodeid TEXT PRIMARY KEY, qsethash TEXT NOT NULL);
             "#,
         )
         .unwrap();
@@ -843,6 +869,27 @@ mod tests {
             r#"{{"version":1,"envelopes":[[{}]],"quorum_sets":[]}}"#,
             env_array
         )
+    }
+
+    #[test]
+    fn test_quorum_info_roundtrip() {
+        let conn = setup_db();
+        conn.save_quorum_info(&[
+            ("GA123".to_string(), "aa".repeat(32)),
+            ("GB456".to_string(), "bb".repeat(32)),
+        ])
+        .unwrap();
+        conn.save_quorum_info(&[("GA123".to_string(), "cc".repeat(32))])
+            .unwrap();
+
+        let loaded = conn.load_all_quorum_info().unwrap();
+        assert_eq!(
+            loaded,
+            vec![
+                ("GA123".to_string(), "cc".repeat(32)),
+                ("GB456".to_string(), "bb".repeat(32)),
+            ]
+        );
     }
 
     #[test]
