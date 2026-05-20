@@ -1357,11 +1357,64 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::{
         ContractCodeEntry, ContractCodeEntryExt, ContractDataDurability, ContractDataEntry,
-        ContractId, ExtensionPoint, Hash, LedgerEntryExt, ScAddress, ScVal,
+        ContractId, ExtensionPoint, Hash, LedgerEntryExt, LedgerKeyContractCode,
+        LedgerKeyContractData, ScAddress, ScVal,
     };
 
     fn make_contract_address() -> ScAddress {
         ScAddress::Contract(ContractId(Hash([1u8; 32])))
+    }
+
+    /// Compute the shard index a contract data entry with the given key_bytes
+    /// would land in. Uses the same hash path as production code.
+    fn contract_data_shard_index(key_bytes: [u8; 32]) -> usize {
+        let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: make_contract_address(),
+            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                key_bytes.to_vec().try_into().unwrap(),
+            )),
+            durability: ContractDataDurability::Persistent,
+        });
+        let key_hash = Hash256::hash_xdr(&ledger_key);
+        (key_hash.as_bytes()[0] >> 2) as usize
+    }
+
+    /// Compute the shard index a contract code entry with the given hash would
+    /// land in.
+    fn contract_code_shard_index(hash_bytes: [u8; 32]) -> usize {
+        let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash(hash_bytes),
+        });
+        let key_hash = Hash256::hash_xdr(&ledger_key);
+        (key_hash.as_bytes()[0] >> 2) as usize
+    }
+
+    /// Find two byte arrays whose contract data entries land in different shards.
+    fn find_two_data_keys_in_different_shards() -> ([u8; 32], usize, [u8; 32], usize) {
+        let key_a = [0x00; 32];
+        let shard_a = contract_data_shard_index(key_a);
+        for i in 1u8..=255 {
+            let key_b = [i; 32];
+            let shard_b = contract_data_shard_index(key_b);
+            if shard_b != shard_a {
+                return (key_a, shard_a, key_b, shard_b);
+            }
+        }
+        panic!("could not find two keys in different shards");
+    }
+
+    /// Find two byte arrays whose contract code entries land in different shards.
+    fn find_two_code_keys_in_different_shards() -> ([u8; 32], usize, [u8; 32], usize) {
+        let key_a = [0x00; 32];
+        let shard_a = contract_code_shard_index(key_a);
+        for i in 1u8..=255 {
+            let key_b = [i; 32];
+            let shard_b = contract_code_shard_index(key_b);
+            if shard_b != shard_a {
+                return (key_a, shard_a, key_b, shard_b);
+            }
+        }
+        panic!("could not find two keys in different shards");
     }
 
     fn make_contract_data_entry(key_bytes: [u8; 32]) -> LedgerEntry {
@@ -2160,61 +2213,67 @@ mod tests {
 
     /// Test that snapshot mutation only detaches the touched contract data shard.
     ///
-    /// Creates two entries that land in different shards, takes a snapshot,
-    /// mutates one key, and asserts only the touched shard detaches while the
-    /// untouched shard remains shared.
+    /// Creates two entries that land in different shards (verified via the actual
+    /// hash-based shard routing), takes a snapshot, mutates one key, and asserts
+    /// only the touched shard detaches while the untouched shard remains shared.
     #[test]
     fn test_snapshot_mutation_detaches_only_touched_contract_data_shard() {
         let mut state = InMemorySorobanState::new();
 
-        // Find two keys that land in different shards.
-        // Key [0x00; 32] -> shard 0 (top 6 bits of 0x00 >> 2 = 0)
-        // Key [0xFC; 32] -> shard 63 (top 6 bits of 0xFC >> 2 = 63)
-        let entry_shard0 = make_contract_data_entry([0x00; 32]);
-        let entry_shard63 = make_contract_data_entry([0xFC; 32]);
+        // Find two keys that provably land in different shards.
+        let (key_a_bytes, shard_a, key_b_bytes, shard_b) = find_two_data_keys_in_different_shards();
+        assert_ne!(shard_a, shard_b, "precondition: keys in different shards");
 
-        state.create_contract_data(entry_shard0.clone()).unwrap();
-        state.create_contract_data(entry_shard63.clone()).unwrap();
+        let entry_a = make_contract_data_entry(key_a_bytes);
+        let entry_b = make_contract_data_entry(key_b_bytes);
+
+        state.create_contract_data(entry_a.clone()).unwrap();
+        state.create_contract_data(entry_b.clone()).unwrap();
         assert_eq!(state.contract_data_count(), 2);
 
         // Take a snapshot — all shards are now shared (strong_count=2 for
         // the two occupied shards).
         let snap = state.snapshot();
 
-        // Mutate entry in shard 0 only.
-        let mut updated = make_contract_data_entry([0x00; 32]);
+        // Record shard Arc pointers before mutation.
+        let ptr_shard_b_before = Arc::as_ptr(&state.contract_data_entries.shards[shard_b]);
+
+        // Mutate entry in shard_a only.
+        let mut updated = make_contract_data_entry(key_a_bytes);
         if let LedgerEntryData::ContractData(cd) = &mut updated.data {
             cd.val = ScVal::I32(999);
         }
         state.update_contract_data(updated).unwrap();
 
-        // The shard containing [0xFC] should still be shared (the snapshot
-        // Arc wasn't cloned because we only touched shard 0).
-        // Verify snapshot isolation: snapshot still sees original values.
-        let snap_key_shard63 = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: make_contract_address(),
-            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                [0xFC; 32].to_vec().try_into().unwrap(),
-            )),
-            durability: ContractDataDurability::Persistent,
-        });
-        assert!(snap.get(&snap_key_shard63).is_some());
+        // The shard containing key_b should still be the same Arc (not cloned).
+        let ptr_shard_b_after = Arc::as_ptr(&state.contract_data_entries.shards[shard_b]);
+        assert_eq!(
+            ptr_shard_b_before, ptr_shard_b_after,
+            "untouched shard must remain shared (same Arc pointer)"
+        );
 
-        // Snapshot should see original value for shard 0 entry
-        let snap_key_shard0 = LedgerKey::ContractData(LedgerKeyContractData {
+        // The touched shard (shard_a) should have detached (new Arc).
+        assert_eq!(
+            Arc::strong_count(&state.contract_data_entries.shards[shard_a]),
+            1,
+            "mutated shard must be solely owned after make_mut"
+        );
+
+        // Verify snapshot isolation: snapshot still sees original values.
+        let snap_key_a = LedgerKey::ContractData(LedgerKeyContractData {
             contract: make_contract_address(),
             key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                [0x00; 32].to_vec().try_into().unwrap(),
+                key_a_bytes.to_vec().try_into().unwrap(),
             )),
             durability: ContractDataDurability::Persistent,
         });
-        let snap_entry = snap.get(&snap_key_shard0).unwrap();
+        let snap_entry = snap.get(&snap_key_a).unwrap();
         if let LedgerEntryData::ContractData(cd) = &snap_entry.data {
             assert_eq!(cd.val, ScVal::I32(42), "snapshot must see original value");
         }
 
         // Live state should see updated value
-        let live_entry = state.get(&snap_key_shard0).unwrap();
+        let live_entry = state.get(&snap_key_a).unwrap();
         if let LedgerEntryData::ContractData(cd) = &live_entry.data {
             assert_eq!(cd.val, ScVal::I32(999), "live state must see updated value");
         }
@@ -2225,38 +2284,58 @@ mod tests {
     fn test_snapshot_mutation_detaches_only_touched_contract_code_shard() {
         let mut state = InMemorySorobanState::new();
 
-        // Two code entries in different shards
-        let entry_shard0 = make_contract_code_entry([0x00; 32]);
-        let entry_shard63 = make_contract_code_entry([0xFC; 32]);
+        // Find two code keys that land in different shards.
+        let (key_a_bytes, shard_a, key_b_bytes, shard_b) = find_two_code_keys_in_different_shards();
+        assert_ne!(shard_a, shard_b, "precondition: keys in different shards");
+
+        let entry_a = make_contract_code_entry(key_a_bytes);
+        let entry_b = make_contract_code_entry(key_b_bytes);
 
         state
-            .create_contract_code(entry_shard0.clone(), 25, None)
+            .create_contract_code(entry_a.clone(), 25, None)
             .unwrap();
         state
-            .create_contract_code(entry_shard63.clone(), 25, None)
+            .create_contract_code(entry_b.clone(), 25, None)
             .unwrap();
         assert_eq!(state.contract_code_count(), 2);
 
         let snap = state.snapshot();
         let snap_code_size = snap.contract_code_state_size();
 
-        // Update code in shard 0 only
-        let mut updated = make_contract_code_entry([0x00; 32]);
+        // Record the untouched shard's Arc pointer before mutation.
+        let ptr_shard_b_before = Arc::as_ptr(&state.contract_code_entries.shards[shard_b]);
+
+        // Update code in shard_a only.
+        let mut updated = make_contract_code_entry(key_a_bytes);
         if let LedgerEntryData::ContractCode(cc) = &mut updated.data {
             cc.code = vec![1u8; 200].try_into().unwrap();
         }
         state.update_contract_code(updated, 25, None).unwrap();
 
-        // Snapshot sizes must be unchanged (snapshot isolation)
+        // The untouched shard must still share the same Arc (not cloned).
+        let ptr_shard_b_after = Arc::as_ptr(&state.contract_code_entries.shards[shard_b]);
+        assert_eq!(
+            ptr_shard_b_before, ptr_shard_b_after,
+            "untouched code shard must remain shared (same Arc pointer)"
+        );
+
+        // The touched shard must have been detached.
+        assert_eq!(
+            Arc::strong_count(&state.contract_code_entries.shards[shard_a]),
+            1,
+            "mutated code shard must be solely owned"
+        );
+
+        // Snapshot sizes must be unchanged (snapshot isolation).
         assert_eq!(snap.contract_code_state_size(), snap_code_size);
         assert_eq!(snap.contract_code_count(), 2);
 
-        // Snapshot should still be able to look up the shard 63 entry
-        let key_shard63 = LedgerKeyContractCode {
-            hash: Hash([0xFC; 32]),
+        // Snapshot should still be able to look up the shard_b entry.
+        let key_b = LedgerKeyContractCode {
+            hash: Hash(key_b_bytes),
         };
         assert!(
-            snap.get_contract_code(&key_shard63).is_some(),
+            snap.get_contract_code(&key_b).is_some(),
             "snapshot must still see untouched shard entry"
         );
     }
@@ -2293,7 +2372,12 @@ mod tests {
         // have count 3 (the empty shards are still shared).
         // max_arc_strong_count reports the max across all shards.
         let (d, _c) = state.arc_strong_counts();
-        assert!(d >= 1, "after mutation, max count should be at least 1");
+        // The mutated shard detached (count=1), but all other shards (including
+        // the empty ones) are still shared with both snapshots (count=3).
+        assert_eq!(
+            d, 3,
+            "max count should be 3 from the untouched shared shards"
+        );
 
         // Drop snapshots — all counts return to 1.
         drop(_snap1);

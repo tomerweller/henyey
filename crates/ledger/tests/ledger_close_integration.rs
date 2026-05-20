@@ -1438,13 +1438,86 @@ fn test_ledger_close_counts_ops_for_pre_execution_rejected_transactions() {
 /// but the close should still complete normally.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_close_ledger_with_held_snapshot_preserves_results() {
+    use henyey_common::NetworkId;
+    use henyey_crypto::{sign_hash, SecretKey};
+    use stellar_xdr::curr::{
+        AccountEntry, AccountEntryExt, AccountId, BucketListType, BytesM, ContractCodeEntry,
+        ContractCodeEntryExt, ExtendFootprintTtlOp, LedgerFootprint, LedgerKey,
+        LedgerKeyContractCode, MuxedAccount, Operation, OperationBody, Preconditions, PublicKey,
+        SequenceNumber, Signature as XdrSignature, SignatureHint, SorobanResources,
+        SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope,
+        TransactionExt, TransactionV1Envelope, TtlEntry, Uint256,
+    };
+
+    let network_id = NetworkId::testnet();
+    let secret = SecretKey::from_seed(&[42u8; 32]);
+    let source_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        *secret.public_key().as_bytes(),
+    )));
+
+    // Set up a bucket list with a source account + contract code + TTL.
+    let mut bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
+    let source_entry = LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: source_id.clone(),
+            balance: 10_000_000_000,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: Default::default(),
+            thresholds: stellar_xdr::curr::Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    let code_hash = Hash([7u8; 32]);
+    let contract_code_entry = LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::ContractCode(ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash: code_hash.clone(),
+            code: BytesM::try_from(vec![1u8, 2u8, 3u8]).unwrap(),
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: code_hash.clone(),
+    });
+    let key_hash: Hash = henyey_common::Hash256::hash_xdr(&contract_key).into();
+    let ttl_entry = LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::Ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: 10,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    bucket_list
+        .add_batch(
+            1,
+            25,
+            BucketListType::Live,
+            vec![source_entry, contract_code_entry, ttl_entry],
+            vec![],
+            vec![],
+        )
+        .expect("add_batch");
+
     let config = LedgerManagerConfig {
         validate_bucket_hash: false,
         ..Default::default()
     };
-    let ledger = Arc::new(LedgerManager::new("Test Network".to_string(), config));
+    let ledger = Arc::new(LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        config,
+    ));
 
-    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
     let hot_archive = HotArchiveBucketList::new();
     let header = make_genesis_header();
     let header_hash = compute_header_hash(&header).expect("hash");
@@ -1453,14 +1526,15 @@ async fn test_close_ledger_with_held_snapshot_preserves_results() {
         .expect("init");
 
     // Close ledger 1 (empty) to advance past genesis.
+    let prev_hash = ledger.current_header_hash();
     let close_data = LedgerCloseData::new(
         1,
         TransactionSetVariant::Classic(TransactionSet {
-            previous_ledger_hash: Hash([0u8; 32]),
+            previous_ledger_hash: Hash::from(prev_hash),
             txs: VecM::default(),
         }),
         1,
-        ledger.current_header_hash(),
+        prev_hash,
     );
     let handle = tokio::runtime::Handle::current();
     let lm = ledger.clone();
@@ -1474,23 +1548,76 @@ async fn test_close_ledger_with_held_snapshot_preserves_results() {
     // This bumps the Arc strong_count on all shards from 1 to 2.
     let snapshot = ledger.create_snapshot().expect("create_snapshot");
 
-    // Close ledger 2 (also empty — but this exercises the soroban_state update
-    // path which now has to Arc::make_mut against shared shards).
+    // Close ledger 2 WITH a Soroban ExtendFootprintTtl transaction that
+    // exercises the soroban_state update path (TTL extension writes to the
+    // code entry's shard) while a snapshot is held, forcing Arc::make_mut
+    // on the shared shard.
+    let soroban_data = SorobanTransactionData {
+        ext: SorobanTransactionDataExt::V0,
+        resources: SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: vec![contract_key].try_into().unwrap(),
+                read_write: VecM::default(),
+            },
+            instructions: 0,
+            disk_read_bytes: 100,
+            write_bytes: 0,
+        },
+        resource_fee: 100_000,
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 110_000,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![Operation {
+            source_account: None,
+            body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+                ext: ExtensionPoint::V0,
+                extend_to: 100,
+            }),
+        }]
+        .try_into()
+        .unwrap(),
+        ext: TransactionExt::V1(soroban_data),
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), network_id);
+    let hash = frame.hash(&network_id).expect("tx hash");
+    let signature = sign_hash(&secret, &hash);
+    let public_key = secret.public_key();
+    let pk_bytes = public_key.as_bytes();
+    let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
+    let decorated = DecoratedSignature {
+        hint,
+        signature: XdrSignature(signature.0.to_vec().try_into().unwrap()),
+    };
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let prev_hash_2 = ledger.current_header_hash();
     let close_data_2 = LedgerCloseData::new(
         2,
         TransactionSetVariant::Classic(TransactionSet {
-            previous_ledger_hash: Hash([0u8; 32]),
-            txs: VecM::default(),
+            previous_ledger_hash: Hash::from(prev_hash_2),
+            txs: vec![envelope].try_into().unwrap(),
         }),
-        2,
-        ledger.current_header_hash(),
+        100,
+        prev_hash_2,
     );
     let lm = ledger.clone();
     let h = handle.clone();
     let result = tokio::task::spawn_blocking(move || lm.close_ledger(close_data_2, Some(h)))
         .await
         .expect("spawn_blocking")
-        .expect("close 2 with held snapshot should succeed");
+        .expect("close 2 with held snapshot and Soroban mutation should succeed");
 
     // Verify the close produced a valid result.
     assert_eq!(result.header.ledger_seq, 2);
@@ -1502,14 +1629,15 @@ async fn test_close_ledger_with_held_snapshot_preserves_results() {
     // Drop the snapshot and verify a subsequent close still works.
     drop(snapshot);
 
+    let prev_hash_3 = ledger.current_header_hash();
     let close_data_3 = LedgerCloseData::new(
         3,
         TransactionSetVariant::Classic(TransactionSet {
-            previous_ledger_hash: Hash([0u8; 32]),
+            previous_ledger_hash: Hash::from(prev_hash_3),
             txs: VecM::default(),
         }),
         3,
-        ledger.current_header_hash(),
+        prev_hash_3,
     );
     let lm = ledger.clone();
     let h = handle.clone();
