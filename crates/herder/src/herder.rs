@@ -2495,7 +2495,14 @@ impl Herder {
             // sequence before the non-validator early return (HerderImpl.cpp:1546-1573,
             // 1616-1620). Only report ObserverBuilt if the tx-set was actually
             // built and cached; propagate error if build_nomination_value aborts.
-            let cache_before = self.scp_driver.tx_set_cache_size();
+            //
+            // Use store_generation (not cache_size) to detect success: store_generation
+            // increments on every successful store including in-place overwrites of
+            // an already-cached hash. This ensures repeated observer triggers for the
+            // same slot/hash correctly report ObserverBuilt instead of erroring.
+            // Parity: stellar-core treats re-adding an already-known tx-set as
+            // success (PendingEnvelopes.cpp:185-238).
+            let gen_before = self.scp_driver.tx_set_store_generation();
             let build_result = self.build_nomination_value();
             let build_value_ms = t0.elapsed().as_millis();
 
@@ -2514,15 +2521,11 @@ impl Herder {
                 return Ok(TriggerOutcome::SkippedStale);
             }
 
-            // Determine success by whether the tx-set cache actually grew.
-            // build_nomination_value returns None both on genuine pre-cache
-            // failures (snapshot, self-validation) AND on the expected observer
-            // path where signing fails due to missing secret_key. The cache
-            // count distinguishes these: the cache grows only after
-            // validate_and_cache_built_tx_set succeeds (step 3.5 inside
-            // build_nomination_value).
-            let cache_after = self.scp_driver.tx_set_cache_size();
-            if cache_after > cache_before {
+            // Determine success by whether a store occurred during build.
+            // store_generation grows on both new inserts and in-place updates,
+            // so repeated triggers for the same tx-set hash still succeed.
+            let gen_after = self.scp_driver.tx_set_store_generation();
+            if gen_after > gen_before {
                 tracing::debug!(
                     slot,
                     build_value_ms,
@@ -2531,7 +2534,7 @@ impl Herder {
                 return Ok(TriggerOutcome::ObserverBuilt);
             }
 
-            // Cache did not grow — genuine pre-cache failure.
+            // Generation unchanged — genuine pre-cache failure.
             if build_result.is_some() {
                 // build_result is Some means signing succeeded too (unexpected
                 // for an observer) — still report success since cache must have
@@ -13408,6 +13411,37 @@ mod issue_2819_spec_adherence_tests {
         assert!(
             slot_state.map_or(true, |s| !s.is_nominating),
             "observer must not enter SCP nomination"
+        );
+    }
+
+    /// Regression test for #2819 — repeated observer triggers must not fail.
+    ///
+    /// stellar-core treats re-adding an already-cached tx-set as success
+    /// (PendingEnvelopes.cpp:185-238). Before this fix, henyey's observer
+    /// path inferred success from cache SIZE growth, which fails on the
+    /// second trigger because `TxSetTracker::store` overwrites in place
+    /// without growing the cache. The fix uses `store_generation` instead.
+    #[test]
+    fn test_trigger_next_ledger_observer_repeated_trigger_succeeds() {
+        let herder = make_observer_herder();
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        // First trigger — builds and caches the tx-set.
+        let result1 = herder.trigger_next_ledger(1);
+        assert_eq!(
+            result1.expect("first observer trigger should not error"),
+            TriggerOutcome::ObserverBuilt,
+            "first observer trigger should succeed"
+        );
+
+        // Second trigger for the same slot — the tx-set hash is already
+        // cached, so cache size won't grow. Must still report ObserverBuilt.
+        let result2 = herder.trigger_next_ledger(1);
+        assert_eq!(
+            result2.expect("second observer trigger should not error"),
+            TriggerOutcome::ObserverBuilt,
+            "repeated observer trigger must succeed (parity: re-add is success)"
         );
     }
 

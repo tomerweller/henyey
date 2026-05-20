@@ -2530,6 +2530,11 @@ impl ScpDriver {
         self.tx_tracker.cache_count()
     }
 
+    /// Monotonic store generation — see [`TxSetTracker::store_generation`].
+    pub fn tx_set_store_generation(&self) -> u64 {
+        self.tx_tracker.store_generation()
+    }
+
     /// Get the pending tx sets count.
     pub fn pending_tx_sets_size(&self) -> usize {
         self.tx_tracker.pending_count()
