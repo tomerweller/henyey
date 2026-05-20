@@ -147,7 +147,7 @@ Corresponds to: `PersistentState.h`, `Maintainer.h`
 | `getSCPStateAllSlots()` | `ScpQueries::get_scp_state_all_slots()` | Full |
 | `getTxSetsForAllSlots()` / `setSCPStateV1ForSlot()` | partial `ScpQueries` support | Partial |
 | `getTxSetHashesForAllSlots()` / `hasTxSet()` / `deleteTxSets()` | — | None |
-| `REBUILD_FOR_OFFER_TABLE` flag (`set`/`should`/`clear`) | `CATCHUP_PERSIST_PENDING` sentinel + non-authoritative pre-LCL writes (§14.5 two-window design; see `crates/app/README.md`) | Full (semantic parity, different mechanism) |
+| `REBUILD_FOR_OFFER_TABLE` flag (`set`/`should`/`clear`) | `CATCHUP_PERSIST_PENDING` sentinel + non-authoritative pre-LCL writes (§14.5 two-window design; see `crates/app/README.md`) | Partial (startup/catchup path is safe; CLI readers still use `MAX(ledgerseq)`) |
 | `Maintainer::start()` / `performMaintenance()` | `Maintainer::start()`, `perform_maintenance()`, `perform_maintenance_with_count()` | Full |
 
 ### Surveys, metadata, and logging (`src/survey.rs`, `src/meta_stream.rs`, `src/logging.rs`)

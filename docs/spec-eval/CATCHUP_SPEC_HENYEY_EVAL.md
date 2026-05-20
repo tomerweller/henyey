@@ -476,7 +476,7 @@ Source file references use the format `file.rs:line`.
 |-------------|--------|----------|
 | Checkpoint builder recovers on restart | ✅ | `checkpoint_builder.rs:340-436` — `cleanup()` method |
 | LCL restored from persistent storage | ✅ | Handled by database layer |
-| Crash after bucket apply → re-catch up from advanced LCL | ✅ | Two-window design: (1) pre-LCL writes are non-authoritative (startup reads `last_closed_ledger`/HAS, not ahead-of-LCL rows); (2) `CATCHUP_PERSIST_PENDING` sentinel forces full bucket-apply on restart if deferred persist was interrupted. See `crates/app/README.md` §14.5 design note. |
+| Crash after bucket apply → re-catch up from advanced LCL | ⚠️ | Two-window design: (1) startup restore path is safe (reads `last_closed_ledger`/HAS, not ahead-of-LCL rows); (2) `CATCHUP_PERSIST_PENDING` sentinel forces full bucket-apply on restart if deferred persist was interrupted. **Gap:** CLI readers (`publish_history`, `self_check`) still use `MAX(ledgerseq)` and may observe ahead-of-LCL state after a Window-1 crash. See `crates/app/README.md` §14.5 design note. |
 | Crash before bucket apply → catch up from scratch | ✅ | No partial state to recover |
 
 #### Hash Verification Failures (§13.5)
