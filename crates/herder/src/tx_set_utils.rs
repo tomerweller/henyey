@@ -1133,6 +1133,16 @@ fn remove_txs(
 /// # Parity
 ///
 /// Mirrors `makeTxSetFromTransactions` in stellar-core `TxSetFrame.cpp:836-860`.
+/// Result of trimming invalid transactions from two phases.
+pub(crate) struct TrimResult {
+    /// Valid classic transactions remaining after trim.
+    pub valid_classic: Vec<HashedTx>,
+    /// Valid soroban transactions remaining after trim.
+    pub valid_soroban: Vec<HashedTx>,
+    /// Hashes of all transactions trimmed as invalid across both phases.
+    pub trimmed_hashes: Vec<Hash256>,
+}
+
 pub(crate) fn trim_invalid_two_phase_hashed(
     classic_txs: Vec<HashedTx>,
     soroban_txs: Vec<HashedTx>,
@@ -1140,13 +1150,14 @@ pub(crate) fn trim_invalid_two_phase_hashed(
     close_time_bounds: &CloseTimeBounds,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
     account_provider: Option<&dyn AccountProvider>,
-) -> (Vec<HashedTx>, Vec<HashedTx>) {
+) -> TrimResult {
     use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 
     let use_cross_phase_fee_map =
         protocol_version_starts_from(ctx.protocol_version, ProtocolVersion::V26);
 
     let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
+    let mut trimmed_hashes = Vec::new();
 
     // Phase 0: Classic
     let classic_invalid = get_invalid_hashed_tx_list_with_fee_map(
@@ -1160,6 +1171,7 @@ pub(crate) fn trim_invalid_two_phase_hashed(
     let valid_classic = if classic_invalid.is_empty() {
         classic_txs
     } else {
+        trimmed_hashes.extend(classic_invalid.iter().map(|htx| htx.hash()));
         remove_hashed_txs(classic_txs, &classic_invalid)
     };
 
@@ -1180,10 +1192,15 @@ pub(crate) fn trim_invalid_two_phase_hashed(
     let valid_soroban = if soroban_invalid.is_empty() {
         soroban_txs
     } else {
+        trimmed_hashes.extend(soroban_invalid.iter().map(|htx| htx.hash()));
         remove_hashed_txs(soroban_txs, &soroban_invalid)
     };
 
-    (valid_classic, valid_soroban)
+    TrimResult {
+        valid_classic,
+        valid_soroban,
+        trimmed_hashes,
+    }
 }
 
 /// Trim invalid transactions from two phases (Classic + Soroban), sharing the
@@ -1217,7 +1234,7 @@ pub fn trim_invalid_two_phase(
         .map(|tx| HashedTx::new(tx.clone()))
         .collect();
 
-    let (valid_classic, valid_soroban) = trim_invalid_two_phase_hashed(
+    let result = trim_invalid_two_phase_hashed(
         classic_hashed,
         soroban_hashed,
         ctx,
@@ -1227,11 +1244,13 @@ pub fn trim_invalid_two_phase(
     );
 
     (
-        valid_classic
+        result
+            .valid_classic
             .into_iter()
             .map(|htx| htx.into_envelope())
             .collect(),
-        valid_soroban
+        result
+            .valid_soroban
             .into_iter()
             .map(|htx| htx.into_envelope())
             .collect(),

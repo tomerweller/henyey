@@ -76,7 +76,7 @@ pub(crate) mod flood_queue;
 mod selection;
 mod tx_set;
 
-pub(crate) use selection::{BuildContext, NominationBuildContext};
+pub(crate) use selection::{BuildContext, BuildOutput, NominationBuildContext};
 pub use tx_set::*;
 
 /// Result of attempting to add a transaction to the queue.
@@ -8369,15 +8369,17 @@ mod snapshot_providers_tests {
         let account_provider = CountingAccountProvider::new();
 
         // Build tx set with override providers — should NOT panic.
-        let _tx_set = queue.build_generalized_tx_set_with_providers(
-            crate::tx_queue::selection::BuildContext::Queue,
-            Hash256::ZERO,
-            100,
-            None,
-            0,
-            Some(&fee_provider),
-            Some(&account_provider),
-        );
+        let _tx_set = queue
+            .build_generalized_tx_set_with_providers(
+                crate::tx_queue::selection::BuildContext::Queue,
+                Hash256::ZERO,
+                100,
+                None,
+                0,
+                Some(&fee_provider),
+                Some(&account_provider),
+            )
+            .tx_set;
 
         // The override providers should have been called (at least once
         // per source account for the fee provider during trim_invalid).
@@ -8403,15 +8405,17 @@ mod snapshot_providers_tests {
         }
 
         // Build without override — should use queue's stored providers.
-        let _tx_set = queue.build_generalized_tx_set_with_providers(
-            crate::tx_queue::selection::BuildContext::Queue,
-            Hash256::ZERO,
-            100,
-            None,
-            0,
-            None,
-            None,
-        );
+        let _tx_set = queue
+            .build_generalized_tx_set_with_providers(
+                crate::tx_queue::selection::BuildContext::Queue,
+                Hash256::ZERO,
+                100,
+                None,
+                0,
+                None,
+                None,
+            )
+            .tx_set;
 
         assert!(
             counting_fee.calls() > 0 || counting_account.calls() > 0,

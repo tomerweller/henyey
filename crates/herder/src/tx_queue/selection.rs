@@ -15,6 +15,16 @@ pub struct NominationBuildContext {
     pub validation_ctx: crate::tx_set_utils::TxSetValidationContext,
 }
 
+/// Result of building a generalized transaction set.
+pub struct BuildOutput {
+    /// The built transaction set.
+    pub tx_set: TransactionSet,
+    /// Hashes of transactions trimmed as invalid during the build.
+    /// Callers (e.g. trigger_next_ledger) should ban these to prevent
+    /// stale transactions from blocking queue admission.
+    pub trimmed_invalid_hashes: Vec<Hash256>,
+}
+
 /// Where the builder sources its ledger-state inputs.
 pub enum BuildContext<'a> {
     /// Nomination path: all fields from snapshot header.
@@ -125,6 +135,7 @@ impl TransactionQueue {
             None,
             None,
         )
+        .tx_set
     }
 
     /// Build a GeneralizedTransactionSet with caller-supplied snapshot providers.
@@ -138,7 +149,7 @@ impl TransactionQueue {
         close_time_offset: u64,
         override_fee_provider: Option<&dyn FeeBalanceProvider>,
         override_account_provider: Option<&dyn AccountProvider>,
-    ) -> TransactionSet {
+    ) -> BuildOutput {
         use stellar_xdr::curr::GeneralizedTransactionSet;
 
         // Derive base_fee, protocol_version, and validation context from the
@@ -219,23 +230,29 @@ impl TransactionQueue {
         let account_ref: Option<&dyn AccountProvider> =
             override_account_provider.or(queue_account.as_deref());
 
-        let (classic_txs, mut soroban_txs) = if fee_ref.is_some() || account_ref.is_some() {
-            let ctx = trim_ctx.expect("trim_ctx always Some");
-            let close_time_bounds = crate::tx_set_utils::CloseTimeBounds::with_offsets(
-                close_time_offset,
-                close_time_offset,
-            );
-            crate::tx_set_utils::trim_invalid_two_phase_hashed(
-                classic_txs,
-                soroban_txs,
-                &ctx,
-                &close_time_bounds,
-                fee_ref,
-                account_ref,
-            )
-        } else {
-            (classic_txs, soroban_txs)
-        };
+        let (classic_txs, mut soroban_txs, trimmed_invalid_hashes) =
+            if fee_ref.is_some() || account_ref.is_some() {
+                let ctx = trim_ctx.expect("trim_ctx always Some");
+                let close_time_bounds = crate::tx_set_utils::CloseTimeBounds::with_offsets(
+                    close_time_offset,
+                    close_time_offset,
+                );
+                let result = crate::tx_set_utils::trim_invalid_two_phase_hashed(
+                    classic_txs,
+                    soroban_txs,
+                    &ctx,
+                    &close_time_bounds,
+                    fee_ref,
+                    account_ref,
+                );
+                (
+                    result.valid_classic,
+                    result.valid_soroban,
+                    result.trimmed_hashes,
+                )
+            } else {
+                (classic_txs, soroban_txs, Vec::new())
+            };
 
         sort_hashed_txs(&mut soroban_txs);
 
@@ -261,7 +278,10 @@ impl TransactionQueue {
                 .unwrap_or_default(),
         });
 
-        TransactionSet::new_generalized(gen_tx_set)
+        BuildOutput {
+            tx_set: TransactionSet::new_generalized(gen_tx_set),
+            trimmed_invalid_hashes,
+        }
     }
 
     #[cfg(test)]
