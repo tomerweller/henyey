@@ -289,18 +289,25 @@ impl TxSetTracker {
     /// Store a validity result. Uses random-two-choice eviction at capacity.
     ///
     /// Returns the previous cached value for this key, if any.
-    /// Emits a warning when a previously-invalid entry is overwritten with valid
-    /// (false→true flip), per HERDER_SPEC INV-H8 detection.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a previously-invalid entry would be overwritten with `true`
+    /// (false→true flip). This is fatal per HERDER_SPEC §9.7 / INV-H8 and
+    /// mirrors stellar-core's `cacheValidTxSet` which throws
+    /// `std::runtime_error("Inconsistent txSet validity for tx set ...")`.
+    /// The panic fires BEFORE the overwrite so the cached `false` remains intact.
     pub fn store_valid(&self, key: (Hash256, Hash256, u64), valid: bool) -> Option<bool> {
         let mut cache = self.valid_cache.lock();
         let previous = cache.get(&key).copied();
-        if let Some(false) = previous {
-            if valid {
-                warn!(
-                    ?key,
-                    "tx set valid cache flip: false→true (INV-H8 detection)"
-                );
-            }
+        if previous == Some(false) && valid {
+            // Fatal: the tx-set hash is the second tuple element.
+            let tx_set_hash = key.1;
+            panic!(
+                "Inconsistent txSet validity for tx set {} (INV-H8): \
+                 cached as invalid, now revalidated as valid",
+                tx_set_hash.to_hex()
+            );
         }
         cache.put(key, valid);
         previous
