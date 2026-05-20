@@ -51,7 +51,7 @@ test_review_pr_workspace_contract_resolves_under_home_data() {
      grep -q '\$HOME/data/.*pr-.*-review' "$REVIEW_PR_SKILL"; then
     tap_ok "$desc"
   else
-    tap_not_ok "$desc" "SKILL.md does not contain a ~/data/\$SESSION_ID/review-pr workspace derivation"
+    tap_not_ok "$desc" "SKILL.md does not contain a ~/data/\$SESSION_ID/pr-\$PR_NUM-review (or legacy review-pr) workspace derivation"
   fi
 }
 
@@ -241,22 +241,26 @@ test_review_pr_exit_paths_cleanup_workspace_base() {
   local desc="review-pr exit paths cleanup reviewer workspace base"
 
   # Every terminal Step 7 path (merge, wait, bounce, block) must clean up the
-  # reviewer workspace base (WORKTREE_BASE or equivalent). We check that the
-  # SKILL.md mentions removing/cleaning the review workspace on exit paths.
-  # Look for rm -rf paired with the review workspace variable, or a cleanup
-  # helper invocation, across the Step 7 / exit-path sections.
-  if grep -q 'rm -rf.*WORKTREE_BASE\|rm -rf.*review-pr-\$ISSUE\|cleanup_review_workspace\|rm -rf.*pr-\$PR_NUM-review\|rm -rf.*\$REVIEW_WORKSPACE' "$REVIEW_PR_SKILL"; then
-    # Also ensure cleanup appears on bounce/wait/block paths, not just merge.
-    # We need at least 2 distinct cleanup references (merge + at least one other path).
+  # reviewer workspace base (WORKTREE_BASE or equivalent). We scope the search
+  # to the Step 7 section (starts at "## Step 7") to avoid false positives from
+  # the workspace-contract prose earlier in the file.
+  local step7_content
+  step7_content=$(sed -n '/^## Step 7/,$p' "$REVIEW_PR_SKILL")
+
+  local cleanup_pattern='rm -rf.*WORKTREE_BASE\|rm -rf.*review-pr-\$ISSUE\|cleanup_review_workspace\|rm -rf.*pr-\$PR_NUM-review\|rm -rf.*\$REVIEW_WORKSPACE'
+
+  if echo "$step7_content" | grep -q "$cleanup_pattern"; then
+    # Count cleanup references within Step 7 only. We need at least 4
+    # (one per terminal path: merge, wait, bounce, block).
     local cleanup_count
-    cleanup_count=$(grep -c 'rm -rf.*WORKTREE_BASE\|rm -rf.*review-pr-\$ISSUE\|cleanup_review_workspace\|rm -rf.*pr-\$PR_NUM-review\|rm -rf.*\$REVIEW_WORKSPACE' "$REVIEW_PR_SKILL" || true)
-    if [ "$cleanup_count" -ge 2 ]; then
+    cleanup_count=$(echo "$step7_content" | grep -c "$cleanup_pattern" || true)
+    if [ "$cleanup_count" -ge 4 ]; then
       tap_ok "$desc"
     else
-      tap_not_ok "$desc" "Cleanup found only once; must appear on multiple exit paths (merge + bounce/wait/block)"
+      tap_not_ok "$desc" "Cleanup found $cleanup_count times in Step 7; need at least 4 (merge + wait + bounce + block)"
     fi
   else
-    tap_not_ok "$desc" "No review workspace cleanup (rm -rf \$WORKTREE_BASE or equivalent) found in exit paths"
+    tap_not_ok "$desc" "No review workspace cleanup (rm -rf \$WORKTREE_BASE or equivalent) found in Step 7 exit paths"
   fi
 }
 
@@ -306,6 +310,62 @@ test_review_pr_reviewer_scratch_dirs() {
 }
 
 # --------------------------------------------------------------------------
+# Test: review-pr validates WORKTREE_BASE before rm -rf (safety check)
+# --------------------------------------------------------------------------
+test_review_pr_validate_worktree_base_safety() {
+  local desc="review-pr validates WORKTREE_BASE before rm -rf (safety check)"
+
+  # The skill must define a validate_worktree_base helper that rejects broad
+  # paths (/, $HOME, $HOME/data) and only accepts the expected pr-*-review pattern.
+  # Every rm -rf of WORKTREE_BASE must be guarded by this validation.
+  local has_validator=false
+  local all_guarded=true
+
+  if grep -q 'validate_worktree_base' "$REVIEW_PR_SKILL"; then
+    has_validator=true
+  fi
+
+  # Check that every rm -rf $WORKTREE_BASE in Step 7 is within a block guarded
+  # by validate_worktree_base (the validation is on the if-line, not the rm line).
+  # We check that there are no rm -rf $WORKTREE_BASE lines that aren't preceded
+  # (within 2 lines above) by validate_worktree_base.
+  local step7_content
+  step7_content=$(sed -n '/^## Step 7/,$p' "$REVIEW_PR_SKILL")
+  local unguarded_count=0
+  local line_num=0
+  local prev1="" prev2=""
+  while IFS= read -r line; do
+    line_num=$((line_num + 1))
+    if echo "$line" | grep -q 'rm -rf.*WORKTREE_BASE'; then
+      # Skip prose mentions (lines containing backticks around the command)
+      if echo "$line" | grep -q '`rm -rf'; then
+        prev2="$prev1"; prev1="$line"
+        continue
+      fi
+      # Check if validate_worktree_base appears in previous 2 lines
+      if ! echo "$prev1$prev2" | grep -q 'validate_worktree_base'; then
+        unguarded_count=$((unguarded_count + 1))
+      fi
+    fi
+    prev2="$prev1"
+    prev1="$line"
+  done <<< "$step7_content"
+
+  if [ "$unguarded_count" -gt 0 ]; then
+    all_guarded=false
+  fi
+
+  if $has_validator && $all_guarded; then
+    tap_ok "$desc"
+  else
+    local reason=""
+    $has_validator || reason="no validate_worktree_base helper defined"
+    $all_guarded || reason="${reason:+$reason; }some rm -rf \$WORKTREE_BASE calls not guarded by validate_worktree_base"
+    tap_not_ok "$desc" "$reason"
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -320,6 +380,7 @@ test_plan_cargo_target_under_data
 test_review_pr_exit_paths_cleanup_workspace_base
 test_review_pr_forbids_tmp_and_repo_root_patterns
 test_review_pr_reviewer_scratch_dirs
+test_review_pr_validate_worktree_base_safety
 test_claude_review_pr_synced
 test_claude_plan_synced
 

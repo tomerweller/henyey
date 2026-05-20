@@ -157,6 +157,27 @@ SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/pr-$PR_NUM-review}"
 export CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"
 
+# Safety: validate WORKTREE_BASE is under $HOME/data/ and matches expected layout.
+# Reject overly broad paths that could cause catastrophic deletion on cleanup.
+validate_worktree_base() {
+  local base="$1"
+  local resolved
+  resolved="$(cd "$base" 2>/dev/null && pwd || echo "$base")"
+  if [ -z "$resolved" ] ||
+     [ "$resolved" = "/" ] ||
+     [ "$resolved" = "$HOME" ] ||
+     [ "$resolved" = "$HOME/data" ] ||
+     [ "$resolved" = "$HOME/data/" ]; then
+    echo "FATAL: WORKTREE_BASE='$resolved' is too broad; refusing rm -rf" >&2
+    return 1
+  fi
+  case "$resolved" in
+    "$HOME/data/"*/pr-*-review) return 0 ;;
+    "$HOME/data/"*/review-pr-*) return 0 ;;
+    *) echo "FATAL: WORKTREE_BASE='$resolved' does not match expected pattern \$HOME/data/<session>/pr-<N>-review" >&2; return 1 ;;
+  esac
+}
+
 mkdir -p "$WORKTREE_BASE/reviewer-a" "$WORKTREE_BASE/reviewer-b"
 ```
 
@@ -549,7 +570,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 # Clean up the reviewer workspace (Step 3.5 artifacts).
 # This is the primary fix for #2843 — ensures reviewer scratch state never
 # lingers on disk after /review-pr completes.
-if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ]; then
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE"; then
   rm -rf "$WORKTREE_BASE"
 fi
 
@@ -598,7 +619,7 @@ Unassign yourself so the next tick re-picks this issue.
 
 ```bash
 # Clean up reviewer workspace before exiting (prevents stale artifacts on disk).
-if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ]; then
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE"; then
   rm -rf "$WORKTREE_BASE"
 fi
 ```
@@ -630,7 +651,7 @@ Move state and unassign:
 
 ```bash
 # Clean up reviewer workspace before exiting (prevents stale artifacts on disk).
-if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ]; then
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE"; then
   rm -rf "$WORKTREE_BASE"
 fi
 
@@ -680,7 +701,7 @@ Move state:
 
 ```bash
 # Clean up reviewer workspace before exiting (prevents stale artifacts on disk).
-if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ]; then
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE"; then
   rm -rf "$WORKTREE_BASE"
 fi
 
