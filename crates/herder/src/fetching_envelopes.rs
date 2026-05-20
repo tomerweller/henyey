@@ -758,6 +758,14 @@ impl FetchingEnvelopes {
         );
     }
 
+    /// Seed the quorum-set cache with a pre-validated quorum set during startup
+    /// restore. Unlike `recv_quorum_set`, this bypasses the fetcher tracking
+    /// check — on startup there are no outstanding fetches, so restored quorum
+    /// sets would otherwise be rejected.
+    pub fn seed_quorum_set(&self, hash: Hash256, quorum_set: ScpQuorumSet) {
+        self.qs_cache_put(hash, Arc::new(quorum_set));
+    }
+
     /// Get the number of cached QuorumSets.
     pub fn quorum_set_cache_size(&self) -> usize {
         self.qs_cache_len()

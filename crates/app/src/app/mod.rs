@@ -1634,18 +1634,6 @@ impl App {
             panic!("set_scp_persistence called more than once");
         }
 
-        // Restore persisted SCP state on startup so a node recovering from a
-        // crash can resume tracking from the persisted slot rather than waiting
-        // for fresh envelopes. Parity: stellar-core `HerderImpl::restoreSCPState()`
-        // called from `Herder::start()` (HerderImpl.cpp:2415).
-        match scp_persistence_manager.restore_scp_state() {
-            Ok(restored) => herder.apply_restored_scp_state(restored),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "Failed to restore SCP state on startup — node will wait for fresh envelopes"
-            ),
-        }
-
         if let Some(qs) = herder.local_quorum_set() {
             let hash = hash_quorum_set(&qs);
             if let Err(err) = db.store_scp_quorum_set(&hash, 0, &qs) {
