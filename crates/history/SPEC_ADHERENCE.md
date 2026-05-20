@@ -3,7 +3,7 @@
 **Spec version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Crate:** crates/history (with crates/historywork)
 **Last updated:** 2026-05-20
-**Overall adherence:** 91% (Full 66 | Partial 5 | Absent 1 | Drift 1 | N/A 7)
+**Overall adherence:** 90% (Full 65 | Partial 6 | Absent 1 | Drift 1 | N/A 7)
 
 Sections §7 (LedgerApplyManager), §8.4 (apply-buffered drain),
 INV-C8, and INV-C12 live in `crates/app` — they are marked N/A here
@@ -59,7 +59,7 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 | §14.2 | Archive rotation | Full | `catchup/mod.rs:369`, `catchup/download.rs:120` |
 | §14.3 | Fatal failure flag | N/A | `fatal_state_failure` in `crates/app/src/app/mod.rs:557` |
 | §14.4 | Publish-side crash recovery | Full | `checkpoint_builder.rs:491-680` |
-| §14.5 | Catchup-side crash recovery | Full | Two-window design: non-authoritative pre-LCL writes + `CATCHUP_PERSIST_PENDING` sentinel; see Detailed §14.5 |
+| §14.5 | Catchup-side crash recovery | Partial | Two-window design: non-authoritative pre-LCL writes + `CATCHUP_PERSIST_PENDING` sentinel; CLI readers still anchor on `MAX(ledgerseq)`; see Detailed §14.5 |
 | §16 | Constants table | Full | all values match (see Constants below) |
 
 ---
@@ -133,7 +133,7 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 - **§10.3 apply algorithm + newest-wins**: cross-crate (`crates/bucket/src/bucket_list.rs:1969-1989` + `manager.rs:850-890`). **N/A** for INV-C9 (see invariant table).
 - **§10.4 index buckets**: indirect via `BucketList::restore_from_has` in `crates/bucket`. **Full**.
 - **§10.5 AssumeState**: `catchup/buckets.rs:154-216` (`restart_merges`). **Full**.
-- **§10.6 post-apply LCL setup + REBUILD_FOR_OFFER_TABLE clearing**: **Full** — `catchup/mod.rs:488-500` calls `ledger_manager.reset()` + `initialize()`. The literal `REBUILD_FOR_OFFER_TABLE` flag is not needed because henyey has no SQL offer table; the equivalent recovery contract is provided by the two-window design documented in §14.5 below and `crates/app/README.md`.
+- **§10.6 post-apply LCL setup + REBUILD_FOR_OFFER_TABLE clearing**: **Full** — `catchup/mod.rs:500-502` calls `ledger_manager.reset()` + `initialize()`. The literal `REBUILD_FOR_OFFER_TABLE` flag is not needed because henyey has no SQL offer table; the equivalent recovery contract is provided by the two-window design documented in §14.5 below and `crates/app/README.md`. Note: §14.5 itself is Partial due to CLI reader paths; the `reset()` + `initialize()` sequence here is fully equivalent to stellar-core's post-apply LCL setup.
 
 ### §11 — Transaction Replay
 - **§11.1 per-checkpoint workflow**: `catchup/replay.rs:460-552`. **Full**. After each apply: hash mismatch yields `ReplayHashMismatch`.
