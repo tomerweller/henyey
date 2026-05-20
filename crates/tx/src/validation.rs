@@ -1927,6 +1927,87 @@ mod tests {
         assert!(validate_full(&TransactionFrame::from_owned(envelope), &context, &account).is_ok());
     }
 
+    /// validate_full must reject envelopes exceeding XDR depth limit as InvalidStructure.
+    /// This exercises the `check_xdr_depth` guard at the top of `validate_full` (line 823),
+    /// which is a separate call site from `validate_basic`.
+    #[test]
+    fn test_validate_full_rejects_over_depth_envelope() {
+        // Build a deeply nested ScVal to exceed the 500-depth XDR limit.
+        let mut val = ScVal::U32(42);
+        for _ in 0..501 {
+            val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+                vec![val].try_into().unwrap(),
+            )));
+        }
+
+        let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let account_id = AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+                    function_name: ScSymbol(StringM::<32>::try_from("deep".to_string()).unwrap()),
+                    args: vec![val].try_into().unwrap(),
+                }),
+                auth: VecM::default(),
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 10_000,
+            seq_num: SequenceNumber(2),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: VecM::default(),
+                        read_write: VecM::default(),
+                    },
+                    instructions: 100,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 5000,
+            }),
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let context = LedgerContext::testnet(1, 1000);
+        let account = create_account_entry(account_id, 1);
+        let frame = TransactionFrame::from_owned(envelope);
+
+        let result = validate_full(&frame, &context, &account);
+        let errors = result.expect_err("validate_full should reject over-depth envelope");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidStructure(_))),
+            "expected InvalidStructure for over-depth envelope, got: {:?}",
+            errors
+        );
+
+        // Verify the error message includes the depth limit value.
+        let msg = match &errors[0] {
+            ValidationError::InvalidStructure(m) => m.clone(),
+            other => panic!("expected InvalidStructure, got: {:?}", other),
+        };
+        assert!(
+            msg.contains(&XDR_DEPTH_LIMIT.to_string()),
+            "error message should include limit value {}, got: {}",
+            XDR_DEPTH_LIMIT,
+            msg
+        );
+    }
+
     /// Test validate_time_bounds with min_time in the future.
     #[test]
     fn test_validate_time_bounds_too_early() {
