@@ -485,6 +485,17 @@ impl CatchupManager {
             }
         }
 
+        // §14.5 parity: this writes a checkpoint-keyed `bucketlist` row to
+        // SQLite. It is durable but NON-AUTHORITATIVE — startup restore
+        // (`load_last_known_ledger`) reads from `last_closed_ledger` +
+        // `HISTORY_ARCHIVE_STATE`, not from future `bucketlist` rows.
+        // Readers (publish, CLI self-check) pick snapshots via
+        // `latest_checkpoint_before_or_at(current_ledger)`, so rows ahead
+        // of the durable LCL never become authoritative restart state. A
+        // crash here leaves orphaned rows that are overwritten by the next
+        // successful catchup. This is the first of two crash windows; the
+        // second (deferred-persist) is guarded by `CATCHUP_PERSIST_PENDING`
+        // in `crates/app/src/app/catchup_impl.rs`.
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
         if ledger_manager.is_initialized() {
@@ -523,6 +534,10 @@ impl CatchupManager {
     ) -> Result<CatchupResult> {
         let (final_seq, final_hash, ledgers_applied) = if checkpoint_seq >= target {
             // No replay needed — target is exactly at checkpoint.
+            // §14.5 parity: like `persist_bucket_list_snapshot` above,
+            // this header row is non-authoritative until `last_closed_ledger`
+            // advances via the final persist transaction. Safe to leave
+            // on crash for the same reason.
             self.persist_header_only(checkpoint_header)?;
 
             // Emit synthetic LedgerCloseMeta for the bucket-applied ledger.

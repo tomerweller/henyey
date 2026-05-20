@@ -157,6 +157,18 @@ Buffered ledger application is intentionally interleaved with the main event loo
 
 Metadata streaming has asymmetric failure semantics: writes to the configured main output stream are fatal and abort the node, while rotating debug stream failures are logged and ignored. This mirrors the requirement that primary ingestion output must never be silently dropped.
 
+### Catchup Crash Recovery (§14.5 parity)
+
+stellar-core uses a `REBUILD_FOR_OFFER_TABLE` persistent-state flag because its SQL offer tables are mutated incrementally during bucket apply. On restart, `maybeRebuildLedger()` detects the flag and rebuilds SQL state from buckets.
+
+henyey has no SQL offer table — it uses BucketListDB-only persistence with an in-memory offer index — so the literal flag is not needed. Instead, crash recovery is ensured by a **two-window design**:
+
+1. **Window 1 — mid-catchup before final LCL/HAS persist.** Pre-final-persist writes (`persist_bucket_list_snapshot`, `persist_header_only`) are durable but non-authoritative. Startup restore (`load_last_known_ledger`) reads from `last_closed_ledger` and `HISTORY_ARCHIVE_STATE`, not from ahead-of-LCL rows. Readers (publish, CLI self-check) choose snapshots via `latest_checkpoint_before_or_at(current_ledger)`, so orphaned rows never become authoritative and are overwritten by the next successful catchup.
+
+2. **Window 2 — post-catchup / pre-deferred-persist.** After catchup succeeds in memory, `catchup_impl.rs` sets the `CATCHUP_PERSIST_PENDING` sentinel before handing off to the deferred persist task. If the node crashes before that task commits, `App::new()` → `check_catchup_persist_pending()` detects the sentinel on restart and seeds `catchup_needs_full_reset`, forcing the next catchup down the full bucket-apply path. The sentinel is only cleared atomically with the final state write in `CatchupPersistData::write_to_db`, ensuring crash-idempotence across repeated restarts.
+
+This preserves the same recovery contract as stellar-core — restart never trusts interrupted catchup state — via a different mechanism suited to the BucketListDB-only architecture.
+
 ## stellar-core Mapping
 
 | Rust | stellar-core |

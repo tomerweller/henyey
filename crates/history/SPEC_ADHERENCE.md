@@ -59,7 +59,7 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 | §14.2 | Archive rotation | Full | `catchup/mod.rs:369`, `catchup/download.rs:120` |
 | §14.3 | Fatal failure flag | N/A | `fatal_state_failure` in `crates/app/src/app/mod.rs:557` |
 | §14.4 | Publish-side crash recovery | Full | `checkpoint_builder.rs:491-680` |
-| §14.5 | Catchup-side crash recovery | Absent | `REBUILD_FOR_OFFER_TABLE` persistent-state flag not located; see Detailed §14.5 |
+| §14.5 | Catchup-side crash recovery | Full | Two-window design: non-authoritative pre-LCL writes + `CATCHUP_PERSIST_PENDING` sentinel; see Detailed §14.5 |
 | §16 | Constants table | Full | all values match (see Constants below) |
 
 ---
@@ -133,7 +133,7 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 - **§10.3 apply algorithm + newest-wins**: cross-crate (`crates/bucket/src/bucket_list.rs:1969-1989` + `manager.rs:850-890`). **N/A** for INV-C9 (see invariant table).
 - **§10.4 index buckets**: indirect via `BucketList::restore_from_has` in `crates/bucket`. **Full**.
 - **§10.5 AssumeState**: `catchup/buckets.rs:154-216` (`restart_merges`). **Full**.
-- **§10.6 post-apply LCL setup + REBUILD_FOR_OFFER_TABLE clearing**: half present — `catchup/mod.rs:488-500` calls `ledger_manager.reset()` + `initialize()`. The `REBUILD_FOR_OFFER_TABLE` persistent-state flag itself is not located in this crate. **See §14.5 below.**
+- **§10.6 post-apply LCL setup + REBUILD_FOR_OFFER_TABLE clearing**: **Full** — `catchup/mod.rs:488-500` calls `ledger_manager.reset()` + `initialize()`. The literal `REBUILD_FOR_OFFER_TABLE` flag is not needed because henyey has no SQL offer table; the equivalent recovery contract is provided by the two-window design documented in §14.5 below and `crates/app/README.md`.
 
 ### §11 — Transaction Replay
 - **§11.1 per-checkpoint workflow**: `catchup/replay.rs:460-552`. **Full**. After each apply: hash mismatch yields `ReplayHashMismatch`.
@@ -148,11 +148,12 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 - **Status**: Partial. The verification *function* is correct and tested (`test_verify_tx_result_set_genesis_empty/nonempty/non_genesis_empty`), but it is called from `replay/execution.rs:680` during live replay — not from a separate `VerifyTxResultsWork`-equivalent that runs over the entire replay range in OFFLINE_COMPLETE mode. Henyey has no OFFLINE_COMPLETE entry point at all (see §6.1). The MUST-NOT clauses for OFFLINE_BASIC/ONLINE are trivially satisfied (no caller invokes the function in those modes), but the MUST clause for OFFLINE_COMPLETE has no caller because the mode does not exist as a configuration option.
 
 ### §14.5 — Catchup-side crash recovery
-- **Claim §14.5-1**: `REBUILD_FOR_OFFER_TABLE` persistent-state flag must survive a crash during bucket apply; on restart, detect and re-trigger catchup.
-- **Rust**: not located. `grep REBUILD_FOR_OFFER_TABLE` returns no hits. `grep "rebuild.*offer\|rebuild.*for"` in `crates/history/`, `crates/app/`, `crates/ledger/` returns nothing semantically equivalent.
-- **Status**: Absent. **Verified by two search strategies**: (1) symbol grep across all crates for `REBUILD_FOR_OFFER_TABLE` and variants, (2) semantic search for "rebuild" / "offer table" / persistent-state flag patterns. Neither yields a flag clear/set pair at the documented commit boundary (`setLastClosedLedger` ↔ `clearRebuildForOfferTable`).
-- **Risk**: a crash during bucket apply could leave the database in an inconsistent state without a forced re-catchup signal on restart. The risk is *partially* mitigated by `catchup/mod.rs:488-500` calling `reset() + initialize()` in a single visible transition, but there is no durable marker that the bucket apply was interrupted.
-- **Recommendation**: file a follow-up to add a persistent-state flag (henyey-db key) with the same semantic role.
+- **Claim §14.5-1**: A crash during bucket apply must not leave the node in an inconsistent state; on restart, the node must detect the interruption and force safe recovery (re-catchup).
+- **stellar-core mechanism**: `REBUILD_FOR_OFFER_TABLE` flag set before bucket apply (SQL offer tables are mutated incrementally), cleared after `setLastClosedLedger()`; startup `maybeRebuildLedger()` detects and rebuilds.
+- **henyey mechanism (two-window design)**:
+  - **Window 1 (pre-final-persist):** `persist_bucket_list_snapshot()` (`catchup/mod.rs:488`) and `persist_header_only()` (`catchup/mod.rs:526`) write checkpoint-keyed rows that are durable but non-authoritative. Startup restore reads from `last_closed_ledger` / `HISTORY_ARCHIVE_STATE` (in `crates/app`), not from ahead-of-LCL rows. Readers (publish, CLI self-check) choose snapshots via `latest_checkpoint_before_or_at(current_ledger)`. A crash here leaves orphaned rows overwritten by the next successful catchup.
+  - **Window 2 (post-catchup / pre-deferred-persist):** `crates/app/src/app/catchup_impl.rs` sets `CATCHUP_PERSIST_PENDING` before handing off deferred persist. `App::new()` → `check_catchup_persist_pending()` detects it on restart and seeds `catchup_needs_full_reset`, forcing full bucket-apply recovery. The sentinel is cleared atomically with the final state write in `CatchupPersistData::write_to_db` (`crates/app/src/app/persist.rs`).
+- **Status**: **Full** (semantic parity via different mechanism). The recovery contract — restart never trusts interrupted catchup state — is preserved without a literal `REBUILD_FOR_OFFER_TABLE` flag because henyey has no SQL offer table (BucketListDB-only with in-memory offer index; see `crates/ledger/PARITY_STATUS.md`).
 
 ### §16 — Constants
 All constants present with correct values:
@@ -220,6 +221,6 @@ No dangling anchors were detected — all cited sections exist in the regenerate
 
 1. **Add OFFLINE_BASIC / OFFLINE_COMPLETE / ONLINE mode discriminator** to `CatchupMode` (or a sibling enum). Wire OFFLINE_COMPLETE to a `verify_results_for_range` work that loops over `results-*.xdr.gz` files for every checkpoint in the replay range, invoking `verify_tx_result_set` per ledger. Closes the §12 / INV-C6 gap.
 2. **Plumb SCP-side trusted hash through** to `catchup/replay.rs:235` so `TrustSource::Scp` is actually exercised in ONLINE mode. Closes the INV-C5 gap (currently relies on internal-only chain consistency).
-3. **Add a `REBUILD_FOR_OFFER_TABLE`-equivalent persistent-state flag** (henyey-db row) cleared by the same code that calls `setLastClosedLedger` at the end of bucket apply. Closes the §14.5 gap.
+3. ~~**Add a `REBUILD_FOR_OFFER_TABLE`-equivalent persistent-state flag**~~ *(Resolved — §14.5 now documented as Full via the two-window design; no new flag needed.)*
 4. ~~**Update spec §5.3** to acknowledge SQLite-backed publish queue as a conforming alternative storage shape (or vice versa, if filesystem-backed is required for stellar-core interoperability).~~ *(No spec update needed — documented in-repo as intentional implementation difference; queue is node-local. Tracked as Drift 1 above.)*
 5. **Update spec §6.3** to make the post-#2677 collapsed factoring of Case 1 / Case 2 / Case 4b explicit, eliminating the apparent drift.

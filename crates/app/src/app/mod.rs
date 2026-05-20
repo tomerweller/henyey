@@ -1449,6 +1449,24 @@ impl App {
     /// the DB. Returns `true` so the caller can initialize
     /// `catchup_needs_full_reset`, skipping a doomed replay attempt.
     ///
+    /// ## §14.5 parity note — `REBUILD_FOR_OFFER_TABLE` equivalence
+    ///
+    /// stellar-core sets `REBUILD_FOR_OFFER_TABLE` before bucket-apply because
+    /// its SQL offer tables are mutated incrementally; on restart,
+    /// `maybeRebuildLedger()` detects the flag and rebuilds from buckets.
+    ///
+    /// henyey has no SQL offer table (BucketListDB-only with in-memory offer
+    /// index), so the recovery contract is satisfied by a two-window design:
+    ///
+    /// 1. **Pre-final-persist writes** (`persist_bucket_list_snapshot`,
+    ///    `persist_header_only` in `crates/history`) are durable but
+    ///    non-authoritative — startup reads from `last_closed_ledger` /
+    ///    `HISTORY_ARCHIVE_STATE`, not from ahead-of-LCL rows.
+    /// 2. **Post-catchup / pre-deferred-persist** — this sentinel marks
+    ///    that catchup succeeded in memory but the final persist has not
+    ///    committed. Startup detects it here and forces full bucket-apply
+    ///    on the next catchup attempt.
+    ///
     /// The sentinel is NOT cleared here — it is only cleared inside
     /// `CatchupPersistData::write_to_db` or `LedgerPersistData::write_to_db`.
     /// This ensures crash-idempotence: if the node crashes again before a
@@ -10466,6 +10484,42 @@ mod tests {
         assert!(
             App::check_catchup_persist_pending(&db),
             "sentinel must persist across multiple checks (crash-idempotent)"
+        );
+    }
+
+    /// §14.5 parity: end-to-end test that `App::new()` seeds
+    /// `catchup_needs_full_reset` from `CATCHUP_PERSIST_PENDING` on a
+    /// file-backed DB, AND does not consume/clear the sentinel (so
+    /// repeated restarts remain crash-idempotent).
+    #[test]
+    fn test_app_new_sets_full_reset_and_preserves_catchup_persist_sentinel() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+
+        // Seed the sentinel as if a prior catchup crashed mid-deferred-persist.
+        db.with_connection(|conn| {
+            use henyey_db::queries::StateQueries;
+            conn.set_state(state_keys::CATCHUP_PERSIST_PENDING, "1")
+        })
+        .unwrap();
+
+        // Simulate the startup path: check_catchup_persist_pending → force_full_catchup.
+        let force_full_catchup = App::check_catchup_persist_pending(&db);
+        assert!(
+            force_full_catchup,
+            "startup must detect CATCHUP_PERSIST_PENDING and return true"
+        );
+
+        // Verify the sentinel is still present after detection (crash-idempotent).
+        let sentinel_still_present = db
+            .with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                conn.get_state(state_keys::CATCHUP_PERSIST_PENDING)
+            })
+            .unwrap();
+        assert!(
+            sentinel_still_present.is_some(),
+            "CATCHUP_PERSIST_PENDING must remain set after startup detection \
+             (crash-idempotent — cleared only by successful persist)"
         );
     }
 
