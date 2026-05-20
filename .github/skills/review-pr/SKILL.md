@@ -161,8 +161,23 @@ WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/pr-$PR_NUM-review}"
 # Called at bootstrap (before mkdir/export) AND before every rm -rf on exit paths.
 validate_worktree_base() {
   local base="$1"
+
+  # Reject path traversal components before any resolution — prevents escaping
+  # ~/data/ even when the target directory does not yet exist.
+  case "$base" in
+    */..*|*/../*|../*|..) echo "FATAL: WORKTREE_BASE='$base' contains '..' traversal; refusing" >&2; return 1 ;;
+  esac
+
+  # Canonicalize: use realpath --canonicalize-missing if available (resolves
+  # symlinks/.. without requiring the path to exist), otherwise fall back to
+  # cd-based resolution for existing paths or the already-sanitized raw string.
   local resolved
-  resolved="$(cd "$base" 2>/dev/null && pwd || echo "$base")"
+  if command -v realpath >/dev/null 2>&1; then
+    resolved="$(realpath --canonicalize-missing "$base")"
+  else
+    resolved="$(cd "$base" 2>/dev/null && pwd || echo "$base")"
+  fi
+
   if [ -z "$resolved" ] ||
      [ "$resolved" = "/" ] ||
      [ "$resolved" = "$HOME" ] ||

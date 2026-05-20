@@ -365,6 +365,27 @@ test_review_pr_validate_worktree_base_safety() {
   fi
 }
 
+test_review_pr_validate_worktree_base_rejects_traversal() {
+  local desc="review-pr validate_worktree_base rejects '..' path traversal"
+
+  # The validator must reject paths containing '..' components even when the
+  # directory does not exist yet (cannot rely on cd-based canonicalization).
+  # Check that the function body explicitly rejects '..' before resolution.
+  local func_body
+  func_body=$(sed -n '/^validate_worktree_base()/,/^}/p' "$REVIEW_PR_SKILL")
+
+  if echo "$func_body" | grep -qE '\.\.' ; then
+    # Verify the rejection is an actual guard (contains return 1 or exit)
+    if echo "$func_body" | grep -B2 -A2 '\.\.' | grep -qE 'return 1|exit 1'; then
+      tap_ok "$desc"
+    else
+      tap_not_ok "$desc" "'..' mentioned but no rejection (return 1/exit) found near it"
+    fi
+  else
+    tap_not_ok "$desc" "validate_worktree_base does not check for '..' traversal"
+  fi
+}
+
 test_review_pr_validate_worktree_base_at_bootstrap() {
   local desc="review-pr validates WORKTREE_BASE at bootstrap before mkdir/export"
 
@@ -427,6 +448,7 @@ test_review_pr_exit_paths_cleanup_workspace_base
 test_review_pr_forbids_tmp_and_repo_root_patterns
 test_review_pr_reviewer_scratch_dirs
 test_review_pr_validate_worktree_base_safety
+test_review_pr_validate_worktree_base_rejects_traversal
 test_review_pr_validate_worktree_base_at_bootstrap
 test_claude_review_pr_synced
 test_claude_plan_synced
