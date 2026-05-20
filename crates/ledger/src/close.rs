@@ -1098,6 +1098,8 @@ impl std::ops::AddAssign<&LedgerClosePerf> for LedgerClosePerf {
         // (not cumulative), so take the latest rather than summing.
         self.soroban_state_data_arc_count = rhs.soroban_state_data_arc_count;
         self.soroban_state_code_arc_count = rhs.soroban_state_code_arc_count;
+        self.soroban_stage_count = rhs.soroban_stage_count;
+        self.soroban_max_cluster_count = rhs.soroban_max_cluster_count;
     }
 }
 
@@ -2007,25 +2009,35 @@ mod tests {
         let mut agg = LedgerClosePerf::default();
         assert_eq!(agg.soroban_state_data_arc_count, 0);
         assert_eq!(agg.soroban_state_code_arc_count, 0);
+        assert_eq!(agg.soroban_stage_count, 0);
+        assert_eq!(agg.soroban_max_cluster_count, 0);
 
         let perf1 = LedgerClosePerf {
             soroban_state_data_arc_count: 2,
             soroban_state_code_arc_count: 1,
+            soroban_stage_count: 4,
+            soroban_max_cluster_count: 10,
             ..Default::default()
         };
         agg += &perf1;
         assert_eq!(agg.soroban_state_data_arc_count, 2);
         assert_eq!(agg.soroban_state_code_arc_count, 1);
+        assert_eq!(agg.soroban_stage_count, 4);
+        assert_eq!(agg.soroban_max_cluster_count, 10);
 
         let perf2 = LedgerClosePerf {
             soroban_state_data_arc_count: 3,
             soroban_state_code_arc_count: 5,
+            soroban_stage_count: 2,
+            soroban_max_cluster_count: 7,
             ..Default::default()
         };
         agg += &perf2;
-        // Arc counts are instantaneous per-close observations, not cumulative.
-        // The aggregate should keep the latest sample (3/5), not sum (5/6).
+        // These fields are instantaneous per-close observations, not cumulative.
+        // The aggregate should keep the latest sample, not sum.
         assert_eq!(agg.soroban_state_data_arc_count, 3);
         assert_eq!(agg.soroban_state_code_arc_count, 5);
+        assert_eq!(agg.soroban_stage_count, 2);
+        assert_eq!(agg.soroban_max_cluster_count, 7);
     }
 }
