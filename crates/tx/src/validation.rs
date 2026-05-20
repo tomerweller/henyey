@@ -72,16 +72,24 @@ pub(crate) const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
 /// This validates the full outer envelope by attempting a depth-limited XDR write.
 /// If the envelope's recursive structure exceeds 500 levels, it is rejected as malformed.
 fn check_xdr_depth(frame: &TransactionFrame) -> std::result::Result<(), PreSeqNumError> {
-    if frame
-        .envelope()
-        .to_xdr(Limits::depth(XDR_DEPTH_LIMIT))
-        .is_err()
-    {
-        return Err(PreSeqNumError::Malformed(
-            "XDR depth limit exceeded".to_string(),
-        ));
+    if let Err(err) = frame.envelope().to_xdr(Limits::depth(XDR_DEPTH_LIMIT)) {
+        return Err(format_xdr_depth_error(err));
     }
     Ok(())
+}
+
+/// Convert a `stellar_xdr` error from a depth-limited XDR write into a
+/// [`PreSeqNumError::Malformed`] with an actionable message.
+///
+/// - `DepthLimitExceeded` → includes the configured limit value.
+/// - Any other XDR error → preserves the underlying error text.
+fn format_xdr_depth_error(err: stellar_xdr::curr::Error) -> PreSeqNumError {
+    match err {
+        stellar_xdr::curr::Error::DepthLimitExceeded => PreSeqNumError::Malformed(format!(
+            "XDR depth limit exceeded (limit: {XDR_DEPTH_LIMIT})"
+        )),
+        other => PreSeqNumError::Malformed(format!("XDR depth check failed: {other}")),
+    }
 }
 
 /// Per-transaction Soroban resource limits from the network configuration.
@@ -1917,6 +1925,87 @@ mod tests {
         let context = LedgerContext::testnet(1, 1000);
         let account = create_account_entry(account_id, 1);
         assert!(validate_full(&TransactionFrame::from_owned(envelope), &context, &account).is_ok());
+    }
+
+    /// validate_full must reject envelopes exceeding XDR depth limit as InvalidStructure.
+    /// This exercises the `check_xdr_depth` guard at the top of `validate_full` (line 823),
+    /// which is a separate call site from `validate_basic`.
+    #[test]
+    fn test_validate_full_rejects_over_depth_envelope() {
+        // Build a deeply nested ScVal to exceed the 500-depth XDR limit.
+        let mut val = ScVal::U32(42);
+        for _ in 0..501 {
+            val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+                vec![val].try_into().unwrap(),
+            )));
+        }
+
+        let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let account_id = AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+                    function_name: ScSymbol(StringM::<32>::try_from("deep".to_string()).unwrap()),
+                    args: vec![val].try_into().unwrap(),
+                }),
+                auth: VecM::default(),
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 10_000,
+            seq_num: SequenceNumber(2),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: VecM::default(),
+                        read_write: VecM::default(),
+                    },
+                    instructions: 100,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 5000,
+            }),
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let context = LedgerContext::testnet(1, 1000);
+        let account = create_account_entry(account_id, 1);
+        let frame = TransactionFrame::from_owned(envelope);
+
+        let result = validate_full(&frame, &context, &account);
+        let errors = result.expect_err("validate_full should reject over-depth envelope");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidStructure(_))),
+            "expected InvalidStructure for over-depth envelope, got: {:?}",
+            errors
+        );
+
+        // Verify the error message includes the depth limit value.
+        let msg = match &errors[0] {
+            ValidationError::InvalidStructure(m) => m.clone(),
+            other => panic!("expected InvalidStructure, got: {:?}", other),
+        };
+        assert!(
+            msg.contains(&XDR_DEPTH_LIMIT.to_string()),
+            "error message should include limit value {}, got: {}",
+            XDR_DEPTH_LIMIT,
+            msg
+        );
     }
 
     /// Test validate_time_bounds with min_time in the future.
@@ -3814,5 +3903,50 @@ mod tests {
         let count = get_num_disk_read_entries(&data.resources, &data.ext, &frame);
         // Account key = 1 classic disk read, ContractData = 0 (Soroban, in-memory)
         assert_eq!(count, 1);
+    }
+
+    // ========================================================================
+    // #2845 — XDR depth guard error detail tests
+    // ========================================================================
+
+    #[test]
+    fn test_xdr_depth_error_message_includes_limit() {
+        let err = stellar_xdr::curr::Error::DepthLimitExceeded;
+        let result = format_xdr_depth_error(err);
+        assert_eq!(
+            result,
+            PreSeqNumError::Malformed(format!(
+                "XDR depth limit exceeded (limit: {})",
+                XDR_DEPTH_LIMIT
+            )),
+            "depth error message should include the configured limit"
+        );
+        let msg = match &result {
+            PreSeqNumError::Malformed(m) => m.clone(),
+            _ => panic!("expected Malformed"),
+        };
+        assert!(
+            msg.contains(&XDR_DEPTH_LIMIT.to_string()),
+            "message should mention the configured limit value, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_xdr_depth_error_message_preserves_non_depth_xdr_error() {
+        let err = stellar_xdr::curr::Error::LengthLimitExceeded;
+        let expected_inner = format!("{err}");
+        let result = format_xdr_depth_error(err);
+        let msg = match &result {
+            PreSeqNumError::Malformed(m) => m.clone(),
+            _ => panic!("expected Malformed"),
+        };
+        assert!(
+            msg.contains(&expected_inner),
+            "message should contain the original XDR error text, got: {msg}"
+        );
+        assert!(
+            msg.contains("XDR depth check failed"),
+            "message should have 'XDR depth check failed' prefix, got: {msg}"
+        );
     }
 }

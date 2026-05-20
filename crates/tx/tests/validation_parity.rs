@@ -541,22 +541,23 @@ fn make_over_depth_soroban_envelope() -> TransactionEnvelope {
 
 /// §5.1-1: check_valid_pre_seq_num must reject envelopes exceeding XDR depth limit of 500.
 /// Parity: stellar-core TransactionFrame.cpp:1973 — `if (!xdr::check_xdr_depth(mEnvelope, 500))`
+/// Note: stellar-core only asserts txMALFORMED (result code), not the message text.
+/// We verify the Malformed classification here; message content is tested in unit tests.
 #[test]
 fn test_reject_transaction_exceeding_xdr_depth_limit() {
     let envelope = make_over_depth_soroban_envelope();
     let frame = TransactionFrame::from_owned(envelope);
 
     let result = check_valid_pre_seq_num(&frame, PROTOCOL_VERSION, 0);
-    assert_eq!(
-        result,
-        Err(PreSeqNumError::Malformed(
-            "XDR depth limit exceeded".to_string()
-        )),
-        "check_valid_pre_seq_num should reject over-depth envelope as Malformed"
+    assert!(
+        matches!(&result, Err(PreSeqNumError::Malformed(_))),
+        "check_valid_pre_seq_num should reject over-depth envelope as Malformed, got: {:?}",
+        result
     );
 }
 
 /// §5.1-1: validate_basic must also reject envelopes exceeding XDR depth limit.
+/// Parity: stellar-core only asserts txMALFORMED; we verify InvalidStructure classification.
 #[test]
 fn test_validate_basic_rejects_transaction_exceeding_xdr_depth_limit() {
     use henyey_tx::validation::{validate_basic, LedgerContext, ValidationError};
@@ -576,10 +577,52 @@ fn test_validate_basic_rejects_transaction_exceeding_xdr_depth_limit() {
     let errors = result.expect_err("validate_basic should reject over-depth envelope");
     let has_depth_error = errors
         .iter()
-        .any(|e| matches!(e, ValidationError::InvalidStructure(msg) if msg.contains("depth")));
+        .any(|e| matches!(e, ValidationError::InvalidStructure(_)));
     assert!(
         has_depth_error,
-        "expected InvalidStructure error about XDR depth, got: {:?}",
+        "expected InvalidStructure error for over-depth envelope, got: {:?}",
         errors
+    );
+}
+
+/// §5.1-1: Fee-bump envelopes must also be rejected when the outer envelope exceeds
+/// the XDR depth limit. Parity: stellar-core FeeBumpTransactionFrame.cpp:278.
+#[test]
+fn test_reject_fee_bump_transaction_exceeding_xdr_depth_limit() {
+    use stellar_xdr::curr::{
+        DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+        FeeBumpTransactionInnerTx, Signature, SignatureHint,
+    };
+
+    // Build an over-depth inner envelope and wrap it in a fee-bump.
+    let inner_envelope = make_over_depth_soroban_envelope();
+    let inner_tx_env = match inner_envelope {
+        TransactionEnvelope::Tx(env) => env,
+        _ => panic!("expected Tx variant"),
+    };
+
+    let fee_bump_tx = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+        fee: 20_000,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_tx_env),
+        ext: FeeBumpTransactionExt::V0,
+    };
+
+    let fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump_tx,
+        signatures: vec![DecoratedSignature {
+            hint: SignatureHint([0u8; 4]),
+            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+        }]
+        .try_into()
+        .unwrap(),
+    });
+
+    let frame = TransactionFrame::from_owned(fee_bump_envelope);
+    let result = check_valid_pre_seq_num(&frame, PROTOCOL_VERSION, 0);
+    assert!(
+        matches!(&result, Err(PreSeqNumError::Malformed(_))),
+        "check_valid_pre_seq_num should reject over-depth fee-bump envelope as Malformed, got: {:?}",
+        result
     );
 }
