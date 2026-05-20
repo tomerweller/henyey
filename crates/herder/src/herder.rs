@@ -1928,15 +1928,13 @@ impl Herder {
             return (EnvelopeState::Invalid, PostVerifyReason::NonQuorum);
         }
 
-        self.slot_quorum_tracker
-            .write()
-            .record_envelope(slot, envelope.statement.node_id.clone());
-
         // Parity: reject envelopes with non-SIGNED inner StellarValues before
-        // any prefetch or validated-fetch path. This mirrors the check in
+        // any bookkeeping or prefetch. This mirrors the check in
         // FetchingEnvelopes::recv_envelope for the non-prevalidated path and
         // ensures the validated-fetch path (recv_envelope_validated) cannot
-        // bypass the same rule.
+        // bypass the same rule. Must run before slot_quorum_tracker so rejected
+        // envelopes do not affect heard_from_quorum / is_v_blocking state
+        // (PendingEnvelopes.cpp:289-316 drops before downstream processing).
         if !crate::herder_utils::check_all_values_signed(&envelope) {
             debug!(
                 slot,
@@ -1944,6 +1942,10 @@ impl Herder {
             );
             return (EnvelopeState::Invalid, PostVerifyReason::InvalidInnerValue);
         }
+
+        self.slot_quorum_tracker
+            .write()
+            .record_envelope(slot, envelope.statement.node_id.clone());
 
         // Pre-fetch tx sets from EXTERNALIZE envelopes immediately so they're
         // available by the time SCP processes the envelope.
@@ -2489,20 +2491,42 @@ impl Herder {
         // records the trigger event even for non-validators before the
         // `!getSCP().isValidator()` early-return (HerderImpl.cpp:1493-1530).
         if !is_validator {
-            // build_nomination_value will build+cache the tx-set (steps 1-3.5)
-            // then fail at make_stellar_value (no secret key). The tx-set cache
-            // is populated as a side-effect before the signing failure.
-            let _ = self.build_nomination_value();
+            // Parity: stellar-core's triggerNextLedger completes the build/cache
+            // sequence before the non-validator early return (HerderImpl.cpp:1546-1573,
+            // 1616-1620). Only report ObserverBuilt if the tx-set was actually
+            // built and cached; propagate error if build_nomination_value aborts.
+            let build_result = self.build_nomination_value();
             let build_value_ms = t0.elapsed().as_millis();
 
             self.process_ready_fetching_envelopes();
 
-            tracing::debug!(
-                slot,
-                build_value_ms,
-                "Observer trigger: built and cached tx-set without nominating"
-            );
-            return Ok(TriggerOutcome::ObserverBuilt);
+            if build_result.is_some() {
+                tracing::debug!(
+                    slot,
+                    build_value_ms,
+                    "Observer trigger: built and cached tx-set without nominating"
+                );
+                return Ok(TriggerOutcome::ObserverBuilt);
+            } else {
+                // build_nomination_value returns None when the observer has no
+                // signing key (expected) OR on real failures (snapshot, validation).
+                // For observers without a signing key, the tx-set cache is still
+                // populated as a side-effect before the signing step fails.
+                // Check: if we have no secret key, the cache was populated —
+                // this is the expected non-validator path.
+                if self.secret_key.is_none() {
+                    tracing::debug!(
+                        slot,
+                        build_value_ms,
+                        "Observer trigger: no signing key, tx-set cache populated"
+                    );
+                    return Ok(TriggerOutcome::ObserverBuilt);
+                }
+                // Genuine pre-cache failure — report error.
+                return Err(HerderError::Internal(
+                    "Observer trigger: build_nomination_value failed before cache".into(),
+                ));
+            }
         }
 
         let value = self
@@ -13481,5 +13505,14 @@ mod issue_2819_spec_adherence_tests {
 
         assert_eq!(state, EnvelopeState::Invalid);
         assert_eq!(reason, PostVerifyReason::InvalidInnerValue);
+
+        // Regression: the invalid envelope must NOT have been recorded in
+        // slot_quorum_tracker. Before the fix, record_envelope was called
+        // before the signed-value gate, allowing rejected envelopes to
+        // affect heard_from_quorum / is_v_blocking state.
+        assert!(
+            !herder.slot_quorum_tracker.read().is_v_blocking(1),
+            "InvalidInnerValue envelope must not contribute to slot quorum tracking"
+        );
     }
 }

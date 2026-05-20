@@ -135,9 +135,9 @@ pub fn to_short_strkey(node_id: &NodeId) -> String {
 ///
 /// This is the shared validation gate called from both `FetchingEnvelopes::recv_envelope`
 /// (non-prevalidated path) and `Herder::process_verified` (post-verification path).
-/// It walks every statement value (NOMINATE votes/accepted, PREPARE ballot/prepared/
-/// preparedPrime, CONFIRM ballot, EXTERNALIZE commit), fails if any fails to decode,
-/// and fails if any decoded value uses `StellarValueExt::Basic`.
+/// It walks every statement value using the same extraction rules as stellar-core's
+/// `getStatementValues` (BallotProtocol.cpp:1924-1945): for PREPARE statements,
+/// `prep.ballot.value` is only inspected when `prep.ballot.counter != 0`.
 ///
 /// Parity: stellar-core rejects envelopes with non-SIGNED inner StellarValues in
 /// `PendingEnvelopes.cpp::recvSCPEnvelope` and `HerderSCPDriver.cpp::validateValue`.
@@ -152,7 +152,12 @@ pub fn check_all_values_signed(envelope: &ScpEnvelope) -> bool {
             .map(|v| v.0.as_slice())
             .collect(),
         ScpStatementPledges::Prepare(prep) => {
-            let mut vals = vec![prep.ballot.value.0.as_slice()];
+            // Parity: stellar-core's getStatementValues (BallotProtocol.cpp:1924-1945)
+            // only includes prep.ballot.value when counter != 0.
+            let mut vals = Vec::new();
+            if prep.ballot.counter != 0 {
+                vals.push(prep.ballot.value.0.as_slice());
+            }
             if let Some(ref prepared) = prep.prepared {
                 vals.push(prepared.value.0.as_slice());
             }
@@ -204,7 +209,8 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::{
         Limits, ScpBallot, ScpNomination, ScpStatement, ScpStatementExternalize,
-        ScpStatementPledges, StellarValue, StellarValueExt, TimePoint, Uint256, Value, WriteXdr,
+        ScpStatementPledges, ScpStatementPrepare, StellarValue, StellarValueExt, TimePoint,
+        Uint256, Value, WriteXdr,
     };
 
     fn make_test_stellar_value(tx_set_hash: [u8; 32], close_time: u64) -> StellarValue {
@@ -459,5 +465,68 @@ mod tests {
         };
 
         assert!(!check_all_values_signed(&envelope));
+    }
+
+    /// Regression: zero-counter PREPARE with Basic ballot value must be ACCEPTED
+    /// because stellar-core's getStatementValues skips prep.ballot.value when
+    /// counter == 0 (BallotProtocol.cpp:1924-1945).
+    #[test]
+    fn test_check_all_values_signed_zero_counter_prepare_skips_ballot_value() {
+        let basic_value = make_test_stellar_value([1u8; 32], 100);
+
+        // Zero-counter PREPARE: ballot.value is Basic but should not be checked.
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: make_test_node_id(1),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    ballot: ScpBallot {
+                        counter: 0,
+                        value: encode_value(&basic_value),
+                    },
+                    prepared: None,
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        assert!(
+            check_all_values_signed(&envelope),
+            "zero-counter PREPARE should not inspect ballot.value (parity with stellar-core)"
+        );
+    }
+
+    /// Regression: non-zero-counter PREPARE with Basic ballot value is still rejected.
+    #[test]
+    fn test_check_all_values_signed_nonzero_counter_prepare_rejects_basic() {
+        let basic_value = make_test_stellar_value([1u8; 32], 100);
+
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: make_test_node_id(1),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    ballot: ScpBallot {
+                        counter: 1,
+                        value: encode_value(&basic_value),
+                    },
+                    prepared: None,
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        assert!(
+            !check_all_values_signed(&envelope),
+            "non-zero-counter PREPARE with Basic ballot value should be rejected"
+        );
     }
 }
