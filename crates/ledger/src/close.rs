@@ -2002,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ledger_close_perf_add_assign_accumulates_soroban_arc_counts() {
+    fn test_ledger_close_perf_add_assign_keeps_soroban_arc_counts_latest() {
         let mut agg = LedgerClosePerf::default();
         assert_eq!(agg.soroban_state_data_arc_count, 0);
         assert_eq!(agg.soroban_state_code_arc_count, 0);
@@ -2022,7 +2022,9 @@ mod tests {
             ..Default::default()
         };
         agg += &perf2;
-        assert_eq!(agg.soroban_state_data_arc_count, 5);
-        assert_eq!(agg.soroban_state_code_arc_count, 6);
+        // Arc counts are instantaneous per-close observations, not cumulative.
+        // The aggregate should keep the latest sample (3/5), not sum (5/6).
+        assert_eq!(agg.soroban_state_data_arc_count, 3);
+        assert_eq!(agg.soroban_state_code_arc_count, 5);
     }
 }
