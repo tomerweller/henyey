@@ -10422,6 +10422,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = crate::config::ConfigBuilder::new()
             .in_memory(true)
+            .database_path(dir.path().join("test.db"))
             .bucket_directory(dir.path().join("buckets"))
             .build();
 
@@ -10445,6 +10446,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = crate::config::ConfigBuilder::new()
             .in_memory(true)
+            .database_path(dir.path().join("test.db"))
             .bucket_directory(dir.path().join("buckets"))
             .build();
 
@@ -10472,6 +10474,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = crate::config::ConfigBuilder::new()
             .in_memory(true)
+            .database_path(dir.path().join("test.db"))
             .bucket_directory(dir.path().join("buckets"))
             .build();
 
@@ -10490,6 +10493,102 @@ mod tests {
         assert!(
             (!at_genesis) || app.was_force_scp_bootstrapped(),
             "restore should proceed at genesis with force_scp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_scp_state_via_app_uses_sqlite_persistence() {
+        use henyey_herder::{ScpPersistenceManager, SqliteScpPersistence};
+        use henyey_scp::hash_quorum_set;
+        use stellar_xdr::curr::{
+            Limits, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementPledges,
+            Signature, StellarValue, StellarValueExt, TimePoint, Value, WriteXdr,
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("restore-scp-state.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .bucket_directory(dir.path().join("buckets"))
+            .build();
+
+        let app = Arc::new(App::new(config).await.unwrap());
+        app.herder.start_syncing();
+        app.herder.bootstrap(2);
+
+        let manager =
+            ScpPersistenceManager::new(Box::new(SqliteScpPersistence::new(app.database().clone())));
+        let local_node_id = app.herder.scp().local_node_id().clone();
+        let lcl_hash = app.ledger_manager.current_header_hash();
+        let tx_set = henyey_herder::TransactionSet::new(lcl_hash, Vec::new());
+        let tx_set_hash = *tx_set.hash();
+        let tx_set_bytes = tx_set
+            .to_xdr_stored_set()
+            .to_xdr(Limits::none())
+            .expect("encode stored tx set");
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let quorum_set_hash = hash_quorum_set(&quorum_set);
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(1000),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: local_node_id.clone(),
+                slot_index: 7,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash(quorum_set_hash.0),
+                    votes: vec![Value(
+                        stellar_value
+                            .to_xdr(Limits::none())
+                            .expect("encode stellar value")
+                            .try_into()
+                            .unwrap(),
+                    )]
+                    .try_into()
+                    .unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        manager
+            .persist_scp_state(
+                7,
+                &[envelope],
+                &[(stellar_xdr::curr::Hash(tx_set_hash.0), tx_set_bytes)],
+                &[(
+                    stellar_xdr::curr::Hash(quorum_set_hash.0),
+                    quorum_set.clone(),
+                )],
+            )
+            .unwrap();
+
+        app.herder.restore_scp_state();
+
+        assert!(
+            app.herder.has_tx_set(&tx_set_hash),
+            "tx set should be cached after app-level restore"
+        );
+        assert!(
+            app.herder
+                .get_quorum_set_by_hash(&quorum_set_hash)
+                .is_some(),
+            "quorum set should be cached after app-level restore"
+        );
+        assert_eq!(
+            app.herder.scp().get_entire_current_state(7).len(),
+            1,
+            "SCP envelope should be restored through app herder"
         );
     }
 

@@ -188,6 +188,17 @@ pub trait ScpStatePersistence: Send + Sync {
     /// Delete persisted transaction sets by their hashes.
     fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<()>;
 
+    /// Save quorum info (node → qset hash mapping).
+    fn save_quorum_info(&self, entries: &[(String, String)]) -> Result<()> {
+        let _ = entries;
+        Ok(())
+    }
+
+    /// Load all quorum info entries.
+    fn load_all_quorum_info(&self) -> Result<Vec<(String, String)>> {
+        Ok(vec![])
+    }
+
     /// Atomic purge of unreferenced persisted transaction sets.
     ///
     /// Implementations that have transactional storage (e.g. SQLite) should
@@ -252,6 +263,8 @@ pub struct InMemoryScpPersistence {
     states: parking_lot::RwLock<std::collections::HashMap<u64, PersistedSlotState>>,
     /// Transaction sets by hash.
     tx_sets: parking_lot::RwLock<std::collections::HashMap<Hash, Vec<u8>>>,
+    /// Last-known node → quorum-set hash mappings.
+    quorum_info: parking_lot::RwLock<std::collections::HashMap<String, String>>,
 }
 
 impl InMemoryScpPersistence {
@@ -260,6 +273,7 @@ impl InMemoryScpPersistence {
         Self {
             states: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tx_sets: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            quorum_info: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -326,6 +340,25 @@ impl ScpStatePersistence for InMemoryScpPersistence {
             tx_sets.remove(hash);
         }
         Ok(())
+    }
+
+    fn save_quorum_info(&self, entries: &[(String, String)]) -> Result<()> {
+        let mut quorum_info = self.quorum_info.write();
+        for (node_id, qset_hash) in entries {
+            quorum_info.insert(node_id.clone(), qset_hash.clone());
+        }
+        Ok(())
+    }
+
+    fn load_all_quorum_info(&self) -> Result<Vec<(String, String)>> {
+        let mut entries: Vec<_> = self
+            .quorum_info
+            .read()
+            .iter()
+            .map(|(node_id, qset_hash)| (node_id.clone(), qset_hash.clone()))
+            .collect();
+        entries.sort();
+        Ok(entries)
     }
 }
 
@@ -536,6 +569,21 @@ impl ScpPersistenceManager {
         // Save SCP state
         self.storage.save_scp_state(slot, &state)?;
 
+        let mut quorum_info = std::collections::HashMap::new();
+        for envelope in envelopes {
+            let Some(qset_hash) = get_quorum_set_hash(envelope) else {
+                continue;
+            };
+            let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(node_key) =
+                &envelope.statement.node_id.0;
+            let node_id = stellar_strkey::ed25519::PublicKey(node_key.0).to_string();
+            quorum_info.insert(node_id, hex::encode(qset_hash.0));
+        }
+        if !quorum_info.is_empty() {
+            let quorum_info_entries: Vec<_> = quorum_info.into_iter().collect();
+            self.storage.save_quorum_info(&quorum_info_entries)?;
+        }
+
         debug!("Persisted SCP state for slot {}", slot);
 
         Ok(())
@@ -557,6 +605,8 @@ impl ScpPersistenceManager {
         for (hash, tx_set) in tx_sets {
             restored.tx_sets.push((hash, tx_set));
         }
+
+        restored.quorum_info = self.storage.load_all_quorum_info()?;
 
         // Load SCP states — all-or-nothing per slot.
         // Parity: stellar-core wraps each persisted slot in one try block
@@ -622,10 +672,11 @@ impl ScpPersistenceManager {
         }
 
         info!(
-            "Restored SCP state: {} envelopes, {} tx sets, {} quorum sets",
+            "Restored SCP state: {} envelopes, {} tx sets, {} quorum sets, {} quorum info entries",
             restored.envelopes.len(),
             restored.tx_sets.len(),
-            restored.quorum_sets.len()
+            restored.quorum_sets.len(),
+            restored.quorum_info.len()
         );
 
         Ok(restored)
@@ -681,6 +732,8 @@ pub struct RestoredScpState {
     pub tx_sets: Vec<(Hash, Vec<u8>)>,
     /// Restored quorum sets.
     pub quorum_sets: Vec<(Hash, ScpQuorumSet)>,
+    /// Persisted node → quorum-set hash mappings.
+    pub quorum_info: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -1165,6 +1218,18 @@ impl ScpStatePersistence for SqliteScpPersistence {
             .map_err(HerderError::Internal)
     }
 
+    fn save_quorum_info(&self, entries: &[(String, String)]) -> Result<()> {
+        self.inner
+            .save_quorum_info(entries)
+            .map_err(HerderError::Internal)
+    }
+
+    fn load_all_quorum_info(&self) -> Result<Vec<(String, String)>> {
+        self.inner
+            .load_all_quorum_info()
+            .map_err(HerderError::Internal)
+    }
+
     /// Override the trait default with a SQLite-transactional implementation
     /// so the read-then-delete sequence is atomic w.r.t. concurrent writers.
     /// See `henyey_db::SqliteScpPersistence::purge_unreferenced_tx_sets_atomic`
@@ -1212,6 +1277,22 @@ mod sqlite_tests {
         persistence.delete_scp_state_below(101).unwrap();
         let remaining = persistence.load_all_scp_states().unwrap();
         assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_sqlite_quorum_info_persistence() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let persistence = SqliteScpPersistence::new(db);
+
+        persistence
+            .save_quorum_info(&[("GA123".to_string(), "aa".repeat(32))])
+            .unwrap();
+        persistence
+            .save_quorum_info(&[("GA123".to_string(), "bb".repeat(32))])
+            .unwrap();
+
+        let all = persistence.load_all_quorum_info().unwrap();
+        assert_eq!(all, vec![("GA123".to_string(), "bb".repeat(32))]);
     }
 
     #[test]

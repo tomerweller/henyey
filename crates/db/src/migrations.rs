@@ -34,7 +34,7 @@ use tracing::info;
 /// This should be incremented whenever a new migration is added.
 /// The database initialization and migration system uses this to
 /// determine if upgrades are needed.
-pub(crate) const CURRENT_VERSION: i32 = 10;
+pub(crate) const CURRENT_VERSION: i32 = 11;
 
 /// Represents a single database migration.
 ///
@@ -176,6 +176,17 @@ const MIGRATIONS: &[Migration] = &[
         "#,
         description:
             "Add status+ledger+txindex index for efficient status-filtered transaction queries",
+    },
+    Migration {
+        from_version: 10,
+        to_version: 11,
+        upgrade_sql: r#"
+            CREATE TABLE IF NOT EXISTS quoruminfo (
+                nodeid TEXT PRIMARY KEY,
+                qsethash TEXT NOT NULL
+            );
+        "#,
+        description: "Add quoruminfo table for persisted node quorum-set mappings",
     },
 ];
 
@@ -442,6 +453,44 @@ mod tests {
         assert!(
             index_exists,
             "events_topic1_id index should exist after migration"
+        );
+        assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_10_to_11_adds_quoruminfo_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE storestate (statename TEXT PRIMARY KEY, state TEXT);
+            CREATE TABLE txhistory (
+                txid TEXT PRIMARY KEY,
+                ledgerseq INTEGER NOT NULL,
+                txindex INTEGER NOT NULL,
+                txbody BLOB NOT NULL,
+                txresult BLOB NOT NULL,
+                txmeta BLOB,
+                status INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX txhistory_ledger ON txhistory(ledgerseq);
+            CREATE INDEX txhistory_status_ledger ON txhistory(status, ledgerseq, txindex);
+            "#,
+        )
+        .unwrap();
+        set_schema_version(&conn, 10).unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'quoruminfo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            table_exists,
+            "quoruminfo table should exist after migration"
         );
         assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_VERSION);
     }

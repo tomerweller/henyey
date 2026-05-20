@@ -898,13 +898,10 @@ impl Herder {
         let Some(manager) = self.scp_persistence.get() else {
             return;
         };
-        match manager.restore_scp_state() {
-            Ok(restored) => self.apply_restored_scp_state(restored),
-            Err(e) => warn!(
-                error = %e,
-                "Failed to restore SCP state on startup — node will wait for fresh envelopes"
-            ),
-        }
+        let restored = manager.restore_scp_state().expect(
+            "SCP state restore failed: persistence read error is fatal (parity: stellar-core)",
+        );
+        self.apply_restored_scp_state(restored);
     }
 
     /// Apply restored SCP state from persistence on startup.
@@ -976,6 +973,8 @@ impl Herder {
         // Called once at the end; idempotent — semantically equivalent to
         // stellar-core's per-slot calls.
         {
+            let quorum_info_map: HashMap<_, _> = state.quorum_info.into_iter().collect();
+
             // Collect all node IDs that have envelopes in SCP.
             let node_ids: Vec<_> = state
                 .envelopes
@@ -999,7 +998,18 @@ impl Herder {
             }
 
             let mut tracker = self.quorum_tracker.write();
-            if let Err(err) = tracker.rebuild(|id| self.scp_driver.get_quorum_set(id)) {
+            if let Err(err) = tracker.rebuild(|id| {
+                if let Some(qs) = self.scp_driver.get_quorum_set(id) {
+                    return Some(qs);
+                }
+
+                let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(node_key) = &id.0;
+                let node_id_str = stellar_strkey::ed25519::PublicKey(node_key.0).to_string();
+                let hash_hex = quorum_info_map.get(&node_id_str)?;
+                let hash_bytes: [u8; 32] = hex::decode(hash_hex).ok()?.try_into().ok()?;
+                self.scp_driver
+                    .get_quorum_set_by_hash(&Hash256::from_bytes(hash_bytes))
+            }) {
                 warn!(error = %err, "Failed to rebuild quorum tracker after SCP state restore");
             }
         }
@@ -13325,6 +13335,7 @@ mod restore_scp_state_tests {
             envelopes: vec![(slot, envelope.clone())],
             tx_sets: vec![],
             quorum_sets: vec![],
+            quorum_info: vec![],
         };
 
         herder.apply_restored_scp_state(restored);
@@ -13360,6 +13371,7 @@ mod restore_scp_state_tests {
             envelopes: vec![],
             tx_sets: vec![],
             quorum_sets: vec![(xdr_hash, qs.clone())],
+            quorum_info: vec![],
         };
 
         herder.apply_restored_scp_state(restored);
@@ -13384,6 +13396,7 @@ mod restore_scp_state_tests {
             envelopes: vec![],
             tx_sets: vec![(xdr_hash, bytes)],
             quorum_sets: vec![],
+            quorum_info: vec![],
         };
 
         herder.apply_restored_scp_state(restored);
@@ -13414,6 +13427,7 @@ mod restore_scp_state_tests {
             envelopes: vec![],
             tx_sets: vec![(corrupt_hash, corrupt_bytes), (valid_hash, valid_bytes)],
             quorum_sets: vec![],
+            quorum_info: vec![],
         };
 
         // Should not panic — corrupt entry is skipped.
@@ -13456,6 +13470,7 @@ mod restore_scp_state_tests {
             envelopes: vec![],
             tx_sets: vec![],
             quorum_sets: vec![(xdr_hash.clone(), qs)],
+            quorum_info: vec![],
         };
         herder.apply_restored_scp_state(restored);
 
@@ -13488,6 +13503,61 @@ mod restore_scp_state_tests {
             result,
             crate::fetching_envelopes::RecvResult::Ready,
             "Envelope referencing a restored quorum set should be Ready, not Fetching"
+        );
+    }
+
+    #[test]
+    fn test_apply_restored_scp_state_uses_persisted_quorum_info_fallback() {
+        let herder = make_test_herder();
+        let local_node_id = herder.scp.local_node_id().clone();
+        let remote_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            Uint256([42u8; 32]),
+        ));
+
+        let remote_qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![remote_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let remote_qs_hash = hash_quorum_set(&remote_qs);
+
+        let local_qs = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![local_node_id.clone(), remote_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let local_qs_hash = hash_quorum_set(&local_qs);
+
+        let local_env = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: local_node_id.clone(),
+                slot_index: 7,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash(local_qs_hash.0),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        let remote_node_str = stellar_strkey::ed25519::PublicKey([42u8; 32]).to_string();
+        herder.apply_restored_scp_state(RestoredScpState {
+            envelopes: vec![(7, local_env)],
+            tx_sets: vec![],
+            quorum_sets: vec![
+                (stellar_xdr::curr::Hash(local_qs_hash.0), local_qs.clone()),
+                (stellar_xdr::curr::Hash(remote_qs_hash.0), remote_qs.clone()),
+            ],
+            quorum_info: vec![(remote_node_str, hex::encode(remote_qs_hash.0))],
+        });
+
+        let tracker = herder.quorum_tracker.read();
+        assert!(
+            tracker.is_node_definitely_in_quorum(&remote_node_id),
+            "remote node should be tracked via persisted quoruminfo fallback"
         );
     }
 

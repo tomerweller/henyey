@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS scpquorums (
     lastledgerseq INTEGER NOT NULL,
     qset BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quoruminfo (
+    nodeid TEXT PRIMARY KEY,
+    qsethash TEXT NOT NULL
+);
 
 -- Peers
 CREATE TABLE IF NOT EXISTS peers (
