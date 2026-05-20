@@ -501,6 +501,29 @@ test_review_pr_validate_worktree_base_rejects_wrong_pr() {
   fi
 }
 
+test_review_pr_validate_worktree_base_accepts_legacy_issue_override() {
+  local desc="review-pr validate_worktree_base accepts legacy review-pr-\$ISSUE when ISSUE != PR_NUM"
+
+  # When a PR closes a different-numbered issue (e.g. PR #2846 closes #2843),
+  # legacy wrappers may set WORKTREE_BASE=$HOME/data/$SESSION_ID/review-pr-2843.
+  # The validator must accept this even when called with PR_NUM=2846.
+  local func_body
+  func_body=$(sed -n '/^validate_worktree_base()/,/^}/p' "$REVIEW_PR_SKILL")
+
+  # Check that the function has a pattern accepting review-pr-<any-number> or
+  # review-pr-[0-9]* in the expected_pr branch (not just review-pr-$expected_pr).
+  local has_legacy_accept=false
+  if echo "$func_body" | grep -qE 'review-pr-\[0-9\]\*|review-pr-\*|review-pr-[^"$]*legacy'; then
+    has_legacy_accept=true
+  fi
+
+  if $has_legacy_accept; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "validate_worktree_base does not accept legacy review-pr-\$ISSUE overrides when ISSUE != PR_NUM"
+  fi
+}
+
 # --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
@@ -520,6 +543,7 @@ test_review_pr_validate_worktree_base_safety
 test_review_pr_validate_worktree_base_rejects_traversal
 test_review_pr_validate_worktree_base_at_bootstrap
 test_review_pr_validate_worktree_base_rejects_wrong_pr
+test_review_pr_validate_worktree_base_accepts_legacy_issue_override
 test_review_pr_session_id_fallback_collision_resistant
 test_claude_review_pr_synced
 test_claude_plan_synced

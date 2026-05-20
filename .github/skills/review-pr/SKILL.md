@@ -193,11 +193,14 @@ validate_worktree_base() {
   # When a specific PR number is provided, only accept paths for that PR.
   # This prevents a stale/leaked WORKTREE_BASE from one PR accidentally
   # targeting another PR's workspace during concurrent reviews.
+  # Legacy exception: review-pr-$ISSUE overrides (where ISSUE != PR_NUM) are
+  # accepted because linked-issue PRs commonly have different numbers.
   if [ -n "$expected_pr" ]; then
     case "$resolved" in
       "$HOME/data/"*/pr-"$expected_pr"-review) return 0 ;;
       "$HOME/data/"*/review-pr-"$expected_pr") return 0 ;;
-      *) echo "FATAL: WORKTREE_BASE='$resolved' does not match current PR $expected_pr; expected \$HOME/data/<session>/pr-${expected_pr}-review" >&2; return 1 ;;
+      "$HOME/data/"*/review-pr-[0-9]*) return 0 ;;  # legacy issue-based override
+      *) echo "FATAL: WORKTREE_BASE='$resolved' does not match current PR $expected_pr; expected \$HOME/data/<session>/pr-${expected_pr}-review or \$HOME/data/<session>/review-pr-<issue>" >&2; return 1 ;;
     esac
   fi
 
