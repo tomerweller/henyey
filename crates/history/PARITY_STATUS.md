@@ -264,9 +264,9 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rationale**: Native HTTP improves retries, error reporting, and connection reuse on the common read path.
 
 3. **Publish queue storage**
-   - **stellar-core**: Carries filesystem-era queue concepts plus SQL-backed persistence.
-   - **Rust**: Starts directly with a SQLite-backed queue in `henyey-db`.
-   - **Rationale**: The Rust implementation skips migration baggage and keeps queue state crash-safe in one place.
+   - **stellar-core**: Uses a filesystem queue directory where each pending checkpoint is represented by `<seq>.checkpoint.dirty` (written by `writeCheckpointFile(..., false)` in `publishQueuePath()`) and finalized to `<seq>.checkpoint` by `maybeCheckpointComplete()`. On restart, `restoreCheckpoint()` iterates the queue directory and removes entries above LCL.
+   - **Rust**: Uses a SQLite `publishqueue` table (`ledgerseq → HAS JSON`). Rows are created atomically inside the ledger-close DB transaction (`conn.enqueue_publish(...)` in `crates/app/src/app/ledger_close.rs`). There is no pending/dirty row state — the entry either committed or it didn't. On restart, `restore_checkpoint()` calls `remove_above_lcl()` to clean stale rows, paralleling stellar-core's filesystem cleanup.
+   - **Rationale**: The queue is node-local and never externally observable. SQLite's ACID commit replaces the two-phase `.dirty` → rename pattern while providing equivalent durability and restart-safety guarantees. The Rust implementation skips migration baggage and keeps queue state crash-safe in one transactional store. Checkpoint XDR file staging (the part that *is* filesystem-based) remains in `CheckpointBuilder` with `.dirty` files and durable rename, identical in spirit to stellar-core.
 
 4. **FutureBucket handling**
    - **stellar-core**: Exposes both blocking and incremental future-resolution helpers on HAS.

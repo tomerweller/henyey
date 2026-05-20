@@ -132,6 +132,18 @@ println!("ledger {} closed at {}", header.ledger_seq, header.scp_value.close_tim
 - `CheckpointBuilder` uses `.dirty` files plus durable rename so partially written checkpoints never become visible as final archive outputs. Unlike stellar-core, henyey's `CheckpointBuilder` only handles startup crash-recovery cleanup — there is no per-ledger append path (checkpoint files are reconstructed from SQLite at publish time). The parity equivalent of stellar-core's `skipFirstCheckpointSinceItIsIncomplete` is therefore enforced one level up, at the publish-queue enqueue site in `henyey-app`'s `LedgerPersistInputs::serialize_and_write_to_db` (see `PARITY_STATUS.md`).
 - Publish-queue backpressure mirrors stellar-core's hysteresis thresholds with `PUBLISH_QUEUE_MAX_SIZE` and `PUBLISH_QUEUE_UNBLOCK_APPLICATION`.
 
+### Publish queue: SQLite vs filesystem
+
+The publish pipeline uses two distinct persistence mechanisms that are easy to conflate:
+
+1. **Checkpoint XDR streams** (ledger headers, transactions, results) are built by `CheckpointBuilder` using `.dirty` files with durable rename — this is the filesystem durability path equivalent to stellar-core's checkpoint file staging.
+
+2. **Publish queue metadata** (which checkpoints are pending publication, with their `HistoryArchiveState` snapshot) is stored in SQLite (`publishqueue` table) rather than stellar-core's filesystem queue of `<seq>.checkpoint` / `<seq>.checkpoint.dirty` files.
+
+This split is an intentional design choice. The publish queue is node-local and never externally observable (other nodes never read it), so the storage shape has no consensus or interoperability implications. SQLite provides the same durability guarantees — rows appear atomically on transaction commit inside `ledger_close`, replacing the two-phase `.dirty` → rename pattern with single-phase ACID commit. On restart, stale queue rows above LCL are removed by `restore_checkpoint()` in `henyey-app` (via `remove_above_lcl()`), just as stellar-core's `restoreCheckpoint()` removes stale filesystem queue entries.
+
+See `publish_queue.rs` module docs for the full semantic mapping to stellar-core's `HistoryManagerImpl.cpp` (`writeCheckpointFile`, `maybeCheckpointComplete`, `restoreCheckpoint`).
+
 ## stellar-core Mapping
 
 | Rust | stellar-core |
